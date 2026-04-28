@@ -54,6 +54,7 @@ cover/
 # Environments
 .env
 .venv
+Python/
 env/
 venv/
 ENV/
@@ -65,3 +66,6 @@ venv.bak/
 !.devcouncil/
 !.devcouncil/config.yaml
 !.devcouncil/graphify.yaml
+
+# Local coding client configuration
+.gemini/
