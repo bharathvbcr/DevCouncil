@@ -1,6 +1,9 @@
-from devcouncil.domain.task import Task
-from devcouncil.domain.requirement import Requirement
+from pathlib import Path
 from typing import List
+
+from devcouncil.domain.requirement import Requirement
+from devcouncil.domain.task import Task
+from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
 
 class PromptBuilder:
     def build_task_prompt(self, task: Task, requirements: List[Requirement]) -> str:
@@ -21,20 +24,26 @@ class PromptBuilder:
 
         prompt += "\n## Allowed files\n"
         for pf in task.planned_files:
-            prompt += f"- {pf.path} ({pf.allowed_change}): {pf.reason}\n"
+            prompt += f"- `{pf.path}` ({pf.allowed_change}): {pf.reason}\n"
 
         if task.forbidden_changes:
             prompt += "\n## Forbidden changes\n"
             for fc in task.forbidden_changes:
-                prompt += f"- {fc}\n"
+                prompt += f"- `{fc}`\n"
 
         prompt += "\n## Expected tests\n"
         for et in task.expected_tests:
-            prompt += f"- {et}\n"
+            prompt += f"- `{et}`\n"
 
         prompt += "\n## Allowed commands\n"
         for cmd in task.allowed_commands:
-            prompt += f"- {cmd}\n"
+            prompt += f"- `{cmd}`\n"
+
+        graph_context = CodeReviewGraphAdapter(Path(".")).prompt_section(
+            [planned.path for planned in task.planned_files]
+        )
+        if graph_context:
+            prompt += f"\n{graph_context}"
 
         prompt += """
 ## Instructions

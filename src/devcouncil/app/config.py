@@ -56,6 +56,23 @@ class PrivacyConfig(BaseModel):
     store_prompts_locally: bool = True
 
 
+class AgentFlowIntegrationConfig(BaseModel):
+    enabled: bool = False
+    trace_path: str = ".devcouncil/logs/traces.jsonl"
+    mode: str = "jsonl"
+
+
+class CodeReviewGraphIntegrationConfig(BaseModel):
+    enabled: bool = False
+    command: str = "code-review-graph"
+    optional: bool = True
+
+
+class IntegrationsConfig(BaseModel):
+    agent_flow: AgentFlowIntegrationConfig = Field(default_factory=AgentFlowIntegrationConfig)
+    code_review_graph: CodeReviewGraphIntegrationConfig = Field(default_factory=CodeReviewGraphIntegrationConfig)
+
+
 class ProviderConfig(BaseModel):
     sort: str = "price"
     allow_fallbacks: bool = True
@@ -73,6 +90,7 @@ class DevCouncilConfig(BaseModel):
     gates: GatesConfig = Field(default_factory=GatesConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
+    integrations: IntegrationsConfig = Field(default_factory=IntegrationsConfig)
 
 
 def load_config(project_root: Path = Path(".")) -> DevCouncilConfig:

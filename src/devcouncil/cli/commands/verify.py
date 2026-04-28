@@ -12,6 +12,8 @@ from devcouncil.llm.router import ModelRouter
 from devcouncil.domain.evidence import CommandResult, DiffEvidence, TestEvidence
 from devcouncil.app.config import load_config, get_api_key
 from devcouncil.app.state_machine import ProjectPhase
+from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
+from devcouncil.telemetry.traces import TraceLogger
 
 console = Console()
 MAX_RENDERED_GAPS = 20
@@ -58,6 +60,22 @@ def verify(
         blocked_tasks = 0
 
         for task in tasks:
+            TraceLogger(Path(".")).log_event(
+                "task_verification_started",
+                {"task_id": task.id},
+                task_id=task.id,
+                summary=f"Verifying {task.id}",
+            )
+            graph_context = CodeReviewGraphAdapter(Path(".")).get_context(
+                [planned.path for planned in task.planned_files]
+            )
+            if graph_context.available:
+                TraceLogger(Path(".")).log_event(
+                    "graph_context_loaded",
+                    graph_context.model_dump(),
+                    task_id=task.id,
+                    summary=f"Loaded graph context for {task.id}",
+                )
             StateRepository(session).record_phase(ProjectPhase.TASK_VERIFYING.value)
             gap_repo.delete_for_task(task.id)
             evidence_repo.delete_for_task(task.id)
@@ -81,8 +99,20 @@ def verify(
             if any(gap.blocking for gap in gaps):
                 task.status = "blocked"
                 blocked_tasks += 1
+                TraceLogger(Path(".")).log_event(
+                    "gate_failed",
+                    {"task_id": task.id, "gap_count": len(gaps)},
+                    task_id=task.id,
+                    summary=f"{task.id} blocked with {len(gaps)} gap(s)",
+                )
             else:
                 task.status = "verified"
+                TraceLogger(Path(".")).log_event(
+                    "task_verified",
+                    {"task_id": task.id, "gap_count": len(gaps)},
+                    task_id=task.id,
+                    summary=f"{task.id} verified",
+                )
             task_repo.save(task)
 
         StateRepository(session).record_phase(

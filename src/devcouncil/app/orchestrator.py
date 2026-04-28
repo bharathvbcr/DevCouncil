@@ -8,6 +8,7 @@ from devcouncil.app.run_context import RunContext
 from devcouncil.app.events import bus, EventTypes
 from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import StateRepository
+from devcouncil.telemetry.traces import TraceLogger
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,12 @@ class Orchestrator:
             goal=goal
         )
         self.current_run.initialize()
+        TraceLogger(self.project_root).log_event(
+            "planning_started",
+            {"goal": goal},
+            run_id=run_id,
+            summary=f"Planning started: {goal}",
+        )
         
         await bus.emit(EventTypes.PLANNING_STARTED, {"run_id": run_id, "goal": goal})
         return self.current_run
@@ -63,6 +70,12 @@ class Orchestrator:
                 )
                 
         logger.info(f"Transitioned from {old_phase.value} to {target_phase.value}")
+        TraceLogger(self.project_root).log_event(
+            "phase_transition",
+            {"from": old_phase.value, "to": target_phase.value},
+            run_id=self.current_run.run_id if self.current_run else None,
+            summary=f"{old_phase.value} -> {target_phase.value}",
+        )
         
         if target_phase == ProjectPhase.PLAN_APPROVED:
             await bus.emit(EventTypes.PLANNING_COMPLETED, {"run_id": self.current_run.run_id if self.current_run else None})
