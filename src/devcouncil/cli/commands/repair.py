@@ -1,0 +1,69 @@
+import typer
+from rich.console import Console
+from devcouncil.storage.db import get_db
+from devcouncil.storage.repositories import TaskRepository, GapRepository
+from devcouncil.planning.repair_service import RepairService
+from devcouncil.execution.context_builder import ContextBuilder
+from devcouncil.llm.provider import OpenRouterProvider
+from devcouncil.llm.router import ModelRouter
+from devcouncil.app.config import load_config, get_api_key
+import asyncio
+from pathlib import Path
+
+app = typer.Typer()
+console = Console()
+
+async def run_repair_flow():
+    db = get_db()
+    if not db:
+        console.print("[red]DevCouncil not initialized. Run 'dev init' first.[/red]")
+        return
+
+    with db.get_session() as session:
+        gap_repo = GapRepository(session)
+        task_repo = TaskRepository(session)
+
+        all_gaps = gap_repo.get_all()
+        blocking_gaps = [g for g in all_gaps if g.blocking]
+        
+        if not blocking_gaps:
+            console.print("[green]No blocking gaps found. Nothing to repair![/green]")
+            return
+
+        console.print(f"Found [bold]{len(blocking_gaps)}[/bold] blocking gaps. Orchestrating repair plan...")
+
+        # Load router
+        try:
+            config = load_config(Path("."))
+            api_key = get_api_key(config.models.provider)
+        except (FileNotFoundError, ValueError) as e:
+            console.print(f"[red]{e}[/red]")
+            return
+        
+        provider = OpenRouterProvider(api_key)
+        role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
+        router = ModelRouter(provider, role_config)
+        repair_service = RepairService(router)
+        context_builder = ContextBuilder(Path("."))
+        
+        # Build minimal context for repair.
+        project_context = context_builder.get_structure_summary()
+
+        repair_output = await repair_service.generate_repair_plan(blocking_gaps, str(project_context))
+        
+        for task in repair_output.suggested_tasks:
+            task.id = f"REPAIR-{task.id}"
+            task_repo.save(task)
+            console.print(f"  - Created intelligent repair task [bold]{task.id}[/bold]: {task.title}")
+
+        console.print(f"\n[green]Successfully generated {len(repair_output.suggested_tasks)} repair tasks.[/green]")
+
+@app.callback(invoke_without_command=True)
+def repair(ctx: typer.Context):
+    """
+    Convert blocking gaps into intelligent repair tasks using LLM inference.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+
+    asyncio.run(run_repair_flow())
