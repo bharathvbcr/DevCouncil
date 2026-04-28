@@ -1,5 +1,4 @@
 import typer
-import subprocess
 import json
 from rich.console import Console
 from pathlib import Path
@@ -7,40 +6,55 @@ from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import TaskRepository, RequirementRepository
 from devcouncil.executors.mini_swe import MiniSWEExecutor
 from devcouncil.executors.openhands import OpenHandsExecutor
+from devcouncil.executors.coding_cli import CodingCliExecutor
 from devcouncil.executors.native.agent import NativeAgent
-from devcouncil.llm.provider import OpenRouterProvider
+from devcouncil.llm.provider import create_provider, validate_model_provider
 from devcouncil.llm.router import ModelRouter
 from devcouncil.app.config import load_config, get_api_key
 from devcouncil.domain.evidence import CommandResult, DiffEvidence, TestEvidence
 from devcouncil.storage.repositories import GapRepository, EvidenceRepository, StateRepository
 from devcouncil.verification.verifier import Verifier
 from devcouncil.app.state_machine import ProjectPhase
+from devcouncil.cli.commands.init import initialize_project
 
 console = Console()
+CODING_EXECUTOR_ALIASES = {
+    "codex": "codex",
+    "codex-cli": "codex",
+    "gemini": "gemini",
+    "gemini-cli": "gemini",
+    "claude": "claude",
+    "claude-code": "claude",
+    "claude-cli": "claude",
+}
 
-def _current_changed_files() -> list[str]:
+CODING_EXECUTORS = set(CODING_EXECUTOR_ALIASES.keys())
+
+def _current_changed_files(project_root: Path = Path(".")) -> list[str]:
     from devcouncil.verification.verifier import Verifier
 
-    return Verifier(Path(".")).get_changed_files()
+    return Verifier(project_root).get_changed_files()
 
-def _capture_after_patch(task_id: str):
+def _capture_after_patch(task_id: str, project_root: Path = Path(".")):
     """Capture the diff after task execution for use by rollback."""
     try:
-        checkpoint_dir = Path(".devcouncil/checkpoints")
+        from devcouncil.verification.verifier import Verifier
+
+        checkpoint_dir = project_root / ".devcouncil" / "checkpoints"
         checkpoint_dir.mkdir(exist_ok=True)
-        diff = subprocess.check_output(["git", "diff", "HEAD"]).decode("utf-8", errors="ignore")
+        diff = Verifier(project_root).get_diff()
         if diff:
             with open(checkpoint_dir / f"{task_id}-after.patch", "w", encoding="utf-8") as f:
                 f.write(diff)
     except Exception:
         pass  # Non-critical — don't block execution
 
-def _capture_before_snapshot(task_id: str):
-    checkpoint_dir = Path(".devcouncil/checkpoints")
+def _capture_before_snapshot(task_id: str, project_root: Path = Path(".")):
+    checkpoint_dir = project_root / ".devcouncil" / "checkpoints"
     checkpoint_dir.mkdir(exist_ok=True)
     snapshot = {
         "task_id": task_id,
-        "changed_files": _current_changed_files(),
+        "changed_files": _current_changed_files(project_root),
     }
     (checkpoint_dir / f"{task_id}-before.json").write_text(
         json.dumps(snapshot, indent=2),
@@ -50,11 +64,11 @@ def _capture_before_snapshot(task_id: str):
 def _record_project_phase(session, phase: ProjectPhase):
     StateRepository(session).record_phase(phase.value)
 
-def _verify_after_execution(session, task, reqs, router=None) -> bool:
+def _verify_after_execution(session, task, reqs, router=None, project_root: Path = Path(".")) -> bool:
     """Run deterministic verification after an automated executor finishes."""
     import asyncio
 
-    verifier = Verifier(Path("."), router=router)
+    verifier = Verifier(project_root, router=router)
     gaps, evidence = asyncio.run(verifier.verify_task(task, reqs))
 
     gap_repo = GapRepository(session)
@@ -78,14 +92,22 @@ def _verify_after_execution(session, task, reqs, router=None) -> bool:
 
 def run(
     task_id: str = typer.Argument(..., help="ID of the task to run"),
-    executor: str = typer.Option("manual", "--executor", "-e", help="Executor to use (manual, shell)"),
+    executor: str = typer.Option(
+        "manual",
+        "--executor",
+        "-e",
+        help="Executor to use (manual, mini, openhands, native, codex, codex-cli, gemini, gemini-cli, claude, claude-code, claude-cli)",
+    ),
+    project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
 ):
     """
     Execute a specific task.
     """
-    db = get_db()
+    root = project_root.expanduser().resolve()
+    initialize_project(root, quiet=True)
+    db = get_db(root)
     if not db:
-        console.print("[red]DevCouncil not initialized. Run 'dev init' first.[/red]")
+        console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
         return
 
     with db.get_session() as session:
@@ -97,7 +119,7 @@ def run(
 
         from devcouncil.gating.policy import GatePolicy
         policy = GatePolicy()
-        gate_result = policy.check_task_ready(task, Path("."))
+        gate_result = policy.check_task_ready(task, root)
         if not gate_result.passed:
             console.print(f"[red]Task {task_id} is not ready for execution.[/red]")
             for gap in gate_result.gaps:
@@ -109,10 +131,12 @@ def run(
 
         # 1. Create Git checkpoint
         try:
-            checkpoint_dir = Path(".devcouncil/checkpoints")
+            from devcouncil.verification.verifier import Verifier
+
+            checkpoint_dir = root / ".devcouncil" / "checkpoints"
             checkpoint_dir.mkdir(exist_ok=True)
-            _capture_before_snapshot(task_id)
-            diff = subprocess.check_output(["git", "diff", "HEAD"]).decode("utf-8", errors="ignore")
+            _capture_before_snapshot(task_id, root)
+            diff = Verifier(root).get_diff()
             if diff:
                 with open(checkpoint_dir / f"{task_id}-before.patch", "w", encoding="utf-8") as f:
                     f.write(diff)
@@ -120,6 +144,7 @@ def run(
         except Exception as e:
             console.print(f"[yellow]Warning: Failed to create git checkpoint: {e}[/yellow]")
 
+        executor = executor.strip().lower().replace("_", "-")
         if executor == "manual":
             _record_project_phase(session, ProjectPhase.TASK_EXECUTING)
             task.status = "running"
@@ -127,16 +152,38 @@ def run(
             console.print(f"\n[green]Task {task_id} is now marked as RUNNING.[/green]")
             console.print("Use 'dev prompt TASK-ID' to get the prompt for this task.")
             console.print("When finished, use 'dev verify TASK-ID' to check the results.")
+        elif executor in CODING_EXECUTORS:
+            _record_project_phase(session, ProjectPhase.TASK_EXECUTING)
+            req_repo = RequirementRepository(session)
+            reqs = req_repo.get_all()
+            cli_client = CODING_EXECUTOR_ALIASES[executor]
+            cli_executor = CodingCliExecutor(root, cli_client)
+            exec_result = cli_executor.run_task(task, reqs)
+            _capture_after_patch(task_id, root)
+            if exec_result.success:
+                _record_project_phase(session, ProjectPhase.TASK_VERIFYING)
+                verified = _verify_after_execution(session, task, reqs, project_root=root)
+                _record_project_phase(
+                    session,
+                    ProjectPhase.TASK_VERIFIED if verified else ProjectPhase.TASK_BLOCKED,
+                )
+                task_repo.save(task)
+                if verified:
+                    console.print(f"\n[green]{executor.upper()} finished and task {task_id} verified.[/green]")
+                else:
+                    console.print(f"\n[yellow]{executor.upper()} finished, but task {task_id} is blocked by verification gaps.[/yellow]")
+            else:
+                console.print(f"\n[red]{executor.upper()} failed to start or execute: {exec_result.message}[/red]")
         elif executor == "mini":
             _record_project_phase(session, ProjectPhase.TASK_EXECUTING)
             req_repo = RequirementRepository(session)
             reqs = req_repo.get_all()
-            mini_executor = MiniSWEExecutor(Path("."))
+            mini_executor = MiniSWEExecutor(root)
             exec_result = mini_executor.run_task(task, reqs)
-            _capture_after_patch(task_id)
+            _capture_after_patch(task_id, root)
             if exec_result.success:
                 _record_project_phase(session, ProjectPhase.TASK_VERIFYING)
-                verified = _verify_after_execution(session, task, reqs)
+                verified = _verify_after_execution(session, task, reqs, project_root=root)
                 _record_project_phase(
                     session,
                     ProjectPhase.TASK_VERIFIED if verified else ProjectPhase.TASK_BLOCKED,
@@ -152,12 +199,12 @@ def run(
             _record_project_phase(session, ProjectPhase.TASK_EXECUTING)
             req_repo = RequirementRepository(session)
             reqs = req_repo.get_all()
-            oh_executor = OpenHandsExecutor(Path("."))
+            oh_executor = OpenHandsExecutor(root)
             exec_result = oh_executor.run_task(task, reqs)
-            _capture_after_patch(task_id)
+            _capture_after_patch(task_id, root)
             if exec_result.success:
                 _record_project_phase(session, ProjectPhase.TASK_VERIFYING)
-                verified = _verify_after_execution(session, task, reqs)
+                verified = _verify_after_execution(session, task, reqs, project_root=root)
                 _record_project_phase(
                     session,
                     ProjectPhase.TASK_VERIFIED if verified else ProjectPhase.TASK_BLOCKED,
@@ -172,13 +219,14 @@ def run(
         elif executor == "native":
             # Load config for model routing and permissions
             try:
-                config = load_config(Path("."))
-                api_key = get_api_key(config.models.provider)
+                config = load_config(root)
+                validate_model_provider(config.models.provider)
+                api_key = get_api_key(config.models.provider, root)
             except (FileNotFoundError, ValueError) as e:
                 console.print(f"[red]{e}[/red]")
                 return
             
-            provider = OpenRouterProvider(api_key)
+            provider = create_provider(config.models.provider, api_key)
             role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
             router = ModelRouter(provider, role_config)
             
@@ -191,8 +239,8 @@ def run(
             policy = PermissionPolicy(
                 allowed_shell_commands=allowed_cmds,
             )
-            perm_manager = PermissionManager(policy, Path("."))
-            task_runner = TaskRunner(Path("."), perm_manager)
+            perm_manager = PermissionManager(policy, root)
+            task_runner = TaskRunner(root, perm_manager)
             
             req_repo = RequirementRepository(session)
             reqs = req_repo.get_all()
@@ -201,11 +249,11 @@ def run(
             _record_project_phase(session, ProjectPhase.TASK_EXECUTING)
             agent = NativeAgent(router, task_runner)
             exec_result = asyncio.run(agent.run_task(task, reqs))
-            _capture_after_patch(task_id)
+            _capture_after_patch(task_id, root)
             
             if exec_result.success:
                 _record_project_phase(session, ProjectPhase.TASK_VERIFYING)
-                verified = _verify_after_execution(session, task, reqs, router=router)
+                verified = _verify_after_execution(session, task, reqs, router=router, project_root=root)
                 _record_project_phase(
                     session,
                     ProjectPhase.TASK_VERIFIED if verified else ProjectPhase.TASK_BLOCKED,

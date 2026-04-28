@@ -1,11 +1,13 @@
 import typer
 from rich.console import Console
 from rich.table import Table
+from pathlib import Path
 
 from devcouncil.app.errors import GatingError
 from devcouncil.artifacts.validators import ArtifactValidator
 from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import RequirementRepository, TaskRepository
+from devcouncil.cli.commands.init import initialize_project
 
 app = typer.Typer()
 console = Console()
@@ -14,9 +16,10 @@ console = Console()
 @app.command(name="validate")
 def validate():
     """Validate requirements and tasks stored in the artifact graph."""
+    initialize_project(Path("."), quiet=True)
     db = get_db()
     if not db:
-        console.print("[red]DevCouncil not initialized. Run 'dev init' first.[/red]")
+        console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
         raise typer.Exit(code=1)
 
     errors: list[str] = []

@@ -31,7 +31,7 @@ sequenceDiagram
     User->>CLI: dev run TASK-001
     CLI->>Orch: run_task(TASK-001)
     Orch->>Exec: Execute Task
-    Exec->>User: (Manual) "Please modify file X"
+    Exec->>User: (Manual) "Please modify file X" or run automated executor internally
     Exec->>Graph: Save Evidence (Diffs, Logs)
     
     Note over User, Graph: Phase: Verification

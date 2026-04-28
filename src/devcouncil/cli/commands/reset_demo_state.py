@@ -1,9 +1,11 @@
 import typer
 from rich.console import Console
 from sqlmodel import delete
+from pathlib import Path
 
 from devcouncil.storage.db import get_db
 from devcouncil.storage.models import EvidenceModel, GapModel, RequirementModel, TaskModel
+from devcouncil.cli.commands.init import initialize_project
 
 console = Console()
 
@@ -16,9 +18,10 @@ def reset_demo_state(
         console.print("[red]Refusing to clear state without --yes.[/red]")
         raise typer.Exit(code=1)
 
+    initialize_project(Path("."), quiet=True)
     db = get_db()
     if not db:
-        console.print("[red]DevCouncil not initialized. Run 'dev init' first.[/red]")
+        console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
         raise typer.Exit(code=1)
 
     with db.get_session() as session:

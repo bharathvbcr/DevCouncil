@@ -6,11 +6,16 @@ logger = logging.getLogger(__name__)
 
 class CleanGitCheck:
     """Ensures the working tree is clean before a task starts."""
+
+    def _is_runtime_state(self, line: str) -> bool:
+        path = line[3:].strip().replace("\\", "/")
+        return path.startswith(".devcouncil/")
     
     def check(self, project_root, task_id: str) -> list[Gap]:
         try:
             status = subprocess.check_output(["git", "status", "--porcelain"], cwd=project_root).decode()
-            if status.strip():
+            dirty_lines = [line for line in status.splitlines() if line.strip() and not self._is_runtime_state(line)]
+            if dirty_lines:
                 return [Gap(
                     id=f"GAP-{task_id}-DIRTY-GIT",
                     severity="high",

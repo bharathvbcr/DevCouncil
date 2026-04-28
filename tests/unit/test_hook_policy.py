@@ -33,6 +33,25 @@ def test_hook_policy_accepts_claude_style_tool_input_shape():
     assert decision.action == "allow"
 
 
+def test_hook_policy_accepts_gemini_style_tool_input_shape():
+    decision = HookPolicy().evaluate(
+        {"tool_name": "write_file", "tool_input": {"target_file": "src/app.py"}},
+        _task(),
+    )
+
+    assert decision.action == "allow"
+
+
+def test_hook_policy_accepts_codex_style_shell_command_shape():
+    decision = HookPolicy().evaluate(
+        {"tool_name": "shell_command", "input": {"command": "git commit --no-verify -m test"}},
+        _task(),
+    )
+
+    assert decision.action == "deny"
+    assert "Verification bypass" in decision.reason
+
+
 def test_hook_policy_blocks_unplanned_file_write():
     decision = HookPolicy().evaluate(
         {"name": "write_file", "arguments": {"path": "src/other.py"}},
