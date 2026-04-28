@@ -20,8 +20,8 @@
     "verification"
   ],
   "bin": {
-    "devcouncil": "./bin/devcouncil.js",
-    "dev": "./bin/devcouncil.js"
+    "devcouncil": "bin/devcouncil.js",
+    "dev": "bin/devcouncil.js"
   },
   "files": [
     "bin/",
