@@ -1,0 +1,30 @@
+[project]
+name = "devcouncil"
+version = "0.1.0"
+description = "Gated orchestrator for AI-assisted software development"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "typer>=0.12.3",
+    "rich>=13.7.1",
+    "pydantic>=2.7.1",
+    "pyyaml>=6.0.1",
+    "sqlmodel>=0.0.19",
+    "httpx>=0.27.0",
+    "gitpython>=3.1.43",
+]
+
+[project.scripts]
+dev = "devcouncil.cli.main:app"
+devcouncil = "devcouncil.cli.main:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2.0",
+    "ruff>=0.4.4",
+    "mypy>=1.10.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
