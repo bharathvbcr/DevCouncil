@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from pathlib import Path
 
 from devcouncil.domain.assumption import Assumption
 from devcouncil.domain.critique import CritiqueFinding
@@ -100,3 +101,26 @@ def test_plan_gate_blocks_unknown_task_links():
     assert not result.passed
     assert any("UNKNOWN-REQ" in gap.id for gap in result.gaps)
     assert any("UNKNOWN-AC" in gap.id for gap in result.gaps)
+
+
+def test_task_ready_blocks_missing_commands_and_expected_evidence(monkeypatch):
+    policy = GatePolicy()
+    monkeypatch.setattr(policy.clean_git, "check", lambda project_root, task_id: [])
+
+    result = policy.check_task_ready(_task(), Path("."))
+
+    assert not result.passed
+    assert any("NO-COMMANDS" in gap.id for gap in result.gaps)
+    assert any("NO-EXPECTED-EVIDENCE" in gap.id for gap in result.gaps)
+
+
+def test_task_ready_passes_with_commands_and_expected_evidence(monkeypatch):
+    policy = GatePolicy()
+    monkeypatch.setattr(policy.clean_git, "check", lambda project_root, task_id: [])
+    task = _task()
+    task.allowed_commands = ["pytest tests/test_auth.py"]
+    task.expected_tests = ["pytest tests/test_auth.py"]
+
+    result = policy.check_task_ready(task, Path("."))
+
+    assert result.passed

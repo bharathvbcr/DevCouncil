@@ -1,11 +1,21 @@
 from sqlmodel import Session, select, delete
 from typing import List, Optional, Any
 import json
-from devcouncil.storage.models import RequirementModel, TaskModel, GapModel, EvidenceModel, ProjectStateModel
+from devcouncil.storage.models import (
+    RequirementModel,
+    AssumptionModel,
+    TaskModel,
+    GapModel,
+    EvidenceModel,
+    CritiqueFindingModel,
+    ProjectStateModel,
+)
 from devcouncil.domain.requirement import Requirement, AcceptanceCriterion
+from devcouncil.domain.assumption import Assumption
 from devcouncil.domain.task import Task, PlannedFile
 from devcouncil.domain.gap import Gap
 from devcouncil.domain.evidence import CommandResult, DiffEvidence, TestEvidence
+from devcouncil.domain.critique import CritiqueFinding
 from devcouncil.artifacts.graph import ArtifactGraph
 
 class RequirementRepository:
@@ -36,6 +46,42 @@ class RequirementRepository:
             priority=req.priority,
             source=req.source,
             acceptance_criteria_json=json.dumps([ac.model_dump() for ac in req.acceptance_criteria])
+        )
+        self.session.merge(model)
+        self.session.commit()
+
+
+class AssumptionRepository:
+    def __init__(self, session: Session):
+        self.session = session
+
+    def get_all(self) -> List[Assumption]:
+        statement = select(AssumptionModel)
+        models = self.session.exec(statement).all()
+        return [
+            Assumption(
+                id=m.id,
+                statement=m.statement,
+                confidence=m.confidence,
+                impact=m.impact,
+                reversible=m.reversible,
+                requires_user_confirmation=m.requires_user_confirmation,
+                linked_requirement_ids=json.loads(m.linked_requirement_ids_json),
+                status=m.status,
+            )
+            for m in models
+        ]
+
+    def save(self, assumption: Assumption):
+        model = AssumptionModel(
+            id=assumption.id,
+            statement=assumption.statement,
+            confidence=assumption.confidence,
+            impact=assumption.impact,
+            reversible=assumption.reversible,
+            requires_user_confirmation=assumption.requires_user_confirmation,
+            linked_requirement_ids_json=json.dumps(assumption.linked_requirement_ids),
+            status=assumption.status,
         )
         self.session.merge(model)
         self.session.commit()
@@ -141,6 +187,10 @@ class GapRepository:
         self.session.exec(delete(GapModel).where(GapModel.task_id == task_id))
         self.session.commit()
 
+    def delete_plan_gaps(self):
+        self.session.exec(delete(GapModel).where(GapModel.id.like("GAP-PLAN-%")))
+        self.session.commit()
+
 class EvidenceRepository:
     def __init__(self, session: Session):
         self.session = session
@@ -192,20 +242,68 @@ class EvidenceRepository:
         self.session.exec(delete(EvidenceModel).where(EvidenceModel.task_id == task_id))
         self.session.commit()
 
+
+class CritiqueFindingRepository:
+    def __init__(self, session: Session):
+        self.session = session
+
+    def get_all(self) -> List[CritiqueFinding]:
+        statement = select(CritiqueFindingModel)
+        models = self.session.exec(statement).all()
+        return [
+            CritiqueFinding(
+                id=m.id,
+                source_agent=m.source_agent,
+                target_plan_id=m.target_plan_id,
+                severity=m.severity,
+                finding_type=m.finding_type,
+                claim=m.claim,
+                linked_requirement_id=m.linked_requirement_id,
+                suggested_requirement=m.suggested_requirement,
+                suggested_task=m.suggested_task,
+                falsifiable_check=m.falsifiable_check,
+                status=m.status,
+            )
+            for m in models
+        ]
+
+    def save(self, finding: CritiqueFinding):
+        model = CritiqueFindingModel(
+            id=finding.id,
+            source_agent=finding.source_agent,
+            target_plan_id=finding.target_plan_id,
+            severity=finding.severity,
+            finding_type=finding.finding_type,
+            claim=finding.claim,
+            linked_requirement_id=finding.linked_requirement_id,
+            suggested_requirement=finding.suggested_requirement,
+            suggested_task=finding.suggested_task,
+            falsifiable_check=finding.falsifiable_check,
+            status=finding.status,
+        )
+        self.session.merge(model)
+        self.session.commit()
+
 class ArtifactGraphRepository:
     def __init__(self, session: Session):
         self.session = session
         self.req_repo = RequirementRepository(session)
+        self.assumption_repo = AssumptionRepository(session)
         self.task_repo = TaskRepository(session)
         self.gap_repo = GapRepository(session)
         self.evidence_repo = EvidenceRepository(session)
+        self.finding_repo = CritiqueFindingRepository(session)
 
     def load_graph(self) -> ArtifactGraph:
         graph = ArtifactGraph()
         for req in self.req_repo.get_all():
             graph.add_requirement(req)
+        for assumption in self.assumption_repo.get_all():
+            graph.add_assumption(assumption)
         for task in self.task_repo.get_all():
             graph.add_task(task)
+        for finding in self.finding_repo.get_all():
+            graph.add_finding(finding)
         for gap in self.gap_repo.get_all():
             graph.add_gap(gap)
         for ev in self.evidence_repo.get_all():
