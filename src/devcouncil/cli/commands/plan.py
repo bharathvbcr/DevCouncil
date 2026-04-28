@@ -16,6 +16,7 @@ from devcouncil.storage.repositories import (
     GapRepository,
 )
 from devcouncil.indexing.repo_mapper import RepoMapper
+from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
 from devcouncil.llm.provider import OpenRouterProvider, MockProvider
 from devcouncil.llm.router import ModelRouter
 from devcouncil.planning.spec_service import SpecService
@@ -119,6 +120,9 @@ async def run_plan_flow(
         repo_map = mapper.map_repo(goal)
         repo_map_json = repo_map.model_dump_json(indent=2)
         orchestrator.save_run_artifact("repo_map.json", json.loads(repo_map_json))
+        graph_context = CodeReviewGraphAdapter(Path(".")).get_context()
+        if graph_context.available:
+            orchestrator.save_run_artifact("code_review_graph_context.json", graph_context.model_dump())
         await orchestrator.transition_to(ProjectPhase.REPO_MAPPED)
 
         # 2. Spec / Requirements

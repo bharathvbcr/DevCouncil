@@ -51,8 +51,69 @@ DEFAULT_CONFIG = {
         "redact_env_vars": True,
         "redact_secrets_in_logs": True,
         "store_prompts_locally": True
+    },
+    "integrations": {
+        "agent_flow": {
+            "enabled": False,
+            "trace_path": ".devcouncil/logs/traces.jsonl",
+            "mode": "jsonl",
+        },
+        "code_review_graph": {
+            "enabled": False,
+            "command": "code-review-graph",
+            "optional": True,
+        },
     }
 }
+
+
+def initialize_project(
+    project_root: Path = Path("."),
+    project_name: str | None = None,
+    with_gitnexus: bool = False,
+    with_graphify: bool = False,
+) -> bool:
+    """Initialize DevCouncil project state.
+
+    Returns True when a fresh .devcouncil directory was created.
+    """
+    project_root = project_root.resolve()
+    dev_dir = project_root / ".devcouncil"
+    created = False
+
+    if not dev_dir.exists():
+        console.print("Initializing DevCouncil...")
+        dev_dir.mkdir(exist_ok=True)
+        (dev_dir / "runs").mkdir(exist_ok=True)
+        (dev_dir / "cache").mkdir(exist_ok=True)
+        (dev_dir / "checkpoints").mkdir(exist_ok=True)
+        (dev_dir / "logs").mkdir(exist_ok=True)
+
+        config_path = dev_dir / "config.yaml"
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        if project_name:
+            config["project"]["name"] = project_name
+        else:
+            config["project"]["name"] = project_root.name
+
+        with open(config_path, "w") as f:
+            yaml.dump(config, f, default_flow_style=False)
+
+        db = Database(dev_dir / "state.sqlite")
+        db.create_db_and_tables()
+        console.print(f"[green]Successfully initialized DevCouncil in {dev_dir}[/green]")
+        created = True
+
+    if with_gitnexus:
+        nexus = GitNexusIntegration(project_root)
+        nexus.initialize()
+
+    if with_graphify:
+        graphify = GraphifyIntegration(project_root)
+        graphify.initialize()
+
+    return created
+
 
 @app.callback(invoke_without_command=True)
 def init(
@@ -73,33 +134,9 @@ def init(
         console.print("Use --gitnexus or --graphify to add upgrade paths.")
         raise typer.Exit()
 
-    if not dev_dir.exists():
-        console.print("Initializing DevCouncil...")
-        dev_dir.mkdir(exist_ok=True)
-        (dev_dir / "runs").mkdir(exist_ok=True)
-        (dev_dir / "cache").mkdir(exist_ok=True)
-        (dev_dir / "checkpoints").mkdir(exist_ok=True)
-        (dev_dir / "logs").mkdir(exist_ok=True)
-
-        config_path = dev_dir / "config.yaml"
-        config = copy.deepcopy(DEFAULT_CONFIG)
-        if project_name:
-            config["project"]["name"] = project_name
-        else:
-            config["project"]["name"] = Path.cwd().name
-
-        with open(config_path, "w") as f:
-            yaml.dump(config, f, default_flow_style=False)
-
-        # Initialize DB
-        db = Database(dev_dir / "state.sqlite")
-        db.create_db_and_tables()
-        console.print(f"[green]Successfully initialized DevCouncil in {dev_dir}[/green]")
-
-    if with_gitnexus:
-        nexus = GitNexusIntegration(Path("."))
-        nexus.initialize()
-
-    if with_graphify:
-        graphify = GraphifyIntegration(Path("."))
-        graphify.initialize()
+    initialize_project(
+        Path("."),
+        project_name=project_name,
+        with_gitnexus=with_gitnexus,
+        with_graphify=with_graphify,
+    )
