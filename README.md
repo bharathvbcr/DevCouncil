@@ -1,176 +1,196 @@
-# DevCouncil
+# DevCouncil: The Gated AI Orchestrator
 
-**AI coding with staff-engineer-style execution gates.**
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![uv](https://img.shields.io/badge/managed%20by-uv-purple.svg)](https://github.com/astral-sh/uv)
 
-DevCouncil is a gated orchestrator for AI-assisted software development. It ensures that AI-generated work proves it satisfied the original intent by enforcing strict software-engineering gates. It maps requirements to deterministic tasks, patches, and evidence via a persistent **Artifact Graph**.
+**"DevCouncil should not merely generate code. It should make AI-generated work prove that it satisfied the original intent."**
 
----
-
-## 🚀 Core Thesis
-
-**DevCouncil should not merely generate code. It should make AI-generated work prove that it satisfied the original intent.**
-
-AI coding agents often fail in subtle ways:
-- They build the happy path and skip edge cases.
-- They implement one requirement while forgetting another.
-- They say tests passed but do not prove the important behavior.
-- They modify unrelated files or change architecture without justification.
-- They hide critical assumptions inside transient chat history.
-
-DevCouncil attacks this by treating the implementation process like a high-performing software team, where **evidence**, not LLM "vibes," is the final authority.
+DevCouncil is a high-integrity, command-line orchestration platform for AI-assisted software development. Unlike traditional "chat-and-code" agents that prioritize generation speed over correctness, DevCouncil treats AI implementation as a formal engineering process. It enforces a rigorous team-based workflow—complete with spec writers, architects, hostile critics, and deterministic verification gates—to ensure that every line of generated code is authorized, tested, and traceable.
 
 ---
 
-## 🔄 The Gated Orchestration Flow
+## 🛑 The Problem: The "Happy Path" Trap
+Current AI coding agents are incredibly powerful but often fail in subtle, expensive ways:
+*   **Context Erosion**: They lose the original PRD requirements after several turns of chat.
+*   **Unauthorized Side Effects**: They modify unrelated files or introduce "architecture drift" without justification.
+*   **Verification Theater**: They report "tests passed" without proving that the specific new requirement was actually exercised.
+*   **Implicit Assumptions**: Critical architectural decisions are hidden in chat history rather than documented.
 
-DevCouncil follows a rigorous, multi-agent implementation lifecycle:
-
-1. **Goal Analysis**: Deep indexing and repository mapping.
-2. **Requirements Drafting**: Extracting explicit functional requirements and assumptions.
-3. **The Council Debate**:
-   - **Planner A**: Pragmatic tech lead (simplest maintainable implementation).
-   - **Planner B**: Production architect (security, edge cases, failure modes).
-   - **Cross-Critique**: Agents attack each other's plans for flaws or omissions.
-   - **Arbitration**: A final "graph compilation" into a single coherent task graph.
-4. **Gated Execution**:
-   - Tasks are scoped with allowed files and authorized commands.
-   - Execution via **Native Agent**, **OpenHands**, **mini-SWE-agent**, or **Manual** mode.
-5. **Deterministic Verification**:
-   - Scans for **Orphan Diffs** (unauthorized file changes).
-   - Runs automated **Secret Scanning** and test coverage.
-   - **LLM Implementation Review** against the approved artifact graph.
-6. **Repair Loop**: Blocking gaps are automatically converted into focused repair tasks.
-7. **Evidence Reporting**: Generates a final implementation matrix proving requirement coverage.
+**DevCouncil solves this by enforcing staff-engineer-style execution gates.** It refuses to call a task "done" until the implementation evidence (diffs, command logs, and test results) deterministically satisfies the requirement's acceptance criteria.
 
 ---
 
-## ✨ Features
+## 🔄 The Multi-Agent Orchestration Flow
 
-- **Artifact Graph**: A persistent data structure connecting Requirements -> Tasks -> Evidence -> Gaps.
-- **Multi-Agent Council**: Leverage diverse models (Claude, GPT, Gemini) for independent planning and critique.
-- **Execution Guardrails**: Strict permission system blocking unauthorized file writes or shell commands.
-- **Security Scanning**: Automated detection of API keys, tokens, and secrets in generated code.
-- **Self-Healing LLM Router**: Automatic recovery from malformed JSON or schema validation errors.
-- **MCP Server**: Expose DevCouncil status and tasks to tools like Claude Code and Cursor.
-- **Intelligent Repair**: LLM-driven inference to close verification gaps.
+DevCouncil implements a sophisticated 7-phase implementation lifecycle designed to stress-test plans before a single line of code is written.
+
+### 1. Repository Mapping & Deep Indexing
+The orchestrator performs a deterministic scan of your repository using `git` and `ripgrep`. It detects languages, frameworks, package managers, and ranks "candidate files" based on your goal to provide the models with a high-fidelity context window without token bloat.
+
+### 2. Requirements & Assumption Drafting
+A specialized **Spec Writer** agent extracts explicit functional requirements and acceptance criteria. Simultaneously, an **Assumption Extractor** logs architectural assumptions (e.g., "Using existing DB schema"), ensuring these decisions are tracked as first-class citizens.
+
+### 3. The Council Debate (Planner A vs. Planner B)
+To avoid single-model bias, DevCouncil spawns a "Council":
+*   **Planner A (Pragmatic Tech Lead)**: Optimizes for the simplest, most maintainable implementation with minimal dependencies.
+*   **Planner B (Production Architect)**: Focuses on security, performance, edge cases, and robust failure modes.
+*   **Cross-Critique**: Agent A attacks Plan B, and Agent B attacks Plan A, hunting for omissions or risks.
+*   **Rebuttal & Arbitration**: The planners defend their decisions, and an **Arbiter** (Engineering Manager) compiles a final, unified task graph.
+
+### 4. Gated Execution
+Tasks are dispatched to execution adapters. Every task is constrained by:
+*   **Allowed Files**: Only specific paths authorized during planning can be modified.
+*   **Authorized Commands**: Only approved test/build commands can be executed.
+*   **Safety Checkpoints**: Automated Git snapshots are taken before and after every execution for instant rollback.
+
+### 5. Deterministic Verification
+The **Verifier** engine runs a 12-step audit of the implementation:
+*   **Orphan Diff Detection**: Blocks the task if any unauthorized files were touched.
+*   **Secret Scanning**: Scans for API keys and tokens using the `SecretScanner`.
+*   **Command Gating**: Ensures all unit and integration tests pass with zero exit codes.
+*   **LLM Implementation Review**: A final audit where an LLM reviews the actual diff against the original requirement.
+
+### 6. The Repair Loop
+If verification fails, DevCouncil doesn't just error out. It generates **Intelligent Repair Tasks**. These tasks provide the agent with the exact verification failure evidence, allowing it to close the "gap" in a focused sub-sprint.
+
+### 7. Evidence Reporting
+Final implementation is exported as a comprehensive **Evidence Report (Markdown/JSON)**, mapping every Requirement to a Task, a Diff, and a passing Test Result.
+
+---
+
+## ✨ Key Features & Components
+
+### 🧠 The Artifact Graph
+The core engine of DevCouncil. It is a persistent, directed graph stored in SQLite that tracks the lineage of your project:
+`Requirement -> Acceptance Criterion -> Task -> Planned File -> Changed File -> Command Result -> Test Evidence -> Gap`.
+
+### 🛡️ Security Guardrails
+*   **Permission Manager**: A strict allowlist system that prevents AI agents from accessing `.git`, `.env`, or sensitive directories.
+*   **Secret Redaction**: Pre-processes all repo data to strip sensitive patterns before sending them to LLM providers.
+*   **Command Allowlist**: Restricts agents to a safe subset of shell commands (e.g., `pytest`, `npm test`).
+
+### 🔌 Multi-Model Routing
+Built-in support for **OpenRouter**, allowing you to assign different models to different roles based on their strengths (e.g., Claude 3.5 Sonnet for planning, GPT-4o for critique).
+
+### 🤖 Executor Adapters
+*   **Native**: A built-in "thought-action-observation" loop with `apply_patch` and `read_file` capabilities.
+*   **OpenHands & mini-SWE-agent**: Full integration with leading autonomous agent frameworks.
+*   **Manual**: Generates high-context Markdown prompts for use in Cursor, Aider, or VS Code.
+
+### 📡 MCP Server
+DevCouncil acts as a **Model Context Protocol** server. You can connect it to Claude Desktop or Cursor to let your external agent "check-in" with the DevCouncil state machine and verify its work against the artifact graph.
 
 ---
 
 ## 📐 Visual Architecture
 
-### Artifact Graph
-The core data structure that ensures every line of code traces back to a requirement.
-
-```mermaid
-graph TD;
-    Requirement-->AcceptanceCriterion;
-    Requirement-->Task;
-    Task-->PlannedFile;
-    Task-->ChangedFile;
-    Task-->TestEvidence;
-    Task-->CommandResult;
-    Requirement-->Gap;
-    Task-->Gap;
-```
-
-### Gating State Machine
-The deterministic workflow that manages the implementation lifecycle.
+### The State Machine Lifecycle
+DevCouncil manages the project through a series of deterministic state transitions.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> NEW
-    NEW --> REPO_MAPPED
-    REPO_MAPPED --> REQUIREMENTS_DRAFTED
-    REQUIREMENTS_DRAFTED --> PLANS_GENERATED
-    PLANS_GENERATED --> CRITIQUES_GENERATED
-    CRITIQUES_GENERATED --> ARBITRATED
-    ARBITRATED --> PLAN_APPROVED
-    PLAN_APPROVED --> TASK_READY
+    [*] --> NEW: dev init
+    NEW --> REPO_MAPPED: dev plan
+    REPO_MAPPED --> REQUIREMENTS_DRAFTED: SpecService
+    REQUIREMENTS_DRAFTED --> PLANS_GENERATED: Independent A/B
+    PLANS_GENERATED --> CRITIQUES_GENERATED: Cross-Audit
+    CRITIQUES_GENERATED --> ARBITRATED: ArbiterService
+    ARBITRATED --> PLAN_APPROVED: User Approval
+    PLAN_APPROVED --> TASK_READY: GatePolicy
     
-    TASK_READY --> TASK_EXECUTING
-    TASK_EXECUTING --> TASK_VERIFYING
+    TASK_READY --> TASK_EXECUTING: dev run
+    TASK_EXECUTING --> TASK_VERIFYING: dev verify
     
     TASK_VERIFYING --> TASK_VERIFIED: Success
-    TASK_VERIFYING --> TASK_BLOCKED: Failure
+    TASK_VERIFYING --> TASK_BLOCKED: Failure (Gap)
     
-    TASK_BLOCKED --> TASK_READY: Repair
+    TASK_BLOCKED --> TASK_READY: dev repair
     
     TASK_VERIFIED --> TASK_READY: Next Task
-    TASK_VERIFIED --> PROJECT_DONE: All Done
+    TASK_VERIFIED --> PROJECT_DONE: All Evidence Captured
     
-    PROJECT_DONE --> [*]
+    PROJECT_DONE --> [*]: dev report
 ```
 
 ---
 
 ## 🛠 Installation
 
-Recommended global CLI install:
+### Prerequisites
+*   Python 3.12 or higher.
+*   [uv](https://github.com/astral-sh/uv) (recommended for dependency management).
+*   `git` and `ripgrep` installed on your system.
 
+### Global Installation
 ```bash
 uv tool install --force .
 devcouncil --help
 ```
 
-From a local checkout:
+### Local Development Setup
 ```bash
-# Windows
-.\scripts\install.ps1
-
-# macOS/Linux
-./scripts/install.sh
+git clone https://github.com/bharathvbcr/DevCouncil.git
+cd DevCouncil
+uv venv
+uv pip install -e .
 ```
 
 ---
 
-## 📖 Usage
+## 📖 Deep-Dive Usage Guide
 
-### 1. Initialize
+### 1. Initialize Your Workspace
 ```bash
-devcouncil init
+devcouncil init --name "MySecureProject"
+```
+This creates `.devcouncil/` containing `config.yaml` and the `state.sqlite` database.
+
+### 2. Run a Planning Council
+```bash
+devcouncil plan "Add a robust password reset flow with hashed tokens"
+```
+*Tip: Use `--dry-run` to see the flow without making actual LLM calls.*
+
+### 3. Track Implementation Health
+```bash
+devcouncil status  # High-level overview of gaps and costs
+devcouncil tasks   # List the implementation graph
+devcouncil show TASK-001  # Detailed requirements for a task
 ```
 
-### 2. Plan
+### 4. Safe Execution & Verification
 ```bash
-devcouncil plan "Add password reset with single-use expiring tokens"
-```
-
-### 3. Status & Tasks
-```bash
-devcouncil status
-devcouncil tasks
-devcouncil show TASK-001
-```
-
-### 4. Run & Verify
-```bash
+# Execute using the internal native agent
 devcouncil run TASK-001 --executor native
+
+# Verify the work against the gates
 devcouncil verify TASK-001
+
+# If blocked, generate repair tasks
 devcouncil repair
 ```
 
-### 5. Report
+### 5. Generate Proof of Work
 ```bash
-devcouncil report
+devcouncil report --json > coverage-report.json
 ```
 
 ---
 
-## 🔌 MCP Server
-Expose tasks and project status to your IDE (Cursor) or Agent (Claude Code):
-```bash
-uv run python -m devcouncil.integrations.mcp.server
-```
-
----
-
-## 📚 Documentation
-- [Architecture & Orchestration](docs/architecture.md)
-- [Artifact Graph](docs/artifact-graph.md)
-- [Gating Policy](docs/gating-policy.md)
-- [Executor Adapters](docs/executor-adapters.md)
+## 📚 Technical Documentation
+*   [Detailed Architecture & Orchestration](docs/architecture.md)
+*   [Understanding the Artifact Graph](docs/artifact-graph.md)
+*   [Gating Policies & Verification Logic](docs/gating-policy.md)
+*   [Developing New Executor Adapters](docs/executor-adapters.md)
+*   [Model Routing & Role Configuration](docs/model-routing.md)
 
 ---
 
 ## 📜 License
-Licensed under the [Apache-2.0 License](LICENSE).
+Licensed under the **Apache License, Version 2.0**. See the [LICENSE](LICENSE) file for details.
+
+---
+
+**Built for developers who demand evidence-based AI implementation.**
+"Trust the AI, but verify the graph."
