@@ -1,0 +1,17 @@
+{
+  "name": "devcouncil",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Gated orchestrator for AI-assisted software development",
+  "scripts": {
+    "install:dev": "uv tool install --force .",
+    "install:editable": "uv pip install -e .",
+    "dev": "uv run devcouncil",
+    "test": "uv run pytest",
+    "lint": "uv run ruff check .",
+    "check": "uv run ruff check . && uv run pytest"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
