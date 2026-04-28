@@ -12,6 +12,7 @@ from devcouncil.app.errors import ExecutionError
 
 from devcouncil.execution.patch import PatchEngine
 from devcouncil.execution.paths import resolve_project_path
+from devcouncil.telemetry.traces import TraceLogger
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +30,18 @@ class TaskRunner:
 
     def apply_patch(self, patch: str, task: Task) -> bool:
         """Apply a patch if permissions allow (all affected files must be in planned_files)."""
-        for path in self._extract_patch_paths(patch):
+        paths = self._extract_patch_paths(patch)
+        for path in paths:
             self._validate_path_within_root(path)
             self.permissions.validate_action("file_write", path, task)
-        return self.patch_engine.apply_patch(patch)
+        applied = self.patch_engine.apply_patch(patch)
+        TraceLogger(self.project_root).log_event(
+            "tool_patch_applied",
+            {"paths": sorted(paths), "success": applied},
+            task_id=task.id,
+            summary=f"Patch {'applied' if applied else 'failed'} for {task.id}",
+        )
+        return applied
 
     def _extract_patch_paths(self, patch: str) -> set[str]:
         """Extract repository-relative file paths touched by a unified git patch."""
@@ -101,6 +110,12 @@ class TaskRunner:
             stderr = result.stderr or ""
             stdout_path = self._save_command_log(task.id, command, "stdout", stdout)
             stderr_path = self._save_command_log(task.id, command, "stderr", stderr)
+            TraceLogger(self.project_root).log_event(
+                "command_executed",
+                {"command": command, "exit_code": result.returncode},
+                task_id=task.id,
+                summary=f"{command} exited {result.returncode}",
+            )
             return CommandResult(
                 command=command,
                 exit_code=result.returncode,
@@ -121,5 +136,11 @@ class TaskRunner:
         try:
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(content, encoding="utf-8")
+            TraceLogger(self.project_root).log_event(
+                "file_written",
+                {"path": path},
+                task_id=task.id,
+                summary=f"Wrote {path}",
+            )
         except Exception as e:
             raise ExecutionError(f"Failed to write file {path}: {e}")

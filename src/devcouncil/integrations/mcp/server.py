@@ -1,4 +1,5 @@
 import asyncio
+import os
 from pathlib import Path
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -6,8 +7,14 @@ from mcp.types import Tool, TextContent
 from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import TaskRepository, ArtifactGraphRepository
 from devcouncil.reporting.report_builder import ReportBuilder
+from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
 
 app = Server("devcouncil")
+
+
+def _project_root() -> Path:
+    configured = os.environ.get("DEVCOUNCIL_PROJECT_ROOT")
+    return Path(configured).expanduser().resolve() if configured else Path(".")
 
 @app.list_tools()
 async def list_tools() -> list[Tool]:
@@ -42,11 +49,25 @@ async def list_tools() -> list[Tool]:
                 "required": ["task_id"]
             }
         ),
+        Tool(
+            name="devcouncil_graph_context",
+            description="Get optional code-review-graph structural context for changed or planned files.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Repository-relative files to contextualize.",
+                    }
+                },
+            },
+        ),
     ]
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    db = get_db(Path("."))
+    db = get_db(_project_root())
     if not db:
         return [TextContent(type="text", text="Error: DevCouncil not initialized in this directory.")]
 
@@ -82,6 +103,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 return [TextContent(type="text", text=f"Error: Task {task_id} not found.")]
             
             return [TextContent(type="text", text=task.model_dump_json(indent=2))]
+
+    elif name == "devcouncil_graph_context":
+        files = arguments.get("files", [])
+        if not isinstance(files, list):
+            files = []
+        context = CodeReviewGraphAdapter(_project_root()).get_context([str(file) for file in files])
+        return [TextContent(type="text", text=context.model_dump_json(indent=2))]
 
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 

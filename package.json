@@ -1,12 +1,42 @@
 {
   "name": "devcouncil",
-  "private": true,
   "version": "0.1.0",
   "description": "Gated orchestrator for AI-assisted software development",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/bharathvbcr/DevCouncil#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bharathvbcr/DevCouncil.git"
+  },
+  "bugs": {
+    "url": "https://github.com/bharathvbcr/DevCouncil/issues"
+  },
+  "keywords": [
+    "ai",
+    "cli",
+    "coding-agent",
+    "devtools",
+    "orchestration",
+    "verification"
+  ],
+  "bin": {
+    "devcouncil": "./bin/devcouncil.js",
+    "dev": "./bin/devcouncil.js"
+  },
+  "files": [
+    "bin/",
+    "src/**/*.py",
+    "src/**/*.md",
+    "pyproject.toml",
+    "uv.lock",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "install:dev": "uv tool install --force .",
     "install:editable": "uv pip install -e .",
     "dev": "uv run devcouncil",
+    "pack:check": "npm pack --dry-run",
     "test": "uv run pytest",
     "lint": "uv run ruff check .",
     "check": "uv run ruff check . && uv run pytest"
