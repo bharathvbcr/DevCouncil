@@ -1,13 +1,15 @@
 import typer
 import asyncio
+import json
 from rich.console import Console
 from rich.table import Table
 from pathlib import Path
 from typing import Optional
+from devcouncil.cli.commands.init import initialize_project
 from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import TaskRepository, RequirementRepository, GapRepository, EvidenceRepository, StateRepository
 from devcouncil.verification.verifier import Verifier
-from devcouncil.llm.provider import OpenRouterProvider
+from devcouncil.llm.provider import create_provider, validate_model_provider
 from devcouncil.llm.router import ModelRouter
 from devcouncil.domain.evidence import CommandResult, DiffEvidence, TestEvidence
 from devcouncil.app.config import load_config, get_api_key
@@ -20,13 +22,20 @@ MAX_RENDERED_GAPS = 20
 
 def verify(
     task_id: Optional[str] = typer.Argument(None, help="Optional ID of the task to verify"),
+    json_format: bool = typer.Option(False, "--json", help="Output machine-readable JSON."),
+    project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
 ):
     """
     Verify one task, or all tasks when TASK_ID is omitted.
     """
-    db = get_db()
+    root = project_root.expanduser().resolve()
+    initialize_project(root, quiet=True)
+    db = get_db(root)
     if not db:
-        console.print("[red]DevCouncil not initialized. Run 'dev init' first.[/red]")
+        if json_format:
+            typer.echo(json.dumps({"ok": False, "error": "DevCouncil state is unavailable in this directory."}, indent=2))
+        else:
+            console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
         return
 
     with db.get_session() as session:
@@ -39,7 +48,10 @@ def verify(
         tasks = [task for task in tasks if task is not None]
         if not tasks:
             missing = f"Task {task_id} not found." if task_id else "No tasks found to verify."
-            console.print(f"[red]{missing}[/red]")
+            if json_format:
+                typer.echo(json.dumps({"ok": False, "error": missing}, indent=2))
+            else:
+                console.print(f"[red]{missing}[/red]")
             return
 
         reqs = req_repo.get_all()
@@ -47,30 +59,32 @@ def verify(
         # Load router for LLM review if possible
         router = None
         try:
-            config = load_config(Path("."))
-            api_key = get_api_key(config.models.provider)
-            provider = OpenRouterProvider(api_key)
+            config = load_config(root)
+            validate_model_provider(config.models.provider)
+            api_key = get_api_key(config.models.provider, root)
+            provider = create_provider(config.models.provider, api_key)
             role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
             router = ModelRouter(provider, role_config)
         except Exception:
             pass
 
-        verifier = Verifier(Path("."), router=router)
+        verifier = Verifier(root, router=router)
         total_gaps = 0
         blocked_tasks = 0
+        task_results = []
 
         for task in tasks:
-            TraceLogger(Path(".")).log_event(
+            TraceLogger(root).log_event(
                 "task_verification_started",
                 {"task_id": task.id},
                 task_id=task.id,
                 summary=f"Verifying {task.id}",
             )
-            graph_context = CodeReviewGraphAdapter(Path(".")).get_context(
+            graph_context = CodeReviewGraphAdapter(root).get_context(
                 [planned.path for planned in task.planned_files]
             )
             if graph_context.available:
-                TraceLogger(Path(".")).log_event(
+                TraceLogger(root).log_event(
                     "graph_context_loaded",
                     graph_context.model_dump(),
                     task_id=task.id,
@@ -94,12 +108,13 @@ def verify(
                 elif isinstance(ev, TestEvidence):
                     evidence_repo.save_test_evidence(ev, task.id)
 
-            _print_task_result(task.id, gaps)
+            if not json_format:
+                _print_task_result(task.id, gaps)
 
             if any(gap.blocking for gap in gaps):
                 task.status = "blocked"
                 blocked_tasks += 1
-                TraceLogger(Path(".")).log_event(
+                TraceLogger(root).log_event(
                     "gate_failed",
                     {"task_id": task.id, "gap_count": len(gaps)},
                     task_id=task.id,
@@ -107,19 +122,34 @@ def verify(
                 )
             else:
                 task.status = "verified"
-                TraceLogger(Path(".")).log_event(
+                TraceLogger(root).log_event(
                     "task_verified",
                     {"task_id": task.id, "gap_count": len(gaps)},
                     task_id=task.id,
                     summary=f"{task.id} verified",
                 )
             task_repo.save(task)
+            task_results.append({
+                "task_id": task.id,
+                "status": task.status,
+                "gap_count": len(gaps),
+                "blocking_gap_count": len([gap for gap in gaps if gap.blocking]),
+                "gaps": [gap.model_dump() for gap in gaps],
+            })
 
         StateRepository(session).record_phase(
             ProjectPhase.TASK_BLOCKED.value if blocked_tasks else ProjectPhase.TASK_VERIFIED.value
         )
 
-        if len(tasks) > 1:
+        if json_format:
+            typer.echo(json.dumps({
+                "ok": blocked_tasks == 0,
+                "verified_tasks": len(tasks),
+                "blocked_tasks": blocked_tasks,
+                "total_gaps": total_gaps,
+                "tasks": task_results,
+            }, indent=2))
+        elif len(tasks) > 1:
             if blocked_tasks:
                 console.print(
                     f"\n[yellow]Verified {len(tasks)} tasks: {blocked_tasks} blocked, "

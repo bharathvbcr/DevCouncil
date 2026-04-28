@@ -17,6 +17,8 @@ from devcouncil.domain.evidence import TestEvidence, DiffEvidence, CommandResult
 from devcouncil.gating.checks.secret_scan_check import SecretScanner
 from devcouncil.verification.implementation_reviewer import ImplementationReviewer
 from devcouncil.llm.router import ModelRouter
+from devcouncil.utils.redaction import redact_string
+from devcouncil.live.cards import unresolved_blocking_cards
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,8 @@ IGNORED_CHANGE_PATTERNS = (
     ".ruff_cache/*",
     ".devcouncil/*",
 )
+
+MAX_UNTRACKED_DIFF_BYTES = 256_000
 
 class Verifier:
     def __init__(self, project_root: Path, router: Optional[ModelRouter] = None):
@@ -47,9 +51,11 @@ class Verifier:
         try:
             if not self._has_head():
                 return self._get_initial_repo_diff()
-            return subprocess.check_output(
+            tracked_diff = subprocess.check_output(
                 ["git", "diff", "HEAD"], cwd=self.project_root
             ).decode("utf-8", errors="replace")
+            untracked_diff = self._get_untracked_files_diff()
+            return "\n".join(part for part in [tracked_diff, untracked_diff] if part)
         except Exception as e:
             logger.warning("Failed to get git diff: %s", e)
             return ""
@@ -61,7 +67,9 @@ class Verifier:
             output = subprocess.check_output(
                 ["git", "diff", "HEAD", "--name-only"], cwd=self.project_root
             ).decode("utf-8", errors="replace").splitlines()
-            return self._filter_change_paths(output)
+            files = set(output)
+            files.update(self._get_untracked_files())
+            return self._filter_change_paths(sorted(files))
         except Exception as e:
             logger.warning("Failed to get changed files: %s", e)
             return []
@@ -93,6 +101,9 @@ class Verifier:
             )
             if result.returncode == 0 and result.stdout:
                 parts.append(result.stdout)
+        untracked_diff = self._get_untracked_files_diff()
+        if untracked_diff:
+            parts.append(untracked_diff)
         return "\n".join(parts)
 
     def _get_status_files(self) -> List[str]:
@@ -115,6 +126,62 @@ class Verifier:
         if not files:
             files.update(self._walk_project_files())
         return self._filter_change_paths(sorted(files))
+
+    def _get_untracked_files(self) -> List[str]:
+        try:
+            output = subprocess.check_output(
+                ["git", "ls-files", "--others", "--exclude-standard"],
+                cwd=self.project_root,
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8", errors="replace").splitlines()
+            return self._filter_change_paths(output)
+        except Exception as e:
+            logger.debug("Failed to list untracked files: %s", e)
+            return []
+
+    def _get_untracked_files_diff(self) -> str:
+        parts: List[str] = []
+        for rel_path in self._get_untracked_files():
+            full_path = self.project_root / rel_path
+            if not full_path.is_file():
+                continue
+            parts.append(self._format_new_file_diff(rel_path, full_path))
+        return "\n".join(part for part in parts if part)
+
+    def _format_new_file_diff(self, rel_path: str, full_path: Path) -> str:
+        try:
+            raw = full_path.read_bytes()
+        except Exception as e:
+            logger.debug("Failed to read untracked file %s: %s", rel_path, e)
+            return ""
+
+        header = [
+            f"diff --git a/{rel_path} b/{rel_path}",
+            "new file mode 100644",
+            "--- /dev/null",
+            f"+++ b/{rel_path}",
+        ]
+        if b"\0" in raw[:8192]:
+            return "\n".join([*header, f"Binary files /dev/null and b/{rel_path} differ"])
+
+        truncated = len(raw) > MAX_UNTRACKED_DIFF_BYTES
+        if truncated:
+            raw = raw[:MAX_UNTRACKED_DIFF_BYTES]
+        text = raw.decode("utf-8", errors="replace")
+        lines = text.splitlines()
+        if text.endswith(("\n", "\r")):
+            line_count = len(lines)
+        else:
+            line_count = max(len(lines), 1 if text else 0)
+
+        diff_lines = [*header, f"@@ -0,0 +1,{line_count} @@"]
+        if not text:
+            return "\n".join(header) + "\n"
+
+        diff_lines.extend(f"+{line}" for line in lines)
+        if truncated:
+            diff_lines.append("+[devcouncil: untracked file diff truncated]")
+        return "\n".join(diff_lines)
 
     def _walk_project_files(self) -> List[str]:
         files: List[str] = []
@@ -178,7 +245,7 @@ class Verifier:
         cmd_hash = hashlib.sha256(command.encode()).hexdigest()[:8]
         filename = f"{label}-{cmd_hash}-{stream}.log"
         log_path = log_dir / filename
-        log_path.write_text(content, encoding="utf-8")
+        log_path.write_text(redact_string(content), encoding="utf-8")
         return str(log_path)
 
     def _run_command(self, command: str, task_id: str = "verify") -> CommandResult:
@@ -203,6 +270,8 @@ class Verifier:
             stderr = result.stderr or ""
             stdout_path = self._save_log(task_id, command, "stdout", stdout)
             stderr_path = self._save_log(task_id, command, "stderr", stderr)
+            stdout_summary = redact_string(stdout[-500:] if stdout else "(empty)")
+            stderr_summary = redact_string(stderr[-500:] if stderr else "(empty)")
             return CommandResult(
                 command=command,
                 exit_code=result.returncode,
@@ -210,8 +279,8 @@ class Verifier:
                 stderr_path=stderr_path,
                 summary=(
                     f"Exit code {result.returncode}. "
-                    f"stdout: {stdout[-500:] if stdout else '(empty)'}. "
-                    f"stderr: {stderr[-500:] if stderr else '(empty)'}"
+                    f"stdout: {stdout_summary}. "
+                    f"stderr: {stderr_summary}"
                 ),
             )
         except Exception as e:
@@ -234,6 +303,30 @@ class Verifier:
         }
         return [f for f in changed_files if Path(f).name in dep_files]
 
+    def _classify_change_paths(self, changed_files: List[str]) -> Tuple[List[str], List[str]]:
+        changed_set = set(changed_files)
+        added = set(self._get_untracked_files())
+        deleted: set[str] = set()
+        try:
+            output = subprocess.check_output(
+                ["git", "diff", "HEAD", "--name-status"],
+                cwd=self.project_root,
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8", errors="replace").splitlines()
+            for line in output:
+                parts = line.split("\t")
+                if len(parts) < 2:
+                    continue
+                status = parts[0]
+                path = parts[-1].replace("\\", "/")
+                if status.startswith("A"):
+                    added.add(path)
+                elif status.startswith("D"):
+                    deleted.add(path)
+        except Exception as e:
+            logger.debug("Failed to classify changed files: %s", e)
+        return sorted(added & changed_set), sorted(deleted & changed_set)
+
     async def verify_task(self, task: Task, requirements: List[Requirement]) -> Tuple[List[Gap], List[Any]]:
         self._gap_counter = 0
         gaps: List[Gap] = []
@@ -242,11 +335,12 @@ class Verifier:
         diff_content = self.get_diff()
 
         if diff_content:
+            added_files, deleted_files = self._classify_change_paths(changed_files)
             diff_ev = DiffEvidence(
                 task_id=task.id,
                 changed_files=changed_files,
-                added_files=[], 
-                deleted_files=[], 
+                added_files=added_files,
+                deleted_files=deleted_files,
                 diff_summary=f"Diff captured for {len(changed_files)} files."
             )
             evidence_to_save.append(diff_ev)
@@ -381,6 +475,22 @@ class Verifier:
                     gaps.append(finding)
             except Exception as e:
                 logger.error("Implementation review failed: %s", e)
+
+        # 8. Open live-review cards
+        for card in unresolved_blocking_cards(self.project_root, task_id=task.id):
+            gaps.append(Gap(
+                id=self._next_gap_id(task.id, "LIVE"),
+                severity="critical",
+                gap_type="architecture_drift",
+                task_id=task.id,
+                description=f"Open critical live-review card remains: {card.summary}",
+                evidence=[card.id, card.message_for_agent],
+                recommended_fix=(
+                    f"Address the critique card, then run `dev watch resolve {card.id}` "
+                    "or mark it ignored with justification outside the verification gate."
+                ),
+                blocking=True,
+            ))
 
         return gaps, evidence_to_save
 

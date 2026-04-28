@@ -1,6 +1,7 @@
 import fnmatch
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any, Optional
 
@@ -19,7 +20,10 @@ class HookDecision:
 
 
 class HookPolicy:
-    """Policy-backed hook checks for Claude-style pre-tool-use events."""
+    """Policy-backed hook checks for coding CLI tool-use events."""
+
+    def __init__(self, project_root: Path | None = None):
+        self.project_root = project_root.resolve() if project_root else None
 
     secret_path_patterns = (
         ".env",
@@ -43,8 +47,28 @@ class HookPolicy:
         "wrangler.toml",
         "index.html",
     )
-    write_tools = {"write_file", "edit_file", "replace", "Write", "Edit", "MultiEdit"}
-    shell_tools = {"bash", "shell", "run_command", "Bash"}
+    write_tools = {
+        "apply_patch",
+        "edit",
+        "edit_file",
+        "replace",
+        "write",
+        "write_file",
+        "Edit",
+        "MultiEdit",
+        "Write",
+    }
+    shell_tools = {
+        "bash",
+        "exec",
+        "exec_command",
+        "local_shell",
+        "run_command",
+        "run_shell_command",
+        "shell",
+        "shell_command",
+        "Bash",
+    }
 
     def evaluate(self, call_data: dict[str, Any], active_task: Optional[Task]) -> HookDecision:
         tool_name = str(call_data.get("name") or call_data.get("tool_name") or call_data.get("tool") or "")
@@ -90,6 +114,9 @@ class HookPolicy:
         if self._matches_any(path, self.secret_path_patterns):
             return HookDecision("deny", "Secret and credential paths are never writable through hooks.", path)
 
+        if active_task is None:
+            return HookDecision("deny", "No running DevCouncil task authorizes this file write.", path)
+
         if active_task and not self._is_planned_file(path, active_task):
             return HookDecision("deny", f"Task {active_task.id} does not authorize changes to {path}.", path)
 
@@ -109,11 +136,19 @@ class HookPolicy:
             or arguments.get("filepath")
             or arguments.get("filePath")
             or arguments.get("target")
+            or arguments.get("target_file")
         )
         return str(value) if value else None
 
     def _normalize_path(self, raw_path: str) -> str:
         path = raw_path.strip().strip('"').replace("\\", "/")
+        if self.project_root:
+            try:
+                candidate = Path(path)
+                resolved = candidate.resolve() if candidate.is_absolute() else (self.project_root / path).resolve()
+                return resolved.relative_to(self.project_root).as_posix()
+            except (OSError, ValueError):
+                pass
         if re.match(r"^[A-Za-z]:/", path):
             parts = PurePosixPath(path).parts
             path = "/".join(parts[1:])

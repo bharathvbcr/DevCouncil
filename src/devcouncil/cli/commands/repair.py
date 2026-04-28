@@ -4,9 +4,10 @@ from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import TaskRepository, GapRepository
 from devcouncil.planning.repair_service import RepairService
 from devcouncil.execution.context_builder import ContextBuilder
-from devcouncil.llm.provider import OpenRouterProvider
+from devcouncil.llm.provider import create_provider, validate_model_provider
 from devcouncil.llm.router import ModelRouter
 from devcouncil.app.config import load_config, get_api_key
+from devcouncil.cli.commands.init import initialize_project
 import asyncio
 from pathlib import Path
 
@@ -14,9 +15,10 @@ app = typer.Typer()
 console = Console()
 
 async def run_repair_flow():
+    initialize_project(Path("."), quiet=True)
     db = get_db()
     if not db:
-        console.print("[red]DevCouncil not initialized. Run 'dev init' first.[/red]")
+        console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
         return
 
     with db.get_session() as session:
@@ -35,12 +37,13 @@ async def run_repair_flow():
         # Load router
         try:
             config = load_config(Path("."))
-            api_key = get_api_key(config.models.provider)
+            validate_model_provider(config.models.provider)
+            api_key = get_api_key(config.models.provider, Path("."))
         except (FileNotFoundError, ValueError) as e:
             console.print(f"[red]{e}[/red]")
             return
         
-        provider = OpenRouterProvider(api_key)
+        provider = create_provider(config.models.provider, api_key)
         role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
         router = ModelRouter(provider, role_config)
         repair_service = RepairService(router)

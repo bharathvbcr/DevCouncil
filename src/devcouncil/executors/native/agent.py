@@ -40,7 +40,6 @@ Current Project Context:
 You have access to the following tools:
 - read_file(path: str)
 - list_files()
-- write_file(path: str, content: str)
 - apply_patch(patch: str)
 - run_command(command: str)
 
@@ -89,14 +88,15 @@ Rules:
                         files = self.context_builder.get_structure_summary()
                         result_summary = f"Found {len(files)} files in repository."
                     elif tool_call.tool == "write_file":
-                        self.task_runner.write_file(tool_call.args["path"], tool_call.args["content"], task)
-                        result_summary = f"Successfully wrote to {tool_call.args['path']}."
+                        raise PermissionError("write_file is disabled for the native executor; use apply_patch.")
                     elif tool_call.tool == "apply_patch":
                         self.task_runner.apply_patch(tool_call.args["patch"], task)
                         result_summary = "Successfully applied patch."
                     elif tool_call.tool == "run_command":
                         cmd_result = self.task_runner.run_command(tool_call.args["command"], task)
                         result_summary = f"Command finished with exit code {cmd_result.exit_code}."
+                    else:
+                        raise ValueError(f"Unknown tool: {tool_call.tool}")
                     
                     messages.append({"role": "user", "content": f"[Tool Result] '{tool_call.tool}': {result_summary}"})
                 except Exception as e:

@@ -16,9 +16,10 @@ def tail(
     follow: bool = typer.Option(False, "--follow", "-f", help="Continue polling for new events."),
     limit: int = typer.Option(50, "--limit", "-n", help="Maximum events to print before following."),
     jsonl: bool = typer.Option(True, "--jsonl/--pretty", help="Print JSONL or compact text rows."),
+    project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
 ):
     """Print the DevCouncil trace JSONL stream for replay or debugging."""
-    project_root = Path(".")
+    project_root = project_root.expanduser().resolve()
     printed = 0
 
     def emit_new(start_index: int) -> int:
@@ -26,7 +27,7 @@ def tail(
         selected = events[start_index:]
         for event in selected:
             if jsonl:
-                console.print(event.model_dump_json())
+                typer.echo(event.model_dump_json())
             else:
                 console.print(
                     f"{event.timestamp} {event.type} "

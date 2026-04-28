@@ -6,6 +6,9 @@ from devcouncil.domain.task import Task
 from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
 
 class PromptBuilder:
+    def __init__(self, project_root: Path = Path(".")):
+        self.project_root = project_root
+
     def build_task_prompt(self, task: Task, requirements: List[Requirement]) -> str:
         req_map = {r.id: r for r in requirements}
         task_reqs = [req_map[rid] for rid in task.requirement_ids if rid in req_map]
@@ -39,7 +42,7 @@ class PromptBuilder:
         for cmd in task.allowed_commands:
             prompt += f"- `{cmd}`\n"
 
-        graph_context = CodeReviewGraphAdapter(Path(".")).prompt_section(
+        graph_context = CodeReviewGraphAdapter(self.project_root).prompt_section(
             [planned.path for planned in task.planned_files]
         )
         if graph_context:

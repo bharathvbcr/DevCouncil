@@ -284,6 +284,83 @@ class CritiqueFindingRepository:
         self.session.merge(model)
         self.session.commit()
 
+
+class PlanningStateRepository:
+    """Manage the persisted active plan graph."""
+
+    def __init__(self, session: Session):
+        self.session = session
+
+    def clear_active_plan(self):
+        for model in (
+            EvidenceModel,
+            GapModel,
+            CritiqueFindingModel,
+            TaskModel,
+            AssumptionModel,
+            RequirementModel,
+        ):
+            self.session.exec(delete(model))
+
+    def replace_active_plan(
+        self,
+        requirements: list[Requirement],
+        assumptions: list[Assumption],
+        tasks: list[Task],
+        findings: list[CritiqueFinding],
+    ):
+        self.clear_active_plan()
+        for req in requirements:
+            self.session.merge(RequirementModel(
+                id=req.id,
+                title=req.title,
+                description=req.description,
+                priority=req.priority,
+                source=req.source,
+                acceptance_criteria_json=json.dumps([ac.model_dump() for ac in req.acceptance_criteria]),
+            ))
+
+        for assumption in assumptions:
+            self.session.merge(AssumptionModel(
+                id=assumption.id,
+                statement=assumption.statement,
+                confidence=assumption.confidence,
+                impact=assumption.impact,
+                reversible=assumption.reversible,
+                requires_user_confirmation=assumption.requires_user_confirmation,
+                linked_requirement_ids_json=json.dumps(assumption.linked_requirement_ids),
+                status=assumption.status,
+            ))
+
+        for task in tasks:
+            self.session.merge(TaskModel(
+                id=task.id,
+                title=task.title,
+                description=task.description,
+                requirement_ids_json=json.dumps(task.requirement_ids),
+                acceptance_criterion_ids_json=json.dumps(task.acceptance_criterion_ids),
+                planned_files_json=json.dumps([pf.model_dump() for pf in task.planned_files]),
+                expected_tests_json=json.dumps(task.expected_tests),
+                allowed_commands_json=json.dumps(task.allowed_commands),
+                forbidden_changes_json=json.dumps(task.forbidden_changes),
+                status=task.status,
+            ))
+
+        for finding in findings:
+            self.session.merge(CritiqueFindingModel(
+                id=finding.id,
+                source_agent=finding.source_agent,
+                target_plan_id=finding.target_plan_id,
+                severity=finding.severity,
+                finding_type=finding.finding_type,
+                claim=finding.claim,
+                linked_requirement_id=finding.linked_requirement_id,
+                suggested_requirement=finding.suggested_requirement,
+                suggested_task=finding.suggested_task,
+                falsifiable_check=finding.falsifiable_check,
+                status=finding.status,
+            ))
+
 class ArtifactGraphRepository:
     def __init__(self, session: Session):
         self.session = session

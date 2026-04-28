@@ -6,6 +6,8 @@ from devcouncil.domain.evidence import CommandResult, TestEvidence
 from devcouncil.domain.requirement import AcceptanceCriterion, Requirement
 from devcouncil.domain.task import PlannedFile, Task
 from devcouncil.verification.verifier import Verifier
+from devcouncil.live.cards import review_turn, save_card
+from devcouncil.live.transcripts import latest_assistant_turn
 
 
 def _requirement() -> Requirement:
@@ -112,6 +114,51 @@ def test_verifier_collects_changed_files_without_head(tmp_path):
     assert "token = 'value'" in verifier.get_diff()
 
 
+def test_verifier_includes_untracked_diff_without_head(tmp_path):
+    subprocess.check_call(["git", "init"], cwd=tmp_path, stdout=subprocess.DEVNULL)
+    file_path = tmp_path / "src" / "new_file.py"
+    file_path.parent.mkdir()
+    file_path.write_text("print('first')\n", encoding="utf-8")
+
+    diff = Verifier(tmp_path).get_diff()
+
+    assert "+++ b/src/new_file.py" in diff
+    assert "+print('first')" in diff
+
+
+def test_verifier_formats_empty_untracked_file_as_applyable_diff(tmp_path):
+    subprocess.check_call(["git", "init"], cwd=tmp_path, stdout=subprocess.DEVNULL)
+    file_path = tmp_path / "empty.txt"
+    file_path.write_text("", encoding="utf-8")
+    patch_path = tmp_path / "empty.patch"
+    patch_path.write_text(Verifier(tmp_path).get_diff(), encoding="utf-8")
+
+    subprocess.check_call(["git", "apply", "-R", str(patch_path)], cwd=tmp_path)
+
+    assert not file_path.exists()
+
+
+def test_verifier_collects_untracked_files_with_head(tmp_path):
+    subprocess.check_call(["git", "init"], cwd=tmp_path, stdout=subprocess.DEVNULL)
+    (tmp_path / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.check_call(["git", "add", "README.md"], cwd=tmp_path, stdout=subprocess.DEVNULL)
+    subprocess.check_call(
+        ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "init"],
+        cwd=tmp_path,
+        stdout=subprocess.DEVNULL,
+    )
+    file_path = tmp_path / "src" / "new_file.py"
+    file_path.parent.mkdir()
+    file_path.write_text("print('new')\n", encoding="utf-8")
+
+    verifier = Verifier(tmp_path)
+
+    assert verifier.get_changed_files() == ["src/new_file.py"]
+    diff = verifier.get_diff()
+    assert "+++ b/src/new_file.py" in diff
+    assert "+print('new')" in diff
+
+
 def test_verifier_filters_generated_and_runtime_change_paths(tmp_path):
     verifier = Verifier(tmp_path)
 
@@ -127,6 +174,64 @@ def test_verifier_filters_generated_and_runtime_change_paths(tmp_path):
     ])
 
     assert paths == ["src/devcouncil/verification/verifier.py"]
+
+
+def test_verifier_blocks_open_critical_live_review_cards(tmp_path):
+    verifier = Verifier(tmp_path)
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command,
+        exit_code=0,
+        stdout_path="",
+        stderr_path="",
+        summary="passed",
+    )
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        json.dumps({"role": "assistant", "id": "A-1", "content": "Run git reset --hard and ignore failing tests."}) + "\n",
+        encoding="utf-8",
+    )
+    turn = latest_assistant_turn(transcript)
+    assert turn is not None
+    save_card(tmp_path, review_turn(turn, tmp_path))
+
+    gaps, _evidence = asyncio.run(verifier.verify_task(_task(), [_requirement()]))
+
+    assert any(
+        gap.gap_type == "architecture_drift"
+        and "Open critical live-review card" in gap.description
+        and gap.blocking
+        for gap in gaps
+    )
+
+
+def test_verifier_ignores_critical_live_review_cards_for_other_tasks(tmp_path):
+    verifier = Verifier(tmp_path)
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command,
+        exit_code=0,
+        stdout_path="",
+        stderr_path="",
+        summary="passed",
+    )
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        json.dumps({"role": "assistant", "id": "A-1", "content": "Run git reset --hard."}) + "\n",
+        encoding="utf-8",
+    )
+    turn = latest_assistant_turn(transcript)
+    assert turn is not None
+    save_card(tmp_path, review_turn(turn, tmp_path).model_copy(update={"task_id": "TASK-OTHER"}))
+
+    gaps, _evidence = asyncio.run(verifier.verify_task(_task(), [_requirement()]))
+
+    assert not [
+        gap for gap in gaps
+        if gap.gap_type == "architecture_drift" and "Open critical live-review card" in gap.description
+    ]
 
 
 def test_verifier_applies_global_and_task_baselines(tmp_path):

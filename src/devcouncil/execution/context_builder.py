@@ -46,7 +46,7 @@ class ContextBuilder:
         try:
             import subprocess
             output = subprocess.check_output(
-                ["git", "ls-files"], 
+                ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
                 cwd=self.project_root,
                 stderr=subprocess.DEVNULL
             ).decode().splitlines()

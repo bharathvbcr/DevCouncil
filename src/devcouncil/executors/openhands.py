@@ -13,19 +13,23 @@ class OpenHandsExecutor(Executor):
         self.project_root = project_root
 
     def run_task(self, task: Task, requirements: list[Requirement]) -> ExecutionResult:
-        builder = PromptBuilder()
+        builder = PromptBuilder(self.project_root)
         task_prompt = builder.build_task_prompt(task, requirements)
         
         console.print(f"Starting [bold]OpenHands[/bold] for task {task.id}...")
         
         # OpenHands often expects a workspace mount and an instruction.
-        # This adapter simulates the headless/CLI invocation.
+        # Keep the full prompt out of argv so Windows command-line limits and
+        # terminal logs do not become part of the execution boundary.
         # Reference: https://github.com/All-Hands-AI/OpenHands
+        instruction_file = self.project_root / ".devcouncil" / f"{task.id}-openhands-task.md"
+        instruction_file.parent.mkdir(parents=True, exist_ok=True)
+        instruction_file.write_text(task_prompt, encoding="utf-8")
         
         cmd = [
             "openhands", "run",
             "--workspace-base", str(self.project_root),
-            "--task", task_prompt,
+            "--task-file", str(instruction_file),
             "--headless"
         ]
         

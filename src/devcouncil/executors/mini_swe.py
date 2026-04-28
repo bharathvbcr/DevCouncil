@@ -1,4 +1,5 @@
 import subprocess
+import sys
 from pathlib import Path
 from rich.console import Console
 from devcouncil.domain.task import Task
@@ -13,19 +14,20 @@ class MiniSWEExecutor(Executor):
         self.project_root = project_root
 
     def run_task(self, task: Task, requirements: list[Requirement]) -> ExecutionResult:
-        builder = PromptBuilder()
+        builder = PromptBuilder(self.project_root)
         task_prompt = builder.build_task_prompt(task, requirements)
         
         # Write temporary instruction file for mini-SWE-agent
-        instruction_file = self.project_root / ".devcouncil" / "task_instruction.md"
-        instruction_file.write_text(task_prompt)
+        instruction_file = self.project_root / ".devcouncil" / f"{task.id}-mini-swe-task.md"
+        instruction_file.parent.mkdir(parents=True, exist_ok=True)
+        instruction_file.write_text(task_prompt, encoding="utf-8")
         
         console.print(f"Starting [bold]mini-SWE-agent[/bold] for task {task.id}...")
         
         # In a real implementation, we'd invoke the agent CLI
         # For now, we simulate the command call
         cmd = [
-            "python", "-m", "mini_swe_agent.main", 
+            sys.executable, "-m", "mini_swe_agent.main",
             "--instruction-file", str(instruction_file),
             "--repo-path", str(self.project_root)
         ]

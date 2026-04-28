@@ -12,8 +12,13 @@
 - [x] Artifact Coverage Graph
 
 ## Future Enhancements
-- [ ] LSP integration
-- [ ] Tree-sitter ast matching
-- [ ] MCP implementation for LLM tools
-- [ ] Live UI Dashboard
-- [ ] Native GitHub/GitLab PR Comments integration
+- [x] LSP integration
+- [x] Tree-sitter ast matching
+- [x] MCP integration for CLI and execution tooling (starter support)
+- [x] Live UI Dashboard
+- [x] Native GitHub/GitLab PR Comments integration
+
+Related references:
+
+- [Sage](https://github.com/usetig/sage): peer-review-first planning inspiration.
+- [karpathy/llm-council](https://github.com/karpathy/llm-council): multi-LLM council-style decision workflows.

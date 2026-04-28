@@ -10,6 +10,7 @@ console = Console()
 def rollback(
     ctx: typer.Context,
     task_id: str = typer.Argument(..., help="ID of the task to rollback"),
+    project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
 ):
     """
     Revert changes using a task's git checkpoint.
@@ -17,16 +18,18 @@ def rollback(
     if ctx.invoked_subcommand is not None:
         return
 
-    checkpoint_file = Path(".devcouncil/checkpoints") / f"{task_id}-before.patch"
-    
-    if not checkpoint_file.exists():
-        console.print(f"[red]No checkpoint found for task {task_id} at {checkpoint_file}.[/red]")
+    root = project_root.expanduser().resolve()
+    checkpoint_file = root / ".devcouncil" / "checkpoints" / f"{task_id}-before.patch"
+    after_patch = root / ".devcouncil" / "checkpoints" / f"{task_id}-after.patch"
+
+    if not checkpoint_file.exists() and not after_patch.exists():
+        console.print(
+            f"[red]No checkpoint found for task {task_id}. Expected {after_patch} "
+            f"or {checkpoint_file}.[/red]"
+        )
         raise typer.Exit(code=1)
 
-    console.print(f"Rolling back changes using checkpoint [bold]{checkpoint_file}[/bold]...")
-
-    # Check for the after-patch (captured after task ran)
-    after_patch = Path(".devcouncil/checkpoints") / f"{task_id}-after.patch"
+    console.print(f"Rolling back task [bold]{task_id}[/bold]...")
     
     try:
         if after_patch.exists():
@@ -34,7 +37,7 @@ def rollback(
             console.print(f"Applying reverse patch from [bold]{after_patch}[/bold]...")
             subprocess.check_call(
                 ["git", "apply", "-R", str(after_patch)],
-                cwd=".",
+                cwd=root,
             )
             console.print(f"[green]Successfully rolled back task {task_id} changes.[/green]")
         else:
