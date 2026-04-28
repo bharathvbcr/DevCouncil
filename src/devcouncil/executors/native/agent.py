@@ -7,6 +7,7 @@ from devcouncil.execution.executor import Executor, ExecutionResult
 from devcouncil.llm.router import ModelRouter
 from devcouncil.execution.task_runner import TaskRunner
 from devcouncil.execution.context_builder import ContextBuilder
+from devcouncil.execution.paths import resolve_project_path
 
 console = Console()
 
@@ -73,11 +74,7 @@ Rules:
                 try:
                     if tool_call.tool == "read_file":
                         path = tool_call.args["path"]
-                        # Security: prevent path traversal
-                        resolved = (self.task_runner.project_root / path).resolve()
-                        root_resolved = self.task_runner.project_root.resolve()
-                        if not str(resolved).startswith(str(root_resolved)):
-                            raise PermissionError(f"Path traversal blocked: {path}")
+                        resolved = resolve_project_path(self.task_runner.project_root, path)
                         # Security: block reading sensitive files
                         sensitive_patterns = {".env", ".pem", ".key", "credentials", "secrets"}
                         path_lower = path.lower()

@@ -76,6 +76,29 @@ def test_verifier_blocks_unproven_acceptance_criteria(tmp_path):
     )
 
 
+def test_verifier_does_not_use_arbitrary_allowed_command_as_ac_evidence(tmp_path):
+    task = _task()
+    task.allowed_commands = ["echo ok"]
+    verifier = Verifier(tmp_path)
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command,
+        exit_code=0,
+        stdout_path="",
+        stderr_path="",
+        summary="ok",
+    )
+
+    gaps, evidence = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    assert not [ev for ev in evidence if isinstance(ev, TestEvidence)]
+    assert any(
+        gap.gap_type == "acceptance_criteria_unproven" and gap.blocking
+        for gap in gaps
+    )
+
+
 def test_verifier_collects_changed_files_without_head(tmp_path):
     subprocess.check_call(["git", "init"], cwd=tmp_path, stdout=subprocess.DEVNULL)
     file_path = tmp_path / "src" / "auth.py"
