@@ -20,6 +20,7 @@ DEFAULT_CONFIG = {
         "provider": "openrouter",
         "roles": {
             "spec_writer": {"model": "anthropic/claude-3.5-sonnet"},
+            "prompt_enhancer": {"model": "anthropic/claude-3.5-sonnet"},
             "planner_a": {"model": "anthropic/claude-3.5-sonnet"},
             "planner_b": {"model": "google/gemini-pro-1.5"},
             "critic_a": {"model": "openai/gpt-4o"},
@@ -27,6 +28,7 @@ DEFAULT_CONFIG = {
             "arbiter": {"model": "openai/gpt-4o"},
             "native_agent": {"model": "anthropic/claude-3.5-sonnet"},
             "implementation_reviewer": {"model": "openai/gpt-4o"},
+            "live_reviewer": {"model": "openai/gpt-4o"},
         }
     },
     "commands": {
@@ -63,6 +65,12 @@ DEFAULT_CONFIG = {
             "command": "code-review-graph",
             "optional": True,
         },
+        "live_review": {
+            "enabled": True,
+            "cards_path": ".devcouncil/live/cards",
+            "signals_path": ".devcouncil/live/signals",
+            "default_client": "claude",
+        },
     }
 }
 
@@ -72,6 +80,7 @@ def initialize_project(
     project_name: str | None = None,
     with_gitnexus: bool = False,
     with_graphify: bool = False,
+    quiet: bool = False,
 ) -> bool:
     """Initialize DevCouncil project state.
 
@@ -82,7 +91,8 @@ def initialize_project(
     created = False
 
     if not dev_dir.exists():
-        console.print("Initializing DevCouncil...")
+        if not quiet:
+            console.print("Initializing DevCouncil...")
         dev_dir.mkdir(exist_ok=True)
         (dev_dir / "runs").mkdir(exist_ok=True)
         (dev_dir / "cache").mkdir(exist_ok=True)
@@ -101,7 +111,8 @@ def initialize_project(
 
         db = Database(dev_dir / "state.sqlite")
         db.create_db_and_tables()
-        console.print(f"[green]Successfully initialized DevCouncil in {dev_dir}[/green]")
+        if not quiet:
+            console.print(f"[green]Successfully initialized DevCouncil in {dev_dir}[/green]")
         created = True
 
     if with_gitnexus:

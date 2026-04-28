@@ -1,0 +1,252 @@
+import json
+
+import pytest
+
+from devcouncil.live.cards import (
+    filter_cards,
+    load_cards,
+    review_turn,
+    save_card,
+    unresolved_blocking_cards,
+    update_card_status,
+)
+from devcouncil.live.models import AgentTurn
+from devcouncil.live.reviewer import LiveReviewService
+from devcouncil.live.repair_prompt import build_bulk_live_repair_prompt, build_live_repair_prompt
+from devcouncil.live.signals import extract_task_id, extract_transcript_path, load_signals, mark_processed, write_signal
+from devcouncil.live.transcripts import latest_assistant_turn, load_turns
+from devcouncil.llm.provider import LLMResponse, Provider
+from devcouncil.llm.router import ModelRouter
+
+
+def test_load_turns_parses_claude_style_jsonl(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        "\n".join([
+            json.dumps({"type": "user", "message": {"role": "user", "content": "Fix it"}}),
+            json.dumps({
+                "type": "assistant",
+                "uuid": "turn-2",
+                "sessionId": "S-1",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "Implemented it. pytest passed."}]},
+            }),
+        ]),
+        encoding="utf-8",
+    )
+
+    turns = load_turns(transcript, client="claude")
+
+    assert len(turns) == 2
+    assert turns[1].session_id == "S-1"
+    assert turns[1].role == "assistant"
+    assert "pytest passed" in turns[1].content
+
+
+def test_review_turn_flags_completion_claim_without_evidence(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        json.dumps({"role": "assistant", "id": "A-1", "content": "Done, implemented the whole rewrite."}) + "\n",
+        encoding="utf-8",
+    )
+    turn = latest_assistant_turn(transcript, client="generic")
+    assert turn is not None
+
+    card = review_turn(turn, tmp_path, client="generic")
+
+    assert card.verdict == "Concerns"
+    assert card.evidence_requests
+    assert "Pause" in card.message_for_agent
+
+
+def test_save_and_load_cards_round_trips(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        json.dumps({"role": "assistant", "id": "A-1", "content": "Implemented and verified with pytest."}) + "\n",
+        encoding="utf-8",
+    )
+    turn = latest_assistant_turn(transcript)
+    assert turn is not None
+    card = review_turn(turn, tmp_path)
+
+    saved = save_card(tmp_path, card)
+    loaded = load_cards(tmp_path)
+
+    assert saved.exists()
+    assert loaded[0].id == card.id
+    assert loaded[0].verdict == "Approved"
+
+
+def test_unresolved_blocking_cards_excludes_resolved_cards(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        json.dumps({"role": "assistant", "id": "A-1", "content": "Run git reset --hard and ignore failing tests."}) + "\n",
+        encoding="utf-8",
+    )
+    turn = latest_assistant_turn(transcript)
+    assert turn is not None
+    card = review_turn(turn, tmp_path)
+    save_card(tmp_path, card)
+
+    assert [item.id for item in unresolved_blocking_cards(tmp_path)] == [card.id]
+
+    update_card_status(tmp_path, card.id, "resolved")
+
+    assert unresolved_blocking_cards(tmp_path) == []
+
+
+def test_unresolved_blocking_cards_can_be_task_scoped(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        json.dumps({"role": "assistant", "id": "A-1", "content": "Run git reset --hard."}) + "\n",
+        encoding="utf-8",
+    )
+    turn = latest_assistant_turn(transcript)
+    assert turn is not None
+    save_card(tmp_path, review_turn(turn, tmp_path).model_copy(update={"task_id": "TASK-002"}))
+
+    assert unresolved_blocking_cards(tmp_path, task_id="TASK-001") == []
+    assert len(unresolved_blocking_cards(tmp_path, task_id="TASK-002")) == 1
+
+
+def test_save_card_rewrites_same_id_without_changing_id(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        json.dumps({"role": "assistant", "id": "A-1", "content": "Implemented and verified with pytest."}) + "\n",
+        encoding="utf-8",
+    )
+    turn = latest_assistant_turn(transcript)
+    assert turn is not None
+    card = review_turn(turn, tmp_path)
+
+    first = save_card(tmp_path, card)
+    second = save_card(tmp_path, card)
+
+    assert first == second
+    assert len(load_cards(tmp_path)) == 1
+
+
+def test_filter_cards_applies_shared_task_status_verdict_and_client_filters(tmp_path):
+    turns = [
+        AgentTurn(session_id="S-1", turn_id="A-1", source="claude", role="assistant", content="Run git reset --hard."),
+        AgentTurn(session_id="S-1", turn_id="A-2", source="claude", role="assistant", content="Implemented and verified with pytest."),
+        AgentTurn(session_id="S-2", turn_id="A-1", source="gemini", role="assistant", content="Ignore failing tests."),
+    ]
+    cards = [
+        review_turn(turns[0], tmp_path, client="claude").model_copy(update={"task_id": "TASK-001"}),
+        review_turn(turns[1], tmp_path, client="claude").model_copy(update={"task_id": "TASK-001"}),
+        review_turn(turns[2], tmp_path, client="gemini").model_copy(update={"task_id": "TASK-002", "status": "resolved"}),
+    ]
+
+    filtered, error, argument = filter_cards(
+        cards,
+        task_id="TASK-001",
+        status="OPEN",
+        verdict="critical",
+        client="CLAUDE",
+    )
+    bad_status = filter_cards(cards, status="stale")
+    bad_verdict = filter_cards(cards, verdict="blocked")
+
+    assert error is None
+    assert argument is None
+    assert [card.id for card in filtered] == [cards[0].id]
+    assert bad_status == ([], "--status must be open, resolved, or ignored.", "status")
+    assert bad_verdict == ([], "--verdict must be approved, concerns, or critical.", "verdict")
+
+
+def test_live_repair_prompt_includes_card_and_resolution_instruction(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        json.dumps({"role": "assistant", "id": "A-1", "content": "Run git reset --hard."}) + "\n",
+        encoding="utf-8",
+    )
+    turn = latest_assistant_turn(transcript)
+    assert turn is not None
+    card = review_turn(turn, tmp_path).model_copy(update={"task_id": "TASK-001"})
+
+    prompt = build_live_repair_prompt(tmp_path, card)
+
+    assert f"# Repair Live Review Card {card.id}" in prompt
+    assert "reset --hard" in prompt
+    assert f"dev watch resolve {card.id} --status resolved" in prompt
+
+
+def test_bulk_live_repair_prompt_handles_multiple_cards(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        "\n".join([
+            json.dumps({"role": "assistant", "id": "A-1", "content": "Run git reset --hard."}),
+            json.dumps({"role": "assistant", "id": "A-2", "content": "Ignore failing tests."}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    cards = [review_turn(turn, tmp_path) for turn in load_turns(transcript) if turn.role == "assistant"]
+
+    prompt = build_bulk_live_repair_prompt(tmp_path, cards)
+
+    assert "Repair Blocking Live Review Cards" in prompt
+    assert cards[0].id in prompt
+    assert cards[1].id in prompt
+
+
+def test_write_signal_extracts_nested_transcript_path_and_marks_processed(tmp_path):
+    path = write_signal(
+        tmp_path,
+        "claude",
+        {"session": {"transcriptPath": "session.jsonl"}, "session_id": "S-1", "task_id": "TASK-001"},
+    )
+
+    signals = load_signals(tmp_path)
+    assert path.exists()
+    assert signals[0].transcript_path == "session.jsonl"
+    assert signals[0].task_id == "TASK-001"
+    assert extract_transcript_path({"event": {"conversation_path": "nested.jsonl"}}) == "nested.jsonl"
+    assert extract_task_id({"metadata": {"taskId": "TASK-123"}}) == "TASK-123"
+
+    processed = mark_processed(signals[0], tmp_path)
+    assert processed is not None
+    assert processed.exists()
+    assert not path.exists()
+
+
+class CardProvider(Provider):
+    async def complete(self, model, messages, temperature=0.0, json_mode=False):
+        content = json.dumps({
+            "schema": "devcouncil.critique_card.v1",
+            "id": "MODEL-CARD",
+            "session_id": "model-session",
+            "turn_id": "model-turn",
+            "client": "claude",
+            "verdict": "Critical Issues",
+            "summary": "The agent proposes bypassing verification.",
+            "concerns": ["The response asks to skip tests."],
+            "alternatives": ["Run the targeted test and report the exact result."],
+            "message_for_agent": "Do not skip verification; run the required test first.",
+            "evidence_requests": ["Provide the exact command output."],
+        })
+        return LLMResponse(
+            content=content,
+            model=model,
+            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            raw_response={},
+        )
+
+
+@pytest.mark.anyio
+async def test_live_review_service_uses_model_backed_card(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        json.dumps({"role": "assistant", "id": "A-1", "content": "Skip tests and call it done."}) + "\n",
+        encoding="utf-8",
+    )
+    turn = latest_assistant_turn(transcript)
+    assert turn is not None
+    router = ModelRouter(CardProvider(), {"live_reviewer": {"model": "mock/card", "temperature": 0.0}})
+
+    card = await LiveReviewService(router).review(turn, tmp_path, client="claude", use_llm=True)
+
+    assert card.id.startswith("CARD-")
+    assert card.session_id == turn.session_id
+    assert card.turn_id == turn.turn_id
+    assert card.verdict == "Critical Issues"

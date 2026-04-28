@@ -2,15 +2,19 @@ from devcouncil.domain.assumption import Assumption
 from devcouncil.domain.critique import CritiqueFinding
 from devcouncil.domain.evidence import CommandResult, TestEvidence
 from devcouncil.domain.gap import Gap
+from devcouncil.domain.requirement import Requirement
+from devcouncil.domain.task import PlannedFile, Task
 from devcouncil.storage.db import Database, SCHEMA_VERSION
-from devcouncil.storage.models import ProjectStateModel, SchemaVersionModel
+from devcouncil.storage.models import ProjectStateModel, SchemaVersionModel, TaskModel
 from devcouncil.storage.repositories import (
     ArtifactGraphRepository,
     AssumptionRepository,
     CritiqueFindingRepository,
     EvidenceRepository,
     GapRepository,
+    PlanningStateRepository,
     StateRepository,
+    TaskRepository,
 )
 
 
@@ -180,3 +184,50 @@ def test_artifact_graph_repository_loads_assumptions_and_findings(tmp_path):
 
         assert list(graph.assumptions) == ["ASM-001"]
         assert list(graph.findings) == ["FIND-001"]
+
+
+def test_planning_state_replace_rolls_back_on_write_failure(tmp_path, monkeypatch):
+    db = Database(tmp_path / "state.sqlite")
+    db.create_db_and_tables()
+
+    with db.get_session() as session:
+        TaskRepository(session).save(Task(
+            id="TASK-OLD",
+            title="Old",
+            description="old",
+            planned_files=[PlannedFile(path="old.py", reason="old", allowed_change="modify")],
+            status="verified",
+        ))
+
+    def fail_on_new_task(self, instance, *args, **kwargs):
+        if isinstance(instance, TaskModel) and instance.id == "TASK-NEW":
+            raise RuntimeError("forced write failure")
+        return original_merge(self, instance, *args, **kwargs)
+
+    from sqlmodel import Session
+
+    original_merge = Session.merge
+    monkeypatch.setattr(Session, "merge", fail_on_new_task)
+
+    try:
+        with db.get_session() as session:
+            PlanningStateRepository(session).replace_active_plan(
+                [Requirement(id="REQ-001", title="New", description="new", priority="high", source="user")],
+                [],
+                [
+                    Task(
+                        id="TASK-NEW",
+                        title="New",
+                        description="new",
+                        planned_files=[PlannedFile(path="new.py", reason="new", allowed_change="modify")],
+                    )
+                ],
+                [],
+            )
+    except RuntimeError:
+        pass
+
+    with db.get_session() as session:
+        tasks = TaskRepository(session).get_all()
+        assert [task.id for task in tasks] == ["TASK-OLD"]
+        assert tasks[0].status == "verified"

@@ -5,7 +5,9 @@ import subprocess
 from pathlib import Path
 from typing import List, Dict
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from devcouncil.indexing.lsp import LspInspector
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +18,7 @@ class RepoMap(BaseModel):
     test_commands: List[str]
     important_files: List[str]
     candidate_files: List[Dict[str, str]]
+    lsp: Dict[str, object] = Field(default_factory=dict)
 
 class RepoMapper:
     def __init__(self, project_root: Path):
@@ -201,4 +204,5 @@ class RepoMapper:
                 "Cargo.toml", "Makefile", "Dockerfile", ".github/workflows",
             ]],
             candidate_files=candidates,
+            lsp=LspInspector(self.project_root).summary(files),
         )

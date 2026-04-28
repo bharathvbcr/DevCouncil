@@ -68,9 +68,17 @@ class CodeReviewGraphIntegrationConfig(BaseModel):
     optional: bool = True
 
 
+class LiveReviewIntegrationConfig(BaseModel):
+    enabled: bool = True
+    cards_path: str = ".devcouncil/live/cards"
+    signals_path: str = ".devcouncil/live/signals"
+    default_client: str = "claude"
+
+
 class IntegrationsConfig(BaseModel):
     agent_flow: AgentFlowIntegrationConfig = Field(default_factory=AgentFlowIntegrationConfig)
     code_review_graph: CodeReviewGraphIntegrationConfig = Field(default_factory=CodeReviewGraphIntegrationConfig)
+    live_review: LiveReviewIntegrationConfig = Field(default_factory=LiveReviewIntegrationConfig)
 
 
 class ProviderConfig(BaseModel):
@@ -111,21 +119,40 @@ def load_config(project_root: Path = Path(".")) -> DevCouncilConfig:
     return DevCouncilConfig.model_validate(raw)
 
 
-def get_api_key(provider: str = "openrouter") -> str:
-    """Retrieve the API key for the configured provider from environment.
-    
-    Raises ValueError if not found.
-    """
+def provider_api_key_env_var(provider: str = "openrouter") -> str:
     env_map = {
         "openrouter": "OPENROUTER_API_KEY",
         "openai": "OPENAI_API_KEY",
         "anthropic": "ANTHROPIC_API_KEY",
     }
-    env_var = env_map.get(provider, f"{provider.upper()}_API_KEY")
-    key = os.environ.get(env_var)
+    return env_map.get(provider, f"{provider.upper()}_API_KEY")
+
+
+def load_local_secrets(project_root: Path = Path(".")) -> Dict[str, str]:
+    secrets_path = project_root / ".devcouncil" / "secrets.env"
+    if not secrets_path.exists():
+        return {}
+
+    secrets: Dict[str, str] = {}
+    for line in secrets_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        secrets[key.strip()] = value.strip().strip('"').strip("'")
+    return secrets
+
+
+def get_api_key(provider: str = "openrouter", project_root: Path = Path(".")) -> str:
+    """Retrieve the API key for the configured provider from environment.
+    
+    Raises ValueError if not found.
+    """
+    env_var = provider_api_key_env_var(provider)
+    key = os.environ.get(env_var) or load_local_secrets(project_root).get(env_var)
     if not key:
         raise ValueError(
-            f"API key not found. Set {env_var} in your environment. "
+            f"API key not found. Set {env_var} in your environment or run 'dev setup'. "
             f"Provider: {provider}"
         )
     return key

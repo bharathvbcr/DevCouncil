@@ -6,6 +6,9 @@ import httpx
 import json
 from pathlib import Path
 
+SUPPORTED_MODEL_PROVIDERS = ("openrouter",)
+
+
 class LLMResponse(BaseModel):
     content: str
     model: str
@@ -22,6 +25,24 @@ class Provider(ABC):
         json_mode: bool = False
     ) -> LLMResponse:
         pass
+
+
+def validate_model_provider(provider_name: str) -> str:
+    normalized = provider_name.strip().lower()
+    if normalized in SUPPORTED_MODEL_PROVIDERS:
+        return normalized
+    supported = ", ".join(SUPPORTED_MODEL_PROVIDERS)
+    raise ValueError(
+        f"Unsupported model provider '{provider_name}'. "
+        f"Supported providers: {supported}."
+    )
+
+
+def create_provider(provider_name: str, api_key: str) -> Provider:
+    normalized = validate_model_provider(provider_name)
+    if normalized == "openrouter":
+        return OpenRouterProvider(api_key)
+    raise AssertionError(f"Provider validation passed for unhandled provider: {normalized}")
 
 class OpenRouterProvider(Provider):
     def __init__(self, api_key: str):

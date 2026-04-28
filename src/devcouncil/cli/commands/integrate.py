@@ -1,3 +1,4 @@
+import json
 import shutil
 import subprocess
 import sys
@@ -13,7 +14,10 @@ setup_app = typer.Typer(help="Set up optional external companion integrations.")
 app.add_typer(setup_app, name="setup")
 console = Console()
 
-SUPPORTED_TOOLS = ("codex", "gemini")
+SUPPORTED_TOOLS = ("codex", "gemini", "claude", "cursor")
+SUPPORTED_HOOK_TOOLS = ("codex", "gemini", "claude")
+PREFERRED_COMMAND = "dev integrate"
+LEGACY_COMMAND = "dev setup --integrate"
 
 
 def _project_root(path: Path | None) -> Path:
@@ -51,12 +55,66 @@ def _gemini_command(project_root: Path, scope: str) -> list[str]:
     ]
 
 
+def _claude_command(project_root: Path, scope: str) -> list[str]:
+    return [
+        "claude",
+        "mcp",
+        "add",
+        "--scope",
+        scope,
+        "--env",
+        f"DEVCOUNCIL_PROJECT_ROOT={project_root}",
+        "devcouncil",
+        "--",
+        *_server_args(project_root),
+    ]
+
+
+def _cursor_command(project_root: Path) -> list[str]:
+    server = {
+        "name": "devcouncil",
+        "command": "devcouncil",
+        "args": ["mcp-server"],
+        "env": {"DEVCOUNCIL_PROJECT_ROOT": str(project_root)},
+    }
+    return ["cursor", "--add-mcp", json.dumps(server, separators=(",", ":"))]
+
+
 def _format_command(command: list[str]) -> str:
+    if sys.platform == "win32":
+        return " ".join(_quote_powershell_arg(arg) for arg in command)
     return subprocess.list2cmdline(command)
 
 
+def _quote_powershell_arg(arg: str) -> str:
+    if arg == "":
+        return "''"
+    special_chars = set(" \t\r\n'\"{}[](),;|&<>")
+    if not any(char in special_chars for char in arg):
+        return arg
+    return "'" + arg.replace("'", "''") + "'"
+
+
+def _hook_command(project_root: Path, client: str, event: str) -> str:
+    return _format_command([
+        "devcouncil",
+        "hook",
+        event,
+        "--client",
+        client,
+        "--project-root",
+        str(project_root),
+    ])
+
+
 def _run(command: list[str]) -> int:
-    result = subprocess.run(command, text=True)
+    executable = shutil.which(command[0])
+    if not executable:
+        return 127
+    resolved = [executable, *command[1:]]
+    use_shell = sys.platform == "win32" and Path(executable).suffix.lower() in {".bat", ".cmd", ".ps1"}
+    invocation = subprocess.list2cmdline(resolved) if use_shell else resolved
+    result = subprocess.run(invocation, text=True, shell=use_shell)
     return result.returncode
 
 
@@ -98,6 +156,181 @@ def _save_raw_config(project_root: Path, config: dict) -> None:
     path = _config_path(project_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+
+def _load_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8")) or {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _save_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def _upsert_hook(settings: dict, event: str, matcher: str, command: str, name: str) -> None:
+    hooks = settings.setdefault("hooks", {})
+    groups = hooks.setdefault(event, [])
+    for group in groups:
+        if group.get("matcher") == matcher:
+            group_hooks = group.setdefault("hooks", [])
+            if not any(hook.get("command") == command for hook in group_hooks):
+                group_hooks.append({
+                    "type": "command",
+                    "name": name,
+                    "command": command,
+                    "timeout": 10000,
+                })
+            return
+    groups.append({
+        "matcher": matcher,
+        "hooks": [{
+            "type": "command",
+            "name": name,
+            "command": command,
+            "timeout": 10000,
+        }],
+    })
+
+
+def _ensure_codex_hooks_enabled(project_root: Path) -> Path:
+    config_path = project_root / ".codex" / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    if "codex_hooks" not in existing:
+        if "[features]" in existing:
+            lines = existing.splitlines()
+            updated: list[str] = []
+            in_features = False
+            inserted = False
+            for line in lines:
+                stripped = line.strip()
+                if stripped == "[features]":
+                    in_features = True
+                    updated.append(line)
+                    continue
+                if in_features and stripped.startswith("[") and stripped.endswith("]"):
+                    updated.append("codex_hooks = true")
+                    inserted = True
+                    in_features = False
+                updated.append(line)
+            if in_features and not inserted:
+                updated.append("codex_hooks = true")
+            config_path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+        else:
+            separator = "\n" if existing and not existing.endswith("\n") else ""
+            config_path.write_text(f"{existing}{separator}\n[features]\ncodex_hooks = true\n", encoding="utf-8")
+    return config_path
+
+
+def _install_codex_hooks(project_root: Path) -> list[Path]:
+    path = project_root / ".codex" / "hooks.json"
+    settings = _load_json(path)
+    matcher = "Bash|shell_command|exec_command|local_shell|Write|Edit|MultiEdit|write_file|edit_file|apply_patch"
+    _upsert_hook(
+        settings,
+        "PreToolUse",
+        matcher,
+        _hook_command(project_root, "codex", "pre-tool-use"),
+        "devcouncil-pre-tool-use",
+    )
+    _upsert_hook(
+        settings,
+        "PostToolUse",
+        matcher,
+        _hook_command(project_root, "codex", "post-tool-use"),
+        "devcouncil-post-tool-use",
+    )
+    _save_json(path, settings)
+    return [path, _ensure_codex_hooks_enabled(project_root)]
+
+
+def _install_gemini_hooks(project_root: Path) -> list[Path]:
+    path = project_root / ".gemini" / "settings.json"
+    settings = _load_json(path)
+    matcher = "run_shell_command|shell_command|write_file|edit_file|replace|apply_patch"
+    _upsert_hook(
+        settings,
+        "BeforeTool",
+        matcher,
+        _hook_command(project_root, "gemini", "pre-tool-use"),
+        "devcouncil-pre-tool-use",
+    )
+    _upsert_hook(
+        settings,
+        "AfterTool",
+        matcher,
+        _hook_command(project_root, "gemini", "post-tool-use"),
+        "devcouncil-post-tool-use",
+    )
+    _save_json(path, settings)
+    return [path]
+
+
+def _install_claude_hooks(project_root: Path) -> list[Path]:
+    path = project_root / ".claude" / "settings.local.json"
+    settings = _load_json(path)
+    matcher = "Bash|Write|Edit|MultiEdit"
+    _upsert_hook(
+        settings,
+        "PreToolUse",
+        matcher,
+        _hook_command(project_root, "claude", "pre-tool-use"),
+        "devcouncil-pre-tool-use",
+    )
+    _upsert_hook(
+        settings,
+        "PostToolUse",
+        matcher,
+        _hook_command(project_root, "claude", "post-tool-use"),
+        "devcouncil-post-tool-use",
+    )
+    _upsert_hook(
+        settings,
+        "Stop",
+        "",
+        _hook_command(project_root, "claude", "agent-response"),
+        "devcouncil-agent-response-ready",
+    )
+    _save_json(path, settings)
+    return [path]
+
+
+def _preview_hook_paths(project_root: Path, tool: str) -> list[tuple[str, Path]]:
+    paths = {
+        "codex": [project_root / ".codex" / "hooks.json", project_root / ".codex" / "config.toml"],
+        "gemini": [project_root / ".gemini" / "settings.json"],
+        "claude": [project_root / ".claude" / "settings.local.json"],
+    }
+    selected = SUPPORTED_HOOK_TOOLS if tool == "all" else (tool,)
+    return [(client, path) for client in selected for path in paths[client]]
+
+
+def _configure_native_hooks(project_root: Path, tool: str = "all", apply: bool = False) -> None:
+    if tool not in {"all", *SUPPORTED_HOOK_TOOLS}:
+        console.print("[red]--tool must be one of: all, codex, gemini, claude.[/red]")
+        raise typer.Exit(code=2)
+
+    if not apply:
+        console.print("[bold]Native hook config preview[/bold]")
+        for client, path in _preview_hook_paths(project_root, tool):
+            console.print(f"{client}: {path}")
+        console.print("[yellow]Preview only. Rerun with --apply to write hook config files.[/yellow]")
+        return
+
+    selected = SUPPORTED_HOOK_TOOLS if tool == "all" else (tool,)
+    installers = {
+        "codex": _install_codex_hooks,
+        "gemini": _install_gemini_hooks,
+        "claude": _install_claude_hooks,
+    }
+    for client in selected:
+        written = installers[client](project_root)
+        console.print(f"[green]{client} native hooks configured:[/green] {', '.join(str(path) for path in written)}")
 
 
 def _print_command(tool: str, command: list[str], apply: bool):
@@ -142,10 +375,14 @@ def overview(ctx: typer.Context):
     table.add_column("Tool", style="cyan")
     table.add_column("Setup command", style="green")
     table.add_column("Notes")
-    table.add_row("Codex CLI", "dev integrate codex --apply", "Adds DevCouncil as a stdio MCP server.")
-    table.add_row("Gemini CLI", "dev integrate gemini --apply", "Adds DevCouncil as a project-scoped stdio MCP server.")
-    table.add_row("Both", "dev integrate all --apply", "Runs both setup commands.")
+    table.add_row("Codex CLI", f"{PREFERRED_COMMAND} codex --apply", "Adds DevCouncil as a stdio MCP server.")
+    table.add_row("Gemini CLI", f"{PREFERRED_COMMAND} gemini --apply", "Adds DevCouncil as a project-scoped stdio MCP server.")
+    table.add_row("Claude Code", f"{PREFERRED_COMMAND} claude --apply", "Adds DevCouncil as a Claude Code MCP server.")
+    table.add_row("Cursor", f"{PREFERRED_COMMAND} cursor --apply", "Adds DevCouncil as a Cursor MCP server.")
+    table.add_row("All", f"{PREFERRED_COMMAND} all --apply", "Runs MCP setup and installs native hooks.")
+    table.add_row("Native hooks", f"{PREFERRED_COMMAND} hooks --apply", "Installs Codex, Gemini, and Claude hook files.")
     console.print(table)
+    console.print(f"\nIf your install exposes only the setup flow, use: {LEGACY_COMMAND} --apply")
     console.print("\nRun without [bold]--apply[/bold] to preview the exact commands first.")
 
 
@@ -160,9 +397,11 @@ def integrations_doctor():
     checks = [
         ("Agent Flow", "agent-flow-app", "Optional live/replay visualizer for trace JSONL."),
         ("code-review-graph", "code-review-graph", "Optional structural graph context adapter."),
-        ("Claude Code", "claude", "Optional hook runtime for pre-tool-use enforcement."),
-        ("Codex CLI", "codex", "Optional MCP client and headless executor companion."),
-        ("Gemini CLI", "gemini", "Optional MCP client companion."),
+        ("Claude Code", "claude", "Optional MCP client and native hook runtime for pre-tool-use enforcement."),
+        ("Codex CLI", "codex", "Optional MCP client, headless executor companion, and native hook runtime."),
+        ("Gemini CLI", "gemini", "Optional MCP client companion and native hook runtime."),
+        ("Cursor", "cursor", "Optional MCP client and agent companion."),
+        ("Aider", "aider", "Optional prompt/stdin sidecar; no first-party MCP setup command."),
     ]
     for label, executable, notes in checks:
         found = shutil.which(executable)
@@ -212,26 +451,89 @@ def gemini(
         raise typer.Exit(code=1)
 
 
+@app.command("claude")
+def claude(
+    apply: bool = typer.Option(False, "--apply", help="Run the setup command instead of printing it."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+    scope: str = typer.Option("local", "--scope", help="Claude MCP config scope: local, project, or user."),
+):
+    """
+    Set up DevCouncil MCP tools for Claude Code.
+    """
+    if scope not in {"local", "project", "user"}:
+        console.print("[red]--scope must be 'local', 'project', or 'user'.[/red]")
+        raise typer.Exit(code=2)
+
+    root = _project_root(project_root)
+    command = _claude_command(root, scope)
+    ok = _configure("Claude Code", command, apply)
+    if not ok and apply:
+        raise typer.Exit(code=1)
+
+
+@app.command("cursor")
+def cursor(
+    apply: bool = typer.Option(False, "--apply", help="Run the setup command instead of printing it."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """
+    Set up DevCouncil MCP tools for Cursor.
+    """
+    root = _project_root(project_root)
+    command = _cursor_command(root)
+    ok = _configure("Cursor", command, apply)
+    if not ok and apply:
+        raise typer.Exit(code=1)
+
+
 @app.command("all")
 def all_tools(
     apply: bool = typer.Option(False, "--apply", help="Run setup commands instead of printing them."),
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
     gemini_scope: str = typer.Option("project", "--gemini-scope", help="Gemini MCP config scope: project or user."),
+    claude_scope: str = typer.Option("local", "--claude-scope", help="Claude MCP config scope: local, project, or user."),
+    hooks: bool = typer.Option(True, "--hooks/--no-hooks", help="Include native Codex, Gemini, and Claude hook setup."),
 ):
     """
-    Set up DevCouncil MCP tools for every supported coding CLI found on PATH.
+    Set up DevCouncil MCP tools and native hooks for every supported coding CLI found on PATH.
     """
     if gemini_scope not in {"project", "user"}:
         console.print("[red]--gemini-scope must be 'project' or 'user'.[/red]")
         raise typer.Exit(code=2)
+    if claude_scope not in {"local", "project", "user"}:
+        console.print("[red]--claude-scope must be 'local', 'project', or 'user'.[/red]")
+        raise typer.Exit(code=2)
 
     root = _project_root(project_root)
-    results = [
-        _configure("Codex CLI", _codex_command(root), apply),
-        _configure("Gemini CLI", _gemini_command(root, gemini_scope), apply),
+    commands = [
+        ("Codex CLI", _codex_command(root)),
+        ("Gemini CLI", _gemini_command(root, gemini_scope)),
+        ("Claude Code", _claude_command(root, claude_scope)),
+        ("Cursor", _cursor_command(root)),
     ]
+    results = []
+    for tool, command in commands:
+        if apply and not shutil.which(command[0]):
+            console.print(f"[yellow]{tool} CLI not found on PATH. Skipping optional integration.[/yellow]")
+            continue
+        results.append(_configure(tool, command, apply))
+    if hooks:
+        _configure_native_hooks(root, "all", apply)
     if apply and not all(results):
         raise typer.Exit(code=1)
+
+
+@app.command("hooks")
+def hooks(
+    apply: bool = typer.Option(False, "--apply", help="Write native hook config files instead of previewing paths."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+    tool: str = typer.Option("all", "--tool", help="Hook target: all, codex, gemini, or claude."),
+):
+    """
+    Install DevCouncil native hook configuration for hook-capable coding CLIs.
+    """
+    root = _project_root(project_root)
+    _configure_native_hooks(root, tool, apply)
 
 
 @app.command("check")
@@ -269,6 +571,12 @@ def check(
     code, output = _run_capture(["gemini", "--version"])
     add(code == 0, "Gemini CLI", output.splitlines()[0] if output else "Optional; install Gemini CLI to use this integration.")
 
+    code, output = _run_capture(["claude", "--version"])
+    add(code == 0, "Claude Code", output.splitlines()[0] if output else "Optional; install Claude Code to use this integration.")
+
+    code, output = _run_capture(["cursor", "--version"])
+    add(code == 0, "Cursor", output.splitlines()[0] if output else "Optional; install Cursor to use this integration.")
+
     try:
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import stdio_client
@@ -300,10 +608,13 @@ def check(
 
     console.print(table)
     if failures:
-        console.print("\n[yellow]Fix failed checks, then run:[/yellow] dev integrate all --apply")
+        console.print(
+            f"\n[yellow]Fix failed checks, then run:[/yellow] {PREFERRED_COMMAND} all --apply "
+            f"(or {LEGACY_COMMAND} --apply)."
+        )
         raise typer.Exit(code=1)
 
-    console.print("\n[green]Ready.[/green] Run: dev integrate all --apply")
+    console.print(f"\n[green]Ready.[/green] Run: {PREFERRED_COMMAND} all --apply (or {LEGACY_COMMAND} --apply).")
 
 
 @setup_app.command("agent-flow")

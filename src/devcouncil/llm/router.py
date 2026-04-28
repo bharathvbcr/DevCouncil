@@ -57,6 +57,7 @@ class ModelRouter:
 
         # Check cache first
         response = cache.get(model, msgs, temp, True)
+        cache_hit = response is not None
 
         if not response:
             for attempt in range(3):
@@ -75,7 +76,8 @@ class ModelRouter:
                     logger.warning(f"LLM request failed (attempt {attempt+1}): {e}. Retrying...")
                     await asyncio.sleep(2 ** attempt)
 
-        tracker.log_usage(model, response.usage)
+        if not cache_hit:
+            tracker.log_usage(model, response.usage)
 
         logger.info(
             "LLM response: role=%s model=%s tokens=%s",

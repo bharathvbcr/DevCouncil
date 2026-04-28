@@ -1,6 +1,12 @@
 import json
 
+from typer.testing import CliRunner
+
+from devcouncil.cli.main import app
 from devcouncil.telemetry.traces import TRACE_SCHEMA_VERSION, TraceLogger, read_trace_events
+
+
+runner = CliRunner()
 
 
 def test_trace_logger_writes_stable_jsonl(tmp_path):
@@ -32,3 +38,20 @@ def test_read_trace_events_accepts_legacy_lines(tmp_path):
     assert len(events) == 1
     assert events[0].type == "gate_failed"
     assert events[0].task_id == "TASK-001"
+
+
+def test_trace_tail_jsonl_remains_one_json_object_per_line(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    TraceLogger(tmp_path).log_event(
+        "task_verified",
+        {"message": "x" * 300},
+        task_id="TASK-001",
+        summary="x" * 300,
+    )
+
+    result = runner.invoke(app, ["trace", "tail", "--limit", "1"])
+
+    assert result.exit_code == 0
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert json.loads(lines[0])["task_id"] == "TASK-001"

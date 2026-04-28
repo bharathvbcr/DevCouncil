@@ -1,12 +1,18 @@
 import typer
+from pathlib import Path
+
 from devcouncil.cli.commands import (
     artifacts,
     baseline,
     config,
+    ast,
+    dashboard,
     doctor,
+    go,
     hook,
     init,
     integrate,
+    lsp,
     map,
     mcp_server,
     plan,
@@ -23,7 +29,9 @@ from devcouncil.cli.commands import (
     trace,
     verify,
     version,
+    watch,
 )
+from devcouncil.cli.commands.init import initialize_project
 
 app = typer.Typer(
     name="dev",
@@ -34,9 +42,7 @@ app = typer.Typer(
 # Typer subcommands (those using app = Typer())
 app.add_typer(init.app, name="init")
 app.add_typer(doctor.app, name="doctor")
-app.add_typer(prompt.app, name="prompt")
 app.add_typer(tasks.app, name="tasks")
-app.add_typer(show.app, name="show")
 app.add_typer(report.app, name="report")
 app.add_typer(rollback.app, name="rollback")
 app.add_typer(config.app, name="config")
@@ -48,23 +54,35 @@ app.add_typer(integrate.app, name="integrate")
 app.add_typer(integrate.app, name="integrations")
 app.add_typer(trace.app, name="trace")
 app.add_typer(setup.app, name="setup")
+app.add_typer(lsp.app, name="lsp")
+app.add_typer(ast.app, name="ast")
+app.add_typer(dashboard.app, name="dashboard")
+app.add_typer(watch.app, name="watch")
 
 # Direct command registrations (those defined as def cmd())
 app.command(name="baseline")(baseline.baseline)
+app.command(name="e2e")(go.go)
+app.command(name="go")(go.go)
 app.command(name="map")(map.map_repo)
 app.command(name="plan")(plan.plan)
+app.command(name="prompt")(prompt.prompt)
 app.command(name="reset-demo-state")(reset_demo_state.reset_demo_state)
 app.command(name="run")(run.run)
+app.command(name="show")(show.show)
 app.command(name="verify")(verify.verify)
 app.command(name="repair")(repair.repair)
 app.command(name="status")(status.status)
 
 @app.callback()
-def main():
+def main(ctx: typer.Context):
     """
     DevCouncil: Gated orchestrator for AI-assisted software development.
     """
-    pass
+    if ctx.invoked_subcommand in {"init", "setup"}:
+        return
+
+    initialize_project(Path("."), quiet=True)
+    return
 
 if __name__ == "__main__":
     app()

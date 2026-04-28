@@ -6,10 +6,13 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
+from devcouncil.app.config import load_config, load_local_secrets, provider_api_key_env_var
+from devcouncil.llm.provider import SUPPORTED_MODEL_PROVIDERS, validate_model_provider
+
 app = typer.Typer()
 console = Console()
 
-def render_doctor_check():
+def render_doctor_check(project_root: Path = Path(".")):
     def _command_version(command: list[str]) -> str | None:
         executable = shutil.which(command[0])
         if not executable:
@@ -66,31 +69,72 @@ def render_doctor_check():
     # Check supported coding CLIs
     codex_ver = _command_version(["codex", "--version"])
     if codex_ver:
-        table.add_row("Codex CLI", "[green]OK[/green]", f"{codex_ver}. Setup: dev integrate codex --apply")
+        table.add_row(
+            "Codex CLI",
+            "[green]OK[/green]",
+            f"{codex_ver}. Setup: dev integrate codex --apply (or dev setup --integrate --apply).",
+        )
     else:
-        table.add_row("Codex CLI", "[yellow]Missing[/yellow]", "Optional. Install Codex, then run 'dev integrate codex --apply'.")
+        table.add_row(
+            "Codex CLI",
+            "[yellow]Missing[/yellow]",
+            "Optional. Install Codex, then run 'dev integrate codex --apply' (or 'dev setup --integrate --apply').",
+        )
 
     gemini_ver = _command_version(["gemini", "--version"])
     if gemini_ver:
-        table.add_row("Gemini CLI", "[green]OK[/green]", f"{gemini_ver}. Setup: dev integrate gemini --apply")
+        table.add_row(
+            "Gemini CLI",
+            "[green]OK[/green]",
+            f"{gemini_ver}. Setup: dev integrate gemini --apply (or dev setup --integrate --apply).",
+        )
     else:
-        table.add_row("Gemini CLI", "[yellow]Missing[/yellow]", "Optional. Install Gemini CLI, then run 'dev integrate gemini --apply'.")
+        table.add_row(
+            "Gemini CLI",
+            "[yellow]Missing[/yellow]",
+            "Optional. Install Gemini CLI, then run 'dev integrate gemini --apply' (or 'dev setup --integrate --apply').",
+        )
 
-    # Check OpenRouter API Key
-    if os.environ.get("OPENROUTER_API_KEY"):
-        table.add_row("OPENROUTER_API_KEY", "[green]OK[/green]", "Found in environment.")
+    try:
+        provider = load_config(project_root).models.provider
+    except Exception:
+        provider = "openrouter"
+    try:
+        provider = validate_model_provider(provider)
+    except ValueError:
+        supported = ", ".join(SUPPORTED_MODEL_PROVIDERS)
+        table.add_row(
+            "models.provider",
+            "[red]Unsupported[/red]",
+            f"{provider} is configured, but this runtime supports: {supported}.",
+        )
+        console.print(table)
+        return
+    env_var = provider_api_key_env_var(provider)
+    local_secrets = load_local_secrets(project_root)
+    if os.environ.get(env_var):
+        table.add_row(env_var, "[green]OK[/green]", f"Found in environment for {provider}.")
+    elif local_secrets.get(env_var):
+        table.add_row(env_var, "[green]OK[/green]", f"Found in .devcouncil/secrets.env for {provider}.")
     else:
-        table.add_row("OPENROUTER_API_KEY", "[yellow]Missing[/yellow]", "Required if using OpenRouter provider.")
+        table.add_row(env_var, "[yellow]Missing[/yellow]", f"Required if using {provider} provider. Run 'dev setup'.")
 
     console.print(table)
 
 
 @app.callback(invoke_without_command=True)
-def doctor(ctx: typer.Context):
+def doctor(
+    ctx: typer.Context,
+    project_root: Path = typer.Option(
+        Path("."),
+        "--project-root",
+        help="Repository root containing .devcouncil/config.yaml.",
+    ),
+):
     """
     Check the environment for DevCouncil prerequisites.
     """
     if ctx.invoked_subcommand is not None:
         return
 
-    render_doctor_check()
+    render_doctor_check(project_root.expanduser().resolve())

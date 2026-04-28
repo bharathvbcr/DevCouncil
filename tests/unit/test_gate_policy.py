@@ -6,6 +6,7 @@ from devcouncil.domain.critique import CritiqueFinding
 from devcouncil.domain.requirement import AcceptanceCriterion, Requirement
 from devcouncil.domain.task import PlannedFile, Task
 from devcouncil.gating.policy import GatePolicy
+from devcouncil.cli.commands.plan import _reconcile_findings
 
 
 def _requirement() -> Requirement:
@@ -76,6 +77,30 @@ def test_plan_gate_blocks_open_high_critique_finding():
 
     assert not result.passed
     assert any("FIND-001" in gap.id for gap in result.gaps)
+
+
+def test_reconciled_arbiter_findings_do_not_remain_open():
+    accepted = CritiqueFinding(
+        id="FIND-001",
+        source_agent="critic_a",
+        target_plan_id="PLAN-B",
+        severity="high",
+        finding_type="security_risk",
+        claim="Plan does not hash reset tokens",
+        falsifiable_check="Inspect token persistence",
+        status="open",
+    )
+    rejected = accepted.model_copy(update={"id": "FIND-002"})
+    decision = SimpleNamespace(
+        accepted_finding_ids=["FIND-001"],
+        rejected_finding_ids=[{"id": "FIND-002", "reason": "Covered elsewhere"}],
+    )
+
+    reconciled = _reconcile_findings([accepted, rejected], decision)
+
+    assert [finding.status for finding in reconciled] == ["converted", "rejected"]
+    result = GatePolicy().check_plan_approval([_requirement()], [_task()], findings=reconciled)
+    assert result.passed
 
 
 def test_plan_gate_blocks_unanswered_question():

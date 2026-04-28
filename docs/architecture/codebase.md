@@ -34,7 +34,7 @@ graph TD
 
     subgraph Execution ["Task Execution"]
         ExecEngine["Execution Engine"]
-        Executors["Executors (Manual, Mini-SWE, etc.)"]
+        Executors["Executors (Manual, Mini-SWE, OpenHands, Native, Coding CLIs)"]
         Sandbox["Sandbox/Container"]
     end
 
@@ -76,7 +76,7 @@ graph TD
 | `council` | The multi-agent debate engine that handles requirement gathering and planning. |
 | `domain` | Core data models and schemas (Requirements, Tasks, Evidence). |
 | `execution` | Logic for running tasks and managing execution environments. |
-| `executors` | Concrete adapters for external tools (e.g., manual human input, OpenHands). |
+| `executors` | Concrete adapters for execution strategies (manual, mini-SWE-agent, OpenHands, native, and coding CLIs). |
 | `gating` | Policy-based check logic that decides if a task or phase can proceed. |
 | `indexing` | Static analysis and repository mapping for LLM context. |
 | `llm` | Abstraction layer for different LLM providers (OpenAI, Anthropic, etc.). |
