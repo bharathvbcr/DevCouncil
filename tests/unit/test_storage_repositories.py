@@ -1,8 +1,17 @@
+from devcouncil.domain.assumption import Assumption
+from devcouncil.domain.critique import CritiqueFinding
 from devcouncil.domain.evidence import CommandResult, TestEvidence
 from devcouncil.domain.gap import Gap
 from devcouncil.storage.db import Database, SCHEMA_VERSION
 from devcouncil.storage.models import ProjectStateModel, SchemaVersionModel
-from devcouncil.storage.repositories import EvidenceRepository, GapRepository, StateRepository
+from devcouncil.storage.repositories import (
+    ArtifactGraphRepository,
+    AssumptionRepository,
+    CritiqueFindingRepository,
+    EvidenceRepository,
+    GapRepository,
+    StateRepository,
+)
 
 
 def test_gap_repository_deletes_task_scoped_gaps(tmp_path):
@@ -34,6 +43,36 @@ def test_gap_repository_deletes_task_scoped_gaps(tmp_path):
 
         remaining = repo.get_all()
         assert [gap.id for gap in remaining] == ["GAP-TASK-002"]
+
+
+def test_gap_repository_deletes_plan_gate_gaps(tmp_path):
+    db = Database(tmp_path / "state.sqlite")
+    db.create_db_and_tables()
+
+    with db.get_session() as session:
+        repo = GapRepository(session)
+        repo.save(Gap(
+            id="GAP-PLAN-REQ-001-UNMAPPED",
+            severity="high",
+            gap_type="requirement_not_planned",
+            description="plan gap",
+            recommended_fix="fix plan",
+            blocking=True,
+        ))
+        repo.save(Gap(
+            id="GAP-TASK-001",
+            severity="high",
+            gap_type="orphan_diff",
+            task_id="TASK-001",
+            description="task gap",
+            recommended_fix="revert",
+            blocking=True,
+        ))
+
+        repo.delete_plan_gaps()
+
+        remaining = repo.get_all()
+        assert [gap.id for gap in remaining] == ["GAP-TASK-001"]
 
 
 def test_evidence_repository_deletes_task_scoped_command_and_test_evidence(tmp_path):
@@ -109,3 +148,35 @@ def test_state_repository_records_phase_history_without_duplicate_consecutive_en
         assert state is not None
         assert state.current_phase == "TASK_BLOCKED"
         assert state.history_json == '["TASK_VERIFYING", "TASK_BLOCKED"]'
+
+
+def test_artifact_graph_repository_loads_assumptions_and_findings(tmp_path):
+    db = Database(tmp_path / "state.sqlite")
+    db.create_db_and_tables()
+
+    with db.get_session() as session:
+        AssumptionRepository(session).save(Assumption(
+            id="ASM-001",
+            statement="External auth provider supports token revocation",
+            confidence="medium",
+            impact="high",
+            reversible=True,
+            requires_user_confirmation=True,
+            linked_requirement_ids=["REQ-001"],
+            status="open",
+        ))
+        CritiqueFindingRepository(session).save(CritiqueFinding(
+            id="FIND-001",
+            source_agent="critic_a",
+            target_plan_id="PLAN-B",
+            severity="high",
+            finding_type="security_risk",
+            claim="Tokens are not hashed",
+            falsifiable_check="Inspect persistence path",
+            status="open",
+        ))
+
+        graph = ArtifactGraphRepository(session).load_graph()
+
+        assert list(graph.assumptions) == ["ASM-001"]
+        assert list(graph.findings) == ["FIND-001"]

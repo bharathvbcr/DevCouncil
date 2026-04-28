@@ -11,6 +11,7 @@ from devcouncil.domain.evidence import CommandResult
 from devcouncil.app.errors import ExecutionError
 
 from devcouncil.execution.patch import PatchEngine
+from devcouncil.execution.paths import resolve_project_path
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +25,7 @@ class TaskRunner:
 
     def _validate_path_within_root(self, path: str) -> None:
         """Ensure a path resolves to a location within the project root."""
-        resolved = (self.project_root / path).resolve()
-        root_resolved = self.project_root.resolve()
-        if not str(resolved).startswith(str(root_resolved)):
-            raise ExecutionError(f"Path traversal blocked: {path} resolves outside project root.")
+        resolve_project_path(self.project_root, path)
 
     def apply_patch(self, patch: str, task: Task) -> bool:
         """Apply a patch if permissions allow (all affected files must be in planned_files)."""
@@ -118,7 +116,7 @@ class TaskRunner:
         self._validate_path_within_root(path)
         self.permissions.validate_action("file_write", path, task)
         
-        full_path = self.project_root / path
+        full_path = resolve_project_path(self.project_root, path)
         logger.info(f"Writing authorized file: {path}")
         try:
             full_path.parent.mkdir(parents=True, exist_ok=True)

@@ -158,8 +158,31 @@ class GatePolicy:
         
         # 2. Check planned files
         gaps.extend(self.planned_files.check(task))
-        
-        # 3. Check for task dependencies (if implemented)
+
+        # 3. Check execution/verification evidence contract
+        if not task.allowed_commands:
+            gaps.append(Gap(
+                id=f"GAP-{task.id}-NO-COMMANDS",
+                severity="high",
+                gap_type="missing_test",
+                task_id=task.id,
+                description=f"Task {task.id} has no allowed commands for execution or verification.",
+                recommended_fix="Add explicit allowed_commands for the task before execution.",
+                blocking=True,
+            ))
+
+        if not task.expected_tests:
+            gaps.append(Gap(
+                id=f"GAP-{task.id}-NO-EXPECTED-EVIDENCE",
+                severity="high",
+                gap_type="missing_test",
+                task_id=task.id,
+                description=f"Task {task.id} has no expected verification evidence.",
+                recommended_fix="Add expected_tests or targeted static/manual review commands that prove the acceptance criteria.",
+                blocking=True,
+            ))
+
+        # 4. Check for task dependencies (if implemented)
         
         return GateResult(
             passed=len([g for g in gaps if g.blocking]) == 0, 

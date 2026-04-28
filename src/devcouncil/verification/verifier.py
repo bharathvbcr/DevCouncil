@@ -295,13 +295,16 @@ class Verifier:
                     blocking=True,
                 ))
 
-        # 4. Run allowed commands
+        # 4. Run verification commands
         command_results: List[CommandResult] = []
+        evidence_results: List[CommandResult] = []
         for cmd_type, cmds in self._commands_for_task(task).items():
             for cmd in cmds:
                 result = self._run_command(cmd, task_id=task.id)
                 command_results.append(result)
                 evidence_to_save.append(result)
+                if self._command_can_prove_acceptance(cmd_type, cmd):
+                    evidence_results.append(result)
                 if result.exit_code != 0:
                     gaps.append(Gap(
                         id=self._next_gap_id(task.id, cmd_type.upper()),
@@ -315,7 +318,7 @@ class Verifier:
                     ))
 
         # 5. Acceptance-criteria evidence mapping
-        successful_commands = [result for result in command_results if result.exit_code == 0]
+        successful_commands = [result for result in evidence_results if result.exit_code == 0]
         if task.acceptance_criterion_ids:
             if successful_commands:
                 req_by_ac = {
@@ -387,6 +390,28 @@ class Verifier:
         if task.allowed_commands:
             return {"allowed": task.allowed_commands}
         return self._load_commands()
+
+    def _command_can_prove_acceptance(self, cmd_type: str, command: str) -> bool:
+        if cmd_type == "test":
+            return True
+        lowered = command.lower()
+        evidence_keywords = (
+            "test",
+            "pytest",
+            "vitest",
+            "jest",
+            "unittest",
+            "cargo test",
+            "go test",
+            "mvn test",
+            "gradle test",
+            "ruff check",
+            "mypy",
+            "tsc",
+            "typecheck",
+            "type-check",
+        )
+        return any(keyword in lowered for keyword in evidence_keywords)
 
     def _requirement_id_for_ac(self, requirements: List[Requirement], ac_id: str) -> Optional[str]:
         for req in requirements:

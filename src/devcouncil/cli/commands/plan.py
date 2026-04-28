@@ -8,7 +8,13 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from pathlib import Path
 
 from devcouncil.storage.db import get_db
-from devcouncil.storage.repositories import RequirementRepository, TaskRepository
+from devcouncil.storage.repositories import (
+    RequirementRepository,
+    AssumptionRepository,
+    TaskRepository,
+    CritiqueFindingRepository,
+    GapRepository,
+)
 from devcouncil.indexing.repo_mapper import RepoMapper
 from devcouncil.llm.provider import OpenRouterProvider, MockProvider
 from devcouncil.llm.router import ModelRouter
@@ -171,13 +177,21 @@ async def run_plan_flow(
         if persist:
             with db.get_session() as session:
                 req_repo = RequirementRepository(session)
+                assumption_repo = AssumptionRepository(session)
                 task_repo = TaskRepository(session)
+                finding_repo = CritiqueFindingRepository(session)
                 
                 for req in decision.final_requirements:
                     req_repo.save(req)
+
+                for assumption in spec_output.assumptions:
+                    assumption_repo.save(assumption)
                 
                 for task in decision.final_tasks:
                     task_repo.save(task)
+
+                for finding in [*critique_a.findings, *critique_b.findings]:
+                    finding_repo.save(finding)
 
     console.print("[green]Planning complete![/green]")
     if dry_run:
@@ -196,10 +210,19 @@ async def run_plan_flow(
         findings=[*critique_a.findings, *critique_b.findings],
         blocking_questions=spec_output.blocking_questions,
     )
+    if persist:
+        with db.get_session() as session:
+            GapRepository(session).delete_plan_gaps()
+
     if result.passed:
         console.print("[green]Plan approved by gates.[/green]")
         await orchestrator.transition_to(ProjectPhase.PLAN_APPROVED)
     else:
+        if persist:
+            with db.get_session() as session:
+                gap_repo = GapRepository(session)
+                for gap in result.gaps:
+                    gap_repo.save(gap)
         console.print("[yellow]Plan generated but failed gates. See status for gaps.[/yellow]")
         await orchestrator.transition_to(ProjectPhase.AWAITING_USER_DECISIONS)
 
