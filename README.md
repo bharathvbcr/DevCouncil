@@ -12,6 +12,51 @@ DevCouncil ensures that AI-generated work proves it satisfied the original inten
 - **Security Scanning**: Automated secret redaction and detection.
 - **MCP Server**: Expose DevCouncil status and tasks to MCP-compatible LLM tools like Claude Code and Cursor.
 
+## Visual Architecture
+
+### Artifact Graph
+The core data structure that ensures every line of code traces back to a requirement.
+
+```mermaid
+graph TD;
+    Requirement-->AcceptanceCriterion;
+    Requirement-->Task;
+    Task-->PlannedFile;
+    Task-->ChangedFile;
+    Task-->TestEvidence;
+    Task-->CommandResult;
+    Requirement-->Gap;
+    Task-->Gap;
+```
+
+### Gating State Machine
+The deterministic workflow that manages the implementation lifecycle.
+
+```mermaid
+stateDiagram-v2
+    [*] --> NEW
+    NEW --> REPO_MAPPED
+    REPO_MAPPED --> REQUIREMENTS_DRAFTED
+    REQUIREMENTS_DRAFTED --> PLANS_GENERATED
+    PLANS_GENERATED --> CRITIQUES_GENERATED
+    CRITIQUES_GENERATED --> ARBITRATED
+    ARBITRATED --> PLAN_APPROVED
+    PLAN_APPROVED --> TASK_READY
+    
+    TASK_READY --> TASK_EXECUTING
+    TASK_EXECUTING --> TASK_VERIFYING
+    
+    TASK_VERIFYING --> TASK_VERIFIED: Success
+    TASK_VERIFYING --> TASK_BLOCKED: Failure
+    
+    TASK_BLOCKED --> TASK_READY: Repair
+    
+    TASK_VERIFIED --> TASK_READY: Next Task
+    TASK_VERIFIED --> PROJECT_DONE: All Done
+    
+    PROJECT_DONE --> [*]
+```
+
 ## Documentation
 
 - [Architecture & Orchestration](docs/architecture.md)
