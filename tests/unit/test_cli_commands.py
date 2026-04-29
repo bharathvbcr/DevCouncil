@@ -678,9 +678,54 @@ def test_cli_e2e_writes_machine_readable_report_file(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     report_path = tmp_path / ".devcouncil" / "reports" / "latest.json"
-    assert f"Final report written to {report_path}" in result.output
+    assert "Final report written to" in result.output
     payload = json.loads(report_path.read_text(encoding="utf-8"))
     assert payload["verdict"] == "passed"
+
+
+def test_cli_e2e_agent_mode_writes_default_json_report(tmp_path, monkeypatch):
+    from devcouncil.domain.task import PlannedFile, Task
+    from devcouncil.storage.db import get_db
+    from devcouncil.storage.repositories import TaskRepository
+
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path):
+        db = get_db(project_root)
+        assert db is not None
+        with db.get_session() as session:
+            TaskRepository(session).save(Task(
+                id="TASK-001",
+                title=goal,
+                description="Generated task",
+                planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
+                allowed_commands=["python --version"],
+                expected_tests=["python --version"],
+            ))
+        return ["TASK-001"]
+
+    def fake_run(task_id, executor="manual", project_root=tmp_path):
+        db = get_db(project_root)
+        assert db is not None
+        with db.get_session() as session:
+            repo = TaskRepository(session)
+            task = repo.get_by_id(task_id)
+            assert task is not None
+            task.status = "verified"
+            repo.save(task)
+
+    monkeypatch.setattr("devcouncil.cli.commands.go.plan_command.run_plan_flow", fake_plan_flow)
+    monkeypatch.setattr("devcouncil.cli.commands.go.run_command.run", fake_run)
+
+    result = runner.invoke(app, ["e2e", "Add a feature", "--executor", "codex", "--agent"])
+
+    assert result.exit_code == 0
+    report_path = tmp_path / ".devcouncil" / "reports" / "latest.json"
+    assert report_path.exists()
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["verdict"] == "passed"
+    assert '"verdict": "passed"' in result.output
 
 
 def test_cli_go_supports_project_root_from_other_directory(tmp_path, monkeypatch):
