@@ -17,6 +17,8 @@ dev e2e "Describe the implementation goal" --executor codex
 
 `dev e2e` and `dev go` share the same end-to-end implementation: plan, execute, verify, report. If `--executor` is omitted, they use `execution.default_executor` from `.devcouncil/config.yaml`.
 
+For machine-readable integration, add `--agent`. It enables JSON report output and writes `.devcouncil/reports/latest.json`.
+
 ## 1. Create The Implementation Plan
 
 ```bash

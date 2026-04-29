@@ -84,6 +84,15 @@ dev go "Describe the implementation goal" --executor codex
 
 `dev e2e` is the explicit one-command integration target for coding agents. It initializes local DevCouncil state if needed, plans the goal, runs each approved task through the selected executor, verifies the resulting diff, and prints the final report. If `--executor` is omitted, DevCouncil uses `execution.default_executor` from `.devcouncil/config.yaml`. `dev go` is kept as a shorter alias for the same flow.
 
+For machine-readable agent handoff, write the final report to a stable file:
+
+```bash
+dev e2e "Describe the implementation goal" --agent
+dev e2e "Describe the implementation goal" --json --report-file .devcouncil/reports/latest.json
+```
+
+`--agent` is the lowest-friction integration preset. It enables JSON output and writes `.devcouncil/reports/latest.json`.
+
 See the full [quickstart](docs/quickstart.md) for installation variants, API-key setup, and first-run guidance.
 
 ## Core Flow
