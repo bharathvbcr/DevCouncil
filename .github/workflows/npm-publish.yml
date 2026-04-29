@@ -35,8 +35,13 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Run checks
-        run: npm run check
+        run: uv run --python 3.12 ruff check . && uv run --python 3.12 pytest
 
       - name: Check npm package contents
         run: npm run pack:check
