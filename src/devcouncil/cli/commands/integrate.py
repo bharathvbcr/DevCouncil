@@ -1,4 +1,5 @@
 import json
+import shlex
 import shutil
 import subprocess
 import sys
@@ -83,7 +84,7 @@ def _cursor_command(project_root: Path) -> list[str]:
 def _format_command(command: list[str]) -> str:
     if sys.platform == "win32":
         return " ".join(_quote_powershell_arg(arg) for arg in command)
-    return subprocess.list2cmdline(command)
+    return shlex.join(command)
 
 
 def _quote_powershell_arg(arg: str) -> str:
