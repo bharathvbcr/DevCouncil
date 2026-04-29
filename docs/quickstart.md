@@ -116,6 +116,13 @@ dev e2e "Add password reset with expiring single-use tokens" --executor codex
 
 This is equivalent to `dev go`: it auto-initializes DevCouncil state if needed, plans the goal, executes approved tasks with the selected executor, verifies each task, and prints the final report. If `--executor` is omitted, DevCouncil uses `execution.default_executor` from `.devcouncil/config.yaml`. Use `--executor gemini`, `--executor claude`, `--executor native`, `--executor mini`, or `--executor openhands` when that executor is installed and configured.
 
+For coding agents that should avoid scraping terminal output, write the final JSON report to a file:
+
+```bash
+dev e2e "Add password reset with expiring single-use tokens" --agent
+dev e2e "Add password reset with expiring single-use tokens" --json --report-file .devcouncil/reports/latest.json
+```
+
 Create a plan:
 
 ```bash

@@ -6,7 +6,9 @@ dev setup                   # Initialize, run doctor, offer first-run integratio
 dev doctor                  # Check dependencies and environment
 dev version                 # Display the installed DevCouncil version
 dev e2e "goal" --executor codex # Plan, execute, verify, and report in one command
-dev go "goal" --executor codex # Plan, execute, verify, and report in one command
+dev e2e "goal" --agent      # Agent preset: JSON plus .devcouncil/reports/latest.json
+dev e2e "goal" --json --report-file .devcouncil/reports/latest.json # Write machine-readable report
+dev go "goal" --executor codex # Short alias for dev e2e
 dev map "goal"              # Map repo context for a goal
 dev plan "goal"             # Run the full planning council debate
 dev status                  # Show current project state and cost
