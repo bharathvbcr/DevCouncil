@@ -1039,7 +1039,17 @@ def test_cli_go_rejects_manual_executor(tmp_path, monkeypatch):
     result = runner.invoke(app, ["go", "Add a feature", "--executor", "manual"])
 
     assert result.exit_code == 2
+    assert "`dev go` requires an automated executor" in result.output
     assert "requires an automated executor" in result.output
+
+
+def test_cli_e2e_rejects_manual_executor_with_e2e_command_name(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["e2e", "Add a feature", "--executor", "manual"])
+
+    assert result.exit_code == 2
+    assert "`dev e2e` requires an automated executor" in result.output
 
 
 def test_cli_go_rejects_unknown_executor_before_planning(tmp_path, monkeypatch):
@@ -1065,6 +1075,15 @@ def test_cli_go_rejects_unknown_executor_before_planning(tmp_path, monkeypatch):
     assert db is not None
     with db.get_session() as session:
         assert TaskRepository(session).get_all() == []
+
+
+def test_cli_e2e_rejects_unknown_executor_with_e2e_command_name(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["e2e", "Add a feature", "--executor", "experimental"])
+
+    assert result.exit_code == 2
+    assert "Unsupported executor for `dev e2e`" in result.output
 
 
 def test_cli_integrate_prints_coding_cli_setup_commands(tmp_path, monkeypatch):

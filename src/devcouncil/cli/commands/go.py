@@ -120,7 +120,13 @@ def _write_report_file(root: Path, report_file: Path, content: str) -> Path:
     return path
 
 
+def _command_label(ctx: typer.Context) -> str:
+    command = ctx.info_name or "e2e"
+    return f"dev {command}"
+
+
 def go(
+    ctx: typer.Context,
     goal: str = typer.Argument(..., help="Implementation goal to plan, execute, verify, and report."),
     executor: str | None = typer.Option(
         None,
@@ -158,12 +164,16 @@ def go(
             report_file = AGENT_REPORT_FILE
 
     normalized_executor = _normalize_executor(executor) if executor else _configured_executor(root)
+    command_label = _command_label(ctx)
     if normalized_executor == "manual":
-        console.print("[red]`dev go` requires an automated executor. Use `dev run TASK-ID --executor manual` for handoff mode.[/red]")
+        console.print(
+            f"[red]`{command_label}` requires an automated executor. "
+            "Use `dev run TASK-ID --executor manual` for handoff mode.[/red]"
+        )
         raise typer.Exit(code=2)
     if normalized_executor not in SUPPORTED_EXECUTORS:
         console.print(
-            "[red]Unsupported executor for `dev go`: "
+            f"[red]Unsupported executor for `{command_label}`: "
             f"{normalized_executor}. Supported: {', '.join(sorted(SUPPORTED_EXECUTORS))}.[/red]"
         )
         raise typer.Exit(code=2)
