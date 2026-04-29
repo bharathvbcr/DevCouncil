@@ -631,6 +631,58 @@ def test_cli_e2e_uses_configured_default_executor_when_omitted(tmp_path, monkeyp
     assert seen["executor"] == "gemini-cli"
 
 
+def test_cli_e2e_writes_machine_readable_report_file(tmp_path, monkeypatch):
+    from devcouncil.domain.task import PlannedFile, Task
+    from devcouncil.storage.db import get_db
+    from devcouncil.storage.repositories import TaskRepository
+
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path):
+        db = get_db(project_root)
+        assert db is not None
+        with db.get_session() as session:
+            TaskRepository(session).save(Task(
+                id="TASK-001",
+                title=goal,
+                description="Generated task",
+                planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
+                allowed_commands=["python --version"],
+                expected_tests=["python --version"],
+            ))
+        return ["TASK-001"]
+
+    def fake_run(task_id, executor="manual", project_root=tmp_path):
+        db = get_db(project_root)
+        assert db is not None
+        with db.get_session() as session:
+            repo = TaskRepository(session)
+            task = repo.get_by_id(task_id)
+            assert task is not None
+            task.status = "verified"
+            repo.save(task)
+
+    monkeypatch.setattr("devcouncil.cli.commands.go.plan_command.run_plan_flow", fake_plan_flow)
+    monkeypatch.setattr("devcouncil.cli.commands.go.run_command.run", fake_run)
+
+    result = runner.invoke(app, [
+        "e2e",
+        "Add a feature",
+        "--executor",
+        "codex",
+        "--json",
+        "--report-file",
+        ".devcouncil/reports/latest.json",
+    ])
+
+    assert result.exit_code == 0
+    report_path = tmp_path / ".devcouncil" / "reports" / "latest.json"
+    assert f"Final report written to {report_path}" in result.output
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["verdict"] == "passed"
+
+
 def test_cli_go_supports_project_root_from_other_directory(tmp_path, monkeypatch):
     from devcouncil.domain.task import PlannedFile, Task
     from devcouncil.storage.db import get_db
@@ -982,6 +1034,30 @@ def test_cli_integrate_prints_coding_cli_setup_commands(tmp_path, monkeypatch):
     assert "cursor --add-mcp" in result.output
     assert "Native hook config preview" in result.output
     assert "DEVCOUNCIL_PROJECT_ROOT=" in result.output
+
+
+def test_cli_integrate_formats_cursor_command_for_posix_shell(tmp_path, monkeypatch):
+    from devcouncil.cli.commands import integrate
+
+    monkeypatch.setattr(integrate.sys, "platform", "linux")
+
+    command = integrate._format_command(integrate._cursor_command(tmp_path))
+
+    assert "cursor --add-mcp" in command
+    assert "'{\"name\":\"devcouncil\"" in command
+    assert "\\\"name\\\"" not in command
+
+
+def test_cli_integrate_formats_cursor_command_for_powershell(tmp_path, monkeypatch):
+    from devcouncil.cli.commands import integrate
+
+    monkeypatch.setattr(integrate.sys, "platform", "win32")
+
+    command = integrate._format_command(integrate._cursor_command(tmp_path))
+
+    assert "cursor --add-mcp" in command
+    assert "'{\"name\":\"devcouncil\"" in command
+    assert "\\\"name\\\"" not in command
 
 
 def test_cli_integrate_hooks_previews_native_hook_files(tmp_path):
