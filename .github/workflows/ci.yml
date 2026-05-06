@@ -44,6 +44,41 @@ jobs:
             exit "$status"
           fi
 
+      - name: Type check
+        run: |
+          set +e
+          uv run --python 3.12 mypy src 2>&1 | tee mypy.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "### mypy failure"
+              echo '```'
+              tail -n 160 mypy.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            msg=$(tail -n 60 mypy.log | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')
+            echo "::error title=mypy failed::$msg"
+            exit "$status"
+          fi
+
+      - name: Repo map artifact check
+        run: |
+          MAP_PATH=".devcouncil/repo_map.json"
+          uv run --python 3.12 dev map --project-root . --output "$MAP_PATH" >/tmp/repo_map_first_stdout.txt
+          cp "$MAP_PATH" /tmp/repo_map_first.json
+          uv run --python 3.12 dev map --project-root . --output "$MAP_PATH" >/tmp/repo_map_second_stdout.txt
+          if ! cmp -s /tmp/repo_map_first.json "$MAP_PATH"; then
+            echo "::error title=repo map drift::Serialized map output is not stable. Re-run 'uv run dev map --project-root . --output .devcouncil/repo_map.json' and commit updates."
+            diff -u /tmp/repo_map_first.json "$MAP_PATH" | tee /tmp/repo_map.diff
+            exit 1
+          fi
+          if ! cmp -s /tmp/repo_map_first_stdout.txt /tmp/repo_map_second_stdout.txt; then
+            echo "::error title=repo map drift::Map CLI output is not stable."
+            diff -u /tmp/repo_map_first_stdout.txt /tmp/repo_map_second_stdout.txt | tee /tmp/repo_map.diff
+            exit 1
+          fi
+          git diff --quiet -- .devcouncil/repo_map.json AGENTS.md CLAUDE.md
+
       - name: Test
         run: |
           set +e
@@ -62,4 +97,7 @@ jobs:
           fi
 
       - name: Package smoke
-        run: npm pack --dry-run
+        run: |
+          npm pack --dry-run
+          npm run smoke:wheel
+          npm run smoke:package
