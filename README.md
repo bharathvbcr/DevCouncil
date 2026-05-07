@@ -8,7 +8,7 @@
 
 DevCouncil is a high-integrity command-line orchestration platform for AI-assisted software development. It turns AI implementation from a black-box generation task into a gated engineering workflow where every change is authorized, verified, and traceable back to a requirement.
 
-DevCouncil does not replace coding agents. It sits beside tools like Codex CLI, Gemini CLI, Claude Code, Cursor, and Aider, then owns the plan, task scope, verification loop, repair prompts, and evidence trail.
+DevCouncil does not replace coding agents. It sits beside tools like Codex CLI, Gemini CLI, Claude Code, Warp/Oz, Cursor, Aider, and bring-your-own prompt-taking CLIs, then owns the plan, task scope, verification loop, repair prompts, and evidence trail.
 
 ## Documentation
 
@@ -17,7 +17,9 @@ DevCouncil does not replace coding agents. It sits beside tools like Codex CLI, 
 - [Coding CLI integration](docs/coding-cli-integration.md): Codex, Gemini, Claude Code, Cursor, Aider, MCP, hooks, and automated executors.
 - [CLI command reference](docs/cli-reference.md): available `dev` commands.
 - [Architecture](docs/architecture.md): components, artifact graph, state machine, and gated execution.
+- [Executor adapters](docs/executor-adapters.md): manual, coding CLI, native-preview, Mini-SWE, and OpenHands execution paths.
 - [Live review](docs/live-review.md): `dev watch` session review, cards, signals, and blocking behavior.
+- [Model routing](docs/model-routing.md): provider selection, role models, OpenRouter, and Vertex AI setup.
 - [Security model](docs/security.md): redaction, permissions, allowlists, and local state.
 - [Project status](docs/project-status.md): current maturity by subsystem.
 - [Roadmap](docs/roadmap.md): planned work.
@@ -73,12 +75,13 @@ dev verify TASK-001
 
 On a fresh interactive setup, DevCouncil can configure supported coding CLI integrations immediately; pass `--skip-integrations` if you want to defer that step.
 
-Paste only the output from `dev prompt TASK-001` into Codex, Gemini, Claude Code, Cursor, Aider, or another coding tool. Keep `dev setup`, `dev plan`, `dev run`, and `dev verify` in the terminal at the repository root.
+Paste only the output from `dev prompt TASK-001` into Codex, Gemini, Claude Code, Warp, Cursor, Aider, or another coding tool. Keep `dev setup`, `dev plan`, `dev run`, and `dev verify` in the terminal at the repository root.
 
 For an automated end-to-end run with a supported coding CLI installed:
 
 ```bash
 dev e2e "Describe the implementation goal" --executor codex
+dev e2e "Describe the implementation goal" --executor warp
 dev go "Describe the implementation goal" --executor codex
 ```
 
@@ -87,13 +90,36 @@ dev go "Describe the implementation goal" --executor codex
 For machine-readable agent handoff, write the final report to a stable file:
 
 ```bash
-dev e2e "Describe the implementation goal" --agent
-dev e2e "Describe the implementation goal" --json --report-file .devcouncil/reports/latest.json
+dev e2e "Describe the implementation goal" --executor codex --agent
+dev e2e "Describe the implementation goal" --executor codex --json --report-file .devcouncil/reports/latest.json
 ```
 
-`--agent` is the lowest-friction integration preset. It enables JSON output and writes `.devcouncil/reports/latest.json`.
+`--agent` enables JSON output and writes `.devcouncil/reports/latest.json`. Fresh projects default to manual sidecar mode, so pass an automated executor or set `execution.default_executor` before using `dev e2e` without `--executor`.
 
 See the full [quickstart](docs/quickstart.md) for installation variants, API-key setup, and first-run guidance.
+
+Register any local CLI that accepts prompts. `dev agents` is the first-class agent hub; `dev integrate cli-agent` remains available for older scripts:
+
+```bash
+dev agents add opencode --command opencode --arg run --input-mode prompt-file --prompt-arg=--prompt-file --supports-mcp
+dev agents
+dev agents doctor
+dev agents run TASK-001 --agent opencode --profile default
+```
+
+## Current Code Surface
+
+The current implementation includes these repository changes:
+
+- **CLI composition:** `dev`/`devcouncil` now exposes stable daily commands plus preview integration surfaces including `dev agents`, `dev integrate warp`, `dev integrate cli-agent`, `dev config models`, `dev artifacts validate`, `dev watch`, `dev trace`, `dev mcp-server`, `dev lsp`, `dev ast`, and `dev dashboard`.
+- **Agent execution:** built-in coding CLI adapters cover Codex, Gemini, Claude Code, and Warp/Oz. Custom prompt-taking CLIs can be registered with stdin, argument, or prompt-file handoff, execution profiles, environment overrides, help checks, MCP capability flags, and diff-review metadata.
+- **Executor verification:** coding CLI runs write task prompts, redacted logs, run manifests in `.devcouncil/runs/<run-id>/agent-run.json`, trace start/finish/failure events, capture post-run diffs, and automatically run DevCouncil verification.
+- **Model routing:** model defaults moved into packaged YAML resources, `dev init`, `dev setup`, and `dev config models` can set shared or per-role models, and providers now include OpenRouter plus Vertex AI through Google Cloud access tokens.
+- **Configuration and setup:** fresh projects default to manual sidecar execution, setup can preview or apply coding CLI integrations, Vertex AI project/location can be stored in local secrets, and provider switches preserve custom role model overrides.
+- **Repo mapping:** `dev map` writes `.devcouncil/repo_map.json`, filters generated/temp files, emits subsystem navigation metadata, and keeps managed `AGENTS.md` / `CLAUDE.md` workspace guides synchronized.
+- **MCP and live review:** MCP handlers validate required arguments more defensively, live review cards/signals use stable schemas and SHA-256 IDs, and status/report output includes live-review blockers.
+- **Telemetry and packaging:** model pricing moved into a packaged YAML resource shared by telemetry and cost estimation; npm and wheel smoke checks now verify packaged assets and installed CLI startup.
+- **Type and test hardening:** mypy is part of local and release checks, SQLModel repository deletes use typed column expressions, stored domain objects are rebuilt through Pydantic validation, and unit coverage was expanded around CLI commands, executors, model routing, MCP, repo mapping, and pricing.
 
 ## Core Flow
 
@@ -107,6 +133,50 @@ DevCouncil's recommended default is **Manual Sidecar Mode**:
 6. If verification fails, DevCouncil creates a focused repair loop.
 
 The detailed task-by-task workflow lives in [docs/workflow.md](docs/workflow.md).
+
+## How The Repo Runs
+
+```mermaid
+flowchart TD
+    user["User runs dev/devcouncil"] --> cli["Typer CLI\nsrc/devcouncil/cli/main.py"]
+    cli --> config["Config + secrets\n.devcouncil/config.yaml\n.devcouncil/secrets.env"]
+    cli --> map["Repo map\nsrc/devcouncil/indexing/repo_mapper.py"]
+    cli --> planning["Planning commands\ndev plan / dev prompt / dev tasks"]
+
+    config --> providers["Model providers\nOpenRouter or Vertex AI"]
+    providers --> router["ModelRouter\nrole models, cache, telemetry, structured JSON repair"]
+    router --> planning
+
+    planning --> storage["SQLite + repositories\nrequirements, tasks, gaps, evidence, state"]
+    storage --> graph["Artifact graph\nRequirement -> Task -> Diff -> Evidence"]
+    graph --> gates["Gate policy\nplanned files, commands, secret checks"]
+
+    gates --> manual["Manual sidecar\ndev prompt + user agent edits"]
+    gates --> coding["Coding CLI executor\nCodex, Gemini, Claude, Warp, custom CLIs"]
+    gates --> native["Native preview executor\nLLM router + TaskRunner"]
+    gates --> external["Mini-SWE / OpenHands adapters"]
+
+    coding --> runlog["Run artifacts\nprompt file, redacted logs, manifest, trace events"]
+    native --> runlog
+    external --> runlog
+    manual --> diff["Repository diff"]
+    runlog --> diff
+
+    diff --> verify["Verifier\ndev verify / automatic post-run verification"]
+    verify --> evidence["Evidence + gaps"]
+    evidence --> storage
+    evidence --> repair["Repair loop\ndev repair / dev watch repair"]
+    evidence --> report["Reports\ndev report, JSON, GitHub/GitLab comments"]
+
+    cli --> mcp["MCP server\ndev mcp-server"]
+    mcp --> storage
+    mcp --> graph
+    mcp --> repair
+
+    cli --> live["Live review\ndev watch"]
+    live --> cards["Cards + signals\nblocking review feedback"]
+    cards --> report
+```
 
 ## Install From Source
 

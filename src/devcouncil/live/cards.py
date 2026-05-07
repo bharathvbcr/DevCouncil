@@ -4,7 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from devcouncil.live.models import AgentTurn, CardStatus, CritiqueCard
+from devcouncil.live.models import AgentTurn, CardStatus, CritiqueCard, Verdict
 
 RISK_TERMS = (
     "skip tests",
@@ -56,7 +56,7 @@ def review_turn(turn: AgentTurn, project_root: Path, client: str | None = None) 
     if "todo" in lower or "follow-up" in lower or "later" in lower:
         evidence_requests.append("List any remaining TODOs as DevCouncil gaps or repair tasks instead of burying them in chat.")
 
-    verdict = "Approved"
+    verdict: Verdict = "Approved"
     if concerns:
         verdict = "Concerns"
     if any(term in lower for term in ("--no-verify", "reset --hard", "force push", "ignore failing")):
@@ -69,6 +69,7 @@ def review_turn(turn: AgentTurn, project_root: Path, client: str | None = None) 
     message_for_agent = _message_for_agent(verdict, concerns, evidence_requests)
     card_id = _card_id(turn)
     return CritiqueCard(
+        schema="devcouncil.critique_card.v1",
         id=card_id,
         session_id=turn.session_id,
         turn_id=turn.turn_id,
@@ -173,7 +174,7 @@ def unresolved_blocking_cards(project_root: Path, task_id: str | None = None) ->
 
 
 def _card_id(turn: AgentTurn) -> str:
-    digest = hashlib.sha1(f"{turn.session_id}:{turn.turn_id}:{turn.content}".encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(f"{turn.session_id}:{turn.turn_id}:{turn.content}".encode("utf-8")).hexdigest()
     return f"CARD-{digest[:12]}"
 
 
@@ -198,7 +199,7 @@ def _mentions_broad_change(lower: str) -> bool:
     ))
 
 
-def _message_for_agent(verdict: str, concerns: list[str], evidence_requests: list[str]) -> str:
+def _message_for_agent(verdict: Verdict, concerns: list[str], evidence_requests: list[str]) -> str:
     if verdict == "Approved":
         return "Continue, but keep the next response grounded in changed files and verification evidence."
     pieces = ["Pause and address this review before proceeding."]

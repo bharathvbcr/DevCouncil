@@ -15,7 +15,7 @@ from devcouncil.storage.repositories import (
 )
 from devcouncil.indexing.repo_mapper import RepoMapper
 from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
-from devcouncil.llm.provider import MockProvider, create_provider, validate_model_provider
+from devcouncil.llm.provider import Provider, MockProvider, build_role_model_config, create_provider, validate_model_provider
 from devcouncil.llm.router import ModelRouter
 from devcouncil.planning.spec_service import SpecService
 from devcouncil.planning.prompt_enhancer_service import PromptEnhancerService
@@ -32,7 +32,6 @@ from devcouncil.telemetry.traces import TraceLogger
 app = typer.Typer()
 console = Console()
 
-DEFAULT_PLANNING_MODEL = "anthropic/claude-3.5-sonnet"
 REQUIRED_PLANNING_ROLES = (
     "prompt_enhancer",
     "spec_writer",
@@ -75,7 +74,11 @@ def _ensure_planning_roles(config) -> None:
     if fallback is None and config.models.roles:
         fallback = next(iter(config.models.roles.values()))
     if fallback is None:
-        fallback = ModelRoleConfig(model=DEFAULT_PLANNING_MODEL)
+        try:
+            provider_roles = build_role_model_config(config.models.provider)
+            fallback = ModelRoleConfig(model=provider_roles["spec_writer"]["model"])
+        except ValueError:
+            fallback = ModelRoleConfig(model="unconfigured")
 
     for role in REQUIRED_PLANNING_ROLES:
         config.models.roles.setdefault(role, fallback.model_copy())
@@ -112,6 +115,7 @@ async def run_plan_flow(
     run_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-plan"
     await orchestrator.start_run(run_id, goal)
 
+    provider: Provider
     if dry_run:
         # Override config models to be unique roles for mock mapping
         for role in REQUIRED_PLANNING_ROLES:
@@ -158,11 +162,14 @@ async def run_plan_flow(
         # I'll modify PlanService to use a slightly different role string if needed, 
         # but for Dry Run, let's just make the MockProvider return based on the schema requested.
     else:
-        provider = create_provider(config.models.provider, api_key)
+        if api_key is None:
+            console.print("[red]Missing API key for configured model provider.[/red]")
+            return []
+        provider = create_provider(config.models.provider, api_key, project_root=root)
 
     # Build role config after dry-run overrides so mocks are routed correctly.
     role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
-    router = ModelRouter(provider, role_config)
+    router = ModelRouter(provider, role_config, project_root=root)
     
     prompt_enhancer = PromptEnhancerService(router)
     spec_service = SpecService(router)

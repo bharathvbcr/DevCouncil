@@ -70,6 +70,53 @@ def test_cli_map_stdout_is_machine_readable_json(tmp_path, monkeypatch):
     assert "python" in data["languages"]
 
 
+def test_cli_init_accepts_model_selection_options(tmp_path, monkeypatch):
+    import yaml
+
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "init",
+            "--provider",
+            "vertexai",
+            "--model",
+            "google/gemini-custom",
+            "--role-model",
+            "critic_a=google/gemini-critic",
+        ],
+    )
+
+    assert result.exit_code == 0
+    raw_config = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
+    assert raw_config["models"]["provider"] == "vertexai"
+    assert raw_config["models"]["roles"]["spec_writer"]["model"] == "google/gemini-custom"
+    assert raw_config["models"]["roles"]["critic_a"]["model"] == "google/gemini-critic"
+
+
+def test_cli_init_defaults_to_manual_executor(tmp_path, monkeypatch):
+    import yaml
+
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["init"])
+
+    assert result.exit_code == 0
+    raw_config = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
+    assert raw_config["execution"]["default_executor"] == "manual"
+
+
+def test_cli_init_rejects_invalid_role_model_override(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["init", "--role-model", "critic_a"])
+
+    assert result.exit_code == 2
+    assert "Use ROLE=MODEL" in result.output
+    assert not (tmp_path / ".devcouncil").exists()
+
+
 def test_cli_baseline_writes_snapshot(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "README.md").write_text("baseline\n", encoding="utf-8")
@@ -123,6 +170,22 @@ def test_cli_artifacts_validate_fails_on_empty_task_commands(tmp_path, monkeypat
 
     assert result.exit_code == 1
     assert "must define allowed commands or expected tests" in result.output
+
+
+def test_cli_artifacts_validate_honors_project_root(tmp_path, monkeypatch):
+    from devcouncil.cli.commands.init import initialize_project
+
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    initialize_project(project)
+
+    result = runner.invoke(app, ["artifacts", "validate", "--project-root", str(project)])
+
+    assert result.exit_code == 0
+    assert "Artifacts are valid" in result.output
+    assert not (tmp_path / ".devcouncil").exists()
 
 
 def test_cli_plan_dry_run_does_not_persist_mock_tasks(tmp_path, monkeypatch):
@@ -631,6 +694,18 @@ def test_cli_e2e_uses_configured_default_executor_when_omitted(tmp_path, monkeyp
     assert seen["executor"] == "gemini-cli"
 
 
+def test_cli_e2e_without_executor_rejects_manual_default(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    result = runner.invoke(app, ["e2e", "Add a feature", "--agent"])
+
+    assert result.exit_code == 2
+    assert "requires an automated executor" in result.output
+    assert "dev run TASK-ID --executor" in result.output
+    assert "manual" in result.output
+
+
 def test_cli_e2e_writes_machine_readable_report_file(tmp_path, monkeypatch):
     from devcouncil.domain.task import PlannedFile, Task
     from devcouncil.storage.db import get_db
@@ -1086,6 +1161,60 @@ def test_cli_e2e_rejects_unknown_executor_with_e2e_command_name(tmp_path, monkey
     assert "Unsupported executor for `dev e2e`" in result.output
 
 
+def test_cli_go_supports_custom_agent_registry_and_profile(tmp_path, monkeypatch):
+    import yaml
+
+    from devcouncil.domain.task import PlannedFile, Task
+    from devcouncil.storage.db import get_db
+    from devcouncil.storage.repositories import TaskRepository
+
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    config_path = tmp_path / ".devcouncil" / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw.setdefault("integrations", {}).setdefault("cli_agents", {}).setdefault("agents", {})["opencode"] = {
+        "command": "opencode",
+        "input_mode": "stdin",
+    }
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    seen = {}
+
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path):
+        _ = requirements_only, dry_run, persist
+        db = get_db(project_root)
+        assert db is not None
+        with db.get_session() as session:
+            TaskRepository(session).save(Task(
+                id="TASK-001",
+                title=goal,
+                description="Generated task",
+                planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
+                allowed_commands=["python --version"],
+                expected_tests=["python --version"],
+            ))
+        return ["TASK-001"]
+
+    def fake_run(task_id, executor="manual", profile=None, project_root=tmp_path):
+        seen["executor"] = executor
+        seen["profile"] = profile
+        db = get_db(project_root)
+        assert db is not None
+        with db.get_session() as session:
+            repo = TaskRepository(session)
+            task = repo.get_by_id(task_id)
+            assert task is not None
+            task.status = "verified"
+            repo.save(task)
+
+    monkeypatch.setattr("devcouncil.cli.commands.go.plan_command.run_plan_flow", fake_plan_flow)
+    monkeypatch.setattr("devcouncil.cli.commands.go.run_command.run", fake_run)
+
+    result = runner.invoke(app, ["go", "Add a feature", "--executor", "opencode", "--profile", "prod"])
+
+    assert result.exit_code == 0
+    assert seen == {"executor": "opencode", "profile": "prod"}
+
+
 def test_cli_integrate_prints_coding_cli_setup_commands(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
@@ -1096,6 +1225,7 @@ def test_cli_integrate_prints_coding_cli_setup_commands(tmp_path, monkeypatch):
     assert "gemini mcp add --scope project" in result.output
     assert "claude mcp add --scope local" in result.output
     assert "cursor --add-mcp" in result.output
+    assert "Warp / Oz" in result.output
     assert "Native hook config preview" in result.output
     assert "DEVCOUNCIL_PROJECT_ROOT=" in result.output
 
@@ -1913,6 +2043,333 @@ def test_cli_integrate_supports_cursor_mcp_json(tmp_path):
     assert '"DEVCOUNCIL_PROJECT_ROOT":"' in result.output
 
 
+def test_cli_integrate_warp_writes_mcp_config(tmp_path):
+    import yaml
+
+    result = runner.invoke(app, ["integrate", "warp", "--apply", "--project-root", str(tmp_path)])
+
+    assert result.exit_code == 0
+    config_path = tmp_path / ".devcouncil" / "integrations" / "warp-mcp.json"
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    server = data["mcpServers"]["devcouncil"]
+    assert server["command"] == "devcouncil"
+    assert server["args"] == ["mcp-server"]
+    assert server["env"]["DEVCOUNCIL_PROJECT_ROOT"] == str(tmp_path)
+    assert server["working_directory"] == str(tmp_path)
+    raw_config = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
+    warp = raw_config["integrations"]["warp"]
+    assert warp["enabled"] is True
+    assert warp["command"] == "oz"
+    assert warp["run_mode"] == "local"
+    assert warp["mcp_config_path"].replace("\\", "/") == ".devcouncil/integrations/warp-mcp.json"
+
+
+def test_cli_integrate_registers_bring_your_own_cli_executor(tmp_path):
+    import yaml
+
+    result = runner.invoke(
+        app,
+        [
+            "integrate",
+            "cli-agent",
+            "opencode",
+            "--command",
+            "opencode",
+            "--arg",
+            "run",
+            "--input-mode",
+            "prompt-file",
+            "--prompt-arg=--prompt-file",
+            "--apply",
+            "--project-root",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    raw = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
+    agent = raw["integrations"]["cli_agents"]["agents"]["opencode"]
+    assert agent["command"] == "opencode"
+    assert agent["args"] == ["run"]
+    assert agent["input_mode"] == "prompt-file"
+    assert agent["prompt_arg"] == "--prompt-file"
+    assert agent["kind"] == "custom"
+    assert agent["default_profile"] == "default"
+
+
+def test_cli_agents_add_writes_typed_agent_config(tmp_path):
+    import yaml
+
+    result = runner.invoke(
+        app,
+        [
+            "agents",
+            "add",
+            "opencode",
+            "--command",
+            "opencode",
+            "--arg",
+            "run",
+            "--input-mode",
+            "prompt-file",
+            "--prompt-arg=--prompt-file",
+            "--display-name",
+            "OpenCode",
+            "--kind",
+            "coding-cli",
+            "--supports-mcp",
+            "--supports-diff-review",
+            "--default-profile",
+            "prod",
+            "--help-arg",
+            "--help",
+            "--project-root",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    raw = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
+    agent = raw["integrations"]["cli_agents"]["agents"]["opencode"]
+    assert agent["command"] == "opencode"
+    assert agent["args"] == ["run"]
+    assert agent["input_mode"] == "prompt-file"
+    assert agent["display_name"] == "OpenCode"
+    assert agent["kind"] == "coding-cli"
+    assert agent["supports_mcp"] is True
+    assert agent["supports_diff_review"] is True
+    assert agent["default_profile"] == "prod"
+    assert agent["help_command"] == ["opencode", "--help"]
+
+
+def test_cli_agents_add_rejects_unknown_default_profile(tmp_path):
+    result = runner.invoke(
+        app,
+        [
+            "agents",
+            "add",
+            "opencode",
+            "--command",
+            "opencode",
+            "--default-profile",
+            "missing",
+            "--project-root",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Unknown --default-profile 'missing'" in result.output
+
+
+def test_cli_agents_add_rejects_blank_command(tmp_path):
+    result = runner.invoke(
+        app,
+        [
+            "agents",
+            "add",
+            "opencode",
+            "--command",
+            " ",
+            "--project-root",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--command cannot be empty" in result.output
+
+
+def test_cli_integrate_cli_agent_rejects_unknown_default_profile(tmp_path):
+    result = runner.invoke(
+        app,
+        [
+            "integrate",
+            "cli-agent",
+            "opencode",
+            "--command",
+            "opencode",
+            "--default-profile",
+            "missing",
+            "--apply",
+            "--project-root",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Unknown --default-profile 'missing'" in result.output
+
+
+def test_cli_integrate_cli_agent_rejects_blank_name(tmp_path):
+    result = runner.invoke(
+        app,
+        [
+            "integrate",
+            "cli-agent",
+            " ",
+            "--command",
+            "opencode",
+            "--apply",
+            "--project-root",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Agent name cannot be empty" in result.output
+
+
+def test_cli_agents_add_rejects_reserved_builtin_name(tmp_path):
+    result = runner.invoke(
+        app,
+        [
+            "agents",
+            "add",
+            "oz",
+            "--command",
+            "custom-oz",
+            "--project-root",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "reserved for a built-in DevCouncil agent" in result.output
+
+
+def test_cli_integrate_cli_agent_rejects_reserved_builtin_name(tmp_path):
+    result = runner.invoke(
+        app,
+        [
+            "integrate",
+            "cli-agent",
+            "codex",
+            "--command",
+            "custom-codex",
+            "--apply",
+            "--project-root",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "reserved for a built-in DevCouncil agent" in result.output
+
+
+def test_cli_agents_lists_builtins_and_custom_agents(tmp_path, monkeypatch):
+    import yaml
+
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    config_path = tmp_path / ".devcouncil" / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw.setdefault("integrations", {}).setdefault("cli_agents", {}).setdefault("agents", {})["opencode"] = {
+        "command": "opencode",
+        "args": ["run"],
+        "input_mode": "stdin",
+    }
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    result = runner.invoke(app, ["agents"])
+
+    assert result.exit_code == 0
+    assert "codex" in result.output
+    assert "warp" in result.output
+    assert "opencode" in result.output
+
+
+def test_cli_agents_doctor_reports_custom_agent_status(tmp_path, monkeypatch):
+    import yaml
+
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    config_path = tmp_path / ".devcouncil" / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw.setdefault("integrations", {}).setdefault("cli_agents", {}).setdefault("agents", {})["opencode"] = {
+        "command": "opencode",
+        "args": ["run"],
+        "input_mode": "bad-mode",
+    }
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    monkeypatch.setattr("devcouncil.cli.commands.agents._which", lambda command: None)
+
+    result = runner.invoke(app, ["agents", "doctor"])
+
+    assert result.exit_code == 0
+    assert "opencode" in result.output
+    assert "invalid input_mode=bad-mode" in result.output
+
+
+def test_cli_integrate_doctor_uses_project_root_for_custom_agents(tmp_path, monkeypatch):
+    import yaml
+
+    project = tmp_path / "project"
+    project.mkdir()
+    assert runner.invoke(app, ["setup", "--project-root", str(project), "--skip-api-key", "--skip-integrations"]).exit_code == 0
+    config_path = project / ".devcouncil" / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw.setdefault("integrations", {}).setdefault("cli_agents", {}).setdefault("agents", {})["opencode"] = {
+        "command": "opencode",
+        "input_mode": "bad-mode",
+    }
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("shutil.which", lambda command: None)
+
+    result = runner.invoke(app, ["integrate", "doctor", "--project-root", str(project)])
+
+    assert result.exit_code == 0
+    assert "CLI agent: opencode" in result.output
+    assert "invalid input_mode=bad-mode" in result.output
+
+
+def test_cli_agents_run_passes_agent_and_profile(tmp_path, monkeypatch):
+    called = {}
+
+    def fake_run(task_id, executor, profile, project_root):
+        called["task_id"] = task_id
+        called["executor"] = executor
+        called["profile"] = profile
+        called["project_root"] = project_root
+
+    monkeypatch.setattr("devcouncil.cli.commands.agents.run_command.run", fake_run)
+
+    result = runner.invoke(
+        app,
+        ["agents", "run", "TASK-001", "--agent", "opencode", "--profile", "yolo", "--project-root", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0
+    assert called["task_id"] == "TASK-001"
+    assert called["executor"] == "opencode"
+    assert called["profile"] == "yolo"
+    assert called["project_root"] == tmp_path
+
+
+def test_cli_agents_run_omits_profile_to_use_agent_default(tmp_path, monkeypatch):
+    called = {}
+
+    def fake_run(task_id, executor, profile, project_root):
+        called["task_id"] = task_id
+        called["executor"] = executor
+        called["profile"] = profile
+        called["project_root"] = project_root
+
+    monkeypatch.setattr("devcouncil.cli.commands.agents.run_command.run", fake_run)
+
+    result = runner.invoke(
+        app,
+        ["agents", "run", "TASK-001", "--agent", "opencode", "--project-root", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0
+    assert called["task_id"] == "TASK-001"
+    assert called["executor"] == "opencode"
+    assert called["profile"] is None
+    assert called["project_root"] == tmp_path
+
+
 def test_cli_setup_initializes_project_and_prints_next_commands(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
@@ -1961,6 +2418,128 @@ def test_cli_setup_provider_option_updates_config_before_key_setup(tmp_path, mon
     assert raw_config["models"]["provider"] == "openrouter"
     assert "OPENROUTER_API_KEY=sk-openrouter" in (tmp_path / ".devcouncil" / "secrets.env").read_text(encoding="utf-8")
     assert get_api_key("openrouter", tmp_path) == "sk-openrouter"
+
+
+def test_cli_setup_vertexai_provider_writes_access_token(tmp_path, monkeypatch):
+    import yaml
+
+    from devcouncil.app.config import get_api_key
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("VERTEXAI_ACCESS_TOKEN", raising=False)
+
+    result = runner.invoke(
+        app,
+        [
+            "setup",
+            "--provider",
+            "vertexai",
+            "--api-key",
+            "ya29.local",
+            "--vertex-project",
+            "vertex-project",
+            "--vertex-location",
+            "us-central1",
+        ],
+    )
+
+    assert result.exit_code == 0
+    raw_config = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
+    assert raw_config["models"]["provider"] == "vertexai"
+    assert raw_config["models"]["roles"]["spec_writer"]["model"] == "google/gemini-2.0-flash-001"
+    assert raw_config["models"]["roles"]["critic_a"]["model"] == "google/gemini-2.0-flash-001"
+    secrets = (tmp_path / ".devcouncil" / "secrets.env").read_text(encoding="utf-8")
+    assert "VERTEXAI_ACCESS_TOKEN=ya29.local" in secrets
+    assert "VERTEXAI_PROJECT=vertex-project" in secrets
+    assert "VERTEXAI_LOCATION=us-central1" in secrets
+    assert get_api_key("vertexai", tmp_path) == "ya29.local"
+
+
+def test_cli_doctor_reports_vertexai_project_from_local_secret(tmp_path, monkeypatch):
+    import yaml
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("VERTEXAI_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("VERTEXAI_PROJECT", raising=False)
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    assert runner.invoke(
+        app,
+        [
+            "setup",
+            "--provider",
+            "vertexai",
+            "--api-key",
+            "ya29.local",
+            "--vertex-project",
+            "vertex-project",
+            "--skip-integrations",
+        ],
+    ).exit_code == 0
+
+    raw_config = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
+    assert raw_config["models"]["provider"] == "vertexai"
+
+    result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "VERTEXAI_ACCESS_TOKEN" in result.output
+    assert "VERTEXAI_PROJECT" in result.output
+    assert "Found in .devcouncil/secrets.env" in result.output
+    assert "VERTEXAI_LOCATION" in result.output
+    assert "global" in result.output
+
+
+def test_cli_doctor_reports_vertexai_gcloud_token(tmp_path, monkeypatch):
+    import yaml
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("VERTEXAI_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr("devcouncil.app.config.shutil.which", lambda command: "gcloud" if command == "gcloud" else None)
+    monkeypatch.setattr("devcouncil.app.config.subprocess.check_output", lambda *args, **kwargs: "ya29.gcloud\n")
+    assert runner.invoke(
+        app,
+        [
+            "setup",
+            "--provider",
+            "vertexai",
+            "--vertex-project",
+            "vertex-project",
+            "--skip-integrations",
+        ],
+    ).exit_code == 0
+    raw_config = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
+    assert raw_config["models"]["provider"] == "vertexai"
+
+    result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "VERTEXAI_ACCESS_TOKEN" in result.output
+    assert "gcloud" in result.output
+
+
+def test_cli_setup_accepts_model_selection_options(tmp_path, monkeypatch):
+    import yaml
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    result = runner.invoke(
+        app,
+        [
+            "setup",
+            "--skip-api-key",
+            "--skip-integrations",
+            "--model",
+            "openai/custom-default",
+            "--role-model",
+            "planner_b=google/custom-planner",
+        ],
+    )
+
+    assert result.exit_code == 0
+    raw_config = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
+    assert raw_config["models"]["roles"]["spec_writer"]["model"] == "openai/custom-default"
+    assert raw_config["models"]["roles"]["planner_b"]["model"] == "google/custom-planner"
 
 
 def test_cli_setup_rejects_unsupported_model_provider(tmp_path, monkeypatch):
@@ -2036,12 +2615,122 @@ def test_cli_config_models_can_update_provider(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert runner.invoke(app, ["init"]).exit_code == 0
 
-    result = runner.invoke(app, ["config", "models", "--provider", "openrouter"])
+    result = runner.invoke(app, ["config", "models", "--provider", "vertexai"])
 
     assert result.exit_code == 0
-    assert "Model provider remains 'openrouter'" in result.output
+    assert "Updated model provider from 'openrouter' to 'vertexai'" in result.output
+    assert "Updated default role models for 'vertexai'" in result.output
     raw_config = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
-    assert raw_config["models"]["provider"] == "openrouter"
+    assert raw_config["models"]["provider"] == "vertexai"
+    assert raw_config["models"]["roles"]["arbiter"]["model"] == "google/gemini-2.0-flash-001"
+
+
+def test_cli_config_models_honors_project_root(tmp_path, monkeypatch):
+    from devcouncil.cli.commands.init import initialize_project
+    import yaml
+
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(tmp_path)
+    initialize_project(project)
+
+    result = runner.invoke(app, ["config", "models", "--provider", "vertexai", "--project-root", str(project)])
+
+    assert result.exit_code == 0
+    raw_config = yaml.safe_load((project / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
+    assert raw_config["models"]["provider"] == "vertexai"
+    assert not (tmp_path / ".devcouncil").exists()
+
+
+def test_cli_reset_demo_state_honors_project_root(tmp_path, monkeypatch):
+    from devcouncil.cli.commands.init import initialize_project
+
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(tmp_path)
+    initialize_project(project)
+
+    result = runner.invoke(app, ["reset-demo-state", "--yes", "--project-root", str(project)])
+
+    assert result.exit_code == 0
+    assert "Cleared requirements" in result.output
+    assert not (tmp_path / ".devcouncil").exists()
+
+
+def test_cli_repair_honors_project_root_when_no_gaps(tmp_path, monkeypatch):
+    from devcouncil.cli.commands.init import initialize_project
+
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(tmp_path)
+    initialize_project(project)
+
+    result = runner.invoke(app, ["repair", "--project-root", str(project)])
+
+    assert result.exit_code == 0
+    assert "No blocking gaps" in result.output
+    assert not (tmp_path / ".devcouncil").exists()
+
+
+def test_cli_config_models_can_update_all_roles_with_overrides(tmp_path, monkeypatch):
+    import yaml
+
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    result = runner.invoke(
+        app,
+        [
+            "config",
+            "models",
+            "--model",
+            "openai/custom-default",
+            "--role-model",
+            "planner_b=google/custom-planner",
+        ],
+    )
+
+    assert result.exit_code == 0
+    raw_config = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
+    assert raw_config["models"]["roles"]["spec_writer"]["model"] == "openai/custom-default"
+    assert raw_config["models"]["roles"]["planner_b"]["model"] == "google/custom-planner"
+
+
+def test_cli_config_models_can_update_provider_and_model_in_one_command(tmp_path, monkeypatch):
+    import yaml
+
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    result = runner.invoke(
+        app,
+        [
+            "config",
+            "models",
+            "--provider",
+            "vertexai",
+            "--model",
+            "google/custom-default",
+            "--role-model",
+            "critic_a=google/custom-critic",
+        ],
+    )
+
+    assert result.exit_code == 0
+    raw_config = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
+    assert raw_config["models"]["provider"] == "vertexai"
+    assert raw_config["models"]["roles"]["spec_writer"]["model"] == "google/custom-default"
+    assert raw_config["models"]["roles"]["critic_a"]["model"] == "google/custom-critic"
+
+
+def test_cli_config_models_rejects_invalid_role_model_override(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    result = runner.invoke(app, ["config", "models", "--role-model", "critic_a"])
+
+    assert result.exit_code == 2
+    assert "Use ROLE=MODEL" in result.output
 
 
 def test_cli_config_models_rejects_unsupported_provider(tmp_path, monkeypatch):
@@ -2567,6 +3256,8 @@ def test_cli_run_supports_coding_cli_alias_executors(tmp_path, monkeypatch):
         ("codex-cli", "codex"),
         ("gemini-cli", "gemini"),
         ("claude-cli", "claude"),
+        ("warp-cli", "warp"),
+        ("oz", "warp"),
     ]:
         called.clear()
         result = runner.invoke(app, ["run", "TASK-001", "--executor", alias])

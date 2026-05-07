@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 from devcouncil.live.models import AgentSession, AgentTurn, session_id_from_path
+
+RoleName = Literal["user", "assistant", "system", "tool", "unknown"]
+KNOWN_ROLES: set[RoleName] = {"user", "assistant", "system", "tool"}
 
 
 CLAUDE_TRANSCRIPT_ROOT = Path.home() / ".claude" / "projects"
@@ -98,18 +101,18 @@ def _turn_from_record(raw: dict[str, Any], session_id: str, turn_index: int, cli
     )
 
 
-def _role(raw: dict[str, Any]) -> str:
+def _role(raw: dict[str, Any]) -> RoleName:
     role = raw.get("role")
     if isinstance(role, str):
-        return role if role in {"user", "assistant", "system", "tool"} else "unknown"
+        return role if role in KNOWN_ROLES else "unknown"
     message = raw.get("message")
     if isinstance(message, dict):
         nested = message.get("role")
         if isinstance(nested, str):
-            return nested if nested in {"user", "assistant", "system", "tool"} else "unknown"
+            return nested if nested in KNOWN_ROLES else "unknown"
     record_type = raw.get("type")
-    if record_type in {"user", "assistant", "system"}:
-        return str(record_type)
+    if record_type in KNOWN_ROLES:
+        return record_type
     return "unknown"
 
 

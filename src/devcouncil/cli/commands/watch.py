@@ -284,13 +284,13 @@ def repair_all(
         for item in summary["blocking_cards"]
         if isinstance(item.get("id"), str)
     ]
-    cards = [card for card in cards if card is not None]
-    prompt = build_bulk_live_repair_prompt(root, cards)
+    resolved_cards = [card for card in cards if card is not None]
+    prompt = build_bulk_live_repair_prompt(root, resolved_cards)
     if json_format:
         typer.echo(json.dumps({
             "ok": True,
             "scope_task_id": summary["scope_task_id"],
-            "cards": [card.model_dump() for card in cards],
+            "cards": [card.model_dump() for card in resolved_cards],
             "prompt": prompt,
         }, indent=2))
         return
@@ -563,9 +563,9 @@ async def _review_turn(turn, root: Path, client: str, use_llm: bool, task_id: st
         config = load_config(root)
         validate_model_provider(config.models.provider)
         api_key = get_api_key(config.models.provider, root)
-        provider = create_provider(config.models.provider, api_key)
+        provider = create_provider(config.models.provider, api_key, project_root=root)
         role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
-        router = ModelRouter(provider, role_config)
+        router = ModelRouter(provider, role_config, project_root=root)
     except Exception as exc:
         console.print(f"[yellow]Model-backed review unavailable; using deterministic card: {exc}[/yellow]")
         card = review_turn(turn, root, client=client)

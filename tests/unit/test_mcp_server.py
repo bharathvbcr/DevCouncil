@@ -403,6 +403,24 @@ async def test_mcp_returns_structured_errors_for_bad_tool_arguments(tmp_path, mo
 
 
 @pytest.mark.anyio
+async def test_mcp_required_string_boundaries_for_live_and_execution_tools(tmp_path, monkeypatch):
+    dev_dir = tmp_path / ".devcouncil"
+    dev_dir.mkdir()
+    Database(dev_dir / "state.sqlite").create_db_and_tables()
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+
+    missing_card = await call_tool("devcouncil_live_repair_prompt", {})
+    non_string_card = await call_tool("devcouncil_live_repair_prompt", {"card_id": ["CARD-1"]})
+    missing_execution_task = await call_tool("devcouncil_prepare_execution", {})
+    non_string_execution_task = await call_tool("devcouncil_prepare_execution", {"task_id": {"id": "TASK-001"}})
+
+    assert json.loads(missing_card[0].text)["argument"] == "card_id"
+    assert json.loads(non_string_card[0].text)["code"] == "invalid_arguments"
+    assert json.loads(missing_execution_task[0].text)["argument"] == "task_id"
+    assert json.loads(non_string_execution_task[0].text)["code"] == "invalid_arguments"
+
+
+@pytest.mark.anyio
 async def test_mcp_normalizes_non_object_arguments_and_bool_limits(tmp_path, monkeypatch):
     from devcouncil.telemetry.traces import TraceLogger
 

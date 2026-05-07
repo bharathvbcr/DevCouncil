@@ -8,7 +8,7 @@ Two entry points:
 """
 
 import re
-from typing import Dict, List, Optional, Pattern
+from typing import Any, Dict, List, Optional, Pattern
 
 # Common patterns for sensitive data — each with a human-readable label
 SECRET_PATTERNS: Dict[str, Pattern] = {
@@ -121,9 +121,9 @@ def redact_env_vars(text: str) -> str:
     return env_pattern.sub(_env_replacer, text)
 
 
-def redact_dict(data: dict) -> dict:
+def redact_dict(data: dict[str, Any]) -> dict[str, Any]:
     """Recursively redact sensitive patterns from a dictionary (e.g. JSON response)."""
-    result = {}
+    result: dict[str, Any] = {}
     for k, v in data.items():
         if isinstance(v, str):
             result[k] = redact_text(v)

@@ -10,6 +10,7 @@ from devcouncil.cli.commands import report as report_command
 from devcouncil.cli.commands import run as run_command
 from devcouncil.app.config import load_config
 from devcouncil.cli.commands.init import initialize_project
+from devcouncil.executors.agent_registry import AGENT_ALIASES, load_cli_agent_specs
 from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import ArtifactGraphRepository, StateRepository, TaskRepository
 from devcouncil.app.state_machine import ProjectPhase
@@ -28,9 +29,15 @@ SUPPORTED_EXECUTORS = {
     "claude-code",
     "claude-cli",
     "native",
+    "native-preview",
     "mini",
     "openhands",
+    "warp",
+    "warp-cli",
+    "oz",
+    "oz-cli",
 }
+SUPPORTED_EXECUTORS.update(AGENT_ALIASES)
 
 AGENT_REPORT_FILE = Path(".devcouncil/reports/latest.json")
 
@@ -45,6 +52,11 @@ def _configured_executor(root: Path) -> str:
     except FileNotFoundError:
         configured = "codex"
     return _normalize_executor(configured or "codex")
+
+
+def _custom_cli_agents(root: Path) -> set[str]:
+    specs = load_cli_agent_specs(root)
+    return {name for name, spec in specs.items() if not spec.built_in}
 
 
 def _load_tasks(root: Path):
@@ -151,6 +163,7 @@ def go(
         "--agent",
         help="Use coding-agent defaults: JSON report plus .devcouncil/reports/latest.json.",
     ),
+    profile: str | None = typer.Option(None, "--profile", help="CLI-agent execution profile to pass to dev run."),
     project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
 ):
     """
@@ -171,10 +184,11 @@ def go(
             "Use `dev run TASK-ID --executor manual` for handoff mode.[/red]"
         )
         raise typer.Exit(code=2)
-    if normalized_executor not in SUPPORTED_EXECUTORS:
+    supported = SUPPORTED_EXECUTORS | _custom_cli_agents(root)
+    if normalized_executor not in supported:
         console.print(
             f"[red]Unsupported executor for `{command_label}`: "
-            f"{normalized_executor}. Supported: {', '.join(sorted(SUPPORTED_EXECUTORS))}.[/red]"
+            f"{normalized_executor}. Supported: {', '.join(sorted(supported))}.[/red]"
         )
         raise typer.Exit(code=2)
 
@@ -199,7 +213,10 @@ def go(
 
         console.print(f"\n[bold]Executing {task.id}[/bold] with [bold]{normalized_executor}[/bold]...")
         executed_task_ids.append(task.id)
-        run_command.run(task.id, executor=normalized_executor, project_root=root)
+        if profile:
+            run_command.run(task.id, executor=normalized_executor, profile=profile, project_root=root)
+        else:
+            run_command.run(task.id, executor=normalized_executor, project_root=root)
 
         latest = {item.id: item for item in _load_tasks(root)}.get(task.id)
         latest_status = latest.status if latest else "missing"
@@ -219,7 +236,7 @@ def go(
 
     console.print("\n[bold]Final DevCouncil report[/bold]")
     report_command.report(
-        SimpleNamespace(invoked_subcommand=None),
+        SimpleNamespace(invoked_subcommand=None),  # type: ignore[arg-type]
         planning_only=False,
         json_format=json_report,
         github=False,

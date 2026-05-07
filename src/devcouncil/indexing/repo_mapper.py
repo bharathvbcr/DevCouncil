@@ -783,11 +783,14 @@ class RepoMapper:
     def _is_runtime_or_generated_file(self, path: str) -> bool:
         normalized = path.replace("\\", "/")
         parts = set(normalized.split("/"))
+        name = Path(normalized).name
         if "__pycache__" in parts or normalized.endswith(".pyc"):
             return True
         if parts.intersection({".git", ".devcouncil", ".pytest_cache", ".ruff_cache", ".mypy_cache", ".venv"}):
             return True
         if normalized.startswith("dist/") or normalized.startswith("build/"):
+            return True
+        if name.startswith(("tmp", "temp", ".tmp", "debug")) or name.endswith("~"):
             return True
         return False
 
@@ -935,14 +938,15 @@ class RepoMapper:
 
         # Naive keyword matching fallback
         goal_words = set(goal.lower().split())
+        scored_candidates: list[tuple[int, str]] = []
         for f in files:
             f_lower = f.lower()
             score = sum(1 for word in goal_words if word in f_lower)
             if score > 0:
-                candidates.append((score, f))
+                scored_candidates.append((score, f))
         candidates = [
             {"path": path, "reason": f"Matches goal keywords (score: {score})"}
-            for score, path in sorted(candidates, key=lambda item: (item[0], item[1]), reverse=True)
+            for score, path in sorted(scored_candidates, key=lambda item: (item[0], item[1]), reverse=True)
         ][:10]
         return candidates
 

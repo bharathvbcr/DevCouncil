@@ -1,8 +1,8 @@
 import typer
-from pathlib import Path
 
 from devcouncil.cli.commands import (
     artifacts,
+    agents,
     baseline,
     config,
     ast,
@@ -31,7 +31,6 @@ from devcouncil.cli.commands import (
     version,
     watch,
 )
-from devcouncil.cli.commands.init import initialize_project
 
 app = typer.Typer(
     name="dev",
@@ -47,6 +46,7 @@ app.add_typer(report.app, name="report")
 app.add_typer(rollback.app, name="rollback")
 app.add_typer(config.app, name="config")
 app.add_typer(artifacts.app, name="artifacts")
+app.add_typer(agents.app, name="agents")
 app.add_typer(hook.app, name="hook")
 app.add_typer(version.app, name="version")
 app.add_typer(mcp_server.app, name="mcp-server")
@@ -78,10 +78,6 @@ def main(ctx: typer.Context):
     """
     DevCouncil: Gated orchestrator for AI-assisted software development.
     """
-    if ctx.invoked_subcommand in {"init", "setup"}:
-        return
-
-    initialize_project(Path("."), quiet=True)
     return
 
 if __name__ == "__main__":

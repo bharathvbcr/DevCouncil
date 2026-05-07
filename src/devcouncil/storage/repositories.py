@@ -1,4 +1,4 @@
-from sqlmodel import Session, select, delete
+from sqlmodel import Session, col, delete, select
 from typing import List, Optional, Any
 import json
 from devcouncil.storage.models import (
@@ -28,14 +28,14 @@ class RequirementRepository:
         results = []
         for m in models:
             ac_list = [AcceptanceCriterion.model_validate(ac) for ac in json.loads(m.acceptance_criteria_json)]
-            results.append(Requirement(
-                id=m.id,
-                title=m.title,
-                description=m.description,
-                priority=m.priority,
-                source=m.source,
-                acceptance_criteria=ac_list
-            ))
+            results.append(Requirement.model_validate({
+                "id": m.id,
+                "title": m.title,
+                "description": m.description,
+                "priority": m.priority,
+                "source": m.source,
+                "acceptance_criteria": ac_list,
+            }))
         return results
 
     def save(self, req: Requirement):
@@ -59,16 +59,16 @@ class AssumptionRepository:
         statement = select(AssumptionModel)
         models = self.session.exec(statement).all()
         return [
-            Assumption(
-                id=m.id,
-                statement=m.statement,
-                confidence=m.confidence,
-                impact=m.impact,
-                reversible=m.reversible,
-                requires_user_confirmation=m.requires_user_confirmation,
-                linked_requirement_ids=json.loads(m.linked_requirement_ids_json),
-                status=m.status,
-            )
+            Assumption.model_validate({
+                "id": m.id,
+                "statement": m.statement,
+                "confidence": m.confidence,
+                "impact": m.impact,
+                "reversible": m.reversible,
+                "requires_user_confirmation": m.requires_user_confirmation,
+                "linked_requirement_ids": json.loads(m.linked_requirement_ids_json),
+                "status": m.status,
+            })
             for m in models
         ]
 
@@ -97,18 +97,18 @@ class TaskRepository:
             return None
         
         pf_list = [PlannedFile.model_validate(pf) for pf in json.loads(m.planned_files_json)]
-        return Task(
-            id=m.id,
-            title=m.title,
-            description=m.description,
-            requirement_ids=json.loads(m.requirement_ids_json),
-            acceptance_criterion_ids=json.loads(m.acceptance_criterion_ids_json),
-            planned_files=pf_list,
-            expected_tests=json.loads(m.expected_tests_json),
-            allowed_commands=json.loads(m.allowed_commands_json),
-            forbidden_changes=json.loads(m.forbidden_changes_json),
-            status=m.status
-        )
+        return Task.model_validate({
+            "id": m.id,
+            "title": m.title,
+            "description": m.description,
+            "requirement_ids": json.loads(m.requirement_ids_json),
+            "acceptance_criterion_ids": json.loads(m.acceptance_criterion_ids_json),
+            "planned_files": pf_list,
+            "expected_tests": json.loads(m.expected_tests_json),
+            "allowed_commands": json.loads(m.allowed_commands_json),
+            "forbidden_changes": json.loads(m.forbidden_changes_json),
+            "status": m.status,
+        })
 
     def get_all(self) -> List[Task]:
         statement = select(TaskModel)
@@ -116,18 +116,18 @@ class TaskRepository:
         results = []
         for m in models:
             pf_list = [PlannedFile.model_validate(pf) for pf in json.loads(m.planned_files_json)]
-            results.append(Task(
-                id=m.id,
-                title=m.title,
-                description=m.description,
-                requirement_ids=json.loads(m.requirement_ids_json),
-                acceptance_criterion_ids=json.loads(m.acceptance_criterion_ids_json),
-                planned_files=pf_list,
-                expected_tests=json.loads(m.expected_tests_json),
-                allowed_commands=json.loads(m.allowed_commands_json),
-                forbidden_changes=json.loads(m.forbidden_changes_json),
-                status=m.status
-            ))
+            results.append(Task.model_validate({
+                "id": m.id,
+                "title": m.title,
+                "description": m.description,
+                "requirement_ids": json.loads(m.requirement_ids_json),
+                "acceptance_criterion_ids": json.loads(m.acceptance_criterion_ids_json),
+                "planned_files": pf_list,
+                "expected_tests": json.loads(m.expected_tests_json),
+                "allowed_commands": json.loads(m.allowed_commands_json),
+                "forbidden_changes": json.loads(m.forbidden_changes_json),
+                "status": m.status,
+            }))
         return results
 
     def save(self, task: Task):
@@ -155,17 +155,17 @@ class GapRepository:
         models = self.session.exec(statement).all()
         results = []
         for m in models:
-            results.append(Gap(
-                id=m.id,
-                severity=m.severity,
-                gap_type=m.gap_type,
-                requirement_id=m.requirement_id,
-                task_id=m.task_id,
-                description=m.description,
-                evidence=json.loads(m.evidence_json),
-                recommended_fix=m.recommended_fix,
-                blocking=m.blocking
-            ))
+            results.append(Gap.model_validate({
+                "id": m.id,
+                "severity": m.severity,
+                "gap_type": m.gap_type,
+                "requirement_id": m.requirement_id,
+                "task_id": m.task_id,
+                "description": m.description,
+                "evidence": json.loads(m.evidence_json),
+                "recommended_fix": m.recommended_fix,
+                "blocking": m.blocking,
+            }))
         return results
 
     def save(self, gap: Gap):
@@ -184,11 +184,11 @@ class GapRepository:
         self.session.commit()
 
     def delete_for_task(self, task_id: str):
-        self.session.exec(delete(GapModel).where(GapModel.task_id == task_id))
+        self.session.exec(delete(GapModel).where(col(GapModel.task_id) == task_id))
         self.session.commit()
 
     def delete_plan_gaps(self):
-        self.session.exec(delete(GapModel).where(GapModel.id.like("GAP-PLAN-%")))
+        self.session.exec(delete(GapModel).where(col(GapModel.id).like("GAP-PLAN-%")))
         self.session.commit()
 
 class EvidenceRepository:
@@ -227,7 +227,7 @@ class EvidenceRepository:
     def get_all(self) -> List[Any]:
         statement = select(EvidenceModel)
         models = self.session.exec(statement).all()
-        results = []
+        results: List[Any] = []
         for m in models:
             data = json.loads(m.data_json)
             if m.type == "command":
@@ -239,7 +239,7 @@ class EvidenceRepository:
         return results
 
     def delete_for_task(self, task_id: str):
-        self.session.exec(delete(EvidenceModel).where(EvidenceModel.task_id == task_id))
+        self.session.exec(delete(EvidenceModel).where(col(EvidenceModel.task_id) == task_id))
         self.session.commit()
 
 
@@ -251,19 +251,19 @@ class CritiqueFindingRepository:
         statement = select(CritiqueFindingModel)
         models = self.session.exec(statement).all()
         return [
-            CritiqueFinding(
-                id=m.id,
-                source_agent=m.source_agent,
-                target_plan_id=m.target_plan_id,
-                severity=m.severity,
-                finding_type=m.finding_type,
-                claim=m.claim,
-                linked_requirement_id=m.linked_requirement_id,
-                suggested_requirement=m.suggested_requirement,
-                suggested_task=m.suggested_task,
-                falsifiable_check=m.falsifiable_check,
-                status=m.status,
-            )
+            CritiqueFinding.model_validate({
+                "id": m.id,
+                "source_agent": m.source_agent,
+                "target_plan_id": m.target_plan_id,
+                "severity": m.severity,
+                "finding_type": m.finding_type,
+                "claim": m.claim,
+                "linked_requirement_id": m.linked_requirement_id,
+                "suggested_requirement": m.suggested_requirement,
+                "suggested_task": m.suggested_task,
+                "falsifiable_check": m.falsifiable_check,
+                "status": m.status,
+            })
             for m in models
         ]
 

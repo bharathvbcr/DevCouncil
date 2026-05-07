@@ -7,6 +7,7 @@ from devcouncil.storage.repositories import TaskRepository, RequirementRepositor
 from devcouncil.executors.mini_swe import MiniSWEExecutor
 from devcouncil.executors.openhands import OpenHandsExecutor
 from devcouncil.executors.coding_cli import CodingCliExecutor
+from devcouncil.executors.agent_registry import AGENT_ALIASES, load_cli_agent_specs
 from devcouncil.executors.native.agent import NativeAgent
 from devcouncil.llm.provider import create_provider, validate_model_provider
 from devcouncil.llm.router import ModelRouter
@@ -16,19 +17,17 @@ from devcouncil.storage.repositories import GapRepository, EvidenceRepository, S
 from devcouncil.verification.verifier import Verifier
 from devcouncil.app.state_machine import ProjectPhase
 from devcouncil.cli.commands.init import initialize_project
+from devcouncil.telemetry.traces import TraceLogger
 
 console = Console()
-CODING_EXECUTOR_ALIASES = {
-    "codex": "codex",
-    "codex-cli": "codex",
-    "gemini": "gemini",
-    "gemini-cli": "gemini",
-    "claude": "claude",
-    "claude-code": "claude",
-    "claude-cli": "claude",
-}
+CODING_EXECUTOR_ALIASES = {name: name for name in ("codex", "gemini", "claude", "warp")} | AGENT_ALIASES
 
 CODING_EXECUTORS = set(CODING_EXECUTOR_ALIASES.keys())
+
+
+def _custom_cli_agents(project_root: Path) -> set[str]:
+    specs = load_cli_agent_specs(project_root)
+    return {name for name, spec in specs.items() if not spec.built_in}
 
 def _current_changed_files(project_root: Path = Path(".")) -> list[str]:
     from devcouncil.verification.verifier import Verifier
@@ -90,14 +89,25 @@ def _verify_after_execution(session, task, reqs, router=None, project_root: Path
     task.status = "blocked" if any(g.blocking for g in gaps) else "verified"
     return task.status == "verified"
 
+
+def _record_agent_verification(project_root: Path, task_id: str, executor: str, run_id: str | None, verified: bool) -> None:
+    TraceLogger(project_root).log_event(
+        "agent_run_verified",
+        {"agent": executor, "verified": verified},
+        run_id=run_id,
+        task_id=task_id,
+        summary=f"{executor} verification {'passed' if verified else 'blocked'} for {task_id}",
+    )
+
 def run(
     task_id: str = typer.Argument(..., help="ID of the task to run"),
     executor: str = typer.Option(
         "manual",
         "--executor",
         "-e",
-        help="Executor to use (manual, mini, openhands, native, codex, codex-cli, gemini, gemini-cli, claude, claude-code, claude-cli)",
+        help="Executor to use (manual, mini, openhands, native-preview, codex, gemini, claude, warp, or a configured agent)",
     ),
+    profile: str | None = typer.Option(None, "--profile", help="CLI-agent execution profile: default, yolo, prod, or a configured profile."),
     project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
 ):
     """
@@ -118,8 +128,8 @@ def run(
             return
 
         from devcouncil.gating.policy import GatePolicy
-        policy = GatePolicy()
-        gate_result = policy.check_task_ready(task, root)
+        gate_policy = GatePolicy()
+        gate_result = gate_policy.check_task_ready(task, root)
         if not gate_result.passed:
             console.print(f"[red]Task {task_id} is not ready for execution.[/red]")
             for gap in gate_result.gaps:
@@ -152,17 +162,22 @@ def run(
             console.print(f"\n[green]Task {task_id} is now marked as RUNNING.[/green]")
             console.print("Use 'dev prompt TASK-ID' to get the prompt for this task.")
             console.print("When finished, use 'dev verify TASK-ID' to check the results.")
-        elif executor in CODING_EXECUTORS:
+        elif executor in CODING_EXECUTORS or executor in _custom_cli_agents(root):
             _record_project_phase(session, ProjectPhase.TASK_EXECUTING)
             req_repo = RequirementRepository(session)
             reqs = req_repo.get_all()
-            cli_client = CODING_EXECUTOR_ALIASES[executor]
-            cli_executor = CodingCliExecutor(root, cli_client)
+            cli_client = CODING_EXECUTOR_ALIASES.get(executor, executor)
+            cli_executor = (
+                CodingCliExecutor(root, cli_client, profile=profile)
+                if profile
+                else CodingCliExecutor(root, cli_client)
+            )
             exec_result = cli_executor.run_task(task, reqs)
             _capture_after_patch(task_id, root)
             if exec_result.success:
                 _record_project_phase(session, ProjectPhase.TASK_VERIFYING)
                 verified = _verify_after_execution(session, task, reqs, project_root=root)
+                _record_agent_verification(root, task.id, cli_client, getattr(cli_executor, "last_run_id", None), verified)
                 _record_project_phase(
                     session,
                     ProjectPhase.TASK_VERIFIED if verified else ProjectPhase.TASK_BLOCKED,
@@ -216,7 +231,7 @@ def run(
                     console.print(f"\n[yellow]OpenHands finished, but task {task_id} is blocked by verification gaps.[/yellow]")
             else:
                 console.print("\n[red]OpenHands failed to start or execute.[/red]")
-        elif executor == "native":
+        elif executor in {"native", "native-preview"}:
             # Load config for model routing and permissions
             try:
                 config = load_config(root)
@@ -226,9 +241,9 @@ def run(
                 console.print(f"[red]{e}[/red]")
                 return
             
-            provider = create_provider(config.models.provider, api_key)
+            provider = create_provider(config.models.provider, api_key, project_root=root)
             role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
-            router = ModelRouter(provider, role_config)
+            router = ModelRouter(provider, role_config, project_root=root)
             
             # Setup Permission System
             from devcouncil.execution.permissions import PermissionPolicy, PermissionManager
@@ -236,19 +251,18 @@ def run(
             
             # Populate policy from config commands
             allowed_cmds = config.commands.test + config.commands.lint + config.commands.typecheck
-            policy = PermissionPolicy(
+            permission_policy = PermissionPolicy(
                 allowed_shell_commands=allowed_cmds,
             )
-            perm_manager = PermissionManager(policy, root)
+            perm_manager = PermissionManager(permission_policy, root)
             task_runner = TaskRunner(root, perm_manager)
             
             req_repo = RequirementRepository(session)
             reqs = req_repo.get_all()
             
-            import asyncio
             _record_project_phase(session, ProjectPhase.TASK_EXECUTING)
             agent = NativeAgent(router, task_runner)
-            exec_result = asyncio.run(agent.run_task(task, reqs))
+            exec_result = agent.run_task(task, reqs)
             _capture_after_patch(task_id, root)
             
             if exec_result.success:

@@ -48,30 +48,42 @@ jobs:
           set +e
           uv run --python 3.12 ruff check . 2>&1 | tee ruff.log
           ruff_status=${PIPESTATUS[0]}
+          uv run --python 3.12 mypy src 2>&1 | tee mypy.log
+          mypy_status=${PIPESTATUS[0]}
           uv run --python 3.12 pytest 2>&1 | tee pytest.log
           pytest_status=${PIPESTATUS[0]}
-          if [ "$ruff_status" -ne 0 ] || [ "$pytest_status" -ne 0 ]; then
+          if [ "$ruff_status" -ne 0 ] || [ "$mypy_status" -ne 0 ] || [ "$pytest_status" -ne 0 ]; then
             {
               echo "### ruff tail"
               echo '```'
               tail -n 80 ruff.log
+              echo '```'
+              echo "### mypy tail"
+              echo '```'
+              tail -n 120 mypy.log
               echo '```'
               echo "### pytest tail"
               echo '```'
               tail -n 160 pytest.log
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
-            combined="$(tail -n 30 ruff.log; tail -n 60 pytest.log)"
+            combined="$(tail -n 30 ruff.log; tail -n 60 mypy.log; tail -n 60 pytest.log)"
             msg=$(printf "%s" "$combined" | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')
             echo "::error title=release checks failed::$msg"
             if [ "$ruff_status" -ne 0 ]; then
               exit "$ruff_status"
             fi
+            if [ "$mypy_status" -ne 0 ]; then
+              exit "$mypy_status"
+            fi
             exit "$pytest_status"
           fi
 
       - name: Check npm package contents
-        run: npm run pack:check
+        run: |
+          npm run pack:check
+          npm run smoke:wheel
+          npm run smoke:package
 
   publish:
     name: Publish to npm
