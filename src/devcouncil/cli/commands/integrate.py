@@ -6,16 +6,25 @@ import sys
 from pathlib import Path
 
 import typer
-import yaml
+import yaml  # type: ignore[import-untyped]
 from rich.console import Console
 from rich.table import Table
+
+from devcouncil.executors.agent_registry import (
+    VALID_INPUT_MODES,
+    agent_config_entry,
+    is_reserved_agent_name,
+    load_agent_profiles,
+    load_cli_agent_specs,
+    normalize_agent_name,
+)
 
 app = typer.Typer(help="Set up DevCouncil integrations with coding CLIs.")
 setup_app = typer.Typer(help="Set up optional external companion integrations.")
 app.add_typer(setup_app, name="setup")
 console = Console()
 
-SUPPORTED_TOOLS = ("codex", "gemini", "claude", "cursor")
+SUPPORTED_TOOLS = ("codex", "gemini", "claude", "cursor", "warp")
 SUPPORTED_HOOK_TOOLS = ("codex", "gemini", "claude")
 PREFERRED_COMMAND = "dev integrate"
 LEGACY_COMMAND = "dev setup --integrate"
@@ -79,6 +88,60 @@ def _cursor_command(project_root: Path) -> list[str]:
         "env": {"DEVCOUNCIL_PROJECT_ROOT": str(project_root)},
     }
     return ["cursor", "--add-mcp", json.dumps(server, separators=(",", ":"))]
+
+
+def _warp_mcp_config(project_root: Path) -> dict:
+    return {
+        "mcpServers": {
+            "devcouncil": {
+                "command": "devcouncil",
+                "args": ["mcp-server"],
+                "env": {"DEVCOUNCIL_PROJECT_ROOT": str(project_root)},
+                "working_directory": str(project_root),
+            }
+        }
+    }
+
+
+def _warp_mcp_path(project_root: Path) -> Path:
+    return project_root / ".devcouncil" / "integrations" / "warp-mcp.json"
+
+
+def _write_warp_mcp_config(project_root: Path) -> Path:
+    path = _warp_mcp_path(project_root)
+    _save_json(path, _warp_mcp_config(project_root))
+    return path
+
+
+def _record_warp_config(project_root: Path) -> None:
+    config = _load_raw_config(project_root)
+    integrations = config.setdefault("integrations", {})
+    warp = integrations.setdefault("warp", {})
+    warp.update({
+        "enabled": True,
+        "command": warp.get("command", "oz"),
+        "run_mode": warp.get("run_mode", "local"),
+        "mcp_config_path": str(_warp_mcp_path(project_root).relative_to(project_root)),
+    })
+    _save_raw_config(project_root, config)
+
+
+def _configure_warp(project_root: Path, apply: bool) -> bool:
+    path = _warp_mcp_path(project_root)
+    config = _warp_mcp_config(project_root)
+    if not apply:
+        console.print("[bold]Warp / Oz[/bold]")
+        console.print(f"MCP config file: [dim]{path}[/dim]")
+        console.print(json.dumps(config, separators=(",", ":")), soft_wrap=True)
+        console.print(f"Direct executor command: [dim]oz agent run --cwd {project_root} --mcp {path} --prompt <task prompt>[/dim]")
+        return True
+
+    written = _write_warp_mcp_config(project_root)
+    _record_warp_config(project_root)
+    console.print(f"[green]Warp MCP config written:[/green] {written}")
+    if not shutil.which("oz"):
+        console.print("[yellow]oz CLI not found on PATH. Install Warp/Oz before using `dev run --executor warp`.[/yellow]")
+    return True
 
 
 def _format_command(command: list[str]) -> str:
@@ -380,6 +443,8 @@ def overview(ctx: typer.Context):
     table.add_row("Gemini CLI", f"{PREFERRED_COMMAND} gemini --apply", "Adds DevCouncil as a project-scoped stdio MCP server.")
     table.add_row("Claude Code", f"{PREFERRED_COMMAND} claude --apply", "Adds DevCouncil as a Claude Code MCP server.")
     table.add_row("Cursor", f"{PREFERRED_COMMAND} cursor --apply", "Adds DevCouncil as a Cursor MCP server.")
+    table.add_row("Warp / Oz", f"{PREFERRED_COMMAND} warp --apply", "Writes a Warp-compatible MCP JSON file for local agents and Oz CLI.")
+    table.add_row("Bring your own CLI", f"{PREFERRED_COMMAND} cli-agent NAME --command TOOL --apply", "Registers any prompt-taking CLI as a DevCouncil executor.")
     table.add_row("All", f"{PREFERRED_COMMAND} all --apply", "Runs MCP setup and installs native hooks.")
     table.add_row("Native hooks", f"{PREFERRED_COMMAND} hooks --apply", "Installs Codex, Gemini, and Claude hook files.")
     console.print(table)
@@ -388,12 +453,15 @@ def overview(ctx: typer.Context):
 
 
 @app.command("doctor")
-def integrations_doctor():
+def integrations_doctor(
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
     """Check optional integration tools and local client wiring prerequisites."""
+    root = _project_root(project_root)
     table = Table(title="DevCouncil Integration Doctor")
-    table.add_column("Integration", style="cyan")
+    table.add_column("Integration", style="cyan", no_wrap=True)
     table.add_column("Status")
-    table.add_column("Notes")
+    table.add_column("Notes", overflow="fold")
 
     checks = [
         ("Agent Flow", "agent-flow-app", "Optional live/replay visualizer for trace JSONL."),
@@ -402,13 +470,31 @@ def integrations_doctor():
         ("Codex CLI", "codex", "Optional MCP client, headless executor companion, and native hook runtime."),
         ("Gemini CLI", "gemini", "Optional MCP client companion and native hook runtime."),
         ("Cursor", "cursor", "Optional MCP client and agent companion."),
+        ("Warp / Oz", "oz", "Optional Warp/Oz CLI companion and agent executor."),
         ("Aider", "aider", "Optional prompt/stdin sidecar; no first-party MCP setup command."),
     ]
     for label, executable, notes in checks:
         found = shutil.which(executable)
         table.add_row(label, "[green]OK[/green]" if found else "[yellow]Missing[/yellow]", found or notes)
 
-    config = _config_path(Path("."))
+    profiles = load_agent_profiles(root)
+    for name, spec in load_cli_agent_specs(root).items():
+        if spec.built_in:
+            continue
+        found = shutil.which(spec.executable)
+        mode_ok = spec.input_mode in VALID_INPUT_MODES
+        profile_ok = spec.default_profile in profiles
+        status = "[green]OK[/green]" if found and mode_ok and profile_ok else "[red]Invalid[/red]"
+        if not found:
+            status = "[yellow]Missing[/yellow]"
+        details = found or f"{spec.executable} not found on PATH"
+        if not mode_ok:
+            details = f"invalid input_mode={spec.input_mode}"
+        if not profile_ok:
+            details = f"{details}; missing profile={spec.default_profile}"
+        table.add_row(f"CLI agent: {name}", status, details)
+
+    config = _config_path(root)
     table.add_row(
         "DevCouncil config",
         "[green]OK[/green]" if config.exists() else "[red]Missing[/red]",
@@ -487,6 +573,86 @@ def cursor(
         raise typer.Exit(code=1)
 
 
+@app.command("warp")
+def warp(
+    apply: bool = typer.Option(False, "--apply", help="Write Warp MCP config instead of printing it."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """
+    Set up DevCouncil MCP tools for Warp local agents and the Oz CLI.
+    """
+    root = _project_root(project_root)
+    _configure_warp(root, apply)
+
+
+@app.command("cli-agent")
+def cli_agent(
+    name: str = typer.Argument(..., help="Executor name to register, for example opencode or aider."),
+    command: str = typer.Option(..., "--command", help="Executable to launch."),
+    arg: list[str] | None = typer.Option(None, "--arg", help="Argument to pass to the CLI. Repeat for multiple args."),
+    input_mode: str = typer.Option("stdin", "--input-mode", help="Prompt input mode: stdin, argument, or prompt-file."),
+    prompt_arg: str | None = typer.Option(None, "--prompt-arg", help="Flag used before the prompt or prompt file, for example --prompt."),
+    timeout_seconds: int | None = typer.Option(None, "--timeout-seconds", help="Agent-specific timeout override."),
+    display_name: str | None = typer.Option(None, "--display-name", help="Human-readable agent name."),
+    kind: str = typer.Option("custom", "--kind", help="Agent kind, for example coding-cli or review-cli."),
+    supports_mcp: bool = typer.Option(False, "--supports-mcp", help="Mark this agent as MCP-capable."),
+    supports_diff_review: bool = typer.Option(False, "--supports-diff-review", help="Mark this agent as able to review diffs."),
+    default_profile: str = typer.Option("default", "--default-profile", help="Default execution profile for this agent."),
+    help_arg: list[str] | None = typer.Option(None, "--help-arg", help="Argument for the agent help command. Repeat for multiple args."),
+    apply: bool = typer.Option(False, "--apply", help="Write .devcouncil/config.yaml instead of previewing."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """
+    Register an arbitrary prompt-taking CLI as a DevCouncil executor.
+    """
+    if input_mode not in VALID_INPUT_MODES:
+        console.print("[red]--input-mode must be one of: stdin, argument, prompt-file.[/red]")
+        raise typer.Exit(code=2)
+    if not name.strip():
+        console.print("[red]Agent name cannot be empty.[/red]")
+        raise typer.Exit(code=2)
+    if not command.strip():
+        console.print("[red]--command cannot be empty.[/red]")
+        raise typer.Exit(code=2)
+
+    root = _project_root(project_root)
+    if is_reserved_agent_name(name):
+        console.print(f"[red]'{name}' is reserved for a built-in DevCouncil agent.[/red]")
+        raise typer.Exit(code=2)
+    if default_profile not in load_agent_profiles(root):
+        console.print(f"[red]Unknown --default-profile '{default_profile}'.[/red]")
+        raise typer.Exit(code=2)
+
+    normalized = normalize_agent_name(name)
+    entry = agent_config_entry(
+        command=command,
+        args=arg or [],
+        input_mode=input_mode,
+        prompt_arg=prompt_arg,
+        timeout_seconds=timeout_seconds,
+        display_name=display_name,
+        kind=kind,
+        supports_mcp=supports_mcp,
+        supports_diff_review=supports_diff_review,
+        default_profile=default_profile,
+        help_command=[command, *(help_arg or [])] if help_arg else [],
+    )
+
+    if not apply:
+        console.print("[bold]Bring your own CLI executor preview[/bold]")
+        console.print(f"Executor: [cyan]{normalized}[/cyan]")
+        console.print(json.dumps(entry, indent=2), soft_wrap=True)
+        console.print(f"Run with: [dim]dev run TASK-001 --executor {normalized}[/dim]")
+        console.print("[yellow]Preview only. Rerun with --apply to update .devcouncil/config.yaml.[/yellow]")
+        return
+
+    config = _load_raw_config(root)
+    agents = config.setdefault("integrations", {}).setdefault("cli_agents", {}).setdefault("agents", {})
+    agents[normalized] = entry
+    _save_raw_config(root, config)
+    console.print(f"[green]Registered CLI executor '{normalized}' in .devcouncil/config.yaml.[/green]")
+
+
 @app.command("all")
 def all_tools(
     apply: bool = typer.Option(False, "--apply", help="Run setup commands instead of printing them."),
@@ -518,6 +684,7 @@ def all_tools(
             console.print(f"[yellow]{tool} CLI not found on PATH. Skipping optional integration.[/yellow]")
             continue
         results.append(_configure(tool, command, apply))
+    results.append(_configure_warp(root, apply))
     if hooks:
         _configure_native_hooks(root, "all", apply)
     if apply and not all(results):
@@ -558,6 +725,9 @@ def check(
         if not ok:
             failures += 1
 
+    def add_optional(ok: bool, name: str, details: str):
+        table.add_row(name, "[green]OK[/green]" if ok else "[yellow]Missing[/yellow]", details)
+
     add((root / ".devcouncil").exists(), "Project state", str(root / ".devcouncil"))
 
     devcouncil_path = shutil.which("devcouncil")
@@ -566,17 +736,38 @@ def check(
     code, output = _run_capture(["devcouncil", "--help"])
     add(code == 0, "devcouncil command", output.splitlines()[0] if output else "No output")
 
-    code, output = _run_capture(["codex", "--version"])
-    add(code == 0, "Codex CLI", output.splitlines()[0] if output else "Optional; install Codex to use this integration.")
+    raw_config = _load_raw_config(root)
 
     code, output = _run_capture(["gemini", "--version"])
-    add(code == 0, "Gemini CLI", output.splitlines()[0] if output else "Optional; install Gemini CLI to use this integration.")
+    add_optional(code == 0, "Gemini CLI", output.splitlines()[0] if output else "Optional; install Gemini CLI to use this integration.")
+
+    code, output = _run_capture(["codex", "--version"])
+    add_optional(code == 0, "Codex CLI", output.splitlines()[0] if output else "Optional; install Codex to use this integration.")
 
     code, output = _run_capture(["claude", "--version"])
-    add(code == 0, "Claude Code", output.splitlines()[0] if output else "Optional; install Claude Code to use this integration.")
+    add_optional(code == 0, "Claude Code", output.splitlines()[0] if output else "Optional; install Claude Code to use this integration.")
 
     code, output = _run_capture(["cursor", "--version"])
-    add(code == 0, "Cursor", output.splitlines()[0] if output else "Optional; install Cursor to use this integration.")
+    add_optional(code == 0, "Cursor", output.splitlines()[0] if output else "Optional; install Cursor to use this integration.")
+
+    code, output = _run_capture(["oz", "--version"])
+    add_optional(code == 0, "Warp / Oz", output.splitlines()[0] if output else "Optional; install Warp/Oz to use this integration.")
+
+    warp_config = _warp_mcp_path(root)
+    warp_enabled = bool(raw_config.get("integrations", {}).get("warp", {}).get("enabled"))
+    if warp_enabled:
+        add(warp_config.exists(), "Warp MCP config", str(warp_config) if warp_config.exists() else f"Run {PREFERRED_COMMAND} warp --apply.")
+    else:
+        table.add_row("Warp MCP config", "[dim]SKIP[/dim]", f"Run {PREFERRED_COMMAND} warp --apply to enable.")
+
+    custom_agents = raw_config.get("integrations", {}).get("cli_agents", {}).get("agents", {})
+    if custom_agents:
+        for name, agent in sorted(custom_agents.items()):
+            command = str(agent.get("command", "")).strip()
+            found = shutil.which(command) if command else None
+            add(found is not None, f"CLI agent: {name}", found or f"{command or 'command'} not found on PATH")
+    else:
+        table.add_row("Custom CLI agents", "[dim]SKIP[/dim]", "No agents registered.")
 
     try:
         from mcp import ClientSession, StdioServerParameters

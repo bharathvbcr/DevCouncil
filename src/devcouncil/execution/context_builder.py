@@ -41,7 +41,7 @@ class ContextBuilder:
         
         return json.dumps(context, indent=2)
 
-    def get_structure_summary(self, task: Task = None) -> List[str]:
+    def get_structure_summary(self, task: Task | None = None) -> List[str]:
         """Simple list of files in the project for context."""
         try:
             import subprocess

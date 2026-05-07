@@ -12,14 +12,16 @@ console = Console()
 
 def reset_demo_state(
     yes: bool = typer.Option(False, "--yes", help="Confirm clearing planning/demo artifacts."),
+    project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
 ):
     """Clear demo planning artifacts from the local DevCouncil state database."""
     if not yes:
         console.print("[red]Refusing to clear state without --yes.[/red]")
         raise typer.Exit(code=1)
 
-    initialize_project(Path("."), quiet=True)
-    db = get_db()
+    root = project_root.expanduser().resolve()
+    initialize_project(root, quiet=True)
+    db = get_db(root)
     if not db:
         console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
         raise typer.Exit(code=1)

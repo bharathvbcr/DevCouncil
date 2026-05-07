@@ -9,8 +9,10 @@ DevCouncil works with any tool that can accept a prompt and edit files in the sa
 | **Codex CLI** | Supported | Supported via `codex exec` | Supported via `codex mcp` | Native via `dev integrate hooks` |
 | **Gemini CLI** | Supported | Supported via `gemini -p` or stdin | Supported via `gemini mcp` | Native via `dev integrate hooks` |
 | **Claude Code** | Supported | Tool-dependent | Supported via `claude mcp` | Native via `dev integrate hooks` |
+| **Warp / Oz** | Supported | Supported via `oz agent run` | Supported via Warp/Oz MCP JSON | Verification-gated sidecar |
 | **Cursor** | Supported | Tool-dependent | Supported via `cursor --add-mcp` | Verification-gated sidecar |
 | **Aider** | Supported | Prompt/stdin friendly | Not a primary path | Verification-gated sidecar |
+| **Bring your own CLI** | Supported | Supported through configurable stdin, argument, or prompt-file handoff | Tool-dependent | Verification-gated sidecar |
 
 ## Fast Integration Setup
 
@@ -55,7 +57,15 @@ dev integrate codex --apply
 dev integrate gemini --apply
 dev integrate claude --apply
 dev integrate cursor --apply
+dev integrate warp --apply
 dev integrate hooks --apply
+```
+
+Register an arbitrary prompt-taking CLI:
+
+```bash
+dev integrate cli-agent opencode --command opencode --arg run --input-mode prompt-file --prompt-arg=--prompt-file --apply
+dev run TASK-001 --executor opencode
 ```
 
 If a configured MCP client launches tools from a different directory, point it at the target repository:
@@ -207,6 +217,98 @@ dev integrate cursor --apply
 
 The command registers `devcouncil mcp-server` through Cursor's `--add-mcp` option with `DEVCOUNCIL_PROJECT_ROOT` set to the repository that contains `.devcouncil/`.
 
+## Warp / Oz
+
+DevCouncil supports Warp in two modes:
+
+- Warp local agents can use DevCouncil through the generated MCP JSON file.
+- The Oz CLI can run DevCouncil tasks directly with `dev run --executor warp` or `dev run --executor oz`.
+
+MCP setup:
+
+```bash
+dev integrate warp --apply
+```
+
+This writes `.devcouncil/integrations/warp-mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "devcouncil": {
+      "command": "devcouncil",
+      "args": ["mcp-server"],
+      "env": {
+        "DEVCOUNCIL_PROJECT_ROOT": "/path/to/project"
+      },
+      "working_directory": "/path/to/project"
+    }
+  }
+}
+```
+
+Direct execution:
+
+```bash
+dev run TASK-001 --executor warp
+dev run TASK-001 --executor oz
+```
+
+Optional Warp/Oz execution settings can live in `.devcouncil/config.yaml`:
+
+```yaml
+integrations:
+  warp:
+    enabled: true
+    command: oz
+    run_mode: local
+    profile: your-profile-id
+    model: your-model-id
+    share:
+      - team:view
+```
+
+For cloud runs, set `run_mode: cloud` and `environment: <environment-id>`. DevCouncil still verifies the local working tree after the executor returns, so cloud workflows should sync changes back before verification.
+
+## Bring Your Own CLI
+
+DevCouncil can register any local CLI as an agent when the tool can receive a prompt through stdin, a command-line argument, or a prompt file. Registered agents are listed with `dev agents`, checked with `dev agents doctor`, and run with `dev agents run`.
+
+Examples:
+
+```bash
+# stdin prompt
+dev agents add myagent --command myagent --arg run --input-mode stdin
+
+# prompt argument
+dev agents add myagent --command myagent --arg run --input-mode argument --prompt-arg=--prompt
+
+# prompt file
+dev agents add myagent --command myagent --arg run --input-mode prompt-file --prompt-arg=--prompt-file
+
+# MCP-capable agent
+dev agents add myagent --command myagent --arg run --input-mode prompt-file --prompt-arg=--prompt-file --supports-mcp --help-arg --help
+```
+
+Then run:
+
+```bash
+dev agents run TASK-001 --agent myagent --profile default
+dev agents run TASK-001 --agent myagent --profile yolo
+dev agents run TASK-001 --agent myagent --profile prod
+```
+
+If `--profile` is omitted, DevCouncil uses the agent's configured `default_profile`. `default` is balanced local execution, `yolo` lets the agent move faster while DevCouncil still verifies the final diff, and `prod` adds restrictive prompt guidance for high-risk repositories. Built-in names and aliases such as `codex`, `claude`, `gemini`, `warp`, and `oz` are reserved for DevCouncil's built-in adapters.
+
+The generated task prompt is written to `.devcouncil/<TASK-ID>-<executor>-task.md`, and each agent launch writes `.devcouncil/runs/<run-id>/agent-run.json` plus trace events for start, finish, failure, and verification.
+
+Compatibility path:
+
+```bash
+dev integrate cli-agent myagent --command myagent --arg run --input-mode stdin --apply
+dev run TASK-001 --executor myagent --profile default
+```
+
 ## Aider
 
 Start Aider in the target repository:
@@ -239,12 +341,12 @@ DevCouncil also has additional automated executor adapters:
 ```bash
 dev run TASK-001 --executor mini
 dev run TASK-001 --executor openhands
-dev run TASK-001 --executor native
+dev run TASK-001 --executor native-preview
 ```
 
 Use these only when the target executor is installed and configured locally. Automated executor mode lets DevCouncil launch the implementation loop itself, capture the post-run diff, and verify the task automatically.
 
-The live executor adapter values are `manual`, `mini`, `openhands`, `native`, `codex`, `gemini`, and `claude`.
-`codex-cli`, `gemini-cli`, `claude-code`, and `claude-cli` are accepted aliases for their canonical names.
+The live executor adapter values are `manual`, `mini`, `openhands`, `native-preview`, `native`, `codex`, `gemini`, `claude`, `warp`, and configured custom CLI names.
+`codex-cli`, `gemini-cli`, `claude-code`, `claude-cli`, `warp-cli`, `oz`, and `oz-cli` are accepted aliases for their canonical names.
 
 Direct `dev run --executor <coding-client>` execution now runs the selected coding CLI and automatically runs verification after the tool returns.

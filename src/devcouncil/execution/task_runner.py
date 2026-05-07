@@ -149,7 +149,7 @@ class TaskRunner:
         """Write content to a file if allowed by permissions."""
         self._validate_path_within_root(path)
         full_path = resolve_project_path(self.project_root, path)
-        operation = "modify" if full_path.exists() else "create"
+        operation: Literal["create", "modify"] = "modify" if full_path.exists() else "create"
         self.permissions.validate_action("file_write", path, task, operation=operation)
 
         logger.info(f"Writing authorized file: {path}")

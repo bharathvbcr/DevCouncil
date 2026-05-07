@@ -6,6 +6,8 @@ Replaces scattered yaml.safe_load() calls with a single validated config service
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Dict, List
 
@@ -75,10 +77,51 @@ class LiveReviewIntegrationConfig(BaseModel):
     default_client: str = "claude"
 
 
+class WarpIntegrationConfig(BaseModel):
+    enabled: bool = False
+    command: str = "oz"
+    run_mode: str = "local"
+    mcp_config_path: str = ".devcouncil/integrations/warp-mcp.json"
+    profile: str | None = None
+    model: str | None = None
+    environment: str | None = None
+    share: List[str] = Field(default_factory=list)
+
+
+class CliAgentProfileConfig(BaseModel):
+    description: str = ""
+    timeout_seconds: int | None = None
+    prompt_preamble: str = ""
+    require_explicit_confirmation: bool = False
+
+
+class CustomCliAgentConfig(BaseModel):
+    command: str
+    args: List[str] = Field(default_factory=list)
+    input_mode: str = "stdin"
+    prompt_arg: str | None = None
+    timeout_seconds: int | None = None
+    env: Dict[str, str] = Field(default_factory=dict)
+    display_name: str | None = None
+    kind: str = "custom"
+    supports_mcp: bool = False
+    supports_diff_review: bool = False
+    default_profile: str = "default"
+    help_command: List[str] = Field(default_factory=list)
+
+
+class CliAgentsIntegrationConfig(BaseModel):
+    enabled: bool = True
+    profiles: Dict[str, CliAgentProfileConfig] = Field(default_factory=dict)
+    agents: Dict[str, CustomCliAgentConfig] = Field(default_factory=dict)
+
+
 class IntegrationsConfig(BaseModel):
     agent_flow: AgentFlowIntegrationConfig = Field(default_factory=AgentFlowIntegrationConfig)
     code_review_graph: CodeReviewGraphIntegrationConfig = Field(default_factory=CodeReviewGraphIntegrationConfig)
     live_review: LiveReviewIntegrationConfig = Field(default_factory=LiveReviewIntegrationConfig)
+    warp: WarpIntegrationConfig = Field(default_factory=WarpIntegrationConfig)
+    cli_agents: CliAgentsIntegrationConfig = Field(default_factory=CliAgentsIntegrationConfig)
 
 
 class ProviderConfig(BaseModel):
@@ -107,7 +150,7 @@ def load_config(project_root: Path = Path(".")) -> DevCouncilConfig:
     Returns DevCouncilConfig with defaults for any missing fields.
     Raises FileNotFoundError if config doesn't exist.
     """
-    import yaml
+    import yaml  # type: ignore[import-untyped]
 
     config_path = project_root / ".devcouncil" / "config.yaml"
     if not config_path.exists():
@@ -120,12 +163,18 @@ def load_config(project_root: Path = Path(".")) -> DevCouncilConfig:
 
 
 def provider_api_key_env_var(provider: str = "openrouter") -> str:
+    normalized = provider.strip().lower().replace("-", "").replace("_", "")
     env_map = {
         "openrouter": "OPENROUTER_API_KEY",
+        "vertexai": "VERTEXAI_ACCESS_TOKEN",
         "openai": "OPENAI_API_KEY",
         "anthropic": "ANTHROPIC_API_KEY",
     }
-    return env_map.get(provider, f"{provider.upper()}_API_KEY")
+    return env_map.get(normalized, f"{normalized.upper()}_API_KEY")
+
+
+def _normalized_provider_name(provider: str) -> str:
+    return provider.strip().lower().replace("-", "").replace("_", "")
 
 
 def load_local_secrets(project_root: Path = Path(".")) -> Dict[str, str]:
@@ -143,6 +192,24 @@ def load_local_secrets(project_root: Path = Path(".")) -> Dict[str, str]:
     return secrets
 
 
+def get_gcloud_access_token() -> str | None:
+    executable = shutil.which("gcloud")
+    if not executable:
+        return None
+    try:
+        token = subprocess.check_output(
+            [executable, "auth", "print-access-token"],
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        ).strip()
+    except Exception:
+        return None
+    return token or None
+
+
 def get_api_key(provider: str = "openrouter", project_root: Path = Path(".")) -> str:
     """Retrieve the API key for the configured provider from environment.
     
@@ -150,9 +217,16 @@ def get_api_key(provider: str = "openrouter", project_root: Path = Path(".")) ->
     """
     env_var = provider_api_key_env_var(provider)
     key = os.environ.get(env_var) or load_local_secrets(project_root).get(env_var)
+    if not key and _normalized_provider_name(provider) == "vertexai":
+        key = get_gcloud_access_token()
     if not key:
+        extra = (
+            " You can also authenticate with 'gcloud auth login' for vertexai."
+            if _normalized_provider_name(provider) == "vertexai"
+            else ""
+        )
         raise ValueError(
             f"API key not found. Set {env_var} in your environment or run 'dev setup'. "
-            f"Provider: {provider}"
+            f"Provider: {provider}.{extra}"
         )
     return key

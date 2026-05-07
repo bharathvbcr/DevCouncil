@@ -1,34 +1,26 @@
 import logging
 from typing import Dict
 
+from devcouncil.telemetry.pricing import pricing_for_model
+
 logger = logging.getLogger(__name__)
 
 class CostEstimator:
     """Estimates LLM usage cost based on provider pricing."""
-    
-    # Rough estimates, update for production
-    PRICING = {
-        "anthropic/claude-3.5-sonnet": {"input": 0.000003, "output": 0.000015},
-        "anthropic/claude-3-opus": {"input": 0.000015, "output": 0.000075},
-        "anthropic/claude-sonnet-4": {"input": 0.000003, "output": 0.000015},
-        "google/gemini-pro-1.5": {"input": 0.00000125, "output": 0.000005},
-        "google/gemini-2.5-pro": {"input": 0.00000125, "output": 0.00001},
-        "openai/gpt-4o": {"input": 0.000005, "output": 0.000015},
-        "openai/o3-mini": {"input": 0.0000011, "output": 0.0000044},
-    }
 
     # Conservative default for unknown models
-    DEFAULT_PRICING = {"input": 0.000005, "output": 0.000015}
+    DEFAULT_PRICING = {"prompt_per_1k": 0.005, "completion_per_1k": 0.015}
 
     @classmethod
     def estimate_cost(cls, model: str, usage: Dict[str, int]) -> float:
-        prices = cls.PRICING.get(model)
-        if not prices:
+        prices = pricing_for_model(model, cls.DEFAULT_PRICING)
+        if prices == cls.DEFAULT_PRICING:
             logger.debug("Unknown model for cost estimation: %s — using default pricing", model)
-            prices = cls.DEFAULT_PRICING
             
         prompt_tokens = usage.get("prompt_tokens", 0)
         completion_tokens = usage.get("completion_tokens", 0)
         
-        cost = (prompt_tokens * prices["input"]) + (completion_tokens * prices["output"])
+        cost = ((prompt_tokens / 1000.0) * prices["prompt_per_1k"]) + (
+            (completion_tokens / 1000.0) * prices["completion_per_1k"]
+        )
         return cost

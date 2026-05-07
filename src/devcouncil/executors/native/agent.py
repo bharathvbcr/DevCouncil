@@ -1,4 +1,5 @@
 from typing import List, Dict, Any
+import asyncio
 from rich.console import Console
 from pydantic import BaseModel
 from devcouncil.domain.task import Task
@@ -26,8 +27,13 @@ class NativeAgent(Executor):
         self.task_runner = task_runner
         self.context_builder = ContextBuilder(task_runner.project_root)
 
-    async def run_task(self, task: Task, requirements: List[Requirement]) -> ExecutionResult:
+    def run_task(self, task: Task, requirements: List[Requirement]) -> ExecutionResult:
+        """Run the preview native executor behind the normal synchronous executor contract."""
+        return asyncio.run(self._run_task_async(task, requirements))
+
+    async def _run_task_async(self, task: Task, requirements: List[Requirement]) -> ExecutionResult:
         console.print(f"Starting [bold]Native Executor[/bold] for task {task.id}...")
+        console.print("[yellow]Native executor is preview quality; DevCouncil verification remains the completion gate.[/yellow]")
         
         # 1. Gather rich context
         context_json = self.context_builder.build_task_context(task, requirements)
@@ -66,7 +72,7 @@ Rules:
             
             if action.finish:
                 console.print("[green]Native agent signaled completion.[/green]")
-                return ExecutionResult(success=True, message="Agent signaled completion")
+                return ExecutionResult(success=True, message="Agent signaled completion; pending DevCouncil verification")
 
             for tool_call in action.tool_calls:
                 result_summary = ""

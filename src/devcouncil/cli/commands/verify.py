@@ -62,9 +62,9 @@ def verify(
             config = load_config(root)
             validate_model_provider(config.models.provider)
             api_key = get_api_key(config.models.provider, root)
-            provider = create_provider(config.models.provider, api_key)
+            provider = create_provider(config.models.provider, api_key, project_root=root)
             role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
-            router = ModelRouter(provider, role_config)
+            router = ModelRouter(provider, role_config, project_root=root)
         except Exception:
             pass
 

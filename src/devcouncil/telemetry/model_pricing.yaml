@@ -1,0 +1,21 @@
+anthropic/claude-3-opus:
+  prompt_per_1k: 0.015
+  completion_per_1k: 0.075
+anthropic/claude-3.5-sonnet:
+  prompt_per_1k: 0.003
+  completion_per_1k: 0.015
+anthropic/claude-sonnet-4:
+  prompt_per_1k: 0.003
+  completion_per_1k: 0.015
+google/gemini-pro-1.5:
+  prompt_per_1k: 0.00125
+  completion_per_1k: 0.005
+google/gemini-2.5-pro:
+  prompt_per_1k: 0.00125
+  completion_per_1k: 0.01
+openai/gpt-4o:
+  prompt_per_1k: 0.005
+  completion_per_1k: 0.015
+openai/o3-mini:
+  prompt_per_1k: 0.0011
+  completion_per_1k: 0.0044

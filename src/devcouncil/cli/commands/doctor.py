@@ -6,7 +6,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from devcouncil.app.config import load_config, load_local_secrets, provider_api_key_env_var
+from devcouncil.app.config import get_gcloud_access_token, load_config, load_local_secrets, provider_api_key_env_var
 from devcouncil.llm.provider import SUPPORTED_MODEL_PROVIDERS, validate_model_provider
 
 app = typer.Typer()
@@ -116,8 +116,31 @@ def render_doctor_check(project_root: Path = Path(".")):
         table.add_row(env_var, "[green]OK[/green]", f"Found in environment for {provider}.")
     elif local_secrets.get(env_var):
         table.add_row(env_var, "[green]OK[/green]", f"Found in .devcouncil/secrets.env for {provider}.")
+    elif provider == "vertexai" and get_gcloud_access_token():
+        table.add_row(env_var, "[green]OK[/green]", "Resolvable via gcloud auth print-access-token.")
+        table.caption = "Resolvable via gcloud auth print-access-token."
     else:
         table.add_row(env_var, "[yellow]Missing[/yellow]", f"Required if using {provider} provider. Run 'dev setup'.")
+
+    if provider == "vertexai":
+        project = (
+            os.environ.get("VERTEXAI_PROJECT")
+            or os.environ.get("GOOGLE_CLOUD_PROJECT")
+            or local_secrets.get("VERTEXAI_PROJECT")
+            or local_secrets.get("GOOGLE_CLOUD_PROJECT")
+        )
+        if project:
+            source = "environment" if os.environ.get("VERTEXAI_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT") else ".devcouncil/secrets.env"
+            table.add_row("VERTEXAI_PROJECT", "[green]OK[/green]", f"Found in {source}.")
+        else:
+            table.add_row(
+                "VERTEXAI_PROJECT",
+                "[yellow]Missing[/yellow]",
+                "Required for vertexai. Run 'dev setup --provider vertexai --vertex-project PROJECT_ID'.",
+            )
+
+        location = os.environ.get("VERTEXAI_LOCATION") or local_secrets.get("VERTEXAI_LOCATION", "global")
+        table.add_row("VERTEXAI_LOCATION", "[green]OK[/green]", location)
 
     console.print(table)
 

@@ -27,6 +27,7 @@
     "bin/",
     "src/**/*.py",
     "src/**/*.md",
+    "src/**/*.yaml",
     "pyproject.toml",
     "uv.lock",
     "README.md",
@@ -37,9 +38,12 @@
     "install:editable": "uv pip install -e .",
     "dev": "uv run devcouncil",
     "pack:check": "npm pack --dry-run",
+    "smoke:wheel": "uv run python scripts/check-wheel-assets.py",
+    "smoke:package": "node scripts/npm-runtime-smoke.mjs",
     "test": "uv run pytest",
     "lint": "uv run ruff check .",
-    "check": "uv run ruff check . && uv run pytest"
+    "typecheck": "uv run mypy src",
+    "check": "uv run ruff check . && uv run mypy src && uv run pytest"
   },
   "engines": {
     "node": ">=18"

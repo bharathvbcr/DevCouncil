@@ -2,12 +2,7 @@ import json
 from pathlib import Path
 from typing import Dict, Any
 
-COST_PER_1K_TOKENS = {
-    "anthropic/claude-3-opus": {"prompt": 0.015, "completion": 0.075},
-    "anthropic/claude-3.5-sonnet": {"prompt": 0.003, "completion": 0.015},
-    "openai/gpt-4o": {"prompt": 0.005, "completion": 0.015},
-    "google/gemini-pro-1.5": {"prompt": 0.00125, "completion": 0.00375},
-}
+from devcouncil.telemetry.pricing import pricing_for_model
 
 class TelemetryTracker:
     def __init__(self, project_root: Path):
@@ -32,8 +27,10 @@ class TelemetryTracker:
         prompt_tokens = usage.get("prompt_tokens", 0)
         completion_tokens = usage.get("completion_tokens", 0)
 
-        rates = COST_PER_1K_TOKENS.get(model, {"prompt": 0.0, "completion": 0.0})
-        cost = (prompt_tokens / 1000.0) * rates["prompt"] + (completion_tokens / 1000.0) * rates["completion"]
+        rates = pricing_for_model(model)
+        cost = (prompt_tokens / 1000.0) * rates["prompt_per_1k"] + (
+            completion_tokens / 1000.0
+        ) * rates["completion_per_1k"]
 
         self.stats["total_cost"] += cost
         self.stats["total_prompt_tokens"] += prompt_tokens

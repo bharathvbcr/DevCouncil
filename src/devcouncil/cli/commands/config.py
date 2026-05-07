@@ -2,8 +2,14 @@ import typer
 import yaml
 from pathlib import Path
 from rich.console import Console
+from devcouncil.cli.commands.init import parse_role_model_overrides
 from devcouncil.app.config import load_config
-from devcouncil.llm.provider import SUPPORTED_MODEL_PROVIDERS, validate_model_provider
+from devcouncil.llm.provider import (
+    SUPPORTED_MODEL_PROVIDERS,
+    apply_provider_default_role_models,
+    build_role_model_config,
+    validate_model_provider,
+)
 
 app = typer.Typer(help="Manage DevCouncil configuration")
 console = Console()
@@ -11,20 +17,33 @@ console = Console()
 @app.command("models")
 def models(
     role: str = typer.Option(None, "--role", "-r", help="Specific role to show/edit"),
-    model: str = typer.Option(None, "--model", "-m", help="New model string to set for the role"),
+    model: str = typer.Option(None, "--model", "-m", help="New model string to set for the role, or every role when --role is omitted."),
     provider: str = typer.Option(None, "--provider", help="Set the model provider."),
+    role_model: list[str] | None = typer.Option(
+        None,
+        "--role-model",
+        help="Per-role model override in ROLE=MODEL form. Can be repeated.",
+    ),
+    project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
 ):
     """View or edit model role configuration."""
+    root = project_root.expanduser().resolve()
     try:
-        load_config(Path("."))
+        load_config(root)
     except FileNotFoundError as e:
         console.print(f"[red]{e}[/red]")
         return
 
-    config_path = Path(".devcouncil/config.yaml")
+    config_path = root / ".devcouncil" / "config.yaml"
     
     with open(config_path) as f:
         raw_config = yaml.safe_load(f) or {}
+
+    try:
+        role_models = parse_role_model_overrides(role_model)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2) from e
 
     if provider:
         try:
@@ -35,12 +54,32 @@ def models(
         raw_config.setdefault("models", {})
         previous = raw_config["models"].get("provider", "openrouter")
         raw_config["models"]["provider"] = normalized_provider
+        updated_role_defaults = apply_provider_default_role_models(raw_config, previous, normalized_provider)
         with open(config_path, "w") as f:
             yaml.dump(raw_config, f, default_flow_style=False)
         if previous == normalized_provider:
             console.print(f"[green]Model provider remains '{normalized_provider}'.[/green]")
         else:
             console.print(f"[green]Updated model provider from '{previous}' to '{normalized_provider}'.[/green]")
+        if updated_role_defaults:
+            console.print(f"[green]Updated default role models for '{normalized_provider}'.[/green]")
+        if not model and not role_models:
+            return
+
+    if not role and (model or role_models):
+        raw_config.setdefault("models", {})
+        configured_provider = validate_model_provider(raw_config["models"].get("provider", "openrouter"))
+        raw_config["models"]["roles"] = build_role_model_config(
+            configured_provider,
+            model=model,
+            role_models=role_models,
+        )
+        with open(config_path, "w") as f:
+            yaml.dump(raw_config, f, default_flow_style=False)
+        if model:
+            console.print(f"[green]Updated all model roles to use '{model}'.[/green]")
+        for selected_role, selected_model in role_models.items():
+            console.print(f"[green]Updated '{selected_role}' to use model '{selected_model}'.[/green]")
         return
 
     if not role:

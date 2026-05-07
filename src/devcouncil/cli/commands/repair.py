@@ -14,9 +14,10 @@ from pathlib import Path
 app = typer.Typer()
 console = Console()
 
-async def run_repair_flow():
-    initialize_project(Path("."), quiet=True)
-    db = get_db()
+async def run_repair_flow(project_root: Path = Path(".")):
+    root = project_root.expanduser().resolve()
+    initialize_project(root, quiet=True)
+    db = get_db(root)
     if not db:
         console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
         return
@@ -36,18 +37,18 @@ async def run_repair_flow():
 
         # Load router
         try:
-            config = load_config(Path("."))
+            config = load_config(root)
             validate_model_provider(config.models.provider)
-            api_key = get_api_key(config.models.provider, Path("."))
+            api_key = get_api_key(config.models.provider, root)
         except (FileNotFoundError, ValueError) as e:
             console.print(f"[red]{e}[/red]")
             return
         
-        provider = create_provider(config.models.provider, api_key)
+        provider = create_provider(config.models.provider, api_key, project_root=root)
         role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
-        router = ModelRouter(provider, role_config)
+        router = ModelRouter(provider, role_config, project_root=root)
         repair_service = RepairService(router)
-        context_builder = ContextBuilder(Path("."))
+        context_builder = ContextBuilder(root)
         
         # Build minimal context for repair.
         project_context = context_builder.get_structure_summary()
@@ -62,11 +63,14 @@ async def run_repair_flow():
         console.print(f"\n[green]Successfully generated {len(repair_output.suggested_tasks)} repair tasks.[/green]")
 
 @app.callback(invoke_without_command=True)
-def repair(ctx: typer.Context):
+def repair(
+    ctx: typer.Context,
+    project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
+):
     """
     Convert blocking gaps into intelligent repair tasks using LLM inference.
     """
     if ctx.invoked_subcommand is not None:
         return
 
-    asyncio.run(run_repair_flow())
+    asyncio.run(run_repair_flow(project_root))
