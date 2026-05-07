@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from importlib import resources
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -9,6 +10,12 @@ from devcouncil.app.project_status import compute_phase
 from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import ArtifactGraphRepository, StateRepository, TaskRepository
 from devcouncil.telemetry.traces import read_trace_events
+
+LOGO_ASSET = "devcouncil-logo.svg"
+
+
+def logo_svg() -> str:
+    return resources.files("devcouncil.assets").joinpath(LOGO_ASSET).read_text(encoding="utf-8")
 
 
 def dashboard_payload(project_root: Path) -> dict:
@@ -38,11 +45,14 @@ def dashboard_html() -> str:
   <title>DevCouncil Dashboard</title>
   <style>
     body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f7f7f5; color: #202124; }
-    header { padding: 20px 28px; border-bottom: 1px solid #d9d9d4; background: #ffffff; display: flex; align-items: center; justify-content: space-between; }
+    header { padding: 18px 28px; border-bottom: 1px solid #d9d9d4; background: #ffffff; display: flex; align-items: center; justify-content: space-between; gap: 18px; }
     main { padding: 24px 28px; display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
     section { background: #ffffff; border: 1px solid #d9d9d4; border-radius: 8px; padding: 16px; }
     h1 { font-size: 20px; margin: 0; }
     h2 { font-size: 15px; margin: 0 0 12px; }
+    .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .brand img { width: 54px; height: 54px; flex: 0 0 auto; filter: drop-shadow(0 8px 12px rgba(12, 36, 52, 0.22)); }
+    .phase-line { white-space: nowrap; }
     .phase { font-weight: 700; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { text-align: left; border-bottom: 1px solid #ededeb; padding: 8px; vertical-align: top; }
@@ -51,7 +61,7 @@ def dashboard_html() -> str:
   </style>
 </head>
 <body>
-  <header><h1>DevCouncil Dashboard</h1><div>Phase: <span id="phase" class="phase">loading</span></div></header>
+  <header><div class="brand"><img src="/assets/devcouncil-logo.svg" alt="DevCouncil logo"><h1>DevCouncil Dashboard</h1></div><div class="phase-line">Phase: <span id="phase" class="phase">loading</span></div></header>
   <main>
     <section><h2>Coverage</h2><pre id="coverage">{}</pre></section>
     <section><h2>Tasks</h2><table><thead><tr><th>ID</th><th>Status</th><th>Title</th></tr></thead><tbody id="tasks"></tbody></table></section>
@@ -92,6 +102,15 @@ def run_dashboard(project_root: Path, host: str = "127.0.0.1", port: int = 8765)
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
             parsed = urlparse(self.path)
+            if parsed.path == f"/assets/{LOGO_ASSET}":
+                body = logo_svg().encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if parsed.path == "/api/status":
                 body = json.dumps(dashboard_payload(project_root)).encode("utf-8")
                 self.send_response(200)

@@ -27,6 +27,7 @@
     "bin/",
     "src/**/*.py",
     "src/**/*.md",
+    "src/**/*.svg",
     "src/**/*.yaml",
     "pyproject.toml",
     "uv.lock",

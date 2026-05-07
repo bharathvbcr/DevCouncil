@@ -56,6 +56,7 @@ try {
   assertOk(pack, "npm pack");
   const packed = JSON.parse(pack.stdout);
   const packMetadata = packed[0];
+  assertPackedFile(packMetadata, "src/devcouncil/assets/devcouncil-logo.svg");
   assertPackedFile(packMetadata, "src/devcouncil/llm/model_defaults.yaml");
   assertPackedFile(packMetadata, "src/devcouncil/telemetry/model_pricing.yaml");
   packedTarball = path.join(repoRoot, packMetadata.filename);
