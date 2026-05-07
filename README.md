@@ -1,6 +1,6 @@
 # DevCouncil: The Gated AI Orchestrator
 
-<p align="center"> <img src="src/devcouncil/assets/devcouncil-logo.svg" alt="DevCouncil Logo" width="300"> </p>
+<p align="center"> <img src="src/devcouncil/assets/devcouncil_logo_3d.png" alt="DevCouncil Logo" width="300"> </p>
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
