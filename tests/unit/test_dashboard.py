@@ -41,7 +41,7 @@ def test_dashboard_logo_asset_is_packaged_svg():
     svg = logo_svg()
 
     assert svg.startswith("<svg")
-    assert "#FF2A35" in svg
+    assert "#ff3333" in svg
     assert "#000000" in svg
     assert "linearGradient" in svg
 
