@@ -37,3 +37,4 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel.force-include]
 "src/devcouncil/llm/model_defaults.yaml" = "devcouncil/llm/model_defaults.yaml"
 "src/devcouncil/telemetry/model_pricing.yaml" = "devcouncil/telemetry/model_pricing.yaml"
+"src/devcouncil/assets/devcouncil-logo.svg" = "devcouncil/assets/devcouncil-logo.svg"
