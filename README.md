@@ -148,8 +148,8 @@ flowchart TD
     router --> planning
 
     planning --> storage["SQLite + repositories\nrequirements, tasks, gaps, evidence, state"]
-    storage --> graph["Artifact graph\nRequirement -> Task -> Diff -> Evidence"]
-    graph --> gates["Gate policy\nplanned files, commands, secret checks"]
+    storage --> artifactGraph["Artifact graph\nRequirement -> Task -> Diff -> Evidence"]
+    artifactGraph --> gates["Gate policy\nplanned files, commands, secret checks"]
 
     gates --> manual["Manual sidecar\ndev prompt + user agent edits"]
     gates --> coding["Coding CLI executor\nCodex, Gemini, Claude, Warp, custom CLIs"]
@@ -170,7 +170,7 @@ flowchart TD
 
     cli --> mcp["MCP server\ndev mcp-server"]
     mcp --> storage
-    mcp --> graph
+    mcp --> artifactGraph
     mcp --> repair
 
     cli --> live["Live review\ndev watch"]
