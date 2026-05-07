@@ -48,7 +48,9 @@ coverage.xml
 *.cover
 *.py,cover
 .hypothesis/
+.mypy_cache/
 .pytest_cache/
+.ruff_cache/
 cover/
 
 # Environments
