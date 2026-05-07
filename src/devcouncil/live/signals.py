@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,9 +43,8 @@ def write_signal(project_root: Path, client: str, payload: dict[str, Any]) -> Pa
         review_command=_review_command(client.lower(), transcript_path, task_id),
     )
     key = transcript_path or session_id or json.dumps(payload, sort_keys=True, default=str)
-    import hashlib
 
-    digest = hashlib.sha1(key.encode("utf-8", errors="replace")).hexdigest()[:12]
+    digest = hashlib.sha256(key.encode("utf-8", errors="replace")).hexdigest()[:12]
     path = directory / f"{client.lower()}-{digest}.json"
     signal.path = str(path)
     path.write_text(signal.model_dump_json(indent=2) + "\n", encoding="utf-8")

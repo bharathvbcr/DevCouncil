@@ -397,15 +397,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 return _error_text(f"{arg_name} must be a string", code="invalid_arguments", argument=arg_name)
 
         limit = _int_argument(arguments, "limit", 20, minimum=1, maximum=200)
-        filtered, error, argument = filter_cards(
+        filtered, filter_error, argument = filter_cards(
             load_cards(root),
             task_id=task_id,
             status=status,
             verdict=verdict,
             client=client,
         )
-        if error:
-            return _error_text(error, code="invalid_arguments", argument=argument)
+        if filter_error:
+            return _error_text(filter_error, code="invalid_arguments", argument=argument)
 
         total = len(filtered)
         return [TextContent(
@@ -424,9 +424,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         )]
 
     elif name == "devcouncil_live_repair_prompt":
-        card_id, error = _required_string_argument(arguments, "card_id")
-        if error:
-            return error
+        card_id, arg_error = _required_string_argument(arguments, "card_id")
+        if arg_error:
+            return arg_error
+        assert card_id is not None
         card = get_card(root, card_id)
         if not card:
             return _error_text(f"Critique card {card_id} not found.", code="not_found", card_id=card_id)
@@ -448,21 +449,22 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             for item in summary["blocking_cards"]
             if isinstance(item.get("id"), str)
         ]
-        cards = [card for card in cards if card is not None]
+        resolved_cards = [card for card in cards if card is not None]
         return [TextContent(
             type="text",
             text=json.dumps({
                 "scope_task_id": summary["scope_task_id"],
-                "cards": [card.model_dump() for card in cards],
-                "prompt": build_bulk_live_repair_prompt(root, cards),
+                "cards": [card.model_dump() for card in resolved_cards],
+                "prompt": build_bulk_live_repair_prompt(root, resolved_cards),
             }, indent=2),
         )]
             
     elif name == "devcouncil_get_task":
         assert db is not None
-        task_id, error = _required_string_argument(arguments, "task_id")
-        if error:
-            return error
+        task_id, arg_error = _required_string_argument(arguments, "task_id")
+        if arg_error:
+            return arg_error
+        assert task_id is not None
             
         with db.get_session() as session:
             task_repo = TaskRepository(session)
@@ -482,9 +484,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     elif name == "devcouncil_get_prompt":
         assert db is not None
-        task_id, error = _required_string_argument(arguments, "task_id")
-        if error:
-            return error
+        task_id, arg_error = _required_string_argument(arguments, "task_id")
+        if arg_error:
+            return arg_error
+        assert task_id is not None
 
         with db.get_session() as session:
             task_repo = TaskRepository(session)
@@ -506,9 +509,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     elif name == "devcouncil_policy_check_write":
         assert db is not None
-        path, error = _required_string_argument(arguments, "path")
-        if error:
-            return error
+        path, arg_error = _required_string_argument(arguments, "path")
+        if arg_error:
+            return arg_error
+        assert path is not None
         task_id = _optional_string_argument(arguments, "task_id")
         if task_id == "":
             return _error_text("task_id must be a string", code="invalid_arguments", argument="task_id")
@@ -570,9 +574,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     elif name == "devcouncil_prepare_execution":
         assert db is not None
-        task_id, error = _required_string_argument(arguments, "task_id")
-        if error:
-            return error
+        task_id, arg_error = _required_string_argument(arguments, "task_id")
+        if arg_error:
+            return arg_error
+        assert task_id is not None
         with db.get_session() as session:
             task_repo = TaskRepository(session)
             req_repo = RequirementRepository(session)

@@ -2,7 +2,7 @@
 
 This is the shortest path for a new developer who wants to install DevCouncil, initialize a repository, connect a coding CLI, and run the first gated task.
 
-Run DevCouncil commands in a normal terminal from the root of the repository you want DevCouncil to manage. Do not run these commands inside the coding CLI chat. Later, you paste the generated `dev prompt TASK-ID` output into Codex, Gemini, Claude Code, Cursor, or Aider.
+Run DevCouncil commands in a normal terminal from the root of the repository you want DevCouncil to manage. Do not run these commands inside the coding CLI chat. Later, you paste the generated `dev prompt TASK-ID` output into Codex, Gemini, Claude Code, Warp, Cursor, Aider, or another registered CLI agent.
 
 ## Where To Run Commands
 
@@ -80,7 +80,27 @@ To set the provider at the same time:
 dev setup --provider openrouter --api-key YOUR_KEY
 ```
 
-Current model-backed DevCouncil commands support the `openrouter` provider.
+To choose models during initialization, pass one model for every role, then add per-role overrides only where needed:
+
+```bash
+dev setup --provider vertexai --model YOUR_DEFAULT_MODEL --role-model critic_a=YOUR_CRITIC_MODEL
+```
+
+Current model-backed DevCouncil commands support the `openrouter` and `vertexai` providers. Vertex AI uses a Google Cloud access token plus project configuration:
+
+```bash
+export VERTEXAI_PROJECT=your-gcp-project
+export VERTEXAI_LOCATION=global
+dev setup --provider vertexai --api-key "$(gcloud auth print-access-token)"
+```
+
+You can also store Vertex project settings locally:
+
+```bash
+dev setup --provider vertexai --vertex-project your-gcp-project --vertex-location global --api-key "$(gcloud auth print-access-token)"
+```
+
+If `VERTEXAI_ACCESS_TOKEN` is not configured, DevCouncil can use `gcloud auth print-access-token` automatically after `gcloud auth login`.
 
 Most other entry commands (`dev map`, `dev plan`, `dev run`, `dev status`, `dev verify`, etc.) now auto-initialize the project state if `.devcouncil/` is missing.
 
@@ -92,7 +112,7 @@ dev setup --integrate
 
 Fresh interactive setup prompts to apply supported coding CLI integrations immediately. Use `dev setup --skip-integrations` to defer that step.
 
-`dev run --executor <client>` can be used for supported direct CLI execution modes (`codex`, `gemini`, `claude` and their aliases), and it now performs verification after the tool exits.
+`dev run --executor <client>` can be used for supported direct CLI execution modes (`codex`, `gemini`, `claude`, `warp`, configured custom CLI agents, and their aliases), and it now performs verification after the tool exits.
 
 To apply supported MCP integrations for detected clients:
 
@@ -114,13 +134,13 @@ For a coding agent or CI-style integration with a supported executor installed, 
 dev e2e "Add password reset with expiring single-use tokens" --executor codex
 ```
 
-This is equivalent to `dev go`: it auto-initializes DevCouncil state if needed, plans the goal, executes approved tasks with the selected executor, verifies each task, and prints the final report. If `--executor` is omitted, DevCouncil uses `execution.default_executor` from `.devcouncil/config.yaml`. Use `--executor gemini`, `--executor claude`, `--executor native`, `--executor mini`, or `--executor openhands` when that executor is installed and configured.
+This is equivalent to `dev go`: it auto-initializes DevCouncil state if needed, plans the goal, executes approved tasks with the selected executor, verifies each task, and prints the final report. If `--executor` is omitted, DevCouncil uses `execution.default_executor` from `.devcouncil/config.yaml`. Use `--executor gemini`, `--executor claude`, `--executor warp`, `--executor native-preview`, `--executor mini`, or `--executor openhands` when that executor is installed and configured.
 
 For coding agents that should avoid scraping terminal output, write the final JSON report to a file:
 
 ```bash
-dev e2e "Add password reset with expiring single-use tokens" --agent
-dev e2e "Add password reset with expiring single-use tokens" --json --report-file .devcouncil/reports/latest.json
+dev e2e "Add password reset with expiring single-use tokens" --executor codex --agent
+dev e2e "Add password reset with expiring single-use tokens" --executor codex --json --report-file .devcouncil/reports/latest.json
 ```
 
 Create a plan:
@@ -149,8 +169,19 @@ Paste the output of that command into your coding CLI, or run directly through D
 dev run TASK-001 --executor codex
 dev run TASK-001 --executor gemini
 dev run TASK-001 --executor claude
+dev run TASK-001 --executor warp
 ```
-Aliases such as `codex-cli`, `gemini-cli`, `claude-code`, and `claude-cli` are also accepted for direct DevCouncil execution mode.
+Aliases such as `codex-cli`, `gemini-cli`, `claude-code`, `claude-cli`, `warp-cli`, `oz`, and `oz-cli` are also accepted for direct DevCouncil execution mode.
+
+To bring your own CLI agent:
+
+```bash
+dev agents add myagent --command myagent --arg run --input-mode stdin
+dev agents doctor
+dev agents run TASK-001 --agent myagent --profile default
+```
+
+Use `--profile yolo` for faster local runs that are still verified by DevCouncil, or `--profile prod` for restrictive prompts in high-risk repositories. The older `dev integrate cli-agent ... --apply` command still writes the same agent registry for compatibility.
 
 Keep running DevCouncil verification commands in the same terminal at the repository root.
 `dev run` executes coding-client adapters and automatically verifies changes after each run.

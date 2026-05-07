@@ -31,14 +31,17 @@ class TraceEvent(BaseModel):
     def from_legacy(cls, raw: Dict[str, Any]) -> "TraceEvent":
         if raw.get("schema") == TRACE_SCHEMA_VERSION:
             return cls.model_validate(raw)
-        details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
-        task_id = details.get("task_id") if isinstance(details.get("task_id"), str) else None
-        summary = details.get("summary") if isinstance(details.get("summary"), str) else ""
+        raw_details = raw.get("details")
+        details: Dict[str, Any] = raw_details if isinstance(raw_details, dict) else {}
+        raw_task_id = details.get("task_id")
+        raw_summary = details.get("summary")
+        raw_run_id = raw.get("run_id")
         return cls(
+            schema=TRACE_SCHEMA_VERSION,
             type=str(raw.get("type", "legacy_event")),
-            run_id=raw.get("run_id"),
-            task_id=task_id,
-            summary=summary,
+            run_id=raw_run_id if isinstance(raw_run_id, str) else None,
+            task_id=raw_task_id if isinstance(raw_task_id, str) else None,
+            summary=raw_summary if isinstance(raw_summary, str) else "",
             details=details,
         )
 
@@ -61,6 +64,7 @@ class TraceLogger:
     ) -> TraceEvent:
         """Append an orchestration event trace."""
         trace = TraceEvent(
+            schema=TRACE_SCHEMA_VERSION,
             type=event_type,
             details=details,
             run_id=run_id,

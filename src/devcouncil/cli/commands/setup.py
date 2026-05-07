@@ -8,18 +8,19 @@ import yaml
 from rich.console import Console
 from rich.panel import Panel
 
-from devcouncil.app.config import load_config, load_local_secrets, provider_api_key_env_var
+from devcouncil.app.config import get_gcloud_access_token, load_config, load_local_secrets, provider_api_key_env_var
 from devcouncil.cli.commands.doctor import render_doctor_check
-from devcouncil.cli.commands.init import initialize_project
+from devcouncil.cli.commands.init import initialize_project, parse_role_model_overrides
 from devcouncil.cli.commands.integrate import (
     _claude_command,
     _codex_command,
     _configure_native_hooks,
+    _configure_warp,
     _configure,
     _cursor_command,
     _gemini_command,
 )
-from devcouncil.llm.provider import validate_model_provider
+from devcouncil.llm.provider import apply_provider_default_role_models, build_role_model_config, validate_model_provider
 
 app = typer.Typer()
 console = Console()
@@ -32,9 +33,36 @@ def _set_model_provider(project_root: Path, provider: str) -> None:
     raw_config.setdefault("models", {})
     previous = raw_config["models"].get("provider", "openrouter")
     raw_config["models"]["provider"] = normalized
+    updated_role_defaults = apply_provider_default_role_models(raw_config, previous, normalized)
     config_path.write_text(yaml.dump(raw_config, default_flow_style=False), encoding="utf-8")
     if previous != normalized:
         console.print(f"[green]Updated model provider from {previous} to {normalized}.[/green]")
+    if updated_role_defaults:
+        console.print(f"[green]Updated default role models for {normalized}.[/green]")
+
+
+def _set_model_roles(
+    project_root: Path,
+    model: str | None = None,
+    role_models: dict[str, str] | None = None,
+) -> None:
+    if not model and not role_models:
+        return
+
+    config_path = project_root / ".devcouncil" / "config.yaml"
+    raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    raw_config.setdefault("models", {})
+    provider = validate_model_provider(raw_config["models"].get("provider", "openrouter"))
+    raw_config["models"]["roles"] = build_role_model_config(
+        provider,
+        model=model,
+        role_models=role_models,
+    )
+    config_path.write_text(yaml.dump(raw_config, default_flow_style=False), encoding="utf-8")
+    if model:
+        console.print(f"[green]Updated all model roles to use {model}.[/green]")
+    for role, selected_model in (role_models or {}).items():
+        console.print(f"[green]Updated {role} to use {selected_model}.[/green]")
 
 
 def _write_local_secret(project_root: Path, env_var: str, value: str) -> Path:
@@ -54,6 +82,35 @@ def _write_local_secret(project_root: Path, env_var: str, value: str) -> Path:
     return path
 
 
+def _configure_vertexai_settings(
+    project_root: Path,
+    provider: str,
+    vertex_project: str | None,
+    vertex_location: str | None,
+) -> None:
+    if provider != "vertexai":
+        return
+
+    local_secrets = load_local_secrets(project_root)
+    if vertex_project:
+        _write_local_secret(project_root, "VERTEXAI_PROJECT", vertex_project)
+        console.print("[green]Saved VERTEXAI_PROJECT to .devcouncil/secrets.env.[/green]")
+    elif not (
+        os.environ.get("VERTEXAI_PROJECT")
+        or os.environ.get("GOOGLE_CLOUD_PROJECT")
+        or local_secrets.get("VERTEXAI_PROJECT")
+        or local_secrets.get("GOOGLE_CLOUD_PROJECT")
+    ):
+        console.print(
+            "[yellow]VERTEXAI_PROJECT is not set. "
+            "Set it in your shell or rerun setup with --vertex-project PROJECT_ID.[/yellow]"
+        )
+
+    if vertex_location:
+        _write_local_secret(project_root, "VERTEXAI_LOCATION", vertex_location)
+        console.print("[green]Saved VERTEXAI_LOCATION to .devcouncil/secrets.env.[/green]")
+
+
 def _configure_api_key(project_root: Path, api_key: str | None, skip_api_key: bool) -> None:
     config = load_config(project_root)
     provider = config.models.provider
@@ -69,6 +126,9 @@ def _configure_api_key(project_root: Path, api_key: str | None, skip_api_key: bo
     if api_key:
         _write_local_secret(project_root, env_var, api_key)
         console.print(f"[green]Saved {env_var} to .devcouncil/secrets.env.[/green]")
+        return
+    if provider == "vertexai" and get_gcloud_access_token():
+        console.print("[green]Vertex AI access token is available from gcloud auth print-access-token.[/green]")
         return
     if skip_api_key:
         console.print(f"[yellow]Skipped {env_var} setup. Model-backed commands will ask again if it is missing.[/yellow]")
@@ -117,6 +177,7 @@ def _configure_coding_cli_integrations(project_root: Path, apply: bool, gemini_s
             console.print(f"[yellow]{tool} CLI not found on PATH. Skipping optional integration.[/yellow]")
             continue
         results.append(_configure(tool, command, apply))
+    results.append(_configure_warp(project_root, apply))
     _configure_native_hooks(project_root, "all", apply)
     if apply and any(not ok for ok in results):
         raise typer.Exit(code=1)
@@ -157,7 +218,15 @@ def setup(
     apply: bool = typer.Option(False, "--apply", help="Apply integration config instead of previewing commands."),
     gemini_scope: str = typer.Option("project", "--gemini-scope", help="Gemini MCP config scope: project or user."),
     provider: str | None = typer.Option(None, "--provider", help="Set models.provider before configuring the API key."),
+    model: str | None = typer.Option(None, "--model", "-m", help="Model id to use for every default role."),
+    role_model: list[str] | None = typer.Option(
+        None,
+        "--role-model",
+        help="Per-role model override in ROLE=MODEL form. Can be repeated.",
+    ),
     api_key: str | None = typer.Option(None, "--api-key", help="Store the configured provider API key in local .devcouncil/secrets.env."),
+    vertex_project: str | None = typer.Option(None, "--vertex-project", help="Store VERTEXAI_PROJECT for the vertexai provider."),
+    vertex_location: str | None = typer.Option(None, "--vertex-location", help="Store VERTEXAI_LOCATION for the vertexai provider. Defaults to global."),
     skip_api_key: bool = typer.Option(False, "--skip-api-key", help="Skip the first-run model API key prompt."),
     skip_integrations: bool = typer.Option(False, "--skip-integrations", help="Skip the first-run coding CLI integration prompt."),
 ):
@@ -174,7 +243,20 @@ def setup(
         raise typer.Exit(code=2)
 
     root = project_root.expanduser().resolve()
-    created = initialize_project(root, project_name=name)
+    try:
+        role_models = parse_role_model_overrides(role_model)
+        initial_provider = validate_model_provider(provider) if provider else "openrouter"
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2) from e
+
+    created = initialize_project(
+        root,
+        project_name=name,
+        model_provider=initial_provider,
+        model=model,
+        role_models=role_models,
+    )
     if not created:
         console.print(f"[yellow]DevCouncil is already initialized at {root / '.devcouncil'}.[/yellow]")
 
@@ -185,6 +267,10 @@ def setup(
             console.print(f"[red]{e}[/red]")
             raise typer.Exit(code=2) from e
 
+    _set_model_roles(root, model=model, role_models=role_models)
+
+    configured_provider = load_config(root).models.provider
+    _configure_vertexai_settings(root, configured_provider, vertex_project, vertex_location)
     _configure_api_key(root, api_key, skip_api_key)
 
     console.print()

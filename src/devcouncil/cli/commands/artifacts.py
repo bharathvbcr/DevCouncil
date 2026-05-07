@@ -14,10 +14,13 @@ console = Console()
 
 
 @app.command(name="validate")
-def validate():
+def validate(
+    project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
+):
     """Validate requirements and tasks stored in the artifact graph."""
-    initialize_project(Path("."), quiet=True)
-    db = get_db()
+    root = project_root.expanduser().resolve()
+    initialize_project(root, quiet=True)
+    db = get_db(root)
     if not db:
         console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
         raise typer.Exit(code=1)

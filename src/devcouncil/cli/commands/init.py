@@ -1,4 +1,5 @@
 import copy
+from typing import Any
 import typer
 import yaml
 from rich.console import Console
@@ -6,6 +7,7 @@ from pathlib import Path
 from devcouncil.storage.db import Database
 from devcouncil.integrations.gitnexus import GitNexusIntegration
 from devcouncil.integrations.graphify import GraphifyIntegration
+from devcouncil.llm.provider import build_role_model_config, validate_model_provider
 
 app = typer.Typer()
 console = Console()
@@ -18,18 +20,7 @@ DEFAULT_CONFIG = {
     },
     "models": {
         "provider": "openrouter",
-        "roles": {
-            "spec_writer": {"model": "anthropic/claude-3.5-sonnet"},
-            "prompt_enhancer": {"model": "anthropic/claude-3.5-sonnet"},
-            "planner_a": {"model": "anthropic/claude-3.5-sonnet"},
-            "planner_b": {"model": "google/gemini-pro-1.5"},
-            "critic_a": {"model": "openai/gpt-4o"},
-            "critic_b": {"model": "anthropic/claude-3-opus"},
-            "arbiter": {"model": "openai/gpt-4o"},
-            "native_agent": {"model": "anthropic/claude-3.5-sonnet"},
-            "implementation_reviewer": {"model": "openai/gpt-4o"},
-            "live_reviewer": {"model": "openai/gpt-4o"},
-        }
+        "roles": build_role_model_config("openrouter"),
     },
     "commands": {
         "test": ["pytest", "npm test"],
@@ -45,7 +36,7 @@ DEFAULT_CONFIG = {
         "block_failed_commands": True
     },
     "execution": {
-        "default_executor": "native",
+        "default_executor": "manual",
         "max_repair_attempts": 3,
         "checkpoint_before_each_task": True
     },
@@ -71,13 +62,50 @@ DEFAULT_CONFIG = {
             "signals_path": ".devcouncil/live/signals",
             "default_client": "claude",
         },
+        "cli_agents": {
+            "enabled": True,
+            "profiles": {
+                "default": {
+                    "description": "Balanced local execution with DevCouncil verification.",
+                },
+                "yolo": {
+                    "description": "Faster local execution; DevCouncil still verifies the final diff.",
+                    "timeout_seconds": 3600,
+                    "prompt_preamble": "Profile: yolo. Move efficiently within the task scope.",
+                },
+                "prod": {
+                    "description": "Restrictive execution for high-risk repositories.",
+                    "timeout_seconds": 1800,
+                    "prompt_preamble": "Profile: prod. Keep edits minimal and explicitly within task scope.",
+                    "require_explicit_confirmation": True,
+                },
+            },
+            "agents": {},
+        },
     }
 }
+
+
+def parse_role_model_overrides(values: list[str] | None) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for value in values or []:
+        if "=" not in value:
+            raise ValueError(f"Invalid --role-model value '{value}'. Use ROLE=MODEL.")
+        role, model = value.split("=", 1)
+        role = role.strip()
+        model = model.strip()
+        if not role or not model:
+            raise ValueError(f"Invalid --role-model value '{value}'. Use ROLE=MODEL.")
+        overrides[role] = model
+    return overrides
 
 
 def initialize_project(
     project_root: Path = Path("."),
     project_name: str | None = None,
+    model_provider: str = "openrouter",
+    model: str | None = None,
+    role_models: dict[str, str] | None = None,
     with_gitnexus: bool = False,
     with_graphify: bool = False,
     quiet: bool = False,
@@ -100,11 +128,18 @@ def initialize_project(
         (dev_dir / "logs").mkdir(exist_ok=True)
 
         config_path = dev_dir / "config.yaml"
-        config = copy.deepcopy(DEFAULT_CONFIG)
+        config: dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
         if project_name:
             config["project"]["name"] = project_name
         else:
             config["project"]["name"] = project_root.name
+        provider = validate_model_provider(model_provider)
+        config["models"]["provider"] = provider
+        config["models"]["roles"] = build_role_model_config(
+            provider,
+            model=model,
+            role_models=role_models,
+        )
 
         with open(config_path, "w") as f:
             yaml.dump(config, f, default_flow_style=False)
@@ -130,6 +165,13 @@ def initialize_project(
 def init(
     ctx: typer.Context,
     project_name: str = typer.Option(None, "--name", "-n", help="Project name"),
+    provider: str = typer.Option("openrouter", "--provider", help="Model provider for generated config."),
+    model: str | None = typer.Option(None, "--model", "-m", help="Model id to use for every default role."),
+    role_model: list[str] | None = typer.Option(
+        None,
+        "--role-model",
+        help="Per-role model override in ROLE=MODEL form. Can be repeated.",
+    ),
     with_gitnexus: bool = typer.Option(False, "--gitnexus", help="Initialize GitNexus structural awareness"),
     with_graphify: bool = typer.Option(False, "--graphify", help="Initialize Graphify knowledge graph engine"),
 ):
@@ -145,9 +187,19 @@ def init(
         console.print("Use --gitnexus or --graphify to add upgrade paths.")
         raise typer.Exit()
 
+    try:
+        role_models = parse_role_model_overrides(role_model)
+        model_provider = validate_model_provider(provider)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2) from e
+
     initialize_project(
         Path("."),
         project_name=project_name,
+        model_provider=model_provider,
+        model=model,
+        role_models=role_models,
         with_gitnexus=with_gitnexus,
         with_graphify=with_graphify,
     )

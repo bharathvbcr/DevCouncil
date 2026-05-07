@@ -59,7 +59,7 @@ class AstMatcher:
 
     def _has_tree_sitter(self) -> bool:
         try:
-            import tree_sitter  # noqa: F401
+            import tree_sitter  # type: ignore[import-not-found]  # noqa: F401
         except Exception:
             return False
         return True
