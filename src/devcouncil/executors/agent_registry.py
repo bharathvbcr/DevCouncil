@@ -36,6 +36,8 @@ BUILTIN_AGENT_NAMES = {
     "opencode",
     "warp",
 }
+
+BUILTIN_CODING_EXECUTOR_NAMES = tuple(sorted(BUILTIN_AGENT_NAMES))
 VALID_INPUT_MODES = {"stdin", "argument", "prompt-file"}
 
 

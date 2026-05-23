@@ -57,6 +57,9 @@ class HookPolicy:
         "Edit",
         "MultiEdit",
         "Write",
+        "create_file",
+        "str_replace",
+        "search_replace",
     }
     shell_tools = {
         "bash",
@@ -65,9 +68,11 @@ class HookPolicy:
         "local_shell",
         "run_command",
         "run_shell_command",
+        "run_terminal_cmd",
         "shell",
         "shell_command",
         "Bash",
+        "Shell",
     }
 
     def evaluate(self, call_data: dict[str, Any], active_task: Optional[Task]) -> HookDecision:

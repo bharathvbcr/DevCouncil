@@ -7,7 +7,11 @@ from devcouncil.storage.repositories import TaskRepository, RequirementRepositor
 from devcouncil.executors.mini_swe import MiniSWEExecutor
 from devcouncil.executors.openhands import OpenHandsExecutor
 from devcouncil.executors.coding_cli import CodingCliExecutor
-from devcouncil.executors.agent_registry import AGENT_ALIASES, load_cli_agent_specs
+from devcouncil.executors.agent_registry import (
+    AGENT_ALIASES,
+    BUILTIN_CODING_EXECUTOR_NAMES,
+    load_cli_agent_specs,
+)
 from devcouncil.executors.native.agent import NativeAgent
 from devcouncil.llm.provider import create_provider, validate_model_provider
 from devcouncil.llm.router import ModelRouter
@@ -20,9 +24,7 @@ from devcouncil.cli.commands.init import initialize_project
 from devcouncil.telemetry.traces import TraceLogger
 
 console = Console()
-CODING_EXECUTOR_ALIASES = {
-    name: name for name in ("codex", "gemini", "claude", "opencode", "antigravity", "warp", "cursor", "aider")
-} | AGENT_ALIASES
+CODING_EXECUTOR_ALIASES = {name: name for name in BUILTIN_CODING_EXECUTOR_NAMES} | AGENT_ALIASES
 
 CODING_EXECUTORS = set(CODING_EXECUTOR_ALIASES.keys())
 
@@ -107,7 +109,10 @@ def run(
         "manual",
         "--executor",
         "-e",
-        help="Executor to use (manual, mini, openhands, native-preview, codex, gemini, claude, opencode, antigravity, warp, or a configured agent)",
+        help=(
+            "Executor to use (manual, mini, openhands, native-preview, "
+            "codex, gemini, claude, opencode, antigravity, warp, cursor, aider, or a configured agent)"
+        ),
     ),
     profile: str | None = typer.Option(None, "--profile", help="CLI-agent execution profile: default, yolo, prod, or a configured profile."),
     project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),

@@ -46,7 +46,8 @@ DevCouncil assigns each supported coding CLI to one of three integration tiers. 
 | Codex, Gemini, Claude | Yes — project hook JSON + `devcouncil hook pre-tool-use` |
 | Cursor | Yes — `.cursor/hooks.json` (`preToolUse` / `postToolUse`) |
 | OpenCode | Yes — bundled plugin in `.devcouncil/integrations/` |
-| OpenCode / Antigravity / Warp / Aider (executor only) | Verification-gated; hooks optional |
+| OpenCode | Native plugin via `dev integrate hooks` |
+| Antigravity / Warp / Aider (executor only) | Verification-gated; hooks optional |
 | Unregistered BYO CLI | Verification-gated only |
 
 ## Target parity (project decision)
