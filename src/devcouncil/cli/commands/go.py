@@ -10,7 +10,11 @@ from devcouncil.cli.commands import report as report_command
 from devcouncil.cli.commands import run as run_command
 from devcouncil.app.config import load_config
 from devcouncil.cli.commands.init import initialize_project
-from devcouncil.executors.agent_registry import AGENT_ALIASES, load_cli_agent_specs
+from devcouncil.executors.agent_registry import (
+    AGENT_ALIASES,
+    BUILTIN_CODING_EXECUTOR_NAMES,
+    load_cli_agent_specs,
+)
 from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import ArtifactGraphRepository, StateRepository, TaskRepository
 from devcouncil.app.state_machine import ProjectPhase
@@ -21,29 +25,11 @@ from devcouncil.reporting.report_builder import ReportBuilder
 console = Console()
 
 SUPPORTED_EXECUTORS = {
-    "codex",
-    "codex-cli",
-    "gemini",
-    "gemini-cli",
-    "claude",
-    "claude-code",
-    "claude-cli",
-    "opencode",
-    "opencode-cli",
-    "open-code",
-    "antigravity",
-    "antigravity-cli",
-    "agy",
-    "agy-cli",
-    "google-antigravity",
+    *BUILTIN_CODING_EXECUTOR_NAMES,
     "native",
     "native-preview",
     "mini",
     "openhands",
-    "warp",
-    "warp-cli",
-    "oz",
-    "oz-cli",
 }
 SUPPORTED_EXECUTORS.update(AGENT_ALIASES)
 

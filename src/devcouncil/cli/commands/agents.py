@@ -17,6 +17,7 @@ from devcouncil.executors.agent_registry import (
     load_agent_profiles,
     load_cli_agent_specs,
     normalize_agent_name,
+    resolve_cursor_agent_executable,
 )
 
 app = typer.Typer(help="Manage DevCouncil CLI agents.")
@@ -122,7 +123,10 @@ def doctor(
     table.add_column("Details", no_wrap=True)
 
     for name, spec in sorted(load_cli_agent_specs(root).items()):
-        executable = _which(spec.executable)
+        if spec.name == "cursor":
+            executable = resolve_cursor_agent_executable()
+        else:
+            executable = _which(spec.executable)
         mode_ok = spec.input_mode in VALID_INPUT_MODES
         profile_ok = spec.default_profile in profiles
         help_ok, help_detail = _check_help(spec.help_command or [spec.executable, "--help"])

@@ -60,6 +60,7 @@ try {
   assertPackedFile(packMetadata, "src/devcouncil/assets/devcouncil_logo_premium.png");
   assertPackedFile(packMetadata, "src/devcouncil/llm/model_defaults.yaml");
   assertPackedFile(packMetadata, "src/devcouncil/telemetry/model_pricing.yaml");
+  assertPackedFile(packMetadata, "src/devcouncil/integrations/opencode_devcouncil_plugin.mjs");
   packedTarball = path.join(repoRoot, packMetadata.filename);
 
   assertOk(runNpm(["init", "-y"], { cwd: workspace }), "npm init");
@@ -73,6 +74,37 @@ try {
   const doctor = run(process.execPath, [installedBin, "doctor"], { cwd: workspace, shell: false });
   assertOk(doctor, "installed devcouncil doctor");
   assertIncludes(doctor.stdout, "DevCouncil Doctor Check", "installed devcouncil doctor");
+
+  const integrationProject = mkdtempSync(path.join(workspace, "integration-project-"));
+  const nodeBin = path.join(workspace, "node_modules", ".bin");
+  const integrationEnv = {
+    ...process.env,
+    PATH: `${nodeBin}${path.delimiter}${process.env.PATH ?? ""}`,
+  };
+  const init = run(process.execPath, [installedBin, "init"], {
+    cwd: integrationProject,
+    shell: false,
+    env: integrationEnv,
+  });
+  assertOk(init, "installed devcouncil init for integration smoke");
+
+  const hooks = run(
+    process.execPath,
+    [installedBin, "integrate", "hooks", "--apply"],
+    { cwd: integrationProject, shell: false, env: integrationEnv },
+  );
+  assertOk(hooks, "installed devcouncil integrate hooks --apply");
+  assertIncludes(hooks.stdout, "cursor native hooks configured", "integrate hooks cursor");
+  assertIncludes(hooks.stdout, "opencode native hooks configured", "integrate hooks opencode");
+
+  const integrateCheck = run(process.execPath, [installedBin, "integrate", "check"], {
+    cwd: integrationProject,
+    shell: false,
+    env: integrationEnv,
+  });
+  assertOk(integrateCheck, "installed devcouncil integrate check");
+  assertIncludes(integrateCheck.stdout, "Bundled OpenCode hook plugin", "integrate check bundled plugin");
+  assertIncludes(integrateCheck.stdout, "Ready.", "integrate check ready");
 
   const emptyPath = mkdtempSync(path.join(workspace, "empty-path-"));
   const missingUv = run(process.execPath, [installedBin, "--help"], {

@@ -560,7 +560,6 @@ def _install_cursor_hooks(project_root: Path) -> list[Path]:
     integrations = config.setdefault("integrations", {})
     cursor = integrations.setdefault("cursor", {})
     cursor.update({
-        "enabled": cursor.get("enabled", True),
         "hooks_path": str(path.relative_to(project_root)),
     })
     _save_raw_config(project_root, config)
@@ -1076,9 +1075,14 @@ def check(
     add((root / ".devcouncil").exists(), "Project state", str(root / ".devcouncil"))
 
     devcouncil_path = shutil.which("devcouncil")
-    add(devcouncil_path is not None, "devcouncil CLI", devcouncil_path or "Install DevCouncil first.")
+    devcouncil_launch = [devcouncil_path] if devcouncil_path else [sys.executable, "-m", "devcouncil"]
+    add(
+        devcouncil_path is not None or Path(sys.executable).exists(),
+        "devcouncil CLI",
+        devcouncil_path or f"{sys.executable} -m devcouncil",
+    )
 
-    code, output = _run_capture(["devcouncil", "--help"])
+    code, output = _run_capture([*devcouncil_launch, "--help"])
     add(code == 0, "devcouncil command", output.splitlines()[0] if output else "No output")
 
     raw_config = _load_raw_config(root)
@@ -1148,6 +1152,50 @@ def check(
         add(warp_config.exists(), "Warp MCP config", str(warp_config) if warp_config.exists() else f"Run {PREFERRED_COMMAND} warp --apply.")
     else:
         table.add_row("Warp MCP config", "[dim]SKIP[/dim]", f"Run {PREFERRED_COMMAND} warp --apply to enable.")
+
+    aider_enabled = bool(raw_config.get("integrations", {}).get("aider", {}).get("enabled"))
+    if aider_enabled:
+        table.add_row("Aider integration", "[green]OK[/green]", "Run: dev run TASK-001 --executor aider")
+    else:
+        table.add_row("Aider integration", "[dim]SKIP[/dim]", f"Run {PREFERRED_COMMAND} aider --apply to enable.")
+
+    cursor_hooks = root / ".cursor" / "hooks.json"
+    if cursor_enabled or cursor_hooks.exists():
+        hooks_ok = False
+        if cursor_hooks.exists():
+            try:
+                hooks_data = json.loads(cursor_hooks.read_text(encoding="utf-8")) or {}
+                hooks_ok = "preToolUse" in hooks_data.get("hooks", {})
+            except json.JSONDecodeError:
+                hooks_ok = False
+        add(
+            hooks_ok,
+            "Cursor hooks",
+            str(cursor_hooks) if hooks_ok else f"Run {PREFERRED_COMMAND} hooks --apply --tool cursor.",
+        )
+
+    opencode_plugin = _opencode_plugin_path(root)
+    if opencode_enabled or opencode_plugin.exists():
+        plugin_ok = opencode_plugin.exists()
+        plugin_registered = False
+        if plugin_ok and opencode_config.exists():
+            try:
+                opencode_data = json.loads(opencode_config.read_text(encoding="utf-8")) or {}
+                plugin_registered = f"./.devcouncil/integrations/{OPENCODE_HOOK_PLUGIN_NAME}" in (opencode_data.get("plugin") or [])
+            except json.JSONDecodeError:
+                plugin_registered = False
+        add(
+            plugin_ok and plugin_registered,
+            "OpenCode hook plugin",
+            str(opencode_plugin) if plugin_ok and plugin_registered else f"Run {PREFERRED_COMMAND} hooks --apply --tool opencode.",
+        )
+
+    bundled_plugin = _opencode_plugin_source()
+    add(
+        bundled_plugin.exists(),
+        "Bundled OpenCode hook plugin",
+        str(bundled_plugin) if bundled_plugin.exists() else "Reinstall DevCouncil; package asset is missing.",
+    )
 
     custom_agents = raw_config.get("integrations", {}).get("cli_agents", {}).get("agents", {})
     if custom_agents:

@@ -30,6 +30,7 @@
     "src/**/*.png",
     "src/**/*.svg",
     "src/**/*.yaml",
+    "src/**/*.mjs",
     "pyproject.toml",
     "uv.lock",
     "README.md",

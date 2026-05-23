@@ -1302,6 +1302,22 @@ def test_cli_integrate_hooks_apply_writes_native_hook_files(tmp_path):
     assert "codex_hooks = true" in (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
 
 
+def test_cli_integrate_check_reports_hook_wiring(tmp_path):
+    (tmp_path / ".devcouncil").mkdir()
+    result = runner.invoke(
+        app,
+        ["integrate", "hooks", "--apply", "--project-root", str(tmp_path)],
+    )
+    assert result.exit_code == 0
+
+    check = runner.invoke(app, ["integrate", "check", "--project-root", str(tmp_path)])
+    assert check.exit_code == 0
+    assert "Cursor hooks" in check.output
+    assert "OpenCode hook plugin" in check.output
+    assert "Bundled OpenCode hook plugin" in check.output
+    assert "Ready." in check.output
+
+
 def test_cli_integrate_aider_apply_records_executor(tmp_path):
     import yaml
 
@@ -3365,6 +3381,9 @@ def test_cli_run_supports_coding_cli_alias_executors(tmp_path, monkeypatch):
         ("agy", "antigravity"),
         ("warp-cli", "warp"),
         ("oz", "warp"),
+        ("cursor-agent", "cursor"),
+        ("cursor-cli", "cursor"),
+        ("aider", "aider"),
     ]:
         called.clear()
         result = runner.invoke(app, ["run", "TASK-001", "--executor", alias])
