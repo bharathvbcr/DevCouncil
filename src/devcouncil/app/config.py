@@ -88,6 +88,26 @@ class WarpIntegrationConfig(BaseModel):
     share: List[str] = Field(default_factory=list)
 
 
+class OpenCodeIntegrationConfig(BaseModel):
+    enabled: bool = False
+    config_path: str = "opencode.json"
+
+
+class AntigravityIntegrationConfig(BaseModel):
+    enabled: bool = False
+    mcp_config_path: str = ".agents/mcp_config.json"
+
+
+class CursorIntegrationConfig(BaseModel):
+    enabled: bool = False
+    config_path: str = ".cursor/mcp.json"
+    hooks_path: str = ".cursor/hooks.json"
+
+
+class AiderIntegrationConfig(BaseModel):
+    enabled: bool = False
+
+
 class CliAgentProfileConfig(BaseModel):
     description: str = ""
     timeout_seconds: int | None = None
@@ -120,7 +140,11 @@ class IntegrationsConfig(BaseModel):
     agent_flow: AgentFlowIntegrationConfig = Field(default_factory=AgentFlowIntegrationConfig)
     code_review_graph: CodeReviewGraphIntegrationConfig = Field(default_factory=CodeReviewGraphIntegrationConfig)
     live_review: LiveReviewIntegrationConfig = Field(default_factory=LiveReviewIntegrationConfig)
+    cursor: CursorIntegrationConfig = Field(default_factory=CursorIntegrationConfig)
+    aider: AiderIntegrationConfig = Field(default_factory=AiderIntegrationConfig)
+    antigravity: AntigravityIntegrationConfig = Field(default_factory=AntigravityIntegrationConfig)
     warp: WarpIntegrationConfig = Field(default_factory=WarpIntegrationConfig)
+    opencode: OpenCodeIntegrationConfig = Field(default_factory=OpenCodeIntegrationConfig)
     cli_agents: CliAgentsIntegrationConfig = Field(default_factory=CliAgentsIntegrationConfig)
 
 

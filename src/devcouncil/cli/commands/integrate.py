@@ -24,8 +24,9 @@ setup_app = typer.Typer(help="Set up optional external companion integrations.")
 app.add_typer(setup_app, name="setup")
 console = Console()
 
-SUPPORTED_TOOLS = ("codex", "gemini", "claude", "cursor", "warp")
-SUPPORTED_HOOK_TOOLS = ("codex", "gemini", "claude")
+SUPPORTED_TOOLS = ("codex", "gemini", "claude", "cursor", "opencode", "antigravity", "warp", "aider")
+SUPPORTED_HOOK_TOOLS = ("codex", "gemini", "claude", "cursor")
+OPENCODE_HOOK_PLUGIN_NAME = "opencode_devcouncil_plugin.mjs"
 PREFERRED_COMMAND = "dev integrate"
 LEGACY_COMMAND = "dev setup --integrate"
 
@@ -80,25 +81,29 @@ def _claude_command(project_root: Path, scope: str) -> list[str]:
     ]
 
 
-def _cursor_command(project_root: Path) -> list[str]:
-    server = {
-        "name": "devcouncil",
-        "command": "devcouncil",
-        "args": ["mcp-server"],
-        "env": {"DEVCOUNCIL_PROJECT_ROOT": str(project_root)},
+def _cursor_config_path(project_root: Path) -> Path:
+    return project_root / ".cursor" / "mcp.json"
+
+
+def _cursor_mcp_config(project_root: Path) -> dict:
+    return {
+        "mcpServers": {
+            "devcouncil": {
+                "type": "stdio",
+                "command": "devcouncil",
+                "args": ["mcp-server"],
+                "env": {"DEVCOUNCIL_PROJECT_ROOT": str(project_root)},
+            }
+        }
     }
-    return ["cursor", "--add-mcp", json.dumps(server, separators=(",", ":"))]
 
 
 def _warp_mcp_config(project_root: Path) -> dict:
     return {
-        "mcpServers": {
-            "devcouncil": {
-                "command": "devcouncil",
-                "args": ["mcp-server"],
-                "env": {"DEVCOUNCIL_PROJECT_ROOT": str(project_root)},
-                "working_directory": str(project_root),
-            }
+        "devcouncil": {
+            "command": "devcouncil",
+            "args": ["mcp-server"],
+            "env": {"DEVCOUNCIL_PROJECT_ROOT": str(project_root)},
         }
     }
 
@@ -107,10 +112,61 @@ def _warp_mcp_path(project_root: Path) -> Path:
     return project_root / ".devcouncil" / "integrations" / "warp-mcp.json"
 
 
+def _opencode_config_path(project_root: Path) -> Path:
+    return project_root / "opencode.json"
+
+
+def _opencode_mcp_entry(project_root: Path) -> dict:
+    return {
+        "type": "local",
+        "command": ["devcouncil", "mcp-server"],
+        "environment": {"DEVCOUNCIL_PROJECT_ROOT": str(project_root)},
+        "enabled": True,
+        "timeout": 10000,
+    }
+
+
+def _antigravity_mcp_path(project_root: Path) -> Path:
+    return project_root / ".agents" / "mcp_config.json"
+
+
+def _antigravity_mcp_config(project_root: Path) -> dict:
+    return {
+        "mcpServers": {
+            "devcouncil": {
+                "command": "devcouncil",
+                "args": ["mcp-server"],
+                "env": {"DEVCOUNCIL_PROJECT_ROOT": str(project_root)},
+                "cwd": str(project_root),
+            }
+        }
+    }
+
+
 def _write_warp_mcp_config(project_root: Path) -> Path:
     path = _warp_mcp_path(project_root)
     _save_json(path, _warp_mcp_config(project_root))
     return path
+
+
+def _write_cursor_config(project_root: Path) -> Path:
+    path = _cursor_config_path(project_root)
+    data = _load_json_strict(path, "Cursor")
+    mcp_servers = data.setdefault("mcpServers", {})
+    mcp_servers["devcouncil"] = _cursor_mcp_config(project_root)["mcpServers"]["devcouncil"]
+    _save_json(path, data)
+    return path
+
+
+def _record_cursor_config(project_root: Path) -> None:
+    config = _load_raw_config(project_root)
+    integrations = config.setdefault("integrations", {})
+    cursor = integrations.setdefault("cursor", {})
+    cursor.update({
+        "enabled": True,
+        "config_path": str(_cursor_config_path(project_root).relative_to(project_root)),
+    })
+    _save_raw_config(project_root, config)
 
 
 def _record_warp_config(project_root: Path) -> None:
@@ -124,6 +180,133 @@ def _record_warp_config(project_root: Path) -> None:
         "mcp_config_path": str(_warp_mcp_path(project_root).relative_to(project_root)),
     })
     _save_raw_config(project_root, config)
+
+
+def _record_opencode_config(project_root: Path) -> None:
+    config = _load_raw_config(project_root)
+    integrations = config.setdefault("integrations", {})
+    opencode = integrations.setdefault("opencode", {})
+    opencode.update({
+        "enabled": True,
+        "config_path": str(_opencode_config_path(project_root).relative_to(project_root)),
+    })
+    _save_raw_config(project_root, config)
+
+
+def _record_antigravity_config(project_root: Path) -> None:
+    config = _load_raw_config(project_root)
+    integrations = config.setdefault("integrations", {})
+    antigravity = integrations.setdefault("antigravity", {})
+    antigravity.update({
+        "enabled": True,
+        "mcp_config_path": str(_antigravity_mcp_path(project_root).relative_to(project_root)),
+    })
+    _save_raw_config(project_root, config)
+
+
+def _load_json_strict(path: Path, label: str = "JSON") -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8")) or {}
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path} is not valid JSON. Fix the {label} config before rerunning integration setup.") from exc
+
+
+def _write_opencode_config(project_root: Path) -> Path:
+    path = _opencode_config_path(project_root)
+    data = _load_json_strict(path, "OpenCode")
+    data.setdefault("$schema", "https://opencode.ai/config.json")
+    mcp = data.setdefault("mcp", {})
+    mcp["devcouncil"] = _opencode_mcp_entry(project_root)
+    _save_json(path, data)
+    return path
+
+
+def _write_antigravity_mcp_config(project_root: Path) -> Path:
+    path = _antigravity_mcp_path(project_root)
+    data = _load_json_strict(path, "Antigravity")
+    mcp_servers = data.setdefault("mcpServers", {})
+    mcp_servers["devcouncil"] = _antigravity_mcp_config(project_root)["mcpServers"]["devcouncil"]
+    _save_json(path, data)
+    return path
+
+
+def _configure_cursor(project_root: Path, apply: bool) -> bool:
+    path = _cursor_config_path(project_root)
+    config = _cursor_mcp_config(project_root)
+    if not apply:
+        console.print("[bold]Cursor[/bold]")
+        console.print(f"Project MCP config file: [dim]{path}[/dim]")
+        console.print(json.dumps(config, separators=(",", ":")), soft_wrap=True)
+        console.print("Verify in Cursor CLI with: [dim]cursor-agent mcp list[/dim]")
+        return True
+
+    if not shutil.which("cursor") and not shutil.which("cursor-agent"):
+        console.print("[yellow]Cursor CLI not found on PATH. Project MCP config will still be available to Cursor.[/yellow]")
+    try:
+        written = _write_cursor_config(project_root)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return False
+    _record_cursor_config(project_root)
+    console.print(f"[green]Cursor MCP config written:[/green] {written}")
+    return True
+
+
+def _configure_opencode(project_root: Path, apply: bool) -> bool:
+    path = _opencode_config_path(project_root)
+    config = {
+        "$schema": "https://opencode.ai/config.json",
+        "mcp": {"devcouncil": _opencode_mcp_entry(project_root)},
+    }
+    if not apply:
+        console.print("[bold]OpenCode[/bold]")
+        console.print(f"Project config file: [dim]{path}[/dim]")
+        console.print(json.dumps(config, separators=(",", ":")), soft_wrap=True)
+        console.print(
+            "Direct executor command: "
+            "[dim]opencode run --file .devcouncil/TASK-001-opencode-task.md "
+            '"Execute the DevCouncil task described in the attached prompt file."[/dim]'
+        )
+        return True
+
+    if not shutil.which("opencode"):
+        console.print("[yellow]OpenCode CLI not found on PATH. Install it before using `dev run --executor opencode`.[/yellow]")
+    try:
+        written = _write_opencode_config(project_root)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return False
+    _record_opencode_config(project_root)
+    console.print(f"[green]OpenCode MCP config written:[/green] {written}")
+    return True
+
+
+def _configure_antigravity(project_root: Path, apply: bool) -> bool:
+    path = _antigravity_mcp_path(project_root)
+    config = _antigravity_mcp_config(project_root)
+    if not apply:
+        console.print("[bold]Google Antigravity CLI[/bold]")
+        console.print(f"Project MCP config file: [dim]{path}[/dim]")
+        console.print(json.dumps(config, separators=(",", ":")), soft_wrap=True)
+        console.print(
+            "Direct executor command: "
+            "[dim]agy --print --print-timeout 30m "
+            '"Read and execute the DevCouncil task prompt at .devcouncil/TASK-001-antigravity-task.md."[/dim]'
+        )
+        return True
+
+    if not shutil.which("agy"):
+        console.print("[yellow]Antigravity CLI (`agy`) not found on PATH. Install it before using `dev run --executor antigravity`.[/yellow]")
+    try:
+        written = _write_antigravity_mcp_config(project_root)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return False
+    _record_antigravity_config(project_root)
+    console.print(f"[green]Antigravity MCP config written:[/green] {written}")
+    return True
 
 
 def _configure_warp(project_root: Path, apply: bool) -> bool:
@@ -157,6 +340,14 @@ def _quote_powershell_arg(arg: str) -> str:
     if not any(char in special_chars for char in arg):
         return arg
     return "'" + arg.replace("'", "''") + "'"
+
+
+def _opencode_plugin_source() -> Path:
+    return Path(__file__).resolve().parents[2] / "integrations" / OPENCODE_HOOK_PLUGIN_NAME
+
+
+def _opencode_plugin_path(project_root: Path) -> Path:
+    return project_root / ".devcouncil" / "integrations" / OPENCODE_HOOK_PLUGIN_NAME
 
 
 def _hook_command(project_root: Path, client: str, event: str) -> str:
@@ -335,6 +526,67 @@ def _install_gemini_hooks(project_root: Path) -> list[Path]:
     return [path]
 
 
+def _upsert_cursor_hook(settings: dict, event: str, matcher: str, command: str) -> None:
+    hooks = settings.setdefault("hooks", {})
+    entries = hooks.setdefault(event, [])
+    for entry in entries:
+        if entry.get("command") == command:
+            return
+    payload: dict = {"command": command}
+    if matcher:
+        payload["matcher"] = matcher
+    entries.append(payload)
+
+
+def _install_cursor_hooks(project_root: Path) -> list[Path]:
+    path = project_root / ".cursor" / "hooks.json"
+    settings = _load_json(path)
+    settings.setdefault("version", 1)
+    matcher = "Shell|Write|Edit|MultiEdit|Read|Task"
+    _upsert_cursor_hook(
+        settings,
+        "preToolUse",
+        matcher,
+        _hook_command(project_root, "cursor", "pre-tool-use"),
+    )
+    _upsert_cursor_hook(
+        settings,
+        "postToolUse",
+        matcher,
+        _hook_command(project_root, "cursor", "post-tool-use"),
+    )
+    _save_json(path, settings)
+    config = _load_raw_config(project_root)
+    integrations = config.setdefault("integrations", {})
+    cursor = integrations.setdefault("cursor", {})
+    cursor.update({
+        "enabled": cursor.get("enabled", True),
+        "hooks_path": str(path.relative_to(project_root)),
+    })
+    _save_raw_config(project_root, config)
+    return [path]
+
+
+def _install_opencode_hooks(project_root: Path) -> list[Path]:
+    source = _opencode_plugin_source()
+    if not source.exists():
+        raise FileNotFoundError(f"Missing bundled OpenCode hook plugin: {source}")
+    destination = _opencode_plugin_path(project_root)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
+    path = _opencode_config_path(project_root)
+    data = _load_json_strict(path, "OpenCode") if path.exists() else {"$schema": "https://opencode.ai/config.json"}
+    data.setdefault("$schema", "https://opencode.ai/config.json")
+    plugins = data.setdefault("plugin", [])
+    plugin_ref = f"./.devcouncil/integrations/{OPENCODE_HOOK_PLUGIN_NAME}"
+    if plugin_ref not in plugins:
+        plugins.append(plugin_ref)
+    _save_json(path, data)
+    _record_opencode_config(project_root)
+    return [destination, path]
+
+
 def _install_claude_hooks(project_root: Path) -> list[Path]:
     path = project_root / ".claude" / "settings.local.json"
     settings = _load_json(path)
@@ -369,14 +621,22 @@ def _preview_hook_paths(project_root: Path, tool: str) -> list[tuple[str, Path]]
         "codex": [project_root / ".codex" / "hooks.json", project_root / ".codex" / "config.toml"],
         "gemini": [project_root / ".gemini" / "settings.json"],
         "claude": [project_root / ".claude" / "settings.local.json"],
+        "cursor": [project_root / ".cursor" / "hooks.json"],
+        "opencode": [_opencode_plugin_path(project_root), _opencode_config_path(project_root)],
     }
-    selected = SUPPORTED_HOOK_TOOLS if tool == "all" else (tool,)
-    return [(client, path) for client in selected for path in paths[client]]
+    if tool == "all":
+        selected = (*SUPPORTED_HOOK_TOOLS, "opencode")
+    elif tool == "opencode":
+        selected = ("opencode",)
+    else:
+        selected = (tool,)
+    return [(client, path) for client in selected for path in paths.get(client, [])]
 
 
 def _configure_native_hooks(project_root: Path, tool: str = "all", apply: bool = False) -> None:
-    if tool not in {"all", *SUPPORTED_HOOK_TOOLS}:
-        console.print("[red]--tool must be one of: all, codex, gemini, claude.[/red]")
+    allowed = {"all", *SUPPORTED_HOOK_TOOLS, "opencode"}
+    if tool not in allowed:
+        console.print("[red]--tool must be one of: all, codex, gemini, claude, cursor, opencode.[/red]")
         raise typer.Exit(code=2)
 
     if not apply:
@@ -386,14 +646,25 @@ def _configure_native_hooks(project_root: Path, tool: str = "all", apply: bool =
         console.print("[yellow]Preview only. Rerun with --apply to write hook config files.[/yellow]")
         return
 
-    selected = SUPPORTED_HOOK_TOOLS if tool == "all" else (tool,)
+    if tool == "all":
+        selected = (*SUPPORTED_HOOK_TOOLS, "opencode")
+    elif tool == "opencode":
+        selected = ("opencode",)
+    else:
+        selected = (tool,)
     installers = {
         "codex": _install_codex_hooks,
         "gemini": _install_gemini_hooks,
         "claude": _install_claude_hooks,
+        "cursor": _install_cursor_hooks,
+        "opencode": _install_opencode_hooks,
     }
     for client in selected:
-        written = installers[client](project_root)
+        try:
+            written = installers[client](project_root)
+        except (ValueError, FileNotFoundError) as exc:
+            console.print(f"[red]{client} hook setup failed: {exc}[/red]")
+            raise typer.Exit(code=1) from exc
         console.print(f"[green]{client} native hooks configured:[/green] {', '.join(str(path) for path in written)}")
 
 
@@ -442,11 +713,14 @@ def overview(ctx: typer.Context):
     table.add_row("Codex CLI", f"{PREFERRED_COMMAND} codex --apply", "Adds DevCouncil as a stdio MCP server.")
     table.add_row("Gemini CLI", f"{PREFERRED_COMMAND} gemini --apply", "Adds DevCouncil as a project-scoped stdio MCP server.")
     table.add_row("Claude Code", f"{PREFERRED_COMMAND} claude --apply", "Adds DevCouncil as a Claude Code MCP server.")
-    table.add_row("Cursor", f"{PREFERRED_COMMAND} cursor --apply", "Adds DevCouncil as a Cursor MCP server.")
+    table.add_row("Cursor", f"{PREFERRED_COMMAND} cursor --apply", "Writes project .cursor/mcp.json for Cursor editor and cursor-agent.")
+    table.add_row("OpenCode", f"{PREFERRED_COMMAND} opencode --apply", "Adds DevCouncil as a project-scoped OpenCode MCP server and executor.")
+    table.add_row("Google Antigravity CLI", f"{PREFERRED_COMMAND} antigravity --apply", "Writes project .agents/mcp_config.json and enables the agy executor.")
     table.add_row("Warp / Oz", f"{PREFERRED_COMMAND} warp --apply", "Writes a Warp-compatible MCP JSON file for local agents and Oz CLI.")
+    table.add_row("Aider", f"{PREFERRED_COMMAND} aider --apply", "Enables the built-in Aider headless executor (no MCP).")
     table.add_row("Bring your own CLI", f"{PREFERRED_COMMAND} cli-agent NAME --command TOOL --apply", "Registers any prompt-taking CLI as a DevCouncil executor.")
     table.add_row("All", f"{PREFERRED_COMMAND} all --apply", "Runs MCP setup and installs native hooks.")
-    table.add_row("Native hooks", f"{PREFERRED_COMMAND} hooks --apply", "Installs Codex, Gemini, and Claude hook files.")
+    table.add_row("Native hooks", f"{PREFERRED_COMMAND} hooks --apply", "Installs Codex, Gemini, Claude, Cursor, and OpenCode hook files.")
     console.print(table)
     console.print(f"\nIf your install exposes only the setup flow, use: {LEGACY_COMMAND} --apply")
     console.print("\nRun without [bold]--apply[/bold] to preview the exact commands first.")
@@ -469,9 +743,11 @@ def integrations_doctor(
         ("Claude Code", "claude", "Optional MCP client and native hook runtime for pre-tool-use enforcement."),
         ("Codex CLI", "codex", "Optional MCP client, headless executor companion, and native hook runtime."),
         ("Gemini CLI", "gemini", "Optional MCP client companion and native hook runtime."),
-        ("Cursor", "cursor", "Optional MCP client and agent companion."),
+        ("Cursor", "cursor-agent", "Optional MCP client, cursor-agent executor, and native hooks."),
+        ("OpenCode", "opencode", "Optional MCP client and headless coding-agent executor."),
+        ("Google Antigravity CLI", "agy", "Optional Antigravity CLI companion and headless coding-agent executor."),
         ("Warp / Oz", "oz", "Optional Warp/Oz CLI companion and agent executor."),
-        ("Aider", "aider", "Optional prompt/stdin sidecar; no first-party MCP setup command."),
+        ("Aider", "aider", "Optional headless executor via `dev run --executor aider` (no MCP)."),
     ]
     for label, executable, notes in checks:
         found = shutil.which(executable)
@@ -560,15 +836,43 @@ def claude(
 
 @app.command("cursor")
 def cursor(
-    apply: bool = typer.Option(False, "--apply", help="Run the setup command instead of printing it."),
+    apply: bool = typer.Option(False, "--apply", help="Write project Cursor MCP config instead of printing it."),
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
 ):
     """
     Set up DevCouncil MCP tools for Cursor.
     """
     root = _project_root(project_root)
-    command = _cursor_command(root)
-    ok = _configure("Cursor", command, apply)
+    ok = _configure_cursor(root, apply)
+    if not ok and apply:
+        raise typer.Exit(code=1)
+
+
+@app.command("opencode")
+def opencode(
+    apply: bool = typer.Option(False, "--apply", help="Write project OpenCode config instead of printing it."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """
+    Set up DevCouncil MCP tools for OpenCode.
+    """
+    root = _project_root(project_root)
+    ok = _configure_opencode(root, apply)
+    if not ok and apply:
+        raise typer.Exit(code=1)
+
+
+@app.command("agy")
+@app.command("antigravity")
+def antigravity(
+    apply: bool = typer.Option(False, "--apply", help="Write project Antigravity MCP config instead of printing it."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """
+    Set up DevCouncil MCP tools for Google Antigravity CLI.
+    """
+    root = _project_root(project_root)
+    ok = _configure_antigravity(root, apply)
     if not ok and apply:
         raise typer.Exit(code=1)
 
@@ -583,6 +887,44 @@ def warp(
     """
     root = _project_root(project_root)
     _configure_warp(root, apply)
+
+
+def _record_aider_config(project_root: Path) -> None:
+    config = _load_raw_config(project_root)
+    integrations = config.setdefault("integrations", {})
+    aider = integrations.setdefault("aider", {})
+    aider.update({"enabled": True})
+    _save_raw_config(project_root, config)
+
+
+def _configure_aider(project_root: Path, apply: bool) -> bool:
+    command = ["aider", "--yes", "--no-show-model-warnings", "--message", "<task prompt>"]
+    if not apply:
+        console.print("[bold]Aider[/bold]")
+        console.print("Built-in executor: [dim]dev run TASK-001 --executor aider[/dim]")
+        console.print("Launch command: [dim]" + _format_command(command) + "[/dim]")
+        console.print("Aider does not expose a first-party DevCouncil MCP server.")
+        return True
+
+    if not shutil.which("aider"):
+        console.print("[yellow]Aider CLI not found on PATH. Install it before using `dev run --executor aider`.[/yellow]")
+    _record_aider_config(project_root)
+    console.print("[green]Aider executor enabled in .devcouncil/config.yaml.[/green]")
+    return True
+
+
+@app.command("aider")
+def aider(
+    apply: bool = typer.Option(False, "--apply", help="Record the built-in Aider executor in DevCouncil config."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """
+    Enable the built-in Aider headless executor (no MCP integration).
+    """
+    root = _project_root(project_root)
+    ok = _configure_aider(root, apply)
+    if not ok and apply:
+        raise typer.Exit(code=1)
 
 
 @app.command("cli-agent")
@@ -676,7 +1018,6 @@ def all_tools(
         ("Codex CLI", _codex_command(root)),
         ("Gemini CLI", _gemini_command(root, gemini_scope)),
         ("Claude Code", _claude_command(root, claude_scope)),
-        ("Cursor", _cursor_command(root)),
     ]
     results = []
     for tool, command in commands:
@@ -684,7 +1025,11 @@ def all_tools(
             console.print(f"[yellow]{tool} CLI not found on PATH. Skipping optional integration.[/yellow]")
             continue
         results.append(_configure(tool, command, apply))
+    results.append(_configure_cursor(root, apply))
+    results.append(_configure_opencode(root, apply))
+    results.append(_configure_antigravity(root, apply))
     results.append(_configure_warp(root, apply))
+    results.append(_configure_aider(root, apply))
     if hooks:
         _configure_native_hooks(root, "all", apply)
     if apply and not all(results):
@@ -695,10 +1040,10 @@ def all_tools(
 def hooks(
     apply: bool = typer.Option(False, "--apply", help="Write native hook config files instead of previewing paths."),
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
-    tool: str = typer.Option("all", "--tool", help="Hook target: all, codex, gemini, or claude."),
+    tool: str = typer.Option("all", "--tool", help="Hook target: all, codex, gemini, claude, cursor, or opencode."),
 ):
     """
-    Install DevCouncil native hook configuration for hook-capable coding CLIs.
+    Install DevCouncil hook configuration for Codex, Gemini, Claude, Cursor, and OpenCode.
     """
     root = _project_root(project_root)
     _configure_native_hooks(root, tool, apply)
@@ -747,11 +1092,55 @@ def check(
     code, output = _run_capture(["claude", "--version"])
     add_optional(code == 0, "Claude Code", output.splitlines()[0] if output else "Optional; install Claude Code to use this integration.")
 
-    code, output = _run_capture(["cursor", "--version"])
-    add_optional(code == 0, "Cursor", output.splitlines()[0] if output else "Optional; install Cursor to use this integration.")
+    code, output = _run_capture(["cursor-agent", "--version"])
+    if code != 0:
+        code, output = _run_capture(["cursor", "--version"])
+    add_optional(code == 0, "Cursor", output.splitlines()[0] if output else "Optional; install Cursor or cursor-agent to use this integration.")
+
+    code, output = _run_capture(["opencode", "--version"])
+    add_optional(code == 0, "OpenCode", output.splitlines()[0] if output else "Optional; install OpenCode to use this integration.")
+
+    code, output = _run_capture(["agy", "--version"])
+    add_optional(code == 0, "Google Antigravity CLI", output.splitlines()[0] if output else "Optional; install Antigravity CLI to use this integration.")
 
     code, output = _run_capture(["oz", "--version"])
     add_optional(code == 0, "Warp / Oz", output.splitlines()[0] if output else "Optional; install Warp/Oz to use this integration.")
+
+    code, output = _run_capture(["aider", "--version"])
+    add_optional(code == 0, "Aider", output.splitlines()[0] if output else "Optional; install Aider to use this integration.")
+
+    cursor_config = _cursor_config_path(root)
+    cursor_enabled = bool(raw_config.get("integrations", {}).get("cursor", {}).get("enabled"))
+    if cursor_enabled:
+        add(
+            cursor_config.exists(),
+            "Cursor MCP config",
+            str(cursor_config) if cursor_config.exists() else f"Run {PREFERRED_COMMAND} cursor --apply.",
+        )
+    else:
+        table.add_row("Cursor MCP config", "[dim]SKIP[/dim]", f"Run {PREFERRED_COMMAND} cursor --apply to enable.")
+
+    opencode_config = _opencode_config_path(root)
+    opencode_enabled = bool(raw_config.get("integrations", {}).get("opencode", {}).get("enabled"))
+    if opencode_enabled:
+        add(
+            opencode_config.exists(),
+            "OpenCode MCP config",
+            str(opencode_config) if opencode_config.exists() else f"Run {PREFERRED_COMMAND} opencode --apply.",
+        )
+    else:
+        table.add_row("OpenCode MCP config", "[dim]SKIP[/dim]", f"Run {PREFERRED_COMMAND} opencode --apply to enable.")
+
+    antigravity_config = _antigravity_mcp_path(root)
+    antigravity_enabled = bool(raw_config.get("integrations", {}).get("antigravity", {}).get("enabled"))
+    if antigravity_enabled:
+        add(
+            antigravity_config.exists(),
+            "Antigravity MCP config",
+            str(antigravity_config) if antigravity_config.exists() else f"Run {PREFERRED_COMMAND} antigravity --apply.",
+        )
+    else:
+        table.add_row("Antigravity MCP config", "[dim]SKIP[/dim]", f"Run {PREFERRED_COMMAND} antigravity --apply to enable.")
 
     warp_config = _warp_mcp_path(root)
     warp_enabled = bool(raw_config.get("integrations", {}).get("warp", {}).get("enabled"))

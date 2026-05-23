@@ -1,7 +1,7 @@
 # DevCouncil: The Gated AI Orchestrator
 
 <p align="center">
-  <img src="src/devcouncil/assets/devcouncil-logo.svg" alt="DevCouncil Logo" width="300">
+  <img src="src/devcouncil/assets/devcouncil_logo_premium.png" alt="DevCouncil Logo" width="300">
 </p>
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
@@ -12,13 +12,14 @@
 
 DevCouncil is a high-integrity command-line orchestration platform for AI-assisted software development. It turns AI implementation from a black-box generation task into a gated engineering workflow where every change is authorized, verified, and traceable back to a requirement.
 
-DevCouncil does not replace coding agents. It sits beside tools like Codex CLI, Gemini CLI, Claude Code, Warp/Oz, Cursor, Aider, and bring-your-own prompt-taking CLIs, then owns the plan, task scope, verification loop, repair prompts, and evidence trail.
+DevCouncil does not replace coding agents. It sits beside tools like Codex CLI, Gemini CLI, Claude Code, OpenCode, Google Antigravity CLI, Warp/Oz, Cursor, Aider, and bring-your-own prompt-taking CLIs, then owns the plan, task scope, verification loop, repair prompts, and evidence trail.
 
 ## Documentation
 
 - [Quickstart](docs/quickstart.md): shortest install-to-first-task path.
 - [Daily workflow](docs/workflow.md): manual sidecar loop, verification, repair, and rollback.
-- [Coding CLI integration](docs/coding-cli-integration.md): Codex, Gemini, Claude Code, Cursor, Aider, MCP, hooks, and automated executors.
+- [Coding CLI integration](docs/coding-cli-integration.md): Codex, Gemini, Claude Code, OpenCode, Antigravity, Cursor, Aider, MCP, hooks, and automated executors.
+- [Integration tiers](docs/integration-tiers.md): headless executor vs MCP-only vs sidecar definitions.
 - [CLI command reference](docs/cli-reference.md): available `dev` commands.
 - [Architecture](docs/architecture.md): components, artifact graph, state machine, and gated execution.
 - [Executor adapters](docs/executor-adapters.md): manual, coding CLI, native-preview, Mini-SWE, and OpenHands execution paths.
@@ -79,12 +80,13 @@ dev verify TASK-001
 
 On a fresh interactive setup, DevCouncil can configure supported coding CLI integrations immediately; pass `--skip-integrations` if you want to defer that step.
 
-Paste only the output from `dev prompt TASK-001` into Codex, Gemini, Claude Code, Warp, Cursor, Aider, or another coding tool. Keep `dev setup`, `dev plan`, `dev run`, and `dev verify` in the terminal at the repository root.
+Paste only the output from `dev prompt TASK-001` into Codex, Gemini, Claude Code, OpenCode, Antigravity, Warp, Cursor, Aider, or another coding tool. Keep `dev setup`, `dev plan`, `dev run`, and `dev verify` in the terminal at the repository root.
 
 For an automated end-to-end run with a supported coding CLI installed:
 
 ```bash
 dev e2e "Describe the implementation goal" --executor codex
+dev e2e "Describe the implementation goal" --executor antigravity
 dev e2e "Describe the implementation goal" --executor warp
 dev go "Describe the implementation goal" --executor codex
 ```
@@ -102,13 +104,24 @@ dev e2e "Describe the implementation goal" --executor codex --json --report-file
 
 See the full [quickstart](docs/quickstart.md) for installation variants, API-key setup, and first-run guidance.
 
-Register any local CLI that accepts prompts. `dev agents` is the first-class agent hub; `dev integrate cli-agent` remains available for older scripts:
+OpenCode and Google Antigravity CLI are built-in executors and MCP integrations:
 
 ```bash
-dev agents add opencode --command opencode --arg run --input-mode prompt-file --prompt-arg=--prompt-file --supports-mcp
+dev integrate opencode --apply
+dev run TASK-001 --executor opencode
+dev agents run TASK-001 --agent opencode --profile default
+dev integrate antigravity --apply
+dev run TASK-001 --executor antigravity
+dev agents run TASK-001 --agent agy --profile default
+```
+
+Register any other local CLI that accepts prompts. `dev agents` is the first-class agent hub; `dev integrate cli-agent` remains available for older scripts:
+
+```bash
+dev agents add myagent --command myagent --arg run --input-mode prompt-file --prompt-arg=--prompt-file --supports-mcp
 dev agents
 dev agents doctor
-dev agents run TASK-001 --agent opencode --profile default
+dev agents run TASK-001 --agent myagent --profile default
 ```
 
 ## Feature Set
@@ -133,11 +146,11 @@ DevCouncil is an application layer around coding agents. It does not just emit p
 
 - **CLI:** `dev` and `devcouncil` expose the same Typer command surface for local terminal workflows.
 - **Agent hub:** `dev agents` lists built-in and custom agents, `dev agents add` registers prompt-taking CLIs, `dev agents doctor` checks wiring, and `dev agents run` executes a task through a named agent/profile.
-- **Integration hub:** `dev integrate all --apply` configures supported coding CLI and MCP integrations; targeted setup exists for Codex, Gemini, Claude Code, Cursor, Warp/Oz, hooks, and custom CLI agents.
+- **Integration hub:** `dev integrate all --apply` configures supported coding CLI and MCP integrations; targeted setup exists for Codex, Gemini, Claude Code, OpenCode, Antigravity, Cursor, Warp/Oz, hooks, and custom CLI agents.
 - **MCP server:** `dev mcp-server` exposes DevCouncil context and workflow tools over stdio for MCP-capable clients.
 - **Live review:** `dev watch` tracks review cards, signals, blocking feedback, and repair guidance while a session is active.
 - **Trace viewer:** `dev trace tail --follow` streams local DevCouncil trace events for execution, verification, and agent handoff.
-- **Dashboard:** `dev dashboard` serves a local status dashboard for project state and live workflow visibility.
+- **Dashboard:** `dev dashboard --open` serves a local status dashboard and opens it in the default browser for project state and live workflow visibility.
 - **Config editor:** `dev config` and `dev config models` inspect/update provider, model, executor, and command configuration.
 - **Artifact tools:** `dev artifacts validate` checks stored graph integrity.
 - **Code intelligence:** `dev lsp inspect` checks optional language-server readiness, and `dev ast match` searches code structurally.
@@ -148,11 +161,11 @@ DevCouncil is an application layer around coding agents. It does not just emit p
 DevCouncil works with human-in-the-loop sidecar sessions and automated prompt handoff:
 
 - **Manual sidecar:** paste `dev prompt TASK-001` into any agent, then run `dev verify TASK-001`.
-- **Built-in coding CLI adapters:** `codex`, `gemini`, `claude`, `warp`, and aliases such as `codex-cli`, `gemini-cli`, `claude-code`, `warp-cli`, `oz`, and `oz-cli`.
+- **Built-in coding CLI adapters:** `codex`, `gemini`, `claude`, `opencode`, `antigravity`, `warp`, `cursor`, `aider`, and aliases such as `codex-cli`, `gemini-cli`, `claude-code`, `opencode-cli`, `antigravity-cli`, `agy`, `agy-cli`, `warp-cli`, `oz`, `cursor-agent`, and `cursor-cli`.
 - **Custom CLI agents:** register any prompt-taking command with stdin, argument, or prompt-file handoff.
 - **Execution profiles:** custom agents can use profiles such as `default`, `yolo`, and `prod` to adjust prompt constraints while DevCouncil still verifies the final diff.
 - **External automated adapters:** `mini`, `openhands`, `native-preview`, and `native` are available when the corresponding local executor is configured.
-- **Hook-aware clients:** `dev integrate hooks --apply` installs native write/shell tool hooks for supported clients so DevCouncil policy can block unauthorized actions before verification.
+- **Hook-aware clients:** `dev integrate hooks --apply` installs write/shell hooks for Codex, Gemini, Claude, Cursor, and OpenCode so DevCouncil policy can block unauthorized actions before verification.
 
 ### Gates And Evidence
 
@@ -193,7 +206,7 @@ DevCouncil stores local workflow state in the target repository:
 - `.devcouncil/logs/`: redacted stdout/stderr from verification commands.
 - `.devcouncil/runs/<run-id>/agent-run.json`: prompt, executor, profile, exit status, and run metadata for automated agent executions.
 - `.devcouncil/reports/latest.json`: optional machine-readable report generated by `dev e2e --agent`.
-- `.devcouncil/integrations/`: generated integration files such as Warp/Oz MCP JSON.
+- `.devcouncil/integrations/` and `.agents/`: generated integration files such as Warp/Oz MCP JSON and Antigravity MCP config.
 
 ### Maturity
 
@@ -230,7 +243,7 @@ flowchart TD
     artifactGraph --> gates["Gate policy\nplanned files, commands, secret checks"]
 
     gates --> manual["Manual sidecar\ndev prompt + user agent edits"]
-    gates --> coding["Coding CLI executor\nCodex, Gemini, Claude, Warp, custom CLIs"]
+    gates --> coding["Coding CLI executor\nCodex, Gemini, Claude, OpenCode, Antigravity, Warp, custom CLIs"]
     gates --> native["Native preview executor\nLLM router + TaskRunner"]
     gates --> external["Mini-SWE / OpenHands adapters"]
 

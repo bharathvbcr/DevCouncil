@@ -1,7 +1,7 @@
 from devcouncil.storage.db import Database
 import socketserver
 
-from devcouncil.ui.dashboard import dashboard_html, dashboard_payload, logo_svg, run_dashboard
+from devcouncil.ui.dashboard import dashboard_html, dashboard_payload, logo_asset_bytes, logo_svg, run_dashboard
 
 
 def test_dashboard_payload_handles_uninitialized_project(tmp_path):
@@ -31,10 +31,17 @@ def test_dashboard_html_contains_live_status_endpoint():
     html = dashboard_html()
 
     assert "/api/status" in html
-    assert "/assets/devcouncil-logo.svg" in html
+    assert "/assets/devcouncil_logo_premium.png" in html
     assert "DevCouncil Dashboard" in html
     assert "replaceChildren" in html
     assert "innerHTML" not in html
+
+
+def test_dashboard_premium_logo_asset_is_packaged_png():
+    logo = logo_asset_bytes()
+
+    assert logo.startswith(b"\x89PNG\r\n\x1a\n")
+    assert len(logo) > 100_000
 
 
 def test_dashboard_logo_asset_is_packaged_svg():

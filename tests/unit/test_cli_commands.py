@@ -1172,8 +1172,8 @@ def test_cli_go_supports_custom_agent_registry_and_profile(tmp_path, monkeypatch
     assert runner.invoke(app, ["init"]).exit_code == 0
     config_path = tmp_path / ".devcouncil" / "config.yaml"
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    raw.setdefault("integrations", {}).setdefault("cli_agents", {}).setdefault("agents", {})["opencode"] = {
-        "command": "opencode",
+    raw.setdefault("integrations", {}).setdefault("cli_agents", {}).setdefault("agents", {})["custombot"] = {
+        "command": "custombot",
         "input_mode": "stdin",
     }
     config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
@@ -1209,10 +1209,10 @@ def test_cli_go_supports_custom_agent_registry_and_profile(tmp_path, monkeypatch
     monkeypatch.setattr("devcouncil.cli.commands.go.plan_command.run_plan_flow", fake_plan_flow)
     monkeypatch.setattr("devcouncil.cli.commands.go.run_command.run", fake_run)
 
-    result = runner.invoke(app, ["go", "Add a feature", "--executor", "opencode", "--profile", "prod"])
+    result = runner.invoke(app, ["go", "Add a feature", "--executor", "custombot", "--profile", "prod"])
 
     assert result.exit_code == 0
-    assert seen == {"executor": "opencode", "profile": "prod"}
+    assert seen == {"executor": "custombot", "profile": "prod"}
 
 
 def test_cli_integrate_prints_coding_cli_setup_commands(tmp_path, monkeypatch):
@@ -1224,34 +1224,48 @@ def test_cli_integrate_prints_coding_cli_setup_commands(tmp_path, monkeypatch):
     assert "codex mcp add devcouncil" in result.output
     assert "gemini mcp add --scope project" in result.output
     assert "claude mcp add --scope local" in result.output
-    assert "cursor --add-mcp" in result.output
+    assert ".cursor" in result.output
+    assert '"mcpServers":{"devcouncil"' in result.output
+    assert "OpenCode" in result.output
+    assert '"mcp":{"devcouncil"' in result.output
+    assert "Google Antigravity CLI" in result.output
+    assert ".agents" in result.output
     assert "Warp / Oz" in result.output
     assert "Native hook config preview" in result.output
     assert "DEVCOUNCIL_PROJECT_ROOT=" in result.output
 
 
-def test_cli_integrate_formats_cursor_command_for_posix_shell(tmp_path, monkeypatch):
+def test_cli_integrate_cursor_preview_uses_project_mcp_json(tmp_path):
     from devcouncil.cli.commands import integrate
 
-    monkeypatch.setattr(integrate.sys, "platform", "linux")
+    config = integrate._cursor_mcp_config(tmp_path)
 
-    command = integrate._format_command(integrate._cursor_command(tmp_path))
+    server = config["mcpServers"]["devcouncil"]
+    assert server["type"] == "stdio"
+    assert server["command"] == "devcouncil"
+    assert server["args"] == ["mcp-server"]
+    assert server["env"]["DEVCOUNCIL_PROJECT_ROOT"] == str(tmp_path)
 
-    assert "cursor --add-mcp" in command
-    assert "'{\"name\":\"devcouncil\"" in command
-    assert "\\\"name\\\"" not in command
 
+def test_cli_integrate_cursor_writes_project_mcp_json(tmp_path, monkeypatch):
+    import yaml
 
-def test_cli_integrate_formats_cursor_command_for_powershell(tmp_path, monkeypatch):
-    from devcouncil.cli.commands import integrate
+    monkeypatch.setattr("shutil.which", lambda command: None)
 
-    monkeypatch.setattr(integrate.sys, "platform", "win32")
+    result = runner.invoke(app, ["integrate", "cursor", "--apply", "--project-root", str(tmp_path)])
 
-    command = integrate._format_command(integrate._cursor_command(tmp_path))
-
-    assert "cursor --add-mcp" in command
-    assert "'{\"name\":\"devcouncil\"" in command
-    assert "\\\"name\\\"" not in command
+    assert result.exit_code == 0
+    config_path = tmp_path / ".cursor" / "mcp.json"
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    server = data["mcpServers"]["devcouncil"]
+    assert server["type"] == "stdio"
+    assert server["command"] == "devcouncil"
+    assert server["args"] == ["mcp-server"]
+    assert server["env"]["DEVCOUNCIL_PROJECT_ROOT"] == str(tmp_path)
+    raw_config = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
+    cursor = raw_config["integrations"]["cursor"]
+    assert cursor["enabled"] is True
+    assert cursor["config_path"].replace("\\", "/") == ".cursor/mcp.json"
 
 
 def test_cli_integrate_hooks_previews_native_hook_files(tmp_path):
@@ -1261,6 +1275,8 @@ def test_cli_integrate_hooks_previews_native_hook_files(tmp_path):
     assert ".codex" in result.output
     assert ".gemini" in result.output
     assert ".claude" in result.output
+    assert ".cursor" in result.output
+    assert "opencode_devcouncil_plugin.mjs" in result.output
     assert "Preview only" in result.output
 
 
@@ -1271,12 +1287,29 @@ def test_cli_integrate_hooks_apply_writes_native_hook_files(tmp_path):
     codex_hooks = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     gemini_settings = json.loads((tmp_path / ".gemini" / "settings.json").read_text(encoding="utf-8"))
     claude_settings = json.loads((tmp_path / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
+    cursor_hooks = json.loads((tmp_path / ".cursor" / "hooks.json").read_text(encoding="utf-8"))
     assert "PreToolUse" in codex_hooks["hooks"]
     assert "BeforeTool" in gemini_settings["hooks"]
     assert "PreToolUse" in claude_settings["hooks"]
     assert "Stop" in claude_settings["hooks"]
     assert "agent-response" in json.dumps(claude_settings)
+    assert "preToolUse" in cursor_hooks["hooks"]
+    assert "postToolUse" in cursor_hooks["hooks"]
+    assert "pre-tool-use" in json.dumps(cursor_hooks)
+    assert (tmp_path / ".devcouncil" / "integrations" / "opencode_devcouncil_plugin.mjs").exists()
+    opencode_config = json.loads((tmp_path / "opencode.json").read_text(encoding="utf-8"))
+    assert "./.devcouncil/integrations/opencode_devcouncil_plugin.mjs" in opencode_config["plugin"]
     assert "codex_hooks = true" in (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
+
+
+def test_cli_integrate_aider_apply_records_executor(tmp_path):
+    import yaml
+
+    result = runner.invoke(app, ["integrate", "aider", "--apply", "--project-root", str(tmp_path)])
+
+    assert result.exit_code == 0
+    raw_config = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
+    assert raw_config["integrations"]["aider"]["enabled"] is True
 
 
 def test_cli_integrate_all_apply_writes_native_hook_files_when_clients_missing(tmp_path, monkeypatch):
@@ -1301,6 +1334,8 @@ def test_cli_integrations_doctor_reports_optional_tools(tmp_path, monkeypatch):
     assert "Agent Flow" in result.output
     assert "Claude Code" in result.output
     assert "Cursor" in result.output
+    assert "OpenCode" in result.output
+    assert "Google Antigravity CLI" in result.output
     assert "Aider" in result.output
 
 
@@ -2038,8 +2073,9 @@ def test_cli_integrate_supports_cursor_mcp_json(tmp_path):
     )
 
     assert result.exit_code == 0
-    assert "cursor --add-mcp" in result.output
-    assert '"name":"devcouncil"' in result.output
+    assert ".cursor" in result.output
+    assert '"mcpServers":{"devcouncil"' in result.output
+    assert '"type":"stdio"' in result.output
     assert '"DEVCOUNCIL_PROJECT_ROOT":"' in result.output
 
 
@@ -2051,17 +2087,59 @@ def test_cli_integrate_warp_writes_mcp_config(tmp_path):
     assert result.exit_code == 0
     config_path = tmp_path / ".devcouncil" / "integrations" / "warp-mcp.json"
     data = json.loads(config_path.read_text(encoding="utf-8"))
-    server = data["mcpServers"]["devcouncil"]
+    server = data["devcouncil"]
     assert server["command"] == "devcouncil"
     assert server["args"] == ["mcp-server"]
     assert server["env"]["DEVCOUNCIL_PROJECT_ROOT"] == str(tmp_path)
-    assert server["working_directory"] == str(tmp_path)
+    assert "working_directory" not in server
     raw_config = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
     warp = raw_config["integrations"]["warp"]
     assert warp["enabled"] is True
     assert warp["command"] == "oz"
     assert warp["run_mode"] == "local"
     assert warp["mcp_config_path"].replace("\\", "/") == ".devcouncil/integrations/warp-mcp.json"
+
+
+def test_cli_integrate_opencode_writes_project_mcp_config(tmp_path, monkeypatch):
+    import yaml
+
+    monkeypatch.setattr("shutil.which", lambda command: f"/usr/bin/{command}")
+
+    result = runner.invoke(app, ["integrate", "opencode", "--apply", "--project-root", str(tmp_path)])
+
+    assert result.exit_code == 0
+    config_path = tmp_path / "opencode.json"
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    server = data["mcp"]["devcouncil"]
+    assert server["type"] == "local"
+    assert server["command"] == ["devcouncil", "mcp-server"]
+    assert server["environment"]["DEVCOUNCIL_PROJECT_ROOT"] == str(tmp_path)
+    assert server["enabled"] is True
+    raw_config = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
+    opencode = raw_config["integrations"]["opencode"]
+    assert opencode["enabled"] is True
+    assert opencode["config_path"] == "opencode.json"
+
+
+def test_cli_integrate_antigravity_writes_project_mcp_config(tmp_path, monkeypatch):
+    import yaml
+
+    monkeypatch.setattr("shutil.which", lambda command: f"/usr/bin/{command}")
+
+    result = runner.invoke(app, ["integrate", "antigravity", "--apply", "--project-root", str(tmp_path)])
+
+    assert result.exit_code == 0
+    config_path = tmp_path / ".agents" / "mcp_config.json"
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    server = data["mcpServers"]["devcouncil"]
+    assert server["command"] == "devcouncil"
+    assert server["args"] == ["mcp-server"]
+    assert server["env"]["DEVCOUNCIL_PROJECT_ROOT"] == str(tmp_path)
+    assert server["cwd"] == str(tmp_path)
+    raw_config = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
+    antigravity = raw_config["integrations"]["antigravity"]
+    assert antigravity["enabled"] is True
+    assert antigravity["mcp_config_path"].replace("\\", "/") == ".agents/mcp_config.json"
 
 
 def test_cli_integrate_registers_bring_your_own_cli_executor(tmp_path):
@@ -2072,9 +2150,9 @@ def test_cli_integrate_registers_bring_your_own_cli_executor(tmp_path):
         [
             "integrate",
             "cli-agent",
-            "opencode",
+            "custombot",
             "--command",
-            "opencode",
+            "custombot",
             "--arg",
             "run",
             "--input-mode",
@@ -2088,8 +2166,8 @@ def test_cli_integrate_registers_bring_your_own_cli_executor(tmp_path):
 
     assert result.exit_code == 0
     raw = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
-    agent = raw["integrations"]["cli_agents"]["agents"]["opencode"]
-    assert agent["command"] == "opencode"
+    agent = raw["integrations"]["cli_agents"]["agents"]["custombot"]
+    assert agent["command"] == "custombot"
     assert agent["args"] == ["run"]
     assert agent["input_mode"] == "prompt-file"
     assert agent["prompt_arg"] == "--prompt-file"
@@ -2105,9 +2183,9 @@ def test_cli_agents_add_writes_typed_agent_config(tmp_path):
         [
             "agents",
             "add",
-            "opencode",
+            "custombot",
             "--command",
-            "opencode",
+            "custombot",
             "--arg",
             "run",
             "--input-mode",
@@ -2130,8 +2208,8 @@ def test_cli_agents_add_writes_typed_agent_config(tmp_path):
 
     assert result.exit_code == 0
     raw = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
-    agent = raw["integrations"]["cli_agents"]["agents"]["opencode"]
-    assert agent["command"] == "opencode"
+    agent = raw["integrations"]["cli_agents"]["agents"]["custombot"]
+    assert agent["command"] == "custombot"
     assert agent["args"] == ["run"]
     assert agent["input_mode"] == "prompt-file"
     assert agent["display_name"] == "OpenCode"
@@ -2139,7 +2217,7 @@ def test_cli_agents_add_writes_typed_agent_config(tmp_path):
     assert agent["supports_mcp"] is True
     assert agent["supports_diff_review"] is True
     assert agent["default_profile"] == "prod"
-    assert agent["help_command"] == ["opencode", "--help"]
+    assert agent["help_command"] == ["custombot", "--help"]
 
 
 def test_cli_agents_add_rejects_unknown_default_profile(tmp_path):
@@ -2148,9 +2226,9 @@ def test_cli_agents_add_rejects_unknown_default_profile(tmp_path):
         [
             "agents",
             "add",
-            "opencode",
+            "custombot",
             "--command",
-            "opencode",
+            "custombot",
             "--default-profile",
             "missing",
             "--project-root",
@@ -2186,9 +2264,9 @@ def test_cli_integrate_cli_agent_rejects_unknown_default_profile(tmp_path):
         [
             "integrate",
             "cli-agent",
-            "opencode",
+            "custombot",
             "--command",
-            "opencode",
+            "custombot",
             "--default-profile",
             "missing",
             "--apply",
@@ -2221,40 +2299,42 @@ def test_cli_integrate_cli_agent_rejects_blank_name(tmp_path):
 
 
 def test_cli_agents_add_rejects_reserved_builtin_name(tmp_path):
-    result = runner.invoke(
-        app,
-        [
-            "agents",
-            "add",
-            "oz",
-            "--command",
-            "custom-oz",
-            "--project-root",
-            str(tmp_path),
-        ],
-    )
+    for name in ("oz", "agy"):
+        result = runner.invoke(
+            app,
+            [
+                "agents",
+                "add",
+                name,
+                "--command",
+                f"custom-{name}",
+                "--project-root",
+                str(tmp_path),
+            ],
+        )
 
-    assert result.exit_code == 2
-    assert "reserved for a built-in DevCouncil agent" in result.output
+        assert result.exit_code == 2
+        assert "reserved for a built-in DevCouncil agent" in result.output
 
 
 def test_cli_integrate_cli_agent_rejects_reserved_builtin_name(tmp_path):
-    result = runner.invoke(
-        app,
-        [
-            "integrate",
-            "cli-agent",
-            "codex",
-            "--command",
-            "custom-codex",
-            "--apply",
-            "--project-root",
-            str(tmp_path),
-        ],
-    )
+    for name in ("codex", "google-antigravity"):
+        result = runner.invoke(
+            app,
+            [
+                "integrate",
+                "cli-agent",
+                name,
+                "--command",
+                f"custom-{name}",
+                "--apply",
+                "--project-root",
+                str(tmp_path),
+            ],
+        )
 
-    assert result.exit_code == 2
-    assert "reserved for a built-in DevCouncil agent" in result.output
+        assert result.exit_code == 2
+        assert "reserved for a built-in DevCouncil agent" in result.output
 
 
 def test_cli_agents_lists_builtins_and_custom_agents(tmp_path, monkeypatch):
@@ -2264,8 +2344,8 @@ def test_cli_agents_lists_builtins_and_custom_agents(tmp_path, monkeypatch):
     assert runner.invoke(app, ["init"]).exit_code == 0
     config_path = tmp_path / ".devcouncil" / "config.yaml"
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    raw.setdefault("integrations", {}).setdefault("cli_agents", {}).setdefault("agents", {})["opencode"] = {
-        "command": "opencode",
+    raw.setdefault("integrations", {}).setdefault("cli_agents", {}).setdefault("agents", {})["custombot"] = {
+        "command": "custombot",
         "args": ["run"],
         "input_mode": "stdin",
     }
@@ -2277,6 +2357,8 @@ def test_cli_agents_lists_builtins_and_custom_agents(tmp_path, monkeypatch):
     assert "codex" in result.output
     assert "warp" in result.output
     assert "opencode" in result.output
+    assert "antigravity" in result.output
+    assert "custombot" in result.output
 
 
 def test_cli_agents_doctor_reports_custom_agent_status(tmp_path, monkeypatch):
@@ -2286,8 +2368,8 @@ def test_cli_agents_doctor_reports_custom_agent_status(tmp_path, monkeypatch):
     assert runner.invoke(app, ["init"]).exit_code == 0
     config_path = tmp_path / ".devcouncil" / "config.yaml"
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    raw.setdefault("integrations", {}).setdefault("cli_agents", {}).setdefault("agents", {})["opencode"] = {
-        "command": "opencode",
+    raw.setdefault("integrations", {}).setdefault("cli_agents", {}).setdefault("agents", {})["custombot"] = {
+        "command": "custombot",
         "args": ["run"],
         "input_mode": "bad-mode",
     }
@@ -2297,7 +2379,7 @@ def test_cli_agents_doctor_reports_custom_agent_status(tmp_path, monkeypatch):
     result = runner.invoke(app, ["agents", "doctor"])
 
     assert result.exit_code == 0
-    assert "opencode" in result.output
+    assert "custombot" in result.output
     assert "invalid input_mode=bad-mode" in result.output
 
 
@@ -2309,8 +2391,8 @@ def test_cli_integrate_doctor_uses_project_root_for_custom_agents(tmp_path, monk
     assert runner.invoke(app, ["setup", "--project-root", str(project), "--skip-api-key", "--skip-integrations"]).exit_code == 0
     config_path = project / ".devcouncil" / "config.yaml"
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    raw.setdefault("integrations", {}).setdefault("cli_agents", {}).setdefault("agents", {})["opencode"] = {
-        "command": "opencode",
+    raw.setdefault("integrations", {}).setdefault("cli_agents", {}).setdefault("agents", {})["custombot"] = {
+        "command": "custombot",
         "input_mode": "bad-mode",
     }
     config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
@@ -2320,7 +2402,7 @@ def test_cli_integrate_doctor_uses_project_root_for_custom_agents(tmp_path, monk
     result = runner.invoke(app, ["integrate", "doctor", "--project-root", str(project)])
 
     assert result.exit_code == 0
-    assert "CLI agent: opencode" in result.output
+    assert "CLI agent: custombot" in result.output
     assert "invalid input_mode=bad-mode" in result.output
 
 
@@ -2368,6 +2450,26 @@ def test_cli_agents_run_omits_profile_to_use_agent_default(tmp_path, monkeypatch
     assert called["executor"] == "opencode"
     assert called["profile"] is None
     assert called["project_root"] == tmp_path
+
+
+def test_cli_dashboard_open_launches_browser_before_serving(tmp_path, monkeypatch):
+    opened = {}
+    served = {}
+
+    monkeypatch.setattr("devcouncil.cli.commands.dashboard.webbrowser.open", lambda url: opened.setdefault("url", url))
+    monkeypatch.setattr(
+        "devcouncil.cli.commands.dashboard.run_dashboard",
+        lambda root, host, port: served.update({"root": root, "host": host, "port": port}),
+    )
+
+    result = runner.invoke(
+        app,
+        ["dashboard", "--open", "--host", "127.0.0.1", "--port", "9999", "--project-root", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0
+    assert opened["url"] == "http://127.0.0.1:9999"
+    assert served == {"root": tmp_path, "host": "127.0.0.1", "port": 9999}
 
 
 def test_cli_setup_initializes_project_and_prints_next_commands(tmp_path, monkeypatch):
@@ -2761,7 +2863,10 @@ def test_cli_setup_can_preview_integrations(tmp_path, monkeypatch):
     assert "codex mcp add devcouncil" in result.output
     assert "gemini mcp add --scope project" in result.output
     assert "claude mcp add --scope local" in result.output
-    assert "cursor --add-mcp" in result.output
+    assert ".cursor" in result.output
+    assert '"mcpServers":{"devcouncil"' in result.output
+    assert "Google Antigravity CLI" in result.output
+    assert ".agents" in result.output
     assert "Native hook config preview" in result.output
     assert f"DEVCOUNCIL_PROJECT_ROOT={tmp_path}" in result.output
 
@@ -3256,6 +3361,8 @@ def test_cli_run_supports_coding_cli_alias_executors(tmp_path, monkeypatch):
         ("codex-cli", "codex"),
         ("gemini-cli", "gemini"),
         ("claude-cli", "claude"),
+        ("antigravity-cli", "antigravity"),
+        ("agy", "antigravity"),
         ("warp-cli", "warp"),
         ("oz", "warp"),
     ]:

@@ -11,11 +11,16 @@ from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import ArtifactGraphRepository, StateRepository, TaskRepository
 from devcouncil.telemetry.traces import read_trace_events
 
-LOGO_ASSET = "devcouncil-logo.svg"
+LOGO_ASSET = "devcouncil_logo_premium.png"
+LEGACY_LOGO_ASSET = "devcouncil-logo.svg"
 
 
 def logo_svg() -> str:
-    return resources.files("devcouncil.assets").joinpath(LOGO_ASSET).read_text(encoding="utf-8")
+    return resources.files("devcouncil.assets").joinpath(LEGACY_LOGO_ASSET).read_text(encoding="utf-8")
+
+
+def logo_asset_bytes() -> bytes:
+    return resources.files("devcouncil.assets").joinpath(LOGO_ASSET).read_bytes()
 
 
 def dashboard_payload(project_root: Path) -> dict:
@@ -61,7 +66,7 @@ def dashboard_html() -> str:
   </style>
 </head>
 <body>
-  <header><div class="brand"><img src="/assets/devcouncil-logo.svg" alt="DevCouncil logo"><h1>DevCouncil Dashboard</h1></div><div class="phase-line">Phase: <span id="phase" class="phase">loading</span></div></header>
+  <header><div class="brand"><img src="/assets/devcouncil_logo_premium.png" alt="DevCouncil logo"><h1>DevCouncil Dashboard</h1></div><div class="phase-line">Phase: <span id="phase" class="phase">loading</span></div></header>
   <main>
     <section><h2>Coverage</h2><pre id="coverage">{}</pre></section>
     <section><h2>Tasks</h2><table><thead><tr><th>ID</th><th>Status</th><th>Title</th></tr></thead><tbody id="tasks"></tbody></table></section>
@@ -103,6 +108,15 @@ def run_dashboard(project_root: Path, host: str = "127.0.0.1", port: int = 8765)
         def do_GET(self):  # noqa: N802
             parsed = urlparse(self.path)
             if parsed.path == f"/assets/{LOGO_ASSET}":
+                body = logo_asset_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if parsed.path == f"/assets/{LEGACY_LOGO_ASSET}":
                 body = logo_svg().encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "image/svg+xml; charset=utf-8")

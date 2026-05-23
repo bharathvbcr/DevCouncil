@@ -95,6 +95,90 @@ def render_doctor_check(project_root: Path = Path(".")):
             "Optional. Install Gemini CLI, then run 'dev integrate gemini --apply' (or 'dev setup --integrate --apply').",
         )
 
+    claude_ver = _command_version(["claude", "--version"])
+    if claude_ver:
+        table.add_row(
+            "Claude Code",
+            "[green]OK[/green]",
+            f"{claude_ver}. Setup: dev integrate claude --apply (or dev setup --integrate --apply).",
+        )
+    else:
+        table.add_row(
+            "Claude Code",
+            "[yellow]Missing[/yellow]",
+            "Optional. Install Claude Code, then run 'dev integrate claude --apply' (or 'dev setup --integrate --apply').",
+        )
+
+    cursor_ver = _command_version(["cursor-agent", "--version"]) or _command_version(["cursor", "--version"])
+    if cursor_ver:
+        table.add_row(
+            "Cursor",
+            "[green]OK[/green]",
+            f"{cursor_ver}. Setup: dev integrate cursor --apply (or dev setup --integrate --apply).",
+        )
+    else:
+        table.add_row(
+            "Cursor",
+            "[yellow]Missing[/yellow]",
+            "Optional. Install Cursor/cursor-agent, then run 'dev integrate cursor --apply' (or 'dev setup --integrate --apply').",
+        )
+
+    opencode_ver = _command_version(["opencode", "--version"])
+    if opencode_ver:
+        table.add_row(
+            "OpenCode",
+            "[green]OK[/green]",
+            f"{opencode_ver}. Setup: dev integrate opencode --apply (or dev setup --integrate --apply).",
+        )
+    else:
+        table.add_row(
+            "OpenCode",
+            "[yellow]Missing[/yellow]",
+            "Optional. Install OpenCode, then run 'dev integrate opencode --apply' (or 'dev setup --integrate --apply').",
+        )
+
+    agy_ver = _command_version(["agy", "--version"])
+    if agy_ver:
+        table.add_row(
+            "Google Antigravity CLI",
+            "[green]OK[/green]",
+            f"{agy_ver}. Setup: dev integrate antigravity --apply (or dev setup --integrate --apply).",
+        )
+    else:
+        table.add_row(
+            "Google Antigravity CLI",
+            "[yellow]Missing[/yellow]",
+            "Optional. Install Antigravity CLI, then run 'dev integrate antigravity --apply' (or 'dev setup --integrate --apply').",
+        )
+
+    oz_ver = _command_version(["oz", "--version"])
+    if oz_ver:
+        table.add_row(
+            "Warp / Oz",
+            "[green]OK[/green]",
+            f"{oz_ver}. Setup: dev integrate warp --apply (or dev setup --integrate --apply).",
+        )
+    else:
+        table.add_row(
+            "Warp / Oz",
+            "[yellow]Missing[/yellow]",
+            "Optional. Install Warp/Oz, then run 'dev integrate warp --apply' (or 'dev setup --integrate --apply').",
+        )
+
+    aider_ver = _command_version(["aider", "--version"])
+    if aider_ver:
+        table.add_row(
+            "Aider",
+            "[green]OK[/green]",
+            f"{aider_ver}. Setup: dev integrate aider --apply. Run with: dev run TASK-001 --executor aider.",
+        )
+    else:
+        table.add_row(
+            "Aider",
+            "[yellow]Missing[/yellow]",
+            "Optional. Install Aider, then run 'dev integrate aider --apply'.",
+        )
+
     try:
         provider = load_config(project_root).models.provider
     except Exception:

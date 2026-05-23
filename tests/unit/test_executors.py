@@ -123,6 +123,12 @@ def test_coding_cli_executor_normalizes_aliases(tmp_path, monkeypatch):
         ("gemini_cli", ["gemini"]),
         ("claude-code", ["claude", "-p"]),
         ("claude_cli", ["claude", "-p"]),
+        ("opencode", ["opencode", "run", "--file"]),
+        ("opencode-cli", ["opencode", "run", "--file"]),
+        ("antigravity", ["agy", "--print", "--print-timeout", "30m"]),
+        ("antigravity-cli", ["agy", "--print", "--print-timeout", "30m"]),
+        ("agy", ["agy", "--print", "--print-timeout", "30m"]),
+        ("agy-cli", ["agy", "--print", "--print-timeout", "30m"]),
         ("warp", ["oz", "agent", "run"]),
         ("oz-cli", ["oz", "agent", "run"]),
     ]:
@@ -152,12 +158,12 @@ def test_coding_cli_executor_supports_custom_cli_agents(tmp_path, monkeypatch):
             "integrations": {
                 "cli_agents": {
                     "agents": {
-                        "opencode": {
-                            "command": "opencode",
+                        "custombot": {
+                            "command": "custombot",
                             "args": ["run"],
                             "input_mode": "prompt-file",
                             "prompt_arg": "--prompt-file",
-                            "env": {"OPENCODE_MODE": "devcouncil"},
+                            "env": {"CUSTOMBOT_MODE": "devcouncil"},
                         }
                     }
                 }
@@ -177,13 +183,179 @@ def test_coding_cli_executor_supports_custom_cli_agents(tmp_path, monkeypatch):
         ],
     )
 
+    result = CodingCliExecutor(tmp_path, "custombot").run_task(task, [])
+
+    assert result.success
+    assert captured["cmd"][:3] == ["custombot", "run", "--prompt-file"]
+    assert captured["cmd"][3].endswith("TASK-001-custombot-task.md")
+    assert captured["input"] is None
+    assert captured["env"]["CUSTOMBOT_MODE"] == "devcouncil"
+
+
+def test_coding_cli_executor_builtin_opencode_uses_attached_prompt_file(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_which(_command):
+        return f"/usr/bin/{_command}"
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["input"] = kwargs.get("input")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    task = Task(
+        id="TASK-001",
+        title="OpenCode",
+        description="Implement feature",
+        planned_files=[
+            PlannedFile(path="src/app.py", reason="logic", allowed_change="modify"),
+        ],
+    )
+
     result = CodingCliExecutor(tmp_path, "opencode").run_task(task, [])
 
     assert result.success
-    assert captured["cmd"][:3] == ["opencode", "run", "--prompt-file"]
+    assert captured["cmd"][:3] == ["opencode", "run", "--file"]
     assert captured["cmd"][3].endswith("TASK-001-opencode-task.md")
+    assert captured["cmd"][4] == "Execute the DevCouncil task described in the attached prompt file."
     assert captured["input"] is None
-    assert captured["env"]["OPENCODE_MODE"] == "devcouncil"
+
+
+def test_coding_cli_executor_builtin_antigravity_uses_task_file_prompt(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_which(_command):
+        return f"/usr/bin/{_command}"
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["input"] = kwargs.get("input")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    task = Task(
+        id="TASK-001",
+        title="Antigravity",
+        description="Implement feature",
+        planned_files=[
+            PlannedFile(path="src/app.py", reason="logic", allowed_change="modify"),
+        ],
+    )
+
+    result = CodingCliExecutor(tmp_path, "agy").run_task(task, [])
+
+    assert result.success
+    assert captured["cmd"][:4] == ["agy", "--print", "--print-timeout", "30m"]
+    assert captured["cmd"][4].endswith("TASK-001-antigravity-task.md.")
+    assert "Read and execute the DevCouncil task prompt" in captured["cmd"][4]
+    assert captured["input"] is None
+    task_file = tmp_path / ".devcouncil" / "TASK-001-antigravity-task.md"
+    assert task_file.exists()
+
+
+def test_coding_cli_executor_builtin_cursor_uses_cursor_agent_print_mode(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_which(command):
+        if command in {"cursor-agent", "agent"}:
+            return f"/usr/bin/{command}"
+        return None
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["input"] = kwargs.get("input")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    task = Task(
+        id="TASK-001",
+        title="Cursor",
+        description="Implement feature",
+        planned_files=[
+            PlannedFile(path="src/app.py", reason="logic", allowed_change="modify"),
+        ],
+    )
+
+    result = CodingCliExecutor(tmp_path, "cursor-agent").run_task(task, [])
+
+    assert result.success
+    assert captured["cmd"][0] == "cursor-agent"
+    assert captured["cmd"][:4] == ["cursor-agent", "--print", "--trust", "--workspace"]
+    assert captured["cmd"][4] == str(tmp_path)
+    assert captured["cmd"][5].endswith("TASK-001-cursor-task.md.")
+    assert captured["input"] is None
+
+
+def test_coding_cli_executor_builtin_aider_uses_message_argument(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_which(_command):
+        return f"/usr/bin/{_command}"
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["input"] = kwargs.get("input")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    task = Task(
+        id="TASK-001",
+        title="Aider",
+        description="Implement feature",
+        planned_files=[
+            PlannedFile(path="src/app.py", reason="logic", allowed_change="modify"),
+        ],
+    )
+
+    result = CodingCliExecutor(tmp_path, "aider").run_task(task, [])
+
+    assert result.success
+    assert captured["cmd"][:4] == ["aider", "--yes", "--no-show-model-warnings", "--message"]
+    assert "TASK-001" in captured["cmd"][4]
+    assert captured["input"] is None
+
+
+def test_coding_cli_executor_warp_writes_oz_mcp_server_map(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_which(_command):
+        return f"/usr/bin/{_command}"
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    task = Task(
+        id="TASK-001",
+        title="Warp",
+        description="Implement feature",
+        planned_files=[
+            PlannedFile(path="src/app.py", reason="logic", allowed_change="modify"),
+        ],
+    )
+
+    result = CodingCliExecutor(tmp_path, "warp").run_task(task, [])
+
+    assert result.success
+    assert "--mcp" in captured["cmd"]
+    config_path = tmp_path / ".devcouncil" / "integrations" / "warp-mcp.json"
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert data["devcouncil"]["command"] == "devcouncil"
+    assert data["devcouncil"]["args"] == ["mcp-server"]
+    assert data["devcouncil"]["env"]["DEVCOUNCIL_PROJECT_ROOT"] == str(tmp_path)
+    assert "mcpServers" not in data
 
 
 def test_agent_registry_does_not_let_custom_agents_shadow_builtins(tmp_path):
@@ -203,6 +375,14 @@ def test_agent_registry_does_not_let_custom_agents_shadow_builtins(tmp_path):
                             "command": "custom-codex",
                             "input_mode": "stdin",
                         },
+                        "opencode": {
+                            "command": "custom-opencode",
+                            "input_mode": "stdin",
+                        },
+                        "agy": {
+                            "command": "custom-agy",
+                            "input_mode": "stdin",
+                        },
                     }
                 }
             }
@@ -214,7 +394,10 @@ def test_agent_registry_does_not_let_custom_agents_shadow_builtins(tmp_path):
 
     assert specs["warp"].command == "oz"
     assert specs["codex"].command == "codex"
+    assert specs["opencode"].command == "opencode"
+    assert specs["antigravity"].command == "agy"
     assert "oz" not in specs
+    assert "agy" not in specs
 
 
 def test_coding_cli_executor_writes_manifest_and_trace_events(tmp_path, monkeypatch):

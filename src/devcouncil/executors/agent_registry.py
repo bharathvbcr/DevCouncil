@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -8,16 +9,33 @@ from devcouncil.app.config import CliAgentProfileConfig, load_config
 
 
 AGENT_ALIASES = {
+    "agy": "antigravity",
+    "agy-cli": "antigravity",
+    "antigravity-cli": "antigravity",
+    "google-antigravity": "antigravity",
     "codex-cli": "codex",
     "gemini-cli": "gemini",
     "claude-cli": "claude",
     "claude-code": "claude",
+    "opencode-cli": "opencode",
+    "open-code": "opencode",
     "warp-cli": "warp",
     "oz": "warp",
     "oz-cli": "warp",
+    "cursor-agent": "cursor",
+    "cursor-cli": "cursor",
 }
 
-BUILTIN_AGENT_NAMES = {"codex", "gemini", "claude", "warp"}
+BUILTIN_AGENT_NAMES = {
+    "aider",
+    "antigravity",
+    "claude",
+    "codex",
+    "cursor",
+    "gemini",
+    "opencode",
+    "warp",
+}
 VALID_INPUT_MODES = {"stdin", "argument", "prompt-file"}
 
 
@@ -55,6 +73,13 @@ def normalize_agent_name(name: str) -> str:
     return AGENT_ALIASES.get(normalized, normalized)
 
 
+def resolve_cursor_agent_executable() -> str | None:
+    for candidate in ("cursor-agent", "agent"):
+        if shutil.which(candidate):
+            return candidate
+    return None
+
+
 def is_reserved_agent_name(name: str) -> bool:
     return normalize_agent_name(name) in BUILTIN_AGENT_NAMES
 
@@ -90,6 +115,38 @@ def builtin_agent_specs(project_root: Path) -> dict[str, CliAgentSpec]:
             supports_diff_review=True,
             built_in=True,
         ),
+        "opencode": CliAgentSpec(
+            name="opencode",
+            command="opencode",
+            args=[
+                "run",
+                "--file",
+                "{prompt_file}",
+                "Execute the DevCouncil task described in the attached prompt file.",
+            ],
+            input_mode="prompt-file",
+            display_name="OpenCode",
+            kind="coding-cli",
+            supports_mcp=True,
+            supports_diff_review=True,
+            built_in=True,
+        ),
+        "antigravity": CliAgentSpec(
+            name="antigravity",
+            command="agy",
+            args=[
+                "--print",
+                "--print-timeout",
+                "30m",
+                "Read and execute the DevCouncil task prompt at {prompt_file}.",
+            ],
+            input_mode="prompt-file",
+            display_name="Google Antigravity CLI",
+            kind="coding-cli",
+            supports_mcp=True,
+            supports_diff_review=True,
+            built_in=True,
+        ),
         "warp": CliAgentSpec(
             name="warp",
             command="oz",
@@ -98,6 +155,34 @@ def builtin_agent_specs(project_root: Path) -> dict[str, CliAgentSpec]:
             display_name="Warp / Oz",
             kind="agent-platform",
             supports_mcp=True,
+            supports_diff_review=True,
+            built_in=True,
+        ),
+        "cursor": CliAgentSpec(
+            name="cursor",
+            command=resolve_cursor_agent_executable() or "cursor-agent",
+            args=[
+                "--print",
+                "--trust",
+                "--workspace",
+                str(project_root),
+                "Read and execute the DevCouncil task prompt at {prompt_file}.",
+            ],
+            input_mode="prompt-file",
+            display_name="Cursor Agent",
+            kind="coding-cli",
+            supports_mcp=True,
+            supports_diff_review=True,
+            built_in=True,
+        ),
+        "aider": CliAgentSpec(
+            name="aider",
+            command="aider",
+            args=["--yes", "--no-show-model-warnings", "--message"],
+            input_mode="argument",
+            display_name="Aider",
+            kind="coding-cli",
+            supports_mcp=False,
             supports_diff_review=True,
             built_in=True,
         ),
