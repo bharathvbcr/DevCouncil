@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +37,7 @@ class CodingCliExecutor(Executor):
         client: str,
         timeout_seconds: int = 1800,
         profile: str | None = None,
+        stream_output: bool | None = None,
     ):
         self.project_root = project_root
         self.client = self._normalize_client(client)
@@ -44,6 +46,7 @@ class CodingCliExecutor(Executor):
         self.profile_name = profile or self.spec.default_profile or "default"
         self.profile = load_agent_profiles(project_root).get(self.profile_name)
         self.last_run_id: str | None = None
+        self.stream_output = self._resolve_stream_output(stream_output)
 
     def _normalize_client(self, client: str) -> str:
         return normalize_agent_name(client)
@@ -54,25 +57,37 @@ class CodingCliExecutor(Executor):
             return spec
         raise ValueError(f"Unsupported coding CLI client: {self.client}")
 
-    def _command(self) -> list[str]:
+    def _resolve_stream_output(self, stream_output: bool | None) -> bool:
+        if stream_output is not None:
+            return stream_output
+        try:
+            return bool(load_config(self.project_root).execution.stream_cli_output)
+        except Exception:
+            return False
+
+    def _command(self, task_id: str | None = None) -> list[str]:
         if self.client == "warp":
             return self._warp_command()
         if self.client == "cursor":
-            return self._cursor_command()
+            return self._cursor_command(task_id)
         return self.spec.base_command()
 
-    def _cursor_command(self) -> list[str]:
+    def _cursor_command(self, task_id: str | None = None) -> list[str]:
         executable = resolve_cursor_agent_executable()
         if not executable:
             raise ValueError("cursor-agent (or agent) is not installed or not on PATH.")
-        return [
+        command = [
             executable,
             "--print",
             "--trust",
             "--workspace",
             str(self.project_root),
-            "Read and execute the DevCouncil task prompt at {prompt_file}.",
         ]
+        chat_id = self._cursor_resume_chat_id(task_id)
+        if chat_id:
+            command.extend(["--resume", chat_id])
+        command.append("Read and execute the DevCouncil task prompt at {prompt_file}.")
+        return command
 
     def _warp_command(self) -> list[str]:
         config = self._load_warp_config()
@@ -129,7 +144,7 @@ class CodingCliExecutor(Executor):
             )
 
         try:
-            command = self._command()
+            command = self._command(task.id)
         except ValueError as exc:
             return ExecutionResult(success=False, message=str(exc))
 
@@ -174,17 +189,7 @@ class CodingCliExecutor(Executor):
                 task_id=task.id,
                 summary=f"Started {self.client} for {task.id}",
             )
-            result = subprocess.run(
-                invocation,
-                input=input_text,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                cwd=self.project_root,
-                env=env,
-                timeout=self._effective_timeout(),
-            )
+            result = self._run_subprocess(invocation, input_text, env)
             self._write_log(log_prefix, result)
             if result.returncode != 0:
                 stderr_preview = (result.stderr or result.stdout or "").strip().splitlines()[:5]
@@ -223,6 +228,118 @@ class CodingCliExecutor(Executor):
             )
         except Exception as exc:
             return ExecutionResult(success=False, message=str(exc))
+
+    def _run_subprocess(
+        self,
+        invocation: list[str],
+        input_text: str | None,
+        env: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        timeout = self._effective_timeout()
+        if not self.stream_output:
+            return subprocess.run(
+                invocation,
+                input=input_text,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=self.project_root,
+                env=env,
+                timeout=timeout,
+            )
+
+        process = subprocess.Popen(
+            invocation,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=self.project_root,
+            env=env,
+        )
+        if input_text is not None and process.stdin is not None:
+            process.stdin.write(input_text)
+            process.stdin.close()
+
+        captured: list[str] = []
+        deadline = time.monotonic() + timeout
+        assert process.stdout is not None
+        while True:
+            if time.monotonic() > deadline:
+                process.kill()
+                raise subprocess.TimeoutExpired(invocation, timeout)
+            line = process.stdout.readline()
+            if line:
+                console.print(line, end="")
+                captured.append(line)
+                continue
+            if process.poll() is not None:
+                break
+
+        return subprocess.CompletedProcess(
+            invocation,
+            process.returncode or 0,
+            stdout="".join(captured),
+            stderr="",
+        )
+
+    def _cursor_resume_mode(self) -> str:
+        try:
+            mode = (load_config(self.project_root).execution.cursor_resume_mode or "off").strip().lower()
+        except Exception:
+            mode = "off"
+        if mode not in {"off", "project", "task"}:
+            return "off"
+        return mode
+
+    def _cursor_session_path(self, task_id: str | None = None) -> Path:
+        if self._cursor_resume_mode() == "task" and task_id:
+            return self.project_root / ".devcouncil" / "sessions" / f"{task_id}-cursor.json"
+        return self.project_root / ".devcouncil" / "integrations" / "cursor-session.json"
+
+    def _cursor_resume_chat_id(self, task_id: str | None) -> str | None:
+        mode = self._cursor_resume_mode()
+        if mode == "off":
+            return None
+        path = self._cursor_session_path(task_id if mode == "task" else None)
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8")) or {}
+            except json.JSONDecodeError:
+                data = {}
+            chat_id = str(data.get("chat_id") or "").strip()
+            if chat_id:
+                return chat_id
+        chat_id = self._ensure_cursor_chat_id()
+        if not chat_id:
+            return None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"chat_id": chat_id}, indent=2) + "\n", encoding="utf-8")
+        return chat_id
+
+    def _ensure_cursor_chat_id(self) -> str | None:
+        executable = resolve_cursor_agent_executable()
+        if not executable:
+            return None
+        try:
+            result = subprocess.run(
+                [executable, "create-chat"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=self.project_root,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            return None
+        if result.returncode != 0:
+            return None
+        chat_id = (result.stdout or result.stderr or "").strip().splitlines()[-1].strip()
+        return chat_id or None
 
     def _effective_timeout(self) -> int:
         if self.profile and self.profile.timeout_seconds:

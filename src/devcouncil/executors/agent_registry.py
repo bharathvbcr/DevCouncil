@@ -82,6 +82,59 @@ def resolve_cursor_agent_executable() -> str | None:
     return None
 
 
+CODING_CLI_PROBE_ORDER: tuple[str, ...] = (
+    "codex",
+    "gemini",
+    "claude",
+    "cursor",
+    "opencode",
+    "antigravity",
+    "warp",
+    "aider",
+)
+
+
+def resolve_coding_cli_executable(project_root: Path, client: str) -> str | None:
+    normalized = normalize_agent_name(client)
+    if normalized == "cursor":
+        return resolve_cursor_agent_executable()
+    spec = get_cli_agent_spec(project_root, normalized)
+    if not spec:
+        return None
+    return spec.executable if shutil.which(spec.executable) else None
+
+
+def detect_available_coding_cli(
+    project_root: Path,
+    probe_order: tuple[str, ...] | None = None,
+) -> str | None:
+    for client in probe_order or CODING_CLI_PROBE_ORDER:
+        if resolve_coding_cli_executable(project_root, client):
+            return client
+    return None
+
+
+def resolve_automated_executor(
+    project_root: Path,
+    explicit: str | None = None,
+    *,
+    probe_order: tuple[str, ...] | None = None,
+) -> str:
+    if explicit:
+        return normalize_agent_name(explicit)
+    try:
+        config = load_config(project_root).execution
+        configured = normalize_agent_name(config.default_executor)
+        if not probe_order and config.coding_cli_probe_order:
+            probe_order = tuple(normalize_agent_name(name) for name in config.coding_cli_probe_order)
+    except Exception:
+        configured = "manual"
+    if configured != "manual":
+        return configured
+    detected = detect_available_coding_cli(project_root, probe_order=probe_order)
+    return detected or configured
+
+
 def is_reserved_agent_name(name: str) -> bool:
     return normalize_agent_name(name) in BUILTIN_AGENT_NAMES
 

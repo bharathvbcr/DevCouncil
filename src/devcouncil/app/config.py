@@ -50,6 +50,9 @@ class ExecutionConfig(BaseModel):
     max_repair_attempts: int = 3
     checkpoint_before_each_task: bool = True
     command_timeout: int = 300
+    stream_cli_output: bool = False
+    cursor_resume_mode: str = "off"
+    coding_cli_probe_order: List[str] = Field(default_factory=list)
 
 
 class PrivacyConfig(BaseModel):

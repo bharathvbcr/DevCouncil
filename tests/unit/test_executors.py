@@ -258,6 +258,119 @@ def test_coding_cli_executor_builtin_antigravity_uses_task_file_prompt(tmp_path,
     assert task_file.exists()
 
 
+def test_detect_available_coding_cli_prefers_probe_order(tmp_path, monkeypatch):
+    def fake_which(command):
+        return "/usr/bin/aider" if command == "aider" else None
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    from devcouncil.executors.agent_registry import detect_available_coding_cli
+
+    assert detect_available_coding_cli(tmp_path, probe_order=("codex", "aider")) == "aider"
+
+
+def test_resolve_automated_executor_falls_back_to_detected_cli(tmp_path, monkeypatch):
+    def fake_which(command):
+        return "/usr/bin/gemini" if command == "gemini" else None
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    from devcouncil.executors.agent_registry import resolve_automated_executor
+
+    assert resolve_automated_executor(tmp_path, None) == "gemini"
+
+
+def test_coding_cli_executor_cursor_resume_uses_create_chat(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_which(command):
+        if command in {"cursor-agent", "agent"}:
+            return f"/usr/bin/{command}"
+        return None
+
+    def fake_run(cmd, **kwargs):
+        if cmd[1:] == ["create-chat"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="chat-abc123\n", stderr="")
+        captured["cmd"] = cmd
+        captured["input"] = kwargs.get("input")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "execution:\n  cursor_resume_mode: project\n",
+        encoding="utf-8",
+    )
+
+    task = Task(
+        id="TASK-001",
+        title="Cursor",
+        description="Implement feature",
+        planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
+    )
+
+    result = CodingCliExecutor(tmp_path, "cursor").run_task(task, [])
+
+    assert result.success
+    assert captured["cmd"][:6] == ["cursor-agent", "--print", "--trust", "--workspace", str(tmp_path), "--resume"]
+    assert captured["cmd"][6] == "chat-abc123"
+    session = json.loads((tmp_path / ".devcouncil" / "integrations" / "cursor-session.json").read_text(encoding="utf-8"))
+    assert session["chat_id"] == "chat-abc123"
+
+
+def test_coding_cli_executor_stream_mode_uses_live_output(tmp_path, monkeypatch):
+    captured = {}
+
+    class FakeStdout:
+        def __init__(self, lines):
+            self._lines = list(lines)
+            self._index = 0
+
+        def readline(self):
+            if self._index >= len(self._lines):
+                return ""
+            line = self._lines[self._index]
+            self._index += 1
+            return line
+
+        def close(self):
+            return None
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdin = None
+            self.stdout = FakeStdout(["line one\n", "line two\n"])
+            self.returncode = 0
+
+        def poll(self):
+            return 0 if self.stdout._index >= len(self.stdout._lines) else None
+
+        def kill(self):
+            return None
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProcess()
+
+    def fake_which(_command):
+        return f"/usr/bin/{_command}"
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    task = Task(
+        id="TASK-001",
+        title="Codex",
+        description="Implement feature",
+        planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
+    )
+
+    result = CodingCliExecutor(tmp_path, "codex", stream_output=True).run_task(task, [])
+
+    assert result.success
+    assert captured["cmd"][:2] == ["codex", "exec"]
+
+
 def test_coding_cli_executor_builtin_cursor_uses_cursor_agent_print_mode(tmp_path, monkeypatch):
     captured = {}
 

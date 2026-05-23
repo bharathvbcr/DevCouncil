@@ -35,6 +35,9 @@ dev integrate antigravity --apply # Write project Antigravity MCP config for Dev
 dev integrate warp --apply  # Write Warp/Oz MCP config for DevCouncil
 dev integrate cli-agent NAME --command TOOL --apply # Register any prompt-taking CLI executor
 dev integrate check         # Verify coding CLI and MCP readiness
+dev integrate check --strict  # Fail when optional coding CLIs are missing
+dev run TASK --stream       # Stream coding CLI output live during execution
+dev go GOAL                 # Auto-picks first coding CLI on PATH when default_executor is manual
 dev integrate doctor        # Check optional integration tools
 dev agents                  # List built-in and custom CLI agents
 dev agents add NAME --command TOOL # Register a prompt-taking CLI agent

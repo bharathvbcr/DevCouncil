@@ -1051,6 +1051,11 @@ def hooks(
 @app.command("check")
 def check(
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+    strict: bool = typer.Option(
+        False,
+        "--strict",
+        help="Treat missing optional coding CLIs as failures instead of warnings.",
+    ),
 ):
     """
     Check whether DevCouncil is ready to integrate with coding CLIs.
@@ -1070,6 +1075,9 @@ def check(
             failures += 1
 
     def add_optional(ok: bool, name: str, details: str):
+        if strict and not ok:
+            add(False, name, details)
+            return
         table.add_row(name, "[green]OK[/green]" if ok else "[yellow]Missing[/yellow]", details)
 
     add((root / ".devcouncil").exists(), "Project state", str(root / ".devcouncil"))
