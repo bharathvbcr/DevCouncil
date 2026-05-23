@@ -14,10 +14,12 @@ from devcouncil.cli.commands.init import initialize_project, parse_role_model_ov
 from devcouncil.cli.commands.integrate import (
     _claude_command,
     _codex_command,
+    _configure_antigravity,
+    _configure_cursor,
     _configure_native_hooks,
+    _configure_opencode,
     _configure_warp,
     _configure,
-    _cursor_command,
     _gemini_command,
 )
 from devcouncil.llm.provider import apply_provider_default_role_models, build_role_model_config, validate_model_provider
@@ -169,7 +171,6 @@ def _configure_coding_cli_integrations(project_root: Path, apply: bool, gemini_s
         ("Codex CLI", _codex_command(project_root)),
         ("Gemini CLI", _gemini_command(project_root, gemini_scope)),
         ("Claude Code", _claude_command(project_root, "local")),
-        ("Cursor", _cursor_command(project_root)),
     ]
     results = []
     for tool, command in commands:
@@ -177,6 +178,9 @@ def _configure_coding_cli_integrations(project_root: Path, apply: bool, gemini_s
             console.print(f"[yellow]{tool} CLI not found on PATH. Skipping optional integration.[/yellow]")
             continue
         results.append(_configure(tool, command, apply))
+    results.append(_configure_cursor(project_root, apply))
+    results.append(_configure_opencode(project_root, apply))
+    results.append(_configure_antigravity(project_root, apply))
     results.append(_configure_warp(project_root, apply))
     _configure_native_hooks(project_root, "all", apply)
     if apply and any(not ok for ok in results):
@@ -299,6 +303,8 @@ def setup(
             "dev run TASK-001 --executor codex",
             "dev run TASK-001 --executor gemini",
             "dev run TASK-001 --executor claude",
+            "dev run TASK-001 --executor opencode",
+            "dev run TASK-001 --executor antigravity",
             "dev verify TASK-001",
             "",
             "Use [bold]dev setup --integrate[/bold] to preview coding CLI MCP and native hook setup.",

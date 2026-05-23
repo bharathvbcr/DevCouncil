@@ -25,9 +25,13 @@ dev report --github-pr-comment # Post the report as a GitHub PR comment
 dev report --gitlab-pr-comment # Post the report as a GitLab MR comment
 dev rollback TASK-001       # Revert changes using task checkpoint
 dev mcp-server              # Start DevCouncil MCP server over stdio
-dev integrate hooks --apply # Install native Codex, Gemini, and Claude hooks
+dev integrate hooks --apply # Install Codex, Gemini, Claude, Cursor, and OpenCode hooks
+dev integrate aider --apply   # Enable built-in Aider headless executor
 dev hook --help             # Show lower-level hook commands
 dev integrate all --apply   # Configure supported coding CLI integrations
+dev integrate cursor --apply # Write project Cursor MCP config for DevCouncil
+dev integrate opencode --apply # Write project OpenCode MCP config for DevCouncil
+dev integrate antigravity --apply # Write project Antigravity MCP config for DevCouncil
 dev integrate warp --apply  # Write Warp/Oz MCP config for DevCouncil
 dev integrate cli-agent NAME --command TOOL --apply # Register any prompt-taking CLI executor
 dev integrate check         # Verify coding CLI and MCP readiness
@@ -38,7 +42,7 @@ dev agents doctor           # Check agent PATH, prompt mode, help command, and p
 dev agents run TASK-001 --agent NAME --profile default # Run a task with a named CLI agent
 dev lsp inspect             # Inspect optional language-server readiness
 dev ast match "symbol"      # Search symbols with structural AST matching
-dev dashboard               # Serve the live local status dashboard
+dev dashboard --open        # Serve the live local status dashboard and open a browser
 dev trace tail --follow     # Tail local DevCouncil trace events
 dev artifacts validate      # Validate stored artifact integrity
 dev config                  # Inspect or update configuration

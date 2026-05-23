@@ -19,6 +19,7 @@ from devcouncil.executors.agent_registry import (
     get_cli_agent_spec,
     load_agent_profiles,
     normalize_agent_name,
+    resolve_cursor_agent_executable,
 )
 from devcouncil.telemetry.traces import TraceLogger
 from devcouncil.utils.redaction import redact_text
@@ -56,7 +57,22 @@ class CodingCliExecutor(Executor):
     def _command(self) -> list[str]:
         if self.client == "warp":
             return self._warp_command()
+        if self.client == "cursor":
+            return self._cursor_command()
         return self.spec.base_command()
+
+    def _cursor_command(self) -> list[str]:
+        executable = resolve_cursor_agent_executable()
+        if not executable:
+            raise ValueError("cursor-agent (or agent) is not installed or not on PATH.")
+        return [
+            executable,
+            "--print",
+            "--trust",
+            "--workspace",
+            str(self.project_root),
+            "Read and execute the DevCouncil task prompt at {prompt_file}.",
+        ]
 
     def _warp_command(self) -> list[str]:
         config = self._load_warp_config()
@@ -296,24 +312,20 @@ class CodingCliExecutor(Executor):
         if not path.is_absolute():
             path = self.project_root / path
         path.parent.mkdir(parents=True, exist_ok=True)
-        if not path.exists():
-            import json
-
-            path.write_text(
-                json.dumps(
-                    {
-                        "mcpServers": {
-                            "devcouncil": {
-                                "command": "devcouncil",
-                                "args": ["mcp-server"],
-                                "env": {"DEVCOUNCIL_PROJECT_ROOT": str(self.project_root)},
-                                "working_directory": str(self.project_root),
-                            }
-                        }
-                    },
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
+        desired = {
+            "devcouncil": {
+                "command": "devcouncil",
+                "args": ["mcp-server"],
+                "env": {"DEVCOUNCIL_PROJECT_ROOT": str(self.project_root)},
+            }
+        }
+        should_write = not path.exists()
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8")) or {}
+            except json.JSONDecodeError:
+                existing = {}
+            should_write = "mcpServers" in existing and "devcouncil" not in existing
+        if should_write:
+            path.write_text(json.dumps(desired, indent=2) + "\n", encoding="utf-8")
         return path

@@ -9,8 +9,10 @@ from pathlib import Path
 
 REQUIRED_FILES = {
     "devcouncil/assets/devcouncil-logo.svg",
+    "devcouncil/assets/devcouncil_logo_premium.png",
     "devcouncil/llm/model_defaults.yaml",
     "devcouncil/telemetry/model_pricing.yaml",
+    "devcouncil/integrations/opencode_devcouncil_plugin.mjs",
 }
 
 

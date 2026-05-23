@@ -20,7 +20,9 @@ from devcouncil.cli.commands.init import initialize_project
 from devcouncil.telemetry.traces import TraceLogger
 
 console = Console()
-CODING_EXECUTOR_ALIASES = {name: name for name in ("codex", "gemini", "claude", "warp")} | AGENT_ALIASES
+CODING_EXECUTOR_ALIASES = {
+    name: name for name in ("codex", "gemini", "claude", "opencode", "antigravity", "warp", "cursor", "aider")
+} | AGENT_ALIASES
 
 CODING_EXECUTORS = set(CODING_EXECUTOR_ALIASES.keys())
 
@@ -105,7 +107,7 @@ def run(
         "manual",
         "--executor",
         "-e",
-        help="Executor to use (manual, mini, openhands, native-preview, codex, gemini, claude, warp, or a configured agent)",
+        help="Executor to use (manual, mini, openhands, native-preview, codex, gemini, claude, opencode, antigravity, warp, or a configured agent)",
     ),
     profile: str | None = typer.Option(None, "--profile", help="CLI-agent execution profile: default, yolo, prod, or a configured profile."),
     project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),

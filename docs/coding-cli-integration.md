@@ -2,6 +2,8 @@
 
 DevCouncil works with any tool that can accept a prompt and edit files in the same repository.
 
+For the official tier definitions (headless executor vs MCP-only vs sidecar), see [integration-tiers.md](integration-tiers.md).
+
 ## Compatibility Matrix
 
 | Tool | Manual sidecar prompts | Headless prompt handoff | DevCouncil MCP tools | Write-blocking hooks |
@@ -9,9 +11,11 @@ DevCouncil works with any tool that can accept a prompt and edit files in the sa
 | **Codex CLI** | Supported | Supported via `codex exec` | Supported via `codex mcp` | Native via `dev integrate hooks` |
 | **Gemini CLI** | Supported | Supported via `gemini -p` or stdin | Supported via `gemini mcp` | Native via `dev integrate hooks` |
 | **Claude Code** | Supported | Tool-dependent | Supported via `claude mcp` | Native via `dev integrate hooks` |
+| **OpenCode** | Supported | Supported via `opencode run --file` | Supported via project `opencode.json` | Native via `dev integrate hooks` (bundled plugin) |
+| **Google Antigravity CLI** | Supported | Supported via `agy --print` | Supported via project `.agents/mcp_config.json` | Verification-gated sidecar |
 | **Warp / Oz** | Supported | Supported via `oz agent run` | Supported via Warp/Oz MCP JSON | Verification-gated sidecar |
-| **Cursor** | Supported | Tool-dependent | Supported via `cursor --add-mcp` | Verification-gated sidecar |
-| **Aider** | Supported | Prompt/stdin friendly | Not a primary path | Verification-gated sidecar |
+| **Cursor** | Supported | Supported via `cursor-agent --print --trust` | Supported via project `.cursor/mcp.json` | Native via `dev integrate hooks` (`.cursor/hooks.json`) |
+| **Aider** | Supported | Supported via `aider --yes --message` | Not a primary path | Verification-gated sidecar |
 | **Bring your own CLI** | Supported | Supported through configurable stdin, argument, or prompt-file handoff | Tool-dependent | Verification-gated sidecar |
 
 ## Fast Integration Setup
@@ -56,16 +60,34 @@ Set up one first-party integration at a time, or install native hooks separately
 dev integrate codex --apply
 dev integrate gemini --apply
 dev integrate claude --apply
+dev integrate opencode --apply
+dev integrate antigravity --apply
 dev integrate cursor --apply
 dev integrate warp --apply
+dev integrate aider --apply
 dev integrate hooks --apply
+```
+
+OpenCode is built in and uses an attached prompt file so large DevCouncil task prompts do not become giant command-line arguments:
+
+```bash
+dev run TASK-001 --executor opencode
+dev agents run TASK-001 --agent opencode --profile default
+```
+
+Google Antigravity CLI is also built in. DevCouncil writes the full task prompt to a task file and launches `agy --print` with a short instruction to read that file:
+
+```bash
+dev integrate antigravity --apply
+dev run TASK-001 --executor antigravity
+dev agents run TASK-001 --agent agy --profile default
 ```
 
 Register an arbitrary prompt-taking CLI:
 
 ```bash
-dev integrate cli-agent opencode --command opencode --arg run --input-mode prompt-file --prompt-arg=--prompt-file --apply
-dev run TASK-001 --executor opencode
+dev integrate cli-agent myagent --command myagent --arg run --input-mode stdin --apply
+dev run TASK-001 --executor myagent
 ```
 
 If a configured MCP client launches tools from a different directory, point it at the target repository:
@@ -164,7 +186,7 @@ DevCouncil also includes a native hook installer for hook-capable coding CLIs:
 dev integrate hooks --apply
 ```
 
-This writes project-local hook config for Codex CLI, Gemini CLI, and Claude Code. The hooks call `devcouncil hook pre-tool-use` before write/shell tools and `devcouncil hook post-tool-use` after tool execution, with `DEVCOUNCIL_PROJECT_ROOT` carried through the generated command.
+This writes project-local hook config for Codex CLI, Gemini CLI, Claude Code, Cursor (`.cursor/hooks.json`), and OpenCode (bundled `.devcouncil/integrations/opencode_devcouncil_plugin.mjs`). The hooks call `devcouncil hook pre-tool-use` before write/shell tools and `devcouncil hook post-tool-use` after tool execution, with `DEVCOUNCIL_PROJECT_ROOT` carried through the generated command.
 
 The lower-level hook command group remains available:
 
@@ -192,9 +214,84 @@ dev integrate claude --apply
 
 Use `--scope local`, `--scope project`, or `--scope user` to choose where Claude Code stores the MCP server registration. DevCouncil defaults to `local`.
 
+## OpenCode
+
+DevCouncil treats OpenCode as a first-class coding CLI executor:
+
+```bash
+dev run TASK-001 --executor opencode
+```
+
+The executor writes the DevCouncil task prompt to `.devcouncil/TASK-001-opencode-task.md` and launches:
+
+```bash
+opencode run --file .devcouncil/TASK-001-opencode-task.md "Execute the DevCouncil task described in the attached prompt file."
+```
+
+MCP setup:
+
+```bash
+dev integrate opencode --apply
+```
+
+This writes a project-level `opencode.json` entry for the local DevCouncil MCP server with `DEVCOUNCIL_PROJECT_ROOT` set to the repository root.
+
+Upstream reference: [OpenCode MCP servers](https://thdxr.dev.opencode.ai/docs/mcp-servers/).
+
+## Google Antigravity CLI
+
+DevCouncil treats Google's Antigravity CLI as a first-class coding CLI executor:
+
+```bash
+dev run TASK-001 --executor antigravity
+dev run TASK-001 --executor agy
+```
+
+The executor writes the DevCouncil task prompt to `.devcouncil/TASK-001-antigravity-task.md` and launches:
+
+```bash
+agy --print --print-timeout 30m "Read and execute the DevCouncil task prompt at .devcouncil/TASK-001-antigravity-task.md."
+```
+
+MCP setup:
+
+```bash
+dev integrate antigravity --apply
+```
+
+This writes a project-level `.agents/mcp_config.json` entry for the local DevCouncil MCP server with `DEVCOUNCIL_PROJECT_ROOT` set to the repository root:
+
+```json
+{
+  "mcpServers": {
+    "devcouncil": {
+      "command": "devcouncil",
+      "args": ["mcp-server"],
+      "env": {
+        "DEVCOUNCIL_PROJECT_ROOT": "/path/to/project"
+      },
+      "cwd": "/path/to/project"
+    }
+  }
+}
+```
+
+Upstream references: [Antigravity CLI overview](https://antigravity.google/docs/cli-overview), [Antigravity CLI migration notes](https://antigravity.google/docs/gcli-migration), and [Antigravity MCP configuration](https://antigravity.google/docs/mcp).
+
 ## Cursor
 
-Use DevCouncil as the planning and verification shell around Cursor:
+Use DevCouncil as the planning and verification shell around Cursor.
+
+Headless execution with Cursor Agent CLI:
+
+```bash
+dev integrate cursor --apply
+dev run TASK-001 --executor cursor
+```
+
+The executor launches `cursor-agent --print --trust --workspace <repo>` with a prompt that points at `.devcouncil/TASK-001-cursor-task.md`.
+
+Manual sidecar flow (editor chat):
 
 ```bash
 dev run TASK-001 --executor manual
@@ -207,15 +304,32 @@ Paste the prompt into Cursor Chat or Agent mode and instruct Cursor to stay with
 dev verify TASK-001
 ```
 
-If Cursor changes files outside the task scope, DevCouncil verification should flag the unauthorized diff.
-
 MCP setup:
 
 ```bash
 dev integrate cursor --apply
 ```
 
-The command registers `devcouncil mcp-server` through Cursor's `--add-mcp` option with `DEVCOUNCIL_PROJECT_ROOT` set to the repository that contains `.devcouncil/`.
+The command writes `.cursor/mcp.json` in the project so Cursor editor and `cursor-agent` can discover the same DevCouncil MCP server:
+
+```json
+{
+  "mcpServers": {
+    "devcouncil": {
+      "type": "stdio",
+      "command": "devcouncil",
+      "args": ["mcp-server"],
+      "env": {
+        "DEVCOUNCIL_PROJECT_ROOT": "/path/to/project"
+      }
+    }
+  }
+}
+```
+
+Check Cursor CLI discovery with `cursor-agent mcp list`.
+
+Upstream reference: [Cursor CLI MCP](https://docs.cursor.com/cli/mcp).
 
 ## Warp / Oz
 
@@ -234,14 +348,11 @@ This writes `.devcouncil/integrations/warp-mcp.json`:
 
 ```json
 {
-  "mcpServers": {
-    "devcouncil": {
-      "command": "devcouncil",
-      "args": ["mcp-server"],
-      "env": {
-        "DEVCOUNCIL_PROJECT_ROOT": "/path/to/project"
-      },
-      "working_directory": "/path/to/project"
+  "devcouncil": {
+    "command": "devcouncil",
+    "args": ["mcp-server"],
+    "env": {
+      "DEVCOUNCIL_PROJECT_ROOT": "/path/to/project"
     }
   }
 }
@@ -269,6 +380,8 @@ integrations:
 ```
 
 For cloud runs, set `run_mode: cloud` and `environment: <environment-id>`. DevCouncil still verifies the local working tree after the executor returns, so cloud workflows should sync changes back before verification.
+
+Upstream reference: [Warp/Oz MCP servers](https://docs.warp.dev/reference/cli/mcp-servers).
 
 ## Bring Your Own CLI
 
@@ -298,7 +411,7 @@ dev agents run TASK-001 --agent myagent --profile yolo
 dev agents run TASK-001 --agent myagent --profile prod
 ```
 
-If `--profile` is omitted, DevCouncil uses the agent's configured `default_profile`. `default` is balanced local execution, `yolo` lets the agent move faster while DevCouncil still verifies the final diff, and `prod` adds restrictive prompt guidance for high-risk repositories. Built-in names and aliases such as `codex`, `claude`, `gemini`, `warp`, and `oz` are reserved for DevCouncil's built-in adapters.
+If `--profile` is omitted, DevCouncil uses the agent's configured `default_profile`. `default` is balanced local execution, `yolo` lets the agent move faster while DevCouncil still verifies the final diff, and `prod` adds restrictive prompt guidance for high-risk repositories. Built-in names and aliases such as `codex`, `claude`, `gemini`, `opencode`, `antigravity`, `agy`, `warp`, and `oz` are reserved for DevCouncil's built-in adapters.
 
 The generated task prompt is written to `.devcouncil/<TASK-ID>-<executor>-task.md`, and each agent launch writes `.devcouncil/runs/<run-id>/agent-run.json` plus trace events for start, finish, failure, and verification.
 
@@ -311,26 +424,30 @@ dev run TASK-001 --executor myagent --profile default
 
 ## Aider
 
-Start Aider in the target repository:
+Headless execution:
+
+```bash
+dev integrate aider --apply
+dev run TASK-001 --executor aider
+```
+
+DevCouncil launches `aider --yes --no-show-model-warnings --message <task prompt>` and verifies the working tree when Aider exits.
+
+Manual sidecar flow:
 
 ```bash
 cd path/to/project
 aider
-```
-
-Paste the output from:
-
-```bash
 dev prompt TASK-001
 ```
 
-After Aider commits or leaves a working-tree diff:
+Paste the prompt into Aider. After Aider commits or leaves a working-tree diff:
 
 ```bash
 dev verify TASK-001
 ```
 
-If you want DevCouncil to inspect the live working tree before committing, verify before creating the final commit.
+Aider does not have a first-party DevCouncil MCP integration path.
 
 ## Automated Executors
 
@@ -346,7 +463,7 @@ dev run TASK-001 --executor native-preview
 
 Use these only when the target executor is installed and configured locally. Automated executor mode lets DevCouncil launch the implementation loop itself, capture the post-run diff, and verify the task automatically.
 
-The live executor adapter values are `manual`, `mini`, `openhands`, `native-preview`, `native`, `codex`, `gemini`, `claude`, `warp`, and configured custom CLI names.
-`codex-cli`, `gemini-cli`, `claude-code`, `claude-cli`, `warp-cli`, `oz`, and `oz-cli` are accepted aliases for their canonical names.
+The live executor adapter values are `manual`, `mini`, `openhands`, `native-preview`, `native`, `codex`, `gemini`, `claude`, `opencode`, `antigravity`, `warp`, `cursor`, `aider`, and configured custom CLI names.
+`codex-cli`, `gemini-cli`, `claude-code`, `claude-cli`, `opencode-cli`, `open-code`, `antigravity-cli`, `google-antigravity`, `agy`, `agy-cli`, `warp-cli`, `oz`, `oz-cli`, `cursor-agent`, and `cursor-cli` are accepted aliases for their canonical names.
 
 Direct `dev run --executor <coding-client>` execution now runs the selected coding CLI and automatically runs verification after the tool returns.

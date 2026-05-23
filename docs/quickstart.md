@@ -2,7 +2,7 @@
 
 This is the shortest path for a new developer who wants to install DevCouncil, initialize a repository, connect a coding CLI, and run the first gated task.
 
-Run DevCouncil commands in a normal terminal from the root of the repository you want DevCouncil to manage. Do not run these commands inside the coding CLI chat. Later, you paste the generated `dev prompt TASK-ID` output into Codex, Gemini, Claude Code, Warp, Cursor, Aider, or another registered CLI agent.
+Run DevCouncil commands in a normal terminal from the root of the repository you want DevCouncil to manage. Do not run these commands inside the coding CLI chat. Later, you paste the generated `dev prompt TASK-ID` output into Codex, Gemini, Claude Code, OpenCode, Antigravity, Warp, Cursor, Aider, or another registered CLI agent.
 
 ## Where To Run Commands
 
@@ -112,7 +112,7 @@ dev setup --integrate
 
 Fresh interactive setup prompts to apply supported coding CLI integrations immediately. Use `dev setup --skip-integrations` to defer that step.
 
-`dev run --executor <client>` can be used for supported direct CLI execution modes (`codex`, `gemini`, `claude`, `warp`, configured custom CLI agents, and their aliases), and it now performs verification after the tool exits.
+`dev run --executor <client>` can be used for supported direct CLI execution modes (`codex`, `gemini`, `claude`, `opencode`, `antigravity`, `warp`, configured custom CLI agents, and their aliases), and it now performs verification after the tool exits.
 
 To apply supported MCP integrations for detected clients:
 
@@ -134,7 +134,7 @@ For a coding agent or CI-style integration with a supported executor installed, 
 dev e2e "Add password reset with expiring single-use tokens" --executor codex
 ```
 
-This is equivalent to `dev go`: it auto-initializes DevCouncil state if needed, plans the goal, executes approved tasks with the selected executor, verifies each task, and prints the final report. If `--executor` is omitted, DevCouncil uses `execution.default_executor` from `.devcouncil/config.yaml`. Use `--executor gemini`, `--executor claude`, `--executor warp`, `--executor native-preview`, `--executor mini`, or `--executor openhands` when that executor is installed and configured.
+This is equivalent to `dev go`: it auto-initializes DevCouncil state if needed, plans the goal, executes approved tasks with the selected executor, verifies each task, and prints the final report. If `--executor` is omitted, DevCouncil uses `execution.default_executor` from `.devcouncil/config.yaml`. Use `--executor gemini`, `--executor claude`, `--executor opencode`, `--executor antigravity`, `--executor warp`, `--executor native-preview`, `--executor mini`, or `--executor openhands` when that executor is installed and configured.
 
 For coding agents that should avoid scraping terminal output, write the final JSON report to a file:
 
@@ -169,9 +169,11 @@ Paste the output of that command into your coding CLI, or run directly through D
 dev run TASK-001 --executor codex
 dev run TASK-001 --executor gemini
 dev run TASK-001 --executor claude
+dev run TASK-001 --executor opencode
+dev run TASK-001 --executor antigravity
 dev run TASK-001 --executor warp
 ```
-Aliases such as `codex-cli`, `gemini-cli`, `claude-code`, `claude-cli`, `warp-cli`, `oz`, and `oz-cli` are also accepted for direct DevCouncil execution mode.
+Aliases such as `codex-cli`, `gemini-cli`, `claude-code`, `claude-cli`, `opencode-cli`, `open-code`, `antigravity-cli`, `agy`, `agy-cli`, `warp-cli`, `oz`, and `oz-cli` are also accepted for direct DevCouncil execution mode.
 
 To bring your own CLI agent:
 
@@ -195,7 +197,7 @@ dev verify TASK-001
 Optional live inspection surfaces:
 
 ```bash
-dev dashboard
+dev dashboard --open
 dev lsp inspect
 dev ast match "target_symbol"
 ```

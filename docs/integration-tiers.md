@@ -1,0 +1,62 @@
+# Coding CLI Integration Tiers
+
+DevCouncil assigns each supported coding CLI to one of three integration tiers. Use this page to choose the right workflow and to see what deeper parity would require.
+
+## Tier 1 — Headless executor
+
+**Tools:** Codex CLI, Gemini CLI, Claude Code, OpenCode, Google Antigravity CLI, Warp/Oz, Cursor Agent (`cursor-agent`), Aider
+
+**Capabilities:**
+
+- `dev run TASK-001 --executor <client>` launches the tool non-interactively
+- Task prompt written to `.devcouncil/<TASK>-<client>-task.md` when needed
+- Post-run `dev verify` runs automatically
+- Run manifest and trace events under `.devcouncil/runs/`
+
+**Setup:** `dev integrate <client> --apply` for MCP where supported; executors work once the CLI is on `PATH`.
+
+## Tier 2 — MCP companion (no headless executor)
+
+**Tools:** None by default (Cursor is Tier 1 for `cursor-agent` and Tier 2 for editor-only workflows)
+
+**Capabilities:**
+
+- `dev integrate cursor --apply` writes `.cursor/mcp.json`
+- Agent calls DevCouncil MCP tools during an interactive session
+- Human pastes `dev prompt TASK-001` or uses the editor agent UI
+
+**Setup:** `dev integrate cursor --apply` (MCP only if you stay in the editor without `cursor-agent`).
+
+## Tier 3 — Sidecar only
+
+**Tools:** Bring-your-own CLI (until registered), any tool without a first-party adapter
+
+**Capabilities:**
+
+- `dev run TASK-001 --executor manual` + `dev prompt TASK-001` pasted into the tool
+- `dev verify TASK-001` after edits
+- Optional registration: `dev integrate cli-agent NAME ... --apply`
+
+**Setup:** No MCP or hooks required; verification is always the completion gate.
+
+## Hooks and policy
+
+| Tier | Native write/shell hooks (`dev integrate hooks --apply`) |
+| :--- | :--- |
+| Codex, Gemini, Claude | Yes — project hook JSON + `devcouncil hook pre-tool-use` |
+| Cursor | Yes — `.cursor/hooks.json` (`preToolUse` / `postToolUse`) |
+| OpenCode | Yes — bundled plugin in `.devcouncil/integrations/` |
+| OpenCode / Antigravity / Warp / Aider (executor only) | Verification-gated; hooks optional |
+| Unregistered BYO CLI | Verification-gated only |
+
+## Target parity (project decision)
+
+| Tool | Target tier | Notes |
+| :--- | :--- | :--- |
+| Codex, Gemini, Claude, OpenCode, Antigravity, Warp | Tier 1 | Shipped |
+| Cursor | Tier 1 via `cursor-agent --print --trust` | Shipped |
+| Aider | Tier 1 via `aider --yes --message` | Shipped |
+| Editor-only Cursor | Tier 2 | MCP + manual prompt |
+| Custom CLIs | Tier 3 → Tier 1 when registered | `dev integrate cli-agent` |
+
+See [coding-cli-integration.md](coding-cli-integration.md) for commands and examples.

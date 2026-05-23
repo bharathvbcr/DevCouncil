@@ -16,10 +16,17 @@ The `native-preview` executor implements a preview loop that calls the `read_fil
 - `claude`: Launches `claude -p` with generated task prompt via stdin.
 - `claude-code`: Alias for `claude`.
 - `claude-cli`: Alias for `claude`.
+- `opencode`: Launches `opencode run --file` with the generated DevCouncil task prompt file.
+- `opencode-cli`, `open-code`: Aliases for `opencode`.
+- `antigravity`: Launches `agy --print` with a prompt pointing at the generated DevCouncil task prompt file.
+- `antigravity-cli`, `google-antigravity`, `agy`, `agy-cli`: Aliases for `antigravity`.
 - `warp`: Launches `oz agent run` with DevCouncil MCP context.
 - `warp-cli`, `oz`, `oz-cli`: Aliases for `warp`.
+- `cursor`: Launches `cursor-agent --print --trust` with a generated DevCouncil task prompt file.
+- `cursor-agent`, `cursor-cli`: Aliases for `cursor`.
+- `aider`: Launches `aider --yes --message` with the generated DevCouncil task prompt.
 - configured CLI agent names: Launch any prompt-taking CLI registered with `dev integrate cli-agent`.
 - `native-preview`: Runs DevCouncil's built-in preview native executor loop.
 - `native`: Backward-compatible alias for `native-preview`.
 
-Coding CLI adapters (`codex`, `gemini`, `claude`, `warp`, and configured CLI agents) write the task prompt to `.devcouncil/{TASK}-{client}-task.md`, then launch the selected CLI in the repository root with `DEVCOUNCIL_PROJECT_ROOT` set.
+Coding CLI adapters (`codex`, `gemini`, `claude`, `opencode`, `antigravity`, `warp`, `cursor`, `aider`, and configured CLI agents) write the task prompt to `.devcouncil/{TASK}-{client}-task.md` when needed, then launch the selected CLI in the repository root with `DEVCOUNCIL_PROJECT_ROOT` set.
