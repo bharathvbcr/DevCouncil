@@ -61,3 +61,13 @@ DevCouncil assigns each supported coding CLI to one of three integration tiers. 
 | Custom CLIs | Tier 3 → Tier 1 when registered | `dev integrate cli-agent` |
 
 See [coding-cli-integration.md](coding-cli-integration.md) for commands and examples.
+
+## Automation helpers (third pass)
+
+| Feature | Command / config |
+| :--- | :--- |
+| Auto-pick coding CLI when `default_executor` is `manual` | Used by `dev go` — first CLI on PATH in probe order |
+| Custom probe order | `execution.coding_cli_probe_order` in `.devcouncil/config.yaml` |
+| Live CLI output | `dev run TASK --executor codex --stream` or `execution.stream_cli_output: true` |
+| Cursor session resume | `execution.cursor_resume_mode: project` or `task` (uses `cursor-agent create-chat` + `--resume`) |
+| Strict integration doctor | `dev integrate check --strict` |

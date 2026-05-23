@@ -8,12 +8,12 @@ from rich.console import Console
 from devcouncil.cli.commands import plan as plan_command
 from devcouncil.cli.commands import report as report_command
 from devcouncil.cli.commands import run as run_command
-from devcouncil.app.config import load_config
 from devcouncil.cli.commands.init import initialize_project
 from devcouncil.executors.agent_registry import (
     AGENT_ALIASES,
     BUILTIN_CODING_EXECUTOR_NAMES,
     load_cli_agent_specs,
+    resolve_automated_executor,
 )
 from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import ArtifactGraphRepository, StateRepository, TaskRepository
@@ -38,14 +38,6 @@ AGENT_REPORT_FILE = Path(".devcouncil/reports/latest.json")
 
 def _normalize_executor(executor: str) -> str:
     return executor.strip().lower().replace("_", "-")
-
-
-def _configured_executor(root: Path) -> str:
-    try:
-        configured = load_config(root).execution.default_executor
-    except FileNotFoundError:
-        configured = "codex"
-    return _normalize_executor(configured or "codex")
 
 
 def _custom_cli_agents(root: Path) -> set[str]:
@@ -158,6 +150,11 @@ def go(
         help="Use coding-agent defaults: JSON report plus .devcouncil/reports/latest.json.",
     ),
     profile: str | None = typer.Option(None, "--profile", help="CLI-agent execution profile to pass to dev run."),
+    stream: bool = typer.Option(
+        False,
+        "--stream",
+        help="Stream coding CLI stdout/stderr live during execution (also enabled by execution.stream_cli_output).",
+    ),
     project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
 ):
     """
@@ -170,14 +167,19 @@ def go(
         if report_file is None:
             report_file = AGENT_REPORT_FILE
 
-    normalized_executor = _normalize_executor(executor) if executor else _configured_executor(root)
+    normalized_executor = resolve_automated_executor(root, executor)
     command_label = _command_label(ctx)
     if normalized_executor == "manual":
         console.print(
             f"[red]`{command_label}` requires an automated executor. "
-            "Use `dev run TASK-ID --executor manual` for handoff mode.[/red]"
+            "Set execution.default_executor in .devcouncil/config.yaml or install a coding CLI on PATH.[/red]"
         )
         raise typer.Exit(code=2)
+    if executor is None and normalized_executor != "manual":
+        console.print(
+            f"[dim]Using automated executor:[/dim] [bold]{normalized_executor}[/bold] "
+            "(from config or first coding CLI found on PATH)."
+        )
     supported = SUPPORTED_EXECUTORS | _custom_cli_agents(root)
     if normalized_executor not in supported:
         console.print(
@@ -207,10 +209,13 @@ def go(
 
         console.print(f"\n[bold]Executing {task.id}[/bold] with [bold]{normalized_executor}[/bold]...")
         executed_task_ids.append(task.id)
-        if profile:
-            run_command.run(task.id, executor=normalized_executor, profile=profile, project_root=root)
-        else:
-            run_command.run(task.id, executor=normalized_executor, project_root=root)
+        run_command.run(
+            task.id,
+            executor=normalized_executor,
+            profile=profile,
+            stream=stream,
+            project_root=root,
+        )
 
         latest = {item.id: item for item in _load_tasks(root)}.get(task.id)
         latest_status = latest.status if latest else "missing"

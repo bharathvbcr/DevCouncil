@@ -115,6 +115,11 @@ def run(
         ),
     ),
     profile: str | None = typer.Option(None, "--profile", help="CLI-agent execution profile: default, yolo, prod, or a configured profile."),
+    stream: bool = typer.Option(
+        False,
+        "--stream",
+        help="Stream coding CLI stdout/stderr live (also enabled by execution.stream_cli_output).",
+    ),
     project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
 ):
     """
@@ -174,11 +179,7 @@ def run(
             req_repo = RequirementRepository(session)
             reqs = req_repo.get_all()
             cli_client = CODING_EXECUTOR_ALIASES.get(executor, executor)
-            cli_executor = (
-                CodingCliExecutor(root, cli_client, profile=profile)
-                if profile
-                else CodingCliExecutor(root, cli_client)
-            )
+            cli_executor = CodingCliExecutor(root, cli_client, profile=profile, stream_output=stream or None)
             exec_result = cli_executor.run_task(task, reqs)
             _capture_after_patch(task_id, root)
             if exec_result.success:

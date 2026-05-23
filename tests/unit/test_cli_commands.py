@@ -580,7 +580,7 @@ def test_cli_go_plans_runs_tasks_and_reports(tmp_path, monkeypatch):
             ))
         return ["TASK-001"]
 
-    def fake_run(task_id, executor="manual", project_root=tmp_path):
+    def fake_run(task_id, executor="manual", project_root=tmp_path, **kwargs):
         db = get_db(tmp_path)
         assert db is not None
         with db.get_session() as session:
@@ -623,7 +623,7 @@ def test_cli_e2e_alias_plans_runs_tasks_and_reports(tmp_path, monkeypatch):
             ))
         return ["TASK-001"]
 
-    def fake_run(task_id, executor="manual", project_root=tmp_path):
+    def fake_run(task_id, executor="manual", project_root=tmp_path, **kwargs):
         db = get_db(project_root)
         assert db is not None
         with db.get_session() as session:
@@ -674,7 +674,7 @@ def test_cli_e2e_uses_configured_default_executor_when_omitted(tmp_path, monkeyp
 
     seen = {}
 
-    def fake_run(task_id, executor="manual", project_root=tmp_path):
+    def fake_run(task_id, executor="manual", project_root=tmp_path, **kwargs):
         seen["executor"] = executor
         db = get_db(project_root)
         assert db is not None
@@ -691,19 +691,20 @@ def test_cli_e2e_uses_configured_default_executor_when_omitted(tmp_path, monkeyp
     result = runner.invoke(app, ["e2e", "Add a feature", "--json-report"])
 
     assert result.exit_code == 0
-    assert seen["executor"] == "gemini-cli"
+    assert seen["executor"] == "gemini"
 
 
 def test_cli_e2e_without_executor_rejects_manual_default(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert runner.invoke(app, ["init"]).exit_code == 0
+    monkeypatch.setattr("shutil.which", lambda _command: None)
 
     result = runner.invoke(app, ["e2e", "Add a feature", "--agent"])
 
     assert result.exit_code == 2
     assert "requires an automated executor" in result.output
-    assert "dev run TASK-ID --executor" in result.output
-    assert "manual" in result.output
+    assert "execution.default_executor" in result.output
+    assert "coding CLI on PATH" in result.output
 
 
 def test_cli_e2e_writes_machine_readable_report_file(tmp_path, monkeypatch):
@@ -728,7 +729,7 @@ def test_cli_e2e_writes_machine_readable_report_file(tmp_path, monkeypatch):
             ))
         return ["TASK-001"]
 
-    def fake_run(task_id, executor="manual", project_root=tmp_path):
+    def fake_run(task_id, executor="manual", project_root=tmp_path, **kwargs):
         db = get_db(project_root)
         assert db is not None
         with db.get_session() as session:
@@ -780,7 +781,7 @@ def test_cli_e2e_agent_mode_writes_default_json_report(tmp_path, monkeypatch):
             ))
         return ["TASK-001"]
 
-    def fake_run(task_id, executor="manual", project_root=tmp_path):
+    def fake_run(task_id, executor="manual", project_root=tmp_path, **kwargs):
         db = get_db(project_root)
         assert db is not None
         with db.get_session() as session:
@@ -831,7 +832,7 @@ def test_cli_go_supports_project_root_from_other_directory(tmp_path, monkeypatch
             ))
         return ["TASK-001"]
 
-    def fake_run(task_id, executor="manual", project_root=Path(".")):
+    def fake_run(task_id, executor="manual", project_root=Path("."), **kwargs):
         seen["run_root"] = project_root
         db = get_db(project_root)
         assert db is not None
@@ -888,7 +889,7 @@ def test_cli_go_only_runs_tasks_from_current_plan(tmp_path, monkeypatch):
 
     ran = []
 
-    def fake_run(task_id, executor="manual", project_root=tmp_path):
+    def fake_run(task_id, executor="manual", project_root=tmp_path, **kwargs):
         ran.append(task_id)
         db = get_db(project_root)
         assert db is not None
@@ -961,7 +962,7 @@ def test_cli_go_deduplicates_planned_task_ids(tmp_path, monkeypatch):
 
     ran = []
 
-    def fake_run(task_id, executor="manual", project_root=tmp_path):
+    def fake_run(task_id, executor="manual", project_root=tmp_path, **kwargs):
         ran.append(task_id)
         db = get_db(project_root)
         assert db is not None
@@ -1003,7 +1004,7 @@ def test_cli_go_fails_when_executor_leaves_task_unverified(tmp_path, monkeypatch
             ))
         return ["TASK-001"]
 
-    def fake_run(task_id, executor="manual", project_root=tmp_path):
+    def fake_run(task_id, executor="manual", project_root=tmp_path, **kwargs):
         _ = task_id, executor, project_root
 
     monkeypatch.setattr("devcouncil.cli.commands.go.plan_command.run_plan_flow", fake_plan_flow)
@@ -1040,7 +1041,7 @@ def test_cli_go_fails_when_all_planned_tasks_were_precompleted(tmp_path, monkeyp
 
     ran = []
 
-    def fake_run(task_id, executor="manual", project_root=tmp_path):
+    def fake_run(task_id, executor="manual", project_root=tmp_path, **kwargs):
         ran.append(task_id)
 
     monkeypatch.setattr("devcouncil.cli.commands.go.plan_command.run_plan_flow", fake_plan_flow)
@@ -1083,7 +1084,7 @@ def test_cli_go_continue_on_blocked_runs_later_tasks_but_fails_project(tmp_path,
 
     ran = []
 
-    def fake_run(task_id, executor="manual", project_root=tmp_path):
+    def fake_run(task_id, executor="manual", project_root=tmp_path, **kwargs):
         ran.append(task_id)
         db = get_db(project_root)
         assert db is not None
@@ -1194,7 +1195,7 @@ def test_cli_go_supports_custom_agent_registry_and_profile(tmp_path, monkeypatch
             ))
         return ["TASK-001"]
 
-    def fake_run(task_id, executor="manual", profile=None, project_root=tmp_path):
+    def fake_run(task_id, executor="manual", profile=None, project_root=tmp_path, **kwargs):
         seen["executor"] = executor
         seen["profile"] = profile
         db = get_db(project_root)
@@ -1212,7 +1213,8 @@ def test_cli_go_supports_custom_agent_registry_and_profile(tmp_path, monkeypatch
     result = runner.invoke(app, ["go", "Add a feature", "--executor", "custombot", "--profile", "prod"])
 
     assert result.exit_code == 0
-    assert seen == {"executor": "custombot", "profile": "prod"}
+    assert seen["executor"] == "custombot"
+    assert seen["profile"] == "prod"
 
 
 def test_cli_integrate_prints_coding_cli_setup_commands(tmp_path, monkeypatch):
@@ -1300,6 +1302,65 @@ def test_cli_integrate_hooks_apply_writes_native_hook_files(tmp_path):
     opencode_config = json.loads((tmp_path / "opencode.json").read_text(encoding="utf-8"))
     assert "./.devcouncil/integrations/opencode_devcouncil_plugin.mjs" in opencode_config["plugin"]
     assert "codex_hooks = true" in (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
+
+
+def test_cli_integrate_check_strict_fails_when_optional_cli_missing(tmp_path):
+    (tmp_path / ".devcouncil").mkdir()
+    result = runner.invoke(app, ["integrate", "check", "--strict", "--project-root", str(tmp_path)])
+    assert result.exit_code == 1
+    assert "Missing" not in result.output or "FAIL" in result.output
+
+
+def test_cli_go_auto_detects_coding_cli_when_default_is_manual(tmp_path, monkeypatch):
+    from devcouncil.domain.task import PlannedFile, Task
+    from devcouncil.storage.db import get_db
+    from devcouncil.storage.repositories import TaskRepository
+
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    def fake_which(command):
+        return "/usr/bin/codex" if command == "codex" else None
+
+    monkeypatch.setattr("shutil.which", fake_which)
+
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path):
+        _ = goal, requirements_only, dry_run, persist
+        db = get_db(project_root)
+        assert db is not None
+        with db.get_session() as session:
+            TaskRepository(session).save(Task(
+                id="TASK-001",
+                title="Auto executor",
+                description="Detect codex",
+                planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
+                allowed_commands=["python -m pytest"],
+                expected_tests=["python -m pytest"],
+            ))
+        return ["TASK-001"]
+
+    seen = {}
+
+    def fake_run(task_id, executor="manual", profile=None, stream=False, project_root=tmp_path, **kwargs):
+        seen["executor"] = executor
+        seen["stream"] = stream
+        db = get_db(project_root)
+        assert db is not None
+        with db.get_session() as session:
+            repo = TaskRepository(session)
+            task = repo.get_by_id(task_id)
+            assert task is not None
+            task.status = "verified"
+            repo.save(task)
+
+    monkeypatch.setattr("devcouncil.cli.commands.go.plan_command.run_plan_flow", fake_plan_flow)
+    monkeypatch.setattr("devcouncil.cli.commands.go.run_command.run", fake_run)
+
+    result = runner.invoke(app, ["go", "Ship feature", "--json-report"])
+
+    assert result.exit_code == 0
+    assert seen.get("executor") == "codex"
+    assert "Using automated executor" in result.output
 
 
 def test_cli_integrate_check_reports_hook_wiring(tmp_path):
@@ -3268,7 +3329,7 @@ def test_cli_run_supports_coding_cli_executors(tmp_path, monkeypatch):
     called = {}
 
     class FakeCodingExecutor:
-        def __init__(self, project_root, client):
+        def __init__(self, project_root, client, **kwargs):
             called["client"] = client
             called["project_root"] = str(project_root)
 
@@ -3351,7 +3412,7 @@ def test_cli_run_supports_coding_cli_alias_executors(tmp_path, monkeypatch):
     called = {}
 
     class FakeCodingExecutor:
-        def __init__(self, project_root, client):
+        def __init__(self, project_root, client, **kwargs):
             called["client"] = client
 
         def run_task(self, task, reqs):
