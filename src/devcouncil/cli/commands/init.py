@@ -8,6 +8,7 @@ from devcouncil.storage.db import Database
 from devcouncil.integrations.gitnexus import GitNexusIntegration
 from devcouncil.integrations.graphify import GraphifyIntegration
 from devcouncil.llm.provider import build_role_model_config, validate_model_provider
+from devcouncil.repo.gitignore import ensure_gitignore
 
 app = typer.Typer()
 console = Console()
@@ -115,6 +116,7 @@ def initialize_project(
     Returns True when a fresh .devcouncil directory was created.
     """
     project_root = project_root.resolve()
+    ensure_gitignore(project_root)
     dev_dir = project_root / ".devcouncil"
     created = False
 

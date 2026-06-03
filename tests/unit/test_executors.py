@@ -93,6 +93,48 @@ def test_coding_cli_executor_uses_stdin_prompt(tmp_path, monkeypatch):
     assert "TASK-001" in captured["input"]
 
 
+def test_coding_cli_executor_updates_gitignore_for_runtime_artifacts(tmp_path, monkeypatch):
+    gitignore_path = tmp_path / ".gitignore"
+    gitignore_path.write_text("existing-rule\n", encoding="utf-8")
+
+    def fake_which(_command):
+        return f"/usr/bin/{_command}"
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    monkeypatch.setattr("subprocess.run", fake_run)
+    task = Task(
+        id="TASK-001",
+        title="Coding CLI",
+        description="Implement feature",
+        planned_files=[
+            PlannedFile(path="src/app.py", reason="logic", allowed_change="modify"),
+        ],
+    )
+
+    result = CodingCliExecutor(tmp_path, "codex").run_task(task, [])
+
+    assert result.success
+    content = gitignore_path.read_text(encoding="utf-8")
+    assert "existing-rule" in content
+    for expected in [
+        ".devcouncil/*",
+        "!.devcouncil/config.yaml",
+        ".agents/",
+        ".codex/",
+        ".aider*",
+        "logs/",
+        "tmp/",
+        "scratch/",
+        "dumps/",
+        "*.log",
+        "*.dump",
+    ]:
+        assert expected in content
+
+
 def test_coding_cli_executor_normalizes_aliases(tmp_path, monkeypatch):
     captured = {}
 

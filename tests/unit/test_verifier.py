@@ -176,6 +176,17 @@ def test_verifier_filters_generated_and_runtime_change_paths(tmp_path):
     assert paths == ["src/devcouncil/verification/verifier.py"]
 
 
+def test_verifier_filters_dev_managed_gitignore_update_without_head(tmp_path):
+    from devcouncil.repo.gitignore import ensure_gitignore
+
+    subprocess.check_call(["git", "init"], cwd=tmp_path, stdout=subprocess.DEVNULL)
+    ensure_gitignore(tmp_path)
+
+    verifier = Verifier(tmp_path)
+
+    assert ".gitignore" not in verifier.get_changed_files()
+
+
 def test_verifier_blocks_open_critical_live_review_cards(tmp_path):
     verifier = Verifier(tmp_path)
     verifier.get_changed_files = lambda: ["src/auth.py"]

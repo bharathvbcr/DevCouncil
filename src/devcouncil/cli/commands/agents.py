@@ -18,6 +18,7 @@ from devcouncil.executors.agent_registry import (
     load_cli_agent_specs,
     normalize_agent_name,
 )
+from devcouncil.optimization.gepa_agent import GepaUnavailableError, optimize_agent_profile
 
 app = typer.Typer(help="Manage DevCouncil CLI agents.")
 console = Console()
@@ -185,3 +186,51 @@ def _check_help(command: list[str]) -> tuple[bool, str]:
     except subprocess.TimeoutExpired:
         return False, "help command timed out"
     return result.returncode == 0, f"help command exited {result.returncode}"
+
+
+@app.command("optimize")
+def optimize_agent(
+    agent: str = typer.Option(..., "--agent", "-a", help="Agent name to optimize, for example codex or opencode."),
+    profile_name: str = typer.Option("default", "--profile", help="Profile name to optimize: default, yolo, prod, or configured."),
+    evals_path: Path = typer.Option(..., "--evals", help="JSON or JSONL GEPA evaluation dataset."),
+    max_metric_calls: int = typer.Option(40, "--max-metric-calls", min=1, help="Maximum GEPA metric calls."),
+    objective: str | None = typer.Option(None, "--objective", help="Override the default optimization objective."),
+    apply: bool = typer.Option(
+        False,
+        "--apply/--dry-run",
+        help="Write the optimized preamble into .devcouncil/config.yaml. Defaults to dry-run.",
+    ),
+    output_path: Path | None = typer.Option(None, "--output", help="Write the optimization artifact to this path."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """
+    Optimize a CLI-agent profile prompt preamble with GEPA.
+    """
+    root = _project_root(project_root)
+    try:
+        result = optimize_agent_profile(
+            project_root=root,
+            agent=agent,
+            profile_name=profile_name,
+            evals_path=evals_path,
+            max_metric_calls=max_metric_calls,
+            objective=objective,
+            apply=apply,
+            output_path=output_path,
+        )
+    except GepaUnavailableError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+    mode = "applied" if result.applied else "dry-run"
+    score = "unknown" if result.best_score is None else f"{result.best_score:.3f}"
+    console.print(
+        f"[green]GEPA optimization complete ({mode}) for {result.agent}:{result.profile_name}.[/green]"
+    )
+    console.print(f"Score: [bold]{score}[/bold]")
+    console.print(f"Artifact: [dim]{result.artifact_path}[/dim]")
+    console.print("\n[bold]Optimized preamble[/bold]")
+    console.print(result.best_preamble or "[dim](empty)[/dim]")

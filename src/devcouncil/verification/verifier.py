@@ -17,6 +17,7 @@ from devcouncil.domain.evidence import TestEvidence, DiffEvidence, CommandResult
 from devcouncil.gating.checks.secret_scan_check import SecretScanner
 from devcouncil.verification.implementation_reviewer import ImplementationReviewer
 from devcouncil.llm.router import ModelRouter
+from devcouncil.repo.gitignore import build_gitignore_content
 from devcouncil.utils.redaction import redact_string
 from devcouncil.live.cards import unresolved_blocking_cards
 
@@ -202,7 +203,32 @@ class Verifier:
         ]
 
     def _is_ignored_change(self, path: str) -> bool:
+        if path == ".gitignore" and self._is_managed_gitignore_update():
+            return True
         return any(fnmatch.fnmatch(path, pattern) for pattern in IGNORED_CHANGE_PATTERNS)
+
+    def _is_managed_gitignore_update(self) -> bool:
+        gitignore_path = self.project_root / ".gitignore"
+        try:
+            current = gitignore_path.read_text(encoding="utf-8")
+        except OSError:
+            return False
+
+        base = ""
+        if self._has_head():
+            result = subprocess.run(
+                ["git", "show", "HEAD:.gitignore"],
+                cwd=self.project_root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if result.returncode != 0:
+                return False
+            base = result.stdout
+
+        return current == build_gitignore_content(base)
 
     def _load_baseline_files(self) -> set[str]:
         return self._load_snapshot_files(self.project_root / ".devcouncil" / "baseline.json")

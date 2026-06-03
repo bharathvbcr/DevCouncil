@@ -109,6 +109,13 @@ dev agents doctor
 dev agents run TASK-001 --agent opencode --profile default
 ```
 
+GEPA prompt-profile optimization is available for the agent hub:
+
+```bash
+dev agents optimize --agent codex --profile yolo --evals .devcouncil/evals/agent-profile.jsonl --dry-run
+dev agents optimize --agent codex --profile yolo --evals .devcouncil/evals/agent-profile.jsonl --apply
+```
+
 ## Feature Set
 
 DevCouncil is an application layer around coding agents. It does not just emit prompts; it owns the workflow state, validates task scope, records evidence, and produces release-style reports.
@@ -130,7 +137,7 @@ DevCouncil is an application layer around coding agents. It does not just emit p
 ### App Surfaces
 
 - **CLI:** `dev` and `devcouncil` expose the same Typer command surface for local terminal workflows.
-- **Agent hub:** `dev agents` lists built-in and custom agents, `dev agents add` registers prompt-taking CLIs, `dev agents doctor` checks wiring, and `dev agents run` executes a task through a named agent/profile.
+- **Agent hub:** `dev agents` lists built-in and custom agents, `dev agents add` registers prompt-taking CLIs, `dev agents doctor` checks wiring, `dev agents run` executes a task through a named agent/profile, and `dev agents optimize` uses GEPA to tune profile preambles from offline eval examples.
 - **Integration hub:** `dev integrate all --apply` configures supported coding CLI and MCP integrations; targeted setup exists for Codex, Gemini, Claude Code, Cursor, Warp/Oz, hooks, and custom CLI agents.
 - **MCP server:** `dev mcp-server` exposes DevCouncil context and workflow tools over stdio for MCP-capable clients.
 - **Live review:** `dev watch` tracks review cards, signals, blocking feedback, and repair guidance while a session is active.

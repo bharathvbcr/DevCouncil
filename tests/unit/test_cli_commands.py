@@ -107,6 +107,40 @@ def test_cli_init_defaults_to_manual_executor(tmp_path, monkeypatch):
     assert raw_config["execution"]["default_executor"] == "manual"
 
 
+def test_cli_init_creates_gitignore(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    # Pre-create gitignore with existing contents to test appending
+    gitignore_path = tmp_path / ".gitignore"
+    gitignore_path.write_text("my_ignored_file\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["init"])
+    assert result.exit_code == 0
+    assert gitignore_path.exists()
+    content = gitignore_path.read_text(encoding="utf-8")
+    assert "my_ignored_file" in content
+    assert ".devcouncil/*" in content
+    assert "!.devcouncil/config.yaml" in content
+    assert ".aider*" in content
+    assert ".gemini/" in content
+    assert ".claude*" in content
+    assert ".cursor/" in content
+    assert ".agents/" in content
+    assert ".codex/" in content
+    assert ".openhands/" in content
+    assert ".opencode/" in content
+    assert "*.tmp" in content
+    assert "*.log" in content
+    assert "logs/" in content
+    assert "tmp/" in content
+    assert "scratch/" in content
+    assert "dumps/" in content
+    assert ".env" in content
+    assert "__pycache__/" in content
+    assert ".conductor/" in content
+    assert ".conducor/" in content
+
+
 def test_cli_init_rejects_invalid_role_model_override(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 

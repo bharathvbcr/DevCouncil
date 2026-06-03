@@ -36,6 +36,7 @@ dev agents                  # List built-in and custom CLI agents
 dev agents add NAME --command TOOL # Register a prompt-taking CLI agent
 dev agents doctor           # Check agent PATH, prompt mode, help command, and profile wiring
 dev agents run TASK-001 --agent NAME --profile default # Run a task with a named CLI agent
+dev agents optimize --agent codex --profile yolo --evals .devcouncil/evals/agent-profile.jsonl --dry-run # GEPA prompt-profile optimization
 dev lsp inspect             # Inspect optional language-server readiness
 dev ast match "symbol"      # Search symbols with structural AST matching
 dev dashboard               # Serve the live local status dashboard

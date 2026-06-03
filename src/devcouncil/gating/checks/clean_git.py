@@ -1,20 +1,51 @@
 import subprocess
 import logging
+from pathlib import Path
+
 from devcouncil.domain.gap import Gap
+from devcouncil.repo.gitignore import build_gitignore_content
 
 logger = logging.getLogger(__name__)
+
 
 class CleanGitCheck:
     """Ensures the working tree is clean before a task starts."""
 
-    def _is_runtime_state(self, line: str) -> bool:
+    def _is_runtime_state(self, line: str, project_root: Path) -> bool:
         path = line[3:].strip().replace("\\", "/")
-        return path.startswith(".devcouncil/")
-    
-    def check(self, project_root, task_id: str) -> list[Gap]:
+        if path.startswith(".devcouncil/"):
+            return True
+        status = line[:2]
+        return path == ".gitignore" and self._is_managed_gitignore_update(project_root, status)
+
+    def _is_managed_gitignore_update(self, project_root: Path, status: str) -> bool:
+        gitignore_path = project_root / ".gitignore"
         try:
-            status = subprocess.check_output(["git", "status", "--porcelain"], cwd=project_root).decode()
-            dirty_lines = [line for line in status.splitlines() if line.strip() and not self._is_runtime_state(line)]
+            current = gitignore_path.read_text(encoding="utf-8")
+        except OSError:
+            return False
+
+        base = ""
+        if status != "??":
+            result = subprocess.run(
+                ["git", "show", "HEAD:.gitignore"],
+                cwd=project_root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if result.returncode != 0:
+                return False
+            base = result.stdout
+
+        return current == build_gitignore_content(base)
+
+    def check(self, project_root, task_id: str) -> list[Gap]:
+        root = Path(project_root)
+        try:
+            status = subprocess.check_output(["git", "status", "--porcelain"], cwd=root).decode()
+            dirty_lines = [line for line in status.splitlines() if line.strip() and not self._is_runtime_state(line, root)]
             if dirty_lines:
                 return [Gap(
                     id=f"GAP-{task_id}-DIRTY-GIT",
