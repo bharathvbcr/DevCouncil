@@ -1,0 +1,102 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+
+GITIGNORE_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "DevCouncil local state",
+        (
+            ".devcouncil/*",
+            "!.devcouncil/",
+            "!.devcouncil/config.yaml",
+            "!.devcouncil/graphify.yaml",
+        ),
+    ),
+    (
+        "Local AI coding agents",
+        (
+            ".agents/",
+            ".codex/",
+            ".aider*",
+            ".gemini/",
+            ".claude*",
+            ".cursor/",
+            ".openhands/",
+            ".opencode/",
+            ".conductor/",
+            ".conducor/",
+        ),
+    ),
+    (
+        "Temporary, log, and dump artifacts",
+        (
+            "logs/",
+            "log/",
+            "tmp/",
+            "temp/",
+            ".tmp/",
+            ".temp/",
+            "scratch/",
+            "dumps/",
+            "dump/",
+            "*.tmp",
+            "*.temp",
+            "*.log",
+            "*.dmp",
+            "*.dump",
+            "*.bak",
+            "*.swp",
+            "*_results.txt",
+            "*_log.txt",
+            "*_output.txt",
+        ),
+    ),
+    (
+        "Environment, dependency, and cache directories",
+        (
+            "__pycache__/",
+            "*.py[cod]",
+            ".venv/",
+            "venv/",
+            "node_modules/",
+            ".env",
+            ".env.local",
+            ".pytest_cache/",
+            ".mypy_cache/",
+            ".ruff_cache/",
+            ".DS_Store",
+            "Thumbs.db",
+        ),
+    ),
+)
+
+
+def ensure_gitignore(project_root: Path) -> None:
+    gitignore_path = project_root / ".gitignore"
+    content = ""
+    if gitignore_path.exists():
+        try:
+            content = gitignore_path.read_text(encoding="utf-8")
+        except OSError:
+            return
+
+    existing_rules = {line.strip() for line in content.splitlines() if line.strip()}
+    chunks: list[str] = []
+    for heading, rules in GITIGNORE_SECTIONS:
+        missing_rules = [rule for rule in rules if rule not in existing_rules]
+        if missing_rules:
+            chunks.append("\n".join([f"# {heading}", *missing_rules]))
+
+    if not chunks:
+        return
+
+    prefix = ""
+    if content:
+        prefix = "" if content.endswith("\n") else "\n"
+        prefix += "\n"
+
+    try:
+        gitignore_path.write_text(content + prefix + "\n\n".join(chunks) + "\n", encoding="utf-8")
+    except OSError:
+        return

@@ -22,6 +22,7 @@ from devcouncil.executors.agent_registry import (
     normalize_agent_name,
     resolve_cursor_agent_executable,
 )
+from devcouncil.repo.gitignore import ensure_gitignore
 from devcouncil.telemetry.traces import TraceLogger
 from devcouncil.utils.redaction import redact_text
 
@@ -142,6 +143,8 @@ class CodingCliExecutor(Executor):
                     "Use one of: argument, prompt-file, stdin."
                 ),
             )
+
+        ensure_gitignore(self.project_root)
 
         try:
             command = self._command(task.id)

@@ -8,6 +8,7 @@ from devcouncil.storage.db import Database
 from devcouncil.integrations.gitnexus import GitNexusIntegration
 from devcouncil.integrations.graphify import GraphifyIntegration
 from devcouncil.llm.provider import build_role_model_config, validate_model_provider
+from devcouncil.repo.gitignore import ensure_gitignore
 
 app = typer.Typer()
 console = Console()
@@ -163,103 +164,6 @@ def initialize_project(
 
     ensure_gitignore(project_root)
     return created
-
-
-def ensure_gitignore(project_root: Path) -> None:
-    gitignore_path = project_root / ".gitignore"
-
-    devcouncil_ignores = [
-        "# DevCouncil specific ignores",
-        ".devcouncil/*",
-        "!.devcouncil/",
-        "!.devcouncil/config.yaml",
-        "!.devcouncil/graphify.yaml",
-    ]
-
-    agent_ignores = [
-        "# Local AI coding client caches and logs",
-        ".aider*",
-        ".gemini/",
-        ".claude*",
-        ".cursor/",
-        ".openhands/",
-        ".opencode/",
-    ]
-
-    common_ignores = [
-        "# Common temporary and dump files",
-        "*.tmp",
-        "*.temp",
-        "*.log",
-        "*.dmp",
-        "*.dump",
-        "*.bak",
-        "*.swp",
-        ".DS_Store",
-        "Thumbs.db",
-    ]
-
-    env_and_cache_ignores = [
-        "# Standard environment, dependency, and cache directories",
-        "__pycache__/",
-        "*.py[cod]",
-        ".venv/",
-        "venv/",
-        "node_modules/",
-        ".env",
-        ".env.local",
-        ".pytest_cache/",
-        ".mypy_cache/",
-        ".ruff_cache/",
-    ]
-
-    all_ignores = (
-        devcouncil_ignores
-        + [""]
-        + agent_ignores
-        + [""]
-        + common_ignores
-        + [""]
-        + env_and_cache_ignores
-    )
-
-    if not gitignore_path.exists():
-        try:
-            gitignore_path.write_text("\n".join(all_ignores) + "\n", encoding="utf-8")
-        except Exception:
-            pass
-        return
-
-    try:
-        content = gitignore_path.read_text(encoding="utf-8")
-        lines_to_append = []
-
-        if ".devcouncil/*" not in content and ".devcouncil/" not in content:
-            lines_to_append.extend(devcouncil_ignores)
-
-        if ".aider*" not in content:
-            if lines_to_append:
-                lines_to_append.append("")
-            lines_to_append.extend(agent_ignores)
-
-        if "*.tmp" not in content and "*.temp" not in content:
-            if lines_to_append:
-                lines_to_append.append("")
-            lines_to_append.extend(common_ignores)
-
-        if ".env" not in content and "__pycache__/" not in content:
-            if lines_to_append:
-                lines_to_append.append("")
-            lines_to_append.extend(env_and_cache_ignores)
-
-        if lines_to_append:
-            suffix = ""
-            if content and not content.endswith("\n"):
-                suffix = "\n"
-            suffix += "\n" + "\n".join(lines_to_append) + "\n"
-            gitignore_path.write_text(content + suffix, encoding="utf-8")
-    except Exception:
-        pass
 
 
 @app.callback(invoke_without_command=True)

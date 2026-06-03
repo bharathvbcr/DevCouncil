@@ -422,6 +422,30 @@ dev integrate cli-agent myagent --command myagent --arg run --input-mode stdin -
 dev run TASK-001 --executor myagent --profile default
 ```
 
+### GEPA Profile Optimization
+
+DevCouncil can use GEPA to optimize the prompt preamble for a CLI-agent profile from offline evaluation examples.
+
+Write JSONL or JSON with examples of observed agent failures and desired prompt behavior:
+
+```json
+{"id":"missing-verification","observed_failure":"The agent claimed success without running tests.","desired_behavior":"Run allowed verification before the final response.","required_terms":["verification","evidence"],"forbidden_terms":["skip tests"]}
+```
+
+Preview the optimized profile text without changing config:
+
+```bash
+dev agents optimize --agent codex --profile yolo --evals .devcouncil/evals/agent-profile.jsonl --dry-run
+```
+
+Apply the best preamble into `.devcouncil/config.yaml` only after inspecting the artifact:
+
+```bash
+dev agents optimize --agent codex --profile yolo --evals .devcouncil/evals/agent-profile.jsonl --apply
+```
+
+The command writes an optimization artifact under `.devcouncil/optimizations/` by default. It does not run the coding CLI, stash changes, reset the repository, or clean untracked files; GEPA evaluates candidate prompt text against the offline examples.
+
 ## Aider
 
 Headless execution:
