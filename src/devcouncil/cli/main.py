@@ -30,7 +30,12 @@ from devcouncil.cli.commands import (
     verify,
     version,
     watch,
+    shell,
+    semantic,
+    evidence,
+    handoff,
 )
+from devcouncil.cli.commands.watch_fs import watch_fs
 
 app = typer.Typer(
     name="dev",
@@ -58,6 +63,11 @@ app.add_typer(lsp.app, name="lsp")
 app.add_typer(ast.app, name="ast")
 app.add_typer(dashboard.app, name="dashboard")
 app.add_typer(watch.app, name="watch")
+app.add_typer(shell.app, name="shell")
+app.add_typer(semantic.app, name="semantic")
+app.add_typer(evidence.app, name="evidence")
+app.add_typer(handoff.app, name="handoff")
+watch.app.command("fs")(watch_fs)
 
 # Direct command registrations (those defined as def cmd())
 app.command(name="baseline")(baseline.baseline)
@@ -72,6 +82,7 @@ app.command(name="show")(show.show)
 app.command(name="verify")(verify.verify)
 app.command(name="repair")(repair.repair)
 app.command(name="status")(status.status)
+app.command(name="optimize")(agents.optimize_agent)
 
 @app.callback()
 def main(ctx: typer.Context):

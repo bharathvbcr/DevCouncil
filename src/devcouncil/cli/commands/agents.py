@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import sys
 from pathlib import Path
 
+from pydantic import BaseModel, Field
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -13,10 +15,12 @@ from devcouncil.cli.commands.integrate import _load_raw_config, _project_root, _
 from devcouncil.executors.agent_registry import (
     VALID_INPUT_MODES,
     agent_config_entry,
+    detect_available_coding_cli,
     is_reserved_agent_name,
     load_agent_profiles,
     load_cli_agent_specs,
     normalize_agent_name,
+    resolve_automated_executor,
     resolve_cursor_agent_executable,
 )
 
@@ -151,6 +155,15 @@ def doctor(
         table.add_row(name, status, "; ".join(details))
 
     console.print(table)
+    detected = detect_available_coding_cli(root)
+    if detected:
+        resolved = resolve_automated_executor(root, None)
+        console.print(
+            f"\n[dim]Auto-pick for dev go / dev run:[/dim] [cyan]{resolved}[/cyan] "
+            f"(first built-in CLI on PATH in probe order)"
+        )
+    else:
+        console.print("\n[dim]No built-in coding CLI on PATH for auto-pick.[/dim]")
 
 
 @app.command("run")
@@ -158,10 +171,15 @@ def run_agent(
     task_id: str = typer.Argument(..., help="ID of the task to run."),
     agent: str = typer.Option(..., "--agent", "-a", help="Agent name to execute."),
     profile: str | None = typer.Option(None, "--profile", help="Execution profile: default, yolo, prod, or configured."),
+    stream: bool = typer.Option(
+        False,
+        "--stream",
+        help="Stream coding CLI stdout/stderr live (also enabled by execution.stream_cli_output).",
+    ),
     project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
 ):
     """Run a DevCouncil task with a named CLI agent and profile."""
-    run_command.run(task_id, executor=agent, profile=profile, project_root=project_root)
+    run_command.run(task_id, executor=agent, profile=profile, stream=stream, project_root=project_root)
 
 
 def _which(command: str) -> str | None:
@@ -189,3 +207,257 @@ def _check_help(command: list[str]) -> tuple[bool, str]:
     except subprocess.TimeoutExpired:
         return False, "help command timed out"
     return result.returncode == 0, f"help command exited {result.returncode}"
+
+
+class GepaMutation(BaseModel):
+    reflection: str = Field(description="Explanation of why the previous run failed and what needs to be improved in the prompt preamble.")
+    optimized_preamble: str = Field(description="The updated prompt preamble containing instructions for the agent.")
+
+
+async def run_optimize_flow(
+    task_id: str,
+    agent: str,
+    profile_name: str,
+    iterations: int,
+    project_root: Path,
+) -> None:
+    from devcouncil.app.config import get_api_key, load_config
+    from devcouncil.executors.agent_registry import get_cli_agent_spec
+    from devcouncil.executors.coding_cli import CodingCliExecutor
+    from devcouncil.llm.provider import create_provider, validate_model_provider
+    from devcouncil.llm.router import ModelRouter
+    from devcouncil.storage.db import get_db
+    from devcouncil.storage.repositories import RequirementRepository, TaskRepository
+    from devcouncil.verification.verifier import Verifier
+
+    root = project_root.expanduser().resolve()
+    db = get_db(root)
+    if not db:
+        console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
+        raise typer.Exit(code=1)
+
+    config = load_config(root)
+    try:
+        validate_model_provider(config.models.provider)
+        api_key = get_api_key(config.models.provider, root)
+    except ValueError as e:
+        console.print(f"[red]LLM provider configuration error: {e}[/red]")
+        raise typer.Exit(code=1)
+
+    provider = create_provider(config.models.provider, api_key, project_root=root)
+    role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
+    router = ModelRouter(provider, role_config, project_root=root)
+
+    with db.get_session() as session:
+        task_repo = TaskRepository(session)
+        task = task_repo.get_by_id(task_id)
+        if not task:
+            console.print(f"[red]Task {task_id} not found.[/red]")
+            raise typer.Exit(code=1)
+
+        req_repo = RequirementRepository(session)
+        reqs = req_repo.get_all()
+
+    normalized_agent = normalize_agent_name(agent)
+    spec = get_cli_agent_spec(root, normalized_agent)
+    if not spec:
+        console.print(f"[red]Agent '{agent}' is not registered or supported.[/red]")
+        raise typer.Exit(code=1)
+
+    profiles = load_agent_profiles(root)
+    profile_cfg = profiles.get(profile_name)
+    if not profile_cfg:
+        console.print(f"[red]Profile '{profile_name}' not found for agent '{normalized_agent}'.[/red]")
+        raise typer.Exit(code=1)
+
+    # Check if git is dirty and stash
+    is_dirty = False
+    try:
+        status_out = subprocess.check_output(["git", "status", "--porcelain"], cwd=root, text=True).strip()
+        if status_out:
+            is_dirty = True
+    except Exception:
+        pass
+
+    if is_dirty:
+        console.print("[yellow]Working directory is dirty. Stashing changes to ensure clean baseline...[/yellow]")
+        subprocess.run(["git", "stash", "-u"], cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    current_preamble = profile_cfg.prompt_preamble or ""
+    best_preamble = current_preamble
+    best_score = -1
+    best_success = False
+
+    console.print(f"\n[bold]Starting GEPA optimization loop for agent {normalized_agent.upper()} ({profile_name} profile)...[/bold]")
+    console.print(f"Seed Prompt Preamble: {repr(current_preamble)}\n")
+
+    try:
+        for iter_idx in range(1, iterations + 1):
+            console.print(f"[bold cyan]--- Iteration {iter_idx} of {iterations} ---[/bold cyan]")
+            console.print(f"Preamble: {repr(current_preamble)}")
+
+            # Update prompt_preamble temporarily in config.yaml
+            temp_raw_config = _load_raw_config(root)
+            integrations = temp_raw_config.setdefault("integrations", {})
+            cli_agents = integrations.setdefault("cli_agents", {})
+            profiles_dict = cli_agents.setdefault("profiles", {})
+            profile_data = profiles_dict.setdefault(profile_name, {})
+            profile_data["prompt_preamble"] = current_preamble
+            _save_raw_config(root, temp_raw_config)
+
+            # Rollout
+            console.print("Running agent rollout...")
+            cli_executor = CodingCliExecutor(root, normalized_agent, profile=profile_name)
+            exec_result = cli_executor.run_task(task, reqs)
+
+            # Verification
+            console.print("Running verification...")
+            verifier = Verifier(root, router=router)
+            gaps, evidence = await verifier.verify_task(task, reqs)
+
+            blocking_gaps = [g for g in gaps if g.blocking]
+            non_blocking_gaps = [g for g in gaps if not g.blocking]
+
+            exit_code = 0 if exec_result.success else -1
+            success = exec_result.success and len(blocking_gaps) == 0
+
+            if not exec_result.success:
+                score = 0
+            else:
+                score = 100 - (len(blocking_gaps) * 20) - (len(non_blocking_gaps) * 5)
+                score = max(0, score)
+
+            console.print(f"Rollout Success: [bold]{exec_result.success}[/bold], Exit Code: {exit_code}")
+            console.print(f"Verification Success: [bold]{len(blocking_gaps) == 0}[/bold], Gaps Found: {len(gaps)} ({len(blocking_gaps)} blocking)")
+            console.print(f"Iteration Score: [bold green]{score}/100[/bold green]\n")
+
+            if score > best_score or (score == best_score and success and not best_success):
+                best_score = score
+                best_preamble = current_preamble
+                best_success = success
+
+            # Clean up working tree for next iteration
+            console.print("Cleaning repository state for next run...")
+            subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["git", "clean", "-fd"], cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            # If we achieved 100% success and 0 gaps, we can stop early!
+            if best_success and best_score == 100:
+                console.print("[bold green]Success! Achieved perfect score (100/100). Stopping early.[/bold green]")
+                break
+
+            if iter_idx == iterations:
+                break
+
+            # Reflection and Mutation using critic LLM
+            gaps_desc = ""
+            for idx, g in enumerate(gaps, 1):
+                gaps_desc += f"{idx}. [{g.severity.upper()}] {g.description} (Recommended Fix: {g.recommended_fix})\n"
+            if not gaps_desc:
+                gaps_desc = "No verification gaps reported, but agent CLI run failed."
+
+            log_content = ""
+            log_path = root / ".devcouncil" / "logs" / f"{task.id}-{normalized_agent}.log"
+            if log_path.exists():
+                try:
+                    log_content = log_path.read_text(encoding="utf-8")
+                    if len(log_content) > 1500:
+                        log_content = "...[truncated]...\n" + log_content[-1500:]
+                except Exception:
+                    pass
+
+            reqs_str = "\n".join([f"- {r.title}" for r in reqs])
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are the GEPA (Generative Evaluation and Prompt Adaptation) prompt optimization assistant. "
+                        "You analyze agent run failures and optimize prompt preambles."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"""Optimize the prompt preamble for the agent CLI: {normalized_agent}.
+
+Task Goal:
+{task.description}
+
+Active Requirements:
+{reqs_str}
+
+Current Preamble:
+---
+{current_preamble}
+---
+
+Rollout Outcome:
+Exit Code: {exit_code}
+
+Execution Log Preview:
+---
+{log_content}
+---
+
+Verification Gaps:
+{gaps_desc}
+
+Please reflect on why the agent failed. Then, propose a mutated and optimized prompt preamble.
+Focus on instructions that would guide the agent to correct the specific issues mentioned in the verification gaps and logs.
+Ensure the updated preamble is concise and directly actionable by the agent. Keep any general profile constraints from the current preamble if they are still relevant.
+"""
+                }
+            ]
+
+            try:
+                mutation = await router.complete_structured(
+                    role="critic_a",
+                    messages=messages,
+                    schema=GepaMutation,
+                    temperature=0.7
+                )
+                current_preamble = mutation.optimized_preamble
+                console.print(f"[bold green]LLM Reflection:[/bold green] {mutation.reflection}")
+                console.print(f"[bold green]Mutated Preamble:[/bold green] {repr(current_preamble)}\n")
+            except Exception as e:
+                console.print(f"[red]Failed to run LLM reflection: {e}[/red]")
+                break
+
+    finally:
+        # Restore configuration with the best preamble found
+        console.print("\n[bold green]Optimization complete![/bold green]")
+        console.print(f"Best Preamble Found (Score {best_score}/100): {repr(best_preamble)}")
+
+        final_raw_config = _load_raw_config(root)
+        integrations = final_raw_config.setdefault("integrations", {})
+        cli_agents = integrations.setdefault("cli_agents", {})
+        profiles_dict = cli_agents.setdefault("profiles", {})
+        profile_data = profiles_dict.setdefault(profile_name, {})
+        profile_data["prompt_preamble"] = best_preamble
+        _save_raw_config(root, final_raw_config)
+        console.print(f"[green]Saved best preamble to profile '{profile_name}' in .devcouncil/config.yaml.[/green]")
+
+        if is_dirty:
+            console.print("[yellow]Restoring stashed changes...[/yellow]")
+            subprocess.run(["git", "stash", "pop"], cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+@app.command("optimize")
+def optimize_agent(
+    task_id: str = typer.Argument(..., help="ID of the task to run for optimization."),
+    agent: str = typer.Option(..., "--agent", "-a", help="Agent name to execute/optimize."),
+    profile_name: str = typer.Option("default", "--profile", help="The profile name to optimize (e.g. default, yolo, prod)."),
+    iterations: int = typer.Option(3, "--iterations", "-i", help="Number of optimization cycles/iterations."),
+    project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """
+    Optimize an agent's prompt preamble using GEPA (Genetic-Pareto / reflective evolution).
+    """
+    asyncio.run(
+        run_optimize_flow(
+            task_id=task_id,
+            agent=agent,
+            profile_name=profile_name,
+            iterations=iterations,
+            project_root=project_root,
+        )
+    )
