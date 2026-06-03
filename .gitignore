@@ -71,3 +71,44 @@ venv.bak/
 
 # Local coding client configuration
 .gemini/
+.aider*
+.claude*
+.cursor/
+.openhands/
+.opencode/
+.conductor/
+.conducor/
+
+# Common temporary and dump files
+*.tmp
+*.temp
+*.log
+*.dmp
+*.dump
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local AI coding agents
+.agents/
+.codex/
+
+# Temporary, log, and dump artifacts
+logs/
+log/
+tmp/
+temp/
+.tmp/
+.temp/
+scratch/
+dumps/
+dump/
+*_results.txt
+*_log.txt
+*_output.txt
+
+# Environment, dependency, and cache directories
+.venv/
+node_modules/
+.env.local

@@ -125,12 +125,20 @@ def test_cli_init_creates_gitignore(tmp_path, monkeypatch):
     assert ".gemini/" in content
     assert ".claude*" in content
     assert ".cursor/" in content
+    assert ".agents/" in content
+    assert ".codex/" in content
     assert ".openhands/" in content
     assert ".opencode/" in content
     assert "*.tmp" in content
     assert "*.log" in content
+    assert "logs/" in content
+    assert "tmp/" in content
+    assert "scratch/" in content
+    assert "dumps/" in content
     assert ".env" in content
     assert "__pycache__/" in content
+    assert ".conductor/" in content
+    assert ".conducor/" in content
 
 
 def test_cli_init_rejects_invalid_role_model_override(tmp_path, monkeypatch):
