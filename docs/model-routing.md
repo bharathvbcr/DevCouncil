@@ -15,6 +15,7 @@ Supported `models.provider` values:
 
 - `openrouter`: uses `OPENROUTER_API_KEY`.
 - `vertexai`: uses `VERTEXAI_ACCESS_TOKEN` or `gcloud auth print-access-token`, `VERTEXAI_PROJECT` or `GOOGLE_CLOUD_PROJECT`, and optional `VERTEXAI_LOCATION` defaulting to `global`.
+- `doubleword`: uses `DOUBLEWORD_API_KEY` and the OpenAI-compatible chat API at `https://api.doubleword.ai/v1`.
 
 Vertex AI uses Google Cloud Auth access tokens, not long-lived OpenRouter-style API keys. For local use, generate a token with:
 
@@ -38,4 +39,8 @@ dev setup --provider vertexai --vertex-project your-gcp-project --vertex-locatio
 
 Google Cloud access tokens are short-lived. If `VERTEXAI_ACCESS_TOKEN` is not set in the environment or local secrets, DevCouncil falls back to `gcloud auth print-access-token`.
 
-Use Vertex-hosted model names in role config, for example `google/YOUR_MODEL_ID`.
+Use provider-specific model names in role config, for example:
+
+- OpenRouter: `anthropic/claude-sonnet-4.6`, `openai/gpt-5.5`, `google/gemini-2.5-pro`
+- Vertex AI: `google/gemini-2.5-flash`
+- Doubleword: `deepseek/deepseek-v4`

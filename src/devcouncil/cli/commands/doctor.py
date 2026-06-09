@@ -7,6 +7,13 @@ from rich.console import Console
 from rich.table import Table
 
 from devcouncil.app.config import get_gcloud_access_token, load_config, load_local_secrets, provider_api_key_env_var
+from devcouncil.executors.agent_registry import (
+    CODING_CLI_INTEGRATION_INFO,
+    CODING_CLI_PROBE_ORDER,
+    CODING_CLI_VERSION_COMMANDS,
+    detect_available_coding_cli,
+    resolve_automated_executor,
+)
 from devcouncil.llm.provider import SUPPORTED_MODEL_PROVIDERS, validate_model_provider
 
 app = typer.Typer()
@@ -66,117 +73,39 @@ def render_doctor_check(project_root: Path = Path(".")):
     else:
         table.add_row("ripgrep (rg)", "[yellow]Missing[/yellow]", "ripgrep is highly recommended for fast repo mapping.")
 
-    # Check supported coding CLIs
-    codex_ver = _command_version(["codex", "--version"])
-    if codex_ver:
-        table.add_row(
-            "Codex CLI",
-            "[green]OK[/green]",
-            f"{codex_ver}. Setup: dev integrate codex --apply (or dev setup --integrate --apply).",
-        )
-    else:
-        table.add_row(
-            "Codex CLI",
-            "[yellow]Missing[/yellow]",
-            "Optional. Install Codex, then run 'dev integrate codex --apply' (or 'dev setup --integrate --apply').",
-        )
+    # Check supported coding CLIs (driven by the agent registry, so new
+    # built-in agents show up here without doctor edits).
+    for name in CODING_CLI_PROBE_ORDER:
+        info = CODING_CLI_INTEGRATION_INFO.get(name)
+        if info is None:
+            continue
+        version = None
+        for probe in CODING_CLI_VERSION_COMMANDS.get(name, ()):
+            version = _command_version(list(probe))
+            if version:
+                break
+        if version:
+            table.add_row(info.label, "[green]OK[/green]", f"{version}. Setup: {info.notes}.")
+        else:
+            table.add_row(
+                info.label,
+                "[yellow]Missing[/yellow]",
+                f"Optional. Install {info.label}, then use: {info.notes}.",
+            )
 
-    gemini_ver = _command_version(["gemini", "--version"])
-    if gemini_ver:
+    detected = detect_available_coding_cli(project_root)
+    resolved = resolve_automated_executor(project_root, None)
+    if detected:
         table.add_row(
-            "Gemini CLI",
+            "Recommended coding CLI",
             "[green]OK[/green]",
-            f"{gemini_ver}. Setup: dev integrate gemini --apply (or dev setup --integrate --apply).",
+            f"Use --executor {resolved} for dev go / dev run (detected on PATH).",
         )
     else:
         table.add_row(
-            "Gemini CLI",
+            "Recommended coding CLI",
             "[yellow]Missing[/yellow]",
-            "Optional. Install Gemini CLI, then run 'dev integrate gemini --apply' (or 'dev setup --integrate --apply').",
-        )
-
-    claude_ver = _command_version(["claude", "--version"])
-    if claude_ver:
-        table.add_row(
-            "Claude Code",
-            "[green]OK[/green]",
-            f"{claude_ver}. Setup: dev integrate claude --apply (or dev setup --integrate --apply).",
-        )
-    else:
-        table.add_row(
-            "Claude Code",
-            "[yellow]Missing[/yellow]",
-            "Optional. Install Claude Code, then run 'dev integrate claude --apply' (or 'dev setup --integrate --apply').",
-        )
-
-    cursor_ver = _command_version(["cursor-agent", "--version"]) or _command_version(["cursor", "--version"])
-    if cursor_ver:
-        table.add_row(
-            "Cursor",
-            "[green]OK[/green]",
-            f"{cursor_ver}. Setup: dev integrate cursor --apply (or dev setup --integrate --apply).",
-        )
-    else:
-        table.add_row(
-            "Cursor",
-            "[yellow]Missing[/yellow]",
-            "Optional. Install Cursor/cursor-agent, then run 'dev integrate cursor --apply' (or 'dev setup --integrate --apply').",
-        )
-
-    opencode_ver = _command_version(["opencode", "--version"])
-    if opencode_ver:
-        table.add_row(
-            "OpenCode",
-            "[green]OK[/green]",
-            f"{opencode_ver}. Setup: dev integrate opencode --apply (or dev setup --integrate --apply).",
-        )
-    else:
-        table.add_row(
-            "OpenCode",
-            "[yellow]Missing[/yellow]",
-            "Optional. Install OpenCode, then run 'dev integrate opencode --apply' (or 'dev setup --integrate --apply').",
-        )
-
-    agy_ver = _command_version(["agy", "--version"])
-    if agy_ver:
-        table.add_row(
-            "Google Antigravity CLI",
-            "[green]OK[/green]",
-            f"{agy_ver}. Setup: dev integrate antigravity --apply (or dev setup --integrate --apply).",
-        )
-    else:
-        table.add_row(
-            "Google Antigravity CLI",
-            "[yellow]Missing[/yellow]",
-            "Optional. Install Antigravity CLI, then run 'dev integrate antigravity --apply' (or 'dev setup --integrate --apply').",
-        )
-
-    oz_ver = _command_version(["oz", "--version"])
-    if oz_ver:
-        table.add_row(
-            "Warp / Oz",
-            "[green]OK[/green]",
-            f"{oz_ver}. Setup: dev integrate warp --apply (or dev setup --integrate --apply).",
-        )
-    else:
-        table.add_row(
-            "Warp / Oz",
-            "[yellow]Missing[/yellow]",
-            "Optional. Install Warp/Oz, then run 'dev integrate warp --apply' (or 'dev setup --integrate --apply').",
-        )
-
-    aider_ver = _command_version(["aider", "--version"])
-    if aider_ver:
-        table.add_row(
-            "Aider",
-            "[green]OK[/green]",
-            f"{aider_ver}. Setup: dev integrate aider --apply. Run with: dev run TASK-001 --executor aider.",
-        )
-    else:
-        table.add_row(
-            "Aider",
-            "[yellow]Missing[/yellow]",
-            "Optional. Install Aider, then run 'dev integrate aider --apply'.",
+            "No built-in coding CLI on PATH. Run dev integrate recommend after installing one.",
         )
 
     try:

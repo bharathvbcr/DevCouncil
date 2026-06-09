@@ -9,7 +9,9 @@ class CleanGitCheck:
 
     def _is_runtime_state(self, line: str) -> bool:
         path = line[3:].strip().replace("\\", "/")
-        return path.startswith(".devcouncil/")
+        # DevCouncil manages the root .gitignore itself (ensure_gitignore runs on
+        # init and before every task), so it must not block execution.
+        return path.startswith(".devcouncil/") or path == ".gitignore"
     
     def check(self, project_root, task_id: str) -> list[Gap]:
         try:

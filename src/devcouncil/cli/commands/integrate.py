@@ -3,6 +3,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import typer
@@ -11,12 +12,24 @@ from rich.console import Console
 from rich.table import Table
 
 from devcouncil.executors.agent_registry import (
+    BUILTIN_CODING_EXECUTOR_NAMES,
+    CODING_CLI_INTEGRATION_INFO,
     VALID_INPUT_MODES,
     agent_config_entry,
+    detect_available_coding_cli,
+    integration_tier_label,
     is_reserved_agent_name,
     load_agent_profiles,
     load_cli_agent_specs,
     normalize_agent_name,
+    resolve_automated_executor,
+    resolve_coding_cli_executable,
+    resolve_coding_cli_probe_order,
+)
+from devcouncil.integrations.actions import apply_integration_target
+from devcouncil.integrations.check import (
+    build_integration_check_report,
+    integration_status_summary,
 )
 
 app = typer.Typer(help="Set up DevCouncil integrations with coding CLIs.")
@@ -31,8 +44,8 @@ PREFERRED_COMMAND = "dev integrate"
 LEGACY_COMMAND = "dev setup --integrate"
 
 
-def _project_root(path: Path | None) -> Path:
-    return (path or Path(".")).expanduser().resolve()
+def _project_root(path: str | Path | None) -> Path:
+    return Path(path or ".").expanduser().resolve()
 
 
 def _server_args(project_root: Path) -> list[str]:
@@ -158,50 +171,76 @@ def _write_cursor_config(project_root: Path) -> Path:
     return path
 
 
-def _record_cursor_config(project_root: Path) -> None:
+# When set, _mutate_raw_config applies record mutations in memory and
+# _batched_raw_config saves config.yaml once at the end (used by
+# `dev integrate all --apply`, which otherwise re-parses YAML per tool).
+_PENDING_RAW_CONFIG: dict | None = None
+
+
+@contextmanager
+def _batched_raw_config(project_root: Path):
+    global _PENDING_RAW_CONFIG
+    _PENDING_RAW_CONFIG = _load_raw_config(project_root)
+    try:
+        yield
+        _save_raw_config(project_root, _PENDING_RAW_CONFIG)
+    finally:
+        _PENDING_RAW_CONFIG = None
+
+
+def _mutate_raw_config(project_root: Path, mutate) -> None:
+    if _PENDING_RAW_CONFIG is not None:
+        mutate(_PENDING_RAW_CONFIG)
+        return
     config = _load_raw_config(project_root)
-    integrations = config.setdefault("integrations", {})
-    cursor = integrations.setdefault("cursor", {})
-    cursor.update({
-        "enabled": True,
-        "config_path": str(_cursor_config_path(project_root).relative_to(project_root)),
-    })
+    mutate(config)
     _save_raw_config(project_root, config)
+
+
+def _record_cursor_config(project_root: Path) -> None:
+    def mutate(config: dict) -> None:
+        cursor = config.setdefault("integrations", {}).setdefault("cursor", {})
+        cursor.update({
+            "enabled": True,
+            "config_path": str(_cursor_config_path(project_root).relative_to(project_root)),
+        })
+
+    _mutate_raw_config(project_root, mutate)
 
 
 def _record_warp_config(project_root: Path) -> None:
-    config = _load_raw_config(project_root)
-    integrations = config.setdefault("integrations", {})
-    warp = integrations.setdefault("warp", {})
-    warp.update({
-        "enabled": True,
-        "command": warp.get("command", "oz"),
-        "run_mode": warp.get("run_mode", "local"),
-        "mcp_config_path": str(_warp_mcp_path(project_root).relative_to(project_root)),
-    })
-    _save_raw_config(project_root, config)
+    def mutate(config: dict) -> None:
+        warp = config.setdefault("integrations", {}).setdefault("warp", {})
+        warp.update({
+            "enabled": True,
+            "command": warp.get("command", "oz"),
+            "run_mode": warp.get("run_mode", "local"),
+            "mcp_config_path": str(_warp_mcp_path(project_root).relative_to(project_root)),
+        })
+
+    _mutate_raw_config(project_root, mutate)
 
 
 def _record_opencode_config(project_root: Path) -> None:
-    config = _load_raw_config(project_root)
-    integrations = config.setdefault("integrations", {})
-    opencode = integrations.setdefault("opencode", {})
-    opencode.update({
-        "enabled": True,
-        "config_path": str(_opencode_config_path(project_root).relative_to(project_root)),
-    })
-    _save_raw_config(project_root, config)
+    def mutate(config: dict) -> None:
+        opencode = config.setdefault("integrations", {}).setdefault("opencode", {})
+        opencode.update({
+            "enabled": True,
+            "config_path": str(_opencode_config_path(project_root).relative_to(project_root)),
+        })
+
+    _mutate_raw_config(project_root, mutate)
 
 
 def _record_antigravity_config(project_root: Path) -> None:
-    config = _load_raw_config(project_root)
-    integrations = config.setdefault("integrations", {})
-    antigravity = integrations.setdefault("antigravity", {})
-    antigravity.update({
-        "enabled": True,
-        "mcp_config_path": str(_antigravity_mcp_path(project_root).relative_to(project_root)),
-    })
-    _save_raw_config(project_root, config)
+    def mutate(config: dict) -> None:
+        antigravity = config.setdefault("integrations", {}).setdefault("antigravity", {})
+        antigravity.update({
+            "enabled": True,
+            "mcp_config_path": str(_antigravity_mcp_path(project_root).relative_to(project_root)),
+        })
+
+    _mutate_raw_config(project_root, mutate)
 
 
 def _load_json_strict(path: Path, label: str = "JSON") -> dict:
@@ -362,6 +401,35 @@ def _hook_command(project_root: Path, client: str, event: str) -> str:
     ])
 
 
+def _probe_mcp_tools(root: Path, *, timeout_seconds: float = 30.0) -> list[str]:
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+    import asyncio
+    import os
+
+    async def _list_tools() -> list[str]:
+        env = os.environ.copy()
+        env["DEVCOUNCIL_PROJECT_ROOT"] = str(root)
+        params = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "devcouncil", "mcp-server"],
+            cwd=str(root),
+            env=env,
+        )
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                tools = await session.list_tools()
+                return [tool.name for tool in tools.tools]
+
+    async def _list_tools_with_deadline() -> list[str]:
+        # A wedged server process would otherwise block `dev integrate check`
+        # indefinitely; the caller treats TimeoutError as a failed probe.
+        return await asyncio.wait_for(_list_tools(), timeout=timeout_seconds)
+
+    return asyncio.run(_list_tools_with_deadline())
+
+
 def _run(command: list[str]) -> int:
     executable = shutil.which(command[0])
     if not executable:
@@ -369,7 +437,10 @@ def _run(command: list[str]) -> int:
     resolved = [executable, *command[1:]]
     use_shell = sys.platform == "win32" and Path(executable).suffix.lower() in {".bat", ".cmd", ".ps1"}
     invocation = subprocess.list2cmdline(resolved) if use_shell else resolved
-    result = subprocess.run(invocation, text=True, shell=use_shell)
+    try:
+        result = subprocess.run(invocation, text=True, shell=use_shell)
+    except (FileNotFoundError, OSError):
+        return 127
     return result.returncode
 
 
@@ -393,6 +464,8 @@ def _run_capture(command: list[str], timeout: int = 10) -> tuple[int, str]:
         )
     except subprocess.TimeoutExpired:
         return 124, "timed out"
+    except (FileNotFoundError, OSError) as exc:
+        return 127, f"{command[0]} could not be executed: {exc}"
     return result.returncode, (result.stdout + result.stderr).strip()
 
 
@@ -577,7 +650,12 @@ def _install_opencode_hooks(project_root: Path) -> list[Path]:
     path = _opencode_config_path(project_root)
     data = _load_json_strict(path, "OpenCode") if path.exists() else {"$schema": "https://opencode.ai/config.json"}
     data.setdefault("$schema", "https://opencode.ai/config.json")
-    plugins = data.setdefault("plugin", [])
+    plugins_raw = data.setdefault("plugin", [])
+    if not isinstance(plugins_raw, list):
+        plugins_raw = []
+        data["plugin"] = plugins_raw
+    plugins: list[str] = [str(item) for item in plugins_raw]
+    data["plugin"] = plugins
     plugin_ref = f"./.devcouncil/integrations/{OPENCODE_HOOK_PLUGIN_NAME}"
     if plugin_ref not in plugins:
         plugins.append(plugin_ref)
@@ -623,6 +701,7 @@ def _preview_hook_paths(project_root: Path, tool: str) -> list[tuple[str, Path]]
         "cursor": [project_root / ".cursor" / "hooks.json"],
         "opencode": [_opencode_plugin_path(project_root), _opencode_config_path(project_root)],
     }
+    selected: tuple[str, ...]
     if tool == "all":
         selected = (*SUPPORTED_HOOK_TOOLS, "opencode")
     elif tool == "opencode":
@@ -645,6 +724,7 @@ def _configure_native_hooks(project_root: Path, tool: str = "all", apply: bool =
         console.print("[yellow]Preview only. Rerun with --apply to write hook config files.[/yellow]")
         return
 
+    selected: tuple[str, ...]
     if tool == "all":
         selected = (*SUPPORTED_HOOK_TOOLS, "opencode")
     elif tool == "opencode":
@@ -720,6 +800,10 @@ def overview(ctx: typer.Context):
     table.add_row("Bring your own CLI", f"{PREFERRED_COMMAND} cli-agent NAME --command TOOL --apply", "Registers any prompt-taking CLI as a DevCouncil executor.")
     table.add_row("All", f"{PREFERRED_COMMAND} all --apply", "Runs MCP setup and installs native hooks.")
     table.add_row("Native hooks", f"{PREFERRED_COMMAND} hooks --apply", "Installs Codex, Gemini, Claude, Cursor, and OpenCode hook files.")
+    table.add_row("Recommend", f"{PREFERRED_COMMAND} recommend", "Show the best executor for this machine and project.")
+    table.add_row("Status", f"{PREFERRED_COMMAND} status", "Compact PATH + config summary (no MCP probe).")
+    table.add_row("Matrix", f"{PREFERRED_COMMAND} matrix", "Print built-in coding CLI integration tiers.")
+    table.add_row("Check", f"{PREFERRED_COMMAND} check", "Verify MCP, hooks, and optional CLIs (--strict, --json for CI).")
     console.print(table)
     console.print(f"\nIf your install exposes only the setup flow, use: {LEGACY_COMMAND} --apply")
     console.print("\nRun without [bold]--apply[/bold] to preview the exact commands first.")
@@ -842,6 +926,13 @@ def cursor(
     Set up DevCouncil MCP tools for Cursor.
     """
     root = _project_root(project_root)
+    if apply:
+        report = apply_integration_target(root, "cursor")
+        if not report.ok:
+            console.print(report.to_json())
+            raise typer.Exit(code=1)
+        console.print("[green]Cursor integration configured.[/green]")
+        return
     ok = _configure_cursor(root, apply)
     if not ok and apply:
         raise typer.Exit(code=1)
@@ -856,6 +947,13 @@ def opencode(
     Set up DevCouncil MCP tools for OpenCode.
     """
     root = _project_root(project_root)
+    if apply:
+        report = apply_integration_target(root, "opencode")
+        if not report.ok:
+            console.print(report.to_json())
+            raise typer.Exit(code=1)
+        console.print("[green]OpenCode integration configured.[/green]")
+        return
     ok = _configure_opencode(root, apply)
     if not ok and apply:
         raise typer.Exit(code=1)
@@ -871,6 +969,13 @@ def antigravity(
     Set up DevCouncil MCP tools for Google Antigravity CLI.
     """
     root = _project_root(project_root)
+    if apply:
+        report = apply_integration_target(root, "antigravity")
+        if not report.ok:
+            console.print(report.to_json())
+            raise typer.Exit(code=1)
+        console.print("[green]Antigravity integration configured.[/green]")
+        return
     ok = _configure_antigravity(root, apply)
     if not ok and apply:
         raise typer.Exit(code=1)
@@ -885,15 +990,21 @@ def warp(
     Set up DevCouncil MCP tools for Warp local agents and the Oz CLI.
     """
     root = _project_root(project_root)
+    if apply:
+        report = apply_integration_target(root, "warp")
+        if not report.ok:
+            console.print(report.to_json())
+            raise typer.Exit(code=1)
+        console.print("[green]Warp integration configured.[/green]")
+        return
     _configure_warp(root, apply)
 
 
 def _record_aider_config(project_root: Path) -> None:
-    config = _load_raw_config(project_root)
-    integrations = config.setdefault("integrations", {})
-    aider = integrations.setdefault("aider", {})
-    aider.update({"enabled": True})
-    _save_raw_config(project_root, config)
+    def mutate(config: dict) -> None:
+        config.setdefault("integrations", {}).setdefault("aider", {}).update({"enabled": True})
+
+    _mutate_raw_config(project_root, mutate)
 
 
 def _configure_aider(project_root: Path, apply: bool) -> bool:
@@ -921,6 +1032,13 @@ def aider(
     Enable the built-in Aider headless executor (no MCP integration).
     """
     root = _project_root(project_root)
+    if apply:
+        report = apply_integration_target(root, "aider")
+        if not report.ok:
+            console.print(report.to_json())
+            raise typer.Exit(code=1)
+        console.print("[green]Aider integration configured.[/green]")
+        return
     ok = _configure_aider(root, apply)
     if not ok and apply:
         raise typer.Exit(code=1)
@@ -1001,6 +1119,11 @@ def all_tools(
     gemini_scope: str = typer.Option("project", "--gemini-scope", help="Gemini MCP config scope: project or user."),
     claude_scope: str = typer.Option("local", "--claude-scope", help="Claude MCP config scope: local, project, or user."),
     hooks: bool = typer.Option(True, "--hooks/--no-hooks", help="Include native Codex, Gemini, and Claude hook setup."),
+    strict: bool = typer.Option(
+        False,
+        "--strict",
+        help="After --apply, run dev integrate check --strict and fail on missing optional CLIs.",
+    ),
 ):
     """
     Set up DevCouncil MCP tools and native hooks for every supported coding CLI found on PATH.
@@ -1013,26 +1136,160 @@ def all_tools(
         raise typer.Exit(code=2)
 
     root = _project_root(project_root)
+    if apply:
+        report = apply_integration_target(
+            root,
+            "all",
+            include_hooks=hooks,
+            strict=strict,
+            gemini_scope=gemini_scope,
+            claude_scope=claude_scope,
+        )
+        if not report.ok:
+            console.print(report.to_json())
+            raise typer.Exit(code=1)
+        console.print("[green]Coding CLI integrations configured.[/green]")
+        return
+
     commands = [
         ("Codex CLI", _codex_command(root)),
         ("Gemini CLI", _gemini_command(root, gemini_scope)),
         ("Claude Code", _claude_command(root, claude_scope)),
     ]
-    results = []
     for tool, command in commands:
-        if apply and not shutil.which(command[0]):
-            console.print(f"[yellow]{tool} CLI not found on PATH. Skipping optional integration.[/yellow]")
-            continue
-        results.append(_configure(tool, command, apply))
-    results.append(_configure_cursor(root, apply))
-    results.append(_configure_opencode(root, apply))
-    results.append(_configure_antigravity(root, apply))
-    results.append(_configure_warp(root, apply))
-    results.append(_configure_aider(root, apply))
+        _configure(tool, command, apply)
+    _configure_cursor(root, apply)
+    _configure_opencode(root, apply)
+    _configure_antigravity(root, apply)
+    _configure_warp(root, apply)
+    _configure_aider(root, apply)
     if hooks:
         _configure_native_hooks(root, "all", apply)
-    if apply and not all(results):
-        raise typer.Exit(code=1)
+
+
+@app.command("recommend")
+def recommend(
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """Recommend a coding CLI executor for this machine and project."""
+    root = _project_root(project_root)
+    probe_order = resolve_coding_cli_probe_order(root)
+    detected = detect_available_coding_cli(root, probe_order=probe_order)
+    resolved = resolve_automated_executor(root, None)
+
+    table = Table(title="DevCouncil Integration Recommendations")
+    table.add_column("Client", style="cyan")
+    table.add_column("PATH")
+    table.add_column("Tier")
+    table.add_column("MCP")
+    table.add_column("Hooks")
+
+    for client in probe_order:
+        info = CODING_CLI_INTEGRATION_INFO.get(client)
+        on_path = resolve_coding_cli_executable(root, client)
+        table.add_row(
+            client,
+            "[green]yes[/green]" if on_path else "[dim]no[/dim]",
+            integration_tier_label(client),
+            "yes" if info and info.mcp else "no",
+            "yes" if info and info.hooks else "no",
+        )
+
+    console.print(table)
+    if summary := integration_status_summary(root):
+        if summary.get("custom_probe_order"):
+            console.print(
+                f"\n[dim]Probe order:[/dim] {', '.join(summary['probe_order'])} "
+                f"(from execution.coding_cli_probe_order)"
+            )
+        else:
+            console.print(f"\n[dim]Probe order:[/dim] {', '.join(summary['probe_order'])} (default)")
+    if detected:
+        console.print(f"\n[bold]Recommended executor:[/bold] [cyan]{resolved}[/cyan]")
+        console.print(f"Run: [dim]dev run TASK-001 --executor {resolved}[/dim]")
+        console.print(f"Or:  [dim]dev go \"Your goal\" --executor {resolved}[/dim]")
+        console.print(f"Setup: [dim]{PREFERRED_COMMAND} {resolved} --apply[/dim]")
+    else:
+        console.print("\n[yellow]No built-in coding CLI was found on PATH.[/yellow]")
+        console.print("Install Codex, Gemini, Claude Code, Cursor Agent, OpenCode, or register a custom CLI:")
+        console.print(f"[dim]{PREFERRED_COMMAND} cli-agent NAME --command TOOL --apply[/dim]")
+
+
+@app.command("status")
+def status(
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+):
+    """Show a compact integration summary without running the MCP server probe."""
+    root = _project_root(project_root)
+    summary = integration_status_summary(root)
+    raw_config = _load_raw_config(root) if (root / ".devcouncil").exists() else {}
+    integrations = raw_config.get("integrations", {})
+
+    if as_json:
+        payload = {
+            **summary,
+            "integrations_enabled": {
+                name: bool(integrations.get(name, {}).get("enabled"))
+                for name in ("cursor", "opencode", "antigravity", "warp", "aider")
+            },
+        }
+        typer.echo(json.dumps(payload, indent=2))
+        return
+
+    table = Table(title="DevCouncil Integration Status")
+    table.add_column("Setting", style="cyan")
+    table.add_column("Value")
+
+    table.add_row("Project", "[green]initialized[/green]" if summary["project_initialized"] else "[yellow]not initialized[/yellow]")
+    table.add_row("Default executor", summary["default_executor"])
+    table.add_row("Resolved executor", summary["resolved_executor"])
+    table.add_row("CLIs on PATH", ", ".join(summary["coding_clis_on_path"]) or "[dim]none[/dim]")
+    table.add_row("Probe order", ", ".join(summary["probe_order"]))
+    table.add_row("Stream CLI output", "yes" if summary["stream_cli_output"] else "no")
+    table.add_row("Cursor resume mode", summary["cursor_resume_mode"])
+
+    for name in ("cursor", "opencode", "antigravity", "warp", "aider"):
+        enabled = bool(integrations.get(name, {}).get("enabled"))
+        table.add_row(f"{name} integration", "[green]enabled[/green]" if enabled else "[dim]off[/dim]")
+
+    console.print(table)
+    if summary["resolved_executor"] not in {"", "manual"}:
+        console.print(
+            f"\n[dim]Next:[/dim] dev run TASK-001 --executor {summary['resolved_executor']} "
+            f"| {PREFERRED_COMMAND} check for full readiness"
+        )
+    else:
+        console.print(f"\n[dim]Next:[/dim] {PREFERRED_COMMAND} recommend | {PREFERRED_COMMAND} check")
+
+
+@app.command("matrix")
+def matrix(
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """Print built-in coding CLI integration tiers and capabilities."""
+    root = _project_root(project_root)
+    _ = root
+    table = Table(title="DevCouncil Coding CLI Integration Matrix")
+    table.add_column("Client", style="cyan")
+    table.add_column("Tier")
+    table.add_column("Headless")
+    table.add_column("MCP setup")
+    table.add_column("Native hooks")
+    table.add_column("Notes")
+
+    for client in sorted(BUILTIN_CODING_EXECUTOR_NAMES):
+        info = CODING_CLI_INTEGRATION_INFO.get(client)
+        table.add_row(
+            client,
+            integration_tier_label(client),
+            "yes" if info and info.tier == 1 else "no",
+            "yes" if info and info.mcp else "no",
+            "yes" if info and info.hooks else "verify only",
+            info.notes if info else "",
+        )
+    console.print(table)
+    console.print("\nSee [dim]docs/integration-tiers.md[/dim] for workflow guidance.")
 
 
 @app.command("hooks")
@@ -1045,6 +1302,13 @@ def hooks(
     Install DevCouncil hook configuration for Codex, Gemini, Claude, Cursor, and OpenCode.
     """
     root = _project_root(project_root)
+    if apply and tool == "all":
+        report = apply_integration_target(root, "hooks")
+        if not report.ok:
+            console.print(report.to_json())
+            raise typer.Exit(code=1)
+        console.print("[green]Native hooks configured.[/green]")
+        return
     _configure_native_hooks(root, tool, apply)
 
 
@@ -1056,202 +1320,60 @@ def check(
         "--strict",
         help="Treat missing optional coding CLIs as failures instead of warnings.",
     ),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON for CI."),
+    report_file: Path | None = typer.Option(
+        None,
+        "--report-file",
+        "--output",
+        "-o",
+        help="Write the JSON integration report to this file (implies structured output).",
+    ),
 ):
     """
     Check whether DevCouncil is ready to integrate with coding CLIs.
     """
     root = _project_root(project_root)
+    report = build_integration_check_report(root, strict=strict)
     table = Table(title="DevCouncil Integration Check")
     table.add_column("Check", style="cyan")
     table.add_column("Status", style="magenta")
     table.add_column("Details")
 
-    failures = 0
+    for row in report.checks:
+        if row.status == "ok":
+            rendered = "[green]OK[/green]"
+        elif row.status == "skip":
+            rendered = "[dim]SKIP[/dim]"
+        elif row.status == "missing":
+            rendered = "[yellow]Missing[/yellow]"
+        else:
+            rendered = "[red]FAIL[/red]"
+        table.add_row(row.name, rendered, row.details)
 
-    def add(ok: bool, name: str, details: str):
-        nonlocal failures
-        table.add_row(name, "[green]OK[/green]" if ok else "[red]FAIL[/red]", details)
-        if not ok:
-            failures += 1
+    write_json = as_json or report_file is not None
+    if write_json:
+        json_text = report.to_json()
+        if report_file is not None:
+            report_path = Path(report_file).expanduser().resolve()
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(json_text + "\n", encoding="utf-8")
+            if not as_json:
+                console.print(f"[dim]Wrote integration report to[/dim] {report_path}")
+        if as_json:
+            typer.echo(json_text)
+    if not write_json or not as_json:
+        console.print(table)
 
-    def add_optional(ok: bool, name: str, details: str):
-        if strict and not ok:
-            add(False, name, details)
-            return
-        table.add_row(name, "[green]OK[/green]" if ok else "[yellow]Missing[/yellow]", details)
-
-    add((root / ".devcouncil").exists(), "Project state", str(root / ".devcouncil"))
-
-    devcouncil_path = shutil.which("devcouncil")
-    devcouncil_launch = [devcouncil_path] if devcouncil_path else [sys.executable, "-m", "devcouncil"]
-    add(
-        devcouncil_path is not None or Path(sys.executable).exists(),
-        "devcouncil CLI",
-        devcouncil_path or f"{sys.executable} -m devcouncil",
-    )
-
-    code, output = _run_capture([*devcouncil_launch, "--help"])
-    add(code == 0, "devcouncil command", output.splitlines()[0] if output else "No output")
-
-    raw_config = _load_raw_config(root)
-
-    code, output = _run_capture(["gemini", "--version"])
-    add_optional(code == 0, "Gemini CLI", output.splitlines()[0] if output else "Optional; install Gemini CLI to use this integration.")
-
-    code, output = _run_capture(["codex", "--version"])
-    add_optional(code == 0, "Codex CLI", output.splitlines()[0] if output else "Optional; install Codex to use this integration.")
-
-    code, output = _run_capture(["claude", "--version"])
-    add_optional(code == 0, "Claude Code", output.splitlines()[0] if output else "Optional; install Claude Code to use this integration.")
-
-    code, output = _run_capture(["cursor-agent", "--version"])
-    if code != 0:
-        code, output = _run_capture(["cursor", "--version"])
-    add_optional(code == 0, "Cursor", output.splitlines()[0] if output else "Optional; install Cursor or cursor-agent to use this integration.")
-
-    code, output = _run_capture(["opencode", "--version"])
-    add_optional(code == 0, "OpenCode", output.splitlines()[0] if output else "Optional; install OpenCode to use this integration.")
-
-    code, output = _run_capture(["agy", "--version"])
-    add_optional(code == 0, "Google Antigravity CLI", output.splitlines()[0] if output else "Optional; install Antigravity CLI to use this integration.")
-
-    code, output = _run_capture(["oz", "--version"])
-    add_optional(code == 0, "Warp / Oz", output.splitlines()[0] if output else "Optional; install Warp/Oz to use this integration.")
-
-    code, output = _run_capture(["aider", "--version"])
-    add_optional(code == 0, "Aider", output.splitlines()[0] if output else "Optional; install Aider to use this integration.")
-
-    cursor_config = _cursor_config_path(root)
-    cursor_enabled = bool(raw_config.get("integrations", {}).get("cursor", {}).get("enabled"))
-    if cursor_enabled:
-        add(
-            cursor_config.exists(),
-            "Cursor MCP config",
-            str(cursor_config) if cursor_config.exists() else f"Run {PREFERRED_COMMAND} cursor --apply.",
-        )
-    else:
-        table.add_row("Cursor MCP config", "[dim]SKIP[/dim]", f"Run {PREFERRED_COMMAND} cursor --apply to enable.")
-
-    opencode_config = _opencode_config_path(root)
-    opencode_enabled = bool(raw_config.get("integrations", {}).get("opencode", {}).get("enabled"))
-    if opencode_enabled:
-        add(
-            opencode_config.exists(),
-            "OpenCode MCP config",
-            str(opencode_config) if opencode_config.exists() else f"Run {PREFERRED_COMMAND} opencode --apply.",
-        )
-    else:
-        table.add_row("OpenCode MCP config", "[dim]SKIP[/dim]", f"Run {PREFERRED_COMMAND} opencode --apply to enable.")
-
-    antigravity_config = _antigravity_mcp_path(root)
-    antigravity_enabled = bool(raw_config.get("integrations", {}).get("antigravity", {}).get("enabled"))
-    if antigravity_enabled:
-        add(
-            antigravity_config.exists(),
-            "Antigravity MCP config",
-            str(antigravity_config) if antigravity_config.exists() else f"Run {PREFERRED_COMMAND} antigravity --apply.",
-        )
-    else:
-        table.add_row("Antigravity MCP config", "[dim]SKIP[/dim]", f"Run {PREFERRED_COMMAND} antigravity --apply to enable.")
-
-    warp_config = _warp_mcp_path(root)
-    warp_enabled = bool(raw_config.get("integrations", {}).get("warp", {}).get("enabled"))
-    if warp_enabled:
-        add(warp_config.exists(), "Warp MCP config", str(warp_config) if warp_config.exists() else f"Run {PREFERRED_COMMAND} warp --apply.")
-    else:
-        table.add_row("Warp MCP config", "[dim]SKIP[/dim]", f"Run {PREFERRED_COMMAND} warp --apply to enable.")
-
-    aider_enabled = bool(raw_config.get("integrations", {}).get("aider", {}).get("enabled"))
-    if aider_enabled:
-        table.add_row("Aider integration", "[green]OK[/green]", "Run: dev run TASK-001 --executor aider")
-    else:
-        table.add_row("Aider integration", "[dim]SKIP[/dim]", f"Run {PREFERRED_COMMAND} aider --apply to enable.")
-
-    cursor_hooks = root / ".cursor" / "hooks.json"
-    if cursor_enabled or cursor_hooks.exists():
-        hooks_ok = False
-        if cursor_hooks.exists():
-            try:
-                hooks_data = json.loads(cursor_hooks.read_text(encoding="utf-8")) or {}
-                hooks_ok = "preToolUse" in hooks_data.get("hooks", {})
-            except json.JSONDecodeError:
-                hooks_ok = False
-        add(
-            hooks_ok,
-            "Cursor hooks",
-            str(cursor_hooks) if hooks_ok else f"Run {PREFERRED_COMMAND} hooks --apply --tool cursor.",
-        )
-
-    opencode_plugin = _opencode_plugin_path(root)
-    if opencode_enabled or opencode_plugin.exists():
-        plugin_ok = opencode_plugin.exists()
-        plugin_registered = False
-        if plugin_ok and opencode_config.exists():
-            try:
-                opencode_data = json.loads(opencode_config.read_text(encoding="utf-8")) or {}
-                plugin_registered = f"./.devcouncil/integrations/{OPENCODE_HOOK_PLUGIN_NAME}" in (opencode_data.get("plugin") or [])
-            except json.JSONDecodeError:
-                plugin_registered = False
-        add(
-            plugin_ok and plugin_registered,
-            "OpenCode hook plugin",
-            str(opencode_plugin) if plugin_ok and plugin_registered else f"Run {PREFERRED_COMMAND} hooks --apply --tool opencode.",
-        )
-
-    bundled_plugin = _opencode_plugin_source()
-    add(
-        bundled_plugin.exists(),
-        "Bundled OpenCode hook plugin",
-        str(bundled_plugin) if bundled_plugin.exists() else "Reinstall DevCouncil; package asset is missing.",
-    )
-
-    custom_agents = raw_config.get("integrations", {}).get("cli_agents", {}).get("agents", {})
-    if custom_agents:
-        for name, agent in sorted(custom_agents.items()):
-            command = str(agent.get("command", "")).strip()
-            found = shutil.which(command) if command else None
-            add(found is not None, f"CLI agent: {name}", found or f"{command or 'command'} not found on PATH")
-    else:
-        table.add_row("Custom CLI agents", "[dim]SKIP[/dim]", "No agents registered.")
-
-    try:
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
-
-        async def _list_tools() -> list[str]:
-            import os
-
-            env = os.environ.copy()
-            env["DEVCOUNCIL_PROJECT_ROOT"] = str(root)
-            params = StdioServerParameters(
-                command=sys.executable,
-                args=["-m", "devcouncil", "mcp-server"],
-                cwd=str(root),
-                env=env,
+    if report.failures:
+        if not as_json:
+            console.print(
+                f"\n[yellow]Fix failed checks, then run:[/yellow] {PREFERRED_COMMAND} all --apply "
+                f"(or {LEGACY_COMMAND} --apply)."
             )
-            async with stdio_client(params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    tools = await session.list_tools()
-                    return [tool.name for tool in tools.tools]
-
-        import asyncio
-
-        tools = asyncio.run(_list_tools())
-        expected = {"devcouncil_status", "devcouncil_report", "devcouncil_get_task"}
-        add(expected.issubset(set(tools)), "MCP server", ", ".join(tools))
-    except Exception as exc:
-        add(False, "MCP server", str(exc))
-
-    console.print(table)
-    if failures:
-        console.print(
-            f"\n[yellow]Fix failed checks, then run:[/yellow] {PREFERRED_COMMAND} all --apply "
-            f"(or {LEGACY_COMMAND} --apply)."
-        )
         raise typer.Exit(code=1)
 
-    console.print(f"\n[green]Ready.[/green] Run: {PREFERRED_COMMAND} all --apply (or {LEGACY_COMMAND} --apply).")
+    if not as_json:
+        console.print(f"\n[green]Ready.[/green] Run: {PREFERRED_COMMAND} all --apply (or {LEGACY_COMMAND} --apply).")
 
 
 @setup_app.command("agent-flow")

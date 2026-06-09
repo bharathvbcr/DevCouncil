@@ -24,7 +24,7 @@ DevCouncil does not replace coding agents. It sits beside tools like Codex CLI, 
 - [Architecture](docs/architecture.md): components, artifact graph, state machine, and gated execution.
 - [Executor adapters](docs/executor-adapters.md): manual, coding CLI, native-preview, Mini-SWE, and OpenHands execution paths.
 - [Live review](docs/live-review.md): `dev watch` session review, cards, signals, and blocking behavior.
-- [Model routing](docs/model-routing.md): provider selection, role models, OpenRouter, and Vertex AI setup.
+- [Model routing](docs/model-routing.md): provider selection, role models, OpenRouter, Vertex AI, and Doubleword setup.
 - [Security model](docs/security.md): redaction, permissions, allowlists, and local state.
 - [Project status](docs/project-status.md): current maturity by subsystem.
 - [Roadmap](docs/roadmap.md): planned work.
@@ -187,7 +187,7 @@ DevCouncil blocks completion on concrete gaps rather than model confidence:
 
 ### Providers, Models, And Cost Tracking
 
-- **Providers:** OpenRouter and Vertex AI are supported through local configuration and secrets.
+- **Providers:** OpenRouter, Vertex AI, and Doubleword are supported through local configuration and secrets.
 - **Role models:** planner, critic, arbiter, reviewer, and repair roles can share one model or use per-role overrides.
 - **Structured repair:** model routing includes JSON repair paths for structured planning and review outputs.
 - **Model defaults:** packaged YAML defaults ship with the tool so installed CLI environments do not depend on source-tree-only files.
@@ -241,7 +241,7 @@ flowchart TD
     cli --> map["Repo map\nsrc/devcouncil/indexing/repo_mapper.py"]
     cli --> planning["Planning commands\ndev plan / dev prompt / dev tasks"]
 
-    config --> providers["Model providers\nOpenRouter or Vertex AI"]
+    config --> providers["Model providers\nOpenRouter, Vertex AI, or Doubleword"]
     providers --> router["ModelRouter\nrole models, cache, telemetry, structured JSON repair"]
     router --> planning
 

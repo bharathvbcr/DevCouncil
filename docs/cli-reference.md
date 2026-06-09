@@ -3,6 +3,7 @@
 ```bash
 dev init                    # Initialize DevCouncil in a repo
 dev init --provider vertexai --model YOUR_MODEL_ID # Initialize with one model for every role
+dev init --provider doubleword --model YOUR_MODEL_ID # Doubleword drop-in OpenAI-compatible provider
 dev init --role-model planner_b=YOUR_MODEL_ID # Override one role model during init
 dev setup                   # Initialize, run doctor, offer first-run integrations, and print next steps
 dev doctor                  # Check dependencies and environment
@@ -13,12 +14,23 @@ dev e2e "goal" --executor codex --json --report-file .devcouncil/reports/latest.
 dev go "goal" --executor codex # Short alias for dev e2e
 dev map "goal"              # Map repo context for a goal
 dev plan "goal"             # Run the full planning council debate
+dev approve                 # Approve the latest generated plan (AWAITING_USER_DECISIONS -> PLAN_APPROVED)
+dev approve --force         # Approve even if blocking gate gaps remain
+dev approve --run-id RUN-ID # Approve a specific planning run's decision
 dev status                  # Show current project state and cost
 dev tasks                   # List planned tasks and statuses
 dev show TASK-001           # Show task details and constraints
 dev prompt TASK-001         # Generate prompt for an external agent
 dev run TASK-001            # Execute task via selected executor
+dev run TASK-001 --executor copilot # Built-in executors: codex, gemini, claude, opencode, antigravity, warp, cursor, aider, copilot, goose, amp, qwen, crush
 dev verify TASK-001         # Verify diff, commands, and evidence
+dev verify TASK-001 --sandbox local|docker|nix # Run verification in a sandbox
+dev shell TASK-001 --command "pytest tests/" # Run one guarded shell command
+dev watch fs --task TASK-001 --once           # Attribute filesystem changes once
+dev semantic snapshot TASK-001 --stage before # Capture semantic snapshot
+dev semantic diff TASK-001                    # Compare semantic before/after snapshots
+dev evidence suggest TASK-001 --apply         # Append high-confidence expected tests
+dev handoff TASK-001 --from codex --to aider  # Write agent handoff manifest
 dev repair                  # Generate repair tasks from gaps
 dev report                  # Generate final evidence report
 dev report --github-pr-comment # Post the report as a GitHub PR comment
@@ -34,9 +46,17 @@ dev integrate opencode --apply # Write project OpenCode MCP config for DevCounci
 dev integrate antigravity --apply # Write project Antigravity MCP config for DevCouncil
 dev integrate warp --apply  # Write Warp/Oz MCP config for DevCouncil
 dev integrate cli-agent NAME --command TOOL --apply # Register any prompt-taking CLI executor
-dev integrate check         # Verify coding CLI and MCP readiness
-dev integrate check --strict  # Fail when optional coding CLIs are missing
+dev integrate recommend
+dev integrate status
+dev integrate status --json
+dev integrate matrix
+dev integrate check
+dev integrate check --strict
+dev integrate check --json
+dev integrate check --report-file .devcouncil/integration-report.json
+dev integrate check -o .devcouncil/integration-report.json
 dev run TASK --stream       # Stream coding CLI output live during execution
+dev integrate all --apply --strict  # Apply integrations then run strict check
 dev go GOAL                 # Auto-picks first coding CLI on PATH when default_executor is manual
 dev integrate doctor        # Check optional integration tools
 dev agents                  # List built-in and custom CLI agents
@@ -52,4 +72,8 @@ dev artifacts validate      # Validate stored artifact integrity
 dev config                  # Inspect or update configuration
 dev config models --model YOUR_MODEL_ID # Update every configured model role
 dev config models --role-model critic_a=YOUR_MODEL_ID # Update one model role by name
+dev baseline                # Capture a verification baseline of current changes
+dev optimize --agent codex --profile yolo --evals .devcouncil/evals/agent-profile.jsonl # Alias for dev agents optimize
+dev reset-demo-state        # Clear demo planning artifacts from the local DevCouncil state
+dev integrations status     # Alias for dev integrate status
 ```

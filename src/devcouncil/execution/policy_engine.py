@@ -1,0 +1,277 @@
+"""Shared task policy engine for shell commands and file changes."""
+
+from __future__ import annotations
+
+import fnmatch
+import re
+from pathlib import Path
+from typing import Literal
+
+from pydantic import BaseModel
+
+from devcouncil.domain.task import PlannedFile, Task
+
+
+class PolicyDecision(BaseModel):
+    action: Literal["allow", "warn", "deny"]
+    reason: str
+    target: str
+    task_id: str | None = None
+
+
+_NO_TASK_ALLOWED_COMMANDS = (
+    "dev status",
+    "dev tasks",
+    "git status",
+    "git diff",
+    "git diff *",
+)
+
+# Shared with HookPolicy — keep these as the single source of truth for
+# protected/secret path patterns.
+PROTECTED_WRITE_PATTERNS = (
+    "package.json",
+    "pyproject.toml",
+    "uv.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "Dockerfile",
+    "docker-compose.yml",
+    ".github/workflows/*.yml",
+    ".github/workflows/*.yaml",
+    "schema.prisma",
+    "wrangler.toml",
+    "index.html",
+)
+
+SECRET_PATH_PATTERNS = (
+    ".env",
+    ".env.*",
+    "**/.env",
+    "**/.env.*",
+    "**/credentials/**",
+    "**/secrets/**",
+    "**/*.pem",
+    "**/*.key",
+)
+
+_RESTRICTED_PATH_PATTERNS = (
+    ".git/*",
+    ".devcouncil/*",
+)
+
+
+class TaskPolicyEngine:
+    def __init__(
+        self,
+        project_root: Path,
+        global_allowed_commands: list[str] | None = None,
+    ):
+        self.project_root = project_root.resolve()
+        self.global_allowed_commands = global_allowed_commands or []
+
+    def evaluate_command(self, command: str, task: Task | None) -> PolicyDecision:
+        normalized = " ".join(command.split())
+        if not normalized:
+            return PolicyDecision(
+                action="deny",
+                reason="Empty command is not allowed.",
+                target=command,
+                task_id=task.id if task else None,
+            )
+
+        if task is None:
+            if any(fnmatch.fnmatch(normalized, allowed) for allowed in _NO_TASK_ALLOWED_COMMANDS):
+                return PolicyDecision(
+                    action="allow",
+                    reason="Read-only command allowed without active task.",
+                    target=normalized,
+                )
+            return PolicyDecision(
+                action="deny",
+                reason="Shell commands require an active task lease.",
+                target=normalized,
+            )
+
+        if any(fnmatch.fnmatch(normalized, allowed) for allowed in task.allowed_commands):
+            return PolicyDecision(
+                action="allow",
+                reason="Command matches task allowed_commands.",
+                target=normalized,
+                task_id=task.id,
+            )
+        if any(fnmatch.fnmatch(normalized, allowed) for allowed in self.global_allowed_commands):
+            return PolicyDecision(
+                action="allow",
+                reason="Command matches global allowed commands.",
+                target=normalized,
+                task_id=task.id,
+            )
+        return PolicyDecision(
+            action="deny",
+            reason="Command is not in task or global allowlists.",
+            target=normalized,
+            task_id=task.id,
+        )
+
+    def evaluate_file_change(
+        self,
+        path: str,
+        task: Task | None,
+        operation: Literal["create", "modify", "delete", "write"] = "write",
+        *,
+        internal: bool = False,
+    ) -> PolicyDecision:
+        normalized = self._normalize_path(path)
+        task_id = task.id if task else None
+
+        if self._matches_any(normalized, SECRET_PATH_PATTERNS):
+            return PolicyDecision(
+                action="deny",
+                reason="Secret and credential paths are never writable.",
+                target=normalized,
+                task_id=task_id,
+            )
+
+        if not internal and self._matches_restricted(normalized):
+            return PolicyDecision(
+                action="deny",
+                reason="Protected repository paths cannot be modified.",
+                target=normalized,
+                task_id=task_id,
+            )
+
+        if task is None:
+            return PolicyDecision(
+                action="deny",
+                reason="No running DevCouncil task authorizes this file write.",
+                target=normalized,
+            )
+
+        if self._matches_forbidden(normalized, task):
+            return PolicyDecision(
+                action="deny",
+                reason="Path is listed in forbidden_changes.",
+                target=normalized,
+                task_id=task.id,
+            )
+
+        planned = self._planned_file_for(normalized, task)
+        if planned is None:
+            return PolicyDecision(
+                action="deny",
+                reason=f"Task {task.id} does not authorize changes to {normalized}.",
+                target=normalized,
+                task_id=task.id,
+            )
+
+        if planned.allowed_change == "read_only":
+            return PolicyDecision(
+                action="deny",
+                reason="Planned file is read-only.",
+                target=normalized,
+                task_id=task.id,
+            )
+        if operation == "write":
+            if planned.allowed_change not in {"create", "modify"}:
+                return PolicyDecision(
+                    action="deny",
+                    reason=f"Operation {operation} not allowed for planned file.",
+                    target=normalized,
+                    task_id=task.id,
+                )
+        elif planned.allowed_change != operation:
+            return PolicyDecision(
+                action="deny",
+                reason=f"Operation {operation} not allowed for planned file.",
+                target=normalized,
+                task_id=task.id,
+            )
+
+        if self._matches_any(normalized, PROTECTED_WRITE_PATTERNS):
+            return PolicyDecision(
+                action="warn",
+                reason=f"{normalized} is a protected high-impact file; verification gates must approve it.",
+                target=normalized,
+                task_id=task.id,
+            )
+
+        return PolicyDecision(
+            action="allow",
+            reason="File change is allowed.",
+            target=normalized,
+            task_id=task.id,
+        )
+
+    def evaluate_hook_command(self, command: str) -> PolicyDecision:
+        """Git safety checks for hook/shell tool paths."""
+        normalized = " ".join(command.split())
+        lowered = normalized.lower()
+        if not normalized:
+            return PolicyDecision(action="allow", reason="No command detected.", target=normalized)
+
+        if "--no-verify" in lowered or "--no-gpg-sign" in lowered:
+            return PolicyDecision(
+                action="deny",
+                reason="Verification bypass flags are not allowed.",
+                target=normalized,
+            )
+
+        if re.search(r"\bgit\s+reset\s+--hard\s+(origin/)?(main|master)\b", lowered):
+            return PolicyDecision(
+                action="deny",
+                reason="Protected branch hard resets are not allowed.",
+                target=normalized,
+            )
+
+        if re.search(r"\bgit\s+push\b.*(\s--force(?:-with-lease)?\b|\s-f\b)", lowered):
+            return PolicyDecision(
+                action="deny",
+                reason="Force pushes are not allowed.",
+                target=normalized,
+            )
+
+        if re.search(r"\bgit\s+push\s+\S+\s+((head:)?(main|master)|(main|master):\S+)\b", lowered):
+            return PolicyDecision(
+                action="warn",
+                reason="Direct pushes to protected branches should go through verification gates.",
+                target=normalized,
+            )
+
+        return PolicyDecision(action="allow", reason="Command is allowed.", target=normalized)
+
+    def _normalize_path(self, raw_path: str) -> str:
+        path = raw_path.strip().strip('"').replace("\\", "/")
+        try:
+            candidate = Path(path)
+            resolved = candidate.resolve() if candidate.is_absolute() else (self.project_root / path).resolve()
+            return resolved.relative_to(self.project_root).as_posix()
+        except (OSError, ValueError):
+            pass
+        if path.startswith("./"):
+            path = path[2:]
+        return path
+
+    def _planned_file_for(self, path: str, task: Task) -> PlannedFile | None:
+        for planned in task.planned_files:
+            planned_path = planned.path.replace("\\", "/")
+            if path == planned_path or fnmatch.fnmatch(path, planned_path):
+                return planned
+        return None
+
+    def _matches_forbidden(self, path: str, task: Task) -> bool:
+        for forbidden in task.forbidden_changes:
+            pattern = forbidden.replace("\\", "/")
+            if path == pattern or fnmatch.fnmatch(path, pattern):
+                return True
+        return False
+
+    def _matches_restricted(self, path: str) -> bool:
+        for pattern in _RESTRICTED_PATH_PATTERNS:
+            if fnmatch.fnmatch(path, pattern) or path.startswith(pattern.strip("*")):
+                return True
+        return False
+
+    def _matches_any(self, path: str, patterns: tuple[str, ...]) -> bool:
+        return any(fnmatch.fnmatch(path, pattern) for pattern in patterns)

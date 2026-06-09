@@ -4,6 +4,7 @@ from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
 from devcouncil.domain.task import PlannedFile, Task
 from devcouncil.app.errors import GatingError
+from devcouncil.execution.policy_engine import TaskPolicyEngine
 
 class PermissionPolicy(BaseModel):
     """Defines the security boundaries for task execution."""
@@ -17,6 +18,10 @@ class PermissionManager:
         self.policy = policy
         self.project_root = project_root
         self.dynamic_ignores = self._load_devcouncilignore()
+        self.policy_engine = TaskPolicyEngine(
+            project_root,
+            global_allowed_commands=policy.allowed_shell_commands,
+        )
 
     def _load_devcouncilignore(self) -> List[str]:
         """Load additional restricted paths from .devcouncilignore."""
@@ -34,24 +39,17 @@ class PermissionManager:
         path: str,
         task: Task,
         operation: Literal["create", "modify", "delete", "write"] = "write",
+        *,
+        internal: bool = False,
     ) -> bool:
         """Check if a file change is authorized by the task or policy."""
-        # 1. Check restricted paths (e.g. .git) and dynamic ignores
-        all_restricted = self.policy.restricted_paths + self.dynamic_ignores
-        for restricted in all_restricted:
+        for restricted in self.dynamic_ignores:
             if fnmatch.fnmatch(path, restricted) or path.startswith(restricted.strip("*")):
                 return False
-
-        # 2. Check if path is in task's planned files with a compatible operation.
-        planned = self._planned_file_for(path, task)
-        if not planned:
-            return False
-
-        if planned.allowed_change == "read_only":
-            return False
-        if operation == "write":
-            return planned.allowed_change in {"create", "modify"}
-        return planned.allowed_change == operation
+        decision = self.policy_engine.evaluate_file_change(
+            path, task, operation, internal=internal
+        )
+        return decision.action in {"allow", "warn"}
 
     def _planned_file_for(self, path: str, task: Task) -> Optional[PlannedFile]:
         normalized = path.replace("\\", "/")
@@ -63,15 +61,8 @@ class PermissionManager:
 
     def is_command_allowed(self, command: str, task: Task) -> bool:
         """Check if a shell command is authorized by the task or global allowlist."""
-        # 1. Check task-specific allowlist
-        if any(fnmatch.fnmatch(command, allowed) for allowed in task.allowed_commands):
-            return True
-            
-        # 2. Check global policy allowlist
-        if any(fnmatch.fnmatch(command, allowed) for allowed in self.policy.allowed_shell_commands):
-            return True
-            
-        return False
+        decision = self.policy_engine.evaluate_command(command, task)
+        return decision.action == "allow"
 
     def validate_action(
         self,
@@ -79,10 +70,12 @@ class PermissionManager:
         target: str,
         task: Task,
         operation: Literal["create", "modify", "delete", "write"] = "write",
+        *,
+        internal: bool = False,
     ):
         """Raise GatingError if an execution action violates permissions."""
         if action_type == "file_write":
-            if not self.is_file_change_allowed(target, task, operation):
+            if not self.is_file_change_allowed(target, task, operation, internal=internal):
                 raise GatingError(
                     f"Unauthorized file {operation}: {target}. "
                     "File and operation must match task planned_files."

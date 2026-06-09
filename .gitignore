@@ -112,3 +112,4 @@ dump/
 .venv/
 node_modules/
 .env.local
+.gitnexus

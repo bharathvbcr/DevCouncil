@@ -1,0 +1,146 @@
+from __future__ import annotations
+
+import json
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from devcouncil.integrations.check import build_integration_check_report
+
+VALID_INTEGRATION_TARGETS = {
+    "all",
+    "hooks",
+    "codex",
+    "gemini",
+    "claude",
+    "cursor",
+    "opencode",
+    "antigravity",
+    "agy",
+    "warp",
+    "aider",
+}
+
+TARGET_ALIASES = {
+    "agy": "antigravity",
+}
+
+
+@dataclass(frozen=True)
+class IntegrationActionReport:
+    target: str
+    ok: bool
+    results: list[dict[str, Any]]
+    warnings: list[str]
+    check: dict[str, Any]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "target": self.target,
+            "ok": self.ok,
+            "results": self.results,
+            "warnings": self.warnings,
+            "check": self.check,
+        }
+
+    def to_json(self, *, indent: int | None = 2) -> str:
+        return json.dumps(self.as_dict(), indent=indent)
+
+
+def normalize_apply_target(target: str) -> str:
+    normalized = (target or "").strip().lower().replace("_", "-")
+    normalized = TARGET_ALIASES.get(normalized, normalized)
+    if normalized not in VALID_INTEGRATION_TARGETS:
+        allowed = ", ".join(sorted(VALID_INTEGRATION_TARGETS))
+        raise ValueError(f"Unsupported integration target '{target}'. Expected one of: {allowed}.")
+    return normalized
+
+
+def apply_integration_target(
+    project_root: Path,
+    target: str,
+    *,
+    include_hooks: bool = True,
+    strict: bool = False,
+    gemini_scope: str = "project",
+    claude_scope: str = "local",
+) -> IntegrationActionReport:
+    from devcouncil.cli.commands import integrate
+
+    root = project_root.expanduser().resolve()
+    normalized = normalize_apply_target(target)
+    warnings: list[str] = []
+    results: list[dict[str, Any]] = []
+
+    def add_result(name: str, ok: bool, path: Path | None = None, message: str = "") -> None:
+        results.append({
+            "target": name,
+            "ok": ok,
+            "path": str(path.relative_to(root)) if path and path.is_relative_to(root) else (str(path) if path else ""),
+            "message": message,
+        })
+
+    def apply_first_party(name: str) -> None:
+        command_builders = {
+            "codex": integrate._codex_command,
+            "gemini": lambda project: integrate._gemini_command(project, gemini_scope),
+            "claude": lambda project: integrate._claude_command(project, claude_scope),
+        }
+        command = command_builders[name](root)
+        if not shutil.which(command[0]):
+            warning = f"{name} CLI not found on PATH; skipped CLI MCP registration."
+            warnings.append(warning)
+            integrate.console.print(f"[yellow]{name} CLI not found on PATH. Skipping optional integration.[/yellow]")
+            add_result(name, True, None, "CLI not found; skipped optional global/client registration.")
+            return
+        code = integrate._run(command)
+        add_result(name, code == 0, None, "MCP registration command exited " + str(code))
+
+    def apply_project_file(name: str) -> None:
+        writers = {
+            "cursor": integrate._write_cursor_config,
+            "opencode": integrate._write_opencode_config,
+            "antigravity": integrate._write_antigravity_mcp_config,
+            "warp": integrate._write_warp_mcp_config,
+        }
+        recorders = {
+            "cursor": integrate._record_cursor_config,
+            "opencode": integrate._record_opencode_config,
+            "antigravity": integrate._record_antigravity_config,
+            "warp": integrate._record_warp_config,
+        }
+        path = writers[name](root)
+        recorders[name](root)
+        add_result(name, True, path, "Project integration config written.")
+
+    def apply_aider() -> None:
+        integrate._record_aider_config(root)
+        add_result("aider", True, root / ".devcouncil" / "config.yaml", "Aider executor enabled.")
+
+    def apply_hooks() -> None:
+        integrate._configure_native_hooks(root, "all", apply=True)
+        add_result("hooks", True, None, "Native hook files configured.")
+
+    if normalized == "all":
+        for name in ("codex", "gemini", "claude"):
+            apply_first_party(name)
+        # Batch the per-tool config.yaml record updates into one load/save.
+        with integrate._batched_raw_config(root):
+            for name in ("cursor", "opencode", "antigravity", "warp"):
+                apply_project_file(name)
+            apply_aider()
+        if include_hooks:
+            apply_hooks()
+    elif normalized in {"codex", "gemini", "claude"}:
+        apply_first_party(normalized)
+    elif normalized in {"cursor", "opencode", "antigravity", "warp"}:
+        apply_project_file(normalized)
+    elif normalized == "aider":
+        apply_aider()
+    elif normalized == "hooks":
+        apply_hooks()
+
+    check = build_integration_check_report(root, strict=strict).as_dict()
+    ok = all(item["ok"] for item in results) and (not strict or bool(check["ok"]))
+    return IntegrationActionReport(normalized, ok, results, warnings, check)

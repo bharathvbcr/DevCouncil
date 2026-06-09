@@ -226,31 +226,35 @@ async def run_plan_flow(
             console.print(Panel(f"Found {len(spec_output.requirements)} requirements.", title="Requirements Generated"))
             return []
 
-        # 4. Independent Plans
-        progress.add_task(description="Generating Plan A (Pragmatic)...", total=None)
-        plan_a = await plan_service.generate_plan("planner_a", debate_goal, json.dumps([r.model_dump() for r in spec_output.requirements]), repo_map_json)
+        requirements_json = json.dumps([r.model_dump() for r in spec_output.requirements])
+
+        # 4. Independent Plans (run concurrently — they don't depend on each other)
+        progress.add_task(description="Generating Plans A (Pragmatic) and B (Robust)...", total=None)
+        plan_a, plan_b = await asyncio.gather(
+            plan_service.generate_plan("planner_a", debate_goal, requirements_json, repo_map_json),
+            plan_service.generate_plan("planner_b", debate_goal, requirements_json, repo_map_json),
+        )
         orchestrator.save_run_artifact("plan_a.json", plan_a.model_dump())
-        
-        progress.add_task(description="Generating Plan B (Robust)...", total=None)
-        plan_b = await plan_service.generate_plan("planner_b", debate_goal, json.dumps([r.model_dump() for r in spec_output.requirements]), repo_map_json)
         orchestrator.save_run_artifact("plan_b.json", plan_b.model_dump())
         await orchestrator.transition_to(ProjectPhase.PLANS_GENERATED)
 
-        # 5. Cross-Critique
-        progress.add_task(description="Critiquing Plan B...", total=None)
-        critique_a = await critique_service.generate_critique("critic_a", plan_b.model_dump_json(), json.dumps([r.model_dump() for r in spec_output.requirements]))
+        # 5. Cross-Critique (independent — run concurrently)
+        progress.add_task(description="Critiquing Plans A and B...", total=None)
+        critique_a, critique_b = await asyncio.gather(
+            critique_service.generate_critique("critic_a", plan_b.model_dump_json(), requirements_json),
+            critique_service.generate_critique("critic_b", plan_a.model_dump_json(), requirements_json),
+        )
         orchestrator.save_run_artifact("critique_a.json", critique_a.model_dump())
-        
-        progress.add_task(description="Critiquing Plan A...", total=None)
-        critique_b = await critique_service.generate_critique("critic_b", plan_a.model_dump_json(), json.dumps([r.model_dump() for r in spec_output.requirements]))
         orchestrator.save_run_artifact("critique_b.json", critique_b.model_dump())
         await orchestrator.transition_to(ProjectPhase.CRITIQUES_GENERATED)
 
-        # 6. Rebuttals
+        # 6. Rebuttals (independent — run concurrently)
         progress.add_task(description="Generating rebuttals...", total=None)
-        rebuttal_a = await critique_service.generate_rebuttal("planner_a", plan_a.model_dump_json(), critique_b.model_dump_json())
+        rebuttal_a, rebuttal_b = await asyncio.gather(
+            critique_service.generate_rebuttal("planner_a", plan_a.model_dump_json(), critique_b.model_dump_json()),
+            critique_service.generate_rebuttal("planner_b", plan_b.model_dump_json(), critique_a.model_dump_json()),
+        )
         orchestrator.save_run_artifact("rebuttal_a.json", rebuttal_a.model_dump())
-        rebuttal_b = await critique_service.generate_rebuttal("planner_b", plan_b.model_dump_json(), critique_a.model_dump_json())
         orchestrator.save_run_artifact("rebuttal_b.json", rebuttal_b.model_dump())
 
         # 7. Arbitration
@@ -314,6 +318,92 @@ async def run_plan_flow(
         console.print("[yellow]Plan generated but failed gates. See status for gaps.[/yellow]")
         await orchestrator.transition_to(ProjectPhase.AWAITING_USER_DECISIONS)
         return []
+
+def _latest_run_with_decision(root: Path, run_id: str | None) -> Path | None:
+    runs_dir = root / ".devcouncil" / "runs"
+    if run_id:
+        candidate = runs_dir / run_id
+        return candidate if (candidate / "decision.json").exists() else None
+    if not runs_dir.exists():
+        return None
+    candidates = [d for d in runs_dir.iterdir() if (d / "decision.json").exists()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda d: (d / "decision.json").stat().st_mtime)
+
+
+def approve(
+    run_id: str | None = typer.Option(None, "--run-id", help="Run whose generated plan to approve (defaults to the most recent run with a decision)."),
+    force: bool = typer.Option(False, "--force", help="Approve even if blocking gate gaps remain."),
+    project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """
+    Approve a generated plan after reviewing gate gaps (AWAITING_USER_DECISIONS -> PLAN_APPROVED).
+    """
+    from devcouncil.planning.arbiter_service import ArbiterDecision
+    from devcouncil.planning.critique_service import CritiqueOutput
+    from devcouncil.planning.spec_service import SpecOutput
+
+    root = project_root.expanduser().resolve()
+    db = get_db(root)
+    if not db:
+        console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
+        raise typer.Exit(code=1)
+
+    run_dir = _latest_run_with_decision(root, run_id)
+    if run_dir is None:
+        console.print("[red]No planning run with a decision was found. Run 'dev plan' first.[/red]")
+        raise typer.Exit(code=1)
+
+    decision = ArbiterDecision.model_validate_json((run_dir / "decision.json").read_text(encoding="utf-8"))
+    spec_path = run_dir / "requirements.json"
+    spec_output = (
+        SpecOutput.model_validate_json(spec_path.read_text(encoding="utf-8")) if spec_path.exists() else None
+    )
+
+    findings = []
+    for name in ("critique_a.json", "critique_b.json"):
+        critique_path = run_dir / name
+        if critique_path.exists():
+            findings.extend(CritiqueOutput.model_validate_json(critique_path.read_text(encoding="utf-8")).findings)
+    reconciled_findings = _reconcile_findings(findings, decision)
+    final_tasks = [task.model_copy(update={"status": "planned"}) for task in decision.final_tasks]
+    assumptions = spec_output.assumptions if spec_output else []
+
+    policy = GatePolicy()
+    result = policy.check_plan_approval(
+        decision.final_requirements,
+        final_tasks,
+        assumptions=assumptions,
+        findings=reconciled_findings,
+        blocking_questions=spec_output.blocking_questions if spec_output else [],
+    )
+    if not result.passed and not force:
+        console.print("[yellow]Plan still fails approval gates:[/yellow]")
+        for gap in result.gaps:
+            marker = "[red][BLOCKING][/red] " if gap.blocking else ""
+            console.print(f" - {marker}{gap.description} (Fix: {gap.recommended_fix})")
+        console.print("Resolve the gaps and re-run 'dev plan', or use --force to approve anyway.")
+        raise typer.Exit(code=1)
+
+    with db.get_session() as session:
+        GapRepository(session).delete_plan_gaps()
+        PlanningStateRepository(session).replace_active_plan(
+            decision.final_requirements,
+            assumptions,
+            final_tasks,
+            reconciled_findings,
+        )
+
+    orchestrator = Orchestrator(root)
+    try:
+        asyncio.run(orchestrator.transition_to(ProjectPhase.PLAN_APPROVED))
+    except ValueError as exc:
+        console.print(f"[red]Cannot approve from the current project phase: {exc}[/red]")
+        raise typer.Exit(code=1)
+    console.print(f"[green]Plan from run {run_dir.name} approved ({len(final_tasks)} tasks).[/green]")
+    console.print("Use 'dev tasks list' to see the planned tasks and 'dev run TASK-ID' to execute one.")
+
 
 @app.command()
 def plan(

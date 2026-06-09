@@ -36,6 +36,16 @@ class CommandsConfig(BaseModel):
     typecheck: List[str] = Field(default_factory=list)
 
 
+class VerificationSandboxConfig(BaseModel):
+    docker_image: str = "python:3.12-slim"
+    docker_setup_commands: List[str] = Field(default_factory=list)
+    nix_flake_attr: str | None = None
+
+
+class VerificationConfig(BaseModel):
+    sandbox: VerificationSandboxConfig = Field(default_factory=VerificationSandboxConfig)
+
+
 class GatesConfig(BaseModel):
     require_clean_git_before_task: bool = True
     block_orphan_diffs: bool = True
@@ -139,7 +149,12 @@ class CliAgentsIntegrationConfig(BaseModel):
     agents: Dict[str, CustomCliAgentConfig] = Field(default_factory=dict)
 
 
+class McpIntegrationConfig(BaseModel):
+    write_task_scope_to_config: bool = False
+
+
 class IntegrationsConfig(BaseModel):
+    mcp: McpIntegrationConfig = Field(default_factory=McpIntegrationConfig)
     agent_flow: AgentFlowIntegrationConfig = Field(default_factory=AgentFlowIntegrationConfig)
     code_review_graph: CodeReviewGraphIntegrationConfig = Field(default_factory=CodeReviewGraphIntegrationConfig)
     live_review: LiveReviewIntegrationConfig = Field(default_factory=LiveReviewIntegrationConfig)
@@ -167,6 +182,7 @@ class DevCouncilConfig(BaseModel):
     commands: CommandsConfig = Field(default_factory=CommandsConfig)
     gates: GatesConfig = Field(default_factory=GatesConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    verification: VerificationConfig = Field(default_factory=VerificationConfig)
     privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
     integrations: IntegrationsConfig = Field(default_factory=IntegrationsConfig)
 
@@ -183,8 +199,13 @@ def load_config(project_root: Path = Path(".")) -> DevCouncilConfig:
     if not config_path.exists():
         raise FileNotFoundError(f"Config not found at {config_path}. Run 'dev init' first.")
 
-    with open(config_path) as f:
-        raw = yaml.safe_load(f) or {}
+    with open(config_path, encoding="utf-8") as f:
+        try:
+            raw = yaml.safe_load(f) or {}
+        except yaml.YAMLError as exc:
+            raise ValueError(
+                f"Invalid YAML in {config_path}: {exc}. Fix the syntax or re-run 'dev init'."
+            ) from exc
 
     return DevCouncilConfig.model_validate(raw)
 
@@ -194,6 +215,7 @@ def provider_api_key_env_var(provider: str = "openrouter") -> str:
     env_map = {
         "openrouter": "OPENROUTER_API_KEY",
         "vertexai": "VERTEXAI_ACCESS_TOKEN",
+        "doubleword": "DOUBLEWORD_API_KEY",
         "openai": "OPENAI_API_KEY",
         "anthropic": "ANTHROPIC_API_KEY",
     }

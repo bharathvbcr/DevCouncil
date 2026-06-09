@@ -23,4 +23,4 @@ Status labels:
 | **GitHub PR Checks** | Preview: `dev report --github` |
 | **GitHub/GitLab PR Comments** | Preview: `dev report --github-pr-comment`, `dev report --gitlab-pr-comment` |
 | **LSP / AST Indexing** | Preview: `dev lsp inspect`, `dev ast match` |
-| **Live Dashboard** | Preview: `dev dashboard --open` |
+| **Live Dashboard** | Preview: `dev dashboard --open`, status panels, recent runs, and guarded local integration apply controls |

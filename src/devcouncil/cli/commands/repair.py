@@ -35,32 +35,45 @@ async def run_repair_flow(project_root: Path = Path(".")):
 
         console.print(f"Found [bold]{len(blocking_gaps)}[/bold] blocking gaps. Orchestrating repair plan...")
 
-        # Load router
+        # Load router when credentials are available. Correction manifests have a
+        # deterministic fallback path, so missing model credentials must not block
+        # repair artifact generation.
+        repair_service = None
         try:
             config = load_config(root)
             validate_model_provider(config.models.provider)
             api_key = get_api_key(config.models.provider, root)
         except (FileNotFoundError, ValueError) as e:
-            console.print(f"[red]{e}[/red]")
-            return
-        
-        provider = create_provider(config.models.provider, api_key, project_root=root)
-        role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
-        router = ModelRouter(provider, role_config, project_root=root)
-        repair_service = RepairService(router)
+            console.print(f"[yellow]{e}[/yellow]")
+        else:
+            provider = create_provider(config.models.provider, api_key, project_root=root)
+            role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
+            router = ModelRouter(provider, role_config, project_root=root)
+            repair_service = RepairService(router)
         context_builder = ContextBuilder(root)
         
         # Build minimal context for repair.
         project_context = context_builder.get_structure_summary()
 
-        repair_output = await repair_service.generate_repair_plan(blocking_gaps, str(project_context))
-        
-        for task in repair_output.suggested_tasks:
-            task.id = f"REPAIR-{task.id}"
-            task_repo.save(task)
-            console.print(f"  - Created intelligent repair task [bold]{task.id}[/bold]: {task.title}")
+        from devcouncil.planning.correction_manifest import write_correction_manifest
 
-        console.print(f"\n[green]Successfully generated {len(repair_output.suggested_tasks)} repair tasks.[/green]")
+        task_ids = {gap.task_id for gap in blocking_gaps if gap.task_id}
+        for scoped_task_id in task_ids:
+            if scoped_task_id:
+                path = write_correction_manifest(root, scoped_task_id, repair_service=repair_service)
+                if path:
+                    console.print(f"  - Wrote correction manifest [dim]{path}[/dim]")
+
+        repair_count = 0
+        if repair_service is not None:
+            repair_output = await repair_service.generate_repair_plan(blocking_gaps, str(project_context))
+            for task in repair_output.suggested_tasks:
+                task.id = f"REPAIR-{task.id}"
+                task_repo.save(task)
+                repair_count += 1
+                console.print(f"  - Created intelligent repair task [bold]{task.id}[/bold]: {task.title}")
+
+        console.print(f"\n[green]Successfully generated {repair_count} repair tasks.[/green]")
 
 @app.callback(invoke_without_command=True)
 def repair(

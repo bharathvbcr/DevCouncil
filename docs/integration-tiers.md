@@ -45,8 +45,7 @@ DevCouncil assigns each supported coding CLI to one of three integration tiers. 
 | :--- | :--- |
 | Codex, Gemini, Claude | Yes — project hook JSON + `devcouncil hook pre-tool-use` |
 | Cursor | Yes — `.cursor/hooks.json` (`preToolUse` / `postToolUse`) |
-| OpenCode | Yes — bundled plugin in `.devcouncil/integrations/` |
-| OpenCode | Native plugin via `dev integrate hooks` |
+| OpenCode | Yes — bundled plugin via `dev integrate hooks` |
 | Antigravity / Warp / Aider (executor only) | Verification-gated; hooks optional |
 | Unregistered BYO CLI | Verification-gated only |
 
@@ -62,7 +61,7 @@ DevCouncil assigns each supported coding CLI to one of three integration tiers. 
 
 See [coding-cli-integration.md](coding-cli-integration.md) for commands and examples.
 
-## Automation helpers (third pass)
+## Automation helpers
 
 | Feature | Command / config |
 | :--- | :--- |
@@ -71,3 +70,14 @@ See [coding-cli-integration.md](coding-cli-integration.md) for commands and exam
 | Live CLI output | `dev run TASK --executor codex --stream` or `execution.stream_cli_output: true` |
 | Cursor session resume | `execution.cursor_resume_mode: project` or `task` (uses `cursor-agent create-chat` + `--resume`) |
 | Strict integration doctor | `dev integrate check --strict` |
+| Pick best executor on this machine | `dev integrate recommend` |
+| View tier matrix | `dev integrate matrix` |
+| Fast integration snapshot | `dev integrate status` / `dev integrate status --json` (includes `capabilities`) |
+| Streamed run transcript | `.devcouncil/runs/<run-id>/transcript.txt` when `--stream` is used |
+| CI integration report | `dev integrate check --json` (`ok`, `failures`, `recommended_executor`, `checks`) |
+| CI report file | `dev integrate check --report-file` / `-o` / `--output` |
+| Run artifact manifests | `.devcouncil/runs/<run-id>/agent-run.json` with completion metadata |
+| Dashboard integration panel | `dev dashboard --open` — `/api/status` includes `integrations` and `recent_runs` |
+| Dashboard apply/fix controls | `dev dashboard --open` local-only controls backed by the same integration service as `dev integrate` |
+
+MCP exposes read-only integration status through `devcouncil_integration_status`; it does not apply integration changes.

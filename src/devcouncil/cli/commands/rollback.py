@@ -1,7 +1,8 @@
 import typer
-import subprocess
 from pathlib import Path
 from rich.console import Console
+
+from devcouncil.execution.checkpoints import CheckpointService
 
 app = typer.Typer()
 console = Console()
@@ -19,42 +20,40 @@ def rollback(
         return
 
     root = project_root.expanduser().resolve()
-    checkpoint_file = root / ".devcouncil" / "checkpoints" / f"{task_id}-before.patch"
-    after_patch = root / ".devcouncil" / "checkpoints" / f"{task_id}-after.patch"
+    checkpoint_dir = root / ".devcouncil" / "checkpoints"
+    checkpoint_file = checkpoint_dir / f"{task_id}-before.patch"
+    after_patch = checkpoint_dir / f"{task_id}-after.patch"
+    service = CheckpointService(root)
 
     if not checkpoint_file.exists() and not after_patch.exists():
-        console.print(
-            f"[red]No checkpoint found for task {task_id}. Expected {after_patch} "
-            f"or {checkpoint_file}.[/red]"
-        )
-        raise typer.Exit(code=1)
+        before_ref = CheckpointService.REF_BEFORE.format(task_id=task_id)
+        after_ref = CheckpointService.REF_AFTER.format(task_id=task_id)
+        if not service._ref_exists(before_ref) and not service._ref_exists(after_ref):
+            console.print(
+                f"[red]No checkpoint found for task {task_id}. Expected {after_patch} "
+                f"or {checkpoint_file}.[/red]"
+            )
+            raise typer.Exit(code=1)
 
     console.print(f"Rolling back task [bold]{task_id}[/bold]...")
-    
-    try:
-        if after_patch.exists():
-            # Reverse-apply the task's changes only
-            console.print(f"Applying reverse patch from [bold]{after_patch}[/bold]...")
-            subprocess.check_call(
-                ["git", "apply", "-R", str(after_patch)],
-                cwd=root,
-            )
-            console.print(f"[green]Successfully rolled back task {task_id} changes.[/green]")
-        else:
-            # No after-patch, but we have the before-patch — warn and offer manual reset
+    result = service.rollback(task_id)
+    if "failed" in result.message.lower() or result.message.startswith("No checkpoint"):
+        console.print(f"[yellow]{result.message}[/yellow]")
+        if checkpoint_file.exists():
             console.print(
-                f"[yellow]No after-patch found at {after_patch}.[/yellow]\n"
                 f"The before-patch at {checkpoint_file} captured the state before the task ran.\n"
                 f"To manually reset:\n"
                 f"  1. [bold]git stash[/bold] (if you want to keep current changes)\n"
                 f"  2. [bold]git checkout -- .[/bold] (discard working tree changes)\n"
                 f"  3. [bold]git apply {checkpoint_file}[/bold] (restore pre-task state)"
             )
-    except subprocess.CalledProcessError as e:
-        console.print(f"[red]Failed to apply reverse patch: {e}[/red]")
-        console.print("[yellow]The patch may conflict with current changes. Try resolving manually:[/yellow]")
-        console.print(f"  git apply -R --3way {after_patch}")
+        elif after_patch.exists():
+            console.print(
+                f"Only the after-patch at {after_patch} exists (it captured the task's changes).\n"
+                f"To manually revert those changes from the working tree:\n"
+                f"  1. [bold]git apply --stat {after_patch}[/bold] (inspect what the task changed)\n"
+                f"  2. [bold]git apply -R {after_patch}[/bold] (reverse-apply the task's changes)"
+            )
         raise typer.Exit(code=1)
-    except Exception as e:
-        console.print(f"[red]Failed to rollback: {e}[/red]")
-        raise typer.Exit(code=1)
+
+    console.print(f"[green]Successfully rolled back task {task_id}.[/green] {result.message}")

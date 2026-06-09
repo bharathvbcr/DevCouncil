@@ -2520,7 +2520,7 @@ def test_cli_integrate_doctor_uses_project_root_for_custom_agents(tmp_path, monk
 def test_cli_agents_run_passes_agent_and_profile(tmp_path, monkeypatch):
     called = {}
 
-    def fake_run(task_id, executor, profile, project_root):
+    def fake_run(task_id, executor, profile, project_root, **kwargs):
         called["task_id"] = task_id
         called["executor"] = executor
         called["profile"] = profile
@@ -2543,7 +2543,7 @@ def test_cli_agents_run_passes_agent_and_profile(tmp_path, monkeypatch):
 def test_cli_agents_run_omits_profile_to_use_agent_default(tmp_path, monkeypatch):
     called = {}
 
-    def fake_run(task_id, executor, profile, project_root):
+    def fake_run(task_id, executor, profile, project_root, **kwargs):
         called["task_id"] = task_id
         called["executor"] = executor
         called["profile"] = profile
@@ -2659,8 +2659,8 @@ def test_cli_setup_vertexai_provider_writes_access_token(tmp_path, monkeypatch):
     assert result.exit_code == 0
     raw_config = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
     assert raw_config["models"]["provider"] == "vertexai"
-    assert raw_config["models"]["roles"]["spec_writer"]["model"] == "google/gemini-2.0-flash-001"
-    assert raw_config["models"]["roles"]["critic_a"]["model"] == "google/gemini-2.0-flash-001"
+    assert raw_config["models"]["roles"]["spec_writer"]["model"] == "google/gemini-2.5-flash"
+    assert raw_config["models"]["roles"]["critic_a"]["model"] == "google/gemini-2.5-flash"
     secrets = (tmp_path / ".devcouncil" / "secrets.env").read_text(encoding="utf-8")
     assert "VERTEXAI_ACCESS_TOKEN=ya29.local" in secrets
     assert "VERTEXAI_PROJECT=vertex-project" in secrets
@@ -2835,7 +2835,7 @@ def test_cli_config_models_can_update_provider(tmp_path, monkeypatch):
     assert "Updated default role models for 'vertexai'" in result.output
     raw_config = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
     assert raw_config["models"]["provider"] == "vertexai"
-    assert raw_config["models"]["roles"]["arbiter"]["model"] == "google/gemini-2.0-flash-001"
+    assert raw_config["models"]["roles"]["arbiter"]["model"] == "google/gemini-2.5-flash"
 
 
 def test_cli_config_models_honors_project_root(tmp_path, monkeypatch):

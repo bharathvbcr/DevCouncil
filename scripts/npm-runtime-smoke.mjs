@@ -105,6 +105,61 @@ try {
   assertOk(integrateCheck, "installed devcouncil integrate check");
   assertIncludes(integrateCheck.stdout, "Bundled OpenCode hook plugin", "integrate check bundled plugin");
   assertIncludes(integrateCheck.stdout, "Ready.", "integrate check ready");
+  assertIncludes(integrateCheck.stdout, "Recommended coding CLI", "integrate check recommended executor");
+
+  const recommend = run(process.execPath, [installedBin, "integrate", "recommend"], {
+    cwd: integrationProject,
+    shell: false,
+    env: integrationEnv,
+  });
+  assertOk(recommend, "installed devcouncil integrate recommend");
+  assertIncludes(recommend.stdout, "Integration Recommendations", "integrate recommend");
+
+  const integrateStatus = run(process.execPath, [installedBin, "integrate", "status"], {
+    cwd: integrationProject,
+    shell: false,
+    env: integrationEnv,
+  });
+  assertOk(integrateStatus, "installed devcouncil integrate status");
+  assertIncludes(integrateStatus.stdout, "Integration Status", "integrate status");
+
+  const matrix = run(process.execPath, [installedBin, "integrate", "matrix"], {
+    cwd: integrationProject,
+    shell: false,
+    env: integrationEnv,
+  });
+  assertOk(matrix, "installed devcouncil integrate matrix");
+  assertIncludes(matrix.stdout, "Integration Matrix", "integrate matrix");
+
+  const integrateJson = run(
+    process.execPath,
+    [installedBin, "integrate", "check", "--json"],
+    { cwd: integrationProject, shell: false, env: integrationEnv },
+  );
+  assertOk(integrateJson, "installed devcouncil integrate check --json");
+  const report = JSON.parse(integrateJson.stdout);
+  if (typeof report.ok !== "boolean" || !Array.isArray(report.checks)) {
+    throw new Error("integrate check --json did not return expected shape");
+  }
+
+  const statusJson = run(
+    process.execPath,
+    [installedBin, "integrate", "status", "--json"],
+    { cwd: integrationProject, shell: false, env: integrationEnv },
+  );
+  assertOk(statusJson, "installed devcouncil integrate status --json");
+  const parsedStatus = JSON.parse(statusJson.stdout);
+  if (!Array.isArray(parsedStatus.capabilities)) {
+    throw new Error("integrate status --json did not include capabilities");
+  }
+
+  const reportPath = path.join(integrationProject, "integration-report.json");
+  const integrateReportFile = run(
+    process.execPath,
+    [installedBin, "integrate", "check", "-o", reportPath],
+    { cwd: integrationProject, shell: false, env: integrationEnv },
+  );
+  assertOk(integrateReportFile, "installed devcouncil integrate check -o");
 
   const emptyPath = mkdtempSync(path.join(workspace, "empty-path-"));
   const missingUv = run(process.execPath, [installedBin, "--help"], {

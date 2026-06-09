@@ -224,6 +224,13 @@ class EvidenceRepository:
         self.session.add(model)
         self.session.commit()
 
+    def get_command_results_for_task(self, task_id: str) -> List[CommandResult]:
+        statement = select(EvidenceModel).where(EvidenceModel.task_id == task_id).where(
+            EvidenceModel.type == "command"
+        )
+        models = self.session.exec(statement).all()
+        return [CommandResult.model_validate(json.loads(m.data_json)) for m in models]
+
     def get_all(self) -> List[Any]:
         statement = select(EvidenceModel)
         models = self.session.exec(statement).all()
