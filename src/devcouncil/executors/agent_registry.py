@@ -24,16 +24,32 @@ AGENT_ALIASES = {
     "oz-cli": "warp",
     "cursor-agent": "cursor",
     "cursor-cli": "cursor",
+    "copilot-cli": "copilot",
+    "github-copilot": "copilot",
+    "gh-copilot": "copilot",
+    "goose-cli": "goose",
+    "block-goose": "goose",
+    "amp-cli": "amp",
+    "sourcegraph-amp": "amp",
+    "qwen-code": "qwen",
+    "qwen-cli": "qwen",
+    "crush-cli": "crush",
+    "charm-crush": "crush",
 }
 
 BUILTIN_AGENT_NAMES = {
     "aider",
+    "amp",
     "antigravity",
     "claude",
     "codex",
+    "copilot",
+    "crush",
     "cursor",
     "gemini",
+    "goose",
     "opencode",
+    "qwen",
     "warp",
 }
 
@@ -57,6 +73,9 @@ class CliAgentSpec:
     default_profile: str = "default"
     help_command: list[str] = field(default_factory=list)
     built_in: bool = False
+    capabilities: list[str] = field(default_factory=list)
+    supports_handoff: bool = False
+    preferred_artifact_format: str = "json"
 
     @property
     def label(self) -> str:
@@ -91,7 +110,108 @@ CODING_CLI_PROBE_ORDER: tuple[str, ...] = (
     "antigravity",
     "warp",
     "aider",
+    "copilot",
+    "goose",
+    "amp",
+    "qwen",
+    "crush",
 )
+
+@dataclass(frozen=True)
+class CodingCliIntegrationInfo:
+    name: str
+    label: str
+    tier: int
+    headless: bool
+    mcp: bool
+    hooks: bool
+    launcher_shim: bool
+    notes: str
+
+
+# Tier 1 = headless executor + verify; tier 2 = MCP companion; hooks = native pre-tool policy.
+CODING_CLI_INTEGRATION_INFO: dict[str, CodingCliIntegrationInfo] = {
+    "codex": CodingCliIntegrationInfo(
+        "codex", "Codex CLI", 1, True, True, True, True, "dev integrate codex --apply"
+    ),
+    "gemini": CodingCliIntegrationInfo(
+        "gemini", "Gemini CLI", 1, True, True, True, True, "dev integrate gemini --apply"
+    ),
+    "claude": CodingCliIntegrationInfo(
+        "claude", "Claude Code", 1, True, True, True, True, "dev integrate claude --apply"
+    ),
+    "cursor": CodingCliIntegrationInfo(
+        "cursor",
+        "Cursor",
+        1,
+        True,
+        True,
+        True,
+        True,
+        "dev integrate cursor --apply; cursor-agent for headless",
+    ),
+    "opencode": CodingCliIntegrationInfo(
+        "opencode", "OpenCode", 1, True, True, True, True, "dev integrate opencode --apply"
+    ),
+    "antigravity": CodingCliIntegrationInfo(
+        "antigravity",
+        "Google Antigravity CLI",
+        1,
+        True,
+        True,
+        False,
+        True,
+        "dev integrate antigravity --apply",
+    ),
+    "warp": CodingCliIntegrationInfo(
+        "warp", "Warp / Oz", 1, True, True, False, True, "dev integrate warp --apply"
+    ),
+    "aider": CodingCliIntegrationInfo(
+        "aider", "Aider", 1, True, False, False, True, "dev integrate aider --apply"
+    ),
+    "copilot": CodingCliIntegrationInfo(
+        "copilot", "GitHub Copilot CLI", 1, True, True, False, True, "dev run TASK-ID --executor copilot"
+    ),
+    "goose": CodingCliIntegrationInfo(
+        "goose", "Goose", 1, True, True, False, True, "dev run TASK-ID --executor goose"
+    ),
+    "amp": CodingCliIntegrationInfo(
+        "amp", "Amp (Sourcegraph)", 1, True, True, False, True, "dev run TASK-ID --executor amp"
+    ),
+    "qwen": CodingCliIntegrationInfo(
+        "qwen", "Qwen Code", 1, True, True, False, True, "dev run TASK-ID --executor qwen"
+    ),
+    "crush": CodingCliIntegrationInfo(
+        "crush", "Crush (Charm)", 1, True, True, False, True, "dev run TASK-ID --executor crush"
+    ),
+}
+
+# First successful probe wins (cursor tries cursor-agent then cursor).
+CODING_CLI_VERSION_COMMANDS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "codex": (("codex", "--version"),),
+    "gemini": (("gemini", "--version"),),
+    "claude": (("claude", "--version"),),
+    "cursor": (("cursor-agent", "--version"), ("cursor", "--version")),
+    "opencode": (("opencode", "--version"),),
+    "antigravity": (("agy", "--version"),),
+    "warp": (("oz", "--version"),),
+    "aider": (("aider", "--version"),),
+    "copilot": (("copilot", "--version"),),
+    "goose": (("goose", "--version"),),
+    "amp": (("amp", "--version"),),
+    "qwen": (("qwen", "--version"),),
+    "crush": (("crush", "--version"),),
+}
+
+
+def integration_tier_label(client: str) -> str:
+    info = CODING_CLI_INTEGRATION_INFO.get(normalize_agent_name(client))
+    tier = info.tier if info is not None else 3
+    if tier == 1:
+        return "Tier 1 (headless executor)"
+    if tier == 2:
+        return "Tier 2 (MCP companion)"
+    return "Tier 3 (sidecar)"
 
 
 def resolve_coding_cli_executable(project_root: Path, client: str) -> str | None:
@@ -104,11 +224,21 @@ def resolve_coding_cli_executable(project_root: Path, client: str) -> str | None
     return spec.executable if shutil.which(spec.executable) else None
 
 
+def resolve_coding_cli_probe_order(project_root: Path) -> tuple[str, ...]:
+    try:
+        configured = load_config(project_root).execution.coding_cli_probe_order
+        if configured:
+            return tuple(normalize_agent_name(name) for name in configured)
+    except Exception:
+        pass
+    return CODING_CLI_PROBE_ORDER
+
+
 def detect_available_coding_cli(
     project_root: Path,
     probe_order: tuple[str, ...] | None = None,
 ) -> str | None:
-    for client in probe_order or CODING_CLI_PROBE_ORDER:
+    for client in probe_order or resolve_coding_cli_probe_order(project_root):
         if resolve_coding_cli_executable(project_root, client):
             return client
     return None
@@ -125,10 +255,12 @@ def resolve_automated_executor(
     try:
         config = load_config(project_root).execution
         configured = normalize_agent_name(config.default_executor)
-        if not probe_order and config.coding_cli_probe_order:
-            probe_order = tuple(normalize_agent_name(name) for name in config.coding_cli_probe_order)
+        if probe_order is None:
+            probe_order = resolve_coding_cli_probe_order(project_root)
     except Exception:
         configured = "manual"
+        if probe_order is None:
+            probe_order = CODING_CLI_PROBE_ORDER
     if configured != "manual":
         return configured
     detected = detect_available_coding_cli(project_root, probe_order=probe_order)
@@ -150,6 +282,7 @@ def builtin_agent_specs(project_root: Path) -> dict[str, CliAgentSpec]:
             kind="coding-cli",
             supports_mcp=True,
             supports_diff_review=True,
+            supports_handoff=True,
             built_in=True,
         ),
         "gemini": CliAgentSpec(
@@ -168,6 +301,7 @@ def builtin_agent_specs(project_root: Path) -> dict[str, CliAgentSpec]:
             kind="coding-cli",
             supports_mcp=True,
             supports_diff_review=True,
+            supports_handoff=True,
             built_in=True,
         ),
         "opencode": CliAgentSpec(
@@ -184,6 +318,7 @@ def builtin_agent_specs(project_root: Path) -> dict[str, CliAgentSpec]:
             kind="coding-cli",
             supports_mcp=True,
             supports_diff_review=True,
+            supports_handoff=True,
             built_in=True,
         ),
         "antigravity": CliAgentSpec(
@@ -200,6 +335,7 @@ def builtin_agent_specs(project_root: Path) -> dict[str, CliAgentSpec]:
             kind="coding-cli",
             supports_mcp=True,
             supports_diff_review=True,
+            supports_handoff=True,
             built_in=True,
         ),
         "warp": CliAgentSpec(
@@ -211,6 +347,7 @@ def builtin_agent_specs(project_root: Path) -> dict[str, CliAgentSpec]:
             kind="agent-platform",
             supports_mcp=True,
             supports_diff_review=True,
+            supports_handoff=True,
             built_in=True,
         ),
         "cursor": CliAgentSpec(
@@ -228,6 +365,7 @@ def builtin_agent_specs(project_root: Path) -> dict[str, CliAgentSpec]:
             kind="coding-cli",
             supports_mcp=True,
             supports_diff_review=True,
+            supports_handoff=True,
             built_in=True,
         ),
         "aider": CliAgentSpec(
@@ -239,6 +377,65 @@ def builtin_agent_specs(project_root: Path) -> dict[str, CliAgentSpec]:
             kind="coding-cli",
             supports_mcp=False,
             supports_diff_review=True,
+            supports_handoff=True,
+            built_in=True,
+        ),
+        "copilot": CliAgentSpec(
+            name="copilot",
+            command="copilot",
+            args=["--allow-all-tools", "-p"],
+            input_mode="argument",
+            display_name="GitHub Copilot CLI",
+            kind="coding-cli",
+            supports_mcp=True,
+            supports_diff_review=True,
+            supports_handoff=True,
+            built_in=True,
+        ),
+        "goose": CliAgentSpec(
+            name="goose",
+            command="goose",
+            args=["run", "-i", "{prompt_file}"],
+            input_mode="prompt-file",
+            display_name="Goose",
+            kind="coding-cli",
+            supports_mcp=True,
+            supports_diff_review=True,
+            supports_handoff=True,
+            built_in=True,
+        ),
+        "amp": CliAgentSpec(
+            name="amp",
+            command="amp",
+            args=["-x"],
+            input_mode="argument",
+            display_name="Amp (Sourcegraph)",
+            kind="coding-cli",
+            supports_mcp=True,
+            supports_diff_review=True,
+            supports_handoff=True,
+            built_in=True,
+        ),
+        "qwen": CliAgentSpec(
+            name="qwen",
+            command="qwen",
+            display_name="Qwen Code",
+            kind="coding-cli",
+            supports_mcp=True,
+            supports_diff_review=True,
+            supports_handoff=True,
+            built_in=True,
+        ),
+        "crush": CliAgentSpec(
+            name="crush",
+            command="crush",
+            args=["run"],
+            input_mode="argument",
+            display_name="Crush (Charm)",
+            kind="coding-cli",
+            supports_mcp=True,
+            supports_diff_review=True,
+            supports_handoff=True,
             built_in=True,
         ),
     }

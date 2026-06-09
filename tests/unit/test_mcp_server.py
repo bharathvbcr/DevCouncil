@@ -14,6 +14,27 @@ def anyio_backend():
 
 
 @pytest.mark.anyio
+async def test_mcp_lists_integration_status_tool():
+    tools = await list_tools()
+    assert "devcouncil_integration_status" in {tool.name for tool in tools}
+
+
+@pytest.mark.anyio
+async def test_mcp_integration_status_is_read_only(tmp_path, monkeypatch):
+    dev_dir = tmp_path / ".devcouncil"
+    dev_dir.mkdir()
+    Database(dev_dir / "state.sqlite").create_db_and_tables()
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+
+    result = await call_tool("devcouncil_integration_status", {})
+    payload = json.loads(result[0].text)
+
+    assert "capabilities" in payload
+    assert "apply" not in payload
+    assert any(row["name"] == "codex" for row in payload["capabilities"])
+
+
+@pytest.mark.anyio
 async def test_mcp_lists_graph_context_tool():
     tools = await list_tools()
 

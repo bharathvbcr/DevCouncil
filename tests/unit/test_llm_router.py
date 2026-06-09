@@ -7,6 +7,7 @@ from devcouncil.app.config import get_api_key
 from devcouncil.llm.provider import (
     LLMResponse,
     OpenRouterProvider,
+    DoublewordProvider,
     Provider,
     VertexAIProvider,
     apply_provider_default_role_models,
@@ -58,6 +59,14 @@ def test_create_provider_builds_openrouter_provider():
 
     assert isinstance(provider, OpenRouterProvider)
     assert provider.api_key == "sk-test"
+
+
+def test_create_provider_builds_doubleword_provider():
+    provider = create_provider("doubleword", "dw-test")
+
+    assert isinstance(provider, DoublewordProvider)
+    assert provider.api_key == "dw-test"
+    assert provider.base_url == "https://api.doubleword.ai/v1"
 
 
 def test_create_provider_builds_vertexai_provider(monkeypatch):
@@ -125,7 +134,7 @@ def test_apply_provider_default_role_models_updates_only_previous_defaults():
     raw_config = {
         "models": {
             "roles": {
-                "spec_writer": {"model": "anthropic/claude-3.5-sonnet"},
+                "spec_writer": {"model": "anthropic/claude-sonnet-4.6"},
                 "planner_a": {"model": "custom/model"},
             }
         }
@@ -135,9 +144,9 @@ def test_apply_provider_default_role_models_updates_only_previous_defaults():
 
     assert changed is True
     roles = raw_config["models"]["roles"]
-    assert roles["spec_writer"]["model"] == "google/gemini-2.0-flash-001"
+    assert roles["spec_writer"]["model"] == "google/gemini-2.5-flash"
     assert roles["planner_a"]["model"] == "custom/model"
-    assert roles["live_reviewer"]["model"] == "google/gemini-2.0-flash-001"
+    assert roles["live_reviewer"]["model"] == "google/gemini-2.5-flash"
 
 
 def test_apply_provider_default_role_models_tolerates_unsupported_previous_provider():
@@ -148,7 +157,7 @@ def test_apply_provider_default_role_models_tolerates_unsupported_previous_provi
     assert changed is True
     roles = raw_config["models"]["roles"]
     assert roles["planner_a"]["model"] == "custom/model"
-    assert roles["arbiter"]["model"] == "google/gemini-2.0-flash-001"
+    assert roles["arbiter"]["model"] == "google/gemini-2.5-flash"
 
 
 def test_build_role_model_config_applies_shared_and_per_role_models():
@@ -167,6 +176,7 @@ def test_default_role_models_are_loaded_from_resource_file():
 
     assert "openrouter" in defaults
     assert "vertexai" in defaults
+    assert "doubleword" in defaults
     assert "spec_writer" in defaults["openrouter"]
 
 

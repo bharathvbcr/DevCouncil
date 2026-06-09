@@ -31,6 +31,9 @@ IGNORED_CHANGE_PATTERNS = (
     ".mypy_cache/*",
     ".ruff_cache/*",
     ".devcouncil/*",
+    # DevCouncil manages the root .gitignore itself (ensure_gitignore runs on
+    # init and before every task), so its drift is not task work.
+    ".gitignore",
 )
 
 MAX_UNTRACKED_DIFF_BYTES = 256_000
@@ -374,6 +377,8 @@ class Verifier:
                     blocking=True,
                 ))
 
+        gaps.extend(self._check_semantic_diff(task))
+
         # 3. Dependency change detection
         dep_changes = self._check_dependency_changes(changed_files)
         for dep_file in dep_changes:
@@ -493,6 +498,59 @@ class Verifier:
             ))
 
         return gaps, evidence_to_save
+
+    def _check_semantic_diff(self, task: Task) -> List[Gap]:
+        gaps: List[Gap] = []
+        semantic_path = self.project_root / ".devcouncil" / "semantic" / task.id
+        after_path = semantic_path / "after.json"
+        if not after_path.exists():
+            return gaps
+        try:
+            from devcouncil.indexing.semantic_index import SemanticIndex
+
+            result = SemanticIndex(self.project_root).diff(task.id)
+        except Exception as e:
+            logger.warning("Semantic diff check failed for %s; skipping semantic gaps: %s", task.id, e)
+            return gaps
+
+        planned_paths = {pf.path for pf in task.planned_files}
+        for item in result.get("classifications", []):
+            change_type = item.get("type", "")
+            path = item.get("path", "")
+            if change_type == "public_api_change" and path not in planned_paths:
+                gaps.append(Gap(
+                    id=self._next_gap_id(task.id, "SEM"),
+                    severity="high",
+                    gap_type="architecture_drift",
+                    task_id=task.id,
+                    description=f"Unplanned public API change detected in {path}.",
+                    evidence=[path],
+                    recommended_fix="Add file to planned_files and document acceptance criteria.",
+                    blocking=not bool(task.acceptance_criterion_ids),
+                ))
+            elif change_type == "import_dependency_change" and path not in planned_paths:
+                gaps.append(Gap(
+                    id=self._next_gap_id(task.id, "IMP"),
+                    severity="medium",
+                    gap_type="dependency_risk",
+                    task_id=task.id,
+                    description=f"Import dependency change in {path}.",
+                    evidence=[path],
+                    recommended_fix="Confirm dependency change is intentional.",
+                    blocking=False,
+                ))
+            elif change_type == "config_schema_dependency_change" and path not in planned_paths:
+                gaps.append(Gap(
+                    id=self._next_gap_id(task.id, "CFG"),
+                    severity="high",
+                    gap_type="dependency_risk",
+                    task_id=task.id,
+                    description=f"Config/schema change detected in {path}.",
+                    evidence=[path],
+                    recommended_fix="Plan the config change or revert it.",
+                    blocking=True,
+                ))
+        return gaps
 
     def _commands_for_task(self, task: Task) -> Dict[str, List[str]]:
         if task.expected_tests:

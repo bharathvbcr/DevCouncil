@@ -81,3 +81,105 @@ class ProjectStateModel(SQLModel, table=True):
     id: str = Field(primary_key=True, default="singleton")
     current_phase: str
     history_json: str = Field(default="[]")
+
+
+class TaskLeaseModel(SQLModel, table=True):
+    __tablename__ = "task_leases"
+    id: str = Field(primary_key=True)
+    task_id: str = Field(index=True)
+    owner: str
+    agent: Optional[str] = None
+    client_id: Optional[str] = None
+    run_id: Optional[str] = None
+    branch: Optional[str] = None
+    lease_token: str
+    status: str = Field(default="active", index=True)
+    created_at: str
+    expires_at: Optional[str] = None
+    released_at: Optional[str] = None
+
+
+class ShellSessionModel(SQLModel, table=True):
+    __tablename__ = "shell_sessions"
+    id: str = Field(primary_key=True)
+    task_id: str = Field(index=True)
+    lease_id: Optional[str] = None
+    shell: str
+    cwd: str
+    status: str
+    started_at: str
+    ended_at: Optional[str] = None
+
+
+class ShellCommandEventModel(SQLModel, table=True):
+    __tablename__ = "shell_command_events"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    task_id: str = Field(index=True)
+    session_id: Optional[str] = None
+    command: str
+    status: str
+    exit_code: Optional[int] = None
+    reason: str = ""
+    stdout_path: str = ""
+    stderr_path: str = ""
+    created_at: str
+
+
+class FileChangeEventModel(SQLModel, table=True):
+    __tablename__ = "file_change_events"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    task_id: Optional[str] = Field(default=None, index=True)
+    lease_id: Optional[str] = None
+    session_id: Optional[str] = None
+    path: str
+    operation: str
+    allowed: bool
+    reason: str = ""
+    created_at: str
+
+
+class SemanticDiffModel(SQLModel, table=True):
+    __tablename__ = "semantic_diffs"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    task_id: str = Field(index=True)
+    before_snapshot_path: str
+    after_snapshot_path: str
+    classifications_json: str = "[]"
+    summary: str = ""
+    created_at: str
+
+
+class AgentHandoffModel(SQLModel, table=True):
+    __tablename__ = "agent_handoffs"
+    id: str = Field(primary_key=True)
+    task_id: str = Field(index=True)
+    from_agent: str
+    to_agent: str
+    run_id: str
+    manifest_path: str
+    status: str
+    created_at: str
+
+
+class CorrectionManifestModel(SQLModel, table=True):
+    __tablename__ = "correction_manifests"
+    id: str = Field(primary_key=True)
+    task_id: str = Field(index=True)
+    run_id: Optional[str] = None
+    manifest_path: str
+    retry_budget: int = 3
+    attempt: int = 0
+    status: str
+    created_at: str
+
+
+class VerificationRunModel(SQLModel, table=True):
+    __tablename__ = "verification_runs"
+    id: str = Field(primary_key=True)
+    task_id: str = Field(index=True)
+    sandbox: str
+    environment_json: str = "{}"
+    commands_json: str = "[]"
+    status: str
+    started_at: str
+    finished_at: Optional[str] = None

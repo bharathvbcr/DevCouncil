@@ -6,6 +6,11 @@ from pathlib import PurePosixPath
 from typing import Any, Optional
 
 from devcouncil.domain.task import Task
+from devcouncil.execution.policy_engine import (
+    PROTECTED_WRITE_PATTERNS,
+    SECRET_PATH_PATTERNS,
+    TaskPolicyEngine,
+)
 
 
 @dataclass(frozen=True)
@@ -23,30 +28,11 @@ class HookPolicy:
     """Policy-backed hook checks for coding CLI tool-use events."""
 
     def __init__(self, project_root: Path | None = None):
-        self.project_root = project_root.resolve() if project_root else None
+        self.project_root = (project_root or Path(".")).resolve()
+        self.policy_engine = TaskPolicyEngine(self.project_root)
 
-    secret_path_patterns = (
-        ".env",
-        ".env.*",
-        "**/.env",
-        "**/.env.*",
-        "**/credentials/**",
-        "**/secrets/**",
-        "**/*.pem",
-        "**/*.key",
-    )
-    protected_path_patterns = (
-        "package.json",
-        "pyproject.toml",
-        "uv.lock",
-        "Dockerfile",
-        "docker-compose.yml",
-        ".github/workflows/*.yml",
-        ".github/workflows/*.yaml",
-        "schema.prisma",
-        "wrangler.toml",
-        "index.html",
-    )
+    secret_path_patterns = SECRET_PATH_PATTERNS
+    protected_path_patterns = PROTECTED_WRITE_PATTERNS
     write_tools = {
         "apply_patch",
         "edit",
@@ -92,43 +78,20 @@ class HookPolicy:
         return HookDecision("allow", "Tool is outside DevCouncil hook policy.")
 
     def evaluate_command(self, command: str) -> HookDecision:
-        normalized = " ".join(command.split())
-        lowered = normalized.lower()
-        if not normalized:
-            return HookDecision("allow", "No command detected.")
-
-        if "--no-verify" in lowered or "--no-gpg-sign" in lowered:
-            return HookDecision("deny", "Verification bypass flags are not allowed.", normalized)
-
-        if re.search(r"\bgit\s+reset\s+--hard\s+(origin/)?(main|master)\b", lowered):
-            return HookDecision("deny", "Protected branch hard resets are not allowed.", normalized)
-
-        if re.search(r"\bgit\s+push\b.*(\s--force(?:-with-lease)?\b|\s-f\b)", lowered):
-            return HookDecision("deny", "Force pushes are not allowed.", normalized)
-
-        if re.search(r"\bgit\s+push\s+\S+\s+((head:)?(main|master)|(main|master):\S+)\b", lowered):
-            return HookDecision("warn", "Direct pushes to protected branches should go through verification gates.", normalized)
-
-        return HookDecision("allow", "Command is allowed.", normalized)
+        if self.policy_engine is None:
+            return HookDecision("allow", "No project root configured.")
+        decision = self.policy_engine.evaluate_hook_command(command)
+        return HookDecision(decision.action, decision.reason, decision.target)
 
     def evaluate_file_write(self, raw_path: Optional[str], active_task: Optional[Task]) -> HookDecision:
         if not raw_path:
             return HookDecision("allow", "No file path detected.")
+        if self.policy_engine is None:
+            return HookDecision("deny", "No project root configured.", raw_path)
 
         path = self._normalize_path(raw_path)
-        if self._matches_any(path, self.secret_path_patterns):
-            return HookDecision("deny", "Secret and credential paths are never writable through hooks.", path)
-
-        if active_task is None:
-            return HookDecision("deny", "No running DevCouncil task authorizes this file write.", path)
-
-        if active_task and not self._is_planned_file(path, active_task):
-            return HookDecision("deny", f"Task {active_task.id} does not authorize changes to {path}.", path)
-
-        if self._matches_any(path, self.protected_path_patterns):
-            return HookDecision("warn", f"{path} is a protected high-impact file; verification gates must approve it.", path)
-
-        return HookDecision("allow", "File write is allowed.", path)
+        decision = self.policy_engine.evaluate_file_change(path, active_task)
+        return HookDecision(decision.action, decision.reason, decision.target)
 
     def _extract_command(self, arguments: dict[str, Any]) -> str:
         value = arguments.get("command") or arguments.get("cmd") or arguments.get("script") or ""

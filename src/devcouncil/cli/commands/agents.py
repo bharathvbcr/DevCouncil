@@ -187,6 +187,42 @@ def _which(command: str) -> str | None:
     return which(command)
 
 
+@app.command("help")
+def agent_help(
+    name: str = typer.Argument(..., help="Agent name, for example codex or opencode."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """Show the underlying CLI agent's own help output."""
+    root = _project_root(project_root)
+    spec = load_cli_agent_specs(root).get(normalize_agent_name(name))
+    if spec is None:
+        console.print(f"[red]Unknown agent '{name}'. Use 'dev agents' to list available agents.[/red]")
+        raise typer.Exit(code=1)
+    command = list(spec.help_command) or [spec.executable, "--help"]
+    executable = _which(command[0])
+    if not executable:
+        console.print(f"[red]{command[0]} is not installed or not on PATH.[/red]")
+        raise typer.Exit(code=1)
+    resolved = [executable, *command[1:]]
+    use_shell = sys.platform == "win32" and Path(executable).suffix.lower() in {".bat", ".cmd", ".ps1"}
+    try:
+        result = subprocess.run(
+            subprocess.list2cmdline(resolved) if use_shell else resolved,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            shell=use_shell,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        console.print(f"[red]Failed to run {' '.join(command)}: {exc}[/red]")
+        raise typer.Exit(code=1)
+    output = (result.stdout or "") + (result.stderr or "")
+    typer.echo(output.strip())
+    raise typer.Exit(code=result.returncode)
+
+
 def _check_help(command: list[str]) -> tuple[bool, str]:
     executable = _which(command[0]) if command else None
     if not command or not executable:

@@ -8,7 +8,16 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 from devcouncil.storage.db import get_db
-from devcouncil.storage.repositories import TaskRepository, ArtifactGraphRepository, StateRepository, RequirementRepository
+from devcouncil.storage.repositories import (
+    TaskRepository,
+    ArtifactGraphRepository,
+    StateRepository,
+    RequirementRepository,
+    EvidenceRepository,
+    GapRepository,
+)
+from devcouncil.storage.native import TaskLeaseRepository, ShellCommandRepository
+from devcouncil.domain.evidence import CommandResult, DiffEvidence, TestEvidence
 from devcouncil.reporting.report_builder import ReportBuilder
 from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
 from devcouncil.execution.hook_policy import HookPolicy
@@ -19,6 +28,7 @@ from devcouncil.indexing.lsp import LspInspector
 from devcouncil.app.project_status import compute_phase
 from devcouncil.live.cards import filter_cards, get_card, load_cards
 from devcouncil.live.repair_prompt import build_bulk_live_repair_prompt, build_live_repair_prompt
+from devcouncil.integrations.check import integration_status_summary
 from devcouncil.live.summary import live_review_summary
 
 app = Server("devcouncil")
@@ -32,6 +42,13 @@ _DB_REQUIRED_TOOLS = {
     "devcouncil_policy_check_write",
     "devcouncil_graph_context",
     "devcouncil_prepare_execution",
+    "devcouncil_checkout_task",
+    "devcouncil_release_task",
+    "devcouncil_update_task_scope",
+    "devcouncil_append_evidence",
+    "devcouncil_record_command",
+    "devcouncil_verify_task",
+    "devcouncil_handoff_agent",
 }
 _CLI_ALLOWED_ROOTS = {"status", "tasks", "report", "map", "prompt", "show", "trace", "lsp", "ast", "verify"}
 _CLI_FORBIDDEN_FLAGS = {"--project-root", "--github", "--github-pr-comment", "--gitlab-pr-comment"}
@@ -83,6 +100,15 @@ def _optional_string_argument(arguments: dict, name: str) -> str | None:
     if value is None:
         return None
     return value if isinstance(value, str) else ""
+
+
+def _optional_string_list_argument(arguments: dict, name: str) -> tuple[list[str], list[TextContent] | None]:
+    value = arguments.get(name)
+    if value is None:
+        return [], None
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return [], _error_text(f"{name} must be a string array", code="invalid_arguments", argument=name)
+    return value, None
 
 
 def _required_string_argument(arguments: dict, name: str) -> tuple[str | None, list[TextContent] | None]:
@@ -147,6 +173,11 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {}
             }
+        ),
+        Tool(
+            name="devcouncil_integration_status",
+            description="Get read-only coding CLI integration status, capability rows, detected clients, and recommended executor.",
+            inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
             name="devcouncil_report",
@@ -339,6 +370,105 @@ async def list_tools() -> list[Tool]:
                 "required": ["task_id"],
             },
         ),
+        Tool(
+            name="devcouncil_checkout_task",
+            description="Acquire a task lease and return scope for MCP write tools.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "client_id": {"type": "string"},
+                    "agent": {"type": "string"},
+                    "force": {"type": "boolean", "default": False},
+                },
+                "required": ["task_id", "client_id"],
+            },
+        ),
+        Tool(
+            name="devcouncil_release_task",
+            description="Release a task lease using its token.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "lease_token": {"type": "string"},
+                },
+                "required": ["task_id", "lease_token"],
+            },
+        ),
+        Tool(
+            name="devcouncil_update_task_scope",
+            description="Append unique expected tests or allowed commands for a leased task.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "lease_token": {"type": "string"},
+                    "expected_tests": {"type": "array", "items": {"type": "string"}},
+                    "allowed_commands": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["task_id", "lease_token"],
+            },
+        ),
+        Tool(
+            name="devcouncil_append_evidence",
+            description="Append command evidence for a leased task.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "lease_token": {"type": "string"},
+                    "command": {"type": "string"},
+                    "exit_code": {"type": "integer"},
+                    "summary": {"type": "string"},
+                },
+                "required": ["task_id", "lease_token", "command", "exit_code", "summary"],
+            },
+        ),
+        Tool(
+            name="devcouncil_record_command",
+            description="Record a shell command event for a leased task.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "lease_token": {"type": "string"},
+                    "command": {"type": "string"},
+                    "status": {"type": "string"},
+                    "exit_code": {"type": "integer"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["task_id", "lease_token", "command", "status"],
+            },
+        ),
+        Tool(
+            name="devcouncil_verify_task",
+            description="Run verification for a leased task (local sandbox).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "lease_token": {"type": "string"},
+                    "sandbox": {"type": "string", "enum": ["local", "docker", "nix"], "default": "local"},
+                },
+                "required": ["task_id", "lease_token"],
+            },
+        ),
+        Tool(
+            name="devcouncil_handoff_agent",
+            description="Hand off a task between coding CLI agents.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "lease_token": {"type": "string"},
+                    "from_agent": {"type": "string"},
+                    "to_agent": {"type": "string"},
+                    "instruction": {"type": "string"},
+                },
+                "required": ["task_id", "lease_token", "from_agent", "to_agent"],
+            },
+        ),
     ]
 
 @app.call_tool()
@@ -348,6 +478,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     db = get_db(root)
     if name in _DB_REQUIRED_TOOLS and not db:
         return _error_text("DevCouncil not initialized in this directory.", code="not_initialized")
+
+    if name == "devcouncil_integration_status":
+        return _json_text(integration_status_summary(root))
 
     if name == "devcouncil_status":
         assert db is not None
@@ -592,6 +725,260 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "allowed_commands": task.allowed_commands,
                 "expected_tests": task.expected_tests,
             }, indent=2))]
+
+    elif name == "devcouncil_checkout_task":
+        assert db is not None
+        task_id, arg_error = _required_string_argument(arguments, "task_id")
+        if arg_error:
+            return arg_error
+        client_id, arg_error = _required_string_argument(arguments, "client_id")
+        if arg_error:
+            return arg_error
+        assert task_id is not None and client_id is not None
+        agent = _optional_string_argument(arguments, "agent")
+        if agent == "":
+            return _error_text("agent must be a string", code="invalid_arguments", argument="agent")
+        force_value = arguments.get("force", False)
+        if not isinstance(force_value, bool):
+            return _error_text("force must be a boolean", code="invalid_arguments", argument="force")
+        force = force_value
+        with db.get_session() as session:
+            task_repo = TaskRepository(session)
+            task = task_repo.get_by_id(task_id)
+            if not task:
+                return _error_text(f"Task {task_id} not found.", code="not_found", task_id=task_id)
+            lease_repo = TaskLeaseRepository(session)
+            try:
+                lease = lease_repo.acquire(
+                    task_id,
+                    owner=f"mcp:{client_id}",
+                    agent=agent,
+                    client_id=client_id,
+                    force=force,
+                )
+            except ValueError as exc:
+                return _error_text(str(exc), code="lease_conflict", task_id=task_id)
+            prompt = PromptBuilder(root).build_task_prompt(task, RequirementRepository(session).get_all())
+            semantic = None
+            semantic_path = root / ".devcouncil" / "semantic" / task_id / "before.json"
+            if semantic_path.exists():
+                semantic = json.loads(semantic_path.read_text(encoding="utf-8"))
+            return _json_text({
+                "ok": True,
+                "lease_token": lease.lease_token,
+                "task_id": task.id,
+                "status": task.status,
+                "prompt": prompt,
+                "planned_files": [f.model_dump() for f in task.planned_files],
+                "allowed_commands": task.allowed_commands,
+                "expected_tests": task.expected_tests,
+                "semantic_context": semantic,
+            })
+
+    elif name == "devcouncil_release_task":
+        assert db is not None
+        task_id, arg_error = _required_string_argument(arguments, "task_id")
+        if arg_error:
+            return arg_error
+        lease_token, arg_error = _required_string_argument(arguments, "lease_token")
+        if arg_error:
+            return arg_error
+        assert task_id is not None and lease_token is not None
+        with db.get_session() as session:
+            released = TaskLeaseRepository(session).release(task_id, lease_token)
+            if not released:
+                return _error_text("Invalid lease token.", code="invalid_lease", task_id=task_id)
+            return _json_text({"ok": True, "task_id": task_id, "released": True})
+
+    elif name == "devcouncil_update_task_scope":
+        assert db is not None
+        task_id, arg_error = _required_string_argument(arguments, "task_id")
+        if arg_error:
+            return arg_error
+        lease_token, arg_error = _required_string_argument(arguments, "lease_token")
+        if arg_error:
+            return arg_error
+        assert task_id is not None and lease_token is not None
+        expected_tests, arg_error = _optional_string_list_argument(arguments, "expected_tests")
+        if arg_error:
+            return arg_error
+        allowed_commands, arg_error = _optional_string_list_argument(arguments, "allowed_commands")
+        if arg_error:
+            return arg_error
+        with db.get_session() as session:
+            lease_repo = TaskLeaseRepository(session)
+            if not lease_repo.validate(task_id, lease_token):
+                return _error_text("Invalid lease token.", code="invalid_lease", task_id=task_id)
+            task_repo = TaskRepository(session)
+            task = task_repo.get_by_id(task_id)
+            if not task:
+                return _error_text(f"Task {task_id} not found.", code="not_found", task_id=task_id)
+            for cmd in allowed_commands:
+                if cmd not in task.allowed_commands:
+                    task.allowed_commands.append(cmd)
+            for test in expected_tests:
+                if test not in task.expected_tests:
+                    task.expected_tests.append(test)
+            task_repo.save(task)
+            return _json_text({
+                "ok": True,
+                "task_id": task_id,
+                "allowed_commands": task.allowed_commands,
+                "expected_tests": task.expected_tests,
+            })
+
+    elif name == "devcouncil_append_evidence":
+        assert db is not None
+        task_id, arg_error = _required_string_argument(arguments, "task_id")
+        if arg_error:
+            return arg_error
+        lease_token, arg_error = _required_string_argument(arguments, "lease_token")
+        if arg_error:
+            return arg_error
+        command, arg_error = _required_string_argument(arguments, "command")
+        if arg_error:
+            return arg_error
+        summary_text, arg_error = _required_string_argument(arguments, "summary")
+        if arg_error:
+            return arg_error
+        assert task_id is not None and lease_token is not None
+        exit_code = arguments.get("exit_code", 0)
+        if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+            return _error_text("exit_code must be an integer", code="invalid_arguments")
+        with db.get_session() as session:
+            if not TaskLeaseRepository(session).validate(task_id, lease_token):
+                return _error_text("Invalid lease token.", code="invalid_lease", task_id=task_id)
+            EvidenceRepository(session).save_command_result(
+                task_id,
+                CommandResult(
+                    command=command or "",
+                    exit_code=exit_code,
+                    stdout_path="",
+                    stderr_path="",
+                    summary=summary_text or "",
+                ),
+            )
+            return _json_text({"ok": True, "task_id": task_id, "recorded": True})
+
+    elif name == "devcouncil_record_command":
+        assert db is not None
+        task_id, arg_error = _required_string_argument(arguments, "task_id")
+        if arg_error:
+            return arg_error
+        lease_token, arg_error = _required_string_argument(arguments, "lease_token")
+        if arg_error:
+            return arg_error
+        command, arg_error = _required_string_argument(arguments, "command")
+        if arg_error:
+            return arg_error
+        status, arg_error = _required_string_argument(arguments, "status")
+        if arg_error:
+            return arg_error
+        assert task_id is not None and lease_token is not None
+        with db.get_session() as session:
+            if not TaskLeaseRepository(session).validate(task_id, lease_token):
+                return _error_text("Invalid lease token.", code="invalid_lease", task_id=task_id)
+            exit_code = arguments.get("exit_code")
+            if exit_code is not None and (not isinstance(exit_code, int) or isinstance(exit_code, bool)):
+                return _error_text("exit_code must be an integer", code="invalid_arguments")
+            ShellCommandRepository(session).record(
+                task_id,
+                command or "",
+                status or "finished",
+                exit_code=exit_code if isinstance(exit_code, int) else None,
+                reason=str(arguments.get("reason") or ""),
+            )
+            return _json_text({"ok": True, "task_id": task_id, "recorded": True})
+
+    elif name == "devcouncil_verify_task":
+        assert db is not None
+        task_id, arg_error = _required_string_argument(arguments, "task_id")
+        if arg_error:
+            return arg_error
+        lease_token, arg_error = _required_string_argument(arguments, "lease_token")
+        if arg_error:
+            return arg_error
+        assert task_id is not None and lease_token is not None
+        sandbox = _optional_string_argument(arguments, "sandbox") or "local"
+        if sandbox in {"docker", "nix"}:
+            return _json_text({
+                "ok": False,
+                "code": "unsupported_sandbox",
+                "reason": f"Sandbox {sandbox} is not available in this build.",
+                "sandbox": sandbox,
+            })
+        with db.get_session() as session:
+            if not TaskLeaseRepository(session).validate(task_id, lease_token):
+                return _error_text("Invalid lease token.", code="invalid_lease", task_id=task_id)
+            task_repo = TaskRepository(session)
+            task = task_repo.get_by_id(task_id)
+            if not task:
+                return _error_text(f"Task {task_id} not found.", code="not_found", task_id=task_id)
+            from devcouncil.verification.verifier import Verifier
+
+            GapRepository(session).delete_for_task(task_id)
+            EvidenceRepository(session).delete_for_task(task_id)
+            evidence_gaps, evidence = await Verifier(root).verify_task(
+                task, RequirementRepository(session).get_all()
+            )
+            gaps = evidence_gaps
+            for gap in gaps:
+                GapRepository(session).save(gap)
+            for ev in evidence:
+                if isinstance(ev, CommandResult):
+                    EvidenceRepository(session).save_command_result(task_id, ev)
+                elif isinstance(ev, DiffEvidence):
+                    EvidenceRepository(session).save_diff_evidence(ev)
+                elif isinstance(ev, TestEvidence):
+                    EvidenceRepository(session).save_test_evidence(ev, task_id)
+            task.status = "blocked" if any(g.blocking for g in gaps) else "verified"
+            task_repo.save(task)
+            blocking = [g.model_dump() for g in gaps if g.blocking]
+            return _json_text({
+                "ok": True,
+                "task_id": task_id,
+                "status": task.status,
+                "sandbox": sandbox,
+                "blocking_gaps": blocking,
+                "passed": len(blocking) == 0,
+            })
+
+    elif name == "devcouncil_handoff_agent":
+        assert db is not None
+        task_id, arg_error = _required_string_argument(arguments, "task_id")
+        if arg_error:
+            return arg_error
+        lease_token, arg_error = _required_string_argument(arguments, "lease_token")
+        if arg_error:
+            return arg_error
+        from_agent, arg_error = _required_string_argument(arguments, "from_agent")
+        if arg_error:
+            return arg_error
+        to_agent, arg_error = _required_string_argument(arguments, "to_agent")
+        if arg_error:
+            return arg_error
+        assert task_id is not None and lease_token is not None
+        with db.get_session() as session:
+            if not TaskLeaseRepository(session).validate(task_id, lease_token):
+                return _error_text("Invalid lease token.", code="invalid_lease", task_id=task_id)
+        try:
+            from devcouncil.execution.handoff import HandoffService
+
+            manifest, handoff_path, run_id = HandoffService(root).create(
+                task_id,
+                from_agent or "",
+                to_agent or "",
+                instruction=str(arguments.get("instruction") or ""),
+            )
+            return _json_text({
+                "ok": True,
+                "task_id": task_id,
+                "manifest_path": str(handoff_path),
+                "run_id": run_id,
+                "manifest": manifest.model_dump(),
+            })
+        except ValueError as exc:
+            return _error_text(str(exc), code="handoff_failed", task_id=task_id)
 
     return _error_text(f"Unknown tool: {name}", code="unknown_tool", tool=name)
 

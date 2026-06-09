@@ -360,6 +360,71 @@ def test_coding_cli_executor_cursor_resume_uses_create_chat(tmp_path, monkeypatc
     assert session["chat_id"] == "chat-abc123"
 
 
+def test_coding_cli_executor_stream_mode_writes_transcript(tmp_path, monkeypatch):
+    captured = {}
+
+    class FakeStdout:
+        def __init__(self, lines):
+            self._lines = list(lines)
+            self._index = 0
+
+        def readline(self):
+            if self._index >= len(self._lines):
+                return ""
+            line = self._lines[self._index]
+            self._index += 1
+            return line
+
+        def close(self):
+            return None
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdin = None
+            self.stdout = FakeStdout(["line one\n"])
+            self.returncode = 0
+
+        def poll(self):
+            return 0 if self.stdout._index >= len(self.stdout._lines) else None
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            return None
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProcess()
+
+    def fake_which(_command):
+        return f"/usr/bin/{_command}"
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    task = Task(
+        id="TASK-001",
+        title="Codex",
+        description="Implement feature",
+        planned_files=[
+            PlannedFile(path="src/app.py", reason="logic", allowed_change="modify"),
+        ],
+    )
+
+    result = CodingCliExecutor(tmp_path, "codex", stream_output=True).run_task(task, [])
+
+    assert result.success
+    run_dirs = list((tmp_path / ".devcouncil" / "runs").iterdir())
+    assert run_dirs
+    transcript = run_dirs[0] / "transcript.txt"
+    assert transcript.exists()
+    assert "line one" in transcript.read_text(encoding="utf-8")
+    manifest = json.loads((run_dirs[0] / "agent-run.json").read_text(encoding="utf-8"))
+    assert manifest.get("stream") is True
+    assert manifest.get("transcript")
+
+
 def test_coding_cli_executor_stream_mode_uses_live_output(tmp_path, monkeypatch):
     captured = {}
 
@@ -386,6 +451,9 @@ def test_coding_cli_executor_stream_mode_uses_live_output(tmp_path, monkeypatch)
 
         def poll(self):
             return 0 if self.stdout._index >= len(self.stdout._lines) else None
+
+        def wait(self, timeout=None):
+            return self.returncode
 
         def kill(self):
             return None
@@ -553,6 +621,63 @@ def test_agent_registry_does_not_let_custom_agents_shadow_builtins(tmp_path):
     assert specs["antigravity"].command == "agy"
     assert "oz" not in specs
     assert "agy" not in specs
+
+
+def test_coding_cli_executor_manifest_records_completion_metadata(tmp_path, monkeypatch):
+    def fake_which(_command):
+        return f"/usr/bin/{_command}"
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args[0], 0, stdout="done\nsecret=redacted\n", stderr="")
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    task = Task(
+        id="TASK-001",
+        title="Codex",
+        description="Implement feature",
+        planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
+    )
+
+    result = CodingCliExecutor(tmp_path, "codex").run_task(task, [])
+
+    assert result.success
+    run_dirs = list((tmp_path / ".devcouncil" / "runs").iterdir())
+    manifest = json.loads((run_dirs[0] / "agent-run.json").read_text(encoding="utf-8"))
+    assert manifest["artifact_version"] == 1
+    assert manifest["status"] == "finished"
+    assert manifest["returncode"] == 0
+    assert manifest["duration_seconds"] is not None
+    assert manifest["stdout_preview"]
+
+
+def test_coding_cli_executor_manifest_records_unexpected_exception(tmp_path, monkeypatch):
+    def fake_which(_command):
+        return f"/usr/bin/{_command}"
+
+    def fake_run(*args, **kwargs):
+        raise OSError("process launch failed")
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    task = Task(
+        id="TASK-001",
+        title="Codex",
+        description="Implement feature",
+        planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
+    )
+
+    result = CodingCliExecutor(tmp_path, "codex").run_task(task, [])
+
+    assert not result.success
+    run_dirs = list((tmp_path / ".devcouncil" / "runs").iterdir())
+    manifest = json.loads((run_dirs[0] / "agent-run.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+    assert manifest["returncode"] is None
+    assert manifest["duration_seconds"] is not None
+    assert manifest["stderr_preview"] == ["process launch failed"]
 
 
 def test_coding_cli_executor_writes_manifest_and_trace_events(tmp_path, monkeypatch):

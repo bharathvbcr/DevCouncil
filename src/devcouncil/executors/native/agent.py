@@ -37,11 +37,18 @@ class NativeAgent(Executor):
         
         # 1. Gather rich context
         context_json = self.context_builder.build_task_context(task, requirements)
-        
+        from devcouncil.planning.correction_manifest import load_latest_correction_manifest
+
+        correction = load_latest_correction_manifest(self.task_runner.project_root, task.id)
+        correction_block = ""
+        if correction is not None:
+            correction_block = f"\nCorrection Manifest:\n{correction.model_dump_json(indent=2)}\n"
+
         system_prompt = f"""
 You are the DevCouncil Native Agent. Your goal is to implement the provided task.
 Current Project Context:
 {context_json}
+{correction_block}
 
 You have access to the following tools:
 - read_file(path: str)

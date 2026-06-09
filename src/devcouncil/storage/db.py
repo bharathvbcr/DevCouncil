@@ -8,7 +8,8 @@ from typing import Optional
 from devcouncil.storage.models import SchemaVersionModel
 
 
-SCHEMA_VERSION = 1
+# v3: per-task indexes on the task/audit tables (task_id, lease status).
+SCHEMA_VERSION = 3
 
 
 class Database:
@@ -28,11 +29,17 @@ class Database:
                 session.add(SchemaVersionModel(id="singleton", version=SCHEMA_VERSION))
                 session.commit()
                 return
-            if current.version != SCHEMA_VERSION:
+            if current.version > SCHEMA_VERSION:
                 raise RuntimeError(
                     f"Unsupported DevCouncil schema version {current.version}; "
                     f"expected {SCHEMA_VERSION}."
                 )
+            if current.version < SCHEMA_VERSION:
+                self._create_tables()
+                current.version = SCHEMA_VERSION
+                session.add(current)
+                session.commit()
+                return
 
     def _create_tables(self):
         try:
@@ -40,6 +47,18 @@ class Database:
         except OperationalError as exc:
             if "already exists" not in str(exc):
                 raise
+        self._create_missing_indexes()
+
+    def _create_missing_indexes(self):
+        # create_all skips tables that already exist, so indexes added to the
+        # model definitions later never materialize on existing databases.
+        for table in SQLModel.metadata.sorted_tables:
+            for index in table.indexes:
+                try:
+                    index.create(self.engine, checkfirst=True)
+                except OperationalError as exc:
+                    if "already exists" not in str(exc):
+                        raise
 
     @contextmanager
     def get_session(self):

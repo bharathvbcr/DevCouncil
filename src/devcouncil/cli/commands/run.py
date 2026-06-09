@@ -1,5 +1,4 @@
 import typer
-import json
 from rich.console import Console
 from pathlib import Path
 from devcouncil.storage.db import get_db
@@ -41,28 +40,16 @@ def _current_changed_files(project_root: Path = Path(".")) -> list[str]:
 def _capture_after_patch(task_id: str, project_root: Path = Path(".")):
     """Capture the diff after task execution for use by rollback."""
     try:
-        from devcouncil.verification.verifier import Verifier
+        from devcouncil.execution.checkpoints import CheckpointService
 
-        checkpoint_dir = project_root / ".devcouncil" / "checkpoints"
-        checkpoint_dir.mkdir(exist_ok=True)
-        diff = Verifier(project_root).get_diff()
-        if diff:
-            with open(checkpoint_dir / f"{task_id}-after.patch", "w", encoding="utf-8") as f:
-                f.write(diff)
+        CheckpointService(project_root).create_after(task_id)
     except Exception:
         pass  # Non-critical — don't block execution
 
 def _capture_before_snapshot(task_id: str, project_root: Path = Path(".")):
-    checkpoint_dir = project_root / ".devcouncil" / "checkpoints"
-    checkpoint_dir.mkdir(exist_ok=True)
-    snapshot = {
-        "task_id": task_id,
-        "changed_files": _current_changed_files(project_root),
-    }
-    (checkpoint_dir / f"{task_id}-before.json").write_text(
-        json.dumps(snapshot, indent=2),
-        encoding="utf-8",
-    )
+    from devcouncil.execution.checkpoints import CheckpointService
+
+    CheckpointService(project_root).create_before(task_id)
 
 def _record_project_phase(session, phase: ProjectPhase):
     StateRepository(session).record_phase(phase.value)
@@ -111,7 +98,8 @@ def run(
         "-e",
         help=(
             "Executor to use (manual, mini, openhands, native-preview, "
-            "codex, gemini, claude, opencode, antigravity, warp, cursor, aider, or a configured agent)"
+            "codex, gemini, claude, opencode, antigravity, warp, cursor, aider, "
+            "copilot, goose, amp, qwen, crush, or a configured agent)"
         ),
     ),
     profile: str | None = typer.Option(None, "--profile", help="CLI-agent execution profile: default, yolo, prod, or a configured profile."),
@@ -153,20 +141,23 @@ def run(
 
         # 1. Create Git checkpoint
         try:
-            from devcouncil.verification.verifier import Verifier
+            from devcouncil.execution.checkpoints import CheckpointService
 
-            checkpoint_dir = root / ".devcouncil" / "checkpoints"
-            checkpoint_dir.mkdir(exist_ok=True)
-            _capture_before_snapshot(task_id, root)
-            diff = Verifier(root).get_diff()
-            if diff:
-                with open(checkpoint_dir / f"{task_id}-before.patch", "w", encoding="utf-8") as f:
-                    f.write(diff)
-                console.print(f"Created git checkpoint at {checkpoint_dir}/{task_id}-before.patch")
+            result = CheckpointService(root).create_before(task_id)
+            if result.patch_path:
+                console.print(f"Created git checkpoint at {result.patch_path}")
+            elif result.git_ref_created:
+                console.print(f"Created git checkpoint ref {result.ref}")
         except Exception as e:
             console.print(f"[yellow]Warning: Failed to create git checkpoint: {e}[/yellow]")
 
         executor = executor.strip().lower().replace("_", "-")
+        if executor not in CODING_EXECUTORS and executor not in _custom_cli_agents(root):
+            ignored = [flag for flag, value in (("--profile", profile), ("--stream", stream)) if value]
+            if ignored:
+                console.print(
+                    f"[yellow]{' and '.join(ignored)} only apply to coding CLI executors and are ignored for '{executor}'.[/yellow]"
+                )
         if executor == "manual":
             _record_project_phase(session, ProjectPhase.TASK_EXECUTING)
             task.status = "running"
@@ -191,6 +182,13 @@ def run(
                     ProjectPhase.TASK_VERIFIED if verified else ProjectPhase.TASK_BLOCKED,
                 )
                 task_repo.save(task)
+                run_id = getattr(cli_executor, "last_run_id", None)
+                if run_id:
+                    run_dir = root / ".devcouncil" / "runs" / run_id
+                    console.print(f"Run artifacts: [dim]{run_dir}[/dim]")
+                    transcript_path = getattr(cli_executor, "last_transcript_path", None)
+                    if transcript_path:
+                        console.print(f"Transcript: [dim]{transcript_path}[/dim]")
                 if verified:
                     console.print(f"\n[green]{executor.upper()} finished and task {task_id} verified.[/green]")
                 else:

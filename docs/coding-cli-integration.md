@@ -16,6 +16,11 @@ For the official tier definitions (headless executor vs MCP-only vs sidecar), se
 | **Warp / Oz** | Supported | Supported via `oz agent run` | Supported via Warp/Oz MCP JSON | Verification-gated sidecar |
 | **Cursor** | Supported | Supported via `cursor-agent --print --trust` | Supported via project `.cursor/mcp.json` | Native via `dev integrate hooks` (`.cursor/hooks.json`) |
 | **Aider** | Supported | Supported via `aider --yes --message` | Not a primary path | Verification-gated sidecar |
+| **GitHub Copilot CLI** | Supported | Supported via `copilot --allow-all-tools -p` | Tool-managed MCP config | Verification-gated sidecar |
+| **Goose** | Supported | Supported via `goose run -i <prompt-file>` | Tool-managed extensions | Verification-gated sidecar |
+| **Amp (Sourcegraph)** | Supported | Supported via `amp -x` | Tool-managed MCP config | Verification-gated sidecar |
+| **Qwen Code** | Supported | Supported via stdin (Gemini-CLI compatible) | Tool-managed MCP config | Verification-gated sidecar |
+| **Crush (Charm)** | Supported | Supported via `crush run` | Tool-managed MCP config | Verification-gated sidecar |
 | **Bring your own CLI** | Supported | Supported through configurable stdin, argument, or prompt-file handoff | Tool-dependent | Verification-gated sidecar |
 
 ## Fast Integration Setup
@@ -50,9 +55,31 @@ Verify that DevCouncil is ready to expose MCP tools:
 
 ```bash
 dev integrate check
+dev integrate check --strict   # Fail when optional CLIs are missing (CI)
+dev integrate check --json     # Machine-readable report (ok, recommended_executor, checks)
+dev integrate check --report-file report.json  # Write the same JSON report to a file
+dev integrate check -o report.json             # Alias for --report-file / --output
+dev integrate status           # Fast PATH + config snapshot (no MCP probe)
+dev integrate status --json
+dev integrate recommend        # Best executor for this machine
+dev integrate matrix           # Built-in tier/capability table
+dev integrate all --apply --strict  # Apply all integrations, then strict check
 ```
 
 `dev integrations` is an alias for `dev integrate`.
+
+## Dashboard integration controls
+
+`dev dashboard --open` serves a local dashboard with integration diagnostics and guarded apply/fix controls.
+
+The dashboard can:
+
+- run the same readiness check as `dev integrate check --json`
+- apply project-local MCP files for Cursor, OpenCode, Antigravity, and Warp/Oz
+- install supported hook files for Codex, Gemini, Claude, Cursor, and OpenCode
+- re-run status after every action
+
+Dashboard mutations are local-only. The server accepts apply requests only from loopback clients and requires a per-server token embedded in the served page. The API accepts only known integration targets, not arbitrary shell commands.
 
 Set up one first-party integration at a time, or install native hooks separately:
 
@@ -473,6 +500,20 @@ dev verify TASK-001
 
 Aider does not have a first-party DevCouncil MCP integration path.
 
+## GitHub Copilot CLI, Goose, Amp, Qwen Code, and Crush
+
+These coding agents are built-in headless executors. No `dev integrate` step is required — install the CLI and run:
+
+```bash
+dev run TASK-001 --executor copilot   # copilot --allow-all-tools -p <task prompt>
+dev run TASK-001 --executor goose     # goose run -i <prompt file>
+dev run TASK-001 --executor amp       # amp -x <task prompt>
+dev run TASK-001 --executor qwen      # task prompt over stdin (Gemini CLI-compatible)
+dev run TASK-001 --executor crush     # crush run <task prompt>
+```
+
+DevCouncil captures the post-run diff and verifies the task automatically, the same as other Tier 1 executors. `dev doctor` and `dev integrate check` report whether each CLI is installed. Register the DevCouncil MCP server through each tool's own MCP configuration if you want DevCouncil tools available inside the agent session.
+
 ## Automated Executors
 
 Manual sidecar mode is the recommended default because it works with any coding CLI and keeps the human in control of the agent session.
@@ -487,7 +528,7 @@ dev run TASK-001 --executor native-preview
 
 Use these only when the target executor is installed and configured locally. Automated executor mode lets DevCouncil launch the implementation loop itself, capture the post-run diff, and verify the task automatically.
 
-The live executor adapter values are `manual`, `mini`, `openhands`, `native-preview`, `native`, `codex`, `gemini`, `claude`, `opencode`, `antigravity`, `warp`, `cursor`, `aider`, and configured custom CLI names.
-`codex-cli`, `gemini-cli`, `claude-code`, `claude-cli`, `opencode-cli`, `open-code`, `antigravity-cli`, `google-antigravity`, `agy`, `agy-cli`, `warp-cli`, `oz`, `oz-cli`, `cursor-agent`, and `cursor-cli` are accepted aliases for their canonical names.
+The live executor adapter values are `manual`, `mini`, `openhands`, `native-preview`, `native`, `codex`, `gemini`, `claude`, `opencode`, `antigravity`, `warp`, `cursor`, `aider`, `copilot`, `goose`, `amp`, `qwen`, `crush`, and configured custom CLI names.
+`codex-cli`, `gemini-cli`, `claude-code`, `claude-cli`, `opencode-cli`, `open-code`, `antigravity-cli`, `google-antigravity`, `agy`, `agy-cli`, `warp-cli`, `oz`, `oz-cli`, `cursor-agent`, `cursor-cli`, `copilot-cli`, `github-copilot`, `gh-copilot`, `goose-cli`, `block-goose`, `amp-cli`, `sourcegraph-amp`, `qwen-code`, `qwen-cli`, `crush-cli`, and `charm-crush` are accepted aliases for their canonical names.
 
 Direct `dev run --executor <coding-client>` execution now runs the selected coding CLI and automatically runs verification after the tool returns.

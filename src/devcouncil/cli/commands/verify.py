@@ -22,6 +22,7 @@ MAX_RENDERED_GAPS = 20
 
 def verify(
     task_id: Optional[str] = typer.Argument(None, help="Optional ID of the task to verify"),
+    sandbox: str = typer.Option("local", "--sandbox", help="Verification sandbox: local, docker, or nix."),
     json_format: bool = typer.Option(False, "--json", help="Output machine-readable JSON."),
     project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
 ):
@@ -68,12 +69,59 @@ def verify(
         except Exception:
             pass
 
+        from devcouncil.verification.sandbox import get_sandbox
+
         verifier = Verifier(root, router=router)
         total_gaps = 0
         blocked_tasks = 0
         task_results = []
 
         for task in tasks:
+            if sandbox != "local":
+                commands = task.expected_tests or task.allowed_commands
+                sandbox_result = get_sandbox(sandbox, root).run(task, commands, reqs)
+                if sandbox_result.status == "unsupported":
+                    message = f"Sandbox {sandbox} is unavailable."
+                    if json_format:
+                        typer.echo(json.dumps({"ok": False, "error": message, "sandbox": sandbox}, indent=2))
+                    else:
+                        console.print(f"[red]{message}[/red]")
+                    return
+                if sandbox_result.status == "failed":
+                    task.status = "blocked"
+                    blocked_tasks += 1
+                    task_repo.save(task)
+                    task_results.append({
+                        "task_id": task.id,
+                        "status": task.status,
+                        "sandbox": sandbox,
+                        "gap_count": 1,
+                        "blocking_gap_count": 1,
+                        "gaps": [],
+                    })
+                    if json_format:
+                        typer.echo(json.dumps({
+                            "ok": False,
+                            "task_id": task.id,
+                            "sandbox": sandbox,
+                            "commands": sandbox_result.commands,
+                        }, indent=2))
+                    else:
+                        console.print(f"[red]{task.id} failed in {sandbox} sandbox.[/red]")
+                    continue
+                task.status = "verified"
+                task_repo.save(task)
+                task_results.append({
+                    "task_id": task.id,
+                    "status": task.status,
+                    "sandbox": sandbox,
+                    "gap_count": 0,
+                    "blocking_gap_count": 0,
+                    "gaps": [],
+                })
+                if not json_format:
+                    console.print(f"[green]{task.id} passed in {sandbox} sandbox.[/green]")
+                continue
             TraceLogger(root).log_event(
                 "task_verification_started",
                 {"task_id": task.id},

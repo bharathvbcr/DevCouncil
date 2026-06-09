@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 import yaml
 
-SUPPORTED_MODEL_PROVIDERS = ("openrouter", "vertexai")
+SUPPORTED_MODEL_PROVIDERS = ("openrouter", "vertexai", "doubleword")
 PROVIDER_ALIASES = {
     "vertex-ai": "vertexai",
     "vertex_ai": "vertexai",
@@ -116,6 +116,8 @@ def create_provider(provider_name: str, api_key: str, project_root: Path = Path(
     normalized = validate_model_provider(provider_name)
     if normalized == "openrouter":
         return OpenRouterProvider(api_key)
+    if normalized == "doubleword":
+        return DoublewordProvider(api_key)
     if normalized == "vertexai":
         from devcouncil.app.config import load_local_secrets
         local_secrets = load_local_secrets(project_root)
@@ -201,6 +203,54 @@ class OpenRouterProvider(Provider):
             
             _log_model_call(payload, data, resp.usage)
                 
+            return resp
+
+
+class DoublewordProvider(Provider):
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://api.doubleword.ai/v1"
+
+    async def complete(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.0,
+        json_mode: bool = False
+    ) -> LLMResponse:
+        msgs = copy.deepcopy(messages)
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model,
+            "messages": msgs,
+            "temperature": temperature,
+        }
+
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+            if msgs[-1]["role"] == "user":
+                msgs[-1]["content"] += "\n\nOutput must be a valid JSON object."
+
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            response = await client.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=payload
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            resp = LLMResponse(
+                content=data["choices"][0]["message"]["content"],
+                model=data["model"],
+                usage=data.get("usage", {}),
+                raw_response=data
+            )
+
+            _log_model_call(payload, data, resp.usage)
             return resp
 
 

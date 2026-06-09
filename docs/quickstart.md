@@ -80,13 +80,21 @@ To set the provider at the same time:
 dev setup --provider openrouter --api-key YOUR_KEY
 ```
 
+For Doubleword usage with its drop-in OpenAI-compatible API:
+
+```bash
+dev setup --provider doubleword --api-key YOUR_KEY
+```
+
 To choose models during initialization, pass one model for every role, then add per-role overrides only where needed:
 
 ```bash
 dev setup --provider vertexai --model YOUR_DEFAULT_MODEL --role-model critic_a=YOUR_CRITIC_MODEL
 ```
 
-Current model-backed DevCouncil commands support the `openrouter` and `vertexai` providers. Vertex AI uses a Google Cloud access token plus project configuration:
+Current model-backed DevCouncil commands support the `openrouter`, `vertexai`, and `doubleword` providers.
+
+Vertex AI uses a Google Cloud access token plus project configuration:
 
 ```bash
 export VERTEXAI_PROJECT=your-gcp-project
