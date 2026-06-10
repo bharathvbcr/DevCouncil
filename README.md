@@ -1,7 +1,7 @@
 # DevCouncil: The Gated AI Orchestrator
 
 <p align="center">
-  <img src="src/devcouncil/assets/devcouncil_logo_premium.png" alt="DevCouncil Logo" width="300">
+  <img src="https://raw.githubusercontent.com/bharathvbcr/DevCouncil/main/src/devcouncil/assets/devcouncil_logo_premium.png" alt="DevCouncil Logo" width="300">
 </p>
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)

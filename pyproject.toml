@@ -17,6 +17,11 @@ dependencies = [
     "watchdog>=4.0.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/bharathvbcr/DevCouncil"
+Repository = "https://github.com/bharathvbcr/DevCouncil.git"
+Issues = "https://github.com/bharathvbcr/DevCouncil/issues"
+
 [project.scripts]
 dev = "devcouncil.cli.main:app"
 devcouncil = "devcouncil.cli.main:app"
