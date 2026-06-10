@@ -69,6 +69,10 @@ venv.bak/
 !.devcouncil/config.yaml
 !.devcouncil/graphify.yaml
 
+# Working plan and agentic-session documents (not public documentation)
+*_Implementation_Plan.md
+docs/superpowers/plans/
+
 # Local coding client configuration
 .gemini/
 .aider*
