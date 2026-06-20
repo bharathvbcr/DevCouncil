@@ -8,7 +8,13 @@ import yaml
 from rich.console import Console
 from rich.panel import Panel
 
-from devcouncil.app.config import get_gcloud_access_token, load_config, load_local_secrets, provider_api_key_env_var
+from devcouncil.app.config import (
+    _normalized_provider_name,
+    get_gcloud_access_token,
+    load_config,
+    load_local_secrets,
+    provider_api_key_env_var,
+)
 from devcouncil.cli.commands.doctor import render_doctor_check
 from devcouncil.cli.commands.init import initialize_project, parse_role_model_overrides
 from devcouncil.cli.commands.integrate import (
@@ -116,6 +122,11 @@ def _configure_vertexai_settings(
 def _configure_api_key(project_root: Path, api_key: str | None, skip_api_key: bool) -> None:
     config = load_config(project_root)
     provider = config.models.provider
+    if _normalized_provider_name(provider) == "ollama":
+        console.print(
+            "[green]Ollama uses a local server (default http://localhost:11434); no API key required.[/green]"
+        )
+        return
     env_var = provider_api_key_env_var(provider)
     local_secrets = load_local_secrets(project_root)
 

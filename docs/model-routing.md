@@ -16,6 +16,7 @@ Supported `models.provider` values:
 - `openrouter`: uses `OPENROUTER_API_KEY`.
 - `vertexai`: uses `VERTEXAI_ACCESS_TOKEN` or `gcloud auth print-access-token`, `VERTEXAI_PROJECT` or `GOOGLE_CLOUD_PROJECT`, and optional `VERTEXAI_LOCATION` defaulting to `global`.
 - `doubleword`: uses `DOUBLEWORD_API_KEY` and the OpenAI-compatible chat API at `https://api.doubleword.ai/v1`.
+- `ollama`: local models served by Ollama; needs NO API key. Uses the OpenAI-compatible endpoint at `http://localhost:11434/v1`. Override with `OLLAMA_BASE_URL` (taken verbatim) or Ollama's native `OLLAMA_HOST` (scheme and `/v1` are auto-normalized).
 
 Vertex AI uses Google Cloud Auth access tokens, not long-lived OpenRouter-style API keys. For local use, generate a token with:
 
@@ -44,3 +45,10 @@ Use provider-specific model names in role config, for example:
 - OpenRouter: `anthropic/claude-sonnet-4.6`, `openai/gpt-5.5`, `google/gemini-2.5-pro`
 - Vertex AI: `google/gemini-2.5-flash`
 - Doubleword: `deepseek/deepseek-v4`
+- Ollama: `qwen2.5-coder:7b`, `llama3.1` (any locally-pulled model tag; sent verbatim to Ollama)
+
+For local Ollama (no API key required):
+
+```bash
+dev setup --provider ollama --model qwen2.5-coder:7b
+```

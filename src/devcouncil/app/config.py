@@ -250,6 +250,7 @@ def provider_api_key_env_var(provider: str = "openrouter") -> str:
         "openrouter": "OPENROUTER_API_KEY",
         "vertexai": "VERTEXAI_ACCESS_TOKEN",
         "doubleword": "DOUBLEWORD_API_KEY",
+        "ollama": "OLLAMA_API_KEY",
         "openai": "OPENAI_API_KEY",
         "anthropic": "ANTHROPIC_API_KEY",
     }
@@ -302,6 +303,10 @@ def get_api_key(provider: str = "openrouter", project_root: Path = Path(".")) ->
     key = os.environ.get(env_var) or load_local_secrets(project_root).get(env_var)
     if not key and _normalized_provider_name(provider) == "vertexai":
         key = get_gcloud_access_token()
+    if not key and _normalized_provider_name(provider) == "ollama":
+        # Ollama is a local server and needs no API key; an explicitly-set
+        # OLLAMA_API_KEY still flows through above if present.
+        return ""
     if not key:
         extra = (
             " You can also authenticate with 'gcloud auth login' for vertexai."

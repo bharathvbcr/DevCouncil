@@ -10,10 +10,12 @@ import json
 from pathlib import Path
 import yaml
 
-SUPPORTED_MODEL_PROVIDERS = ("openrouter", "vertexai", "doubleword")
+SUPPORTED_MODEL_PROVIDERS = ("openrouter", "vertexai", "doubleword", "ollama")
 PROVIDER_ALIASES = {
     "vertex-ai": "vertexai",
     "vertex_ai": "vertexai",
+    "ollama-local": "ollama",
+    "ollama_local": "ollama",
 }
 MODEL_DEFAULTS_RESOURCE = "model_defaults.yaml"
 
@@ -166,6 +168,8 @@ def create_provider(provider_name: str, api_key: str, project_root: Path = Path(
         return OpenRouterProvider(api_key, project_root=project_root)
     if normalized == "doubleword":
         return DoublewordProvider(api_key, project_root=project_root)
+    if normalized == "ollama":
+        return OllamaProvider(api_key, project_root=project_root)
     if normalized == "vertexai":
         from devcouncil.app.config import load_local_secrets
         local_secrets = load_local_secrets(project_root)
@@ -187,6 +191,7 @@ def _log_model_call(
     project_root: Path = Path("."),
     task_id: Optional[str] = None,
     run_id: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> None:
     try:
         from datetime import datetime, timezone
@@ -198,15 +203,17 @@ def _log_model_call(
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / "model_calls.jsonl"
 
-        # task_id/run_id/timestamp are optional and backward-compatible: older
-        # records simply lack them and are grouped under "(unattributed)" by the
-        # cost reporter.
+        # task_id/run_id/timestamp/provider are optional and backward-compatible: older
+        # records simply lack them and are grouped under "(unattributed)" by the cost
+        # reporter. provider lets the cost ledger zero-cost local providers (ollama)
+        # regardless of the open-ended model tag Ollama echoes back.
         log_payload = {
             "request": redact_dict(payload),
             "response": redact_dict(data),
             "usage": usage,
             "task_id": task_id,
             "run_id": run_id,
+            "provider": provider,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         with open(log_file, "a", encoding="utf-8") as f:
@@ -322,6 +329,87 @@ class DoublewordProvider(Provider):
             )
 
             _log_model_call(payload, data, resp.usage, self.project_root, task_id=task_id, run_id=run_id)
+            return resp
+
+
+class OllamaProvider(Provider):
+    """Local Ollama provider via its OpenAI-compatible Chat Completions endpoint.
+
+    Ollama serves an OpenAI-compatible API at ``http://localhost:11434/v1`` and
+    needs no API key. The base URL is overridable via ``OLLAMA_BASE_URL`` (taken
+    verbatim) or Ollama's native ``OLLAMA_HOST`` (normalized: a missing scheme is
+    prefixed with ``http://`` and a missing ``/v1`` suffix is appended).
+    """
+
+    def __init__(self, api_key: str = "", project_root: Path = Path("."), base_url: str | None = None):
+        self.api_key = api_key
+        self.base_url = base_url or self._resolve_base_url()
+        self.project_root = project_root
+
+    @staticmethod
+    def _resolve_base_url() -> str:
+        explicit = os.environ.get("OLLAMA_BASE_URL")
+        if explicit:
+            return explicit.rstrip("/")
+        host = os.environ.get("OLLAMA_HOST")
+        if host:
+            host = host.strip()
+            if "://" not in host:
+                host = f"http://{host}"
+            host = host.rstrip("/")
+            if not host.endswith("/v1"):
+                host = f"{host}/v1"
+            return host
+        return "http://localhost:11434/v1"
+
+    async def complete(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.0,
+        json_mode: bool = False,
+        task_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> LLMResponse:
+        msgs = copy.deepcopy(messages)
+        headers = {
+            "Content-Type": "application/json",
+        }
+        # Ollama ignores auth, but a configured key (e.g. for a reverse proxy)
+        # passes through harmlessly.
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        payload = {
+            "model": model,
+            "messages": msgs,
+            "temperature": temperature,
+        }
+
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+            if msgs[-1]["role"] == "user":
+                msgs[-1]["content"] += "\n\nOutput must be a valid JSON object."
+
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            response = await client.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=payload
+            )
+            raise_for_provider_status(response, "Ollama")
+            data = response.json()
+
+            resp = LLMResponse(
+                content=data["choices"][0]["message"]["content"],
+                # Ollama may omit ``model`` or return a local tag — fall back to
+                # the requested id rather than KeyError-ing on data["model"].
+                model=data.get("model", model),
+                usage=data.get("usage", {}),
+                raw_response=data
+            )
+
+            _log_model_call(payload, data, resp.usage, self.project_root, task_id=task_id, run_id=run_id, provider="ollama")
             return resp
 
 

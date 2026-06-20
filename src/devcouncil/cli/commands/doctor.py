@@ -123,6 +123,19 @@ def render_doctor_check(project_root: Path = Path(".")):
         )
         console.print(table)
         return
+    if provider == "ollama":
+        # Use the provider's own resolver so the displayed URL reflects OLLAMA_HOST
+        # (with scheme/-/v1 normalization), not just OLLAMA_BASE_URL.
+        from devcouncil.llm.provider import OllamaProvider
+
+        base_url = OllamaProvider._resolve_base_url()
+        table.add_row(
+            "OLLAMA",
+            "[green]OK[/green]",
+            f"Local provider; no API key required (server: {base_url}).",
+        )
+        console.print(table)
+        return
     env_var = provider_api_key_env_var(provider)
     local_secrets = load_local_secrets(project_root)
     if os.environ.get(env_var):

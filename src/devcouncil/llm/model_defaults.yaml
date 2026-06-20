@@ -31,3 +31,14 @@ doubleword:
   native_agent: deepseek/deepseek-v4
   implementation_reviewer: deepseek/deepseek-v4
   live_reviewer: deepseek/deepseek-v4
+ollama:
+  spec_writer: qwen2.5-coder:7b
+  prompt_enhancer: qwen2.5-coder:7b
+  planner_a: qwen2.5-coder:7b
+  planner_b: qwen2.5-coder:7b
+  critic_a: qwen2.5-coder:7b
+  critic_b: qwen2.5-coder:7b
+  arbiter: qwen2.5-coder:7b
+  native_agent: qwen2.5-coder:7b
+  implementation_reviewer: qwen2.5-coder:7b
+  live_reviewer: qwen2.5-coder:7b

@@ -16,8 +16,21 @@ class CostEstimator:
     # Conservative default for unknown models
     DEFAULT_PRICING = {"prompt_per_1k": 0.005, "completion_per_1k": 0.015}
 
+    # Local providers run on-device and incur no per-token cost. Ollama model ids
+    # are open-ended (e.g. ``qwen2.5-coder:7b`` or an ``ollama/<name>`` form), so
+    # match the conventional prefixes rather than relying on the open-ended yaml.
+    LOCAL_MODEL_PREFIXES = ("ollama/", "ollama:")
+
+    @classmethod
+    def _is_local_model(cls, model: str) -> bool:
+        return model.startswith(cls.LOCAL_MODEL_PREFIXES)
+
     @classmethod
     def estimate_cost(cls, model: str, usage: Dict[str, int]) -> float:
+        # Local/Ollama models are free regardless of yaml coverage; short-circuit
+        # before the conservative DEFAULT_PRICING fallback would bill them.
+        if cls._is_local_model(model):
+            return 0.0
         prices = pricing_for_model(model, cls.DEFAULT_PRICING)
         if prices == cls.DEFAULT_PRICING:
             logger.debug("Unknown model for cost estimation: %s — using default pricing", model)
@@ -66,8 +79,12 @@ def read_cost_records(project_root: Path) -> List[Dict[str, Any]]:
             model = str(response.get("model", "") or "")
         raw_usage = entry.get("usage")
         usage: Dict[str, Any] = raw_usage if isinstance(raw_usage, dict) else {}
+        # Local providers (ollama) are always free, regardless of the open-ended model
+        # tag Ollama echoes back (e.g. ``mistral:latest``) — trust the recorded provider
+        # over fragile model-id prefix matching.
+        provider = str(entry.get("provider") or "")
         try:
-            cost = CostEstimator.estimate_cost(model, usage)
+            cost = 0.0 if provider == "ollama" else CostEstimator.estimate_cost(model, usage)
         except Exception:
             cost = 0.0
         records.append(
