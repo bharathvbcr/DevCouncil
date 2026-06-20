@@ -18,6 +18,7 @@ from devcouncil.executors.agent_registry import (
     resolve_coding_cli_executable,
     resolve_coding_cli_probe_order,
 )
+from devcouncil.utils.subprocess_env import clean_subprocess_env
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,7 @@ def probe_cli_version(command: list[str], *, timeout: int = 10) -> tuple[int, st
             errors="replace",
             shell=use_shell,
             timeout=timeout,
+            env=clean_subprocess_env(),
         )
     except subprocess.TimeoutExpired:
         return 124, "timed out"
@@ -215,6 +217,7 @@ def integration_capability_rows(project_root: Path) -> list[dict[str, object]]:
             "headless": info.headless,
             "mcp": info.mcp,
             "hooks": info.hooks,
+            "enforcement": info.enforcement,
             "launcher_shim": info.launcher_shim,
             "notes": info.notes,
             "configured": config_status == "ok",
@@ -224,6 +227,34 @@ def integration_capability_rows(project_root: Path) -> list[dict[str, object]]:
             "apply_target": client,
         })
     return rows
+
+
+def _hook_config_references_devcouncil(path: Path) -> bool | None:
+    """Return whether a client hook config still wires DevCouncil's gate.
+
+    ``True``  -> the file exists and references ``devcouncil`` somewhere in its hooks.
+    ``False`` -> the file exists but no longer references it (tampered/disarmed).
+    ``None``  -> the file does not exist (client was never integrated here).
+
+    Reads the raw text rather than parsing each client's bespoke schema so it works
+    uniformly across JSON hook files and is resilient to format drift; the goal is a
+    tamper tripwire, not full schema validation."""
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return "devcouncil" in text.lower()
+
+
+def _hook_config_tamper_targets(project_root: Path) -> list[tuple[str, Path]]:
+    return [
+        ("Claude", project_root / ".claude" / "settings.local.json"),
+        ("Codex", project_root / ".codex" / "hooks.json"),
+        ("Gemini", project_root / ".gemini" / "settings.json"),
+        ("Cursor", project_root / ".cursor" / "hooks.json"),
+    ]
 
 
 def build_integration_check_report(project_root: Path, *, strict: bool = False) -> IntegrationCheckReport:
@@ -338,6 +369,19 @@ def build_integration_check_report(project_root: Path, *, strict: bool = False) 
         add(expected.issubset(set(tools)), "MCP server", ", ".join(tools))
     except Exception as exc:
         add(False, "MCP server", str(exc))
+
+    # Tamper tripwire: any installed client hook config must still reference the
+    # DevCouncil gate. A present-but-unreferenced file means the pre-action gate was
+    # disarmed (by an agent or by hand) and is reported as a failure.
+    for label, hook_path in _hook_config_tamper_targets(root):
+        references = _hook_config_references_devcouncil(hook_path)
+        if references is None:
+            continue
+        add(
+            references,
+            f"{label} hook integrity",
+            str(hook_path) if references else f"{hook_path} no longer references devcouncil (tampered/disarmed).",
+        )
 
     detected = detect_available_coding_cli(root)
     recommended = resolve_automated_executor(root, None) if detected else None

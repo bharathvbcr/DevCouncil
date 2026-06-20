@@ -14,7 +14,7 @@ from devcouncil.domain.requirement import Requirement, AcceptanceCriterion
 from devcouncil.domain.assumption import Assumption
 from devcouncil.domain.task import Task, PlannedFile
 from devcouncil.domain.gap import Gap
-from devcouncil.domain.evidence import CommandResult, DiffEvidence, TestEvidence
+from devcouncil.domain.evidence import CommandResult, DiffEvidence, DiffCoverageEvidence, TestEvidence
 from devcouncil.domain.critique import CritiqueFinding
 from devcouncil.artifacts.graph import ArtifactGraph
 
@@ -165,6 +165,10 @@ class GapRepository:
                 "evidence": json.loads(m.evidence_json),
                 "recommended_fix": m.recommended_fix,
                 "blocking": m.blocking,
+                "file": m.file,
+                "line": m.line,
+                "suggested_command": m.suggested_command,
+                "acceptance_criterion_id": m.acceptance_criterion_id,
             }))
         return results
 
@@ -178,7 +182,11 @@ class GapRepository:
             description=gap.description,
             evidence_json=json.dumps(gap.evidence),
             recommended_fix=gap.recommended_fix,
-            blocking=gap.blocking
+            blocking=gap.blocking,
+            file=gap.file,
+            line=gap.line,
+            suggested_command=gap.suggested_command,
+            acceptance_criterion_id=gap.acceptance_criterion_id,
         )
         self.session.merge(model)
         self.session.commit()
@@ -224,6 +232,15 @@ class EvidenceRepository:
         self.session.add(model)
         self.session.commit()
 
+    def save_diff_coverage_evidence(self, ev: DiffCoverageEvidence):
+        model = EvidenceModel(
+            type="diff_coverage",
+            task_id=ev.task_id,
+            data_json=ev.model_dump_json()
+        )
+        self.session.add(model)
+        self.session.commit()
+
     def get_command_results_for_task(self, task_id: str) -> List[CommandResult]:
         statement = select(EvidenceModel).where(EvidenceModel.task_id == task_id).where(
             EvidenceModel.type == "command"
@@ -241,6 +258,8 @@ class EvidenceRepository:
                 results.append(CommandResult.model_validate(data))
             elif m.type == "diff":
                 results.append(DiffEvidence.model_validate(data))
+            elif m.type == "diff_coverage":
+                results.append(DiffCoverageEvidence.model_validate(data))
             elif m.type == "test":
                 results.append(TestEvidence.model_validate(data))
         return results
@@ -393,6 +412,10 @@ class ArtifactGraphRepository:
         for ev in self.evidence_repo.get_all():
             if isinstance(ev, CommandResult):
                 graph.add_command_result(ev)
+            elif isinstance(ev, DiffCoverageEvidence):
+                # Must precede DiffEvidence: distinct type, and the diff↔coverage proof
+                # was silently dropped on reload before this branch existed.
+                graph.add_diff_coverage_evidence(ev)
             elif isinstance(ev, DiffEvidence):
                 graph.add_diff_evidence(ev)
             elif isinstance(ev, TestEvidence):

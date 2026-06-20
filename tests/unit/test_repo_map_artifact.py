@@ -26,10 +26,8 @@ def test_repo_map_artifact_is_stable_and_valid(tmp_path, monkeypatch):
 
     first_raw = map_path.read_text(encoding="utf-8")
     first_payload = json.loads(first_raw)
-    # Map generation writes AGENTS.md and CLAUDE.md as side effects; remove them so both runs map over
-    # the same repository state.
-    (tmp_path / "AGENTS.md").unlink(missing_ok=True)
-    (tmp_path / "CLAUDE.md").unlink(missing_ok=True)
+    # `dev init` now generates AGENTS.md and CLAUDE.md, so the agent guides are a stable part of the
+    # initialized repository state and are present (and regenerated identically) on both map runs.
 
     second = runner.invoke(app, ["map", "sample", "--output", ".devcouncil/repo_map.json"])
     assert second.exit_code == 0
@@ -92,7 +90,10 @@ def test_repo_map_artifact_is_stable_and_valid(tmp_path, monkeypatch):
 
     for subsystem in subsystems:
         area = subsystem["area"]
-        assert area.startswith("src/devcouncil/"), f"invalid subsystem area: {area}"
+        # Subsystems are inferred generically from the directory tree for non-DevCouncil
+        # repos (this sample repo), so the area just needs to be a real path prefix with
+        # files under it (asserted below) rather than a hardcoded DevCouncil path.
+        assert area, "subsystem area must be non-empty"
         assert area not in seen_areas, f"duplicate subsystem area: {area}"
         seen_areas.add(area)
         assert any(path.startswith(f"{area}/") for path in file_set), f"area prefix missing files: {area}"

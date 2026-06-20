@@ -79,14 +79,40 @@ def test_hook_policy_blocks_secret_path_even_when_planned():
 def test_hook_policy_denies_dangerous_git_commands():
     policy = HookPolicy()
 
+    # Git-safety deny wins regardless of active task.
     assert policy.evaluate_command("git push --force").action == "deny"
     assert policy.evaluate_command("git commit --no-verify -m test").action == "deny"
     assert policy.evaluate_command("git reset --hard origin/main").action == "deny"
 
 
-def test_hook_policy_warns_for_protected_file_and_direct_push():
+def _task_allowing(*commands: str) -> Task:
+    return Task(
+        id="TASK-001",
+        title="Task",
+        description="desc",
+        allowed_commands=list(commands),
+        planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
+        status="running",
+    )
+
+
+def test_hook_policy_warns_for_protected_file():
     policy = HookPolicy()
 
     assert policy.evaluate_file_write("package.json", _task()).action == "warn"
-    assert policy.evaluate_command("git push origin main").action == "warn"
-    assert policy.evaluate_command("git push origin HEAD:main").action == "warn"
+
+
+def test_hook_policy_warns_for_direct_push_when_task_allows_it():
+    # The push command must be authorized by the task for the protected-branch warn to
+    # surface; otherwise the missing lease denies it (fail-closed) before the warn.
+    policy = HookPolicy()
+    task = _task_allowing("git push origin *")
+
+    assert policy.evaluate_command("git push origin main", task).action == "warn"
+    assert policy.evaluate_command("git push origin HEAD:main", task).action == "warn"
+
+
+def test_hook_policy_denies_direct_push_without_active_task():
+    policy = HookPolicy()
+
+    assert policy.evaluate_command("git push origin main", None).action == "deny"

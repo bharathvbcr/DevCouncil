@@ -15,13 +15,13 @@ from devcouncil.storage.repositories import (
 )
 from devcouncil.indexing.repo_mapper import RepoMapper
 from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
-from devcouncil.llm.provider import Provider, MockProvider, build_role_model_config, create_provider, validate_model_provider
-from devcouncil.llm.router import ModelRouter
+from devcouncil.llm.provider import Provider, MockProvider, ProviderRequestError, build_role_model_config, create_provider, validate_model_provider
+from devcouncil.llm.router import ModelRouter, StructuredOutputError
 from devcouncil.planning.spec_service import SpecService
 from devcouncil.planning.prompt_enhancer_service import PromptEnhancerService
 from devcouncil.planning.plan_service import PlanService
 from devcouncil.planning.critique_service import CritiqueService
-from devcouncil.planning.arbiter_service import ArbiterService
+from devcouncil.planning.arbiter_service import ArbiterDecision, ArbiterService
 from devcouncil.gating.policy import GatePolicy
 from devcouncil.app.orchestrator import Orchestrator
 from devcouncil.app.state_machine import ProjectPhase
@@ -89,6 +89,7 @@ async def run_plan_flow(
     dry_run: bool = False,
     persist: bool = True,
     project_root: Path = Path("."),
+    quick: bool = False,
 ):
     root = project_root.expanduser().resolve()
     initialize_project(root, quiet=True)
@@ -199,9 +200,15 @@ async def run_plan_flow(
             goal,
             repo_map_json,
             graph_context.model_dump_json() if graph_context.available else None,
+            project_root=root,
         )
         debate_goal = prompt_enhancement.debate_prompt()
         orchestrator.save_run_artifact("prompt_enhancement.json", prompt_enhancement.model_dump())
+        if prompt_enhancement.applied_skills:
+            console.print(
+                "[dim]Domain skills applied:[/dim] "
+                + ", ".join(prompt_enhancement.applied_skills)
+            )
         TraceLogger(root).log_event(
             "prompt_enhanced",
             {
@@ -210,6 +217,7 @@ async def run_plan_flow(
                 "codebase_context_count": len(prompt_enhancement.codebase_context),
                 "constraint_count": len(prompt_enhancement.constraints),
                 "debate_focus_count": len(prompt_enhancement.debate_focus),
+                "applied_skills": prompt_enhancement.applied_skills,
                 "artifact": f".devcouncil/runs/{run_id}/prompt_enhancement.json",
             },
             run_id=run_id,
@@ -228,51 +236,80 @@ async def run_plan_flow(
 
         requirements_json = json.dumps([r.model_dump() for r in spec_output.requirements])
 
-        # 4. Independent Plans (run concurrently — they don't depend on each other)
-        progress.add_task(description="Generating Plans A (Pragmatic) and B (Robust)...", total=None)
-        plan_a, plan_b = await asyncio.gather(
-            plan_service.generate_plan("planner_a", debate_goal, requirements_json, repo_map_json),
-            plan_service.generate_plan("planner_b", debate_goal, requirements_json, repo_map_json),
-        )
-        orchestrator.save_run_artifact("plan_a.json", plan_a.model_dump())
-        orchestrator.save_run_artifact("plan_b.json", plan_b.model_dump())
-        await orchestrator.transition_to(ProjectPhase.PLANS_GENERATED)
+        if quick:
+            # Rigor dial: single pragmatic plan, no A/B debate, critique, rebuttal,
+            # or arbitration. Spec requirements (with their acceptance criteria)
+            # become the final requirements verbatim. This trades the council's
+            # adversarial robustness for ~5 fewer model calls — the right setting
+            # for small, well-scoped changes where verification (which still gates
+            # every diff) is the real safety net, not planning debate.
+            progress.add_task(description="Generating single plan (quick mode)...", total=None)
+            plan_a = await plan_service.generate_plan(
+                "planner_a", debate_goal, requirements_json, repo_map_json
+            )
+            orchestrator.save_run_artifact("plan_a.json", plan_a.model_dump())
+            await orchestrator.transition_to(ProjectPhase.PLANS_GENERATED)
 
-        # 5. Cross-Critique (independent — run concurrently)
-        progress.add_task(description="Critiquing Plans A and B...", total=None)
-        critique_a, critique_b = await asyncio.gather(
-            critique_service.generate_critique("critic_a", plan_b.model_dump_json(), requirements_json),
-            critique_service.generate_critique("critic_b", plan_a.model_dump_json(), requirements_json),
-        )
-        orchestrator.save_run_artifact("critique_a.json", critique_a.model_dump())
-        orchestrator.save_run_artifact("critique_b.json", critique_b.model_dump())
-        await orchestrator.transition_to(ProjectPhase.CRITIQUES_GENERATED)
+            decision = ArbiterDecision(
+                accepted_finding_ids=[],
+                rejected_finding_ids=[],
+                final_requirements=spec_output.requirements,
+                final_tasks=plan_a.tasks,
+            )
+            orchestrator.save_run_artifact("decision.json", decision.model_dump())
+            # Walk through CRITIQUES_GENERATED (the only path to ARBITRATED) without
+            # actually critiquing, so the rest of the lifecycle (approval, gates,
+            # status, the report's phase) is identical to the full council flow.
+            await orchestrator.transition_to(ProjectPhase.CRITIQUES_GENERATED)
+            await orchestrator.transition_to(ProjectPhase.ARBITRATED)
+            reconciled_findings = []
+            final_tasks = [task.model_copy(update={"status": "planned"}) for task in decision.final_tasks]
+        else:
+            # 4. Independent Plans (run concurrently — they don't depend on each other)
+            progress.add_task(description="Generating Plans A (Pragmatic) and B (Robust)...", total=None)
+            plan_a, plan_b = await asyncio.gather(
+                plan_service.generate_plan("planner_a", debate_goal, requirements_json, repo_map_json),
+                plan_service.generate_plan("planner_b", debate_goal, requirements_json, repo_map_json),
+            )
+            orchestrator.save_run_artifact("plan_a.json", plan_a.model_dump())
+            orchestrator.save_run_artifact("plan_b.json", plan_b.model_dump())
+            await orchestrator.transition_to(ProjectPhase.PLANS_GENERATED)
 
-        # 6. Rebuttals (independent — run concurrently)
-        progress.add_task(description="Generating rebuttals...", total=None)
-        rebuttal_a, rebuttal_b = await asyncio.gather(
-            critique_service.generate_rebuttal("planner_a", plan_a.model_dump_json(), critique_b.model_dump_json()),
-            critique_service.generate_rebuttal("planner_b", plan_b.model_dump_json(), critique_a.model_dump_json()),
-        )
-        orchestrator.save_run_artifact("rebuttal_a.json", rebuttal_a.model_dump())
-        orchestrator.save_run_artifact("rebuttal_b.json", rebuttal_b.model_dump())
+            # 5. Cross-Critique (independent — run concurrently)
+            progress.add_task(description="Critiquing Plans A and B...", total=None)
+            critique_a, critique_b = await asyncio.gather(
+                critique_service.generate_critique("critic_a", plan_b.model_dump_json(), requirements_json),
+                critique_service.generate_critique("critic_b", plan_a.model_dump_json(), requirements_json),
+            )
+            orchestrator.save_run_artifact("critique_a.json", critique_a.model_dump())
+            orchestrator.save_run_artifact("critique_b.json", critique_b.model_dump())
+            await orchestrator.transition_to(ProjectPhase.CRITIQUES_GENERATED)
 
-        # 7. Arbitration
-        progress.add_task(description="Arbitrating final plan...", total=None)
-        decision = await arbiter_service.arbitrate(
-            debate_goal,
-            json.dumps([r.model_dump() for r in spec_output.requirements]),
-            plan_a.model_dump_json(),
-            plan_b.model_dump_json(),
-            critique_a.model_dump_json(),
-            critique_b.model_dump_json(),
-            rebuttal_a.model_dump_json(),
-            rebuttal_b.model_dump_json()
-        )
-        orchestrator.save_run_artifact("decision.json", decision.model_dump())
-        await orchestrator.transition_to(ProjectPhase.ARBITRATED)
-        reconciled_findings = _reconcile_findings([*critique_a.findings, *critique_b.findings], decision)
-        final_tasks = [task.model_copy(update={"status": "planned"}) for task in decision.final_tasks]
+            # 6. Rebuttals (independent — run concurrently)
+            progress.add_task(description="Generating rebuttals...", total=None)
+            rebuttal_a, rebuttal_b = await asyncio.gather(
+                critique_service.generate_rebuttal("planner_a", plan_a.model_dump_json(), critique_b.model_dump_json()),
+                critique_service.generate_rebuttal("planner_b", plan_b.model_dump_json(), critique_a.model_dump_json()),
+            )
+            orchestrator.save_run_artifact("rebuttal_a.json", rebuttal_a.model_dump())
+            orchestrator.save_run_artifact("rebuttal_b.json", rebuttal_b.model_dump())
+
+            # 7. Arbitration
+            progress.add_task(description="Arbitrating final plan...", total=None)
+            decision = await arbiter_service.arbitrate(
+                debate_goal,
+                json.dumps([r.model_dump() for r in spec_output.requirements]),
+                plan_a.model_dump_json(),
+                plan_b.model_dump_json(),
+                critique_a.model_dump_json(),
+                critique_b.model_dump_json(),
+                rebuttal_a.model_dump_json(),
+                rebuttal_b.model_dump_json()
+            )
+            orchestrator.save_run_artifact("decision.json", decision.model_dump())
+            await orchestrator.transition_to(ProjectPhase.ARBITRATED)
+            reconciled_findings = _reconcile_findings([*critique_a.findings, *critique_b.findings], decision)
+            final_tasks = [task.model_copy(update={"status": "planned"}) for task in decision.final_tasks]
 
     console.print("[green]Planning complete![/green]")
     console.print(f"[blue]Prompt enhancement:[/blue] .devcouncil/runs/{run_id}/prompt_enhancement.json")
@@ -410,6 +447,12 @@ def plan(
     goal: str = typer.Argument(..., help="The goal of the implementation"),
     requirements_only: bool = typer.Option(False, "--requirements-only", help="Only generate requirements"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Simulate planning without LLM calls"),
+    quick: bool = typer.Option(
+        False,
+        "--quick",
+        help="Rigor dial: skip the A/B debate, critique, rebuttal, and arbitration. "
+        "One spec + one plan (~5 fewer model calls). Verification still gates every diff.",
+    ),
     persist: bool = typer.Option(
         False,
         "--persist/--no-persist",
@@ -421,4 +464,25 @@ def plan(
     Run the full planning cycle (Repo map -> Spec -> Plan A/B -> Critique -> Arbiter).
     """
     should_persist = persist or not dry_run
-    asyncio.run(run_plan_flow(goal, requirements_only, dry_run, should_persist, project_root))
+    try:
+        asyncio.run(run_plan_flow(goal, requirements_only, dry_run, should_persist, project_root, quick=quick))
+    except (ProviderRequestError, StructuredOutputError) as exc:
+        print_planning_error(exc)
+        raise typer.Exit(code=1)
+
+
+def print_planning_error(exc: Exception) -> None:
+    """Render a planning/model failure as an actionable message instead of a traceback."""
+    console.print(f"\n[red]Planning could not complete:[/red] {exc}")
+    if isinstance(exc, StructuredOutputError):
+        console.print(
+            "[yellow]Tip:[/yellow] this role's model could not return valid structured JSON. "
+            "Free/very small models often can't. Set a more capable model, e.g.\n"
+            f"  [bold]dev config models --role {exc.role} --model anthropic/claude-sonnet-4.6[/bold]\n"
+            "  (or set all roles: [bold]dev config models --model <model>[/bold])"
+        )
+    elif isinstance(exc, ProviderRequestError) and exc.status_code == 402:
+        console.print(
+            "[yellow]Tip:[/yellow] add credits at https://openrouter.ai/settings/credits, "
+            "or switch to a free/cheaper model with [bold]dev config models --model <model>[/bold]."
+        )

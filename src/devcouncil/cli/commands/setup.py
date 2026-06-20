@@ -233,6 +233,9 @@ def setup(
     vertex_location: str | None = typer.Option(None, "--vertex-location", help="Store VERTEXAI_LOCATION for the vertexai provider. Defaults to global."),
     skip_api_key: bool = typer.Option(False, "--skip-api-key", help="Skip the first-run model API key prompt."),
     skip_integrations: bool = typer.Option(False, "--skip-integrations", help="Skip the first-run coding CLI integration prompt."),
+    skip_map: bool = typer.Option(False, "--skip-map", help="Skip generating repo_map.json and agent guides on init."),
+    skip_skills: bool = typer.Option(False, "--skip-skills", help="Skip scaffolding engineering skills into .claude/skills/ on init."),
+    scaffold_ci: bool = typer.Option(False, "--scaffold-ci", help="Write a starter .github/workflows/devcouncil.yml from the configured commands."),
 ):
     """
     Initialize DevCouncil from a normal terminal in the target repository root.
@@ -260,6 +263,8 @@ def setup(
         model_provider=initial_provider,
         model=model,
         role_models=role_models,
+        with_map=not skip_map,
+        with_skills=not skip_skills,
     )
     if not created:
         console.print(f"[yellow]DevCouncil is already initialized at {root / '.devcouncil'}.[/yellow]")
@@ -279,6 +284,15 @@ def setup(
 
     console.print()
     render_doctor_check(root)
+
+    if scaffold_ci:
+        from devcouncil.repo.ci_scaffold import WORKFLOW_RELPATH, scaffold_ci as scaffold_ci_workflow
+
+        written = scaffold_ci_workflow(root)
+        if written is None:
+            console.print(f"[yellow]{WORKFLOW_RELPATH.as_posix()} already exists; left unchanged.[/yellow]")
+        else:
+            console.print(f"[green]Wrote starter CI workflow {written.relative_to(root).as_posix()}.[/green]")
 
     if integrate:
         _configure_coding_cli_integrations(root, apply=apply, gemini_scope=gemini_scope)

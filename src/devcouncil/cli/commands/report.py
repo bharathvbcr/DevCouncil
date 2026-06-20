@@ -78,6 +78,11 @@ def report(
     github: bool = typer.Option(False, "--github", help="Post report to GitHub PR Checks"),
     github_pr_comment: bool = typer.Option(False, "--github-pr-comment", help="Post report as a GitHub PR comment"),
     gitlab_pr_comment: bool = typer.Option(False, "--gitlab-pr-comment", help="Post report as a GitLab merge request comment"),
+    fail_on_blocking: bool = typer.Option(
+        False,
+        "--fail-on-blocking",
+        help="Exit non-zero when blocking gaps remain, so shell-driven agents can gate on $?.",
+    ),
     project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
 ):
     """
@@ -127,3 +132,6 @@ def report(
         else:
             output = ReportBuilder.build_markdown(graph, live_review=live_review)
             console.print(Markdown(output))
+
+        if fail_on_blocking and graph.blocking_gaps():
+            raise typer.Exit(code=1)

@@ -4,7 +4,7 @@ from functools import lru_cache
 from importlib import resources
 import os
 from typing import List, Dict, Any, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 import httpx
 import json
 from pathlib import Path
@@ -32,20 +32,68 @@ def load_default_role_models_by_provider() -> Dict[str, Dict[str, str]]:
 DEFAULT_ROLE_MODELS_BY_PROVIDER = load_default_role_models_by_provider()
 
 
+class ProviderRequestError(RuntimeError):
+    """A provider HTTP request failed, with an actionable, user-facing message."""
+
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def raise_for_provider_status(response: "httpx.Response", provider: str) -> None:
+    """Translate an HTTP error response into an actionable ProviderRequestError.
+
+    The raw ``httpx.HTTPStatusError`` surfaces as an unhelpful traceback; common
+    statuses (auth, billing, rate limiting) have concrete remedies worth naming.
+    """
+    status = getattr(response, "status_code", None)
+    if status is None or status < 400:
+        return
+    hints = {
+        401: "authentication failed — check the API key in .devcouncil/secrets.env",
+        402: "payment required — the account is out of credits or has no active balance; add funds and retry",
+        403: "access forbidden — the API key may lack access to the requested model",
+        404: "not found — check the configured model id and provider base URL",
+        429: "rate limited — too many requests; wait a moment and retry",
+    }
+    detail = hints.get(status, "the request was rejected")
+    body = ""
+    text = getattr(response, "text", None)
+    if isinstance(text, str):
+        body = text.strip()[:300]
+    message = f"{provider} API error {status}: {detail}."
+    if body:
+        message = f"{message} Response: {body}"
+    raise ProviderRequestError(message, status_code=status)
+
+
 class LLMResponse(BaseModel):
     content: str
     model: str
-    usage: Dict[str, int]
+    # OpenRouter (and other providers) return richer usage payloads than plain
+    # token counts: a float ``cost`` plus nested ``*_details`` dicts. Keep this
+    # permissive so live responses parse; downstream only reads the int token keys.
+    usage: Dict[str, Any]
     raw_response: Dict[str, Any]
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _coerce_null_content(cls, value: Any) -> str:
+        # Providers return ``content: null`` for reasoning-only, tool-only, or
+        # filtered responses. Treat that as empty text so the router's parse /
+        # healing path can retry instead of crashing on a validation error.
+        return value if value is not None else ""
 
 class Provider(ABC):
     @abstractmethod
     async def complete(
-        self, 
-        model: str, 
-        messages: List[Dict[str, str]], 
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
         temperature: float = 0.0,
-        json_mode: bool = False
+        json_mode: bool = False,
+        task_id: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> LLMResponse:
         pass
 
@@ -115,9 +163,9 @@ def build_role_model_config(
 def create_provider(provider_name: str, api_key: str, project_root: Path = Path(".")) -> Provider:
     normalized = validate_model_provider(provider_name)
     if normalized == "openrouter":
-        return OpenRouterProvider(api_key)
+        return OpenRouterProvider(api_key, project_root=project_root)
     if normalized == "doubleword":
-        return DoublewordProvider(api_key)
+        return DoublewordProvider(api_key, project_root=project_root)
     if normalized == "vertexai":
         from devcouncil.app.config import load_local_secrets
         local_secrets = load_local_secrets(project_root)
@@ -128,21 +176,38 @@ def create_provider(provider_name: str, api_key: str, project_root: Path = Path(
             or local_secrets.get("GOOGLE_CLOUD_PROJECT")
         )
         location = os.environ.get("VERTEXAI_LOCATION") or local_secrets.get("VERTEXAI_LOCATION", "global")
-        return VertexAIProvider(api_key, project_id=project_id, location=location)
+        return VertexAIProvider(api_key, project_id=project_id, location=location, project_root=project_root)
     raise AssertionError(f"Provider validation passed for unhandled provider: {normalized}")
 
 
-def _log_model_call(payload: Dict[str, Any], data: Dict[str, Any], usage: Dict[str, int]) -> None:
+def _log_model_call(
+    payload: Dict[str, Any],
+    data: Dict[str, Any],
+    usage: Dict[str, int],
+    project_root: Path = Path("."),
+    task_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+) -> None:
     try:
+        from datetime import datetime, timezone
+
         from devcouncil.utils.redaction import redact_dict
-        log_dir = Path(".devcouncil/logs")
+        # Resolve against the provider's project root, not the process cwd — otherwise
+        # running `dev` from another directory logged spend to the wrong project.
+        log_dir = project_root / ".devcouncil" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / "model_calls.jsonl"
 
+        # task_id/run_id/timestamp are optional and backward-compatible: older
+        # records simply lack them and are grouped under "(unattributed)" by the
+        # cost reporter.
         log_payload = {
             "request": redact_dict(payload),
             "response": redact_dict(data),
             "usage": usage,
+            "task_id": task_id,
+            "run_id": run_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(log_payload) + "\n")
@@ -152,16 +217,19 @@ def _log_model_call(payload: Dict[str, Any], data: Dict[str, Any], usage: Dict[s
 
 
 class OpenRouterProvider(Provider):
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, project_root: Path = Path(".")):
         self.api_key = api_key
         self.base_url = "https://openrouter.ai/api/v1"
+        self.project_root = project_root
 
     async def complete(
         self, 
         model: str, 
         messages: List[Dict[str, str]], 
         temperature: float = 0.0,
-        json_mode: bool = False
+        json_mode: bool = False,
+        task_id: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> LLMResponse:
         # Deep-copy to avoid mutating the caller's messages list
         msgs = copy.deepcopy(messages)
@@ -191,32 +259,35 @@ class OpenRouterProvider(Provider):
                 headers=headers,
                 json=payload
             )
-            response.raise_for_status()
+            raise_for_provider_status(response, "OpenRouter")
             data = response.json()
-            
+
             resp = LLMResponse(
                 content=data["choices"][0]["message"]["content"],
                 model=data["model"],
                 usage=data.get("usage", {}),
                 raw_response=data
             )
-            
-            _log_model_call(payload, data, resp.usage)
-                
+
+            _log_model_call(payload, data, resp.usage, self.project_root, task_id=task_id, run_id=run_id)
+
             return resp
 
 
 class DoublewordProvider(Provider):
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, project_root: Path = Path(".")):
         self.api_key = api_key
         self.base_url = "https://api.doubleword.ai/v1"
+        self.project_root = project_root
 
     async def complete(
         self,
         model: str,
         messages: List[Dict[str, str]],
         temperature: float = 0.0,
-        json_mode: bool = False
+        json_mode: bool = False,
+        task_id: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> LLMResponse:
         msgs = copy.deepcopy(messages)
         headers = {
@@ -240,7 +311,7 @@ class DoublewordProvider(Provider):
                 headers=headers,
                 json=payload
             )
-            response.raise_for_status()
+            raise_for_provider_status(response, "Doubleword")
             data = response.json()
 
             resp = LLMResponse(
@@ -250,17 +321,18 @@ class DoublewordProvider(Provider):
                 raw_response=data
             )
 
-            _log_model_call(payload, data, resp.usage)
+            _log_model_call(payload, data, resp.usage, self.project_root, task_id=task_id, run_id=run_id)
             return resp
 
 
 class VertexAIProvider(Provider):
     """Vertex AI provider using Google's OpenAI-compatible Chat Completions API."""
 
-    def __init__(self, access_token: str, project_id: str | None = None, location: str | None = None):
+    def __init__(self, access_token: str, project_id: str | None = None, location: str | None = None, project_root: Path = Path(".")):
         self.access_token = access_token
         self.project_id = project_id or os.environ.get("VERTEXAI_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT")
         self.location = location or os.environ.get("VERTEXAI_LOCATION", "global")
+        self.project_root = project_root
 
     @property
     def base_url(self) -> str:
@@ -293,7 +365,9 @@ class VertexAIProvider(Provider):
         model: str,
         messages: List[Dict[str, str]],
         temperature: float = 0.0,
-        json_mode: bool = False
+        json_mode: bool = False,
+        task_id: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> LLMResponse:
         msgs = copy.deepcopy(messages)
 
@@ -320,7 +394,7 @@ class VertexAIProvider(Provider):
                     headers=self._headers(),
                     json=payload
                 )
-            response.raise_for_status()
+            raise_for_provider_status(response, "Vertex AI")
             data = response.json()
 
             resp = LLMResponse(
@@ -330,7 +404,7 @@ class VertexAIProvider(Provider):
                 raw_response=data
             )
 
-            _log_model_call(payload, data, resp.usage)
+            _log_model_call(payload, data, resp.usage, self.project_root, task_id=task_id, run_id=run_id)
             return resp
 
 class MockProvider(Provider):
@@ -345,7 +419,9 @@ class MockProvider(Provider):
         model: str, 
         messages: List[Dict[str, str]], 
         temperature: float = 0.0,
-        json_mode: bool = False
+        json_mode: bool = False,
+        task_id: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> LLMResponse:
         res = self.responses.get(model, '{"mock": "response"}')
         

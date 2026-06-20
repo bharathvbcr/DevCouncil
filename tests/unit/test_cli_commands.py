@@ -10,6 +10,68 @@ from devcouncil.cli.main import app
 runner = CliRunner()
 
 
+def test_cli_check_reports_scope_and_secrets(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+    subprocess.run(["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-m", "init"],
+                   cwd=tmp_path, capture_output=True)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    # make a change that includes a secret-looking value
+    (tmp_path / "app.py").write_text(
+        'x = 1\nAPI_KEY = "sk-1234567890abcdefghijklmnopqrstuv"\n', encoding="utf-8"
+    )
+
+    result = runner.invoke(app, ["check", "--json"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert "app.py" in data["changed_files"]
+    assert data["secret_findings"]  # the fake API key is flagged
+
+
+def test_cli_check_clean_tree_reports_nothing(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True)
+    subprocess.run(["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-m", "init"],
+                   cwd=tmp_path, capture_output=True)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    result = runner.invoke(app, ["check", "--json"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.output)["ok"] is True
+
+
+def test_cli_check_expands_github_reference_goal(tmp_path, monkeypatch):
+    import devcouncil.cli.commands.check as check_cmd
+    from devcouncil.verification.ad_hoc_check import AdHocCheckResult
+
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    captured = {}
+    monkeypatch.setattr(
+        check_cmd, "resolve_goal_intent",
+        lambda goal, root: ("Implement issue #142: Add reset\n\nbody", "Pulled intent from issue #142 via gh."),
+    )
+
+    def fake_gate(root, requirement, **kwargs):
+        captured["requirement"] = requirement
+        return AdHocCheckResult(requirement=requirement, reason="no_changes", changed_files=[], gaps=[], next_actions=[])
+
+    monkeypatch.setattr(check_cmd, "run_working_tree_check", fake_gate)
+
+    result = runner.invoke(app, ["check", "--goal", "#142", "--verify"])
+
+    # The evidence gate received the expanded issue text, not the bare "#142".
+    assert captured["requirement"].startswith("Implement issue #142: Add reset")
+    assert "Pulled intent from issue #142" in result.output
+
+
 def test_cli_map_writes_repo_map(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "pyproject.toml").write_text("[project]\nname='sample'\n", encoding="utf-8")
@@ -279,6 +341,29 @@ def test_cli_plan_dry_run_can_persist_when_requested(tmp_path, monkeypatch):
         assert [task.id for task in TaskRepository(session).get_all()] == ["TASK-001"]
 
 
+def test_cli_plan_quick_mode_skips_the_council(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    result = runner.invoke(app, ["plan", "Add password reset", "--dry-run", "--persist", "--quick"])
+
+    assert result.exit_code == 0
+    assert "Final Tasks: 1" in result.output
+    run_dirs = list((tmp_path / ".devcouncil" / "runs").glob("*"))
+    assert len(run_dirs) == 1
+    run_dir = run_dirs[0]
+    # Single plan + synthesized decision; no A/B debate, critique, or rebuttal calls.
+    assert (run_dir / "plan_a.json").exists()
+    assert (run_dir / "decision.json").exists()
+    assert not (run_dir / "plan_b.json").exists()
+    assert not (run_dir / "critique_a.json").exists()
+    assert not (run_dir / "rebuttal_a.json").exists()
+    # The spec's requirements pass through verbatim as the final requirements.
+    decision = json.loads((run_dir / "decision.json").read_text(encoding="utf-8"))
+    assert [r["id"] for r in decision["final_requirements"]] == ["REQ-001"]
+    assert [t["id"] for t in decision["final_tasks"]] == ["TASK-001"]
+
+
 def test_cli_plan_dry_run_saves_codebase_prompt_enhancement(tmp_path, monkeypatch):
     from devcouncil.telemetry.traces import read_trace_events
 
@@ -317,8 +402,8 @@ def test_cli_plan_sends_enhanced_prompt_to_debate_services(tmp_path, monkeypatch
     assert runner.invoke(app, ["init"]).exit_code == 0
     seen = {"spec": [], "plan": [], "arbiter": []}
 
-    async def fake_enhance(self, goal, repo_map_json, graph_context_json=None):
-        _ = self, repo_map_json, graph_context_json
+    async def fake_enhance(self, goal, repo_map_json, graph_context_json=None, project_root=None):
+        _ = self, repo_map_json, graph_context_json, project_root
         return PromptEnhancement(
             original_goal="wrong model echo",
             enhanced_goal=f"Enhanced for this codebase: {goal}",
@@ -600,7 +685,7 @@ def test_cli_go_plans_runs_tasks_and_reports(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert runner.invoke(app, ["init"]).exit_code == 0
 
-    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path):
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path, **_kwargs):
         db = get_db(tmp_path)
         assert db is not None
         with db.get_session() as session:
@@ -635,6 +720,48 @@ def test_cli_go_plans_runs_tasks_and_reports(tmp_path, monkeypatch):
     assert '"verdict": "passed"' in result.output
 
 
+def test_cli_go_expands_github_reference_goal_before_planning(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    captured = {}
+
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path, **_kwargs):
+        captured["goal"] = goal
+        return []
+
+    monkeypatch.setattr("devcouncil.cli.commands.go.plan_command.run_plan_flow", fake_plan_flow)
+    monkeypatch.setattr(
+        "devcouncil.cli.commands.go.resolve_goal_intent",
+        lambda goal, root: ("Implement issue #142: Add password reset\n\nfull body", "Pulled intent from issue #142 via gh."),
+    )
+
+    result = runner.invoke(app, ["go", "#142", "--executor", "codex"])
+
+    # Planning ran against the expanded issue text, not the bare "#142".
+    assert captured["goal"].startswith("Implement issue #142: Add password reset")
+    assert "Pulled intent from issue #142" in result.output
+
+
+def test_cli_go_quick_flag_is_forwarded_to_planning(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    captured = {}
+
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path, **kwargs):
+        captured["quick"] = kwargs.get("quick")
+        return []
+
+    monkeypatch.setattr("devcouncil.cli.commands.go.plan_command.run_plan_flow", fake_plan_flow)
+
+    runner.invoke(app, ["go", "Add a feature", "--executor", "codex", "--quick"])
+    assert captured["quick"] is True
+
+    runner.invoke(app, ["go", "Add a feature", "--executor", "codex"])
+    assert captured["quick"] is False
+
+
 def test_cli_e2e_alias_plans_runs_tasks_and_reports(tmp_path, monkeypatch):
     from devcouncil.domain.task import PlannedFile, Task
     from devcouncil.storage.db import get_db
@@ -643,7 +770,7 @@ def test_cli_e2e_alias_plans_runs_tasks_and_reports(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert runner.invoke(app, ["init"]).exit_code == 0
 
-    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path):
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path, **_kwargs):
         db = get_db(project_root)
         assert db is not None
         with db.get_session() as session:
@@ -692,7 +819,7 @@ def test_cli_e2e_uses_configured_default_executor_when_omitted(tmp_path, monkeyp
     raw_config["execution"]["default_executor"] = "gemini-cli"
     config_path.write_text(yaml.safe_dump(raw_config), encoding="utf-8")
 
-    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path):
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path, **_kwargs):
         db = get_db(project_root)
         assert db is not None
         with db.get_session() as session:
@@ -749,7 +876,7 @@ def test_cli_e2e_writes_machine_readable_report_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert runner.invoke(app, ["init"]).exit_code == 0
 
-    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path):
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path, **_kwargs):
         db = get_db(project_root)
         assert db is not None
         with db.get_session() as session:
@@ -801,7 +928,7 @@ def test_cli_e2e_agent_mode_writes_default_json_report(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert runner.invoke(app, ["init"]).exit_code == 0
 
-    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path):
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path, **_kwargs):
         db = get_db(project_root)
         assert db is not None
         with db.get_session() as session:
@@ -851,7 +978,7 @@ def test_cli_go_supports_project_root_from_other_directory(tmp_path, monkeypatch
 
     seen = {}
 
-    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=Path(".")):
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=Path("."), **_kwargs):
         seen["plan_root"] = project_root
         db = get_db(project_root)
         assert db is not None
@@ -907,7 +1034,7 @@ def test_cli_go_only_runs_tasks_from_current_plan(tmp_path, monkeypatch):
             expected_tests=["python --version"],
         ))
 
-    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path):
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path, **_kwargs):
         db = get_db(project_root)
         assert db is not None
         with db.get_session() as session:
@@ -946,7 +1073,7 @@ def test_cli_go_only_runs_tasks_from_current_plan(tmp_path, monkeypatch):
 def test_cli_go_fails_when_plan_returns_no_task_ids(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
-    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path):
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path, **_kwargs):
         return []
 
     monkeypatch.setattr("devcouncil.cli.commands.go.plan_command.run_plan_flow", fake_plan_flow)
@@ -960,7 +1087,7 @@ def test_cli_go_fails_when_plan_returns_no_task_ids(tmp_path, monkeypatch):
 def test_cli_go_fails_when_planned_task_id_is_not_persisted(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
-    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path):
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path, **_kwargs):
         _ = goal, requirements_only, dry_run, persist, project_root
         return ["TASK-MISSING"]
 
@@ -980,7 +1107,7 @@ def test_cli_go_deduplicates_planned_task_ids(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert runner.invoke(app, ["init"]).exit_code == 0
 
-    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path):
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path, **_kwargs):
         db = get_db(project_root)
         assert db is not None
         with db.get_session() as session:
@@ -1024,7 +1151,7 @@ def test_cli_go_fails_when_executor_leaves_task_unverified(tmp_path, monkeypatch
     monkeypatch.chdir(tmp_path)
     assert runner.invoke(app, ["init"]).exit_code == 0
 
-    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path):
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path, **_kwargs):
         db = get_db(project_root)
         assert db is not None
         with db.get_session() as session:
@@ -1033,8 +1160,8 @@ def test_cli_go_fails_when_executor_leaves_task_unverified(tmp_path, monkeypatch
                 title=goal,
                 description="Executor will not verify this",
                 planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
-                allowed_commands=["python --version"],
-                expected_tests=["python --version"],
+                allowed_commands=["python -c \"import sys; sys.exit(1)\""],
+                expected_tests=["python -c \"import sys; sys.exit(1)\""],
             ))
         return ["TASK-001"]
 
@@ -1047,7 +1174,9 @@ def test_cli_go_fails_when_executor_leaves_task_unverified(tmp_path, monkeypatch
     result = runner.invoke(app, ["go", "Add a feature", "--executor", "codex", "--json-report"])
 
     assert result.exit_code == 1
-    assert "Unfinished task(s): TASK-001 (planned)" in result.output
+    # After the final reconciliation pass the task's real verification (a failing
+    # command) keeps it unfinished; the exact status is blocked rather than planned.
+    assert "Unfinished task(s): TASK-001" in result.output
 
 
 def test_cli_go_fails_when_all_planned_tasks_were_precompleted(tmp_path, monkeypatch):
@@ -1058,7 +1187,7 @@ def test_cli_go_fails_when_all_planned_tasks_were_precompleted(tmp_path, monkeyp
     monkeypatch.chdir(tmp_path)
     assert runner.invoke(app, ["init"]).exit_code == 0
 
-    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path):
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path, **_kwargs):
         db = get_db(project_root)
         assert db is not None
         with db.get_session() as session:
@@ -1100,19 +1229,26 @@ def test_cli_go_continue_on_blocked_runs_later_tasks_but_fails_project(tmp_path,
     monkeypatch.chdir(tmp_path)
     assert runner.invoke(app, ["init"]).exit_code == 0
 
-    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path):
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path, **_kwargs):
         db = get_db(project_root)
         assert db is not None
         with db.get_session() as session:
             repo = TaskRepository(session)
             for task_id in ("TASK-001", "TASK-002"):
+                # TASK-001 has a genuinely failing check so it stays blocked through
+                # the final reconciliation pass; TASK-002's check passes.
+                check = (
+                    'python -c "import sys; sys.exit(1)"'
+                    if task_id == "TASK-001"
+                    else "python --version"
+                )
                 repo.save(Task(
                     id=task_id,
                     title=f"{goal} {task_id}",
                     description="Generated task",
                     planned_files=[PlannedFile(path=f"src/{task_id}.py", reason="logic", allowed_change="modify")],
-                    allowed_commands=["python --version"],
-                    expected_tests=["python --version"],
+                    allowed_commands=[check],
+                    expected_tests=[check],
                 ))
         return ["TASK-001", "TASK-002"]
 
@@ -1169,7 +1305,7 @@ def test_cli_go_rejects_unknown_executor_before_planning(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     called = False
 
-    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path):
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path, **_kwargs):
         nonlocal called
         called = True
         return []
@@ -1214,7 +1350,7 @@ def test_cli_go_supports_custom_agent_registry_and_profile(tmp_path, monkeypatch
     config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     seen = {}
 
-    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path):
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path, **_kwargs):
         _ = requirements_only, dry_run, persist
         db = get_db(project_root)
         assert db is not None
@@ -1358,7 +1494,7 @@ def test_cli_go_auto_detects_coding_cli_when_default_is_manual(tmp_path, monkeyp
 
     monkeypatch.setattr("shutil.which", fake_which)
 
-    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path):
+    async def fake_plan_flow(goal, requirements_only=False, dry_run=False, persist=True, project_root=tmp_path, **_kwargs):
         _ = goal, requirements_only, dry_run, persist
         db = get_db(project_root)
         assert db is not None
@@ -3287,12 +3423,53 @@ def test_cli_verify_json_output(tmp_path, monkeypatch):
             allowed_commands=["python --version"],
         ))
 
+    # Produce the planned change so there is real work to verify. An empty diff is
+    # now correctly blocked (the agent cannot "pass" having written nothing), so a
+    # passing-verify shape test must actually implement the file.
+    (tmp_path / "src").mkdir(exist_ok=True)
+    (tmp_path / "src" / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+
     result = runner.invoke(app, ["verify", "TASK-001", "--json"])
 
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["ok"] is True
     assert payload["tasks"][0]["task_id"] == "TASK-001"
+    # The verify response now reports the rigor of the run.
+    assert payload["tasks"][0]["verification_mode"] in {"coarse", "compiled"}
+    assert payload["tasks"][0]["diff_empty"] is False
+
+
+def test_cli_verify_blocks_empty_diff(tmp_path, monkeypatch):
+    """A task that declares changes but produced none is blocked (exit 1)."""
+    from devcouncil.domain.requirement import AcceptanceCriterion, Requirement
+    from devcouncil.domain.task import PlannedFile, Task
+    from devcouncil.storage.db import get_db
+    from devcouncil.storage.repositories import RequirementRepository, TaskRepository
+
+    monkeypatch.chdir(tmp_path)
+    subprocess.check_call(["git", "init"], cwd=tmp_path, stdout=subprocess.DEVNULL)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    db = get_db(tmp_path)
+    assert db is not None
+    with db.get_session() as session:
+        RequirementRepository(session).save(Requirement(
+            id="REQ-001", title="R", description="d", priority="high", source="user",
+            acceptance_criteria=[AcceptanceCriterion(id="AC-001", description="t", verification_method="unit_test")],
+        ))
+        TaskRepository(session).save(Task(
+            id="TASK-001", title="T", description="d",
+            requirement_ids=["REQ-001"], acceptance_criterion_ids=["AC-001"],
+            planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
+            expected_tests=["python --version"],
+        ))
+
+    result = runner.invoke(app, ["verify", "TASK-001", "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert any(g["gap_type"] == "task_not_implemented" for g in payload["tasks"][0]["gaps"])
 
 
 def test_cli_prompt_project_root_option(tmp_path, monkeypatch):

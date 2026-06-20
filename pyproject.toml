@@ -32,6 +32,9 @@ dev = [
     "ruff>=0.4.4",
     "mypy>=1.10.0",
     "types-pyyaml>=6.0.12.20260408",
+    # Used only to exercise the diff↔coverage path end-to-end in tests. DevCouncil
+    # never requires coverage at runtime — it uses whatever the target repo provides.
+    "coverage>=7.4",
 ]
 
 [tool.pytest.ini_options]

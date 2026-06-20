@@ -19,6 +19,29 @@ class PolicyDecision(BaseModel):
     task_id: str | None = None
 
 
+def normalize_repo_path(project_root: Path, raw_path: str) -> tuple[str, bool]:
+    """Resolve ``raw_path`` against ``project_root`` and report containment.
+
+    Returns ``(normalized_posix_path, is_outside_root)``. This is the single source of
+    truth used by both the task policy engine and the coding-CLI hook policy, so a path
+    is normalized identically wherever it is checked — closing the bypass where a path
+    that failed to resolve was returned raw and enforced differently than it was
+    checked. ``is_outside_root`` is True for anything that escapes the project (absolute
+    elsewhere, ``..`` traversal) or cannot be resolved, so callers fail closed."""
+    cleaned = raw_path.strip().strip('"').replace("\\", "/")
+    root = project_root.resolve()
+    try:
+        candidate = Path(cleaned)
+        resolved = candidate.resolve() if candidate.is_absolute() else (root / cleaned).resolve()
+    except OSError:
+        fallback = cleaned[2:] if cleaned.startswith("./") else cleaned
+        return fallback, True
+    try:
+        return resolved.relative_to(root).as_posix(), False
+    except ValueError:
+        return resolved.as_posix(), True
+
+
 _NO_TASK_ALLOWED_COMMANDS = (
     "dev status",
     "dev tasks",
@@ -54,11 +77,50 @@ SECRET_PATH_PATTERNS = (
     "**/secrets/**",
     "**/*.pem",
     "**/*.key",
+    # Private SSH keys and well-known credential/token files. These are never
+    # writable through the gate so an agent cannot plant or overwrite credentials.
+    "**/id_rsa",
+    "**/id_dsa",
+    "**/id_ecdsa",
+    "**/id_ed25519",
+    "id_rsa",
+    "id_ed25519",
+    ".npmrc",
+    "**/.npmrc",
+    ".pypirc",
+    "**/.pypirc",
+    ".netrc",
+    "**/.netrc",
+    "**/.aws/credentials",
+    ".aws/credentials",
+    "**/*.pfx",
+    "**/*.p12",
+    "*.pfx",
+    "*.p12",
+    ".git-credentials",
+    "**/.git-credentials",
+    "**/kube/config",
+    "**/.kube/config",
 )
 
 _RESTRICTED_PATH_PATTERNS = (
     ".git/*",
     ".devcouncil/*",
+    # Protect the client hook/agent configs themselves: an agent must not be able to
+    # disarm or rewire the pre-action gate by editing its own client integration files.
+    ".claude/*",
+    ".claude/**",
+    ".codex/*",
+    ".codex/**",
+    ".cursor/*",
+    ".cursor/**",
+    ".gemini/*",
+    ".gemini/**",
+    ".opencode/*",
+    ".opencode/**",
+    ".agents/*",
+    ".agents/**",
+    "opencode.json",
 )
 
 
@@ -123,8 +185,16 @@ class TaskPolicyEngine:
         *,
         internal: bool = False,
     ) -> PolicyDecision:
-        normalized = self._normalize_path(path)
+        normalized, outside_root = normalize_repo_path(self.project_root, path)
         task_id = task.id if task else None
+
+        if outside_root:
+            return PolicyDecision(
+                action="deny",
+                reason="Path is outside the project root.",
+                target=normalized,
+                task_id=task_id,
+            )
 
         if self._matches_any(normalized, SECRET_PATH_PATTERNS):
             return PolicyDecision(
@@ -225,7 +295,12 @@ class TaskPolicyEngine:
                 target=normalized,
             )
 
-        if re.search(r"\bgit\s+push\b.*(\s--force(?:-with-lease)?\b|\s-f\b)", lowered):
+        if re.search(r"\bgit\s+push\b.*(\s--force(?:-with-lease)?\b|\s-f\b)", lowered) or re.search(
+            r"\bgit\s+push\s+\S+\s+\+\S", lowered
+        ):
+            # The second pattern catches the leading-plus refspec form
+            # (`git push origin +HEAD:master`), which forces a non-fast-forward update
+            # without the --force flag.
             return PolicyDecision(
                 action="deny",
                 reason="Force pushes are not allowed.",
@@ -242,16 +317,7 @@ class TaskPolicyEngine:
         return PolicyDecision(action="allow", reason="Command is allowed.", target=normalized)
 
     def _normalize_path(self, raw_path: str) -> str:
-        path = raw_path.strip().strip('"').replace("\\", "/")
-        try:
-            candidate = Path(path)
-            resolved = candidate.resolve() if candidate.is_absolute() else (self.project_root / path).resolve()
-            return resolved.relative_to(self.project_root).as_posix()
-        except (OSError, ValueError):
-            pass
-        if path.startswith("./"):
-            path = path[2:]
-        return path
+        return normalize_repo_path(self.project_root, raw_path)[0]
 
     def _planned_file_for(self, path: str, task: Task) -> PlannedFile | None:
         for planned in task.planned_files:

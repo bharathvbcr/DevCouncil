@@ -9,8 +9,18 @@ class JsonReportGenerator:
         summary = graph.coverage_summary()
         live_blockers = len((live_review or {}).get("blocking_cards", []))
         
+        # Three honest states (see markdown_report for rationale):
+        #   blocked    - positive evidence of a problem.
+        #   incomplete - nothing failing, but not every AC has passing evidence.
+        #   passed     - no blocking gaps and every AC proven.
+        if summary["blocking_gaps"] > 0 or live_blockers > 0:
+            verdict = "blocked"
+        elif summary["ac_without_evidence"] > 0:
+            verdict = "incomplete"
+        else:
+            verdict = "passed"
         report = {
-            "verdict": "blocked" if summary["blocking_gaps"] > 0 or live_blockers > 0 else "passed",
+            "verdict": verdict,
             "coverage_summary": summary,
             "blocking_gaps": [g.model_dump() for g in graph.blocking_gaps()]
         }

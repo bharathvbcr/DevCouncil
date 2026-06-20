@@ -11,7 +11,9 @@ from devcouncil.storage.repositories import TaskRepository, RequirementRepositor
 from devcouncil.verification.verifier import Verifier
 from devcouncil.llm.provider import create_provider, validate_model_provider
 from devcouncil.llm.router import ModelRouter
-from devcouncil.domain.evidence import CommandResult, DiffEvidence, TestEvidence
+from devcouncil.domain.evidence import CommandResult, DiffEvidence, DiffCoverageEvidence, TestEvidence
+from devcouncil.domain.gap import Gap
+from devcouncil.verification.next_actions import split_next_actions
 from devcouncil.app.config import load_config, get_api_key
 from devcouncil.app.state_machine import ProjectPhase
 from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
@@ -19,6 +21,29 @@ from devcouncil.telemetry.traces import TraceLogger
 
 console = Console()
 MAX_RENDERED_GAPS = 20
+
+
+def reconcile_cross_task_acceptance(
+    gaps: list[Gap], proven_acs: set[str]
+) -> list[Gap]:
+    """Drop a task's blocking ``acceptance_criteria_unproven`` gaps whose criterion is
+    already proven by passing evidence in another task.
+
+    Acceptance criteria are requirement-level, not task-private: when the planner splits
+    "implement X" and "add tests for X" into separate tasks that share criteria, the
+    implement task would otherwise stay blocked for criteria the test task proved. The
+    caller passes ``proven_acs`` gathered from passing evidence re-run against the current
+    tree, so a regression would have failed the test and excluded the criterion — only
+    genuinely-satisfied criteria are cleared. Returns the gaps to keep."""
+    return [
+        gap
+        for gap in gaps
+        if not (
+            gap.blocking
+            and gap.gap_type == "acceptance_criteria_unproven"
+            and gap.acceptance_criterion_id in proven_acs
+        )
+    ]
 
 def verify(
     task_id: Optional[str] = typer.Argument(None, help="Optional ID of the task to verify"),
@@ -75,6 +100,10 @@ def verify(
         total_gaps = 0
         blocked_tasks = 0
         task_results = []
+        # Cross-task acceptance reconciliation state: a criterion proven by passing
+        # evidence in ANY task is proven for every task that shares it.
+        proven_acs: set[str] = set()
+        per_task_gaps: dict[str, list] = {}
 
         for task in tasks:
             if sandbox != "local":
@@ -143,6 +172,7 @@ def verify(
             evidence_repo.delete_for_task(task.id)
 
             gaps, evidence = asyncio.run(verifier.verify_task(task, reqs))
+            outcome = verifier.last_outcome
             total_gaps += len(gaps)
 
             for gap in gaps:
@@ -151,11 +181,16 @@ def verify(
             for ev in evidence:
                 if isinstance(ev, CommandResult):
                     evidence_repo.save_command_result(task.id, ev)
+                elif isinstance(ev, DiffCoverageEvidence):
+                    evidence_repo.save_diff_coverage_evidence(ev)
                 elif isinstance(ev, DiffEvidence):
                     evidence_repo.save_diff_evidence(ev)
                 elif isinstance(ev, TestEvidence):
                     evidence_repo.save_test_evidence(ev, task.id)
+                    if ev.status == "passed" and ev.acceptance_criterion_id:
+                        proven_acs.add(ev.acceptance_criterion_id)
 
+            per_task_gaps[task.id] = gaps
             if not json_format:
                 _print_task_result(task.id, gaps)
 
@@ -177,13 +212,58 @@ def verify(
                     summary=f"{task.id} verified",
                 )
             task_repo.save(task)
+            blocking_actions, advisory_actions = split_next_actions(gaps)
             task_results.append({
                 "task_id": task.id,
                 "status": task.status,
                 "gap_count": len(gaps),
                 "blocking_gap_count": len([gap for gap in gaps if gap.blocking]),
                 "gaps": [gap.model_dump() for gap in gaps],
+                "next_actions": [action.model_dump() for action in blocking_actions],
+                "advisory_actions": [action.model_dump() for action in advisory_actions],
+                "verification_mode": outcome.mode if outcome else "unknown",
+                "compiler_active": outcome.compiler_active if outcome else False,
+                "diff_empty": outcome.diff_empty if outcome else False,
+                "coverage_measured": outcome.coverage_measured if outcome else False,
+                "coverage_skipped_reason": outcome.coverage_skipped_reason if outcome else None,
             })
+
+        # Cross-task acceptance reconciliation (only meaningful across the full set).
+        # The planner sometimes splits "implement X" and "add tests for X" into separate
+        # tasks that share acceptance criteria; the implement task would otherwise stay
+        # blocked for criteria the test task already proved. A criterion proven by passing
+        # evidence in ANY task is proven for every task that shares it. Evidence was re-run
+        # against the current tree, so a regression would have failed the test and the AC
+        # would not be in proven_acs — this clears only genuinely-satisfied criteria.
+        if task_id is None and proven_acs:
+            for task in tasks:
+                gaps = per_task_gaps.get(task.id, [])
+                kept = reconcile_cross_task_acceptance(gaps, proven_acs)
+                if len(kept) == len(gaps):
+                    continue
+                gap_repo.delete_for_task(task.id)
+                for gap in kept:
+                    gap_repo.save(gap)
+                per_task_gaps[task.id] = kept
+                if task.status == "blocked" and not any(gap.blocking for gap in kept):
+                    task.status = "verified"
+                    blocked_tasks = max(0, blocked_tasks - 1)
+                    TraceLogger(root).log_event(
+                        "task_reconciled",
+                        {"task_id": task.id, "cross_task_proven": True},
+                        task_id=task.id,
+                        summary=f"{task.id} verified via cross-task acceptance reconciliation",
+                    )
+                task_repo.save(task)
+                for result in task_results:
+                    if result["task_id"] == task.id:
+                        blocking_actions, advisory_actions = split_next_actions(kept)
+                        result["status"] = task.status
+                        result["gap_count"] = len(kept)
+                        result["blocking_gap_count"] = len([gap for gap in kept if gap.blocking])
+                        result["gaps"] = [gap.model_dump() for gap in kept]
+                        result["next_actions"] = [action.model_dump() for action in blocking_actions]
+                        result["advisory_actions"] = [action.model_dump() for action in advisory_actions]
 
         StateRepository(session).record_phase(
             ProjectPhase.TASK_BLOCKED.value if blocked_tasks else ProjectPhase.TASK_VERIFIED.value
@@ -205,6 +285,13 @@ def verify(
                 )
             else:
                 console.print(f"\n[green]Verified {len(tasks)} tasks successfully.[/green]")
+
+    # Exit-code contract (so shell-driven agents can gate on $?):
+    #   0 = all verified, no blocking gaps
+    #   1 = at least one task is blocked by a verification gap
+    # Argument/state errors above return early with their own message and exit 0.
+    if blocked_tasks:
+        raise typer.Exit(code=1)
 
 
 def _print_task_result(task_id: str, gaps):

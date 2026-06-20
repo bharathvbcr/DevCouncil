@@ -16,18 +16,89 @@ from devcouncil.llm.provider import (
     load_default_role_models_by_provider,
     validate_model_provider,
 )
-from devcouncil.llm.router import ModelRouter
+from devcouncil.llm.router import ModelRouter, StructuredOutputError
 
 
 class RouterOutput(BaseModel):
     value: str
 
 
+class BrokenJsonProvider(Provider):
+    """Always returns content that can never validate against RouterOutput,
+    so both the initial parse and the healing retry fail."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def complete(self, model, messages, temperature=0.0, json_mode=False, run_id=None, **kwargs):
+        self.calls += 1
+        return LLMResponse(
+            content="not json at all {",
+            model=model,
+            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            raw_response={},
+        )
+
+
+def test_complete_structured_raises_structured_output_error_without_fallback(tmp_path):
+    router = ModelRouter(BrokenJsonProvider(), {"critic_a": {"model": "weak/free"}}, project_root=tmp_path)
+    import asyncio
+
+    with pytest.raises(StructuredOutputError) as excinfo:
+        asyncio.run(router.complete_structured(role="critic_a", messages=[{"role": "user", "content": "x"}], schema=RouterOutput))
+    assert excinfo.value.role == "critic_a"
+    assert excinfo.value.model == "weak/free"
+
+
+class FlakyProvider(Provider):
+    """Returns malformed JSON for the first `fail_first` calls, then valid JSON —
+    simulating a model that botches one structured attempt but recovers on a fresh one."""
+
+    def __init__(self, fail_first=2):
+        self.calls = 0
+        self.fail_first = fail_first
+
+    async def complete(self, model, messages, temperature=0.0, json_mode=False, run_id=None, **kwargs):
+        self.calls += 1
+        content = "not json {" if self.calls <= self.fail_first else json.dumps({"value": "recovered"})
+        return LLMResponse(content=content, model=model,
+                           usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                           raw_response={})
+
+
+def test_complete_structured_retries_fresh_and_recovers(tmp_path):
+    import asyncio
+
+    provider = FlakyProvider(fail_first=2)  # first attempt (complete + heal) fail; second succeeds
+    router = ModelRouter(provider, {"critic_a": {"model": "weak/flaky"}}, project_root=tmp_path)
+    result = asyncio.run(
+        router.complete_structured(role="critic_a", messages=[{"role": "user", "content": "x"}], schema=RouterOutput)
+    )
+    assert result.value == "recovered"
+    assert provider.calls >= 3  # proves it made a fresh attempt rather than giving up
+
+
+def test_complete_structured_returns_fallback_on_failure(tmp_path):
+    router = ModelRouter(BrokenJsonProvider(), {"critic_a": {"model": "weak/free"}}, project_root=tmp_path)
+    import asyncio
+
+    fallback = RouterOutput(value="degraded")
+    result = asyncio.run(
+        router.complete_structured(
+            role="critic_a",
+            messages=[{"role": "user", "content": "x"}],
+            schema=RouterOutput,
+            fallback=fallback,
+        )
+    )
+    assert result.value == "degraded"
+
+
 class CountingProvider(Provider):
     def __init__(self):
         self.calls = 0
 
-    async def complete(self, model, messages, temperature=0.0, json_mode=False):
+    async def complete(self, model, messages, temperature=0.0, json_mode=False, run_id=None, **kwargs):
         self.calls += 1
         content = json.dumps({"value": "ok"})
         return LLMResponse(

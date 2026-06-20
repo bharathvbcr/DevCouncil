@@ -1,3 +1,6 @@
+import ast
+import json
+import re
 from pathlib import Path
 from typing import List
 
@@ -5,15 +8,505 @@ from devcouncil.domain.requirement import Requirement
 from devcouncil.domain.task import Task
 from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
 
+# Context budget for injected file bodies. Skills are bounded separately; these keep
+# a task that touches many/large files from blowing up the prompt. Lowest-priority
+# content (later files) is truncated/omitted first, with an explicit marker.
+MAX_FILE_CONTEXT_CHARS = 24_000   # total across all injected file bodies
+MAX_PER_FILE_CHARS = 8_000        # cap on any single file body
+MAX_SYMBOLS_PER_FILE = 40
+# Global ceiling on the assembled prompt. The core (goal/requirements/scope/instructions)
+# is always kept; optional context sections are fitted in priority order and the
+# lowest-priority ones are dropped (with a marker) if the whole prompt would exceed this.
+MAX_PROMPT_CHARS = 60_000
+
+_LANG_BY_EXT = {
+    ".py": "python", ".js": "javascript", ".jsx": "jsx", ".ts": "typescript",
+    ".tsx": "tsx", ".go": "go", ".rs": "rust", ".java": "java", ".kt": "kotlin",
+    ".swift": "swift", ".rb": "ruby", ".cs": "csharp", ".cpp": "cpp", ".c": "c",
+    ".sh": "bash", ".yml": "yaml", ".yaml": "yaml", ".json": "json", ".toml": "toml",
+    ".md": "markdown", ".sql": "sql",
+}
+
+
 class PromptBuilder:
     def __init__(self, project_root: Path = Path(".")):
         self.project_root = project_root
 
-    def build_task_prompt(self, task: Task, requirements: List[Requirement]) -> str:
+    @staticmethod
+    def _lang_for(path: str) -> str:
+        return _LANG_BY_EXT.get(Path(path).suffix.lower(), "")
+
+    def _symbol_outline(self, path: str, text: str) -> List[str]:
+        """Cheap top-level symbol index (signatures + line numbers) so the agent edits
+        in place and uses correct names/arities instead of guessing or duplicating.
+
+        Python uses stdlib ``ast`` (method signatures, async/@property/@staticmethod
+        markers under each class). Other languages (ts/tsx/js/jsx/go/rs/java) use bounded
+        regex over exported/public declarations. No tree-sitter, no model call. Never
+        raises; honors the per-file symbol cap."""
+        if path.endswith(".py"):
+            return self._python_symbol_outline(text)
+        return self._regex_symbol_outline(path, text)
+
+    def _python_symbol_outline(self, text: str) -> List[str]:
+        try:
+            tree = ast.parse(text)
+        except Exception:
+            return []
+
+        def _decorator_markers(node) -> str:
+            names: set[str] = set()
+            for dec in getattr(node, "decorator_list", []):
+                target = dec.func if isinstance(dec, ast.Call) else dec
+                if isinstance(target, ast.Attribute):
+                    names.add(target.attr)
+                elif isinstance(target, ast.Name):
+                    names.add(target.id)
+            marks = [m for m in ("property", "staticmethod", "classmethod") if m in names]
+            return (" @" + " @".join(marks)) if marks else ""
+
+        def _func_sig(node) -> str:
+            args = ", ".join(a.arg for a in node.args.args)
+            kw = "async " if isinstance(node, ast.AsyncFunctionDef) else ""
+            return f"{kw}def {node.name}({args}) L{node.lineno}{_decorator_markers(node)}"
+
+        out: List[str] = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out.append(_func_sig(node))
+            elif isinstance(node, ast.ClassDef):
+                out.append(f"class {node.name} L{node.lineno}")
+                for n in node.body:
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        out.append("  " + _func_sig(n))
+                        if len(out) >= MAX_SYMBOLS_PER_FILE:
+                            break
+            if len(out) >= MAX_SYMBOLS_PER_FILE:
+                break
+        return out[:MAX_SYMBOLS_PER_FILE]
+
+    # Bounded per-language regexes over exported/public top-level declarations. Each
+    # capture group 2 is the symbol name; group 1 (when present) is the keyword/kind.
+    _OUTLINE_PATTERNS: dict[str, list[tuple[str, re.Pattern[str]]]] = {}
+
+    def _regex_symbol_outline(self, path: str, text: str) -> List[str]:
+        suffix = Path(path).suffix.lower()
+        lang = {
+            ".ts": "ts", ".tsx": "ts", ".js": "js", ".jsx": "js",
+            ".go": "go", ".rs": "rs", ".java": "java",
+        }.get(suffix)
+        if not lang:
+            return []
+        patterns = self._regex_outline_patterns().get(lang)
+        if not patterns:
+            return []
+        out: List[str] = []
+        for lineno, raw in enumerate(text.splitlines(), start=1):
+            for label, pattern in patterns:
+                m = pattern.match(raw)
+                if not m:
+                    continue
+                name = m.group("name")
+                out.append(f"{label} {name} L{lineno}")
+                break
+            if len(out) >= MAX_SYMBOLS_PER_FILE:
+                break
+        return out[:MAX_SYMBOLS_PER_FILE]
+
+    @classmethod
+    def _regex_outline_patterns(cls):
+        if cls._OUTLINE_PATTERNS:
+            return cls._OUTLINE_PATTERNS
+        n = r"(?P<name>[A-Za-z_$][\w$]*)"
+        ts = [
+            ("export class", re.compile(r"^\s*export\s+(?:default\s+)?(?:abstract\s+)?class\s+" + n)),
+            ("export interface", re.compile(r"^\s*export\s+interface\s+" + n)),
+            ("export type", re.compile(r"^\s*export\s+type\s+" + n)),
+            ("export enum", re.compile(r"^\s*export\s+(?:const\s+)?enum\s+" + n)),
+            ("export function", re.compile(r"^\s*export\s+(?:default\s+)?(?:async\s+)?function\s*\*?\s+" + n)),
+            ("export const", re.compile(r"^\s*export\s+(?:const|let|var)\s+" + n)),
+        ]
+        js = [
+            ("export class", re.compile(r"^\s*export\s+(?:default\s+)?class\s+" + n)),
+            ("export function", re.compile(r"^\s*export\s+(?:default\s+)?(?:async\s+)?function\s*\*?\s+" + n)),
+            ("export const", re.compile(r"^\s*export\s+(?:const|let|var)\s+" + n)),
+            ("class", re.compile(r"^\s*class\s+" + n)),
+            ("function", re.compile(r"^\s*(?:async\s+)?function\s*\*?\s+" + n)),
+        ]
+        go = [
+            # Go exports = capitalized identifiers; func may carry a receiver.
+            ("func", re.compile(r"^func\s+(?:\([^)]*\)\s*)?(?P<name>[A-Z]\w*)\s*[\(\[]")),
+            ("type", re.compile(r"^type\s+(?P<name>[A-Z]\w*)\s+")),
+        ]
+        rs = [
+            ("pub fn", re.compile(r"^\s*pub(?:\([^)]*\))?\s+(?:async\s+)?(?:unsafe\s+)?fn\s+" + n)),
+            ("pub struct", re.compile(r"^\s*pub(?:\([^)]*\))?\s+struct\s+" + n)),
+            ("pub enum", re.compile(r"^\s*pub(?:\([^)]*\))?\s+enum\s+" + n)),
+            ("pub trait", re.compile(r"^\s*pub(?:\([^)]*\))?\s+trait\s+" + n)),
+        ]
+        java = [
+            ("class", re.compile(r"^\s*(?:public|protected|private)?\s*(?:abstract\s+|final\s+)?class\s+" + n)),
+            ("interface", re.compile(r"^\s*(?:public|protected|private)?\s*interface\s+" + n)),
+            ("enum", re.compile(r"^\s*(?:public|protected|private)?\s*enum\s+" + n)),
+            # public/protected methods: <modifiers> <return-type> name(
+            ("method", re.compile(
+                r"^\s*(?:public|protected)\s+(?:static\s+|final\s+|abstract\s+|synchronized\s+|native\s+)*"
+                r"[\w<>\[\],.?\s]+?\s+(?P<name>[A-Za-z_]\w*)\s*\(")),
+        ]
+        cls._OUTLINE_PATTERNS = {"ts": ts, "js": js, "go": go, "rs": rs, "java": java}
+        return cls._OUTLINE_PATTERNS
+
+    def _planned_files_section(self, task: Task) -> str:
+        """Inject the current (redacted) contents of the task's planned files.
+
+        The capable production agents previously received file PATHS only and had to
+        rediscover every file and guess signatures — a leading cause of wrong-arity /
+        wrong-import edits that fail verification. Reading the real contents here lifts
+        one-shot success. Bounded by a total + per-file char budget (see constants);
+        new files are shown as headers only."""
+        from devcouncil.utils.redaction import redact_string
+
+        blocks: List[str] = []
+        budget = MAX_FILE_CONTEXT_CHARS
+        omitted = 0
+        for pf in task.planned_files:
+            label = pf.allowed_change
+            file_path = self.project_root / pf.path
+            if not (file_path.exists() and file_path.is_file()):
+                blocks.append(f"### `{pf.path}` [{label}] — new file (does not exist yet)\n")
+                continue
+            if budget <= 0:
+                omitted += 1
+                continue
+            try:
+                raw = file_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                blocks.append(f"### `{pf.path}` [{label}] — [error reading file]\n")
+                continue
+            content = redact_string(raw)
+            cap = min(MAX_PER_FILE_CHARS, budget)
+            truncated = len(content) > cap
+            if truncated:
+                content = content[:cap]
+            budget -= len(content)
+            symbols = self._symbol_outline(pf.path, raw)
+            block = f"### `{pf.path}` [{label}]\n"
+            if symbols:
+                block += "Symbols: " + "; ".join(symbols) + "\n"
+            block += f"```{self._lang_for(pf.path)}\n{content}\n```"
+            if truncated:
+                block += f"\n_[truncated to {cap} chars — open the file for the rest]_"
+            blocks.append(block + "\n")
+        if omitted:
+            blocks.append(f"_[{omitted} more planned file(s) omitted to fit the context budget — open them directly]_\n")
+        if not blocks:
+            return ""
+        return (
+            "\n## Current file contents (read before editing)\n"
+            "_Edit these in place; redacted secrets shown as ***._\n\n"
+            + "\n".join(blocks)
+        )
+
+    def _load_repo_map(self) -> dict | None:
+        """Parse ``.devcouncil/repo_map.json`` once per prompt (None if absent/unreadable)."""
+        map_path = self.project_root / ".devcouncil" / "repo_map.json"
+        if not map_path.exists():
+            return None
+        try:
+            data = json.loads(map_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def _repo_map_stale(self, data: dict | None) -> bool:
+        """Whether the loaded repo map is behind the repo's current state, so its
+        structural context / dependents may be wrong. Best-effort; never raises."""
+        if not data:
+            return False
+        try:
+            from devcouncil.indexing.repo_mapper import RepoMapper
+
+            return RepoMapper(self.project_root).map_is_stale(data)
+        except Exception:
+            return False
+
+    _STALE_MAP_NOTE = (
+        "_⚠ The repo map is behind the current code (run `dev map` to refresh); "
+        "treat the structure below as approximate._\n"
+    )
+
+    _NO_MAP_NOTE = (
+        "_(no repo map; run `dev map` for structural orientation)_\n"
+    )
+
+    def _repo_map_section(self, planned_paths: List[str], data: dict | None = None) -> str:
+        """Structural orientation from ``.devcouncil/repo_map.json`` — the fallback used
+        when the optional code-review-graph CLI is absent (the common case). Surfaces the
+        subsystem(s) the planned files live in, their key files, neighbors, and flow, so
+        an agent in an unfamiliar repo knows where it is before editing."""
+        if data is None:
+            data = self._load_repo_map()
+        if not data:
+            return ""
+        subsystems = data.get("subsystems") or []
+        files_by_path = {
+            f.get("path"): f for f in (data.get("files") or []) if isinstance(f, dict)
+        }
+        norm = [p.replace("\\", "/") for p in planned_paths]
+        relevant = [
+            s for s in subsystems
+            if isinstance(s, dict) and s.get("area")
+            and any(p == s["area"] or p.startswith(s["area"] + "/") for p in norm)
+        ]
+        if not relevant:
+            return ""
+        lines = ["## Repo map (structural context)"]
+        for s in relevant[:3]:
+            lines.append(f"\n**{s.get('area')}** — {s.get('summary', '')}".rstrip())
+            critical = [c for c in (s.get("critical_files") or []) if c not in norm][:6]
+            if critical:
+                lines.append("Key files:")
+                for c in critical:
+                    summary = (files_by_path.get(c) or {}).get("summary", "")
+                    lines.append(f"- `{c}`" + (f" — {summary}" if summary else ""))
+            neighbors = s.get("neighbors") or []
+            if neighbors:
+                lines.append("Neighboring subsystems: " + ", ".join(f"`{n}`" for n in neighbors[:6]))
+            handoffs = s.get("handoff_paths") or []
+            if handoffs:
+                lines.append("Cross-subsystem flow: " + "; ".join(handoffs[:4]))
+        return "\n".join(lines).strip() + "\n"
+
+    def _skills_section(self, task: Task) -> str:
+        """The full engineering-skill intake that applies to this task.
+
+        Selection is codebase-aware (task goal keywords + the repo's own files, so an
+        Android repo pulls the android skill via build.gradle even when the task text
+        doesn't say "android"). The full skill text is injected inline — the senior-dev
+        intake (current libraries, deprecations to avoid, the right build/test CLI
+        commands) goes straight to the coding agent rather than relying on it to open
+        scaffolded files. Never raises — a skills failure must not break prompt building.
+        """
+        try:
+            from devcouncil.skills.registry import bound_skills, render_preamble, select_skills
+
+            goal = f"{task.title}\n{task.description}"
+            selected = select_skills(goal=goal, project_root=self.project_root)
+            # Bound how much skill text rides inline so a repo that matches many skills
+            # can't blow up the task prompt; deferred skills are still on disk.
+            inline, deferred = bound_skills(selected)
+            preamble = render_preamble(inline)
+        except Exception:
+            return ""
+        if not selected or not preamble:
+            return ""
+
+        names = ", ".join(skill.name for skill in selected)
+        section = (
+            "\n## Engineering skills (apply before and while coding)\n"
+            f"_Applicable skills: {names}. Follow this current-practice intake; "
+            "don't rely on stale training data._\n\n"
+            f"{preamble}\n"
+        )
+        if deferred:
+            section += "\n_Also applicable (read the full text in `.claude/skills/<name>/SKILL.md`):_\n"
+            for skill in deferred:
+                blurb = skill.description or skill.title
+                suffix = f" — {blurb}" if blurb else ""
+                section += f"- `{skill.name}`{suffix}\n"
+        return section
+
+    def _dependents_section(self, task: Task, data: dict | None) -> str:
+        """List, per planned file the agent will change, the files that import it — the
+        blast radius. Sourced from repo_map.json's precomputed reverse-import index, so
+        the agent updates or preserves call sites instead of silently breaking them."""
+        dependents = (data or {}).get("dependents") or {}
+        if not isinstance(dependents, dict) or not dependents:
+            return ""
+        lines: List[str] = []
+        for pf in task.planned_files:
+            # New files have no dependents yet; only existing code carries blast radius.
+            if pf.allowed_change == "create":
+                continue
+            # Normalize the planned path to posix before the lookup — the map keys are
+            # always posix, so a backslash planned path on Windows would otherwise miss
+            # and silently drop the whole blast-radius entry (see _repo_map_section).
+            importers = dependents.get(pf.path.replace("\\", "/")) or []
+            if not importers:
+                continue
+            shown = importers[:8]
+            more = f" (+{len(importers) - len(shown)} more)" if len(importers) > len(shown) else ""
+            lines.append(f"- `{pf.path}` is imported by: " + ", ".join(f"`{p}`" for p in shown) + more)
+        if not lines:
+            return ""
+        return (
+            "\n## Dependents (blast radius)\n"
+            "_These files import the files you're changing — keep their call sites working, "
+            "or update them in scope._\n"
+            + "\n".join(lines)
+            + "\n"
+        )
+
+    # Call-sites block bounds: keep it tight so this lowest-priority context can't crowd
+    # out the file bodies / dependents it complements.
+    _CALL_SITES_MAX_DEP_FILES = 3      # dependent files grepped per changed file
+    _CALL_SITES_MAX_SYMBOLS = 6        # exported symbols searched per changed file
+    _CALL_SITES_MAX_LINES_PER_FILE = 3  # referencing lines emitted per dependent file
+    _CALL_SITES_MAX_TOTAL = 24         # hard cap on emitted file:line rows
+    _CALL_SITES_LINE_CHARS = 160       # truncate a long using line
+
+    def _exported_symbol_names(self, path: str, text: str) -> List[str]:
+        """Top-level symbol names from a file's outline (no signatures), used to grep
+        dependents for referencing lines."""
+        names: List[str] = []
+        for entry in self._symbol_outline(path, text):
+            stripped = entry.strip()
+            # Outline rows look like "def name(args) L1", "class Name L5",
+            # "export function Name L3", "  async def m(...) Lx" — pull the identifier
+            # that precedes the first "(" or " L".
+            head = stripped.split(" L")[0]
+            head = head.split("(")[0].strip()
+            ident = head.split()[-1] if head.split() else ""
+            ident = ident.strip(":")
+            if ident and ident.isidentifier() and ident not in names:
+                names.append(ident)
+            if len(names) >= self._CALL_SITES_MAX_SYMBOLS:
+                break
+        return names
+
+    def _call_sites_section(self, task: Task, data: dict | None) -> str:
+        """Lowest-priority context: for each changed file, show where its exported symbols
+        are actually used in the top dependent files (file:line + the using line). Helps
+        the agent update call sites in scope. Tightly bounded; never raises."""
+        dependents = (data or {}).get("dependents") or {}
+        if not isinstance(dependents, dict) or not dependents:
+            return ""
+        lines: List[str] = []
+        emitted = 0
+        for pf in task.planned_files:
+            if pf.allowed_change == "create" or emitted >= self._CALL_SITES_MAX_TOTAL:
+                continue
+            key = pf.path.replace("\\", "/")
+            importers = dependents.get(key) or []
+            if not importers:
+                continue
+            src_path = self.project_root / pf.path
+            try:
+                src_text = src_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            symbols = self._exported_symbol_names(pf.path, src_text)
+            if not symbols:
+                continue
+            file_rows: List[str] = []
+            for importer in importers[: self._CALL_SITES_MAX_DEP_FILES]:
+                if emitted >= self._CALL_SITES_MAX_TOTAL:
+                    break
+                try:
+                    dep_text = (self.project_root / importer).read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                hits = 0
+                for lineno, raw in enumerate(dep_text.splitlines(), start=1):
+                    if hits >= self._CALL_SITES_MAX_LINES_PER_FILE or emitted >= self._CALL_SITES_MAX_TOTAL:
+                        break
+                    if any(self._references_symbol(raw, sym) for sym in symbols):
+                        snippet = raw.strip()[: self._CALL_SITES_LINE_CHARS]
+                        file_rows.append(f"  - `{importer}:{lineno}` — `{snippet}`")
+                        hits += 1
+                        emitted += 1
+            if file_rows:
+                lines.append(f"- `{pf.path}` (uses of {', '.join(f'`{s}`' for s in symbols)}):")
+                lines.extend(file_rows)
+        if not lines:
+            return ""
+        return (
+            "\n## Call sites (where your symbols are used)\n"
+            "_Referencing lines in dependent files — update these if you change a signature._\n"
+            + "\n".join(lines)
+            + "\n"
+        )
+
+    @staticmethod
+    def _references_symbol(line: str, symbol: str) -> bool:
+        """Whole-word match of ``symbol`` in ``line``. Cheap; avoids matching substrings
+        of longer identifiers."""
+        idx = line.find(symbol)
+        if idx < 0:
+            return False
+        before = line[idx - 1] if idx > 0 else ""
+        after = line[idx + len(symbol)] if idx + len(symbol) < len(line) else ""
+        return not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_")
+
+    # Bound the dependency-risk block so this low-priority, opt-in context can't
+    # crowd out file bodies / dependents.
+    _DEP_RISKS_MAX = 12
+
+    def _dependency_risks_section(self, data: dict | None) -> str:
+        """Surface dependency vulnerabilities recorded in repo_map.json (opt-in SCA).
+
+        Lowest-priority, optional context: warns an agent that may bump a vulnerable
+        dependency. Absent unless `dev map` was run with SCA enabled. Never raises."""
+        risks = (data or {}).get("dependency_risks") or []
+        if not isinstance(risks, list) or not risks:
+            return ""
+        lines: List[str] = []
+        for risk in risks[: self._DEP_RISKS_MAX]:
+            if not isinstance(risk, dict):
+                continue
+            pkg = str(risk.get("package", "")).strip() or "(unknown)"
+            version = str(risk.get("installed_version", "")).strip()
+            severity = str(risk.get("severity", "")).strip() or "unknown"
+            advisory = str(risk.get("advisory_id", "")).strip()
+            summary = str(risk.get("summary", "")).strip()
+            head = f"`{pkg}`" + (f" {version}" if version else "")
+            tail = f" [{severity}]"
+            if advisory:
+                tail += f" {advisory}"
+            if summary:
+                tail += f" — {summary[:160]}"
+            lines.append(f"- {head}{tail}")
+        if not lines:
+            return ""
+        more = len(risks) - len(lines)
+        if more > 0:
+            lines.append(f"- _(+{more} more — see `.devcouncil/repo_map.json`)_")
+        return (
+            "\n## Dependency risks (known vulnerabilities)\n"
+            "_Reported by a local dependency auditor. Avoid bumping a listed package to a "
+            "still-vulnerable version; prefer a patched release._\n"
+            + "\n".join(lines)
+            + "\n"
+        )
+
+    @staticmethod
+    def _fit_segments(segments: list[dict], budget: int) -> str:
+        """Fit optional context segments into ``budget`` chars. Segments are kept in
+        priority order (lower = more important) and emitted in display order; any that
+        don't fit are dropped with an explicit marker so truncation is never silent."""
+        kept: list[dict] = []
+        used = 0
+        dropped: list[dict] = []
+        for seg in sorted(segments, key=lambda s: (s["priority"], s["order"])):
+            if budget > 0 and used + len(seg["text"]) <= budget:
+                kept.append(seg)
+                used += len(seg["text"])
+            else:
+                dropped.append(seg)
+        body = "".join(seg["text"] for seg in sorted(kept, key=lambda s: s["order"]))
+        if dropped:
+            names = ", ".join(s["name"] for s in sorted(dropped, key=lambda s: s["order"]))
+            body += f"\n_[Context budget reached — omitted: {names}. Open these directly if needed.]_\n"
+        return body
+
+    def build_task_prompt(
+        self, task: Task, requirements: List[Requirement], *, max_chars: int = MAX_PROMPT_CHARS
+    ) -> str:
         req_map = {r.id: r for r in requirements}
         task_reqs = [req_map[rid] for rid in task.requirement_ids if rid in req_map]
-        
-        prompt = f"""# Implement {task.id}: {task.title}
+
+        # --- Core: always kept (the goal/scope/instructions the agent must have). ---
+        core = f"""# Implement {task.id}: {task.title}
 
 ## Goal
 {task.description}
@@ -21,34 +514,32 @@ class PromptBuilder:
 ## Requirements
 """
         for req in task_reqs:
-            prompt += f"- {req.id}: {req.title}\n"
+            core += f"- {req.id}: {req.title}\n"
             for ac in req.acceptance_criteria:
-                prompt += f"  - [ ] {ac.description} ({ac.verification_method})\n"
+                core += f"  - [ ] {ac.description} ({ac.verification_method})\n"
 
-        prompt += "\n## Allowed files\n"
+        core += "\n## Allowed files\n"
         for pf in task.planned_files:
-            prompt += f"- `{pf.path}` ({pf.allowed_change}): {pf.reason}\n"
+            core += f"- `{pf.path}` ({pf.allowed_change}): {pf.reason}\n"
 
         if task.forbidden_changes:
-            prompt += "\n## Forbidden changes\n"
+            core += (
+                "\n## Forbidden changes\n"
+                "_Do not modify these. Verification always rejects them; on hook-enabled "
+                "clients they are also blocked before the write._\n"
+            )
             for fc in task.forbidden_changes:
-                prompt += f"- `{fc}`\n"
+                core += f"- `{fc}`\n"
 
-        prompt += "\n## Expected tests\n"
+        core += "\n## Expected tests\n"
         for et in task.expected_tests:
-            prompt += f"- `{et}`\n"
+            core += f"- `{et}`\n"
 
-        prompt += "\n## Allowed commands\n"
+        core += "\n## Allowed commands\n"
         for cmd in task.allowed_commands:
-            prompt += f"- `{cmd}`\n"
+            core += f"- `{cmd}`\n"
 
-        graph_context = CodeReviewGraphAdapter(self.project_root).prompt_section(
-            [planned.path for planned in task.planned_files]
-        )
-        if graph_context:
-            prompt += f"\n{graph_context}"
-
-        prompt += """
+        instructions = """
 ## Instructions
 1. Implement the goal described above.
 2. Ensure all acceptance criteria are met.
@@ -56,4 +547,60 @@ class PromptBuilder:
 4. Run the allowed commands to verify your work.
 5. Provide evidence of passing tests.
 """
-        return prompt
+
+        # --- Optional context: fitted within the remaining budget, dropped lowest-
+        # priority first. Priority: file contents (1) > structural (2) ~ dependents (2)
+        # > skills (3); display order keeps the original reading sequence. ---
+        repo_map_data = self._load_repo_map()
+        repo_map_stale = self._repo_map_stale(repo_map_data)
+        planned_paths = [planned.path for planned in task.planned_files]
+        segments: list[dict] = []
+
+        graph_context = CodeReviewGraphAdapter(self.project_root).prompt_section(planned_paths)
+        struct_text = ""
+        struct_has_stale_note = False
+        if graph_context:
+            struct_text = f"\n{graph_context}"
+        else:
+            repo_map_context = self._repo_map_section(planned_paths, repo_map_data)
+            if repo_map_context:
+                prefix = f"\n{self._STALE_MAP_NOTE}" if repo_map_stale else ""
+                struct_has_stale_note = repo_map_stale
+                struct_text = f"{prefix}\n{repo_map_context}"
+        if struct_text:
+            segments.append({"order": 1, "priority": 2, "name": "structural context", "text": struct_text})
+        elif repo_map_data is None:
+            # No graph CLI and the repo map file is entirely absent (not merely stale):
+            # nudge the agent to run `dev map`, surfaced the same way staleness is.
+            segments.append({
+                "order": 1, "priority": 2, "name": "no repo map note",
+                "text": f"\n{self._NO_MAP_NOTE}",
+            })
+
+        files_text = self._planned_files_section(task)
+        if files_text:
+            segments.append({"order": 2, "priority": 1, "name": "file contents", "text": files_text})
+
+        dependents_section = self._dependents_section(task, repo_map_data)
+        if dependents_section:
+            prefix = f"\n{self._STALE_MAP_NOTE}" if (repo_map_stale and not struct_has_stale_note) else ""
+            segments.append({"order": 3, "priority": 2, "name": "dependents", "text": prefix + dependents_section})
+
+        skills_text = self._skills_section(task)
+        if skills_text:
+            segments.append({"order": 4, "priority": 3, "name": "engineering skills", "text": skills_text})
+
+        # Lowest priority (4): the budget drops call sites first. It only adds value once
+        # the file bodies + dependents are present anyway.
+        call_sites_text = self._call_sites_section(task, repo_map_data)
+        if call_sites_text:
+            segments.append({"order": 5, "priority": 4, "name": "call sites", "text": call_sites_text})
+
+        # Lowest priority (5): dependency risks are opt-in, advisory context — the
+        # budget drops them first so they never displace structural/file context.
+        dependency_risks_text = self._dependency_risks_section(repo_map_data)
+        if dependency_risks_text:
+            segments.append({"order": 6, "priority": 5, "name": "dependency risks", "text": dependency_risks_text})
+
+        optional = self._fit_segments(segments, max_chars - len(core) - len(instructions))
+        return core + optional + instructions

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from devcouncil.live.models import AgentTurn, CardStatus, CritiqueCard, Verdict
@@ -31,21 +33,171 @@ EVIDENCE_TERMS = (
     "verified",
 )
 
+# Word-boundary matchers so "done" matches "I'm done" but not "abandoned"/"undone".
+_COMPLETION_RE = re.compile(
+    r"\b(done|complete|completed|finished|implemented|fixed|ready|all set|"
+    r"ship it|good to go|works now|it works)\b"
+)
+# An agent asserting its verification actually passed (the claim we cross-check).
+_PASS_CLAIM_RE = re.compile(
+    r"(tests?\s+(?:are\s+|now\s+)?pass(?:ing|ed|es)?"
+    r"|all\s+(?:tests?|checks?|cases?)\s+pass"
+    r"|passing\s+tests?"
+    r"|\bverified\b|verification\s+(?:pass|succeed)"
+    r"|tests?\s+green|green\s+tests?"
+    r"|(?:ran|run)\s+[^.\n]{0,40}?\bpass)"
+)
+# Negations that flip a nearby claim ("not done", "tests do not pass", "still failing").
+_NEGATION_RE = re.compile(
+    r"\b(not|isn'?t|aren'?t|won'?t|can'?t|cannot|haven'?t|hasn'?t|don'?t|"
+    r"doesn'?t|didn'?t|no longer|never|yet to|still need|still failing|"
+    r"not yet|unable|fail(?:s|ing|ed)?)\b"
+)
+_NEGATION_WINDOW = 30
 
-def review_turn(turn: AgentTurn, project_root: Path, client: str | None = None) -> CritiqueCard:
-    """Generate a deterministic critique card for an agent response."""
+
+def _claim_present(pattern: re.Pattern[str], lower: str) -> bool:
+    """True if `pattern` matches and is not negated by a word shortly before it."""
+    for match in pattern.finditer(lower):
+        prefix = lower[max(0, match.start() - _NEGATION_WINDOW):match.start()]
+        if _NEGATION_RE.search(prefix):
+            continue
+        return True
+    return False
+
+
+@dataclass
+class _TaskGrounding:
+    """A snapshot of a task's real verification state from the artifact graph."""
+
+    task_id: str
+    status: str
+    blocking_gaps: int
+    failing_commands: int
+    acs_total: int
+    acs_passing: int
+
+    @property
+    def acs_unproven(self) -> int:
+        return max(0, self.acs_total - self.acs_passing)
+
+    @property
+    def is_satisfied(self) -> bool:
+        return (
+            self.status in ("verified", "done")
+            and self.blocking_gaps == 0
+            and (self.acs_total == 0 or self.acs_passing >= self.acs_total)
+        )
+
+
+def _load_task_grounding(project_root: Path, task_id: str | None) -> _TaskGrounding | None:
+    """Load the scoped task's real verification state so claims can be checked
+    against evidence instead of trusted on the agent's word. Best-effort: any
+    failure (no DB, unknown task) returns None and the caller falls back to the
+    pure-heuristic review."""
+    if not task_id:
+        return None
+    try:
+        from devcouncil.storage.db import get_db
+        from devcouncil.storage.repositories import ArtifactGraphRepository
+
+        db = get_db(project_root)
+        if not db:
+            return None
+        with db.get_session() as session:
+            graph = ArtifactGraphRepository(session).load_graph()
+    except Exception:
+        return None
+
+    task = graph.tasks.get(task_id)
+    if task is None:
+        return None
+
+    blocking = [g for g in graph.gaps.values() if g.task_id == task_id and g.blocking]
+    failing = [g for g in blocking if g.gap_type == "test_failed"]
+    ac_ids = set(task.acceptance_criterion_ids)
+    passing_ac = {
+        ev.acceptance_criterion_id
+        for ev in graph.test_evidence
+        if ev.acceptance_criterion_id in ac_ids and getattr(ev, "status", "") == "passed"
+    }
+    return _TaskGrounding(
+        task_id=task_id,
+        status=task.status,
+        blocking_gaps=len(blocking),
+        failing_commands=len(failing),
+        acs_total=len(ac_ids),
+        acs_passing=len(passing_ac),
+    )
+
+
+def review_turn(
+    turn: AgentTurn,
+    project_root: Path,
+    client: str | None = None,
+    task_id: str | None = None,
+) -> CritiqueCard:
+    """Generate a deterministic critique card for an agent response.
+
+    When ``task_id`` resolves to a known task, completion/verification claims are
+    checked against the task's real artifact state (status, blocking gaps, passing
+    acceptance-criterion evidence) instead of being trusted by keyword alone. With
+    no task state available it falls back to the lightweight keyword heuristic.
+    """
     content = turn.content.strip()
     lower = content.lower()
     concerns: list[str] = []
     alternatives: list[str] = []
     evidence_requests: list[str] = []
+    verdict: Verdict = "Approved"
+
+    grounding = _load_task_grounding(project_root, task_id)
 
     risky_terms = [term for term in RISK_TERMS if term in lower]
     if risky_terms:
         concerns.append(f"Response contains risky implementation language: {', '.join(risky_terms[:4])}.")
         alternatives.append("Replace risky shortcuts with a scoped implementation and explicit rollback or verification path.")
 
-    if _looks_like_completion_claim(lower) and not any(term in lower for term in EVIDENCE_TERMS):
+    claims_completion = _claim_present(_COMPLETION_RE, lower)
+    claims_passing = _claim_present(_PASS_CLAIM_RE, lower)
+
+    if grounding is not None:
+        # Evidence-grounded review: cross-check the agent's claims against reality.
+        if claims_passing and grounding.failing_commands > 0:
+            concerns.append(
+                f"Agent claims verification passes, but DevCouncil recorded "
+                f"{grounding.failing_commands} failing verification command(s) for "
+                f"task {grounding.task_id}."
+            )
+            evidence_requests.append(
+                f"Re-run 'dev verify {grounding.task_id}' and fix the failing command(s) "
+                "before claiming success."
+            )
+            verdict = "Critical Issues"
+        elif (claims_completion or claims_passing) and not grounding.is_satisfied:
+            details = [f"task {grounding.task_id} is '{grounding.status}'"]
+            if grounding.blocking_gaps:
+                details.append(f"{grounding.blocking_gaps} blocking gap(s)")
+            if grounding.acs_unproven:
+                details.append(
+                    f"{grounding.acs_unproven}/{grounding.acs_total} acceptance "
+                    "criteria still lack passing evidence"
+                )
+            concerns.append(
+                "Completion claim is not yet backed by DevCouncil evidence: "
+                + ", ".join(details) + "."
+            )
+            evidence_requests.append(
+                f"Run 'dev verify {grounding.task_id}' and resolve the gaps so the "
+                "claim is supported by passing evidence."
+            )
+        elif claims_completion and grounding.is_satisfied:
+            alternatives.append(
+                f"Completion is corroborated by passing evidence for task {grounding.task_id}; "
+                "proceed."
+            )
+    elif claims_completion and not any(term in lower for term in EVIDENCE_TERMS):
+        # No task state to ground against: best-effort keyword heuristic.
         concerns.append("The response appears to claim completion without naming verification evidence.")
         evidence_requests.append("State the exact commands, checks, or reviewed artifacts that prove the change.")
 
@@ -56,8 +208,7 @@ def review_turn(turn: AgentTurn, project_root: Path, client: str | None = None) 
     if "todo" in lower or "follow-up" in lower or "later" in lower:
         evidence_requests.append("List any remaining TODOs as DevCouncil gaps or repair tasks instead of burying them in chat.")
 
-    verdict: Verdict = "Approved"
-    if concerns:
+    if concerns and verdict == "Approved":
         verdict = "Concerns"
     if any(term in lower for term in ("--no-verify", "reset --hard", "force push", "ignore failing")):
         verdict = "Critical Issues"
@@ -73,6 +224,7 @@ def review_turn(turn: AgentTurn, project_root: Path, client: str | None = None) 
         id=card_id,
         session_id=turn.session_id,
         turn_id=turn.turn_id,
+        task_id=task_id,
         client=client or turn.source,
         verdict=verdict,
         summary=summary,
@@ -176,17 +328,6 @@ def unresolved_blocking_cards(project_root: Path, task_id: str | None = None) ->
 def _card_id(turn: AgentTurn) -> str:
     digest = hashlib.sha256(f"{turn.session_id}:{turn.turn_id}:{turn.content}".encode("utf-8")).hexdigest()
     return f"CARD-{digest[:12]}"
-
-
-def _looks_like_completion_claim(lower: str) -> bool:
-    return any(phrase in lower for phrase in (
-        "done",
-        "completed",
-        "implemented",
-        "fixed",
-        "ready",
-        "all set",
-    ))
 
 
 def _mentions_broad_change(lower: str) -> bool:

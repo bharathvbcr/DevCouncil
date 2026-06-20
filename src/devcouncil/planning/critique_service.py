@@ -39,7 +39,10 @@ Every finding must include a falsifiable_check.
         return await self.router.complete_structured(
             role=role,
             messages=messages,
-            schema=CritiqueOutput
+            schema=CritiqueOutput,
+            # Degrade gracefully on weaker models: an un-critiqued plan is still a
+            # usable plan, far better than crashing the whole planning run.
+            fallback=CritiqueOutput(findings=[]),
         )
 
     async def generate_rebuttal(self, role: str, original_plan_json: str, findings_json: str) -> RebuttalOutput:
@@ -62,5 +65,7 @@ You are the planner who created the original plan. Review the critique findings.
         return await self.router.complete_structured(
             role=role,
             messages=messages,
-            schema=RebuttalOutput
+            schema=RebuttalOutput,
+            # No rebuttals means findings stand as-is — a safe, conservative default.
+            fallback=RebuttalOutput(rebuttals=[]),
         )

@@ -8,7 +8,7 @@ from devcouncil.cli.commands.init import initialize_project
 from devcouncil.app.project_status import compute_phase
 from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import ArtifactGraphRepository, StateRepository
-from devcouncil.telemetry.cost import CostEstimator
+from devcouncil.telemetry.cost import CostEstimator, cost_by_task
 from devcouncil.live.summary import live_review_summary
 
 console = Console()
@@ -51,6 +51,7 @@ def _status_payload(project_root: Path) -> dict:
             "phase": phase,
             "coverage_summary": summary,
             "total_cost": total_cost,
+            "cost_by_task": cost_by_task(project_root),
             "task_status_counts": status_counts,
             "blocking_gaps": [gap.model_dump() for gap in blocking_gaps],
             "live_review": live_review_summary(project_root),
@@ -59,6 +60,11 @@ def _status_payload(project_root: Path) -> dict:
 
 def status(
     json_format: bool = typer.Option(False, "--json", help="Output machine-readable JSON."),
+    fail_on_blocking: bool = typer.Option(
+        False,
+        "--fail-on-blocking",
+        help="Exit non-zero when blocking gaps remain, so shell-driven agents can gate on $?.",
+    ),
     project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
 ):
     """
@@ -66,8 +72,14 @@ def status(
     """
     root = project_root.expanduser().resolve()
     payload = _status_payload(root)
+
+    def _maybe_fail() -> None:
+        if fail_on_blocking and payload.get("blocking_gaps"):
+            raise typer.Exit(code=1)
+
     if json_format:
         typer.echo(json.dumps(payload, indent=2))
+        _maybe_fail()
         return
 
     if not payload["initialized"]:
@@ -108,6 +120,16 @@ def status(
             table.add_row(state, str(count))
         console.print(table)
 
+    cost_groups = payload.get("cost_by_task") or {}
+    if cost_groups:
+        cost_table = Table(title="Cost by Task")
+        cost_table.add_column("Task", style="cyan")
+        cost_table.add_column("Cost ($)", justify="right")
+        cost_table.add_column("Calls", justify="right")
+        for name, stats in sorted(cost_groups.items(), key=lambda kv: kv[1]["cost"], reverse=True):
+            cost_table.add_row(name, f"{stats['cost']:.4f}", str(stats["calls"]))
+        console.print(cost_table)
+
     blocking_gaps = payload["blocking_gaps"]
     if blocking_gaps:
         console.print(f"\n[red bold]WARNING: {len(blocking_gaps)} blocking gap(s) must be resolved:[/red bold]")
@@ -115,3 +137,5 @@ def status(
             console.print(f"  - [red]{gap['id']}[/red]: {gap['description'][:80]}")
         if len(blocking_gaps) > 5:
             console.print(f"  ... and {len(blocking_gaps) - 5} more. Run [bold]dev report[/bold] for details.")
+
+    _maybe_fail()

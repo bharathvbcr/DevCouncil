@@ -27,6 +27,7 @@ from devcouncil.executors.agent_registry import (
     resolve_coding_cli_probe_order,
 )
 from devcouncil.integrations.actions import apply_integration_target
+from devcouncil.utils.subprocess_env import clean_subprocess_env
 from devcouncil.integrations.check import (
     build_integration_check_report,
     integration_status_summary,
@@ -46,6 +47,20 @@ LEGACY_COMMAND = "dev setup --integrate"
 
 def _project_root(path: str | Path | None) -> Path:
     return Path(path or ".").expanduser().resolve()
+
+
+def _warn_if_verify_only(client: str) -> None:
+    """Print a prominent containment warning when wiring a verify-only client.
+
+    Verify-only clients have no native pre-tool-use hook, so DevCouncil cannot block a
+    forbidden write or command before it happens — it is only caught post-hoc at verify
+    time. Surface this loudly so users don't assume hard containment."""
+    info = CODING_CLI_INTEGRATION_INFO.get(normalize_agent_name(client))
+    if info is not None and not info.hooks:
+        console.print(
+            f"[bold yellow]Warning ({info.label}): No pre-action containment — "
+            "forbidden writes/commands are caught only at verify time.[/bold yellow]"
+        )
 
 
 def _server_args(project_root: Path) -> list[str]:
@@ -80,15 +95,19 @@ def _gemini_command(project_root: Path, scope: str) -> list[str]:
 
 
 def _claude_command(project_root: Path, scope: str) -> list[str]:
+    # The server name must come BEFORE --env: the current Claude CLI treats --env
+    # as variadic, so `--env KEY=VALUE devcouncil` swallows the name `devcouncil`
+    # as a second (invalid) env var. Putting the name first — matching the working
+    # codex form — and terminating options with `--` avoids that.
     return [
         "claude",
         "mcp",
         "add",
         "--scope",
         scope,
+        "devcouncil",
         "--env",
         f"DEVCOUNCIL_PROJECT_ROOT={project_root}",
-        "devcouncil",
         "--",
         *_server_args(project_root),
     ]
@@ -461,6 +480,7 @@ def _run_capture(command: list[str], timeout: int = 10) -> tuple[int, str]:
             errors="replace",
             shell=use_shell,
             timeout=timeout,
+            env=clean_subprocess_env(),
         )
     except subprocess.TimeoutExpired:
         return 124, "timed out"
@@ -975,6 +995,7 @@ def antigravity(
             console.print(report.to_json())
             raise typer.Exit(code=1)
         console.print("[green]Antigravity integration configured.[/green]")
+        _warn_if_verify_only("antigravity")
         return
     ok = _configure_antigravity(root, apply)
     if not ok and apply:
@@ -996,6 +1017,7 @@ def warp(
             console.print(report.to_json())
             raise typer.Exit(code=1)
         console.print("[green]Warp integration configured.[/green]")
+        _warn_if_verify_only("warp")
         return
     _configure_warp(root, apply)
 
@@ -1038,6 +1060,7 @@ def aider(
             console.print(report.to_json())
             raise typer.Exit(code=1)
         console.print("[green]Aider integration configured.[/green]")
+        _warn_if_verify_only("aider")
         return
     ok = _configure_aider(root, apply)
     if not ok and apply:
@@ -1276,19 +1299,27 @@ def matrix(
     table.add_column("Headless")
     table.add_column("MCP setup")
     table.add_column("Native hooks")
+    table.add_column("Enforcement")
     table.add_column("Notes")
 
     for client in sorted(BUILTIN_CODING_EXECUTOR_NAMES):
         info = CODING_CLI_INTEGRATION_INFO.get(client)
+        posture = info.enforcement if info else "verify-only"
+        posture_render = "[green]pre-action[/green]" if posture == "pre-action" else "[yellow]verify-only[/yellow]"
         table.add_row(
             client,
             integration_tier_label(client),
             "yes" if info and info.tier == 1 else "no",
             "yes" if info and info.mcp else "no",
             "yes" if info and info.hooks else "verify only",
+            posture_render,
             info.notes if info else "",
         )
     console.print(table)
+    console.print(
+        "\n[dim]Enforcement:[/dim] [green]pre-action[/green] blocks forbidden writes/commands "
+        "before they happen; [yellow]verify-only[/yellow] catches them only at verify time."
+    )
     console.print("\nSee [dim]docs/integration-tiers.md[/dim] for workflow guidance.")
 
 
