@@ -16,7 +16,7 @@ Supported `models.provider` values:
 - `openrouter`: uses `OPENROUTER_API_KEY`.
 - `vertexai`: uses `VERTEXAI_ACCESS_TOKEN` or `gcloud auth print-access-token`, `VERTEXAI_PROJECT` or `GOOGLE_CLOUD_PROJECT`, and optional `VERTEXAI_LOCATION` defaulting to `global`.
 - `doubleword`: uses `DOUBLEWORD_API_KEY` and the OpenAI-compatible chat API at `https://api.doubleword.ai/v1`.
-- `ollama`: local models served by Ollama; needs NO API key. Uses the OpenAI-compatible endpoint at `http://localhost:11434/v1`. Override with `OLLAMA_BASE_URL` (taken verbatim) or Ollama's native `OLLAMA_HOST` (scheme and `/v1` are auto-normalized).
+- `ollama`: local models served by Ollama; needs NO API key. Talks to Ollama's native `/api/chat` endpoint (derived from the base URL) so `num_ctx` and JSON `format` are honored. Override the server with `OLLAMA_BASE_URL` (taken verbatim) or Ollama's native `OLLAMA_HOST` (scheme and `/v1` are auto-normalized). **Set `OLLAMA_NUM_CTX` (recommend `16384`)** — DevCouncil's planning prompts can reach ~15k tokens, and Ollama's small default context (~2048–4096) would silently truncate them; `dev doctor` warns when it is unset or too small. The council roles emit structured JSON, so prefer a capable local model (≥27B, e.g. `qwen2.5-coder:32b` / `gemma2:27b` / `command-r:35b`).
 
 Vertex AI uses Google Cloud Auth access tokens, not long-lived OpenRouter-style API keys. For local use, generate a token with:
 

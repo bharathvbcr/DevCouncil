@@ -126,14 +126,36 @@ def render_doctor_check(project_root: Path = Path(".")):
     if provider == "ollama":
         # Use the provider's own resolver so the displayed URL reflects OLLAMA_HOST
         # (with scheme/-/v1 normalization), not just OLLAMA_BASE_URL.
+        from devcouncil.execution.prompt_builder import MAX_PROMPT_CHARS
         from devcouncil.llm.provider import OllamaProvider
 
         base_url = OllamaProvider._resolve_base_url()
+        num_ctx = OllamaProvider._resolve_num_ctx()
+        # DevCouncil's planning prompts reach ~MAX_PROMPT_CHARS chars (~4 chars/token);
+        # recommend a context window that covers the prompt plus headroom for output.
+        recommended_ctx = 16384
+        min_ctx = max(8192, (MAX_PROMPT_CHARS // 4))
         table.add_row(
             "OLLAMA",
             "[green]OK[/green]",
             f"Local provider; no API key required (server: {base_url}).",
         )
+        if num_ctx is None:
+            table.add_row(
+                "OLLAMA num_ctx",
+                "[yellow]WARN[/yellow]",
+                f"OLLAMA_NUM_CTX not set — Ollama's small default (~2048-4096) will "
+                f"truncate DevCouncil's large planning prompts. Set OLLAMA_NUM_CTX={recommended_ctx}.",
+            )
+        elif num_ctx < min_ctx:
+            table.add_row(
+                "OLLAMA num_ctx",
+                "[yellow]WARN[/yellow]",
+                f"OLLAMA_NUM_CTX={num_ctx} may be too small for planning prompts "
+                f"(~{MAX_PROMPT_CHARS // 4} tokens); recommend >= {recommended_ctx}.",
+            )
+        else:
+            table.add_row("OLLAMA num_ctx", "[green]OK[/green]", f"context window = {num_ctx} tokens.")
         console.print(table)
         return
     env_var = provider_api_key_env_var(provider)

@@ -333,18 +333,30 @@ class DoublewordProvider(Provider):
 
 
 class OllamaProvider(Provider):
-    """Local Ollama provider via its OpenAI-compatible Chat Completions endpoint.
+    """Local Ollama provider via its NATIVE ``/api/chat`` endpoint.
 
-    Ollama serves an OpenAI-compatible API at ``http://localhost:11434/v1`` and
-    needs no API key. The base URL is overridable via ``OLLAMA_BASE_URL`` (taken
-    verbatim) or Ollama's native ``OLLAMA_HOST`` (normalized: a missing scheme is
-    prefixed with ``http://`` and a missing ``/v1`` suffix is appended).
+    Ollama needs no API key. The base URL is overridable via ``OLLAMA_BASE_URL``
+    (taken verbatim) or Ollama's native ``OLLAMA_HOST`` (normalized: a missing scheme
+    is prefixed with ``http://`` and a missing ``/v1`` suffix is appended). The actual
+    request goes to the native ``/api/chat`` endpoint (derived by stripping a trailing
+    ``/v1``) rather than the OpenAI-compatible ``/v1/chat/completions`` — because the
+    native endpoint is the only one that honors ``options.num_ctx`` (set via
+    ``OLLAMA_NUM_CTX``) and ``format: json``. DevCouncil's planning prompts are large
+    (up to ~15k tokens), so without a raised ``num_ctx`` Ollama's small default context
+    would silently truncate them.
     """
 
-    def __init__(self, api_key: str = "", project_root: Path = Path("."), base_url: str | None = None):
+    def __init__(
+        self,
+        api_key: str = "",
+        project_root: Path = Path("."),
+        base_url: str | None = None,
+        num_ctx: int | None = None,
+    ):
         self.api_key = api_key
         self.base_url = base_url or self._resolve_base_url()
         self.project_root = project_root
+        self.num_ctx = num_ctx if num_ctx is not None else self._resolve_num_ctx()
 
     @staticmethod
     def _resolve_base_url() -> str:
@@ -361,6 +373,25 @@ class OllamaProvider(Provider):
                 host = f"{host}/v1"
             return host
         return "http://localhost:11434/v1"
+
+    @staticmethod
+    def _resolve_num_ctx() -> int | None:
+        """Context window from ``OLLAMA_NUM_CTX`` (positive int), else None (server default)."""
+        raw = os.environ.get("OLLAMA_NUM_CTX")
+        if not raw:
+            return None
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    def _chat_endpoint(self) -> str:
+        """Native chat endpoint derived from base_url (strip a trailing ``/v1``)."""
+        root = self.base_url.rstrip("/")
+        if root.endswith("/v1"):
+            root = root[: -len("/v1")].rstrip("/")
+        return f"{root}/api/chat"
 
     async def complete(
         self,
@@ -380,33 +411,52 @@ class OllamaProvider(Provider):
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        payload = {
+        # Native /api/chat options. temperature and num_ctx live under "options"; a
+        # raised num_ctx (OLLAMA_NUM_CTX) prevents silent truncation of large prompts.
+        options: Dict[str, Any] = {"temperature": temperature}
+        if self.num_ctx:
+            options["num_ctx"] = self.num_ctx
+
+        payload: Dict[str, Any] = {
             "model": model,
             "messages": msgs,
-            "temperature": temperature,
+            "stream": False,
+            "options": options,
         }
 
         if json_mode:
-            payload["response_format"] = {"type": "json_object"}
+            # Native structured-output switch (more reliable than OpenAI response_format
+            # on Ollama). Still nudge the prompt so the model knows to emit JSON.
+            payload["format"] = "json"
             if msgs[-1]["role"] == "user":
                 msgs[-1]["content"] += "\n\nOutput must be a valid JSON object."
 
         async with httpx.AsyncClient(timeout=180.0) as client:
             response = await client.post(
-                f"{self.base_url}/chat/completions",
+                self._chat_endpoint(),
                 headers=headers,
-                json=payload
+                json=payload,
             )
             raise_for_provider_status(response, "Ollama")
             data = response.json()
 
+            # Native response shape: {"message": {"content": ...}, "model": ...,
+            # "prompt_eval_count": N, "eval_count": M}. Map token counts to the
+            # OpenAI-style keys the cost ledger/tracker expect.
+            prompt_tokens = int(data.get("prompt_eval_count", 0) or 0)
+            completion_tokens = int(data.get("eval_count", 0) or 0)
+            usage = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }
             resp = LLMResponse(
-                content=data["choices"][0]["message"]["content"],
+                content=(data.get("message") or {}).get("content", ""),
                 # Ollama may omit ``model`` or return a local tag — fall back to
-                # the requested id rather than KeyError-ing on data["model"].
+                # the requested id rather than KeyError-ing.
                 model=data.get("model", model),
-                usage=data.get("usage", {}),
-                raw_response=data
+                usage=usage,
+                raw_response=data,
             )
 
             _log_model_call(payload, data, resp.usage, self.project_root, task_id=task_id, run_id=run_id, provider="ollama")

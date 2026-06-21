@@ -125,89 +125,139 @@ def test_base_url_explicit_arg_wins(monkeypatch):
 # --- complete() HTTP behavior ----------------------------------------------
 
 
+def _native_response(content="hello", model="qwen2.5-coder:7b", pe=5, ec=7):
+    # Ollama native /api/chat response shape.
+    data = {"message": {"role": "assistant", "content": content}, "done": True}
+    if model is not None:
+        data["model"] = model
+    data["prompt_eval_count"] = pe
+    data["eval_count"] = ec
+    return FakeResponse(200, data)
+
+
 @pytest.mark.anyio
-async def test_complete_posts_to_ollama_without_auth_header(tmp_path, monkeypatch):
+async def test_complete_posts_to_native_chat_endpoint_without_auth(tmp_path, monkeypatch):
     monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
     monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
     calls = []
-    response = FakeResponse(
-        200,
-        {
-            "choices": [{"message": {"content": "hello"}}],
-            "model": "qwen2.5-coder:7b",
-            "usage": {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12},
-        },
-    )
     monkeypatch.setattr(
-        "devcouncil.llm.provider.httpx.AsyncClient", make_fake_client(calls, response)
+        "devcouncil.llm.provider.httpx.AsyncClient", make_fake_client(calls, _native_response())
     )
 
     provider = OllamaProvider(api_key="", project_root=tmp_path)
     resp = await provider.complete("qwen2.5-coder:7b", [{"role": "user", "content": "hi"}])
 
     assert len(calls) == 1
-    assert calls[0]["url"] == "http://localhost:11434/v1/chat/completions"
-    # no key -> no Authorization header
+    # native endpoint, derived from the /v1 base by stripping the suffix
+    assert calls[0]["url"] == "http://localhost:11434/api/chat"
+    assert calls[0]["json"]["stream"] is False
     assert "Authorization" not in calls[0]["headers"]
     assert resp.content == "hello"
     assert resp.model == "qwen2.5-coder:7b"
+    # native token counts mapped to OpenAI-style keys
     assert resp.usage == {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12}
 
 
 @pytest.mark.anyio
-async def test_complete_honors_json_mode(tmp_path, monkeypatch):
+async def test_complete_honors_json_mode_native_format(tmp_path, monkeypatch):
     calls = []
-    response = FakeResponse(
-        200,
-        {"choices": [{"message": {"content": "{}"}}], "model": "qwen2.5-coder:7b", "usage": {}},
-    )
     monkeypatch.setattr(
-        "devcouncil.llm.provider.httpx.AsyncClient", make_fake_client(calls, response)
+        "devcouncil.llm.provider.httpx.AsyncClient",
+        make_fake_client(calls, _native_response(content="{}")),
     )
-
     provider = OllamaProvider(api_key="", base_url="http://localhost:11434/v1", project_root=tmp_path)
     await provider.complete(
-        "qwen2.5-coder:7b",
-        [{"role": "user", "content": "give json"}],
-        json_mode=True,
+        "qwen2.5-coder:7b", [{"role": "user", "content": "give json"}], json_mode=True
     )
-
     body = calls[0]["json"]
-    assert body["response_format"] == {"type": "json_object"}
+    assert body["format"] == "json"
     assert body["messages"][-1]["content"].endswith("Output must be a valid JSON object.")
+
+
+@pytest.mark.anyio
+async def test_num_ctx_from_env_passed_in_options(tmp_path, monkeypatch):
+    monkeypatch.setenv("OLLAMA_NUM_CTX", "16384")
+    calls = []
+    monkeypatch.setattr(
+        "devcouncil.llm.provider.httpx.AsyncClient", make_fake_client(calls, _native_response())
+    )
+    provider = OllamaProvider(project_root=tmp_path)
+    await provider.complete("m", [{"role": "user", "content": "hi"}], temperature=0.2)
+    options = calls[0]["json"]["options"]
+    assert options["num_ctx"] == 16384
+    assert options["temperature"] == 0.2
+
+
+@pytest.mark.anyio
+async def test_num_ctx_absent_when_unset(tmp_path, monkeypatch):
+    monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
+    calls = []
+    monkeypatch.setattr(
+        "devcouncil.llm.provider.httpx.AsyncClient", make_fake_client(calls, _native_response())
+    )
+    provider = OllamaProvider(project_root=tmp_path)
+    await provider.complete("m", [{"role": "user", "content": "hi"}])
+    assert "num_ctx" not in calls[0]["json"]["options"]
+
+
+def test_chat_endpoint_derivation():
+    assert OllamaProvider(base_url="http://localhost:11434/v1")._chat_endpoint() == "http://localhost:11434/api/chat"
+    assert OllamaProvider(base_url="http://remote:9999")._chat_endpoint() == "http://remote:9999/api/chat"
 
 
 @pytest.mark.anyio
 async def test_complete_falls_back_to_requested_model_when_omitted(tmp_path, monkeypatch):
     calls = []
-    response = FakeResponse(
-        200,
-        # Ollama may omit "model" entirely
-        {"choices": [{"message": {"content": "x"}}]},
-    )
     monkeypatch.setattr(
-        "devcouncil.llm.provider.httpx.AsyncClient", make_fake_client(calls, response)
+        "devcouncil.llm.provider.httpx.AsyncClient",
+        make_fake_client(calls, _native_response(content="x", model=None, pe=0, ec=0)),
     )
-
     provider = OllamaProvider(project_root=tmp_path)
     resp = await provider.complete("llama3.1", [{"role": "user", "content": "hi"}])
     assert resp.model == "llama3.1"
-    assert resp.usage == {}
+    assert resp.usage == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
 
 @pytest.mark.anyio
 async def test_complete_sends_authorization_when_key_present(tmp_path, monkeypatch):
     calls = []
-    response = FakeResponse(
-        200, {"choices": [{"message": {"content": "x"}}], "model": "m", "usage": {}}
-    )
     monkeypatch.setattr(
-        "devcouncil.llm.provider.httpx.AsyncClient", make_fake_client(calls, response)
+        "devcouncil.llm.provider.httpx.AsyncClient",
+        make_fake_client(calls, _native_response(model="m")),
     )
-
     provider = OllamaProvider(api_key="proxy-token", base_url="http://localhost:11434/v1", project_root=tmp_path)
     await provider.complete("m", [{"role": "user", "content": "hi"}])
     assert calls[0]["headers"]["Authorization"] == "Bearer proxy-token"
+
+
+# --- num_ctx resolution + doctor smoke -------------------------------------
+
+
+def test_resolve_num_ctx(monkeypatch):
+    monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
+    assert OllamaProvider._resolve_num_ctx() is None
+    monkeypatch.setenv("OLLAMA_NUM_CTX", "16384")
+    assert OllamaProvider._resolve_num_ctx() == 16384
+    monkeypatch.setenv("OLLAMA_NUM_CTX", "0")
+    assert OllamaProvider._resolve_num_ctx() is None
+    monkeypatch.setenv("OLLAMA_NUM_CTX", "not-an-int")
+    assert OllamaProvider._resolve_num_ctx() is None
+
+
+@pytest.mark.parametrize("num_ctx", [None, "16384"])
+def test_doctor_ollama_branch_runs(tmp_path, monkeypatch, num_ctx):
+    # Guards the doctor ollama branch (num_ctx warning path) against import/runtime
+    # errors for both unset and set context.
+    from devcouncil.cli.commands.doctor import render_doctor_check
+    from devcouncil.cli.commands.init import initialize_project
+
+    if num_ctx is None:
+        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
+    else:
+        monkeypatch.setenv("OLLAMA_NUM_CTX", num_ctx)
+    initialize_project(tmp_path, model_provider="ollama", with_map=False, with_skills=False)
+    render_doctor_check(tmp_path)  # must not raise
 
 
 # --- cost is $0 for local models -------------------------------------------
