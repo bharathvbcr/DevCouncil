@@ -13,6 +13,36 @@ from devcouncil.repo.gitignore import ensure_gitignore
 app = typer.Typer()
 console = Console()
 
+# Per-stack default verification commands. A fresh project gets ONLY the commands
+# for the stack(s) actually detected in the repo, so the verifier never inherits a
+# cross-stack gate (e.g. `npm test`/`eslint`/`tsc` on a Python repo) that it would run
+# as a blocking fallback and fail for tooling/stack reasons instead of a real defect.
+_STACK_COMMAND_DEFAULTS: dict[str, dict[str, list[str]]] = {
+    "python": {"test": ["pytest"], "lint": ["ruff check ."], "typecheck": ["mypy ."]},
+    "node": {"test": ["npm test"], "lint": ["eslint ."], "typecheck": ["tsc --noEmit"]},
+}
+
+
+def _stack_aware_commands(project_root: Path) -> dict[str, list[str]]:
+    """Default test/lint/typecheck commands scoped to the repo's detected stack(s).
+
+    Returns empty lists when no stack is detected — empty is safe (no speculative
+    fallback gates) and far better than guessing wrong-stack tools."""
+    from devcouncil.repo.ci_scaffold import detect_stacks
+
+    commands: dict[str, list[str]] = {"test": [], "lint": [], "typecheck": []}
+    try:
+        stacks = detect_stacks(project_root)
+    except Exception:
+        return commands
+    for stack in sorted(stacks):
+        for key, cmds in _STACK_COMMAND_DEFAULTS.get(stack, {}).items():
+            for command in cmds:
+                if command not in commands[key]:
+                    commands[key].append(command)
+    return commands
+
+
 DEFAULT_CONFIG = {
     "project": {
         "name": "devcouncil-project",
@@ -24,9 +54,9 @@ DEFAULT_CONFIG = {
         "roles": build_role_model_config("openrouter"),
     },
     "commands": {
-        "test": ["pytest", "npm test"],
-        "lint": ["flake8", "eslint"],
-        "typecheck": ["mypy", "tsc"]
+        "test": [],
+        "lint": [],
+        "typecheck": [],
     },
     "gates": {
         "require_clean_git_before_task": True,
@@ -104,6 +134,42 @@ def parse_role_model_overrides(values: list[str] | None) -> dict[str, str]:
     return overrides
 
 
+def _generate_initial_map(project_root: Path, quiet: bool) -> None:
+    """Best-effort repo map + agent guide generation on fresh init.
+
+    Imported lazily to avoid a circular import with the map command, and wrapped
+    so a mapping failure never blocks initialization.
+    """
+    try:
+        from devcouncil.cli.commands.map import generate_map_artifacts
+
+        generate_map_artifacts(project_root, project_root / ".devcouncil" / "repo_map.json")
+        if not quiet:
+            console.print("[green]Generated .devcouncil/repo_map.json and agent guides (AGENTS.md, CLAUDE.md).[/green]")
+    except Exception as exc:  # mapping is best-effort, never fatal
+        if not quiet:
+            console.print(f"[yellow]Skipped repo map generation: {exc}. Run 'dev map' later.[/yellow]")
+
+
+def _scaffold_initial_skills(project_root: Path, quiet: bool) -> None:
+    """Best-effort scaffolding of applicable engineering skills into .claude/skills/.
+
+    Always writes the core-engineering skill; adds domain skills (android, ios, web,
+    ...) whose file triggers match the repository. Never fatal.
+    """
+    try:
+        from devcouncil.skills.registry import scaffold_skills, select_skills
+
+        selected = select_skills(project_root=project_root)
+        written = scaffold_skills(project_root, selected)
+        if written and not quiet:
+            names = ", ".join(sorted(skill.name for skill in selected))
+            console.print(f"[green]Scaffolded {len(written)} skill(s) into .claude/skills/ ({names}).[/green]")
+    except Exception as exc:  # skill scaffolding is best-effort, never fatal
+        if not quiet:
+            console.print(f"[yellow]Skipped skill scaffolding: {exc}. Run 'dev skills scaffold' later.[/yellow]")
+
+
 def initialize_project(
     project_root: Path = Path("."),
     project_name: str | None = None,
@@ -112,6 +178,8 @@ def initialize_project(
     role_models: dict[str, str] | None = None,
     with_gitnexus: bool = False,
     with_graphify: bool = False,
+    with_map: bool = True,
+    with_skills: bool = True,
     quiet: bool = False,
 ) -> bool:
     """Initialize DevCouncil project state.
@@ -133,6 +201,8 @@ def initialize_project(
 
         config_path = dev_dir / "config.yaml"
         config: dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
+        # Scope default verification commands to the repo's actual stack(s).
+        config["commands"] = _stack_aware_commands(project_root)
         if project_name:
             config["project"]["name"] = project_name
         else:
@@ -153,6 +223,11 @@ def initialize_project(
         if not quiet:
             console.print(f"[green]Successfully initialized DevCouncil in {dev_dir}[/green]")
         created = True
+
+        if with_map:
+            _generate_initial_map(project_root, quiet)
+        if with_skills:
+            _scaffold_initial_skills(project_root, quiet)
 
     if with_gitnexus:
         nexus = GitNexusIntegration(project_root)
@@ -179,6 +254,8 @@ def init(
     ),
     with_gitnexus: bool = typer.Option(False, "--gitnexus", help="Initialize GitNexus structural awareness"),
     with_graphify: bool = typer.Option(False, "--graphify", help="Initialize Graphify knowledge graph engine"),
+    skip_map: bool = typer.Option(False, "--skip-map", help="Skip generating repo_map.json and agent guides on init."),
+    skip_skills: bool = typer.Option(False, "--skip-skills", help="Skip scaffolding engineering skills into .claude/skills/ on init."),
 ):
     """
     Initialize DevCouncil in the current directory.
@@ -207,4 +284,6 @@ def init(
         role_models=role_models,
         with_gitnexus=with_gitnexus,
         with_graphify=with_graphify,
+        with_map=not skip_map,
+        with_skills=not skip_skills,
     )

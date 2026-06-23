@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, select
 
 from devcouncil.storage.models import (
@@ -172,7 +173,14 @@ class TaskLeaseRepository:
             expires_at=expires_at,
         )
         self.session.add(model)
-        self.session.commit()
+        try:
+            self.session.commit()
+        except IntegrityError as exc:
+            # Lost a concurrent race: another writer inserted the active lease between
+            # our active_for_task() check and this commit. The partial unique index
+            # rejected the duplicate — surface it as the same conflict callers expect.
+            self.session.rollback()
+            raise ValueError(f"Active lease already exists for task {task_id}") from exc
         self.session.refresh(model)
         return _lease_from_model(model)
 
@@ -213,6 +221,40 @@ class TaskLeaseRepository:
     def validate(self, task_id: str, lease_token: str) -> bool:
         active = self.active_for_task(task_id)
         return active is not None and active.lease_token == lease_token
+
+    def renew(self, task_id: str, lease_token: str, ttl_seconds: int) -> TaskLeaseRecord | None:
+        """Push the lease's expiry out by ``ttl_seconds`` from now. Returns the updated
+        record, or None when the token is invalid / the lease already expired."""
+        active = self.active_for_task(task_id)
+        if active is None or active.lease_token != lease_token:
+            return None
+        model = self.session.get(TaskLeaseModel, active.id)
+        if model is None:
+            return None
+        model.expires_at = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
+        self.session.add(model)
+        self.session.commit()
+        self.session.refresh(model)
+        return _lease_from_model(model)
+
+    def list_leases(self, *, active_only: bool = True) -> list[tuple[TaskLeaseRecord, bool]]:
+        """Return ``(lease, expired)`` pairs for fleet supervision. ``expired`` means the
+        lease is still marked active but past its TTL (a crashed/disconnected agent)."""
+        statement = select(TaskLeaseModel)
+        if active_only:
+            statement = statement.where(TaskLeaseModel.status == "active")
+        statement = statement.order_by(col(TaskLeaseModel.created_at).desc())
+        now = datetime.now(timezone.utc)
+        results: list[tuple[TaskLeaseRecord, bool]] = []
+        for model in self.session.exec(statement).all():
+            expired = False
+            if model.status == "active" and model.expires_at:
+                expires = datetime.fromisoformat(model.expires_at)
+                if expires.tzinfo is None:
+                    expires = expires.replace(tzinfo=timezone.utc)
+                expired = now > expires
+            results.append((_lease_from_model(model), expired))
+        return results
 
 
 class ShellSessionRepository:
@@ -316,6 +358,14 @@ class FileChangeRepository:
         self.session.commit()
         self.session.refresh(model)
         return FileChangeRecord.model_validate(model.model_dump())
+
+    def list_for_task(self, task_id: str) -> list[FileChangeRecord]:
+        statement = (
+            select(FileChangeEventModel)
+            .where(FileChangeEventModel.task_id == task_id)
+            .order_by(col(FileChangeEventModel.created_at))
+        )
+        return [FileChangeRecord.model_validate(m.model_dump()) for m in self.session.exec(statement).all()]
 
 
 class SemanticDiffRepository:
@@ -485,3 +535,23 @@ class VerificationRunRepository:
             started_at=model.started_at,
             finished_at=model.finished_at,
         )
+
+    def list_for_task(self, task_id: str) -> list[VerificationRunRecord]:
+        statement = (
+            select(VerificationRunModel)
+            .where(VerificationRunModel.task_id == task_id)
+            .order_by(col(VerificationRunModel.started_at))
+        )
+        records: list[VerificationRunRecord] = []
+        for model in self.session.exec(statement).all():
+            records.append(VerificationRunRecord(
+                id=model.id,
+                task_id=model.task_id,
+                sandbox=model.sandbox,
+                environment=json.loads(model.environment_json),
+                commands=json.loads(model.commands_json),
+                status=model.status,
+                started_at=model.started_at,
+                finished_at=model.finished_at,
+            ))
+        return records

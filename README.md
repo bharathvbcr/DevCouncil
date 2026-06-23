@@ -24,7 +24,7 @@ DevCouncil does not replace coding agents. It sits beside tools like Codex CLI, 
 - [Architecture](docs/architecture.md): components, artifact graph, state machine, and gated execution.
 - [Executor adapters](docs/executor-adapters.md): manual, coding CLI, native-preview, Mini-SWE, and OpenHands execution paths.
 - [Live review](docs/live-review.md): `dev watch` session review, cards, signals, and blocking behavior.
-- [Model routing](docs/model-routing.md): provider selection, role models, OpenRouter, Vertex AI, and Doubleword setup.
+- [Model routing](docs/model-routing.md): provider selection, role models, OpenRouter, Vertex AI, Doubleword, and Ollama (local) setup.
 - [Security model](docs/security.md): redaction, permissions, allowlists, and local state.
 - [Project status](docs/project-status.md): current maturity by subsystem.
 - [Roadmap](docs/roadmap.md): planned work.
@@ -137,14 +137,16 @@ DevCouncil is an application layer around coding agents. It does not just emit p
 
 ### Workflow Features
 
-- **Repository onboarding:** `dev setup` initializes `.devcouncil/`, runs environment checks, offers integration setup, and prints the next useful commands.
-- **Repository mapping:** `dev map` writes `.devcouncil/repo_map.json`, identifies important files and subsystems, filters generated/temp files, and keeps managed `AGENTS.md` / `CLAUDE.md` workspace guides synchronized.
+- **Repository onboarding:** `dev setup` initializes `.devcouncil/`, generates the repo map + `AGENTS.md`/`CLAUDE.md` guides, scaffolds applicable engineering skills, runs environment checks, offers integration setup, and prints the next useful commands. Use `--skip-map` / `--skip-skills` to opt out, or `--scaffold-ci` to also write a starter GitHub Actions workflow.
+- **Repository mapping:** `dev map` writes `.devcouncil/repo_map.json`, identifies important files and subsystems, filters generated/temp files, and keeps managed `AGENTS.md` / `CLAUDE.md` workspace guides synchronized. Subsystems, entry points, neighbors, and important surfaces are now inferred generically for **any** repository — grouped from the directory tree and ranked by an import-graph in-degree — so the map (and the structural context it feeds into prompts) is meaningful outside DevCouncil's own tree, not just within it. The map records the git HEAD and tracked-file fingerprint it was built from; when prompts reuse a map that has fallen behind the current code, they flag it as stale (run `dev map` to refresh) rather than silently feeding wrong structure. The map is also generated automatically on first init.
+- **Engineering skills:** `dev skills` lists the bundled skills and shows which apply to the repository; `dev skills scaffold` writes them into `.claude/skills/<name>/SKILL.md`. A merged always-on `core-engineering` skill (think-before-coding, simplicity, surgical changes, goal-driven execution, evidence-grounded communication) plus domain skills (Android, iOS, Windows, web, AI training) that brief the agent on current SDKs, deprecations, and tooling before coding. Applicable skills are also embedded into `dev prompt` output.
+- **CI scaffolding:** `dev scaffold-ci` writes a starter `.github/workflows/devcouncil.yml` derived from the configured test/lint/typecheck commands, filtered to the detected language stack; it never overwrites existing CI unless `--force`.
 - **Planning council:** `dev plan` turns a goal into requirements, acceptance criteria, assumptions, critique findings, and executable tasks.
-- **Task graph:** `dev tasks` and `dev show TASK-001` expose requirement links, acceptance-criterion links, planned files, expected tests, allowed commands, forbidden changes, and status.
-- **Scoped task prompts:** `dev prompt TASK-001` creates a constrained implementation prompt for sidecar agents, including file scope, verification expectations, and forbidden changes.
+- **Task graph:** `dev tasks` and `dev show TASK-001` expose requirement links, acceptance-criterion links, planned files, expected tests, allowed commands, forbidden changes, dependencies, and status. Tasks can declare `depends_on`; the plan gate rejects unknown dependencies and cycles, and `dev go`/`dev e2e` run tasks in topological order and skip a task whose prerequisites didn't complete (rather than letting it fail spuriously and burn its repair budget).
+- **Scoped task prompts:** `dev prompt TASK-001` creates a constrained implementation prompt for sidecar agents, including file scope, verification expectations, and forbidden changes. The prompt now embeds the current (secret-redacted) contents of each planned file with a top-level symbol outline, structural orientation (from the code-review graph when available, otherwise the generated `repo_map.json`), and a **dependents (blast-radius) list** — the files that import each file being changed, from the map's precomputed reverse-import index — so the agent edits in place and keeps call sites working instead of starting blind. A central prompt budget keeps the core (goal/scope/instructions) always present and fits the optional context sections in priority order (file contents > structural > dependents > skills), dropping the lowest-priority ones with an explicit marker rather than overflowing silently.
 - **Execution:** `dev run TASK-001` supports manual sidecar mode, built-in coding CLI executors, external executors, and registered custom CLI agents.
-- **One-command flow:** `dev e2e "goal"` and `dev go "goal"` can initialize state, plan, run approved tasks, verify the diff, and generate a report.
-- **Verification:** `dev verify TASK-001` captures the diff, runs expected evidence commands, checks planned-file compliance, detects orphan changes, flags unplanned dependency edits, scans for secrets, and links evidence to acceptance criteria.
+- **One-command flow:** `dev e2e "goal"` and `dev go "goal"` can initialize state, plan, run approved tasks, verify the diff, and generate a report. With an automated executor the run is now a **closed loop**: a task that fails verification is re-driven through a bounded self-repair loop (a correction manifest is written and the executor re-run) until it verifies or the `execution.max_repair_attempts` budget is spent, with no-progress detection that stops early when the same blocking gaps reappear.
+- **Verification:** `dev verify TASK-001` captures the diff, runs expected evidence commands, checks planned-file compliance, detects orphan changes, flags unplanned dependency edits, scans for secrets, and links evidence to acceptance criteria. An **empty diff can no longer pass** a task that declares files to create or modify (work that committed earlier is still recognized via the task checkpoint), and the result reports the rigor it ran at (`verification_mode` compiled vs coarse, `diff_empty`, `coverage_measured`/`coverage_skipped_reason`) plus a distinct `advisory_actions` list so an agent never mistakes "passed" for "proven." `dev verify` exits non-zero when a task is blocked so shell-driven agents can gate on `$?`.
 - **Repair:** `dev repair` converts blocking gaps into focused follow-up work instead of leaving failures as vague test output.
 - **Rollback:** `dev rollback TASK-001` uses task checkpoints to revert scoped work when a task needs to be backed out.
 - **Reporting:** `dev report` emits a requirements coverage table, evidence summary, blocking gaps, and live-review blockers; JSON and PR-comment paths are available for automation.
@@ -153,11 +155,12 @@ DevCouncil is an application layer around coding agents. It does not just emit p
 
 - **CLI:** `dev` and `devcouncil` expose the same Typer command surface for local terminal workflows.
 - **Agent hub:** `dev agents` lists built-in and custom agents, `dev agents add` registers prompt-taking CLIs, `dev agents doctor` checks wiring, `dev agents run` executes a task through a named agent/profile, and `dev agents optimize` uses GEPA to tune profile preambles from offline eval examples.
-- **Integration hub:** `dev integrate all --apply` configures supported coding CLI and MCP integrations; targeted setup exists for Codex, Gemini, Claude Code, OpenCode, Antigravity, Cursor, Warp/Oz, hooks, and custom CLI agents.
-- **MCP server:** `dev mcp-server` exposes DevCouncil context and workflow tools over stdio for MCP-capable clients.
+- **Integration hub:** `dev integrate all --apply` configures supported coding CLI and MCP integrations; targeted setup exists for Codex, Gemini, Claude Code, OpenCode, Antigravity, Cursor, Warp/Oz, hooks, and custom CLI agents. `dev integrate check` now reports each client's **enforcement posture** — `pre-action` (a native hook blocks unauthorized writes before they happen) vs `verify-only` (forbidden changes are caught only after the fact by verification) — so the containment guarantee isn't overstated for clients without a pre-action gate.
+- **MCP server:** `dev mcp-server` exposes DevCouncil context and workflow tools over stdio for MCP-capable clients. `devcouncil_verify_task` now runs DevCouncil's strong compiled per-criterion checks when a provider key is configured (falling back to a clearly-labeled `coarse` mode otherwise), refuses to pass on an empty diff, and returns `verification_mode`, `diff_empty`, `coverage_measured`/`coverage_skipped_reason`, and an `advisory_actions` array alongside the blocking `next_actions`. Cheap, re-verify-free read tools — `devcouncil_get_gaps` and `devcouncil_get_next_actions` — let a reconnecting agent resume outstanding work from persisted gaps (which now carry `file`/`line`/`suggested_command`/`acceptance_criterion_id`). Task leases expire on a config-driven TTL so a crashed agent's task frees itself, with `devcouncil_renew_lease` and `devcouncil_list_leases` for long runs and fleet supervision; a partial-unique DB index enforces a single active lease per task, so concurrent checkouts can't both win the writer slot. A pure-MCP agent can now make the change itself through lease-gated write tools — `devcouncil_write_file` and `devcouncil_apply_patch` — which policy-check every target path *before* it lands (out-of-scope, protected, or escaping paths are rejected; a patch with any out-of-scope target is rejected whole, never partially applied), write atomically, and record a `FileChangeEvent` for provenance. The corpus is also browsable as MCP **resources** (`devcouncil://report`, `devcouncil://tasks`, `devcouncil://gaps`, `devcouncil://cards`, `devcouncil://task/{id}`) so a host can read project state without a tool call. `devcouncil_get_task_provenance` then exposes that audit trail — gated file changes, verification runs, diff-coverage evidence, and the latest correction manifest — so what happened on disk is inspectable. The diff↔coverage proof is now also retained across graph reloads (it was previously dropped), so reports and `dev status` reflect whether the changed lines were actually exercised.
 - **Live review:** `dev watch` tracks review cards, signals, blocking feedback, and repair guidance while a session is active.
 - **Trace viewer:** `dev trace tail --follow` streams local DevCouncil trace events for execution, verification, and agent handoff.
 - **Dashboard:** `dev dashboard --open` serves a local status dashboard and opens it in the default browser for project state and live workflow visibility.
+- **Agent-consumable CLI:** machine output for shell-driven agents — `dev prompt --json` (`{ok, task_id, prompt}`), `dev handoff --json` (`{ok, manifest_path, run_id, next_command}` to chain `dev run`), `dev verify` exits non-zero when blocked, and `dev status`/`dev report` accept `--fail-on-blocking` to exit non-zero on outstanding blocking gaps so a loop can gate on `$?`.
 - **Config editor:** `dev config` and `dev config models` inspect/update provider, model, executor, and command configuration.
 - **Artifact tools:** `dev artifacts validate` checks stored graph integrity.
 - **Code intelligence:** `dev lsp inspect` checks optional language-server readiness, and `dev ast match` searches code structurally.
@@ -172,7 +175,7 @@ DevCouncil works with human-in-the-loop sidecar sessions and automated prompt ha
 - **Custom CLI agents:** register any prompt-taking command with stdin, argument, or prompt-file handoff.
 - **Execution profiles:** custom agents can use profiles such as `default`, `yolo`, and `prod` to adjust prompt constraints while DevCouncil still verifies the final diff.
 - **External automated adapters:** `mini`, `openhands`, `native-preview`, and `native` are available when the corresponding local executor is configured.
-- **Hook-aware clients:** `dev integrate hooks --apply` installs write/shell hooks for Codex, Gemini, Claude, Cursor, and OpenCode so DevCouncil policy can block unauthorized actions before verification.
+- **Hook-aware clients:** `dev integrate hooks --apply` installs write/shell hooks for Codex, Gemini, Claude, Cursor, and OpenCode so DevCouncil policy can block unauthorized actions before verification. The post-task hook can run deterministic verification of the active task and record gaps (enable `execution.verify_on_post_task`; off by default to keep hooks fast). File-write policy uses one shared path normalizer across the hook and task-policy paths that resolves every target and **denies anything outside the project root** (so the path that's checked is the path that's enforced), and the pre-tool-use hook is fail-closed: an unparseable or error payload is surfaced (and blocked under `--strict`/`DEVCOUNCIL_HOOK_STRICT`) rather than silently allowed.
 
 ### Gates And Evidence
 
@@ -187,7 +190,7 @@ DevCouncil blocks completion on concrete gaps rather than model confidence:
 
 ### Providers, Models, And Cost Tracking
 
-- **Providers:** OpenRouter, Vertex AI, and Doubleword are supported through local configuration and secrets.
+- **Providers:** OpenRouter, Vertex AI, Doubleword, and Ollama (local, no key) are supported through local configuration and secrets.
 - **Role models:** planner, critic, arbiter, reviewer, and repair roles can share one model or use per-role overrides.
 - **Structured repair:** model routing includes JSON repair paths for structured planning and review outputs.
 - **Model defaults:** packaged YAML defaults ship with the tool so installed CLI environments do not depend on source-tree-only files.
@@ -206,7 +209,7 @@ DevCouncil blocks completion on concrete gaps rather than model confidence:
 DevCouncil stores local workflow state in the target repository:
 
 - `.devcouncil/config.yaml`: provider, executor, command, integration, and workflow settings.
-- `.devcouncil/secrets.env`: local provider secrets such as API keys or Vertex AI project/location values.
+- `.devcouncil/secrets.env`: local provider secrets such as API keys or Vertex AI project/location values. Git-ignored; copy `.devcouncil/secrets.env.example` and fill in real values. Environment variables take precedence over this file.
 - `.devcouncil/repo_map.json`: generated repository map and subsystem navigation index.
 - `.devcouncil/state.sqlite`: SQLite state for requirements, assumptions, tasks, evidence, gaps, critique findings, and project phase history.
 - `.devcouncil/checkpoints/`: task snapshots used by verification and rollback.
@@ -241,7 +244,7 @@ flowchart TD
     cli --> map["Repo map\nsrc/devcouncil/indexing/repo_mapper.py"]
     cli --> planning["Planning commands\ndev plan / dev prompt / dev tasks"]
 
-    config --> providers["Model providers\nOpenRouter, Vertex AI, or Doubleword"]
+    config --> providers["Model providers\nOpenRouter, Vertex AI, Doubleword, or Ollama"]
     providers --> router["ModelRouter\nrole models, cache, telemetry, structured JSON repair"]
     router --> planning
 

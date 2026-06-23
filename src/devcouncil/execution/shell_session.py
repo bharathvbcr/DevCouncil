@@ -9,6 +9,8 @@ import subprocess
 import uuid
 from pathlib import Path
 
+from rich.console import Console
+
 from devcouncil.domain.evidence import CommandResult
 from devcouncil.domain.task import Task
 from devcouncil.execution.checkpoints import CheckpointService
@@ -72,6 +74,8 @@ class ShellWrappedBackend(ShellBackend):
 
 _EVIDENCE_COMMAND_HINTS = ("pytest", "ruff", "mypy", "npm test", "npm run lint", "npm run typecheck")
 
+console = Console()
+
 
 class GuardedShellSession:
     def __init__(self, project_root: Path, task: Task, *, shell: str = "auto"):
@@ -87,7 +91,7 @@ class GuardedShellSession:
         self.log_dir = self.project_root / ".devcouncil" / "logs"
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
-    def start(self) -> None:
+    def start(self, *, force: bool = False) -> None:
         db = get_db(self.project_root)
         if not db:
             raise RuntimeError("DevCouncil not initialized.")
@@ -96,6 +100,7 @@ class GuardedShellSession:
                 self.task.id,
                 owner="dev shell",
                 agent=self.shell,
+                force=force,
             )
             self.lease_token = lease.lease_token
             shell_session = ShellSessionRepository(session).start(
@@ -132,16 +137,29 @@ class GuardedShellSession:
                 {"command": normalized, "reason": decision.reason},
                 task_id=self.task.id,
             )
+            # Tell the user *why* — a silent non-zero exit is unactionable.
+            console.print(
+                f"[red]Command denied for {self.task.id}:[/red] {decision.reason or 'not permitted by task policy.'}"
+            )
+            console.print(
+                "[dim]Add it to the task's allowed_commands, or run it outside DevCouncil.[/dim]"
+            )
             return 1
 
         try:
             result = self.backend.run_command(normalized, self.project_root)
-        except NotImplementedError as exc:
+        except (NotImplementedError, FileNotFoundError, OSError) as exc:
             self._record_command(normalized, "denied", reason=str(exc))
+            console.print(f"[red]Could not run '{normalized}':[/red] {exc}")
             return 1
 
         stdout_path.write_text(result.stdout or "", encoding="utf-8")
         stderr_path.write_text(result.stderr or "", encoding="utf-8")
+        # Echo the command output so the guarded shell is actually usable.
+        if result.stdout:
+            console.print(result.stdout, end="", markup=False, highlight=False)
+        if result.stderr:
+            console.print(result.stderr, end="", markup=False, highlight=False, style="dim")
         status = "finished" if result.returncode == 0 else "failed"
         self._record_command(
             normalized,

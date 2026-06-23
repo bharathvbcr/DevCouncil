@@ -15,6 +15,12 @@ SECRET_PATTERNS: Dict[str, Pattern] = {
     "aws_access_key": re.compile(r"(?i)\b(AKIA[0-9A-Z]{16})\b"),
     "aws_secret_key": re.compile(r"(?i)(?:aws_secret_access_key|aws_secret|secret_key)\s*[=:]\s*([0-9a-zA-Z/+]{40})"),
     "github_token": re.compile(r"(?i)\b(gh[pusr]_[A-Za-z0-9_]{36})\b"),
+    # Anthropic keys are matched before the generic OpenAI-style sk- pattern so the
+    # more specific label wins.
+    "anthropic_key": re.compile(r"\b(sk-ant-[A-Za-z0-9_-]{20,})\b"),
+    "openai_key": re.compile(r"\b(sk-[A-Za-z0-9_-]{20,})\b"),
+    "google_api_key": re.compile(r"\b(AIza[0-9A-Za-z_-]{35})\b"),
+    "stripe_live_key": re.compile(r"\b((?:sk|rk)_live_[0-9A-Za-z]{16,})\b"),
     "slack_token": re.compile(r"(?i)\b(xox[baprs]-[0-9]{12}-[0-9]{12}-[0-9]{12}-[a-z0-9]{32})\b"),
     "jwt": re.compile(r"(?i)\b(ey[a-zA-Z0-9_-]{10,}\.ey[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,})\b"),
     "generic_api_key": re.compile(r"(?i)(api[_-]?key|secret|token|password)[\"'\s]*[:=][\"'\s]*([a-zA-Z0-9_\-\.]{16,})"),

@@ -42,6 +42,89 @@ def test_load_turns_parses_claude_style_jsonl(tmp_path):
     assert "pytest passed" in turns[1].content
 
 
+def _seed_task_state(tmp_path, *, status, gaps=(), evidence=()):
+    from devcouncil.domain.requirement import AcceptanceCriterion, Requirement
+    from devcouncil.domain.task import PlannedFile, Task
+    from devcouncil.storage.db import get_db
+    from devcouncil.storage.repositories import (
+        EvidenceRepository,
+        GapRepository,
+        RequirementRepository,
+        TaskRepository,
+    )
+
+    (tmp_path / ".devcouncil").mkdir(exist_ok=True)
+    db = get_db(tmp_path)
+    assert db is not None
+    with db.get_session() as session:
+        RequirementRepository(session).save(Requirement(
+            id="REQ-1", title="t", description="d", priority="high", source="user",
+            acceptance_criteria=[AcceptanceCriterion(id="AC-1", description="x", verification_method="unit_test")],
+        ))
+        TaskRepository(session).save(Task(
+            id="TASK-1", title="t", description="d",
+            requirement_ids=["REQ-1"], acceptance_criterion_ids=["AC-1"],
+            planned_files=[PlannedFile(path="a.py", reason="r", allowed_change="modify")],
+            status=status,
+        ))
+        for gap in gaps:
+            GapRepository(session).save(gap)
+        for ev in evidence:
+            EvidenceRepository(session).save_test_evidence(ev, "TASK-1")
+
+
+def test_review_grounded_flags_premature_completion_when_task_not_verified(tmp_path):
+    _seed_task_state(tmp_path, status="running")
+    turn = AgentTurn(session_id="S", turn_id="A", source="claude", role="assistant",
+                     content="Done! Implemented the median function.")
+
+    card = review_turn(turn, tmp_path, client="claude", task_id="TASK-1")
+
+    assert card.verdict == "Concerns"
+    assert any("not yet backed by DevCouncil evidence" in c for c in card.concerns)
+    assert any("dev verify TASK-1" in r for r in card.evidence_requests)
+
+
+def test_review_grounded_critical_when_claims_pass_but_failing_evidence(tmp_path):
+    from devcouncil.domain.gap import Gap
+
+    failing = Gap(id="G1", severity="high", gap_type="test_failed", task_id="TASK-1",
+                  description="pytest failed", recommended_fix="fix", blocking=True)
+    _seed_task_state(tmp_path, status="blocked", gaps=[failing])
+    turn = AgentTurn(session_id="S", turn_id="A", source="claude", role="assistant",
+                     content="All tests pass now — the implementation is complete.")
+
+    card = review_turn(turn, tmp_path, client="claude", task_id="TASK-1")
+
+    assert card.verdict == "Critical Issues"
+    assert any("failing verification command" in c for c in card.concerns)
+
+
+def test_review_grounded_approves_when_completion_backed_by_evidence(tmp_path):
+    from devcouncil.domain.evidence import TestEvidence
+
+    ev = TestEvidence(requirement_id="REQ-1", acceptance_criterion_id="AC-1",
+                      command="python -m pytest -q", status="passed", evidence_summary="ok")
+    _seed_task_state(tmp_path, status="verified", evidence=[ev])
+    turn = AgentTurn(session_id="S", turn_id="A", source="claude", role="assistant",
+                     content="Done — implemented and verified.")
+
+    card = review_turn(turn, tmp_path, client="claude", task_id="TASK-1")
+
+    assert card.verdict == "Approved"
+    assert not card.concerns
+
+
+def test_review_negation_does_not_flag_completion(tmp_path):
+    turn = AgentTurn(session_id="S", turn_id="A", source="claude", role="assistant",
+                     content="I'm not done yet and the work is not finished.")
+
+    card = review_turn(turn, tmp_path, client="claude")
+
+    assert card.verdict == "Approved"
+    assert not any("claim completion" in c.lower() for c in card.concerns)
+
+
 def test_review_turn_flags_completion_claim_without_evidence(tmp_path):
     transcript = tmp_path / "session.jsonl"
     transcript.write_text(
@@ -210,7 +293,7 @@ def test_write_signal_extracts_nested_transcript_path_and_marks_processed(tmp_pa
 
 
 class CardProvider(Provider):
-    async def complete(self, model, messages, temperature=0.0, json_mode=False):
+    async def complete(self, model, messages, temperature=0.0, json_mode=False, run_id=None, **kwargs):
         content = json.dumps({
             "schema": "devcouncil.critique_card.v1",
             "id": "MODEL-CARD",

@@ -13,6 +13,12 @@ REQUIRED_FILES = {
     "devcouncil/llm/model_defaults.yaml",
     "devcouncil/telemetry/model_pricing.yaml",
     "devcouncil/integrations/opencode_devcouncil_plugin.mjs",
+    "devcouncil/skills/library/core-engineering.md",
+    "devcouncil/skills/library/android.md",
+    "devcouncil/skills/library/ios.md",
+    "devcouncil/skills/library/windows.md",
+    "devcouncil/skills/library/web.md",
+    "devcouncil/skills/library/ai-training.md",
 }
 
 

@@ -1,4 +1,5 @@
 from sqlmodel import SQLModel, Field
+from sqlalchemy import Index, text
 from typing import Optional
 
 
@@ -61,6 +62,13 @@ class GapModel(SQLModel, table=True):
     evidence_json: str = Field(default="[]")
     recommended_fix: str
     blocking: bool
+    # Machine-routable repair hints. Persisted (v4) so the typed next-actions
+    # contract survives a reload — a reconnecting/crashed agent can read outstanding
+    # gaps without the heuristic reconstruction the loader used to fall back to.
+    file: Optional[str] = None
+    line: Optional[int] = None
+    suggested_command: Optional[str] = None
+    acceptance_criterion_id: Optional[str] = None
 
 class CritiqueFindingModel(SQLModel, table=True):
     __tablename__ = "critique_findings"
@@ -85,6 +93,17 @@ class ProjectStateModel(SQLModel, table=True):
 
 class TaskLeaseModel(SQLModel, table=True):
     __tablename__ = "task_leases"
+    # Enforce the single-writer guarantee at the DB level: at most one ACTIVE lease per
+    # task. A partial unique index turns a concurrent double-checkout race into an
+    # IntegrityError (surfaced as lease_conflict) instead of two live leases.
+    __table_args__ = (
+        Index(
+            "ux_task_leases_active",
+            "task_id",
+            unique=True,
+            sqlite_where=text("status = 'active'"),
+        ),
+    )
     id: str = Field(primary_key=True)
     task_id: str = Field(index=True)
     owner: str

@@ -128,15 +128,21 @@ def test_plan_gate_blocks_unknown_task_links():
     assert any("UNKNOWN-AC" in gap.id for gap in result.gaps)
 
 
-def test_task_ready_blocks_missing_commands_and_expected_evidence(monkeypatch):
+def test_task_ready_warns_but_allows_missing_commands_and_expected_evidence(monkeypatch):
     policy = GatePolicy()
     monkeypatch.setattr(policy.clean_git, "check", lambda project_root, task_id: [])
 
     result = policy.check_task_ready(_task(), Path("."))
 
-    assert not result.passed
-    assert any("NO-COMMANDS" in gap.id for gap in result.gaps)
-    assert any("NO-EXPECTED-EVIDENCE" in gap.id for gap in result.gaps)
+    # A missing verification contract is a verify-time concern: readiness must not
+    # block execution on it (the executor still needs to implement the code).
+    assert result.passed
+    contract_gaps = [
+        gap for gap in result.gaps
+        if "NO-COMMANDS" in gap.id or "NO-EXPECTED-EVIDENCE" in gap.id
+    ]
+    assert contract_gaps
+    assert not any(gap.blocking for gap in contract_gaps)
 
 
 def test_task_ready_passes_with_commands_and_expected_evidence(monkeypatch):

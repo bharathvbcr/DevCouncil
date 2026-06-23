@@ -14,6 +14,7 @@ def shell(
     task_id: str = typer.Argument(..., help="Task ID"),
     command: str | None = typer.Option(None, "--command", help="Run one guarded command and exit."),
     shell_name: str = typer.Option("auto", "--shell", help="Shell backend: auto, pwsh, bash, zsh."),
+    force: bool = typer.Option(False, "--force", help="Reclaim a stale lease from a previous (possibly crashed) session."),
     project_root: Path = typer.Option(Path("."), "--project-root"),
 ):
     """
@@ -37,7 +38,18 @@ def shell(
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=2)
-    session_runner.start()
+    try:
+        session_runner.start(force=force)
+    except ValueError as exc:
+        # A live or stale lease from a prior session blocks a new one. Don't dump
+        # a traceback — tell the user how to recover.
+        console.print(f"[red]{exc}[/red]")
+        console.print(
+            "[yellow]Another shell session may be active for this task. If it is "
+            "stale (a previous session crashed), re-run with [bold]--force[/bold] to "
+            "reclaim it.[/yellow]"
+        )
+        raise typer.Exit(code=2)
     try:
         if command:
             code = session_runner.run_one(command)

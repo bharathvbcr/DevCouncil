@@ -3,7 +3,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -93,3 +93,54 @@ def read_trace_events(project_root: Path) -> Iterable[TraceEvent]:
         except Exception as exc:
             logger.debug("Skipping invalid trace line: %s", exc)
     return events
+
+
+def read_trace_events_since(
+    project_root: Path, cursor: Optional[int] = None
+) -> Tuple[List[TraceEvent], int]:
+    """Incrementally read trace events appended after ``cursor``.
+
+    The cursor is a byte offset into the trace file, which is robust to appends
+    (the file is append-only) and makes repeated polling O(new bytes) rather than
+    O(all events). Returns ``(events, next_cursor)`` where ``next_cursor`` should
+    be passed back on the next call to fetch only newer events.
+
+    Never raises: on any error it returns an empty batch and a safe cursor. A
+    ``cursor`` past the current end-of-file (e.g. the log was rotated/truncated)
+    is treated as a reset so the caller still makes progress.
+    """
+    trace_file = project_root / ".devcouncil" / "logs" / "traces.jsonl"
+    start = cursor if isinstance(cursor, int) and cursor >= 0 else 0
+    if not trace_file.exists():
+        return [], start
+
+    try:
+        size = trace_file.stat().st_size
+        # File shrank (rotation/truncation) — restart from the beginning.
+        if start > size:
+            start = 0
+
+        with open(trace_file, "rb") as f:
+            f.seek(start)
+            chunk = f.read()
+    except Exception as exc:
+        logger.debug("Failed incremental trace read: %s", exc)
+        return [], start
+
+    # Only consume up to the last complete line so a half-written final line is
+    # re-read (not skipped) on the next poll once it is fully flushed.
+    last_newline = chunk.rfind(b"\n")
+    if last_newline == -1:
+        return [], start
+    consumed = chunk[: last_newline + 1]
+    next_cursor = start + len(consumed)
+
+    events: List[TraceEvent] = []
+    for raw_line in consumed.decode("utf-8", errors="replace").splitlines():
+        if not raw_line.strip():
+            continue
+        try:
+            events.append(TraceEvent.from_legacy(json.loads(raw_line)))
+        except Exception as exc:
+            logger.debug("Skipping invalid trace line: %s", exc)
+    return events, next_cursor

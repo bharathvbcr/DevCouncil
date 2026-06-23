@@ -16,7 +16,16 @@ class LspServerCandidate:
 
 
 class LspInspector:
-    """Starter LSP integration focused on discovery and safe initialize payloads."""
+    """Language-server *detection* only — DevCouncil does not run an LSP client.
+
+    This inspector exists to answer one honest question: which language servers
+    for the repo's languages are installed on PATH? It does NOT spawn a server,
+    does NOT speak the LSP wire protocol, and does NOT send the ``initialize``
+    handshake. ``starter_initialize_payload`` builds the JSON-RPC ``initialize``
+    request a *future* client would send, but it is never transmitted — it is
+    surfaced purely as a reference/starter payload, clearly labelled as such, so
+    no consumer mistakes detection for a live LSP capability.
+    """
 
     _LANGUAGE_SERVERS: dict[str, list[list[str]]] = {
         "python": [["pyright-langserver", "--stdio"], ["pylsp"]],
@@ -76,7 +85,14 @@ class LspInspector:
                 )
         return candidates
 
-    def initialize_request(self, language: str) -> dict[str, Any]:
+    def starter_initialize_payload(self, language: str) -> dict[str, Any]:
+        """Build the JSON-RPC ``initialize`` request a future LSP client *would* send.
+
+        This payload is NEVER sent — DevCouncil has no LSP client. It is provided
+        only as a reference/starter for anyone wiring up real LSP support. See the
+        ``initialize_requests`` block in :meth:`summary`, which carries the same
+        non-sent payloads under an explicit ``"_note"`` disclaimer.
+        """
         return {
             "jsonrpc": "2.0",
             "id": 1,
@@ -97,10 +113,32 @@ class LspInspector:
             },
         }
 
+    # Made explicit in every summary so no consumer reads this as a live LSP feature.
+    _DETECTION_ONLY_NOTE = (
+        "Detection only: DevCouncil checks which language servers are installed on "
+        "PATH; it does not run an LSP client or send any requests."
+    )
+    _STARTER_PAYLOAD_NOTE = (
+        "Starter payloads only — these initialize requests are NEVER sent. They are "
+        "a reference for wiring up a real LSP client later."
+    )
+
     def summary(self, files: list[str] | None = None) -> dict[str, Any]:
         candidates = self.server_candidates(files)
         return {
+            "mode": "detection-only",
+            "note": self._DETECTION_ONLY_NOTE,
             "languages": self.detect_languages(files),
+            "detected_servers": [
+                {
+                    "language": candidate.language,
+                    "command": candidate.command,
+                    "available": candidate.available,
+                    "reason": candidate.reason,
+                }
+                for candidate in candidates
+            ],
+            # Back-compat alias for "detected_servers" (older consumers/tests).
             "servers": [
                 {
                     "language": candidate.language,
@@ -111,8 +149,11 @@ class LspInspector:
                 for candidate in candidates
             ],
             "initialize_requests": {
-                language: self.initialize_request(language)
-                for language in sorted({candidate.language for candidate in candidates})
+                "_note": self._STARTER_PAYLOAD_NOTE,
+                **{
+                    language: self.starter_initialize_payload(language)
+                    for language in sorted({candidate.language for candidate in candidates})
+                },
             },
         }
 

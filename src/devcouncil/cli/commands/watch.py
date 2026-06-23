@@ -557,8 +557,9 @@ def _log_signal_processed(root: Path, signal: ReviewSignal, processed_path: Path
 
 async def _review_turn(turn, root: Path, client: str, use_llm: bool, task_id: str | None = None):
     if not use_llm:
-        card = review_turn(turn, root, client=client)
-        return card.model_copy(update={"task_id": task_id}) if task_id else card
+        # Pass task_id so the deterministic review can ground completion/evidence
+        # claims against the task's real verification state.
+        return review_turn(turn, root, client=client, task_id=task_id)
     try:
         config = load_config(root)
         validate_model_provider(config.models.provider)
@@ -568,7 +569,6 @@ async def _review_turn(turn, root: Path, client: str, use_llm: bool, task_id: st
         router = ModelRouter(provider, role_config, project_root=root)
     except Exception as exc:
         console.print(f"[yellow]Model-backed review unavailable; using deterministic card: {exc}[/yellow]")
-        card = review_turn(turn, root, client=client)
-        return card.model_copy(update={"task_id": task_id}) if task_id else card
+        return review_turn(turn, root, client=client, task_id=task_id)
     card = await LiveReviewService(router).review(turn, root, client=client, use_llm=True)
     return card.model_copy(update={"task_id": task_id}) if task_id else card

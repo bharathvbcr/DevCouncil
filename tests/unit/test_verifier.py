@@ -63,19 +63,132 @@ def test_verifier_records_ac_evidence_for_passing_command(tmp_path):
     assert ac_evidence[0].status == "passed"
 
 
+def test_verifier_classifies_syntaxerror_command_as_malformed_not_code_failure(tmp_path):
+    task = _task()
+    task.expected_tests = ['python -c "import m; try: m.f()\nexcept ValueError: pass"']
+    verifier = Verifier(tmp_path)
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command,
+        exit_code=1,
+        stdout_path="",
+        stderr_path="",
+        summary="Exit code 1. stdout: (empty). stderr:   File \"<string>\", line 1\n    import m; try: m.f()\nSyntaxError: invalid syntax",
+    )
+
+    gaps, _ = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    # A broken command must NOT be reported as a code/test failure, and a command
+    # that cannot run is not evidence of a defect, so it must not block on its own.
+    assert not [g for g in gaps if g.gap_type == "test_failed"]
+    bad = [g for g in gaps if g.gap_type == "invalid_verification_command"]
+    assert bad and not bad[0].blocking
+    assert "could not run" in bad[0].description.lower()
+
+
+def test_verifier_real_test_failure_stays_test_failed(tmp_path):
+    task = _task()
+    task.expected_tests = ['python -c "import m; assert m.f() == 1"']
+    verifier = Verifier(tmp_path)
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command,
+        exit_code=1,
+        stdout_path="",
+        stderr_path="",
+        summary="Exit code 1. stdout: (empty). stderr: AssertionError",
+    )
+
+    gaps, _ = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    assert any(g.gap_type == "test_failed" and g.blocking for g in gaps)
+    assert not [g for g in gaps if g.gap_type == "invalid_verification_command"]
+
+
+def test_verifier_uses_compiled_acceptance_checks_per_criterion(tmp_path):
+    # When an acceptance compiler is available, the verifier runs DevCouncil-owned
+    # per-criterion checks and maps evidence 1:1 — a passing check proves exactly
+    # its criterion (not "any command passed -> everything proven").
+    class FakeCompiler:
+        async def compile(self, task, requirements, code_context):
+            return {"AC-001": ['python -c "assert True"']}
+
+    task = _task()
+    verifier = Verifier(tmp_path)
+    verifier.acceptance_compiler = FakeCompiler()
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    verifier._commands_for_task = lambda task: {}  # no expected_tests; rely on compiled checks
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command, exit_code=0, stdout_path="", stderr_path="", summary="ok",
+    )
+
+    gaps, evidence = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    proven = [ev for ev in evidence if isinstance(ev, TestEvidence) and ev.acceptance_criterion_id == "AC-001" and ev.status == "passed"]
+    assert proven
+    assert not any(g.gap_type == "acceptance_criteria_unproven" and g.blocking for g in gaps)
+
+
+def test_verifier_compiled_check_failure_blocks_its_criterion(tmp_path):
+    class FakeCompiler:
+        async def compile(self, task, requirements, code_context):
+            return {"AC-001": ['python -c "assert calc.x"']}
+
+    task = _task()
+    verifier = Verifier(tmp_path)
+    verifier.acceptance_compiler = FakeCompiler()
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    verifier._commands_for_task = lambda task: {}
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command, exit_code=1, stdout_path="", stderr_path="", summary="AssertionError",
+    )
+
+    gaps, _ = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    assert any(g.gap_type == "test_failed" and g.blocking for g in gaps)
+
+
 def test_verifier_blocks_unproven_acceptance_criteria(tmp_path):
+    # A task with a verification contract but no passing evidence and no way to
+    # verify (no commands at all) must block — there is no proof of completion.
+    task = _task()
+    task.allowed_commands = []
     verifier = Verifier(tmp_path)
     verifier.get_changed_files = lambda: ["src/auth.py"]
     verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
     verifier._load_commands = lambda: {"test": [], "lint": [], "typecheck": []}
 
-    gaps, evidence = asyncio.run(verifier.verify_task(_task(), [_requirement()]))
+    gaps, evidence = asyncio.run(verifier.verify_task(task, [_requirement()]))
 
     assert not [ev for ev in evidence if isinstance(ev, TestEvidence)]
     assert any(
         gap.gap_type == "acceptance_criteria_unproven" and gap.blocking
         for gap in gaps
     )
+
+
+def test_verifier_does_not_block_when_only_failures_are_unrunnable(tmp_path):
+    # The false-negative fix: if verification was attempted but every failing
+    # command was unrunnable (missing tool / missing tests) and nothing genuinely
+    # failed, do NOT block correct work — surface it as a non-blocking gap.
+    task = _task()
+    task.expected_tests = ["python -m flake8 src/auth.py", "python -m pytest tests/test_auth.py -q"]
+    verifier = Verifier(tmp_path)
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command, exit_code=1, stdout_path="", stderr_path="",
+        summary="Exit code 1. stderr: No module named flake8",
+    )
+
+    gaps, _ = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    assert not [g for g in gaps if g.gap_type == "test_failed"]
+    assert not [g for g in gaps if g.blocking]  # nothing blocks on unrunnable verification
 
 
 def test_verifier_does_not_use_arbitrary_allowed_command_as_ac_evidence(tmp_path):

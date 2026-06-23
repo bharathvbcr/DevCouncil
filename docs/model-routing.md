@@ -16,6 +16,7 @@ Supported `models.provider` values:
 - `openrouter`: uses `OPENROUTER_API_KEY`.
 - `vertexai`: uses `VERTEXAI_ACCESS_TOKEN` or `gcloud auth print-access-token`, `VERTEXAI_PROJECT` or `GOOGLE_CLOUD_PROJECT`, and optional `VERTEXAI_LOCATION` defaulting to `global`.
 - `doubleword`: uses `DOUBLEWORD_API_KEY` and the OpenAI-compatible chat API at `https://api.doubleword.ai/v1`.
+- `ollama`: local models served by Ollama; needs NO API key. Talks to Ollama's native `/api/chat` endpoint (derived from the base URL) so `num_ctx` and JSON `format` are honored. Override the server with `OLLAMA_BASE_URL` (taken verbatim) or Ollama's native `OLLAMA_HOST` (scheme and `/v1` are auto-normalized). **Set `OLLAMA_NUM_CTX` (recommend `16384`)** — DevCouncil's planning prompts can reach ~15k tokens, and Ollama's small default context (~2048–4096) would silently truncate them; `dev doctor` warns when it is unset or too small. The council roles emit structured JSON, so prefer a capable local model (≥27B, e.g. `qwen2.5-coder:32b` / `gemma2:27b` / `command-r:35b`).
 
 Vertex AI uses Google Cloud Auth access tokens, not long-lived OpenRouter-style API keys. For local use, generate a token with:
 
@@ -44,3 +45,10 @@ Use provider-specific model names in role config, for example:
 - OpenRouter: `anthropic/claude-sonnet-4.6`, `openai/gpt-5.5`, `google/gemini-2.5-pro`
 - Vertex AI: `google/gemini-2.5-flash`
 - Doubleword: `deepseek/deepseek-v4`
+- Ollama: `qwen2.5-coder:7b`, `llama3.1` (any locally-pulled model tag; sent verbatim to Ollama)
+
+For local Ollama (no API key required):
+
+```bash
+dev setup --provider ollama --model qwen2.5-coder:7b
+```

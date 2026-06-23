@@ -3,6 +3,7 @@ import os
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -71,10 +72,86 @@ class CodingCliExecutor(Executor):
 
     def _command(self, task_id: str | None = None) -> list[str]:
         if self.client == "warp":
-            return self._warp_command()
-        if self.client == "cursor":
-            return self._cursor_command(task_id)
-        return self.spec.base_command()
+            base = self._warp_command()
+        elif self.client == "cursor":
+            base = self._cursor_command(task_id)
+        else:
+            base = self.spec.base_command()
+        return self._apply_profile_args(base)
+
+    # Per-CLI flag used to override the model, when the CLI accepts one. Clients
+    # absent from this map simply ignore a profile ``model`` override.
+    _MODEL_FLAGS: dict[str, str] = {
+        "claude": "--model",
+        "codex": "--model",
+        "gemini": "--model",
+        "cursor": "--model",
+        "qwen": "--model",
+        "opencode": "--model",
+        "aider": "--model",
+    }
+
+    def _apply_profile_args(self, command: list[str]) -> list[str]:
+        """Apply per-profile CLI overrides to the resolved command.
+
+        Empty/None overrides reproduce today's invocation exactly (no regression):
+        ``model`` rewrites/adds the model flag for CLIs that accept one,
+        ``permission_mode`` is translated into the right per-CLI flag (and an
+        overly-permissive baked-in flag is replaced for stricter modes), and
+        ``extra_args`` are appended verbatim. Surfaced in the run manifest so
+        ``dev runs show`` reveals exactly how the CLI was invoked."""
+        if not self.profile:
+            return command
+        result = list(command)
+        result = self._apply_permission_mode(result)
+        result = self._apply_model_override(result)
+        extra_args = list(self.profile.extra_args or [])
+        if extra_args:
+            result = [*result, *extra_args]
+        return result
+
+    def _apply_model_override(self, command: list[str]) -> list[str]:
+        model = (self.profile.model or "").strip() if self.profile else ""
+        if not model:
+            return command
+        flag = self._MODEL_FLAGS.get(self.client)
+        if not flag:
+            return command
+        result = list(command)
+        for index, part in enumerate(result):
+            if part == flag and index + 1 < len(result):
+                result[index + 1] = model
+                return result
+        return [*result, flag, model]
+
+    def _apply_permission_mode(self, command: list[str]) -> list[str]:
+        mode = (self.profile.permission_mode or "").strip() if self.profile else ""
+        if not mode:
+            return command
+        if self.client == "claude":
+            return self._apply_claude_permission_mode(command, mode)
+        return command
+
+    @staticmethod
+    def _apply_claude_permission_mode(command: list[str], mode: str) -> list[str]:
+        """Translate an abstract permission mode into Claude Code's
+        ``--permission-mode`` value. ``auto`` keeps blanket auto-apply
+        (``acceptEdits``); ``gated``/``ask`` drop blanket auto-apply so edits are
+        gated (``default``); ``plan`` is read-only planning. An explicit native
+        value (e.g. ``acceptEdits``, ``bypassPermissions``) is passed through."""
+        translation = {
+            "auto": "acceptEdits",
+            "gated": "default",
+            "ask": "default",
+            "plan": "plan",
+        }
+        value = translation.get(mode.lower(), mode)
+        result = list(command)
+        for index, part in enumerate(result):
+            if part == "--permission-mode" and index + 1 < len(result):
+                result[index + 1] = value
+                return result
+        return [*result, "--permission-mode", value]
 
     def _cursor_command(self, task_id: str | None = None) -> list[str]:
         executable = resolve_cursor_agent_executable()
@@ -184,12 +261,14 @@ class CodingCliExecutor(Executor):
 
         console.print(f"Starting [bold]{self.client.upper()}[/bold] for task [bold]{task.id}[/bold]...")
         console.print(f"Task prompt: [dim]{instruction_file}[/dim]")
-        console.print(f"Command: [dim]{' '.join(command)}[/dim]")
 
         started = time.monotonic()
         try:
             invocation, input_text = self._invocation(command, prompt, instruction_file)
             display_invocation = self._display_invocation(invocation, prompt)
+            # Print the resolved command (placeholders like {prompt_file} already
+            # substituted, prompt redacted) rather than the raw template.
+            console.print(f"Command: [dim]{' '.join(display_invocation)}[/dim]")
             manifest_path = self._write_run_manifest(
                 run_id,
                 task,
@@ -293,6 +372,40 @@ class CodingCliExecutor(Executor):
             )
             return ExecutionResult(success=False, message=str(exc))
 
+    def _resolve_invocation(self, invocation: list[str], env: dict[str, str]) -> list[str]:
+        """Route Windows batch shims through the command interpreter.
+
+        Coding CLIs installed via npm are exposed on Windows as ``.cmd``/``.bat``
+        shims (e.g. ``codex.CMD``). ``CreateProcess`` (shell=False) cannot execute
+        a batch file directly nor apply PATHEXT to a bare ``codex``, so the run
+        fails with ``WinError 2``/``193``. When the program resolves to such a
+        shim, invoke it via ``cmd /c <shim>``; ``.exe`` programs and non-Windows
+        platforms are left untouched so the invocation passed to the agent is
+        otherwise verbatim.
+        """
+        if not invocation or os.name != "nt":
+            return invocation
+        resolved = shutil.which(invocation[0])
+        if resolved and resolved.lower().endswith((".cmd", ".bat")):
+            comspec = os.environ.get("COMSPEC", "cmd.exe")
+            return [comspec, "/c", resolved, *invocation[1:]]
+        return invocation
+
+    @staticmethod
+    def _emit_stream_line(line: str) -> None:
+        """Print a streamed agent line without letting a non-encodable character
+        crash the run. Coding agents emit Unicode (e.g. ``✓``) that the
+        Windows console / a redirected cp1252 stdout cannot encode; an unguarded
+        ``console.print`` would raise UnicodeEncodeError and be misreported as the
+        agent failing to start, even though it ran (and may have applied edits).
+        """
+        try:
+            console.print(line, end="")
+        except UnicodeEncodeError:
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+            safe = line.encode(encoding, errors="replace").decode(encoding, errors="replace")
+            console.print(safe, end="")
+
     def _run_subprocess(
         self,
         invocation: list[str],
@@ -301,6 +414,7 @@ class CodingCliExecutor(Executor):
         transcript_path: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         timeout = self._effective_timeout()
+        invocation = self._resolve_invocation(invocation, env)
         if not self.stream_output:
             return subprocess.run(
                 invocation,
@@ -370,7 +484,7 @@ class CodingCliExecutor(Executor):
                     continue
                 if line is None:
                     break
-                console.print(line, end="")
+                self._emit_stream_line(line)
                 captured.append(line)
                 if transcript_handle is not None:
                     transcript_handle.write(redact_text(line))
@@ -483,6 +597,17 @@ class CodingCliExecutor(Executor):
             return prompt
         return "\n\n".join(["# DevCouncil Agent Profile", *additions, prompt])
 
+    def _profile_override_summary(self) -> dict[str, object]:
+        """Resolved per-profile CLI overrides recorded in the manifest so a
+        supervisor can see exactly how the profile constrained the invocation."""
+        if not self.profile:
+            return {"extra_args": [], "permission_mode": None, "model": None}
+        return {
+            "extra_args": list(self.profile.extra_args or []),
+            "permission_mode": self.profile.permission_mode,
+            "model": self.profile.model,
+        }
+
     def _update_run_manifest(self, run_id: str, **updates: object) -> None:
         manifest_path = self.project_root / ".devcouncil" / "runs" / run_id / "agent-run.json"
         if not manifest_path.exists():
@@ -519,6 +644,7 @@ class CodingCliExecutor(Executor):
             "agent": self.client,
             "display_name": self.spec.label,
             "profile": self.profile_name,
+            "profile_overrides": self._profile_override_summary(),
             "kind": self.spec.kind,
             "command": invocation,
             "prompt_file": str(instruction_file),

@@ -5,12 +5,18 @@ from pydantic import BaseModel
 from devcouncil.domain.task import Task
 from devcouncil.domain.requirement import Requirement
 from devcouncil.execution.executor import Executor, ExecutionResult
-from devcouncil.llm.router import ModelRouter
+from devcouncil.llm.router import ModelRouter, StructuredOutputError
 from devcouncil.execution.task_runner import TaskRunner
 from devcouncil.execution.context_builder import ContextBuilder
 from devcouncil.execution.paths import resolve_project_path
+from devcouncil.app.errors import ExecutionError
 
 console = Console()
+
+# Resilience bounds for the preview native loop.
+MAX_AGENT_STEPS = 10
+MAX_STRUCTURED_FAILURES = 2          # model can't produce a valid action -> give up cleanly
+MAX_CONSECUTIVE_PATCH_FAILURES = 3   # stop spinning on a patch the model can't fix
 
 class ToolCall(BaseModel):
     tool: str
@@ -53,7 +59,7 @@ Current Project Context:
 You have access to the following tools:
 - read_file(path: str)
 - list_files()
-- apply_patch(patch: str)
+- apply_patch(patch: str)  OR  apply_patch(path: str, content: str) as a fallback when a valid unified diff cannot be produced
 - run_command(command: str)
 
 Rules:
@@ -67,19 +73,59 @@ Rules:
         # Initial task prompt
         messages.append({"role": "user", "content": f"Begin implementing task {task.id} based on the context provided."})
 
-        # Basic tool loop (Max 10 steps for safety in MVP)
-        for step in range(10):
-            action = await self.router.complete_structured(
-                role="native_agent", 
-                messages=messages,
-                schema=AgentAction
-            )
-            
+        # Bounded tool loop. Counters let us fail a single task cleanly instead of
+        # crashing the whole run (structured-output faults) or spinning on an
+        # unfixable patch.
+        structured_failures = 0
+        consecutive_patch_failures = 0
+        for step in range(MAX_AGENT_STEPS):
+            try:
+                action = await self.router.complete_structured(
+                    role="native_agent",
+                    messages=messages,
+                    schema=AgentAction,
+                )
+            except StructuredOutputError as exc:
+                # The model could not produce a valid action even after healing/retry.
+                # native_agent has no fallback by design, so handle it here rather than
+                # letting it propagate and abort the entire `dev go` run.
+                structured_failures += 1
+                console.print(f"[red]Native agent could not parse a valid action: {exc}[/red]")
+                if structured_failures >= MAX_STRUCTURED_FAILURES:
+                    return ExecutionResult(
+                        success=False,
+                        message=f"Native agent gave up after {structured_failures} unparseable responses.",
+                    )
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "[System] Your previous response was not valid JSON for the "
+                        "AgentAction schema. Reply with a single valid JSON object only "
+                        "(fields: thought, tool_calls, finish) — no prose, no fences."
+                    ),
+                })
+                continue
+            structured_failures = 0
+
             console.print(f"\n[bold]Step {step+1}:[/bold] {action.thought}")
-            
+
+            # Record the agent's own turn so subsequent steps see what it already did.
+            # Without this the model only sees tool RESULTS, not its prior actions, and
+            # tends to repeat itself and never converge within the step budget.
+            messages.append({"role": "assistant", "content": action.model_dump_json()})
+
             if action.finish:
                 console.print("[green]Native agent signaled completion.[/green]")
                 return ExecutionResult(success=True, message="Agent signaled completion; pending DevCouncil verification")
+
+            if not action.tool_calls:
+                # No action and not finished — nudge instead of silently burning a step.
+                messages.append({"role": "user", "content": (
+                    "[System] You produced no tool_calls and did not finish. Call a tool "
+                    "(read_file/list_files/apply_patch/run_command) to make progress, or set "
+                    "finish=true if the task is complete."
+                )})
+                continue
 
             for tool_call in action.tool_calls:
                 result_summary = ""
@@ -103,8 +149,26 @@ Rules:
                     elif tool_call.tool == "write_file":
                         raise PermissionError("write_file is disabled for the native executor; use apply_patch.")
                     elif tool_call.tool == "apply_patch":
-                        self.task_runner.apply_patch(tool_call.args["patch"], task)
-                        result_summary = "Successfully applied patch."
+                        if "path" in tool_call.args and "content" in tool_call.args:
+                            # Fallback for when the model can't produce a valid unified
+                            # diff. Routes through write_file, which enforces the same
+                            # planned-files permission check — no widening of scope.
+                            self.task_runner.write_file(
+                                tool_call.args["path"], tool_call.args["content"], task
+                            )
+                            consecutive_patch_failures = 0
+                            result_summary = f"Wrote {tool_call.args['path']} via path+content fallback."
+                        else:
+                            patch = tool_call.args.get("patch", "")
+                            if not patch or not patch.strip():
+                                raise ExecutionError(
+                                    "Empty patch. Provide a unified git diff beginning with "
+                                    "'diff --git a/<path> b/<path>', then '--- a/<path>' (or "
+                                    "'--- /dev/null' for a new file), '+++ b/<path>', and '@@' hunks."
+                                )
+                            self.task_runner.apply_patch(patch, task)
+                            consecutive_patch_failures = 0
+                            result_summary = "Successfully applied patch."
                     elif tool_call.tool == "run_command":
                         cmd_result = self.task_runner.run_command(tool_call.args["command"], task)
                         result_summary = f"Command finished with exit code {cmd_result.exit_code}."
@@ -114,7 +178,25 @@ Rules:
                     messages.append({"role": "user", "content": f"[Tool Result] '{tool_call.tool}': {result_summary}"})
                 except Exception as e:
                     console.print(f"[red]Error executing tool {tool_call.tool}: {e}[/red]")
-                    messages.append({"role": "user", "content": f"[Tool Error] '{tool_call.tool}' failed: {e}"})
+                    if tool_call.tool == "apply_patch":
+                        consecutive_patch_failures += 1
+                        if consecutive_patch_failures >= MAX_CONSECUTIVE_PATCH_FAILURES:
+                            return ExecutionResult(
+                                success=False,
+                                message=(
+                                    f"Native agent failed to apply a patch "
+                                    f"{consecutive_patch_failures} times in a row."
+                                ),
+                            )
+                        messages.append({"role": "user", "content": (
+                            f"[Tool Error] 'apply_patch' failed: {e}\n"
+                            "Re-read the target file, match the existing context lines EXACTLY, "
+                            "and do NOT resubmit the same patch. If you cannot produce a valid "
+                            "unified diff, call apply_patch with 'path' and 'content' instead to "
+                            "write the whole file."
+                        )})
+                    else:
+                        messages.append({"role": "user", "content": f"[Tool Error] '{tool_call.tool}' failed: {e}"})
 
         console.print("[red]Native agent reached maximum step limit.[/red]")
         return ExecutionResult(success=False, message="Reached maximum step limit")

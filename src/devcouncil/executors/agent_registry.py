@@ -128,6 +128,14 @@ class CodingCliIntegrationInfo:
     launcher_shim: bool
     notes: str
 
+    @property
+    def enforcement(self) -> str:
+        """Honest containment posture: ``pre-action`` when a native hook blocks
+        unauthorized writes/commands before they happen, else ``verify-only`` — for
+        which "forbidden changes" are caught only post-hoc by verification, not blocked
+        up front. Surfaced so users aren't misled into assuming hard containment."""
+        return "pre-action" if self.hooks else "verify-only"
+
 
 # Tier 1 = headless executor + verify; tier 2 = MCP companion; hooks = native pre-tool policy.
 CODING_CLI_INTEGRATION_INFO: dict[str, CodingCliIntegrationInfo] = {
@@ -295,8 +303,11 @@ def builtin_agent_specs(project_root: Path) -> dict[str, CliAgentSpec]:
         ),
         "claude": CliAgentSpec(
             name="claude",
+            # `-p` runs headless; `--permission-mode acceptEdits` lets Claude Code
+            # actually apply file edits without an interactive approval prompt
+            # (otherwise it only describes the change and the diff stays empty).
             command="claude",
-            args=["-p"],
+            args=["-p", "--permission-mode", "acceptEdits"],
             display_name="Claude Code",
             kind="coding-cli",
             supports_mcp=True,
@@ -492,6 +503,9 @@ def default_agent_profiles() -> dict[str, dict[str, Any]]:
                 "inside the planned files and run the expected verification commands."
             ),
             "require_explicit_confirmation": False,
+            # yolo leans on the CLI's most permissive auto-apply mode so the agent
+            # never stalls on an approval prompt.
+            "permission_mode": "auto",
         },
         "prod": {
             "description": "Restrictive execution for high-risk repositories.",
@@ -502,6 +516,10 @@ def default_agent_profiles() -> dict[str, dict[str, Any]]:
                 "prefer minimal, easily reviewed edits."
             ),
             "require_explicit_confirmation": True,
+            # prod drops blanket auto-approval: edits are gated rather than blindly
+            # applied, so the subprocess invocation is materially more contained than
+            # yolo's instead of being byte-for-byte identical.
+            "permission_mode": "gated",
         },
     }
 

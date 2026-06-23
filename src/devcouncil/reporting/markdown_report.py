@@ -10,8 +10,17 @@ class MarkdownReportGenerator:
         summary = graph.coverage_summary()
         live_blockers = (live_review or {}).get("blocking_cards", [])
 
+        unverified_ac = summary["ac_without_evidence"]
+
         md_output = "# DevCouncil Report\n\n"
         md_output += "## Verdict\n"
+        # Three honest states:
+        #   Blocked    - positive evidence of a problem (blocking gaps / live blockers).
+        #   Incomplete - nothing is failing, but not every acceptance criterion has
+        #                passing evidence yet (un-run, or could not be verified). NOT
+        #                a failure — distinguishing this from Blocked is what keeps the
+        #                "blocked" signal trustworthy (no false negatives on correct work).
+        #   Passed     - no blocking gaps and every acceptance criterion is proven.
         if summary["blocking_gaps"] > 0 or live_blockers:
             parts = []
             if summary["blocking_gaps"] > 0:
@@ -19,6 +28,12 @@ class MarkdownReportGenerator:
             if live_blockers:
                 parts.append(f"{len(live_blockers)} live-review blocker(s)")
             md_output += f"**Blocked**: {', '.join(parts)} remain.\n\n"
+        elif unverified_ac > 0:
+            md_output += (
+                f"**Incomplete**: nothing is failing, but {unverified_ac} acceptance "
+                "criterion(s) lack passing evidence (un-run or unverifiable). Not ready "
+                "for release.\n\n"
+            )
         else:
             md_output += "**Passed**: Ready for release.\n\n"
 

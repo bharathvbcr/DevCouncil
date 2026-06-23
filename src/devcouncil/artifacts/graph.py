@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Set, Tuple
 from devcouncil.domain.requirement import Requirement, AcceptanceCriterion
 from devcouncil.domain.task import Task
 from devcouncil.domain.assumption import Assumption
-from devcouncil.domain.evidence import CommandResult, DiffEvidence, TestEvidence
+from devcouncil.domain.evidence import CommandResult, DiffCoverageEvidence, DiffEvidence, TestEvidence
 from devcouncil.domain.gap import Gap
 from devcouncil.domain.critique import CritiqueFinding
 
@@ -35,6 +35,7 @@ class ArtifactGraph:
     test_evidence: List[TestEvidence] = field(default_factory=list)
     diff_evidence: List[DiffEvidence] = field(default_factory=list)
     command_results: List[CommandResult] = field(default_factory=list)
+    diff_coverage_evidence: List[DiffCoverageEvidence] = field(default_factory=list)
 
     # --- Mutation ---
 
@@ -62,6 +63,17 @@ class ArtifactGraph:
     def add_command_result(self, cr: CommandResult) -> None:
         self.command_results.append(cr)
 
+    def add_diff_coverage_evidence(self, ev: DiffCoverageEvidence) -> None:
+        self.diff_coverage_evidence.append(ev)
+
+    def diff_coverage_findings(self) -> List[DiffCoverageEvidence]:
+        """Measured diff-coverage runs where the changed lines were NOT fully exercised
+        — i.e. a green suite that did not actually run the new code."""
+        return [
+            ev for ev in self.diff_coverage_evidence
+            if ev.measured and ev.changed_lines and ev.covered_lines < ev.changed_lines
+        ]
+
     # --- Coverage Queries ---
 
     def requirements_without_tasks(self) -> List[Requirement]:
@@ -80,10 +92,16 @@ class ArtifactGraph:
         return [r for r in self.requirements.values() if not r.acceptance_criteria]
 
     def acceptance_criteria_without_evidence(self) -> List[Tuple[str, AcceptanceCriterion]]:
-        """AC IDs that have no test evidence mapped to them."""
+        """AC IDs that have no *passing* test evidence mapped to them.
+
+        Only ``passed`` evidence counts: a failed or not-run check is not proof, so
+        it must not remove a criterion from the unproven list (which would feed a
+        falsely-green coverage summary to ``dev status`` and the MCP surface).
+        """
         evidenced_ac_ids: Set[str] = set()
         for ev in self.test_evidence:
-            evidenced_ac_ids.add(ev.acceptance_criterion_id)
+            if getattr(ev, "status", "passed") == "passed":
+                evidenced_ac_ids.add(ev.acceptance_criterion_id)
 
         results: List[Tuple[str, AcceptanceCriterion]] = []
         for req in self.requirements.values():
@@ -137,6 +155,8 @@ class ArtifactGraph:
             "ac_without_evidence": len(self.acceptance_criteria_without_evidence()),
             "total_gaps": len(self.gaps),
             "blocking_gaps": len(self.blocking_gaps()),
+            "diff_coverage_runs": len(self.diff_coverage_evidence),
+            "unexercised_diff_findings": len(self.diff_coverage_findings()),
             "open_findings": len(self.open_findings()),
             "high_critical_open_findings": len(self.open_findings("high")),
             "unconfirmed_high_assumptions": len(self.unconfirmed_high_impact_assumptions()),

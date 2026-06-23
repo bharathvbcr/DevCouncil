@@ -1,0 +1,19 @@
+models:
+  provider: openrouter
+  roles:
+    arbiter:
+      model: openai/gpt-4o
+    critic_a:
+      model: openai/gpt-4o
+    critic_b:
+      model: anthropic/claude-opus-4.8
+    planner_a:
+      model: anthropic/claude-sonnet-4.6
+    planner_b:
+      model: google/gemini-3.1-pro-preview
+    spec_writer:
+      model: anthropic/claude-sonnet-4.6
+project:
+  default_branch: main
+  name: DevCouncil
+  root: .

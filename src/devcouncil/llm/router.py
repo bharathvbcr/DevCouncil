@@ -14,7 +14,25 @@ from devcouncil.telemetry.traces import TraceLogger
 logger = logging.getLogger(__name__)
 StructuredModel = TypeVar("StructuredModel", bound=BaseModel)
 
+
+class StructuredOutputError(RuntimeError):
+    """A model could not produce valid structured output for a role, even after
+    a healing retry. Carries the role/model so the CLI can give actionable advice
+    (usually: switch that role to a more capable model)."""
+
+    def __init__(self, message: str, *, role: str, model: str):
+        super().__init__(message)
+        self.role = role
+        self.model = model
+
+
 class ModelRouter:
+    # Independent fresh attempts at producing valid structured output before
+    # giving up. Even capable models occasionally emit malformed JSON; a second
+    # clean attempt usually succeeds. Malformed responses are never cached, so a
+    # retry is genuinely fresh rather than re-serving the same bad JSON.
+    STRUCTURED_ATTEMPTS = 2
+
     def __init__(
         self,
         provider: Provider,
@@ -25,6 +43,59 @@ class ModelRouter:
         self.role_config = role_config
         self.project_root = project_root
 
+    @staticmethod
+    def _extract_json(content: str) -> str:
+        """Best-effort extraction of a JSON document from a model response.
+
+        Handles the common ways a model wraps valid JSON: triple-backtick fences and
+        surrounding prose ("Here you go: {...} thanks"). Strips fences, returns the
+        whole thing if it already parses, otherwise scans for the first balanced
+        object/array (string- and escape-aware so braces inside string values don't
+        confuse it). Falls back to the de-fenced text so the existing healing path
+        still produces a meaningful error. A strict superset of plain fence-stripping
+        — clean/fenced JSON is returned unchanged."""
+        text = content.strip()
+        if "```json" in text:
+            text = text.split("```json", 1)[1].split("```", 1)[0].strip()
+        elif "```" in text:
+            text = text.split("```", 1)[1].split("```", 1)[0].strip()
+        try:
+            json.loads(text)
+            return text
+        except Exception:
+            pass
+        for opener, closer in (("{", "}"), ("[", "]")):
+            start = text.find(opener)
+            if start == -1:
+                continue
+            depth = 0
+            in_str = False
+            escaped = False
+            for i in range(start, len(text)):
+                ch = text[i]
+                if in_str:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == '"':
+                        in_str = False
+                    continue
+                if ch == '"':
+                    in_str = True
+                elif ch == opener:
+                    depth += 1
+                elif ch == closer:
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[start:i + 1]
+                        try:
+                            json.loads(candidate)
+                            return candidate
+                        except Exception:
+                            break
+        return text
+
     async def complete_structured(
         self,
         role: str,
@@ -32,6 +103,8 @@ class ModelRouter:
         schema: Type[StructuredModel],
         temperature: Optional[float] = None,
         run_id: Optional[str] = None,
+        fallback: Optional[StructuredModel] = None,
+        _attempt: int = 0,
     ) -> StructuredModel:
         config = self.role_config.get(role)
         if not config:
@@ -74,9 +147,9 @@ class ModelRouter:
                         model=model,
                         messages=msgs,
                         temperature=temp,
-                        json_mode=True
+                        json_mode=True,
+                        run_id=run_id,
                     )
-                    cache.set(model, msgs, temp, True, response)
                     break
                 except Exception as e:
                     if attempt == 2:
@@ -96,15 +169,13 @@ class ModelRouter:
         )
         
         try:
-            # Attempt to find JSON block if it's wrapped in markdown
-            content = response.content.strip()
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-                
+            # Extract JSON from fences/surrounding prose (balanced-aware).
+            content = self._extract_json(response.content)
             data = json.loads(content)
-            return schema.model_validate(data)
+            result = schema.model_validate(data)
+            if not cache_hit:
+                cache.set(model, msgs, temp, True, response)  # cache only validated output
+            return result
         except Exception as e:
             logger.warning(f"Initial parse failed for {role}, attempting healing: {e}")
             traces.log_event(
@@ -134,16 +205,17 @@ Please return the corrected JSON object only. No prose.
                 model=model,
                 messages=[{"role": "user", "content": healing_prompt}],
                 temperature=0.0,
-                json_mode=True
+                json_mode=True,
+                run_id=run_id,
             )
             tracker.log_usage(healed_response.model, healed_response.usage)
             
             try:
-                healed_content = healed_response.content.strip()
-                if "```json" in healed_content:
-                    healed_content = healed_content.split("```json")[1].split("```")[0].strip()
+                healed_content = self._extract_json(healed_response.content)
                 data = json.loads(healed_content)
-                return schema.model_validate(data)
+                result = schema.model_validate(data)
+                cache.set(model, msgs, temp, True, healed_response)
+                return result
             except Exception as final_e:
                 logger.error(f"Healing failed for {role}: {final_e}")
                 traces.log_event(
@@ -159,4 +231,50 @@ Please return the corrected JSON object only. No prose.
                     run_id=run_id,
                     summary=f"Structured response repair failed for {role}.",
                 )
-                raise ValueError(f"Failed to parse or validate LLM response after healing: {final_e}\nContent (truncated): {response.content[:200]}...")
+                if _attempt + 1 < self.STRUCTURED_ATTEMPTS:
+                    # A fresh, independent attempt often succeeds where one bad draft
+                    # (plus its repair) failed. The malformed response was never
+                    # cached, so this re-runs the completion rather than re-reading it.
+                    # Prepend a strict JSON-only instruction (on a copy, so the caller's
+                    # messages are untouched) to nudge the retry toward parseable output.
+                    logger.warning(
+                        "Structured output failed for role '%s'; retrying fresh "
+                        "(attempt %d/%d).",
+                        role, _attempt + 2, self.STRUCTURED_ATTEMPTS,
+                    )
+                    strict_messages = copy.deepcopy(messages)
+                    strict_messages.insert(0, {
+                        "role": "system",
+                        "content": (
+                            "Respond with a single valid JSON object only — no prose, no "
+                            "markdown fences, no trailing text. It must parse with a strict "
+                            "JSON parser and match the requested schema."
+                        ),
+                    })
+                    return await self.complete_structured(
+                        role,
+                        strict_messages,
+                        schema,
+                        temperature=temperature,
+                        run_id=run_id,
+                        fallback=fallback,
+                        _attempt=_attempt + 1,
+                    )
+                if fallback is not None:
+                    # Degradable role (e.g. critique/rebuttal/enhancement): keep
+                    # planning alive on weaker models instead of crashing the run.
+                    logger.warning(
+                        "Role '%s' (model '%s') could not produce valid %s; "
+                        "using a safe fallback so planning can continue.",
+                        role, model, schema.__name__,
+                    )
+                    return fallback
+                raise StructuredOutputError(
+                    f"Model '{model}' for role '{role}' could not produce valid "
+                    f"{schema.__name__} JSON, even after a repair attempt. "
+                    f"Use a more capable model for this role "
+                    f"(e.g. 'dev config models --role {role} --model <model>'). "
+                    f"Parser error: {final_e}",
+                    role=role,
+                    model=model,
+                )

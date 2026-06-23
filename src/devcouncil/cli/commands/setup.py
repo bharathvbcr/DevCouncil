@@ -8,7 +8,13 @@ import yaml
 from rich.console import Console
 from rich.panel import Panel
 
-from devcouncil.app.config import get_gcloud_access_token, load_config, load_local_secrets, provider_api_key_env_var
+from devcouncil.app.config import (
+    _normalized_provider_name,
+    get_gcloud_access_token,
+    load_config,
+    load_local_secrets,
+    provider_api_key_env_var,
+)
 from devcouncil.cli.commands.doctor import render_doctor_check
 from devcouncil.cli.commands.init import initialize_project, parse_role_model_overrides
 from devcouncil.cli.commands.integrate import (
@@ -116,6 +122,11 @@ def _configure_vertexai_settings(
 def _configure_api_key(project_root: Path, api_key: str | None, skip_api_key: bool) -> None:
     config = load_config(project_root)
     provider = config.models.provider
+    if _normalized_provider_name(provider) == "ollama":
+        console.print(
+            "[green]Ollama uses a local server (default http://localhost:11434); no API key required.[/green]"
+        )
+        return
     env_var = provider_api_key_env_var(provider)
     local_secrets = load_local_secrets(project_root)
 
@@ -233,6 +244,9 @@ def setup(
     vertex_location: str | None = typer.Option(None, "--vertex-location", help="Store VERTEXAI_LOCATION for the vertexai provider. Defaults to global."),
     skip_api_key: bool = typer.Option(False, "--skip-api-key", help="Skip the first-run model API key prompt."),
     skip_integrations: bool = typer.Option(False, "--skip-integrations", help="Skip the first-run coding CLI integration prompt."),
+    skip_map: bool = typer.Option(False, "--skip-map", help="Skip generating repo_map.json and agent guides on init."),
+    skip_skills: bool = typer.Option(False, "--skip-skills", help="Skip scaffolding engineering skills into .claude/skills/ on init."),
+    scaffold_ci: bool = typer.Option(False, "--scaffold-ci", help="Write a starter .github/workflows/devcouncil.yml from the configured commands."),
 ):
     """
     Initialize DevCouncil from a normal terminal in the target repository root.
@@ -260,6 +274,8 @@ def setup(
         model_provider=initial_provider,
         model=model,
         role_models=role_models,
+        with_map=not skip_map,
+        with_skills=not skip_skills,
     )
     if not created:
         console.print(f"[yellow]DevCouncil is already initialized at {root / '.devcouncil'}.[/yellow]")
@@ -279,6 +295,15 @@ def setup(
 
     console.print()
     render_doctor_check(root)
+
+    if scaffold_ci:
+        from devcouncil.repo.ci_scaffold import WORKFLOW_RELPATH, scaffold_ci as scaffold_ci_workflow
+
+        written = scaffold_ci_workflow(root)
+        if written is None:
+            console.print(f"[yellow]{WORKFLOW_RELPATH.as_posix()} already exists; left unchanged.[/yellow]")
+        else:
+            console.print(f"[green]Wrote starter CI workflow {written.relative_to(root).as_posix()}.[/green]")
 
     if integrate:
         _configure_coding_cli_integrations(root, apply=apply, gemini_scope=gemini_scope)

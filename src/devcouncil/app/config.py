@@ -42,8 +42,26 @@ class VerificationSandboxConfig(BaseModel):
     nix_flake_attr: str | None = None
 
 
+class DiffCoverageConfig(BaseModel):
+    """Diff↔coverage gating: prove the *changed* lines were exercised by tests.
+
+    ``measure`` runs the diff-coverage analysis and records it as evidence (and a
+    non-blocking signal) whenever the target repo's coverage tooling is present.
+    ``enforce`` promotes an unexercised diff to a *blocking* gap. Enforcement is
+    off by default so the signal is visible before it ever gates — a passing test
+    that does not touch the new code is surfaced first, then teams opt in to
+    blocking. ``min_ratio`` of 0.0 means "require at least one changed executable
+    line to be exercised"; a higher value demands that fraction of changed lines.
+    """
+
+    measure: bool = True
+    enforce: bool = False
+    min_ratio: float = 0.0
+
+
 class VerificationConfig(BaseModel):
     sandbox: VerificationSandboxConfig = Field(default_factory=VerificationSandboxConfig)
+    diff_coverage: DiffCoverageConfig = Field(default_factory=DiffCoverageConfig)
 
 
 class GatesConfig(BaseModel):
@@ -61,6 +79,13 @@ class ExecutionConfig(BaseModel):
     checkpoint_before_each_task: bool = True
     command_timeout: int = 300
     stream_cli_output: bool = False
+    # Default lifetime of an MCP task lease. A crashed/disconnected agent's lease
+    # auto-expires after this, so the task frees up without a human running force.
+    lease_ttl_seconds: int = 1800
+    # When true, the post-task coding-CLI hook runs deterministic verification of the
+    # active task (and records gaps) instead of only printing a reminder. Off by default
+    # so hooks stay fast/cheap unless a team opts in.
+    verify_on_post_task: bool = False
     cursor_resume_mode: str = "off"
     coding_cli_probe_order: List[str] = Field(default_factory=list)
 
@@ -126,6 +151,15 @@ class CliAgentProfileConfig(BaseModel):
     timeout_seconds: int | None = None
     prompt_preamble: str = ""
     require_explicit_confirmation: bool = False
+    # Per-profile CLI containment overrides. Empty/None reproduce today's behavior
+    # exactly so a profile that only sets a prompt preamble is a no-op on the
+    # subprocess invocation. ``extra_args`` are appended verbatim to the resolved
+    # command, ``permission_mode`` is translated into the right per-CLI flag where
+    # known (and overly-permissive flags are dropped for stricter modes), and
+    # ``model`` overrides the model flag for CLIs that accept one.
+    extra_args: List[str] = Field(default_factory=list)
+    permission_mode: str | None = None
+    model: str | None = None
 
 
 class CustomCliAgentConfig(BaseModel):
@@ -216,6 +250,7 @@ def provider_api_key_env_var(provider: str = "openrouter") -> str:
         "openrouter": "OPENROUTER_API_KEY",
         "vertexai": "VERTEXAI_ACCESS_TOKEN",
         "doubleword": "DOUBLEWORD_API_KEY",
+        "ollama": "OLLAMA_API_KEY",
         "openai": "OPENAI_API_KEY",
         "anthropic": "ANTHROPIC_API_KEY",
     }
@@ -268,6 +303,10 @@ def get_api_key(provider: str = "openrouter", project_root: Path = Path(".")) ->
     key = os.environ.get(env_var) or load_local_secrets(project_root).get(env_var)
     if not key and _normalized_provider_name(provider) == "vertexai":
         key = get_gcloud_access_token()
+    if not key and _normalized_provider_name(provider) == "ollama":
+        # Ollama is a local server and needs no API key; an explicitly-set
+        # OLLAMA_API_KEY still flows through above if present.
+        return ""
     if not key:
         extra = (
             " You can also authenticate with 'gcloud auth login' for vertexai."

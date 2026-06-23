@@ -127,3 +127,16 @@ dump/
 # Dependency and cache directories
 .venv/
 node_modules/
+
+# DevCouncil local state
+.devcouncil/*
+!.devcouncil/
+!.devcouncil/config.yaml
+!.devcouncil/graphify.yaml
+!.devcouncil/secrets.env.example
+
+# Environment, dependency, and cache directories
+.env.local
+
+# Generated benchmark outputs (the benchmark source under benchmarks/ stays tracked)
+benchmarks/results/

@@ -31,3 +31,18 @@ openai/gpt-5.5:
 google/gemini-2.5-flash:
   prompt_per_1k: 0.0003
   completion_per_1k: 0.0025
+# Local Ollama models run on-device and are free. Bare tags (no ``ollama/``
+# prefix) are listed here so the cost reporter shows $0; the cost.py prefix
+# guard covers any other ``ollama/`` or ``ollama:`` model id.
+qwen2.5-coder:7b:
+  prompt_per_1k: 0.0
+  completion_per_1k: 0.0
+qwen2.5-coder:14b:
+  prompt_per_1k: 0.0
+  completion_per_1k: 0.0
+qwen2.5-coder:32b:
+  prompt_per_1k: 0.0
+  completion_per_1k: 0.0
+llama3.1:
+  prompt_per_1k: 0.0
+  completion_per_1k: 0.0

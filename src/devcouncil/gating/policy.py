@@ -15,6 +15,64 @@ class GateResult(BaseModel):
     passed: bool
     gaps: List[Gap]
 
+
+def _find_dependency_cycle(tasks: List[Task]) -> Optional[List[str]]:
+    """Return one dependency cycle as an id path (e.g. [A, B, A]), or None. Only edges
+    to known task ids are followed; unknown deps are reported separately."""
+    ids = {t.id for t in tasks}
+    graph = {t.id: [d for d in t.depends_on if d in ids] for t in tasks}
+    WHITE, GREY, BLACK = 0, 1, 2
+    color = {tid: WHITE for tid in graph}
+    stack: List[str] = []
+
+    def visit(node: str) -> Optional[List[str]]:
+        color[node] = GREY
+        stack.append(node)
+        for nxt in graph.get(node, []):
+            if color[nxt] == GREY:
+                return stack[stack.index(nxt):] + [nxt]
+            if color[nxt] == WHITE:
+                found = visit(nxt)
+                if found:
+                    return found
+        stack.pop()
+        color[node] = BLACK
+        return None
+
+    for tid in graph:
+        if color[tid] == WHITE:
+            found = visit(tid)
+            if found:
+                return found
+    return None
+
+
+def topological_order(tasks: List[Task]) -> List[Task]:
+    """Order tasks so every task follows the ones it depends on. Stable: preserves the
+    given order among independent tasks. Falls back to the original order if a cycle
+    makes a full ordering impossible (the plan gate blocks cycles separately)."""
+    by_id = {t.id: t for t in tasks}
+    indegree = {t.id: 0 for t in tasks}
+    dependents: dict[str, List[str]] = {t.id: [] for t in tasks}
+    for task in tasks:
+        for dep in task.depends_on:
+            if dep in by_id:
+                indegree[task.id] += 1
+                dependents[dep].append(task.id)
+    # Kahn's algorithm, seeded in original order for stability.
+    ready = [t.id for t in tasks if indegree[t.id] == 0]
+    ordered: List[str] = []
+    while ready:
+        current = ready.pop(0)
+        ordered.append(current)
+        for child in dependents[current]:
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                ready.append(child)
+    if len(ordered) != len(tasks):  # cycle — fall back to original order
+        return list(tasks)
+    return [by_id[tid] for tid in ordered]
+
 class GatePolicy:
     """Central engine for executing project and task level quality gates."""
     
@@ -104,6 +162,65 @@ class GatePolicy:
                     blocking=True,
                 ))
 
+        # Surface read-only-only tasks at PLANNING time (advisory): a task that declares
+        # planned files but none writable can implement nothing, and was previously only
+        # caught at execution by the task-readiness gate.
+        for task in tasks:
+            if task.planned_files and not any(
+                pf.allowed_change in ("create", "modify", "delete") for pf in task.planned_files
+            ):
+                gaps.append(Gap(
+                    id=f"GAP-PLAN-{task.id}-READ-ONLY",
+                    severity="medium",
+                    gap_type="task_not_implemented",
+                    task_id=task.id,
+                    description=(
+                        f"Task {task.id} declares planned files but none are writable "
+                        "(all read_only); it cannot implement any change. Expected only if "
+                        "this is an analysis-only task."
+                    ),
+                    recommended_fix=(
+                        "Grant 'create', 'modify', or 'delete' to at least one planned file, "
+                        "or confirm the task is intentionally analysis-only."
+                    ),
+                    blocking=False,
+                ))
+
+        # Surface overlapping ownership (advisory): when 2+ tasks each declare a
+        # writable (create/modify/delete) change to the SAME file, the plan is
+        # over-decomposed — the later task tends to duplicate or conflict with the
+        # earlier one (e.g. both add the same function), which then fails per-task
+        # verification. Consolidating a file's work into one task avoids this.
+        writers_by_file: dict[str, list[str]] = {}
+        for task in tasks:
+            for pf in task.planned_files:
+                if pf.allowed_change in ("create", "modify", "delete"):
+                    path = pf.path.replace("\\", "/")
+                    writers_by_file.setdefault(path, [])
+                    if task.id not in writers_by_file[path]:
+                        writers_by_file[path].append(task.id)
+        for path, owners in writers_by_file.items():
+            if len(owners) > 1:
+                gaps.append(Gap(
+                    id=f"GAP-PLAN-OVERLAP-{owners[0]}-{path.replace('/', '_')}",
+                    severity="medium",
+                    gap_type="task_not_implemented",
+                    description=(
+                        f"{len(owners)} tasks ({', '.join(owners)}) each declare writable "
+                        f"changes to {path}; overlapping ownership over-decomposes the plan "
+                        "and tends to cause duplicate/conflicting edits at execution."
+                    ),
+                    recommended_fix=(
+                        f"Consolidate the work on {path} into a single task, or scope the "
+                        "others to read_only."
+                    ),
+                    blocking=False,
+                ))
+
+        # Validate the task dependency DAG: unknown depends_on ids and cycles would make
+        # execution ordering impossible / stall the run, so block the plan on them.
+        gaps.extend(self._validate_task_dependencies(tasks))
+
         for assumption in assumptions or []:
             if (
                 assumption.impact == "high"
@@ -159,32 +276,63 @@ class GatePolicy:
         # 2. Check planned files
         gaps.extend(self.planned_files.check(task))
 
-        # 3. Check execution/verification evidence contract
-        if not task.allowed_commands:
+        # 3. Surface a missing execution/verification contract — but do NOT block
+        # execution on it. The executor still needs to run to implement the code,
+        # and the evidence requirement is genuinely enforced at verify time
+        # (acceptance_criteria_unproven / NOAC gaps). Blocking here only prevents
+        # implementation and stalls multi-task plans when the planner under-specs a
+        # task; these stay advisory so the work can proceed and be judged on output.
+        if not task.allowed_commands and not task.expected_tests:
             gaps.append(Gap(
                 id=f"GAP-{task.id}-NO-COMMANDS",
-                severity="high",
+                severity="medium",
                 gap_type="missing_test",
                 task_id=task.id,
                 description=f"Task {task.id} has no allowed commands for execution or verification.",
-                recommended_fix="Add explicit allowed_commands for the task before execution.",
-                blocking=True,
+                recommended_fix="Add explicit allowed_commands or expected_tests so verification can prove the acceptance criteria.",
+                blocking=False,
             ))
 
         if not task.expected_tests:
             gaps.append(Gap(
                 id=f"GAP-{task.id}-NO-EXPECTED-EVIDENCE",
-                severity="high",
+                severity="medium",
                 gap_type="missing_test",
                 task_id=task.id,
                 description=f"Task {task.id} has no expected verification evidence.",
                 recommended_fix="Add expected_tests or targeted static/manual review commands that prove the acceptance criteria.",
-                blocking=True,
+                blocking=False,
             ))
 
-        # 4. Check for task dependencies (if implemented)
-        
         return GateResult(
-            passed=len([g for g in gaps if g.blocking]) == 0, 
+            passed=len([g for g in gaps if g.blocking]) == 0,
             gaps=gaps
         )
+
+    def _validate_task_dependencies(self, tasks: List[Task]) -> List[Gap]:
+        """Block on a malformed dependency DAG: unknown depends_on ids and cycles."""
+        gaps: List[Gap] = []
+        ids = {t.id for t in tasks}
+        for task in tasks:
+            unknown = [dep for dep in task.depends_on if dep not in ids]
+            if unknown:
+                gaps.append(Gap(
+                    id=f"GAP-PLAN-{task.id}-UNKNOWN-DEP",
+                    severity="high",
+                    gap_type="task_not_implemented",
+                    task_id=task.id,
+                    description=f"Task {task.id} depends on unknown task(s): {', '.join(unknown)}.",
+                    recommended_fix="Reference only task IDs that exist in this plan, or remove the dependency.",
+                    blocking=True,
+                ))
+        cycle = _find_dependency_cycle(tasks)
+        if cycle:
+            gaps.append(Gap(
+                id="GAP-PLAN-DEP-CYCLE",
+                severity="high",
+                gap_type="task_not_implemented",
+                description=f"Task dependency cycle detected: {' -> '.join(cycle)}.",
+                recommended_fix="Break the cycle so the tasks can be ordered and executed.",
+                blocking=True,
+            ))
+        return gaps
