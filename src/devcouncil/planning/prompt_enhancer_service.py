@@ -22,6 +22,11 @@ class PromptEnhancement(BaseModel):
     # deterministically after the model call — the LLM does not populate them.
     applied_skills: list[str] = Field(default_factory=list)
     skills_brief: str = ""
+    # Curated project knowledge (Open Knowledge Format bundles) and the project design
+    # system (design.md), selected from ``.devcouncil/knowledge`` for this goal. Like the
+    # skills fields, set deterministically after the model call.
+    applied_knowledge: list[str] = Field(default_factory=list)
+    knowledge_brief: str = ""
 
     def normalized(self, original_goal: str) -> "PromptEnhancement":
         enhanced_goal = self.enhanced_goal.strip() or original_goal
@@ -63,6 +68,15 @@ class PromptEnhancement(BaseModel):
                 "agent receives the full skill text; the plan must already assume it.",
                 self.skills_brief,
             ])
+        if self.knowledge_brief:
+            sections.extend([
+                "",
+                "## Project knowledge & design system (ground the plan in these)",
+                "Curated org/domain knowledge (Open Knowledge Format) and the project's "
+                "design.md. Honor design tokens/components and reuse known facts rather than "
+                "re-deriving or contradicting them.",
+                self.knowledge_brief,
+            ])
         return "\n".join(sections)
 
 
@@ -81,6 +95,10 @@ class PromptEnhancerService:
         skills_intake = _full_intake(skills)
         skills_brief = _compact_brief(skills)
 
+        knowledge = _select_knowledge(goal, project_root)
+        knowledge_intake = _knowledge_intake(knowledge)
+        knowledge_brief = _knowledge_brief(knowledge)
+
         prompt = f"""
 Original user goal:
 {goal}
@@ -93,6 +111,9 @@ Code review graph context:
 
 Applicable engineering skills (senior-level domain intake for this codebase/goal):
 {skills_intake or "(no domain skills matched; rely on general engineering judgment)"}
+
+Project knowledge & design system (curated facts and design tokens for this codebase):
+{knowledge_intake or "(no project knowledge ingested)"}
 
 You are DevCouncil's codebase-specific prompt enhancer.
 Rewrite the user goal into a better planning prompt before it is sent to the council debate.
@@ -122,6 +143,8 @@ Requirements:
             update={
                 "applied_skills": [skill.name for skill in skills],
                 "skills_brief": skills_brief,
+                "applied_knowledge": [source.name for source in knowledge],
+                "knowledge_brief": knowledge_brief,
             }
         )
 
@@ -160,6 +183,55 @@ def _compact_brief(skills: list) -> str:
     for skill in skills:
         description = (getattr(skill, "description", "") or "").strip()
         lines.append(f"- **{skill.name}** — {description}" if description else f"- **{skill.name}**")
+    return "\n".join(lines).strip()
+
+
+def _select_knowledge(goal: str, project_root: Path | None):
+    """OKF/design knowledge selection for planning; never raises (best-effort)."""
+    if project_root is None:
+        return []
+    try:
+        from devcouncil.app.config import load_config
+        from devcouncil.knowledge.sources import select_knowledge_sources
+
+        cfg = load_config(project_root).knowledge
+        if not cfg.enabled:
+            return []
+        return select_knowledge_sources(
+            goal=goal, project_root=project_root,
+            directory=cfg.directory, design_always=cfg.design_always,
+        )
+    except Exception:
+        return []
+
+
+def _knowledge_intake(sources: list) -> str:
+    """Full knowledge bodies (capped) for the one-shot enhancer call."""
+    if not sources:
+        return ""
+    blocks: list[str] = []
+    total = 0
+    for source in sources[:_MAX_SKILLS_FOR_INTAKE]:
+        body = (getattr(source, "body", "") or "").strip()
+        if not body:
+            continue
+        kind = getattr(source, "kind", "knowledge")
+        block = f"### {kind}: {getattr(source, 'name', '')}\n{body}"
+        total += len(block)
+        if total > _MAX_INTAKE_CHARS:
+            break
+        blocks.append(block)
+    return "\n\n".join(blocks).strip()
+
+
+def _knowledge_brief(sources: list) -> str:
+    """One line per knowledge source (kind + name + description) for the debate prompt."""
+    lines = []
+    for source in sources:
+        description = (getattr(source, "description", "") or "").strip()
+        kind = getattr(source, "kind", "knowledge")
+        head = f"- **{getattr(source, 'name', '')}** ({kind})"
+        lines.append(f"{head} — {description}" if description else head)
     return "\n".join(lines).strip()
 
 

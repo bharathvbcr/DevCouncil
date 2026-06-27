@@ -361,6 +361,50 @@ class PromptBuilder:
                 section += f"- `{skill.name}`{suffix}\n"
         return section
 
+    def _knowledge_sections(self, task: Task) -> tuple[str, str]:
+        """Selected design-system and OKF knowledge context for this task.
+
+        Returns ``(design_text, knowledge_text)`` — either may be empty. Sourced from
+        ``.devcouncil/knowledge/{design,okf}`` via the same trigger-based selection the
+        skills library uses: a design system is always-on (a UI agent must honor it),
+        OKF knowledge fires on goal keywords / document tags. Bounded by config char
+        budgets. Never raises — a knowledge failure must not break prompt building."""
+        try:
+            from devcouncil.app.config import load_config
+            from devcouncil.knowledge.sources import (
+                render_knowledge_preamble,
+                select_knowledge_sources,
+            )
+
+            cfg = load_config(self.project_root).knowledge
+            if not cfg.enabled:
+                return "", ""
+            goal = f"{task.title}\n{task.description}"
+            sources = select_knowledge_sources(
+                goal=goal, project_root=self.project_root,
+                directory=cfg.directory, design_always=cfg.design_always,
+            )
+            design_text = render_knowledge_preamble(sources, max_chars=cfg.design_max_chars, kind="design")
+            knowledge_text = render_knowledge_preamble(sources, max_chars=cfg.okf_max_chars, kind="okf")
+        except Exception:
+            return "", ""
+
+        design_block = ""
+        if design_text:
+            design_block = (
+                "\n## Design system (honor these tokens and rules)\n"
+                "_The project's design.md. Use these tokens/components; don't invent ad-hoc styles._\n\n"
+                f"{design_text}\n"
+            )
+        knowledge_block = ""
+        if knowledge_text:
+            knowledge_block = (
+                "\n## Project knowledge (Open Knowledge Format)\n"
+                "_Curated org/domain knowledge relevant to this task. Ground your work in it._\n\n"
+                f"{knowledge_text}\n"
+            )
+        return design_block, knowledge_block
+
     def _dependents_section(self, task: Task, data: dict | None) -> str:
         """List, per planned file the agent will change, the files that import it — the
         blast radius. Sourced from repo_map.json's precomputed reverse-import index, so
@@ -643,6 +687,15 @@ class PromptBuilder:
         skills_text = self._skills_section(task)
         if skills_text:
             segments.append({"order": 4, "priority": 3, "name": "engineering skills", "text": skills_text})
+
+        # Design system (a hard constraint for UI work) and OKF project knowledge. The
+        # design system rides just above skills; OKF knowledge alongside them. Both are
+        # bounded by config char budgets in `_knowledge_sections`.
+        design_text, knowledge_text = self._knowledge_sections(task)
+        if design_text:
+            segments.append({"order": 4, "priority": 2, "name": "design system", "text": design_text})
+        if knowledge_text:
+            segments.append({"order": 4, "priority": 3, "name": "project knowledge", "text": knowledge_text})
 
         # Lowest priority (4): the budget drops call sites first. It only adds value once
         # the file bodies + dependents are present anyway.

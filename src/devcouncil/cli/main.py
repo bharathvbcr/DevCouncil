@@ -37,6 +37,7 @@ from devcouncil.cli.commands import (  # noqa: E402 - imports follow stdio recon
     cost,
     ast,
     dashboard,
+    design,
     doctor,
     go,
     hook,
@@ -45,6 +46,7 @@ from devcouncil.cli.commands import (  # noqa: E402 - imports follow stdio recon
     lsp,
     map,
     mcp_server,
+    okf,
     plan,
     prompt,
     repair,
@@ -101,6 +103,8 @@ app.add_typer(watch.app, name="watch")
 app.add_typer(semantic.app, name="semantic")
 app.add_typer(evidence.app, name="evidence")
 app.add_typer(skills.app, name="skills")
+app.add_typer(okf.app, name="okf")
+app.add_typer(design.app, name="design")
 watch.app.command("fs")(watch_fs)
 
 # Direct command registrations (those defined as def cmd())

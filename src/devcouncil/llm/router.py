@@ -42,6 +42,34 @@ class ModelRouter:
         self.provider = provider
         self.role_config = role_config
         self.project_root = project_root
+        # Lazily-built providers for roles that override ``models.provider`` with
+        # their own ``provider:`` (e.g. live_reviewer on Ollama while planners run
+        # on OpenRouter). Keyed by normalized provider name; the default provider
+        # passed in above is reused for roles without an override.
+        self._role_providers: Dict[str, Provider] = {}
+
+    def _provider_for_role(self, role_config: Dict[str, Any]) -> Provider:
+        """Resolve the provider for a role, honoring a per-role ``provider`` override.
+
+        Roles without an override use the default provider supplied at construction.
+        Overriding roles get a provider built on demand (and cached) from the
+        configured credentials, so one router can fan a single run across multiple
+        providers."""
+        role_provider = role_config.get("provider")
+        if not role_provider:
+            return self.provider
+        # Local imports avoid a circular import at module load (provider/config
+        # both reference this package).
+        from devcouncil.llm.provider import create_provider, validate_model_provider
+        from devcouncil.app.config import get_api_key
+
+        normalized = validate_model_provider(role_provider)
+        if normalized not in self._role_providers:
+            api_key = get_api_key(normalized, self.project_root)
+            self._role_providers[normalized] = create_provider(
+                normalized, api_key, project_root=self.project_root
+            )
+        return self._role_providers[normalized]
 
     @staticmethod
     def _extract_json(content: str) -> str:
@@ -103,15 +131,18 @@ class ModelRouter:
         messages: List[Dict[str, str]],
         temperature: float,
         run_id: Optional[str],
+        provider: Optional[Provider] = None,
         attempts: int = 3,
     ) -> "LLMResponse":
         """Provider completion with bounded exponential-backoff retry. Used for BOTH the
         initial call and the healing call so a transient fault in either is retried (and,
         if still failing, surfaced to the caller's fallback logic) rather than aborting
-        the run."""
+        the run. ``provider`` defaults to the router's default provider but may be a
+        per-role provider for roles that override ``models.provider``."""
+        provider = provider or self.provider
         for attempt in range(attempts):
             try:
-                return await self.provider.complete(
+                return await provider.complete(
                     model=model,
                     messages=messages,
                     temperature=temperature,
@@ -141,9 +172,10 @@ class ModelRouter:
         config = self.role_config.get(role)
         if not config:
             raise ValueError(f"No config found for role: {role}")
-        
+
         model = config["model"]
         temp = temperature if temperature is not None else config.get("temperature", 0.0)
+        provider = self._provider_for_role(config)
         
         # Deep-copy to avoid mutating the caller's messages list
         msgs = copy.deepcopy(messages)
@@ -171,9 +203,9 @@ class ModelRouter:
         # Provider knobs (e.g. Ollama num_ctx / base_url) that change the output for an
         # identical prompt must be part of the cache key, else raising OLLAMA_NUM_CTX
         # after a truncated answer would keep serving the stale response.
-        provider_fp = self.provider.cache_fingerprint()
+        provider_fp = provider.cache_fingerprint()
         # Zero local (Ollama) usage by provider so telemetry matches the cost ledger.
-        provider_local = self.provider.is_local_cost_free()
+        provider_local = provider.is_local_cost_free()
 
         # Check cache first
         response = cache.get(model, msgs, temp, True, provider_fp)
@@ -181,7 +213,7 @@ class ModelRouter:
 
         if not response:
             response = await self._complete_with_retry(
-                model=model, messages=msgs, temperature=temp, run_id=run_id
+                model=model, messages=msgs, temperature=temp, run_id=run_id, provider=provider
             )
 
         if response is None:
@@ -239,6 +271,7 @@ Please return the corrected JSON object only. No prose.
                     messages=[{"role": "user", "content": healing_prompt}],
                     temperature=0.0,
                     run_id=run_id,
+                    provider=provider,
                 )
                 tracker.log_usage(healed_response.model, healed_response.usage, local=provider_local)
                 healed_content = self._extract_json(healed_response.content)

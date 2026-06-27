@@ -11,12 +11,27 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ModelRoleConfig(BaseModel):
     model: str
     temperature: float = 0.0
+    # Optional per-role provider override. When unset, the role uses
+    # ``models.provider``. Lets a single run route some roles to one provider
+    # (e.g. planning on OpenRouter) and others to another (e.g. live review on
+    # local Ollama). Validated/normalized against the supported provider list.
+    provider: str | None = None
+
+    @field_validator("provider")
+    @classmethod
+    def _normalize_provider(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        # Lazy import avoids a circular import (llm.provider imports app.config).
+        from devcouncil.llm.provider import validate_model_provider
+
+        return validate_model_provider(value)
 
 
 class ModelsConfig(BaseModel):
@@ -200,6 +215,23 @@ class IntegrationsConfig(BaseModel):
     cli_agents: CliAgentsIntegrationConfig = Field(default_factory=CliAgentsIntegrationConfig)
 
 
+class KnowledgeConfig(BaseModel):
+    """Ingested knowledge (Open Knowledge Format bundles + a project design.md) that gets
+    injected into planning/council/task prompts.
+
+    Sources live under ``<directory>/{okf,design}``. A design system is always selected
+    (``design_always``) because a coding agent should honor it on every UI task; OKF
+    knowledge is selected by goal keywords / document tags. The ``*_max_chars`` budgets
+    bound how much rides inline so a large knowledge base can't crowd out file context.
+    """
+
+    enabled: bool = True
+    directory: str = ".devcouncil/knowledge"
+    design_always: bool = True
+    okf_max_chars: int = 3000
+    design_max_chars: int = 4000
+
+
 class ProviderConfig(BaseModel):
     sort: str = "price"
     allow_fallbacks: bool = True
@@ -219,6 +251,7 @@ class DevCouncilConfig(BaseModel):
     verification: VerificationConfig = Field(default_factory=VerificationConfig)
     privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
     integrations: IntegrationsConfig = Field(default_factory=IntegrationsConfig)
+    knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
 
 
 def load_config(project_root: Path = Path(".")) -> DevCouncilConfig:

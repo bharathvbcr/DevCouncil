@@ -80,6 +80,130 @@ def _ollama_model_present(model: str, pulled: set[str]) -> bool:
     return any(tag in candidates or tag.split(":", 1)[0] == base and ":" not in model for tag in pulled)
 
 
+def _knowledge_dir(project_root: Path) -> str:
+    """Configured knowledge directory (honors ``knowledge.directory``), best-effort.
+
+    Mirrors ``cli.commands.okf._knowledge_okf_dir`` so doctor inspects the same location
+    ingest writes to. Any config failure falls back to the documented default rather than
+    raising — doctor must keep running even with a broken config.
+    """
+    directory = ".devcouncil/knowledge"
+    try:
+        directory = load_config(project_root).knowledge.directory
+    except Exception:
+        pass
+    return directory
+
+
+def check_ingested_knowledge(project_root: Path) -> list[tuple[str, str, str]]:
+    """Best-effort health rows for ingested knowledge under ``<knowledge dir>/{okf,design}``.
+
+    Returns ``(component, status_markup, notes)`` rows for the doctor table. This is the
+    most common "ingested but silently broken" surface: an OKF bundle with a dangling
+    cross-link, or a design.md with broken token references, both validate clean to the
+    eye but degrade the prompt context. We therefore read+validate every ingested bundle
+    and lint the design system, reporting counts and any problems.
+
+    Never raises: any knowledge-layer failure becomes a ``WARN`` row, and an empty
+    knowledge area yields a neutral ``INFO`` row — a project that never ingested knowledge
+    is not a misconfiguration.
+    """
+    ok = "[green]OK[/green]"
+    warn = "[yellow]WARN[/yellow]"
+    info = "[cyan]INFO[/cyan]"
+    rows: list[tuple[str, str, str]] = []
+
+    directory = _knowledge_dir(project_root)
+    base = project_root / directory
+    okf_area = base / "okf"
+    design_md = base / "design" / "design.md"
+
+    # Identify ingested OKF bundles. `dev okf ingest` writes each bundle into its own
+    # subfolder under okf/; treat each such subdir as a bundle. If documents sit loose
+    # directly under okf/ (and there are no subfolder bundles), treat okf/ as one bundle.
+    # Choosing one or the other avoids double-counting documents via rglob.
+    bundle_dirs: list[Path] = []
+    if okf_area.is_dir():
+        try:
+            subdir_bundles = [
+                child
+                for child in sorted(okf_area.iterdir())
+                if child.is_dir() and any(child.rglob("*.md"))
+            ]
+        except Exception:
+            subdir_bundles = []
+        loose_docs = any(p.is_file() for p in okf_area.glob("*.md"))
+        if subdir_bundles:
+            bundle_dirs = subdir_bundles
+        elif loose_docs:
+            bundle_dirs = [okf_area]
+
+    has_design = design_md.is_file()
+
+    # Nothing ingested at all → neutral info line, not a failure.
+    if not bundle_dirs and not has_design:
+        rows.append(
+            (
+                "Ingested knowledge",
+                info,
+                f"No ingested knowledge under {directory}/ (okf/, design/). "
+                "Add some with 'dev okf ingest <bundle>'.",
+            )
+        )
+        return rows
+
+    # --- OKF bundles -----------------------------------------------------------------
+    if bundle_dirs:
+        from devcouncil.knowledge.okf import read_bundle, validate_bundle
+
+        total_docs = 0
+        problems: list[str] = []
+        for bdir in bundle_dirs:
+            try:
+                bundle = read_bundle(bdir)
+                total_docs += len(bundle.documents)
+                problems.extend(validate_bundle(bundle))
+            except Exception as exc:  # never let a malformed bundle crash doctor
+                problems.append(f"{bdir.name}: failed to read bundle ({exc})")
+        summary = f"{len(bundle_dirs)} bundle(s), {total_docs} document(s)"
+        if problems:
+            preview = "; ".join(problems[:5])
+            extra = "" if len(problems) <= 5 else f" (+{len(problems) - 5} more)"
+            rows.append(
+                (
+                    "Ingested OKF",
+                    warn,
+                    f"{summary}: {len(problems)} validation problem(s): {preview}{extra}.",
+                )
+            )
+        else:
+            rows.append(("Ingested OKF", ok, f"{summary}; no validation problems."))
+
+    # --- Design system ----------------------------------------------------------------
+    if has_design:
+        from devcouncil.knowledge.design import lint, parse_design_md
+
+        try:
+            findings = lint(parse_design_md(design_md))
+        except Exception as exc:  # never let a malformed design.md crash doctor
+            rows.append(("Ingested design.md", warn, f"present, but lint failed: {exc}."))
+        else:
+            if findings:
+                preview = "; ".join(f.format() for f in findings[:5])
+                extra = "" if len(findings) <= 5 else f" (+{len(findings) - 5} more)"
+                rows.append(
+                    (
+                        "Ingested design.md",
+                        warn,
+                        f"present; {len(findings)} lint finding(s): {preview}{extra}.",
+                    )
+                )
+            else:
+                rows.append(("Ingested design.md", ok, "present; 0 lint findings."))
+
+    return rows
+
+
 def render_doctor_check(project_root: Path = Path(".")):
     def _command_version(command: list[str]) -> str | None:
         executable = shutil.which(command[0])
@@ -168,6 +292,11 @@ def render_doctor_check(project_root: Path = Path(".")):
             "[yellow]Missing[/yellow]",
             "No built-in coding CLI on PATH. Run dev integrate recommend after installing one.",
         )
+
+    # Ingested-knowledge health (added before the provider branch so it appears on every
+    # code path, including the early returns for ollama / unsupported providers).
+    for component, status, notes in check_ingested_knowledge(project_root):
+        table.add_row(component, status, notes)
 
     try:
         provider = load_config(project_root).models.provider

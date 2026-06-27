@@ -349,6 +349,51 @@ def _project_root() -> Path:
     return Path(configured).expanduser().resolve() if configured else Path(".")
 
 
+def _knowledge_source_uri(kind: str, name: str) -> str:
+    """Stable, parseable resource URI for one ingested knowledge source.
+
+    The name is percent-encoded so OKF/design source names with spaces or slashes
+    still yield a valid AnyUrl and round-trip cleanly through read_resource."""
+    from urllib.parse import quote
+
+    return f"devcouncil://knowledge/{kind}/{quote(name, safe='')}"
+
+
+def _discover_knowledge_sources(root: Path) -> list:
+    """Best-effort enumeration of ingested OKF/design knowledge for the project.
+
+    A broken or absent knowledge layer must never break resource listing, so any
+    failure degrades to an empty list (mirrors the other optional handlers here).
+
+    Honors the project's ``knowledge`` config (enabled / directory / design_always) so MCP
+    exposes exactly what the planning and task prompts do — otherwise a project that
+    disabled or relocated its knowledge would still leak it through MCP resources."""
+    try:
+        from devcouncil.knowledge.sources import discover_knowledge_sources
+
+        directory, design_always = _knowledge_settings(root)
+        if directory is None:  # explicitly disabled in config
+            return []
+        return discover_knowledge_sources(root, directory=directory, design_always=design_always)
+    except Exception:
+        return []
+
+
+def _knowledge_settings(root: Path) -> tuple[str | None, bool]:
+    """Resolve (directory, design_always) for knowledge exposure from project config.
+
+    Returns ``(None, _)`` when the project explicitly disables knowledge so callers can
+    suppress it. Falls back to defaults when no/invalid config is present (the MCP server
+    must keep working for projects without a full ``.devcouncil/config.yaml``)."""
+    try:
+        from devcouncil.app.config import load_config
+
+        cfg = load_config(root).knowledge
+        return (None if not cfg.enabled else cfg.directory), cfg.design_always
+    except Exception:
+        return ".devcouncil/knowledge", True
+
+
 def _is_secret_path(root: Path, rel_or_abs: str) -> bool:
     """True when a path matches a protected secret/credential glob.
 
@@ -949,6 +994,24 @@ async def list_tools() -> list[Tool]:
                 },
             },
         ),
+        Tool(
+            name="devcouncil_select_knowledge",
+            description=(
+                "Select the ingested project knowledge (OKF documents and the design "
+                "system) that applies to a goal and return it as a ready-to-inject "
+                "markdown preamble, so a coding agent can ask 'what project knowledge "
+                "applies to <goal>?'. Always-on design knowledge is included; OKF "
+                "documents are matched on goal keywords. Returns the matched sources "
+                "and the rendered preamble."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string", "description": "The task or goal to find applicable knowledge for."},
+                },
+                "required": ["goal"],
+            },
+        ),
     ]
 
 @app.list_resources()
@@ -978,6 +1041,23 @@ async def list_resources() -> list[Resource]:
                     description=f"Scope, status, and gaps for {task.id}.",
                     mimeType="application/json",
                 ))
+    # Project knowledge (ingested OKF + design.md) — surfaced only when something has
+    # actually been ingested, so hosts without a knowledge layer see no empty entries.
+    knowledge_sources = _discover_knowledge_sources(root)
+    if knowledge_sources:
+        resources.append(Resource(
+            uri=AnyUrl("devcouncil://knowledge"),
+            name="Project knowledge",
+            description="Index of ingested OKF and design knowledge for this project.",
+            mimeType="text/markdown",
+        ))
+        for source in knowledge_sources:
+            resources.append(Resource(
+                uri=AnyUrl(_knowledge_source_uri(source.kind, source.name)),
+                name=f"Knowledge ({source.kind}): {source.description or source.name}",
+                description=source.description or source.name,
+                mimeType="text/markdown",
+            ))
     return resources
 
 
@@ -1017,6 +1097,31 @@ async def read_resource(uri: AnyUrl) -> str:
                 return json.dumps({"ok": False, "error": f"Task {task_id} not found."})
             gaps = [g.model_dump() for g in GapRepository(session).get_all() if g.task_id == task_id]
         return json.dumps({"task": task.model_dump(), "gaps": gaps}, indent=2)
+
+    if key == "devcouncil://knowledge":
+        # Markdown index linking each ingested source to its per-source resource URI.
+        sources = _discover_knowledge_sources(root)
+        if not sources:
+            return "# Project knowledge\n\nNo OKF or design knowledge has been ingested for this project."
+        lines = ["# Project knowledge", "", "Ingested OKF and design knowledge for this project.", ""]
+        for kind in ("design", "okf"):
+            kind_sources = [s for s in sources if s.kind == kind]
+            if not kind_sources:
+                continue
+            lines.append(f"## {kind.upper() if kind == 'okf' else kind.capitalize()}")
+            lines.append("")
+            for source in kind_sources:
+                uri = _knowledge_source_uri(source.kind, source.name)
+                desc = source.description or source.name
+                lines.append(f"- [{desc}]({uri})")
+            lines.append("")
+        return "\n".join(lines).strip()
+    if key.startswith("devcouncil://knowledge/"):
+        # Match the requested URI back to a discovered source and render its markdown.
+        for source in _discover_knowledge_sources(root):
+            if _knowledge_source_uri(source.kind, source.name) == key:
+                return source.render() or source.body
+        return f"Knowledge source not found: {key}"
 
     raise ValueError(f"Unknown resource: {uri}")
 
@@ -2110,6 +2215,46 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             "transcript_tail": tail,
             "transcript_truncated": truncated,
         })
+
+    elif name == "devcouncil_select_knowledge":
+        # No DB needed: knowledge lives on disk. Best-effort — a knowledge failure
+        # degrades to an empty preamble rather than crashing the server.
+        goal, arg_error = _required_string_argument(arguments, "goal")
+        if arg_error:
+            return arg_error
+        assert goal is not None
+        try:
+            from devcouncil.knowledge.sources import (
+                render_knowledge_preamble,
+                select_knowledge_sources,
+            )
+
+            # Honor the project's knowledge config so MCP selection matches the prompts.
+            directory, design_always = _knowledge_settings(root)
+            if directory is None:  # explicitly disabled
+                sources = []
+            else:
+                sources = select_knowledge_sources(
+                    goal, root, directory=directory, design_always=design_always
+                )
+            preamble = render_knowledge_preamble(sources)
+            return _json_text({
+                "ok": True,
+                "goal": goal,
+                "sources": [
+                    {"name": s.name, "kind": s.kind, "description": s.description}
+                    for s in sources
+                ],
+                "preamble": preamble,
+            })
+        except Exception as exc:
+            return _json_text({
+                "ok": True,
+                "goal": goal,
+                "sources": [],
+                "preamble": "",
+                "note": f"knowledge unavailable: {exc}",
+            })
 
     return _error_text(f"Unknown tool: {name}", code="unknown_tool", tool=name)
 

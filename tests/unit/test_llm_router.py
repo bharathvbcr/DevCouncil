@@ -323,3 +323,69 @@ async def test_router_does_not_count_cached_usage_twice(tmp_path, monkeypatch):
     telemetry = json.loads((tmp_path / ".devcouncil" / "logs" / "telemetry.json").read_text(encoding="utf-8"))
     assert telemetry["total_prompt_tokens"] == 7
     assert telemetry["total_completion_tokens"] == 3
+
+
+# --- Per-role provider routing --------------------------------------------------
+
+from devcouncil.app.config import ModelRoleConfig
+from devcouncil.llm.provider import OllamaProvider
+
+
+def test_model_role_config_normalizes_and_validates_provider():
+    assert ModelRoleConfig(model="m").provider is None
+    assert ModelRoleConfig(model="m", provider="ollama-local").provider == "ollama"
+    with pytest.raises(Exception):
+        ModelRoleConfig(model="m", provider="nope")
+
+
+def test_provider_for_role_uses_default_when_unset(tmp_path):
+    default = CountingProvider()
+    router = ModelRouter(default, {"planner_a": {"model": "x/y"}}, project_root=tmp_path)
+    assert router._provider_for_role({"model": "x/y"}) is default
+
+
+def test_provider_for_role_builds_and_caches_override(tmp_path):
+    default = CountingProvider()
+    router = ModelRouter(default, {}, project_root=tmp_path)
+    cfg = {"model": "ornith", "provider": "ollama"}
+    p1 = router._provider_for_role(cfg)
+    p2 = router._provider_for_role(cfg)
+    assert isinstance(p1, OllamaProvider)
+    assert p1 is not default
+    assert p1 is p2  # cached per provider name
+
+
+@pytest.mark.anyio
+async def test_router_routes_roles_to_distinct_providers(tmp_path, monkeypatch):
+    """Planning role uses the default provider; a role with provider: ollama is
+    routed to a separately-built Ollama provider in the same router."""
+    monkeypatch.chdir(tmp_path)
+    default = CountingProvider()
+
+    captured = {}
+
+    class FakeOllama(OllamaProvider):
+        async def complete(self, model, messages, temperature=0.0, json_mode=False, task_id=None, run_id=None):
+            captured["ollama_model"] = model
+            return LLMResponse(
+                content='{"value": "ok"}', model=model,
+                usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                raw_response={},
+            )
+
+    monkeypatch.setattr("devcouncil.llm.provider.OllamaProvider", FakeOllama)
+
+    router = ModelRouter(
+        default,
+        {
+            "planner_a": {"model": "or/planner"},
+            "live_reviewer": {"model": "ornith", "provider": "ollama"},
+        },
+        project_root=tmp_path,
+    )
+
+    await router.complete_structured("planner_a", [{"role": "user", "content": "x"}], RouterOutput)
+    await router.complete_structured("live_reviewer", [{"role": "user", "content": "x"}], RouterOutput)
+
+    assert default.calls == 1  # only the planning role hit the default provider
+    assert captured["ollama_model"] == "ornith"  # the override role hit Ollama
