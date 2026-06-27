@@ -17,6 +17,7 @@
 - [x] MCP integration for CLI and execution tooling (starter support)
 - [x] Live UI Dashboard
 - [x] Native GitHub/GitLab PR Comments integration
+- [x] OKF <-> skills bridge (export skills as OKF documents; ingest OKF skill documents as selectable skills)
 
 Related references:
 

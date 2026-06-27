@@ -25,6 +25,7 @@ DevCouncil does not replace coding agents. It sits beside tools like Codex CLI, 
 - [Executor adapters](docs/executor-adapters.md): manual, coding CLI, native-preview, Mini-SWE, and OpenHands execution paths.
 - [Live review](docs/live-review.md): `dev watch` session review, cards, signals, and blocking behavior.
 - [Model routing](docs/model-routing.md): provider selection, role models, OpenRouter, Vertex AI, Doubleword, and Ollama (local) setup.
+- [Knowledge formats](docs/knowledge-formats.md): Open Knowledge Format (OKF) export/ingest and design.md design-system lint/export, injected as planning and coding context, plus the bidirectional OKF <-> engineering-skills bridge (`dev okf export --skills` / `dev okf ingest`).
 - [Security model](docs/security.md): redaction, permissions, allowlists, and local state.
 - [Project status](docs/project-status.md): current maturity by subsystem.
 - [Roadmap](docs/roadmap.md): planned work.

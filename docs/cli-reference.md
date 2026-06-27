@@ -35,6 +35,12 @@ dev repair                  # Generate repair tasks from gaps
 dev report                  # Generate final evidence report
 dev report --github-pr-comment # Post the report as a GitHub PR comment
 dev report --gitlab-pr-comment # Post the report as a GitLab MR comment
+dev okf export -o ./bundle   # Export the artifact graph as an Open Knowledge Format bundle
+dev okf validate ./bundle    # Validate an OKF bundle (typed docs, resolved links)
+dev okf ingest ./bundle      # Ingest an OKF bundle as planning/coding context
+dev design lint              # Lint the project design.md (refs, contrast, ordering)
+dev design export -f css     # Export design tokens (css | tailwind | w3c)
+dev design show              # Summarize design tokens and sections
 dev rollback TASK-001       # Revert changes using task checkpoint
 dev mcp-server              # Start DevCouncil MCP server over stdio
 dev integrate hooks --apply # Install Codex, Gemini, Claude, Cursor, and OpenCode hooks

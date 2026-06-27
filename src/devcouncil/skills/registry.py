@@ -14,8 +14,9 @@ import os
 import re
 from pathlib import Path
 
-import yaml
 from pydantic import BaseModel, Field
+
+from devcouncil.knowledge.frontmatter import build_frontmatter_markdown, split_frontmatter
 
 LIBRARY_DIR = Path(__file__).resolve().parent / "library"
 
@@ -90,22 +91,15 @@ class Skill(BaseModel):
 
     def to_skill_md(self) -> str:
         """Render as a Claude-Code-style SKILL.md (name + description frontmatter + body)."""
-        front = yaml.safe_dump(
+        return build_frontmatter_markdown(
             {"name": self.name, "description": self.description},
-            sort_keys=False,
-            default_flow_style=False,
-            allow_unicode=True,
-        ).strip()
-        return f"---\n{front}\n---\n\n{self.body.strip()}\n"
+            self.body,
+        )
 
 
-def _split_frontmatter(text: str) -> tuple[dict, str]:
-    if text.startswith("---"):
-        parts = text.split("---", 2)
-        if len(parts) == 3:
-            meta = yaml.safe_load(parts[1]) or {}
-            return (meta if isinstance(meta, dict) else {}), parts[2].lstrip("\n")
-    return {}, text
+# Frontmatter parsing lives in devcouncil.knowledge.frontmatter so skills and the OKF /
+# design.md formats share one implementation; kept aliased here for existing callers.
+_split_frontmatter = split_frontmatter
 
 
 def _skill_from_file(path: Path) -> Skill:
@@ -161,9 +155,53 @@ def discover_repo_skills(project_root: Path) -> list[Skill]:
     return found
 
 
-def load_skills(library_dir: Path = LIBRARY_DIR, project_root: Path | None = None) -> list[Skill]:
+def load_okf_skills(project_root: Path, directory: str = ".devcouncil/knowledge") -> list[Skill]:
+    """Load skills from ingested OKF documents typed as engineering skills.
+
+    Reads every ``*.md`` under ``<project_root>/<directory>/okf/`` (recursively), parses
+    each as an :class:`~devcouncil.knowledge.okf.OKFDocument`, and keeps the ones whose
+    ``type`` marks them as a skill (the OKF->Skill conversion returns ``None`` for any
+    other node type — BigQuery tables, tasks, ...). This is how an OKF bundle ingested
+    from another repo contributes its skills to selection alongside the packaged library.
+
+    ``index.md`` files are skipped: a bundle index is navigation scaffolding, not a node.
+    The document's ``rel_path`` is set relative to the okf dir so its skill ``name`` derives
+    from the file stem (matching how the export side names ``skills/<name>.md``).
+    """
+    # Lazy import to avoid a registry <-> skill_bridge import cycle (see that module);
+    # OKFDocument is cycle-safe (knowledge.okf doesn't import skills) but kept here too
+    # to keep the OKF-ingest dependency local to the one function that uses it.
+    from devcouncil.knowledge.okf import OKFDocument
+    from devcouncil.knowledge.skill_bridge import okf_document_to_skill
+
+    okf_dir = project_root / directory / "okf"
+    if not okf_dir.exists():
+        return []
+    skills: list[Skill] = []
+    for path in sorted(okf_dir.rglob("*.md")):
+        if path.name == "index.md":
+            continue
+        rel = path.relative_to(okf_dir).as_posix()
+        doc = OKFDocument.from_markdown(path.read_text(encoding="utf-8"), rel_path=rel)
+        skill = okf_document_to_skill(doc)
+        if skill is not None:
+            skills.append(skill)
+    return skills
+
+
+def load_skills(
+    library_dir: Path = LIBRARY_DIR,
+    project_root: Path | None = None,
+    include_okf: bool = True,
+) -> list[Skill]:
     """Load skills: the packaged library plus, when ``project_root`` is given, the
-    repo's own skills. Repo-local skills override packaged ones with the same name.
+    repo's own skills and (when ``include_okf``) skills from ingested OKF documents.
+    Repo-local skills override packaged ones with the same name.
+
+    OKF-derived skills are merged in last and only for names not already taken, so a
+    packaged library skill or a repo-local skill always wins a name conflict over an
+    ingested bundle node (the local definition is authoritative and carries richer
+    selection metadata like globs that OKF tags can't represent).
 
     Always-on skills come first, then alphabetical. Markdown files without skill
     frontmatter (e.g. a contributor README) are ignored.
@@ -190,6 +228,21 @@ def load_skills(library_dir: Path = LIBRARY_DIR, project_root: Path | None = Non
                     "triggers": skill.triggers if has_own_triggers else base.triggers,
                 })
             by_name[skill.name] = skill  # repo-local wins on name conflict
+        if include_okf:
+            # Honor a custom knowledge.directory: `dev okf ingest` and knowledge-source
+            # discovery both write/read under the configured dir, so the skill-ingest read
+            # path must too — otherwise ingested OKF skills land somewhere this never looks
+            # and silently never get selected. Best-effort; lazy import keeps app.config out
+            # of the skills package's module-load graph.
+            knowledge_dir = ".devcouncil/knowledge"
+            try:
+                from devcouncil.app.config import load_config
+                knowledge_dir = load_config(project_root).knowledge.directory
+            except Exception:
+                pass
+            for skill in load_okf_skills(project_root, directory=knowledge_dir):
+                # Only fill gaps: library + repo-local skills win on name conflict.
+                by_name.setdefault(skill.name, skill)
     skills = list(by_name.values())
     skills.sort(key=lambda s: (not s.always, s.name))
     return skills
