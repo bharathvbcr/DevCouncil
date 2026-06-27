@@ -42,3 +42,10 @@ def test_skill_to_skill_md_uses_shared_builder():
     assert meta["name"] == "demo"
     assert meta["description"] == "A demo skill."
     assert body.strip() == "Do the thing."
+
+
+def test_crlf_body_has_no_leading_carriage_return():
+    meta, body = split_frontmatter("---\r\ntype: X\r\n---\r\nBody line.\r\n")
+    assert meta["type"] == "X"
+    assert not body.startswith("\r")
+    assert body.startswith("Body line.")

@@ -93,3 +93,22 @@ def test_export_css_tailwind_w3c():
 
     w3c = json.loads(export(ds, "w3c"))
     assert w3c["color"]["primary"] == {"$value": "#1a1a1a", "$type": "color"}
+
+
+def test_lint_flags_duplicate_section_without_false_ordering():
+    # A canonical section appearing twice is a duplicate-section problem, and must NOT be
+    # mislabeled "out of canonical order" when the (de-duplicated) order is correct.
+    src = """---
+colors:
+  primary: "#123456"
+---
+# Overview
+o
+# Colors
+c
+# Colors
+again
+"""
+    rules = {f.rule for f in lint(parse_design_md(src))}
+    assert "duplicate-section" in rules
+    assert "section-ordering" not in rules

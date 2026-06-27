@@ -32,6 +32,8 @@ CANONICAL_SECTIONS = [
     "components",
     "do's and don'ts",
 ]
+# O(1) membership companion to the ordered list above.
+_CANONICAL_SET = frozenset(CANONICAL_SECTIONS)
 
 # Token categories a component property may reference (e.g. "colors.primary").
 _TOKEN_CATEGORIES = ("colors", "typography", "rounded", "spacing")
@@ -272,10 +274,28 @@ def lint(ds: DesignSystem) -> list[Finding]:
                 message=f"color token 'colors.{name}' is never referenced by a component",
             ))
 
-    # section-ordering
-    present = [(h.lower(), h) for h, _ in ds.sections if h.lower() in CANONICAL_SECTIONS]
-    expected = [name for name in CANONICAL_SECTIONS if name in {p[0] for p in present}]
-    actual = [p[0] for p in present]
+    # section-ordering (+ duplicate-section)
+    present = [low for h, _ in ds.sections if (low := h.lower()) in _CANONICAL_SET]
+    # A duplicated canonical section is its own problem; report it and de-duplicate before
+    # the ordering check, so a duplicated-but-correctly-ordered doc isn't mislabeled as
+    # "out of canonical order" (the duplicate alone made actual != expected).
+    seen: set[str] = set()
+    actual: list[str] = []
+    duplicates: list[str] = []
+    for name in present:
+        if name in seen:
+            if name not in duplicates:
+                duplicates.append(name)
+        else:
+            seen.add(name)
+            actual.append(name)
+    for name in duplicates:
+        findings.append(Finding(
+            rule="duplicate-section",
+            severity="warning",
+            message=f"section '{name}' appears more than once",
+        ))
+    expected = [name for name in CANONICAL_SECTIONS if name in seen]
     if actual != expected:
         findings.append(Finding(
             rule="section-ordering",

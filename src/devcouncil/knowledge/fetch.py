@@ -108,8 +108,12 @@ def _safe_extract_tar(archive: Path, dest: Path) -> None:
                     f"unsafe archive entry {member.name!r} escapes the extraction directory"
                 )
             # A symlink/hardlink could still point outside even if its own path is safe.
+            # Symlink ``linkname`` is relative to the link's own directory; hardlink
+            # ``linkname`` is relative to the archive root — resolve each against the
+            # correct base, else a hardlink escaping via the root is mis-validated.
             if member.issym() or member.islnk():
-                link_target = (target.parent / member.linkname).resolve()
+                base = target.parent if member.issym() else dest
+                link_target = (base / member.linkname).resolve()
                 if not _within(dest_resolved, link_target):
                     raise UnsafeArchiveError(
                         f"unsafe link target {member.linkname!r} in entry {member.name!r}"

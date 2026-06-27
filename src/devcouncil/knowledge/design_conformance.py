@@ -64,6 +64,38 @@ _PX_TOKEN_RE = re.compile(r"^(\d+(?:\.\d+)?)px$")
 _NUM_TOKEN_RE = re.compile(r"^\d+(?:\.\d+)?$")
 
 
+def _quoted_spans(line: str) -> list[tuple[int, int]]:
+    """Index ranges of ``line`` that sit inside a ``'`` or ``"`` string literal.
+
+    Used to drop declarations whose *property name* lives inside a plain string — e.g. a
+    ``color: #ff0000`` substring in ``console.log("color: #ff0000")`` is a log message, not
+    a real style declaration, and flagging it is exactly the false positive the module's
+    contract warns against. Backtick template literals are intentionally NOT treated as
+    strings, so CSS-in-JS (styled-components) hardcoded values stay scannable. Escape-aware
+    and per-line (matching the existing per-line scan; multi-line strings aren't tracked)."""
+    spans: list[tuple[int, int]] = []
+    quote = ""
+    start = 0
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                spans.append((start, i))
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+            start = i + 1
+        i += 1
+    if quote:  # unterminated quote: treat the rest of the line as string
+        spans.append((start, n))
+    return spans
+
+
 class Violation(BaseModel):
     """A hardcoded style literal that bypasses a design token."""
 
@@ -193,13 +225,29 @@ def scan_text(text: str, ds: DesignSystem, filename: str = "") -> list[Violation
     token value are allowed, and a kind is only judged when the design system defines tokens
     of that kind (see module docstring).
     """
-    color_tokens = _color_token_values(ds)
-    font_scale = _font_size_scale(ds)
-    spacing_scale = _spacing_scale(ds)
+    return _scan_text(
+        text, _color_token_values(ds), _font_size_scale(ds), _spacing_scale(ds), filename
+    )
 
+
+def _scan_text(
+    text: str,
+    color_tokens: set[str],
+    font_scale: set[float],
+    spacing_scale: set[float],
+    filename: str = "",
+) -> list[Violation]:
+    """Scan one text against pre-computed token scales. The scales depend only on the
+    design system, so :func:`scan_files` computes them once and reuses them across files."""
     violations: list[Violation] = []
     for lineno, line in enumerate(_strip_comments(text), start=1):
+        quoted = _quoted_spans(line)
         for m in _DECL_RE.finditer(line):
+            # Skip a "declaration" whose property name is inside a quoted string — it's a
+            # log/error/message string, not real styling (a CSS-in-JS backtick literal is
+            # not treated as a string, so styled-components values are still caught).
+            if any(s <= m.start("prop") < e for s, e in quoted):
+                continue
             prop = _normalize_prop(m.group("prop"))
             value = m.group("value")
             snippet = m.group(0).strip()
@@ -249,6 +297,10 @@ def scan_files(paths: list[Path], ds: DesignSystem) -> list[Violation]:
     Non-style extensions are skipped, and unreadable / binary files are silently ignored so
     a single bad file never aborts a conformance check.
     """
+    # Token scales depend only on the design system — compute once, not per file.
+    color_tokens = _color_token_values(ds)
+    font_scale = _font_size_scale(ds)
+    spacing_scale = _spacing_scale(ds)
     violations: list[Violation] = []
     for path in paths:
         if path.suffix.lower() not in STYLE_EXTENSIONS:
@@ -257,5 +309,7 @@ def scan_files(paths: list[Path], ds: DesignSystem) -> list[Violation]:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError, ValueError):
             continue
-        violations.extend(scan_text(text, ds, filename=str(path)))
+        violations.extend(
+            _scan_text(text, color_tokens, font_scale, spacing_scale, filename=str(path))
+        )
     return violations

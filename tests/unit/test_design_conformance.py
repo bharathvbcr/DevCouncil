@@ -1,7 +1,5 @@
 """Design-system conformance scanning: flag hardcoded literals bypassing tokens."""
 
-from pathlib import Path
-
 from typer.testing import CliRunner
 
 from devcouncil.cli.main import app
@@ -145,3 +143,20 @@ def test_cli_check_explicit_files_and_design(tmp_path):
         app, ["design", "check", str(style), "--design", str(design)])
     assert result.exit_code == 1
     assert "99px" in result.output
+
+
+def test_hex_inside_string_literal_is_not_flagged():
+    ds = _ds()
+    # "color: #..." sitting inside a log/error string is a message, not a declaration.
+    assert scan_text('console.log("color: #ff0000 is bad");', ds, filename="a.ts") == []
+    assert scan_text("throw new Error('set color: #abcdef');", ds, filename="a.ts") == []
+
+
+def test_quoted_value_and_css_in_js_still_flagged():
+    ds = _ds()
+    # A real JS style-object value is quoted, but the PROPERTY is outside the string.
+    obj = scan_text("const s = { color: '#ff0000' };", ds, filename="a.ts")
+    assert any(v.kind == "color" for v in obj)
+    # styled-components backtick CSS-in-JS stays scannable (backticks aren't strings here).
+    styled = scan_text("const B = styled.button`color: #ff0000;`;", ds, filename="a.ts")
+    assert any(v.kind == "color" for v in styled)

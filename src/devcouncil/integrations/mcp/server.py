@@ -363,13 +363,35 @@ def _discover_knowledge_sources(root: Path) -> list:
     """Best-effort enumeration of ingested OKF/design knowledge for the project.
 
     A broken or absent knowledge layer must never break resource listing, so any
-    failure degrades to an empty list (mirrors the other optional handlers here)."""
+    failure degrades to an empty list (mirrors the other optional handlers here).
+
+    Honors the project's ``knowledge`` config (enabled / directory / design_always) so MCP
+    exposes exactly what the planning and task prompts do — otherwise a project that
+    disabled or relocated its knowledge would still leak it through MCP resources."""
     try:
         from devcouncil.knowledge.sources import discover_knowledge_sources
 
-        return discover_knowledge_sources(root)
+        directory, design_always = _knowledge_settings(root)
+        if directory is None:  # explicitly disabled in config
+            return []
+        return discover_knowledge_sources(root, directory=directory, design_always=design_always)
     except Exception:
         return []
+
+
+def _knowledge_settings(root: Path) -> tuple[str | None, bool]:
+    """Resolve (directory, design_always) for knowledge exposure from project config.
+
+    Returns ``(None, _)`` when the project explicitly disables knowledge so callers can
+    suppress it. Falls back to defaults when no/invalid config is present (the MCP server
+    must keep working for projects without a full ``.devcouncil/config.yaml``)."""
+    try:
+        from devcouncil.app.config import load_config
+
+        cfg = load_config(root).knowledge
+        return (None if not cfg.enabled else cfg.directory), cfg.design_always
+    except Exception:
+        return ".devcouncil/knowledge", True
 
 
 def _is_secret_path(root: Path, rel_or_abs: str) -> bool:
@@ -2207,7 +2229,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 select_knowledge_sources,
             )
 
-            sources = select_knowledge_sources(goal, root)
+            # Honor the project's knowledge config so MCP selection matches the prompts.
+            directory, design_always = _knowledge_settings(root)
+            if directory is None:  # explicitly disabled
+                sources = []
+            else:
+                sources = select_knowledge_sources(
+                    goal, root, directory=directory, design_always=design_always
+                )
             preamble = render_knowledge_preamble(sources)
             return _json_text({
                 "ok": True,

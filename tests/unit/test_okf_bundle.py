@@ -66,3 +66,17 @@ def test_links_escaping_bundle_root_are_dropped(tmp_path):
     )
     bundle = read_bundle(tmp_path)
     assert bundle.by_path()["a.md"].links == []
+
+
+def test_image_and_asset_links_are_not_intra_bundle_edges(tmp_path):
+    # Only .md targets are intra-bundle document edges; images / non-md assets must not be
+    # recorded as links (else validate_bundle falsely reports them broken).
+    (tmp_path / "doc.md").write_text(
+        "---\ntype: Note\ntitle: D\n---\n"
+        "![diagram](diagram.png) and [data](data.csv) and [real](other.md).",
+        encoding="utf-8",
+    )
+    (tmp_path / "other.md").write_text("---\ntype: Note\ntitle: O\n---\nx", encoding="utf-8")
+    bundle = read_bundle(tmp_path)
+    assert bundle.by_path()["doc.md"].links == ["other.md"]
+    assert validate_bundle(bundle) == []

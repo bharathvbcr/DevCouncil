@@ -37,23 +37,25 @@ class KnowledgeSource(BaseModel):
     priority: int = 50
     source_path: Path | None = None
 
+    def _match_and_score(self, goal_lower: str) -> tuple[bool, int]:
+        """Whether this source applies to ``goal_lower`` and its relevance rank, in one
+        keyword scan. Unlike a Skill, ``matches`` is NOT equivalent to ``score > 0`` here:
+        OKF sources have a nonzero ``priority`` floor, so the two must be returned together."""
+        if self.always:
+            return True, 1_000_000 + self.priority
+        hits = sum(1 for kw in self.triggers.keywords if _keyword_in_text(kw, goal_lower))
+        return hits > 0, self.priority + 5 * hits
+
     def matches(self, goal: str) -> bool:
         """True if this source applies to the given goal text.
 
         Design systems are always-on (a coding agent should always honor them); OKF
         knowledge is matched on goal keywords like a domain skill.
         """
-        if self.always:
-            return True
-        goal_lower = goal.lower()
-        return any(_keyword_in_text(kw, goal_lower) for kw in self.triggers.keywords)
+        return self._match_and_score(goal.lower())[0]
 
     def relevance_score(self, goal: str) -> int:
-        if self.always:
-            return 1_000_000 + self.priority
-        goal_lower = goal.lower()
-        hits = sum(1 for kw in self.triggers.keywords if _keyword_in_text(kw, goal_lower))
-        return self.priority + 5 * hits
+        return self._match_and_score(goal.lower())[1]
 
     def render(self) -> str:
         """A titled markdown block for inclusion in a prompt preamble."""
@@ -61,7 +63,40 @@ class KnowledgeSource(BaseModel):
         return f"{header}\n\n{self.body.strip()}".strip()
 
 
+# Parsed-source cache keyed on (resolved path, mtime_ns, kind, always, priority). Knowledge
+# discovery runs once per task during planning (and repeatedly via MCP), so without this an
+# N-task plan re-reads + re-parses every knowledge file N times. Keyed on mtime so an edited
+# or freshly-ingested file is re-parsed; the args are in the key because they shape the
+# resulting source. Cached sources are read-only (callers only match/score/render them).
+_source_cache: dict[tuple[str, int, str, bool, int], KnowledgeSource] = {}
+_SOURCE_CACHE_MAX = 512
+
+
+def clear_knowledge_caches() -> None:
+    """Drop the cached parsed knowledge sources (useful in long-running processes/tests)."""
+    _source_cache.clear()
+
+
 def _source_from_file(path: Path, kind: Kind, always: bool, priority: int) -> KnowledgeSource:
+    try:
+        key: tuple[str, int, str, bool, int] | None = (
+            str(path.resolve()), path.stat().st_mtime_ns, kind, always, priority,
+        )
+    except OSError:
+        key = None
+    if key is not None:
+        cached = _source_cache.get(key)
+        if cached is not None:
+            return cached
+    source = _parse_source_file(path, kind, always, priority)
+    if key is not None:
+        if len(_source_cache) >= _SOURCE_CACHE_MAX:
+            _source_cache.clear()
+        _source_cache[key] = source
+    return source
+
+
+def _parse_source_file(path: Path, kind: Kind, always: bool, priority: int) -> KnowledgeSource:
     meta, body = split_frontmatter(path.read_text(encoding="utf-8"))
     triggers = meta.get("triggers") or {}
     # Derive keywords from explicit triggers and, for OKF, the document's tags — so an
@@ -123,9 +158,15 @@ def select_knowledge_sources(
     if project_root is None:
         return []
     sources = discover_knowledge_sources(project_root, directory, design_always=design_always)
-    matched = [s for s in sources if s.matches(goal)]
-    matched.sort(key=lambda s: (not s.always, -s.relevance_score(goal), s.name))
-    return matched
+    # One goal.lower() + one keyword scan per source (match and rank computed together).
+    goal_lower = goal.lower()
+    scored: list[tuple[KnowledgeSource, int]] = []
+    for source in sources:
+        ok, score = source._match_and_score(goal_lower)
+        if ok:
+            scored.append((source, score))
+    scored.sort(key=lambda item: (not item[0].always, -item[1], item[0].name))
+    return [source for source, _ in scored]
 
 
 def render_knowledge_preamble(
@@ -136,6 +177,7 @@ def render_knowledge_preamble(
     """Concatenate source bodies (optionally filtered to one ``kind``) into a single
     preamble, bounded to ``max_chars`` total. Sources are taken in the order given (so the
     most relevant survive the budget); the first source is always included."""
+    separator = "\n\n---\n\n"
     chosen = [s for s in sources if kind is None or s.kind == kind]
     blocks: list[str] = []
     total = 0
@@ -143,8 +185,11 @@ def render_knowledge_preamble(
         block = source.render()
         if not block:
             continue
-        if blocks and total + len(block) > max_chars:
+        # Count the separator that will join this block to the previous one, so the budget
+        # bounds the *rendered* preamble length, not just the sum of block bodies.
+        extra = len(separator) if blocks else 0
+        if blocks and total + extra + len(block) > max_chars:
             break
         blocks.append(block)
-        total += len(block)
-    return "\n\n---\n\n".join(blocks).strip()
+        total += extra + len(block)
+    return separator.join(blocks).strip()

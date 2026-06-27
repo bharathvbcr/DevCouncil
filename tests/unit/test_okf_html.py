@@ -75,3 +75,18 @@ def test_roundtrip_from_read_bundle(tmp_path):
     pages = render_bundle_html(parsed)
     assert "index.html" in pages
     assert 'href="customers.html"' in pages["tables/orders.html"]
+
+
+def test_obfuscated_dangerous_schemes_are_neutralized():
+    # Whitespace/control chars inside a scheme (which browsers strip before resolving it)
+    # must not slip past the scheme guard.
+    bundle = OKFBundle(documents=[OKFDocument(
+        type="Note", title="x", rel_path="n.md",
+        body="[tab](java\tscript:alert(1)) [space]( javascript:alert(2)) "
+             "[vb](VBScript:msgbox(3)) link.\n",
+    )])
+    page = render_bundle_html(bundle)["n.html"]
+    # Every dangerous target collapses to href="#"; no payload reaches the output.
+    assert "alert" not in page
+    assert "msgbox" not in page
+    assert page.count('href="#"') >= 3

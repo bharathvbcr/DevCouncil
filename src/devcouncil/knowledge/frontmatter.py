@@ -27,7 +27,7 @@ def split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
                 meta = yaml.safe_load(parts[1]) or {}
             except yaml.YAMLError:
                 meta = {}
-            return (meta if isinstance(meta, dict) else {}), parts[2].lstrip("\n")
+            return (meta if isinstance(meta, dict) else {}), parts[2].lstrip("\r\n")
     return {}, text
 
 

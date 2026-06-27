@@ -90,13 +90,19 @@ class OKFBundle(BaseModel):
 
 def _resolve_link(source_rel_path: str, target: str) -> str | None:
     """Resolve a markdown link target found in ``source_rel_path`` to a bundle-relative
-    POSIX path, or ``None`` if it is external (URL), an in-page anchor, or escapes root.
+    POSIX path, or ``None`` if it is external (URL), an in-page anchor, a non-document
+    asset, or escapes root.
+
+    Only ``.md`` targets are treated as intra-bundle document edges: a bundle's document
+    set is markdown-only, so links to images (``![alt](x.png)``) or other assets must not
+    be recorded as edges — otherwise ``validate_bundle`` would flag every such link as a
+    broken intra-bundle reference.
     """
     target = target.strip()
     if not target or target.startswith("#") or _URL_RE.match(target) or target.startswith("mailto:"):
         return None
     target = target.split("#", 1)[0].strip()  # drop any anchor fragment
-    if not target:
+    if not target or not target.endswith(".md"):
         return None
     source_dir = PurePosix(source_rel_path).parent
     try:
@@ -150,9 +156,11 @@ def read_bundle(bundle_dir: Path) -> OKFBundle:
         rel = path.relative_to(bundle_dir).as_posix()
         doc = OKFDocument.from_markdown(path.read_text(encoding="utf-8"), rel_path=rel)
         links: list[str] = []
+        seen_links: set[str] = set()
         for match in _LINK_RE.finditer(doc.body):
             resolved = _resolve_link(rel, match.group("target"))
-            if resolved and resolved not in links:
+            if resolved and resolved not in seen_links:
+                seen_links.add(resolved)
                 links.append(resolved)
         doc.links = links
         docs.append(doc)

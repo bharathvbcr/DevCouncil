@@ -34,7 +34,17 @@ _ITALIC_RE = re.compile(r"(?<!\*)\*(?!\*)([^*]+)\*(?!\*)")
 _PLACEHOLDER_RE = re.compile("(\\d+)")
 
 _URL_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
-_BAD_SCHEME_RE = re.compile(r"^\s*(?:javascript|data|vbscript)\s*:", re.IGNORECASE)
+_BAD_SCHEME_RE = re.compile(r"^(?:javascript|data|vbscript):", re.IGNORECASE)
+# Whitespace + C0 control chars. Browsers strip these from a URL before resolving its
+# scheme, so they must be removed before the scheme check — otherwise "java&#9;script:"
+# or " javascript:" slips past the guard yet still executes once the browser reassembles it.
+_SCHEME_NOISE_RE = re.compile(r"[\x00-\x20]+")
+
+
+def _is_dangerous_scheme(target: str) -> bool:
+    """True if ``target`` carries a dangerous URL scheme, even when obfuscated with leading
+    or interior whitespace / control characters (e.g. ``java\\tscript:``, `` javascript:``)."""
+    return bool(_BAD_SCHEME_RE.match(_SCHEME_NOISE_RE.sub("", target)))
 
 _STYLE = """
 body{font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
@@ -63,7 +73,7 @@ def _rel_href(src_html: str, dst_html: str) -> str:
 
 def _safe_external(target: str) -> str:
     """Escape an external/anchor link target, neutralizing dangerous schemes to ``#``."""
-    if _BAD_SCHEME_RE.match(target):
+    if _is_dangerous_scheme(target):
         return "#"
     return html.escape(target.strip(), quote=True)
 
@@ -77,7 +87,7 @@ def _rewrite_link(target: str, current_md_rel: str, present: set[str]) -> str:
     checked but otherwise left to behave as a normal link.
     """
     t = target.strip()
-    if not t or _BAD_SCHEME_RE.match(t):
+    if not t or _is_dangerous_scheme(t):
         return "#"
     if t.startswith("#") or t.startswith("mailto:") or _URL_SCHEME_RE.match(t):
         return _safe_external(t)
