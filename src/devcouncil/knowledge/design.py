@@ -17,6 +17,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from devcouncil.knowledge.frontmatter import split_frontmatter
+# Cycle-safe: knowledge.okf does not import this module (or the skills package).
+from devcouncil.knowledge.okf import OKFDocument
 
 # Canonical section order from the design.md spec; sections that ARE present must appear
 # in this relative order. Lowercased for comparison.
@@ -114,6 +116,55 @@ def parse_design_md(source: str | Path) -> DesignSystem:
         components=_as_dict(meta.get("components")),
         sections=_parse_sections(body),
         body=body.strip(),
+    )
+
+
+def design_system_to_okf_document(
+    ds: DesignSystem, rel_path: str = "design/design.md"
+) -> OKFDocument:
+    """Render a :class:`DesignSystem` as an OKF document for inclusion in a bundle.
+
+    Mirrors :func:`skill_bridge.skill_to_okf_document` so design knowledge travels in an OKF
+    bundle alongside skills and the artifact graph. The body is a deterministic, readable
+    rendering of the design tokens (in fixed category order, preserving each category's own
+    key order) followed by the human-readable rationale (``ds.body``). ``tags`` are left empty
+    and ``timestamp`` is left to the caller (a design system is library content, not a
+    timestamped artifact).
+    """
+    title = ds.name or "Design System"
+    lines: list[str] = []
+
+    def _emit(label: str, mapping: dict[str, Any]) -> None:
+        if not mapping:
+            return
+        lines.append(f"### {label}")
+        for name, value in mapping.items():
+            if isinstance(value, dict):
+                inner = ", ".join(f"{k}: {v}" for k, v in value.items())
+                lines.append(f"- **{name}**: {inner}")
+            else:
+                lines.append(f"- **{name}**: {value}")
+        lines.append("")
+
+    _emit("Colors", ds.colors)
+    _emit("Typography", ds.typography)
+    _emit("Rounded", ds.rounded)
+    _emit("Spacing", ds.spacing)
+    _emit("Components", ds.components)
+
+    if ds.body:
+        lines.append("## Rationale")
+        lines.append("")
+        lines.append(ds.body)
+
+    return OKFDocument(
+        type="Design System",
+        title=title,
+        description=f"Design system tokens and guidance for {title}."[:280],
+        tags=[],
+        timestamp="",
+        body="\n".join(lines).strip(),
+        rel_path=rel_path,
     )
 
 

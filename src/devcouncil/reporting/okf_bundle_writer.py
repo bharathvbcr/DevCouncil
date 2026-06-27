@@ -48,6 +48,8 @@ class OKFBundleWriter:
         timestamp: str = "",
         include_skills: bool = False,
         skills: "list | None" = None,
+        include_design: bool = False,
+        design=None,
     ) -> OKFBundle:
         """Build the in-memory :class:`OKFBundle` (no filesystem writes).
 
@@ -55,6 +57,11 @@ class OKFBundleWriter:
         is rendered as an OKF document (via the shared :mod:`skill_bridge`) under
         ``skills/`` and indexed by a ``skills/index.md`` node so the bundle stays a single
         connected, link-valid graph. Default behavior (no skills) is unchanged.
+
+        Symmetrically, when ``include_design`` is set and a ``design`` (a
+        :class:`devcouncil.knowledge.design.DesignSystem`) is supplied, it is rendered as a
+        ``Design System`` OKF document under ``design/`` and indexed by ``design/index.md``,
+        which the root index links. Default behavior (no design) is unchanged.
         """
         docs: list[OKFDocument] = []
 
@@ -187,10 +194,36 @@ class OKFBundleWriter:
         )
         docs.extend(skill_docs)
 
+        # --- Design system (optional) ---
+        design_doc = (
+            OKFBundleWriter._build_design_doc(design, timestamp)
+            if include_design and design is not None
+            else None
+        )
+        if design_doc is not None:
+            docs.append(design_doc)
+
         # --- index.md hierarchy ---
-        docs.extend(OKFBundleWriter._build_indexes(graph, project_name, timestamp, skill_docs))
+        docs.extend(
+            OKFBundleWriter._build_indexes(graph, project_name, timestamp, skill_docs, design_doc)
+        )
 
         return OKFBundle(documents=docs)
+
+    @staticmethod
+    def _build_design_doc(design, timestamp: str) -> OKFDocument:
+        """Render a design system as an OKF document under ``design/``.
+
+        Conversion goes through :func:`design.design_system_to_okf_document` so the bundle
+        and any future design ingest share one DesignSystem<->OKF mapping. The bundle-level
+        ``timestamp`` is stamped on (the renderer itself leaves it empty as library content).
+        """
+        from devcouncil.knowledge.design import design_system_to_okf_document
+
+        doc = design_system_to_okf_document(design)
+        if timestamp:
+            doc = doc.model_copy(update={"timestamp": timestamp})
+        return doc
 
     @staticmethod
     def _build_skill_docs(skills: "list", timestamp: str) -> list[OKFDocument]:
@@ -217,6 +250,7 @@ class OKFBundleWriter:
         project_name: str,
         timestamp: str,
         skill_docs: "list[OKFDocument] | None" = None,
+        design_doc: "OKFDocument | None" = None,
     ) -> list[OKFDocument]:
         indexes: list[OKFDocument] = []
         summary = graph.coverage_summary()
@@ -258,6 +292,23 @@ class OKFBundleWriter:
                 rel_path=rel,
             ))
 
+        # Design index — links to the single design document so it joins the graph.
+        if design_doc is not None:
+            rel = "design/index.md"
+            lines = [
+                "1 design system.",
+                "",
+                f"- {_link(rel, design_doc.rel_path, design_doc.title or design_doc.rel_path)}",
+            ]
+            indexes.append(OKFDocument(
+                type="OKF Index",
+                title="Design System",
+                description="Design system exported from DevCouncil.",
+                timestamp=timestamp,
+                body="\n".join(lines).strip(),
+                rel_path=rel,
+            ))
+
         # Root index links to each section index.
         root_lines = [
             f"Knowledge bundle exported from **{project_name}** in Open Knowledge Format.",
@@ -275,6 +326,8 @@ class OKFBundleWriter:
         ]
         if skill_docs:
             root_lines.append("- [Skills](skills/index.md)")
+        if design_doc is not None:
+            root_lines.append("- [Design System](design/index.md)")
         indexes.append(OKFDocument(
             type="OKF Index",
             title=project_name,
@@ -294,6 +347,8 @@ class OKFBundleWriter:
         timestamp: str = "",
         include_skills: bool = False,
         skills: "list | None" = None,
+        include_design: bool = False,
+        design=None,
     ) -> list[Path]:
         """Build the bundle and write it under ``output_dir``; returns written paths."""
         bundle = OKFBundleWriter.build(
@@ -303,5 +358,7 @@ class OKFBundleWriter:
             timestamp,
             include_skills=include_skills,
             skills=skills,
+            include_design=include_design,
+            design=design,
         )
         return write_bundle(bundle, output_dir)
