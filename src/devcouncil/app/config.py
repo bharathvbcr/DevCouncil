@@ -11,12 +11,27 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ModelRoleConfig(BaseModel):
     model: str
     temperature: float = 0.0
+    # Optional per-role provider override. When unset, the role uses
+    # ``models.provider``. Lets a single run route some roles to one provider
+    # (e.g. planning on OpenRouter) and others to another (e.g. live review on
+    # local Ollama). Validated/normalized against the supported provider list.
+    provider: str | None = None
+
+    @field_validator("provider")
+    @classmethod
+    def _normalize_provider(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        # Lazy import avoids a circular import (llm.provider imports app.config).
+        from devcouncil.llm.provider import validate_model_provider
+
+        return validate_model_provider(value)
 
 
 class ModelsConfig(BaseModel):

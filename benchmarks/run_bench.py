@@ -166,7 +166,30 @@ def arm_raw(ws: Path, prompt: str, timeout: int) -> dict:
             "output_tail": out[-400:]}
 
 
-def arm_devcouncil(ws: Path, goal: str, model: str, executor: str, timeout: int) -> dict:
+def _apply_monitor_routing(ws: Path, roles: list[str], provider: str, model: str) -> None:
+    """Route the execution-time review roles to a different (e.g. local) provider.
+
+    After ``dev config models`` sets every role to the OpenRouter planner, this
+    overrides the named review roles' ``provider``/``model`` in the workspace
+    config so a single ``dev e2e`` run plans on OpenRouter while the gates that
+    guide and monitor execution (implementation_reviewer / live_reviewer) run on
+    the local provider. Relies on per-role provider support in ModelRouter.
+    """
+    import yaml
+
+    cfg_path = ws / ".devcouncil" / "config.yaml"
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    role_cfg = cfg.setdefault("models", {}).setdefault("roles", {})
+    for role in roles:
+        entry = role_cfg.setdefault(role, {})
+        entry["provider"] = provider
+        entry["model"] = model
+    cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+
+
+def arm_devcouncil(ws: Path, goal: str, model: str, executor: str, timeout: int,
+                   monitor_model: str = "", monitor_provider: str = "ollama",
+                   monitor_roles: tuple[str, ...] = ()) -> dict:
     t0 = time.monotonic()
     init_code, init_out = run([DEV, "init"], cwd=ws, timeout=120)
     key = os.environ.get("OPENROUTER_API_KEY", "")
@@ -174,6 +197,10 @@ def arm_devcouncil(ws: Path, goal: str, model: str, executor: str, timeout: int)
     dc_dir.mkdir(parents=True, exist_ok=True)  # defensive: never fail on a missing dir
     (dc_dir / "secrets.env").write_text(f"OPENROUTER_API_KEY={key}\n", encoding="utf-8")
     run([DEV, "config", "models", "--provider", "openrouter", "-m", model], cwd=ws, timeout=120)
+    # Hybrid routing: keep planning on OpenRouter, push the execution-time review
+    # gates to a local provider (Ollama) so monitoring is local and cost-free.
+    if monitor_model and monitor_roles:
+        _apply_monitor_routing(ws, list(monitor_roles), monitor_provider, monitor_model)
     code, out = run([DEV, "e2e", goal, "--executor", executor, "--force", "--continue-on-blocked"],
                     cwd=ws, timeout=timeout)
     if "Passed: Ready for release" in out:
@@ -194,7 +221,8 @@ def arm_devcouncil(ws: Path, goal: str, model: str, executor: str, timeout: int)
             "cost_usd": round(cost, 4), "output_tail": out[-400:]}
 
 
-def run_task(task, arms, model, executor, raw_timeout, dc_timeout, score_python, keep, base, dc_retries=1):
+def run_task(task, arms, model, executor, raw_timeout, dc_timeout, score_python, keep, base, dc_retries=1,
+             monitor_model="", monitor_provider="ollama", monitor_roles=()):
     results = {}
     for arm in arms:
         ws = make_workspace(base / arm, task)
@@ -203,7 +231,8 @@ def run_task(task, arms, model, executor, raw_timeout, dc_timeout, score_python,
         elif arm == "C":
             run_info = arm_raw(ws, task.spec, raw_timeout)
         elif arm == "B":
-            run_info = arm_devcouncil(ws, task.goal, model, executor, dc_timeout)
+            run_info = arm_devcouncil(ws, task.goal, model, executor, dc_timeout,
+                                      monitor_model, monitor_provider, monitor_roles)
             # Planners occasionally emit malformed JSON for a non-degradable role,
             # which surfaces as verdict=error and no usable result. Retry a fresh
             # workspace so transient planner flakiness does not poison the data point.
@@ -213,7 +242,8 @@ def run_task(task, arms, model, executor, raw_timeout, dc_timeout, score_python,
                 if not keep:
                     shutil.rmtree(ws, ignore_errors=True)
                 ws = make_workspace(base / f"{arm}_retry{attempt}", task)
-                run_info = arm_devcouncil(ws, task.goal, model, executor, dc_timeout)
+                run_info = arm_devcouncil(ws, task.goal, model, executor, dc_timeout,
+                                          monitor_model, monitor_provider, monitor_roles)
         else:
             continue
         sc = score(ws, task, score_python)
@@ -311,7 +341,15 @@ def main():
     ap.add_argument("--score-python", default=sys.executable, help="Interpreter used to run hidden tests.")
     ap.add_argument("--out", default=str(Path(__file__).parent / "results"))
     ap.add_argument("--keep-workspaces", action="store_true")
+    ap.add_argument("--monitor-model", default="",
+                    help="If set, route the execution-time review roles to this model on --monitor-provider "
+                         "(hybrid: OpenRouter plans, local model guides/monitors). e.g. an Ollama tag.")
+    ap.add_argument("--monitor-provider", default="ollama",
+                    help="Provider for the execution-time review roles when --monitor-model is set.")
+    ap.add_argument("--monitor-roles", default="implementation_reviewer,live_reviewer",
+                    help="Comma list of roles to route to --monitor-provider/--monitor-model.")
     args = ap.parse_args()
+    monitor_roles = tuple(r.strip() for r in args.monitor_roles.split(",") if r.strip())
 
     if DEV is None and "B" in args.arms:
         sys.exit("Could not find `dev`. Activate the project venv or add it to PATH.")
@@ -335,7 +373,9 @@ def main():
             print(f"  -> {label} ...", flush=True)
             run_base = base / f"{task.name}_{rep}"
             arms_res = run_task(task, arms, args.model, args.executor, args.timeout, args.dc_timeout,
-                                args.score_python, args.keep_workspaces, run_base, dc_retries=args.dc_retries)
+                                args.score_python, args.keep_workspaces, run_base, dc_retries=args.dc_retries,
+                                monitor_model=args.monitor_model, monitor_provider=args.monitor_provider,
+                                monitor_roles=monitor_roles)
             for a, r in arms_res.items():
                 print(f"      arm {a}: {r['score']}/{r['total']}"
                       + (f"  verdict={r['verdict']}  ${r['cost_usd']}" if a == "B" else "")
@@ -344,8 +384,13 @@ def main():
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     raw_path = out_dir / f"{ts}.json"
-    raw_path.write_text(json.dumps({"model": args.model, "executor": args.executor, "records": records}, indent=2),
-                        encoding="utf-8")
+    raw_path.write_text(json.dumps({
+        "model": args.model,
+        "executor": args.executor,
+        "monitor": ({"provider": args.monitor_provider, "model": args.monitor_model,
+                     "roles": list(monitor_roles)} if args.monitor_model else None),
+        "records": records,
+    }, indent=2), encoding="utf-8")
     summary = summarize(records, arms)
     (out_dir / f"{ts}.md").write_text(summary, encoding="utf-8")
     print(summary)
