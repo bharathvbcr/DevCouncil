@@ -268,6 +268,28 @@ def setup(
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(code=2) from e
 
+    # Size the default local model to the host's memory ceiling (unified RAM on Apple
+    # Silicon, VRAM on a discrete GPU, system RAM otherwise) instead of the static 7b,
+    # so users on any OS get a capable council out of the box. Only when the user chose
+    # Ollama and did not pin a model.
+    if initial_provider == "ollama" and model is None:
+        from devcouncil import hardware
+
+        host = hardware.describe_host()
+        model = host.recommended_ollama_model
+        console.print(
+            f"[green]Detected {host.chip_label} ({host.memory_label}); "
+            f"defaulting Ollama model to {model}.[/green] "
+            "Override with --model, and pull it first: "
+            f"[bold]ollama pull {model}[/bold]."
+        )
+    elif initial_provider == "ollama" and model is not None:
+        # Model pinned explicitly — still remind the user it must be pulled locally.
+        console.print(
+            f"[green]Using Ollama model {model}.[/green] "
+            f"Pull it first if needed: [bold]ollama pull {model}[/bold]."
+        )
+
     created = initialize_project(
         root,
         project_name=name,

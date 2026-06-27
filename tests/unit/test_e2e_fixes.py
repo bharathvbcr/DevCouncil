@@ -99,7 +99,11 @@ def _native(router, runner):
     agent.router = router
     agent.task_runner = runner
     from devcouncil.execution.context_builder import ContextBuilder
+    from devcouncil.execution.prompt_builder import PromptBuilder
     agent.context_builder = ContextBuilder(runner.project_root)
+    # The native executor now assembles implementation context via the budgeted
+    # PromptBuilder; stub it so these loop-behavior tests stay fast and isolated.
+    agent.prompt_builder = PromptBuilder(runner.project_root)
     return agent
 
 
@@ -114,7 +118,7 @@ def test_native_agent_structured_error_does_not_propagate(tmp_path, monkeypatch)
     def always_raise(n):
         raise StructuredOutputError("bad json", role="native_agent", model="m")
     agent = _native(_Router(always_raise), _TaskRunner(tmp_path))
-    monkeypatch.setattr(agent.context_builder, "build_task_context", lambda t, r: "{}")
+    monkeypatch.setattr(agent.prompt_builder, "build_task_prompt", lambda t, r: "CTX")
     result = asyncio.run(agent._run_task_async(_task(), []))
     assert isinstance(result, ExecutionResult) and result.success is False  # no propagation
 
@@ -127,7 +131,7 @@ def test_native_agent_aborts_on_repeated_patch_failures(tmp_path, monkeypatch):
         return AgentAction(thought="patch", tool_calls=[ToolCall(tool="apply_patch", args={"patch": "garbage"})])
     runner = _TaskRunner(tmp_path, apply_raises=True)
     agent = _native(_Router(emit_bad_patch), runner)
-    monkeypatch.setattr(agent.context_builder, "build_task_context", lambda t, r: "{}")
+    monkeypatch.setattr(agent.prompt_builder, "build_task_prompt", lambda t, r: "CTX")
     result = asyncio.run(agent._run_task_async(_task(), []))
     assert result.success is False
     assert "patch" in result.message.lower()  # aborted on patch failures, not step cap
@@ -143,7 +147,7 @@ def test_native_agent_path_content_fallback_writes_file(tmp_path, monkeypatch):
         AgentAction(thought="done", finish=True),
     ]
     agent = _native(_Router(lambda n: steps[n - 1]), runner)
-    monkeypatch.setattr(agent.context_builder, "build_task_context", lambda t, r: "{}")
+    monkeypatch.setattr(agent.prompt_builder, "build_task_prompt", lambda t, r: "CTX")
     result = asyncio.run(agent._run_task_async(_task(), []))
     assert result.success is True
     assert runner.written == [("src/a.py", "X=1\n")]  # fallback routed through write_file
@@ -231,7 +235,7 @@ def test_native_agent_records_action_and_nudges_on_empty(tmp_path, monkeypatch):
             return AgentAction(thought="done", finish=True)
 
     agent = _native(R(), _TaskRunner(tmp_path))
-    monkeypatch.setattr(agent.context_builder, "build_task_context", lambda t, r: "{}")
+    monkeypatch.setattr(agent.prompt_builder, "build_task_prompt", lambda t, r: "CTX")
     result = asyncio.run(agent._run_task_async(_task(), []))
     assert result.success is True
     # The 2nd model call must see the assistant's own step-1 action AND the nudge.
@@ -253,7 +257,7 @@ def test_native_agent_empty_actions_bounded_by_step_cap(tmp_path, monkeypatch):
 
     r = R()
     agent = _native(r, _TaskRunner(tmp_path))
-    monkeypatch.setattr(agent.context_builder, "build_task_context", lambda t, r2: "{}")
+    monkeypatch.setattr(agent.prompt_builder, "build_task_prompt", lambda t, r: "CTX")
     result = asyncio.run(agent._run_task_async(_task(), []))
     assert result.success is False
     assert r.calls == MAX_AGENT_STEPS  # bounded; no infinite spin

@@ -99,6 +99,21 @@ class Provider(ABC):
     ) -> LLMResponse:
         pass
 
+    def cache_fingerprint(self) -> str:
+        """Provider-specific options that change the model's output and therefore must
+        be part of the LLM cache key. Empty for providers whose output depends only on
+        ``(model, messages, temperature, json_mode)``; overridden where a runtime knob
+        (e.g. Ollama's ``num_ctx`` / base URL) silently alters results for an identical
+        prompt."""
+        return ""
+
+    def is_local_cost_free(self) -> bool:
+        """True for on-device providers that incur no per-token cost (Ollama). Lets the
+        telemetry tracker zero local usage by PROVIDER rather than by model-id matching —
+        local model tags are open-ended (``qwen2.5-coder:7b``) and may collide with priced
+        entries. Mirrors the provider-based zeroing in ``telemetry/cost.py``."""
+        return False
+
 
 def validate_model_provider(provider_name: str) -> str:
     normalized = provider_name.strip().lower()
@@ -357,6 +372,40 @@ class OllamaProvider(Provider):
         self.base_url = base_url or self._resolve_base_url()
         self.project_root = project_root
         self.num_ctx = num_ctx if num_ctx is not None else self._resolve_num_ctx()
+        self.timeout = self._resolve_timeout()
+
+    # Local generation latency is unbounded (cold loads, CPU-only hosts, large
+    # ``num_ctx``) and is not a network failure, so Ollama gets a generous default
+    # and an explicit override rather than the cloud providers' fixed 180s.
+    DEFAULT_TIMEOUT = 600.0
+
+    @staticmethod
+    def _resolve_timeout() -> float | None:
+        """Read timeout from ``OLLAMA_TIMEOUT`` seconds (positive float). ``0``/``none``/
+        ``off`` disables it entirely for very slow local models; unset/invalid falls back
+        to :data:`DEFAULT_TIMEOUT`."""
+        raw = os.environ.get("OLLAMA_TIMEOUT")
+        if raw is None:
+            return OllamaProvider.DEFAULT_TIMEOUT
+        raw = raw.strip().lower()
+        if raw in {"0", "none", "off", ""}:
+            return None
+        try:
+            value = float(raw)
+        except ValueError:
+            return OllamaProvider.DEFAULT_TIMEOUT
+        return value if value > 0 else None
+
+    def cache_fingerprint(self) -> str:
+        # num_ctx and the target server change the response for an identical prompt (a
+        # larger window avoids the truncation a smaller one silently applies; a different
+        # endpoint is a different model server), so both must invalidate the cache. Key on
+        # the *normalized* /api/chat endpoint, not the raw base_url, so equivalent configs
+        # (OLLAMA_HOST vs OLLAMA_BASE_URL, with/without a trailing /v1) collapse to one key.
+        return f"ollama:num_ctx={self.num_ctx};endpoint={self._chat_endpoint()}"
+
+    def is_local_cost_free(self) -> bool:
+        return True
 
     @staticmethod
     def _resolve_base_url() -> str:
@@ -431,7 +480,7 @@ class OllamaProvider(Provider):
             if msgs[-1]["role"] == "user":
                 msgs[-1]["content"] += "\n\nOutput must be a valid JSON object."
 
-        async with httpx.AsyncClient(timeout=180.0) as client:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(
                 self._chat_endpoint(),
                 headers=headers,

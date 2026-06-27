@@ -1,5 +1,6 @@
 import ast
 import json
+import logging
 import re
 from pathlib import Path
 from typing import List
@@ -7,6 +8,8 @@ from typing import List
 from devcouncil.domain.requirement import Requirement
 from devcouncil.domain.task import Task
 from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
+
+logger = logging.getLogger(__name__)
 
 # Context budget for injected file bodies. Skills are bounded separately; these keep
 # a task that touches many/large files from blowing up the prompt. Lowest-priority
@@ -18,6 +21,48 @@ MAX_SYMBOLS_PER_FILE = 40
 # is always kept; optional context sections are fitted in priority order and the
 # lowest-priority ones are dropped (with a marker) if the whole prompt would exceed this.
 MAX_PROMPT_CHARS = 60_000
+
+# Rough chars-per-token for English/code; deliberately conservative so the derived
+# budget under-fills the window rather than over-fills it.
+_CHARS_PER_TOKEN = 4
+# Tokens reserved inside the model's context window for the model's own completion plus
+# the schema/JSON instructions the router appends to each call.
+_RESERVED_COMPLETION_TOKENS = 1536
+# Never shrink the budget below this; a window this small can't run the council anyway,
+# and clamping here keeps the core prompt intact instead of pathologically truncating.
+_MIN_PROMPT_CHARS = 8_000
+
+
+def _local_context_window_budget(project_root: Path) -> int | None:
+    """Char budget derived from a constrained local context window, or ``None``.
+
+    When the run targets the local Ollama provider with an explicit ``OLLAMA_NUM_CTX``,
+    the server silently truncates anything past that window — so a char-only budget that
+    ignores it lets the carefully-assembled prompt get cut off mid-stream. Returns a char
+    budget that fits the window (minus completion headroom) so :meth:`build_task_prompt`
+    can cap itself. Returns ``None`` for cloud providers / unset windows, leaving the
+    default behavior (and the large cloud CLIs' big windows) untouched. Best-effort:
+    any error degrades to ``None``."""
+    try:
+        from devcouncil.app.config import load_config
+
+        provider = load_config(project_root).models.provider.strip().lower()
+        if provider not in {"ollama", "ollama-local", "ollama_local"}:
+            return None
+    except Exception:
+        return None
+
+    from devcouncil.llm.provider import OllamaProvider
+
+    num_ctx = OllamaProvider._resolve_num_ctx()
+    if not num_ctx:
+        # No explicit window: Ollama uses a small default, but DevCouncil cannot know it.
+        # `dev doctor` already warns to set OLLAMA_NUM_CTX; don't guess a cap here.
+        return None
+    usable_tokens = num_ctx - _RESERVED_COMPLETION_TOKENS
+    if usable_tokens <= 0:
+        return _MIN_PROMPT_CHARS
+    return max(_MIN_PROMPT_CHARS, usable_tokens * _CHARS_PER_TOKEN)
 
 _LANG_BY_EXT = {
     ".py": "python", ".js": "javascript", ".jsx": "jsx", ".ts": "typescript",
@@ -500,8 +545,17 @@ class PromptBuilder:
         return body
 
     def build_task_prompt(
-        self, task: Task, requirements: List[Requirement], *, max_chars: int = MAX_PROMPT_CHARS
+        self, task: Task, requirements: List[Requirement], *, max_chars: int | None = None
     ) -> str:
+        if max_chars is None:
+            max_chars = MAX_PROMPT_CHARS
+        # When the run targets a constrained local window (Ollama + OLLAMA_NUM_CTX),
+        # cap the budget so the server doesn't silently truncate past the window. Never
+        # raises the budget above the caller's value — only lowers it to fit.
+        window_budget = _local_context_window_budget(self.project_root)
+        if window_budget is not None:
+            max_chars = min(max_chars, window_budget)
+
         req_map = {r.id: r for r in requirements}
         task_reqs = [req_map[rid] for rid in task.requirement_ids if rid in req_map]
 
@@ -602,5 +656,16 @@ class PromptBuilder:
         if dependency_risks_text:
             segments.append({"order": 6, "priority": 5, "name": "dependency risks", "text": dependency_risks_text})
 
-        optional = self._fit_segments(segments, max_chars - len(core) - len(instructions))
+        # The core + instructions are never dropped; if they alone exceed the budget the
+        # model's server will truncate them, so warn loudly instead of failing silently.
+        core_len = len(core) + len(instructions)
+        if core_len > max_chars:
+            logger.warning(
+                "Task %s core prompt (%d chars) exceeds the context budget (%d chars). "
+                "On a local model with a small OLLAMA_NUM_CTX this will be truncated server-side; "
+                "raise OLLAMA_NUM_CTX or split the task.",
+                task.id, core_len, max_chars,
+            )
+
+        optional = self._fit_segments(segments, max_chars - core_len)
         return core + optional + instructions

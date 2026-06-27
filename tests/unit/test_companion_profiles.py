@@ -29,11 +29,31 @@ def test_no_profile_reproduces_baseline(tmp_path):
     assert executor._apply_profile_args(["claude", "-p"]) == ["claude", "-p"]
 
 
-def test_extra_args_are_appended(tmp_path):
+def test_extra_args_appear_in_stdin_invocation(tmp_path):
+    # extra_args are placed by _invocation (not _command), so the prompt flag of an
+    # argument-mode CLI can't be split from its value. For a stdin CLI they land at the tail.
+    from pathlib import Path as _Path
+
     profile = CliAgentProfileConfig(extra_args=["--max-turns", "5"])
     executor = _executor(tmp_path, "claude", profile)
-    command = executor._command()
-    assert command[-2:] == ["--max-turns", "5"]
+    invocation, stdin = executor._invocation(executor._command(), "PROMPT", _Path("instr.md"))
+    assert "--max-turns" in invocation and "5" in invocation
+    assert stdin == "PROMPT"  # claude reads the prompt from stdin
+
+
+def test_extra_args_precede_trailing_prompt_flag(tmp_path):
+    # The bug this guards: for an argument-mode CLI whose last base token IS the prompt
+    # flag (e.g. warp --prompt / aider --message), extra_args must go BEFORE that flag so
+    # it still binds to the prompt — not between the flag and its value.
+    import dataclasses
+    from pathlib import Path as _Path
+
+    profile = CliAgentProfileConfig(extra_args=["--max-turns", "5"])
+    executor = _executor(tmp_path, "claude", profile)
+    executor.spec = dataclasses.replace(executor.spec, input_mode="argument", prompt_arg=None)
+    invocation, stdin = executor._invocation(["tool", "--prompt"], "PROMPT", _Path("instr.md"))
+    assert invocation == ["tool", "--max-turns", "5", "--prompt", "PROMPT"]
+    assert stdin is None
 
 
 def test_model_override_replaces_existing_flag(tmp_path):

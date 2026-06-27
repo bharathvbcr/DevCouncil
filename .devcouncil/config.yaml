@@ -1,18 +1,26 @@
 models:
-  provider: openrouter
+  provider: ollama
   roles:
     arbiter:
-      model: openai/gpt-4o
+      model: hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0
     critic_a:
-      model: openai/gpt-4o
+      model: hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0
     critic_b:
-      model: anthropic/claude-opus-4.8
+      model: hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0
+    implementation_reviewer:
+      model: hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0
+    live_reviewer:
+      model: hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0
+    native_agent:
+      model: hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0
     planner_a:
-      model: anthropic/claude-sonnet-4.6
+      model: hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0
     planner_b:
-      model: google/gemini-3.1-pro-preview
+      model: hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0
+    prompt_enhancer:
+      model: hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0
     spec_writer:
-      model: anthropic/claude-sonnet-4.6
+      model: hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0
 project:
   default_branch: main
   name: DevCouncil

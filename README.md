@@ -80,6 +80,19 @@ dev verify TASK-001
 
 On a fresh interactive setup, DevCouncil can configure supported coding CLI integrations immediately; pass `--skip-integrations` if you want to defer that step.
 
+### Run locally on macOS (Apple Silicon + Ollama)
+
+DevCouncil runs fully offline against [Ollama](https://ollama.com) — no API key, no per-token cost. It is Apple-Silicon-aware: `dev setup --provider ollama` sizes the default local model to your Mac's unified memory, and `dev doctor` reports the chip/RAM, pings the Ollama server, and flags a too-small context window.
+
+```bash
+brew install ollama && ollama serve
+ollama pull qwen2.5-coder:32b     # use the size `dev doctor` recommends for your RAM
+export OLLAMA_NUM_CTX=16384       # large planning prompts need a raised context window
+dev setup --provider ollama      # auto-selects the model for your RAM
+```
+
+See [Model routing → macOS / Apple Silicon](docs/model-routing.md) for the RAM-to-model table.
+
 Paste only the output from `dev prompt TASK-001` into Codex, Gemini, Claude Code, OpenCode, Antigravity, Warp, Cursor, Aider, or another coding tool. Keep `dev setup`, `dev plan`, `dev run`, and `dev verify` in the terminal at the repository root.
 
 For an automated end-to-end run with a supported coding CLI installed:

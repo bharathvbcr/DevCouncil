@@ -23,14 +23,20 @@ class TelemetryTracker:
         with open(self.log_file, "w") as f:
             json.dump(self.stats, f, indent=2)
 
-    def log_usage(self, model: str, usage: Dict[str, int]):
+    def log_usage(self, model: str, usage: Dict[str, int], *, local: bool = False):
         prompt_tokens = usage.get("prompt_tokens", 0)
         completion_tokens = usage.get("completion_tokens", 0)
 
-        rates = pricing_for_model(model)
-        cost = (prompt_tokens / 1000.0) * rates["prompt_per_1k"] + (
-            completion_tokens / 1000.0
-        ) * rates["completion_per_1k"]
+        if local:
+            # On-device providers (Ollama) incur no per-token cost. Zero by provider, not
+            # by model-id matching — consistent with telemetry/cost.py — so a local tag
+            # that happens to collide with a priced entry is never billed.
+            cost = 0.0
+        else:
+            rates = pricing_for_model(model)
+            cost = (prompt_tokens / 1000.0) * rates["prompt_per_1k"] + (
+                completion_tokens / 1000.0
+            ) * rates["completion_per_1k"]
 
         self.stats["total_cost"] += cost
         self.stats["total_prompt_tokens"] += prompt_tokens

@@ -740,7 +740,7 @@ def _configure_native_hooks(project_root: Path, tool: str = "all", apply: bool =
     if not apply:
         console.print("[bold]Native hook config preview[/bold]")
         for client, path in _preview_hook_paths(project_root, tool):
-            console.print(f"{client}: {path}")
+            console.print(f"{client}: {path}", soft_wrap=True)
         console.print("[yellow]Preview only. Rerun with --apply to write hook config files.[/yellow]")
         return
 

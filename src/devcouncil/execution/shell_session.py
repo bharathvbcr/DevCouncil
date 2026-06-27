@@ -14,7 +14,7 @@ from rich.console import Console
 from devcouncil.domain.evidence import CommandResult
 from devcouncil.domain.task import Task
 from devcouncil.execution.checkpoints import CheckpointService
-from devcouncil.execution.policy_engine import TaskPolicyEngine
+from devcouncil.execution.hook_policy import HookPolicy
 from devcouncil.storage.db import get_db
 from devcouncil.storage.native import ShellCommandRepository, ShellSessionRepository, TaskLeaseRepository
 from devcouncil.storage.repositories import EvidenceRepository, TaskRepository
@@ -82,7 +82,13 @@ class GuardedShellSession:
         self.project_root = project_root.resolve()
         self.task = task
         self.shell = shell
-        self.policy = TaskPolicyEngine(self.project_root)
+        # HookPolicy (not the bare TaskPolicyEngine) so a chained command is split into
+        # its segments and EACH is allowlisted, plus git-safety denies (force-push,
+        # --no-verify, protected-branch reset). Critical for the `--shell bash/zsh`
+        # backend, which hands the whole string to a real shell that interprets
+        # `;`/`&&`/`|` — a single whole-string allowlist match would let an allowed
+        # prefix smuggle an arbitrary command past the gate.
+        self.policy = HookPolicy(self.project_root)
         self.backend: ShellBackend = (
             CommandLoopBackend() if shell in {"auto", "loop"} else ShellWrappedBackend(shell)
         )

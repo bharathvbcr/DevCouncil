@@ -773,6 +773,10 @@ class Verifier:
         evidence_results: List[CommandResult] = []
         genuine_failure = False  # a command that actually ran and failed (real defect signal)
         had_unrunnable = False   # a command that could not run (missing tool / missing tests)
+        # Genuine test failures demoted to non-blocking only because a compiler is active.
+        # That demotion is legitimate ONLY if the compiler actually produces per-criterion
+        # checks to take authority; re-promoted below if it produces none.
+        demoted_failures: List[Gap] = []
         for cmd_type, cmds in self._commands_for_task(task).items():
             for cmd in cmds:
                 applicable, skip_reason = self._command_applicable(cmd)
@@ -843,7 +847,7 @@ class Verifier:
                         if blocking:
                             genuine_failure = True
                         fail_file, fail_line = self._failure_location(result)
-                        gaps.append(Gap(
+                        gap = Gap(
                             id=self._next_gap_id(task.id, cmd_type.upper()),
                             severity="high" if blocking else "medium",
                             gap_type="quality_gate_failed" if is_quality_gate else "test_failed",
@@ -861,7 +865,12 @@ class Verifier:
                             line=fail_line,
                             stdout_path=result.stdout_path or None,
                             stderr_path=result.stderr_path or None,
-                        ))
+                        )
+                        gaps.append(gap)
+                        # A real test failure demoted only because the compiler is active:
+                        # remember it so we can re-promote if the compiler yields no checks.
+                        if compiler_active and not is_quality_gate and not blocking:
+                            demoted_failures.append(gap)
 
         # 4b. Compiled acceptance checks — precise, DevCouncil-owned per-criterion
         # evidence. Derive one runnable check per acceptance criterion from the
@@ -918,8 +927,34 @@ class Verifier:
                             ))
                 compiled_pass[ac_id] = ac_ok
 
+        # The compiler only earns the authority to demote a genuinely-failing planner
+        # test if it produced a per-criterion check for EVERY targeted AC. A partial
+        # compile is not enough: the uncovered ACs fall back to the coarse signal, so a
+        # demoted real failure + coarse-proven remainder would otherwise slip past the
+        # gate. If coverage is incomplete (or zero — empty compile / all-wrong-stack /
+        # a compile exception swallowed to {}), re-promote the demoted failures.
+        compiler_covered_all = bool(task.acceptance_criterion_ids) and all(
+            compiled_cmds_by_ac.get(ac_id) for ac_id in task.acceptance_criterion_ids
+        )
+        if compiler_active and not compiler_covered_all and demoted_failures:
+            for gap in demoted_failures:
+                gap.blocking = True
+                gap.severity = "high"
+                genuine_failure = True
+                logger.info(
+                    "Re-promoted demoted test failure %s to blocking: acceptance compiler "
+                    "did not produce a check for every criterion of task %s.",
+                    gap.id, task.id,
+                )
+
         # 5. Acceptance-criteria evidence mapping (precise, per criterion).
-        successful_commands = [result for result in evidence_results if result.exit_code == 0]
+        # Quality-only commands (lint/typecheck) are excluded: a passing `mypy`/`ruff
+        # check`/`tsc` exercises no behavior, so it must not coarse-prove a behavioral AC
+        # — the same false-confidence the per-criterion checks exist to prevent.
+        successful_commands = [
+            result for result in evidence_results
+            if result.exit_code == 0 and not self._is_quality_only_command(result.command)
+        ]
         # Coarse fallback (used only when no compiled per-criterion check exists for an
         # AC): a criterion may be marked proven by a passing acceptance-capable command
         # ONLY when the task actually produced work. Without this guard a no-op run
@@ -929,22 +964,59 @@ class Verifier:
         if task.acceptance_criterion_ids:
             req_by_ac = {ac.id: req.id for req in requirements for ac in req.acceptance_criteria}
             unproven_acs: List[str] = []
+            coarse_proven_acs: List[str] = []
             for ac_id in task.acceptance_criterion_ids:
                 # An AC is proven if its compiled check passed; if no compiled check
                 # exists for it, fall back to the coarse signal (any expected_test passed).
                 proven = compiled_pass.get(ac_id)
+                coarse = False
                 if proven is None:
                     proven = coarse_proof_available
+                    coarse = proven  # proven only by the coarse, not-AC-specific signal
                 if proven:
-                    evidence_to_save.append(TestEvidence(
-                        requirement_id=req_by_ac.get(ac_id, task.requirement_ids[0] if task.requirement_ids else ""),
-                        acceptance_criterion_id=ac_id,
-                        command="(devcouncil acceptance check)",
-                        status="passed",
-                        evidence_summary="Acceptance criterion proven by an executed verification check.",
-                    ))
+                    if coarse:
+                        coarse_proven_acs.append(ac_id)
+                    # Don't persist a "passed" record for a coarse-proven criterion during a
+                    # run that also has a genuine blocking failure — the gate already fails,
+                    # and a stored "passed" would mislead audits that read evidence directly.
+                    if not (coarse and genuine_failure):
+                        evidence_to_save.append(TestEvidence(
+                            requirement_id=req_by_ac.get(ac_id, task.requirement_ids[0] if task.requirement_ids else ""),
+                            acceptance_criterion_id=ac_id,
+                            command="(devcouncil acceptance check)",
+                            status="passed",
+                            evidence_summary=(
+                                "Acceptance criterion proven only by a COARSE signal (a passing "
+                                "acceptance-capable command, not a per-criterion check); behavior "
+                                "not precisely verified."
+                                if coarse else
+                                "Acceptance criterion proven by a per-criterion compiled check."
+                            ),
+                        ))
                 else:
                     unproven_acs.append(ac_id)
+            # Surface coarse proof as a first-class advisory: these criteria passed only
+            # because some acceptance-capable command exited 0, not because a check tied
+            # to the criterion passed. Non-blocking, but no longer invisible.
+            if coarse_proven_acs:
+                gaps.append(Gap(
+                    id=self._next_gap_id(task.id, "COARSE"),
+                    severity="low",
+                    gap_type="coarse_acceptance_proof",
+                    task_id=task.id,
+                    description=(
+                        "Verification mode = COARSE for "
+                        f"{', '.join(coarse_proven_acs)}: proven by a passing acceptance-capable "
+                        "command, not a per-criterion check. Behavior is not precisely verified."
+                    ),
+                    evidence=[f"coarse-proven: {', '.join(coarse_proven_acs)}"],
+                    recommended_fix=(
+                        "Add a verification command (or test) that exercises each listed criterion "
+                        "specifically, so DevCouncil can compile a per-criterion check instead of "
+                        "relying on the coarse fallback."
+                    ),
+                    blocking=False,
+                ))
             if unproven_acs:
                 # Block only on positive evidence of a problem. If verification was
                 # attempted but every failure was unrunnable (missing tooling / tests)

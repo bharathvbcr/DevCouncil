@@ -105,9 +105,10 @@ class CodingCliExecutor(Executor):
         result = list(command)
         result = self._apply_permission_mode(result)
         result = self._apply_model_override(result)
-        extra_args = list(self.profile.extra_args or [])
-        if extra_args:
-            result = [*result, *extra_args]
+        # NOTE: extra_args are NOT appended here. For argument/prompt-file CLIs the prompt
+        # (and sometimes its flag, e.g. warp --prompt / aider --message) is appended last
+        # by _invocation; appending extra_args at the tail here would slot them between the
+        # prompt flag and its value. _invocation places them correctly instead.
         return result
 
     def _apply_model_override(self, command: list[str]) -> list[str]:
@@ -385,7 +386,10 @@ class CodingCliExecutor(Executor):
         """
         if not invocation or os.name != "nt":
             return invocation
-        resolved = shutil.which(invocation[0])
+        # Resolve against the PATH the child will actually run with (which includes any
+        # per-agent env overrides), not the parent process PATH — otherwise shim
+        # detection and execution can disagree on which executable runs.
+        resolved = shutil.which(invocation[0], path=env.get("PATH"))
         if resolved and resolved.lower().endswith((".cmd", ".bat")):
             comspec = os.environ.get("COMSPEC", "cmd.exe")
             return [comspec, "/c", resolved, *invocation[1:]]
@@ -477,6 +481,18 @@ class CodingCliExecutor(Executor):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     process.kill()
+                    # Reap the killed child so it doesn't linger as a zombie, and close
+                    # stdin so the feeder thread unblocks. Bounded wait — kill() already
+                    # signalled it.
+                    try:
+                        if process.stdin is not None:
+                            process.stdin.close()
+                    except OSError:
+                        pass
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
                     raise subprocess.TimeoutExpired(invocation, timeout)
                 try:
                     line = lines.get(timeout=min(remaining, 1.0))
@@ -568,19 +584,33 @@ class CodingCliExecutor(Executor):
             part.replace("{prompt_file}", str(instruction_file)).replace("{project_root}", str(self.project_root))
             for part in command
         ]
+        extra = list(self.profile.extra_args) if (self.profile and self.profile.extra_args) else []
+
+        def _place(base: list[str]) -> list[str]:
+            """Insert profile extra_args after the base flags but before a trailing prompt
+            flag (the last token of a baked-in prompt-flag CLI like warp ``--prompt`` /
+            aider ``--message``), so that flag still binds to the prompt appended after it."""
+            if extra and base and base[-1].startswith("-"):
+                return [*base[:-1], *extra, base[-1]]
+            return [*base, *extra]
+
         if mode == "stdin":
-            return resolved, prompt
+            return _place(resolved), prompt
         if mode == "argument":
             if any("{prompt}" in part for part in resolved):
-                return [part.replace("{prompt}", prompt) for part in resolved], None
+                return [part.replace("{prompt}", prompt) for part in resolved] + extra, None
             prompt_arg = self.spec.prompt_arg
-            return [*resolved, *(([prompt_arg] if prompt_arg else [])), prompt], None
+            if prompt_arg:
+                return [*resolved, *extra, prompt_arg, prompt], None
+            return [*_place(resolved), prompt], None
         if mode == "prompt-file":
             if "{prompt_file}" in " ".join(command):
-                return resolved, None
+                return resolved + extra, None
             prompt_arg = self.spec.prompt_arg
-            return [*resolved, *(([prompt_arg] if prompt_arg else [])), str(instruction_file)], None
-        return resolved, prompt
+            if prompt_arg:
+                return [*resolved, *extra, prompt_arg, str(instruction_file)], None
+            return [*_place(resolved), str(instruction_file)], None
+        return _place(resolved), prompt
 
     def _display_invocation(self, invocation: list[str], prompt: str) -> list[str]:
         return [part.replace(prompt, "<task prompt>") for part in invocation]

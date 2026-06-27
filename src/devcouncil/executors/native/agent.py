@@ -8,6 +8,7 @@ from devcouncil.execution.executor import Executor, ExecutionResult
 from devcouncil.llm.router import ModelRouter, StructuredOutputError
 from devcouncil.execution.task_runner import TaskRunner
 from devcouncil.execution.context_builder import ContextBuilder
+from devcouncil.execution.prompt_builder import PromptBuilder
 from devcouncil.execution.paths import resolve_project_path
 from devcouncil.app.errors import ExecutionError
 
@@ -31,7 +32,12 @@ class NativeAgent(Executor):
     def __init__(self, router: ModelRouter, task_runner: TaskRunner):
         self.router = router
         self.task_runner = task_runner
+        # ContextBuilder is retained only for the cheap list_files file listing; the
+        # implementation context itself uses the budgeted PromptBuilder so the native
+        # executor gets the same repo-map orientation, symbol outlines, dependents and
+        # context-window budgeting as the CLI executors (rather than a flat JSON dump).
         self.context_builder = ContextBuilder(task_runner.project_root)
+        self.prompt_builder = PromptBuilder(task_runner.project_root)
 
     def run_task(self, task: Task, requirements: List[Requirement]) -> ExecutionResult:
         """Run the preview native executor behind the normal synchronous executor contract."""
@@ -41,8 +47,8 @@ class NativeAgent(Executor):
         console.print(f"Starting [bold]Native Executor[/bold] for task {task.id}...")
         console.print("[yellow]Native executor is preview quality; DevCouncil verification remains the completion gate.[/yellow]")
         
-        # 1. Gather rich context
-        context_json = self.context_builder.build_task_context(task, requirements)
+        # 1. Gather rich context (budgeted; includes repo-map orientation + symbol outlines)
+        context_block = self.prompt_builder.build_task_prompt(task, requirements)
         from devcouncil.planning.correction_manifest import load_latest_correction_manifest
 
         correction = load_latest_correction_manifest(self.task_runner.project_root, task.id)
@@ -53,7 +59,7 @@ class NativeAgent(Executor):
         system_prompt = f"""
 You are the DevCouncil Native Agent. Your goal is to implement the provided task.
 Current Project Context:
-{context_json}
+{context_block}
 {correction_block}
 
 You have access to the following tools:

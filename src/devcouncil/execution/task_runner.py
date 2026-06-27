@@ -1,4 +1,5 @@
 import hashlib
+import os
 import subprocess
 import logging
 import re
@@ -114,7 +115,10 @@ class TaskRunner:
 
         try:
             result = subprocess.run(
-                shlex.split(command, posix=False),
+                # POSIX-correct tokenization on POSIX hosts (so quoted args like
+                # `pytest -k "a and b"` split right and match the allowlist), Windows
+                # rules on Windows. Matches shell_session.py.
+                shlex.split(command, posix=(os.name != "nt")),
                 shell=False,
                 capture_output=True,
                 text=True,

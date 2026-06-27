@@ -21,6 +21,7 @@ class Gap(BaseModel):
         "migration_gap",
         "quality_gate_failed",
         "skipped_verification_command",
+        "coarse_acceptance_proof",
     ]
     requirement_id: Optional[str] = None
     task_id: Optional[str] = None

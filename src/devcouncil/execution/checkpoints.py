@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
+import tempfile
+import uuid
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -132,7 +135,11 @@ class CheckpointService:
         patch_path = self.checkpoint_dir / f"{task_id}-{stage}.patch"
         json_path: str | None = None
 
-        git_ref_created = self._update_ref(ref)
+        # Point the ref at a snapshot of the *working tree* (the task's actual state),
+        # not bare HEAD — otherwise before/after refs both resolve to the same commit and
+        # the git-ref rollback path can never fire. Falls back to HEAD if snapshotting is
+        # impossible (unborn HEAD / not a git repo), preserving the patch-based rollback.
+        git_ref_created = self._update_ref(ref, self._snapshot_commit())
         try:
             diff = Verifier(self.project_root).get_diff()
             if diff:
@@ -160,24 +167,71 @@ class CheckpointService:
             message=f"Checkpoint {stage} created.",
         )
 
-    def _update_ref(self, ref: str) -> bool:
+    def _update_ref(self, ref: str, commit: str | None = None) -> bool:
+        """Point ``ref`` at ``commit`` (a working-tree snapshot) or, if None, at HEAD."""
         try:
-            head = subprocess.check_output(
-                ["git", "rev-parse", "HEAD"],
-                cwd=self.project_root,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            ).strip()
-            if not head:
+            target = commit
+            if target is None:
+                target = subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=self.project_root,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                ).strip()
+            if not target:
                 return False
             subprocess.check_call(
-                ["git", "update-ref", ref, head],
+                ["git", "update-ref", ref, target],
                 cwd=self.project_root,
             )
             return True
         except (subprocess.CalledProcessError, FileNotFoundError):
             return False
+
+    def _snapshot_commit(self) -> str | None:
+        """Create a commit object capturing the FULL working tree (tracked + untracked,
+        honoring .gitignore) WITHOUT touching the user's index or working tree.
+
+        Uses a throwaway ``GIT_INDEX_FILE`` so staging happens in isolation. Returns the
+        commit sha, or None if it can't be built (unborn HEAD, not a git repo) so the
+        caller falls back to a HEAD ref + the patch-based rollback."""
+        # The temp index lives OUTSIDE the repo: if it sat under the working tree (even in
+        # the gitignored .devcouncil/), `git add -A` could stage the index file itself into
+        # the snapshot. ``.devcouncil`` is excluded from staging for the same reason —
+        # DevCouncil's own run state must never be snapshotted or rolled back.
+        index_path = Path(tempfile.gettempdir()) / f"devcouncil-snapshot-index-{uuid.uuid4().hex}"
+        env = {**os.environ, "GIT_INDEX_FILE": str(index_path)}
+        try:
+            # Seed the temp index from HEAD, stage every change (incl. new files), then
+            # write a tree + commit from that isolated index.
+            subprocess.run(
+                ["git", "read-tree", "HEAD"],
+                cwd=self.project_root, env=env, check=True, capture_output=True, text=True,
+            )
+            subprocess.run(
+                ["git", "add", "-A", "--", ".", ":(exclude).devcouncil"],
+                cwd=self.project_root, env=env, check=True, capture_output=True, text=True,
+            )
+            tree = subprocess.check_output(
+                ["git", "write-tree"],
+                cwd=self.project_root, env=env, text=True, encoding="utf-8", errors="replace",
+            ).strip()
+            if not tree:
+                return None
+            commit = subprocess.check_output(
+                ["git", "-c", "user.name=DevCouncil", "-c", "user.email=devcouncil@local",
+                 "commit-tree", tree, "-p", "HEAD", "-m", "devcouncil checkpoint"],
+                cwd=self.project_root, text=True, encoding="utf-8", errors="replace",
+            ).strip()
+            return commit or None
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return None
+        finally:
+            try:
+                index_path.unlink()
+            except OSError:
+                pass
 
     def _ref_exists(self, ref: str) -> bool:
         try:

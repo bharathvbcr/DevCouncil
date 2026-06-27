@@ -6,7 +6,7 @@ import asyncio
 from pathlib import Path
 
 from pydantic import BaseModel
-from devcouncil.llm.provider import Provider
+from devcouncil.llm.provider import Provider, LLMResponse
 from devcouncil.llm.cache import LLMCache
 from devcouncil.telemetry.tracker import TelemetryTracker
 from devcouncil.telemetry.traces import TraceLogger
@@ -96,6 +96,38 @@ class ModelRouter:
                             break
         return text
 
+    async def _complete_with_retry(
+        self,
+        *,
+        model: str,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        run_id: Optional[str],
+        attempts: int = 3,
+    ) -> "LLMResponse":
+        """Provider completion with bounded exponential-backoff retry. Used for BOTH the
+        initial call and the healing call so a transient fault in either is retried (and,
+        if still failing, surfaced to the caller's fallback logic) rather than aborting
+        the run."""
+        for attempt in range(attempts):
+            try:
+                return await self.provider.complete(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    json_mode=True,
+                    run_id=run_id,
+                )
+            except Exception as exc:
+                if attempt == attempts - 1:
+                    raise
+                logger.warning(
+                    "LLM request failed (attempt %d/%d): %s. Retrying...",
+                    attempt + 1, attempts, exc,
+                )
+                await asyncio.sleep(2 ** attempt)
+        raise RuntimeError("unreachable")  # loop either returns or raises
+
     async def complete_structured(
         self,
         role: str,
@@ -136,32 +168,27 @@ class ModelRouter:
         tracker = TelemetryTracker(self.project_root)
         traces = TraceLogger(self.project_root)
 
+        # Provider knobs (e.g. Ollama num_ctx / base_url) that change the output for an
+        # identical prompt must be part of the cache key, else raising OLLAMA_NUM_CTX
+        # after a truncated answer would keep serving the stale response.
+        provider_fp = self.provider.cache_fingerprint()
+        # Zero local (Ollama) usage by provider so telemetry matches the cost ledger.
+        provider_local = self.provider.is_local_cost_free()
+
         # Check cache first
-        response = cache.get(model, msgs, temp, True)
+        response = cache.get(model, msgs, temp, True, provider_fp)
         cache_hit = response is not None
 
         if not response:
-            for attempt in range(3):
-                try:
-                    response = await self.provider.complete(
-                        model=model,
-                        messages=msgs,
-                        temperature=temp,
-                        json_mode=True,
-                        run_id=run_id,
-                    )
-                    break
-                except Exception as e:
-                    if attempt == 2:
-                        raise
-                    logger.warning(f"LLM request failed (attempt {attempt+1}): {e}. Retrying...")
-                    await asyncio.sleep(2 ** attempt)
+            response = await self._complete_with_retry(
+                model=model, messages=msgs, temperature=temp, run_id=run_id
+            )
 
         if response is None:
             raise RuntimeError(f"LLM request for role {role} did not return a response.")
 
         if not cache_hit:
-            tracker.log_usage(model, response.usage)
+            tracker.log_usage(model, response.usage, local=provider_local)
 
         logger.info(
             "LLM response: role=%s model=%s tokens=%s",
@@ -174,7 +201,7 @@ class ModelRouter:
             data = json.loads(content)
             result = schema.model_validate(data)
             if not cache_hit:
-                cache.set(model, msgs, temp, True, response)  # cache only validated output
+                cache.set(model, msgs, temp, True, response, provider_fp)  # cache only validated output
             return result
         except Exception as e:
             logger.warning(f"Initial parse failed for {role}, attempting healing: {e}")
@@ -200,21 +227,24 @@ Content:
 
 Please return the corrected JSON object only. No prose.
 """
-            # We use a lower temperature for healing
-            healed_response = await self.provider.complete(
-                model=model,
-                messages=[{"role": "user", "content": healing_prompt}],
-                temperature=0.0,
-                json_mode=True,
-                run_id=run_id,
-            )
-            tracker.log_usage(healed_response.model, healed_response.usage)
-            
+            # The healing completion runs INSIDE this try (with the same retry/backoff as
+            # the initial call). A transient failure here (429/timeout) must be treated as
+            # "healing failed" so it routes into the fresh-attempt/fallback logic below,
+            # not propagate as a raw provider error that defeats the supplied fallback.
+            healed_response = None
             try:
+                # We use a lower temperature for healing
+                healed_response = await self._complete_with_retry(
+                    model=model,
+                    messages=[{"role": "user", "content": healing_prompt}],
+                    temperature=0.0,
+                    run_id=run_id,
+                )
+                tracker.log_usage(healed_response.model, healed_response.usage, local=provider_local)
                 healed_content = self._extract_json(healed_response.content)
                 data = json.loads(healed_content)
                 result = schema.model_validate(data)
-                cache.set(model, msgs, temp, True, healed_response)
+                cache.set(model, msgs, temp, True, healed_response, provider_fp)
                 return result
             except Exception as final_e:
                 logger.error(f"Healing failed for {role}: {final_e}")
@@ -222,11 +252,11 @@ Please return the corrected JSON object only. No prose.
                     "llm_structured_parse_repair_failed",
                     {
                         "role": role,
-                        "model": healed_response.model,
+                        "model": healed_response.model if healed_response else model,
                         "schema": schema.__name__,
                         "error": str(final_e),
                         "original_content_preview": response.content[:500],
-                        "healed_content_preview": healed_response.content[:500],
+                        "healed_content_preview": healed_response.content[:500] if healed_response else "(healing request failed)",
                     },
                     run_id=run_id,
                     summary=f"Structured response repair failed for {role}.",

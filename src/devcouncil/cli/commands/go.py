@@ -282,6 +282,16 @@ def _squash_repair_commits(root: Path, task_id: str, base: str, status: str) -> 
         )
         if reset.returncode != 0:
             return False
+        # Stage the FINAL (verified) attempt's still-uncommitted changes too, so they land
+        # in this single squash commit. Without this they'd be committed separately by the
+        # caller afterward, producing two commits for what the message calls "one verified
+        # commit" (and leaving the squash to capture only the [blocked] diffs).
+        add = subprocess.run(
+            ["git", "add", "-A"],
+            cwd=root, capture_output=True, text=True,
+        )
+        if add.returncode != 0:
+            return False
         # Re-commit the squashed tree. There may be nothing staged if every attempt's
         # changes cancelled out (unlikely for a verified task) — tolerate that.
         commit = subprocess.run(

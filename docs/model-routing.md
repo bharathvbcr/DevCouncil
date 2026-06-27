@@ -52,3 +52,37 @@ For local Ollama (no API key required):
 ```bash
 dev setup --provider ollama --model qwen2.5-coder:7b
 ```
+
+### macOS / Apple Silicon (local models)
+
+On a Mac the local model has to fit in **unified memory** (shared by CPU, GPU,
+and the OS), so RAM is the practical ceiling on model size. DevCouncil is
+Apple-Silicon-aware here:
+
+- `dev doctor` reports the chip and RAM, pings the local Ollama server, and
+  recommends a model that will fit.
+- `dev setup --provider ollama` (with no `--model`) auto-selects a size for the
+  detected RAM instead of the static 7b default.
+- `scripts/install.sh` prints the same guidance after a macOS install.
+
+Recommended `qwen2.5-coder` size by memory (the council roles emit structured
+JSON, so larger is better when it fits):
+
+| Unified memory | Recommended model      |
+| -------------- | ---------------------- |
+| ≥ 48 GB        | `qwen2.5-coder:32b`    |
+| 24–47 GB       | `qwen2.5-coder:14b`    |
+| < 24 GB        | `qwen2.5-coder:7b`     |
+
+Typical first-run on Apple Silicon:
+
+```bash
+brew install ollama && ollama serve      # if not already running
+ollama pull qwen2.5-coder:32b            # use the size dev doctor recommends
+export OLLAMA_NUM_CTX=16384              # avoid truncating large planning prompts
+dev setup --provider ollama             # auto-picks the model for your RAM
+dev doctor                              # confirm server + context window
+```
+
+Ollama itself handles Metal GPU acceleration on Apple Silicon — no DevCouncil
+configuration is required for it.

@@ -19,6 +19,67 @@ from devcouncil.llm.provider import SUPPORTED_MODEL_PROVIDERS, validate_model_pr
 app = typer.Typer()
 console = Console()
 
+
+def _probe_ollama(base_url: str) -> tuple[bool, str]:
+    """Best-effort reachability check for a local Ollama server.
+
+    ``base_url`` carries the OpenAI-compatible ``/v1`` suffix; the native
+    ``/api/version`` endpoint lives one level up. Returns (reachable, detail);
+    any failure is reported, never raised.
+    """
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[: -len("/v1")].rstrip("/")
+    try:
+        import httpx
+
+        resp = httpx.get(f"{root}/api/version", timeout=3.0)
+        if resp.status_code < 400:
+            version = ""
+            try:
+                version = (resp.json() or {}).get("version", "")
+            except Exception:
+                version = ""
+            return True, f"Reachable at {root}" + (f" (v{version})." if version else ".")
+        return False, f"Server at {root} returned HTTP {resp.status_code}."
+    except Exception:
+        return False, f"No Ollama server reachable at {root}."
+
+
+def _probe_ollama_models(base_url: str) -> tuple[bool, set[str]]:
+    """Best-effort list of locally-pulled Ollama model tags via native ``/api/tags``.
+
+    Returns (queried_ok, names). ``names`` holds the reported tags (e.g.
+    ``qwen2.5-coder:7b``). Any failure returns (False, set()) and is never raised — a
+    green liveness probe with no pulled model is the most common "configured but doesn't
+    work" trap, so this turns it into an actionable row."""
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[: -len("/v1")].rstrip("/")
+    try:
+        import httpx
+
+        resp = httpx.get(f"{root}/api/tags", timeout=3.0)
+        if resp.status_code >= 400:
+            return False, set()
+        models = (resp.json() or {}).get("models", []) or []
+        names = {str(m.get("name", "")).strip() for m in models if m.get("name")}
+        return True, {n for n in names if n}
+    except Exception:
+        return False, set()
+
+
+def _ollama_model_present(model: str, pulled: set[str]) -> bool:
+    """Whether ``model`` is among the pulled tags, tolerant of the implicit ``:latest``
+    tag Ollama adds to untagged models."""
+    if model in pulled:
+        return True
+    base = model.split(":", 1)[0]
+    # configured "qwen2.5-coder" matches a pulled "qwen2.5-coder:latest", and vice versa.
+    candidates = {model, f"{model}:latest", base, f"{base}:latest"}
+    return any(tag in candidates or tag.split(":", 1)[0] == base and ":" not in model for tag in pulled)
+
+
 def render_doctor_check(project_root: Path = Path(".")):
     def _command_version(command: list[str]) -> str | None:
         executable = shutil.which(command[0])
@@ -140,6 +201,59 @@ def render_doctor_check(project_root: Path = Path(".")):
             "[green]OK[/green]",
             f"Local provider; no API key required (server: {base_url}).",
         )
+
+        # Is the local Ollama server actually up? A native /api/version probe is
+        # cheap and turns the most common failure ("provider configured but
+        # `ollama serve` not running") into an actionable row instead of a
+        # connection traceback on the first model call.
+        reachable, detail = _probe_ollama(base_url)
+        if reachable:
+            table.add_row("OLLAMA server", "[green]OK[/green]", detail)
+        else:
+            table.add_row(
+                "OLLAMA server",
+                "[yellow]WARN[/yellow]",
+                f"{detail} Start it with 'ollama serve' (or 'brew services start ollama').",
+            )
+
+        # A reachable server with the configured model NOT pulled is the most common
+        # "all-green doctor, 404 on first call" trap. Verify the role models exist locally.
+        if reachable:
+            try:
+                configured_models = sorted(
+                    {role.model for role in load_config(project_root).models.roles.values() if role.model}
+                )
+            except Exception:
+                configured_models = []
+            queried_ok, pulled = _probe_ollama_models(base_url)
+            if not queried_ok:
+                table.add_row(
+                    "OLLAMA models",
+                    "[yellow]WARN[/yellow]",
+                    "Could not list pulled models (/api/tags). Ensure each configured model is pulled.",
+                )
+            elif not configured_models:
+                table.add_row(
+                    "OLLAMA models",
+                    "[yellow]WARN[/yellow]",
+                    "No role models configured; run 'dev setup --provider ollama --model <model>'.",
+                )
+            else:
+                missing = [m for m in configured_models if not _ollama_model_present(m, pulled)]
+                if missing:
+                    pulls = "; ".join(f"ollama pull {m}" for m in missing)
+                    table.add_row(
+                        "OLLAMA models",
+                        "[yellow]WARN[/yellow]",
+                        f"Configured model(s) not pulled: {', '.join(missing)}. Pull first: {pulls}.",
+                    )
+                else:
+                    table.add_row(
+                        "OLLAMA models",
+                        "[green]OK[/green]",
+                        f"All configured models present locally ({', '.join(configured_models)}).",
+                    )
+
         if num_ctx is None:
             table.add_row(
                 "OLLAMA num_ctx",
@@ -156,6 +270,21 @@ def render_doctor_check(project_root: Path = Path(".")):
             )
         else:
             table.add_row("OLLAMA num_ctx", "[green]OK[/green]", f"context window = {num_ctx} tokens.")
+
+        # Local model size is bounded by host memory — unified RAM on Apple Silicon,
+        # VRAM on a discrete-GPU box, system RAM otherwise. Surface a model that will
+        # actually fit on this host (any OS), not a one-size default.
+        from devcouncil import hardware
+
+        host = hardware.describe_host()
+        table.add_row(
+            host.platform_label,
+            "[green]OK[/green]",
+            f"{host.chip_label}, {host.memory_label}. "
+            f"Recommended local model: {host.recommended_ollama_model} "
+            f"(dev setup --provider ollama --model {host.recommended_ollama_model}).",
+        )
+
         console.print(table)
         return
     env_var = provider_api_key_env_var(provider)

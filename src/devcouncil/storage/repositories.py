@@ -446,8 +446,40 @@ class StateRepository:
     def record_phase(self, phase: str):
         current = self.get_state()
         history = []
+        prev = None
         if current:
             history = json.loads(current.history_json)
-        if not history or history[-1] != phase:
-            history.append(phase)
+            prev = current.current_phase
+        # Keep the persisted history a LEGAL transition sequence. A repair re-run records
+        # TASK_EXECUTING straight after a terminal TASK_BLOCKED/TASK_VERIFIED, which is not
+        # a direct transition; bridge it through the intermediate phase (TASK_READY) so the
+        # state machine's invariant holds on reload. Fail-soft: an unbridgeable jump is
+        # still recorded verbatim rather than lost.
+        for step in self._bridge_phases(prev, phase):
+            if not history or history[-1] != step:
+                history.append(step)
         self.save_state(phase, history)
+
+    @staticmethod
+    def _bridge_phases(prev: Optional[str], target: str) -> List[str]:
+        """Return the phases to append so prev -> ... -> target is a legal path.
+
+        Inserts a single intermediate phase when prev cannot transition directly to
+        target but a one-hop bridge exists (the repair loop's
+        TASK_BLOCKED/TASK_VERIFIED -> TASK_READY -> TASK_EXECUTING). Returns ``[target]``
+        when prev is unknown, equal, already-legal, or no one-hop bridge exists."""
+        if prev is None or prev == target:
+            return [target]
+        try:
+            from devcouncil.app.state_machine import TRANSITIONS, ProjectPhase
+
+            prev_phase = ProjectPhase(prev)
+            target_phase = ProjectPhase(target)
+        except (ImportError, ValueError):
+            return [target]
+        if target_phase in TRANSITIONS.get(prev_phase, set()):
+            return [target]
+        for mid in TRANSITIONS.get(prev_phase, set()):
+            if target_phase in TRANSITIONS.get(mid, set()):
+                return [mid.value, target]
+        return [target]
