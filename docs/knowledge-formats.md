@@ -22,10 +22,12 @@ Both ride on one shared markdown+frontmatter implementation
 | **Export** | DevCouncil's Requirement→Task→Evidence→Gap graph → a portable OKF bundle | `dev okf export` |
 | **Ingest** | An external OKF bundle → durable planning/coding context | `dev okf ingest <dir>` |
 | **Validate** | Check a bundle's OKF invariants | `dev okf validate <dir>` |
+| **Browse** | Render an OKF bundle as a self-contained, browsable static HTML site | `dev okf html <dir>` |
 | **Context** | Ingested OKF + the project `design.md` are injected into planning/council prompts and the `dev prompt` text pasted into coding CLIs | _(automatic)_ |
 | **Skills → OKF** | Each engineering skill is also emitted into the bundle as a typed OKF document | `dev okf export --skills` |
 | **OKF → Skills** | Ingested OKF documents typed `Engineering Skill` become selectable skills | `dev okf ingest <dir>` |
 | **Lint/Export** | Validate a design system and convert its tokens | `dev design lint` / `dev design export` |
+| **Design check** | Fail on hardcoded color/spacing/typography literals that bypass the design.md tokens | `dev design check [files...]` |
 
 ## Export your artifact graph as OKF
 
@@ -39,6 +41,19 @@ where each document carries OKF frontmatter and the relationships between them a
 markdown links (so the "linked graph" property holds and any OKF-aware tool, including the
 upstream OKF HTML visualizer, can consume it). `dev okf validate` confirms every document
 is typed and every intra-bundle link resolves.
+
+## Browse a bundle as HTML
+
+```bash
+dev okf html ./okf_bundle -o ./okf_site
+```
+
+`dev okf html` renders an OKF bundle into a self-contained static HTML site — an `index.html`
+that groups documents by `type`, plus one page per document, with the bundle's markdown
+cross-links rewritten into working in-site hyperlinks. The output is plain files with no
+server or external assets, so you can open `index.html` directly or publish the directory as
+is. This mirrors the upstream OKF HTML visualizer, giving the same browsable view of any
+bundle that `dev okf export` (or an external producer) emits.
 
 ## Ingest knowledge as context
 
@@ -124,6 +139,21 @@ on every task), so the agent uses your tokens and components instead of inventin
 styles. `dev design lint` mirrors a high-value subset of the upstream `@google/design.md`
 rules: broken token references, missing primary color, WCAG text/background contrast,
 orphaned tokens, and canonical section ordering.
+
+## Check code against the design system
+
+```bash
+dev design check                      # scan the project for token-bypassing literals
+dev design check src/ui/Button.tsx    # scan specific files
+```
+
+`dev design check` scans source files for hardcoded color, spacing, and typography literals
+(hex/`rgb()` colors, raw pixel sizes, inline font families) that bypass the `design.md`
+tokens — the values an AI-generated UI should be pulling from the design system instead of
+inventing. Each violation is reported with its file, line, and the offending literal, and the
+command **exits non-zero** when any are found, so it drops straight into CI or a pre-commit
+hook. This is how DevCouncil lets AI-generated UI work *prove* it honored the design system
+rather than asserting it did.
 
 ## Configuration
 

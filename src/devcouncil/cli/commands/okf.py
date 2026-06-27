@@ -217,3 +217,29 @@ def validate(
     for p in problems:
         console.print(f"  - {p}")
     raise typer.Exit(code=1)
+
+
+@app.command("html")
+def html(
+    bundle: Path = typer.Argument(..., help="Path to an OKF bundle directory to render."),
+    output: Path = typer.Option(Path("okf_site"), "--output", "-o", help="Directory to write the static HTML site into."),
+):
+    """Render an OKF bundle as a browsable, self-contained static HTML site."""
+    src = bundle.expanduser().resolve()
+    if not src.is_dir():
+        console.print(f"[red]Not a directory:[/red] {src}")
+        raise typer.Exit(code=1)
+
+    parsed = read_bundle(src)
+    if not parsed.documents:
+        console.print(f"[yellow]No OKF documents (*.md) found in[/yellow] {src}")
+        raise typer.Exit(code=1)
+
+    from devcouncil.reporting.okf_html import write_bundle_html
+
+    out_dir = output.expanduser().resolve()
+    written = write_bundle_html(parsed, out_dir)
+    console.print(
+        f"[green]Rendered {len(written)} page(s) to[/green] {out_dir} "
+        f"([cyan]{out_dir / 'index.html'}[/cyan])."
+    )
