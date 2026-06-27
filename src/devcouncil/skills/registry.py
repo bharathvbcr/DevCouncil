@@ -102,8 +102,7 @@ class Skill(BaseModel):
 _split_frontmatter = split_frontmatter
 
 
-def _skill_from_file(path: Path) -> Skill:
-    meta, body = _split_frontmatter(path.read_text(encoding="utf-8"))
+def _skill_from_meta(path: Path, meta: dict, body: str) -> Skill:
     triggers = meta.get("triggers") or {}
     return Skill(
         name=str(meta.get("name") or path.stem),
@@ -124,13 +123,19 @@ def _skill_from_file(path: Path) -> Skill:
 REPO_SKILL_DIRS = (".claude/skills", ".devcouncil/skills")
 
 
-def _is_skill_file(path: Path) -> bool:
-    """A markdown file is a skill only if it has frontmatter with a name."""
+def _try_skill_from_file(path: Path) -> Skill | None:
+    """Parse a markdown file into a Skill in a single read, or None if it isn't a skill.
+
+    A markdown file is a skill only if its frontmatter carries a ``name``; plain docs
+    (e.g. a contributor README) are ignored. Reads the file once — previously callers
+    read it twice (an ``_is_skill_file`` check followed by a separate parse)."""
     try:
-        meta, _ = _split_frontmatter(path.read_text(encoding="utf-8"))
+        meta, body = _split_frontmatter(path.read_text(encoding="utf-8"))
     except OSError:
-        return False
-    return bool(meta.get("name"))
+        return None
+    if not meta.get("name"):
+        return None
+    return _skill_from_meta(path, meta, body)
 
 
 def discover_repo_skills(project_root: Path) -> list[Skill]:
@@ -148,10 +153,13 @@ def discover_repo_skills(project_root: Path) -> list[Skill]:
         candidates = sorted(base.rglob("SKILL.md")) + sorted(base.glob("*.md"))
         for path in candidates:
             resolved = path.resolve()
-            if resolved in seen or not _is_skill_file(path):
+            if resolved in seen:
+                continue
+            skill = _try_skill_from_file(path)
+            if skill is None:
                 continue
             seen.add(resolved)
-            found.append(_skill_from_file(path))
+            found.append(skill)
     return found
 
 
@@ -209,8 +217,8 @@ def load_skills(
     by_name: dict[str, Skill] = {}
     if library_dir.exists():
         for path in sorted(library_dir.glob("*.md")):
-            if _is_skill_file(path):
-                skill = _skill_from_file(path)
+            skill = _try_skill_from_file(path)
+            if skill is not None:
                 by_name[skill.name] = skill
     if project_root is not None:
         for skill in discover_repo_skills(project_root):
@@ -314,11 +322,16 @@ def select_skills(
     """
     skills = load_skills(library_dir, project_root)
     repo_files = _collect_repo_basenames(project_root) if project_root else set()
-    matched = [s for s in skills if s.matches(goal, repo_files)]
-    # Rank by relevance so the most applicable domain skill survives the inline budget
-    # on a polyglot repo, instead of whichever happened to load first / sort alphabetically.
-    # always-on skills keep their leading position (highest score); ties break by name.
-    scored = [(s, s.relevance_score(goal, repo_files)) for s in matched]
+    # Score each skill once and keep the ones that apply: for a Skill, matches() is exactly
+    # relevance_score() > 0 (always-on -> 1_000_000; otherwise a positive score requires a
+    # keyword/glob hit, which is what matches() tests), so a single pass replaces the old
+    # match-then-score double walk. (This equivalence is Skill-specific — do NOT copy it to
+    # KnowledgeSource, whose nonzero priority floor breaks it.)
+    # Rank by relevance so the most applicable domain skill survives the inline budget on a
+    # polyglot repo; always-on skills keep their leading position; ties break by name.
+    scored = [
+        (s, score) for s in skills if (score := s.relevance_score(goal, repo_files)) > 0
+    ]
     scored.sort(key=lambda item: (not item[0].always, -item[1], item[0].name))
     return [skill for skill, _ in scored]
 

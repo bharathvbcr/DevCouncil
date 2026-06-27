@@ -24,6 +24,13 @@ class TelemetryTracker:
             json.dump(self.stats, f, indent=2)
 
     def log_usage(self, model: str, usage: Dict[str, int], *, local: bool = False):
+        # Re-read the ledger immediately before mutating so the whole load->mutate->save
+        # runs as one synchronous (await-free) step. The router constructs a fresh tracker
+        # per call and only calls log_usage *after* the LLM await, so snapshotting the
+        # baseline at construction would let concurrent calls (e.g. plan.py's gather, or a
+        # parallelized SkillOpt _evaluate) each load the same baseline and clobber each
+        # other's entries on save. Reloading here makes the last writer additive, not lossy.
+        self.stats = self._load()
         prompt_tokens = usage.get("prompt_tokens", 0)
         completion_tokens = usage.get("completion_tokens", 0)
 
