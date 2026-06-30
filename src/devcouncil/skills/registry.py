@@ -10,6 +10,7 @@ scaffolded into a target repo's ``.claude/skills/`` directory.
 from __future__ import annotations
 
 import fnmatch
+import functools
 import os
 import re
 from pathlib import Path
@@ -197,6 +198,7 @@ def load_okf_skills(project_root: Path, directory: str = ".devcouncil/knowledge"
     return skills
 
 
+@functools.lru_cache(maxsize=32)
 def load_skills(
     library_dir: Path = LIBRARY_DIR,
     project_root: Path | None = None,
@@ -205,6 +207,14 @@ def load_skills(
     """Load skills: the packaged library plus, when ``project_root`` is given, the
     repo's own skills and (when ``include_okf``) skills from ingested OKF documents.
     Repo-local skills override packaged ones with the same name.
+
+    Result is cached per (library_dir, project_root, include_okf) for the lifetime of
+    the process, mirroring the repo-basename cache below: a ``dev e2e``/``repair-all``
+    run calls ``select_skills`` once per task, and re-reading+parsing the whole skill
+    tree (library glob, repo ``SKILL.md`` discovery, OKF markdown) every time is pure
+    waste since the on-disk skills don't change during a run. The returned list is
+    shared and must be treated read-only by callers (all current callers only iterate
+    it); ``clear_skill_caches()`` drops the cache when a refresh is needed.
 
     OKF-derived skills are merged in last and only for names not already taken, so a
     packaged library skill or a repo-local skill always wins a name conflict over an
@@ -272,8 +282,10 @@ _BASENAME_CACHE_MAX = 32
 
 
 def clear_skill_caches() -> None:
-    """Drop the cached repo file scans (useful in long-running processes/tests)."""
+    """Drop the cached repo file scans and loaded-skill sets (useful in long-running
+    processes/tests). Fully resets module-level skill state so test isolation holds."""
     _basename_cache.clear()
+    load_skills.cache_clear()
 
 
 def _walk_repo_basenames(project_root: Path) -> set[str]:

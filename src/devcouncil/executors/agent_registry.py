@@ -95,6 +95,11 @@ def normalize_agent_name(name: str) -> str:
 
 
 def resolve_cursor_agent_executable() -> str | None:
+    # NOTE: intentionally NOT lru_cached. It takes no project_root key, so a
+    # process-wide cache would leak one test's PATH probe (which the suite
+    # monkeypatches shutil.which to control) into the next, breaking isolation.
+    # The PATH search is two cheap shutil.which() calls; the dominant repeated
+    # cost (load_cli_agent_specs / config parsing) is cached instead.
     for candidate in ("cursor-agent", "agent"):
         if shutil.which(candidate):
             return candidate
@@ -246,8 +251,19 @@ def detect_available_coding_cli(
     project_root: Path,
     probe_order: tuple[str, ...] | None = None,
 ) -> str | None:
+    # Load specs once for the whole probe rather than per client (each
+    # resolve_coding_cli_executable() call would otherwise rebuild the spec
+    # table and re-parse config.yaml). Resolution below mirrors
+    # resolve_coding_cli_executable() exactly, just against the prebuilt table.
+    specs = load_cli_agent_specs(project_root)
     for client in probe_order or resolve_coding_cli_probe_order(project_root):
-        if resolve_coding_cli_executable(project_root, client):
+        normalized = normalize_agent_name(client)
+        if normalized == "cursor":
+            if resolve_cursor_agent_executable():
+                return client
+            continue
+        spec = specs.get(normalized)
+        if spec and shutil.which(spec.executable):
             return client
     return None
 
@@ -453,6 +469,11 @@ def builtin_agent_specs(project_root: Path) -> dict[str, CliAgentSpec]:
 
 
 def load_cli_agent_specs(project_root: Path) -> dict[str, CliAgentSpec]:
+    # NOTE: intentionally NOT cached. Callers (e.g. `setup` then `integrate
+    # doctor`) rewrite config.yaml for the same project_root within a single
+    # process and expect the next load to reflect it, so this must stay a live
+    # read. The repeated-reload hot path (the CLI probe loop) instead hoists a
+    # single load — see detect_available_coding_cli.
     specs = builtin_agent_specs(project_root)
     try:
         configured = load_config(project_root).integrations.cli_agents.agents

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from devcouncil.app.config import load_config
+from devcouncil.app.config import DevCouncilConfig, load_config
 
 WORKFLOW_RELPATH = Path(".github") / "workflows" / "devcouncil.yml"
 
@@ -86,9 +86,14 @@ def _python_version(project_root: Path) -> str:
     return "3.12"
 
 
-def render_workflow(project_root: Path, default_branch: str = "main") -> str:
+def render_workflow(
+    project_root: Path,
+    default_branch: str = "main",
+    config: DevCouncilConfig | None = None,
+) -> str:
     """Render the workflow YAML text deterministically from config + detected stacks."""
-    config = load_config(project_root)
+    if config is None:
+        config = load_config(project_root)
     stacks = detect_stacks(project_root)
     commands = config.commands
 
@@ -151,7 +156,10 @@ def scaffold_ci(project_root: Path, force: bool = False) -> Path | None:
     target = project_root / WORKFLOW_RELPATH
     if target.exists() and not force:
         return None
-    default_branch = load_config(project_root).project.default_branch or "main"
+    config = load_config(project_root)
+    default_branch = config.project.default_branch or "main"
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(render_workflow(project_root, default_branch), encoding="utf-8")
+    target.write_text(
+        render_workflow(project_root, default_branch, config), encoding="utf-8"
+    )
     return target

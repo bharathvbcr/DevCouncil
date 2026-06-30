@@ -8,7 +8,7 @@ from devcouncil.cli.commands.init import initialize_project
 from devcouncil.app.project_status import compute_phase
 from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import ArtifactGraphRepository, StateRepository
-from devcouncil.telemetry.cost import CostEstimator, cost_by_task
+from devcouncil.telemetry.cost import group_cost
 from devcouncil.live.summary import live_review_summary
 
 console = Console()
@@ -28,19 +28,10 @@ def _status_payload(project_root: Path) -> dict:
         state = StateRepository(session).get_state()
         phase = compute_phase(graph, state.current_phase if state else None)
 
-        total_cost = 0.0
-        log_file = project_root / ".devcouncil" / "logs" / "model_calls.jsonl"
-        if log_file.exists():
-            with open(log_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        entry = json.loads(line)
-                        total_cost += CostEstimator.estimate_cost(
-                            entry.get("response", {}).get("model", ""),
-                            entry.get("usage", {}),
-                        )
-                    except Exception:
-                        continue
+        # Single read of the model-call ledger: derive both the grand total and the
+        # per-task breakdown from one pass (group_cost -> read_cost_records). This is
+        # provider-aware (ollama records are free), matching the Cost-by-Task table.
+        cost = group_cost(project_root)
 
         status_counts: dict[str, int] = {}
         for task in graph.tasks.values():
@@ -50,8 +41,8 @@ def _status_payload(project_root: Path) -> dict:
             "initialized": True,
             "phase": phase,
             "coverage_summary": summary,
-            "total_cost": total_cost,
-            "cost_by_task": cost_by_task(project_root),
+            "total_cost": cost["total_cost"],
+            "cost_by_task": cost["by_task"],
             "task_status_counts": status_counts,
             "blocking_gaps": [gap.model_dump() for gap in blocking_gaps],
             "live_review": live_review_summary(project_root),

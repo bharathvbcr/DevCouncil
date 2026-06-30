@@ -1,7 +1,10 @@
+import logging
 from typing import List
 from pydantic import BaseModel
 from devcouncil.domain.critique import CritiqueFinding
 from devcouncil.llm.router import ModelRouter
+
+logger = logging.getLogger(__name__)
 
 class CritiqueOutput(BaseModel):
     findings: List[CritiqueFinding]
@@ -36,7 +39,7 @@ Every finding must include a falsifiable_check.
             {"role": "user", "content": prompt}
         ]
         
-        return await self.router.complete_structured(
+        result = await self.router.complete_structured(
             role=role,
             messages=messages,
             schema=CritiqueOutput,
@@ -44,6 +47,8 @@ Every finding must include a falsifiable_check.
             # usable plan, far better than crashing the whole planning run.
             fallback=CritiqueOutput(findings=[]),
         )
+        logger.info("Critique by %s: %d finding(s)", role, len(result.findings))
+        return result
 
     async def generate_rebuttal(self, role: str, original_plan_json: str, findings_json: str) -> RebuttalOutput:
         prompt = f"""
@@ -62,10 +67,12 @@ You are the planner who created the original plan. Review the critique findings.
             {"role": "user", "content": prompt}
         ]
         
-        return await self.router.complete_structured(
+        result = await self.router.complete_structured(
             role=role,
             messages=messages,
             schema=RebuttalOutput,
             # No rebuttals means findings stand as-is — a safe, conservative default.
             fallback=RebuttalOutput(rebuttals=[]),
         )
+        logger.info("Rebuttal by %s: %d rebuttal(s)", role, len(result.rebuttals))
+        return result

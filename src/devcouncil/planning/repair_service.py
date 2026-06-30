@@ -1,9 +1,12 @@
 from typing import List
 import json
+import logging
 from pydantic import BaseModel
 from devcouncil.domain.gap import Gap
 from devcouncil.domain.task import Task
 from devcouncil.llm.router import ModelRouter
+
+logger = logging.getLogger(__name__)
 
 class RepairOutput(BaseModel):
     suggested_tasks: List[Task]
@@ -31,9 +34,12 @@ Your task is to generate focused implementation tasks to fix these gaps.
 Return a JSON object with 'suggested_tasks'.
 """
         messages = [{"role": "user", "content": prompt}]
-        
-        return await self.router.complete_structured(
+
+        logger.info("Generating repair plan from %d gap(s)", len(gaps))
+        result = await self.router.complete_structured(
             role="planner_a",  # Pragmatic tech lead is best suited for repair task generation
             messages=messages,
             schema=RepairOutput
         )
+        logger.info("Repair plan: %d suggested task(s)", len(result.suggested_tasks))
+        return result

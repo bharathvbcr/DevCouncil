@@ -49,8 +49,8 @@ logger = logging.getLogger(__name__)
 # The two co-optimized document slots. ``guidance`` is the agent profile preamble that
 # steers the agent; ``skill`` is the engineering skill document. Edits without an
 # explicit target default to ``skill``.
-GUIDANCE = "guidance"
-SKILL = "skill"
+GUIDANCE: Literal["guidance"] = "guidance"
+SKILL: Literal["skill"] = "skill"
 DOC_TARGETS = (GUIDANCE, SKILL)
 
 # ---------------------------------------------------------------------------
@@ -492,7 +492,7 @@ async def optimize_skill(
         consecutive_noops = 0  # an applied batch (accepted or gate-rejected) is productive
         val_after, _ = await _evaluate(candidate_docs, val, rollout, score, cfg.rollout_concurrency)
         accepted = val_after > best_val_score + cfg.min_improvement
-        edited_targets = sorted({edit.target for edit in applied})
+        edited_targets = sorted({str(edit.target) for edit in applied})
         if accepted:
             score_before = best_val_score
             best_docs = candidate_docs

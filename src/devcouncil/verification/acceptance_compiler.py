@@ -11,6 +11,7 @@ text and the code under review, then maps each check 1:1 to its criterion.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Dict, List
 
 from pydantic import BaseModel
@@ -18,6 +19,8 @@ from pydantic import BaseModel
 from devcouncil.domain.requirement import Requirement
 from devcouncil.domain.task import Task
 from devcouncil.llm.router import ModelRouter
+
+logger = logging.getLogger(__name__)
 
 
 class CompiledCheck(BaseModel):
@@ -27,6 +30,19 @@ class CompiledCheck(BaseModel):
 
 class CompiledChecks(BaseModel):
     checks: List[CompiledCheck]
+
+
+# A worked example pinned to the prompt. Weak/local models follow a concrete
+# AC->command pairing far more reliably than rules alone — it anchors the import
+# style, the exception-guard idiom, and "assert behavior, not state".
+_WORKED_EXAMPLE = """Worked example (follow this shape exactly):
+  Acceptance criterion: "median([]) raises ValueError"
+  Code under review: a new file `stats.py` defining `def median(values): ...`
+  CORRECT command:
+    python -c "import stats\\ntry: stats.median([])\\nexcept ValueError: pass\\nelse: raise SystemExit(1)"
+  Why: it imports the REAL module name implied by the file (stats.py -> import stats),
+  exercises the public function, and asserts the OBSERVABLE behavior (a raised
+  exception) — not any file/git state."""
 
 
 class AcceptanceTestCompiler:
@@ -43,22 +59,148 @@ class AcceptanceTestCompiler:
         """Return {acceptance_criterion_id: [self-contained check command(s)]}.
 
         Best-effort: returns {} if the model cannot produce usable checks, so the
-        caller can fall back to the task's declared expected_tests.
+        caller can fall back to the task's declared expected_tests. Single-shot
+        wrapper over :meth:`compile_candidates` (samples=1) for back-compat.
+        """
+        return await self.compile_candidates(task, requirements, code_context, samples=1)
+
+    async def compile_candidates(
+        self,
+        task: Task,
+        requirements: List[Requirement],
+        code_context: str,
+        samples: int = 1,
+        per_criterion: bool = False,
+    ) -> Dict[str, List[str]]:
+        """Return {acceptance_criterion_id: [up to ``samples`` INDEPENDENT check commands]}.
+
+        Each criterion gets several independently-generated behavioral checks so the
+        caller can decide by majority vote — outvoting a single mis-generated check
+        without auto-passing a real defect. ``samples=1`` yields one command per
+        criterion (identical to the original single-shot ``compile``). Local sampling
+        is cost-free, so a weak model benefits most from a higher count.
+
+        ``per_criterion`` compiles ONE criterion per model call instead of batching them
+        all into a single prompt. A weak model batching N criteria into one JSON response
+        routinely omits or mis-attributes some — producing false ``incomplete`` verdicts —
+        whereas a focused single-criterion prompt is far more reliable. It costs N× the
+        calls (cheap on a local monitor), so it is opt-in.
         """
         ac_by_id = {ac.id: ac for req in requirements for ac in req.acceptance_criteria}
         target = [ac_by_id[i] for i in task.acceptance_criterion_ids if i in ac_by_id]
         if not target:
             return {}
 
+        if per_criterion and len(target) > 1:
+            out: Dict[str, List[str]] = {}
+            for ac in target:
+                out.update(await self._sample_checks([ac], code_context, samples))
+            return out
+        return await self._sample_checks(target, code_context, samples)
+
+    async def _sample_checks(
+        self, target: List, code_context: str, samples: int
+    ) -> Dict[str, List[str]]:
+        """Generate up to ``samples`` independent check commands for ``target`` criteria."""
+        valid_ids = {ac.id for ac in target}
+        out: Dict[str, List[str]] = {}
+        # Independent attempts. Each varies temperature + an attempt marker so the router
+        # cache keys differ (otherwise an identical prompt+temp returns the cached answer
+        # and every "sample" is the same command). Attempt 0 stays deterministic (temp 0).
+        for attempt in range(max(1, samples)):
+            temperature = 0.0 if attempt == 0 else min(0.8, 0.3 + 0.2 * attempt)
+            try:
+                result = await self.router.complete_structured(
+                    role=self.role,
+                    messages=[{"role": "user", "content": self._compile_prompt(target, code_context, attempt)}],
+                    schema=CompiledChecks,
+                    temperature=temperature,
+                    fallback=CompiledChecks(checks=[]),
+                )
+            except Exception as e:
+                logger.warning("Acceptance-check compile attempt %d failed: %s", attempt, e)
+                continue
+            for check in result.checks:
+                cmd = (check.command or "").strip()
+                if check.acceptance_criterion_id in valid_ids and cmd:
+                    bucket = out.setdefault(check.acceptance_criterion_id, [])
+                    if cmd not in bucket:  # dedup identical candidates across attempts
+                        bucket.append(cmd)
+        logger.info(
+            "Compiled acceptance checks for %d/%d criteria (%d samples)",
+            len(out), len(valid_ids), max(1, samples),
+        )
+        return out
+
+    async def repair(
+        self,
+        ac_id: str,
+        ac_description: str,
+        failing_command: str,
+        error_summary: str,
+        code_context: str,
+    ) -> str | None:
+        """Regenerate a compiled check that FAILED TO RUN (malformed/unrunnable).
+
+        Given the broken command and the launcher error, ask the model to fix the
+        COMMAND so it runs against the code — never to change what it asserts. Returns
+        the repaired command, or None if the model cannot produce a usable one. Safe by
+        construction: a check that did not run proves nothing, so regenerating it cannot
+        weaken the gate (a repaired check still has to genuinely pass to count)."""
+        prompt = f"""The following DevCouncil acceptance check FAILED TO RUN — it is malformed or
+its tooling/import is wrong, so it proves nothing about the code. Fix the COMMAND so it
+RUNS and correctly tests the SAME criterion. Do NOT weaken or change what it asserts;
+only fix what stops it from running (wrong module/import name, broken Python one-liner
+syntax, unavailable tool).
+
+Acceptance criterion ({ac_id}): {ac_description}
+
+Failing command:
+{failing_command}
+
+Launcher error / output:
+{error_summary}
+
+Code under review:
+{code_context}
+
+{_WORKED_EXAMPLE}
+
+Return JSON: one CompiledCheck with acceptance_criterion_id={ac_id!r} and the corrected
+single self-contained command. If you cannot produce a runnable behavioral command,
+return an empty checks list."""
+        try:
+            result = await self.router.complete_structured(
+                role=self.role,
+                messages=[{"role": "user", "content": prompt}],
+                schema=CompiledChecks,
+                fallback=CompiledChecks(checks=[]),
+            )
+        except Exception:
+            return None
+        for check in result.checks:
+            cmd = (check.command or "").strip()
+            if check.acceptance_criterion_id == ac_id and cmd and cmd != failing_command.strip():
+                return cmd
+        return None
+
+    def _compile_prompt(self, target, code_context: str, attempt: int = 0) -> str:
         acs_json = json.dumps(
             [{"id": ac.id, "description": ac.description, "method": ac.verification_method} for ac in target],
             indent=2,
+        )
+        # Independent-attempt marker: nudges diversity across samples AND differentiates
+        # the router cache key so a second sample is actually regenerated, not replayed.
+        variant = "" if attempt == 0 else (
+            f"\nIndependent attempt #{attempt}: derive each check FROM SCRATCH; do not assume "
+            "a previous attempt's wording. Prefer a different but equivalent way to exercise "
+            "the same behavior.\n"
         )
         prompt = f"""
 You are DevCouncil's acceptance-test compiler. Convert each acceptance criterion
 below into exactly ONE shell command that EXITS 0 if and only if the BEHAVIOR
 described by the criterion holds for the code shown.
-
+{variant}
 Acceptance criteria:
 {acs_json}
 
@@ -105,21 +247,7 @@ criterion instead of emitting such a command:
 - If a criterion cannot be checked by a behavioral command (e.g. pure 'manual'
   review, or it only describes repo/tooling state), OMIT it rather than inventing
   a state-based or bogus command.
-"""
-        try:
-            result = await self.router.complete_structured(
-                role=self.role,
-                messages=[{"role": "user", "content": prompt}],
-                schema=CompiledChecks,
-                fallback=CompiledChecks(checks=[]),
-            )
-        except Exception:
-            return {}
 
-        out: Dict[str, List[str]] = {}
-        valid_ids = {ac.id for ac in target}
-        for check in result.checks:
-            cmd = (check.command or "").strip()
-            if check.acceptance_criterion_id in valid_ids and cmd:
-                out.setdefault(check.acceptance_criterion_id, []).append(cmd)
-        return out
+{_WORKED_EXAMPLE}
+"""
+        return prompt

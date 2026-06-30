@@ -71,10 +71,26 @@ class KnowledgeSource(BaseModel):
 _source_cache: dict[tuple[str, int, str, bool, int], KnowledgeSource] = {}
 _SOURCE_CACHE_MAX = 512
 
+# Directory-scan cache for discover_knowledge_sources(). The glob/rglob filesystem walk
+# repeats 5-30x per planning session (once per task, plus MCP calls) over a directory tree
+# that almost never changes mid-session, while per-file PARSING is already memoized by
+# _source_cache. This caches the discovered source *list* keyed on the call's shaping args.
+# Each entry also stores a signature: the sorted set of (resolved-path, mtime_ns) for every
+# scanned file. On the next call we recompute that signature (a cheap stat per file vs. the
+# directory walk + frontmatter parse) and invalidate if it differs, so a freshly written,
+# edited, added or removed file is picked up. Keying on the path set (not just mtimes) means
+# add/remove is detected even if the filesystem's mtime granularity is too coarse to notice
+# an in-place rewrite within the same tick. Cached lists are read-only to callers.
+_DiscoverKey = tuple[str, str, bool, int, int]
+_DiscoverSig = tuple[tuple[str, int], ...]
+_discover_cache: dict[_DiscoverKey, tuple[_DiscoverSig, list[KnowledgeSource]]] = {}
+_DISCOVER_CACHE_MAX = 256
+
 
 def clear_knowledge_caches() -> None:
     """Drop the cached parsed knowledge sources (useful in long-running processes/tests)."""
     _source_cache.clear()
+    _discover_cache.clear()
 
 
 def _source_from_file(path: Path, kind: Kind, always: bool, priority: int) -> KnowledgeSource:
@@ -129,18 +145,46 @@ def discover_knowledge_sources(
 ) -> list[KnowledgeSource]:
     """Find ingested knowledge under ``<project_root>/<directory>/{design,okf}``."""
     base = project_root / directory
-    sources: list[KnowledgeSource] = []
+    # Collect the files to ingest (the directory walk we want to cache), as
+    # (path, kind, always, priority) in stable order, before parsing any of them.
+    scanned: list[tuple[Path, Kind, bool, int]] = []
     design_dir = base / "design"
     if design_dir.exists():
         for path in sorted(design_dir.glob("*.md")):
-            sources.append(_source_from_file(path, "design", design_always, design_priority))
+            scanned.append((path, "design", design_always, design_priority))
     okf_dir = base / "okf"
     if okf_dir.exists():
         for path in sorted(okf_dir.rglob("*.md")):
             # Skip OKF index files: they are navigation, not knowledge worth injecting.
             if path.name.lower() == "index.md":
                 continue
-            sources.append(_source_from_file(path, "okf", False, okf_priority))
+            scanned.append((path, "okf", False, okf_priority))
+
+    # Signature of the current scan: (resolved path, mtime_ns) for each file. A miss here
+    # (file added/removed/edited) invalidates the cached list for this key.
+    sig_parts: list[tuple[str, int]] = []
+    for path, _kind, _always, _priority in scanned:
+        try:
+            sig_parts.append((str(path.resolve()), path.stat().st_mtime_ns))
+        except OSError:
+            # Vanished between glob and stat: skip from the signature; parsing handles it.
+            continue
+    signature: _DiscoverSig = tuple(sig_parts)
+
+    key: _DiscoverKey = (
+        str(project_root.resolve()), directory, design_always, design_priority, okf_priority,
+    )
+    cached = _discover_cache.get(key)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+
+    sources = [
+        _source_from_file(path, kind, always, priority)
+        for path, kind, always, priority in scanned
+    ]
+    if len(_discover_cache) >= _DISCOVER_CACHE_MAX:
+        _discover_cache.clear()
+    _discover_cache[key] = (signature, sources)
     return sources
 
 

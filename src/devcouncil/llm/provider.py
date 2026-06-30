@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 import copy
 from functools import lru_cache
 from importlib import resources
+import logging
 import os
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, field_validator
@@ -9,6 +10,8 @@ import httpx
 import json
 from pathlib import Path
 import yaml
+
+logger = logging.getLogger(__name__)
 
 SUPPORTED_MODEL_PROVIDERS = ("openrouter", "vertexai", "doubleword", "ollama")
 PROVIDER_ALIASES = {
@@ -66,6 +69,7 @@ def raise_for_provider_status(response: "httpx.Response", provider: str) -> None
     message = f"{provider} API error {status}: {detail}."
     if body:
         message = f"{message} Response: {body}"
+    logger.error("Provider request failed: %s", message)
     raise ProviderRequestError(message, status_code=status)
 
 
@@ -98,6 +102,41 @@ class Provider(ABC):
         run_id: Optional[str] = None,
     ) -> LLMResponse:
         pass
+
+    def _get_async_client(self, timeout: Any) -> "httpx.AsyncClient":
+        """Lazily create and reuse a single ``httpx.AsyncClient`` per provider instance.
+
+        Building an ``AsyncClient`` (connection pool + SSL context) is expensive and the
+        pool is meant to be reused across calls, so we keep one per instance rather than
+        constructing a fresh client on every ``complete()``. ``timeout`` is fixed per
+        provider instance (cloud providers use 180s; Ollama uses its resolved
+        ``self.timeout``), so binding it at construction time is equivalent to the previous
+        per-call client while still allowing the pool to be reused.
+
+        The client is bound to the event loop that created it. If the same provider
+        instance is ever driven from a *different* loop (e.g. a second ``asyncio.run``),
+        the old client's pool belongs to a now-closed loop and cannot be reused — we
+        detect that and rebind a fresh client to the current loop instead of failing. The
+        client lives for the provider's lifetime (one run / one cached router) and is
+        released on GC or via ``aclose()``; provider instances are bounded, so clients do
+        not accumulate."""
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        client = getattr(self, "_client", None)
+        if client is not None and not client.is_closed and getattr(self, "_client_loop", None) is loop:
+            return client
+        client = httpx.AsyncClient(timeout=timeout)
+        self._client: Optional[httpx.AsyncClient] = client
+        self._client_loop = loop
+        return client
+
+    async def aclose(self) -> None:
+        """Close the reused AsyncClient if one was created."""
+        client = getattr(self, "_client", None)
+        if client is not None:
+            self._client = None
+            await client.aclose()
 
     def cache_fingerprint(self) -> str:
         """Provider-specific options that change the model's output and therefore must
@@ -177,10 +216,37 @@ def build_role_model_config(
     return roles
 
 
-def create_provider(provider_name: str, api_key: str, project_root: Path = Path(".")) -> Provider:
+def openrouter_provider_payload(prefs: Any) -> Optional[Dict[str, Any]]:
+    """Translate DevCouncil's ``ProviderConfig`` (or a plain mapping) into OpenRouter's
+    ``provider`` routing object.
+
+    Returns ``None`` when no prefs are supplied so the request omits the field entirely
+    and OpenRouter applies its own defaults. Only the keys OpenRouter recognizes are
+    forwarded (``sort``, ``allow_fallbacks``, ``require_parameters``, ``data_collection``),
+    so adding unrelated fields to ``ProviderConfig`` never leaks into the API call.
+    """
+    if prefs is None:
+        return None
+    if hasattr(prefs, "model_dump"):
+        data = prefs.model_dump()
+    elif isinstance(prefs, dict):
+        data = prefs
+    else:
+        return None
+    allowed = ("sort", "allow_fallbacks", "require_parameters", "data_collection")
+    payload = {k: data[k] for k in allowed if data.get(k) is not None}
+    return payload or None
+
+
+def create_provider(
+    provider_name: str,
+    api_key: str,
+    project_root: Path = Path("."),
+    provider_prefs: Any = None,
+) -> Provider:
     normalized = validate_model_provider(provider_name)
     if normalized == "openrouter":
-        return OpenRouterProvider(api_key, project_root=project_root)
+        return OpenRouterProvider(api_key, project_root=project_root, provider_prefs=provider_prefs)
     if normalized == "doubleword":
         return DoublewordProvider(api_key, project_root=project_root)
     if normalized == "ollama":
@@ -239,10 +305,21 @@ def _log_model_call(
 
 
 class OpenRouterProvider(Provider):
-    def __init__(self, api_key: str, project_root: Path = Path(".")):
+    def __init__(self, api_key: str, project_root: Path = Path("."), provider_prefs: Any = None):
         self.api_key = api_key
         self.base_url = "https://openrouter.ai/api/v1"
         self.project_root = project_root
+        # OpenRouter routing preferences (sort/allow_fallbacks/require_parameters/
+        # data_collection) sent as the request's ``provider`` field. None → omit it.
+        self.provider_prefs = openrouter_provider_payload(provider_prefs)
+
+    def cache_fingerprint(self) -> str:
+        # Routing prefs change which upstream provider/model serves the request (and the
+        # data-collection policy), so they can change the output for an identical prompt
+        # and must invalidate the cache. Empty when unset so default runs share one key.
+        if not self.provider_prefs:
+            return ""
+        return "openrouter:provider=" + json.dumps(self.provider_prefs, sort_keys=True)
 
     async def complete(
         self, 
@@ -253,8 +330,9 @@ class OpenRouterProvider(Provider):
         task_id: Optional[str] = None,
         run_id: Optional[str] = None,
     ) -> LLMResponse:
-        # Deep-copy to avoid mutating the caller's messages list
-        msgs = copy.deepcopy(messages)
+        # Only deep-copy when json_mode mutates the last message; otherwise the
+        # caller's list is read but never modified, so we can use it directly.
+        msgs = copy.deepcopy(messages) if json_mode else messages
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -262,38 +340,41 @@ class OpenRouterProvider(Provider):
             "HTTP-Referer": "https://github.com/devcouncil/devcouncil", # Optional
             "X-Title": "DevCouncil", # Optional
         }
-        
+
         payload = {
             "model": model,
             "messages": msgs,
             "temperature": temperature,
         }
-        
+
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
             # Ensure the user message mentions JSON
             if msgs[-1]["role"] == "user":
                 msgs[-1]["content"] += "\n\nOutput must be a valid JSON object."
 
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            response = await client.post(
-                f"{self.base_url}/chat/completions",
-                headers=headers,
-                json=payload
-            )
-            raise_for_provider_status(response, "OpenRouter")
-            data = response.json()
+        if self.provider_prefs:
+            payload["provider"] = self.provider_prefs
 
-            resp = LLMResponse(
-                content=data["choices"][0]["message"]["content"],
-                model=data["model"],
-                usage=data.get("usage", {}),
-                raw_response=data
-            )
+        client = self._get_async_client(180.0)
+        response = await client.post(
+            f"{self.base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+        raise_for_provider_status(response, "OpenRouter")
+        data = response.json()
 
-            _log_model_call(payload, data, resp.usage, self.project_root, task_id=task_id, run_id=run_id)
+        resp = LLMResponse(
+            content=data["choices"][0]["message"]["content"],
+            model=data["model"],
+            usage=data.get("usage", {}),
+            raw_response=data
+        )
 
-            return resp
+        _log_model_call(payload, data, resp.usage, self.project_root, task_id=task_id, run_id=run_id)
+
+        return resp
 
 
 class DoublewordProvider(Provider):
@@ -311,7 +392,9 @@ class DoublewordProvider(Provider):
         task_id: Optional[str] = None,
         run_id: Optional[str] = None,
     ) -> LLMResponse:
-        msgs = copy.deepcopy(messages)
+        # Only deep-copy when json_mode mutates the last message; otherwise the
+        # caller's list is read but never modified, so we can use it directly.
+        msgs = copy.deepcopy(messages) if json_mode else messages
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -327,24 +410,24 @@ class DoublewordProvider(Provider):
             if msgs[-1]["role"] == "user":
                 msgs[-1]["content"] += "\n\nOutput must be a valid JSON object."
 
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            response = await client.post(
-                f"{self.base_url}/chat/completions",
-                headers=headers,
-                json=payload
-            )
-            raise_for_provider_status(response, "Doubleword")
-            data = response.json()
+        client = self._get_async_client(180.0)
+        response = await client.post(
+            f"{self.base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+        raise_for_provider_status(response, "Doubleword")
+        data = response.json()
 
-            resp = LLMResponse(
-                content=data["choices"][0]["message"]["content"],
-                model=data["model"],
-                usage=data.get("usage", {}),
-                raw_response=data
-            )
+        resp = LLMResponse(
+            content=data["choices"][0]["message"]["content"],
+            model=data["model"],
+            usage=data.get("usage", {}),
+            raw_response=data
+        )
 
-            _log_model_call(payload, data, resp.usage, self.project_root, task_id=task_id, run_id=run_id)
-            return resp
+        _log_model_call(payload, data, resp.usage, self.project_root, task_id=task_id, run_id=run_id)
+        return resp
 
 
 class OllamaProvider(Provider):
@@ -451,7 +534,9 @@ class OllamaProvider(Provider):
         task_id: Optional[str] = None,
         run_id: Optional[str] = None,
     ) -> LLMResponse:
-        msgs = copy.deepcopy(messages)
+        # Only deep-copy when json_mode mutates the last message; otherwise the
+        # caller's list is read but never modified, so we can use it directly.
+        msgs = copy.deepcopy(messages) if json_mode else messages
         headers = {
             "Content-Type": "application/json",
         }
@@ -480,36 +565,36 @@ class OllamaProvider(Provider):
             if msgs[-1]["role"] == "user":
                 msgs[-1]["content"] += "\n\nOutput must be a valid JSON object."
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
-                self._chat_endpoint(),
-                headers=headers,
-                json=payload,
-            )
-            raise_for_provider_status(response, "Ollama")
-            data = response.json()
+        client = self._get_async_client(self.timeout)
+        response = await client.post(
+            self._chat_endpoint(),
+            headers=headers,
+            json=payload,
+        )
+        raise_for_provider_status(response, "Ollama")
+        data = response.json()
 
-            # Native response shape: {"message": {"content": ...}, "model": ...,
-            # "prompt_eval_count": N, "eval_count": M}. Map token counts to the
-            # OpenAI-style keys the cost ledger/tracker expect.
-            prompt_tokens = int(data.get("prompt_eval_count", 0) or 0)
-            completion_tokens = int(data.get("eval_count", 0) or 0)
-            usage = {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            }
-            resp = LLMResponse(
-                content=(data.get("message") or {}).get("content", ""),
-                # Ollama may omit ``model`` or return a local tag — fall back to
-                # the requested id rather than KeyError-ing.
-                model=data.get("model", model),
-                usage=usage,
-                raw_response=data,
-            )
+        # Native response shape: {"message": {"content": ...}, "model": ...,
+        # "prompt_eval_count": N, "eval_count": M}. Map token counts to the
+        # OpenAI-style keys the cost ledger/tracker expect.
+        prompt_tokens = int(data.get("prompt_eval_count", 0) or 0)
+        completion_tokens = int(data.get("eval_count", 0) or 0)
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+        resp = LLMResponse(
+            content=(data.get("message") or {}).get("content", ""),
+            # Ollama may omit ``model`` or return a local tag — fall back to
+            # the requested id rather than KeyError-ing.
+            model=data.get("model", model),
+            usage=usage,
+            raw_response=data,
+        )
 
-            _log_model_call(payload, data, resp.usage, self.project_root, task_id=task_id, run_id=run_id, provider="ollama")
-            return resp
+        _log_model_call(payload, data, resp.usage, self.project_root, task_id=task_id, run_id=run_id, provider="ollama")
+        return resp
 
 
 class VertexAIProvider(Provider):
@@ -556,7 +641,9 @@ class VertexAIProvider(Provider):
         task_id: Optional[str] = None,
         run_id: Optional[str] = None,
     ) -> LLMResponse:
-        msgs = copy.deepcopy(messages)
+        # Only deep-copy when json_mode mutates the last message; otherwise the
+        # caller's list is read but never modified, so we can use it directly.
+        msgs = copy.deepcopy(messages) if json_mode else messages
 
         payload = {
             "model": model,
@@ -569,30 +656,30 @@ class VertexAIProvider(Provider):
             if msgs[-1]["role"] == "user":
                 msgs[-1]["content"] += "\n\nOutput must be a valid JSON object."
 
-        async with httpx.AsyncClient(timeout=180.0) as client:
+        client = self._get_async_client(180.0)
+        response = await client.post(
+            f"{self.base_url}/chat/completions",
+            headers=self._headers(),
+            json=payload,
+        )
+        if response.status_code in {401, 403} and self._refresh_access_token_from_gcloud():
             response = await client.post(
                 f"{self.base_url}/chat/completions",
                 headers=self._headers(),
-                json=payload
+                json=payload,
             )
-            if response.status_code in {401, 403} and self._refresh_access_token_from_gcloud():
-                response = await client.post(
-                    f"{self.base_url}/chat/completions",
-                    headers=self._headers(),
-                    json=payload
-                )
-            raise_for_provider_status(response, "Vertex AI")
-            data = response.json()
+        raise_for_provider_status(response, "Vertex AI")
+        data = response.json()
 
-            resp = LLMResponse(
-                content=data["choices"][0]["message"]["content"],
-                model=data["model"],
-                usage=data.get("usage", {}),
-                raw_response=data
-            )
+        resp = LLMResponse(
+            content=data["choices"][0]["message"]["content"],
+            model=data["model"],
+            usage=data.get("usage", {}),
+            raw_response=data
+        )
 
-            _log_model_call(payload, data, resp.usage, self.project_root, task_id=task_id, run_id=run_id)
-            return resp
+        _log_model_call(payload, data, resp.usage, self.project_root, task_id=task_id, run_id=run_id)
+        return resp
 
 class MockProvider(Provider):
     """Mock provider for dry runs and testing."""

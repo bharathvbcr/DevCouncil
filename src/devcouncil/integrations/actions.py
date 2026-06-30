@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from devcouncil.integrations.check import build_integration_check_report
+
+logger = logging.getLogger(__name__)
 
 VALID_INTEGRATION_TARGETS = {
     "all",
@@ -65,15 +68,18 @@ def apply_integration_target(
     strict: bool = False,
     gemini_scope: str = "project",
     claude_scope: str = "local",
+    claude_write_gate: bool = False,
 ) -> IntegrationActionReport:
     from devcouncil.cli.commands import integrate
 
     root = project_root.expanduser().resolve()
     normalized = normalize_apply_target(target)
+    logger.info("Applying integration target: %s (root=%s)", normalized, root)
     warnings: list[str] = []
     results: list[dict[str, Any]] = []
 
     def add_result(name: str, ok: bool, path: Path | None = None, message: str = "") -> None:
+        (logger.info if ok else logger.warning)("Integration %s: %s — %s", name, "ok" if ok else "FAILED", message)
         results.append({
             "target": name,
             "ok": ok,
@@ -119,19 +125,33 @@ def apply_integration_target(
         add_result("aider", True, root / ".devcouncil" / "config.yaml", "Aider executor enabled.")
 
     def apply_hooks() -> None:
-        integrate._configure_native_hooks(root, "all", apply=True)
+        integrate._configure_native_hooks(root, "all", apply=True, claude_write_gate=claude_write_gate)
         add_result("hooks", True, None, "Native hook files configured.")
+
+    def apply_claude_assets() -> None:
+        try:
+            written = integrate._install_claude_assets(root)
+        except (ValueError, FileNotFoundError, OSError) as exc:
+            add_result("claude-assets", False, None, f"Claude asset setup failed: {exc}")
+            return
+        add_result("claude-assets", True, None, f"Claude assets installed ({len(written)} file(s)).")
 
     if normalized == "all":
         for name in ("codex", "gemini", "claude"):
             apply_first_party(name)
-        # Batch the per-tool config.yaml record updates into one load/save.
+        # Batch the per-tool config.yaml record updates (project files, aider,
+        # and native hooks) into one load/save cycle. _batched_raw_config is
+        # re-entrant, so apply_hooks()'s own batching participates in this one.
         with integrate._batched_raw_config(root):
             for name in ("cursor", "opencode", "antigravity", "warp"):
                 apply_project_file(name)
             apply_aider()
-        if include_hooks:
-            apply_hooks()
+            if include_hooks:
+                apply_hooks()
+            # The static Claude Code asset surface (slash commands, subagents, output
+            # style, statusline, permissions, skills) — installed regardless of whether
+            # the claude CLI is on PATH, since these are plain files.
+            apply_claude_assets()
     elif normalized in {"codex", "gemini", "claude"}:
         apply_first_party(normalized)
     elif normalized in {"cursor", "opencode", "antigravity", "warp"}:

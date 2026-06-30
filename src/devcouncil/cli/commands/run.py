@@ -1,3 +1,4 @@
+import logging
 import typer
 from rich.console import Console
 from pathlib import Path
@@ -23,6 +24,7 @@ from devcouncil.cli.commands.init import initialize_project
 from devcouncil.telemetry.traces import TraceLogger
 
 console = Console()
+logger = logging.getLogger(__name__)
 CODING_EXECUTOR_ALIASES = {name: name for name in BUILTIN_CODING_EXECUTOR_NAMES} | AGENT_ALIASES
 
 CODING_EXECUTORS = set(CODING_EXECUTOR_ALIASES.keys())
@@ -58,8 +60,14 @@ def _verify_after_execution(session, task, reqs, router=None, project_root: Path
     """Run deterministic verification after an automated executor finishes."""
     import asyncio
 
+    logger.info("Verifying task %s (router=%s)", task.id, "yes" if router else "no")
     verifier = Verifier(project_root, router=router)
     gaps, evidence = asyncio.run(verifier.verify_task(task, reqs))
+    blocking = [g for g in gaps if g.blocking]
+    logger.info(
+        "Verification of %s: %d gap(s) (%d blocking), %d evidence item(s)",
+        task.id, len(gaps), len(blocking), len(evidence),
+    )
 
     gap_repo = GapRepository(session)
     evidence_repo = EvidenceRepository(session)
@@ -79,6 +87,89 @@ def _verify_after_execution(session, task, reqs, router=None, project_root: Path
 
     task.status = "blocked" if any(g.blocking for g in gaps) else "verified"
     return task.status == "verified"
+
+
+def _build_verification_router(project_root: Path):
+    """Best-effort ``ModelRouter`` for LLM-backed verification after a coding-agent run.
+
+    Without a router the ``Verifier`` runs deterministic checks only (no
+    ``implementation_reviewer`` review, no acceptance-criterion compilation). The native
+    executor already builds a router to *run* the agent and reuses it for verification;
+    CLI coding agents (claude, codex, …) don't need one to execute, so they previously
+    verified without the LLM review at all. Build one here so the review gate guides and
+    monitors execution for those agents too. Per-role provider config means these review
+    roles can run on a different provider than planning (e.g. local Ollama).
+
+    Returns ``None`` when no provider/API key is configured so verification degrades to
+    deterministic-only instead of erroring — the LLM review is an enhancement, not a
+    hard requirement of running a task.
+    """
+    try:
+        config = load_config(project_root)
+        validate_model_provider(config.models.provider)
+        api_key = get_api_key(config.models.provider, project_root)
+        provider = create_provider(
+            config.models.provider, api_key, project_root=project_root, provider_prefs=config.provider
+        )
+        role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
+        return ModelRouter(provider, role_config, project_root=project_root)
+    except Exception:
+        return None
+
+
+def _run_live_review_after_execution(project_root: Path, client: str, task_id: str | None) -> None:
+    """Critique the coding agent's latest turn with the ``live_reviewer`` role.
+
+    This is what makes live review actually fire during ``dev e2e``/``dev run`` (previously
+    it only ran via ``dev watch``). It produces an advisory critique card — it does NOT
+    gate the task; the deterministic/LLM verifier already does that. The card feeds the
+    final report's live-review summary and is routed by per-role config (e.g. a local
+    Ollama ``live_reviewer`` while planning runs on OpenRouter).
+
+    The transcript is resolved the same way ``dev watch`` does — the client's NATIVE
+    session log (e.g. claude's projects JSONL), discovered for this project root — not the
+    executor's streamed ``transcript.txt`` (which only exists with --stream and isn't the
+    structured turn format ``latest_assistant_turn`` parses).
+
+    Best-effort and opt-outable: skipped when ``integrations.live_review.enabled`` is
+    false, when no transcript is found, or on any error — a live-review hiccup must never
+    fail the run.
+    """
+    import asyncio
+
+    try:
+        if not load_config(project_root).integrations.live_review.enabled:
+            return
+        from devcouncil.cli.commands.watch import (
+            _resolve_transcript,
+            _review_turn,
+            _save_card_once,
+            _log_card_reviewed,
+        )
+        from devcouncil.live.transcripts import latest_assistant_turn
+
+        transcript = _resolve_transcript(project_root, client, latest=True)
+        if transcript is None or not transcript.exists():
+            return
+        turn = latest_assistant_turn(transcript, client=client)
+        if turn is None:
+            return
+        card = asyncio.run(_review_turn(turn, project_root, client, use_llm=True, task_id=task_id))
+        saved_path, duplicate = _save_card_once(project_root, card, persist=True, force=False)
+        if saved_path:
+            _log_card_reviewed(project_root, card, saved_path, duplicate=duplicate, source="e2e")
+            console.print(f"[dim]Live review ({card.verdict}): {saved_path}[/dim]")
+    except Exception as exc:  # noqa: BLE001 - advisory; never fail the run on a review hiccup
+        console.print(f"[yellow]Live review skipped: {exc}[/yellow]")
+
+
+def _log_exec_outcome(executor: str, task_id: str, *, verified: bool) -> None:
+    """Log a non-coding-CLI executor's post-verification outcome (verified vs blocked),
+    so standalone ``dev run`` has the same flow-decision trail as ``dev go``."""
+    if verified:
+        logger.info("%s finished and %s verified", executor, task_id)
+    else:
+        logger.warning("%s finished but %s blocked by verification gaps", executor, task_id)
 
 
 def _record_agent_verification(project_root: Path, task_id: str, executor: str, run_id: str | None, verified: bool) -> None:
@@ -114,6 +205,9 @@ def run(
     Execute a specific task.
     """
     root = project_root.expanduser().resolve()
+    from devcouncil.telemetry.logging_setup import set_log_dir
+    set_log_dir(root)
+    logger.info("dev run: task=%s executor=%s profile=%s stream=%s", task_id, executor, profile, stream)
     initialize_project(root, quiet=True)
     db = get_db(root)
     if not db:
@@ -131,6 +225,10 @@ def run(
         gate_policy = GatePolicy()
         gate_result = gate_policy.check_task_ready(task, root)
         if not gate_result.passed:
+            logger.warning(
+                "Task %s failed readiness gate: %s",
+                task_id, "; ".join(g.description for g in gate_result.gaps if g.blocking),
+            )
             console.print(f"[red]Task {task_id} is not ready for execution.[/red]")
             for gap in gate_result.gaps:
                 if gap.blocking:
@@ -152,7 +250,8 @@ def run(
             console.print(f"[yellow]Warning: Failed to create git checkpoint: {e}[/yellow]")
 
         executor = executor.strip().lower().replace("_", "-")
-        if executor not in CODING_EXECUTORS and executor not in _custom_cli_agents(root):
+        custom_agents = _custom_cli_agents(root)
+        if executor not in CODING_EXECUTORS and executor not in custom_agents:
             ignored = [flag for flag, value in (("--profile", profile), ("--stream", stream)) if value]
             if ignored:
                 console.print(
@@ -162,10 +261,11 @@ def run(
             _record_project_phase(session, ProjectPhase.TASK_EXECUTING)
             task.status = "running"
             task_repo.save(task)
+            logger.info("%s marked RUNNING for manual sidecar execution", task_id)
             console.print(f"\n[green]Task {task_id} is now marked as RUNNING.[/green]")
             console.print("Use 'dev prompt TASK-ID' to get the prompt for this task.")
             console.print("When finished, use 'dev verify TASK-ID' to check the results.")
-        elif executor in CODING_EXECUTORS or executor in _custom_cli_agents(root):
+        elif executor in CODING_EXECUTORS or executor in custom_agents:
             _record_project_phase(session, ProjectPhase.TASK_EXECUTING)
             req_repo = RequirementRepository(session)
             reqs = req_repo.get_all()
@@ -175,7 +275,9 @@ def run(
             _capture_after_patch(task_id, root)
             if exec_result.success:
                 _record_project_phase(session, ProjectPhase.TASK_VERIFYING)
-                verified = _verify_after_execution(session, task, reqs, project_root=root)
+                verified = _verify_after_execution(
+                    session, task, reqs, router=_build_verification_router(root), project_root=root
+                )
                 _record_agent_verification(root, task.id, cli_client, getattr(cli_executor, "last_run_id", None), verified)
                 _record_project_phase(
                     session,
@@ -183,17 +285,24 @@ def run(
                 )
                 task_repo.save(task)
                 run_id = getattr(cli_executor, "last_run_id", None)
+                transcript_path = getattr(cli_executor, "last_transcript_path", None)
                 if run_id:
                     run_dir = root / ".devcouncil" / "runs" / run_id
                     console.print(f"Run artifacts: [dim]{run_dir}[/dim]")
-                    transcript_path = getattr(cli_executor, "last_transcript_path", None)
+                    if (run_dir / "run.log").exists():
+                        console.print(f"Run log: [dim]dev logs tail --run {run_id}[/dim]")
                     if transcript_path:
                         console.print(f"Transcript: [dim]{transcript_path}[/dim]")
+                # Live review (advisory): critique the agent's turn with the live_reviewer
+                # role so monitoring actually happens during execution, not only via watch.
+                _run_live_review_after_execution(root, cli_client, task.id)
+                _log_exec_outcome(executor, task_id, verified=verified)
                 if verified:
                     console.print(f"\n[green]{executor.upper()} finished and task {task_id} verified.[/green]")
                 else:
                     console.print(f"\n[yellow]{executor.upper()} finished, but task {task_id} is blocked by verification gaps.[/yellow]")
             else:
+                logger.error("%s failed to start or execute for %s: %s", executor, task_id, exec_result.message)
                 console.print(f"\n[red]{executor.upper()} failed to start or execute: {exec_result.message}[/red]")
         elif executor == "mini":
             _record_project_phase(session, ProjectPhase.TASK_EXECUTING)
@@ -204,17 +313,21 @@ def run(
             _capture_after_patch(task_id, root)
             if exec_result.success:
                 _record_project_phase(session, ProjectPhase.TASK_VERIFYING)
-                verified = _verify_after_execution(session, task, reqs, project_root=root)
+                verified = _verify_after_execution(
+                    session, task, reqs, router=_build_verification_router(root), project_root=root
+                )
                 _record_project_phase(
                     session,
                     ProjectPhase.TASK_VERIFIED if verified else ProjectPhase.TASK_BLOCKED,
                 )
                 task_repo.save(task)
+                _log_exec_outcome("mini-SWE-agent", task_id, verified=verified)
                 if verified:
                     console.print(f"\n[green]mini-SWE-agent finished and task {task_id} verified.[/green]")
                 else:
                     console.print(f"\n[yellow]mini-SWE-agent finished, but task {task_id} is blocked by verification gaps.[/yellow]")
             else:
+                logger.error("mini-SWE-agent failed to start or execute for %s", task_id)
                 console.print("\n[red]mini-SWE-agent failed to start or execute.[/red]")
         elif executor == "openhands":
             _record_project_phase(session, ProjectPhase.TASK_EXECUTING)
@@ -225,17 +338,21 @@ def run(
             _capture_after_patch(task_id, root)
             if exec_result.success:
                 _record_project_phase(session, ProjectPhase.TASK_VERIFYING)
-                verified = _verify_after_execution(session, task, reqs, project_root=root)
+                verified = _verify_after_execution(
+                    session, task, reqs, router=_build_verification_router(root), project_root=root
+                )
                 _record_project_phase(
                     session,
                     ProjectPhase.TASK_VERIFIED if verified else ProjectPhase.TASK_BLOCKED,
                 )
                 task_repo.save(task)
+                _log_exec_outcome("OpenHands", task_id, verified=verified)
                 if verified:
                     console.print(f"\n[green]OpenHands finished and task {task_id} verified.[/green]")
                 else:
                     console.print(f"\n[yellow]OpenHands finished, but task {task_id} is blocked by verification gaps.[/yellow]")
             else:
+                logger.error("OpenHands failed to start or execute for %s", task_id)
                 console.print("\n[red]OpenHands failed to start or execute.[/red]")
         elif executor in {"native", "native-preview"}:
             # Load config for model routing and permissions
@@ -244,10 +361,11 @@ def run(
                 validate_model_provider(config.models.provider)
                 api_key = get_api_key(config.models.provider, root)
             except (FileNotFoundError, ValueError) as e:
+                logger.error("Native executor cannot start for %s: %s", task_id, e)
                 console.print(f"[red]{e}[/red]")
                 return
             
-            provider = create_provider(config.models.provider, api_key, project_root=root)
+            provider = create_provider(config.models.provider, api_key, project_root=root, provider_prefs=config.provider)
             role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
             router = ModelRouter(provider, role_config, project_root=root)
             
@@ -279,11 +397,14 @@ def run(
                     ProjectPhase.TASK_VERIFIED if verified else ProjectPhase.TASK_BLOCKED,
                 )
                 task_repo.save(task)
+                _log_exec_outcome("Native agent", task_id, verified=verified)
                 if verified:
                     console.print(f"\n[green]Native agent finished and task {task_id} verified.[/green]")
                 else:
                     console.print(f"\n[yellow]Native agent finished, but task {task_id} is blocked by verification gaps.[/yellow]")
             else:
+                logger.error("Native agent failed during execution for %s", task_id)
                 console.print("\n[red]Native agent failed during execution.[/red]")
         else:
+            logger.error("Executor %r not implemented", executor)
             console.print(f"[red]Executor {executor} not yet implemented.[/red]")

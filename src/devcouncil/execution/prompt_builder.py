@@ -33,7 +33,7 @@ _RESERVED_COMPLETION_TOKENS = 1536
 _MIN_PROMPT_CHARS = 8_000
 
 
-def _local_context_window_budget(project_root: Path) -> int | None:
+def _local_context_window_budget(project_root: Path, cfg=None) -> int | None:
     """Char budget derived from a constrained local context window, or ``None``.
 
     When the run targets the local Ollama provider with an explicit ``OLLAMA_NUM_CTX``,
@@ -42,11 +42,16 @@ def _local_context_window_budget(project_root: Path) -> int | None:
     budget that fits the window (minus completion headroom) so :meth:`build_task_prompt`
     can cap itself. Returns ``None`` for cloud providers / unset windows, leaving the
     default behavior (and the large cloud CLIs' big windows) untouched. Best-effort:
-    any error degrades to ``None``."""
-    try:
-        from devcouncil.app.config import load_config
+    any error degrades to ``None``.
 
-        provider = load_config(project_root).models.provider.strip().lower()
+    ``cfg`` may be a pre-loaded config (loaded once per task by ``build_task_prompt``); when
+    ``None`` it is loaded here so other callers keep working."""
+    try:
+        if cfg is None:
+            from devcouncil.app.config import load_config
+
+            cfg = load_config(project_root)
+        provider = cfg.models.provider.strip().lower()
         if provider not in {"ollama", "ollama-local", "ollama_local"}:
             return None
     except Exception:
@@ -88,10 +93,25 @@ class PromptBuilder:
         Python uses stdlib ``ast`` (method signatures, async/@property/@staticmethod
         markers under each class). Other languages (ts/tsx/js/jsx/go/rs/java) use bounded
         regex over exported/public declarations. No tree-sitter, no model call. Never
-        raises; honors the per-file symbol cap."""
+        raises; honors the per-file symbol cap.
+
+        Results are memoized per ``build_task_prompt`` run via ``self._outline_cache`` so
+        the same file is parsed once even though both the planned-files section and the
+        call-sites section need its outline. The key includes the ``text`` itself (not just
+        ``path``) so that if the file's content differs between the two reads, the outline
+        is recomputed from the current text rather than served stale — and using the text
+        directly (rather than its hash) means there is no collision risk."""
+        cache = getattr(self, "_outline_cache", None)
+        key = (path, text)
+        if cache is not None and key in cache:
+            return cache[key]
         if path.endswith(".py"):
-            return self._python_symbol_outline(text)
-        return self._regex_symbol_outline(path, text)
+            result = self._python_symbol_outline(text)
+        else:
+            result = self._regex_symbol_outline(path, text)
+        if cache is not None:
+            cache[key] = result
+        return result
 
     def _python_symbol_outline(self, text: str) -> List[str]:
         try:
@@ -252,6 +272,15 @@ class PromptBuilder:
             + "\n".join(blocks)
         )
 
+    def _load_prompt_enhancement(self):
+        """Latest run's prompt-enhancement (None if absent/unreadable). Best-effort: a
+        failure here must never break prompt construction."""
+        try:
+            from devcouncil.planning.prompt_enhancer_service import load_latest_prompt_enhancement
+            return load_latest_prompt_enhancement(self.project_root)
+        except Exception:
+            return None
+
     def _load_repo_map(self) -> dict | None:
         """Parse ``.devcouncil/repo_map.json`` once per prompt (None if absent/unreadable)."""
         map_path = self.project_root / ".devcouncil" / "repo_map.json"
@@ -361,31 +390,37 @@ class PromptBuilder:
                 section += f"- `{skill.name}`{suffix}\n"
         return section
 
-    def _knowledge_sections(self, task: Task) -> tuple[str, str]:
+    def _knowledge_sections(self, task: Task, cfg=None) -> tuple[str, str]:
         """Selected design-system and OKF knowledge context for this task.
 
         Returns ``(design_text, knowledge_text)`` — either may be empty. Sourced from
         ``.devcouncil/knowledge/{design,okf}`` via the same trigger-based selection the
         skills library uses: a design system is always-on (a UI agent must honor it),
         OKF knowledge fires on goal keywords / document tags. Bounded by config char
-        budgets. Never raises — a knowledge failure must not break prompt building."""
+        budgets. Never raises — a knowledge failure must not break prompt building.
+
+        ``cfg`` may be a pre-loaded config (loaded once per task by ``build_task_prompt``);
+        when ``None`` it is loaded here so other callers keep working."""
         try:
-            from devcouncil.app.config import load_config
             from devcouncil.knowledge.sources import (
                 render_knowledge_preamble,
                 select_knowledge_sources,
             )
 
-            cfg = load_config(self.project_root).knowledge
-            if not cfg.enabled:
+            if cfg is None:
+                from devcouncil.app.config import load_config
+
+                cfg = load_config(self.project_root)
+            kcfg = cfg.knowledge
+            if not kcfg.enabled:
                 return "", ""
             goal = f"{task.title}\n{task.description}"
             sources = select_knowledge_sources(
                 goal=goal, project_root=self.project_root,
-                directory=cfg.directory, design_always=cfg.design_always,
+                directory=kcfg.directory, design_always=kcfg.design_always,
             )
-            design_text = render_knowledge_preamble(sources, max_chars=cfg.design_max_chars, kind="design")
-            knowledge_text = render_knowledge_preamble(sources, max_chars=cfg.okf_max_chars, kind="okf")
+            design_text = render_knowledge_preamble(sources, max_chars=kcfg.design_max_chars, kind="design")
+            knowledge_text = render_knowledge_preamble(sources, max_chars=kcfg.okf_max_chars, kind="okf")
         except Exception:
             return "", ""
 
@@ -593,10 +628,22 @@ class PromptBuilder:
     ) -> str:
         if max_chars is None:
             max_chars = MAX_PROMPT_CHARS
+        # Per-task outline cache so a planned file's symbol outline is computed once even
+        # though both the planned-files section and the call-sites section consume it.
+        self._outline_cache: dict[str, List[str]] = {}
+        # Load the project config once and share it with the helpers that need it, instead
+        # of each independently re-reading + re-parsing it. Best-effort: if it fails the
+        # helpers fall back to loading it themselves (and degrade the same way).
+        try:
+            from devcouncil.app.config import load_config
+
+            cfg = load_config(self.project_root)
+        except Exception:
+            cfg = None
         # When the run targets a constrained local window (Ollama + OLLAMA_NUM_CTX),
         # cap the budget so the server doesn't silently truncate past the window. Never
         # raises the budget above the caller's value — only lowers it to fit.
-        window_budget = _local_context_window_budget(self.project_root)
+        window_budget = _local_context_window_budget(self.project_root, cfg=cfg)
         if window_budget is not None:
             max_chars = min(max_chars, window_budget)
 
@@ -615,6 +662,18 @@ class PromptBuilder:
             core += f"- {req.id}: {req.title}\n"
             for ac in req.acceptance_criteria:
                 core += f"  - [ ] {ac.description} ({ac.verification_method})\n"
+
+        # Carry the planning prompt-enhancer's codebase-specific constraints through to the
+        # one who writes the code. Otherwise that domain guidance (e.g. "division truncates
+        # toward zero", "no eval") shapes only the planning debate and reaches the executor
+        # only if a planner happened to encode it into an acceptance criterion.
+        enhancement = self._load_prompt_enhancement()
+        if enhancement is not None and (enhancement.constraints or enhancement.applied_skills):
+            core += "\n## Codebase-specific constraints (from planning — honor these)\n"
+            for constraint in enhancement.constraints[:8]:
+                core += f"- {constraint}\n"
+            if enhancement.applied_skills:
+                core += f"- Apply current senior-level practices for: {', '.join(enhancement.applied_skills[:6])}.\n"
 
         core += "\n## Allowed files\n"
         for pf in task.planned_files:
@@ -642,8 +701,12 @@ class PromptBuilder:
 1. Implement the goal described above.
 2. Ensure all acceptance criteria are met.
 3. Only modify the allowed files.
-4. Run the allowed commands to verify your work.
-5. Provide evidence of passing tests.
+4. Stay within this task's scope even inside an allowed file: change only what the
+   acceptance criteria require. Do NOT remove, rename, or alter the signature of an
+   existing public symbol the task did not ask you to touch — verification flags an
+   unrequested public-API change as scope drift and blocks it.
+5. Run the allowed commands to verify your work.
+6. Provide evidence of passing tests.
 """
 
         # --- Optional context: fitted within the remaining budget, dropped lowest-
@@ -691,7 +754,7 @@ class PromptBuilder:
         # Design system (a hard constraint for UI work) and OKF project knowledge. The
         # design system rides just above skills; OKF knowledge alongside them. Both are
         # bounded by config char budgets in `_knowledge_sections`.
-        design_text, knowledge_text = self._knowledge_sections(task)
+        design_text, knowledge_text = self._knowledge_sections(task, cfg=cfg)
         if design_text:
             segments.append({"order": 4, "priority": 2, "name": "design system", "text": design_text})
         if knowledge_text:

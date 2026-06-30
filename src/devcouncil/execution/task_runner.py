@@ -5,8 +5,11 @@ import logging
 import re
 import shlex
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, Optional, TYPE_CHECKING
 from devcouncil.domain.task import Task
+
+if TYPE_CHECKING:
+    from devcouncil.app.config import DevCouncilConfig
 from devcouncil.execution.permissions import PermissionManager
 from devcouncil.domain.evidence import CommandResult
 from devcouncil.app.errors import ExecutionError
@@ -25,6 +28,16 @@ class TaskRunner:
         self.project_root = project_root
         self.permissions = permission_manager
         self.patch_engine = PatchEngine(project_root)
+        # Load config and build the trace logger once: run_command previously
+        # re-parsed config.yaml on every command, and each operation rebuilt a
+        # TraceLogger. Both are reusable for the lifetime of the runner.
+        self.config: "Optional[DevCouncilConfig]"
+        try:
+            from devcouncil.app.config import load_config
+            self.config = load_config(project_root)
+        except Exception:
+            self.config = None
+        self.tracer = TraceLogger(project_root)
 
     def _validate_path_within_root(self, path: str) -> None:
         """Ensure a path resolves to a location within the project root."""
@@ -37,7 +50,7 @@ class TaskRunner:
             self._validate_path_within_root(path)
             self.permissions.validate_action("file_write", path, task, operation=operation)
         applied = self.patch_engine.apply_patch(patch)
-        TraceLogger(self.project_root).log_event(
+        self.tracer.log_event(
             "tool_patch_applied",
             {"paths": sorted(changes), "success": applied},
             task_id=task.id,
@@ -107,9 +120,7 @@ class TaskRunner:
         logger.info(f"Executing authorized command: {command}")
         
         try:
-            from devcouncil.app.config import load_config
-            config = load_config(self.project_root)
-            timeout = config.execution.command_timeout
+            timeout = self.config.execution.command_timeout if self.config is not None else 300
         except Exception:
             timeout = 300
 
@@ -133,7 +144,7 @@ class TaskRunner:
             stderr_path = self._save_command_log(task.id, command, "stderr", stderr)
             stdout_summary = redact_string(stdout[-500:])
             stderr_summary = redact_string(stderr[-500:])
-            TraceLogger(self.project_root).log_event(
+            self.tracer.log_event(
                 "command_executed",
                 {"command": command, "exit_code": result.returncode},
                 task_id=task.id,
@@ -160,7 +171,7 @@ class TaskRunner:
         try:
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(content, encoding="utf-8")
-            TraceLogger(self.project_root).log_event(
+            self.tracer.log_event(
                 "file_written",
                 {"path": path},
                 task_id=task.id,

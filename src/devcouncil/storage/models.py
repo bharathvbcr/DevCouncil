@@ -69,6 +69,10 @@ class GapModel(SQLModel, table=True):
     line: Optional[int] = None
     suggested_command: Optional[str] = None
     acceptance_criterion_id: Optional[str] = None
+    # Verification method the criterion expects (unit_test/manual/llm_review/...). Persisted
+    # so the repair loop can tell an executor-remediable "incomplete" (an automatable check
+    # that did not run) from one a human must close (manual/llm_review) after a reload.
+    expected_verification_method: Optional[str] = None
 
 class CritiqueFindingModel(SQLModel, table=True):
     __tablename__ = "critique_findings"

@@ -1,6 +1,12 @@
+from __future__ import annotations
+
 from pathlib import Path
+from typing import TYPE_CHECKING
+
 from rich.console import Console
-from devcouncil.indexing.graph_index import GraphIndex
+
+if TYPE_CHECKING:
+    from devcouncil.indexing.graph_index import GraphIndex
 
 console = Console()
 AGENT_GUIDE_MARKER = "<!-- Managed by dev map: keep this file in sync with .devcouncil/repo_map.json. -->"
@@ -58,5 +64,7 @@ class GitNexusIntegration:
         """
         Export DevCouncil artifact graph to GitNexus.
         """
+        # TODO: Consume graph_index to export the artifact graph. This is still a stub;
+        # the GraphIndex is intentionally not loaded/instantiated yet to avoid dead work.
+        # The import is kept under TYPE_CHECKING so module import does no eager work.
         console.print("  - Syncing DevCouncil artifacts to GitNexus...")
-        pass

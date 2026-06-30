@@ -1,10 +1,13 @@
 import fnmatch
+import logging
 from pathlib import Path
 from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
 from devcouncil.domain.task import PlannedFile, Task
 from devcouncil.app.errors import GatingError
 from devcouncil.execution.policy_engine import TaskPolicyEngine
+
+logger = logging.getLogger(__name__)
 
 class PermissionPolicy(BaseModel):
     """Defines the security boundaries for task execution."""
@@ -76,10 +79,14 @@ class PermissionManager:
         """Raise GatingError if an execution action violates permissions."""
         if action_type == "file_write":
             if not self.is_file_change_allowed(target, task, operation, internal=internal):
+                logger.warning("DENIED file %s for %s: %s (not in planned_files)", operation, task.id, target)
                 raise GatingError(
                     f"Unauthorized file {operation}: {target}. "
                     "File and operation must match task planned_files."
                 )
+            logger.debug("Allowed file %s for %s: %s", operation, task.id, target)
         elif action_type == "shell":
             if not self.is_command_allowed(target, task):
+                logger.warning("DENIED shell command for %s: %s (not in allowed_commands)", task.id, target)
                 raise GatingError(f"Unauthorized shell command: {target}. Command must be in task's allowed_commands.")
+            logger.debug("Allowed shell command for %s: %s", task.id, target)

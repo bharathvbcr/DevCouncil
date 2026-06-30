@@ -190,7 +190,10 @@ def initialize_project(
     dev_dir = project_root / ".devcouncil"
     created = False
 
-    if not dev_dir.exists():
+    # Detect "already initialized" by the config file, NOT the .devcouncil/ directory:
+    # logging creates .devcouncil/logs/ on every CLI startup, so the directory exists
+    # before init runs. Keying on config.yaml ensures a first init still writes config.
+    if not (dev_dir / "config.yaml").exists():
         if not quiet:
             console.print("Initializing DevCouncil...")
         dev_dir.mkdir(exist_ok=True)
@@ -264,7 +267,9 @@ def init(
         return
 
     dev_dir = Path(".devcouncil")
-    if dev_dir.exists() and not (with_gitnexus or with_graphify):
+    # "Already initialized" means a config.yaml exists — not merely the .devcouncil/
+    # directory, which the logging setup pre-creates (.devcouncil/logs/) on startup.
+    if (dev_dir / "config.yaml").exists() and not (with_gitnexus or with_graphify):
         console.print("[yellow]DevCouncil is already initialized in this directory.[/yellow]")
         console.print("Use --gitnexus or --graphify to add upgrade paths.")
         raise typer.Exit()

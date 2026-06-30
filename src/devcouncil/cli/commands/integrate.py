@@ -199,12 +199,24 @@ _PENDING_RAW_CONFIG: dict | None = None
 @contextmanager
 def _batched_raw_config(project_root: Path):
     global _PENDING_RAW_CONFIG
+    # Re-entrant: if a batch is already active, participate in it instead of
+    # starting a nested load/save (which would otherwise reset the shared
+    # buffer to None on inner exit and drop the outer batch's mutations).
+    if _PENDING_RAW_CONFIG is not None:
+        yield
+        return
     _PENDING_RAW_CONFIG = _load_raw_config(project_root)
     try:
         yield
-        _save_raw_config(project_root, _PENDING_RAW_CONFIG)
     finally:
+        # Persist whatever mutations accumulated, even if an inner installer raised
+        # partway through — matching the old per-installer save, which committed each
+        # installer's change immediately rather than dropping the whole batch on a
+        # mid-loop failure.
+        pending = _PENDING_RAW_CONFIG
         _PENDING_RAW_CONFIG = None
+        if pending is not None:
+            _save_raw_config(project_root, pending)
 
 
 def _mutate_raw_config(project_root: Path, mutate) -> None:
@@ -649,13 +661,14 @@ def _install_cursor_hooks(project_root: Path) -> list[Path]:
         _hook_command(project_root, "cursor", "post-tool-use"),
     )
     _save_json(path, settings)
-    config = _load_raw_config(project_root)
-    integrations = config.setdefault("integrations", {})
-    cursor = integrations.setdefault("cursor", {})
-    cursor.update({
-        "hooks_path": str(path.relative_to(project_root)),
-    })
-    _save_raw_config(project_root, config)
+
+    def mutate(config: dict) -> None:
+        cursor = config.setdefault("integrations", {}).setdefault("cursor", {})
+        cursor.update({
+            "hooks_path": str(path.relative_to(project_root)),
+        })
+
+    _mutate_raw_config(project_root, mutate)
     return [path]
 
 
@@ -684,24 +697,38 @@ def _install_opencode_hooks(project_root: Path) -> list[Path]:
     return [destination, path]
 
 
-def _install_claude_hooks(project_root: Path) -> list[Path]:
+def _install_claude_hooks(project_root: Path, *, write_gate: bool = False) -> list[Path]:
+    """Install DevCouncil's Claude Code hooks into .claude/settings.local.json.
+
+    By default this installs only the *assistive* lifecycle hooks (status injection on
+    SessionStart/UserPromptSubmit, the live-review Stop signal, and the SessionEnd/
+    PreCompact/SubagentStop/Notification trace hooks). These never block a tool call.
+
+    The blocking pre-action **write-gate** (PreToolUse/PostToolUse, which denies any
+    Bash/Write/Edit not authorized by an active task lease) is installed ONLY when
+    ``write_gate`` is True. It is meant for autonomous executor runs, not interactive
+    human sessions — in an interactive session there is no task lease, so the gate would
+    fail-closed and deny every command. (``dev run --executor claude`` does its own
+    post-hoc scope enforcement and does not depend on this hook, so leaving it off by
+    default loses no containment.)"""
     path = project_root / ".claude" / "settings.local.json"
     settings = _load_json(path)
     matcher = "Bash|Write|Edit|MultiEdit"
-    _upsert_hook(
-        settings,
-        "PreToolUse",
-        matcher,
-        _hook_command(project_root, "claude", "pre-tool-use"),
-        "devcouncil-pre-tool-use",
-    )
-    _upsert_hook(
-        settings,
-        "PostToolUse",
-        matcher,
-        _hook_command(project_root, "claude", "post-tool-use"),
-        "devcouncil-post-tool-use",
-    )
+    if write_gate:
+        _upsert_hook(
+            settings,
+            "PreToolUse",
+            matcher,
+            _hook_command(project_root, "claude", "pre-tool-use"),
+            "devcouncil-pre-tool-use",
+        )
+        _upsert_hook(
+            settings,
+            "PostToolUse",
+            matcher,
+            _hook_command(project_root, "claude", "post-tool-use"),
+            "devcouncil-post-tool-use",
+        )
     _upsert_hook(
         settings,
         "Stop",
@@ -709,8 +736,263 @@ def _install_claude_hooks(project_root: Path) -> list[Path]:
         _hook_command(project_root, "claude", "agent-response"),
         "devcouncil-agent-response-ready",
     )
+    # Lifecycle events: status-on-start/prompt, teardown, compaction, subagent finish,
+    # and notifications. These complete DevCouncil's coverage of the documented Claude
+    # Code hook surface beyond the pre/post/stop gate.
+    _upsert_hook(
+        settings,
+        "SessionStart",
+        "startup|resume",
+        _hook_command(project_root, "claude", "session-start"),
+        "devcouncil-session-start",
+    )
+    _upsert_hook(
+        settings,
+        "UserPromptSubmit",
+        "",
+        _hook_command(project_root, "claude", "user-prompt-submit"),
+        "devcouncil-user-prompt-submit",
+    )
+    _upsert_hook(
+        settings,
+        "SessionEnd",
+        "",
+        _hook_command(project_root, "claude", "session-end"),
+        "devcouncil-session-end",
+    )
+    _upsert_hook(
+        settings,
+        "PreCompact",
+        "",
+        _hook_command(project_root, "claude", "pre-compact"),
+        "devcouncil-pre-compact",
+    )
+    _upsert_hook(
+        settings,
+        "SubagentStop",
+        "",
+        _hook_command(project_root, "claude", "subagent-stop"),
+        "devcouncil-subagent-stop",
+    )
+    _upsert_hook(
+        settings,
+        "Notification",
+        "",
+        _hook_command(project_root, "claude", "notification"),
+        "devcouncil-notification",
+    )
     _save_json(path, settings)
     return [path]
+
+
+def _devcouncil_version() -> str:
+    """Package version for plugin manifests, or a stable placeholder when uninstalled."""
+    import importlib.metadata
+
+    try:
+        return importlib.metadata.version("devcouncil")
+    except importlib.metadata.PackageNotFoundError:
+        return "0.0.0"
+
+
+# Read-only DevCouncil commands the generated slash commands / hooks shell out to. Adding
+# them to the Claude permissions allow-list keeps the integration from prompting on every
+# `dev status`/`dev report` the slash commands run.
+_CLAUDE_PERMISSION_ALLOW = [
+    "Bash(dev status:*)",
+    "Bash(dev report:*)",
+    "Bash(dev tasks:*)",
+    "Bash(dev verify:*)",
+    "Bash(dev repair:*)",
+    "Bash(dev plan:*)",
+    "Bash(dev watch:*)",
+    "Bash(devcouncil mcp-server)",
+]
+
+
+def _install_claude_settings(project_root: Path) -> tuple[Path, bool]:
+    """Write the statusLine, MCP enablement, and permission allow-list into Claude settings.
+
+    Merges into .claude/settings.local.json without clobbering existing user entries.
+    Returns (path, changed); only rewrites the file when the merge changes something so
+    re-running integration is a true no-op."""
+    path = project_root / ".claude" / "settings.local.json"
+    settings = _load_json(path)
+    before = json.dumps(settings, sort_keys=True)
+
+    settings["statusLine"] = {
+        "type": "command",
+        "command": "devcouncil hook claude-statusline",
+    }
+    # Auto-enable the project-scoped DevCouncil MCP server so a teammate cloning the repo
+    # doesn't have to approve it interactively.
+    enabled = settings.setdefault("enabledMcpjsonServers", [])
+    if isinstance(enabled, list) and "devcouncil" not in enabled:
+        enabled.append("devcouncil")
+
+    permissions = settings.setdefault("permissions", {})
+    if isinstance(permissions, dict):
+        allow = permissions.setdefault("allow", [])
+        if isinstance(allow, list):
+            for rule in _CLAUDE_PERMISSION_ALLOW:
+                if rule not in allow:
+                    allow.append(rule)
+
+    changed = json.dumps(settings, sort_keys=True) != before
+    if changed:
+        _save_json(path, settings)
+    return path, changed
+
+
+def _selected_skill_assets(project_root: Path):
+    """Scaffold the applicable skills and return them as GeneratedAsset-like records.
+
+    Returns (written_paths, skill_assets) where skill_assets carry (path, content) for the
+    plugin bundler so the plugin ships the same skill bodies that land in .claude/skills/."""
+    from devcouncil.integrations.claude_assets import GeneratedAsset
+    from devcouncil.skills.registry import scaffold_skills, select_skills
+
+    skills = select_skills("", project_root)
+    written = scaffold_skills(project_root, skills)
+    assets: list[GeneratedAsset] = []
+    skills_root = project_root / ".claude" / "skills"
+    for skill in skills:
+        target = skills_root / skill.name / "SKILL.md"
+        if target.exists():
+            assets.append(GeneratedAsset(target, target.read_text(encoding="utf-8")))
+    return written, assets
+
+
+def _install_claude_assets(project_root: Path) -> list[Path]:
+    """Generate the static Claude Code asset surface (commands, agents, output style,
+    statusline, permissions) and scaffold the applicable skills. Idempotent."""
+    from devcouncil.integrations import claude_assets
+
+    written: list[Path] = []
+    assets: list[claude_assets.GeneratedAsset] = []
+    assets += claude_assets.build_slash_commands(project_root)
+    assets += claude_assets.build_subagents(project_root)
+    assets += claude_assets.build_output_style(project_root)
+    for asset in assets:
+        if asset.write_if_changed():
+            written.append(asset.path)
+
+    skills_written, _ = _selected_skill_assets(project_root)
+    written.extend(skills_written)
+    settings_path, settings_changed = _install_claude_settings(project_root)
+    if settings_changed:
+        written.append(settings_path)
+    return written
+
+
+def _install_claude_plugin(project_root: Path, *, write_gate: bool = False) -> list[Path]:
+    """Build the self-contained Claude Code plugin + single-repo marketplace bundle.
+
+    Bundles the commands, agents, applicable skills, hooks, and MCP config so the entire
+    DevCouncil integration installs with one `/plugin install`. Assist-mode hooks by
+    default; pass write_gate=True to bundle the blocking containment gate."""
+    from devcouncil.integrations import claude_assets
+
+    _, skill_assets = _selected_skill_assets(project_root)
+    bundle = claude_assets.build_plugin_bundle(
+        project_root, version=_devcouncil_version(), skill_assets=skill_assets, write_gate=write_gate
+    )
+    return [asset.path for asset in bundle if asset.write_if_changed()]
+
+
+def _uninstall_claude(project_root: Path) -> list[str]:
+    """Remove everything DevCouncil installed into a Claude Code project. Idempotent.
+
+    Strips DevCouncil's hooks (every event), the DevCouncil statusLine, the MCP enablement
+    and permission rules from .claude/settings.local.json (leaving any user-authored
+    entries untouched), deletes the generated commands/subagents/output-style files, and
+    best-effort de-registers the MCP server via `claude mcp remove`. Returns a list of the
+    changes made. The recoverable, in-band counterpart to a fail-closed write-gate."""
+    removed: list[str] = []
+    path = project_root / ".claude" / "settings.local.json"
+    settings = _load_json(path)
+    before = json.dumps(settings, sort_keys=True)
+
+    # Hooks: drop any entry whose command invokes `devcouncil hook`, then prune empties.
+    hooks = settings.get("hooks")
+    if isinstance(hooks, dict):
+        for event in list(hooks):
+            groups = hooks.get(event)
+            if not isinstance(groups, list):
+                continue
+            kept_groups = []
+            for group in groups:
+                inner = group.get("hooks", []) if isinstance(group, dict) else []
+                inner_kept = [
+                    h for h in inner
+                    if "devcouncil hook" not in str(h.get("command", ""))
+                ]
+                if inner_kept:
+                    group["hooks"] = inner_kept
+                    kept_groups.append(group)
+            if kept_groups:
+                hooks[event] = kept_groups
+            else:
+                hooks.pop(event)
+        if not hooks:
+            settings.pop("hooks")
+        removed.append(f"hooks in {path.name}")
+
+    # statusLine: only remove ours.
+    status = settings.get("statusLine")
+    if isinstance(status, dict) and "devcouncil" in str(status.get("command", "")):
+        settings.pop("statusLine")
+        removed.append("statusLine")
+
+    enabled = settings.get("enabledMcpjsonServers")
+    if isinstance(enabled, list) and "devcouncil" in enabled:
+        enabled.remove("devcouncil")
+        if not enabled:
+            settings.pop("enabledMcpjsonServers")
+        removed.append("enabledMcpjsonServers entry")
+
+    permissions = settings.get("permissions")
+    if isinstance(permissions, dict) and isinstance(permissions.get("allow"), list):
+        kept = [r for r in permissions["allow"] if r not in _CLAUDE_PERMISSION_ALLOW]
+        if len(kept) != len(permissions["allow"]):
+            permissions["allow"] = kept
+            removed.append("permission allow-rules")
+        if not permissions.get("allow"):
+            permissions.pop("allow", None)
+        if not permissions:
+            settings.pop("permissions")
+
+    if json.dumps(settings, sort_keys=True) != before:
+        if settings:
+            _save_json(path, settings)
+        elif path.exists():
+            path.unlink()
+            removed.append(f"deleted empty {path.name}")
+
+    # Generated asset files.
+    targets = [
+        project_root / ".claude" / "commands" / "devcouncil",
+        project_root / ".claude" / "output-styles" / "devcouncil.md",
+    ]
+    targets += [
+        project_root / ".claude" / "agents" / f"{name}.md"
+        for name in ("devcouncil-implementer", "devcouncil-verifier", "devcouncil-reviewer")
+    ]
+    for target in targets:
+        if target.is_dir():
+            shutil.rmtree(target)
+            removed.append(str(target.relative_to(project_root)))
+        elif target.exists():
+            target.unlink()
+            removed.append(str(target.relative_to(project_root)))
+
+    # De-register the MCP server (best-effort; only if the claude CLI is present).
+    if shutil.which("claude"):
+        code = _run(["claude", "mcp", "remove", "devcouncil"])
+        if code == 0:
+            removed.append("claude mcp server registration")
+
+    return removed
 
 
 def _preview_hook_paths(project_root: Path, tool: str) -> list[tuple[str, Path]]:
@@ -731,7 +1013,9 @@ def _preview_hook_paths(project_root: Path, tool: str) -> list[tuple[str, Path]]
     return [(client, path) for client in selected for path in paths.get(client, [])]
 
 
-def _configure_native_hooks(project_root: Path, tool: str = "all", apply: bool = False) -> None:
+def _configure_native_hooks(
+    project_root: Path, tool: str = "all", apply: bool = False, *, claude_write_gate: bool = False
+) -> None:
     allowed = {"all", *SUPPORTED_HOOK_TOOLS, "opencode"}
     if tool not in allowed:
         console.print("[red]--tool must be one of: all, codex, gemini, claude, cursor, opencode.[/red]")
@@ -754,17 +1038,22 @@ def _configure_native_hooks(project_root: Path, tool: str = "all", apply: bool =
     installers = {
         "codex": _install_codex_hooks,
         "gemini": _install_gemini_hooks,
-        "claude": _install_claude_hooks,
+        # Claude's blocking write-gate is opt-in (assist-mode default); the other clients
+        # install their native pre/post hooks unconditionally as before.
+        "claude": lambda root: _install_claude_hooks(root, write_gate=claude_write_gate),
         "cursor": _install_cursor_hooks,
         "opencode": _install_opencode_hooks,
     }
-    for client in selected:
-        try:
-            written = installers[client](project_root)
-        except (ValueError, FileNotFoundError) as exc:
-            console.print(f"[red]{client} hook setup failed: {exc}[/red]")
-            raise typer.Exit(code=1) from exc
-        console.print(f"[green]{client} native hooks configured:[/green] {', '.join(str(path) for path in written)}")
+    # Batch the per-installer config.yaml record updates (cursor/opencode)
+    # into one load/save instead of re-parsing YAML per tool.
+    with _batched_raw_config(project_root):
+        for client in selected:
+            try:
+                written = installers[client](project_root)
+            except (ValueError, FileNotFoundError) as exc:
+                console.print(f"[red]{client} hook setup failed: {exc}[/red]")
+                raise typer.Exit(code=1) from exc
+            console.print(f"[green]{client} native hooks configured:[/green] {', '.join(str(path) for path in written)}")
 
 
 def _print_command(tool: str, command: list[str], apply: bool):
@@ -811,7 +1100,10 @@ def overview(ctx: typer.Context):
     table.add_column("Notes")
     table.add_row("Codex CLI", f"{PREFERRED_COMMAND} codex --apply", "Adds DevCouncil as a stdio MCP server.")
     table.add_row("Gemini CLI", f"{PREFERRED_COMMAND} gemini --apply", "Adds DevCouncil as a project-scoped stdio MCP server.")
-    table.add_row("Claude Code", f"{PREFERRED_COMMAND} claude --apply", "Adds DevCouncil as a Claude Code MCP server.")
+    table.add_row("Claude Code", f"{PREFERRED_COMMAND} claude --apply", "MCP + assistive hooks + slash commands, subagents, output style, skills, statusline. Add --write-gate for blocking containment.")
+    table.add_row("Claude assets", f"{PREFERRED_COMMAND} claude-assets --apply", "Slash commands, subagents, output style, statusline, permissions, skills (no MCP/hooks).")
+    table.add_row("Claude plugin", f"{PREFERRED_COMMAND} claude-plugin --apply", "Self-contained Claude Code plugin + marketplace bundling everything for /plugin install.")
+    table.add_row("Claude uninstall", f"{PREFERRED_COMMAND} claude --uninstall", "Remove DevCouncil hooks, statusline, MCP enablement, and generated assets from .claude/.")
     table.add_row("Cursor", f"{PREFERRED_COMMAND} cursor --apply", "Writes project .cursor/mcp.json for Cursor editor and cursor-agent.")
     table.add_row("OpenCode", f"{PREFERRED_COMMAND} opencode --apply", "Adds DevCouncil as a project-scoped OpenCode MCP server and executor.")
     table.add_row("Google Antigravity CLI", f"{PREFERRED_COMMAND} antigravity --apply", "Writes project .agents/mcp_config.json and enables the agy executor.")
@@ -922,19 +1214,146 @@ def claude(
     apply: bool = typer.Option(False, "--apply", help="Run the setup command instead of printing it."),
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
     scope: str = typer.Option("local", "--scope", help="Claude MCP config scope: local, project, or user."),
+    write_gate: bool = typer.Option(
+        False,
+        "--write-gate/--no-write-gate",
+        "--contain/--no-contain",
+        help="Also install the blocking PreToolUse/PostToolUse write-gate (containment). "
+        "Off by default — it denies any tool call not authorized by an active task lease, "
+        "which fail-closes an interactive session. Use it for autonomous executor runs.",
+    ),
+    uninstall: bool = typer.Option(
+        False,
+        "--uninstall",
+        help="Remove DevCouncil's Claude hooks, statusline, MCP enablement, and generated assets.",
+    ),
 ):
     """
-    Set up DevCouncil MCP tools for Claude Code.
+    Set up DevCouncil for Claude Code: MCP server + assistive hooks + slash commands,
+    subagents, output style, skills, and statusline. The blocking write-gate is opt-in
+    via --write-gate. Use --uninstall to remove everything DevCouncil installed.
     """
+    root = _project_root(project_root)
+    if uninstall:
+        removed = _uninstall_claude(root)
+        if removed:
+            console.print(f"[green]Removed DevCouncil Claude integration[/green] ({len(removed)} change(s)):")
+            for item in removed:
+                console.print(f"  {item}")
+        else:
+            console.print("[dim]Nothing to remove — DevCouncil Claude integration not found.[/dim]")
+        return
+
     if scope not in {"local", "project", "user"}:
         console.print("[red]--scope must be 'local', 'project', or 'user'.[/red]")
         raise typer.Exit(code=2)
 
-    root = _project_root(project_root)
     command = _claude_command(root, scope)
     ok = _configure("Claude Code", command, apply)
+    if apply:
+        # One-shot: MCP server + assistive hooks (write-gate only with --write-gate) + the
+        # static asset surface (slash commands, subagents, output style, skills, statusline).
+        try:
+            written = _install_claude_hooks(root, write_gate=write_gate)
+            written += _install_claude_assets(root)
+        except (ValueError, FileNotFoundError, OSError) as exc:
+            console.print(f"[red]Claude asset setup failed: {exc}[/red]")
+            raise typer.Exit(code=1) from exc
+        mode = "with write-gate (containment)" if write_gate else "assist mode (no write-gate)"
+        console.print(
+            f"[green]Claude Code integration installed[/green] ({len(written)} file(s), {mode}): "
+            "MCP, hooks, slash commands, subagents, output style, skills, statusline, permissions."
+        )
+        if not write_gate:
+            console.print(
+                "[dim]Add pre-action containment for autonomous runs with[/dim] "
+                f"[dim]{PREFERRED_COMMAND} claude --apply --write-gate[/dim]"
+            )
+        console.print(
+            "Bundle everything as an installable plugin with: "
+            f"[dim]{PREFERRED_COMMAND} claude-plugin --apply[/dim]"
+        )
     if not ok and apply:
         raise typer.Exit(code=1)
+
+
+@app.command("claude-assets")
+def claude_assets_cmd(
+    apply: bool = typer.Option(False, "--apply", help="Write the Claude asset files instead of previewing them."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """
+    Generate the Claude Code asset surface: slash commands, subagents, output style,
+    statusline, permissions, and scaffolded skills (no MCP/hook registration).
+    """
+    from devcouncil.integrations import claude_assets as _assets
+
+    root = _project_root(project_root)
+    if not apply:
+        console.print("[bold]Claude Code assets (preview)[/bold]")
+        preview = (
+            _assets.build_slash_commands(root)
+            + _assets.build_subagents(root)
+            + _assets.build_output_style(root)
+        )
+        for asset in preview:
+            console.print(f"  {asset.path}", soft_wrap=True)
+        console.print("  .claude/settings.local.json (statusLine + permissions + enabledMcpjsonServers)")
+        console.print("  .claude/skills/<applicable>/SKILL.md")
+        console.print("[yellow]Preview only. Rerun with --apply to write the files.[/yellow]")
+        return
+
+    try:
+        written = _install_claude_assets(root)
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        console.print(f"[red]Claude asset setup failed: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Wrote {len(written)} Claude asset file(s).[/green]")
+    for path in written:
+        try:
+            console.print(f"  {path.relative_to(root).as_posix()}")
+        except ValueError:
+            console.print(f"  {path}")
+
+
+@app.command("claude-plugin")
+def claude_plugin_cmd(
+    apply: bool = typer.Option(False, "--apply", help="Write the plugin bundle instead of previewing it."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+    write_gate: bool = typer.Option(
+        False,
+        "--write-gate/--no-write-gate",
+        "--contain/--no-contain",
+        help="Bundle Claude's blocking write-gate in the plugin hooks (off by default).",
+    ),
+):
+    """
+    Build a self-contained Claude Code plugin + single-repo marketplace bundling the
+    DevCouncil commands, subagents, skills, hooks, and MCP server under
+    .devcouncil/claude-plugin/ for one-command `/plugin install`.
+    """
+    from devcouncil.integrations.claude_assets import PLUGIN_ROOT_REL
+
+    root = _project_root(project_root)
+    market_dir = root / PLUGIN_ROOT_REL
+    if not apply:
+        console.print("[bold]Claude Code plugin bundle (preview)[/bold]")
+        console.print(f"Marketplace + plugin root: [dim]{market_dir}[/dim]")
+        console.print("Install after --apply with:")
+        console.print(f"  [dim]/plugin marketplace add {market_dir}[/dim]")
+        console.print("  [dim]/plugin install devcouncil@devcouncil-local[/dim]")
+        console.print("[yellow]Preview only. Rerun with --apply to write the bundle.[/yellow]")
+        return
+
+    try:
+        written = _install_claude_plugin(root, write_gate=write_gate)
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        console.print(f"[red]Claude plugin build failed: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Built Claude plugin bundle[/green] ({len(written)} file(s)) at {market_dir}")
+    console.print("Install it in Claude Code with:")
+    console.print(f"  [dim]/plugin marketplace add {market_dir}[/dim]")
+    console.print("  [dim]/plugin install devcouncil@devcouncil-local[/dim]")
 
 
 @app.command("cursor")
@@ -1142,6 +1561,12 @@ def all_tools(
     gemini_scope: str = typer.Option("project", "--gemini-scope", help="Gemini MCP config scope: project or user."),
     claude_scope: str = typer.Option("local", "--claude-scope", help="Claude MCP config scope: local, project, or user."),
     hooks: bool = typer.Option(True, "--hooks/--no-hooks", help="Include native Codex, Gemini, and Claude hook setup."),
+    write_gate: bool = typer.Option(
+        False,
+        "--write-gate/--no-write-gate",
+        "--contain/--no-contain",
+        help="Install Claude's blocking write-gate too (off by default; for autonomous executor runs).",
+    ),
     strict: bool = typer.Option(
         False,
         "--strict",
@@ -1167,6 +1592,7 @@ def all_tools(
             strict=strict,
             gemini_scope=gemini_scope,
             claude_scope=claude_scope,
+            claude_write_gate=write_gate,
         )
         if not report.ok:
             console.print(report.to_json())
@@ -1328,19 +1754,51 @@ def hooks(
     apply: bool = typer.Option(False, "--apply", help="Write native hook config files instead of previewing paths."),
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
     tool: str = typer.Option("all", "--tool", help="Hook target: all, codex, gemini, claude, cursor, or opencode."),
+    write_gate: bool = typer.Option(
+        False,
+        "--write-gate/--no-write-gate",
+        "--contain/--no-contain",
+        help="Install Claude's blocking PreToolUse/PostToolUse write-gate too (off by default; "
+        "fail-closes an interactive session without a task lease).",
+    ),
 ):
     """
     Install DevCouncil hook configuration for Codex, Gemini, Claude, Cursor, and OpenCode.
+
+    Claude installs only assistive hooks by default; add --write-gate for pre-action
+    containment (intended for autonomous executor runs).
     """
     root = _project_root(project_root)
     if apply and tool == "all":
-        report = apply_integration_target(root, "hooks")
+        report = apply_integration_target(root, "hooks", claude_write_gate=write_gate)
         if not report.ok:
             console.print(report.to_json())
             raise typer.Exit(code=1)
         console.print("[green]Native hooks configured.[/green]")
         return
-    _configure_native_hooks(root, tool, apply)
+    _configure_native_hooks(root, tool, apply, claude_write_gate=write_gate)
+
+
+@app.command("uninstall")
+def uninstall(
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+    target: str = typer.Option("claude", "--target", help="What to uninstall. Currently: claude."),
+):
+    """
+    Remove a DevCouncil integration. Reverses `dev integrate claude` — hooks, statusline,
+    MCP enablement, permission rules, and the generated commands/subagents/output style.
+    """
+    root = _project_root(project_root)
+    if target != "claude":
+        console.print("[red]--target must be 'claude'.[/red]")
+        raise typer.Exit(code=2)
+    removed = _uninstall_claude(root)
+    if removed:
+        console.print(f"[green]Removed DevCouncil Claude integration[/green] ({len(removed)} change(s)):")
+        for item in removed:
+            console.print(f"  {item}")
+    else:
+        console.print("[dim]Nothing to remove — DevCouncil Claude integration not found.[/dim]")
 
 
 @app.command("check")

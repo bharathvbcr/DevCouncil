@@ -150,27 +150,43 @@ class GapRepository:
     def __init__(self, session: Session):
         self.session = session
 
+    @staticmethod
+    def _to_gap(m: GapModel) -> Gap:
+        return Gap.model_validate({
+            "id": m.id,
+            "severity": m.severity,
+            "gap_type": m.gap_type,
+            "requirement_id": m.requirement_id,
+            "task_id": m.task_id,
+            "description": m.description,
+            "evidence": json.loads(m.evidence_json),
+            "recommended_fix": m.recommended_fix,
+            "blocking": m.blocking,
+            "file": m.file,
+            "line": m.line,
+            "suggested_command": m.suggested_command,
+            "acceptance_criterion_id": m.acceptance_criterion_id,
+            "expected_verification_method": m.expected_verification_method,
+        })
+
     def get_all(self) -> List[Gap]:
         statement = select(GapModel)
         models = self.session.exec(statement).all()
-        results = []
-        for m in models:
-            results.append(Gap.model_validate({
-                "id": m.id,
-                "severity": m.severity,
-                "gap_type": m.gap_type,
-                "requirement_id": m.requirement_id,
-                "task_id": m.task_id,
-                "description": m.description,
-                "evidence": json.loads(m.evidence_json),
-                "recommended_fix": m.recommended_fix,
-                "blocking": m.blocking,
-                "file": m.file,
-                "line": m.line,
-                "suggested_command": m.suggested_command,
-                "acceptance_criterion_id": m.acceptance_criterion_id,
-            }))
-        return results
+        return [self._to_gap(m) for m in models]
+
+    def get_for_task(self, task_id: str) -> List[Gap]:
+        statement = select(GapModel).where(col(GapModel.task_id) == task_id)
+        models = self.session.exec(statement).all()
+        return [self._to_gap(m) for m in models]
+
+    def get_blocking_for_task(self, task_id: str) -> List[Gap]:
+        statement = (
+            select(GapModel)
+            .where(col(GapModel.task_id) == task_id)
+            .where(col(GapModel.blocking) == True)  # noqa: E712 - SQL boolean comparison
+        )
+        models = self.session.exec(statement).all()
+        return [self._to_gap(m) for m in models]
 
     def save(self, gap: Gap):
         model = GapModel(
@@ -187,6 +203,7 @@ class GapRepository:
             line=gap.line,
             suggested_command=gap.suggested_command,
             acceptance_criterion_id=gap.acceptance_criterion_id,
+            expected_verification_method=gap.expected_verification_method,
         )
         self.session.merge(model)
         self.session.commit()

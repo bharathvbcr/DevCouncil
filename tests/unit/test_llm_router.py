@@ -3,9 +3,10 @@ import json
 import pytest
 from pydantic import BaseModel
 
-from devcouncil.app.config import get_api_key
+from devcouncil.app.config import ModelRoleConfig, ProviderConfig, get_api_key
 from devcouncil.llm.provider import (
     LLMResponse,
+    OllamaProvider,
     OpenRouterProvider,
     DoublewordProvider,
     Provider,
@@ -14,6 +15,7 @@ from devcouncil.llm.provider import (
     build_role_model_config,
     create_provider,
     load_default_role_models_by_provider,
+    openrouter_provider_payload,
     validate_model_provider,
 )
 from devcouncil.llm.router import ModelRouter, StructuredOutputError
@@ -327,9 +329,6 @@ async def test_router_does_not_count_cached_usage_twice(tmp_path, monkeypatch):
 
 # --- Per-role provider routing --------------------------------------------------
 
-from devcouncil.app.config import ModelRoleConfig
-from devcouncil.llm.provider import OllamaProvider
-
 
 def test_model_role_config_normalizes_and_validates_provider():
     assert ModelRoleConfig(model="m").provider is None
@@ -389,3 +388,114 @@ async def test_router_routes_roles_to_distinct_providers(tmp_path, monkeypatch):
 
     assert default.calls == 1  # only the planning role hit the default provider
     assert captured["ollama_model"] == "ornith"  # the override role hit Ollama
+
+
+# --- OpenRouter provider routing preferences ------------------------------------
+
+
+class _FakeResp:
+    status_code = 200
+    text = ""
+    def json(self):
+        return {"choices": [{"message": {"content": "{}"}}], "model": "m", "usage": {}}
+
+
+def _fake_client_factory(calls):
+    class _C:
+        def __init__(self, timeout=None):
+            self.is_closed = False
+        async def post(self, url, headers, json):
+            calls.append(json)
+            return _FakeResp()
+    return _C
+
+
+def test_openrouter_provider_payload_maps_and_filters():
+    assert openrouter_provider_payload(None) is None
+    assert openrouter_provider_payload(ProviderConfig()) == {
+        "sort": "price", "allow_fallbacks": True, "require_parameters": True, "data_collection": "deny",
+    }
+    # unknown keys are dropped; None values omitted
+    assert openrouter_provider_payload({"sort": "throughput", "bogus": 1, "data_collection": None}) == {"sort": "throughput"}
+
+
+@pytest.mark.anyio
+async def test_openrouter_sends_provider_prefs_in_payload(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr("devcouncil.llm.provider.httpx.AsyncClient", _fake_client_factory(calls))
+    p = OpenRouterProvider("k", project_root=tmp_path, provider_prefs=ProviderConfig(sort="throughput"))
+    await p.complete("some/model", [{"role": "user", "content": "hi"}])
+    assert calls[0]["provider"]["sort"] == "throughput"
+    assert calls[0]["provider"]["data_collection"] == "deny"
+
+
+@pytest.mark.anyio
+async def test_openrouter_omits_provider_field_when_unset(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr("devcouncil.llm.provider.httpx.AsyncClient", _fake_client_factory(calls))
+    p = OpenRouterProvider("k", project_root=tmp_path)  # no prefs
+    await p.complete("some/model", [{"role": "user", "content": "hi"}])
+    assert "provider" not in calls[0]
+
+
+# --- Schema-echo robustness -----------------------------------------------------
+
+def test_looks_like_schema_echo_detects_schema_documents():
+    from devcouncil.llm.router import ModelRouter as _MR
+    # A genuine instance is not flagged.
+    assert _MR._looks_like_schema_echo('{"value": "ok"}') is False
+    # Echoed schema docs are flagged on their marker keys.
+    assert _MR._looks_like_schema_echo('{"$defs": {}, "properties": {}, "type": "object"}') is True
+    assert _MR._looks_like_schema_echo('{"properties": {"x": {"type": "string"}}}') is True
+    assert _MR._looks_like_schema_echo("not json") is False
+    assert _MR._looks_like_schema_echo('[1,2,3]') is False
+
+
+@pytest.mark.anyio
+async def test_healing_recovers_from_schema_echo(tmp_path, monkeypatch):
+    """First response echoes the schema (parses, fails validation); the healing retry
+    returns a valid instance and is accepted."""
+    monkeypatch.chdir(tmp_path)
+
+    class SchemaEchoThenValid(Provider):
+        def __init__(self):
+            self.calls = 0
+            self.prompts = []
+        async def complete(self, model, messages, temperature=0.0, json_mode=False, task_id=None, run_id=None):
+            self.calls += 1
+            self.prompts.append(messages[-1]["content"])
+            if self.calls == 1:
+                content = '{"$defs": {}, "properties": {"value": {"type": "string"}}, "type": "object"}'
+            else:
+                content = '{"value": "healed"}'
+            return LLMResponse(content=content, model=model,
+                               usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                               raw_response={})
+
+    provider = SchemaEchoThenValid()
+    router = ModelRouter(provider, {"critic_a": {"model": "weak/local"}}, project_root=tmp_path)
+    result = await router.complete_structured("critic_a", [{"role": "user", "content": "x"}], RouterOutput)
+    assert result.value == "healed"
+    # The healing prompt called out the schema-echo explicitly.
+    assert any("returned the JSON *schema*" in p for p in provider.prompts)
+
+
+@pytest.mark.anyio
+async def test_role_override_to_openrouter_inherits_routing_prefs(tmp_path):
+    """A role overriding to OpenRouter (while the default provider is something else)
+    still picks up the project's provider-routing prefs from config."""
+    _write = (tmp_path / ".devcouncil")
+    _write.mkdir(parents=True)
+    (_write / "secrets.env").write_text("OPENROUTER_API_KEY=sk-or-test\n", encoding="utf-8")
+    (_write / "config.yaml").write_text(
+        "provider:\n  sort: throughput\n  data_collection: deny\n"
+        "models:\n  provider: ollama\n  roles:\n    critic_a:\n      model: x\n      provider: openrouter\n",
+        encoding="utf-8",
+    )
+    # Default provider is a dummy; the override should build a real OpenRouter provider.
+    router = ModelRouter(CountingProvider(), {"critic_a": {"model": "x", "provider": "openrouter"}}, project_root=tmp_path)
+    p = router._provider_for_role({"model": "x", "provider": "openrouter"})
+    # ProviderConfig fills defaults, so all four routing keys are present; the explicitly
+    # set ones reflect the config.
+    assert p.provider_prefs["sort"] == "throughput"
+    assert p.provider_prefs["data_collection"] == "deny"

@@ -62,6 +62,8 @@ _PX_RE = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)px\b")
 # A token value that is a bare or px length.
 _PX_TOKEN_RE = re.compile(r"^(\d+(?:\.\d+)?)px$")
 _NUM_TOKEN_RE = re.compile(r"^\d+(?:\.\d+)?$")
+# Strips everything but lowercase letters for property-name normalization (hot scan loop).
+_NORM_PROP_RE = re.compile(r"[^a-z]")
 
 
 def _quoted_spans(line: str) -> list[tuple[int, int]]:
@@ -112,7 +114,7 @@ class Violation(BaseModel):
 
 def _normalize_prop(prop: str) -> str:
     """Collapse a CSS/JS property name to lowercase letters only for set membership."""
-    return re.sub(r"[^a-z]", "", prop.lower())
+    return _NORM_PROP_RE.sub("", prop.lower())
 
 
 def _normalize_hex(value: str) -> str:

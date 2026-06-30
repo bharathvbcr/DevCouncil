@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import logging
 import platform
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 from devcouncil.app.config import DevCouncilConfig, load_config
 from devcouncil.domain.task import Task
@@ -38,6 +43,8 @@ def _save_run(
     commands: list[dict],
     status: Literal["passed", "failed", "unsupported"],
 ) -> None:
+    log = logger.info if status == "passed" else logger.warning
+    log("Sandbox %s for %s: %s (%d command(s))", sandbox, task.id, status, len(commands))
     db = get_db(project_root)
     if not db:
         return
@@ -56,8 +63,6 @@ class LocalSandbox(VerificationSandbox):
         self.project_root = project_root
 
     def run(self, task: Task, commands: list[str], requirements: list) -> SandboxResult:
-        import asyncio
-
         gaps, _ = asyncio.run(Verifier(self.project_root).verify_task(task, requirements))
         status: Literal["passed", "failed", "unsupported"] = (
             "failed" if any(g.blocking for g in gaps) else "passed"
@@ -148,8 +153,6 @@ class NixSandbox(VerificationSandbox):
 
 
 def shutil_which(name: str) -> str | None:
-    import shutil
-
     return shutil.which(name)
 
 

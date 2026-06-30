@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -106,16 +107,50 @@ def _clean_env() -> dict:
     return env
 
 
-def run(cmd, cwd, timeout, input_text=None, env=None):
+def _kill_process_tree(proc) -> None:
+    """Kill the subprocess AND all its descendants.
+
+    The child ran in its own session (``start_new_session``), so signalling the process
+    GROUP reaches the whole tree. ``dev e2e`` spawns ``claude`` (and other) grandchildren;
+    a plain kill of the direct child leaves those orphaned — still running and spending
+    budget long past the per-task timeout. Falls back to a direct kill where process
+    groups are unavailable (e.g. Windows)."""
     try:
-        proc = subprocess.run(
-            cmd, cwd=cwd, input=input_text, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout, env=env,
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def run(cmd, cwd, timeout, input_text=None, env=None):
+    # Launch in a new session/process group so a timeout can terminate the ENTIRE tree,
+    # not just the direct child — otherwise a slow executor's orphaned grandchildren blow
+    # straight through the per-task budget (observed: a 27-min claude attempt under a
+    # 20-min cap). This makes ``timeout`` an authoritative bound on the run.
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=cwd, env=env,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+            start_new_session=True,
         )
-        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
-    except subprocess.TimeoutExpired:
-        return 124, "TIMEOUT"
     except Exception as exc:  # pragma: no cover
+        return 1, f"HARNESS_ERROR: {exc}"
+    try:
+        out, err = proc.communicate(input=input_text, timeout=timeout)
+        return proc.returncode, (out or "") + (err or "")
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        try:
+            out, err = proc.communicate(timeout=15)  # drain whatever was buffered
+        except Exception:
+            out, err = "", ""
+        return 124, "TIMEOUT\n" + (out or "") + (err or "")
+    except Exception as exc:  # pragma: no cover
+        _kill_process_tree(proc)
         return 1, f"HARNESS_ERROR: {exc}"
 
 
@@ -187,20 +222,54 @@ def _apply_monitor_routing(ws: Path, roles: list[str], provider: str, model: str
     cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
 
 
+def _apply_acceptance_check_config(ws: Path, samples: int, repair_attempts: int, per_criterion: bool = False) -> None:
+    """Pin the per-criterion acceptance-check knobs for this run.
+
+    ``samples`` generates that many INDEPENDENT checks per criterion and decides by
+    majority vote; ``repair_attempts`` regenerates a check that failed to RUN from its
+    launcher error. Both target a weak/local reviewer: higher ``samples`` outvotes a
+    single mis-generated check (the false-block), and ``repair_attempts`` rescues an
+    unrunnable check (the under-credited ``incomplete``). Written into the workspace
+    config so a single ``dev e2e`` run uses them — and recorded in the results so a
+    run's numbers are tied to the settings that produced them.
+    """
+    import yaml
+
+    cfg_path = ws / ".devcouncil" / "config.yaml"
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    ac = cfg.setdefault("verification", {}).setdefault("acceptance_checks", {})
+    ac["samples"] = samples
+    ac["repair_attempts"] = repair_attempts
+    ac["per_criterion"] = per_criterion
+    cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+
+
 def arm_devcouncil(ws: Path, goal: str, model: str, executor: str, timeout: int,
                    monitor_model: str = "", monitor_provider: str = "ollama",
-                   monitor_roles: tuple[str, ...] = ()) -> dict:
+                   monitor_roles: tuple[str, ...] = (),
+                   ac_samples: int = 1, ac_repair_attempts: int = 1,
+                   ac_per_criterion: bool = False) -> dict:
     t0 = time.monotonic()
     init_code, init_out = run([DEV, "init"], cwd=ws, timeout=120)
     key = os.environ.get("OPENROUTER_API_KEY", "")
     dc_dir = ws / ".devcouncil"
     dc_dir.mkdir(parents=True, exist_ok=True)  # defensive: never fail on a missing dir
     (dc_dir / "secrets.env").write_text(f"OPENROUTER_API_KEY={key}\n", encoding="utf-8")
-    run([DEV, "config", "models", "--provider", "openrouter", "-m", model], cwd=ws, timeout=120)
+    cfg_code, cfg_out = run([DEV, "config", "models", "--provider", "openrouter", "-m", model], cwd=ws, timeout=120)
+    # If config.yaml was not produced, `dev init`/`dev config models` failed. Fail loudly
+    # with their output instead of crashing cryptically later when the routing/AC helpers
+    # try to read a non-existent config (e.g. the init regression where logging pre-created
+    # .devcouncil/ so `dev init` skipped writing config).
+    if not (dc_dir / "config.yaml").exists():
+        tail = (init_out + "\n" + cfg_out).strip()[-600:]
+        return {"exit": cfg_code or init_code or 1, "seconds": round(time.monotonic() - t0, 1),
+                "verdict": "error", "cost_usd": 0.0,
+                "output_tail": f"SETUP FAILED: no .devcouncil/config.yaml after init/config.\n{tail}"}
     # Hybrid routing: keep planning on OpenRouter, push the execution-time review
     # gates to a local provider (Ollama) so monitoring is local and cost-free.
     if monitor_model and monitor_roles:
         _apply_monitor_routing(ws, list(monitor_roles), monitor_provider, monitor_model)
+    _apply_acceptance_check_config(ws, ac_samples, ac_repair_attempts, ac_per_criterion)
     code, out = run([DEV, "e2e", goal, "--executor", executor, "--force", "--continue-on-blocked"],
                     cwd=ws, timeout=timeout)
     if "Passed: Ready for release" in out:
@@ -222,7 +291,8 @@ def arm_devcouncil(ws: Path, goal: str, model: str, executor: str, timeout: int,
 
 
 def run_task(task, arms, model, executor, raw_timeout, dc_timeout, score_python, keep, base, dc_retries=1,
-             monitor_model="", monitor_provider="ollama", monitor_roles=()):
+             monitor_model="", monitor_provider="ollama", monitor_roles=(),
+             ac_samples=1, ac_repair_attempts=1, ac_per_criterion=False):
     results = {}
     for arm in arms:
         ws = make_workspace(base / arm, task)
@@ -232,7 +302,8 @@ def run_task(task, arms, model, executor, raw_timeout, dc_timeout, score_python,
             run_info = arm_raw(ws, task.spec, raw_timeout)
         elif arm == "B":
             run_info = arm_devcouncil(ws, task.goal, model, executor, dc_timeout,
-                                      monitor_model, monitor_provider, monitor_roles)
+                                      monitor_model, monitor_provider, monitor_roles,
+                                      ac_samples, ac_repair_attempts, ac_per_criterion)
             # Planners occasionally emit malformed JSON for a non-degradable role,
             # which surfaces as verdict=error and no usable result. Retry a fresh
             # workspace so transient planner flakiness does not poison the data point.
@@ -243,7 +314,8 @@ def run_task(task, arms, model, executor, raw_timeout, dc_timeout, score_python,
                     shutil.rmtree(ws, ignore_errors=True)
                 ws = make_workspace(base / f"{arm}_retry{attempt}", task)
                 run_info = arm_devcouncil(ws, task.goal, model, executor, dc_timeout,
-                                          monitor_model, monitor_provider, monitor_roles)
+                                          monitor_model, monitor_provider, monitor_roles,
+                                          ac_samples, ac_repair_attempts, ac_per_criterion)
         else:
             continue
         sc = score(ws, task, score_python)
@@ -269,8 +341,18 @@ def summarize(records: list[dict], arms: list[str]) -> str:
     agg = {a: [] for a in arms}
     false_neg = 0   # verdict=blocked but code is actually full (the bug we are fixing)
     false_pos = 0   # verdict=passed but code is not full
-    decisive = 0    # passed or blocked (not incomplete/error)
+    decisive = 0    # hard claims only: passed or blocked (not incomplete/error)
     decisive_ok = 0
+    # "incomplete" is DevCouncil explicitly declining to certify done (some acceptance
+    # criterion lacks passing evidence). It is not a hard claim, but it is still a
+    # calibratable signal: cautious-correct when the code is genuinely imperfect, and an
+    # under-credit (too conservative) when the code was actually fully correct. Tracking
+    # it lets calibration cover EVERY non-error task instead of silently dropping these.
+    incomplete_total = 0
+    incomplete_cautious = 0      # incomplete + code not full  → correctly withheld a pass
+    incomplete_undercredit = 0   # incomplete + code full      → failed to recognize done
+    covered = 0                  # all non-error verdicts (passed/blocked/incomplete)
+    covered_ok = 0               # verdict consistent with ground truth, incl. incomplete
     silent_total = 0
     silent_surfaced = 0
     for rec in records:
@@ -296,7 +378,30 @@ def summarize(records: list[dict], arms: list[str]) -> str:
                     decisive_ok += 1
                 else:
                     false_pos += 1
-            note = {"blocked": "NO" if full else "yes", "passed": "yes" if full else "NO"}.get(v, "—")
+            elif v == "incomplete":
+                incomplete_total += 1
+                if full:
+                    incomplete_undercredit += 1
+                else:
+                    incomplete_cautious += 1
+            # Overall calibration coverage: judge every verdict DevCouncil actually made
+            # (everything except a harness "error") against ground truth. A verdict is
+            # consistent when it matches reality: passed↔full, blocked↔not-full, and
+            # incomplete↔not-full (a hedge is right only when the code really wasn't done).
+            if v in ("passed", "blocked", "incomplete"):
+                covered += 1
+                consistent = (
+                    (v == "passed" and full)
+                    or (v == "blocked" and not full)
+                    or (v == "incomplete" and not full)
+                )
+                if consistent:
+                    covered_ok += 1
+            note = {
+                "blocked": "NO" if full else "yes",
+                "passed": "yes" if full else "NO",
+                "incomplete": "under" if full else "cautious",
+            }.get(v, "—")
             row.append(v)
             row.append(note)
             # silent-failure surfacing: A shipped a defect; did B avoid silently passing it?
@@ -319,7 +424,18 @@ def summarize(records: list[dict], arms: list[str]) -> str:
         lines.append(f"- **False negatives (blocked correct code):** {false_neg}  ← lower is better")
         lines.append(f"- **False positives (passed incorrect code):** {false_pos}")
         if decisive:
-            lines.append(f"- **Decisive-verdict accuracy:** {decisive_ok}/{decisive} = {decisive_ok/decisive:.0%}")
+            lines.append(f"- **Decisive-verdict accuracy (passed/blocked):** {decisive_ok}/{decisive} = {decisive_ok/decisive:.0%}")
+        if covered:
+            lines.append(
+                f"- **Verdict calibration incl. incomplete:** {covered_ok}/{covered} = {covered_ok/covered:.0%} "
+                f"(covers all {covered} non-error task(s))"
+            )
+        if incomplete_total:
+            lines.append(
+                f"- **Incomplete verdicts:** {incomplete_total} "
+                f"(cautious on imperfect code: {incomplete_cautious}, "
+                f"under-credited correct code: {incomplete_undercredit})"
+            )
     if "B" in arms and silent_total:
         lines.append(f"- **No-silent-pass on raw defects:** {silent_surfaced}/{silent_total} (B never rubber-stamped a defect)")
     if "B" in arms:
@@ -347,7 +463,24 @@ def main():
     ap.add_argument("--monitor-provider", default="ollama",
                     help="Provider for the execution-time review roles when --monitor-model is set.")
     ap.add_argument("--monitor-roles", default="implementation_reviewer,live_reviewer",
-                    help="Comma list of roles to route to --monitor-provider/--monitor-model.")
+                    help="Comma list of roles to route to --monitor-provider/--monitor-model. "
+                         "Both fire DURING e2e execution: implementation_reviewer is the "
+                         "verification gate that drives the self-repair loop (it can block a "
+                         "task); live_reviewer critiques the agent's turn and records an "
+                         "advisory card (non-gating).")
+    ap.add_argument("--ac-samples", type=int, default=1,
+                    help="Arm B: independent per-criterion acceptance checks generated and "
+                         "majority-voted. >1 outvotes a single mis-generated check (cuts false "
+                         "blocks); cost-free on a local monitor, so raise it (e.g. 3) there.")
+    ap.add_argument("--ac-repair-attempts", type=int, default=1,
+                    help="Arm B: times a compiled acceptance check that FAILED TO RUN "
+                         "(wrong import / broken one-liner) is regenerated from its error and "
+                         "re-run. Rescues the under-credited 'incomplete'; can't weaken the gate.")
+    ap.add_argument("--ac-per-criterion", action="store_true",
+                    help="Arm B: compile ONE acceptance check per model call instead of batching "
+                         "all criteria into one prompt. A weak/local monitor omits/mis-attributes "
+                         "some when batched; focused per-criterion prompts are far more reliable "
+                         "(N× the calls — cheap on a local monitor).")
     args = ap.parse_args()
     monitor_roles = tuple(r.strip() for r in args.monitor_roles.split(",") if r.strip())
 
@@ -367,6 +500,9 @@ def main():
     base = Path(tempfile.mkdtemp(prefix="dc_bench_"))
     records = []
     print(f"Running {len(tasks)} task(s) x arms {arms} x {args.repeats} repeat(s). Workspaces: {base}")
+    if "B" in arms:
+        print(f"  acceptance checks: samples={args.ac_samples} repair_attempts={args.ac_repair_attempts} "
+              f"per_criterion={args.ac_per_criterion}")
     for task in tasks:
         for rep in range(args.repeats):
             label = task.name + (f"#{rep+1}" if args.repeats > 1 else "")
@@ -375,7 +511,9 @@ def main():
             arms_res = run_task(task, arms, args.model, args.executor, args.timeout, args.dc_timeout,
                                 args.score_python, args.keep_workspaces, run_base, dc_retries=args.dc_retries,
                                 monitor_model=args.monitor_model, monitor_provider=args.monitor_provider,
-                                monitor_roles=monitor_roles)
+                                monitor_roles=monitor_roles,
+                                ac_samples=args.ac_samples, ac_repair_attempts=args.ac_repair_attempts,
+                                ac_per_criterion=args.ac_per_criterion)
             for a, r in arms_res.items():
                 print(f"      arm {a}: {r['score']}/{r['total']}"
                       + (f"  verdict={r['verdict']}  ${r['cost_usd']}" if a == "B" else "")
@@ -389,6 +527,8 @@ def main():
         "executor": args.executor,
         "monitor": ({"provider": args.monitor_provider, "model": args.monitor_model,
                      "roles": list(monitor_roles)} if args.monitor_model else None),
+        "acceptance_checks": {"samples": args.ac_samples, "repair_attempts": args.ac_repair_attempts,
+                              "per_criterion": args.ac_per_criterion},
         "records": records,
     }, indent=2), encoding="utf-8")
     summary = summarize(records, arms)

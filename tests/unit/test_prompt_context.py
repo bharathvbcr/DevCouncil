@@ -190,3 +190,64 @@ def test_central_budget_keeps_core_and_marks_omissions(tmp_path):
     assert "## Allowed files" in out
     assert "Current file contents" not in out
     assert "Context budget reached" in out
+
+
+def test_prompt_carries_enhancer_constraints_to_executor(tmp_path):
+    # The planning prompt-enhancer's codebase-specific constraints must reach the executor
+    # prompt, not just the planning debate.
+    run_dir = tmp_path / ".devcouncil" / "runs" / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "prompt_enhancement.json").write_text(json.dumps({
+        "original_goal": "rpn eval",
+        "enhanced_goal": "implement an RPN evaluator",
+        "constraints": ["division truncates toward zero", "must not use eval()"],
+        "applied_skills": ["python-numerics"],
+    }), encoding="utf-8")
+
+    task = _task([PlannedFile(path="rpn.py", reason="impl", allowed_change="create")])
+    prompt = PromptBuilder(tmp_path).build_task_prompt(task, [])
+
+    assert "Codebase-specific constraints" in prompt
+    assert "division truncates toward zero" in prompt
+    assert "must not use eval()" in prompt
+    assert "python-numerics" in prompt
+
+
+def test_prompt_has_no_constraints_section_without_enhancement(tmp_path):
+    task = _task([PlannedFile(path="rpn.py", reason="impl", allowed_change="create")])
+    prompt = PromptBuilder(tmp_path).build_task_prompt(task, [])
+    assert "Codebase-specific constraints" not in prompt
+
+
+def test_prompt_enhancement_prefers_active_plan_over_latest_run(tmp_path):
+    from devcouncil.planning.prompt_enhancer_service import load_latest_prompt_enhancement
+    dc = tmp_path / ".devcouncil"
+    run = dc / "runs" / "run-1"
+    run.mkdir(parents=True)
+    (run / "prompt_enhancement.json").write_text(
+        json.dumps({"original_goal": "g", "enhanced_goal": "g", "constraints": ["OLD run constraint"]}),
+        encoding="utf-8")
+    (dc / "active_prompt_enhancement.json").write_text(
+        json.dumps({"original_goal": "g", "enhanced_goal": "g", "constraints": ["ACTIVE constraint"]}),
+        encoding="utf-8")
+    enh = load_latest_prompt_enhancement(tmp_path)
+    assert enh is not None and enh.constraints == ["ACTIVE constraint"]
+
+
+def test_prompt_enhancement_falls_back_to_run_artifact(tmp_path):
+    from devcouncil.planning.prompt_enhancer_service import load_latest_prompt_enhancement
+    run = tmp_path / ".devcouncil" / "runs" / "run-1"
+    run.mkdir(parents=True)
+    (run / "prompt_enhancement.json").write_text(
+        json.dumps({"original_goal": "g", "enhanced_goal": "g", "constraints": ["RUN constraint"]}),
+        encoding="utf-8")
+    enh = load_latest_prompt_enhancement(tmp_path)
+    assert enh is not None and enh.constraints == ["RUN constraint"]
+
+
+def test_prompt_enhancement_loader_safe_on_malformed_json(tmp_path):
+    from devcouncil.planning.prompt_enhancer_service import load_latest_prompt_enhancement
+    dc = tmp_path / ".devcouncil"
+    dc.mkdir(parents=True)
+    (dc / "active_prompt_enhancement.json").write_text("{not json", encoding="utf-8")
+    assert load_latest_prompt_enhancement(tmp_path) is None  # malformed -> None, never raises

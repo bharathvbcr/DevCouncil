@@ -78,6 +78,15 @@ class RepoMapper:
         # Import edges (importer -> imported), computed once per map_repo run and reused
         # by subsystem inference, important-file ranking, and the dependents index.
         self._edges: List[Tuple[str, str]] | None = None
+        # Cache of config-file contents (package.json, pyproject.toml, ...) so framework
+        # and test-command detection don't each re-read the same files from disk.
+        self._config_file_cache: Dict[str, str] = {}
+
+    def _read_config_file(self, name: str) -> str:
+        """Read a repo-root config file once and cache its contents for reuse."""
+        if name not in self._config_file_cache:
+            self._config_file_cache[name] = (self.project_root / name).read_text()
+        return self._config_file_cache[name]
 
     _DEPENDENTS_MAX = 12  # cap dependents listed per file to bound repo_map.json size
 
@@ -768,12 +777,24 @@ class RepoMapper:
 
     def _build_hardcoded_subsystems(self, files: List[str]) -> List[RepoSubsystem]:
         file_set = set(files)
+        # Single O(n) pass: bucket files by their "src/devcouncil/<area>" prefix so the
+        # per-subsystem loop below uses O(1) dict lookups instead of rescanning every
+        # file for each area (and, previously, again for each neighbor). All subsystem
+        # and neighbor keys are 3-component "src/devcouncil/<area>" prefixes, so this
+        # bucketing reproduces the prior `path.startswith(f"{area}/")` semantics exactly.
+        by_area: Dict[str, List[str]] = {}
+        for path in files:
+            parts = path.split("/")
+            if len(parts) >= 4 and parts[0] == "src" and parts[1] == "devcouncil":
+                by_area.setdefault("/".join(parts[:3]), []).append(path)
+        for bucket in by_area.values():
+            bucket.sort()
         subsystems: List[RepoSubsystem] = []
         for area, (summary, entry_points) in self._SUBSYSTEM_INDEX.items():
             available_entry_points = [path for path in entry_points if path in file_set]
             if not available_entry_points:
                 continue
-            area_files = sorted(path for path in files if path.startswith(f"{area}/"))
+            area_files = by_area.get(area, [])
             ranked_files = [path for path in available_entry_points if path in file_set]
             for path in area_files:
                 if path in available_entry_points:
@@ -782,7 +803,7 @@ class RepoMapper:
                     break
                 ranked_files.append(path)
             critical_files = ranked_files[: self._SUBSYSTEM_CRITICAL_MAX]
-            neighbors = [n for n in self._SUBSYSTEM_NEIGHBORS.get(area, []) if any(f.startswith(f"{n}/") for f in files)]
+            neighbors = [n for n in self._SUBSYSTEM_NEIGHBORS.get(area, []) if n in by_area]
             handoff_paths = self._SUBSYSTEM_HANDOFFS.get(area, [])
             role_files = self._build_role_files(area, area_files)
             subsystems.append(
@@ -1262,7 +1283,7 @@ class RepoMapper:
         frameworks = []
         file_set = set(files)
         if "package.json" in file_set:
-            content = (self.project_root / "package.json").read_text()
+            content = self._read_config_file("package.json")
             if "next" in content:
                 frameworks.append("nextjs")
             if "react" in content:
@@ -1274,12 +1295,13 @@ class RepoMapper:
         
         if "requirements.txt" in file_set or "pyproject.toml" in file_set:
             try:
-                content = ""
+                parts: List[str] = []
                 if "requirements.txt" in file_set:
-                    content += (self.project_root / "requirements.txt").read_text()
+                    parts.append(self._read_config_file("requirements.txt"))
                 if "pyproject.toml" in file_set:
-                    content += (self.project_root / "pyproject.toml").read_text()
-                
+                    parts.append(self._read_config_file("pyproject.toml"))
+                content = "".join(parts)
+
                 if "fastapi" in content.lower():
                     frameworks.append("fastapi")
                 if "flask" in content.lower():
@@ -1317,7 +1339,7 @@ class RepoMapper:
         # Node.js projects: read scripts from package.json
         if "package.json" in file_set:
             try:
-                pkg = json.loads((self.project_root / "package.json").read_text())
+                pkg = json.loads(self._read_config_file("package.json"))
                 scripts = pkg.get("scripts", {})
                 pm = "pnpm" if "pnpm-lock.yaml" in file_set else (
                     "yarn" if "yarn.lock" in file_set else "npm"

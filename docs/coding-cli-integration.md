@@ -10,7 +10,7 @@ For the official tier definitions (headless executor vs MCP-only vs sidecar), se
 | :--- | :---: | :---: | :---: | :---: |
 | **Codex CLI** | Supported | Supported via `codex exec` | Supported via `codex mcp` | Native via `dev integrate hooks` |
 | **Gemini CLI** | Supported | Supported via `gemini -p` or stdin | Supported via `gemini mcp` | Native via `dev integrate hooks` |
-| **Claude Code** | Supported | Tool-dependent | Supported via `claude mcp` | Native via `dev integrate hooks` |
+| **Claude Code** | Supported | Tool-dependent | Tools + resources + prompts via `claude mcp` | Assistive hooks + slash commands, subagents, output style, statusline, installable plugin (opt-in `--write-gate` for blocking containment) |
 | **OpenCode** | Supported | Supported via `opencode run --file` | Supported via project `opencode.json` | Native via `dev integrate hooks` (bundled plugin) |
 | **Google Antigravity CLI** | Supported | Supported via `agy --print` | Supported via project `.agents/mcp_config.json` | Verification-gated sidecar |
 | **Warp / Oz** | Supported | Supported via `oz agent run` | Supported via Warp/Oz MCP JSON | Verification-gated sidecar |
@@ -240,6 +240,59 @@ dev integrate claude --apply
 ```
 
 Use `--scope local`, `--scope project`, or `--scope user` to choose where Claude Code stores the MCP server registration. DevCouncil defaults to `local`.
+
+### Complete Claude Code integration
+
+`dev integrate claude --apply` is a one-shot that installs the entire Claude Code surface, not just the MCP server:
+
+- **MCP server** — registered via `claude mcp add`, exposing DevCouncil's tools, resources, and **prompts** (the prompts surface as `/mcp__devcouncil__*` slash commands, e.g. `/mcp__devcouncil__implement_next_task`).
+- **Assistive hooks** — `Stop`, `SessionStart`, `UserPromptSubmit`, `SessionEnd`, `PreCompact`, `SubagentStop`, and `Notification` are wired into `.claude/settings.local.json`. `SessionStart`/`UserPromptSubmit` inject a live DevCouncil status snapshot as context. These never block a tool call.
+- **Slash commands** — `.claude/commands/devcouncil/*.md` (`/devcouncil:status`, `/devcouncil:next`, `/devcouncil:verify`, `/devcouncil:repair`, `/devcouncil:plan`, `/devcouncil:review`, `/devcouncil:report`).
+- **Subagents** — `.claude/agents/devcouncil-implementer.md`, `devcouncil-verifier.md`, and `devcouncil-reviewer.md`, each scoped to the relevant DevCouncil MCP tools.
+- **Output style** — `.claude/output-styles/devcouncil.md` for evidence-first engineering discipline.
+- **Skills** — the applicable engineering skills scaffolded into `.claude/skills/`.
+- **Statusline + permissions** — a `statusLine` showing phase/tasks/gaps and an allow-list for the read-only `dev` commands the slash commands shell out to, merged into `.claude/settings.local.json` (existing keys are preserved).
+
+#### Assist mode vs. the write-gate (important)
+
+By **default** `dev integrate claude --apply` installs *assist mode* — everything above **except** the blocking pre-action write-gate (`PreToolUse`/`PostToolUse`). That write-gate denies any `Bash`/`Write`/`Edit` not authorized by an active task **lease**, so in an interactive human session (where there is no lease) it would fail-closed and block every command. Assist mode keeps DevCouncil's assistance without locking down your own shell.
+
+Add the write-gate explicitly when you want pre-action containment (e.g. for autonomous executor runs):
+
+```bash
+dev integrate claude --apply --write-gate     # alias: --contain
+```
+
+You lose no containment by leaving it off: `dev run --executor claude` performs its own post-hoc scope enforcement (out-of-scope changes are reverted before verify), independent of this hook.
+
+Remove everything DevCouncil installed (hooks, statusline, MCP enablement, permission rules, and the generated commands/subagents/output style — your own settings are preserved):
+
+```bash
+dev integrate claude --uninstall      # or: dev integrate uninstall --target claude
+```
+
+Install only the static asset files (no MCP/hook registration) with:
+
+```bash
+dev integrate claude-assets --apply
+```
+
+#### Installable plugin
+
+Bundle the whole integration as a self-contained Claude Code plugin and single-repo marketplace:
+
+```bash
+dev integrate claude-plugin --apply
+```
+
+This writes a plugin under `.devcouncil/claude-plugin/` (manifest, bundled commands/subagents/skills, an assist-mode `hooks/hooks.json`, and `.mcp.json` resolving paths via `${CLAUDE_PROJECT_DIR}`). Pass `--write-gate` to bundle the blocking containment hooks instead. Install it in Claude Code with:
+
+```text
+/plugin marketplace add <repo>/.devcouncil/claude-plugin
+/plugin install devcouncil@devcouncil-local
+```
+
+All generators are idempotent — re-running writes nothing when the files are already current.
 
 ## OpenCode
 

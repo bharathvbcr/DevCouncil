@@ -145,6 +145,119 @@ TASKS = [
             "does_not_mutate_input": "no_mut(m.merge_intervals, [[1, 3], [2, 6]])",
         },
     ),
+    # --- Harder tier: subtler edge cases a terse goal almost always omits ---------
+    Task(
+        name="eval_rpn",
+        goal="Add an eval_rpn(tokens) function to rpn.py that evaluates a Reverse Polish Notation expression given as a list of string tokens.",
+        spec=(
+            "Add eval_rpn(tokens) to rpn.py. Tokens are strings: integer literals "
+            "(possibly negative) and the operators + - * /. Evaluate the RPN expression "
+            "and return an int. Integer division must TRUNCATE TOWARD ZERO (so "
+            "-7 / 2 == -3, not -4). Raise ValueError if there are too few operands for "
+            "an operator or if operands are left over at the end. Division by zero "
+            "raises (ZeroDivisionError is fine). Do not use eval()."
+        ),
+        seed={"rpn.py": _PY_HEADER},
+        target_file="rpn.py",
+        checks={
+            "basic_add": "m.eval_rpn(['2', '3', '+']) == 5",
+            "leetcode_example": "m.eval_rpn(['5', '1', '2', '+', '4', '*', '+', '3', '-']) == 14",
+            "trunc_toward_zero_pos": "m.eval_rpn(['7', '2', '/']) == 3",
+            "trunc_toward_zero_neg": "m.eval_rpn(['-7', '2', '/']) == -3",
+            "too_few_operands_raises": "raises(m.eval_rpn, ['1', '+'], exc=ValueError)",
+            "leftover_operands_raises": "raises(m.eval_rpn, ['1', '2'], exc=ValueError)",
+            "div_by_zero_raises": "raises(m.eval_rpn, ['1', '0', '/'], exc=Exception)",
+        },
+    ),
+    Task(
+        name="base_convert",
+        goal="Add a base_convert(number, from_base, to_base) function to bases.py that converts a number string from one base to another.",
+        spec=(
+            "Add base_convert(number, from_base, to_base) to bases.py. `number` is a "
+            "string of digits 0-9 then a-z (case-insensitive) valid for from_base. "
+            "Bases range from 2 to 36 inclusive. Return the value re-encoded in to_base "
+            "as a LOWERCASE string. Handle '0' and leading zeros. Raise ValueError if "
+            "either base is outside [2, 36] or if `number` contains a digit not valid "
+            "for from_base. No negative numbers."
+        ),
+        seed={"bases.py": _PY_HEADER},
+        target_file="bases.py",
+        checks={
+            "hex_to_bin": "m.base_convert('FF', 16, 2) == '11111111'",
+            "bin_to_hex_lowercase": "m.base_convert('11111111', 2, 16) == 'ff'",
+            "zero": "m.base_convert('0', 10, 2) == '0'",
+            "base36_digit": "m.base_convert('z', 36, 10) == '35'",
+            "case_insensitive_input": "m.base_convert('ff', 16, 10) == '255'",
+            "leading_zeros": "m.base_convert('00ff', 16, 10) == '255'",
+            "invalid_digit_raises": "raises(m.base_convert, '12', 2, 10, exc=ValueError)",
+            "base_out_of_range_raises": "raises(m.base_convert, '1', 1, 10, exc=ValueError)",
+        },
+    ),
+    Task(
+        name="parse_csv_line",
+        goal="Add a parse_csv_line(line) function to csvline.py that parses a single CSV line into a list of field strings.",
+        spec=(
+            "Add parse_csv_line(line) to csvline.py following RFC-4180-style rules. "
+            "Fields are comma-separated. A field may be wrapped in double quotes, in "
+            "which case it can contain commas and a literal double quote is written as "
+            "two double quotes (\"\"). Unquoted fields are taken verbatim (no "
+            "stripping). Empty fields are preserved, a trailing comma yields a trailing "
+            "empty field, and an empty line parses to ['']."
+        ),
+        seed={"csvline.py": _PY_HEADER},
+        target_file="csvline.py",
+        checks={
+            "plain": "m.parse_csv_line('a,b,c') == ['a', 'b', 'c']",
+            "quoted_comma": "m.parse_csv_line('a,\"b,c\",d') == ['a', 'b,c', 'd']",
+            "escaped_quotes": "m.parse_csv_line('\"he said \"\"hi\"\"\"') == ['he said \"hi\"']",
+            "empty_fields": "m.parse_csv_line('a,,c') == ['a', '', 'c']",
+            "trailing_comma": "m.parse_csv_line('a,b,') == ['a', 'b', '']",
+            "empty_line_one_field": "m.parse_csv_line('') == ['']",
+        },
+    ),
+    Task(
+        name="flatten",
+        goal="Add a flatten(nested) function to flatten.py that flattens an arbitrarily nested list into a single flat list.",
+        spec=(
+            "Add flatten(nested) to flatten.py. Recursively flatten nested LISTS to any "
+            "depth, preserving left-to-right order. Treat strings as ATOMIC values — do "
+            "not iterate their characters. Non-list items pass through unchanged. Empty "
+            "lists contribute nothing. Do not mutate the input."
+        ),
+        seed={"flatten.py": _PY_HEADER},
+        target_file="flatten.py",
+        checks={
+            "deep_nesting": "m.flatten([1, [2, [3, [4]]]]) == [1, 2, 3, 4]",
+            "empty": "m.flatten([]) == []",
+            "strings_are_atomic": "m.flatten(['ab', ['cd']]) == ['ab', 'cd']",
+            "mixed": "m.flatten([1, [2, 3], 4]) == [1, 2, 3, 4]",
+            "empty_nested_vanish": "m.flatten([[[]]]) == []",
+            "does_not_mutate_input": "no_mut(m.flatten, [1, [2, [3]]])",
+        },
+    ),
+    Task(
+        name="parse_duration",
+        goal="Add a parse_duration(s) function to duration.py that parses a duration string like '1h30m' into total seconds.",
+        spec=(
+            "Add parse_duration(s) to duration.py. Parse a string of <integer><unit> "
+            "components where unit is d (days), h (hours), m (minutes), or s (seconds), "
+            "case-insensitive. Sum all components and return total seconds as an int. "
+            "Ignore surrounding/internal whitespace. Raise ValueError on an empty "
+            "string, a number with no unit, or an unknown unit."
+        ),
+        seed={"duration.py": _PY_HEADER},
+        target_file="duration.py",
+        checks={
+            "seconds": "m.parse_duration('90s') == 90",
+            "combined": "m.parse_duration('1h30m') == 5400",
+            "days": "m.parse_duration('2d') == 172800",
+            "case_insensitive": "m.parse_duration('1H30M') == 5400",
+            "whitespace_ignored": "m.parse_duration('  1m 30s ') == 90",
+            "empty_raises": "raises(m.parse_duration, '', exc=ValueError)",
+            "number_without_unit_raises": "raises(m.parse_duration, '10', exc=ValueError)",
+            "unknown_unit_raises": "raises(m.parse_duration, '5y', exc=ValueError)",
+        },
+    ),
 ]
 
 TASKS_BY_NAME = {t.name: t for t in TASKS}

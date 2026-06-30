@@ -299,11 +299,19 @@ def filter_cards(
     return filtered, None, None
 
 
+def load_card_by_id(project_root: Path, card_id: str) -> CritiqueCard | None:
+    """Read a single card directly by id, avoiding a scan of every card file."""
+    path = card_path(project_root, card_id)
+    if not path.exists():
+        return None
+    try:
+        return CritiqueCard.model_validate(json.loads(path.read_text(encoding="utf-8")))
+    except Exception:
+        return None
+
+
 def get_card(project_root: Path, card_id: str) -> CritiqueCard | None:
-    for card in load_cards(project_root):
-        if card.id == card_id:
-            return card
-    return None
+    return load_card_by_id(project_root, card_id)
 
 
 def update_card_status(project_root: Path, card_id: str, status: CardStatus) -> CritiqueCard | None:
@@ -317,9 +325,15 @@ def update_card_status(project_root: Path, card_id: str, status: CardStatus) -> 
     return updated
 
 
-def unresolved_blocking_cards(project_root: Path, task_id: str | None = None) -> list[CritiqueCard]:
+def unresolved_blocking_cards(
+    project_root: Path,
+    task_id: str | None = None,
+    *,
+    cards: list[CritiqueCard] | None = None,
+) -> list[CritiqueCard]:
+    source = cards if cards is not None else load_cards(project_root)
     return [
-        card for card in load_cards(project_root)
+        card for card in source
         if card.status == "open" and card.verdict == "Critical Issues"
         and (task_id is None or card.task_id in {None, task_id})
     ]

@@ -43,6 +43,7 @@ from devcouncil.cli.commands import (  # noqa: E402 - imports follow stdio recon
     hook,
     init,
     integrate,
+    logs,
     lsp,
     map,
     mcp_server,
@@ -93,6 +94,7 @@ app.add_typer(mcp_server.app, name="mcp-server")
 app.add_typer(integrate.app, name="integrate")
 app.add_typer(integrate.app, name="integrations")
 app.add_typer(trace.app, name="trace")
+app.add_typer(logs.app, name="logs")
 app.add_typer(cost.app, name="cost")
 app.add_typer(runs.app, name="runs")
 app.add_typer(setup.app, name="setup")
@@ -131,10 +133,39 @@ app.command(name="status")(status.status)
 app.command(name="optimize")(agents.optimize_agent)
 
 @app.callback()
-def main(ctx: typer.Context):
+def main(
+    ctx: typer.Context,
+    verbose: int = typer.Option(
+        0,
+        "--verbose",
+        "-v",
+        count=True,
+        help="Increase console log verbosity (-v INFO, -vv DEBUG). Everything is "
+        "always captured at DEBUG in .devcouncil/logs/devcouncil.log.",
+    ),
+    quiet: bool = typer.Option(
+        False,
+        "--quiet",
+        "-q",
+        help="Only show errors on the console (the log file still captures everything).",
+    ),
+    log_level: str = typer.Option(
+        None,
+        "--log-level",
+        help="Explicit console log level (DEBUG/INFO/WARNING/ERROR). Overrides -v/-q "
+        "and the DEVCOUNCIL_LOG_LEVEL env var.",
+    ),
+):
     """
     DevCouncil: Gated orchestrator for AI-assisted software development.
     """
+    # Configure logging once, up front, for every command. Without this the many
+    # logger.info/debug calls across the orchestrator, planner, executors and
+    # verifier go nowhere — which is exactly why recurring run failures were so
+    # hard to diagnose. The durable DEBUG log lands in .devcouncil/logs/.
+    from devcouncil.telemetry.logging_setup import configure_logging
+
+    configure_logging(verbosity=verbose, quiet=quiet, log_level=log_level)
     return
 
 if __name__ == "__main__":

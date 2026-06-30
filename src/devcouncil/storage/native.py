@@ -142,16 +142,14 @@ class TaskLeaseRepository:
         ttl_seconds: Optional[int] = None,
         force: bool = False,
     ) -> TaskLeaseRecord:
-        active = self.active_for_task(task_id)
+        active = self._active_model_for_task(task_id)
         if active is not None and not force:
             raise ValueError(f"Active lease already exists for task {task_id}")
         if active is not None and force:
-            existing = self.session.get(TaskLeaseModel, active.id)
-            if existing is not None:
-                existing.status = "stale"
-                existing.released_at = _utc_now()
-                self.session.add(existing)
-                self.session.commit()
+            active.status = "stale"
+            active.released_at = _utc_now()
+            self.session.add(active)
+            self.session.commit()
 
         lease_id = str(uuid.uuid4())
         token = secrets.token_urlsafe(32)
@@ -185,11 +183,8 @@ class TaskLeaseRepository:
         return _lease_from_model(model)
 
     def release(self, task_id: str, lease_token: str, status: str = "released") -> bool:
-        active = self.active_for_task(task_id)
-        if active is None or active.lease_token != lease_token:
-            return False
-        model = self.session.get(TaskLeaseModel, active.id)
-        if model is None:
+        model = self._active_model_for_task(task_id)
+        if model is None or model.lease_token != lease_token:
             return False
         model.status = status
         model.released_at = _utc_now()
@@ -197,7 +192,11 @@ class TaskLeaseRepository:
         self.session.commit()
         return True
 
-    def active_for_task(self, task_id: str) -> TaskLeaseRecord | None:
+    def _active_model_for_task(self, task_id: str) -> Optional[TaskLeaseModel]:
+        """Return the live ACTIVE lease *model* for a task (or None), lazily expiring a
+        lease that is past its TTL. Callers that need a Record wrap the result via
+        _lease_from_model — this avoids re-fetching the same row by primary key after a
+        Record-returning lookup."""
         statement = (
             select(TaskLeaseModel)
             .where(TaskLeaseModel.task_id == task_id)
@@ -216,6 +215,12 @@ class TaskLeaseRepository:
                 self.session.add(model)
                 self.session.commit()
                 return None
+        return model
+
+    def active_for_task(self, task_id: str) -> TaskLeaseRecord | None:
+        model = self._active_model_for_task(task_id)
+        if model is None:
+            return None
         return _lease_from_model(model)
 
     def validate(self, task_id: str, lease_token: str) -> bool:
@@ -225,11 +230,8 @@ class TaskLeaseRepository:
     def renew(self, task_id: str, lease_token: str, ttl_seconds: int) -> TaskLeaseRecord | None:
         """Push the lease's expiry out by ``ttl_seconds`` from now. Returns the updated
         record, or None when the token is invalid / the lease already expired."""
-        active = self.active_for_task(task_id)
-        if active is None or active.lease_token != lease_token:
-            return None
-        model = self.session.get(TaskLeaseModel, active.id)
-        if model is None:
+        model = self._active_model_for_task(task_id)
+        if model is None or model.lease_token != lease_token:
             return None
         model.expires_at = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
         self.session.add(model)

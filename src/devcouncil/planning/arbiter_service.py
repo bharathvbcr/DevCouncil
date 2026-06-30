@@ -1,8 +1,11 @@
+import logging
 from typing import List, Dict
 from pydantic import BaseModel
 from devcouncil.domain.requirement import Requirement
 from devcouncil.domain.task import Task
 from devcouncil.llm.router import ModelRouter
+
+logger = logging.getLogger(__name__)
 
 class ArbiterDecision(BaseModel):
     accepted_finding_ids: List[str]
@@ -49,9 +52,14 @@ You are the arbiter engineering manager. Your goal is to produce the final, defi
         messages = [
             {"role": "user", "content": prompt}
         ]
-        
-        return await self.router.complete_structured(
+
+        result = await self.router.complete_structured(
             role="arbiter",
             messages=messages,
             schema=ArbiterDecision
         )
+        logger.info(
+            "Arbiter decision: %d final requirement(s), %d final task(s), %d finding(s) accepted",
+            len(result.final_requirements), len(result.final_tasks), len(result.accepted_finding_ids),
+        )
+        return result

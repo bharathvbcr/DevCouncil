@@ -31,7 +31,8 @@ _CODE_RE = re.compile(r"`([^`]+)`")
 _LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _BOLD_RE = re.compile(r"\*\*([^*]+)\*\*")
 _ITALIC_RE = re.compile(r"(?<!\*)\*(?!\*)([^*]+)\*(?!\*)")
-_PLACEHOLDER_RE = re.compile("(\\d+)")
+_PLACEHOLDER_RE = re.compile(r"__PH_(\d+)__")
+_TABLE_SEP_RE = re.compile(r"\s*\|?[\s:|-]*-[\s:|-]*\|?\s*")
 
 _URL_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 _BAD_SCHEME_RE = re.compile(r"^(?:javascript|data|vbscript):", re.IGNORECASE)
@@ -108,7 +109,7 @@ def _render_inline(text: str, current_md_rel: str, present: set[str]) -> str:
 
     def _stash(fragment: str) -> str:
         stash.append(fragment)
-        return f"{len(stash) - 1}"
+        return f"__PH_{len(stash) - 1}__"
 
     text = _CODE_RE.sub(lambda m: _stash(f"<code>{html.escape(m.group(1))}</code>"), text)
     text = _LINK_RE.sub(
@@ -140,7 +141,7 @@ def _render_table(rows: list[str], current_md_rel: str, present: set[str]) -> st
 
 
 def _is_table_sep(line: str) -> bool:
-    return bool(re.fullmatch(r"\s*\|?[\s:|-]*-[\s:|-]*\|?\s*", line)) and "-" in line
+    return bool(_TABLE_SEP_RE.fullmatch(line)) and "-" in line
 
 
 def render_markdown(body: str, current_md_rel: str, present: set[str]) -> str:
@@ -170,34 +171,47 @@ def render_markdown(body: str, current_md_rel: str, present: set[str]) -> str:
         stripped = line.strip()
 
         if stripped.startswith("```"):  # fenced code block
-            flush_para(); flush_list()
+            flush_para()
+            flush_list()
             i += 1
             code: list[str] = []
             while i < n and not lines[i].strip().startswith("```"):
-                code.append(lines[i]); i += 1
+                code.append(lines[i])
+                i += 1
             i += 1  # consume closing fence
             out.append(f"<pre><code>{html.escape(chr(10).join(code))}</code></pre>")
             continue
 
         if not stripped:  # blank line
-            flush_para(); flush_list(); i += 1; continue
+            flush_para()
+            flush_list()
+            i += 1
+            continue
 
         heading = re.match(r"^(#{1,6})\s+(.*)$", stripped)
         if heading:
-            flush_para(); flush_list()
+            flush_para()
+            flush_list()
             level = len(heading.group(1))
             out.append(f"<h{level}>{_render_inline(heading.group(2), current_md_rel, present)}</h{level}>")
-            i += 1; continue
+            i += 1
+            continue
 
         if re.fullmatch(r"(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,}", stripped):
-            flush_para(); flush_list(); out.append("<hr>"); i += 1; continue
+            flush_para()
+            flush_list()
+            out.append("<hr>")
+            i += 1
+            continue
 
         if "|" in line and i + 1 < n and _is_table_sep(lines[i + 1]):
-            flush_para(); flush_list()
+            flush_para()
+            flush_list()
             table_rows = [line, lines[i + 1]]
             i += 2
             while i < n and "|" in lines[i] and lines[i].strip():
-                table_rows.append(lines[i]); i += 1
+                table_rows.append(lines[i])
+                i += 1
             out.append(_render_table(table_rows, current_md_rel, present))
             continue
 
@@ -209,15 +223,18 @@ def render_markdown(body: str, current_md_rel: str, present: set[str]) -> str:
             if list_tag and list_tag != tag:
                 flush_list()
             list_tag = tag
-            content = (ul or ol).group(1)
+            match = ul or ol  # one is non-None inside this branch
+            content = match.group(1) if match else ""
             list_items.append(_render_inline(content, current_md_rel, present))
-            i += 1; continue
+            i += 1
+            continue
 
         flush_list()
         para.append(stripped)
         i += 1
 
-    flush_para(); flush_list()
+    flush_para()
+    flush_list()
     return "\n".join(out)
 
 

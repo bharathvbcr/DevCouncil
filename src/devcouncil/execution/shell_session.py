@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shlex
 import shutil
@@ -19,6 +20,8 @@ from devcouncil.storage.db import get_db
 from devcouncil.storage.native import ShellCommandRepository, ShellSessionRepository, TaskLeaseRepository
 from devcouncil.storage.repositories import EvidenceRepository, TaskRepository
 from devcouncil.telemetry.traces import TraceLogger
+
+logger = logging.getLogger(__name__)
 
 
 class ShellBackend:
@@ -137,6 +140,7 @@ class GuardedShellSession:
         stderr_path = self.log_dir / f"{self.task.id}-{log_id}.stderr.log"
 
         if decision.action == "deny":
+            logger.warning("Shell command DENIED for %s: %s (%s)", self.task.id, normalized, decision.reason)
             self._record_command(normalized, "denied", reason=decision.reason)
             TraceLogger(self.project_root).log_event(
                 "shell_command_denied",
@@ -152,9 +156,11 @@ class GuardedShellSession:
             )
             return 1
 
+        logger.info("Shell command for %s: %s", self.task.id, normalized)
         try:
             result = self.backend.run_command(normalized, self.project_root)
         except (NotImplementedError, FileNotFoundError, OSError) as exc:
+            logger.warning("Shell command could not run for %s: %s (%s)", self.task.id, normalized, exc)
             self._record_command(normalized, "denied", reason=str(exc))
             console.print(f"[red]Could not run '{normalized}':[/red] {exc}")
             return 1

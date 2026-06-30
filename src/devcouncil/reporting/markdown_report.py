@@ -40,7 +40,20 @@ class MarkdownReportGenerator:
         md_output += "## Coverage Summary\n"
         md_output += f"- **Requirements**: {summary['total_requirements']} ({summary['requirements_without_tasks']} unmapped)\n"
         md_output += f"- **Tasks**: {summary['total_tasks']} ({summary['tasks_without_requirements']} orphaned)\n"
-        md_output += f"- **Evidence**: {summary['total_ac'] - summary['ac_without_evidence']}/{summary['total_ac']} AC verified\n\n"
+        md_output += f"- **Evidence**: {summary['total_ac'] - summary['ac_without_evidence']}/{summary['total_ac']} AC verified\n"
+        # Proof rigor: HOW the verified criteria were proven. Precise per-criterion checks
+        # (compiled/vote) are trustworthy; ``coarse`` (a passing acceptance-capable command,
+        # not a check tied to the criterion) is weak evidence worth flagging to a reader.
+        proof_modes: dict[str, int] = {}
+        for ev in getattr(graph, "test_evidence", []):
+            if getattr(ev, "status", "") == "passed":
+                proof_modes[getattr(ev, "mode", "") or "unspecified"] = (
+                    proof_modes.get(getattr(ev, "mode", "") or "unspecified", 0) + 1
+                )
+        if proof_modes:
+            rigor = ", ".join(f"{count} {mode}" for mode, count in sorted(proof_modes.items()))
+            md_output += f"- **Proof rigor**: {rigor}\n"
+        md_output += "\n"
 
         md_output += "## Requirements Coverage Table\n"
         md_output += "| Requirement | Task Mapping | Status |\n"

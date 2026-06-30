@@ -152,6 +152,122 @@ def test_verifier_compiled_check_failure_blocks_its_criterion(tmp_path):
     assert any(g.gap_type == "test_failed" and g.blocking for g in gaps)
 
 
+def test_verifier_repairs_unrunnable_compiled_check(tmp_path):
+    # Local-model fix: a compiled check that FAILS TO RUN (wrong import) is regenerated
+    # from the launcher error and re-run. A check that never ran proves nothing, so this
+    # converts a false "incomplete" into real passing evidence without weakening the gate.
+    class FakeCompiler:
+        async def compile_candidates(self, task, requirements, code_context, samples=1, **kwargs):
+            return {"AC-001": ['python -c "import wrongname"']}
+
+        async def repair(self, ac_id, ac_description, failing_command, error_summary, code_context):
+            return 'python -c "assert True"'
+
+    task = _task()
+    verifier = Verifier(tmp_path)
+    verifier.acceptance_compiler = FakeCompiler()
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    verifier._commands_for_task = lambda task: {}
+
+    def fake_run(command, task_id="verify"):
+        if "wrongname" in command:  # original, unrunnable
+            return CommandResult(command=command, exit_code=1, stdout_path="", stderr_path="",
+                                 summary="Exit code 1. stderr: No module named wrongname")
+        return CommandResult(command=command, exit_code=0, stdout_path="", stderr_path="", summary="ok")
+    verifier._run_command = fake_run
+
+    gaps, evidence = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    assert [ev for ev in evidence if isinstance(ev, TestEvidence) and ev.acceptance_criterion_id == "AC-001" and ev.status == "passed"]
+    assert not any(g.gap_type == "acceptance_criteria_unproven" and g.blocking for g in gaps)
+
+
+def test_verifier_records_vote_mode_and_tally_in_evidence(tmp_path):
+    # Auditability: a criterion proven by a multi-check majority records mode="vote" and
+    # the tally in its evidence summary, so a "passed" can be inspected for rigor.
+    class FakeCompiler:
+        async def compile_candidates(self, task, requirements, code_context, samples=1, **kwargs):
+            return {"AC-001": ['python -c "assert ok1"', 'python -c "assert ok2"', 'python -c "assert bad"']}
+
+    task = _task()
+    verifier = Verifier(tmp_path)
+    verifier.acceptance_compiler = FakeCompiler()
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    verifier._commands_for_task = lambda task: {}
+
+    def fake_run(command, task_id="verify"):
+        if "bad" in command:
+            return CommandResult(command=command, exit_code=1, stdout_path="", stderr_path="",
+                                 summary="Exit code 1. stderr: AssertionError")
+        return CommandResult(command=command, exit_code=0, stdout_path="", stderr_path="", summary="ok")
+    verifier._run_command = fake_run
+
+    _, evidence = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    ev = [e for e in evidence if isinstance(e, TestEvidence) and e.acceptance_criterion_id == "AC-001" and e.status == "passed"]
+    assert ev and ev[0].mode == "vote"
+    assert "2/3 passed" in ev[0].evidence_summary
+
+
+def test_verifier_majority_vote_proves_criterion(tmp_path):
+    # Self-consistency: two independent checks pass, one mis-generated check fails by
+    # assertion. A strict majority pass proves the criterion — the lone bad check is
+    # outvoted instead of false-blocking correct code.
+    class FakeCompiler:
+        async def compile_candidates(self, task, requirements, code_context, samples=1, **kwargs):
+            return {"AC-001": ['python -c "assert ok1"', 'python -c "assert ok2"', 'python -c "assert bad"']}
+
+    task = _task()
+    verifier = Verifier(tmp_path)
+    verifier.acceptance_compiler = FakeCompiler()
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    verifier._commands_for_task = lambda task: {}
+
+    def fake_run(command, task_id="verify"):
+        if "bad" in command:
+            return CommandResult(command=command, exit_code=1, stdout_path="", stderr_path="",
+                                 summary="Exit code 1. stderr: AssertionError")
+        return CommandResult(command=command, exit_code=0, stdout_path="", stderr_path="", summary="ok")
+    verifier._run_command = fake_run
+
+    gaps, evidence = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    assert [ev for ev in evidence if isinstance(ev, TestEvidence) and ev.acceptance_criterion_id == "AC-001" and ev.status == "passed"]
+    assert not any(g.blocking for g in gaps)
+
+
+def test_verifier_split_vote_is_inconclusive_and_non_blocking(tmp_path):
+    # When independent checks split with no majority, the result is inconclusive:
+    # neither proof nor a defect. The criterion stays unproven but does NOT block
+    # (no false-block on a lone bad check, no false-pass of a real bug).
+    class FakeCompiler:
+        async def compile_candidates(self, task, requirements, code_context, samples=1, **kwargs):
+            return {"AC-001": ['python -c "assert ok"', 'python -c "assert bad"']}
+
+    task = _task()
+    verifier = Verifier(tmp_path)
+    verifier.acceptance_compiler = FakeCompiler()
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    verifier._commands_for_task = lambda task: {}
+
+    def fake_run(command, task_id="verify"):
+        if "bad" in command:
+            return CommandResult(command=command, exit_code=1, stdout_path="", stderr_path="",
+                                 summary="Exit code 1. stderr: AssertionError")
+        return CommandResult(command=command, exit_code=0, stdout_path="", stderr_path="", summary="ok")
+    verifier._run_command = fake_run
+
+    gaps, evidence = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    assert not [ev for ev in evidence if isinstance(ev, TestEvidence) and ev.status == "passed"]
+    unproven = [g for g in gaps if g.gap_type == "acceptance_criteria_unproven" and g.acceptance_criterion_id == "AC-001"]
+    assert unproven and not unproven[0].blocking  # inconclusive -> surfaced, not blocked
+
+
 def test_verifier_blocks_unproven_acceptance_criteria(tmp_path):
     # A task with a verification contract but no passing evidence and no way to
     # verify (no commands at all) must block — there is no proof of completion.
@@ -287,6 +403,101 @@ def test_verifier_filters_generated_and_runtime_change_paths(tmp_path):
     ])
 
     assert paths == ["src/devcouncil/verification/verifier.py"]
+
+
+def _write_after_snapshot(tmp_path, task_id):
+    snap = tmp_path / ".devcouncil" / "semantic" / task_id
+    snap.mkdir(parents=True, exist_ok=True)
+    (snap / "after.json").write_text("{}", encoding="utf-8")
+
+
+def _patch_semantic_diff(monkeypatch, classifications):
+    from devcouncil.indexing import semantic_index as si
+    monkeypatch.setattr(si.SemanticIndex, "diff", lambda self, tid: {"classifications": classifications})
+
+
+def test_verifier_blocks_unintended_public_symbol_removal(tmp_path, monkeypatch):
+    # Drift WITHIN an allowed file: the executor removed an existing public symbol the
+    # task never asked about. That is scope drift / a regression and must block.
+    task = _task()
+    _write_after_snapshot(tmp_path, task.id)
+    _patch_semantic_diff(monkeypatch, [
+        {"type": "exported_symbol_removed", "path": "src/auth.py", "name": "LegacyHelper"},
+    ])
+    gaps = Verifier(tmp_path)._check_semantic_diff(task, [_requirement()])
+    drift = [g for g in gaps if g.gap_type == "architecture_drift"]
+    assert drift and drift[0].blocking
+    assert "LegacyHelper" in drift[0].description
+
+
+def test_verifier_allows_intended_public_symbol_removal(tmp_path, monkeypatch):
+    # If the task explicitly calls for the removal, it is an intended decision, not drift.
+    task = _task()
+    task.description = "Remove the deprecated LegacyHelper export and its callers."
+    _write_after_snapshot(tmp_path, task.id)
+    _patch_semantic_diff(monkeypatch, [
+        {"type": "exported_symbol_removed", "path": "src/auth.py", "name": "LegacyHelper"},
+    ])
+    gaps = Verifier(tmp_path)._check_semantic_diff(task, [_requirement()])
+    drift = [g for g in gaps if g.gap_type == "architecture_drift"]
+    assert drift and not drift[0].blocking  # surfaced, but not blocked
+
+
+def test_verifier_treats_moved_public_symbol_as_non_blocking(tmp_path, monkeypatch):
+    # Removed from one file and re-exported elsewhere = a move/rename refactor, not drift.
+    task = _task()
+    _write_after_snapshot(tmp_path, task.id)
+    _patch_semantic_diff(monkeypatch, [
+        {"type": "exported_symbol_removed", "path": "src/auth.py", "name": "Helper"},
+        {"type": "exported_symbol_added", "path": "src/util.py", "name": "Helper"},
+    ])
+    gaps = Verifier(tmp_path)._check_semantic_diff(task, [_requirement()])
+    drift = [g for g in gaps if g.gap_type == "architecture_drift"]
+    assert drift and not drift[0].blocking
+
+
+def test_verifier_signature_change_on_planned_file_is_advisory(tmp_path, monkeypatch):
+    # A public signature change on a file the task OWNS is surfaced but never blocks —
+    # tasks legitimately change signatures of their planned files.
+    task = _task()
+    _write_after_snapshot(tmp_path, task.id)
+    _patch_semantic_diff(monkeypatch, [
+        {"type": "public_api_change", "path": "src/auth.py", "name": "login"},
+    ])
+    gaps = Verifier(tmp_path)._check_semantic_diff(task, [_requirement()])
+    drift = [g for g in gaps if g.gap_type == "architecture_drift"]
+    assert drift and not drift[0].blocking
+    assert "signature" in drift[0].description.lower()
+
+
+def test_verifier_blocks_new_third_party_import(tmp_path, monkeypatch):
+    # An undeclared, not-installed third-party package = supply-chain drift -> block,
+    # even in a planned file.
+    task = _task()
+    _write_after_snapshot(tmp_path, task.id)
+    _patch_semantic_diff(monkeypatch, [
+        {"type": "import_dependency_change", "path": "src/auth.py",
+         "statement": "import zzz_nonexistent_pkg_qwerty"},
+    ])
+    gaps = Verifier(tmp_path)._check_semantic_diff(task, [_requirement()])
+    dep = [g for g in gaps if g.gap_type == "dependency_risk"]
+    assert dep and dep[0].blocking
+    assert "zzz_nonexistent_pkg_qwerty" in dep[0].description
+
+
+def test_verifier_does_not_block_stdlib_or_relative_imports(tmp_path, monkeypatch):
+    # stdlib and relative/local imports are never new dependencies. On an UNPLANNED file
+    # they still surface as advisory dependency_risk gaps, but must never block.
+    task = _task()
+    _write_after_snapshot(tmp_path, task.id)
+    _patch_semantic_diff(monkeypatch, [
+        {"type": "import_dependency_change", "path": "src/unplanned.py", "statement": "import os"},
+        {"type": "import_dependency_change", "path": "src/unplanned.py", "statement": "from . import helpers"},
+    ])
+    gaps = Verifier(tmp_path)._check_semantic_diff(task, [_requirement()])
+    import_gaps = [g for g in gaps if g.gap_type == "dependency_risk"]
+    assert import_gaps                              # the imports WERE processed (advisory)
+    assert not any(g.blocking for g in import_gaps)  # but stdlib/relative never block
 
 
 def test_verifier_blocks_open_critical_live_review_cards(tmp_path):

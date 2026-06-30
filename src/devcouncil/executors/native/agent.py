@@ -1,5 +1,6 @@
 from typing import List, Dict, Any
 import asyncio
+import logging
 from rich.console import Console
 from pydantic import BaseModel
 from devcouncil.domain.task import Task
@@ -13,6 +14,7 @@ from devcouncil.execution.paths import resolve_project_path
 from devcouncil.app.errors import ExecutionError
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 # Resilience bounds for the preview native loop.
 MAX_AGENT_STEPS = 10
@@ -44,6 +46,7 @@ class NativeAgent(Executor):
         return asyncio.run(self._run_task_async(task, requirements))
 
     async def _run_task_async(self, task: Task, requirements: List[Requirement]) -> ExecutionResult:
+        logger.info("Native agent starting for %s (max_steps=%d)", task.id, MAX_AGENT_STEPS)
         console.print(f"Starting [bold]Native Executor[/bold] for task {task.id}...")
         console.print("[yellow]Native executor is preview quality; DevCouncil verification remains the completion gate.[/yellow]")
         
@@ -96,8 +99,10 @@ Rules:
                 # native_agent has no fallback by design, so handle it here rather than
                 # letting it propagate and abort the entire `dev go` run.
                 structured_failures += 1
+                logger.warning("Native agent step %d: unparseable action (%d/%d): %s", step + 1, structured_failures, MAX_STRUCTURED_FAILURES, exc)
                 console.print(f"[red]Native agent could not parse a valid action: {exc}[/red]")
                 if structured_failures >= MAX_STRUCTURED_FAILURES:
+                    logger.error("Native agent giving up on %s after %d unparseable responses", task.id, structured_failures)
                     return ExecutionResult(
                         success=False,
                         message=f"Native agent gave up after {structured_failures} unparseable responses.",
@@ -113,6 +118,11 @@ Rules:
                 continue
             structured_failures = 0
 
+            logger.info(
+                "Native agent %s step %d/%d: %d tool call(s)%s",
+                task.id, step + 1, MAX_AGENT_STEPS, len(action.tool_calls),
+                " finish=True" if action.finish else "",
+            )
             console.print(f"\n[bold]Step {step+1}:[/bold] {action.thought}")
 
             # Record the agent's own turn so subsequent steps see what it already did.
@@ -121,6 +131,7 @@ Rules:
             messages.append({"role": "assistant", "content": action.model_dump_json()})
 
             if action.finish:
+                logger.info("Native agent signaled completion for %s at step %d", task.id, step + 1)
                 console.print("[green]Native agent signaled completion.[/green]")
                 return ExecutionResult(success=True, message="Agent signaled completion; pending DevCouncil verification")
 
@@ -135,6 +146,7 @@ Rules:
 
             for tool_call in action.tool_calls:
                 result_summary = ""
+                logger.debug("Native agent tool call: %s args=%s", tool_call.tool, list(tool_call.args))
                 try:
                     if tool_call.tool == "read_file":
                         path = tool_call.args["path"]
@@ -183,10 +195,12 @@ Rules:
                     
                     messages.append({"role": "user", "content": f"[Tool Result] '{tool_call.tool}': {result_summary}"})
                 except Exception as e:
+                    logger.warning("Native agent tool %s failed for %s: %s", tool_call.tool, task.id, e)
                     console.print(f"[red]Error executing tool {tool_call.tool}: {e}[/red]")
                     if tool_call.tool == "apply_patch":
                         consecutive_patch_failures += 1
                         if consecutive_patch_failures >= MAX_CONSECUTIVE_PATCH_FAILURES:
+                            logger.error("Native agent giving up on %s after %d consecutive patch failures", task.id, consecutive_patch_failures)
                             return ExecutionResult(
                                 success=False,
                                 message=(
@@ -204,5 +218,6 @@ Rules:
                     else:
                         messages.append({"role": "user", "content": f"[Tool Error] '{tool_call.tool}' failed: {e}"})
 
+        logger.warning("Native agent reached max step limit (%d) for %s", MAX_AGENT_STEPS, task.id)
         console.print("[red]Native agent reached maximum step limit.[/red]")
         return ExecutionResult(success=False, message="Reached maximum step limit")

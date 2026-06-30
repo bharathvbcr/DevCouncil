@@ -1,8 +1,11 @@
+import logging
 from typing import List
 from pydantic import BaseModel
 from devcouncil.domain.requirement import Requirement
 from devcouncil.domain.assumption import Assumption
 from devcouncil.llm.router import ModelRouter
+
+logger = logging.getLogger(__name__)
 
 class BlockingQuestion(BaseModel):
     id: str
@@ -62,9 +65,14 @@ Each assumption MUST have a confidence and impact level.
         messages = [
             {"role": "user", "content": prompt}
         ]
-        
-        return await self.router.complete_structured(
+
+        result = await self.router.complete_structured(
             role="spec_writer",
             messages=messages,
             schema=SpecOutput
         )
+        logger.info(
+            "Spec generated: %d requirement(s), %d assumption(s), %d blocking question(s)",
+            len(result.requirements), len(result.assumptions), len(result.blocking_questions),
+        )
+        return result

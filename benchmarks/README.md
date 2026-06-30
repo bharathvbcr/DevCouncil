@@ -33,7 +33,15 @@ Aggregate (the headline numbers):
 - **Verdict calibration** — of arm-B tasks DevCouncil reported `passed`, what
   fraction actually scored `== 1.0` (precision); of those it `blocked`, what
   fraction actually scored `< 1.0` (recall of real problems). This is the core
-  trust metric: *when DevCouncil says done, is it done?*
+  trust metric: *when DevCouncil says done, is it done?* Reported two ways:
+  - **Decisive-verdict accuracy** — over hard claims only (`passed`/`blocked`).
+  - **Verdict calibration incl. incomplete** — over *every* non-error task, so a
+    run is never silently dropped from the denominator. DevCouncil's third verdict,
+    `incomplete` (nothing failing, but some acceptance criterion lacks passing
+    evidence), is scored as *cautious-correct* when the code really wasn't full and
+    as an *under-credit* (too conservative) when the code actually scored `1.0`.
+    The summary also prints the incomplete breakdown (cautious vs. under-credited),
+    which typically rises when the reviewer model is too weak to prove the criteria.
 - **Silent-failure conversion** — fraction of tasks where the raw agent shipped
   `< 1.0` (an undetected defect) that DevCouncil instead surfaced as `blocked`.
   This is DevCouncil's headline value: turning false confidence into honest gaps.
@@ -61,8 +69,27 @@ Useful flags:
 - `--timeout 360` — per-arm wall-clock cap.
 - `--keep-workspaces` — keep the temp repos for inspection.
 
-Output: a `results/<timestamp>.json` (raw per-run data) and a printed Markdown
-summary table.
+Arm-B acceptance-check tuning (how DevCouncil proves each acceptance criterion):
+- `--ac-samples N` — generate `N` *independent* per-criterion checks and decide by
+  **majority vote** (default `1`). A criterion is proven only when a strict majority
+  pass; an all-fail is a real defect (blocks); a split is inconclusive (non-blocking).
+  `>1` outvotes a single mis-generated check — the cause of false `blocked` verdicts.
+  Local sampling is cost-free, so raise it (e.g. `3`) when using `--monitor-model`.
+- `--ac-repair-attempts N` — when a compiled check *fails to run* (wrong import, broken
+  one-liner) feed the error back and regenerate the command up to `N` times (default
+  `1`). Rescues the under-credited `incomplete`; can never weaken the gate, since a
+  check that never ran proves nothing.
+- `--ac-per-criterion` — compile **one** acceptance check per model call instead of
+  batching every criterion into a single prompt. A weak/local monitor batching N criteria
+  into one JSON routinely omits or mis-attributes some (a false `incomplete`); a focused
+  single-criterion prompt is far more reliable. Costs N× the calls — cheap on a local
+  monitor. Compounds with `--ac-samples`.
+
+For a weak/local reviewer the high-leverage combination is `--ac-samples 3
+--ac-repair-attempts 2 --ac-per-criterion` alongside `--monitor-model <ollama-tag>`.
+
+Output: a `results/<timestamp>.json` (raw per-run data, including the
+`acceptance_checks` settings used) and a printed Markdown summary table.
 
 ## Methodology notes & honesty caveats
 

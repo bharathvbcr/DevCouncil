@@ -47,6 +47,7 @@ class CheckpointService:
         return self._create(task_id, stage="attempt", ref_name=ref_template)
 
     def rollback(self, task_id: str) -> CheckpointResult:
+        logger.info("Rollback requested for %s", task_id)
         before_ref = self.REF_BEFORE.format(task_id=task_id)
         after_ref = self.REF_AFTER.format(task_id=task_id)
         after_patch = self.checkpoint_dir / f"{task_id}-after.patch"
@@ -140,8 +141,9 @@ class CheckpointService:
         # the git-ref rollback path can never fire. Falls back to HEAD if snapshotting is
         # impossible (unborn HEAD / not a git repo), preserving the patch-based rollback.
         git_ref_created = self._update_ref(ref, self._snapshot_commit())
+        verifier = Verifier(self.project_root)
         try:
-            diff = Verifier(self.project_root).get_diff()
+            diff = verifier.get_diff()
             if diff:
                 patch_path.write_text(diff, encoding="utf-8")
         except Exception as exc:
@@ -152,12 +154,20 @@ class CheckpointService:
         if stage == "before":
             snapshot = {
                 "task_id": task_id,
-                "changed_files": Verifier(self.project_root).get_changed_files(),
+                "changed_files": verifier.get_changed_files(),
             }
             snapshot_path = self.checkpoint_dir / f"{task_id}-before.json"
             snapshot_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
             json_path = str(snapshot_path)
 
+        # Routine bookkeeping (fires before+after every task and repair attempt) — DEBUG
+        # keeps the -v stream milestone-level; the file still records it, and a capture
+        # *failure* is logged at WARNING above.
+        logger.debug(
+            "Checkpoint %s for %s: ref=%s patch=%s",
+            stage, task_id, "yes" if git_ref_created else "no",
+            "yes" if patch_path.exists() else "no",
+        )
         return CheckpointResult(
             task_id=task_id,
             ref=ref if git_ref_created else None,

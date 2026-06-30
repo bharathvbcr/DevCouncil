@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import subprocess
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from devcouncil.verification.implementation_reviewer import ImplementationReview
 from devcouncil.verification.verifier import Verifier
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 def _diff(root: Path, base: str | None) -> str:
@@ -55,6 +57,8 @@ def check(
 ):
     """Audit the current changes — scope, risks, missing edge cases, secrets — no planning required."""
     root = project_root.expanduser().resolve()
+    from devcouncil.telemetry.logging_setup import set_log_dir
+    set_log_dir(root)
     initialize_project(root, quiet=True)
 
     # A --goal of "#142" or a GitHub issue/PR URL is a reference, not a spec —
@@ -85,14 +89,18 @@ def check(
 
     verifier = Verifier(root)
 
+    logger.info("dev check (LLM audit): base=%s goal=%s", base or "working-tree", "set" if goal else "none")
     diff = _diff(root, base)
     if not diff.strip():
+        logger.info("dev check: clean working tree; nothing to audit")
         msg = "No changes to check (clean working tree)."
         typer.echo(json.dumps({"ok": True, "message": msg}) if json_format else msg)
         return
 
     changed_files = verifier.get_changed_files()
     secret_gaps = verifier.secret_scanner.scan_diff(diff, "check")
+    if secret_gaps:
+        logger.warning("dev check: %d possible secret(s) in diff across %d changed file(s)", len(secret_gaps), len(changed_files))
 
     # Blast radius: what do the changed files ripple into? Surfaced from the
     # structural graph when the code-review-graph integration is enabled, so a
@@ -105,7 +113,7 @@ def check(
         config = load_config(root)
         validate_model_provider(config.models.provider)
         api_key = get_api_key(config.models.provider, root)
-        provider = create_provider(config.models.provider, api_key, project_root=root)
+        provider = create_provider(config.models.provider, api_key, project_root=root, provider_prefs=config.provider)
         role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
         router = ModelRouter(provider, role_config, project_root=root)
         synthetic = Task(
@@ -120,9 +128,12 @@ def check(
         review = asyncio.run(ImplementationReviewer(router).review_changes(synthetic, [], diff))
         findings = review.findings
     except (ProviderRequestError, StructuredOutputError) as exc:
+        logger.warning("dev check: LLM review unavailable: %s", exc)
         review_note = f"LLM review unavailable: {exc}"
     except Exception as exc:  # pragma: no cover - best effort
+        logger.warning("dev check: LLM review unavailable: %s", exc)
         review_note = f"LLM review unavailable: {exc}"
+    logger.info("dev check audit complete: %d secret finding(s), %d review finding(s)", len(secret_gaps), len(findings))
 
     if json_format:
         typer.echo(json.dumps({

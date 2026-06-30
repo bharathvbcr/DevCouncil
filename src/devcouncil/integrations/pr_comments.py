@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import httpx
 from urllib.parse import quote
 
 from devcouncil.artifacts.graph import ArtifactGraph
 from devcouncil.reporting.report_builder import ReportBuilder
+
+logger = logging.getLogger(__name__)
 
 
 class PullRequestCommentError(RuntimeError):
@@ -34,10 +37,13 @@ class GitHubPRCommenter:
             "Accept": "application/vnd.github+json",
             "Content-Type": "application/json",
         }
+        logger.info("Posting GitHub PR comment: repo=%s pr=%s", self.repository, self.pull_number)
         async with httpx.AsyncClient() as client:
             response = await client.post(url, headers=headers, json={"body": body})
         if response.status_code >= 400:
+            logger.error("GitHub comment failed: HTTP %s for %s#%s", response.status_code, self.repository, self.pull_number)
             raise PullRequestCommentError(f"GitHub comment failed with HTTP {response.status_code}: {response.text}")
+        logger.info("GitHub PR comment posted to %s#%s", self.repository, self.pull_number)
         return response.json() if response.content else {}
 
 
@@ -55,8 +61,11 @@ class GitLabMRCommenter:
             "PRIVATE-TOKEN": self.token,
             "Content-Type": "application/json",
         }
+        logger.info("Posting GitLab MR note: project=%s mr=%s", self.project_id, self.merge_request_iid)
         async with httpx.AsyncClient() as client:
             response = await client.post(url, headers=headers, json={"body": body})
         if response.status_code >= 400:
+            logger.error("GitLab comment failed: HTTP %s for project=%s mr=%s", response.status_code, self.project_id, self.merge_request_iid)
             raise PullRequestCommentError(f"GitLab comment failed with HTTP {response.status_code}: {response.text}")
+        logger.info("GitLab MR note posted to project=%s mr=%s", self.project_id, self.merge_request_iid)
         return response.json() if response.content else {}

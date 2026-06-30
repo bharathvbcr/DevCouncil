@@ -107,8 +107,11 @@ def probe_coding_cli_version(client: str) -> tuple[bool, str]:
     return False, f"Optional; install {label} to use this integration."
 
 
-def recommended_executor_status(project_root: Path) -> tuple[bool, str]:
-    detected = detect_available_coding_cli(project_root)
+def recommended_executor_status(
+    project_root: Path, detected: str | None = None
+) -> tuple[bool, str]:
+    if detected is None:
+        detected = detect_available_coding_cli(project_root)
     if not detected:
         return False, "No built-in coding CLI on PATH. Run dev integrate recommend after installing one."
     resolved = resolve_automated_executor(project_root, None)
@@ -279,6 +282,7 @@ def build_integration_check_report(project_root: Path, *, strict: bool = False) 
         rows.append(IntegrationCheckRow(name=name, status="skip", details=details))
 
     root = project_root.expanduser().resolve()
+    detected = detect_available_coding_cli(root)
     add((root / ".devcouncil").exists(), "Project state", str(root / ".devcouncil"))
     devcouncil_path = shutil.which("devcouncil")
     add(
@@ -295,7 +299,7 @@ def build_integration_check_report(project_root: Path, *, strict: bool = False) 
         cli_ok, cli_details = probe_coding_cli_version(client)
         add_optional(cli_ok, CODING_CLI_CHECK_LABELS.get(client, client), cli_details)
 
-    rec_ok, rec_details = recommended_executor_status(root)
+    rec_ok, rec_details = recommended_executor_status(root, detected)
     add_optional(rec_ok, "Recommended coding CLI", rec_details)
 
     for row in integration_capability_rows(root):
@@ -383,7 +387,6 @@ def build_integration_check_report(project_root: Path, *, strict: bool = False) 
             str(hook_path) if references else f"{hook_path} no longer references devcouncil (tampered/disarmed).",
         )
 
-    detected = detect_available_coding_cli(root)
     recommended = resolve_automated_executor(root, None) if detected else None
     return IntegrationCheckReport(tuple(rows), recommended, failures)
 

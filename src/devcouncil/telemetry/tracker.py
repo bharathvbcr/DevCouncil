@@ -7,7 +7,11 @@ from devcouncil.telemetry.pricing import pricing_for_model
 class TelemetryTracker:
     def __init__(self, project_root: Path):
         self.log_file = project_root / ".devcouncil" / "logs" / "telemetry.json"
-        self.stats = self._load()
+        # log_usage() reloads the ledger immediately before saving (for concurrent-write
+        # safety), so any value read here would always be overwritten before use. Start
+        # from the same default shape _load() returns for a missing file instead of
+        # doing a dead disk read at construction.
+        self.stats: Dict[str, Any] = {"total_cost": 0.0, "total_prompt_tokens": 0, "total_completion_tokens": 0, "models": {}}
 
     def _load(self) -> Dict[str, Any]:
         if self.log_file.exists():

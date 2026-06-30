@@ -11,6 +11,7 @@ caller keeps the original goal text unchanged — expansion is strictly additive
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shutil
 import subprocess
@@ -18,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from devcouncil.utils.subprocess_env import clean_subprocess_env
+
+logger = logging.getLogger(__name__)
 
 # Cap each pulled discussion comment so a long thread can't dominate the prompt.
 _MAX_COMMENT_CHARS = 600
@@ -58,6 +61,7 @@ def _gh_view(ref: IntentRef, sub: str, root: Path) -> dict | None:
     """Run ``gh <issue|pr> view`` and return the parsed JSON, or None on failure."""
     gh = shutil.which("gh")
     if not gh:
+        logger.debug("gh CLI not on PATH; cannot expand %s #%s", sub, ref.number)
         return None
     cmd = [gh, sub, "view", str(ref.number), "--json", "title,body,comments,url,state"]
     if ref.repo:
@@ -67,13 +71,16 @@ def _gh_view(ref: IntentRef, sub: str, root: Path) -> dict | None:
             cmd, cwd=root, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=20, env=clean_subprocess_env(),
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning("gh %s view %s failed: %s", sub, ref.number, exc)
         return None
     if result.returncode != 0 or not result.stdout.strip():
+        logger.warning("gh %s view %s returned %s: %s", sub, ref.number, result.returncode, (result.stderr or "").strip()[:200])
         return None
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError:
+        logger.warning("gh %s view %s returned unparseable JSON", sub, ref.number)
         return None
     return data if isinstance(data, dict) else None
 

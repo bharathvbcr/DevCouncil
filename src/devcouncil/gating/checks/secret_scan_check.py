@@ -1,7 +1,10 @@
+import logging
 import re
 from typing import List
 from devcouncil.domain.gap import Gap
 from devcouncil.utils.redaction import SECRET_PATTERNS, redact_string
+
+logger = logging.getLogger(__name__)
 
 # Captures the new-file starting line from a unified-diff hunk header (@@ -a,b +c,d @@).
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
@@ -32,6 +35,10 @@ class SecretScanner:
                 for key_type, pattern in SECRET_PATTERNS.items():
                     if pattern.search(line):
                         counter += 1
+                        logger.warning(
+                            "Potential %s secret detected in %s:%d (task %s)",
+                            key_type, current_file, new_line_no, task_id,
+                        )
                         gaps.append(Gap(
                             id=f"GAP-{task_id}-SECRET-{key_type.upper()}-{new_line_no}-{counter}",
                             severity="critical",

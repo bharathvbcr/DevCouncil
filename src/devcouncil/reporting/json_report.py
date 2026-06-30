@@ -19,9 +19,20 @@ class JsonReportGenerator:
             verdict = "incomplete"
         else:
             verdict = "passed"
+        # Proof-rigor breakdown: of the criteria that ARE proven, how were they proven?
+        # ``compiled``/``vote`` are precise per-criterion checks (trustworthy); ``coarse``
+        # means proven only by a passing acceptance-capable command (weak). Surfacing this
+        # lets an auditor see that a "passed" verdict rests on rigorous, not coarse, evidence
+        # — the difference that matters most when a weak/local reviewer compiled the checks.
+        proof_modes: dict[str, int] = {}
+        for ev in getattr(graph, "test_evidence", []):
+            if getattr(ev, "status", "") == "passed":
+                key = getattr(ev, "mode", "") or "unspecified"
+                proof_modes[key] = proof_modes.get(key, 0) + 1
         report = {
             "verdict": verdict,
             "coverage_summary": summary,
+            "proof_modes": proof_modes,
             "blocking_gaps": [g.model_dump() for g in graph.blocking_gaps()]
         }
         if live_review is not None:

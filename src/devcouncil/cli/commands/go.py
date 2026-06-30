@@ -1,11 +1,15 @@
 import asyncio
 import hashlib
+import logging
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 import typer
 from rich.console import Console
+
+from devcouncil.telemetry.stages import log_stage, log_step
+from devcouncil.telemetry.logging_setup import set_log_dir
 
 from devcouncil.app.config import load_config
 from devcouncil.cli.commands import plan as plan_command
@@ -31,6 +35,7 @@ from devcouncil.reporting.report_builder import ReportBuilder
 
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 SUPPORTED_EXECUTORS = {
     *BUILTIN_CODING_EXECUTOR_NAMES,
@@ -104,7 +109,22 @@ def _blocking_gap_signature(root: Path, task_id: str) -> str:
     if not db:
         return ""
     with db.get_session() as session:
-        gaps = [g for g in GapRepository(session).get_all() if g.task_id == task_id and g.blocking]
+        gaps = GapRepository(session).get_blocking_for_task(task_id)
+    key = "\n".join(sorted(f"{g.gap_type}:{g.description}" for g in gaps))
+    return hashlib.sha1(key.encode("utf-8")).hexdigest() if key else ""
+
+
+def _remediable_incomplete_signature(root: Path, task_id: str) -> str:
+    """Fingerprint of a task's remediable "incomplete" gaps (unproven acceptance criteria
+    the executor could still prove), for driving and no-progress-checking the repair loop
+    when the task verified without a hard block but isn't actually done."""
+    from devcouncil.planning.correction_manifest import remediable_incomplete_gaps
+
+    db = get_db(root)
+    if not db:
+        return ""
+    with db.get_session() as session:
+        gaps = remediable_incomplete_gaps(GapRepository(session).get_for_task(task_id))
     key = "\n".join(sorted(f"{g.gap_type}:{g.description}" for g in gaps))
     return hashlib.sha1(key.encode("utf-8")).hexdigest() if key else ""
 
@@ -122,7 +142,7 @@ def _build_repair_service(root: Path):
         config = load_config(root)
         validate_model_provider(config.models.provider)
         api_key = get_api_key(config.models.provider, root)
-        provider = create_provider(config.models.provider, api_key, project_root=root)
+        provider = create_provider(config.models.provider, api_key, project_root=root, provider_prefs=config.provider)
         role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
         return RepairService(ModelRouter(provider, role_config, project_root=root))
     except Exception:
@@ -138,6 +158,7 @@ def _execute_task_with_repair(
     stream: bool,
     max_repairs: int,
     repair_service,
+    config=None,
 ) -> tuple[str, int]:
     """Run a task, then self-repair in a bounded loop until it verifies or the budget
     is exhausted. Returns ``(final_status, repair_attempts_used)``.
@@ -174,16 +195,26 @@ def _execute_task_with_repair(
 
     _run_once()
     status = _task_status(root, task.id)
+    logger.info("Initial run of %s finished as %s (max_repairs=%d)", task.id, status, max_repairs)
 
     attempt = 0
     last_signature: str | None = None
-    while status not in {"verified", "done"} and attempt < max_repairs:
-        signature = _blocking_gap_signature(root, task.id)
+    while attempt < max_repairs:
+        blocked = status not in {"verified", "done"}
+        # When the task is blocked, repair against its blocking gaps. When it "verified"
+        # without a hard block but is still INCOMPLETE (an acceptance criterion the
+        # executor could prove has no passing evidence), keep repairing too — otherwise
+        # arm B stalls one proof short of done (the eval_rpn 5/7-incomplete case).
+        signature = (
+            _blocking_gap_signature(root, task.id) if blocked
+            else _remediable_incomplete_signature(root, task.id)
+        )
         if not signature:
-            # Blocked without recorded blocking gaps (e.g. the executor failed to
-            # start) — there is nothing concrete to repair against, so stop.
+            # Nothing concrete to repair: truly done, or blocked with no recorded gaps
+            # (e.g. the executor failed to start).
             break
         if signature == last_signature:
+            logger.warning("%s: repair made no progress (identical gaps) after attempt %d; stopping loop", task.id, attempt)
             console.print(
                 f"[yellow]{task.id}: repair made no progress (identical blocking gaps); "
                 "stopping the self-repair loop.[/yellow]"
@@ -202,18 +233,23 @@ def _execute_task_with_repair(
         if _commit_task_changes(root, task.id, status):
             intermediate_commits += 1
 
-        manifest_path = write_correction_manifest(root, task.id, repair_service=repair_service)
+        manifest_path = write_correction_manifest(
+            root, task.id, repair_service=repair_service, config=config, include_incomplete=True
+        )
         if manifest_path is None:
             break
         attempt += 1
+        logger.info("Self-repair attempt %d/%d for %s (was %s); manifest=%s", attempt, max_repairs, task.id, status, manifest_path)
         console.print(
             f"\n[bold]Self-repair attempt {attempt}/{max_repairs}[/bold] for "
             f"[bold]{task.id}[/bold] (was {status})..."
         )
         _run_once()
         status = _task_status(root, task.id)
+        logger.info("After repair attempt %d, %s is now %s", attempt, task.id, status)
 
     if status not in {"verified", "done"} and attempt >= max_repairs and max_repairs > 0:
+        logger.warning("%s: gave up after %d repair attempt(s); still %s", task.id, attempt, status)
         console.print(
             f"[yellow]{task.id}: gave up after {attempt} repair attempt(s); still {status}.[/yellow]"
         )
@@ -224,6 +260,7 @@ def _execute_task_with_repair(
     # isn't lost and the final reconciliation pass still sees committed changes.
     if status in {"verified", "done"} and squash_base and intermediate_commits:
         if _squash_repair_commits(root, task.id, squash_base, status):
+            logger.info("Squashed %d blocked attempt commit(s) for %s into one verified commit", intermediate_commits, task.id)
             console.print(
                 f"[dim]Squashed {intermediate_commits} blocked attempt commit(s) for "
                 f"{task.id} into one verified commit.[/dim]"
@@ -463,6 +500,11 @@ def go(
     Run the full DevCouncil loop in one command.
     """
     root = project_root.expanduser().resolve()
+    set_log_dir(root)
+    logger.info(
+        "dev go starting: goal=%r executor=%s quick=%s force=%s root=%s",
+        goal, executor, quick, force, root,
+    )
     initialize_project(root, quiet=True)
 
     # A goal like "#142" or a GitHub issue/PR URL is a reference, not a spec —
@@ -500,7 +542,8 @@ def go(
 
     console.print(f"[bold]Planning goal:[/bold] {goal}")
     try:
-        planned_task_ids = asyncio.run(plan_command.run_plan_flow(goal, dry_run=dry_run, persist=True, project_root=root, quick=quick))
+        with log_stage("plan", project_root=root, quick=quick, dry_run=dry_run):
+            planned_task_ids = asyncio.run(plan_command.run_plan_flow(goal, dry_run=dry_run, persist=True, project_root=root, quick=quick))
     except (ProviderRequestError, StructuredOutputError) as exc:
         plan_command.print_planning_error(exc)
         raise typer.Exit(code=1)
@@ -513,6 +556,7 @@ def go(
     # anyway and proceed — verification still gates each task's actual diff.
     if not task_ids:
         if force:
+            logger.info("No auto-approved tasks; force-approving generated plan past planning gaps")
             try:
                 plan_command.approve(run_id=None, force=True, project_root=root)
             except SystemExit:
@@ -526,6 +570,7 @@ def go(
         else:
             tasks = []
         if not tasks:
+            logger.warning("Planning produced no approved tasks; aborting run")
             console.print("[red]Planning did not produce any approved tasks.[/red]")
             console.print(
                 "Review gaps with [bold]dev status[/bold], then run [bold]dev approve[/bold] "
@@ -548,11 +593,21 @@ def go(
     # the edits), so the repair loop only applies to automated runs.
     max_repairs = _max_repair_attempts(root) if normalized_executor != "manual" else 0
     repair_service = _build_repair_service(root) if max_repairs else None
+    # Load config once for the repair loop so the correction-manifest builder doesn't
+    # reload it from disk on every repair attempt. Only needed when the loop is active;
+    # the builder falls back to loading config itself if this is None.
+    repair_config = load_config(root) if max_repairs else None
     # Run tasks in dependency order so a task never executes before the tasks it needs.
     tasks = topological_order(tasks)
+    log_step(
+        f"execution plan: {len(tasks)} task(s) in dependency order",
+        project_root=root,
+        order=[t.id for t in tasks],
+    )
     completed_ids = {task.id for task in tasks if task.status in {"verified", "done"}}
     for task in tasks:
         if task.status in {"verified", "done"}:
+            logger.info("Skipping %s; already %s", task.id, task.status)
             console.print(f"[green]Skipping {task.id}; already {task.status}.[/green]")
             completed_ids.add(task.id)
             continue
@@ -562,6 +617,7 @@ def go(
         # unsatisfiable precondition. Skip it and surface why.
         unmet = [dep for dep in task.depends_on if dep not in completed_ids]
         if unmet:
+            logger.warning("Skipping %s: upstream %s not completed", task.id, ", ".join(unmet))
             console.print(f"[yellow]Skipping {task.id}: upstream {', '.join(unmet)} not completed.[/yellow]")
             failed.append(f"{task.id} (skipped: upstream {', '.join(unmet)} unsatisfied)")
             continue
@@ -570,14 +626,29 @@ def go(
         executed_task_ids.append(task.id)
         # Run, then self-repair in a bounded loop (closes the autonomous loop: the
         # one-shot executor no longer needs a human to run `dev repair` and re-run).
-        latest_status, repairs_used = _execute_task_with_repair(
-            root,
-            task,
+        with log_stage(
+            "execute_task",
+            project_root=root,
+            task_id=task.id,
             executor=normalized_executor,
-            profile=profile,
-            stream=stream,
             max_repairs=max_repairs,
-            repair_service=repair_service,
+        ):
+            latest_status, repairs_used = _execute_task_with_repair(
+                root,
+                task,
+                executor=normalized_executor,
+                profile=profile,
+                stream=stream,
+                max_repairs=max_repairs,
+                repair_service=repair_service,
+                config=repair_config,
+            )
+        log_step(
+            f"task {task.id} finished as {latest_status}",
+            project_root=root,
+            task_id=task.id,
+            repairs_used=repairs_used,
+            trace=True,
         )
 
         # Commit whatever this task produced so the next task in the plan starts
@@ -585,6 +656,7 @@ def go(
         # tree and the whole multi-task plan stalls after task one.
         if _commit_task_changes(root, task.id, latest_status):
             note = f" after {repairs_used} repair attempt(s)" if repairs_used else ""
+            logger.info("Committed %s changes (%s)%s", task.id, latest_status, note)
             console.print(f"[dim]Committed {task.id} changes ({latest_status}){note}.[/dim]")
 
         if latest_status in {"verified", "done"}:
@@ -595,8 +667,10 @@ def go(
             # don't let one task that blocked or could not start halt the rest. The
             # final reconciliation pass judges the integrated result fairly.
             if not continue_on_blocked:
+                logger.warning("Stopping run: %s ended as %s (no --continue-on-blocked)", task.id, latest_status)
                 console.print(f"[red]Stopping because {task.id} ended as {latest_status}.[/red]")
                 break
+            logger.info("%s ended as %s; continuing to next task (--continue-on-blocked)", task.id, latest_status)
             console.print(f"[yellow]{task.id} ended as {latest_status}; continuing to the next task.[/yellow]")
 
     if not executed_task_ids:
@@ -605,10 +679,13 @@ def go(
     # Final reconciliation: re-verify every task against the fully integrated,
     # committed state. Earlier tasks are verified before later tasks create shared
     # test files, so their gates can pass now even though they blocked mid-run.
-    # The LLM review is diff-gated and the tree is clean here, so this costs no
-    # model calls — it just refreshes statuses/gaps so the final report is honest.
+    # The tree is clean here, so verification uses each task's committed checkpoint
+    # diff to prove its acceptance criteria (rather than skipping on an empty diff and
+    # wrongly blocking). Re-running the same diff is largely an LLM-cache hit, so this
+    # refreshes statuses/gaps cheaply for an honest final report.
     if executed_task_ids and _is_git_repo(root):
         console.print("\n[bold]Reconciling verification against the final integrated state...[/bold]")
+        log_step("reconcile: re-verifying against integrated state", project_root=root)
         try:
             verify_command.verify(task_id=None, sandbox="local", json_format=True, project_root=root)
         except typer.Exit:
@@ -632,10 +709,13 @@ def go(
                 failed.append(f"{planned.id} ({status})")
 
     if not failed:
+        logger.info("dev go complete: all tasks finished")
         _record_project_done(root)
     else:
+        logger.warning("dev go finished with %d unfinished task(s): %s", len(failed), ", ".join(failed))
         _record_project_blocked(root)
 
+    log_step("generating final report", project_root=root)
     console.print("\n[bold]Final DevCouncil report[/bold]")
     report_command.report(
         SimpleNamespace(invoked_subcommand=None),  # type: ignore[arg-type]

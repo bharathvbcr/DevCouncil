@@ -31,9 +31,19 @@ def discover_sessions(project_root: Path, client: str = "claude") -> list[AgentS
             client=client,
             transcript_path=str(path),
             updated_at=str(stat.st_mtime),
-            turns=sum(1 for _ in _safe_lines(path)),
+            # len() over the already-materialized splitlines list avoids a
+            # second Python-level pass and matches the previous line count.
+            turns=len(_safe_lines(path)),
         ))
-    return sorted(sessions, key=lambda item: item.updated_at or "", reverse=True)
+    def _updated_key(item: AgentSession) -> float:
+        # updated_at is a stringified mtime; sort numerically so timestamps with
+        # different digit counts (string sort would misorder them) compare correctly.
+        try:
+            return float(item.updated_at or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    return sorted(sessions, key=_updated_key, reverse=True)
 
 
 def load_turns(path: Path, client: str = "generic") -> list[AgentTurn]:
@@ -50,11 +60,30 @@ def load_turns(path: Path, client: str = "generic") -> list[AgentTurn]:
     return turns
 
 
-def latest_assistant_turn(path: Path, client: str = "generic") -> AgentTurn | None:
+# mtime-keyed cache: reloading and reversing every turn just to find the last
+# assistant message is wasteful when the transcript hasn't changed.
+_LATEST_ASSISTANT_CACHE: dict[str, tuple[float, AgentTurn | None]] = {}
+
+
+def _scan_latest_assistant_turn(path: Path, client: str) -> AgentTurn | None:
     for turn in reversed(load_turns(path, client=client)):
         if turn.role == "assistant":
             return turn
     return None
+
+
+def latest_assistant_turn(path: Path, client: str = "generic") -> AgentTurn | None:
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return _scan_latest_assistant_turn(path, client)
+    key = f"{path}\x00{client}"
+    cached = _LATEST_ASSISTANT_CACHE.get(key)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    result = _scan_latest_assistant_turn(path, client)
+    _LATEST_ASSISTANT_CACHE[key] = (mtime, result)
+    return result
 
 
 def _claude_transcript_candidates(project_root: Path) -> list[Path]:
@@ -62,10 +91,14 @@ def _claude_transcript_candidates(project_root: Path) -> list[Path]:
     candidates = list(local_runtime.glob("*.jsonl"))
     if CLAUDE_TRANSCRIPT_ROOT.exists():
         candidates.extend(CLAUDE_TRANSCRIPT_ROOT.rglob("*.jsonl"))
-    return sorted(set(candidates), key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True)
+    # Dedup, then sort by path for a deterministic, stat-free order. discover_sessions
+    # re-sorts the resulting sessions by mtime; because that sort is stable, giving it a
+    # deterministic input keeps the tie-break (equal-mtime sessions) stable across runs —
+    # whereas an unordered set would let ties reorder run to run.
+    return sorted(set(candidates))
 
 
-def _safe_lines(path: Path) -> Iterable[str]:
+def _safe_lines(path: Path) -> list[str]:
     try:
         return path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:

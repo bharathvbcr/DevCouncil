@@ -1,6 +1,7 @@
 import typer
 import asyncio
 import json
+import logging
 from rich.console import Console
 from rich.table import Table
 from pathlib import Path
@@ -20,6 +21,7 @@ from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
 from devcouncil.telemetry.traces import TraceLogger
 
 console = Console()
+logger = logging.getLogger(__name__)
 MAX_RENDERED_GAPS = 20
 
 
@@ -55,6 +57,9 @@ def verify(
     Verify one task, or all tasks when TASK_ID is omitted.
     """
     root = project_root.expanduser().resolve()
+    from devcouncil.telemetry.logging_setup import set_log_dir
+    set_log_dir(root)
+    logger.info("dev verify: task=%s sandbox=%s", task_id or "ALL", sandbox)
     initialize_project(root, quiet=True)
     db = get_db(root)
     if not db:
@@ -88,7 +93,7 @@ def verify(
             config = load_config(root)
             validate_model_provider(config.models.provider)
             api_key = get_api_key(config.models.provider, root)
-            provider = create_provider(config.models.provider, api_key, project_root=root)
+            provider = create_provider(config.models.provider, api_key, project_root=root, provider_prefs=config.provider)
             role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
             router = ModelRouter(provider, role_config, project_root=root)
         except Exception:
@@ -236,6 +241,7 @@ def verify(
         # against the current tree, so a regression would have failed the test and the AC
         # would not be in proven_acs — this clears only genuinely-satisfied criteria.
         if task_id is None and proven_acs:
+            result_map = {r["task_id"]: r for r in task_results}
             for task in tasks:
                 gaps = per_task_gaps.get(task.id, [])
                 kept = reconcile_cross_task_acceptance(gaps, proven_acs)
@@ -255,15 +261,15 @@ def verify(
                         summary=f"{task.id} verified via cross-task acceptance reconciliation",
                     )
                 task_repo.save(task)
-                for result in task_results:
-                    if result["task_id"] == task.id:
-                        blocking_actions, advisory_actions = split_next_actions(kept)
-                        result["status"] = task.status
-                        result["gap_count"] = len(kept)
-                        result["blocking_gap_count"] = len([gap for gap in kept if gap.blocking])
-                        result["gaps"] = [gap.model_dump() for gap in kept]
-                        result["next_actions"] = [action.model_dump() for action in blocking_actions]
-                        result["advisory_actions"] = [action.model_dump() for action in advisory_actions]
+                if task.id in result_map:
+                    result = result_map[task.id]
+                    blocking_actions, advisory_actions = split_next_actions(kept)
+                    result["status"] = task.status
+                    result["gap_count"] = len(kept)
+                    result["blocking_gap_count"] = len([gap for gap in kept if gap.blocking])
+                    result["gaps"] = [gap.model_dump() for gap in kept]
+                    result["next_actions"] = [action.model_dump() for action in blocking_actions]
+                    result["advisory_actions"] = [action.model_dump() for action in advisory_actions]
 
         StateRepository(session).record_phase(
             ProjectPhase.TASK_BLOCKED.value if blocked_tasks else ProjectPhase.TASK_VERIFIED.value

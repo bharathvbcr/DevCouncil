@@ -93,6 +93,23 @@ def test_committed_work_with_empty_working_diff_is_not_blocked(tmp_path):
     assert [ev for ev in evidence if isinstance(ev, TestEvidence) and ev.status == "passed"]
 
 
+def test_clean_working_tree_falls_back_to_committed_diff(tmp_path):
+    # The 0-evidence false-block bug: dev go commits a task between repair attempts, so
+    # the working-tree diff is empty at re-verify. Verification must fall back to the
+    # COMMITTED checkpoint diff so acceptance compilation/review run (diff_empty False)
+    # instead of skipping and marking every criterion unproven → wrongly blocking.
+    verifier = _passing_verifier(tmp_path, diff="")  # empty working-tree diff
+    verifier._committed_task_diff = lambda task_id: (
+        "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    )
+
+    gaps, evidence = asyncio.run(verifier.verify_task(_task(), [_requirement()]))
+
+    assert verifier.last_outcome is not None and verifier.last_outcome.diff_empty is False
+    assert not [g for g in gaps if g.gap_type == "task_not_implemented"]
+    assert [ev for ev in evidence if isinstance(ev, TestEvidence) and ev.status == "passed"]
+
+
 def test_outcome_reports_compiled_mode_when_router_present(tmp_path):
     class _Reviewer:
         async def review_changes(self, *a, **k):
@@ -187,3 +204,13 @@ def test_optional_ac_unproven_is_advisory(tmp_path):
     gaps, _ = asyncio.run(_unproven_verifier(tmp_path).verify_task(_task_ac(), [_req_with_ac("unit_test", required=False)]))
     ac_gaps = [g for g in gaps if g.gap_type == "acceptance_criteria_unproven" and g.acceptance_criterion_id == "AC-X"]
     assert ac_gaps and ac_gaps[0].blocking is False  # optional -> advisory
+
+
+def test_static_check_ac_unproven_is_advisory(tmp_path):
+    # Quality-only criteria (PEP 8 / docstrings / formatting) must NOT hard-block the
+    # autonomous loop when unproven: they aren't behavioral correctness, and the compiler
+    # frequently can't author a reliable style check (or the criterion is mis-assigned to
+    # a no-diff process task), which otherwise false-blocks correct, conforming code.
+    gaps, _ = asyncio.run(_unproven_verifier(tmp_path).verify_task(_task_ac(), [_req_with_ac("static_check")]))
+    ac_gaps = [g for g in gaps if g.gap_type == "acceptance_criteria_unproven" and g.acceptance_criterion_id == "AC-X"]
+    assert ac_gaps and ac_gaps[0].blocking is False  # static_check -> advisory, not a gate block

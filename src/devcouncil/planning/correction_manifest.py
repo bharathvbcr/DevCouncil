@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,8 @@ from devcouncil.storage.db import get_db
 from devcouncil.storage.native import CorrectionManifestRepository
 from devcouncil.storage.repositories import EvidenceRepository, GapRepository, TaskRepository
 from devcouncil.utils.redaction import redact_text
+
+logger = logging.getLogger(__name__)
 
 # Bounds for the prior-attempt context folded into the manifest. These reach the
 # next executor's prompt verbatim, so they must stay small enough not to crowd out
@@ -55,6 +58,29 @@ class CorrectionManifest(BaseModel):
 
 # Severity ordering: most severe first.
 _SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+# Verification methods the EXECUTOR can satisfy by writing/fixing code+tests. A criterion
+# left unproven for one of these reasons (a check that could not run, an inconclusive
+# auto-check) is remediable — worth another repair pass — whereas manual/llm_review
+# criteria cannot be closed by re-running the agent and must not drive the loop.
+_AUTOMATABLE_METHODS = {"unit_test", "integration_test", "static_check"}
+
+
+def remediable_incomplete_gaps(all_gaps: list[Gap]) -> list[Gap]:
+    """Non-blocking ``acceptance_criteria_unproven`` gaps the executor could still close.
+
+    These are the "incomplete" signals (an acceptance criterion with no passing evidence,
+    but nothing actively failing) whose verification method is automatable — so another
+    repair pass that adds/repairs a proving test can move the task to done. Manual/llm
+    criteria are excluded (re-running the agent cannot prove them)."""
+    return [
+        g for g in all_gaps
+        if not g.blocking
+        and g.gap_type == "acceptance_criteria_unproven"
+        # Unknown/None method is excluded (not assumed automatable): only drive the loop
+        # when we positively know the criterion is one the executor can prove.
+        and g.expected_verification_method in _AUTOMATABLE_METHODS
+    ]
 
 # Gap-type priority within a severity band. Lower sorts first. Executable-evidence
 # failures (a failing test / unproven acceptance criterion) are the real defect signal
@@ -184,8 +210,13 @@ def build_correction_manifest(
     *,
     repair_service=None,
     prior_attempts: int = 0,
+    config=None,
 ) -> CorrectionManifest:
-    config = load_config(project_root)
+    # ``config`` may be threaded in by a caller that already loaded it (e.g. the repair
+    # loop, which would otherwise reload config from disk on every attempt). Fall back
+    # to loading it when not supplied — same result, deterministic for a given root.
+    if config is None:
+        config = load_config(project_root)
     failed: list[str] = []
     failed_results: list = []
     db = get_db(project_root)
@@ -254,7 +285,9 @@ def _union(base: list[str], extra: list[str]) -> list[str]:
     return merged
 
 
-def write_correction_manifest(project_root: Path, task_id: str, *, repair_service=None) -> Path | None:
+def write_correction_manifest(
+    project_root: Path, task_id: str, *, repair_service=None, config=None, include_incomplete: bool = False
+) -> Path | None:
     db = get_db(project_root)
     if not db:
         return None
@@ -262,14 +295,24 @@ def write_correction_manifest(project_root: Path, task_id: str, *, repair_servic
         task = TaskRepository(session).get_by_id(task_id)
         if not task:
             return None
-        gaps = [g for g in GapRepository(session).get_all() if g.task_id == task_id and g.blocking]
+        gaps = GapRepository(session).get_blocking_for_task(task_id)
+        if not gaps and include_incomplete:
+            # No hard block, but the task is "incomplete" — drive a repair pass at the
+            # unproven-but-remediable acceptance criteria so arm B does not stall one
+            # proof short of done.
+            gaps = remediable_incomplete_gaps(GapRepository(session).get_for_task(task_id))
         if not gaps:
+            logger.debug("No gaps to repair for %s; skipping correction manifest", task_id)
             return None
         prior_record = CorrectionManifestRepository(session).latest_for_task(task_id)
         prior_attempts = (prior_record.attempt + 1) if prior_record else 1
 
+    logger.info(
+        "Writing correction manifest for %s: %d gap(s), prior_attempts=%d",
+        task_id, len(gaps), prior_attempts,
+    )
     manifest = build_correction_manifest(
-        project_root, task, gaps, repair_service=repair_service, prior_attempts=prior_attempts
+        project_root, task, gaps, repair_service=repair_service, prior_attempts=prior_attempts, config=config
     )
     run_id = str(uuid.uuid4())
     run_dir = project_root / ".devcouncil" / "runs" / run_id

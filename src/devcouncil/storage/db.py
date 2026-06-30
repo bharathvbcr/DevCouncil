@@ -15,7 +15,37 @@ from devcouncil.storage.models import SchemaVersionModel
 # v4: machine-routable gap columns (file, line, suggested_command,
 #     acceptance_criterion_id) so the repair contract survives a reload.
 # v5: partial unique index enforcing one ACTIVE lease per task (single-writer).
-SCHEMA_VERSION = 5
+# v6: gap column expected_verification_method (repair loop tells an executor-remediable
+#     "incomplete" from a manual/llm one across a reload).
+SCHEMA_VERSION = 6
+
+
+# Module-level caches keyed by *resolved* paths so distinct project roots stay
+# independent (important for test isolation, where every test uses a fresh
+# tmp_path). `_db_instances` returns the same Database (and its single engine)
+# for a given project root instead of rebuilding the engine + re-running the
+# schema check on every get_db() call. `_dedup_done` records db paths whose
+# active-lease dedup migration has already run this process, so the one-time
+# table scan does not repeat on subsequent opens of the same database.
+_db_instances: dict[Path, "Database"] = {}
+_dedup_done: set[Path] = set()
+
+
+def reset_db_cache() -> None:
+    """Drop all cached Database instances and per-path guards.
+
+    Disposes pooled engine connections so the underlying SQLite files can be
+    safely removed/recreated. Intended for tests (or long-lived processes) that
+    rebuild a project's .devcouncil database under a path already opened this
+    process; without this a cached engine could point at a stale/deleted file.
+    """
+    for db in _db_instances.values():
+        try:
+            db.engine.dispose()
+        except Exception:
+            pass
+    _db_instances.clear()
+    _dedup_done.clear()
 
 
 class Database:
@@ -62,8 +92,17 @@ class Database:
         # already has two ACTIVE leases. Older databases predate the constraint, so
         # collapse any duplicates first — keep the newest active lease per task, mark the
         # rest stale — making index creation succeed and restoring single-writer state.
+        #
+        # This only needs to run once per database per process: after the first pass the
+        # partial unique index (created immediately after, in _create_missing_indexes)
+        # prevents any new duplicate active leases, so re-scanning on every open is wasted
+        # work. Guard on the resolved path so distinct databases remain independent.
+        key = self.db_path.resolve()
+        if key in _dedup_done:
+            return
         inspector = inspect(self.engine)
         if "task_leases" not in inspector.get_table_names():
+            # Table not materialized yet; don't record as done so a later open retries.
             return
         with self.engine.begin() as conn:
             rows = conn.execute(
@@ -85,6 +124,7 @@ class Database:
                         text("UPDATE task_leases SET status = 'stale', released_at = :ts WHERE id = :id"),
                         {"ts": now, "id": lease_id},
                     )
+        _dedup_done.add(key)
 
     def _create_missing_columns(self):
         # create_all never alters an existing table, so columns added to a model
@@ -139,9 +179,25 @@ class Database:
 def get_db(project_root: Path = Path(".")) -> Optional[Database]:
     dev_dir = project_root / ".devcouncil"
     if not dev_dir.exists():
+        # Checked before the cache so a not-yet-initialized (or removed) project
+        # never yields a stale cached Database.
         return None
-    
+
+    key = project_root.resolve()
     db_path = dev_dir / "state.sqlite"
+    cached = _db_instances.get(key)
+    # Only reuse the cached instance while its underlying file still exists. If the
+    # .devcouncil dir was wiped and recreated under the same path within one process,
+    # the cached engine points at a deleted file — dispose its pool and rebuild fresh.
+    if cached is not None:
+        if db_path.exists():
+            return cached
+        try:
+            cached.engine.dispose()
+        except Exception:
+            pass
+
     db = Database(db_path)
     db.ensure_schema_version()
+    _db_instances[key] = db
     return db

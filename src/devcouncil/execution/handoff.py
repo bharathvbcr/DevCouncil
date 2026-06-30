@@ -55,7 +55,7 @@ class HandoffService:
             if not task:
                 raise ValueError(f"Task {task_id} not found")
             reqs = RequirementRepository(session).get_all()
-            gaps = [g for g in GapRepository(session).get_all() if g.task_id == task_id and g.blocking]
+            gaps = GapRepository(session).get_blocking_for_task(task_id)
             evidence = EvidenceRepository(session).get_command_results_for_task(task_id)
             semantic = SemanticDiffRepository(session).latest_for_task(task_id)
 

@@ -2,6 +2,7 @@ import typer
 import asyncio
 import json
 import datetime
+import logging
 from typing import Any
 from rich.console import Console
 from rich.panel import Panel
@@ -18,8 +19,8 @@ from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
 from devcouncil.llm.provider import Provider, MockProvider, ProviderRequestError, build_role_model_config, create_provider, validate_model_provider
 from devcouncil.llm.router import ModelRouter, StructuredOutputError
 from devcouncil.planning.spec_service import SpecService
-from devcouncil.planning.prompt_enhancer_service import PromptEnhancerService
-from devcouncil.planning.plan_service import PlanService
+from devcouncil.planning.prompt_enhancer_service import PromptEnhancerService, save_active_prompt_enhancement
+from devcouncil.planning.plan_service import PlanService, backfill_acceptance_criteria
 from devcouncil.planning.critique_service import CritiqueService
 from devcouncil.planning.arbiter_service import ArbiterDecision, ArbiterService
 from devcouncil.gating.policy import GatePolicy
@@ -28,9 +29,11 @@ from devcouncil.app.state_machine import ProjectPhase
 from devcouncil.app.config import ModelRoleConfig, load_config, get_api_key
 from devcouncil.cli.commands.init import initialize_project
 from devcouncil.telemetry.traces import TraceLogger
+from devcouncil.telemetry.stages import log_step
 
 app = typer.Typer()
 console = Console()
+logger = logging.getLogger(__name__)
 
 REQUIRED_PLANNING_ROLES = (
     "prompt_enhancer",
@@ -92,6 +95,8 @@ async def run_plan_flow(
     quick: bool = False,
 ):
     root = project_root.expanduser().resolve()
+    from devcouncil.telemetry.logging_setup import set_log_dir
+    set_log_dir(root)
     initialize_project(root, quiet=True)
     db = get_db(root)
     if not db:
@@ -166,7 +171,7 @@ async def run_plan_flow(
         if api_key is None:
             console.print("[red]Missing API key for configured model provider.[/red]")
             return []
-        provider = create_provider(config.models.provider, api_key, project_root=root)
+        provider = create_provider(config.models.provider, api_key, project_root=root, provider_prefs=config.provider)
 
     # Build role config after dry-run overrides so mocks are routed correctly.
     role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
@@ -185,16 +190,20 @@ async def run_plan_flow(
         transient=True,
     ) as progress:
         # 1. Repo Map
+        log_step("plan/1: mapping repository", project_root=root, run_id=run_id)
         progress.add_task(description="Mapping repository...", total=None)
         repo_map = mapper.map_repo(goal)
         repo_map_json = repo_map.model_dump_json(indent=2)
-        orchestrator.save_run_artifact("repo_map.json", json.loads(repo_map_json))
+        # save_run_artifact re-serializes via json.dump, so pass the dict directly
+        # instead of round-tripping the already-serialized JSON back through json.loads.
+        orchestrator.save_run_artifact("repo_map.json", repo_map.model_dump(mode="json"))
         graph_context = CodeReviewGraphAdapter(root).get_context()
         if graph_context.available:
             orchestrator.save_run_artifact("code_review_graph_context.json", graph_context.model_dump())
         await orchestrator.transition_to(ProjectPhase.REPO_MAPPED)
 
         # 2. Codebase-specific prompt enhancement
+        log_step("plan/2: enhancing prompt for codebase debate", project_root=root, run_id=run_id)
         progress.add_task(description="Enhancing prompt for codebase debate...", total=None)
         prompt_enhancement = await prompt_enhancer.enhance_prompt(
             goal,
@@ -225,6 +234,7 @@ async def run_plan_flow(
         )
 
         # 3. Spec / Requirements
+        log_step("plan/3: generating requirements", project_root=root, run_id=run_id)
         progress.add_task(description="Generating requirements...", total=None)
         spec_output = await spec_service.generate_spec(debate_goal, repo_map_json)
         orchestrator.save_run_artifact("requirements.json", spec_output.model_dump())
@@ -243,6 +253,7 @@ async def run_plan_flow(
             # adversarial robustness for ~5 fewer model calls — the right setting
             # for small, well-scoped changes where verification (which still gates
             # every diff) is the real safety net, not planning debate.
+            log_step("plan/4: generating single plan (quick mode)", project_root=root, run_id=run_id)
             progress.add_task(description="Generating single plan (quick mode)...", total=None)
             plan_a = await plan_service.generate_plan(
                 "planner_a", debate_goal, requirements_json, repo_map_json
@@ -266,6 +277,7 @@ async def run_plan_flow(
             final_tasks = [task.model_copy(update={"status": "planned"}) for task in decision.final_tasks]
         else:
             # 4. Independent Plans (run concurrently — they don't depend on each other)
+            log_step("plan/4: generating Plans A (pragmatic) and B (robust)", project_root=root, run_id=run_id)
             progress.add_task(description="Generating Plans A (Pragmatic) and B (Robust)...", total=None)
             plan_a, plan_b = await asyncio.gather(
                 plan_service.generate_plan("planner_a", debate_goal, requirements_json, repo_map_json),
@@ -275,34 +287,44 @@ async def run_plan_flow(
             orchestrator.save_run_artifact("plan_b.json", plan_b.model_dump())
             await orchestrator.transition_to(ProjectPhase.PLANS_GENERATED)
 
+            # Serialize each plan/critique once and reuse the strings across the
+            # critique, rebuttal, and arbitration steps below.
+            plan_a_json = plan_a.model_dump_json()
+            plan_b_json = plan_b.model_dump_json()
+
             # 5. Cross-Critique (independent — run concurrently)
+            log_step("plan/5: cross-critiquing Plans A and B", project_root=root, run_id=run_id)
             progress.add_task(description="Critiquing Plans A and B...", total=None)
             critique_a, critique_b = await asyncio.gather(
-                critique_service.generate_critique("critic_a", plan_b.model_dump_json(), requirements_json),
-                critique_service.generate_critique("critic_b", plan_a.model_dump_json(), requirements_json),
+                critique_service.generate_critique("critic_a", plan_b_json, requirements_json),
+                critique_service.generate_critique("critic_b", plan_a_json, requirements_json),
             )
             orchestrator.save_run_artifact("critique_a.json", critique_a.model_dump())
             orchestrator.save_run_artifact("critique_b.json", critique_b.model_dump())
             await orchestrator.transition_to(ProjectPhase.CRITIQUES_GENERATED)
+            critique_a_json = critique_a.model_dump_json()
+            critique_b_json = critique_b.model_dump_json()
 
             # 6. Rebuttals (independent — run concurrently)
+            log_step("plan/6: generating rebuttals", project_root=root, run_id=run_id)
             progress.add_task(description="Generating rebuttals...", total=None)
             rebuttal_a, rebuttal_b = await asyncio.gather(
-                critique_service.generate_rebuttal("planner_a", plan_a.model_dump_json(), critique_b.model_dump_json()),
-                critique_service.generate_rebuttal("planner_b", plan_b.model_dump_json(), critique_a.model_dump_json()),
+                critique_service.generate_rebuttal("planner_a", plan_a_json, critique_b_json),
+                critique_service.generate_rebuttal("planner_b", plan_b_json, critique_a_json),
             )
             orchestrator.save_run_artifact("rebuttal_a.json", rebuttal_a.model_dump())
             orchestrator.save_run_artifact("rebuttal_b.json", rebuttal_b.model_dump())
 
             # 7. Arbitration
+            log_step("plan/7: arbitrating final plan", project_root=root, run_id=run_id)
             progress.add_task(description="Arbitrating final plan...", total=None)
             decision = await arbiter_service.arbitrate(
                 debate_goal,
-                json.dumps([r.model_dump() for r in spec_output.requirements]),
-                plan_a.model_dump_json(),
-                plan_b.model_dump_json(),
-                critique_a.model_dump_json(),
-                critique_b.model_dump_json(),
+                requirements_json,
+                plan_a_json,
+                plan_b_json,
+                critique_a_json,
+                critique_b_json,
                 rebuttal_a.model_dump_json(),
                 rebuttal_b.model_dump_json()
             )
@@ -317,10 +339,23 @@ async def run_plan_flow(
         console.print("[blue](DRY RUN: No actual LLM calls were made)[/blue]")
         if not persist:
             console.print("[blue](DRY RUN: Final requirements/tasks were not persisted)[/blue]")
+    # Operationalize the spec's edge-case elaboration: attach every acceptance criterion
+    # the planner left unlinked to a task that owns its requirement, so elaborated edges
+    # (truncation semantics, error paths, boundaries) are actually built and per-criterion
+    # verified instead of silently dropped — the gap that lets a gated run be no better
+    # than the raw prompt.
+    final_tasks, backfilled_acs = backfill_acceptance_criteria(final_tasks, decision.final_requirements)
+    if backfilled_acs:
+        console.print(
+            f"[dim]Linked {len(backfilled_acs)} unmapped acceptance criterion(s) to owning task(s) "
+            "so every elaborated behavior is verified.[/dim]"
+        )
+
     console.print(f"Final Requirements: [bold]{len(decision.final_requirements)}[/bold]")
     console.print(f"Final Tasks: [bold]{len(final_tasks)}[/bold]")
-    
+
     # 8. Check Gates
+    log_step("plan/8: checking plan-approval gates", project_root=root, run_id=run_id)
     policy = GatePolicy()
     result = policy.check_plan_approval(
         decision.final_requirements,
@@ -342,8 +377,12 @@ async def run_plan_flow(
                     final_tasks,
                     reconciled_findings,
                 )
+            # Pin THIS plan's enhancement so the executor reads the domain guidance tied to
+            # the plan it runs (not a later run's by mtime).
+            save_active_prompt_enhancement(root, prompt_enhancement)
 
         console.print("[green]Plan approved by gates.[/green]")
+        logger.info("Plan approved by gates: %d task(s)", len(final_tasks))
         await orchestrator.transition_to(ProjectPhase.PLAN_APPROVED)
         return [task.id for task in final_tasks]
     else:
@@ -353,6 +392,7 @@ async def run_plan_flow(
                 for gap in result.gaps:
                     gap_repo.save(gap)
         console.print("[yellow]Plan generated but failed gates. See status for gaps.[/yellow]")
+        logger.warning("Plan failed approval gates with %d gap(s)", len(result.gaps))
         await orchestrator.transition_to(ProjectPhase.AWAITING_USER_DECISIONS)
         return []
 

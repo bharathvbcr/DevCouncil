@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from devcouncil.live.cards import review_turn
 from devcouncil.live.models import AgentTurn, CritiqueCard
 from devcouncil.llm.router import ModelRouter
+
+logger = logging.getLogger(__name__)
 
 
 class LiveReviewService:
@@ -23,6 +26,7 @@ class LiveReviewService:
     ) -> CritiqueCard:
         fallback = review_turn(turn, project_root, client=client)
         if not use_llm or self.router is None:
+            logger.debug("Live review (deterministic) for %s turn=%s: %s", client, turn.turn_id, fallback.verdict)
             return fallback
 
         prompt = f"""
@@ -46,21 +50,41 @@ Turn: {turn.turn_id}
 Assistant response:
 {turn.content}
 """
-        try:
-            reviewed = await self.router.complete_structured(
-                role=self.role,
-                messages=[{"role": "user", "content": prompt}],
-                schema=CritiqueCard,
-            )
-        except ValueError:
-            reviewed = await self.router.complete_structured(
-                role="implementation_reviewer",
-                messages=[{"role": "user", "content": prompt}],
-                schema=CritiqueCard,
-            )
-        except Exception:
+        samples = self._samples(project_root)
+        cards: list[CritiqueCard] = []
+        for attempt in range(samples):
+            # Vary temperature so independent samples actually differ (and so the router
+            # cache returns distinct generations). Attempt 0 stays deterministic.
+            temperature = 0.0 if attempt == 0 else min(0.8, 0.3 + 0.2 * attempt)
+            try:
+                cards.append(await self.router.complete_structured(
+                    role=self.role,
+                    messages=[{"role": "user", "content": prompt}],
+                    schema=CritiqueCard,
+                    temperature=temperature,
+                ))
+            except ValueError:
+                try:
+                    cards.append(await self.router.complete_structured(
+                        role="implementation_reviewer",
+                        messages=[{"role": "user", "content": prompt}],
+                        schema=CritiqueCard,
+                        temperature=temperature,
+                    ))
+                except Exception:
+                    continue
+            except Exception:
+                continue
+
+        if not cards:
+            logger.warning("Live review produced no cards for %s turn=%s; using deterministic fallback", client, turn.turn_id)
             return fallback
 
+        reviewed = self._vote(cards)
+        logger.info(
+            "Live review (LLM, %d sample(s)) for %s turn=%s: %s",
+            len(cards), client, turn.turn_id, reviewed.verdict,
+        )
         return reviewed.model_copy(update={
             "id": fallback.id,
             "session_id": turn.session_id,
@@ -68,3 +92,38 @@ Assistant response:
             "client": client,
             "source_path": fallback.source_path,
         })
+
+    def _samples(self, project_root: Path) -> int:
+        try:
+            from devcouncil.app.config import load_config
+            return max(1, load_config(project_root).verification.reviewer_checks.samples)
+        except Exception:
+            return 1
+
+    @staticmethod
+    def _vote(cards: list[CritiqueCard]) -> CritiqueCard:
+        """Majority-vote the verdict across independent reviews, then return a card whose
+        verdict matches the vote (so its concerns/evidence are consistent).
+
+        A single review is returned as-is. With several, the BLOCKING verdict
+        ("Critical Issues") is chosen only on a strict majority, and "Approved" likewise;
+        anything else de-escalates to the non-blocking "Concerns". This prevents a lone
+        mis-calibrated reviewer from blocking, without ever auto-approving a real concern."""
+        if len(cards) == 1:
+            return cards[0]
+        from collections import Counter
+
+        counts = Counter(card.verdict for card in cards)
+        threshold = len(cards) / 2
+        if counts.get("Critical Issues", 0) > threshold:
+            verdict = "Critical Issues"
+        elif counts.get("Approved", 0) > threshold:
+            verdict = "Approved"
+        else:
+            verdict = "Concerns"
+        # Return a representative card with the voted verdict so concerns/evidence align;
+        # fall back to the first card if none matches (then override just the verdict).
+        for card in cards:
+            if card.verdict == verdict:
+                return card
+        return cards[0].model_copy(update={"verdict": verdict})

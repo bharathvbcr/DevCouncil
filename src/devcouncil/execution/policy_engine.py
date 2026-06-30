@@ -11,6 +11,15 @@ from pydantic import BaseModel
 
 from devcouncil.domain.task import PlannedFile, Task
 
+# Precompiled git-safety patterns for hook-command evaluation (compiled once at import
+# instead of on every evaluate_hook_command call).
+_HARD_RESET_PROTECTED_RE = re.compile(r"\bgit\s+reset\s+--hard\s+(origin/)?(main|master)\b")
+_FORCE_PUSH_FLAG_RE = re.compile(r"\bgit\s+push\b.*(\s--force(?:-with-lease)?\b|\s-f\b)")
+_FORCE_PUSH_PLUS_REFSPEC_RE = re.compile(r"\bgit\s+push\s+\S+\s+\+\S")
+_PROTECTED_BRANCH_PUSH_RE = re.compile(
+    r"\bgit\s+push\s+\S+\s+((head:)?(main|master)|(main|master):\S+)\b"
+)
+
 
 class PolicyDecision(BaseModel):
     action: Literal["allow", "warn", "deny"]
@@ -288,16 +297,14 @@ class TaskPolicyEngine:
                 target=normalized,
             )
 
-        if re.search(r"\bgit\s+reset\s+--hard\s+(origin/)?(main|master)\b", lowered):
+        if _HARD_RESET_PROTECTED_RE.search(lowered):
             return PolicyDecision(
                 action="deny",
                 reason="Protected branch hard resets are not allowed.",
                 target=normalized,
             )
 
-        if re.search(r"\bgit\s+push\b.*(\s--force(?:-with-lease)?\b|\s-f\b)", lowered) or re.search(
-            r"\bgit\s+push\s+\S+\s+\+\S", lowered
-        ):
+        if _FORCE_PUSH_FLAG_RE.search(lowered) or _FORCE_PUSH_PLUS_REFSPEC_RE.search(lowered):
             # The second pattern catches the leading-plus refspec form
             # (`git push origin +HEAD:master`), which forces a non-fast-forward update
             # without the --force flag.
@@ -307,7 +314,7 @@ class TaskPolicyEngine:
                 target=normalized,
             )
 
-        if re.search(r"\bgit\s+push\s+\S+\s+((head:)?(main|master)|(main|master):\S+)\b", lowered):
+        if _PROTECTED_BRANCH_PUSH_RE.search(lowered):
             return PolicyDecision(
                 action="warn",
                 reason="Direct pushes to protected branches should go through verification gates.",

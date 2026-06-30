@@ -80,22 +80,26 @@ def _ollama_model_present(model: str, pulled: set[str]) -> bool:
     return any(tag in candidates or tag.split(":", 1)[0] == base and ":" not in model for tag in pulled)
 
 
-def _knowledge_dir(project_root: Path) -> str:
+def _knowledge_dir(project_root: Path, config=None) -> str:
     """Configured knowledge directory (honors ``knowledge.directory``), best-effort.
 
     Mirrors ``cli.commands.okf._knowledge_okf_dir`` so doctor inspects the same location
     ingest writes to. Any config failure falls back to the documented default rather than
     raising — doctor must keep running even with a broken config.
+
+    ``config`` is an optional pre-loaded config (default ``None`` loads as before), so a
+    single doctor invocation can reuse one ``load_config`` call across checks.
     """
     directory = ".devcouncil/knowledge"
     try:
-        directory = load_config(project_root).knowledge.directory
+        cfg = config if config is not None else load_config(project_root)
+        directory = cfg.knowledge.directory
     except Exception:
         pass
     return directory
 
 
-def check_ingested_knowledge(project_root: Path) -> list[tuple[str, str, str]]:
+def check_ingested_knowledge(project_root: Path, config=None) -> list[tuple[str, str, str]]:
     """Best-effort health rows for ingested knowledge under ``<knowledge dir>/{okf,design}``.
 
     Returns ``(component, status_markup, notes)`` rows for the doctor table. This is the
@@ -113,7 +117,7 @@ def check_ingested_knowledge(project_root: Path) -> list[tuple[str, str, str]]:
     info = "[cyan]INFO[/cyan]"
     rows: list[tuple[str, str, str]] = []
 
-    directory = _knowledge_dir(project_root)
+    directory = _knowledge_dir(project_root, config=config)
     base = project_root / directory
     okf_area = base / "okf"
     design_md = base / "design" / "design.md"
@@ -204,7 +208,28 @@ def check_ingested_knowledge(project_root: Path) -> list[tuple[str, str, str]]:
     return rows
 
 
+def _add_logging_row(table, project_root: Path) -> None:
+    """Append a logging-health row: where the durable run log lives and how big it
+    is, so a user chasing a recurring failure knows exactly where to look."""
+    from devcouncil.telemetry.logging_setup import LOG_RELATIVE_PATH
+
+    log_path = project_root / LOG_RELATIVE_PATH
+    if log_path.exists():
+        size_kb = log_path.stat().st_size / 1024
+        detail = f"{log_path} ({size_kb:.0f} KB). View: dev logs tail"
+    else:
+        detail = f"Will write to {log_path} on first command. View: dev logs tail"
+    table.add_row("logging", "[green]OK[/green]", detail)
+
+
 def render_doctor_check(project_root: Path = Path(".")):
+    # Load config once for the whole invocation; the diagnostic checks below reuse
+    # this instead of re-reading config.yaml. None falls back to per-check loading.
+    try:
+        config = load_config(project_root)
+    except Exception:
+        config = None
+
     def _command_version(command: list[str]) -> str | None:
         executable = shutil.which(command[0])
         if not executable:
@@ -295,11 +320,11 @@ def render_doctor_check(project_root: Path = Path(".")):
 
     # Ingested-knowledge health (added before the provider branch so it appears on every
     # code path, including the early returns for ollama / unsupported providers).
-    for component, status, notes in check_ingested_knowledge(project_root):
+    for component, status, notes in check_ingested_knowledge(project_root, config=config):
         table.add_row(component, status, notes)
 
     try:
-        provider = load_config(project_root).models.provider
+        provider = config.models.provider if config is not None else "openrouter"
     except Exception:
         provider = "openrouter"
     try:
@@ -311,6 +336,7 @@ def render_doctor_check(project_root: Path = Path(".")):
             "[red]Unsupported[/red]",
             f"{provider} is configured, but this runtime supports: {supported}.",
         )
+        _add_logging_row(table, project_root)
         console.print(table)
         return
     if provider == "ollama":
@@ -347,10 +373,10 @@ def render_doctor_check(project_root: Path = Path(".")):
 
         # A reachable server with the configured model NOT pulled is the most common
         # "all-green doctor, 404 on first call" trap. Verify the role models exist locally.
-        if reachable:
+        if reachable and config is not None:
             try:
                 configured_models = sorted(
-                    {role.model for role in load_config(project_root).models.roles.values() if role.model}
+                    {role.model for role in config.models.roles.values() if role.model}
                 )
             except Exception:
                 configured_models = []
@@ -414,6 +440,7 @@ def render_doctor_check(project_root: Path = Path(".")):
             f"(dev setup --provider ollama --model {host.recommended_ollama_model}).",
         )
 
+        _add_logging_row(table, project_root)
         console.print(table)
         return
     env_var = provider_api_key_env_var(provider)
@@ -448,6 +475,7 @@ def render_doctor_check(project_root: Path = Path(".")):
         location = os.environ.get("VERTEXAI_LOCATION") or local_secrets.get("VERTEXAI_LOCATION", "global")
         table.add_row("VERTEXAI_LOCATION", "[green]OK[/green]", location)
 
+    _add_logging_row(table, project_root)
     console.print(table)
 
 

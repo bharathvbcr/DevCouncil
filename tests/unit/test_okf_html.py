@@ -1,7 +1,11 @@
 """The OKF static HTML visualizer renders a browsable, link-rewritten, XSS-safe site."""
 
 from devcouncil.knowledge.okf import OKFBundle, OKFDocument, read_bundle, write_bundle
-from devcouncil.reporting.okf_html import render_bundle_html, write_bundle_html
+from devcouncil.reporting.okf_html import (
+    render_bundle_html,
+    render_markdown,
+    write_bundle_html,
+)
 
 
 def _bundle() -> OKFBundle:
@@ -75,6 +79,34 @@ def test_roundtrip_from_read_bundle(tmp_path):
     pages = render_bundle_html(parsed)
     assert "index.html" in pages
     assert 'href="customers.html"' in pages["tables/orders.html"]
+
+
+def test_inline_digits_with_code_and_link_render_without_corruption():
+    # Regression: placeholder stashing must not confuse stash indices with bare digits in
+    # the body text. A digit >= stash length used to IndexError, and a digit equal to a real
+    # placeholder index used to be replaced with the wrong stash entry.
+    body = "Item 5 with `code` and [link](http://x) v2.3\n"
+    html_out = render_markdown(body, "n.md", set())
+    # No crash, and every literal digit from the text survives unchanged.
+    assert "Item 5 with" in html_out
+    assert "v2.3" in html_out
+    # The stashed code and link fragments are restored, not the body digits.
+    assert "<code>code</code>" in html_out
+    assert 'href="http://x"' in html_out
+    assert ">link</a>" in html_out
+    # The placeholder token itself never leaks into the output.
+    assert "__PH_" not in html_out
+
+
+def test_many_inline_fragments_with_high_digits():
+    # 12 code spans push stash length past single digits; bare numbers like "7" in the text
+    # must remain text, not index into the stash.
+    spans = " ".join(f"`c{i}`" for i in range(12))
+    body = f"Numbers 7 8 9 10 11 then {spans} end.\n"
+    html_out = render_markdown(body, "n.md", set())
+    assert "Numbers 7 8 9 10 11 then" in html_out
+    assert "<code>c11</code>" in html_out
+    assert "__PH_" not in html_out
 
 
 def test_obfuscated_dangerous_schemes_are_neutralized():

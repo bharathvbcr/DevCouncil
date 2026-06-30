@@ -5,11 +5,15 @@ Replaces scattered yaml.safe_load() calls with a single validated config service
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -74,9 +78,54 @@ class DiffCoverageConfig(BaseModel):
     min_ratio: float = 0.0
 
 
+class AcceptanceCheckConfig(BaseModel):
+    """Tuning for DevCouncil's per-criterion compiled acceptance checks.
+
+    These default to single-shot behavior (``samples=1``, ``repair_attempts=1``)
+    so a strong cloud model is unaffected. They exist to make a WEAK/LOCAL model
+    (e.g. an Ollama reviewer) trustworthy: such a model frequently emits a check
+    that does not run (wrong import, broken one-liner) — recorded as ``incomplete``
+    — or a single mis-asserting check that false-``blocked`` correct code.
+
+    - ``repair_attempts``: when a compiled check FAILS TO RUN (malformed/unrunnable,
+      proves nothing), feed the error back and regenerate the COMMAND up to this many
+      times. Safe by construction — a check that never ran cannot weaken the gate.
+    - ``samples``: generate this many INDEPENDENT checks per criterion and decide by
+      majority vote (proven iff a strict majority pass; unanimous-fail blocks; a split
+      stays unproven with a non-blocking advisory). Local sampling is cost-free, so
+      raising this (e.g. 3) outvotes a single mis-generated check without ever
+      auto-passing a real defect. ``1`` reproduces today's single-check behavior.
+    """
+
+    samples: int = 1
+    repair_attempts: int = 1
+    # Compile one criterion per model call instead of batching them all into a single
+    # prompt. A weak/local model batching N criteria into one JSON routinely omits or
+    # mis-attributes some (a false "incomplete"); a focused single-criterion prompt is far
+    # more reliable. Costs N× the calls — cheap on a local monitor, so opt-in. Off keeps
+    # the single batched call.
+    per_criterion: bool = False
+
+
+class ReviewerCheckConfig(BaseModel):
+    """Self-consistency voting for the LLM live reviewer.
+
+    A weak/local reviewer can emit a lone, mis-calibrated "Critical Issues" verdict that
+    falsely BLOCKS (the live card becomes a blocking gap). Sampling ``samples`` independent
+    reviews and majority-voting the verdict outvotes a single bad judgment: the gate only
+    escalates to the blocking verdict when a strict majority agree; a split de-escalates to
+    the non-blocking "Concerns". ``samples=1`` reproduces today's single-review behavior, so
+    a strong cloud model is unaffected. Local sampling is cost-free — raise it (e.g. 3) there.
+    """
+
+    samples: int = 1
+
+
 class VerificationConfig(BaseModel):
     sandbox: VerificationSandboxConfig = Field(default_factory=VerificationSandboxConfig)
     diff_coverage: DiffCoverageConfig = Field(default_factory=DiffCoverageConfig)
+    acceptance_checks: AcceptanceCheckConfig = Field(default_factory=AcceptanceCheckConfig)
+    reviewer_checks: ReviewerCheckConfig = Field(default_factory=ReviewerCheckConfig)
 
 
 class GatesConfig(BaseModel):
@@ -103,6 +152,13 @@ class ExecutionConfig(BaseModel):
     verify_on_post_task: bool = False
     cursor_resume_mode: str = "off"
     coding_cli_probe_order: List[str] = Field(default_factory=list)
+    # Opt-in scope gate for executors WITHOUT a pre-write hook (CLI subprocesses that write
+    # directly to disk). When true, DevCouncil re-checks every file a coding-CLI subprocess
+    # changed against the task's authorization right after it exits and REVERTS any the task
+    # did not allow — so unplanned drift never reaches the verify gate or a commit, instead
+    # of only being flagged post-verify by orphan_diff. Off by default (it reverts the
+    # agent's writes; teams opt in once their plans declare planned_files reliably).
+    enforce_file_scope_pre_verify: bool = False
 
 
 class PrivacyConfig(BaseModel):
@@ -254,27 +310,56 @@ class DevCouncilConfig(BaseModel):
     knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
 
 
+# Memoized parsed configs keyed by resolved config path. Each entry stores the
+# file's stat signature (mtime_ns, size, inode) so a rewritten config.yaml — common in
+# tests that mutate config mid-process, including delete+recreate — is re-read instead
+# of served stale.
+_CONFIG_CACHE: Dict[Path, Tuple[Tuple[int, int, int], DevCouncilConfig]] = {}
+
+
 def load_config(project_root: Path = Path(".")) -> DevCouncilConfig:
     """Load and validate .devcouncil/config.yaml.
-    
+
     Returns DevCouncilConfig with defaults for any missing fields.
     Raises FileNotFoundError if config doesn't exist.
+
+    Parsed results are memoized per resolved config path and invalidated when the
+    file's mtime/size changes, so repeated callers avoid redundant disk reads while
+    still picking up a rewritten config.
     """
     import yaml  # type: ignore[import-untyped]
 
     config_path = project_root / ".devcouncil" / "config.yaml"
-    if not config_path.exists():
+    try:
+        stat = config_path.stat()
+    except FileNotFoundError:
         raise FileNotFoundError(f"Config not found at {config_path}. Run 'dev init' first.")
 
+    cache_key = config_path.resolve()
+    # Include the inode so a delete+recreate under the same path (new inode) is treated
+    # as changed even if the rewritten file lands with the same mtime and size.
+    signature = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+    cached = _CONFIG_CACHE.get(cache_key)
+    if cached is not None and cached[0] == signature:
+        # The cached instance is shared across callers; treat it as read-only. Nothing
+        # in the codebase mutates a loaded DevCouncilConfig (settings are rewritten on
+        # disk via the raw-config helpers, then re-read), so we avoid a per-call copy.
+        return cached[1]
+
+    logger.debug("Loading config from %s", config_path)
     with open(config_path, encoding="utf-8") as f:
         try:
             raw = yaml.safe_load(f) or {}
         except yaml.YAMLError as exc:
+            logger.error("Invalid YAML in %s: %s", config_path, exc)
             raise ValueError(
                 f"Invalid YAML in {config_path}: {exc}. Fix the syntax or re-run 'dev init'."
             ) from exc
 
-    return DevCouncilConfig.model_validate(raw)
+    config = DevCouncilConfig.model_validate(raw)
+    _CONFIG_CACHE[cache_key] = (signature, config)
+    logger.debug("Config loaded: provider=%s", config.models.provider)
+    return config
 
 
 def provider_api_key_env_var(provider: str = "openrouter") -> str:
@@ -294,10 +379,26 @@ def _normalized_provider_name(provider: str) -> str:
     return provider.strip().lower().replace("-", "").replace("_", "")
 
 
+# Memoized parsed secrets keyed by resolved secrets path, with the same
+# stat-signature (mtime_ns, size) invalidation as load_config.
+_SECRETS_CACHE: Dict[Path, Tuple[Tuple[int, int, int], Dict[str, str]]] = {}
+
+
 def load_local_secrets(project_root: Path = Path(".")) -> Dict[str, str]:
     secrets_path = project_root / ".devcouncil" / "secrets.env"
-    if not secrets_path.exists():
+    try:
+        stat = secrets_path.stat()
+    except FileNotFoundError:
         return {}
+
+    cache_key = secrets_path.resolve()
+    # Include the inode so a delete+recreate under the same path (new inode) is treated
+    # as changed even if the rewritten file lands with the same mtime and size.
+    signature = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+    cached = _SECRETS_CACHE.get(cache_key)
+    if cached is not None and cached[0] == signature:
+        # Copy so callers can't mutate the cached mapping.
+        return dict(cached[1])
 
     secrets: Dict[str, str] = {}
     for line in secrets_path.read_text(encoding="utf-8").splitlines():
@@ -306,10 +407,18 @@ def load_local_secrets(project_root: Path = Path(".")) -> Dict[str, str]:
             continue
         key, value = stripped.split("=", 1)
         secrets[key.strip()] = value.strip().strip('"').strip("'")
+    _SECRETS_CACHE[cache_key] = (signature, dict(secrets))
     return secrets
 
 
 def get_gcloud_access_token() -> str | None:
+    """Fetch a fresh gcloud access token by shelling out to ``gcloud``.
+
+    This always spawns the subprocess (no caching) so callers that need a guaranteed
+    fresh token — e.g. the Vertex provider refreshing after a 401/403 — get one. For
+    the hot path (per-provider-construction key lookups) use
+    :func:`get_cached_gcloud_access_token`, which memoizes the result with a TTL.
+    """
     executable = shutil.which("gcloud")
     if not executable:
         return None
@@ -327,6 +436,37 @@ def get_gcloud_access_token() -> str | None:
     return token or None
 
 
+# Cached gcloud access token + monotonic expiry. gcloud tokens last ~60 min, so the
+# hot path (a fresh provider per role/run calling get_api_key) reuses a fetched token
+# for a conservative window instead of spawning ``gcloud auth print-access-token`` on
+# every lookup. A single gcloud identity is assumed, so no cache key is needed. A
+# failed fetch (None) is never cached.
+_GCLOUD_TOKEN_TTL_SECONDS = 50 * 60
+_gcloud_token_cache: Optional[Tuple[str, float]] = None
+
+
+def get_cached_gcloud_access_token() -> str | None:
+    """Return a gcloud access token, reusing a recent one within the TTL window.
+
+    Falls back to :func:`get_gcloud_access_token` on a cache miss/expiry. ``gcloud``
+    absence is checked first so an environment without gcloud short-circuits to None
+    without ever consulting the cache (preserving the uncached error/None behavior).
+    """
+    global _gcloud_token_cache
+
+    if shutil.which("gcloud") is None:
+        return None
+
+    cached = _gcloud_token_cache
+    if cached is not None and time.monotonic() < cached[1]:
+        return cached[0]
+
+    token = get_gcloud_access_token()
+    if token:
+        _gcloud_token_cache = (token, time.monotonic() + _GCLOUD_TOKEN_TTL_SECONDS)
+    return token
+
+
 def get_api_key(provider: str = "openrouter", project_root: Path = Path(".")) -> str:
     """Retrieve the API key for the configured provider from environment.
     
@@ -335,12 +475,13 @@ def get_api_key(provider: str = "openrouter", project_root: Path = Path(".")) ->
     env_var = provider_api_key_env_var(provider)
     key = os.environ.get(env_var) or load_local_secrets(project_root).get(env_var)
     if not key and _normalized_provider_name(provider) == "vertexai":
-        key = get_gcloud_access_token()
+        key = get_cached_gcloud_access_token()
     if not key and _normalized_provider_name(provider) == "ollama":
         # Ollama is a local server and needs no API key; an explicitly-set
         # OLLAMA_API_KEY still flows through above if present.
         return ""
     if not key:
+        logger.warning("API key not found for provider %s (env var %s)", provider, env_var)
         extra = (
             " You can also authenticate with 'gcloud auth login' for vertexai."
             if _normalized_provider_name(provider) == "vertexai"

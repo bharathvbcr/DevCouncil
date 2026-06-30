@@ -1,11 +1,60 @@
 from devcouncil.domain.gap import Gap
 from devcouncil.domain.task import PlannedFile, Task
-from devcouncil.planning.correction_manifest import build_correction_manifest, write_correction_manifest
+from devcouncil.planning.correction_manifest import (
+    build_correction_manifest,
+    remediable_incomplete_gaps,
+    write_correction_manifest,
+)
 from devcouncil.storage.db import Database
 from devcouncil.storage.repositories import GapRepository, TaskRepository
 from typer.testing import CliRunner
 
 from devcouncil.cli.main import app
+
+
+def _ac_gap(gap_id, *, blocking, method="unit_test", gap_type="acceptance_criteria_unproven"):
+    return Gap(
+        id=gap_id, severity="medium", gap_type=gap_type, task_id="TASK-001",
+        description=f"{gap_id} lacks passing evidence", recommended_fix="prove it",
+        blocking=blocking, expected_verification_method=method,
+    )
+
+
+def test_remediable_incomplete_gaps_filters_to_actionable_unproven_acs():
+    gaps = [
+        _ac_gap("auto-nonblock", blocking=False, method="unit_test"),      # kept
+        _ac_gap("manual-nonblock", blocking=False, method="manual"),       # dropped (not automatable)
+        _ac_gap("auto-blocking", blocking=True, method="unit_test"),       # dropped (already blocking)
+        _ac_gap("coarse", blocking=False, gap_type="coarse_acceptance_proof"),  # dropped (wrong type)
+    ]
+    assert [g.id for g in remediable_incomplete_gaps(gaps)] == ["auto-nonblock"]
+
+
+def _seed_task_with_gap(tmp_path, gap):
+    (tmp_path / ".devcouncil").mkdir(exist_ok=True)
+    (tmp_path / ".devcouncil" / "config.yaml").write_text("project:\n  name: test\n", encoding="utf-8")
+    db = Database(tmp_path / ".devcouncil" / "state.sqlite")
+    db.create_db_and_tables()
+    with db.get_session() as session:
+        TaskRepository(session).save(Task(
+            id="TASK-001", title="T", description="D",
+            planned_files=[PlannedFile(path="src/a.py", reason="x", allowed_change="modify")],
+        ))
+        GapRepository(session).save(gap)
+
+
+def test_manifest_drives_repair_on_remediable_incomplete_only_when_opted_in(tmp_path):
+    _seed_task_with_gap(tmp_path, _ac_gap("GAP-AC", blocking=False, method="unit_test"))
+    # Default: only blocking gaps drive a manifest -> incomplete task yields nothing.
+    assert write_correction_manifest(tmp_path, "TASK-001") is None
+    # Opted in: the remediable unproven AC drives a repair manifest (fixes B stalling).
+    assert write_correction_manifest(tmp_path, "TASK-001", include_incomplete=True) is not None
+
+
+def test_manifest_does_not_repair_non_automatable_incomplete(tmp_path):
+    _seed_task_with_gap(tmp_path, _ac_gap("GAP-MANUAL", blocking=False, method="manual"))
+    # A manual/llm criterion cannot be closed by re-running the agent -> no repair loop.
+    assert write_correction_manifest(tmp_path, "TASK-001", include_incomplete=True) is None
 
 
 def test_deterministic_fallback_manifest(tmp_path, monkeypatch):

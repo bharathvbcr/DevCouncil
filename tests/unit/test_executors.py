@@ -1016,3 +1016,86 @@ def test_coding_cli_executor_reports_missing_binary(tmp_path, monkeypatch):
 
     assert not result.success
     assert "not installed or not on PATH" in result.message
+
+
+def _git(args, cwd):
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+                   cwd=cwd, check=True, capture_output=True)
+
+
+def test_coding_cli_scope_gate_reverts_orphan_keeps_planned(tmp_path):
+    # The opt-in pre-verify scope gate reverts a file the task didn't authorize while
+    # leaving the planned change intact (so non-hook executor drift never persists).
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-qm", "seed"], tmp_path)
+
+    # Simulate the subprocess: modify the planned file AND drop an orphan file.
+    (tmp_path / "src" / "a.py").write_text("x = 2\n", encoding="utf-8")
+    (tmp_path / "src" / "orphan.py").write_text("y = 1\n", encoding="utf-8")
+
+    task = Task(id="T1", title="t", description="d",
+                planned_files=[PlannedFile(path="src/a.py", reason="x", allowed_change="modify")])
+    reverted = CodingCliExecutor(tmp_path, "codex")._enforce_file_scope(task)
+
+    assert [p for p, _ in reverted] == ["src/orphan.py"]
+    assert not (tmp_path / "src" / "orphan.py").exists()        # orphan reverted (deleted)
+    assert (tmp_path / "src" / "a.py").read_text() == "x = 2\n"  # planned change preserved
+
+
+def test_coding_cli_scope_gate_off_by_default(tmp_path):
+    # Without opting in, the gate is inert (no config -> disabled).
+    assert CodingCliExecutor(tmp_path, "codex")._scope_enforcement_enabled() is False
+
+
+def test_coding_cli_scope_gate_keeps_planned_file_deletion(tmp_path):
+    # Deleting a file the task OWNS is within scope -> must NOT be restored.
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "src" / "gone.py").write_text("g = 1\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-qm", "seed"], tmp_path)
+
+    (tmp_path / "src" / "gone.py").unlink()  # executor deletes its own planned file
+    task = Task(id="T1", title="t", description="d", planned_files=[
+        PlannedFile(path="src/a.py", reason="x", allowed_change="modify"),
+        PlannedFile(path="src/gone.py", reason="remove", allowed_change="modify"),
+    ])
+    reverted = CodingCliExecutor(tmp_path, "codex")._enforce_file_scope(task)
+    assert reverted == []                               # nothing out of scope
+    assert not (tmp_path / "src" / "gone.py").exists()  # deletion preserved
+
+
+def test_coding_cli_scope_gate_never_reverts_scaffolding(tmp_path):
+    # DevCouncil-managed scaffolding (AGENTS.md) must survive the gate even when it is
+    # not in planned_files and not yet in the baseline snapshot.
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-qm", "seed"], tmp_path)
+
+    (tmp_path / "AGENTS.md").write_text("# guide\n", encoding="utf-8")
+    task = Task(id="T1", title="t", description="d",
+                planned_files=[PlannedFile(path="src/a.py", reason="x", allowed_change="modify")])
+    reverted = CodingCliExecutor(tmp_path, "codex")._enforce_file_scope(task)
+    assert reverted == []
+    assert (tmp_path / "AGENTS.md").exists()
+
+
+def test_coding_cli_revert_handles_repo_with_no_commits(tmp_path):
+    # In a repo with NO commits, an orphan new file must still be removed (no HEAD to
+    # checkout) — the gate must not silently leave it on disk.
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "orphan.py").write_text("y = 1\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)  # staged but never committed -> no HEAD
+
+    task = Task(id="T1", title="t", description="d",
+                planned_files=[PlannedFile(path="src/a.py", reason="x", allowed_change="modify")])
+    reverted = CodingCliExecutor(tmp_path, "codex")._enforce_file_scope(task)
+    assert [p for p, _ in reverted] == ["src/orphan.py"]
+    assert not (tmp_path / "src" / "orphan.py").exists()

@@ -6,14 +6,18 @@ import time
 from importlib import resources
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 from devcouncil.app.project_status import compute_phase
 from devcouncil.integrations.actions import apply_integration_target
 from devcouncil.integrations.check import build_integration_check_report, integration_status_summary
 from devcouncil.storage.db import get_db
-from devcouncil.storage.repositories import ArtifactGraphRepository, StateRepository, TaskRepository
-from devcouncil.telemetry.traces import read_trace_events
+from devcouncil.storage.repositories import ArtifactGraphRepository, StateRepository
+from devcouncil.telemetry.traces import TraceEvent, read_trace_events_since
+
+if TYPE_CHECKING:
+    from devcouncil.artifacts.graph import ArtifactGraph
 
 LOGO_ASSET = "devcouncil_logo_premium.png"
 LEGACY_LOGO_ASSET = "devcouncil-logo.svg"
@@ -41,9 +45,25 @@ def _load_run_manifest(manifest_path: Path) -> dict | None:
     return dict(manifest)
 
 
+# The glob+stat over every run manifest is wasteful on each 2-second poll; a
+# short TTL cache of the assembled result keeps the loop cheap.
+_RECENT_RUNS_TTL_SECONDS = 2.0
+_RECENT_RUNS_CACHE: dict[str, tuple[float, int, list[dict]]] = {}
+
+
+def _invalidate_recent_runs(project_root: Path) -> None:
+    _RECENT_RUNS_CACHE.pop(str(project_root), None)
+
+
 def recent_run_artifacts(project_root: Path, *, limit: int = 10) -> list[dict]:
+    key = str(project_root)
+    now = time.monotonic()
+    cached = _RECENT_RUNS_CACHE.get(key)
+    if cached is not None and cached[1] == limit and now - cached[0] < _RECENT_RUNS_TTL_SECONDS:
+        return cached[2]
     runs_dir = project_root / ".devcouncil" / "runs"
     if not runs_dir.exists():
+        _RECENT_RUNS_CACHE[key] = (now, limit, [])
         return []
     manifests: list[dict] = []
     for manifest_path in sorted(
@@ -58,6 +78,7 @@ def recent_run_artifacts(project_root: Path, *, limit: int = 10) -> list[dict]:
         manifests.append(manifest)
         if len(manifests) >= limit:
             break
+    _RECENT_RUNS_CACHE[key] = (now, limit, manifests)
     return manifests
 
 
@@ -82,6 +103,49 @@ def _invalidate_integration_summary(project_root: Path) -> None:
     _INTEGRATION_SUMMARY_CACHE.pop(str(project_root), None)
 
 
+# load_graph() runs six full-table scans, but the dashboard only needs the
+# coverage summary and task list. Cache the materialized graph for a short TTL so
+# the 2-second poll loop reuses it instead of rescanning every table each time.
+_ARTIFACT_GRAPH_TTL_SECONDS = 2.0
+_ARTIFACT_GRAPH_CACHE: dict[str, tuple[float, "ArtifactGraph"]] = {}
+
+
+def _artifact_graph_cached(project_root: Path, session) -> "ArtifactGraph":
+    key = str(project_root)
+    now = time.monotonic()
+    cached = _ARTIFACT_GRAPH_CACHE.get(key)
+    if cached is not None and now - cached[0] < _ARTIFACT_GRAPH_TTL_SECONDS:
+        return cached[1]
+    graph = ArtifactGraphRepository(session).load_graph()
+    _ARTIFACT_GRAPH_CACHE[key] = (now, graph)
+    return graph
+
+
+def _invalidate_artifact_graph(project_root: Path) -> None:
+    _ARTIFACT_GRAPH_CACHE.pop(str(project_root), None)
+
+
+# Re-reading and re-parsing the whole trace file on each poll is O(all events).
+# Keep a per-root byte cursor plus the last 50 parsed events; each refresh reads
+# only the bytes appended since the cursor. Semantics match the previous
+# ``list(read_trace_events(...))[-50:]`` (last 50 events, in order).
+_TRACE_EVENTS_LIMIT = 50
+_TRACE_EVENTS_CACHE: dict[str, tuple[int, list[TraceEvent]]] = {}
+
+
+def _recent_trace_events_cached(project_root: Path) -> list[TraceEvent]:
+    key = str(project_root)
+    cursor, buffer = _TRACE_EVENTS_CACHE.get(key, (0, []))
+    new_events, next_cursor = read_trace_events_since(project_root, cursor)
+    if next_cursor < cursor:
+        # File was truncated/rotated: discard the stale buffer and start over.
+        buffer = new_events[-_TRACE_EVENTS_LIMIT:]
+    elif new_events:
+        buffer = (buffer + new_events)[-_TRACE_EVENTS_LIMIT:]
+    _TRACE_EVENTS_CACHE[key] = (next_cursor, buffer)
+    return buffer
+
+
 def logo_svg() -> str:
     return resources.files("devcouncil.assets").joinpath(LEGACY_LOGO_ASSET).read_text(encoding="utf-8")
 
@@ -103,16 +167,16 @@ def dashboard_payload(project_root: Path) -> dict:
             "recent_runs": recent_run_artifacts(project_root),
         }
     with db.get_session() as session:
-        graph = ArtifactGraphRepository(session).load_graph()
+        graph = _artifact_graph_cached(project_root, session)
         state = StateRepository(session).get_state()
         phase = compute_phase(graph, state.current_phase if state else None)
-        tasks = [task.model_dump() for task in TaskRepository(session).get_all()]
+        tasks = [task.model_dump() for task in graph.tasks.values()]
         return {
             "initialized": True,
             "phase": phase,
             "coverage": graph.coverage_summary(),
             "tasks": tasks,
-            "events": [event.model_dump(by_alias=True) for event in list(read_trace_events(project_root))[-50:]],
+            "events": [event.model_dump(by_alias=True) for event in _recent_trace_events_cached(project_root)],
             "integrations": _integration_summary_cached(project_root),
             "recent_runs": recent_run_artifacts(project_root),
         }

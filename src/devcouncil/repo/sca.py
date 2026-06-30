@@ -153,11 +153,21 @@ class ScaScanner:
         # whether a tool "exists"; we skip the PATH gate so canned output flows.
         self._injected = auditor_runner is not None
         self._runner: AuditorRunner = auditor_runner or _default_runner(timeout)
+        # project_root is immutable per instance, so lockfile existence is stable;
+        # memoize per filename to avoid repeated stat calls across auditors.
+        self._lockfile_cache: dict[str, bool] = {}
 
     # -- detection -----------------------------------------------------------
 
+    def _check_cached_lockfile(self, name: str) -> bool:
+        cached = self._lockfile_cache.get(name)
+        if cached is None:
+            cached = (self.project_root / name).exists()
+            self._lockfile_cache[name] = cached
+        return cached
+
     def _has_lockfile(self, auditor: _Auditor) -> bool:
-        return any((self.project_root / name).exists() for name in auditor.lockfiles)
+        return any(self._check_cached_lockfile(name) for name in auditor.lockfiles)
 
     def _is_runnable(self, auditor: _Auditor) -> bool:
         """Relevant to the repo (lockfile present) and runnable (on PATH or injected)."""

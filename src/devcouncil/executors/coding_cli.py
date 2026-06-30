@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import queue
 import shutil
@@ -9,12 +10,13 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from rich.console import Console
 
 from devcouncil.domain.requirement import Requirement
 from devcouncil.domain.task import Task
-from devcouncil.app.config import load_config
+from devcouncil.app.config import DevCouncilConfig, load_config
 from devcouncil.execution.executor import Executor, ExecutionResult
 from devcouncil.execution.prompt_builder import PromptBuilder
 from devcouncil.executors.agent_registry import (
@@ -27,9 +29,17 @@ from devcouncil.executors.agent_registry import (
 )
 from devcouncil.repo.gitignore import ensure_gitignore
 from devcouncil.telemetry.traces import TraceLogger
+from devcouncil.telemetry.logging_setup import run_log
 from devcouncil.utils.redaction import redact_text
 
 console = Console()
+logger = logging.getLogger(__name__)
+
+# DevCouncil-managed scaffolding `dev` writes into a workspace itself (agent guides, the
+# managed .gitignore). The pre-verify scope gate must never revert these — they are not
+# task work, and reverting them would undo `dev`'s own setup. .devcouncil/* is handled
+# by a prefix check at the call site.
+_SCAFFOLDING_PATHS = frozenset({"AGENTS.md", "AGENTS.json", "CLAUDE.md", ".gitignore"})
 
 
 class CodingCliExecutor(Executor):
@@ -44,6 +54,14 @@ class CodingCliExecutor(Executor):
         stream_output: bool | None = None,
     ):
         self.project_root = project_root
+        # Load the project config once per executor instance. The same handle is
+        # reused by _resolve_stream_output, _cursor_resume_mode and the Warp
+        # command builder, which would otherwise each re-parse config.yaml.
+        self._config: Optional[DevCouncilConfig]
+        try:
+            self._config = load_config(project_root)
+        except Exception:
+            self._config = None
         self.client = self._normalize_client(client)
         self.timeout_seconds = timeout_seconds
         self.spec = self._resolve_spec()
@@ -66,7 +84,9 @@ class CodingCliExecutor(Executor):
         if stream_output is not None:
             return stream_output
         try:
-            return bool(load_config(self.project_root).execution.stream_cli_output)
+            if self._config is None:
+                return False
+            return bool(self._config.execution.stream_cli_output)
         except Exception:
             return False
 
@@ -193,8 +213,10 @@ class CodingCliExecutor(Executor):
 
     def _load_warp_config(self) -> dict:
         try:
-            warp = load_config(self.project_root).integrations.warp
-            data = warp.model_dump()
+            if self._config is None:
+                data = {}
+            else:
+                data = self._config.integrations.warp.model_dump()
         except Exception:
             data = {}
         if command := os.environ.get("DEVCOUNCIL_WARP_COMMAND"):
@@ -210,12 +232,15 @@ class CodingCliExecutor(Executor):
         return data
 
     def run_task(self, task: Task, requirements: list[Requirement]) -> ExecutionResult:
+        logger.info("coding_cli.run_task: client=%s profile=%s task=%s", self.client, self.profile_name, task.id)
         if self.profile is None:
+            logger.error("Unknown agent profile %r for %s; cannot start.", self.profile_name, self.client)
             return ExecutionResult(
                 success=False,
                 message=f"Unknown agent profile '{self.profile_name}' for {self.client}.",
             )
         if self.spec.input_mode not in VALID_INPUT_MODES:
+            logger.error("Invalid input_mode %r for %s; cannot start.", self.spec.input_mode, self.client)
             return ExecutionResult(
                 success=False,
                 message=(
@@ -229,10 +254,12 @@ class CodingCliExecutor(Executor):
         try:
             command = self._command(task.id)
         except ValueError as exc:
+            logger.error("Failed to build %s command for %s: %s", self.client, task.id, exc)
             return ExecutionResult(success=False, message=str(exc))
 
         executable = command[0]
         if not shutil.which(executable):
+            logger.error("%s CLI executable %r not found on PATH.", self.client, executable)
             return ExecutionResult(
                 success=False,
                 message=f"{self.client} CLI is not installed or not on PATH.",
@@ -262,6 +289,12 @@ class CodingCliExecutor(Executor):
 
         console.print(f"Starting [bold]{self.client.upper()}[/bold] for task [bold]{task.id}[/bold]...")
         console.print(f"Task prompt: [dim]{instruction_file}[/dim]")
+
+        # Isolate this run's full DEBUG trail in its own run-dir log, on top of the
+        # always-on shared devcouncil.log, so an agent run can be inspected end-to-end
+        # without grepping across unrelated activity / log rotations.
+        run_log_cm = run_log(self.project_root / ".devcouncil" / "runs" / run_id / "run.log")
+        run_log_cm.__enter__()
 
         started = time.monotonic()
         try:
@@ -296,8 +329,10 @@ class CodingCliExecutor(Executor):
                 else None
             )
             started = time.monotonic()
+            logger.info("Launching %s subprocess for %s (timeout=%ss)", self.client, task.id, self._effective_timeout())
             result = self._run_subprocess(invocation, input_text, env, transcript_path=transcript_path)
             duration = round(time.monotonic() - started, 3)
+            logger.info("%s subprocess for %s exited %s in %.2fs", self.client, task.id, result.returncode, duration)
             finished_at = datetime.now(timezone.utc).isoformat()
             self._write_log(log_prefix, result)
             if transcript_path and transcript_path.exists():
@@ -316,6 +351,7 @@ class CodingCliExecutor(Executor):
                 )
                 stderr_preview = (result.stderr or result.stdout or "").strip().splitlines()[:5]
                 detail = redact_text(stderr_preview[0]) if stderr_preview else "No diagnostics were produced."
+                logger.error("%s exited %s for %s: %s", self.client, result.returncode, task.id, detail)
                 TraceLogger(self.project_root).log_event(
                     "agent_run_failed",
                     {"agent": self.client, "profile": self.profile_name, "returncode": result.returncode, "detail": detail},
@@ -343,8 +379,31 @@ class CodingCliExecutor(Executor):
                 task_id=task.id,
                 summary=f"{self.client} finished for {task.id}",
             )
+            # Opt-in pre-verify scope gate: this CLI subprocess wrote directly to disk with
+            # no per-write hook, so revert any out-of-scope change now (before it reaches the
+            # verify gate or a commit) rather than only flagging it as orphan_diff post-verify.
+            if self._scope_enforcement_enabled():
+                reverted = self._enforce_file_scope(task)
+                if reverted:
+                    files = ", ".join(path for path, _ in reverted)
+                    TraceLogger(self.project_root).log_event(
+                        "agent_scope_violation_reverted",
+                        {"agent": self.client, "task_id": task.id,
+                         "reverted": [{"path": p, "reason": r} for p, r in reverted]},
+                        run_id=run_id,
+                        task_id=task.id,
+                        summary=f"Reverted {len(reverted)} out-of-scope change(s) by {self.client}",
+                    )
+                    return ExecutionResult(
+                        success=False,
+                        message=(
+                            f"Reverted {len(reverted)} out-of-scope file change(s) the task did not "
+                            f"authorize: {files}. Re-run keeping edits within the task's allowed files."
+                        ),
+                    )
             return ExecutionResult(success=True, message=f"{self.client} execution finished.")
         except subprocess.TimeoutExpired:
+            logger.error("%s timed out after %ss for %s", self.client, self._effective_timeout(), task.id)
             self._update_run_manifest(
                 run_id,
                 status="timeout",
@@ -363,6 +422,7 @@ class CodingCliExecutor(Executor):
                 message=f"{self.client} execution timed out after {self._effective_timeout()}s.",
             )
         except Exception as exc:
+            logger.exception("%s execution raised for %s: %s", self.client, task.id, exc)
             self._update_run_manifest(
                 run_id,
                 status="failed",
@@ -372,6 +432,71 @@ class CodingCliExecutor(Executor):
                 duration_seconds=round(time.monotonic() - started, 3),
             )
             return ExecutionResult(success=False, message=str(exc))
+        finally:
+            run_log_cm.__exit__(None, None, None)
+
+    def _scope_enforcement_enabled(self) -> bool:
+        try:
+            from devcouncil.app.config import load_config
+            return bool(load_config(self.project_root).execution.enforce_file_scope_pre_verify)
+        except Exception:
+            return False
+
+    def _enforce_file_scope(self, task: Task) -> list[tuple[str, str]]:
+        """Revert any file this task's subprocess changed that the task does not authorize.
+
+        Uses the task's net changed files (baseline/snapshot subtracted, DevCouncil-managed
+        paths already filtered) and the same policy the hook path enforces. Returns the list
+        of ``(path, reason)`` reverted; empty when every change was in scope."""
+        try:
+            from devcouncil.execution.policy_engine import TaskPolicyEngine
+            from devcouncil.verification.verifier import Verifier
+
+            changed = Verifier(self.project_root).get_task_changed_files(task.id)
+        except Exception:
+            return []
+        engine = TaskPolicyEngine(self.project_root)
+        reverted: list[tuple[str, str]] = []
+        for path in changed:
+            # Never touch DevCouncil-managed scaffolding even if it surfaces in the diff
+            # (e.g. baseline snapshots failed to load): `dev` owns these files, not the task.
+            if path in _SCAFFOLDING_PATHS or path.startswith(".devcouncil/"):
+                continue
+            try:
+                decision = engine.evaluate_file_change(path, task, "write")
+            except Exception:
+                continue
+            if decision.action == "deny" and self._revert_path(path):
+                reverted.append((path, decision.reason))
+        return reverted
+
+    def _revert_path(self, rel_path: str) -> bool:
+        """Undo an out-of-scope change. A file that exists in HEAD is restored to HEAD; a
+        file the task newly added (absent from HEAD, or no HEAD at all) is unstaged and
+        deleted. Best-effort — a failed revert returns False so the path is not reported as
+        cleanly gated (and the caller does not claim it was reverted)."""
+        try:
+            in_head = subprocess.run(
+                ["git", "cat-file", "-e", f"HEAD:{rel_path}"],
+                cwd=self.project_root, capture_output=True, text=True,
+            ).returncode == 0
+            if in_head:
+                return subprocess.run(
+                    ["git", "checkout", "HEAD", "--", rel_path],
+                    cwd=self.project_root, capture_output=True, text=True,
+                ).returncode == 0
+            # New file (incl. the no-HEAD case): unstage if staged, then remove the working
+            # copy so it cannot be committed by the next repair attempt.
+            subprocess.run(
+                ["git", "rm", "-f", "--cached", "--ignore-unmatch", rel_path],
+                cwd=self.project_root, capture_output=True, text=True,
+            )
+            full = self.project_root / rel_path
+            if full.is_file():
+                full.unlink()
+            return True
+        except Exception:
+            return False
 
     def _resolve_invocation(self, invocation: list[str], env: dict[str, str]) -> list[str]:
         """Route Windows batch shims through the command interpreter.
@@ -520,7 +645,10 @@ class CodingCliExecutor(Executor):
 
     def _cursor_resume_mode(self) -> str:
         try:
-            mode = (load_config(self.project_root).execution.cursor_resume_mode or "off").strip().lower()
+            if self._config is None:
+                mode = "off"
+            else:
+                mode = (self._config.execution.cursor_resume_mode or "off").strip().lower()
         except Exception:
             mode = "off"
         if mode not in {"off", "project", "task"}:

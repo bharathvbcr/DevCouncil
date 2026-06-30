@@ -134,7 +134,7 @@ def _build_router(project_root: Path):
 
     config = load_config(project_root)
     api_key = get_api_key(config.models.provider, project_root)
-    provider = create_provider(config.models.provider, api_key, project_root=project_root)
+    provider = create_provider(config.models.provider, api_key, project_root=project_root, provider_prefs=config.provider)
     role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
     if not role_config:
         raise RuntimeError(

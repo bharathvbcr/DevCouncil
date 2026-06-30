@@ -9,8 +9,11 @@ States (from §12):
 
 from __future__ import annotations
 
+import logging
 from enum import Enum
 from typing import Dict, List, Set
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -99,6 +102,7 @@ class StateMachine:
         Raises InvalidTransitionError if the transition is not allowed.
         """
         if not self.can_transition(target):
+            logger.error("Invalid phase transition: %s -> %s", self._phase.value, target.value)
             raise InvalidTransitionError(self._phase, target)
         self._phase = target
         self._history.append(target)

@@ -1,8 +1,11 @@
+import logging
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 from devcouncil.llm.router import ModelRouter
+
+logger = logging.getLogger(__name__)
 
 # Cap how much skill text we feed the enhancer so a repo matching many skills
 # can't blow up the planning prompt. Domain skills are ~50 lines each.
@@ -80,6 +83,53 @@ class PromptEnhancement(BaseModel):
         return "\n".join(sections)
 
 
+# Stable copy of the enhancement that produced the CURRENTLY ACTIVE plan. Written when a
+# plan is persisted, so the executor reads the guidance tied to the plan it is running —
+# not whichever run happens to have the newest mtime (a later dry-run/replan would otherwise
+# win). Lives next to the plan state under .devcouncil/.
+_ACTIVE_ENHANCEMENT_FILE = "active_prompt_enhancement.json"
+
+
+def load_latest_prompt_enhancement(project_root: Path) -> "PromptEnhancement | None":
+    """Load the prompt-enhancement for the active plan, or None.
+
+    Prefers the stable ``.devcouncil/active_prompt_enhancement.json`` written when the plan
+    was persisted (so the executor gets the guidance tied to the plan it is running). Falls
+    back to the most recent per-run artifact for plans persisted before that file existed.
+    Best-effort: any read/parse failure returns None so prompt building never breaks."""
+    import json
+
+    def _load(path: Path) -> "PromptEnhancement | None":
+        try:
+            return PromptEnhancement.model_validate(json.loads(path.read_text(encoding="utf-8")))
+        except Exception:
+            return None
+
+    active = project_root / ".devcouncil" / _ACTIVE_ENHANCEMENT_FILE
+    if active.is_file():
+        loaded = _load(active)
+        if loaded is not None:
+            return loaded
+
+    runs = project_root / ".devcouncil" / "runs"
+    if not runs.exists():
+        return None
+    artifacts = [d / "prompt_enhancement.json" for d in runs.iterdir() if (d / "prompt_enhancement.json").is_file()]
+    if not artifacts:
+        return None
+    return _load(max(artifacts, key=lambda p: p.stat().st_mtime))
+
+
+def save_active_prompt_enhancement(project_root: Path, enhancement: "PromptEnhancement") -> None:
+    """Persist the enhancement for the active plan to the stable path. Best-effort."""
+    try:
+        path = project_root / ".devcouncil" / _ACTIVE_ENHANCEMENT_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(enhancement.model_dump_json(indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 class PromptEnhancerService:
     def __init__(self, router: ModelRouter):
         self.router = router
@@ -94,6 +144,8 @@ class PromptEnhancerService:
         skills = _select_skills(goal, project_root)
         skills_intake = _full_intake(skills)
         skills_brief = _compact_brief(skills)
+        if skills:
+            logger.info("Prompt enhancer matched %d skill(s): %s", len(skills), ", ".join(s.name for s in skills))
 
         knowledge = _select_knowledge(goal, project_root)
         knowledge_intake = _knowledge_intake(knowledge)

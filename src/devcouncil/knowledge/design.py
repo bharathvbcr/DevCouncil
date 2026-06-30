@@ -248,6 +248,7 @@ def lint(ds: DesignSystem) -> list[Finding]:
         ))
 
     # contrast: any component declaring both a text and background color
+    color_cache: dict[str, str | None] = {}
     for comp, props in ds.components.items():
         if not isinstance(props, dict):
             continue
@@ -255,7 +256,8 @@ def lint(ds: DesignSystem) -> list[Finding]:
         bg_raw = props.get("backgroundColor")
         if not (isinstance(fg_raw, str) and isinstance(bg_raw, str)):
             continue
-        fg, bg = _resolve_color(ds, fg_raw), _resolve_color(ds, bg_raw)
+        fg = color_cache.setdefault(fg_raw, _resolve_color(ds, fg_raw))
+        bg = color_cache.setdefault(bg_raw, _resolve_color(ds, bg_raw))
         if fg and bg:
             ratio = contrast_ratio(fg, bg)
             if ratio is not None and ratio < 4.5:

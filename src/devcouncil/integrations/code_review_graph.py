@@ -1,4 +1,5 @@
 import json
+import logging
 import shutil
 import subprocess
 from pathlib import Path
@@ -7,6 +8,8 @@ from typing import Any, Iterable
 from pydantic import BaseModel, Field
 
 from devcouncil.app.config import load_config
+
+logger = logging.getLogger(__name__)
 
 
 class CodeReviewGraphContext(BaseModel):
@@ -24,11 +27,17 @@ class CodeReviewGraphAdapter:
 
     def __init__(self, project_root: Path, command: str | None = None):
         self.project_root = project_root
+        self._config: Any = None
         self.command = command or self._configured_command()
+
+    def _get_config(self) -> Any:
+        if self._config is None:
+            self._config = load_config(self.project_root)
+        return self._config
 
     def is_enabled(self) -> bool:
         try:
-            return load_config(self.project_root).integrations.code_review_graph.enabled
+            return self._get_config().integrations.code_review_graph.enabled
         except Exception:
             return False
 
@@ -57,9 +66,11 @@ class CodeReviewGraphAdapter:
         for command in commands:
             result = self._run(command)
             if result.returncode == 0 and result.output.strip():
+                logger.debug("code-review-graph context obtained via: %s", " ".join(command))
                 return self._parse_context(result.output, changed_files)
             errors.append(result.output.strip() or f"exit {result.returncode}")
 
+        logger.warning("code-review-graph ran but returned no context (%d command(s) tried)", len(commands))
         return CodeReviewGraphContext(
             available=True,
             summary="code-review-graph ran but did not return context.",
@@ -84,7 +95,7 @@ class CodeReviewGraphAdapter:
 
     def _configured_command(self) -> str:
         try:
-            return load_config(self.project_root).integrations.code_review_graph.command
+            return self._get_config().integrations.code_review_graph.command
         except Exception:
             return "code-review-graph"
 

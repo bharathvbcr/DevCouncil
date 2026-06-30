@@ -1,3 +1,5 @@
+import logging
+from collections import deque
 from pydantic import BaseModel
 from typing import Any, List, Optional
 from pathlib import Path
@@ -10,6 +12,32 @@ from devcouncil.domain.critique import CritiqueFinding
 from devcouncil.gating.checks.requirement_coverage import RequirementCoverageCheck
 from devcouncil.gating.checks.planned_files_check import PlannedFilesCheck
 from devcouncil.gating.checks.clean_git import CleanGitCheck
+
+logger = logging.getLogger(__name__)
+
+
+def _log_gate(name: str, gaps: List[Gap], *, routine: bool = False, **context: Any) -> bool:
+    """Log a gate decision and return whether it passed (no blocking gaps).
+
+    A passing gate is logged at INFO for once-per-plan checks (a real milestone) but at
+    DEBUG for ``routine`` per-task checks (e.g. task_ready, which fires for every task and
+    every repair attempt) so the ``-v`` stream stays milestone-level. A FAILED gate is
+    always WARNING — that's the signal you actually chase.
+    """
+    blocking = [g for g in gaps if g.blocking]
+    passed = not blocking
+    suffix = "".join(f" {k}={v}" for k, v in context.items())
+    if passed:
+        log = logger.debug if routine else logger.info
+        log("Gate %s PASSED (%d advisory gap(s))%s", name, len(gaps), suffix)
+    else:
+        logger.warning(
+            "Gate %s FAILED%s: %s",
+            name, suffix,
+            "; ".join(f"{g.gap_type}: {g.description}" for g in blocking),
+        )
+    return passed
+
 
 class GateResult(BaseModel):
     passed: bool
@@ -60,10 +88,10 @@ def topological_order(tasks: List[Task]) -> List[Task]:
                 indegree[task.id] += 1
                 dependents[dep].append(task.id)
     # Kahn's algorithm, seeded in original order for stability.
-    ready = [t.id for t in tasks if indegree[t.id] == 0]
+    ready = deque(t.id for t in tasks if indegree[t.id] == 0)
     ordered: List[str] = []
     while ready:
-        current = ready.pop(0)
+        current = ready.popleft()
         ordered.append(current)
         for child in dependents[current]:
             indegree[child] -= 1
@@ -192,13 +220,16 @@ class GatePolicy:
         # earlier one (e.g. both add the same function), which then fails per-task
         # verification. Consolidating a file's work into one task avoids this.
         writers_by_file: dict[str, list[str]] = {}
+        writer_sets: dict[str, set[str]] = {}
         for task in tasks:
             for pf in task.planned_files:
                 if pf.allowed_change in ("create", "modify", "delete"):
                     path = pf.path.replace("\\", "/")
-                    writers_by_file.setdefault(path, [])
-                    if task.id not in writers_by_file[path]:
-                        writers_by_file[path].append(task.id)
+                    owners = writers_by_file.setdefault(path, [])
+                    seen = writer_sets.setdefault(path, set())
+                    if task.id not in seen:
+                        seen.add(task.id)
+                        owners.append(task.id)
         for path, owners in writers_by_file.items():
             if len(owners) > 1:
                 gaps.append(Gap(
@@ -262,7 +293,7 @@ class GatePolicy:
             ))
 
         return GateResult(
-            passed=len([g for g in gaps if g.blocking]) == 0, 
+            passed=_log_gate("plan_approval", gaps),
             gaps=gaps
         )
 
@@ -305,7 +336,7 @@ class GatePolicy:
             ))
 
         return GateResult(
-            passed=len([g for g in gaps if g.blocking]) == 0,
+            passed=_log_gate("task_ready", gaps, routine=True, task_id=task.id),
             gaps=gaps
         )
 

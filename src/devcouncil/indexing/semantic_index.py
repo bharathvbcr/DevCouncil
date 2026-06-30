@@ -34,17 +34,25 @@ class SemanticIndex:
         return self.semantic_dir / task_id / f"{stage}.json"
 
     def create_snapshot(self, task_id: str, stage: str) -> Path:
-        symbols = self._collect_symbols()
+        # Walk the tree ONCE and share the file list across every collector. Previously
+        # create_snapshot triggered four independent full-tree rglob() traversals (symbol
+        # matching, source-file hashing, import extraction, and LSP language detection);
+        # each collector now filters this single in-memory list with its own predicate, so
+        # the on-disk output is unchanged while the filesystem is walked a single time.
+        all_files = [path for path in self.project_root.rglob("*") if path.is_file()]
+        rel_files = [str(path.relative_to(self.project_root)) for path in all_files]
+        symbols = self._collect_symbols(all_files)
+        source_files, imports = self._collect_source_data(all_files)
         payload = {
             "task_id": task_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "repo_map_path": str(self.project_root / ".devcouncil" / "repo_map.json"),
             "files": self._config_file_entries(),
-            "source_files": self._source_file_entries(),
+            "source_files": source_files,
             "symbols": symbols,
-            "imports": self._collect_imports(),
+            "imports": imports,
             "public_symbols": [s for s in symbols if s.get("public")],
-            "lsp": json.loads(LspInspector(self.project_root).summary_json()),
+            "lsp": json.loads(LspInspector(self.project_root).summary_json(rel_files)),
         }
         path = self.snapshot_path(task_id, stage)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -72,9 +80,9 @@ class SemanticIndex:
                 )
         return {"classifications": classifications, "summary": summary}
 
-    def _collect_symbols(self) -> list[dict]:
+    def _collect_symbols(self, files: list[Path] | None = None) -> list[dict]:
         symbols: list[dict] = []
-        for match in self.matcher.match(limit=500):
+        for match in self.matcher.match(limit=500, files=files):
             symbols.append({
                 "path": match.path,
                 "language": match.language,
@@ -86,19 +94,39 @@ class SemanticIndex:
             })
         return symbols
 
-    def _collect_imports(self) -> list[dict]:
+    def _collect_source_data(
+        self, files: list[Path] | None = None
+    ) -> tuple[list[dict], list[dict]]:
+        """Hash every source file and extract its imports in a SINGLE read pass.
+
+        Previously ``_source_file_entries`` read every source file's bytes for hashing
+        while ``_collect_imports`` independently re-read (and, for Python, re-parsed) the
+        same files. This reads each file once: the raw bytes feed the SHA-256 entry, and
+        the decoded text feeds import extraction. The import set is a subset of the hashed
+        set (it additionally skips dot-prefixed paths), so both outputs match the originals
+        exactly — source entries are still sorted by path, imports stay in traversal order.
+        """
+        if files is None:
+            files = [p for p in self.project_root.rglob("*") if p.is_file()]
+        source_entries: list[dict] = []
         imports: list[dict] = []
-        for path in self.project_root.rglob("*"):
+        for path in files:
             if not path.is_file() or path.suffix not in {".py", ".ts", ".tsx", ".js", ".go", ".rs"}:
                 continue
             rel = path.relative_to(self.project_root).as_posix()
-            # Filter on the path relative to the project root — filtering on the
-            # absolute path would skip everything when the repo itself lives
-            # under a dot-directory.
-            rel_parts = Path(rel).parts
-            if self._is_ignored_path(rel) or any(part.startswith(".") for part in rel_parts):
+            if self._is_ignored_path(rel):
                 continue
-            source = path.read_text(encoding="utf-8", errors="replace")
+            raw = path.read_bytes()
+            source_entries.append({"path": rel, "sha256": hashlib.sha256(raw).hexdigest()})
+            # Imports additionally skip dot-prefixed relative paths. Filter on the path
+            # relative to the project root — filtering on the absolute path would skip
+            # everything when the repo itself lives under a dot-directory.
+            rel_parts = Path(rel).parts
+            if any(part.startswith(".") for part in rel_parts):
+                continue
+            # Decode the bytes we already read, normalizing newlines the same way
+            # Path.read_text(newline=None) did, so parsed import statements are identical.
+            source = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
             if path.suffix == ".py":
                 try:
                     tree = ast.parse(source)
@@ -112,7 +140,7 @@ class SemanticIndex:
                 for line in source.splitlines():
                     if re.match(r"^\s*(import|from)\s+", line):
                         imports.append({"path": rel, "statement": line.strip()})
-        return imports
+        return sorted(source_entries, key=lambda item: item["path"]), imports
 
     def _classify(self, before: dict, after: dict) -> list[dict]:
         before_symbols = {(s["path"], s["name"]): s for s in before.get("symbols", [])}
@@ -187,18 +215,6 @@ class SemanticIndex:
                     "content": path.read_text(encoding="utf-8", errors="replace"),
                 })
         return entries
-
-    def _source_file_entries(self) -> list[dict]:
-        entries: list[dict] = []
-        for path in self.project_root.rglob("*"):
-            if not path.is_file() or path.suffix not in {".py", ".ts", ".tsx", ".js", ".go", ".rs"}:
-                continue
-            rel = path.relative_to(self.project_root).as_posix()
-            if self._is_ignored_path(rel):
-                continue
-            raw = path.read_bytes()
-            entries.append({"path": rel, "sha256": hashlib.sha256(raw).hexdigest()})
-        return sorted(entries, key=lambda item: item["path"])
 
     def _is_ignored_path(self, rel_path: str) -> bool:
         ignored_parts = {".git", ".devcouncil", "__pycache__", ".venv", "node_modules", "dist", "build", "target", "vendor"}

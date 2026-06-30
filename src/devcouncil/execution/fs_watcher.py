@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from pathlib import Path
@@ -37,6 +38,8 @@ _EVENT_IGNORED_PREFIXES = _IGNORED_PREFIXES + (".devcouncil/", ".gitignore")
 _TASK_CACHE_TTL_SECONDS = 10.0
 _EVENT_DEBOUNCE_SECONDS = 0.5
 
+logger = logging.getLogger(__name__)
+
 
 class FilesystemWatcher:
     def __init__(
@@ -53,15 +56,20 @@ class FilesystemWatcher:
         self.on_event = on_event
         self.policy = TaskPolicyEngine(self.project_root)
         self._seen: dict[str, float] = {}
+        self._seen_last_cleanup: float = 0.0
         self._task_cache: tuple[float, Task | None] | None = None
+        # Reuse one Verifier across polls (avoids rebuilding its scanners each tick) but
+        # still run get_changed_files() fresh every poll — caching the git result would
+        # make the watcher miss changes for the cache TTL, defeating the poll interval.
+        self._verifier: Verifier | None = None
 
     def should_ignore(self, path: str) -> bool:
         normalized = path.replace("\\", "/")
         return any(normalized.startswith(prefix) for prefix in _IGNORED_PREFIXES)
 
     def scan_once(self) -> list[dict]:
-        task = self._load_task()
-        changed = Verifier(self.project_root).get_changed_files()
+        task = self._task_cached()
+        changed = self._changed_files()
         events: list[dict] = []
         for path in changed:
             if self.should_ignore(path):
@@ -71,6 +79,8 @@ class FilesystemWatcher:
 
     def watch(self) -> None:
         observer = self._start_event_observer()
+        mode = "polling" if observer is None else "event-driven (watchdog)"
+        logger.info("Filesystem watcher started for %s in %s mode", self.task_id, mode)
         if observer is None:
             # Polling fallback when watchdog is unavailable.
             while True:
@@ -129,6 +139,12 @@ class FilesystemWatcher:
         now = time.monotonic()
         last = self._seen.get(rel)
         self._seen[rel] = now
+        # Periodically evict stale entries so _seen doesn't grow unbounded in long watch
+        # sessions. Anything older than the debounce window can never suppress a future
+        # event, so dropping it leaves dedup behavior unchanged. Run at most once/window.
+        if now - self._seen_last_cleanup >= window:
+            self._seen = {key: ts for key, ts in self._seen.items() if now - ts < window}
+            self._seen_last_cleanup = now
         return last is not None and (now - last) < window
 
     def _task_cached(self) -> Task | None:
@@ -138,6 +154,11 @@ class FilesystemWatcher:
         task = self._load_task()
         self._task_cache = (now, task)
         return task
+
+    def _changed_files(self) -> list[str]:
+        if self._verifier is None:
+            self._verifier = Verifier(self.project_root)
+        return self._verifier.get_changed_files()
 
     def _load_task(self) -> Task | None:
         db = get_db(self.project_root)
@@ -165,6 +186,10 @@ class FilesystemWatcher:
                     reason=decision.reason,
                 )
                 if not allowed:
+                    logger.warning(
+                        "Orphan diff for %s: %s %s (%s)",
+                        self.task_id, operation, path, decision.reason,
+                    )
                     gap_repo = GapRepository(session)
                     gap_repo.save(
                         Gap(

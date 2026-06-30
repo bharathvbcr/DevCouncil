@@ -76,6 +76,11 @@ dev lsp inspect             # Inspect optional language-server readiness
 dev ast match "symbol"      # Search symbols with structural AST matching
 dev dashboard --open        # Serve the live local status dashboard and open a browser
 dev trace tail --follow     # Tail local DevCouncil trace events
+dev logs tail -n 100        # Tail the durable run log (.devcouncil/logs/devcouncil.log)
+dev logs tail -f --grep ERROR # Follow the log, showing only matching lines
+dev logs tail --run RUN-ID  # Read one executor run's isolated run.log
+dev logs runs               # List per-run logs, newest first
+dev <command> -v | -vv | -q # Raise/lower console log verbosity (file always DEBUG)
 dev artifacts validate      # Validate stored artifact integrity
 dev config                  # Inspect or update configuration
 dev config models --model YOUR_MODEL_ID # Update every configured model role

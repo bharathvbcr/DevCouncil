@@ -14,6 +14,7 @@ resilient to churn in the command module.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -31,6 +32,8 @@ _AC_ID = "AC-CHECK"
 _TASK_ID = "CHECK"
 
 _DEFAULT_CRITERION = "The working-tree changes are correct and exercised by tests."
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -80,7 +83,9 @@ def run_working_tree_check(
     diff = verifier.get_diff()
     changed_files = verifier.get_changed_files()
     if not diff or not changed_files:
+        logger.info("Ad-hoc check: no working-tree changes; passing trivially")
         return AdHocCheckResult(requirement="", passed=True, reason="no_changes")
+    logger.info("Ad-hoc check: %d changed file(s), enforce_coverage=%s", len(changed_files), enforce_coverage or min_ratio > 0)
 
     criterion = requirement or _DEFAULT_CRITERION
     req = Requirement(
@@ -119,6 +124,7 @@ def run_working_tree_check(
     gaps, evidence = asyncio.run(verifier.verify_task(task, [req]))
     coverage = next((ev for ev in evidence if isinstance(ev, DiffCoverageEvidence)), None)
     blocking = [g for g in gaps if g.blocking]
+    logger.info("Ad-hoc check result: passed=%s (%d gap(s), %d blocking)", not blocking, len(gaps), len(blocking))
     return AdHocCheckResult(
         requirement=criterion,
         changed_files=changed_files,

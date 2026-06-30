@@ -142,6 +142,178 @@ def agent_response(
     if client.lower() in {"codex", "gemini"}:
         print(json.dumps({"decision": "allow", "suppressOutput": True}, separators=(",", ":")))
 
+def _status_line(root: Path) -> str | None:
+    """A one-line DevCouncil status snapshot, or None when uninitialized/unavailable.
+
+    Used by the SessionStart and UserPromptSubmit hooks to inject lightweight project
+    context into Claude Code. Best-effort: any failure returns None so a hook never
+    breaks the session."""
+    try:
+        db = get_db(root)
+        if not db:
+            return None
+        from devcouncil.storage.repositories import ArtifactGraphRepository, StateRepository
+        from devcouncil.app.project_status import compute_phase
+
+        with db.get_session() as session:
+            graph = ArtifactGraphRepository(session).load_graph()
+            summary = graph.coverage_summary()
+            state = StateRepository(session).get_state()
+            phase = compute_phase(graph, state.current_phase if state else None)
+        return (
+            f"DevCouncil — phase: {phase}; tasks: {summary['total_tasks']}; "
+            f"gaps: {summary['total_gaps']} ({summary['blocking_gaps']} blocking). "
+            "Use the devcouncil_* MCP tools and `dev` CLI to stay inside the verify loop."
+        )
+    except Exception:
+        return None
+
+
+def _emit_additional_context(event_name: str, context: str | None) -> None:
+    """Emit a Claude-Code hook result that injects additionalContext (exit 0)."""
+    if not context:
+        return
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": event_name,
+            "additionalContext": context,
+        }
+    }, separators=(",", ":")))
+
+
+def _read_stdin_payload(event_json: str | None) -> dict:
+    text = event_json if event_json is not None else sys.stdin.read()
+    if not text or not text.strip():
+        return {}
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {"raw": text}
+    except json.JSONDecodeError:
+        return {"raw": text}
+
+
+@app.command()
+def session_start(
+    event_json: str | None = typer.Argument(None, help="The JSON hook payload from Claude Code."),
+    client: str = typer.Option("claude", "--client", help="Hook client (claude)."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """Claude Code SessionStart hook: inject a DevCouncil status snapshot as context."""
+    _read_stdin_payload(event_json)
+    root = _project_root(project_root)
+    try:
+        TraceLogger(root).log_event("session_start", {"client": client.lower()}, summary="Claude session started.")
+    except Exception:
+        pass
+    _emit_additional_context("SessionStart", _status_line(root))
+
+
+@app.command()
+def user_prompt_submit(
+    event_json: str | None = typer.Argument(None, help="The JSON hook payload from Claude Code."),
+    client: str = typer.Option("claude", "--client", help="Hook client (claude)."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """Claude Code UserPromptSubmit hook: surface the current DevCouncil status as context."""
+    _read_stdin_payload(event_json)
+    root = _project_root(project_root)
+    _emit_additional_context("UserPromptSubmit", _status_line(root))
+
+
+@app.command()
+def session_end(
+    event_json: str | None = typer.Argument(None, help="The JSON hook payload from Claude Code."),
+    client: str = typer.Option("claude", "--client", help="Hook client (claude)."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """Claude Code SessionEnd hook: record session teardown in the DevCouncil trace."""
+    _read_stdin_payload(event_json)
+    root = _project_root(project_root)
+    try:
+        TraceLogger(root).log_event("session_end", {"client": client.lower()}, summary="Claude session ended.")
+    except Exception:
+        pass
+
+
+@app.command()
+def pre_compact(
+    event_json: str | None = typer.Argument(None, help="The JSON hook payload from Claude Code."),
+    client: str = typer.Option("claude", "--client", help="Hook client (claude)."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """Claude Code PreCompact hook: record that context compaction is about to run."""
+    _read_stdin_payload(event_json)
+    root = _project_root(project_root)
+    try:
+        TraceLogger(root).log_event("pre_compact", {"client": client.lower()}, summary="Claude context compaction starting.")
+    except Exception:
+        pass
+
+
+@app.command()
+def subagent_stop(
+    event_json: str | None = typer.Argument(None, help="The JSON hook payload from Claude Code."),
+    client: str = typer.Option("claude", "--client", help="Hook client (claude)."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """Claude Code SubagentStop hook: write a review signal when a subagent finishes."""
+    payload = _read_stdin_payload(event_json)
+    root = _project_root(project_root)
+    if not any(key in payload for key in ("task_id", "taskId", "task")):
+        active_id = active_task_id(root)
+        if active_id:
+            payload["task_id"] = active_id
+    try:
+        signal_path = write_signal(root, client.lower(), payload)
+        TraceLogger(root).log_event(
+            "subagent_stop",
+            {"client": client.lower(), "signal": str(signal_path)},
+            summary=f"{client} subagent finished; signal recorded.",
+        )
+    except Exception:
+        pass
+
+
+@app.command()
+def notification(
+    event_json: str | None = typer.Argument(None, help="The JSON hook payload from Claude Code."),
+    client: str = typer.Option("claude", "--client", help="Hook client (claude)."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """Claude Code Notification hook: record a Claude notification in the DevCouncil trace."""
+    payload = _read_stdin_payload(event_json)
+    root = _project_root(project_root)
+    try:
+        TraceLogger(root).log_event(
+            "claude_notification",
+            {"client": client.lower(), "message": str(payload.get("message", ""))[:200]},
+            summary="Claude notification.",
+        )
+    except Exception:
+        pass
+
+
+@app.command()
+def claude_statusline(
+    event_json: str | None = typer.Argument(None, help="The JSON status payload from Claude Code."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """Claude Code statusLine command: print a compact DevCouncil status line.
+
+    Reads Claude's status JSON on stdin (cwd, model, ...) and prints one line. Falls back
+    to a minimal marker when the project isn't initialized so the status bar never breaks."""
+    payload = _read_stdin_payload(event_json)
+    # Prefer the cwd Claude reports so the line reflects the active workspace.
+    cwd = payload.get("cwd") if isinstance(payload, dict) else None
+    root = _project_root(Path(cwd) if isinstance(cwd, str) and cwd else project_root)
+    line = _status_line(root)
+    if not line:
+        print("DevCouncil: not initialized")
+        return
+    # statusLine wants a short line; drop the trailing guidance sentence.
+    print(line.split(". Use the")[0])
+
+
 @app.command()
 def post_task(
     client: str = typer.Option("claude", "--client", help="Hook client: claude, codex, gemini, cursor, or generic."),

@@ -18,9 +18,13 @@ class Orchestrator:
         self.project_root = project_root
         self.persist_state = persist_state
         
-        db = get_db(self.project_root)
-        if db:
-            with db.get_session() as session:
+        # Cache the Database handle once: get_db() rebuilds the SQLAlchemy engine
+        # and runs a schema check on every call, and transition_to() is invoked
+        # several times per run. The handle is reusable, so build it here and
+        # reuse it everywhere in this orchestrator instance.
+        self.db = get_db(self.project_root)
+        if self.db:
+            with self.db.get_session() as session:
                 repo = StateRepository(session)
                 state = repo.get_state()
                 if state:
@@ -45,6 +49,7 @@ class Orchestrator:
             goal=goal
         )
         self.current_run.initialize()
+        logger.info("Run started: run_id=%s goal=%r", run_id, goal)
         TraceLogger(self.project_root).log_event(
             "planning_started",
             {"goal": goal},
@@ -60,9 +65,8 @@ class Orchestrator:
         old_phase = self.state_machine.phase
         self.state_machine.transition(target_phase)
         
-        db = get_db(self.project_root)
-        if db and self.persist_state:
-            with db.get_session() as session:
+        if self.db and self.persist_state:
+            with self.db.get_session() as session:
                 repo = StateRepository(session)
                 repo.save_state(
                     self.state_machine.phase.value,

@@ -144,6 +144,13 @@ class ArtifactGraph:
 
     def coverage_summary(self) -> Dict[str, Any]:
         """Produce a coverage summary for reporting."""
+        # Single pass over open findings; the "high"-filtered count reuses the same
+        # severity_order/rank predicate as open_findings("high") (rank >= 2).
+        all_open = self.open_findings()
+        severity_order = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+        high_critical_open = sum(
+            1 for f in all_open if severity_order.get(f.severity, 0) >= severity_order["high"]
+        )
         return {
             "total_requirements": len(self.requirements),
             "requirements_without_tasks": len(self.requirements_without_tasks()),
@@ -157,7 +164,7 @@ class ArtifactGraph:
             "blocking_gaps": len(self.blocking_gaps()),
             "diff_coverage_runs": len(self.diff_coverage_evidence),
             "unexercised_diff_findings": len(self.diff_coverage_findings()),
-            "open_findings": len(self.open_findings()),
-            "high_critical_open_findings": len(self.open_findings("high")),
+            "open_findings": len(all_open),
+            "high_critical_open_findings": high_critical_open,
             "unconfirmed_high_assumptions": len(self.unconfirmed_high_impact_assumptions()),
         }

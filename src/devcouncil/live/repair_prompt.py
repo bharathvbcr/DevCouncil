@@ -8,8 +8,16 @@ from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import RequirementRepository, TaskRepository
 
 
-def build_live_repair_prompt(project_root: Path, card: CritiqueCard) -> str:
-    """Build a ready-to-paste repair prompt for a live-review critique card."""
+def build_live_repair_prompt(
+    project_root: Path,
+    card: CritiqueCard,
+    requirements: list | None = None,
+) -> str:
+    """Build a ready-to-paste repair prompt for a live-review critique card.
+
+    ``requirements`` may be pre-fetched (e.g. by the bulk builder) to avoid
+    re-querying every requirement once per card. ``None`` fetches them as before.
+    """
     prompt = [
         f"# Repair Live Review Card {card.id}",
         "",
@@ -34,7 +42,7 @@ def build_live_repair_prompt(project_root: Path, card: CritiqueCard) -> str:
     if card.message_for_agent:
         prompt.extend(["", "## Message For Agent", card.message_for_agent])
 
-    task_prompt = _task_prompt(project_root, card.task_id)
+    task_prompt = _task_prompt(project_root, card.task_id, requirements=requirements)
     if task_prompt:
         prompt.extend(["", "## Original DevCouncil Task Contract", task_prompt])
 
@@ -59,17 +67,31 @@ def build_bulk_live_repair_prompt(project_root: Path, cards: list[CritiqueCard])
         "",
         f"DevCouncil found {len(cards)} blocking live-review card(s). Address each card below.",
     ]
+    requirements = _load_all_requirements(project_root)
     for index, card in enumerate(cards, start=1):
         sections.extend([
             "",
             f"---\n\n## Card {index}: {card.id}",
             "",
-            build_live_repair_prompt(project_root, card).strip(),
+            build_live_repair_prompt(project_root, card, requirements=requirements).strip(),
         ])
     return "\n".join(sections).rstrip() + "\n"
 
 
-def _task_prompt(project_root: Path, task_id: str | None) -> str | None:
+def _load_all_requirements(project_root: Path) -> list | None:
+    """Fetch all requirements once; returns None when no DB is available."""
+    db = get_db(project_root)
+    if not db:
+        return None
+    with db.get_session() as session:
+        return RequirementRepository(session).get_all()
+
+
+def _task_prompt(
+    project_root: Path,
+    task_id: str | None,
+    requirements: list | None = None,
+) -> str | None:
     if not task_id:
         return None
     db = get_db(project_root)
@@ -79,5 +101,6 @@ def _task_prompt(project_root: Path, task_id: str | None) -> str | None:
         task = TaskRepository(session).get_by_id(task_id)
         if not task:
             return None
-        requirements = RequirementRepository(session).get_all()
+        if requirements is None:
+            requirements = RequirementRepository(session).get_all()
     return PromptBuilder(project_root).build_task_prompt(task, requirements)

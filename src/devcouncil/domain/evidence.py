@@ -42,6 +42,13 @@ class VerificationEvidence(BaseModel):
     command: str
     status: Literal["passed", "failed", "not_run"]
     evidence_summary: str
+    # HOW the criterion was proven, for auditing the gate's rigor (distinct from the
+    # pass/fail status). ``compiled`` = one DevCouncil per-criterion check passed;
+    # ``vote`` = a majority of independent checks passed (self-consistency);
+    # ``coarse`` = proven only by a passing acceptance-capable command, not a check tied
+    # to the criterion (weakest). Empty for legacy/unspecified evidence. Persisted in the
+    # evidence JSON blob, so adding it needs no migration; old rows default to "".
+    mode: Literal["compiled", "vote", "coarse", ""] = ""
 
 # Backward-compatible alias
 TestEvidence = VerificationEvidence

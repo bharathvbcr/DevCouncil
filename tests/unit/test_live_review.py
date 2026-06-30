@@ -333,3 +333,82 @@ async def test_live_review_service_uses_model_backed_card(tmp_path, monkeypatch)
     assert card.session_id == turn.session_id
     assert card.turn_id == turn.turn_id
     assert card.verdict == "Critical Issues"
+
+
+class _VotingCardProvider(Provider):
+    """Returns a different verdict per call so the reviewer's majority vote can be tested."""
+
+    def __init__(self, verdicts):
+        self.verdicts = verdicts
+        self.calls = 0
+
+    async def complete(self, model, messages, temperature=0.0, json_mode=False, run_id=None, **kwargs):
+        verdict = self.verdicts[min(self.calls, len(self.verdicts) - 1)]
+        self.calls += 1
+        content = json.dumps({
+            "schema": "devcouncil.critique_card.v1",
+            "id": "MODEL-CARD",
+            "session_id": "model-session",
+            "turn_id": "model-turn",
+            "client": "claude",
+            "verdict": verdict,
+            "summary": f"verdict {verdict}",
+            "concerns": ["c"],
+            "alternatives": ["a"],
+            "message_for_agent": "m",
+            "evidence_requests": ["e"],
+        })
+        return LLMResponse(
+            content=content, model=model,
+            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            raw_response={},
+        )
+
+
+def _write_reviewer_samples(tmp_path, samples):
+    (tmp_path / ".devcouncil").mkdir(exist_ok=True)
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        f"verification:\n  reviewer_checks:\n    samples: {samples}\n", encoding="utf-8")
+
+
+async def _voted_card(tmp_path, verdicts):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        json.dumps({"role": "assistant", "id": "A-1", "content": "done"}) + "\n", encoding="utf-8")
+    turn = latest_assistant_turn(transcript)
+    provider = _VotingCardProvider(verdicts)
+    router = ModelRouter(provider, {"live_reviewer": {"model": "mock/card", "temperature": 0.0}})
+    card = await LiveReviewService(router).review(turn, tmp_path, client="claude", use_llm=True)
+    return card, provider
+
+
+@pytest.mark.anyio
+async def test_live_review_vote_deescalates_lone_critical(tmp_path, monkeypatch):
+    # 1 "Critical Issues" + 2 "Concerns": no majority to block -> de-escalates to the
+    # non-blocking "Concerns", so a lone mis-calibrated reviewer cannot false-block.
+    monkeypatch.chdir(tmp_path)
+    _write_reviewer_samples(tmp_path, 3)
+    card, provider = await _voted_card(tmp_path, ["Critical Issues", "Concerns", "Concerns"])
+    assert provider.calls == 3  # three independent samples were actually collected
+    assert card.verdict == "Concerns"
+    assert not card.blocks_completion
+
+
+@pytest.mark.anyio
+async def test_live_review_vote_keeps_majority_critical(tmp_path, monkeypatch):
+    # A real problem the majority agrees on still blocks.
+    monkeypatch.chdir(tmp_path)
+    _write_reviewer_samples(tmp_path, 3)
+    card, provider = await _voted_card(tmp_path, ["Critical Issues", "Critical Issues", "Concerns"])
+    assert provider.calls == 3
+    assert card.verdict == "Critical Issues"
+    assert card.blocks_completion
+
+
+@pytest.mark.anyio
+async def test_live_review_single_sample_calls_once(tmp_path, monkeypatch):
+    # Default (no config -> samples=1) must call the model exactly once (unchanged behavior).
+    monkeypatch.chdir(tmp_path)
+    card, provider = await _voted_card(tmp_path, ["Critical Issues"])
+    assert provider.calls == 1
+    assert card.verdict == "Critical Issues"

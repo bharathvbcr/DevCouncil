@@ -1,13 +1,23 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import sys
 from pathlib import Path
 from mcp.server import Server
+from typing import Any, NamedTuple
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent, Resource
+from mcp.types import (
+    Tool,
+    TextContent,
+    Resource,
+    Prompt,
+    PromptArgument,
+    PromptMessage,
+    GetPromptResult,
+)
 from pydantic import AnyUrl
 from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import (
@@ -40,6 +50,8 @@ from devcouncil.live.cards import filter_cards, get_card, load_cards
 from devcouncil.live.repair_prompt import build_bulk_live_repair_prompt, build_live_repair_prompt
 from devcouncil.integrations.check import integration_status_summary
 from devcouncil.live.summary import live_review_summary
+
+logger = logging.getLogger(__name__)
 
 app = Server("devcouncil")
 _DB_REQUIRED_TOOLS = {
@@ -123,7 +135,7 @@ def _read_log_file(path: str | None) -> str:
         return ""
 
 
-def _git_diff(root: Path, paths: list[str], staged: bool) -> dict[str, object]:
+async def _git_diff(root: Path, paths: list[str], staged: bool) -> dict[str, object]:
     """Compute a (optionally path-scoped, optionally staged) git diff.
 
     Returns {ok, files:[{path,status,additions,deletions}], unified_diff (truncated),
@@ -147,9 +159,12 @@ def _git_diff(root: Path, paths: list[str], staged: bool) -> dict[str, object]:
         )
 
     try:
-        diff_proc = _run(diff_args)
-        numstat_proc = _run(numstat_args)
-        namestatus_proc = _run(namestatus_args)
+        loop = asyncio.get_event_loop()
+        diff_proc, numstat_proc, namestatus_proc = await asyncio.gather(
+            loop.run_in_executor(None, _run, diff_args),
+            loop.run_in_executor(None, _run, numstat_args),
+            loop.run_in_executor(None, _run, namestatus_args),
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"ok": False, "files": [], "unified_diff": "", "truncated": False, "error": str(exc)}
 
@@ -246,11 +261,77 @@ def _lease_ttl_seconds(root: Path) -> int:
         return 1800
 
 
+# Per-resolved-root caches for stateless, construction-heavy objects that several
+# MCP handlers would otherwise rebuild on every request. Keyed by str(root.resolve())
+# so distinct project roots (and distinct test temp dirs) never collide. _reset_caches()
+# clears them for tests that need a clean slate within a single process.
+_ROUTER_CACHE: dict[str, tuple[Any, Any]] = {}
+_AST_MATCHER_CACHE: dict[str, AstMatcher] = {}
+_LSP_INSPECTOR_CACHE: dict[str, LspInspector] = {}
+_GRAPH_ADAPTER_CACHE: dict[str, CodeReviewGraphAdapter] = {}
+
+
+def _reset_caches() -> None:
+    """Drop all per-root MCP caches (router/ast/lsp/graph). For test isolation."""
+    _ROUTER_CACHE.clear()
+    _AST_MATCHER_CACHE.clear()
+    _LSP_INSPECTOR_CACHE.clear()
+    _GRAPH_ADAPTER_CACHE.clear()
+
+
+def _get_ast_matcher(root: Path) -> AstMatcher:
+    key = str(root.resolve())
+    matcher = _AST_MATCHER_CACHE.get(key)
+    if matcher is None:
+        matcher = AstMatcher(root)
+        _AST_MATCHER_CACHE[key] = matcher
+    return matcher
+
+
+def _get_lsp_inspector(root: Path) -> LspInspector:
+    key = str(root.resolve())
+    inspector = _LSP_INSPECTOR_CACHE.get(key)
+    if inspector is None:
+        inspector = LspInspector(root)
+        _LSP_INSPECTOR_CACHE[key] = inspector
+    return inspector
+
+
+def _get_graph_adapter(root: Path) -> CodeReviewGraphAdapter:
+    key = str(root.resolve())
+    adapter = _GRAPH_ADAPTER_CACHE.get(key)
+    if adapter is None:
+        adapter = CodeReviewGraphAdapter(root)
+        _GRAPH_ADAPTER_CACHE[key] = adapter
+    return adapter
+
+
 def _load_router(root: Path):
     """Build a ModelRouter from project config, or return None when no provider key
     is configured. When present, the verifier runs DevCouncil's strong compiled
     per-criterion acceptance checks; when None, it falls back to coarse mode (which
-    the verify response now reports explicitly so the agent is never misled)."""
+    the verify response now reports explicitly so the agent is never misled).
+
+    Cached per resolved project root: a verify_task storm would otherwise rebuild the
+    config+provider+router on every call. The cache is invalidated when config.yaml's
+    stat signature changes, so a long-running server picks up a rewritten config (new
+    provider key / model) instead of serving a stale router. Use _reset_caches() to clear
+    in tests."""
+    key = str(root.resolve())
+    try:
+        cfg_stat = (root / ".devcouncil" / "config.yaml").stat()
+        signature: object = (cfg_stat.st_mtime_ns, cfg_stat.st_size, cfg_stat.st_ino)
+    except OSError:
+        signature = None
+    cached = _ROUTER_CACHE.get(key)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    router = _build_router(root)
+    _ROUTER_CACHE[key] = (signature, router)
+    return router
+
+
+def _build_router(root: Path):
     try:
         from devcouncil.app.config import load_config, get_api_key
         from devcouncil.llm.provider import create_provider, validate_model_provider
@@ -259,7 +340,7 @@ def _load_router(root: Path):
         config = load_config(root)
         validate_model_provider(config.models.provider)
         api_key = get_api_key(config.models.provider, root)
-        provider = create_provider(config.models.provider, api_key, project_root=root)
+        provider = create_provider(config.models.provider, api_key, project_root=root, provider_prefs=config.provider)
         role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
         return ModelRouter(provider, role_config, project_root=root)
     except Exception:
@@ -1095,7 +1176,7 @@ async def read_resource(uri: AnyUrl) -> str:
             task = TaskRepository(session).get_by_id(task_id)
             if not task:
                 return json.dumps({"ok": False, "error": f"Task {task_id} not found."})
-            gaps = [g.model_dump() for g in GapRepository(session).get_all() if g.task_id == task_id]
+            gaps = [g.model_dump() for g in GapRepository(session).get_for_task(task_id)]
         return json.dumps({"task": task.model_dump(), "gaps": gaps}, indent=2)
 
     if key == "devcouncil://knowledge":
@@ -1111,9 +1192,9 @@ async def read_resource(uri: AnyUrl) -> str:
             lines.append(f"## {kind.upper() if kind == 'okf' else kind.capitalize()}")
             lines.append("")
             for source in kind_sources:
-                uri = _knowledge_source_uri(source.kind, source.name)
+                link = _knowledge_source_uri(source.kind, source.name)
                 desc = source.description or source.name
-                lines.append(f"- [{desc}]({uri})")
+                lines.append(f"- [{desc}]({link})")
             lines.append("")
         return "\n".join(lines).strip()
     if key.startswith("devcouncil://knowledge/"):
@@ -1126,12 +1207,173 @@ async def read_resource(uri: AnyUrl) -> str:
     raise ValueError(f"Unknown resource: {uri}")
 
 
+# --- MCP prompts ---------------------------------------------------------------
+# Exposed prompts surface in MCP hosts (Claude Code, Codex, ...) as slash commands
+# (e.g. /mcp__devcouncil__implement_next_task). Each renders an actionable, DevCouncil-
+# aware instruction block — injecting a live status snapshot when the project is
+# initialized, and degrading to pure guidance when it is not. They steer a coding agent
+# through the lease -> read -> edit -> verify -> release loop using the devcouncil_* tools.
+
+class _PromptSpec(NamedTuple):
+    name: str
+    description: str
+    arguments: list[PromptArgument]
+
+
+_PROMPT_SPECS: list[_PromptSpec] = [
+    _PromptSpec(
+        name="devcouncil_implement_next_task",
+        description="Pick up the next unblocked DevCouncil task and implement it through the policy-gated MCP loop.",
+        arguments=[
+            PromptArgument(name="client_id", description="Optional stable client id used for the task lease.", required=False),
+        ],
+    ),
+    _PromptSpec(
+        name="devcouncil_repair_task",
+        description="Repair the blocking verification gaps for a task (defaults to the active running task).",
+        arguments=[
+            PromptArgument(name="task_id", description="Task id, e.g. TASK-001. Defaults to the active task.", required=False),
+        ],
+    ),
+    _PromptSpec(
+        name="devcouncil_verify_task",
+        description="Run DevCouncil verification for a task and report blocking gaps.",
+        arguments=[
+            PromptArgument(name="task_id", description="Task id, e.g. TASK-001. Defaults to the active task.", required=False),
+        ],
+    ),
+    _PromptSpec(
+        name="devcouncil_review_live",
+        description="Review pending live-review critique cards and resolve the blocking ones.",
+        arguments=[
+            PromptArgument(name="task_id", description="Optional task scope for the live-review cards.", required=False),
+        ],
+    ),
+    _PromptSpec(
+        name="devcouncil_project_status",
+        description="Summarize the current DevCouncil project phase, tasks, and blocking gaps.",
+        arguments=[],
+    ),
+    _PromptSpec(
+        name="devcouncil_apply_knowledge",
+        description="Select the ingested project knowledge (OKF + design) that applies to a goal and inject it.",
+        arguments=[
+            PromptArgument(name="goal", description="The task or goal to find applicable project knowledge for.", required=True),
+        ],
+    ),
+]
+
+
+def _status_snapshot(root: Path) -> str:
+    """A short live status block for prompt bodies, or an init hint when uninitialized."""
+    db = get_db(root)
+    if not db:
+        return "DevCouncil is not initialized here yet — run `dev init` first."
+    try:
+        with db.get_session() as session:
+            graph = ArtifactGraphRepository(session).load_graph()
+            summary = graph.coverage_summary()
+            state = StateRepository(session).get_state()
+            phase = compute_phase(graph, state.current_phase if state else None)
+        return (
+            f"Phase: {phase} | "
+            f"tasks: {summary['total_tasks']} | "
+            f"gaps: {summary['total_gaps']} ({summary['blocking_gaps']} blocking)"
+        )
+    except Exception:
+        return "DevCouncil status unavailable."
+
+
+def _render_prompt_text(name: str, arguments: dict, root: Path) -> str:
+    snapshot = _status_snapshot(root)
+    if name == "devcouncil_implement_next_task":
+        client_id = arguments.get("client_id") or "claude-code"
+        return (
+            "You are implementing the next DevCouncil task under policy enforcement.\n\n"
+            f"Project status: {snapshot}\n\n"
+            "Do exactly this:\n"
+            "1. Call `devcouncil_next_task` to get the highest-priority unblocked task.\n"
+            f"2. Call `devcouncil_checkout_task` with that task_id and client_id='{client_id}' to acquire a lease.\n"
+            "3. Read the task scope with `devcouncil_get_task` and `devcouncil_get_prompt`; inspect files with `devcouncil_read_file` and `devcouncil_get_diff`.\n"
+            "4. Make changes ONLY through `devcouncil_write_file` / `devcouncil_apply_patch` (the policy gate rejects out-of-scope or protected paths) and run tests with `devcouncil_run_command`.\n"
+            "5. Call `devcouncil_verify_task`; if it reports blocking gaps, fix them and re-verify.\n"
+            "6. When verified, call `devcouncil_release_task` with the lease token.\n\n"
+            "Never edit files outside the task scope. If a write is rejected, call `devcouncil_update_task_scope` only when the change is legitimately in-scope."
+        )
+    if name == "devcouncil_repair_task":
+        task_id = arguments.get("task_id") or "(the active task)"
+        return (
+            f"Repair the blocking verification gaps for {task_id}.\n\n"
+            f"Project status: {snapshot}\n\n"
+            "1. Call `devcouncil_get_gaps` (blocking_only=true) and `devcouncil_get_next_actions` for the task.\n"
+            "2. Inspect the relevant files and evidence with `devcouncil_read_file` and `devcouncil_get_evidence`.\n"
+            "3. Apply minimal fixes via `devcouncil_apply_patch` / `devcouncil_write_file`.\n"
+            "4. Re-run `devcouncil_verify_task` until no blocking gaps remain, then `devcouncil_release_task`."
+        )
+    if name == "devcouncil_verify_task":
+        task_id = arguments.get("task_id") or "(the active task)"
+        return (
+            f"Run DevCouncil verification for {task_id} and report the result.\n\n"
+            f"Project status: {snapshot}\n\n"
+            "Call `devcouncil_verify_task` (you must hold the task lease via `devcouncil_checkout_task`). "
+            "Summarize the blocking gaps and proposed next actions; do not mark work complete while blocking gaps remain."
+        )
+    if name == "devcouncil_review_live":
+        scope = arguments.get("task_id")
+        scope_line = f" scoped to {scope}" if scope else ""
+        return (
+            f"Review the pending live-review critique cards{scope_line}.\n\n"
+            "1. Call `devcouncil_live_review` for the blocker count and `devcouncil_live_cards` (status='open') for the cards.\n"
+            "2. For each blocking card, call `devcouncil_live_repair_prompt` (or `devcouncil_live_repair_all`) to get a ready-to-apply repair.\n"
+            "3. Apply the fixes through the policy-gated write tools and re-verify."
+        )
+    if name == "devcouncil_project_status":
+        return (
+            "Summarize the DevCouncil project state for the user.\n\n"
+            f"Live snapshot: {snapshot}\n\n"
+            "Call `devcouncil_status` and `devcouncil_report` for the full coverage report, then give a concise "
+            "phase / tasks / blocking-gaps summary and recommend the next action."
+        )
+    if name == "devcouncil_apply_knowledge":
+        goal = arguments.get("goal") or ""
+        return (
+            f"Find and apply the project knowledge that applies to this goal: {goal!r}.\n\n"
+            "Call `devcouncil_select_knowledge` with the goal, then treat the returned preamble as authoritative "
+            "project context (design system + OKF docs) for any code you write toward this goal."
+        )
+    return f"Unknown DevCouncil prompt: {name}"
+
+
+@app.list_prompts()
+async def list_prompts() -> list[Prompt]:
+    return [
+        Prompt(name=spec.name, description=spec.description, arguments=list(spec.arguments))
+        for spec in _PROMPT_SPECS
+    ]
+
+
+@app.get_prompt()
+async def get_prompt(name: str, arguments: dict | None) -> GetPromptResult:
+    spec = next((spec for spec in _PROMPT_SPECS if spec.name == name), None)
+    if spec is None:
+        raise ValueError(f"Unknown prompt: {name}")
+    args = _normalize_arguments(arguments)
+    root = _project_root()
+    text = _render_prompt_text(name, args, root)
+    return GetPromptResult(
+        description=spec.description,
+        messages=[PromptMessage(role="user", content=TextContent(type="text", text=text))],
+    )
+
+
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     arguments = _normalize_arguments(arguments)
+    logger.info("MCP call_tool: %s args=%s", name, sorted(arguments) if isinstance(arguments, dict) else arguments)
     root = _project_root()
     db = get_db(root)
     if name in _DB_REQUIRED_TOOLS and not db:
+        logger.warning("MCP tool %s rejected: project not initialized at %s", name, root)
         return _error_text("DevCouncil not initialized in this directory.", code="not_initialized")
 
     if name == "devcouncil_integration_status":
@@ -1267,9 +1509,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         task_id, arg_error = _required_string_argument(arguments, "task_id")
         if arg_error:
             return arg_error
+        assert task_id is not None  # _required_string_argument returns a value when arg_error is None
         blocking_only = bool(arguments.get("blocking_only", False))
         with db.get_session() as session:
-            gaps = [g for g in GapRepository(session).get_all() if g.task_id == task_id]
+            gaps = GapRepository(session).get_for_task(task_id)
         if blocking_only:
             gaps = [g for g in gaps if g.blocking]
         return _json_text({
@@ -1286,7 +1529,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return arg_error
         assert task_id is not None
         with db.get_session() as session:
-            gaps = [g for g in GapRepository(session).get_all() if g.task_id == task_id]
+            gaps = GapRepository(session).get_for_task(task_id)
             task = TaskRepository(session).get_by_id(task_id)
         blocking_actions, advisory_actions = split_next_actions(gaps)
         has_blocking = any(g.blocking for g in gaps)
@@ -1399,11 +1642,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         files = arguments.get("files", [])
         if not isinstance(files, list):
             files = []
-        context = CodeReviewGraphAdapter(root).get_context([file for file in files if isinstance(file, str)])
+        context = _get_graph_adapter(root).get_context([file for file in files if isinstance(file, str)])
         return [TextContent(type="text", text=context.model_dump_json(indent=2))]
 
     elif name == "devcouncil_lsp_status":
-        return [TextContent(type="text", text=LspInspector(root).summary_json())]
+        return [TextContent(type="text", text=_get_lsp_inspector(root).summary_json())]
 
     elif name == "devcouncil_ast_match":
         query = _optional_string_argument(arguments, "query")
@@ -1413,7 +1656,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if value == "":
                 return _error_text(f"{arg_name} must be a string", code="invalid_arguments", argument=arg_name)
         limit = _int_argument(arguments, "limit", 100, minimum=1, maximum=500)
-        matches = AstMatcher(root).match(
+        matches = _get_ast_matcher(root).match(
             query=query or "",
             language=language,
             kind=kind,
@@ -1508,7 +1751,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 # The task is now leased and running-ready: surface the inner-loop tools.
                 "allowed_next_tools": _allowed_next_tools(
                     "running",
-                    any(g.blocking for g in GapRepository(session).get_all() if g.task_id == task_id),
+                    bool(GapRepository(session).get_blocking_for_task(task_id)),
                 ),
             })
 
@@ -2008,7 +2251,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 p = planned.path.replace("\\", "/")
                 if p not in scope_paths:
                     scope_paths.append(p)
-        return _json_text(_git_diff(root, scope_paths, staged_value))
+        return _json_text(await _git_diff(root, scope_paths, staged_value))
 
     elif name == "devcouncil_get_evidence":
         assert db is not None
@@ -2256,6 +2499,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "note": f"knowledge unavailable: {exc}",
             })
 
+    logger.warning("MCP unknown tool requested: %s", name)
     return _error_text(f"Unknown tool: {name}", code="unknown_tool", tool=name)
 
 async def run():

@@ -1462,8 +1462,11 @@ def test_cli_integrate_hooks_apply_writes_native_hook_files(tmp_path):
     cursor_hooks = json.loads((tmp_path / ".cursor" / "hooks.json").read_text(encoding="utf-8"))
     assert "PreToolUse" in codex_hooks["hooks"]
     assert "BeforeTool" in gemini_settings["hooks"]
-    assert "PreToolUse" in claude_settings["hooks"]
+    # Claude installs assist-mode hooks by default (no blocking write-gate). The lifecycle
+    # hooks are present; PreToolUse/PostToolUse only land with --write-gate.
     assert "Stop" in claude_settings["hooks"]
+    assert "SessionStart" in claude_settings["hooks"]
+    assert "PreToolUse" not in claude_settings["hooks"]
     assert "agent-response" in json.dumps(claude_settings)
     assert "preToolUse" in cursor_hooks["hooks"]
     assert "postToolUse" in cursor_hooks["hooks"]

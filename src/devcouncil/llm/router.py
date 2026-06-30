@@ -1,8 +1,10 @@
 from typing import List, Dict, Any, Type, Optional, TypeVar
 import copy
+import functools
 import json
 import logging
 import asyncio
+import time
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -13,6 +15,11 @@ from devcouncil.telemetry.traces import TraceLogger
 
 logger = logging.getLogger(__name__)
 StructuredModel = TypeVar("StructuredModel", bound=BaseModel)
+
+
+@functools.lru_cache(maxsize=128)
+def _cached_schema_json(schema_class) -> str:
+    return json.dumps(schema_class.model_json_schema(), indent=2)
 
 
 class StructuredOutputError(RuntimeError):
@@ -42,6 +49,12 @@ class ModelRouter:
         self.provider = provider
         self.role_config = role_config
         self.project_root = project_root
+        # LLMCache and TraceLogger do disk I/O (mkdir) in their constructors, so build
+        # them once here and reuse across calls. TelemetryTracker is deliberately *not*
+        # hoisted: it is constructed per-call so log_usage's reload-before-save stays
+        # concurrent-write safe.
+        self._cache = LLMCache(self.project_root)
+        self._traces = TraceLogger(self.project_root)
         # Lazily-built providers for roles that override ``models.provider`` with
         # their own ``provider:`` (e.g. live_reviewer on Ollama while planners run
         # on OpenRouter). Keyed by normalized provider name; the default provider
@@ -66,8 +79,19 @@ class ModelRouter:
         normalized = validate_model_provider(role_provider)
         if normalized not in self._role_providers:
             api_key = get_api_key(normalized, self.project_root)
+            # An override to OpenRouter must still honor the project's provider-routing
+            # prefs (sort/allow_fallbacks/data_collection); other providers ignore them.
+            # Best-effort: a missing/invalid config just yields default routing.
+            prefs = None
+            if normalized == "openrouter":
+                try:
+                    from devcouncil.app.config import load_config
+
+                    prefs = load_config(self.project_root).provider
+                except Exception:
+                    prefs = None
             self._role_providers[normalized] = create_provider(
-                normalized, api_key, project_root=self.project_root
+                normalized, api_key, project_root=self.project_root, provider_prefs=prefs
             )
         return self._role_providers[normalized]
 
@@ -123,6 +147,23 @@ class ModelRouter:
                         except Exception:
                             break
         return text
+
+    @staticmethod
+    def _looks_like_schema_echo(text: str) -> bool:
+        """True when the model returned the JSON *schema* instead of an instance.
+
+        Weaker/local models sometimes parrot the schema document we showed them
+        (``{"$defs": ..., "properties": ..., "type": "object"}``). That parses as JSON
+        but never validates, so detecting it lets the healing retry give a pointed
+        correction instead of the generic "fix your JSON" nudge."""
+        try:
+            obj = json.loads(text)
+        except Exception:
+            return False
+        if not isinstance(obj, dict):
+            return False
+        markers = {"$schema", "$defs", "properties", "additionalProperties", "$ref"}
+        return bool(markers & set(obj.keys()))
 
     async def _complete_with_retry(
         self,
@@ -180,9 +221,17 @@ class ModelRouter:
         # Deep-copy to avoid mutating the caller's messages list
         msgs = copy.deepcopy(messages)
         
-        # Add schema instructions to system or user message
-        schema_json = json.dumps(schema.model_json_schema(), indent=2)
-        instruction = f"\n\nYou MUST output a JSON object matching this schema:\n{schema_json}"
+        # Add schema instructions to system or user message. Spell out "instance, not
+        # the schema" explicitly: weaker/local models otherwise sometimes echo the schema
+        # document back (``{"$defs": ..., "properties": ..., "type": "object"}``), which
+        # parses as JSON but fails validation and wastes a healing round.
+        schema_json = _cached_schema_json(schema)
+        instruction = (
+            "\n\nYou MUST output a single JSON object that is an INSTANCE of this schema — "
+            "real values for each field. Do NOT output the schema itself; never include "
+            'keys like "$defs", "$schema", "properties", or "type".\nSchema:\n'
+            f"{schema_json}"
+        )
         
         found_system = False
         for msg in msgs:
@@ -196,9 +245,9 @@ class ModelRouter:
 
         logger.info("LLM call: role=%s model=%s run_id=%s", role, model, run_id)
 
-        cache = LLMCache(self.project_root)
+        cache = self._cache
         tracker = TelemetryTracker(self.project_root)
-        traces = TraceLogger(self.project_root)
+        traces = self._traces
 
         # Provider knobs (e.g. Ollama num_ctx / base_url) that change the output for an
         # identical prompt must be part of the cache key, else raising OLLAMA_NUM_CTX
@@ -211,10 +260,12 @@ class ModelRouter:
         response = cache.get(model, msgs, temp, True, provider_fp)
         cache_hit = response is not None
 
+        started = time.monotonic()
         if not response:
             response = await self._complete_with_retry(
                 model=model, messages=msgs, temperature=temp, run_id=run_id, provider=provider
             )
+        elapsed = time.monotonic() - started
 
         if response is None:
             raise RuntimeError(f"LLM request for role {role} did not return a response.")
@@ -222,9 +273,12 @@ class ModelRouter:
         if not cache_hit:
             tracker.log_usage(model, response.usage, local=provider_local)
 
+        # Include latency + cache status: on a slow (e.g. local) model this is what tells
+        # you *which* call dominated a multi-minute planning/verification stage.
         logger.info(
-            "LLM response: role=%s model=%s tokens=%s",
+            "LLM response: role=%s model=%s tokens=%s %s",
             role, response.model, response.usage,
+            "cache_hit" if cache_hit else f"{elapsed:.1f}s",
         )
         
         try:
@@ -250,13 +304,23 @@ class ModelRouter:
                 summary=f"Structured response parse failed for {role}; attempting repair.",
             )
             
-            # Healing attempt: Ask the model to fix its own JSON
+            # Healing attempt: Ask the model to fix its own JSON. If it echoed the schema
+            # back instead of an instance, say so explicitly — the generic "fix it" nudge
+            # otherwise tends to produce the schema again.
+            echo_hint = ""
+            if self._looks_like_schema_echo(self._extract_json(response.content)):
+                echo_hint = (
+                    "\nIMPORTANT: You returned the JSON *schema* (it contains keys like "
+                    '"$defs"/"properties"/"type"), not a value. Return a concrete INSTANCE: '
+                    "a JSON object whose keys are the schema's property names, each with a "
+                    "real value of the correct type."
+                )
             healing_prompt = f"""
 The following JSON was returned but failed to parse or validate against the schema.
 Error: {str(e)}
 Content:
 {response.content}
-
+{echo_hint}
 Please return the corrected JSON object only. No prose.
 """
             # The healing completion runs INSIDE this try (with the same retry/backoff as
@@ -305,15 +369,17 @@ Please return the corrected JSON object only. No prose.
                         "(attempt %d/%d).",
                         role, _attempt + 2, self.STRUCTURED_ATTEMPTS,
                     )
-                    strict_messages = copy.deepcopy(messages)
-                    strict_messages.insert(0, {
-                        "role": "system",
-                        "content": (
-                            "Respond with a single valid JSON object only — no prose, no "
-                            "markdown fences, no trailing text. It must parse with a strict "
-                            "JSON parser and match the requested schema."
-                        ),
-                    })
+                    strict_messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Respond with a single valid JSON object only — no prose, no "
+                                "markdown fences, no trailing text. It must parse with a strict "
+                                "JSON parser and match the requested schema."
+                            ),
+                        },
+                        *messages,
+                    ]
                     return await self.complete_structured(
                         role,
                         strict_messages,

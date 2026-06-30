@@ -1,3 +1,4 @@
+import logging
 import subprocess
 from pathlib import Path
 from rich.console import Console
@@ -7,6 +8,7 @@ from devcouncil.execution.executor import Executor, ExecutionResult
 from devcouncil.execution.prompt_builder import PromptBuilder
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 class OpenHandsExecutor(Executor):
     def __init__(self, project_root: Path):
@@ -16,6 +18,7 @@ class OpenHandsExecutor(Executor):
         builder = PromptBuilder(self.project_root)
         task_prompt = builder.build_task_prompt(task, requirements)
         
+        logger.info("OpenHands starting for %s", task.id)
         console.print(f"Starting [bold]OpenHands[/bold] for task {task.id}...")
         
         # OpenHands often expects a workspace mount and an instruction.
@@ -48,10 +51,13 @@ class OpenHandsExecutor(Executor):
             )
             self._write_log(task.id, result)
             if result.returncode != 0:
+                logger.error("OpenHands exited %s for %s", result.returncode, task.id)
                 console.print(f"[red]OpenHands exited with {result.returncode}.[/red]")
                 return ExecutionResult(success=False, message=f"Exited with code {result.returncode}")
+            logger.info("OpenHands finished for %s", task.id)
             return ExecutionResult(success=True, message="Completed successfully")
         except Exception as e:
+            logger.exception("OpenHands error for %s: %s", task.id, e)
             console.print(f"[red]Error running OpenHands: {e}[/red]")
             return ExecutionResult(success=False, message=str(e))
 

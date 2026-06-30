@@ -1,7 +1,10 @@
+import logging
 import re
 import subprocess
 from pathlib import Path
 from devcouncil.app.errors import ExecutionError
+
+logger = logging.getLogger(__name__)
 
 
 class PatchEngine:
@@ -66,8 +69,11 @@ class PatchEngine:
                     errors="replace",
                 )
                 if proc.returncode == 0:
+                    logger.info("Patch applied (git apply %s)", " ".join(extra_args) or "strict")
                     return True
                 last_stderr = (proc.stderr or "").strip()
+                logger.debug("git apply %s failed: %s", " ".join(extra_args) or "strict", last_stderr)
+            logger.error("Patch failed after all fallbacks: %s", last_stderr or "(no detail)")
             raise ExecutionError(
                 "Failed to apply patch even with whitespace/3-way fallbacks. "
                 f"git reported: {last_stderr or '(no detail)'}"

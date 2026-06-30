@@ -1,3 +1,4 @@
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -8,6 +9,7 @@ from devcouncil.execution.executor import Executor, ExecutionResult
 from devcouncil.execution.prompt_builder import PromptBuilder
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 class MiniSWEExecutor(Executor):
     def __init__(self, project_root: Path):
@@ -22,6 +24,7 @@ class MiniSWEExecutor(Executor):
         instruction_file.parent.mkdir(parents=True, exist_ok=True)
         instruction_file.write_text(task_prompt, encoding="utf-8")
         
+        logger.info("mini-SWE-agent starting for %s", task.id)
         console.print(f"Starting [bold]mini-SWE-agent[/bold] for task {task.id}...")
         
         # In a real implementation, we'd invoke the agent CLI
@@ -50,10 +53,13 @@ class MiniSWEExecutor(Executor):
             )
             self._write_log(task.id, result)
             if result.returncode != 0:
+                logger.error("mini-SWE-agent exited %s for %s", result.returncode, task.id)
                 console.print(f"[red]mini-SWE-agent exited with {result.returncode}.[/red]")
                 return ExecutionResult(success=False, message='Execution failed')
+            logger.info("mini-SWE-agent finished for %s", task.id)
             return ExecutionResult(success=True, message='Execution successful')
         except Exception as e:
+            logger.exception("mini-SWE-agent error for %s: %s", task.id, e)
             console.print(f"[red]Error running mini-SWE-agent: {e}[/red]")
             return ExecutionResult(success=False, message='Execution failed')
 

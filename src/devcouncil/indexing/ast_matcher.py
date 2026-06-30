@@ -71,12 +71,13 @@ class AstMatcher:
         language: str | None = None,
         kind: str | None = None,
         limit: int = 100,
+        files: list[Path] | None = None,
     ) -> list[AstMatch]:
         language = language.lower() if language else None
         kind = kind.lower() if kind else None
         limit = max(1, limit)
         matches: list[AstMatch] = []
-        for path in self._candidate_files(language):
+        for path in self._candidate_files(language, files):
             try:
                 text = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
@@ -88,22 +89,31 @@ class AstMatcher:
                 return matches[:limit]
         return matches[:limit]
 
-    def _candidate_files(self, language: str | None) -> list[Path]:
+    def _candidate_files(self, language: str | None, files: list[Path] | None = None) -> list[Path]:
         allowed_exts = {
             ext for ext, ext_language in self._EXT_LANGUAGE.items()
             if language is None or ext_language == language
         }
-        files: list[Path] = []
+        # When the caller already walked the tree (e.g. SemanticIndex.create_snapshot
+        # shares one traversal across all collectors), filter that list in memory
+        # instead of re-globbing. The filter is identical to the rglob path below.
+        if files is not None:
+            return sorted(
+                path for path in files
+                if path.is_file() and path.suffix.lower() in allowed_exts
+                and not any(part in self._IGNORED_DIRS for part in path.parts)
+            )
+        candidates: list[Path] = []
         try:
             for path in self.project_root.rglob("*"):
                 if not path.is_file() or path.suffix.lower() not in allowed_exts:
                     continue
                 if any(part in self._IGNORED_DIRS for part in path.parts):
                     continue
-                files.append(path)
+                candidates.append(path)
         except OSError:
-            return files
-        return sorted(files)
+            return candidates
+        return sorted(candidates)
 
     def _match_file(self, rel: str, language: str, text: str, *, query: str, kind: str | None) -> list[AstMatch]:
         if language == "python":

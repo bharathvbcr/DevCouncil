@@ -12,8 +12,21 @@ def live_review_summary(project_root: Path, task_id: str | None = None) -> dict:
     signals = load_signals(project_root)
     active_id = active_task_id(project_root)
     scoped_task_id = task_id or active_id
-    blockers = unresolved_blocking_cards(project_root, task_id=scoped_task_id)
+    blockers = unresolved_blocking_cards(project_root, task_id=scoped_task_id, cards=cards)
     pending_signal_items = [signal.model_dump() for signal in signals]
+    open_count = 0
+    resolved_count = 0
+    ignored_count = 0
+    critical_open_count = 0
+    for card in cards:
+        if card.status == "open":
+            open_count += 1
+            if card.verdict == "Critical Issues":
+                critical_open_count += 1
+        elif card.status == "resolved":
+            resolved_count += 1
+        elif card.status == "ignored":
+            ignored_count += 1
     return {
         "active_task_id": active_id,
         "scope_task_id": scoped_task_id,
@@ -21,13 +34,10 @@ def live_review_summary(project_root: Path, task_id: str | None = None) -> dict:
         "pending_signal_items": pending_signal_items[:10],
         "cards": {
             "total": len(cards),
-            "open": len([card for card in cards if card.status == "open"]),
-            "resolved": len([card for card in cards if card.status == "resolved"]),
-            "ignored": len([card for card in cards if card.status == "ignored"]),
-            "critical_open": len([
-                card for card in cards
-                if card.status == "open" and card.verdict == "Critical Issues"
-            ]),
+            "open": open_count,
+            "resolved": resolved_count,
+            "ignored": ignored_count,
+            "critical_open": critical_open_count,
         },
         "blocking_cards": [card.model_dump() for card in blockers],
         "recent_cards": [card.model_dump() for card in cards[:5]],

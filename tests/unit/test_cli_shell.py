@@ -1,4 +1,5 @@
 import subprocess
+import sys
 
 from sqlmodel import select
 from typer.testing import CliRunner
@@ -11,6 +12,11 @@ from devcouncil.storage.models import ShellCommandEventModel, ShellSessionModel,
 from devcouncil.storage.repositories import TaskRepository
 
 runner = CliRunner()
+
+# Use the interpreter actually running the tests — a bare "python" is not present on
+# every host (e.g. systems that only install "python3"), which would otherwise make the
+# command exit non-zero for an environment reason unrelated to what these tests check.
+_PY = sys.executable
 
 
 def _setup_task(tmp_path, allowed_commands):
@@ -38,18 +44,18 @@ def test_shell_registered_in_help():
 
 
 def test_shell_runs_allowed_command_and_records_session(tmp_path):
-    db = _setup_task(tmp_path, allowed_commands=["python --version"])
+    db = _setup_task(tmp_path, allowed_commands=[f"{_PY} --version"])
 
     result = runner.invoke(
         app,
-        ["shell", "TASK-001", "--command", "python --version", "--project-root", str(tmp_path)],
+        ["shell", "TASK-001", "--command", f"{_PY} --version", "--project-root", str(tmp_path)],
     )
 
     assert result.exit_code == 0
     with db.get_session() as session:
         events = session.exec(select(ShellCommandEventModel)).all()
         assert len(events) == 1
-        assert events[0].command == "python --version"
+        assert events[0].command == f"{_PY} --version"
         assert events[0].status == "finished"
         assert events[0].exit_code == 0
         shell_sessions = session.exec(select(ShellSessionModel)).all()
