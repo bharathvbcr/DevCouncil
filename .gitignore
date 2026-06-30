@@ -99,12 +99,23 @@ docs/superpowers/plans/
 *.tmp
 *.temp
 *.log
+*.log.*
 *.dmp
 *.dump
 *.bak
 *.swp
 .DS_Store
 Thumbs.db
+
+# Crash, core, heap, and profile dumps
+*.out
+*.stackdump
+core.[0-9]*
+*.hprof
+*.heapsnapshot
+*.prof
+*.pstats
+*.lprof
 
 # Temporary, log, and dump directories
 logs/
