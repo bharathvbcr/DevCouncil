@@ -14,13 +14,13 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-logger = logging.getLogger(__name__)
-
 from devcouncil.app.config import DevCouncilConfig, load_config
 from devcouncil.domain.task import Task
 from devcouncil.storage.db import get_db
 from devcouncil.storage.native import VerificationRunRepository
 from devcouncil.verification.verifier import Verifier
+
+logger = logging.getLogger(__name__)
 
 
 class SandboxResult(BaseModel):
