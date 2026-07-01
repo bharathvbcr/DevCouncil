@@ -1,6 +1,6 @@
 {
   "name": "devcouncil",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Gated orchestrator for AI-assisted software development",
   "license": "Apache-2.0",
   "homepage": "https://github.com/bharathvbcr/DevCouncil#readme",
