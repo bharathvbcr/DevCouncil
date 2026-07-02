@@ -15,7 +15,7 @@ For coding agents that need one entrypoint instead of the task-by-task sidecar l
 dev e2e "Describe the implementation goal" --executor codex
 ```
 
-`dev e2e` and `dev go` share the same end-to-end implementation: plan, execute, verify, report. If `--executor` is omitted, they use `execution.default_executor` from `.devcouncil/config.yaml`.
+`dev e2e` and `dev go` share the same end-to-end implementation: plan, execute, verify, report. If `--executor` is omitted, they use `execution.default_executor` from `.devcouncil/config.yaml`. When planning leaves advisory gaps, `dev e2e` stops until you run `dev approve` or re-run with `--force`.
 
 For machine-readable integration, add `--agent` with the selected automated executor. It enables JSON report output and writes `.devcouncil/reports/latest.json`.
 
@@ -25,7 +25,7 @@ For machine-readable integration, add `--agent` with the selected automated exec
 dev plan "Add password reset with expiring single-use tokens"
 ```
 
-DevCouncil maps the repository, drafts requirements, runs planner and critic roles, and stores an approved task graph locally.
+DevCouncil maps the repository, drafts requirements, runs planner and critic roles, and stores the task graph locally. If all plan gates pass, the project moves to `PLAN_APPROVED` automatically. When advisory gaps remain, the phase stays `AWAITING_USER_DECISIONS` until you approve the plan.
 
 Inspect the plan:
 
@@ -33,6 +33,13 @@ Inspect the plan:
 dev status
 dev tasks
 dev show TASK-001
+```
+
+If `dev status` shows `AWAITING_USER_DECISIONS`, approve before running tasks:
+
+```bash
+dev approve              # accept the generated plan
+dev approve --force      # approve even when blocking gate gaps remain
 ```
 
 ## 2. Start One Task
@@ -60,6 +67,12 @@ dev verify TASK-001
 ```
 
 Verification records evidence and marks the task as either `verified` or `blocked`.
+
+For a quick deterministic gate without a planned task (no provider keys):
+
+```bash
+dev check --verify --goal "reset tokens are single-use" --test "pytest tests/test_auth.py -q"
+```
 
 Inspect the result:
 

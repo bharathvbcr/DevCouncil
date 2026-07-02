@@ -22,7 +22,12 @@ on-ramp are Stable; the MCP transport and hooks that carry the loop are still ma
 | **Artifact Graph** | Stable: coverage engine and report generation |
 | **Council Debate** | Stable: multi-agent planning, critique, arbitration |
 | **Manual Executor** | Stable: sidecar mode |
-| **Coding CLI Executors** | Preview: Codex, Gemini, Claude, OpenCode, Antigravity, Warp, Cursor Agent, Aider, and configured CLI agents |
+| **Coding CLI Executors** | Preview: Codex, Gemini, Claude, OpenCode, Antigravity, Warp, Cursor Agent, Aider, Copilot, Goose, Amp, Qwen, Crush, and configured CLI agents |
+| **Ollama (local provider)** | Stable: offline planning and council roles via local Ollama models; no API key required |
+| **Engineering Skills** | Stable: `dev skills` listing/scaffolding; skills embedded in `dev prompt` and planning context |
+| **OKF & design.md** | Preview: `dev okf export`/`ingest`/`validate`/`html`; `dev design lint`/`export`/`check`; OKF ↔ skills bridge |
+| **CI Scaffolding** | Preview: `dev scaffold-ci` writes a starter GitHub Actions workflow from configured commands |
+| **Cost & Run Telemetry** | Stable: `dev cost show` reads local model-call ledger; `dev runs list`/`show` inspects coding-agent run manifests |
 | **Security Scanning** | Stable: secret redaction and detection |
 | **Diff↔Coverage Gate** | Stable: proves the changed lines were exercised by tests; signal-first, opt-in blocking (`verification.diff_coverage`) |
 | **Next-Actions Contract** | Stable: typed, machine-routable repair steps from `dev verify --json`, `dev check --json`, and MCP `verify_task` |

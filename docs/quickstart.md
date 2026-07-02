@@ -2,13 +2,13 @@
 
 This is the shortest path for a new developer who wants to install DevCouncil, initialize a repository, connect a coding CLI, and run the first gated task.
 
-Run DevCouncil commands in a normal terminal from the root of the repository you want DevCouncil to manage. Do not run these commands inside the coding CLI chat. Later, you paste the generated `dev prompt TASK-ID` output into Codex, Gemini, Claude Code, OpenCode, Antigravity, Warp, Cursor, Aider, or another registered CLI agent.
+Run DevCouncil commands in a normal terminal from the root of the repository you want DevCouncil to manage. Do not run these commands inside the coding CLI chat. Later, you paste the generated `dev prompt TASK-ID` output into Codex, Gemini, Claude Code, OpenCode, Antigravity, Warp, Cursor, Aider, Copilot, Goose, Amp, Qwen, Crush, or another registered CLI agent.
 
 ## Where To Run Commands
 
 | Place | Run |
 | :--- | :--- |
-| Terminal at the target repo root | `dev setup`, `dev plan`, `dev run`, `dev prompt`, `dev verify` |
+| Terminal at the target repo root | `dev setup`, `dev plan`, `dev approve`, `dev run`, `dev prompt`, `dev verify`, `dev check` |
 | Coding CLI chat | Only paste the generated `dev prompt TASK-ID` output |
 | Terminal outside the target repo | Add `--project-root path/to/project` |
 
@@ -92,7 +92,18 @@ To choose models during initialization, pass one model for every role, then add 
 dev setup --provider vertexai --model YOUR_DEFAULT_MODEL --role-model critic_a=YOUR_CRITIC_MODEL
 ```
 
-Current model-backed DevCouncil commands support the `openrouter`, `vertexai`, and `doubleword` providers.
+Current model-backed DevCouncil commands support the `openrouter`, `vertexai`, `doubleword`, and `ollama` providers.
+
+For fully offline local runs with [Ollama](https://ollama.com) (no API key):
+
+```bash
+brew install ollama && ollama serve   # macOS; see README for other platforms
+ollama pull qwen2.5-coder:32b         # use the size `dev doctor` recommends for your RAM
+export OLLAMA_NUM_CTX=16384           # planning prompts need a raised context window
+dev setup --provider ollama           # auto-selects the model for your RAM
+```
+
+See [Model routing](model-routing.md) for the RAM-to-model table and provider details.
 
 Vertex AI uses a Google Cloud access token plus project configuration:
 
@@ -120,7 +131,7 @@ dev setup --integrate
 
 Fresh interactive setup prompts to apply supported coding CLI integrations immediately. Use `dev setup --skip-integrations` to defer that step.
 
-`dev run --executor <client>` can be used for supported direct CLI execution modes (`codex`, `gemini`, `claude`, `opencode`, `antigravity`, `warp`, configured custom CLI agents, and their aliases), and it now performs verification after the tool exits.
+`dev run --executor <client>` can be used for supported direct CLI execution modes (`codex`, `gemini`, `claude`, `opencode`, `antigravity`, `warp`, `cursor`, `aider`, `copilot`, `goose`, `amp`, `qwen`, `crush`, configured custom CLI agents, and their aliases), and it now performs verification after the tool exits.
 
 To apply supported MCP integrations for detected clients:
 
@@ -142,7 +153,9 @@ For a coding agent or CI-style integration with a supported executor installed, 
 dev e2e "Add password reset with expiring single-use tokens" --executor codex
 ```
 
-This is equivalent to `dev go`: it auto-initializes DevCouncil state if needed, plans the goal, executes approved tasks with the selected executor, verifies each task, and prints the final report. If `--executor` is omitted, DevCouncil uses `execution.default_executor` from `.devcouncil/config.yaml`. Use `--executor gemini`, `--executor claude`, `--executor opencode`, `--executor antigravity`, `--executor warp`, `--executor native-preview`, `--executor mini`, or `--executor openhands` when that executor is installed and configured.
+This is equivalent to `dev go`: it auto-initializes DevCouncil state if needed, plans the goal, executes approved tasks with the selected executor, verifies each task, and prints the final report. If `--executor` is omitted, DevCouncil uses `execution.default_executor` from `.devcouncil/config.yaml`. Use `--executor gemini`, `--executor claude`, `--executor opencode`, `--executor antigravity`, `--executor warp`, `--executor cursor`, `--executor aider`, `--executor copilot`, `--executor goose`, `--executor amp`, `--executor qwen`, `--executor crush`, `--executor native-preview`, `--executor mini`, or `--executor openhands` when that executor is installed and configured.
+
+If planning raises advisory gaps and `dev e2e` stops with no approved tasks, review `dev status` and run `dev approve` (or re-run with `--force` to proceed past advisory planning gaps automatically).
 
 For coding agents that should avoid scraping terminal output, write the final JSON report to a file:
 
@@ -155,6 +168,14 @@ Create a plan:
 
 ```bash
 dev plan "Add password reset with expiring single-use tokens"
+```
+
+If the plan passes all gates, DevCouncil moves to `PLAN_APPROVED` automatically. When advisory gaps remain (common — critique findings, clarifying questions), the project stays in `AWAITING_USER_DECISIONS` until you approve:
+
+```bash
+dev status
+dev approve              # accept the generated plan and unblock tasks
+dev approve --force      # approve even when blocking gate gaps remain
 ```
 
 Pick one task:
@@ -180,8 +201,15 @@ dev run TASK-001 --executor claude
 dev run TASK-001 --executor opencode
 dev run TASK-001 --executor antigravity
 dev run TASK-001 --executor warp
+dev run TASK-001 --executor cursor
+dev run TASK-001 --executor aider
+dev run TASK-001 --executor copilot
+dev run TASK-001 --executor goose
+dev run TASK-001 --executor amp
+dev run TASK-001 --executor qwen
+dev run TASK-001 --executor crush
 ```
-Aliases such as `codex-cli`, `gemini-cli`, `claude-code`, `claude-cli`, `opencode-cli`, `open-code`, `antigravity-cli`, `agy`, `agy-cli`, `warp-cli`, `oz`, and `oz-cli` are also accepted for direct DevCouncil execution mode.
+Aliases such as `codex-cli`, `gemini-cli`, `claude-code`, `claude-cli`, `opencode-cli`, `open-code`, `antigravity-cli`, `agy`, `agy-cli`, `warp-cli`, `oz`, `oz-cli`, `cursor-agent`, `cursor-cli`, `copilot-cli`, `github-copilot`, `goose-cli`, `amp-cli`, `qwen-code`, and `crush-cli` are also accepted for direct DevCouncil execution mode.
 
 To bring your own CLI agent:
 
@@ -202,12 +230,22 @@ After the coding CLI edits files, verify the task:
 dev verify TASK-001
 ```
 
+For a quick deterministic gate without planning (no provider keys), audit the working tree directly:
+
+```bash
+dev check --verify --goal "password reset tokens are single-use" --test "pytest tests/test_auth.py -q"
+```
+
 Optional live inspection surfaces:
 
 ```bash
 dev dashboard --open
+dev cost show
+dev runs list
 dev lsp inspect
 dev ast match "target_symbol"
+dev skills
+dev scaffold-ci
 ```
 
 To publish the final report back to a review thread, set the provider environment variables and run one of:

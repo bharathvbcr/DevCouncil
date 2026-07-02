@@ -1,17 +1,5 @@
 # Artifact Graph
 
-The Artifact Graph is DevCouncil's core data structure. It connects the "why" (requirements) to the "what" (tasks) and the "proof" (evidence/gaps).
+The canonical artifact-graph documentation lives at [architecture/artifact-graph.md](architecture/artifact-graph.md).
 
-```mermaid
-graph TD;
-    Requirement-->AcceptanceCriterion;
-    Requirement-->Task;
-    Task-->PlannedFile;
-    Task-->ChangedFile;
-    Task-->TestEvidence;
-    Task-->CommandResult;
-    Requirement-->Gap;
-    Task-->Gap;
-```
-
-This graph enables structural querying of test coverage, unmodified files, orphan diffs, and missing evidence.
+That page describes node types (requirements, acceptance criteria, tasks, planned/changed files, evidence, gaps), the ER relationships, and SQLite persistence under `.devcouncil/state.sqlite`.

@@ -4,19 +4,27 @@
 dev init                    # Initialize DevCouncil in a repo
 dev init --provider vertexai --model YOUR_MODEL_ID # Initialize with one model for every role
 dev init --provider doubleword --model YOUR_MODEL_ID # Doubleword drop-in OpenAI-compatible provider
+dev init --provider ollama --model qwen2.5-coder:32b # Local Ollama provider (no API key)
 dev init --role-model planner_b=YOUR_MODEL_ID # Override one role model during init
 dev setup                   # Initialize, run doctor, offer first-run integrations, and print next steps
 dev doctor                  # Check dependencies and environment
 dev version                 # Display the installed DevCouncil version
 dev e2e "goal" --executor codex # Plan, execute, verify, and report in one command
 dev e2e "goal" --executor codex --agent # Agent preset: JSON plus .devcouncil/reports/latest.json
+dev e2e "goal" --executor codex --force  # Proceed past advisory planning gaps automatically
 dev e2e "goal" --executor codex --json --report-file .devcouncil/reports/latest.json # Write machine-readable report
 dev go "goal" --executor codex # Short alias for dev e2e
-dev map "goal"              # Map repo context for a goal
+dev map                     # Build the deterministic repository map (no LLM)
+dev scaffold-ci             # Write a starter .github/workflows/devcouncil.yml from configured commands
+dev scaffold-ci --force     # Overwrite an existing devcouncil.yml workflow
 dev plan "goal"             # Run the full planning council debate
 dev approve                 # Approve the latest generated plan (AWAITING_USER_DECISIONS -> PLAN_APPROVED)
 dev approve --force         # Approve even if blocking gate gaps remain
 dev approve --run-id RUN-ID # Approve a specific planning run's decision
+dev check                   # LLM audit of current changes (no planning required)
+dev check --verify -t "pytest -q" # Deterministic evidence gate on the working tree (no provider keys)
+dev check --verify --enforce-coverage # Block when changed lines are not exercised by tests
+dev check --json            # Machine-readable check output
 dev status                  # Show current project state and cost
 dev tasks                   # List planned tasks and statuses
 dev show TASK-001           # Show task details and constraints
@@ -72,6 +80,13 @@ dev agents add NAME --command TOOL # Register a prompt-taking CLI agent
 dev agents doctor           # Check agent PATH, prompt mode, help command, and profile wiring
 dev agents run TASK-001 --agent NAME --profile default # Run a task with a named CLI agent
 dev agents optimize --agent codex --profile yolo --evals .devcouncil/evals/agent-profile.jsonl --dry-run # GEPA prompt-profile optimization
+dev skills                  # List bundled engineering skills and which apply to this repo
+dev skills show NAME        # Print the full body of one skill
+dev skills scaffold         # Write applicable skills to .claude/skills/<name>/SKILL.md
+dev cost show               # Report estimated model-call cost grouped by task and run
+dev cost show --json        # Machine-readable cost report
+dev runs list               # List recorded coding-agent runs, newest first
+dev runs show RUN-ID        # Show a run manifest plus a redacted transcript tail
 dev lsp inspect             # Inspect optional language-server readiness
 dev ast match "symbol"      # Search symbols with structural AST matching
 dev dashboard --open        # Serve the live local status dashboard and open a browser

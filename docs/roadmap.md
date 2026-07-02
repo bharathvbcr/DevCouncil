@@ -18,6 +18,14 @@
 - [x] Live UI Dashboard
 - [x] Native GitHub/GitLab PR Comments integration
 - [x] OKF <-> skills bridge (export skills as OKF documents; ingest OKF skill documents as selectable skills)
+- [x] design.md design-system lint, export, and CI-friendly `dev design check`
+- [x] Lite verification on-ramp (`dev check --verify`) with diff↔coverage and typed next-actions
+- [x] Expanded coding CLI executors (Copilot, Goose, Amp, Qwen, Crush)
+- [x] Ollama local provider with Apple-Silicon-aware model sizing
+- [x] Engineering skills library and `dev skills scaffold`
+- [x] CI workflow scaffolding (`dev scaffold-ci`)
+- [x] Cost and run telemetry (`dev cost show`, `dev runs list`/`show`)
+- [x] Plan approval flow (`dev approve`) for advisory planning gaps
 
 Related references:
 

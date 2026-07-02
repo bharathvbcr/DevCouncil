@@ -25,8 +25,18 @@ The `native-preview` executor implements a preview loop that calls the `read_fil
 - `cursor`: Launches `cursor-agent --print --trust` with a generated DevCouncil task prompt file.
 - `cursor-agent`, `cursor-cli`: Aliases for `cursor`.
 - `aider`: Launches `aider --yes --message` with the generated DevCouncil task prompt.
-- configured CLI agent names: Launch any prompt-taking CLI registered with `dev integrate cli-agent`.
+- `copilot`: Launches `copilot --allow-all-tools -p` with the generated DevCouncil task prompt.
+- `copilot-cli`, `github-copilot`, `gh-copilot`: Aliases for `copilot`.
+- `goose`: Launches `goose run -i` with the generated DevCouncil task prompt file.
+- `goose-cli`, `block-goose`: Aliases for `goose`.
+- `amp`: Launches `amp -x` with the generated DevCouncil task prompt.
+- `amp-cli`, `sourcegraph-amp`: Aliases for `amp`.
+- `qwen`: Launches Qwen Code with the generated task prompt via stdin.
+- `qwen-code`, `qwen-cli`: Aliases for `qwen`.
+- `crush`: Launches `crush run` with the generated DevCouncil task prompt.
+- `crush-cli`, `charm-crush`: Aliases for `crush`.
+- configured CLI agent names: Launch any prompt-taking CLI registered with `dev integrate cli-agent` or `dev agents add`.
 - `native-preview`: Runs DevCouncil's built-in preview native executor loop.
 - `native`: Backward-compatible alias for `native-preview`.
 
-Coding CLI adapters (`codex`, `gemini`, `claude`, `opencode`, `antigravity`, `warp`, `cursor`, `aider`, and configured CLI agents) write the task prompt to `.devcouncil/{TASK}-{client}-task.md` when needed, then launch the selected CLI in the repository root with `DEVCOUNCIL_PROJECT_ROOT` set.
+Coding CLI adapters (`codex`, `gemini`, `claude`, `opencode`, `antigravity`, `warp`, `cursor`, `aider`, `copilot`, `goose`, `amp`, `qwen`, `crush`, and configured CLI agents) write the task prompt to `.devcouncil/{TASK}-{client}-task.md` when needed, then launch the selected CLI in the repository root with `DEVCOUNCIL_PROJECT_ROOT` set.

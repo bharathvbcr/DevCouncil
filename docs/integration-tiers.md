@@ -4,7 +4,7 @@ DevCouncil assigns each supported coding CLI to one of three integration tiers. 
 
 ## Tier 1 — Headless executor
 
-**Tools:** Codex CLI, Gemini CLI, Claude Code, OpenCode, Google Antigravity CLI, Warp/Oz, Cursor Agent (`cursor-agent`), Aider
+**Tools:** Codex CLI, Gemini CLI, Claude Code, OpenCode, Google Antigravity CLI, Warp/Oz, Cursor Agent (`cursor-agent`), Aider, GitHub Copilot CLI, Goose, Amp (Sourcegraph), Qwen Code, Crush (Charm)
 
 **Capabilities:**
 
@@ -46,7 +46,7 @@ DevCouncil assigns each supported coding CLI to one of three integration tiers. 
 | Codex, Gemini, Claude | Yes — project hook JSON + `devcouncil hook pre-tool-use` |
 | Cursor | Yes — `.cursor/hooks.json` (`preToolUse` / `postToolUse`) |
 | OpenCode | Yes — bundled plugin via `dev integrate hooks` |
-| Antigravity / Warp / Aider (executor only) | Verification-gated; hooks optional |
+| Antigravity / Warp / Aider / Copilot / Goose / Amp / Qwen / Crush (executor only) | Verification-gated; hooks optional |
 | Unregistered BYO CLI | Verification-gated only |
 
 ## Target parity (project decision)
@@ -56,6 +56,7 @@ DevCouncil assigns each supported coding CLI to one of three integration tiers. 
 | Codex, Gemini, Claude, OpenCode, Antigravity, Warp | Tier 1 | Shipped |
 | Cursor | Tier 1 via `cursor-agent --print --trust` | Shipped |
 | Aider | Tier 1 via `aider --yes --message` | Shipped |
+| Copilot, Goose, Amp, Qwen, Crush | Tier 1 via headless CLI adapters | Shipped |
 | Editor-only Cursor | Tier 2 | MCP + manual prompt |
 | Custom CLIs | Tier 3 → Tier 1 when registered | `dev integrate cli-agent` |
 
