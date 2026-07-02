@@ -1,5 +1,6 @@
 import json
 import subprocess
+import uuid
 
 from devcouncil.domain.task import PlannedFile, Task
 from devcouncil.executors.mini_swe import MiniSWEExecutor
@@ -358,6 +359,252 @@ def test_coding_cli_executor_cursor_resume_uses_create_chat(tmp_path, monkeypatc
     assert captured["cmd"][6] == "chat-abc123"
     session = json.loads((tmp_path / ".devcouncil" / "integrations" / "cursor-session.json").read_text(encoding="utf-8"))
     assert session["chat_id"] == "chat-abc123"
+
+
+def test_coding_cli_executor_claude_assigns_and_persists_session_id(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_which(_command):
+        return f"/usr/bin/{_command}"
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    task = Task(
+        id="TASK-777",
+        title="Claude",
+        description="Implement feature",
+        planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
+    )
+
+    executor = CodingCliExecutor(tmp_path, "claude")
+    result = executor.run_task(task, [])
+
+    assert result.success
+    cmd = captured["cmd"]
+    assert cmd[:4] == ["claude", "-p", "--permission-mode", "acceptEdits"]
+    assert "--resume" not in cmd
+    assert "--session-id" in cmd
+    session_id = cmd[cmd.index("--session-id") + 1]
+    uuid.UUID(session_id)  # a valid UUID or this raises
+    assert executor.last_agent_session_id == session_id
+
+    persisted = json.loads(
+        (tmp_path / ".devcouncil" / "sessions" / "TASK-777-claude.json").read_text(encoding="utf-8")
+    )
+    assert persisted["session_id"] == session_id
+
+    manifest = json.loads(
+        (tmp_path / ".devcouncil" / "runs" / executor.last_run_id / "agent-run.json").read_text(encoding="utf-8")
+    )
+    assert manifest["agent_session_id"] == session_id
+
+
+def test_coding_cli_executor_claude_resumes_prior_task_session(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_which(_command):
+        return f"/usr/bin/{_command}"
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    sessions = tmp_path / ".devcouncil" / "sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "TASK-777-claude.json").write_text(
+        json.dumps({"session_id": "11111111-2222-3333-4444-555555555555"}) + "\n",
+        encoding="utf-8",
+    )
+
+    task = Task(
+        id="TASK-777",
+        title="Claude",
+        description="Repair the earlier attempt",
+        planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
+    )
+
+    executor = CodingCliExecutor(tmp_path, "claude")
+    result = executor.run_task(task, [])
+
+    assert result.success
+    cmd = captured["cmd"]
+    assert "--session-id" not in cmd
+    assert "--resume" in cmd
+    assert cmd[cmd.index("--resume") + 1] == "11111111-2222-3333-4444-555555555555"
+    assert executor.last_agent_session_id == "11111111-2222-3333-4444-555555555555"
+
+
+def test_coding_cli_executor_claude_captures_json_result(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_which(_command):
+        return f"/usr/bin/{_command}"
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        payload = {
+            "type": "result",
+            "session_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "total_cost_usd": 0.0421,
+            "num_turns": 3,
+            "is_error": False,
+            "result": "Implemented the feature and ran the tests.",
+            "usage": {"input_tokens": 1200, "output_tokens": 340, "cache_read_input_tokens": 800},
+        }
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    task = Task(
+        id="TASK-778",
+        title="Claude",
+        description="Implement feature",
+        planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
+    )
+
+    executor = CodingCliExecutor(tmp_path, "claude")
+    result = executor.run_task(task, [])
+
+    assert result.success
+    cmd = captured["cmd"]
+    assert cmd[:6] == ["claude", "-p", "--permission-mode", "acceptEdits", "--output-format", "json"]
+
+    # The reported session id wins over the pre-assigned one and is recorded.
+    assert executor.last_agent_session_id == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+    manifest = json.loads(
+        (tmp_path / ".devcouncil" / "runs" / executor.last_run_id / "agent-run.json").read_text(encoding="utf-8")
+    )
+    assert manifest["agent_session_id"] == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    # The resume pointer is rewritten to the id Claude actually reported (not the assigned
+    # one), so a later --resume targets the real session.
+    persisted = json.loads(
+        (tmp_path / ".devcouncil" / "sessions" / "TASK-778-claude.json").read_text(encoding="utf-8")
+    )
+    assert persisted["session_id"] == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    agent_result = manifest["agent_result"]
+    assert agent_result["total_cost_usd"] == 0.0421
+    assert agent_result["num_turns"] == 3
+    assert agent_result["input_tokens"] == 1200
+    assert agent_result["output_tokens"] == 340
+
+
+def test_render_claude_stream_event_summarizes_events():
+    render = CodingCliExecutor._render_claude_stream_event
+
+    # Assistant text is shown; thinking blocks are dropped from the same message.
+    text_event = json.dumps({
+        "type": "assistant",
+        "message": {"content": [
+            {"type": "thinking", "thinking": "internal reasoning"},
+            {"type": "text", "text": "Editing the file"},
+        ]},
+    })
+    assert render(text_event) == "Editing the file\n"
+
+    # Tool use renders as an arrow line with the target.
+    tool_event = json.dumps({
+        "type": "assistant",
+        "message": {"content": [
+            {"type": "tool_use", "name": "Edit", "input": {"file_path": "src/app.py"}},
+        ]},
+    })
+    assert render(tool_event) == "→ Edit src/app.py\n"
+
+    # The terminal result event shows turns and cost.
+    result_event = json.dumps({"type": "result", "num_turns": 2, "total_cost_usd": 0.0512})
+    assert render(result_event) == "✓ 2 turns, $0.0512\n"
+
+    # System / rate-limit noise is suppressed; non-JSON passes through verbatim.
+    assert render(json.dumps({"type": "system", "subtype": "init"})) is None
+    assert render("plain log line\n") == "plain log line\n"
+
+
+def test_coding_cli_executor_claude_stream_captures_telemetry(tmp_path, monkeypatch):
+    captured = {}
+    ndjson = [
+        json.dumps({"type": "system", "subtype": "init", "session_id": "sess-x"}) + "\n",
+        json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "Working"}]}}) + "\n",
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Edit", "input": {"file_path": "src/app.py"}}]}}) + "\n",
+        json.dumps({
+            "type": "result",
+            "session_id": "99999999-8888-7777-6666-555555555555",
+            "total_cost_usd": 0.05,
+            "num_turns": 2,
+            "is_error": False,
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+        }) + "\n",
+    ]
+
+    class FakeStdout:
+        def __init__(self, lines):
+            self._lines = list(lines)
+            self._index = 0
+
+        def readline(self):
+            if self._index >= len(self._lines):
+                return ""
+            line = self._lines[self._index]
+            self._index += 1
+            return line
+
+        def close(self):
+            return None
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdin = None
+            self.stdout = FakeStdout(ndjson)
+            self.returncode = 0
+
+        def poll(self):
+            return 0 if self.stdout._index >= len(self.stdout._lines) else None
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            return None
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProcess()
+
+    monkeypatch.setattr("shutil.which", lambda _c: f"/usr/bin/{_c}")
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    task = Task(
+        id="TASK-779",
+        title="Claude",
+        description="Implement feature",
+        planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
+    )
+
+    result = CodingCliExecutor(tmp_path, "claude", stream_output=True).run_task(task, [])
+
+    assert result.success
+    cmd = captured["cmd"]
+    assert cmd[:7] == ["claude", "-p", "--permission-mode", "acceptEdits", "--output-format", "stream-json", "--verbose"]
+
+    run_dirs = list((tmp_path / ".devcouncil" / "runs").iterdir())
+    transcript = run_dirs[0] / "transcript.txt"
+    # Raw NDJSON is preserved in the transcript even though the console saw readable lines.
+    assert '"tool_use"' in transcript.read_text(encoding="utf-8")
+
+    manifest = json.loads((run_dirs[0] / "agent-run.json").read_text(encoding="utf-8"))
+    assert manifest["agent_session_id"] == "99999999-8888-7777-6666-555555555555"
+    assert manifest["agent_result"]["total_cost_usd"] == 0.05
+    assert manifest["agent_result"]["input_tokens"] == 100
 
 
 def test_coding_cli_executor_stream_mode_writes_transcript(tmp_path, monkeypatch):

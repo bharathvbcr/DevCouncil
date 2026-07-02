@@ -15,11 +15,16 @@ def _executor(tmp_path: Path, client: str, profile: CliAgentProfileConfig) -> Co
 
 
 def test_empty_profile_reproduces_baseline(tmp_path):
-    """An all-default profile must not change today's invocation (no regression)."""
-    baseline = CodingCliExecutor(tmp_path, "claude", profile="default")
+    """An all-default profile must not change today's invocation (no regression).
+
+    Uses codex, whose command has no per-run injection, so the comparison isolates the
+    profile's effect. (Claude's command additionally carries a per-run --session-id and
+    --output-format, covered separately in test_executors.py, so it can't be compared to
+    the bare spec baseline here.)"""
+    baseline = CodingCliExecutor(tmp_path, "codex", profile="default")
     base_command = baseline.spec.base_command()
 
-    empty = _executor(tmp_path, "claude", CliAgentProfileConfig())
+    empty = _executor(tmp_path, "codex", CliAgentProfileConfig())
     assert empty._command() == base_command
 
 

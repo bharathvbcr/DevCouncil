@@ -99,6 +99,32 @@ def test_plugin_bundle_write_gate_includes_blocking_hooks():
     assert "PreToolUse" in hooks["hooks"] and "PostToolUse" in hooks["hooks"]
 
 
+def test_plugin_bundle_includes_lsp_for_detected_languages(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "main.go").write_text("package main\n", encoding="utf-8")
+
+    bundle = claude_assets.build_plugin_bundle(tmp_path, version="1.0.0", skill_assets=[])
+    lsp_asset = next((a for a in bundle if a.path.name == ".lsp.json"), None)
+    assert lsp_asset is not None
+    assert lsp_asset.path.relative_to(tmp_path).as_posix() == ".devcouncil/claude-plugin/devcouncil/.lsp.json"
+
+    config = json.loads(lsp_asset.content)
+    # One server per detected language, in Claude Code's documented schema.
+    assert set(config) == {"python", "go"}
+    assert config["python"]["command"] == "pyright-langserver"
+    assert config["python"]["args"] == ["--stdio"]
+    assert config["python"]["extensionToLanguage"][".py"] == "python"
+    assert config["go"]["command"] == "gopls"
+    assert config["go"]["extensionToLanguage"][".go"] == "go"
+
+
+def test_plugin_bundle_omits_lsp_when_no_supported_languages(tmp_path):
+    (tmp_path / "README.md").write_text("# docs only\n", encoding="utf-8")
+    bundle = claude_assets.build_plugin_bundle(tmp_path, version="1.0.0", skill_assets=[])
+    assert not any(a.path.name == ".lsp.json" for a in bundle)
+
+
 def test_generated_asset_write_if_changed_is_idempotent(tmp_path):
     asset = claude_assets.build_output_style(tmp_path)[0]
     assert asset.write_if_changed() is True
@@ -147,6 +173,48 @@ def test_integrate_claude_plugin_apply_builds_bundle(tmp_path):
     plugin_json = tmp_path / ".devcouncil" / "claude-plugin" / "devcouncil" / ".claude-plugin" / "plugin.json"
     market_json = tmp_path / ".devcouncil" / "claude-plugin" / ".claude-plugin" / "marketplace.json"
     assert plugin_json.exists() and market_json.exists()
+
+
+def test_build_github_workflow_has_triggers_and_gated_run(tmp_path):
+    asset = claude_assets.build_github_workflow(tmp_path)
+    assert asset.path.relative_to(tmp_path).as_posix() == ".github/workflows/devcouncil.yml"
+    content = asset.content
+    # Event triggers, the read-only PR job, and the gated autonomous job.
+    for expected in ("pull_request:", "workflow_dispatch:", "schedule:", "dev report", "claude -p",
+                     "devcouncil_next_task", "${{ secrets.ANTHROPIC_API_KEY }}"):
+        assert expected in content
+
+    try:
+        import yaml
+    except ModuleNotFoundError:
+        return
+    doc = yaml.safe_load(content)
+    assert doc["name"] == "DevCouncil"
+    assert set(doc["jobs"]) == {"verify", "autonomous"}
+    # PR runs are read-only (no API key); autonomous runs are guarded off PRs.
+    assert doc["jobs"]["verify"]["if"] == "github.event_name == 'pull_request'"
+    assert doc["jobs"]["autonomous"]["if"] == "github.event_name != 'pull_request'"
+
+
+def test_integrate_claude_github_apply_writes_workflow(tmp_path):
+    _init_repo(tmp_path)
+    result = runner.invoke(app, ["integrate", "claude-github", "--apply", "--project-root", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    workflow = tmp_path / ".github" / "workflows" / "devcouncil.yml"
+    assert workflow.exists()
+    assert "ANTHROPIC_API_KEY" in result.output
+    # Idempotent: a second apply reports no change.
+    again = runner.invoke(app, ["integrate", "claude-github", "--apply", "--project-root", str(tmp_path)])
+    assert again.exit_code == 0
+    assert "already up to date" in again.output
+
+
+def test_integrate_claude_github_preview_does_not_write(tmp_path):
+    _init_repo(tmp_path)
+    result = runner.invoke(app, ["integrate", "claude-github", "--project-root", str(tmp_path)])
+    assert result.exit_code == 0
+    assert "Preview only" in result.output
+    assert not (tmp_path / ".github").exists()
 
 
 def test_integrate_claude_assets_preview_does_not_write(tmp_path):

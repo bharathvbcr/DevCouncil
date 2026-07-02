@@ -1356,6 +1356,37 @@ def claude_plugin_cmd(
     console.print("  [dim]/plugin install devcouncil@devcouncil-local[/dim]")
 
 
+@app.command("claude-github")
+def claude_github(
+    apply: bool = typer.Option(False, "--apply", help="Write the workflow file instead of previewing it."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """
+    Generate a GitHub Actions workflow that runs DevCouncil + Claude Code on repo events.
+
+    Read-only DevCouncil verification on pull requests, and gated autonomous task pickup via
+    headless Claude Code on manual dispatch or a nightly schedule. This is the stable-primitive
+    alternative to Claude Code's experimental cloud Routines; the autonomous job needs an
+    ANTHROPIC_API_KEY repository secret.
+    """
+    from devcouncil.integrations.claude_assets import build_github_workflow
+
+    root = _project_root(project_root)
+    asset = build_github_workflow(root)
+    if not apply:
+        console.print("[bold]DevCouncil GitHub Actions workflow (preview)[/bold]")
+        console.print(f"Would write: [dim]{asset.path}[/dim]")
+        console.print("[yellow]Preview only. Rerun with --apply to write the workflow.[/yellow]")
+        return
+    changed = asset.write_if_changed()
+    rel = asset.path.relative_to(root)
+    if changed:
+        console.print(f"[green]Wrote GitHub Actions workflow[/green] at {rel}")
+    else:
+        console.print(f"[dim]GitHub Actions workflow already up to date at {rel}[/dim]")
+    console.print("Add an [bold]ANTHROPIC_API_KEY[/bold] repository secret for the autonomous runs.")
+
+
 @app.command("cursor")
 def cursor(
     apply: bool = typer.Option(False, "--apply", help="Write project Cursor MCP config instead of printing it."),

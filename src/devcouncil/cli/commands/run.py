@@ -188,7 +188,7 @@ def run(
         "--executor",
         "-e",
         help=(
-            "Executor to use (manual, mini, openhands, native-preview, "
+            "Executor to use (manual, mini, openhands, native-preview, claude-sdk, "
             "codex, gemini, claude, opencode, antigravity, warp, cursor, aider, "
             "copilot, goose, amp, qwen, crush, or a configured agent)"
         ),
@@ -354,6 +354,36 @@ def run(
             else:
                 logger.error("OpenHands failed to start or execute for %s", task_id)
                 console.print("\n[red]OpenHands failed to start or execute.[/red]")
+        elif executor == "claude-sdk":
+            # In-process Claude Agent SDK executor: every tool call is gated live against
+            # this task's scope, so out-of-scope writes/commands are denied before they land.
+            from devcouncil.executors.claude_sdk import ClaudeSdkExecutor
+
+            _record_project_phase(session, ProjectPhase.TASK_EXECUTING)
+            req_repo = RequirementRepository(session)
+            reqs = req_repo.get_all()
+            sdk_executor = ClaudeSdkExecutor(root, active_task=task)
+            exec_result = sdk_executor.run_task(task, reqs)
+            _capture_after_patch(task_id, root)
+            if exec_result.success:
+                _record_project_phase(session, ProjectPhase.TASK_VERIFYING)
+                verified = _verify_after_execution(
+                    session, task, reqs, router=_build_verification_router(root), project_root=root
+                )
+                _record_project_phase(
+                    session,
+                    ProjectPhase.TASK_VERIFIED if verified else ProjectPhase.TASK_BLOCKED,
+                )
+                task_repo.save(task)
+                _run_live_review_after_execution(root, "claude", task.id)
+                _log_exec_outcome("claude-sdk", task_id, verified=verified)
+                if verified:
+                    console.print(f"\n[green]claude-sdk finished and task {task_id} verified.[/green]")
+                else:
+                    console.print(f"\n[yellow]claude-sdk finished, but task {task_id} is blocked by verification gaps.[/yellow]")
+            else:
+                logger.error("claude-sdk failed to start or execute for %s: %s", task_id, exec_result.message)
+                console.print(f"\n[red]claude-sdk failed to start or execute: {exec_result.message}[/red]")
         elif executor in {"native", "native-preview"}:
             # Load config for model routing and permissions
             try:

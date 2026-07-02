@@ -10,7 +10,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from rich.console import Console
 
@@ -69,6 +69,11 @@ class CodingCliExecutor(Executor):
         self.profile = load_agent_profiles(project_root).get(self.profile_name)
         self.last_run_id: str | None = None
         self.last_transcript_path: Path | None = None
+        # Claude Code session id for the most recent run (assigned by DevCouncil via
+        # --session-id, or reused via --resume). Lets callers/live-review locate the
+        # native ~/.claude transcript for a headless run and resume it for repairs.
+        self.last_agent_session_id: str | None = None
+        self._pending_claude_session: tuple[Path, str] | None = None
         self.stream_output = self._resolve_stream_output(stream_output)
 
     def _normalize_client(self, client: str) -> str:
@@ -95,6 +100,8 @@ class CodingCliExecutor(Executor):
             base = self._warp_command()
         elif self.client == "cursor":
             base = self._cursor_command(task_id)
+        elif self.client == "claude":
+            base = self._claude_command(task_id)
         else:
             base = self.spec.base_command()
         return self._apply_profile_args(base)
@@ -310,6 +317,12 @@ class CodingCliExecutor(Executor):
                 instruction_file,
                 stream=self.stream_output,
             )
+            # Persist the Claude session id now (before the subprocess), so a crashed or
+            # timed-out run still leaves a resumable session, and record it on the manifest.
+            if self.client == "claude":
+                self._persist_claude_session()
+                if self.last_agent_session_id:
+                    self._update_run_manifest(run_id, agent_session_id=self.last_agent_session_id)
             TraceLogger(self.project_root).log_event(
                 "agent_run_started",
                 {
@@ -330,11 +343,30 @@ class CodingCliExecutor(Executor):
             )
             started = time.monotonic()
             logger.info("Launching %s subprocess for %s (timeout=%ss)", self.client, task.id, self._effective_timeout())
-            result = self._run_subprocess(invocation, input_text, env, transcript_path=transcript_path)
+            # Render Claude's NDJSON stream as readable lines while it runs (raw is still
+            # captured to the transcript); other clients print their output verbatim.
+            display_transform = (
+                self._render_claude_stream_event
+                if (self.client == "claude" and self.stream_output)
+                else None
+            )
+            result = self._run_subprocess(
+                invocation, input_text, env,
+                transcript_path=transcript_path,
+                display_transform=display_transform,
+            )
             duration = round(time.monotonic() - started, 3)
             logger.info("%s subprocess for %s exited %s in %.2fs", self.client, task.id, result.returncode, duration)
             finished_at = datetime.now(timezone.utc).isoformat()
             self._write_log(log_prefix, result)
+            # Capture Claude's structured result onto the manifest. Non-stream: parse the one
+            # JSON blob and swap stdout for the human ``result`` text so previews stay readable.
+            # Stream: harvest the terminal result event from the captured NDJSON for telemetry.
+            if self.client == "claude":
+                if self.stream_output:
+                    self._capture_claude_stream_json(run_id, result)
+                else:
+                    result = self._capture_claude_json(run_id, result)
             if transcript_path and transcript_path.exists():
                 self._append_manifest_transcript(run_id, transcript_path)
                 self.last_transcript_path = transcript_path
@@ -541,6 +573,7 @@ class CodingCliExecutor(Executor):
         input_text: str | None,
         env: dict[str, str],
         transcript_path: Path | None = None,
+        display_transform: Callable[[str], str | None] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         timeout = self._effective_timeout()
         invocation = self._resolve_invocation(invocation, env)
@@ -625,7 +658,17 @@ class CodingCliExecutor(Executor):
                     continue
                 if line is None:
                     break
-                self._emit_stream_line(line)
+                # Display may be transformed (e.g. Claude NDJSON → a readable line, or
+                # suppressed for noise), but capture and transcript always keep the raw
+                # bytes so post-run parsing and forensics see the full stream.
+                display: str | None = line
+                if display_transform is not None:
+                    try:
+                        display = display_transform(line)
+                    except Exception:
+                        display = line
+                if display:
+                    self._emit_stream_line(display)
                 captured.append(line)
                 if transcript_handle is not None:
                     transcript_handle.write(redact_text(line))
@@ -700,6 +743,200 @@ class CodingCliExecutor(Executor):
             return None
         chat_id = (result.stdout or result.stderr or "").strip().splitlines()[-1].strip()
         return chat_id or None
+
+    def _claude_command(self, task_id: str | None = None) -> list[str]:
+        """Build Claude Code's headless command with a stable session identity.
+
+        A fresh task run is pinned to a new UUID via ``--session-id`` so DevCouncil
+        knows, up front, which native ``~/.claude`` transcript the run will write —
+        making headless evidence and live review locatable without scraping stdout.
+        A re-run of the SAME task (e.g. a repair iteration) instead ``--resume``\\s the
+        prior session so the model keeps the context of what it already tried, rather
+        than restarting cold from a re-prepended correction manifest. The chosen id is
+        stashed in ``_pending_claude_session`` and persisted once the run launches."""
+        base = list(self.spec.base_command())
+        # Capture Claude's structured result either way. Non-stream: one JSON blob parsed
+        # after exit. Stream: NDJSON events rendered live (readable lines, not raw JSON) and
+        # the terminal result event harvested for telemetry. ``--verbose`` is required by
+        # Claude for stream-json.
+        if self.stream_output:
+            base = [*base, "--output-format", "stream-json", "--verbose"]
+        else:
+            base = [*base, "--output-format", "json"]
+        session_path = self._claude_session_path(task_id)
+        prior = self._read_claude_session_id(session_path)
+        if prior:
+            self._pending_claude_session = (session_path, prior)
+            return [*base, "--resume", prior]
+        new_id = str(uuid.uuid4())
+        self._pending_claude_session = (session_path, new_id)
+        return [*base, "--session-id", new_id]
+
+    def _claude_session_path(self, task_id: str | None) -> Path:
+        name = f"{task_id}-claude.json" if task_id else "claude-session.json"
+        return self.project_root / ".devcouncil" / "sessions" / name
+
+    @staticmethod
+    def _read_claude_session_id(path: Path) -> str | None:
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8")) or {}
+        except json.JSONDecodeError:
+            return None
+        session_id = str(data.get("session_id") or "").strip()
+        return session_id or None
+
+    def _persist_claude_session(self) -> None:
+        """Record the run's Claude session id so a later re-run of the task resumes it.
+
+        Persisted after the subprocess launches (not on exit) so even a crashed or
+        timed-out run leaves a resumable session behind. Also exposes the id via
+        ``last_agent_session_id`` for the caller and the run manifest."""
+        pending = self._pending_claude_session
+        if not pending:
+            return
+        path, session_id = pending
+        self.last_agent_session_id = session_id
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"session_id": session_id}, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            # A non-persisted session only costs a cold repair next time; never fail the run.
+            pass
+
+    def _capture_claude_json(
+        self, run_id: str, result: subprocess.CompletedProcess[str]
+    ) -> subprocess.CompletedProcess[str]:
+        """Parse Claude Code's ``--output-format json`` result blob.
+
+        Records the reported session id, cost, and token usage on the run manifest, then
+        returns a copy of ``result`` with stdout replaced by the human-readable ``result``
+        text so downstream logs/previews/diagnostics read like the old text mode. On any
+        parse failure the original ``result`` is returned unchanged — a telemetry miss must
+        never turn a successful run into a reported failure."""
+        raw = (result.stdout or "").strip()
+        if not raw:
+            return result
+        payload: dict | None = None
+        # Tolerate any leading noise: scan lines from the last back for a JSON object.
+        for line in reversed(raw.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                candidate = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                payload = candidate
+                break
+        if payload is None:
+            try:
+                loaded = json.loads(raw)
+            except json.JSONDecodeError:
+                return result
+            payload = loaded if isinstance(loaded, dict) else None
+        if payload is None:
+            return result
+
+        self._record_claude_result_meta(run_id, payload)
+        text = payload.get("result")
+        if isinstance(text, str) and text.strip():
+            return subprocess.CompletedProcess(
+                result.args, result.returncode, stdout=text, stderr=result.stderr
+            )
+        return result
+
+    def _record_claude_result_meta(self, run_id: str, payload: dict) -> None:
+        """Record session id, cost, and token usage from a Claude ``result`` payload.
+
+        Shared by the non-stream JSON path and the stream-json path; both surface the same
+        terminal ``result`` object, just delivered as one blob vs. the last NDJSON line."""
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+        session_id = str(payload.get("session_id") or "").strip() or None
+        if session_id:
+            self.last_agent_session_id = session_id
+            self._update_run_manifest(run_id, agent_session_id=session_id)
+            # Keep the persisted resume pointer authoritative: if Claude reported a session
+            # id different from the one we assigned, a later --resume must target the real
+            # one, so rewrite the session file to what actually ran.
+            pending = self._pending_claude_session
+            if pending is not None and pending[1] != session_id:
+                self._pending_claude_session = (pending[0], session_id)
+                self._persist_claude_session()
+        meta = {
+            "session_id": session_id,
+            "total_cost_usd": payload.get("total_cost_usd"),
+            "num_turns": payload.get("num_turns"),
+            "is_error": payload.get("is_error"),
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
+        }
+        self._update_run_manifest(run_id, agent_result={k: v for k, v in meta.items() if v is not None})
+
+    def _capture_claude_stream_json(self, run_id: str, result: subprocess.CompletedProcess[str]) -> None:
+        """Record telemetry from a streamed NDJSON run by finding the terminal result event.
+
+        The streaming path already rendered readable lines live; here we only harvest the
+        last ``result`` event for the manifest. Best-effort — never raises into the run."""
+        payload: dict | None = None
+        for line in (result.stdout or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict) and event.get("type") == "result":
+                payload = event  # keep scanning; the last result event wins
+        if payload is not None:
+            self._record_claude_result_meta(run_id, payload)
+
+    @staticmethod
+    def _render_claude_stream_event(line: str) -> str | None:
+        """Turn one Claude stream-json NDJSON line into a concise console line.
+
+        Returns the text to display, or None to suppress the event (system/thinking/rate-
+        limit noise). Non-JSON lines pass through verbatim so nothing is silently dropped."""
+        stripped = line.strip()
+        if not stripped:
+            return None
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            return line
+        if not isinstance(event, dict):
+            return line
+        etype = event.get("type")
+        if etype == "assistant":
+            message = event.get("message") if isinstance(event.get("message"), dict) else {}
+            parts: list[str] = []
+            for block in (message.get("content") or []):
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text" and str(block.get("text") or "").strip():
+                    parts.append(str(block["text"]).strip())
+                elif btype == "tool_use":
+                    name = str(block.get("name") or "tool")
+                    tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+                    target = tool_input.get("file_path") or tool_input.get("path") or tool_input.get("command") or ""
+                    parts.append(f"→ {name} {str(target)[:80]}".rstrip())
+            text = "\n".join(p for p in parts if p)
+            return text + "\n" if text else None
+        if etype == "result":
+            bits: list[str] = []
+            if event.get("num_turns") is not None:
+                bits.append(f"{event['num_turns']} turns")
+            cost = event.get("total_cost_usd")
+            if isinstance(cost, (int, float)):
+                bits.append(f"${cost:.4f}")
+            return ("✓ " + ", ".join(bits) + "\n") if bits else None
+        # system / user / tool_result / rate_limit_event: keep the console quiet.
+        return None
 
     def _effective_timeout(self) -> int:
         if self.profile and self.profile.timeout_seconds:
