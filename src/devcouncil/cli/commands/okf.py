@@ -19,9 +19,12 @@ from devcouncil.cli.commands.init import initialize_project
 from devcouncil.knowledge.okf import read_bundle, validate_bundle
 from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import ArtifactGraphRepository
+from devcouncil.telemetry.stages import log_stage, log_step
+import logging
 
 app = typer.Typer(help="Export, ingest, and validate Open Knowledge Format bundles.")
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 def _knowledge_okf_dir(root: Path) -> Path:
@@ -75,12 +78,22 @@ def export(
 ):
     """Export the DevCouncil artifact graph as an OKF bundle."""
     root = project_root.expanduser().resolve()
+    from devcouncil.telemetry.logging_setup import set_log_dir
+    set_log_dir(root)
+    logger.info("dev okf export")
     initialize_project(root, quiet=True)
     db = get_db(root)
     if not db:
         console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
         raise typer.Exit(code=1)
 
+    with log_stage("okf", project_root=root, subcommand="export"):
+        log_step("okf/1: exporting OKF bundle", project_root=root, trace=True)
+        _run_okf_export(root, db, output, skills, design)
+        log_step("okf/complete", project_root=root, trace=True)
+
+
+def _run_okf_export(root, db, output, skills, design):
     out_dir = output.expanduser().resolve()
     with db.get_session() as session:
         graph = ArtifactGraphRepository(session).load_graph()

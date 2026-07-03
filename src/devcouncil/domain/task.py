@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Literal, List
+from typing import Literal, List, Optional
 
 class PlannedFile(BaseModel):
     path: str
@@ -27,6 +27,14 @@ class Task(BaseModel):
             "repo is already configured for them."
         ),
     )
+    agent_appended_expected_tests: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Subset of expected_tests appended at runtime by a leased agent via "
+            "devcouncil_update_task_scope. These may run during verification but "
+            "cannot coarse-prove acceptance criteria."
+        ),
+    )
     allowed_commands: List[str] = Field(
         default_factory=list,
         description=(
@@ -36,7 +44,25 @@ class Task(BaseModel):
             "only when the task needs no commands beyond those in expected_tests."
         ),
     )
+    agent_appended_allowed_commands: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Subset of allowed_commands appended at runtime by a leased agent via "
+            "devcouncil_update_task_scope. These may run during execution/verification "
+            "but cannot coarse-prove acceptance criteria (self-certification guard, "
+            "mirroring agent_appended_expected_tests)."
+        ),
+    )
     forbidden_changes: List[str] = Field(default_factory=list)
+    difficulty: Optional[Literal["easy", "normal", "hard"]] = Field(
+        default=None,
+        description=(
+            "Manual difficulty override. When set (by a planner or a human) it wins over "
+            "the deterministic estimator in devcouncil.verification.difficulty; hard tasks "
+            "get stricter verification (stub/effort gates block, coverage enforced) per "
+            "the verification.rigor config."
+        ),
+    )
     depends_on: List[str] = Field(
         default_factory=list,
         description=(

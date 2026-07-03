@@ -1,4 +1,5 @@
 import copy
+import logging
 from typing import Any
 import typer
 import yaml
@@ -10,8 +11,11 @@ from devcouncil.integrations.graphify import GraphifyIntegration
 from devcouncil.llm.provider import build_role_model_config, validate_model_provider
 from devcouncil.repo.gitignore import ensure_gitignore
 
+from devcouncil.telemetry.stages import log_stage, log_step
+
 app = typer.Typer()
 console = Console()
+logger = logging.getLogger(__name__)
 
 # Per-stack default verification commands. A fresh project gets ONLY the commands
 # for the stack(s) actually detected in the repo, so the verifier never inherits a
@@ -73,6 +77,19 @@ DEFAULT_CONFIG = {
         "stream_cli_output": False,
         "cursor_resume_mode": "off",
         "coding_cli_probe_order": [],
+    },
+    "verification": {
+        "rigor": {
+            "enabled": True,
+            # never | hard | always — "hard" blocks stub/effort findings only on hard tasks
+            "stub_detection": "hard",
+            "effort_heuristics": "hard",
+            "enforce_coverage_on_hard": True,
+            "reviewer_required_on_hard": False,
+            "extra_repair_attempts_on_hard": 1,
+            "min_added_lines_per_planned_file": 5,
+            "acceptance_samples_on_hard": 2,
+        },
     },
     "privacy": {
         "redact_env_vars": True,
@@ -281,14 +298,21 @@ def init(
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(code=2) from e
 
-    initialize_project(
-        Path("."),
-        project_name=project_name,
-        model_provider=model_provider,
-        model=model,
-        role_models=role_models,
-        with_gitnexus=with_gitnexus,
-        with_graphify=with_graphify,
-        with_map=not skip_map,
-        with_skills=not skip_skills,
-    )
+    root = Path(".").expanduser().resolve()
+    from devcouncil.telemetry.logging_setup import set_log_dir
+    set_log_dir(root)
+    logger.info("dev init: provider=%s gitnexus=%s graphify=%s", provider, with_gitnexus, with_graphify)
+    with log_stage("init", project_root=root, provider=provider):
+        log_step("init/1: scaffolding project", project_root=root, trace=True)
+        initialize_project(
+            root,
+            project_name=project_name,
+            model_provider=model_provider,
+            model=model,
+            role_models=role_models,
+            with_gitnexus=with_gitnexus,
+            with_graphify=with_graphify,
+            with_map=not skip_map,
+            with_skills=not skip_skills,
+        )
+        log_step("init/complete", project_root=root, trace=True)

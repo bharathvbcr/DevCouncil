@@ -73,6 +73,43 @@ def raise_for_provider_status(response: "httpx.Response", provider: str) -> None
     raise ProviderRequestError(message, status_code=status)
 
 
+def _parse_provider_json(response: "httpx.Response", provider: str) -> Dict[str, Any]:
+    """Parse a provider response body, translating a non-JSON body (proxy HTML
+    error page, empty body on a flaky gateway) into an actionable
+    ProviderRequestError instead of a raw JSONDecodeError traceback — the CLI's
+    graceful-exit paths only catch ProviderRequestError/StructuredOutputError."""
+    try:
+        return response.json()
+    except Exception as exc:
+        body = (getattr(response, "text", "") or "").strip()[:300]
+        raise ProviderRequestError(
+            f"{provider} returned a non-JSON response body"
+            + (f": {body!r}" if body else " (empty body).")
+        ) from exc
+
+
+def _extract_chat_content(data: Dict[str, Any], provider: str, model: str) -> Any:
+    """Extract choices[0].message.content, translating a missing-choices shape into
+    an actionable ProviderRequestError. OpenRouter (and OpenAI-compatible gateways)
+    can return HTTP 200 whose body is an ``error`` object instead of choices (e.g.
+    upstream provider failure, moderation) — a raw KeyError here would crash the
+    run with no hint of the actual provider message."""
+    try:
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        detail = ""
+        if isinstance(data, dict):
+            err = data.get("error")
+            if isinstance(err, dict):
+                detail = str(err.get("message") or err)[:300]
+            elif err:
+                detail = str(err)[:300]
+        raise ProviderRequestError(
+            f"{provider} returned no completion choices for model '{model}'"
+            + (f": {detail}" if detail else " (unrecognized response shape).")
+        )
+
+
 class LLMResponse(BaseModel):
     content: str
     model: str
@@ -100,7 +137,15 @@ class Provider(ABC):
         json_mode: bool = False,
         task_id: Optional[str] = None,
         run_id: Optional[str] = None,
+        json_schema: Optional[Dict[str, Any]] = None,
     ) -> LLMResponse:
+        """``json_schema`` (optional, only meaningful with ``json_mode=True``) is the
+        JSON Schema of the expected structured output. Providers that support
+        grammar-constrained decoding (Ollama's native ``format: <schema>``) use it to
+        make the model *incapable* of emitting invalid JSON — the single biggest
+        reliability lever for weak/local models, which otherwise waste healing
+        round-trips echoing the schema or emitting prose. Providers without such
+        support ignore it."""
         pass
 
     def _get_async_client(self, timeout: Any) -> "httpx.AsyncClient":
@@ -273,6 +318,7 @@ def _log_model_call(
     task_id: Optional[str] = None,
     run_id: Optional[str] = None,
     provider: Optional[str] = None,
+    latency_ms: Optional[int] = None,
 ) -> None:
     try:
         from datetime import datetime, timezone
@@ -284,10 +330,12 @@ def _log_model_call(
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / "model_calls.jsonl"
 
-        # task_id/run_id/timestamp/provider are optional and backward-compatible: older
-        # records simply lack them and are grouped under "(unattributed)" by the cost
-        # reporter. provider lets the cost ledger zero-cost local providers (ollama)
-        # regardless of the open-ended model tag Ollama echoes back.
+        # task_id/run_id/timestamp/provider/latency_ms are optional and backward-
+        # compatible: older records simply lack them and are grouped under
+        # "(unattributed)" by the cost reporter. provider lets the cost ledger
+        # zero-cost local providers (ollama) regardless of the open-ended model tag
+        # Ollama echoes back; latency_ms makes slow local calls diagnosable from the
+        # log alone (which call dominated a multi-minute verification stage).
         log_payload = {
             "request": redact_dict(payload),
             "response": redact_dict(data),
@@ -295,6 +343,7 @@ def _log_model_call(
             "task_id": task_id,
             "run_id": run_id,
             "provider": provider,
+            "latency_ms": latency_ms,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         with open(log_file, "a", encoding="utf-8") as f:
@@ -312,6 +361,10 @@ class OpenRouterProvider(Provider):
         # OpenRouter routing preferences (sort/allow_fallbacks/require_parameters/
         # data_collection) sent as the request's ``provider`` field. None → omit it.
         self.provider_prefs = openrouter_provider_payload(provider_prefs)
+        # Models whose serving stack rejected schema-constrained ``response_format``
+        # (per MODEL, not per instance: one router instance fans across models).
+        # Remembered so each such model pays the degrade retry only once.
+        self._schema_format_unsupported: set = set()
 
     def cache_fingerprint(self) -> str:
         # Routing prefs change which upstream provider/model serves the request (and the
@@ -322,13 +375,14 @@ class OpenRouterProvider(Provider):
         return "openrouter:provider=" + json.dumps(self.provider_prefs, sort_keys=True)
 
     async def complete(
-        self, 
-        model: str, 
-        messages: List[Dict[str, str]], 
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
         temperature: float = 0.0,
         json_mode: bool = False,
         task_id: Optional[str] = None,
         run_id: Optional[str] = None,
+        json_schema: Optional[Dict[str, Any]] = None,
     ) -> LLMResponse:
         # Only deep-copy when json_mode mutates the last message; otherwise the
         # caller's list is read but never modified, so we can use it directly.
@@ -348,7 +402,24 @@ class OpenRouterProvider(Provider):
         }
 
         if json_mode:
-            payload["response_format"] = {"type": "json_object"}
+            # Schema-constrained structured output when the caller supplied a schema
+            # and this model hasn't rejected it before. Cloud models on plain
+            # ``json_object`` routinely OMIT fields that would be empty (observed:
+            # gemini-2.5-flash dropping empty ``blocking_questions``/``final_tasks``
+            # lists), which crashes planning schemas; ``json_schema`` makes the
+            # response structurally complete. Models/routes that reject it degrade
+            # to ``json_object`` below and are remembered per model.
+            if json_schema is not None and model not in self._schema_format_unsupported:
+                payload["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "structured_output",
+                        "strict": True,
+                        "schema": json_schema,
+                    },
+                }
+            else:
+                payload["response_format"] = {"type": "json_object"}
             # Ensure the user message mentions JSON
             if msgs[-1]["role"] == "user":
                 msgs[-1]["content"] += "\n\nOutput must be a valid JSON object."
@@ -362,11 +433,31 @@ class OpenRouterProvider(Provider):
             headers=headers,
             json=payload,
         )
+        if (
+            payload.get("response_format", {}).get("type") == "json_schema"
+            and getattr(response, "status_code", 200) >= 400
+        ):
+            # The model/route rejected schema-constrained output (unsupported
+            # parameter, incompatible schema subset, ...). Degrade once to the
+            # plain json_object switch — the prompt still carries the schema
+            # instruction — and never pay this retry again for this model.
+            logger.info(
+                "OpenRouter rejected json_schema response_format for model %s "
+                "(HTTP %s); retrying with json_object",
+                model, response.status_code,
+            )
+            self._schema_format_unsupported.add(model)
+            payload["response_format"] = {"type": "json_object"}
+            response = await client.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+            )
         raise_for_provider_status(response, "OpenRouter")
-        data = response.json()
+        data = _parse_provider_json(response, "OpenRouter")
 
         resp = LLMResponse(
-            content=data["choices"][0]["message"]["content"],
+            content=_extract_chat_content(data, "OpenRouter", model),
             model=data["model"],
             usage=data.get("usage", {}),
             raw_response=data
@@ -391,6 +482,7 @@ class DoublewordProvider(Provider):
         json_mode: bool = False,
         task_id: Optional[str] = None,
         run_id: Optional[str] = None,
+        json_schema: Optional[Dict[str, Any]] = None,  # accepted for interface parity; not used
     ) -> LLMResponse:
         # Only deep-copy when json_mode mutates the last message; otherwise the
         # caller's list is read but never modified, so we can use it directly.
@@ -417,10 +509,10 @@ class DoublewordProvider(Provider):
             json=payload,
         )
         raise_for_provider_status(response, "Doubleword")
-        data = response.json()
+        data = _parse_provider_json(response, "Doubleword")
 
         resp = LLMResponse(
-            content=data["choices"][0]["message"]["content"],
+            content=_extract_chat_content(data, "Doubleword", model),
             model=data["model"],
             usage=data.get("usage", {}),
             raw_response=data
@@ -455,12 +547,200 @@ class OllamaProvider(Provider):
         self.base_url = base_url or self._resolve_base_url()
         self.project_root = project_root
         self.num_ctx = num_ctx if num_ctx is not None else self._resolve_num_ctx()
+        self.max_num_ctx = self._resolve_max_num_ctx()
+        self.keep_alive = self._resolve_keep_alive()
         self.timeout = self._resolve_timeout()
+        self.think = self._resolve_think()
+        self.num_predict = self._resolve_num_predict()
+        self.max_concurrency = self._resolve_max_concurrency()
+        # Set when a server rejects the ``think`` field (older Ollama / non-thinking
+        # model) so subsequent calls skip it instead of paying a retry every time.
+        self._think_unsupported = False
 
     # Local generation latency is unbounded (cold loads, CPU-only hosts, large
     # ``num_ctx``) and is not a network failure, so Ollama gets a generous default
     # and an explicit override rather than the cloud providers' fixed 180s.
     DEFAULT_TIMEOUT = 600.0
+
+    # Default context window when OLLAMA_NUM_CTX is unset. Ollama's own server
+    # default (2k–4k depending on version) silently TRUNCATES DevCouncil's planning
+    # and verification prompts (up to ~15k tokens) — the model then plans/reviews
+    # against half a prompt, which surfaces as garbage plans and miscalibrated
+    # verdicts on local models. 16k covers the largest prompt DevCouncil builds.
+    # Override (up or down, e.g. for a VRAM-limited host) with OLLAMA_NUM_CTX.
+    DEFAULT_NUM_CTX = 16384
+
+    # Default model keep-alive when OLLAMA_KEEP_ALIVE is unset. Ollama unloads a
+    # model after 5 minutes idle; a gated run interleaves LLM calls with long
+    # non-LLM phases (executor runs can exceed 5m), so each council/verify stage
+    # would otherwise pay a multi-minute cold reload of a 30B+ model. "30m" keeps
+    # the model resident across a typical task cycle at zero cost when idle-free.
+    DEFAULT_KEEP_ALIVE = "30m"
+
+    # Ceiling for the ADAPTIVE context window (see complete()): when a prompt would
+    # not fit the configured num_ctx, the request's num_ctx is raised to fit — up to
+    # this cap — instead of letting Ollama silently truncate the prompt (which makes
+    # the model review/plan against half a prompt and surfaces as garbage output and
+    # miscalibrated verdicts). Capped because num_ctx directly scales KV-cache VRAM.
+    # Override with OLLAMA_MAX_NUM_CTX; an explicit OLLAMA_NUM_CTX also raises it
+    # (the cap is never below the configured window).
+    DEFAULT_MAX_NUM_CTX = 65536
+
+    # Crude chars-per-token estimate for sizing the adaptive window. 3 chars/token
+    # deliberately over-estimates tokens (most code/text averages ~3.5-4), so the
+    # adaptive window errs toward "too big" rather than silent truncation.
+    _CHARS_PER_TOKEN = 3.0
+    # Headroom reserved for generation + chat template overhead when fitting a
+    # prompt into the adaptive window.
+    _RESPONSE_HEADROOM_TOKENS = 2048
+
+    @staticmethod
+    def _resolve_keep_alive() -> str | None:
+        """Keep-alive from ``OLLAMA_KEEP_ALIVE`` (Ollama duration string like ``10m``,
+        ``0`` to unload immediately, ``-1`` to pin forever). Unset falls back to
+        :data:`DEFAULT_KEEP_ALIVE`; the literal ``default`` defers to the server."""
+        raw = os.environ.get("OLLAMA_KEEP_ALIVE")
+        if raw is None:
+            return OllamaProvider.DEFAULT_KEEP_ALIVE
+        raw = raw.strip()
+        if not raw or raw.lower() == "default":
+            return None  # omit from payload; let the server decide
+        return raw
+
+    @staticmethod
+    def _resolve_think() -> bool | str | None:
+        """Thinking-mode / thinking-BUDGET override from ``OLLAMA_THINK``.
+
+        Unset -> ``None`` (omit the field; the server/model default applies).
+        Truthy (``1``/``true``/``on``/``yes``) -> request thinking explicitly.
+        Falsy (``0``/``false``/``off``/``no``) -> disable thinking.
+        ``low``/``medium``/``high`` -> a thinking-budget LEVEL, passed through
+        verbatim (Ollama >= 0.12 supports string levels on budget-capable models,
+        e.g. gpt-oss; the existing 400-degrade path covers servers/models that
+        reject it).
+
+        Why this exists: on thinking-capable local models (qwen3 family, deepseek-r1,
+        Ornith) the reasoning channel dominates latency for DevCouncil's structured
+        review/verification calls — measured locally at ~65x (156s with thinking vs
+        2.4s without for one acceptance-check compile). Thinking often *helps* answer
+        quality, so DevCouncil does not flip the default; this knob lets a user trade
+        latency for quality per host. Servers/models that reject the field degrade
+        gracefully (one retry without it, then it is skipped for the provider's life).
+        """
+        raw = os.environ.get("OLLAMA_THINK")
+        if raw is None:
+            return None
+        raw = raw.strip().lower()
+        if raw in {"1", "true", "on", "yes"}:
+            return True
+        if raw in {"0", "false", "off", "no"}:
+            return False
+        if raw in {"low", "medium", "high"}:
+            return raw
+        return None
+
+    # Default client-side cap on in-flight requests to one Ollama server. Callers
+    # legitimately fan out (per-criterion acceptance compiles x samples can launch
+    # 20+ concurrent calls), but a local server generates (near-)serially — so the
+    # HTTP read timeout of a QUEUED request starts ticking long before the server
+    # even sees it, and late requests time out at any timeout setting (the observed
+    # benchmark failure). Capping in-flight requests makes queue wait happen
+    # client-side, where it does not count against the per-request timeout.
+    DEFAULT_MAX_CONCURRENCY = 2
+
+    @staticmethod
+    def _resolve_max_concurrency() -> int | None:
+        """In-flight request cap from ``OLLAMA_MAX_CONCURRENCY`` (positive int).
+        ``0``/``none``/``off`` disables the cap (e.g. for a serving stack that
+        genuinely parallelizes); unset/invalid falls back to
+        :data:`DEFAULT_MAX_CONCURRENCY`."""
+        raw = os.environ.get("OLLAMA_MAX_CONCURRENCY")
+        if raw is None:
+            return OllamaProvider.DEFAULT_MAX_CONCURRENCY
+        raw = raw.strip().lower()
+        if raw in {"0", "none", "off", ""}:
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            return OllamaProvider.DEFAULT_MAX_CONCURRENCY
+        return value if value > 0 else None
+
+    def _get_semaphore(self) -> "asyncio.Semaphore | None":
+        """Lazily create the concurrency semaphore, rebound per event loop.
+
+        Like ``_get_async_client``: an ``asyncio.Semaphore`` belongs to the loop
+        that created it, and one provider instance may be driven from successive
+        ``asyncio.run`` loops. ``None`` when the cap is disabled."""
+        import asyncio
+
+        if not self.max_concurrency:
+            return None
+        loop = asyncio.get_running_loop()
+        sem = getattr(self, "_sem", None)
+        if sem is not None and getattr(self, "_sem_loop", None) is loop:
+            return sem
+        sem = asyncio.Semaphore(self.max_concurrency)
+        self._sem = sem
+        self._sem_loop = loop
+        return sem
+
+    @staticmethod
+    def _resolve_num_predict() -> int | None:
+        """Generation-token cap from ``OLLAMA_NUM_PREDICT`` (positive int; unset or
+        invalid -> no cap). Bounds the WORST CASE of an unbounded thinking spiral: a
+        reasoning model that never stops thinking otherwise generates until the HTTP
+        timeout (600s default), and the router's structured-output layers can stack
+        those stalls past an outer scheduler/benchmark kill. With a cap, a runaway
+        call instead returns quickly with ``done_reason=length`` and flows into the
+        existing truncation warning + healing path."""
+        raw = os.environ.get("OLLAMA_NUM_PREDICT")
+        if not raw:
+            return None
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    @staticmethod
+    def _resolve_max_num_ctx() -> int:
+        """Adaptive-context ceiling from ``OLLAMA_MAX_NUM_CTX`` (positive int).
+        Unset/invalid falls back to :data:`DEFAULT_MAX_NUM_CTX`."""
+        raw = os.environ.get("OLLAMA_MAX_NUM_CTX")
+        if not raw:
+            return OllamaProvider.DEFAULT_MAX_NUM_CTX
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return OllamaProvider.DEFAULT_MAX_NUM_CTX
+        return value if value > 0 else OllamaProvider.DEFAULT_MAX_NUM_CTX
+
+    def _effective_num_ctx(self, messages: List[Dict[str, str]]) -> int | None:
+        """The context window to request for THIS call.
+
+        Starts from the configured ``num_ctx`` and, when the prompt's estimated token
+        count (plus response headroom) would overflow it, grows the window to fit — up
+        to ``max_num_ctx`` (never below an explicitly configured window). Ollama
+        silently TRUNCATES a prompt that exceeds num_ctx, so without this a large
+        verification diff or planning prompt gets reviewed half-read; a too-large
+        request merely costs KV-cache memory. Returns None when num_ctx is disabled
+        (explicit server-default opt-out)."""
+        if not self.num_ctx:
+            return None
+        prompt_chars = sum(len(m.get("content") or "") for m in messages)
+        needed = int(prompt_chars / self._CHARS_PER_TOKEN) + self._RESPONSE_HEADROOM_TOKENS
+        if needed <= self.num_ctx:
+            return self.num_ctx
+        ceiling = max(self.max_num_ctx, self.num_ctx)
+        effective = min(needed, ceiling)
+        if effective > self.num_ctx:
+            logger.info(
+                "Ollama: raising num_ctx %d -> %d for a ~%d-token prompt "
+                "(prevents silent server-side truncation; cap OLLAMA_MAX_NUM_CTX=%d)",
+                self.num_ctx, effective, needed - self._RESPONSE_HEADROOM_TOKENS, ceiling,
+            )
+        return effective
 
     @staticmethod
     def _resolve_timeout() -> float | None:
@@ -480,12 +760,17 @@ class OllamaProvider(Provider):
         return value if value > 0 else None
 
     def cache_fingerprint(self) -> str:
-        # num_ctx and the target server change the response for an identical prompt (a
-        # larger window avoids the truncation a smaller one silently applies; a different
-        # endpoint is a different model server), so both must invalidate the cache. Key on
-        # the *normalized* /api/chat endpoint, not the raw base_url, so equivalent configs
+        # num_ctx (and the adaptive ceiling), think, and the target server all change the
+        # response for an identical prompt (a larger window avoids the truncation a smaller
+        # one silently applies; thinking alters generation; a different endpoint is a
+        # different model server), so each must invalidate the cache. Key on the
+        # *normalized* /api/chat endpoint, not the raw base_url, so equivalent configs
         # (OLLAMA_HOST vs OLLAMA_BASE_URL, with/without a trailing /v1) collapse to one key.
-        return f"ollama:num_ctx={self.num_ctx};endpoint={self._chat_endpoint()}"
+        return (
+            f"ollama:num_ctx={self.num_ctx};max_num_ctx={self.max_num_ctx};"
+            f"think={self.think};num_predict={self.num_predict};"
+            f"endpoint={self._chat_endpoint()}"
+        )
 
     def is_local_cost_free(self) -> bool:
         return True
@@ -508,14 +793,17 @@ class OllamaProvider(Provider):
 
     @staticmethod
     def _resolve_num_ctx() -> int | None:
-        """Context window from ``OLLAMA_NUM_CTX`` (positive int), else None (server default)."""
+        """Context window from ``OLLAMA_NUM_CTX`` (positive int). Unset/invalid falls
+        back to :data:`DEFAULT_NUM_CTX` — never the server default, which is small
+        enough to silently truncate DevCouncil's planning prompts. ``0``/negative
+        explicitly requests the server default (opt-out)."""
         raw = os.environ.get("OLLAMA_NUM_CTX")
         if not raw:
-            return None
+            return OllamaProvider.DEFAULT_NUM_CTX
         try:
             value = int(raw)
         except (TypeError, ValueError):
-            return None
+            return OllamaProvider.DEFAULT_NUM_CTX
         return value if value > 0 else None
 
     def _chat_endpoint(self) -> str:
@@ -533,6 +821,7 @@ class OllamaProvider(Provider):
         json_mode: bool = False,
         task_id: Optional[str] = None,
         run_id: Optional[str] = None,
+        json_schema: Optional[Dict[str, Any]] = None,
     ) -> LLMResponse:
         # Only deep-copy when json_mode mutates the last message; otherwise the
         # caller's list is read but never modified, so we can use it directly.
@@ -545,11 +834,17 @@ class OllamaProvider(Provider):
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        # Native /api/chat options. temperature and num_ctx live under "options"; a
-        # raised num_ctx (OLLAMA_NUM_CTX) prevents silent truncation of large prompts.
+        # Native /api/chat options. temperature and num_ctx live under "options"; the
+        # window is sized per call (see _effective_num_ctx) so a large verification /
+        # planning prompt is never silently truncated server-side.
         options: Dict[str, Any] = {"temperature": temperature}
-        if self.num_ctx:
-            options["num_ctx"] = self.num_ctx
+        effective_ctx = self._effective_num_ctx(msgs)
+        if effective_ctx:
+            options["num_ctx"] = effective_ctx
+        # Cap generation so a thinking model that never stops reasoning returns a
+        # truncated (healable) response instead of running into the HTTP timeout.
+        if self.num_predict:
+            options["num_predict"] = self.num_predict
 
         payload: Dict[str, Any] = {
             "model": model,
@@ -557,26 +852,80 @@ class OllamaProvider(Provider):
             "stream": False,
             "options": options,
         }
+        # Keep the model resident between DevCouncil's interleaved LLM / non-LLM
+        # phases so a 30B+ local model isn't cold-reloaded mid-run (minutes each time).
+        if self.keep_alive is not None:
+            payload["keep_alive"] = self.keep_alive
+        # Explicit thinking-mode request (OLLAMA_THINK). Omitted when unset or when a
+        # previous call learned this server/model rejects the field.
+        if self.think is not None and not self._think_unsupported:
+            payload["think"] = self.think
 
         if json_mode:
-            # Native structured-output switch (more reliable than OpenAI response_format
-            # on Ollama). Still nudge the prompt so the model knows to emit JSON.
-            payload["format"] = "json"
+            # Native structured output. Passing the actual JSON SCHEMA (supported by
+            # Ollama >= 0.5) constrains DECODING to the schema's grammar — a local
+            # model literally cannot emit prose, fences, or a schema echo, which
+            # eliminates most healing retries. Plain "json" is the fallback for
+            # callers without a schema (and for older servers, handled below).
+            payload["format"] = json_schema if json_schema else "json"
             if msgs[-1]["role"] == "user":
                 msgs[-1]["content"] += "\n\nOutput must be a valid JSON object."
 
-        client = self._get_async_client(self.timeout)
-        response = await client.post(
-            self._chat_endpoint(),
-            headers=headers,
-            json=payload,
-        )
-        raise_for_provider_status(response, "Ollama")
-        data = response.json()
+        import contextlib
+        import time as _time
 
-        # Native response shape: {"message": {"content": ...}, "model": ...,
-        # "prompt_eval_count": N, "eval_count": M}. Map token counts to the
-        # OpenAI-style keys the cost ledger/tracker expect.
+        client = self._get_async_client(self.timeout)
+        started = _time.monotonic()
+        # Serialize in-flight requests up to max_concurrency: a local server
+        # generates (near-)serially, so without this a caller fan-out (e.g.
+        # per-criterion acceptance compiles x samples) queues requests SERVER-side
+        # where their read timeouts tick while waiting — late requests then time
+        # out at any timeout setting. The degrade retries below stay inside the
+        # slot so one logical call holds one slot start-to-finish.
+        semaphore = self._get_semaphore()
+        async with (semaphore if semaphore is not None else contextlib.nullcontext()):
+            response = await client.post(
+                self._chat_endpoint(),
+                headers=headers,
+                json=payload,
+            )
+            if "think" in payload and getattr(response, "status_code", 200) >= 400:
+                # Older Ollama servers (< 0.9) and non-thinking models reject the ``think``
+                # field. Drop it once, remember, and never fail the run over a latency knob.
+                logger.info(
+                    "Ollama rejected the think field (HTTP %s); retrying without it",
+                    response.status_code,
+                )
+                self._think_unsupported = True
+                payload.pop("think", None)
+                response = await client.post(
+                    self._chat_endpoint(),
+                    headers=headers,
+                    json=payload,
+                )
+            if json_schema is not None and getattr(response, "status_code", 200) >= 400:
+                # An Ollama server predating schema-constrained ``format`` rejects the
+                # request (400). Degrade once to the plain "json" switch rather than
+                # failing the run over an optional optimization.
+                logger.info(
+                    "Ollama rejected schema-constrained format (HTTP %s); retrying with format=json",
+                    response.status_code,
+                )
+                payload["format"] = "json"
+                response = await client.post(
+                    self._chat_endpoint(),
+                    headers=headers,
+                    json=payload,
+                )
+        raise_for_provider_status(response, "Ollama")
+        # Includes any client-side queue wait — that is the latency the caller
+        # actually experienced, which is what makes a slow stage diagnosable.
+        latency_ms = int((_time.monotonic() - started) * 1000)
+        data = _parse_provider_json(response, "Ollama")
+
+        # Native response shape: {"message": {"content": ..., "thinking": ...},
+        # "model": ..., "prompt_eval_count": N, "eval_count": M}. Map token counts
+        # to the OpenAI-style keys the cost ledger/tracker expect.
         prompt_tokens = int(data.get("prompt_eval_count", 0) or 0)
         completion_tokens = int(data.get("eval_count", 0) or 0)
         usage = {
@@ -584,8 +933,31 @@ class OllamaProvider(Provider):
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
         }
+        message = data.get("message") or {}
+        content = message.get("content", "") or ""
+        if not content.strip() and (message.get("thinking") or "").strip():
+            # A thinking model that spent its whole budget reasoning (or answered
+            # inside the reasoning channel) returns an empty content. Surface the
+            # thinking text so the router's extraction/healing path has SOMETHING
+            # to parse instead of failing on an empty string.
+            content = message["thinking"]
+            logger.warning(
+                "Ollama returned empty content with a non-empty thinking channel "
+                "(model=%s); using the thinking text for parsing. If this recurs, "
+                "set OLLAMA_THINK=false for this host.",
+                data.get("model", model),
+            )
+        if data.get("done_reason") == "length":
+            # Generation hit the token limit mid-answer — structured output is very
+            # likely cut off. Loud, actionable log rather than a silent parse failure.
+            logger.warning(
+                "Ollama generation truncated by length (model=%s, eval_count=%s). "
+                "Structured output may be incomplete; on a thinking model consider "
+                "OLLAMA_THINK=false or a larger context (OLLAMA_NUM_CTX/OLLAMA_MAX_NUM_CTX).",
+                data.get("model", model), completion_tokens,
+            )
         resp = LLMResponse(
-            content=(data.get("message") or {}).get("content", ""),
+            content=content,
             # Ollama may omit ``model`` or return a local tag — fall back to
             # the requested id rather than KeyError-ing.
             model=data.get("model", model),
@@ -593,7 +965,10 @@ class OllamaProvider(Provider):
             raw_response=data,
         )
 
-        _log_model_call(payload, data, resp.usage, self.project_root, task_id=task_id, run_id=run_id, provider="ollama")
+        _log_model_call(
+            payload, data, resp.usage, self.project_root,
+            task_id=task_id, run_id=run_id, provider="ollama", latency_ms=latency_ms,
+        )
         return resp
 
 
@@ -640,6 +1015,7 @@ class VertexAIProvider(Provider):
         json_mode: bool = False,
         task_id: Optional[str] = None,
         run_id: Optional[str] = None,
+        json_schema: Optional[Dict[str, Any]] = None,  # accepted for interface parity; not used
     ) -> LLMResponse:
         # Only deep-copy when json_mode mutates the last message; otherwise the
         # caller's list is read but never modified, so we can use it directly.
@@ -669,10 +1045,10 @@ class VertexAIProvider(Provider):
                 json=payload,
             )
         raise_for_provider_status(response, "Vertex AI")
-        data = response.json()
+        data = _parse_provider_json(response, "Vertex AI")
 
         resp = LLMResponse(
-            content=data["choices"][0]["message"]["content"],
+            content=_extract_chat_content(data, "Vertex AI", model),
             model=data["model"],
             usage=data.get("usage", {}),
             raw_response=data
@@ -689,13 +1065,14 @@ class MockProvider(Provider):
         self._counts: Dict[str, int] = {}
 
     async def complete(
-        self, 
-        model: str, 
-        messages: List[Dict[str, str]], 
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
         temperature: float = 0.0,
         json_mode: bool = False,
         task_id: Optional[str] = None,
         run_id: Optional[str] = None,
+        json_schema: Optional[Dict[str, Any]] = None,  # accepted for interface parity; not used
     ) -> LLMResponse:
         res = self.responses.get(model, '{"mock": "response"}')
         

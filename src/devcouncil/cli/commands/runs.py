@@ -11,6 +11,7 @@ process likely crashed) as ``orphaned``.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -19,9 +20,11 @@ from rich.console import Console
 from rich.table import Table
 
 from devcouncil.utils.redaction import redact_text
+from devcouncil.telemetry.stages import log_stage, log_step
 
 app = typer.Typer(help="List and inspect coding-agent run manifests.")
 console = Console()
+logger = logging.getLogger(__name__)
 
 # A run still marked ``running`` whose manifest has not been touched for longer
 # than this is treated as orphaned (the executor process likely died). Used as a
@@ -142,41 +145,49 @@ def list_runs(
 ) -> None:
     """List recorded coding-agent runs, newest first."""
     root = project_root.expanduser().resolve()
-    orphan_after = _orphan_after_seconds(root)
-    runs = _collect_runs(root, orphan_after=orphan_after)
-    if status:
-        runs = [run for run in runs if run.get("status") == status]
-    if limit > 0:
-        runs = runs[:limit]
+    from devcouncil.telemetry.logging_setup import set_log_dir
+    set_log_dir(root)
+    logger.info("dev runs list: status=%s limit=%d", status, limit)
+    with log_stage("runs", project_root=root, subcommand="list"):
+        log_step("runs/1: collecting run manifests", project_root=root, trace=True)
+        orphan_after = _orphan_after_seconds(root)
+        runs = _collect_runs(root, orphan_after=orphan_after)
+        if status:
+            runs = [run for run in runs if run.get("status") == status]
+        if limit > 0:
+            runs = runs[:limit]
 
-    if json_output:
-        console.print_json(data={"runs": runs, "count": len(runs)})
-        return
+        if json_output:
+            console.print_json(data={"runs": runs, "count": len(runs)})
+            log_step("runs/complete", project_root=root, count=len(runs), trace=True)
+            return
 
-    if not runs:
-        console.print("[dim]No agent runs found under .devcouncil/runs/.[/dim]")
-        return
+        if not runs:
+            console.print("[dim]No agent runs found under .devcouncil/runs/.[/dim]")
+            log_step("runs/complete", project_root=root, count=0, trace=True)
+            return
 
-    table = Table(title="Agent runs")
-    table.add_column("Run ID", overflow="fold")
-    table.add_column("Task")
-    table.add_column("Agent")
-    table.add_column("Profile")
-    table.add_column("Status")
-    table.add_column("Started")
-    for run in runs:
-        status_text = str(run.get("status") or "?")
-        if run.get("orphaned"):
-            status_text = f"[red]{status_text} (orphaned)[/red]"
-        table.add_row(
-            str(run.get("run_id") or ""),
-            str(run.get("task_id") or ""),
-            str(run.get("agent") or ""),
-            str(run.get("profile") or ""),
-            status_text,
-            str(run.get("started_at") or ""),
-        )
-    console.print(table)
+        table = Table(title="Agent runs")
+        table.add_column("Run ID", overflow="fold")
+        table.add_column("Task")
+        table.add_column("Agent")
+        table.add_column("Profile")
+        table.add_column("Status")
+        table.add_column("Started")
+        for run in runs:
+            status_text = str(run.get("status") or "?")
+            if run.get("orphaned"):
+                status_text = f"[red]{status_text} (orphaned)[/red]"
+            table.add_row(
+                str(run.get("run_id") or ""),
+                str(run.get("task_id") or ""),
+                str(run.get("agent") or ""),
+                str(run.get("profile") or ""),
+                status_text,
+                str(run.get("started_at") or ""),
+            )
+        console.print(table)
+        log_step("runs/complete", project_root=root, count=len(runs), trace=True)
 
 
 @app.command("show")
@@ -187,37 +198,44 @@ def show_run(
 ) -> None:
     """Show the full manifest for a run plus a redacted transcript tail."""
     root = project_root.expanduser().resolve()
-    run_dir = _runs_dir(root) / run_id
-    manifest_path = run_dir / "agent-run.json"
-    manifest = _load_manifest(manifest_path)
-    if manifest is None:
+    from devcouncil.telemetry.logging_setup import set_log_dir
+    set_log_dir(root)
+    logger.info("dev runs show: run_id=%s", run_id)
+    with log_stage("runs", project_root=root, subcommand="show", run_id=run_id):
+        log_step("runs/1: loading run manifest", project_root=root, run_id=run_id, trace=True)
+        run_dir = _runs_dir(root) / run_id
+        manifest_path = run_dir / "agent-run.json"
+        manifest = _load_manifest(manifest_path)
+        if manifest is None:
+            if json_output:
+                console.print_json(data={"ok": False, "error": f"Run {run_id} not found.", "run_id": run_id})
+            else:
+                console.print(f"[red]Run {run_id} not found under .devcouncil/runs/.[/red]")
+            raise typer.Exit(code=1)
+
+        orphan_after = _orphan_after_seconds(root)
+        orphaned = _is_orphaned(manifest, manifest_path, orphan_after=orphan_after, now=time.time())
+        transcript_path = _find_transcript(run_dir, manifest)
+        transcript_tail = _transcript_tail(transcript_path) if transcript_path else ""
+
         if json_output:
-            console.print_json(data={"ok": False, "error": f"Run {run_id} not found.", "run_id": run_id})
+            console.print_json(data={
+                "ok": True,
+                "run_id": run_id,
+                "manifest": manifest,
+                "orphaned": orphaned,
+                "transcript_path": str(transcript_path) if transcript_path else None,
+                "transcript_tail": transcript_tail,
+            })
+            log_step("runs/complete", project_root=root, run_id=run_id, trace=True)
+            return
+
+        console.print_json(data=manifest)
+        if orphaned:
+            console.print("[red]This run is orphaned: still marked running but its manifest is stale.[/red]")
+        if transcript_path:
+            console.print(f"\n[bold]Transcript tail[/bold] [dim]({transcript_path})[/dim]:")
+            console.print(transcript_tail or "[dim](empty)[/dim]")
         else:
-            console.print(f"[red]Run {run_id} not found under .devcouncil/runs/.[/red]")
-        raise typer.Exit(code=1)
-
-    orphan_after = _orphan_after_seconds(root)
-    orphaned = _is_orphaned(manifest, manifest_path, orphan_after=orphan_after, now=time.time())
-    transcript_path = _find_transcript(run_dir, manifest)
-    transcript_tail = _transcript_tail(transcript_path) if transcript_path else ""
-
-    if json_output:
-        console.print_json(data={
-            "ok": True,
-            "run_id": run_id,
-            "manifest": manifest,
-            "orphaned": orphaned,
-            "transcript_path": str(transcript_path) if transcript_path else None,
-            "transcript_tail": transcript_tail,
-        })
-        return
-
-    console.print_json(data=manifest)
-    if orphaned:
-        console.print("[red]This run is orphaned: still marked running but its manifest is stale.[/red]")
-    if transcript_path:
-        console.print(f"\n[bold]Transcript tail[/bold] [dim]({transcript_path})[/dim]:")
-        console.print(transcript_tail or "[dim](empty)[/dim]")
-    else:
-        console.print("\n[dim]No transcript file found for this run.[/dim]")
+            console.print("\n[dim]No transcript file found for this run.[/dim]")
+        log_step("runs/complete", project_root=root, run_id=run_id, trace=True)

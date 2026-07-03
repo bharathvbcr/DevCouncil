@@ -270,6 +270,157 @@ def measurable_python_changes(changed: Dict[str, Dict[int, str]]) -> Dict[str, D
     }
 
 
+_JS_SUFFIXES = (".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs")
+_GO_SUFFIX = ".go"
+
+
+def measurable_js_changes(changed: Dict[str, Dict[int, str]]) -> Dict[str, Dict[int, str]]:
+    """Filter to JS/TS source files c8/nyc can instrument."""
+    return {
+        path: lines
+        for path, lines in changed.items()
+        if path.endswith(_JS_SUFFIXES) and not is_test_path(path)
+    }
+
+
+def measurable_go_changes(changed: Dict[str, Dict[int, str]]) -> Dict[str, Dict[int, str]]:
+    """Filter to Go source files ``go test -coverprofile`` can measure."""
+    return {
+        path: lines
+        for path, lines in changed.items()
+        if path.endswith(_GO_SUFFIX) and not is_test_path(path)
+    }
+
+
+def parse_istanbul_json(data: dict, root: Path) -> CoverageData:
+    """Parse c8/nyc ``coverage-final.json`` into :class:`CoverageData`."""
+    executed: Dict[str, Set[int]] = {}
+    executable: Dict[str, Set[int]] = {}
+    if not isinstance(data, dict):
+        return CoverageData()
+    for raw_path, payload in data.items():
+        if not isinstance(payload, dict):
+            continue
+        rel = _relativize(raw_path, root) or _relativize(payload.get("path", raw_path), root)
+        if rel is None:
+            continue
+        stmt_map = payload.get("statementMap") or {}
+        hits = payload.get("s") or {}
+        run: Set[int] = set()
+        all_lines: Set[int] = set()
+        for sid, meta in stmt_map.items():
+            if not isinstance(meta, dict):
+                continue
+            start = meta.get("start") or {}
+            line = int(start.get("line", 0) or 0)
+            if line <= 0:
+                continue
+            all_lines.add(line)
+            if int(hits.get(sid, 0) or 0) > 0:
+                run.add(line)
+        if all_lines:
+            executed[rel] = run
+            executable[rel] = all_lines
+    return CoverageData(executed=executed, executable=executable)
+
+
+def parse_go_coverprofile(text: str, root: Path) -> CoverageData:
+    """Parse ``go tool cover`` profile text into :class:`CoverageData`."""
+    executed: Dict[str, Set[int]] = {}
+    executable: Dict[str, Set[int]] = {}
+    for raw in text.splitlines():
+        if not raw or raw.startswith("mode:"):
+            continue
+        parts = raw.split()
+        if len(parts) < 3:
+            continue
+        loc, count_str = parts[0], parts[2]
+        try:
+            hit = int(count_str)
+        except ValueError:
+            continue
+        file_part = loc.split(":")[0]
+        rel = _relativize(file_part, root)
+        if rel is None:
+            # go profiles often use module paths; try basename match later via intersect.
+            rel = file_part.replace("\\", "/")
+        span = loc.split(":")[-1] if ":" in loc else ""
+        if "," not in span:
+            continue
+        start = span.split(",")[0]
+        try:
+            line = int(start.split(".")[0])
+        except ValueError:
+            continue
+        executable.setdefault(rel, set()).add(line)
+        if hit > 0:
+            executed.setdefault(rel, set()).add(line)
+    return CoverageData(executed=executed, executable=executable)
+
+
+def merge_diff_coverage_results(results: List[DiffCoverageResult]) -> DiffCoverageResult:
+    """Combine per-language measurements into one result."""
+    measured = [r for r in results if r.measured]
+    if not measured:
+        reason = results[0].reason if results else "no measurable source changes in diff"
+        return DiffCoverageResult(measured=False, reason=reason)
+    total_exec = sum(r.changed_executable_lines for r in measured)
+    total_cov = sum(r.covered_changed_lines for r in measured)
+    uncovered: Dict[str, List[int]] = {}
+    absent: List[str] = []
+    tools: List[str] = []
+    for r in measured:
+        if r.tool:
+            tools.append(r.tool)
+        for path, lines in r.uncovered_by_file.items():
+            uncovered.setdefault(path, []).extend(lines)
+        absent.extend(r.absent_files)
+    for path in uncovered:
+        uncovered[path] = sorted(set(uncovered[path]))
+    return DiffCoverageResult(
+        measured=True,
+        tool="+".join(dict.fromkeys(tools)) or "coverage",
+        changed_executable_lines=total_exec,
+        covered_changed_lines=total_cov,
+        uncovered_by_file=uncovered,
+        absent_files=sorted(set(absent)),
+    )
+
+
+def c8_run_argv(command_argv: List[str], *, reports_dir: str) -> Optional[List[str]]:
+    """Wrap a Node/npm test command with c8 instrumentation."""
+    if not command_argv:
+        return None
+    head = Path(command_argv[0]).name.lower()
+    if head.endswith(".exe"):
+        head = head[:-4]
+    # npx c8 ... OR node/node_modules/.bin/c8
+    if head in {"npx", "pnpm", "yarn"}:
+        return [command_argv[0], "c8", "--reporter=json", f"--reports-dir={reports_dir}", *command_argv[1:]]
+    if head in {"npm", "node"}:
+        return ["npx", "c8", "--reporter=json", f"--reports-dir={reports_dir}", *command_argv]
+    return ["npx", "c8", "--reporter=json", f"--reports-dir={reports_dir}", *command_argv]
+
+
+def go_cover_run_argv(command_argv: List[str], profile_path: str) -> Optional[List[str]]:
+    """Inject ``-coverprofile`` into a ``go test`` invocation."""
+    if not command_argv:
+        return None
+    head = Path(command_argv[0]).name.lower()
+    if head.endswith(".exe"):
+        head = head[:-4]
+    if head != "go":
+        return None
+    args = list(command_argv)
+    if "test" not in args:
+        return None
+    if "-coverprofile" in args:
+        return args
+    # Insert after ``go test``.
+    idx = args.index("test") + 1
+    return [*args[:idx], f"-coverprofile={profile_path}", *args[idx:]]
+
+
 def coverage_run_argv(
     command_argv: List[str],
     python: str,

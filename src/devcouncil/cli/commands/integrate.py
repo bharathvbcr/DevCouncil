@@ -10,6 +10,8 @@ import typer
 import yaml  # type: ignore[import-untyped]
 from rich.console import Console
 from rich.table import Table
+from devcouncil.telemetry.stages import log_stage, log_step
+import logging
 
 from devcouncil.executors.agent_registry import (
     BUILTIN_CODING_EXECUTOR_NAMES,
@@ -37,6 +39,7 @@ app = typer.Typer(help="Set up DevCouncil integrations with coding CLIs.")
 setup_app = typer.Typer(help="Set up optional external companion integrations.")
 app.add_typer(setup_app, name="setup")
 console = Console()
+logger = logging.getLogger(__name__)
 
 SUPPORTED_TOOLS = ("codex", "gemini", "claude", "cursor", "opencode", "antigravity", "warp", "aider")
 SUPPORTED_HOOK_TOOLS = ("codex", "gemini", "claude", "cursor")
@@ -1094,31 +1097,35 @@ def overview(ctx: typer.Context):
     if ctx.invoked_subcommand is not None:
         return
 
-    table = Table(title="DevCouncil Coding CLI Integrations")
-    table.add_column("Tool", style="cyan")
-    table.add_column("Setup command", style="green")
-    table.add_column("Notes")
-    table.add_row("Codex CLI", f"{PREFERRED_COMMAND} codex --apply", "Adds DevCouncil as a stdio MCP server.")
-    table.add_row("Gemini CLI", f"{PREFERRED_COMMAND} gemini --apply", "Adds DevCouncil as a project-scoped stdio MCP server.")
-    table.add_row("Claude Code", f"{PREFERRED_COMMAND} claude --apply", "MCP + assistive hooks + slash commands, subagents, output style, skills, statusline. Add --write-gate for blocking containment.")
-    table.add_row("Claude assets", f"{PREFERRED_COMMAND} claude-assets --apply", "Slash commands, subagents, output style, statusline, permissions, skills (no MCP/hooks).")
-    table.add_row("Claude plugin", f"{PREFERRED_COMMAND} claude-plugin --apply", "Self-contained Claude Code plugin + marketplace bundling everything for /plugin install.")
-    table.add_row("Claude uninstall", f"{PREFERRED_COMMAND} claude --uninstall", "Remove DevCouncil hooks, statusline, MCP enablement, and generated assets from .claude/.")
-    table.add_row("Cursor", f"{PREFERRED_COMMAND} cursor --apply", "Writes project .cursor/mcp.json for Cursor editor and cursor-agent.")
-    table.add_row("OpenCode", f"{PREFERRED_COMMAND} opencode --apply", "Adds DevCouncil as a project-scoped OpenCode MCP server and executor.")
-    table.add_row("Google Antigravity CLI", f"{PREFERRED_COMMAND} antigravity --apply", "Writes project .agents/mcp_config.json and enables the agy executor.")
-    table.add_row("Warp / Oz", f"{PREFERRED_COMMAND} warp --apply", "Writes a Warp-compatible MCP JSON file for local agents and Oz CLI.")
-    table.add_row("Aider", f"{PREFERRED_COMMAND} aider --apply", "Enables the built-in Aider headless executor (no MCP).")
-    table.add_row("Bring your own CLI", f"{PREFERRED_COMMAND} cli-agent NAME --command TOOL --apply", "Registers any prompt-taking CLI as a DevCouncil executor.")
-    table.add_row("All", f"{PREFERRED_COMMAND} all --apply", "Runs MCP setup and installs native hooks.")
-    table.add_row("Native hooks", f"{PREFERRED_COMMAND} hooks --apply", "Installs Codex, Gemini, Claude, Cursor, and OpenCode hook files.")
-    table.add_row("Recommend", f"{PREFERRED_COMMAND} recommend", "Show the best executor for this machine and project.")
-    table.add_row("Status", f"{PREFERRED_COMMAND} status", "Compact PATH + config summary (no MCP probe).")
-    table.add_row("Matrix", f"{PREFERRED_COMMAND} matrix", "Print built-in coding CLI integration tiers.")
-    table.add_row("Check", f"{PREFERRED_COMMAND} check", "Verify MCP, hooks, and optional CLIs (--strict, --json for CI).")
-    console.print(table)
-    console.print(f"\nIf your install exposes only the setup flow, use: {LEGACY_COMMAND} --apply")
-    console.print("\nRun without [bold]--apply[/bold] to preview the exact commands first.")
+    logger.info("dev integrate: overview")
+    with log_stage("integrate", subcommand="overview"):
+        log_step("integrate/1: listing integration options", trace=True)
+        table = Table(title="DevCouncil Coding CLI Integrations")
+        table.add_column("Tool", style="cyan")
+        table.add_column("Setup command", style="green")
+        table.add_column("Notes")
+        table.add_row("Codex CLI", f"{PREFERRED_COMMAND} codex --apply", "Adds DevCouncil as a stdio MCP server.")
+        table.add_row("Gemini CLI", f"{PREFERRED_COMMAND} gemini --apply", "Adds DevCouncil as a project-scoped stdio MCP server.")
+        table.add_row("Claude Code", f"{PREFERRED_COMMAND} claude --apply", "MCP + assistive hooks + slash commands, subagents, output style, skills, statusline. Add --write-gate for blocking containment.")
+        table.add_row("Claude assets", f"{PREFERRED_COMMAND} claude-assets --apply", "Slash commands, subagents, output style, statusline, permissions, skills (no MCP/hooks).")
+        table.add_row("Claude plugin", f"{PREFERRED_COMMAND} claude-plugin --apply", "Self-contained Claude Code plugin + marketplace bundling everything for /plugin install.")
+        table.add_row("Claude uninstall", f"{PREFERRED_COMMAND} claude --uninstall", "Remove DevCouncil hooks, statusline, MCP enablement, and generated assets from .claude/.")
+        table.add_row("Cursor", f"{PREFERRED_COMMAND} cursor --apply", "Writes project .cursor/mcp.json for Cursor editor and cursor-agent.")
+        table.add_row("OpenCode", f"{PREFERRED_COMMAND} opencode --apply", "Adds DevCouncil as a project-scoped OpenCode MCP server and executor.")
+        table.add_row("Google Antigravity CLI", f"{PREFERRED_COMMAND} antigravity --apply", "Writes project .agents/mcp_config.json and enables the agy executor.")
+        table.add_row("Warp / Oz", f"{PREFERRED_COMMAND} warp --apply", "Writes a Warp-compatible MCP JSON file for local agents and Oz CLI.")
+        table.add_row("Aider", f"{PREFERRED_COMMAND} aider --apply", "Enables the built-in Aider headless executor (no MCP).")
+        table.add_row("Bring your own CLI", f"{PREFERRED_COMMAND} cli-agent NAME --command TOOL --apply", "Registers any prompt-taking CLI as a DevCouncil executor.")
+        table.add_row("All", f"{PREFERRED_COMMAND} all --apply", "Runs MCP setup and installs native hooks.")
+        table.add_row("Native hooks", f"{PREFERRED_COMMAND} hooks --apply", "Installs Codex, Gemini, Claude, Cursor, and OpenCode hook files.")
+        table.add_row("Recommend", f"{PREFERRED_COMMAND} recommend", "Show the best executor for this machine and project.")
+        table.add_row("Status", f"{PREFERRED_COMMAND} status", "Compact PATH + config summary (no MCP probe).")
+        table.add_row("Matrix", f"{PREFERRED_COMMAND} matrix", "Print built-in coding CLI integration tiers.")
+        table.add_row("Check", f"{PREFERRED_COMMAND} check", "Verify MCP, hooks, and optional CLIs (--strict, --json for CI).")
+        console.print(table)
+        console.print(f"\nIf your install exposes only the setup flow, use: {LEGACY_COMMAND} --apply")
+        console.print("\nRun without [bold]--apply[/bold] to preview the exact commands first.")
+        log_step("integrate/complete", trace=True)
 
 
 @app.command("doctor")

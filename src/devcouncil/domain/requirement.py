@@ -18,5 +18,9 @@ class Requirement(BaseModel):
     title: str
     description: str
     priority: Literal["low", "medium", "high", "critical"]
-    source: Literal["user", "planner", "critic", "arbiter"]
+    # Defaulted: requirements come back through LLM round-trips (arbiter/critic
+    # rewrites) where weaker models sometimes drop provenance metadata; a missing
+    # source shouldn't invalidate an otherwise-sound requirement. "planner" is the
+    # most common origin for machine-generated requirements.
+    source: Literal["user", "planner", "critic", "arbiter"] = "planner"
     acceptance_criteria: List[AcceptanceCriterion] = Field(default_factory=list)

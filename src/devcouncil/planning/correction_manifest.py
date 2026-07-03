@@ -54,6 +54,17 @@ class CorrectionManifest(BaseModel):
     # Both are redacted and size-bounded before being written.
     prior_diff: str = ""
     failing_output: str = ""
+    # One line per prior repair attempt (root cause it targeted + whether the
+    # blocking gaps changed afterwards), carried forward from the previous manifest
+    # so the agent sees its own trajectory instead of rediscovering it.
+    attempt_history: list[str] = Field(default_factory=list)
+    # Deterministic strategy guidance derived from the attempt state: "change
+    # approach" when the same gaps reproduced, "final attempt — analyze, don't
+    # stub" when the budget is nearly spent. Empty on a first attempt.
+    approach_guidance: str = ""
+    # ``file:line reason`` for every stub/placeholder the verifier detected, so the
+    # repair prompt names the exact placeholders to replace.
+    stub_findings: list[str] = Field(default_factory=list)
 
 
 # Severity ordering: most severe first.
@@ -90,6 +101,8 @@ _GAP_TYPE_PRIORITY = {
     "test_failed": 0,
     "acceptance_criteria_unproven": 1,
     "diff_not_exercised": 1,
+    "stub_detected": 1,
+    "stub_declared": 4,
     "task_not_implemented": 2,
     "migration_gap": 2,
     "orphan_diff": 3,
@@ -97,6 +110,7 @@ _GAP_TYPE_PRIORITY = {
     "dependency_risk": 3,
     "architecture_drift": 4,
     "assumption_violated": 4,
+    "suspicious_effort": 4,
     "security_risk": 5,
 }
 
@@ -203,6 +217,51 @@ def _collect_failing_output(project_root: Path, failed_results) -> str:
     return _truncate_tail(redact_text("\n\n".join(blocks)), _MAX_FAILING_OUTPUT_CHARS)
 
 
+REPAIR_RULES = (
+    "## Repair rules (non-negotiable)\n"
+    "1. Only claim completion after every command in `commands_to_rerun` passes locally; "
+    "a claim without fresh passing evidence will be rejected by verification.\n"
+    "2. Never delete, skip, or weaken a test (or an assertion) to make verification pass.\n"
+    "3. Never satisfy a gap with a stub, placeholder, TODO, or hardcoded special-case.\n"
+    "4. If `prior_diff` is present, your previous edit was REJECTED — read `failing_output` "
+    "and fix the root cause; do not re-apply the same change.\n"
+    "5. If the criterion genuinely cannot be met, say so explicitly and explain what is "
+    "missing instead of faking progress.\n"
+)
+
+
+def _build_attempt_history(prior: "CorrectionManifest | None", *, gaps_identical: bool) -> list[str]:
+    """Carry the prior manifest's history forward and append one line for the attempt
+    that just failed. Empty on a first repair."""
+    if prior is None:
+        return []
+    history = list(prior.attempt_history)
+    outcome = "identical blocking gaps reproduced" if gaps_identical else "blocking gaps changed"
+    history.append(
+        f"attempt {max(1, prior.prior_failed_attempts)}: targeted '{prior.root_cause[:160]}'; {outcome}"
+    )
+    # Bounded so a long-running loop cannot swell the manifest.
+    return history[-10:]
+
+
+def _build_approach_guidance(
+    prior: "CorrectionManifest | None", prior_attempts: int, retry_budget: int, *, gaps_identical: bool
+) -> str:
+    parts: list[str] = []
+    if prior is not None and gaps_identical:
+        parts.append(
+            "Your previous approach failed the same way (identical blocking gaps). Do NOT "
+            "retry the same edit; re-read the failing output and change strategy."
+        )
+    if retry_budget and prior_attempts >= retry_budget:
+        parts.append(
+            "This is the FINAL budgeted attempt. If an acceptance criterion cannot be met, "
+            "leave a clear written analysis of why (and what is missing) instead of "
+            "stubbing code or weakening tests."
+        )
+    return " ".join(parts)
+
+
 def build_correction_manifest(
     project_root: Path,
     task: Task,
@@ -211,6 +270,7 @@ def build_correction_manifest(
     repair_service=None,
     prior_attempts: int = 0,
     config=None,
+    prior_manifest: "CorrectionManifest | None" = None,
 ) -> CorrectionManifest:
     # ``config`` may be threaded in by a caller that already loaded it (e.g. the repair
     # loop, which would otherwise reload config from disk on every attempt). Fall back
@@ -234,10 +294,16 @@ def build_correction_manifest(
     # not an arbitrary first gap such as an orphan_diff.
     ordered_gaps = _ordered_blocking_gaps(blocking_gaps)
     root_cause = ordered_gaps[0].description if ordered_gaps else "Unknown failure"
+    ordered_descriptions = [g.description for g in ordered_gaps]
+    gaps_identical = bool(
+        prior_manifest is not None
+        and prior_manifest.ordered_blocking_gaps == ordered_descriptions
+    )
+    retry_budget = config.execution.max_repair_attempts
     manifest = CorrectionManifest(
         task_id=task.id,
         root_cause=root_cause,
-        ordered_blocking_gaps=[g.description for g in ordered_gaps],
+        ordered_blocking_gaps=ordered_descriptions,
         failed_evidence=failed,
         allowed_repair_files=[pf.path for pf in task.planned_files],
         forbidden_changes=list(task.forbidden_changes),
@@ -246,7 +312,7 @@ def build_correction_manifest(
         # hardcoded 0. The agent sees how much of its budget is spent so it knows
         # when to change approach rather than retry the same fix.
         prior_failed_attempts=prior_attempts,
-        retry_budget=config.execution.max_repair_attempts,
+        retry_budget=retry_budget,
         executor_recommendation=config.execution.default_executor,
         created_at=datetime.now(timezone.utc).isoformat(),
         # Prior-attempt context so the next executor repairs against what actually
@@ -254,6 +320,15 @@ def build_correction_manifest(
         # the same wrong approach blind. Both are redacted and size-bounded.
         prior_diff=_collect_prior_diff(project_root, task.id),
         failing_output=_collect_failing_output(project_root, failed_results),
+        attempt_history=_build_attempt_history(prior_manifest, gaps_identical=gaps_identical),
+        approach_guidance=_build_approach_guidance(
+            prior_manifest, prior_attempts, retry_budget, gaps_identical=gaps_identical
+        ),
+        stub_findings=[
+            f"{g.file}:{g.line} {g.description}" if g.file else g.description
+            for g in blocking_gaps
+            if g.gap_type == "stub_detected"
+        ],
     )
 
     if repair_service is not None:
@@ -311,8 +386,12 @@ def write_correction_manifest(
         "Writing correction manifest for %s: %d gap(s), prior_attempts=%d",
         task_id, len(gaps), prior_attempts,
     )
+    # The previous manifest (if any) feeds attempt_history and the identical-gaps
+    # comparison behind approach_guidance. Loaded BEFORE the new one is written.
+    prior_manifest = load_latest_correction_manifest(project_root, task_id)
     manifest = build_correction_manifest(
-        project_root, task, gaps, repair_service=repair_service, prior_attempts=prior_attempts, config=config
+        project_root, task, gaps, repair_service=repair_service, prior_attempts=prior_attempts,
+        config=config, prior_manifest=prior_manifest,
     )
     run_id = str(uuid.uuid4())
     run_dir = project_root / ".devcouncil" / "runs" / run_id
@@ -344,3 +423,15 @@ def load_latest_correction_manifest(project_root: Path, task_id: str) -> Correct
         if not path.exists():
             return None
         return CorrectionManifest.model_validate(json.loads(path.read_text(encoding="utf-8")))
+
+
+def repair_prompt_prefix(project_root: Path, task_id: str) -> str:
+    """Correction manifest + repair rules for a repair run, or ``\"\"`` on first attempt."""
+    correction = load_latest_correction_manifest(project_root, task_id)
+    if correction is None:
+        return ""
+    return (
+        f"# DevCouncil Correction Manifest\n\n"
+        f"{correction.model_dump_json(indent=2)}\n\n"
+        f"{REPAIR_RULES}\n"
+    )

@@ -10,6 +10,7 @@ text and the code under review, then maps each check 1:1 to its criterion.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Dict, List
@@ -92,9 +93,17 @@ class AcceptanceTestCompiler:
             return {}
 
         if per_criterion and len(target) > 1:
+            # Independent per-criterion compiles: run them CONCURRENTLY. Each call is
+            # independent (own prompt, own criterion), so wall-clock drops from N
+            # sequential model calls to max-of-N — the difference between minutes and
+            # tens of minutes on a slow local monitor. A server that processes
+            # requests serially just queues them (no worse than before).
+            results = await asyncio.gather(
+                *(self._sample_checks([ac], code_context, samples) for ac in target)
+            )
             out: Dict[str, List[str]] = {}
-            for ac in target:
-                out.update(await self._sample_checks([ac], code_context, samples))
+            for result in results:
+                out.update(result)
             return out
         return await self._sample_checks(target, code_context, samples)
 
@@ -104,21 +113,29 @@ class AcceptanceTestCompiler:
         """Generate up to ``samples`` independent check commands for ``target`` criteria."""
         valid_ids = {ac.id for ac in target}
         out: Dict[str, List[str]] = {}
+
         # Independent attempts. Each varies temperature + an attempt marker so the router
         # cache keys differ (otherwise an identical prompt+temp returns the cached answer
         # and every "sample" is the same command). Attempt 0 stays deterministic (temp 0).
-        for attempt in range(max(1, samples)):
+        async def _one_attempt(attempt: int) -> "CompiledChecks":
             temperature = 0.0 if attempt == 0 else min(0.8, 0.3 + 0.2 * attempt)
-            try:
-                result = await self.router.complete_structured(
-                    role=self.role,
-                    messages=[{"role": "user", "content": self._compile_prompt(target, code_context, attempt)}],
-                    schema=CompiledChecks,
-                    temperature=temperature,
-                    fallback=CompiledChecks(checks=[]),
-                )
-            except Exception as e:
-                logger.warning("Acceptance-check compile attempt %d failed: %s", attempt, e)
+            return await self.router.complete_structured(
+                role=self.role,
+                messages=[{"role": "user", "content": self._compile_prompt(target, code_context, attempt)}],
+                schema=CompiledChecks,
+                temperature=temperature,
+                fallback=CompiledChecks(checks=[]),
+            )
+
+        # Attempts are independent by construction (distinct prompts/temperatures), so
+        # run them concurrently; results are merged in attempt order to keep candidate
+        # ordering deterministic. A failed attempt costs only itself.
+        results = await asyncio.gather(
+            *(_one_attempt(a) for a in range(max(1, samples))), return_exceptions=True
+        )
+        for attempt, result in enumerate(results):
+            if isinstance(result, BaseException):
+                logger.warning("Acceptance-check compile attempt %d failed: %s", attempt, result)
                 continue
             for check in result.checks:
                 cmd = (check.command or "").strip()
@@ -228,6 +245,12 @@ Rules — the commands are executed verbatim by the verifier:
   python -c "import m; \\ntry: m.f([])\\nexcept ValueError: pass\\nelse: raise SystemExit(1)"
   (real newlines are fine; never put try/if/for after a ';').
 - Use the actual module name implied by the code (e.g. file 'stats.py' -> import stats).
+- Choose DISCRIMINATING inputs: pick the input a plausible-but-lazy implementation
+  would get WRONG, not the easiest happy-path example (which often passes on broken
+  code and proves nothing). Examples: to prove "comment lines are skipped", the
+  comment must CONTAIN the delimiter ('# c=3'); to prove "split on the first X",
+  the value must itself contain X; to prove sorting/ordering, the input must start
+  unsorted; to prove a boundary, test AT the boundary.
 
 HARD PROHIBITIONS — a command that does any of these is INVALID; omit the
 criterion instead of emitting such a command:

@@ -82,3 +82,30 @@ def test_start_event_observer_returns_running_observer(tmp_path):
     finally:
         observer.stop()
         observer.join(timeout=5)
+
+
+def test_live_stub_scan_records_advisory_gap(tmp_path, monkeypatch):
+    _setup(tmp_path)
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "app.py").write_text("def f():\n    pass\n", encoding="utf-8")
+    diff = (
+        "--- a/src/app.py\n"
+        "+++ b/src/app.py\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+def f():\n"
+        "+    pass\n"
+    )
+    monkeypatch.setattr(
+        "devcouncil.execution.fs_watcher.Verifier.get_changed_files",
+        lambda self: ["src/app.py"],
+    )
+    monkeypatch.setattr(
+        "devcouncil.execution.fs_watcher.Verifier.get_diff",
+        lambda self: diff,
+    )
+    watcher = FilesystemWatcher(tmp_path, "TASK-001")
+    watcher.scan_once()
+    with Database(tmp_path / ".devcouncil" / "state.sqlite").get_session() as session:
+        gaps = GapRepository(session).get_all()
+        assert any(g.gap_type == "stub_detected" and not g.blocking for g in gaps)

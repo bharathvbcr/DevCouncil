@@ -39,6 +39,13 @@ def _safe_trace(
     """Mirror a stage/step boundary to the JSONL trace, swallowing any error."""
     if project_root is None:
         return
+    # Never MATERIALIZE a project root that doesn't exist: TraceLogger mkdirs
+    # .devcouncil/ under the given path, so tracing under a typo'd/absent
+    # --project-root would silently create directories there — and break
+    # commands that first check the root's existence (observed: `lsp inspect`
+    # reporting a missing root as valid because the stage trace created it).
+    if not Path(project_root).exists():
+        return
     try:
         from devcouncil.telemetry.traces import TraceLogger
 
@@ -89,11 +96,29 @@ def log_stage(
         yield
     except BaseException as exc:
         elapsed = time.monotonic() - start
-        logger.error("✖ %s failed (%.2fs): %s", name, elapsed, exc)
+        # Control-flow exceptions are NOT stage failures: typer.Exit(1)/SystemExit
+        # is how a CLI command reports a legitimate non-zero verdict (e.g. `verify
+        # --json` on a blocked task), and logging it as "✖ failed" both misleads
+        # and — because the log line prints after the command's JSON — corrupts
+        # machine-readable output for any consumer parsing stdout+stderr.
+        control_flow = isinstance(exc, (SystemExit, KeyboardInterrupt, GeneratorExit))
+        if not control_flow:
+            # typer/click CLI exits, matched STRUCTURALLY rather than by isinstance:
+            # typer can vendor click (typer._click.exceptions.Exit), which does not
+            # subclass the top-level click.exceptions.Exit, so an import-based
+            # isinstance check silently misses typer.Exit.
+            cls = type(exc)
+            control_flow = cls.__name__ in {"Exit", "Abort"} and "click" in (cls.__module__ or "")
+        if control_flow:
+            logger.debug("· %s exited via control flow (%.2fs): %r", name, elapsed, exc)
+            raise
+        # %r, not %s: common failures (httpx.ReadTimeout, CancelledError) stringify
+        # to an EMPTY message, which logs a useless "failed (0.05s): ."
+        logger.error("✖ %s failed (%.2fs): %r", name, elapsed, exc)
         _safe_trace(
             project_root,
             "stage_failed",
-            {"stage": name, "error": str(exc), "elapsed_s": round(elapsed, 3), **context},
+            {"stage": name, "error": repr(exc), "elapsed_s": round(elapsed, 3), **context},
             run_id=run_id,
             task_id=task_id,
             summary=f"Stage failed: {name}",

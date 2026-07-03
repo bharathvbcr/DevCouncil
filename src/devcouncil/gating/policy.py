@@ -12,6 +12,7 @@ from devcouncil.domain.critique import CritiqueFinding
 from devcouncil.gating.checks.requirement_coverage import RequirementCoverageCheck
 from devcouncil.gating.checks.planned_files_check import PlannedFilesCheck
 from devcouncil.gating.checks.clean_git import CleanGitCheck
+from devcouncil.telemetry.stages import log_step
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,13 @@ def _log_gate(name: str, gaps: List[Gap], *, routine: bool = False, **context: A
             name, suffix,
             "; ".join(f"{g.gap_type}: {g.description}" for g in blocking),
         )
+    log_step(
+        f"gate/{name}: {'PASSED' if passed else 'FAILED'}",
+        level=logging.INFO if passed else logging.WARNING,
+        blocking=len(blocking),
+        advisory=len(gaps) - len(blocking),
+        **context,
+    )
     return passed
 
 

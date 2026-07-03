@@ -95,8 +95,15 @@ Assistant response:
 
     def _samples(self, project_root: Path) -> int:
         try:
-            from devcouncil.app.config import load_config
-            return max(1, load_config(project_root).verification.reviewer_checks.samples)
+            from devcouncil.app.config import load_config, role_runs_on_local_provider
+
+            cfg = load_config(project_root)
+            # Auto-tune by reviewer locality: a cost-free local (Ollama) reviewer votes
+            # over 3 independent samples (outvoting a lone mis-calibrated verdict); a
+            # paid cloud reviewer stays single-shot. Explicit config always wins.
+            return cfg.verification.reviewer_checks.resolved(
+                role_runs_on_local_provider(cfg, "live_reviewer")
+            )
         except Exception:
             return 1
 

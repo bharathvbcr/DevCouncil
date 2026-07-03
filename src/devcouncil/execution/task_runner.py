@@ -17,6 +17,7 @@ from devcouncil.app.errors import ExecutionError
 from devcouncil.execution.patch import PatchEngine
 from devcouncil.execution.paths import resolve_project_path
 from devcouncil.telemetry.traces import TraceLogger
+from devcouncil.telemetry.stages import log_step
 from devcouncil.utils.redaction import redact_string
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,12 @@ class TaskRunner:
             self._validate_path_within_root(path)
             self.permissions.validate_action("file_write", path, task, operation=operation)
         applied = self.patch_engine.apply_patch(patch)
+        log_step(
+            f"task_runner/apply_patch: {'applied' if applied else 'failed'}",
+            project_root=self.project_root,
+            task_id=task.id,
+            paths=sorted(changes),
+        )
         self.tracer.log_event(
             "tool_patch_applied",
             {"paths": sorted(changes), "success": applied},
@@ -144,6 +151,12 @@ class TaskRunner:
             stderr_path = self._save_command_log(task.id, command, "stderr", stderr)
             stdout_summary = redact_string(stdout[-500:])
             stderr_summary = redact_string(stderr[-500:])
+            log_step(
+                f"task_runner/run_command: exit {result.returncode}",
+                project_root=self.project_root,
+                task_id=task.id,
+                command=command,
+            )
             self.tracer.log_event(
                 "command_executed",
                 {"command": command, "exit_code": result.returncode},
@@ -171,6 +184,12 @@ class TaskRunner:
         try:
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(content, encoding="utf-8")
+            log_step(
+                f"task_runner/write_file: {path}",
+                project_root=self.project_root,
+                task_id=task.id,
+                operation=operation,
+            )
             self.tracer.log_event(
                 "file_written",
                 {"path": path},

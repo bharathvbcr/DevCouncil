@@ -95,16 +95,36 @@ class AcceptanceCheckConfig(BaseModel):
       stays unproven with a non-blocking advisory). Local sampling is cost-free, so
       raising this (e.g. 3) outvotes a single mis-generated check without ever
       auto-passing a real defect. ``1`` reproduces today's single-check behavior.
+
+    Every knob is OPTIONAL (``None`` = auto). Auto resolves by where the monitor
+    role actually runs — see :meth:`resolved`: a cost-free local (Ollama) monitor
+    gets the calibration-friendly settings this class documents (``samples=3``,
+    ``repair_attempts=2``, ``per_criterion=True``); a paid cloud monitor keeps the
+    single-shot behavior. Setting a value explicitly always wins over auto.
     """
 
-    samples: int = 1
-    repair_attempts: int = 1
+    samples: int | None = None
+    repair_attempts: int | None = None
     # Compile one criterion per model call instead of batching them all into a single
     # prompt. A weak/local model batching N criteria into one JSON routinely omits or
     # mis-attributes some (a false "incomplete"); a focused single-criterion prompt is far
-    # more reliable. Costs N× the calls — cheap on a local monitor, so opt-in. Off keeps
-    # the single batched call.
-    per_criterion: bool = False
+    # more reliable. Costs N× the calls — cheap on a local monitor, so auto-on there.
+    per_criterion: bool | None = None
+
+    # (samples, repair_attempts, per_criterion)
+    _CLOUD_DEFAULTS = (1, 1, False)
+    _LOCAL_DEFAULTS = (3, 2, True)
+
+    def resolved(self, local_monitor: bool) -> tuple[int, int, bool]:
+        """Concrete (samples, repair_attempts, per_criterion) with auto defaults."""
+        d_samples, d_repairs, d_per_criterion = (
+            self._LOCAL_DEFAULTS if local_monitor else self._CLOUD_DEFAULTS
+        )
+        return (
+            max(1, self.samples if self.samples is not None else d_samples),
+            max(0, self.repair_attempts if self.repair_attempts is not None else d_repairs),
+            self.per_criterion if self.per_criterion is not None else d_per_criterion,
+        )
 
 
 class ReviewerCheckConfig(BaseModel):
@@ -116,9 +136,49 @@ class ReviewerCheckConfig(BaseModel):
     escalates to the blocking verdict when a strict majority agree; a split de-escalates to
     the non-blocking "Concerns". ``samples=1`` reproduces today's single-review behavior, so
     a strong cloud model is unaffected. Local sampling is cost-free — raise it (e.g. 3) there.
+
+    ``samples`` is OPTIONAL (``None`` = auto): a local (Ollama) reviewer auto-resolves
+    to 3 votes, a cloud reviewer to 1. An explicit value always wins over auto.
     """
 
-    samples: int = 1
+    samples: int | None = None
+
+    def resolved(self, local_reviewer: bool) -> int:
+        """Concrete sample count with the local/cloud auto default."""
+        if self.samples is not None:
+            return max(1, self.samples)
+        return 3 if local_reviewer else 1
+
+
+class RigorConfig(BaseModel):
+    """Anti-laziness enforcement policy, scaled by task difficulty.
+
+    The stub/effort gates always *run* (unless ``never``); the mode decides when
+    their findings BLOCK: ``hard`` (default) blocks only on tasks classified hard
+    by ``devcouncil.verification.difficulty`` (or a manual ``Task.difficulty``),
+    ``always`` blocks everywhere, ``never`` disables the gate entirely. The
+    remaining knobs escalate existing machinery on hard tasks: coverage
+    enforcement flips ``diff_not_exercised`` to blocking, ``reviewer_required``
+    lets a critical implementation-review finding block (normally advisory), and
+    ``extra_repair_attempts_on_hard`` widens the `dev go` self-repair budget.
+    """
+
+    enabled: bool = True
+    stub_detection: str = "hard"      # never | hard | always
+    effort_heuristics: str = "hard"   # never | hard | always
+    # When coarse fallback proves an AC (passing command, not per-criterion check):
+    # advisory on easy/normal; blocking on hard by default.
+    coarse_acceptance_proof: str = "hard"  # never | hard | always
+    enforce_coverage_on_hard: bool = True
+    reviewer_required_on_hard: bool = False
+    extra_repair_attempts_on_hard: int = 1
+    # Undersized-diff threshold: added CODE lines must reach this many per planned
+    # writable file (only checked when the scope is substantial — >=3 writable
+    # files or any file creation).
+    min_added_lines_per_planned_file: int = 5
+    # On hard tasks, compile at least this many independent acceptance checks per
+    # criterion (input variation) so agents cannot hardcode a single probe value.
+    acceptance_samples_on_hard: int = 2
 
 
 class VerificationConfig(BaseModel):
@@ -126,6 +186,7 @@ class VerificationConfig(BaseModel):
     diff_coverage: DiffCoverageConfig = Field(default_factory=DiffCoverageConfig)
     acceptance_checks: AcceptanceCheckConfig = Field(default_factory=AcceptanceCheckConfig)
     reviewer_checks: ReviewerCheckConfig = Field(default_factory=ReviewerCheckConfig)
+    rigor: RigorConfig = Field(default_factory=RigorConfig)
 
 
 class GatesConfig(BaseModel):
@@ -135,6 +196,12 @@ class GatesConfig(BaseModel):
     block_dependency_changes_without_approval: bool = True
     block_schema_change_without_migration: bool = True
     block_failed_commands: bool = True
+
+
+class PlanningConfig(BaseModel):
+    # In non-interactive flows (stdin not a TTY), unanswered blocking questions from
+    # spec_writer are converted to open assumptions so plan approval does not stall.
+    auto_convert_blocking_questions_in_noninteractive: bool = True
 
 
 class ExecutionConfig(BaseModel):
@@ -159,6 +226,11 @@ class ExecutionConfig(BaseModel):
     # of only being flagged post-verify by orphan_diff. Off by default (it reverts the
     # agent's writes; teams opt in once their plans declare planned_files reliably).
     enforce_file_scope_pre_verify: bool = False
+    # Retries when a coding-CLI subprocess fails with a TRANSIENT network/provider
+    # error ("Connection closed mid-response", 429/5xx, overloaded). Such a failure
+    # says nothing about the task; without a retry it ends the task `blocked` and
+    # burns a repair attempt on a non-code problem. 0 disables the retry.
+    transient_retry_attempts: int = 2
 
 
 class PrivacyConfig(BaseModel):
@@ -303,6 +375,7 @@ class DevCouncilConfig(BaseModel):
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
     commands: CommandsConfig = Field(default_factory=CommandsConfig)
     gates: GatesConfig = Field(default_factory=GatesConfig)
+    planning: PlanningConfig = Field(default_factory=PlanningConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     verification: VerificationConfig = Field(default_factory=VerificationConfig)
     privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
@@ -360,6 +433,26 @@ def load_config(project_root: Path = Path(".")) -> DevCouncilConfig:
     _CONFIG_CACHE[cache_key] = (signature, config)
     logger.debug("Config loaded: provider=%s", config.models.provider)
     return config
+
+
+def role_runs_on_local_provider(config: DevCouncilConfig, role: str) -> bool:
+    """True when ``role`` resolves to a cost-free LOCAL provider (Ollama).
+
+    Honors a per-role ``provider`` override, falling back to ``models.provider``.
+    Used to auto-tune verification knobs (acceptance-check samples / per-criterion
+    compilation / reviewer voting): extra calls are free on a local monitor and are
+    exactly what makes a weak local model's verdicts trustworthy, while a paid cloud
+    monitor keeps the single-shot defaults. Never raises — an unrecognized provider
+    just resolves to False (cloud behavior).
+    """
+    try:
+        from devcouncil.llm.provider import validate_model_provider
+
+        role_cfg = config.models.roles.get(role)
+        provider = (role_cfg.provider if role_cfg and role_cfg.provider else None) or config.models.provider
+        return validate_model_provider(provider) == "ollama"
+    except Exception:
+        return False
 
 
 def provider_api_key_env_var(provider: str = "openrouter") -> str:
@@ -481,7 +574,12 @@ def get_api_key(provider: str = "openrouter", project_root: Path = Path(".")) ->
         # OLLAMA_API_KEY still flows through above if present.
         return ""
     if not key:
-        logger.warning("API key not found for provider %s (env var %s)", provider, env_var)
+        # DEBUG, not WARNING: several callers (e.g. `dev verify` building an optional
+        # LLM router) treat a missing key as an expected, gracefully-degraded state and
+        # swallow the ValueError. The raise below already carries the full actionable
+        # message for callers that surface it; a WARNING here polluted agent-facing
+        # `--json` output whenever the console handler's stream was captured.
+        logger.debug("API key not found for provider %s (env var %s)", provider, env_var)
         extra = (
             " You can also authenticate with 'gcloud auth login' for vertexai."
             if _normalized_provider_name(provider) == "vertexai"

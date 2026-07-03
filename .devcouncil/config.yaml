@@ -1,26 +1,26 @@
 models:
-  provider: ollama
+  provider: openrouter
   roles:
     arbiter:
-      model: hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0
+      model: nvidia/nemotron-3-ultra-550b-a55b:free
     critic_a:
-      model: hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0
+      model: nvidia/nemotron-3-ultra-550b-a55b:free
     critic_b:
-      model: hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0
+      model: nvidia/nemotron-3-ultra-550b-a55b:free
     implementation_reviewer:
-      model: hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0
+      model: nvidia/nemotron-3-ultra-550b-a55b:free
     live_reviewer:
-      model: hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0
+      model: nvidia/nemotron-3-ultra-550b-a55b:free
     native_agent:
-      model: hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0
+      model: nvidia/nemotron-3-ultra-550b-a55b:free
     planner_a:
-      model: hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0
+      model: nvidia/nemotron-3-ultra-550b-a55b:free
     planner_b:
-      model: hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0
+      model: nvidia/nemotron-3-ultra-550b-a55b:free
     prompt_enhancer:
-      model: hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0
+      model: nvidia/nemotron-3-ultra-550b-a55b:free
     spec_writer:
-      model: hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0
+      model: nvidia/nemotron-3-ultra-550b-a55b:free
 project:
   default_branch: main
   name: DevCouncil

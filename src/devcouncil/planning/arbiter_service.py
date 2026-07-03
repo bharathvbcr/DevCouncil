@@ -1,6 +1,6 @@
 import logging
 from typing import List, Dict
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from devcouncil.domain.requirement import Requirement
 from devcouncil.domain.task import Task
 from devcouncil.llm.router import ModelRouter
@@ -8,8 +8,13 @@ from devcouncil.llm.router import ModelRouter
 logger = logging.getLogger(__name__)
 
 class ArbiterDecision(BaseModel):
-    accepted_finding_ids: List[str]
-    rejected_finding_ids: List[Dict[str, str]] # id, reason
+    # Empty finding lists are routinely OMITTED (not sent as "[]") by models on
+    # providers without grammar-constrained decoding; an absent empty list is
+    # not an arbitration failure, so default instead of crashing the run.
+    # final_requirements/final_tasks stay required — a decision without them is
+    # a real failure the healing/retry path must surface.
+    accepted_finding_ids: List[str] = Field(default_factory=list)
+    rejected_finding_ids: List[Dict[str, str]] = Field(default_factory=list)  # id, reason
     final_requirements: List[Requirement]
     final_tasks: List[Task]
 
@@ -48,6 +53,10 @@ You are the arbiter engineering manager. Your goal is to produce the final, defi
 - High-severity unrefuted findings from critics must be incorporated into the final requirements or tasks.
 - If a planner successfully rebutted a finding, you may skip it.
 - Produce a single, coherent task graph.
+- Set each task's ``difficulty`` field to ``easy``, ``normal``, or ``hard`` based on scope
+  (files touched, acceptance criteria count, cross-cutting concerns). Hard tasks get
+  stricter verification — prefer splitting work that would score hard into smaller tasks.
+- Mention ``scaffolding`` in a task description only when intentional placeholders are expected.
 """
         messages = [
             {"role": "user", "content": prompt}

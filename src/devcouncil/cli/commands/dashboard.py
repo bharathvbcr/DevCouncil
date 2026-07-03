@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 import webbrowser
 
@@ -6,9 +7,11 @@ from rich.console import Console
 
 from devcouncil.cli.commands.init import initialize_project
 from devcouncil.ui.dashboard import run_dashboard
+from devcouncil.telemetry.stages import log_stage, log_step
 
 app = typer.Typer(help="Serve the live DevCouncil dashboard.")
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 @app.callback(invoke_without_command=True)
@@ -23,9 +26,14 @@ def dashboard(
     if ctx.invoked_subcommand is not None:
         return
     root = project_root.expanduser().resolve()
+    from devcouncil.telemetry.logging_setup import set_log_dir
+    set_log_dir(root)
+    logger.info("dev dashboard: host=%s port=%d", host, port)
     initialize_project(root, quiet=True)
     url = f"http://{host}:{port}"
-    console.print(f"Serving DevCouncil dashboard at {url}")
-    if open_browser:
-        webbrowser.open(url)
-    run_dashboard(root, host=host, port=port)
+    with log_stage("dashboard", project_root=root, host=host, port=port):
+        log_step("dashboard/1: starting server", project_root=root, trace=True)
+        console.print(f"Serving DevCouncil dashboard at {url}")
+        if open_browser:
+            webbrowser.open(url)
+        run_dashboard(root, host=host, port=port)

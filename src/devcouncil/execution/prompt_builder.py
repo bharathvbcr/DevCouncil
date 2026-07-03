@@ -22,6 +22,24 @@ MAX_SYMBOLS_PER_FILE = 40
 # lowest-priority ones are dropped (with a marker) if the whole prompt would exceed this.
 MAX_PROMPT_CHARS = 60_000
 
+# Appended to the instructions when the task classifies as HARD (see
+# devcouncil.verification.difficulty). Tells the executor up front that the
+# anti-laziness gates will block, so it does not discover strict mode via a
+# failed verify + repair loop. Kept compact — it rides in the never-dropped core.
+_HARD_TASK_RIGOR_SECTION = """
+## Rigor (this task is classified HARD — verification is strict)
+- No stubs, placeholders, or TODO/FIXME markers in added code: the verifier scans the
+  diff and BLOCKS on them. Intentional scaffolding requires the task description to
+  mention "scaffolding" AND the line to carry `devcouncil: allow-stub` (declared stubs
+  are surfaced for human review even when suppressed).
+- Every acceptance criterion needs a passing behavioral check; changed lines must be
+  exercised by the tests you run (diff coverage is enforced).
+- Do not claim completion without running the expected tests and seeing them pass.
+- Never delete, skip, or weaken a test to get to green.
+- If part of the task is genuinely infeasible, say so explicitly and state what is
+  missing instead of stubbing around it.
+"""
+
 # Rough chars-per-token for English/code; deliberately conservative so the derived
 # budget under-fills the window rather than over-fills it.
 _CHARS_PER_TOKEN = 4
@@ -36,13 +54,15 @@ _MIN_PROMPT_CHARS = 8_000
 def _local_context_window_budget(project_root: Path, cfg=None) -> int | None:
     """Char budget derived from a constrained local context window, or ``None``.
 
-    When the run targets the local Ollama provider with an explicit ``OLLAMA_NUM_CTX``,
-    the server silently truncates anything past that window — so a char-only budget that
-    ignores it lets the carefully-assembled prompt get cut off mid-stream. Returns a char
-    budget that fits the window (minus completion headroom) so :meth:`build_task_prompt`
-    can cap itself. Returns ``None`` for cloud providers / unset windows, leaving the
-    default behavior (and the large cloud CLIs' big windows) untouched. Best-effort:
-    any error degrades to ``None``.
+    When the run targets the local Ollama provider, the server silently truncates
+    anything past its context window — so a char-only budget that ignores it lets the
+    carefully-assembled prompt get cut off mid-stream. Returns a char budget that fits
+    the window the provider will actually request (``OLLAMA_NUM_CTX``, else the
+    provider's raised ``DEFAULT_NUM_CTX``), minus completion headroom, so
+    :meth:`build_task_prompt` can cap itself. Returns ``None`` for cloud providers and
+    for an explicit ``OLLAMA_NUM_CTX=0`` opt-out (server-default window, unknowable
+    here), leaving the default behavior untouched. Best-effort: any error degrades
+    to ``None``.
 
     ``cfg`` may be a pre-loaded config (loaded once per task by ``build_task_prompt``); when
     ``None`` it is loaded here so other callers keep working."""
@@ -61,8 +81,8 @@ def _local_context_window_budget(project_root: Path, cfg=None) -> int | None:
 
     num_ctx = OllamaProvider._resolve_num_ctx()
     if not num_ctx:
-        # No explicit window: Ollama uses a small default, but DevCouncil cannot know it.
-        # `dev doctor` already warns to set OLLAMA_NUM_CTX; don't guess a cap here.
+        # Explicit OLLAMA_NUM_CTX=0 opt-out: the server-default window applies and
+        # DevCouncil cannot know it; don't guess a cap here.
         return None
     usable_tokens = num_ctx - _RESERVED_COMPLETION_TOKENS
     if usable_tokens <= 0:
@@ -708,6 +728,19 @@ class PromptBuilder:
 5. Run the allowed commands to verify your work.
 6. Provide evidence of passing tests.
 """
+
+        # Hard-task rigor: when the task classifies as hard, verification runs in
+        # strict mode (stub/effort gates block, diff coverage enforced). Saying so
+        # up front is cheaper than a repair loop after the fact.
+        try:
+            rigor_enabled = True if cfg is None else bool(cfg.verification.rigor.enabled)
+            if rigor_enabled:
+                from devcouncil.verification.difficulty import estimate_difficulty
+
+                if estimate_difficulty(task, requirements) == "hard":
+                    instructions += _HARD_TASK_RIGOR_SECTION
+        except Exception:
+            logger.debug("hard-task rigor section skipped", exc_info=True)
 
         # --- Optional context: fitted within the remaining budget, dropped lowest-
         # priority first. Priority: file contents (1) > structural (2) ~ dependents (2)

@@ -1,6 +1,6 @@
 import logging
 from typing import List
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from devcouncil.domain.requirement import Requirement
 from devcouncil.domain.assumption import Assumption
 from devcouncil.llm.router import ModelRouter
@@ -14,8 +14,14 @@ class BlockingQuestion(BaseModel):
 
 class SpecOutput(BaseModel):
     requirements: List[Requirement]
-    assumptions: List[Assumption]
-    blocking_questions: List[BlockingQuestion]
+    # Models on providers without grammar-constrained decoding (e.g.
+    # gemini-2.5-flash via OpenRouter) routinely OMIT list fields that would be
+    # empty instead of emitting "[]". An absent empty list is semantically
+    # identical to an empty one, so default rather than crash the planning run
+    # with a "Field required" validation error. requirements stays required:
+    # a spec without requirements IS a failure worth surfacing.
+    assumptions: List[Assumption] = Field(default_factory=list)
+    blocking_questions: List[BlockingQuestion] = Field(default_factory=list)
 
 class SpecService:
     def __init__(self, router: ModelRouter):

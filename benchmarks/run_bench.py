@@ -45,6 +45,112 @@ def _resolve(name: str, *preferred: str) -> str | None:
 DEV = _resolve("dev", str(REPO_ROOT / ".venv" / "Scripts" / "dev.exe"), str(REPO_ROOT / ".venv" / "bin" / "dev"))
 CLAUDE = _resolve("claude", str(Path.home() / ".local" / "bin" / "claude.EXE"), str(Path.home() / ".local" / "bin" / "claude"))
 
+# Arm-B defaults: OpenRouter plans and monitors on the free Nemotron tier.
+DEFAULT_DC_TIMEOUT = 2400
+DEFAULT_OPENROUTER_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
+DEFAULT_MONITOR_MODEL = DEFAULT_OPENROUTER_MODEL
+DEFAULT_MONITOR_PROVIDER = "openrouter"
+DEFAULT_OLLAMA_TIMEOUT = "900"  # per-call when --monitor-provider ollama
+SECRETS_PATH = REPO_ROOT / ".devcouncil" / "secrets.env"
+
+
+def _load_repo_secrets() -> dict[str, str]:
+    if not SECRETS_PATH.exists():
+        return {}
+    secrets: dict[str, str] = {}
+    for line in SECRETS_PATH.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        secrets[key.strip()] = value.strip().strip('"').strip("'")
+    return secrets
+
+
+def _resolve_openrouter_key() -> str:
+    return os.environ.get("OPENROUTER_API_KEY", "") or _load_repo_secrets().get("OPENROUTER_API_KEY", "")
+
+
+# Explicit CLI overrides for the arm-B monitor (set from --monitor-think /
+# --monitor-num-predict in main). They beat the inherited environment so a
+# thinking-budget sweep is driven by flags recorded in the results header,
+# not by whatever OLLAMA_* happened to be exported in the shell.
+OLLAMA_ARG_OVERRIDES: dict[str, str] = {}
+
+
+def _bench_env() -> dict:
+    """Child-process env for arm B.
+
+    When the monitor uses Ollama, OLLAMA_THINK=false cuts latency materially.
+    Raise OLLAMA_TIMEOUT when unset so a single compile call is not aborted while the
+    harness still has headroom under DEFAULT_DC_TIMEOUT.
+    """
+    env = dict(os.environ)
+    env.update(OLLAMA_ARG_OVERRIDES)
+    env.setdefault("OLLAMA_THINK", "false")
+    env.setdefault("OLLAMA_TIMEOUT", DEFAULT_OLLAMA_TIMEOUT)
+    return env
+
+
+def _ollama_model_names() -> set[str]:
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen("http://localhost:11434/api/tags", timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return set()
+    return {str(m.get("name", "")) for m in data.get("models", []) if m.get("name")}
+
+
+def _ollama_has_model(tag: str) -> bool:
+    if not tag:
+        return True
+    names = _ollama_model_names()
+    if not names:
+        return False
+    if tag in names:
+        return True
+    base = tag.split(":")[0]
+    return any(n == tag or n.startswith(f"{tag}:") or n.split(":")[0] == base for n in names)
+
+
+def _preflight(arms: list[str], monitor_model: str, monitor_provider: str) -> None:
+    if "B" not in arms:
+        return
+    if not _resolve_openrouter_key():
+        sys.exit(
+            "Set OPENROUTER_API_KEY for DevCouncil planning (arm B), or store it in "
+            f"{SECRETS_PATH.relative_to(REPO_ROOT)}."
+        )
+    if monitor_model and monitor_provider == "ollama":
+        names = _ollama_model_names()
+        if not names:
+            sys.exit("Ollama server not reachable at http://localhost:11434 (arm B monitor).")
+        if not _ollama_has_model(monitor_model):
+            sys.exit(
+                f"Ollama model {monitor_model!r} not found locally. "
+                f"Pull it (ollama pull {monitor_model}) or pass --monitor-model <tag>."
+            )
+
+
+def _classify_verdict(code: int, out: str) -> str:
+    if code == 124 or out.startswith("TIMEOUT"):
+        return "timeout"
+    if "Passed: Ready for release" in out:
+        return "passed"
+    if "Blocked:" in out:
+        return "blocked"
+    if "Incomplete:" in out:
+        return "incomplete"
+    return "error"
+
+
+def _is_retryable_error(run_info: dict) -> bool:
+    """Retry planner/setup flakiness only — not harness timeouts."""
+    return run_info.get("verdict") == "error"
+
 
 SCORE_SCAFFOLD = '''
 import importlib.util, copy, sys, json
@@ -57,7 +163,10 @@ def raises(fn, *args, exc=Exception):
         fn(*args)
     except exc:
         return True
-    except Exception:
+    except BaseException:
+        # Wrong exception type — including SystemExit/KeyboardInterrupt, which do
+        # not subclass Exception and would otherwise kill the whole scaffold and
+        # zero every remaining check.
         return False
     return False
 
@@ -65,7 +174,7 @@ def no_mut(fn, arg):
     before = copy.deepcopy(arg)
     try:
         fn(arg)
-    except Exception:
+    except BaseException:
         pass
     return arg == before
 
@@ -87,7 +196,10 @@ detail = {{}}
 for name, expr in CHECKS.items():
     try:
         ok = bool(eval(expr))
-    except Exception:
+    except BaseException:
+        # BaseException: an implementation calling sys.exit() (or raising
+        # SystemExit) inside one check must fail THAT check, not abort scoring
+        # and zero the entire arm.
         ok = False
     detail[name] = ok
     passed += 1 if ok else 0
@@ -245,17 +357,19 @@ def _apply_acceptance_check_config(ws: Path, samples: int, repair_attempts: int,
 
 
 def arm_devcouncil(ws: Path, goal: str, model: str, executor: str, timeout: int,
-                   monitor_model: str = "", monitor_provider: str = "ollama",
+                   monitor_model: str = "", monitor_provider: str = DEFAULT_MONITOR_PROVIDER,
                    monitor_roles: tuple[str, ...] = (),
                    ac_samples: int = 1, ac_repair_attempts: int = 1,
                    ac_per_criterion: bool = False) -> dict:
     t0 = time.monotonic()
-    init_code, init_out = run([DEV, "init"], cwd=ws, timeout=120)
-    key = os.environ.get("OPENROUTER_API_KEY", "")
+    bench_env = _bench_env()
+    init_code, init_out = run([DEV, "init"], cwd=ws, timeout=120, env=bench_env)
+    key = _resolve_openrouter_key()
     dc_dir = ws / ".devcouncil"
     dc_dir.mkdir(parents=True, exist_ok=True)  # defensive: never fail on a missing dir
     (dc_dir / "secrets.env").write_text(f"OPENROUTER_API_KEY={key}\n", encoding="utf-8")
-    cfg_code, cfg_out = run([DEV, "config", "models", "--provider", "openrouter", "-m", model], cwd=ws, timeout=120)
+    cfg_code, cfg_out = run([DEV, "config", "models", "--provider", "openrouter", "-m", model],
+                            cwd=ws, timeout=120, env=bench_env)
     # If config.yaml was not produced, `dev init`/`dev config models` failed. Fail loudly
     # with their output instead of crashing cryptically later when the routing/AC helpers
     # try to read a non-existent config (e.g. the init regression where logging pre-created
@@ -265,23 +379,15 @@ def arm_devcouncil(ws: Path, goal: str, model: str, executor: str, timeout: int,
         return {"exit": cfg_code or init_code or 1, "seconds": round(time.monotonic() - t0, 1),
                 "verdict": "error", "cost_usd": 0.0,
                 "output_tail": f"SETUP FAILED: no .devcouncil/config.yaml after init/config.\n{tail}"}
-    # Hybrid routing: keep planning on OpenRouter, push the execution-time review
-    # gates to a local provider (Ollama) so monitoring is local and cost-free.
+    # Route execution-time review gates to the monitor provider (OpenRouter by default).
     if monitor_model and monitor_roles:
         _apply_monitor_routing(ws, list(monitor_roles), monitor_provider, monitor_model)
     _apply_acceptance_check_config(ws, ac_samples, ac_repair_attempts, ac_per_criterion)
     code, out = run([DEV, "e2e", goal, "--executor", executor, "--force", "--continue-on-blocked"],
-                    cwd=ws, timeout=timeout)
-    if "Passed: Ready for release" in out:
-        verdict = "passed"
-    elif "Blocked:" in out:
-        verdict = "blocked"
-    elif "Incomplete:" in out:
-        verdict = "incomplete"
-    else:
-        verdict = "error"
+                    cwd=ws, timeout=timeout, env=bench_env)
+    verdict = _classify_verdict(code, out)
     cost = 0.0
-    sc, so = run([DEV, "status", "--json"], cwd=ws, timeout=60)
+    sc, so = run([DEV, "status", "--json"], cwd=ws, timeout=60, env=bench_env)
     try:
         cost = float(json.loads(so).get("total_cost", 0.0))
     except Exception:
@@ -291,7 +397,7 @@ def arm_devcouncil(ws: Path, goal: str, model: str, executor: str, timeout: int,
 
 
 def run_task(task, arms, model, executor, raw_timeout, dc_timeout, score_python, keep, base, dc_retries=1,
-             monitor_model="", monitor_provider="ollama", monitor_roles=(),
+             monitor_model="", monitor_provider=DEFAULT_MONITOR_PROVIDER, monitor_roles=(),
              ac_samples=1, ac_repair_attempts=1, ac_per_criterion=False):
     results = {}
     for arm in arms:
@@ -304,18 +410,27 @@ def run_task(task, arms, model, executor, raw_timeout, dc_timeout, score_python,
             run_info = arm_devcouncil(ws, task.goal, model, executor, dc_timeout,
                                       monitor_model, monitor_provider, monitor_roles,
                                       ac_samples, ac_repair_attempts, ac_per_criterion)
+            run_info["attempts"] = 1
             # Planners occasionally emit malformed JSON for a non-degradable role,
             # which surfaces as verdict=error and no usable result. Retry a fresh
             # workspace so transient planner flakiness does not poison the data point.
+            # Harness timeouts are NOT retried — they already consumed the full budget.
             attempt = 0
-            while run_info["verdict"] == "error" and attempt < dc_retries:
+            while _is_retryable_error(run_info) and attempt < dc_retries:
                 attempt += 1
                 if not keep:
                     shutil.rmtree(ws, ignore_errors=True)
                 ws = make_workspace(base / f"{arm}_retry{attempt}", task)
-                run_info = arm_devcouncil(ws, task.goal, model, executor, dc_timeout,
-                                          monitor_model, monitor_provider, monitor_roles,
-                                          ac_samples, ac_repair_attempts, ac_per_criterion)
+                retry_info = arm_devcouncil(ws, task.goal, model, executor, dc_timeout,
+                                            monitor_model, monitor_provider, monitor_roles,
+                                            ac_samples, ac_repair_attempts, ac_per_criterion)
+                retry_info["attempts"] = attempt + 1
+                # Total spend must include the failed attempt(s): the retried run's own
+                # cost alone under-reports what the data point actually cost.
+                retry_info["cost_usd"] = round(
+                    retry_info.get("cost_usd", 0.0) + run_info.get("cost_usd", 0.0), 4
+                )
+                run_info = retry_info
         else:
             continue
         sc = score(ws, task, score_python)
@@ -355,6 +470,7 @@ def summarize(records: list[dict], arms: list[str]) -> str:
     covered_ok = 0               # verdict consistent with ground truth, incl. incomplete
     silent_total = 0
     silent_surfaced = 0
+    timeouts = 0
     for rec in records:
         row = [rec["task"]]
         for a in arms:
@@ -366,6 +482,8 @@ def summarize(records: list[dict], arms: list[str]) -> str:
             b = rec["arms"].get("B", {})
             v = b.get("verdict", "?")
             full = b.get("fraction", 0) == 1.0
+            if v == "timeout":
+                timeouts += 1
             if v == "blocked":
                 decisive += 1
                 if full:
@@ -401,12 +519,17 @@ def summarize(records: list[dict], arms: list[str]) -> str:
                 "blocked": "NO" if full else "yes",
                 "passed": "yes" if full else "NO",
                 "incomplete": "under" if full else "cautious",
+                "timeout": "timed out",
             }.get(v, "—")
             row.append(v)
             row.append(note)
             # silent-failure surfacing: A shipped a defect; did B avoid silently passing it?
+            # Only verdicts B actually MADE count — an error/timeout run made no claim, so
+            # crediting it as "did not rubber-stamp" would let a completely broken arm B
+            # score a perfect no-silent-pass (observed: a run with 11/11 error verdicts
+            # reporting 4/4).
             a = rec["arms"].get("A", {})
-            if "A" in arms and a.get("fraction", 1.0) < 1.0:
+            if "A" in arms and a.get("fraction", 1.0) < 1.0 and v in ("passed", "blocked", "incomplete"):
                 silent_total += 1
                 if v != "passed" or full:  # B did not falsely pass a defect (blocked/incomplete, or fixed it)
                     silent_surfaced += 1
@@ -423,6 +546,8 @@ def summarize(records: list[dict], arms: list[str]) -> str:
     if "B" in arms:
         lines.append(f"- **False negatives (blocked correct code):** {false_neg}  ← lower is better")
         lines.append(f"- **False positives (passed incorrect code):** {false_pos}")
+        if timeouts:
+            lines.append(f"- **Harness timeouts (arm B):** {timeouts}/{len(records)}")
         if decisive:
             lines.append(f"- **Decisive-verdict accuracy (passed/blocked):** {decisive_ok}/{decisive} = {decisive_ok/decisive:.0%}")
         if covered:
@@ -448,19 +573,20 @@ def main():
     ap = argparse.ArgumentParser(description="DevCouncil effectiveness benchmark")
     ap.add_argument("--arms", default="A,B", help="Comma list of arms: A (raw), B (devcouncil), C (raw+spec).")
     ap.add_argument("--tasks", default="all", help="'all' or comma list of task names.")
-    ap.add_argument("--model", default="google/gemini-2.5-flash", help="DevCouncil planner model (OpenRouter).")
+    ap.add_argument("--model", default=DEFAULT_OPENROUTER_MODEL, help="DevCouncil planner model (OpenRouter).")
     ap.add_argument("--executor", default="claude", help="DevCouncil executor (agent).")
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--timeout", type=int, default=300, help="Per-arm raw-agent timeout (s).")
-    ap.add_argument("--dc-timeout", type=int, default=1200, help="Per-task DevCouncil e2e timeout (s).")
+    ap.add_argument("--dc-timeout", type=int, default=DEFAULT_DC_TIMEOUT,
+                    help="Per-task DevCouncil e2e timeout (s).")
     ap.add_argument("--dc-retries", type=int, default=1, help="Retries when a DevCouncil run errors (planner flakiness).")
     ap.add_argument("--score-python", default=sys.executable, help="Interpreter used to run hidden tests.")
     ap.add_argument("--out", default=str(Path(__file__).parent / "results"))
     ap.add_argument("--keep-workspaces", action="store_true")
-    ap.add_argument("--monitor-model", default="",
-                    help="If set, route the execution-time review roles to this model on --monitor-provider "
-                         "(hybrid: OpenRouter plans, local model guides/monitors). e.g. an Ollama tag.")
-    ap.add_argument("--monitor-provider", default="ollama",
+    ap.add_argument("--monitor-model", default=DEFAULT_MONITOR_MODEL,
+                    help="Route execution-time review roles to this model on --monitor-provider "
+                         "(default: same free Nemotron on OpenRouter). Pass '' to disable.")
+    ap.add_argument("--monitor-provider", default=DEFAULT_MONITOR_PROVIDER,
                     help="Provider for the execution-time review roles when --monitor-model is set.")
     ap.add_argument("--monitor-roles", default="implementation_reviewer,live_reviewer",
                     help="Comma list of roles to route to --monitor-provider/--monitor-model. "
@@ -481,17 +607,29 @@ def main():
                          "all criteria into one prompt. A weak/local monitor omits/mis-attributes "
                          "some when batched; focused per-criterion prompts are far more reliable "
                          "(N× the calls — cheap on a local monitor).")
+    ap.add_argument("--monitor-think", default=None,
+                    choices=["false", "true", "low", "medium", "high"],
+                    help="Thinking mode/budget for the local monitor (sets OLLAMA_THINK for "
+                         "arm B; low|medium|high are budget levels on models that support them, "
+                         "Ollama >= 0.12). Default: false (latency).")
+    ap.add_argument("--monitor-num-predict", type=int, default=None,
+                    help="Hard cap on monitor generation tokens (sets OLLAMA_NUM_PREDICT for "
+                         "arm B). Bounds a runaway thinking spiral to a fast, healable "
+                         "truncation instead of an HTTP-timeout stall.")
     args = ap.parse_args()
     monitor_roles = tuple(r.strip() for r in args.monitor_roles.split(",") if r.strip())
+    if args.monitor_think:
+        OLLAMA_ARG_OVERRIDES["OLLAMA_THINK"] = args.monitor_think
+    if args.monitor_num_predict:
+        OLLAMA_ARG_OVERRIDES["OLLAMA_NUM_PREDICT"] = str(args.monitor_num_predict)
 
     if DEV is None and "B" in args.arms:
         sys.exit("Could not find `dev`. Activate the project venv or add it to PATH.")
     if CLAUDE is None and ("A" in args.arms or "C" in args.arms or args.executor == "claude"):
         sys.exit("Could not find `claude`. Install it or pass a different --executor.")
-    if "B" in args.arms and not os.environ.get("OPENROUTER_API_KEY"):
-        sys.exit("Set OPENROUTER_API_KEY for DevCouncil planning (arm B).")
 
     arms = [a.strip().upper() for a in args.arms.split(",") if a.strip()]
+    _preflight(arms, args.monitor_model, args.monitor_provider)
     task_names = list(TASKS_BY_NAME) if args.tasks == "all" else [t.strip() for t in args.tasks.split(",")]
     tasks = [TASKS_BY_NAME[n] for n in task_names if n in TASKS_BY_NAME]
 
@@ -501,6 +639,10 @@ def main():
     records = []
     print(f"Running {len(tasks)} task(s) x arms {arms} x {args.repeats} repeat(s). Workspaces: {base}")
     if "B" in arms:
+        print(f"  dev e2e timeout: {args.dc_timeout}s")
+        if args.monitor_model:
+            print(f"  monitor: {args.monitor_provider}/{args.monitor_model} "
+                  f"({', '.join(monitor_roles)})")
         print(f"  acceptance checks: samples={args.ac_samples} repair_attempts={args.ac_repair_attempts} "
               f"per_criterion={args.ac_per_criterion}")
     for task in tasks:
@@ -515,9 +657,12 @@ def main():
                                 ac_samples=args.ac_samples, ac_repair_attempts=args.ac_repair_attempts,
                                 ac_per_criterion=args.ac_per_criterion)
             for a, r in arms_res.items():
-                print(f"      arm {a}: {r['score']}/{r['total']}"
-                      + (f"  verdict={r['verdict']}  ${r['cost_usd']}" if a == "B" else "")
-                      + f"  {r['seconds']}s")
+                extra = ""
+                if a == "B":
+                    extra = f"  verdict={r['verdict']}  ${r['cost_usd']}"
+                    if r.get("attempts", 1) > 1:
+                        extra += f"  attempts={r['attempts']}"
+                print(f"      arm {a}: {r['score']}/{r['total']}{extra}  {r['seconds']}s")
             records.append({"task": label, "arms": arms_res})
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -525,6 +670,12 @@ def main():
     raw_path.write_text(json.dumps({
         "model": args.model,
         "executor": args.executor,
+        "dc_timeout": args.dc_timeout,
+        "ollama_env": {
+            "OLLAMA_THINK": _bench_env().get("OLLAMA_THINK"),
+            "OLLAMA_TIMEOUT": _bench_env().get("OLLAMA_TIMEOUT"),
+            "OLLAMA_NUM_PREDICT": _bench_env().get("OLLAMA_NUM_PREDICT"),
+        },
         "monitor": ({"provider": args.monitor_provider, "model": args.monitor_model,
                      "roles": list(monitor_roles)} if args.monitor_model else None),
         "acceptance_checks": {"samples": args.ac_samples, "repair_attempts": args.ac_repair_attempts,

@@ -1,3 +1,6 @@
+import json
+from dataclasses import asdict
+
 import typer
 from rich.console import Console
 from rich.markdown import Markdown
@@ -8,15 +11,18 @@ from devcouncil.integrations.github import GitHubIntegration
 from devcouncil.integrations.pr_comments import GitHubPRCommenter, GitLabMRCommenter, build_pr_comment_body
 from devcouncil.artifacts.graph import ArtifactGraph
 from devcouncil.telemetry.traces import TraceLogger
+from devcouncil.telemetry.stages import log_stage, log_step
 from devcouncil.cli.commands.init import initialize_project
 from devcouncil.live.summary import live_review_summary
 import asyncio
+import logging
 import os
 import subprocess
 from pathlib import Path
 
 app = typer.Typer()
 console = Console()
+logger = logging.getLogger(__name__)
 
 async def run_github_report(graph: ArtifactGraph, project_root: Path):
     token = os.environ.get("GITHUB_TOKEN")
@@ -92,46 +98,82 @@ def report(
         return
 
     root = project_root.expanduser().resolve()
+    from devcouncil.telemetry.logging_setup import set_log_dir
+    set_log_dir(root)
+    logger.info("dev report: json=%s planning_only=%s", json_format, planning_only)
     initialize_project(root, quiet=True)
     db = get_db(root)
     if not db:
         console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
         raise typer.Exit(code=1)
 
-    with db.get_session() as session:
-        graph_repo = ArtifactGraphRepository(session)
-        graph = graph_repo.load_graph()
-        live_review = live_review_summary(root)
-        TraceLogger(root).log_event(
-            "report_generated",
-            {
-                "json": json_format,
-                "github": github,
-                "github_pr_comment": github_pr_comment,
-                "gitlab_pr_comment": gitlab_pr_comment,
-                "planning_only": planning_only,
-            },
-            summary="Generated DevCouncil report",
-        )
-        
-        if github:
-            asyncio.run(run_github_report(graph, root))
-            return
+    with log_stage("report", project_root=root, planning_only=planning_only):
+        log_step("report/1: loading artifact graph", project_root=root)
+        with db.get_session() as session:
+            graph_repo = ArtifactGraphRepository(session)
+            graph = graph_repo.load_graph()
+            live_review = live_review_summary(root)
+            TraceLogger(root).log_event(
+                "report_generated",
+                {
+                    "json": json_format,
+                    "github": github,
+                    "github_pr_comment": github_pr_comment,
+                    "gitlab_pr_comment": gitlab_pr_comment,
+                    "planning_only": planning_only,
+                },
+                summary="Generated DevCouncil report",
+            )
 
-        if github_pr_comment:
-            asyncio.run(run_github_pr_comment(graph, live_review=live_review))
-            return
+            if github:
+                log_step("report/2: posting to GitHub checks", project_root=root)
+                asyncio.run(run_github_report(graph, root))
+                return
 
-        if gitlab_pr_comment:
-            asyncio.run(run_gitlab_mr_comment(graph, live_review=live_review))
-            return
+            if github_pr_comment:
+                log_step("report/2: posting GitHub PR comment", project_root=root)
+                asyncio.run(run_github_pr_comment(graph, live_review=live_review))
+                return
 
-        if json_format:
-            output = ReportBuilder.build_json(graph, live_review=live_review)
-            typer.echo(output)
-        else:
-            output = ReportBuilder.build_markdown(graph, live_review=live_review)
-            console.print(Markdown(output))
+            if gitlab_pr_comment:
+                log_step("report/2: posting GitLab MR comment", project_root=root)
+                asyncio.run(run_gitlab_mr_comment(graph, live_review=live_review))
+                return
 
-        if fail_on_blocking and graph.blocking_gaps():
-            raise typer.Exit(code=1)
+            log_step(
+                "report/2: rendering output",
+                project_root=root,
+                json_format=json_format,
+                trace=True,
+            )
+            if json_format:
+                output = ReportBuilder.build_json(graph, live_review=live_review)
+                typer.echo(output)
+            else:
+                output = ReportBuilder.build_markdown(graph, live_review=live_review)
+                console.print(Markdown(output))
+
+            if fail_on_blocking and graph.blocking_gaps():
+                raise typer.Exit(code=1)
+
+
+@app.command("rigor")
+def rigor_report(
+    json_format: bool = typer.Option(False, "--json", help="Output machine-readable JSON."),
+    project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """Aggregate rigor-gap patterns across persisted verification runs.
+
+    Surfaces recurring stub/effort failures and repair-loop stats so teams can
+    tune ``verification.rigor`` thresholds from evidence rather than guesses.
+    """
+    from devcouncil.verification.rigor_analytics import build_rigor_report
+
+    root = project_root.expanduser().resolve()
+    initialize_project(root, quiet=True)
+    report = build_rigor_report(root)
+
+    if json_format:
+        typer.echo(json.dumps(asdict(report), indent=2))
+    else:
+        console.print(Markdown(report.to_markdown()))

@@ -29,6 +29,7 @@ from devcouncil.llm.router import ModelRouter, StructuredOutputError
 from devcouncil.verification.ad_hoc_check import AdHocCheckResult, run_working_tree_check
 from devcouncil.verification.implementation_reviewer import ImplementationReviewer
 from devcouncil.verification.verifier import Verifier
+from devcouncil.telemetry.stages import log_stage, log_step
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -59,7 +60,20 @@ def check(
     root = project_root.expanduser().resolve()
     from devcouncil.telemetry.logging_setup import set_log_dir
     set_log_dir(root)
+    logger.info("dev check: verify=%s goal=%s base=%s", verify, bool(goal), base or "working-tree")
     initialize_project(root, quiet=True)
+
+    with log_stage("check", project_root=root, verify=verify):
+        _run_check_body(
+            root, goal, base, test_commands, verify, enforce_coverage,
+            min_coverage, json_format,
+        )
+
+
+def _run_check_body(
+    root, goal, base, test_commands, verify, enforce_coverage, min_coverage, json_format,
+):
+    log_step("check/1: resolving diff scope", project_root=root, trace=True)
 
     # A --goal of "#142" or a GitHub issue/PR URL is a reference, not a spec —
     # expand it into the issue/PR title + body so acceptance checks and the review
@@ -87,6 +101,7 @@ def check(
             _render_gate(result)
         raise typer.Exit(code=0 if result.passed else 1)
 
+    log_step("check/2: running LLM audit", project_root=root)
     verifier = Verifier(root)
 
     logger.info("dev check (LLM audit): base=%s goal=%s", base or "working-tree", "set" if goal else "none")
@@ -180,6 +195,7 @@ def check(
         "[dim]Tip: `dev check --verify --test \"<cmd>\"` runs the deterministic evidence gate "
         "(no provider keys).[/dim]"
     )
+    log_step("check/complete", project_root=root, trace=True)
 
 
 def _render_gate(result: AdHocCheckResult) -> None:

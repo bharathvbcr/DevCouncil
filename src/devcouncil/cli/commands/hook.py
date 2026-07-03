@@ -8,6 +8,7 @@ from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import TaskRepository
 from devcouncil.execution.hook_policy import HookPolicy
 from devcouncil.telemetry.traces import TraceLogger
+from devcouncil.telemetry.stages import log_step
 from devcouncil.live.signals import write_signal
 from devcouncil.live.tasks import active_task_id
 
@@ -91,6 +92,7 @@ def pre_tool_use(
             # A real tool call we cannot parse must not silently pass the gate.
             return _emit_unevaluable(normalized_client, "Tool-call payload was not valid JSON; could not enforce policy.", strict)
         root = _project_root(project_root)
+        log_step(f"hook/pre_tool_use: client={normalized_client}", project_root=root)
         active_task = _active_task(root)
 
         decision = HookPolicy(project_root=root).evaluate(call_data, active_task)
@@ -110,7 +112,9 @@ def post_tool_use(
     Coding CLI hook: Records a post-tool-use checkpoint for native hook clients.
     """
     _ = tool_call_json if tool_call_json is not None else sys.stdin.read()
-    _ = _project_root(project_root)
+    root = _project_root(project_root)
+    log_step(f"hook/post_tool_use: client={client}", project_root=root)
+    _ = root
     if client.lower() in {"codex", "gemini"}:
         print(json.dumps({"decision": "allow", "suppressOutput": True}, separators=(",", ":")))
 

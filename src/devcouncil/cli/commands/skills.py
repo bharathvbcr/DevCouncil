@@ -7,9 +7,12 @@ from rich.table import Table
 
 from devcouncil.knowledge.frontmatter import build_frontmatter_markdown
 from devcouncil.skills.registry import Skill, get_skill, load_skills, scaffold_skills, select_skills
+from devcouncil.telemetry.stages import log_stage, log_step
+import logging
 
 app = typer.Typer(help="Inspect and scaffold DevCouncil engineering skills for coding agents.")
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 def _is_repo_skill(skill, project_root: Path) -> bool:
@@ -33,27 +36,33 @@ def skills(
         return
 
     root = project_root.expanduser().resolve()
-    all_skills = load_skills(project_root=root)
-    if not all_skills:
-        console.print("[yellow]No skills found in the DevCouncil skills library.[/yellow]")
-        raise typer.Exit()
+    from devcouncil.telemetry.logging_setup import set_log_dir
+    set_log_dir(root)
+    logger.info("dev skills list: goal=%r", goal)
+    with log_stage("skills", project_root=root):
+        log_step("skills/1: loading skill registry", project_root=root, trace=True)
+        all_skills = load_skills(project_root=root)
+        if not all_skills:
+            console.print("[yellow]No skills found in the DevCouncil skills library.[/yellow]")
+            raise typer.Exit()
 
-    selected = {skill.name for skill in select_skills(goal, root)}
-    table = Table(title="DevCouncil Skills")
-    table.add_column("Skill", style="cyan")
-    table.add_column("Source", justify="center")
-    table.add_column("Applies", justify="center")
-    table.add_column("Description")
-    for skill in all_skills:
-        applies = "always" if skill.always else ("yes" if skill.name in selected else "-")
-        style = "green" if skill.name in selected else "dim"
-        source = "repo" if _is_repo_skill(skill, root) else "library"
-        table.add_row(skill.name, source, f"[{style}]{applies}[/{style}]", skill.description)
-    console.print(table)
-    console.print(
-        "\nScaffold the applicable skills into this repo with: "
-        "[bold]dev skills scaffold[/bold] (add a goal to widen selection, or --all)."
-    )
+        selected = {skill.name for skill in select_skills(goal, root)}
+        table = Table(title="DevCouncil Skills")
+        table.add_column("Skill", style="cyan")
+        table.add_column("Source", justify="center")
+        table.add_column("Applies", justify="center")
+        table.add_column("Description")
+        for skill in all_skills:
+            applies = "always" if skill.always else ("yes" if skill.name in selected else "-")
+            style = "green" if skill.name in selected else "dim"
+            source = "repo" if _is_repo_skill(skill, root) else "library"
+            table.add_row(skill.name, source, f"[{style}]{applies}[/{style}]", skill.description)
+        console.print(table)
+        console.print(
+            "\nScaffold the applicable skills into this repo with: "
+            "[bold]dev skills scaffold[/bold] (add a goal to widen selection, or --all)."
+        )
+        log_step("skills/complete", project_root=root, count=len(all_skills), trace=True)
 
 
 @app.command("show")

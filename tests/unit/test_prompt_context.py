@@ -251,3 +251,28 @@ def test_prompt_enhancement_loader_safe_on_malformed_json(tmp_path):
     dc.mkdir(parents=True)
     (dc / "active_prompt_enhancement.json").write_text("{not json", encoding="utf-8")
     assert load_latest_prompt_enhancement(tmp_path) is None  # malformed -> None, never raises
+
+
+def test_prompt_injects_rigor_section_for_hard_tasks(tmp_path):
+    task = Task(
+        id="TASK-HARD",
+        title="Refactor auth",
+        description="Cross-cutting migration",
+        difficulty="hard",
+        planned_files=[PlannedFile(path="src/auth.py", reason="edit", allowed_change="modify")],
+    )
+    prompt = PromptBuilder(tmp_path).build_task_prompt(task, [])
+    assert "classified HARD" in prompt
+    assert "devcouncil: allow-stub" in prompt
+
+
+def test_prompt_omits_rigor_section_for_easy_tasks(tmp_path):
+    task = Task(
+        id="TASK-EASY",
+        title="Small fix",
+        description="One-line change",
+        difficulty="easy",
+        planned_files=[PlannedFile(path="src/a.py", reason="edit", allowed_change="modify")],
+    )
+    prompt = PromptBuilder(tmp_path).build_task_prompt(task, [])
+    assert "classified HARD" not in prompt

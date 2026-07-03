@@ -190,8 +190,23 @@ async def test_num_ctx_from_env_passed_in_options(tmp_path, monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_num_ctx_absent_when_unset(tmp_path, monkeypatch):
+async def test_num_ctx_defaults_when_unset(tmp_path, monkeypatch):
+    # Unset OLLAMA_NUM_CTX must resolve to the raised DEFAULT_NUM_CTX, not the Ollama
+    # server default (2k-4k), which silently truncates ~15k-token planning prompts.
     monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
+    calls = []
+    monkeypatch.setattr(
+        "devcouncil.llm.provider.httpx.AsyncClient", make_fake_client(calls, _native_response())
+    )
+    provider = OllamaProvider(project_root=tmp_path)
+    await provider.complete("m", [{"role": "user", "content": "hi"}])
+    assert calls[0]["json"]["options"]["num_ctx"] == OllamaProvider.DEFAULT_NUM_CTX
+
+
+@pytest.mark.anyio
+async def test_num_ctx_absent_on_explicit_optout(tmp_path, monkeypatch):
+    # OLLAMA_NUM_CTX=0 explicitly requests the server default (payload omits num_ctx).
+    monkeypatch.setenv("OLLAMA_NUM_CTX", "0")
     calls = []
     monkeypatch.setattr(
         "devcouncil.llm.provider.httpx.AsyncClient", make_fake_client(calls, _native_response())
@@ -235,14 +250,16 @@ async def test_complete_sends_authorization_when_key_present(tmp_path, monkeypat
 
 
 def test_resolve_num_ctx(monkeypatch):
+    # Unset/invalid -> raised default (never the truncating server default);
+    # explicit positive int wins; 0/negative explicitly opts out (server default).
     monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
-    assert OllamaProvider._resolve_num_ctx() is None
-    monkeypatch.setenv("OLLAMA_NUM_CTX", "16384")
-    assert OllamaProvider._resolve_num_ctx() == 16384
+    assert OllamaProvider._resolve_num_ctx() == OllamaProvider.DEFAULT_NUM_CTX
+    monkeypatch.setenv("OLLAMA_NUM_CTX", "32768")
+    assert OllamaProvider._resolve_num_ctx() == 32768
     monkeypatch.setenv("OLLAMA_NUM_CTX", "0")
     assert OllamaProvider._resolve_num_ctx() is None
     monkeypatch.setenv("OLLAMA_NUM_CTX", "not-an-int")
-    assert OllamaProvider._resolve_num_ctx() is None
+    assert OllamaProvider._resolve_num_ctx() == OllamaProvider.DEFAULT_NUM_CTX
 
 
 @pytest.mark.parametrize("num_ctx", [None, "16384"])

@@ -30,6 +30,7 @@ from devcouncil.app.config import get_api_key, load_config
 from devcouncil.llm.provider import create_provider, validate_model_provider
 from devcouncil.llm.router import ModelRouter
 from devcouncil.telemetry.traces import TraceLogger
+from devcouncil.telemetry.stages import log_stage, log_step
 
 app = typer.Typer(help="Review active coding-agent sessions and emit critique cards.")
 console = Console()
@@ -44,19 +45,26 @@ def sessions(
 ):
     """List coding-agent transcripts DevCouncil can review."""
     root = project_root.expanduser().resolve()
-    found = discover_sessions(root, client=client)
-    if json_format:
-        typer.echo(json.dumps({"sessions": [item.model_dump() for item in found]}, indent=2))
-        return
+    from devcouncil.telemetry.logging_setup import set_log_dir
+    set_log_dir(root)
+    logger.info("dev watch sessions: client=%s", client)
+    with log_stage("watch", project_root=root, subcommand="sessions", client=client):
+        log_step("watch/1: discovering sessions", project_root=root, trace=True)
+        found = discover_sessions(root, client=client)
+        if json_format:
+            typer.echo(json.dumps({"sessions": [item.model_dump() for item in found]}, indent=2))
+            log_step("watch/complete", project_root=root, count=len(found), trace=True)
+            return
 
-    table = Table(title="DevCouncil Watch Sessions")
-    table.add_column("Client", style="cyan")
-    table.add_column("Session")
-    table.add_column("Turns", justify="right")
-    table.add_column("Transcript")
-    for item in found:
-        table.add_row(item.client, item.id, str(item.turns), item.transcript_path)
-    console.print(table)
+        table = Table(title="DevCouncil Watch Sessions")
+        table.add_column("Client", style="cyan")
+        table.add_column("Session")
+        table.add_column("Turns", justify="right")
+        table.add_column("Transcript")
+        for item in found:
+            table.add_row(item.client, item.id, str(item.turns), item.transcript_path)
+        console.print(table)
+        log_step("watch/complete", project_root=root, count=len(found), trace=True)
 
 
 @app.command("review")

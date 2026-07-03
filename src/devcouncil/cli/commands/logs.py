@@ -5,6 +5,13 @@ breaks. This command surfaces the always-on shared log
 (``.devcouncil/logs/devcouncil.log``) and the per-run logs
 (``.devcouncil/runs/<run_id>/run.log``) without the user needing to remember
 paths or hand-roll ``tail``/``grep``.
+
+DELIBERATELY UNINSTRUMENTED: this command's subject *is* the log. Emitting log
+records (``logger.info`` / ``log_stage`` / ``log_step``) from here mutates what
+the user asked to inspect — ``tail`` displaces the trailing lines it was asked
+to show with its own records, and ``path`` creates the very file it is supposed
+to report as "not created yet". An introspection command must not modify what
+it introspects, so no stage instrumentation belongs in this file.
 """
 
 import time
@@ -32,7 +39,6 @@ def _print_tail(path: Path, limit: int, grep: Optional[str]) -> None:
     if not path.exists():
         console.print(f"[yellow]No log at {path}. Run a command first (or pass --project-root).[/yellow]")
         raise typer.Exit(code=0)
-    # Read only the tail rather than the whole (potentially large, rotated) file.
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     if grep:
         lines = [line for line in lines if grep.lower() in line.lower()]
@@ -56,11 +62,10 @@ def tail(
     if not follow:
         return
 
-    # Follow mode: poll for appended bytes (the file is append-only between rotations).
     console.print(f"[dim]— following {path} (Ctrl-C to stop) —[/dim]")
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
-            handle.seek(0, 2)  # jump to EOF; we already printed the tail
+            handle.seek(0, 2)
             while True:
                 line = handle.readline()
                 if line:

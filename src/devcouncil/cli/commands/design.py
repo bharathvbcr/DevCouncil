@@ -21,9 +21,12 @@ from devcouncil.knowledge.design_conformance import (
     STYLE_EXTENSIONS,
     scan_files,
 )
+from devcouncil.telemetry.stages import log_stage, log_step
+import logging
 
 app = typer.Typer(help="Lint, export, and inspect a design.md design system.")
 console = Console()
+logger = logging.getLogger(__name__)
 
 # Where a project's design system is looked for, in order.
 _DEFAULT_PATHS = (
@@ -73,23 +76,30 @@ def lint(
 ):
     """Validate a design system: broken token refs, contrast, ordering, orphans."""
     root = project_root.expanduser().resolve()
-    target = _resolve_path(path, root)
-    if target is None:
-        console.print("[red]No design.md found.[/red] Looked for: " + ", ".join(_DEFAULT_PATHS))
-        raise typer.Exit(code=1)
+    from devcouncil.telemetry.logging_setup import set_log_dir
+    set_log_dir(root)
+    logger.info("dev design lint")
+    with log_stage("design", project_root=root, subcommand="lint"):
+        log_step("design/1: linting design system", project_root=root, trace=True)
+        target = _resolve_path(path, root)
+        if target is None:
+            console.print("[red]No design.md found.[/red] Looked for: " + ", ".join(_DEFAULT_PATHS))
+            raise typer.Exit(code=1)
 
-    findings = lint_design(parse_design_md(target))
-    if not findings:
-        console.print(f"[green]✓ {target} passed all design.md lint rules.[/green]")
-        return
+        findings = lint_design(parse_design_md(target))
+        if not findings:
+            console.print(f"[green]✓ {target} passed all design.md lint rules.[/green]")
+            log_step("design/complete", project_root=root, trace=True)
+            return
 
-    errors = [f for f in findings if f.severity == "error"]
-    color = {"error": "red", "warning": "yellow", "info": "cyan"}
-    console.print(f"[bold]{len(findings)} finding(s) in {target}:[/bold]")
-    for f in findings:
-        console.print(f"  [{color.get(f.severity, 'white')}]{f.format()}[/{color.get(f.severity, 'white')}]")
-    if errors:
-        raise typer.Exit(code=1)
+        errors = [f for f in findings if f.severity == "error"]
+        color = {"error": "red", "warning": "yellow", "info": "cyan"}
+        console.print(f"[bold]{len(findings)} finding(s) in {target}:[/bold]")
+        for f in findings:
+            console.print(f"  [{color.get(f.severity, 'white')}]{f.format()}[/{color.get(f.severity, 'white')}]")
+        log_step("design/complete", project_root=root, trace=True)
+        if errors:
+            raise typer.Exit(code=1)
 
 
 @app.command("export")

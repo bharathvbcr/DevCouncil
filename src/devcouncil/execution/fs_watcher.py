@@ -14,6 +14,7 @@ from devcouncil.execution.policy_engine import TaskPolicyEngine
 from devcouncil.storage.db import get_db
 from devcouncil.storage.native import FileChangeRepository, TaskLeaseRepository
 from devcouncil.storage.repositories import GapRepository, TaskRepository
+from devcouncil.verification.stub_detector import detect_stubs, task_allows_scaffolding
 from devcouncil.verification.verifier import Verifier
 
 _IGNORED_PREFIXES = (
@@ -37,6 +38,7 @@ _EVENT_IGNORED_PREFIXES = _IGNORED_PREFIXES + (".devcouncil/", ".gitignore")
 
 _TASK_CACHE_TTL_SECONDS = 10.0
 _EVENT_DEBOUNCE_SECONDS = 0.5
+_STUB_SCAN_INTERVAL_SECONDS = 3.0
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,8 @@ class FilesystemWatcher:
         self._seen: dict[str, float] = {}
         self._seen_last_cleanup: float = 0.0
         self._task_cache: tuple[float, Task | None] | None = None
+        self._last_stub_scan: float = 0.0
+        self._reported_stub_keys: set[tuple[str, int, str]] = set()
         # Reuse one Verifier across polls (avoids rebuilding its scanners each tick) but
         # still run get_changed_files() fresh every poll — caching the git result would
         # make the watcher miss changes for the cache TTL, defeating the poll interval.
@@ -75,6 +79,7 @@ class FilesystemWatcher:
             if self.should_ignore(path):
                 continue
             events.append(self._record_path(path, task, operation="modify"))
+        self._scan_stubs_live(task)
         return events
 
     def watch(self) -> None:
@@ -129,6 +134,7 @@ class FilesystemWatcher:
             return None
         event = self._record_path(rel, self._task_cached(), operation=operation)
         self._notify(event)
+        self._scan_stubs_live(self._task_cached())
         return event
 
     def _notify(self, event: dict) -> None:
@@ -203,3 +209,60 @@ class FilesystemWatcher:
                         )
                     )
         return {"path": path, "operation": operation, "allowed": allowed, "reason": decision.reason}
+
+    def _scan_stubs_live(self, task: Task | None) -> None:
+        """Run stub detection on the current working-tree diff during execution.
+
+        Surfaces non-blocking ``stub_detected`` gaps mid-session — cheaper to fix
+        than waiting for ``dev verify``. Throttled so rapid saves do not spam gaps.
+        """
+        now = time.monotonic()
+        if now - self._last_stub_scan < _STUB_SCAN_INTERVAL_SECONDS:
+            return
+        self._last_stub_scan = now
+        if task is None:
+            return
+        if self._verifier is None:
+            self._verifier = Verifier(self.project_root)
+        try:
+            diff = self._verifier.get_diff()
+        except Exception:
+            return
+        if not diff.strip():
+            return
+        scaffolding_ok = task_allows_scaffolding(task)
+        findings = detect_stubs(self.project_root, diff, honor_allow_stub=scaffolding_ok)
+        if not findings:
+            return
+        db = get_db(self.project_root)
+        if not db:
+            return
+        with db.get_session() as session:
+            gap_repo = GapRepository(session)
+            for finding in findings:
+                key = (finding.file, finding.line, finding.reason)
+                if key in self._reported_stub_keys:
+                    continue
+                self._reported_stub_keys.add(key)
+                gap_repo.save(
+                    Gap(
+                        id=f"GAP-{self.task_id}-LIVESTUB-{uuid.uuid4().hex[:10]}",
+                        severity="medium",
+                        gap_type="stub_detected",
+                        task_id=self.task_id,
+                        description=(
+                            f"Live stub/placeholder at {finding.file}:{finding.line}: {finding.reason}."
+                        ),
+                        evidence=[f"{finding.file}:{finding.line}", finding.snippet],
+                        recommended_fix=(
+                            f"Replace the placeholder at {finding.file}:{finding.line} before continuing."
+                        ),
+                        blocking=False,
+                        file=finding.file,
+                        line=finding.line,
+                    )
+                )
+                logger.info(
+                    "Live stub detected for %s at %s:%s (%s)",
+                    self.task_id, finding.file, finding.line, finding.reason,
+                )

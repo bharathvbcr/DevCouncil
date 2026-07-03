@@ -26,7 +26,9 @@ def test_cli_check_reports_scope_and_secrets(tmp_path, monkeypatch):
     result = runner.invoke(app, ["check", "--json"])
 
     assert result.exit_code == 0
-    data = json.loads(result.output)
+    # Parse stdout only: click >= 8.2's runner tees stderr into ``output``, and this
+    # command legitimately WARNs on stderr (secret found). Real stdout is pure JSON.
+    data = json.loads(result.stdout)
     assert "app.py" in data["changed_files"]
     assert data["secret_findings"]  # the fake API key is flagged
 
@@ -3422,8 +3424,12 @@ def test_cli_verify_json_output(tmp_path, monkeypatch):
             requirement_ids=["REQ-001"],
             acceptance_criterion_ids=["AC-001"],
             planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
-            expected_tests=["python --version"],
-            allowed_commands=["python --version"],
+            # Must be acceptance-capable evidence: command_has_acceptance_evidence now
+            # rejects trivia like `python --version` from coarse-proving a behavioral
+            # AC (the agent self-certification guard), so a passing-verify shape test
+            # must exercise the code it claims to prove.
+            expected_tests=['python -c "from src.app import VALUE; assert VALUE == 1"'],
+            allowed_commands=['python -c "from src.app import VALUE; assert VALUE == 1"'],
         ))
 
     # Produce the planned change so there is real work to verify. An empty diff is

@@ -109,11 +109,26 @@ def test_correction_manifest_attempt_increments(tmp_path):
     write_correction_manifest(tmp_path, "TASK-001")
     second = load_latest_correction_manifest(tmp_path, "TASK-001")
     assert second.prior_failed_attempts == 2
+    assert len(second.attempt_history) == 1
+    assert "attempt 1" in second.attempt_history[0]
 
     db = Database(tmp_path / ".devcouncil" / "state.sqlite")
     with db.get_session() as session:
         record = CorrectionManifestRepository(session).latest_for_task("TASK-001")
         assert record.attempt == 2
+
+
+def test_task_max_repairs_widens_for_hard_tasks(tmp_path):
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "project:\n  name: test\nexecution:\n  max_repair_attempts: 3\n"
+        "verification:\n  rigor:\n    extra_repair_attempts_on_hard: 2\n",
+        encoding="utf-8",
+    )
+    easy = Task(id="TASK-E", title="E", description="easy", difficulty="easy")
+    hard = Task(id="TASK-H", title="H", description="hard", difficulty="hard")
+    assert go._task_max_repairs(tmp_path, easy, 3) == 3
+    assert go._task_max_repairs(tmp_path, hard, 3) == 5
 
 
 def test_executor_exception_does_not_crash_run(monkeypatch, tmp_path):

@@ -22,6 +22,9 @@ class Gap(BaseModel):
         "quality_gate_failed",
         "skipped_verification_command",
         "coarse_acceptance_proof",
+        "stub_detected",
+        "stub_declared",
+        "suspicious_effort",
     ]
     requirement_id: Optional[str] = None
     task_id: Optional[str] = None

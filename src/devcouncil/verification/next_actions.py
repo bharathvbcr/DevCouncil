@@ -40,6 +40,9 @@ _CATEGORY_BY_GAP_TYPE = {
     "migration_gap": "fix_code",
     "requirement_not_planned": "plan",
     "task_not_implemented": "plan",
+    "stub_detected": "fix_code",
+    "stub_declared": "review",
+    "suspicious_effort": "review",
 }
 
 
@@ -104,6 +107,22 @@ def _action_text(gap: Gap, file: Optional[str]) -> str:
         return "Remove the detected secret/finding from the diff and rotate any exposed credential."
     if gap.gap_type == "architecture_drift":
         return "Address the flagged change or resolve the open critique card, then re-verify."
+    if gap.gap_type == "stub_detected":
+        loc = f"{target}{':' + str(gap.line) if gap.line else ''}"
+        return (
+            f"Replace the stub/placeholder at {loc} with a real implementation, then re-verify. "
+            "Do not mark work complete while placeholders remain."
+        )
+    if gap.gap_type == "stub_declared":
+        loc = f"{target}{':' + str(gap.line) if gap.line else ''}"
+        return (
+            f"Review the intentional stub declared at {loc}; replace it before marking done."
+        )
+    if gap.gap_type == "suspicious_effort":
+        return (
+            "The diff looks too small or superficial for the planned scope. Complete the "
+            "planned work (or restore removed tests), then re-verify."
+        )
     # Fall back to the gap's own recommended fix for anything unmapped.
     return gap.recommended_fix
 

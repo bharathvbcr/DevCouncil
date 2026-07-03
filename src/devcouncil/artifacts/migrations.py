@@ -17,4 +17,10 @@ class ArtifactMigrator:
             data["forbidden_changes"] = []
         if "expected_tests" not in data:
             data["expected_tests"] = []
+        if "agent_appended_expected_tests" not in data:
+            data["agent_appended_expected_tests"] = []
+        if "agent_appended_allowed_commands" not in data:
+            data["agent_appended_allowed_commands"] = []
+        if "difficulty" not in data:
+            data["difficulty"] = None
         return data

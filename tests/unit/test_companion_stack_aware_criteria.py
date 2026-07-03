@@ -61,6 +61,17 @@ def test_init_no_stack_gets_empty_commands(tmp_path):
     assert cfg["commands"] == {"test": [], "lint": [], "typecheck": []}
 
 
+def test_init_scaffolds_verification_rigor_defaults(tmp_path):
+    initialize_project(tmp_path, quiet=True, with_map=False, with_skills=False)
+    cfg = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
+    rigor = cfg["verification"]["rigor"]
+    assert rigor["enabled"] is True
+    assert rigor["stub_detection"] == "hard"
+    assert rigor["effort_heuristics"] == "hard"
+    assert rigor["enforce_coverage_on_hard"] is True
+    assert rigor["extra_repair_attempts_on_hard"] == 1
+
+
 # --- verifier: _command_applicable ------------------------------------------
 
 def test_command_applicable_rejects_wrong_stack(tmp_path):

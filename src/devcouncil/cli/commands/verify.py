@@ -19,6 +19,7 @@ from devcouncil.app.config import load_config, get_api_key
 from devcouncil.app.state_machine import ProjectPhase
 from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
 from devcouncil.telemetry.traces import TraceLogger
+from devcouncil.telemetry.stages import log_stage, log_step
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -69,6 +70,19 @@ def verify(
             console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
         return
 
+    with log_stage("verify", project_root=root, task_id=task_id or "ALL", sandbox=sandbox):
+        _run_verify_body(
+            root, task_id, sandbox, json_format, db,
+        )
+
+
+def _run_verify_body(
+    root: Path,
+    task_id: Optional[str],
+    sandbox: str,
+    json_format: bool,
+    db,
+) -> None:
     with db.get_session() as session:
         task_repo = TaskRepository(session)
         req_repo = RequirementRepository(session)
@@ -111,6 +125,12 @@ def verify(
         per_task_gaps: dict[str, list] = {}
 
         for task in tasks:
+            log_step(
+                f"verify task {task.id}",
+                project_root=root,
+                task_id=task.id,
+                sandbox=sandbox,
+            )
             if sandbox != "local":
                 commands = task.expected_tests or task.allowed_commands
                 sandbox_result = get_sandbox(sandbox, root).run(task, commands, reqs)
@@ -231,6 +251,10 @@ def verify(
                 "diff_empty": outcome.diff_empty if outcome else False,
                 "coverage_measured": outcome.coverage_measured if outcome else False,
                 "coverage_skipped_reason": outcome.coverage_skipped_reason if outcome else None,
+                # Anti-laziness rigor: the task's difficulty classification and which
+                # escalations (blocking stub/effort gates, enforced coverage) applied.
+                "difficulty": outcome.difficulty if outcome else None,
+                "rigor_applied": list(outcome.rigor_applied) if outcome else [],
             })
 
         # Cross-task acceptance reconciliation (only meaningful across the full set).

@@ -196,10 +196,21 @@ def test_prompt_budget_caps_to_local_window(tmp_path, monkeypatch):
 
 def test_prompt_budget_none_for_cloud_or_unset(tmp_path, monkeypatch):
     from devcouncil.execution import prompt_builder as pb
+    from devcouncil.llm.provider import OllamaProvider
 
-    # Ollama configured but no explicit window -> don't guess a cap.
+    # Ollama with no explicit window: the provider now sends DEFAULT_NUM_CTX (the
+    # server default would silently truncate planning prompts), so the prompt
+    # budget must cap to that same window — the provider's actual truncation point.
     _write_ollama_config(tmp_path)
     monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
+    expected = max(
+        pb._MIN_PROMPT_CHARS,
+        (OllamaProvider.DEFAULT_NUM_CTX - pb._RESERVED_COMPLETION_TOKENS) * pb._CHARS_PER_TOKEN,
+    )
+    assert pb._local_context_window_budget(tmp_path) == expected
+
+    # Explicit opt-out (OLLAMA_NUM_CTX=0 -> server default): window unknown, don't guess.
+    monkeypatch.setenv("OLLAMA_NUM_CTX", "0")
     assert pb._local_context_window_budget(tmp_path) is None
 
     # Cloud provider -> never capped by OLLAMA_NUM_CTX even if it leaks into the env.

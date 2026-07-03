@@ -10,7 +10,7 @@ import fnmatch
 import json
 import re
 import shlex
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import List, Dict, Any, Literal, Optional, Tuple
 
@@ -21,12 +21,24 @@ from devcouncil.domain.requirement import Requirement
 from devcouncil.domain.gap import Gap
 from devcouncil.domain.evidence import TestEvidence, DiffEvidence, DiffCoverageEvidence, CommandResult
 from devcouncil.verification import diff_coverage as dc
+from devcouncil.verification.difficulty import resolve_rigor_policy
+from devcouncil.verification.effort_heuristics import detect_effort_anomalies
+from devcouncil.verification.stub_detector import (
+    detect_stub_declarations,
+    detect_stubs,
+    task_allows_scaffolding,
+)
+from devcouncil.verification.command_evidence import (
+    command_has_acceptance_evidence,
+    command_is_trivial_evidence,
+)
 from devcouncil.gating.checks.secret_scan_check import SecretScanner
 from devcouncil.verification.implementation_reviewer import ImplementationReviewer
 from devcouncil.verification.acceptance_compiler import AcceptanceTestCompiler
 from devcouncil.llm.router import ModelRouter
 from devcouncil.utils.redaction import redact_string
 from devcouncil.live.cards import unresolved_blocking_cards
+from devcouncil.telemetry.stages import log_step
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +76,11 @@ class VerificationOutcome:
     diff_empty: bool = True
     coverage_measured: bool = False
     coverage_skipped_reason: Optional[str] = None
+    # Rigor metadata: the task's estimated (or manually set) difficulty and which
+    # anti-laziness escalations actually took effect on this run, so "passed" can
+    # be distinguished from "passed under strict gates".
+    difficulty: Optional[str] = None
+    rigor_applied: List[str] = field(default_factory=list)
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -594,29 +611,51 @@ class Verifier:
     def measure_diff_coverage(self, task: Task, diff_content: str) -> dc.DiffCoverageResult:
         """Run the task's test command(s) under coverage and intersect with the diff.
 
-        Returns an *unmeasured* result (never a false positive) whenever reliable
-        data is unavailable: no measurable Python changes, no instrumentable test
-        command, or no coverage tool in the target environment.
+        Supports Python (coverage.py), JS/TS (c8/nyc), and Go (``go test -coverprofile``).
+        Returns an *unmeasured* result whenever reliable data is unavailable.
         """
-        changed = dc.measurable_python_changes(dc.parse_changed_lines(diff_content))
-        if not changed:
-            return dc.DiffCoverageResult(measured=False, reason="no measurable Python changes in diff")
+        parsed = dc.parse_changed_lines(diff_content)
+        py_changed = dc.measurable_python_changes(parsed)
+        js_changed = dc.measurable_js_changes(parsed)
+        go_changed = dc.measurable_go_changes(parsed)
+        if not py_changed and not js_changed and not go_changed:
+            return dc.DiffCoverageResult(measured=False, reason="no measurable source changes in diff")
+
         commands = self._coverage_target_commands(task)
         if not commands:
             return dc.DiffCoverageResult(measured=False, reason="no test command to instrument")
-
-        env = self._verification_env()
-        python = self._resolve_coverage_python(env)
-        if not self._coverage_available(python, env):
-            return dc.DiffCoverageResult(measured=False, reason="coverage tool not available in target environment")
 
         try:
             timeout = load_config(self.project_root).execution.command_timeout
         except Exception:
             timeout = 300
 
+        env = self._verification_env()
         tmp_dir = self.project_root / ".devcouncil" / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
+        results: List[dc.DiffCoverageResult] = []
+
+        if py_changed:
+            results.append(self._measure_python_diff_coverage(task, commands, py_changed, tmp_dir, env, timeout))
+        if js_changed:
+            results.append(self._measure_js_diff_coverage(task, commands, js_changed, tmp_dir, env, timeout))
+        if go_changed:
+            results.append(self._measure_go_diff_coverage(task, commands, go_changed, tmp_dir, env, timeout))
+
+        return dc.merge_diff_coverage_results(results)
+
+    def _measure_python_diff_coverage(
+        self,
+        task: Task,
+        commands: List[str],
+        changed: Dict[str, Dict[int, str]],
+        tmp_dir: Path,
+        env: dict,
+        timeout: int,
+    ) -> dc.DiffCoverageResult:
+        python = self._resolve_coverage_python(env)
+        if not self._coverage_available(python, env):
+            return dc.DiffCoverageResult(measured=False, reason="coverage.py not available")
         data_file = tmp_dir / f"diffcov-{task.id}.coverage"
         json_file = tmp_dir / f"diffcov-{task.id}.json"
         for stale in (data_file, json_file):
@@ -624,7 +663,6 @@ class Verifier:
                 stale.unlink()
             except FileNotFoundError:
                 pass
-
         ran_any = False
         append = False
         inline_scripts: List[Path] = []
@@ -633,8 +671,6 @@ class Verifier:
                 argv = self._split_command(cmd)
                 inline = dc.inline_python_code(argv)
                 if inline is not None:
-                    # Materialise `python -c "CODE"` as a temp script so coverage can
-                    # instrument it (coverage cannot run a bare -c snippet).
                     script = tmp_dir / f"diffcov-inline-{task.id}-{idx}.py"
                     try:
                         script.write_text(dc.inline_script_content(inline, self.project_root), encoding="utf-8")
@@ -651,49 +687,116 @@ class Verifier:
                     continue
                 try:
                     subprocess.run(
-                        cov_argv,
-                        cwd=self.project_root,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=timeout,
-                        env=env,
+                        cov_argv, cwd=self.project_root, capture_output=True,
+                        text=True, encoding="utf-8", errors="replace", timeout=timeout, env=env,
                     )
                 except Exception as exc:
                     logger.warning("Diff-coverage run failed for %s: %s", task.id, exc)
                     continue
                 ran_any = True
                 append = True
-
-            if not ran_any:
-                return dc.DiffCoverageResult(measured=False, reason="no instrumentable test command")
-            if not data_file.exists():
-                return dc.DiffCoverageResult(measured=False, reason="coverage produced no data")
-
-            try:
-                subprocess.run(
-                    [python, "-m", "coverage", "json", f"--data-file={data_file}", "-o", str(json_file)],
-                    cwd=self.project_root,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=120,
-                    env=env,
-                )
-                data = json.loads(json_file.read_text(encoding="utf-8"))
-            except Exception as exc:
-                return dc.DiffCoverageResult(measured=False, reason=f"coverage report unreadable: {exc}")
-
+            if not ran_any or not data_file.exists():
+                return dc.DiffCoverageResult(measured=False, reason="no instrumentable Python test command")
+            subprocess.run(
+                [python, "-m", "coverage", "json", f"--data-file={data_file}", "-o", str(json_file)],
+                cwd=self.project_root, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=120, env=env,
+            )
+            data = json.loads(json_file.read_text(encoding="utf-8"))
             coverage = dc.parse_coverage_json(data, self.project_root)
             return dc.intersect(changed, coverage, tool="coverage.py")
+        except Exception as exc:
+            return dc.DiffCoverageResult(measured=False, reason=f"coverage.py failed: {exc}")
         finally:
             for path in [data_file, json_file, *inline_scripts]:
                 try:
                     path.unlink()
                 except OSError:
                     pass
+
+    def _measure_js_diff_coverage(
+        self,
+        task: Task,
+        commands: List[str],
+        changed: Dict[str, Dict[int, str]],
+        tmp_dir: Path,
+        env: dict,
+        timeout: int,
+    ) -> dc.DiffCoverageResult:
+        reports_dir = tmp_dir / f"c8-{task.id}"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        coverage_file = reports_dir / "coverage-final.json"
+        try:
+            for coverage_file in reports_dir.glob("coverage-final.json"):
+                coverage_file.unlink()
+        except OSError:
+            pass
+        ran_any = False
+        for cmd in commands:
+            argv = self._split_command(cmd)
+            cov_argv = dc.c8_run_argv(argv, reports_dir=str(reports_dir))
+            if cov_argv is None:
+                continue
+            try:
+                subprocess.run(
+                    cov_argv, cwd=self.project_root, capture_output=True,
+                    text=True, encoding="utf-8", errors="replace", timeout=timeout, env=env,
+                )
+            except Exception as exc:
+                logger.warning("c8 diff-coverage run failed for %s: %s", task.id, exc)
+                continue
+            ran_any = True
+        candidates = list(reports_dir.glob("**/coverage-final.json"))
+        if not ran_any or not candidates:
+            return dc.DiffCoverageResult(measured=False, reason="c8 not available or no JS test command")
+        try:
+            data = json.loads(candidates[0].read_text(encoding="utf-8"))
+            coverage = dc.parse_istanbul_json(data, self.project_root)
+            return dc.intersect(changed, coverage, tool="c8")
+        except Exception as exc:
+            return dc.DiffCoverageResult(measured=False, reason=f"c8 report unreadable: {exc}")
+
+    def _measure_go_diff_coverage(
+        self,
+        task: Task,
+        commands: List[str],
+        changed: Dict[str, Dict[int, str]],
+        tmp_dir: Path,
+        env: dict,
+        timeout: int,
+    ) -> dc.DiffCoverageResult:
+        profile = tmp_dir / f"diffcov-{task.id}.out"
+        try:
+            profile.unlink()
+        except FileNotFoundError:
+            pass
+        ran_any = False
+        for cmd in commands:
+            argv = self._split_command(cmd)
+            cov_argv = dc.go_cover_run_argv(argv, str(profile))
+            if cov_argv is None:
+                continue
+            try:
+                subprocess.run(
+                    cov_argv, cwd=self.project_root, capture_output=True,
+                    text=True, encoding="utf-8", errors="replace", timeout=timeout, env=env,
+                )
+            except Exception as exc:
+                logger.warning("go cover run failed for %s: %s", task.id, exc)
+                continue
+            ran_any = True
+        if not ran_any or not profile.exists():
+            return dc.DiffCoverageResult(measured=False, reason="go test -coverprofile not available")
+        try:
+            coverage = dc.parse_go_coverprofile(profile.read_text(encoding="utf-8"), self.project_root)
+            return dc.intersect(changed, coverage, tool="go-cover")
+        except Exception as exc:
+            return dc.DiffCoverageResult(measured=False, reason=f"go cover profile unreadable: {exc}")
+        finally:
+            try:
+                profile.unlink()
+            except OSError:
+                pass
 
     async def verify_task(self, task: Task, requirements: List[Requirement]) -> Tuple[List[Gap], List[Any]]:
         logger.info("verify_task: task=%s requirements=%d", task.id, len(requirements))
@@ -707,14 +810,35 @@ class Verifier:
         self._untracked_cache = self._get_untracked_files()
         ac_samples, ac_repair_attempts = 1, 1
         try:
+            from devcouncil.app.config import role_runs_on_local_provider
+
             _cfg = load_config(self.project_root)
             self._command_timeout_cache = _cfg.execution.command_timeout
-            ac_samples = max(1, _cfg.verification.acceptance_checks.samples)
-            ac_repair_attempts = max(0, _cfg.verification.acceptance_checks.repair_attempts)
-            ac_per_criterion = bool(_cfg.verification.acceptance_checks.per_criterion)
+            # Auto-tune by monitor locality: a cost-free local (Ollama) monitor gets
+            # self-consistency voting, per-criterion compilation, and an extra repair
+            # round (the settings that make a weak local model's verdicts calibrated);
+            # a paid cloud monitor keeps single-shot behavior. Explicit config wins.
+            _local_monitor = role_runs_on_local_provider(_cfg, "implementation_reviewer")
+            ac_samples, ac_repair_attempts, ac_per_criterion = (
+                _cfg.verification.acceptance_checks.resolved(_local_monitor)
+            )
         except Exception:
+            _cfg = None
             self._command_timeout_cache = 300
             ac_per_criterion = False
+        # Resolve the rigor policy (task difficulty + verification.rigor config) once
+        # for this run; it decides whether the anti-laziness gates below block or
+        # merely advise. Never raises — a failure degrades to no extra enforcement.
+        rigor = resolve_rigor_policy(task, requirements, config=_cfg)
+        if rigor.min_acceptance_samples > 1:
+            ac_samples = max(ac_samples, rigor.min_acceptance_samples)
+        log_step(
+            "verify/1: resolved rigor policy",
+            project_root=self.project_root,
+            task_id=task.id,
+            difficulty=rigor.difficulty,
+            rigor_applied=list(rigor.applied),
+        )
         changed_files = self.get_task_changed_files(task.id)
         diff_content = self.get_diff()
         # When the working tree is clean but the task's work was committed (dev go commits
@@ -727,6 +851,13 @@ class Verifier:
             if committed_diff.strip():
                 diff_content = committed_diff
         diff_empty = not bool(diff_content.strip())
+        log_step(
+            "verify/2: collected diff and changed files",
+            project_root=self.project_root,
+            task_id=task.id,
+            changed_files=len(changed_files),
+            diff_empty=diff_empty,
+        )
         # Launch the two independent LLM passes — acceptance compilation and the advisory
         # implementation review — concurrently as soon as the diff is available, instead
         # of awaiting them sequentially later. Each depends only on (task, requirements,
@@ -810,21 +941,54 @@ class Verifier:
                         file=pf.path,
                     ))
 
-            # 2. Orphan-diff detection
+            # 2. Orphan-diff detection. A NEW test-only file is ADVISORY, not blocking:
+            # coding agents routinely (and desirably) add tests the planner did not
+            # enumerate, and an added test cannot change shipped behavior. Blocking on
+            # it was a leading source of false-"blocked" verdicts on correct code.
+            # Everything else unplanned (source files, deletions, modifications of
+            # existing files) still blocks — that is real scope drift.
+            orphan_added, _orphan_deleted = self._classify_change_paths(changed_files)
+            assert_free_test_files: set[str] = set()
+            if diff_content:
+                for finding in detect_stubs(
+                    self.project_root, diff_content, honor_allow_stub=False,
+                ):
+                    if "no assertions" in finding.reason:
+                        assert_free_test_files.add(finding.file)
             for cf in changed_files:
                 if cf not in planned_paths:
+                    new_test_file = (
+                        cf in orphan_added
+                        and self._is_test_path(cf)
+                        and cf not in assert_free_test_files
+                    )
                     gaps.append(Gap(
                         id=self._next_gap_id(task.id, "ORPHAN"),
-                        severity="high",
+                        severity="medium" if new_test_file else "high",
                         gap_type="orphan_diff",
                         task_id=task.id,
-                        description=f"File {cf} was modified but not planned for this task.",
+                        description=(
+                            f"New test file {cf} was added but not planned for this task "
+                            "(advisory: added tests cannot change shipped behavior)."
+                            if new_test_file else
+                            f"File {cf} was modified but not planned for this task."
+                        ),
                         evidence=[cf],
-                        recommended_fix=f"Revert changes to {cf} or add it to the task's planned files.",
-                        blocking=True,
+                        recommended_fix=(
+                            f"Add {cf} to the task's planned files (or fold the tests into a planned test file)."
+                            if new_test_file else
+                            f"Revert changes to {cf} or add it to the task's planned files."
+                        ),
+                        blocking=not new_test_file,
                         file=cf,
                     ))
 
+            log_step(
+                "verify/3: planned-file and orphan-diff checks",
+                project_root=self.project_root,
+                task_id=task.id,
+                gaps_so_far=len(gaps),
+            )
             gaps.extend(self._check_semantic_diff(task, requirements))
 
             # 3. Dependency change detection
@@ -843,11 +1007,97 @@ class Verifier:
                         file=dep_file,
                     ))
 
+            log_step(
+                "verify/4: semantic diff and dependency checks",
+                project_root=self.project_root,
+                task_id=task.id,
+                gaps_so_far=len(gaps),
+            )
+            # 3.5 Stub/TODO detection (anti-laziness). Only lines the diff ADDED are
+            # scanned, so pre-existing debt never blocks a task that did not touch it.
+            # Blocking per the rigor policy (default: blocks only on hard tasks).
+            # allow-stub suppression requires the task to mention scaffolding; every
+            # allow-stub marker is surfaced separately as an advisory stub_declared gap.
+            scaffolding_ok = task_allows_scaffolding(task)
+            if rigor.stub_enabled and diff_content:
+                for finding in detect_stubs(
+                    self.project_root, diff_content, honor_allow_stub=scaffolding_ok,
+                ):
+                    gaps.append(Gap(
+                        id=self._next_gap_id(task.id, "STUB"),
+                        severity="high" if rigor.stub_blocking else "medium",
+                        gap_type="stub_detected",
+                        task_id=task.id,
+                        description=(
+                            f"Placeholder/incomplete code added at {finding.file}:{finding.line}: "
+                            f"{finding.reason}."
+                        ),
+                        evidence=[f"{finding.file}:{finding.line}", finding.snippet],
+                        recommended_fix=(
+                            f"Replace the stub/placeholder at {finding.file}:{finding.line} with a "
+                            "real implementation, then re-verify. Intentional scaffolding requires "
+                            "the task description to mention 'scaffolding' and the line to carry "
+                            "'devcouncil: allow-stub'."
+                        ),
+                        blocking=rigor.stub_blocking,
+                        file=finding.file,
+                        line=finding.line,
+                    ))
+                for decl in detect_stub_declarations(diff_content):
+                    gaps.append(Gap(
+                        id=self._next_gap_id(task.id, "STUBDECL"),
+                        severity="medium",
+                        gap_type="stub_declared",
+                        task_id=task.id,
+                        description=(
+                            f"Intentional stub declared at {decl.file}:{decl.line} "
+                            f"({decl.snippet[:80]})."
+                        ),
+                        evidence=[f"{decl.file}:{decl.line}", decl.snippet],
+                        recommended_fix=(
+                            "Review declared stubs before marking the task done; replace each "
+                            "placeholder with a real implementation when scaffolding is complete."
+                        ),
+                        blocking=False,
+                        file=decl.file,
+                        line=decl.line,
+                    ))
+
+            # 3.6 Effort/diff plausibility heuristics: undersized diff vs planned scope,
+            # comment-only diffs, and test deletion. Conservative by design; advisory
+            # outside hard tasks.
+            if rigor.effort_enabled and diff_content:
+                for eff in detect_effort_anomalies(
+                    task, diff_content, requirements,
+                    min_added_lines_per_planned_file=rigor.min_added_lines_per_planned_file,
+                ):
+                    gaps.append(Gap(
+                        id=self._next_gap_id(task.id, "EFFORT"),
+                        severity=eff.severity,
+                        gap_type="suspicious_effort",
+                        task_id=task.id,
+                        description=eff.detail,
+                        evidence=[eff.reason],
+                        recommended_fix=(
+                            "Review whether the implementation actually fulfills the task scope; "
+                            "complete the planned work (or restore removed tests), then re-verify."
+                        ),
+                        blocking=rigor.effort_blocking,
+                        file=eff.file,
+                    ))
+
             # When DevCouncil can compile its own per-criterion checks, THOSE are the
             # authority and the planner's expected_tests are demoted to advisory — so a
             # bogus planner command (irrelevant linters, npm on a Python project, tests
             # that reference missing files) can no longer block correct work.
             compiler_active = bool(self.acceptance_compiler and diff_content and task.acceptance_criterion_ids)
+            log_step(
+                "verify/5: stub and effort heuristics",
+                project_root=self.project_root,
+                task_id=task.id,
+                compiler_active=compiler_active,
+                gaps_so_far=len(gaps),
+            )
 
             # 4. Run verification commands
             command_results: List[CommandResult] = []
@@ -953,6 +1203,13 @@ class Verifier:
                             if compiler_active and not is_quality_gate and not blocking:
                                 demoted_failures.append(gap)
 
+            log_step(
+                "verify/6: verification commands",
+                project_root=self.project_root,
+                task_id=task.id,
+                commands_run=len(command_results),
+                gaps_so_far=len(gaps),
+            )
             # 4b. Compiled acceptance checks — precise, DevCouncil-owned per-criterion
             # evidence. Derive one runnable check per acceptance criterion from the
             # criterion text + the diff, instead of trusting planner-authored
@@ -988,7 +1245,11 @@ class Verifier:
                     candidates = [c for c in raw_cmds if self._command_applicable(c)[0]]
                     compiled_cmds_by_ac[ac_id] = list(candidates)
                     if not candidates:
-                        compiled_pass[ac_id] = False
+                        # Every candidate was wrong-stack — nothing ran, so nothing was
+                        # proven OR disproven. Leave the criterion WITHOUT a compiled
+                        # verdict (eligible for the coarse fallback below) instead of
+                        # recording a false "not proven" that under-credits correct code.
+                        had_unrunnable = True
                         continue
                     # Run each INDEPENDENT candidate; a check that merely failed to RUN
                     # (malformed/unrunnable) is regenerated from the launcher error up to
@@ -1038,10 +1299,19 @@ class Verifier:
                             fail_results.append((cmd, result))
                             failing_results_by_ac.setdefault(ac_id, []).append(result)
                     decisive = passes + genuine_fails
+                    if decisive == 0:
+                        # Every candidate was unrunnable even after repair. A check that
+                        # never ran proves nothing either way, so record NO compiled
+                        # verdict: the criterion stays eligible for the coarse fallback
+                        # (any passing acceptance-capable command) below. Recording
+                        # False here was the top source of under-credited "incomplete"
+                        # verdicts on weak/local monitor models, whose compiled commands
+                        # frequently fail to launch rather than fail the assertion.
+                        continue
                     # Majority vote over the checks that actually ran. Proven iff a strict
                     # majority pass; unanimous failure of independent checks is strong evidence
                     # of a real defect and blocks; a split is inconclusive (handled below).
-                    ac_proven = decisive > 0 and passes > genuine_fails
+                    ac_proven = passes > genuine_fails
                     compiled_pass[ac_id] = ac_proven
                     if ac_proven:
                         compiled_vote[ac_id] = (passes, decisive, repaired)
@@ -1096,13 +1366,34 @@ class Verifier:
                         gap.id, task.id,
                     )
 
+            log_step(
+                "verify/7: compiled acceptance checks",
+                project_root=self.project_root,
+                task_id=task.id,
+                compiled_criteria=len(compiled_pass),
+                gaps_so_far=len(gaps),
+            )
             # 5. Acceptance-criteria evidence mapping (precise, per criterion).
             # Quality-only commands (lint/typecheck) are excluded: a passing `mypy`/`ruff
             # check`/`tsc` exercises no behavior, so it must not coarse-prove a behavioral AC
             # — the same false-confidence the per-criterion checks exist to prevent.
+            # Agent-appended expected_tests are also excluded: a leased agent must not
+            # self-certify by injecting a trivial passing command via update_task_scope.
+            # Trusted planner/config commands use the DENY-list (command_is_trivial_evidence),
+            # not the strict keyword allowlist: a behavioral command without a test keyword
+            # (`make check`, `./run_smoke.sh`, `python scripts/validate.py`) keeps its
+            # evidential value, while trivia (`python --version`, `echo ok`, `git status`)
+            # still proves nothing. The strict allowlist remains the gate for UNTRUSTED
+            # agent input at update_task_scope.
+            agent_appended = set(task.agent_appended_expected_tests or []) | set(
+                task.agent_appended_allowed_commands or []
+            )
             successful_commands = [
                 result for result in evidence_results
-                if result.exit_code == 0 and not self._is_quality_only_command(result.command)
+                if result.exit_code == 0
+                and not self._is_quality_only_command(result.command)
+                and result.command not in agent_appended
+                and not command_is_trivial_evidence(result.command)
             ]
             # Coarse fallback (used only when no compiled per-criterion check exists for an
             # AC): a criterion may be marked proven by a passing acceptance-capable command
@@ -1159,13 +1450,14 @@ class Verifier:
                             ))
                     else:
                         unproven_acs.append(ac_id)
-                # Surface coarse proof as a first-class advisory: these criteria passed only
+                # Surface coarse proof as a first-class finding: these criteria passed only
                 # because some acceptance-capable command exited 0, not because a check tied
-                # to the criterion passed. Non-blocking, but no longer invisible.
-                if coarse_proven_acs:
+                # to the criterion passed. Advisory on easy/normal tasks; blocking on hard
+                # tasks per the rigor policy.
+                if coarse_proven_acs and rigor.coarse_acceptance_enabled:
                     gaps.append(Gap(
                         id=self._next_gap_id(task.id, "COARSE"),
-                        severity="low",
+                        severity="high" if rigor.coarse_acceptance_blocking else "low",
                         gap_type="coarse_acceptance_proof",
                         task_id=task.id,
                         description=(
@@ -1179,7 +1471,7 @@ class Verifier:
                             "specifically, so DevCouncil can compile a per-criterion check instead of "
                             "relying on the coarse fallback."
                         ),
-                        blocking=False,
+                        blocking=rigor.coarse_acceptance_blocking,
                     ))
                 if unproven_acs:
                     # Block only on positive evidence of a problem. If verification was
@@ -1274,6 +1566,12 @@ class Verifier:
                     blocking=True,
                 ))
 
+            log_step(
+                "verify/8: acceptance-criteria evidence mapping",
+                project_root=self.project_root,
+                task_id=task.id,
+                gaps_so_far=len(gaps),
+            )
             # 5b. Diff↔coverage gate. A green suite is only acceptance evidence if it
             # exercised the lines the diff changed. This catches the failure the README
             # promises to stop: tests "pass" while the new logic is never run (unrelated
@@ -1281,6 +1579,10 @@ class Verifier:
             # repo has coverage tooling and the diff has measurable Python changes; absent
             # that, it degrades silently rather than blocking correct work.
             measure_cov, enforce_cov, min_ratio = self._diff_coverage_settings()
+            # Hard-task escalation: enforce diff coverage (blocking) even when the
+            # config default leaves it advisory. Only tightens, never loosens.
+            if rigor.enforce_coverage:
+                enforce_cov = True
             any_passing = bool(successful_commands) or any(compiled_pass.values())
             coverage_measured = False
             coverage_skipped_reason: Optional[str] = None
@@ -1341,10 +1643,23 @@ class Verifier:
                             suggested_command=target_cmds[0] if target_cmds else None,
                         ))
 
+            log_step(
+                "verify/9: diff coverage",
+                project_root=self.project_root,
+                task_id=task.id,
+                coverage_measured=coverage_measured,
+                gaps_so_far=len(gaps),
+            )
             # 6. Secret scan
             if diff_content:
                 gaps.extend(self.secret_scanner.scan_diff(diff_content, task.id))
 
+            log_step(
+                "verify/10: secret scan",
+                project_root=self.project_root,
+                task_id=task.id,
+                gaps_so_far=len(gaps),
+            )
             # 7. LLM Implementation Review (ADVISORY ONLY).
             # DevCouncil's authority is executable evidence, not model confidence — so
             # an LLM reviewer must never block on its own say-so. Subjective reviewers
@@ -1357,11 +1672,23 @@ class Verifier:
                     review_result = await review_future
                     for finding in review_result.findings:
                         finding.id = self._next_gap_id(task.id, "REVIEW")
-                        finding.blocking = False
+                        # Advisory by default. On hard tasks with the opt-in
+                        # verification.rigor.reviewer_required_on_hard, a CRITICAL
+                        # review finding may block — the one sanctioned exception to
+                        # "an LLM reviewer never blocks on its own say-so".
+                        finding.blocking = bool(
+                            rigor.reviewer_required and finding.severity == "critical"
+                        )
                         gaps.append(finding)
                 except Exception as e:
                     logger.error("Implementation review failed: %s", e)
 
+            log_step(
+                "verify/11: implementation review",
+                project_root=self.project_root,
+                task_id=task.id,
+                gaps_so_far=len(gaps),
+            )
             # 8. Open live-review cards
             for card in unresolved_blocking_cards(self.project_root, task_id=task.id):
                 gaps.append(Gap(
@@ -1378,12 +1705,24 @@ class Verifier:
                     blocking=True,
                 ))
 
+            blocking_count = len([g for g in gaps if g.blocking])
+            log_step(
+                "verify/complete",
+                project_root=self.project_root,
+                task_id=task.id,
+                total_gaps=len(gaps),
+                blocking_gaps=blocking_count,
+                evidence_items=len(evidence_to_save),
+                trace=True,
+            )
             self.last_outcome = VerificationOutcome(
                 mode="compiled" if self.acceptance_compiler else "coarse",
                 compiler_active=compiler_active,
                 diff_empty=diff_empty,
                 coverage_measured=coverage_measured,
                 coverage_skipped_reason=coverage_skipped_reason,
+                difficulty=rigor.difficulty,
+                rigor_applied=list(rigor.applied),
             )
             return gaps, evidence_to_save
         finally:
@@ -1871,6 +2210,26 @@ class Verifier:
             return False, f"command targets the '{stack}' stack not present in this repo (detected: {detected})"
         return True, ""
 
+    @staticmethod
+    def _is_test_path(path: str) -> bool:
+        """True when ``path`` is a test file by common conventions (pytest, jest, go,
+        rust integration tests). Used to demote a NEWLY ADDED unplanned test file from
+        a blocking orphan-diff to an advisory: added tests cannot change shipped
+        behavior, and coding agents adding tests is desirable, not scope drift."""
+        norm = path.replace("\\", "/").lower()
+        name = norm.rsplit("/", 1)[-1]
+        parts = norm.split("/")
+        in_test_dir = any(p in {"tests", "test", "__tests__", "spec"} for p in parts[:-1])
+        looks_like_test = (
+            name.startswith("test_")
+            or name == "conftest.py"
+            or any(name.endswith(suffix) for suffix in (
+                "_test.py", "_test.go", ".test.js", ".test.ts", ".test.jsx", ".test.tsx",
+                ".spec.js", ".spec.ts", ".spec.jsx", ".spec.tsx", "_spec.rb",
+            ))
+        )
+        return looks_like_test or (in_test_dir and not name.startswith("."))
+
     # Linters / formatters / type checkers: a non-zero exit is a style/type OPINION,
     # not proof of a behavioral defect. Blocking a behaviorally-correct task on these is
     # the false-block the benchmark surfaced (the planner even spawns dedicated
@@ -1908,26 +2267,18 @@ class Verifier:
         return tool in self._QUALITY_TOOLS
 
     def _command_can_prove_acceptance(self, cmd_type: str, command: str) -> bool:
+        """Whether a run of ``command`` may count as acceptance evidence.
+
+        Declared TEST commands (planner expected_tests / config commands.test) are
+        trusted unless trivially incapable of proving behavior (``python --version``,
+        ``echo ok``, ``git status``) — the deny-list keeps legitimate keyword-less
+        behavioral commands (``make check``, ``./run_smoke.sh``) evidential. Agent-
+        appended expected_tests are additionally excluded at coarse-proof time.
+        Other command types (allowed_commands) keep the strict keyword allowlist:
+        an incidental ``make build`` succeeding must not prove a behavioral AC."""
         if cmd_type == "test":
-            return True
-        lowered = command.lower()
-        evidence_keywords = (
-            "test",
-            "pytest",
-            "vitest",
-            "jest",
-            "unittest",
-            "cargo test",
-            "go test",
-            "mvn test",
-            "gradle test",
-            "ruff check",
-            "mypy",
-            "tsc",
-            "typecheck",
-            "type-check",
-        )
-        return any(keyword in lowered for keyword in evidence_keywords)
+            return not command_is_trivial_evidence(command)
+        return command_has_acceptance_evidence(command)
 
     def _requirement_id_for_ac(self, requirements: List[Requirement], ac_id: str) -> Optional[str]:
         for req in requirements:

@@ -6,6 +6,7 @@ from devcouncil.domain.task import Task
 from devcouncil.domain.requirement import Requirement
 from devcouncil.execution.executor import Executor, ExecutionResult
 from devcouncil.execution.prompt_builder import PromptBuilder
+from devcouncil.telemetry.stages import log_step
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -16,9 +17,19 @@ class OpenHandsExecutor(Executor):
 
     def run_task(self, task: Task, requirements: list[Requirement]) -> ExecutionResult:
         builder = PromptBuilder(self.project_root)
+        from devcouncil.planning.correction_manifest import repair_prompt_prefix
+
         task_prompt = builder.build_task_prompt(task, requirements)
+        prefix = repair_prompt_prefix(self.project_root, task.id)
+        if prefix:
+            task_prompt = f"{prefix}{task_prompt}"
         
         logger.info("OpenHands starting for %s", task.id)
+        log_step(
+            "executor/openhands: starting task %s" % task.id,
+            project_root=self.project_root,
+            task_id=task.id,
+        )
         console.print(f"Starting [bold]OpenHands[/bold] for task {task.id}...")
         
         # OpenHands often expects a workspace mount and an instruction.
@@ -52,12 +63,33 @@ class OpenHandsExecutor(Executor):
             self._write_log(task.id, result)
             if result.returncode != 0:
                 logger.error("OpenHands exited %s for %s", result.returncode, task.id)
+                log_step(
+                    "executor/openhands: finished task %s" % task.id,
+                    project_root=self.project_root,
+                    task_id=task.id,
+                    returncode=result.returncode,
+                    success=False,
+                )
                 console.print(f"[red]OpenHands exited with {result.returncode}.[/red]")
                 return ExecutionResult(success=False, message=f"Exited with code {result.returncode}")
             logger.info("OpenHands finished for %s", task.id)
+            log_step(
+                "executor/openhands: finished task %s" % task.id,
+                project_root=self.project_root,
+                task_id=task.id,
+                returncode=0,
+                success=True,
+            )
             return ExecutionResult(success=True, message="Completed successfully")
         except Exception as e:
             logger.exception("OpenHands error for %s: %s", task.id, e)
+            log_step(
+                "executor/openhands: finished task %s" % task.id,
+                project_root=self.project_root,
+                task_id=task.id,
+                success=False,
+                error=str(e),
+            )
             console.print(f"[red]Error running OpenHands: {e}[/red]")
             return ExecutionResult(success=False, message=str(e))
 

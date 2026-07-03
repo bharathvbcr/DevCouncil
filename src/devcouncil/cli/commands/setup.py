@@ -29,9 +29,12 @@ from devcouncil.cli.commands.integrate import (
     _gemini_command,
 )
 from devcouncil.llm.provider import apply_provider_default_role_models, build_role_model_config, validate_model_provider
+from devcouncil.telemetry.stages import log_stage, log_step
+import logging
 
 app = typer.Typer()
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 def _set_model_provider(project_root: Path, provider: str) -> None:
@@ -261,6 +264,9 @@ def setup(
         raise typer.Exit(code=2)
 
     root = project_root.expanduser().resolve()
+    from devcouncil.telemetry.logging_setup import set_log_dir
+    set_log_dir(root)
+    logger.info("dev setup: integrate=%s apply=%s", integrate, apply)
     try:
         role_models = parse_role_model_overrides(role_model)
         initial_provider = validate_model_provider(provider) if provider else "openrouter"
@@ -268,95 +274,99 @@ def setup(
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(code=2) from e
 
-    # Size the default local model to the host's memory ceiling (unified RAM on Apple
-    # Silicon, VRAM on a discrete GPU, system RAM otherwise) instead of the static 7b,
-    # so users on any OS get a capable council out of the box. Only when the user chose
-    # Ollama and did not pin a model.
-    if initial_provider == "ollama" and model is None:
-        from devcouncil import hardware
+    with log_stage("setup", project_root=root, integrate=integrate):
+        log_step("setup/1: initializing project", project_root=root, trace=True)
 
-        host = hardware.describe_host()
-        model = host.recommended_ollama_model
-        console.print(
-            f"[green]Detected {host.chip_label} ({host.memory_label}); "
-            f"defaulting Ollama model to {model}.[/green] "
-            "Override with --model, and pull it first: "
-            f"[bold]ollama pull {model}[/bold]."
+        # Size the default local model to the host's memory ceiling (unified RAM on Apple
+        # Silicon, VRAM on a discrete GPU, system RAM otherwise) instead of the static 7b,
+        # so users on any OS get a capable council out of the box. Only when the user chose
+        # Ollama and did not pin a model.
+        if initial_provider == "ollama" and model is None:
+            from devcouncil import hardware
+
+            host = hardware.describe_host()
+            model = host.recommended_ollama_model
+            console.print(
+                f"[green]Detected {host.chip_label} ({host.memory_label}); "
+                f"defaulting Ollama model to {model}.[/green] "
+                "Override with --model, and pull it first: "
+                f"[bold]ollama pull {model}[/bold]."
+            )
+        elif initial_provider == "ollama" and model is not None:
+            # Model pinned explicitly — still remind the user it must be pulled locally.
+            console.print(
+                f"[green]Using Ollama model {model}.[/green] "
+                f"Pull it first if needed: [bold]ollama pull {model}[/bold]."
+            )
+
+        created = initialize_project(
+            root,
+            project_name=name,
+            model_provider=initial_provider,
+            model=model,
+            role_models=role_models,
+            with_map=not skip_map,
+            with_skills=not skip_skills,
         )
-    elif initial_provider == "ollama" and model is not None:
-        # Model pinned explicitly — still remind the user it must be pulled locally.
-        console.print(
-            f"[green]Using Ollama model {model}.[/green] "
-            f"Pull it first if needed: [bold]ollama pull {model}[/bold]."
-        )
+        if not created:
+            console.print(f"[yellow]DevCouncil is already initialized at {root / '.devcouncil'}.[/yellow]")
 
-    created = initialize_project(
-        root,
-        project_name=name,
-        model_provider=initial_provider,
-        model=model,
-        role_models=role_models,
-        with_map=not skip_map,
-        with_skills=not skip_skills,
-    )
-    if not created:
-        console.print(f"[yellow]DevCouncil is already initialized at {root / '.devcouncil'}.[/yellow]")
+        if provider:
+            try:
+                _set_model_provider(root, provider)
+            except ValueError as e:
+                console.print(f"[red]{e}[/red]")
+                raise typer.Exit(code=2) from e
 
-    if provider:
-        try:
-            _set_model_provider(root, provider)
-        except ValueError as e:
-            console.print(f"[red]{e}[/red]")
-            raise typer.Exit(code=2) from e
+        _set_model_roles(root, model=model, role_models=role_models)
 
-    _set_model_roles(root, model=model, role_models=role_models)
+        configured_provider = load_config(root).models.provider
+        _configure_vertexai_settings(root, configured_provider, vertex_project, vertex_location)
+        _configure_api_key(root, api_key, skip_api_key)
 
-    configured_provider = load_config(root).models.provider
-    _configure_vertexai_settings(root, configured_provider, vertex_project, vertex_location)
-    _configure_api_key(root, api_key, skip_api_key)
+        console.print()
+        render_doctor_check(root)
 
-    console.print()
-    render_doctor_check(root)
+        if scaffold_ci:
+            from devcouncil.repo.ci_scaffold import WORKFLOW_RELPATH, scaffold_ci as scaffold_ci_workflow
 
-    if scaffold_ci:
-        from devcouncil.repo.ci_scaffold import WORKFLOW_RELPATH, scaffold_ci as scaffold_ci_workflow
+            written = scaffold_ci_workflow(root)
+            if written is None:
+                console.print(f"[yellow]{WORKFLOW_RELPATH.as_posix()} already exists; left unchanged.[/yellow]")
+            else:
+                console.print(f"[green]Wrote starter CI workflow {written.relative_to(root).as_posix()}.[/green]")
 
-        written = scaffold_ci_workflow(root)
-        if written is None:
-            console.print(f"[yellow]{WORKFLOW_RELPATH.as_posix()} already exists; left unchanged.[/yellow]")
-        else:
-            console.print(f"[green]Wrote starter CI workflow {written.relative_to(root).as_posix()}.[/green]")
+        if integrate:
+            _configure_coding_cli_integrations(root, apply=apply, gemini_scope=gemini_scope)
+        elif created and not skip_integrations:
+            _prompt_for_first_run_integrations(root, apply=True, gemini_scope=gemini_scope)
 
-    if integrate:
-        _configure_coding_cli_integrations(root, apply=apply, gemini_scope=gemini_scope)
-    elif created and not skip_integrations:
-        _prompt_for_first_run_integrations(root, apply=True, gemini_scope=gemini_scope)
-
-    console.print()
-    console.print(Panel.fit(
-        "\n".join([
-            "[bold]Next commands[/bold]",
-            f"Keep running DevCouncil commands in this terminal at: {root}",
-            "One-command agent path:",
-            "dev e2e \"Describe the implementation goal\"",
-            "",
-            "Manual sidecar path:",
-            "dev plan \"Describe the implementation goal\"",
-            "dev tasks",
-            "dev run TASK-001 --executor manual",
-            "dev prompt TASK-001",
-            "Paste only the dev prompt output into your coding CLI.",
-            "Paste only the dev prompt output into your coding CLI, or run directly:",
-            "dev run TASK-001 --executor codex",
-            "dev run TASK-001 --executor gemini",
-            "dev run TASK-001 --executor claude",
-            "dev run TASK-001 --executor opencode",
-            "dev run TASK-001 --executor antigravity",
-            "dev verify TASK-001",
-            "",
-            "Use [bold]dev setup --integrate[/bold] to preview coding CLI MCP and native hook setup.",
-            "Use [bold]dev setup --integrate --apply[/bold] to configure detected clients.",
-        ]),
-        title="DevCouncil is ready",
-        border_style="green",
-    ))
+        console.print()
+        console.print(Panel.fit(
+            "\n".join([
+                "[bold]Next commands[/bold]",
+                f"Keep running DevCouncil commands in this terminal at: {root}",
+                "One-command agent path:",
+                "dev e2e \"Describe the implementation goal\"",
+                "",
+                "Manual sidecar path:",
+                "dev plan \"Describe the implementation goal\"",
+                "dev tasks",
+                "dev run TASK-001 --executor manual",
+                "dev prompt TASK-001",
+                "Paste only the dev prompt output into your coding CLI.",
+                "Paste only the dev prompt output into your coding CLI, or run directly:",
+                "dev run TASK-001 --executor codex",
+                "dev run TASK-001 --executor gemini",
+                "dev run TASK-001 --executor claude",
+                "dev run TASK-001 --executor opencode",
+                "dev run TASK-001 --executor antigravity",
+                "dev verify TASK-001",
+                "",
+                "Use [bold]dev setup --integrate[/bold] to preview coding CLI MCP and native hook setup.",
+                "Use [bold]dev setup --integrate --apply[/bold] to configure detected clients.",
+            ]),
+            title="DevCouncil is ready",
+            border_style="green",
+        ))
+        log_step("setup/complete", project_root=root, trace=True)

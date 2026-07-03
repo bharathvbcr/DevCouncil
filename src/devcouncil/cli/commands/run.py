@@ -22,6 +22,7 @@ from devcouncil.verification.verifier import Verifier
 from devcouncil.app.state_machine import ProjectPhase
 from devcouncil.cli.commands.init import initialize_project
 from devcouncil.telemetry.traces import TraceLogger
+from devcouncil.telemetry.stages import log_stage, log_step
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -61,6 +62,11 @@ def _verify_after_execution(session, task, reqs, router=None, project_root: Path
     import asyncio
 
     logger.info("Verifying task %s (router=%s)", task.id, "yes" if router else "no")
+    log_step(
+        "run/verify: verifying executor output",
+        project_root=project_root,
+        task_id=task.id,
+    )
     verifier = Verifier(project_root, router=router)
     gaps, evidence = asyncio.run(verifier.verify_task(task, reqs))
     blocking = [g for g in gaps if g.blocking]
@@ -214,6 +220,11 @@ def run(
         console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
         return
 
+    with log_stage("run", project_root=root, task_id=task_id, executor=executor):
+        _run_task_body(root, task_id, executor, profile, stream, db)
+
+
+def _run_task_body(root, task_id, executor, profile, stream, db):
     with db.get_session() as session:
         task_repo = TaskRepository(session)
         task = task_repo.get_by_id(task_id)
@@ -237,6 +248,7 @@ def run(
 
         console.print(f"Running task [bold]{task_id}[/bold] using [bold]{executor}[/bold] executor...")
 
+        log_step("run/1: creating git checkpoint", project_root=root, task_id=task_id)
         # 1. Create Git checkpoint
         try:
             from devcouncil.execution.checkpoints import CheckpointService
@@ -266,6 +278,12 @@ def run(
             console.print("Use 'dev prompt TASK-ID' to get the prompt for this task.")
             console.print("When finished, use 'dev verify TASK-ID' to check the results.")
         elif executor in CODING_EXECUTORS or executor in custom_agents:
+            log_step(
+                f"run/2: executing with {executor}",
+                project_root=root,
+                task_id=task_id,
+                executor=executor,
+            )
             _record_project_phase(session, ProjectPhase.TASK_EXECUTING)
             req_repo = RequirementRepository(session)
             reqs = req_repo.get_all()
@@ -305,6 +323,7 @@ def run(
                 logger.error("%s failed to start or execute for %s: %s", executor, task_id, exec_result.message)
                 console.print(f"\n[red]{executor.upper()} failed to start or execute: {exec_result.message}[/red]")
         elif executor == "mini":
+            log_step("run/2: executing with mini-SWE-agent", project_root=root, task_id=task_id)
             _record_project_phase(session, ProjectPhase.TASK_EXECUTING)
             req_repo = RequirementRepository(session)
             reqs = req_repo.get_all()
@@ -330,6 +349,7 @@ def run(
                 logger.error("mini-SWE-agent failed to start or execute for %s", task_id)
                 console.print("\n[red]mini-SWE-agent failed to start or execute.[/red]")
         elif executor == "openhands":
+            log_step("run/2: executing with OpenHands", project_root=root, task_id=task_id)
             _record_project_phase(session, ProjectPhase.TASK_EXECUTING)
             req_repo = RequirementRepository(session)
             reqs = req_repo.get_all()
@@ -355,6 +375,7 @@ def run(
                 logger.error("OpenHands failed to start or execute for %s", task_id)
                 console.print("\n[red]OpenHands failed to start or execute.[/red]")
         elif executor == "claude-sdk":
+            log_step("run/2: executing with claude-sdk", project_root=root, task_id=task_id)
             # In-process Claude Agent SDK executor: every tool call is gated live against
             # this task's scope, so out-of-scope writes/commands are denied before they land.
             from devcouncil.executors.claude_sdk import ClaudeSdkExecutor
@@ -385,6 +406,7 @@ def run(
                 logger.error("claude-sdk failed to start or execute for %s: %s", task_id, exec_result.message)
                 console.print(f"\n[red]claude-sdk failed to start or execute: {exec_result.message}[/red]")
         elif executor in {"native", "native-preview"}:
+            log_step("run/2: executing with native agent", project_root=root, task_id=task_id)
             # Load config for model routing and permissions
             try:
                 config = load_config(root)
@@ -438,3 +460,4 @@ def run(
         else:
             logger.error("Executor %r not implemented", executor)
             console.print(f"[red]Executor {executor} not yet implemented.[/red]")
+        log_step("run/complete", project_root=root, task_id=task_id, executor=executor, trace=True)

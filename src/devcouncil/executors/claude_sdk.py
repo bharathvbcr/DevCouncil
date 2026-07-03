@@ -25,6 +25,7 @@ from devcouncil.domain.task import Task
 from devcouncil.execution.executor import ExecutionResult, Executor
 from devcouncil.execution.hook_policy import HookDecision, HookPolicy
 from devcouncil.execution.prompt_builder import PromptBuilder
+from devcouncil.telemetry.stages import log_step
 
 logger = logging.getLogger(__name__)
 
@@ -105,13 +106,32 @@ class ClaudeSdkExecutor(Executor):
         # A task can be passed at construction (for the gate) or here; the run argument wins.
         if task is not None:
             self.active_task = task
+        log_step(
+            f"executor/claude-sdk: starting task {task.id}",
+            project_root=self.project_root,
+            task_id=task.id,
+        )
         import asyncio
 
         try:
-            return asyncio.run(self._run_async(task, requirements))
+            result = asyncio.run(self._run_async(task, requirements))
+            log_step(
+                f"executor/claude-sdk: finished task {task.id}",
+                project_root=self.project_root,
+                task_id=task.id,
+                success=result.success,
+            )
+            return result
         except RuntimeError as exc:
             # Missing SDK or a nested event loop — report cleanly, never crash the caller.
             logger.error("claude-sdk executor could not run %s: %s", getattr(task, "id", "?"), exc)
+            log_step(
+                f"executor/claude-sdk: finished task {getattr(task, 'id', '?')}",
+                project_root=self.project_root,
+                task_id=getattr(task, "id", None),
+                success=False,
+                error=str(exc),
+            )
             return ExecutionResult(success=False, message=str(exc))
 
     async def _run_async(self, task: Task, requirements: List[Requirement]) -> ExecutionResult:
@@ -119,15 +139,11 @@ class ClaudeSdkExecutor(Executor):
         prompt = PromptBuilder(self.project_root).build_task_prompt(task, requirements)
         # Parity with the subprocess executor: a repair run must carry the correction
         # manifest so the model knows what the prior attempt got wrong.
-        from devcouncil.planning.correction_manifest import load_latest_correction_manifest
+        from devcouncil.planning.correction_manifest import repair_prompt_prefix
 
-        correction = load_latest_correction_manifest(self.project_root, task.id)
-        if correction is not None:
-            prompt = (
-                f"# DevCouncil Correction Manifest\n\n"
-                f"{correction.model_dump_json(indent=2)}\n\n"
-                f"{prompt}"
-            )
+        prefix = repair_prompt_prefix(self.project_root, task.id)
+        if prefix:
+            prompt = f"{prefix}{prompt}"
 
         async def can_use_tool(tool_name: str, tool_input: dict[str, Any], *args: Any, **kwargs: Any):
             decision = self.permission_decision(tool_name, tool_input or {})

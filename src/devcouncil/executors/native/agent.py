@@ -12,6 +12,7 @@ from devcouncil.execution.context_builder import ContextBuilder
 from devcouncil.execution.prompt_builder import PromptBuilder
 from devcouncil.execution.paths import resolve_project_path
 from devcouncil.app.errors import ExecutionError
+from devcouncil.telemetry.stages import log_step
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -43,7 +44,20 @@ class NativeAgent(Executor):
 
     def run_task(self, task: Task, requirements: List[Requirement]) -> ExecutionResult:
         """Run the preview native executor behind the normal synchronous executor contract."""
-        return asyncio.run(self._run_task_async(task, requirements))
+        root = self.task_runner.project_root
+        log_step(
+            f"executor/native: starting task {task.id}",
+            project_root=root,
+            task_id=task.id,
+        )
+        result = asyncio.run(self._run_task_async(task, requirements))
+        log_step(
+            f"executor/native: finished task {task.id}",
+            project_root=root,
+            task_id=task.id,
+            success=result.success,
+        )
+        return result
 
     async def _run_task_async(self, task: Task, requirements: List[Requirement]) -> ExecutionResult:
         logger.info("Native agent starting for %s (max_steps=%d)", task.id, MAX_AGENT_STEPS)
@@ -52,12 +66,10 @@ class NativeAgent(Executor):
         
         # 1. Gather rich context (budgeted; includes repo-map orientation + symbol outlines)
         context_block = self.prompt_builder.build_task_prompt(task, requirements)
-        from devcouncil.planning.correction_manifest import load_latest_correction_manifest
+        from devcouncil.planning.correction_manifest import repair_prompt_prefix
 
-        correction = load_latest_correction_manifest(self.task_runner.project_root, task.id)
-        correction_block = ""
-        if correction is not None:
-            correction_block = f"\nCorrection Manifest:\n{correction.model_dump_json(indent=2)}\n"
+        prefix = repair_prompt_prefix(self.task_runner.project_root, task.id)
+        correction_block = f"\n{prefix}" if prefix else ""
 
         system_prompt = f"""
 You are the DevCouncil Native Agent. Your goal is to implement the provided task.

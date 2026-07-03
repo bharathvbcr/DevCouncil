@@ -98,6 +98,22 @@ def _max_repair_attempts(root: Path) -> int:
         return 0
 
 
+def _task_max_repairs(root: Path, task, base_max: int) -> int:
+    """Per-task repair budget: the base budget widened for HARD tasks per
+    ``verification.rigor.extra_repair_attempts_on_hard``. A disabled loop
+    (base 0) stays disabled. Never raises."""
+    if base_max <= 0:
+        return base_max
+    try:
+        from devcouncil.verification.difficulty import resolve_rigor_policy
+
+        config = load_config(root)
+        policy = resolve_rigor_policy(task, None, config=config)
+        return base_max + max(0, policy.extra_repair_attempts)
+    except Exception:
+        return base_max
+
+
 def _blocking_gap_signature(root: Path, task_id: str) -> str:
     """Fingerprint of a task's current blocking gaps, for no-progress detection.
 
@@ -239,14 +255,36 @@ def _execute_task_with_repair(
         if manifest_path is None:
             break
         attempt += 1
-        logger.info("Self-repair attempt %d/%d for %s (was %s); manifest=%s", attempt, max_repairs, task.id, status, manifest_path)
-        console.print(
-            f"\n[bold]Self-repair attempt {attempt}/{max_repairs}[/bold] for "
-            f"[bold]{task.id}[/bold] (was {status})..."
-        )
-        _run_once()
-        status = _task_status(root, task.id)
-        logger.info("After repair attempt %d, %s is now %s", attempt, task.id, status)
+        with log_stage(
+            "repair",
+            project_root=root,
+            task_id=task.id,
+            attempt=attempt,
+            max_repairs=max_repairs,
+        ):
+            log_step(
+                f"repair attempt {attempt}/{max_repairs} for {task.id}",
+                project_root=root,
+                task_id=task.id,
+                manifest=str(manifest_path),
+                prior_status=status,
+                trace=True,
+            )
+            logger.info("Self-repair attempt %d/%d for %s (was %s); manifest=%s", attempt, max_repairs, task.id, status, manifest_path)
+            console.print(
+                f"\n[bold]Self-repair attempt {attempt}/{max_repairs}[/bold] for "
+                f"[bold]{task.id}[/bold] (was {status})..."
+            )
+            _run_once()
+            status = _task_status(root, task.id)
+            logger.info("After repair attempt %d, %s is now %s", attempt, task.id, status)
+            log_step(
+                f"repair attempt {attempt}/{max_repairs} finished for {task.id}",
+                project_root=root,
+                task_id=task.id,
+                status=status,
+                trace=True,
+            )
 
     if status not in {"verified", "done"} and attempt >= max_repairs and max_repairs > 0:
         logger.warning("%s: gave up after %d repair attempt(s); still %s", task.id, attempt, status)
@@ -626,12 +664,14 @@ def go(
         executed_task_ids.append(task.id)
         # Run, then self-repair in a bounded loop (closes the autonomous loop: the
         # one-shot executor no longer needs a human to run `dev repair` and re-run).
+        # Hard tasks get a wider budget per verification.rigor.
+        task_max_repairs = _task_max_repairs(root, task, max_repairs)
         with log_stage(
             "execute_task",
             project_root=root,
             task_id=task.id,
             executor=normalized_executor,
-            max_repairs=max_repairs,
+            max_repairs=task_max_repairs,
         ):
             latest_status, repairs_used = _execute_task_with_repair(
                 root,
@@ -639,7 +679,7 @@ def go(
                 executor=normalized_executor,
                 profile=profile,
                 stream=stream,
-                max_repairs=max_repairs,
+                max_repairs=task_max_repairs,
                 repair_service=repair_service,
                 config=repair_config,
             )
@@ -685,17 +725,18 @@ def go(
     # refreshes statuses/gaps cheaply for an honest final report.
     if executed_task_ids and _is_git_repo(root):
         console.print("\n[bold]Reconciling verification against the final integrated state...[/bold]")
-        log_step("reconcile: re-verifying against integrated state", project_root=root)
-        try:
-            verify_command.verify(task_id=None, sandbox="local", json_format=True, project_root=root)
-        except typer.Exit:
-            # Expected signal: verify() raises Exit(code=1) when any task is blocked,
-            # but it has already persisted every task status before raising. The
-            # reconciliation pass therefore completed — fall through to the reload so
-            # blocked statuses are refreshed honestly. (Only real errors should skip.)
-            pass
-        except Exception as exc:  # pragma: no cover - reconciliation is best-effort
-            console.print(f"[yellow]Reconciliation pass skipped: {exc}[/yellow]")
+        with log_stage("reconcile", project_root=root, tasks=len(executed_task_ids)):
+            log_step("reconcile: re-verifying against integrated state", project_root=root)
+            try:
+                verify_command.verify(task_id=None, sandbox="local", json_format=True, project_root=root)
+            except typer.Exit:
+                # Expected signal: verify() raises Exit(code=1) when any task is blocked,
+                # but it has already persisted every task status before raising. The
+                # reconciliation pass therefore completed — fall through to the reload so
+                # blocked statuses are refreshed honestly. (Only real errors should skip.)
+                pass
+            except Exception as exc:  # pragma: no cover - reconciliation is best-effort
+                console.print(f"[yellow]Reconciliation pass skipped: {exc}[/yellow]")
         reconciled = {item.id: item for item in _load_tasks(root)}
         # Rebuild from the FULL planned set, not just executed_task_ids: a task skipped
         # for an unmet dependency, or one reconciliation downgraded from done->blocked,
@@ -715,7 +756,7 @@ def go(
         logger.warning("dev go finished with %d unfinished task(s): %s", len(failed), ", ".join(failed))
         _record_project_blocked(root)
 
-    log_step("generating final report", project_root=root)
+    log_step("generating final report", project_root=root, trace=True)
     console.print("\n[bold]Final DevCouncil report[/bold]")
     report_command.report(
         SimpleNamespace(invoked_subcommand=None),  # type: ignore[arg-type]

@@ -170,6 +170,67 @@ async def test_update_scope_rejects_non_array_values(tmp_path, monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_update_scope_rejects_trivial_self_cert_commands(tmp_path, monkeypatch):
+    dev_dir = tmp_path / ".devcouncil"
+    dev_dir.mkdir()
+    db = Database(dev_dir / "state.sqlite")
+    db.create_db_and_tables()
+    with db.get_session() as session:
+        TaskRepository(session).save(Task(id="TASK-001", title="T", description="D"))
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    checkout = json.loads(
+        (await call_tool("devcouncil_checkout_task", {"task_id": "TASK-001", "client_id": "a"}))[0].text
+    )
+
+    result = await call_tool(
+        "devcouncil_update_task_scope",
+        {
+            "task_id": "TASK-001",
+            "lease_token": checkout["lease_token"],
+            "expected_tests": ['python -c "print(\'ok\')"'],
+        },
+    )
+
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    assert payload["expected_tests"] == []
+    assert payload["rejected_expected_tests"] == ['python -c "print(\'ok\')"']
+
+
+@pytest.mark.anyio
+async def test_update_scope_tracks_agent_appended_evidence_commands(tmp_path, monkeypatch):
+    dev_dir = tmp_path / ".devcouncil"
+    dev_dir.mkdir()
+    db = Database(dev_dir / "state.sqlite")
+    db.create_db_and_tables()
+    with db.get_session() as session:
+        TaskRepository(session).save(Task(id="TASK-001", title="T", description="D"))
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    checkout = json.loads(
+        (await call_tool("devcouncil_checkout_task", {"task_id": "TASK-001", "client_id": "a"}))[0].text
+    )
+
+    cmd = "python -m pytest tests/test_app.py -q"
+    result = await call_tool(
+        "devcouncil_update_task_scope",
+        {
+            "task_id": "TASK-001",
+            "lease_token": checkout["lease_token"],
+            "expected_tests": [cmd],
+        },
+    )
+
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    assert cmd in payload["expected_tests"]
+    assert payload["rejected_expected_tests"] == []
+    with db.get_session() as session:
+        task = TaskRepository(session).get_by_id("TASK-001")
+        assert task is not None
+        assert cmd in task.agent_appended_expected_tests
+
+
+@pytest.mark.anyio
 async def test_mcp_verify_persists_gaps_evidence_and_task_status(tmp_path, monkeypatch):
     dev_dir = tmp_path / ".devcouncil"
     dev_dir.mkdir()
@@ -217,3 +278,60 @@ async def test_mcp_verify_persists_gaps_evidence_and_task_status(tmp_path, monke
         assert TaskRepository(session).get_by_id("TASK-001").status == "blocked"
         assert GapRepository(session).get_all()[0].id == "GAP-1"
         assert EvidenceRepository(session).get_command_results_for_task("TASK-001")[0].command == "pytest"
+
+
+@pytest.mark.anyio
+async def test_update_scope_filters_and_tracks_allowed_commands(tmp_path, monkeypatch):
+    """Trivial allowed_commands are rejected; legitimate ones are appended AND
+    recorded in agent_appended_allowed_commands so they can never coarse-prove."""
+    dev_dir = tmp_path / ".devcouncil"
+    dev_dir.mkdir()
+    db = Database(dev_dir / "state.sqlite")
+    db.create_db_and_tables()
+    with db.get_session() as session:
+        TaskRepository(session).save(Task(id="TASK-001", title="T", description="D"))
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    checkout = json.loads(
+        (await call_tool("devcouncil_checkout_task", {"task_id": "TASK-001", "client_id": "a"}))[0].text
+    )
+
+    result = await call_tool(
+        "devcouncil_update_task_scope",
+        {
+            "task_id": "TASK-001",
+            "lease_token": checkout["lease_token"],
+            "allowed_commands": ["echo done", "python --version", "make build"],
+        },
+    )
+
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    assert payload["rejected_allowed_commands"] == ["echo done", "python --version"]
+    assert "make build" in payload["allowed_commands"]
+    with db.get_session() as session:
+        task = TaskRepository(session).get_by_id("TASK-001")
+        assert task is not None
+        assert "make build" in task.agent_appended_allowed_commands
+        assert "echo done" not in task.allowed_commands
+
+
+def test_task_difficulty_and_provenance_round_trip(tmp_path):
+    """difficulty and agent-append provenance must survive a DB save/reload —
+    otherwise the rigor policy and the self-certification guard silently degrade."""
+    dev_dir = tmp_path / ".devcouncil"
+    dev_dir.mkdir()
+    db = Database(dev_dir / "state.sqlite")
+    db.create_db_and_tables()
+    with db.get_session() as session:
+        TaskRepository(session).save(Task(
+            id="TASK-001", title="T", description="D",
+            difficulty="hard",
+            agent_appended_expected_tests=["pytest tests/test_x.py"],
+            agent_appended_allowed_commands=["make build"],
+        ))
+    with db.get_session() as session:
+        task = TaskRepository(session).get_by_id("TASK-001")
+        assert task is not None
+        assert task.difficulty == "hard"
+        assert task.agent_appended_expected_tests == ["pytest tests/test_x.py"]
+        assert task.agent_appended_allowed_commands == ["make build"]

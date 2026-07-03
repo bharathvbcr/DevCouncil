@@ -57,24 +57,39 @@ export OPENROUTER_API_KEY=sk-or-...           # for DevCouncil planning (arm B)
 python benchmarks/run_bench.py \
     --arms A,B \
     --tasks all \
-    --model google/gemini-2.5-flash \         # cheap, reliable planner
-    --executor claude \
+    --model nvidia/nemotron-3-ultra-550b-a55b:free \  # free OpenRouter planner
+    --executor claude \                         # Claude Code
     --out benchmarks/results
 ```
+
+Defaults for arm B (OpenRouter planner + OpenRouter Nemotron monitor + Claude executor):
+- `--model nvidia/nemotron-3-ultra-550b-a55b:free` — free OpenRouter planner for all council roles.
+- `--dc-timeout 2400` — generous e2e budget for planning + monitoring API calls.
+- `--monitor-model nvidia/nemotron-3-ultra-550b-a55b:free` with `--monitor-provider openrouter`
+  (pass `--monitor-model ''` to skip per-role monitor routing).
+- `--ac-samples 1` — single check per criterion (no per-criterion flag).
+- Loads `OPENROUTER_API_KEY` from `.devcouncil/secrets.env` when the env var is unset.
+- When `--monitor-provider ollama`, sets `OLLAMA_THINK=false` and `OLLAMA_TIMEOUT=900` unless
+  already set. Override per run with `--monitor-think false|true|low|medium|high` and
+  `--monitor-num-predict N` (recorded in results JSON as `ollama_env`).
+- Preflight: verifies `OPENROUTER_API_KEY` is set; when monitor provider is Ollama, also checks
+  that the local server is up and the model is pulled.
+- Harness timeouts surface as `verdict=timeout` and are **not** retried (planner/setup errors are).
 
 Useful flags:
 - `--tasks median,chunk` — run a subset.
 - `--arms A,B,C` — include the elaborated-prompt control.
 - `--repeats 3` — repeat each task to measure variance (agents are stochastic).
-- `--timeout 360` — per-arm wall-clock cap.
+- `--timeout 360` — per-arm raw-agent wall-clock cap.
+- `--dc-timeout 3600` — raise further if a larger local monitor still runs long.
 - `--keep-workspaces` — keep the temp repos for inspection.
 
 Arm-B acceptance-check tuning (how DevCouncil proves each acceptance criterion):
 - `--ac-samples N` — generate `N` *independent* per-criterion checks and decide by
-  **majority vote** (default `1`). A criterion is proven only when a strict majority
-  pass; an all-fail is a real defect (blocks); a split is inconclusive (non-blocking).
-  `>1` outvotes a single mis-generated check — the cause of false `blocked` verdicts.
-  Local sampling is cost-free, so raise it (e.g. `3`) when using `--monitor-model`.
+  **majority vote** (default `1` for the benchmark pass). A criterion is proven only
+  when a strict majority pass; an all-fail is a real defect (blocks); a split is
+  inconclusive (non-blocking). `>1` outvotes a single mis-generated check — useful
+  for `local_monitor_probe.py` calibration, not the default e2e run.
 - `--ac-repair-attempts N` — when a compiled check *fails to run* (wrong import, broken
   one-liner) feed the error back and regenerate the command up to `N` times (default
   `1`). Rescues the under-credited `incomplete`; can never weaken the gate, since a
@@ -85,8 +100,42 @@ Arm-B acceptance-check tuning (how DevCouncil proves each acceptance criterion):
   single-criterion prompt is far more reliable. Costs N× the calls — cheap on a local
   monitor. Compounds with `--ac-samples`.
 
-For a weak/local reviewer the high-leverage combination is `--ac-samples 3
---ac-repair-attempts 2 --ac-per-criterion` alongside `--monitor-model <ollama-tag>`.
+For calibrating a weak/local reviewer (not the default e2e pass), use
+`local_monitor_probe.py` with `--samples 3 --per-criterion`, or the e2e flags
+`--ac-samples 3 --ac-repair-attempts 2 --ac-per-criterion` alongside a larger
+`--monitor-model`.
+
+## Local-monitor calibration probe (no cloud key / no agent)
+
+`local_monitor_probe.py` isolates the link the full benchmark showed failing on
+local monitors: can the `implementation_reviewer` model compile runnable,
+faithful per-criterion acceptance checks? It drives the REAL production stack
+(OllamaProvider → ModelRouter → AcceptanceTestCompiler), compiles checks for a
+few fixed tasks, then executes those checks against a **reference**
+implementation (every criterion must be proven — anything less is exactly the
+under-credited `incomplete`/false `blocked` from the e2e benchmark) and a
+**buggy** one (the criteria the bug breaks must NOT be proven — a proven one is
+a rubber-stamped defect).
+
+```bash
+uv run python benchmarks/local_monitor_probe.py                 # config's reviewer model
+uv run python benchmarks/local_monitor_probe.py --model qwen3:8b --samples 3 --per-criterion
+OLLAMA_THINK=false uv run python benchmarks/local_monitor_probe.py   # latency/quality tradeoff
+```
+
+Requires only a running Ollama server. Results land in
+`results/local_monitor_<ts>.{json,md}`. Useful Ollama runtime knobs (all env):
+`OLLAMA_NUM_CTX` (base context window; requests auto-grow up to
+`OLLAMA_MAX_NUM_CTX` when a prompt would otherwise be silently truncated),
+`OLLAMA_THINK=true|false|low|medium|high` (thinking models: reasoning dominates
+latency — measured ~65x on one compile call — but usually improves check
+quality; `low|medium|high` set an explicit thinking BUDGET on models that
+support levels, Ollama >= 0.12), `OLLAMA_NUM_PREDICT` (hard cap on generated
+tokens — bounds a runaway thinking spiral to a fast, healable truncation
+instead of a 600s HTTP timeout), `OLLAMA_MAX_CONCURRENCY` (client-side cap on
+in-flight requests, default 2 — fan-out callers otherwise queue server-side
+where their read timeouts tick while waiting; `off` disables),
+`OLLAMA_KEEP_ALIVE`, `OLLAMA_TIMEOUT`.
 
 Output: a `results/<timestamp>.json` (raw per-run data, including the
 `acceptance_checks` settings used) and a printed Markdown summary table.

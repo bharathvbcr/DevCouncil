@@ -29,6 +29,7 @@ from devcouncil.executors.agent_registry import (
 )
 from devcouncil.repo.gitignore import ensure_gitignore
 from devcouncil.telemetry.traces import TraceLogger
+from devcouncil.telemetry.stages import log_step
 from devcouncil.telemetry.logging_setup import run_log
 from devcouncil.utils.redaction import redact_text
 
@@ -240,6 +241,12 @@ class CodingCliExecutor(Executor):
 
     def run_task(self, task: Task, requirements: list[Requirement]) -> ExecutionResult:
         logger.info("coding_cli.run_task: client=%s profile=%s task=%s", self.client, self.profile_name, task.id)
+        log_step(
+            f"executor/{self.client}: starting task {task.id}",
+            project_root=self.project_root,
+            task_id=task.id,
+            profile=self.profile_name,
+        )
         if self.profile is None:
             logger.error("Unknown agent profile %r for %s; cannot start.", self.profile_name, self.client)
             return ExecutionResult(
@@ -273,15 +280,11 @@ class CodingCliExecutor(Executor):
             )
 
         prompt = PromptBuilder(self.project_root).build_task_prompt(task, requirements)
-        from devcouncil.planning.correction_manifest import load_latest_correction_manifest
+        from devcouncil.planning.correction_manifest import repair_prompt_prefix
 
-        correction = load_latest_correction_manifest(self.project_root, task.id)
-        if correction is not None:
-            prompt = (
-                f"# DevCouncil Correction Manifest\n\n"
-                f"{correction.model_dump_json(indent=2)}\n\n"
-                f"{prompt}"
-            )
+        prefix = repair_prompt_prefix(self.project_root, task.id)
+        if prefix:
+            prompt = f"{prefix}{prompt}"
         prompt = self._apply_profile_prompt(prompt)
         instruction_file = self.project_root / ".devcouncil" / f"{task.id}-{self.client}-task.md"
         instruction_file.parent.mkdir(parents=True, exist_ok=True)
@@ -355,6 +358,45 @@ class CodingCliExecutor(Executor):
                 transcript_path=transcript_path,
                 display_transform=display_transform,
             )
+            # Transient-failure retry: a CLI that died on a network/provider fault
+            # ("API Error: Connection closed mid-response", 429/5xx, overloaded) says
+            # nothing about the task — without a retry the failure ends the task
+            # `blocked`, burns a repair attempt on a non-code problem, and surfaces
+            # as a false negative (seen directly in the benchmark). Only failures
+            # whose output matches a known-transient signature are retried, with a
+            # short backoff; genuine agent errors still fail immediately.
+            retries = 0
+            retry_limit = self._transient_retry_limit()
+            while result.returncode != 0 and retries < retry_limit:
+                reason = self._transient_failure_reason(result)
+                if reason is None:
+                    break
+                retries += 1
+                delay = min(30.0, 5.0 * retries)
+                logger.warning(
+                    "%s failed with a transient error for %s (%s); retrying %d/%d in %.0fs",
+                    self.client, task.id, reason, retries, retry_limit, delay,
+                )
+                TraceLogger(self.project_root).log_event(
+                    "agent_run_transient_retry",
+                    {
+                        "agent": self.client,
+                        "profile": self.profile_name,
+                        "returncode": result.returncode,
+                        "reason": reason,
+                        "attempt": retries,
+                        "limit": retry_limit,
+                    },
+                    run_id=run_id,
+                    task_id=task.id,
+                    summary=f"Transient {self.client} failure ({reason}); retry {retries}/{retry_limit}",
+                )
+                time.sleep(delay)
+                result = self._run_subprocess(
+                    invocation, input_text, env,
+                    transcript_path=transcript_path,
+                    display_transform=display_transform,
+                )
             duration = round(time.monotonic() - started, 3)
             logger.info("%s subprocess for %s exited %s in %.2fs", self.client, task.id, result.returncode, duration)
             finished_at = datetime.now(timezone.utc).isoformat()
@@ -410,6 +452,14 @@ class CodingCliExecutor(Executor):
                 run_id=run_id,
                 task_id=task.id,
                 summary=f"{self.client} finished for {task.id}",
+            )
+            log_step(
+                f"executor/{self.client}: finished task {task.id}",
+                project_root=self.project_root,
+                task_id=task.id,
+                returncode=result.returncode,
+                duration_s=round(duration, 2),
+                trace=True,
             )
             # Opt-in pre-verify scope gate: this CLI subprocess wrote directly to disk with
             # no per-write hook, so revert any out-of-scope change now (before it reaches the
@@ -473,6 +523,58 @@ class CodingCliExecutor(Executor):
             return bool(load_config(self.project_root).execution.enforce_file_scope_pre_verify)
         except Exception:
             return False
+
+    # Output signatures of failures caused by the NETWORK/PROVIDER, not the task.
+    # Matched case-insensitively against stderr plus the tail of stdout. Deliberately
+    # phrase-based (no bare status-code numbers) so code/diff content in stdout cannot
+    # spuriously classify a genuine agent failure as transient.
+    _TRANSIENT_FAILURE_MARKERS = (
+        "connection closed",
+        "connection reset",
+        "connection refused",
+        "connection error",
+        "connection aborted",
+        "econnreset",
+        "econnrefused",
+        "etimedout",
+        "socket hang up",
+        "mid-response",
+        "network error",
+        "fetch failed",
+        "temporarily unavailable",
+        "service unavailable",
+        "internal server error",
+        "bad gateway",
+        "gateway timeout",
+        "overloaded",
+        "rate limit",
+        "too many requests",
+        "request timed out",
+        "timeout awaiting",
+        "tls handshake",
+        "dns",
+    )
+
+    def _transient_failure_reason(self, result: "subprocess.CompletedProcess[str]") -> str | None:
+        """The matched transient marker when a failed run looks network/provider-caused,
+        else None. Scans stderr fully and only the TAIL of stdout (where CLIs print
+        their final error) so large code output cannot trigger a false match."""
+        haystack = f"{result.stderr or ''}\n{(result.stdout or '')[-4000:]}".lower()
+        for marker in self._TRANSIENT_FAILURE_MARKERS:
+            if marker in haystack:
+                return marker
+        return None
+
+    def _transient_retry_limit(self) -> int:
+        """Max transient-failure retries from ``execution.transient_retry_attempts``.
+
+        Defaults conservatively (2) when config is unavailable; 0 disables retry."""
+        try:
+            from devcouncil.app.config import load_config
+
+            return max(0, int(load_config(self.project_root).execution.transient_retry_attempts))
+        except Exception:
+            return 2
 
     def _enforce_file_scope(self, task: Task) -> list[tuple[str, str]]:
         """Revert any file this task's subprocess changed that the task does not authorize.

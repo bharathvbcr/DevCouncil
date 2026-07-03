@@ -7,6 +7,7 @@ from devcouncil.domain.task import Task
 from devcouncil.domain.requirement import Requirement
 from devcouncil.execution.executor import Executor, ExecutionResult
 from devcouncil.execution.prompt_builder import PromptBuilder
+from devcouncil.telemetry.stages import log_step
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -17,7 +18,12 @@ class MiniSWEExecutor(Executor):
 
     def run_task(self, task: Task, requirements: list[Requirement]) -> ExecutionResult:
         builder = PromptBuilder(self.project_root)
+        from devcouncil.planning.correction_manifest import repair_prompt_prefix
+
         task_prompt = builder.build_task_prompt(task, requirements)
+        prefix = repair_prompt_prefix(self.project_root, task.id)
+        if prefix:
+            task_prompt = f"{prefix}{task_prompt}"
         
         # Write temporary instruction file for mini-SWE-agent
         instruction_file = self.project_root / ".devcouncil" / f"{task.id}-mini-swe-task.md"
@@ -25,6 +31,11 @@ class MiniSWEExecutor(Executor):
         instruction_file.write_text(task_prompt, encoding="utf-8")
         
         logger.info("mini-SWE-agent starting for %s", task.id)
+        log_step(
+            f"executor/mini-swe: starting task {task.id}",
+            project_root=self.project_root,
+            task_id=task.id,
+        )
         console.print(f"Starting [bold]mini-SWE-agent[/bold] for task {task.id}...")
         
         # In a real implementation, we'd invoke the agent CLI
@@ -54,12 +65,33 @@ class MiniSWEExecutor(Executor):
             self._write_log(task.id, result)
             if result.returncode != 0:
                 logger.error("mini-SWE-agent exited %s for %s", result.returncode, task.id)
+                log_step(
+                    f"executor/mini-swe: finished task {task.id}",
+                    project_root=self.project_root,
+                    task_id=task.id,
+                    returncode=result.returncode,
+                    success=False,
+                )
                 console.print(f"[red]mini-SWE-agent exited with {result.returncode}.[/red]")
                 return ExecutionResult(success=False, message='Execution failed')
             logger.info("mini-SWE-agent finished for %s", task.id)
+            log_step(
+                f"executor/mini-swe: finished task {task.id}",
+                project_root=self.project_root,
+                task_id=task.id,
+                returncode=0,
+                success=True,
+            )
             return ExecutionResult(success=True, message='Execution successful')
         except Exception as e:
             logger.exception("mini-SWE-agent error for %s: %s", task.id, e)
+            log_step(
+                f"executor/mini-swe: finished task {task.id}",
+                project_root=self.project_root,
+                task_id=task.id,
+                success=False,
+                error=str(e),
+            )
             console.print(f"[red]Error running mini-SWE-agent: {e}[/red]")
             return ExecutionResult(success=False, message='Execution failed')
 

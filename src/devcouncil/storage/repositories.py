@@ -105,8 +105,15 @@ class TaskRepository:
             "acceptance_criterion_ids": json.loads(m.acceptance_criterion_ids_json),
             "planned_files": pf_list,
             "expected_tests": json.loads(m.expected_tests_json),
+            "agent_appended_expected_tests": json.loads(
+                getattr(m, "agent_appended_expected_tests_json", None) or "[]"
+            ),
             "allowed_commands": json.loads(m.allowed_commands_json),
+            "agent_appended_allowed_commands": json.loads(
+                getattr(m, "agent_appended_allowed_commands_json", None) or "[]"
+            ),
             "forbidden_changes": json.loads(m.forbidden_changes_json),
+            "difficulty": getattr(m, "difficulty", None),
             "status": m.status,
         })
 
@@ -124,8 +131,15 @@ class TaskRepository:
                 "acceptance_criterion_ids": json.loads(m.acceptance_criterion_ids_json),
                 "planned_files": pf_list,
                 "expected_tests": json.loads(m.expected_tests_json),
+                "agent_appended_expected_tests": json.loads(
+                    getattr(m, "agent_appended_expected_tests_json", None) or "[]"
+                ),
                 "allowed_commands": json.loads(m.allowed_commands_json),
+                "agent_appended_allowed_commands": json.loads(
+                    getattr(m, "agent_appended_allowed_commands_json", None) or "[]"
+                ),
                 "forbidden_changes": json.loads(m.forbidden_changes_json),
+                "difficulty": getattr(m, "difficulty", None),
                 "status": m.status,
             }))
         return results
@@ -139,8 +153,11 @@ class TaskRepository:
             acceptance_criterion_ids_json=json.dumps(task.acceptance_criterion_ids),
             planned_files_json=json.dumps([pf.model_dump() for pf in task.planned_files]),
             expected_tests_json=json.dumps(task.expected_tests),
+            agent_appended_expected_tests_json=json.dumps(task.agent_appended_expected_tests),
             allowed_commands_json=json.dumps(task.allowed_commands),
+            agent_appended_allowed_commands_json=json.dumps(task.agent_appended_allowed_commands),
             forbidden_changes_json=json.dumps(task.forbidden_changes),
+            difficulty=task.difficulty,
             status=task.status
         )
         self.session.merge(model)
@@ -384,8 +401,11 @@ class PlanningStateRepository:
                 acceptance_criterion_ids_json=json.dumps(task.acceptance_criterion_ids),
                 planned_files_json=json.dumps([pf.model_dump() for pf in task.planned_files]),
                 expected_tests_json=json.dumps(task.expected_tests),
+                agent_appended_expected_tests_json=json.dumps(task.agent_appended_expected_tests),
                 allowed_commands_json=json.dumps(task.allowed_commands),
+                agent_appended_allowed_commands_json=json.dumps(task.agent_appended_allowed_commands),
                 forbidden_changes_json=json.dumps(task.forbidden_changes),
+                difficulty=task.difficulty,
                 status=task.status,
             ))
 

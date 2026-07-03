@@ -42,7 +42,7 @@ Google Cloud access tokens are short-lived. If `VERTEXAI_ACCESS_TOKEN` is not se
 
 Use provider-specific model names in role config, for example:
 
-- OpenRouter: `anthropic/claude-sonnet-4.6`, `openai/gpt-5.5`, `google/gemini-2.5-pro`
+- OpenRouter: `nvidia/nemotron-3-ultra-550b-a55b:free` (default), `anthropic/claude-sonnet-4.6`, `openai/gpt-5.5`
 - Vertex AI: `google/gemini-2.5-flash`
 - Doubleword: `deepseek/deepseek-v4`
 - Ollama: `qwen2.5-coder:7b`, `llama3.1` (any locally-pulled model tag; sent verbatim to Ollama)

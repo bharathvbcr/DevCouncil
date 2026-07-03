@@ -4,14 +4,17 @@ import functools
 import json
 import logging
 import asyncio
+import re
 import time
 from pathlib import Path
 
+import httpx
 from pydantic import BaseModel
-from devcouncil.llm.provider import Provider, LLMResponse
+from devcouncil.llm.provider import Provider, LLMResponse, ProviderRequestError
 from devcouncil.llm.cache import LLMCache
 from devcouncil.telemetry.tracker import TelemetryTracker
 from devcouncil.telemetry.traces import TraceLogger
+from devcouncil.telemetry.stages import log_step
 
 logger = logging.getLogger(__name__)
 StructuredModel = TypeVar("StructuredModel", bound=BaseModel)
@@ -95,34 +98,29 @@ class ModelRouter:
             )
         return self._role_providers[normalized]
 
-    @staticmethod
-    def _extract_json(content: str) -> str:
-        """Best-effort extraction of a JSON document from a model response.
+    # Inline reasoning blocks emitted by thinking models when the serving stack does
+    # not split them into a separate channel (local runners with a mismatched chat
+    # template are the common case). Removed before JSON extraction: the reasoning
+    # prose routinely contains JSON-looking examples that would otherwise be picked
+    # up instead of the real answer that follows the block.
+    _THINK_BLOCK_RE = re.compile(
+        r"<(think|thinking|reasoning|thought)>.*?</\1>", re.DOTALL | re.IGNORECASE
+    )
+    # An UNCLOSED reasoning tag (generation cut off or template quirk): everything
+    # from the opener is reasoning; nothing after it to salvage, but text BEFORE a
+    # dangling opener (rare) may hold the answer.
+    _THINK_OPEN_RE = re.compile(r"<(think|thinking|reasoning|thought)>", re.IGNORECASE)
 
-        Handles the common ways a model wraps valid JSON: triple-backtick fences and
-        surrounding prose ("Here you go: {...} thanks"). Strips fences, returns the
-        whole thing if it already parses, otherwise scans for the first balanced
-        object/array (string- and escape-aware so braces inside string values don't
-        confuse it). Falls back to the de-fenced text so the existing healing path
-        still produces a meaningful error. A strict superset of plain fence-stripping
-        — clean/fenced JSON is returned unchanged."""
-        text = content.strip()
-        if "```json" in text:
-            text = text.split("```json", 1)[1].split("```", 1)[0].strip()
-        elif "```" in text:
-            text = text.split("```", 1)[1].split("```", 1)[0].strip()
-        try:
-            json.loads(text)
-            return text
-        except Exception:
-            pass
-        for opener, closer in (("{", "}"), ("[", "]")):
-            start = text.find(opener)
-            if start == -1:
-                continue
+    @staticmethod
+    def _balanced_candidates(text: str, opener: str, closer: str):
+        """Yield every balanced top-level ``opener...closer`` span in ``text``,
+        string- and escape-aware so braces inside string values don't confuse it."""
+        start = text.find(opener)
+        while start != -1:
             depth = 0
             in_str = False
             escaped = False
+            end = -1
             for i in range(start, len(text)):
                 ch = text[i]
                 if in_str:
@@ -140,12 +138,56 @@ class ModelRouter:
                 elif ch == closer:
                     depth -= 1
                     if depth == 0:
-                        candidate = text[start:i + 1]
-                        try:
-                            json.loads(candidate)
-                            return candidate
-                        except Exception:
-                            break
+                        end = i
+                        break
+            if end == -1:
+                return
+            yield text[start:end + 1]
+            start = text.find(opener, end + 1)
+
+    @classmethod
+    def _extract_json(cls, content: str) -> str:
+        """Best-effort extraction of a JSON document from a model response.
+
+        Handles the common ways a model wraps valid JSON: inline ``<think>`` blocks
+        (local/thinking models whose serving stack leaves reasoning in the content),
+        triple-backtick fences, and surrounding prose ("Here you go: {...} thanks").
+        Strips reasoning blocks and fences, returns the whole thing if it already
+        parses, otherwise scans EVERY balanced object/array candidate (string- and
+        escape-aware) and returns the first that parses — a JSON-looking fragment in
+        leading prose no longer masks the real answer that follows it. Falls back to
+        the de-fenced text so the existing healing path still produces a meaningful
+        error. A strict superset of plain fence-stripping — clean/fenced JSON is
+        returned unchanged."""
+        text = content.strip()
+        # Drop closed reasoning blocks; on a dangling opener keep only what precedes it.
+        if "<" in text:
+            stripped = cls._THINK_BLOCK_RE.sub("", text).strip()
+            dangling = cls._THINK_OPEN_RE.search(stripped)
+            if dangling and "</" not in stripped[dangling.start():]:
+                before = stripped[:dangling.start()].strip()
+                after = stripped[dangling.end():].strip()
+                # The answer usually follows the (cut-off) reasoning; prefer whichever
+                # side actually contains a JSON-ish payload.
+                stripped = after if ("{" in after or "[" in after) else before
+            if stripped:
+                text = stripped
+        if "```json" in text:
+            text = text.split("```json", 1)[1].split("```", 1)[0].strip()
+        elif "```" in text:
+            text = text.split("```", 1)[1].split("```", 1)[0].strip()
+        try:
+            json.loads(text)
+            return text
+        except Exception:
+            pass
+        for opener, closer in (("{", "}"), ("[", "]")):
+            for candidate in cls._balanced_candidates(text, opener, closer):
+                try:
+                    json.loads(candidate)
+                    return candidate
+                except Exception:
+                    continue
         return text
 
     @staticmethod
@@ -174,13 +216,28 @@ class ModelRouter:
         run_id: Optional[str],
         provider: Optional[Provider] = None,
         attempts: int = 3,
+        json_schema: Optional[Dict[str, Any]] = None,
     ) -> "LLMResponse":
         """Provider completion with bounded exponential-backoff retry. Used for BOTH the
         initial call and the healing call so a transient fault in either is retried (and,
         if still failing, surfaced to the caller's fallback logic) rather than aborting
         the run. ``provider`` defaults to the router's default provider but may be a
-        per-role provider for roles that override ``models.provider``."""
+        per-role provider for roles that override ``models.provider``. ``json_schema``
+        flows through to providers that support grammar-constrained structured output
+        (Ollama); others ignore it."""
         provider = provider or self.provider
+        # Only pass json_schema to providers whose ``complete`` accepts it — duck-typed
+        # or third-party Provider implementations may predate the parameter, and a
+        # structured-output OPTIMIZATION must never break them.
+        extra_kwargs: Dict[str, Any] = {}
+        if json_schema is not None:
+            import inspect
+
+            try:
+                if "json_schema" in inspect.signature(provider.complete).parameters:
+                    extra_kwargs["json_schema"] = json_schema
+            except (TypeError, ValueError):
+                pass
         for attempt in range(attempts):
             try:
                 return await provider.complete(
@@ -189,12 +246,33 @@ class ModelRouter:
                     temperature=temperature,
                     json_mode=True,
                     run_id=run_id,
+                    **extra_kwargs,
                 )
+            except httpx.TimeoutException as exc:
+                # A timeout already consumed the provider's ENTIRE request window
+                # (600s by default on a local Ollama host). Retrying the identical
+                # request almost always times out again — and the structured-output
+                # layers above this (healing call + fresh attempts) would multiply
+                # the stall until the whole run is killed from outside (observed:
+                # benchmark arms burning their full 20-minute budget on 2x 600s
+                # timeouts and dying with exit 124 before producing a verdict).
+                # Fail fast with an actionable message instead.
+                raise ProviderRequestError(
+                    f"LLM request to model '{model}' timed out after the provider's "
+                    f"request window ({exc!r}). If this is a local (Ollama) model, "
+                    "generation is too slow for the configured window: raise "
+                    "OLLAMA_TIMEOUT, cap generation with OLLAMA_NUM_PREDICT, reduce "
+                    "thinking with OLLAMA_THINK=low or OLLAMA_THINK=false, or use a "
+                    "smaller/faster model."
+                ) from exc
             except Exception as exc:
                 if attempt == attempts - 1:
                     raise
+                # %r, not %s: common failures (httpx.ReadTimeout, CancelledError)
+                # stringify to an EMPTY message, which previously logged the useless
+                # "failed (attempt 1/3): ." and made timeouts undiagnosable from logs.
                 logger.warning(
-                    "LLM request failed (attempt %d/%d): %s. Retrying...",
+                    "LLM request failed (attempt %d/%d): %r. Retrying...",
                     attempt + 1, attempts, exc,
                 )
                 await asyncio.sleep(2 ** attempt)
@@ -260,11 +338,38 @@ class ModelRouter:
         response = cache.get(model, msgs, temp, True, provider_fp)
         cache_hit = response is not None
 
+        # Structured-output schema for providers with grammar-constrained decoding
+        # (Ollama's native ``format: <schema>``): the model cannot emit invalid JSON,
+        # which on weak/local models eliminates most schema echoes and healing rounds.
+        structured_schema = schema.model_json_schema()
+
         started = time.monotonic()
         if not response:
-            response = await self._complete_with_retry(
-                model=model, messages=msgs, temperature=temp, run_id=run_id, provider=provider
-            )
+            try:
+                response = await self._complete_with_retry(
+                    model=model, messages=msgs, temperature=temp, run_id=run_id, provider=provider,
+                    json_schema=structured_schema,
+                )
+            except ProviderRequestError as exc:
+                # A degradable role (caller supplied a fallback) must degrade on a
+                # provider failure exactly as it does on unparseable output: the
+                # fallback exists to keep the run alive on a flaky/slow model, and a
+                # fail-fast timeout (see _complete_with_retry) or exhausted retries
+                # is the same class of "this role produced nothing usable".
+                if fallback is not None:
+                    logger.warning(
+                        "Role '%s' (model '%s') provider request failed (%s); "
+                        "using a safe fallback so the run can continue.",
+                        role, model, exc,
+                    )
+                    traces.log_event(
+                        "llm_provider_request_failed_fallback",
+                        {"role": role, "model": model, "error": str(exc)},
+                        run_id=run_id,
+                        summary=f"Provider request failed for {role}; degraded to fallback.",
+                    )
+                    return fallback
+                raise
         elapsed = time.monotonic() - started
 
         if response is None:
@@ -279,6 +384,15 @@ class ModelRouter:
             "LLM response: role=%s model=%s tokens=%s %s",
             role, response.model, response.usage,
             "cache_hit" if cache_hit else f"{elapsed:.1f}s",
+        )
+        log_step(
+            f"llm/{role}: {response.model} {'cache_hit' if cache_hit else f'{elapsed:.1f}s'}",
+            project_root=self.project_root,
+            run_id=run_id,
+            role=role,
+            model=response.model,
+            latency_s=round(elapsed, 2) if not cache_hit else 0,
+            cache_hit=cache_hit,
         )
         
         try:
@@ -323,6 +437,16 @@ Content:
 {echo_hint}
 Please return the corrected JSON object only. No prose.
 """
+            # The healing call must SEE the schema. Previously it got only the error
+            # + bad content, so a "Field required" failure asked the model to invent
+            # the missing fields blind — on providers without grammar-constrained
+            # decoding (OpenRouter/Vertex, e.g. gemini-2.5-flash omitting empty
+            # list fields) healing then failed the same way and the whole planning
+            # run crashed. Reuse the same schema instruction as the initial call.
+            healing_messages = [
+                {"role": "system", "content": f"You repair malformed JSON.{instruction}"},
+                {"role": "user", "content": healing_prompt},
+            ]
             # The healing completion runs INSIDE this try (with the same retry/backoff as
             # the initial call). A transient failure here (429/timeout) must be treated as
             # "healing failed" so it routes into the fresh-attempt/fallback logic below,
@@ -332,10 +456,11 @@ Please return the corrected JSON object only. No prose.
                 # We use a lower temperature for healing
                 healed_response = await self._complete_with_retry(
                     model=model,
-                    messages=[{"role": "user", "content": healing_prompt}],
+                    messages=healing_messages,
                     temperature=0.0,
                     run_id=run_id,
                     provider=provider,
+                    json_schema=structured_schema,
                 )
                 tracker.log_usage(healed_response.model, healed_response.usage, local=provider_local)
                 healed_content = self._extract_json(healed_response.content)

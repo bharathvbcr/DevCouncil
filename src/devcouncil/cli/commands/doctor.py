@@ -1,3 +1,4 @@
+import logging
 import typer
 import subprocess
 import os
@@ -17,7 +18,10 @@ from devcouncil.executors.agent_registry import (
 from devcouncil.llm.provider import SUPPORTED_MODEL_PROVIDERS, validate_model_provider
 
 app = typer.Typer()
+from devcouncil.telemetry.stages import log_stage, log_step
+
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 def _probe_ollama(base_url: str) -> tuple[bool, str]:
@@ -410,11 +414,14 @@ def render_doctor_check(project_root: Path = Path(".")):
                     )
 
         if num_ctx is None:
+            # Only reachable via the explicit OLLAMA_NUM_CTX=0 opt-out: unset now
+            # resolves to the provider's raised DEFAULT_NUM_CTX, never the server default.
             table.add_row(
                 "OLLAMA num_ctx",
                 "[yellow]WARN[/yellow]",
-                f"OLLAMA_NUM_CTX not set — Ollama's small default (~2048-4096) will "
-                f"truncate DevCouncil's large planning prompts. Set OLLAMA_NUM_CTX={recommended_ctx}.",
+                f"OLLAMA_NUM_CTX=0 opts into Ollama's small server default (~2048-4096), "
+                f"which will truncate DevCouncil's large planning prompts. Unset it (default "
+                f"{OllamaProvider.DEFAULT_NUM_CTX}) or set OLLAMA_NUM_CTX={recommended_ctx}.",
             )
         elif num_ctx < min_ctx:
             table.add_row(
@@ -424,7 +431,24 @@ def render_doctor_check(project_root: Path = Path(".")):
                 f"(~{MAX_PROMPT_CHARS // 4} tokens); recommend >= {recommended_ctx}.",
             )
         else:
-            table.add_row("OLLAMA num_ctx", "[green]OK[/green]", f"context window = {num_ctx} tokens.")
+            table.add_row(
+                "OLLAMA num_ctx",
+                "[green]OK[/green]",
+                f"context window = {num_ctx} tokens (auto-grows per request up to "
+                f"{OllamaProvider._resolve_max_num_ctx()} for oversized prompts; cap with OLLAMA_MAX_NUM_CTX).",
+            )
+
+        think = OllamaProvider._resolve_think()
+        if think is None:
+            table.add_row(
+                "OLLAMA think",
+                "[green]OK[/green]",
+                "server default. On thinking models (qwen3/deepseek-r1/...) the reasoning "
+                "channel can dominate review latency; OLLAMA_THINK=false trades some check "
+                "quality for much faster verification calls.",
+            )
+        else:
+            table.add_row("OLLAMA think", "[green]OK[/green]", f"OLLAMA_THINK={'true' if think else 'false'}.")
 
         # Local model size is bounded by host memory — unified RAM on Apple Silicon,
         # VRAM on a discrete-GPU box, system RAM otherwise. Surface a model that will
@@ -494,4 +518,11 @@ def doctor(
     if ctx.invoked_subcommand is not None:
         return
 
-    render_doctor_check(project_root.expanduser().resolve())
+    root = project_root.expanduser().resolve()
+    from devcouncil.telemetry.logging_setup import set_log_dir
+    set_log_dir(root)
+    logger.info("dev doctor: project_root=%s", root)
+    with log_stage("doctor", project_root=root):
+        log_step("doctor/1: running environment checks", project_root=root, trace=True)
+        render_doctor_check(root)
+        log_step("doctor/complete", project_root=root, trace=True)

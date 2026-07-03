@@ -22,9 +22,12 @@ from devcouncil.executors.agent_registry import (
     resolve_cursor_agent_executable,
 )
 from devcouncil.optimization.gepa_agent import GepaUnavailableError, optimize_agent_profile
+from devcouncil.telemetry.stages import log_stage, log_step
+import logging
 
 app = typer.Typer(help="Manage DevCouncil CLI agents.")
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 @app.callback(invoke_without_command=True)
@@ -37,24 +40,28 @@ def list_agents(
         return
 
     root = _project_root(project_root)
-    table = Table(title="DevCouncil Agents")
-    table.add_column("Agent", style="cyan")
-    table.add_column("Type")
-    table.add_column("Command")
-    table.add_column("Profile")
-    table.add_column("MCP")
-    table.add_column("Diff Review")
+    logger.info("dev agents list")
+    with log_stage("agents", project_root=root, subcommand="list"):
+        log_step("agents/1: loading agent registry", project_root=root, trace=True)
+        table = Table(title="DevCouncil Agents")
+        table.add_column("Agent", style="cyan")
+        table.add_column("Type")
+        table.add_column("Command")
+        table.add_column("Profile")
+        table.add_column("MCP")
+        table.add_column("Diff Review")
 
-    for name, spec in sorted(load_cli_agent_specs(root).items()):
-        table.add_row(
-            name,
-            "built-in" if spec.built_in else spec.kind,
-            " ".join(spec.base_command()),
-            spec.default_profile,
-            "yes" if spec.supports_mcp else "no",
-            "yes" if spec.supports_diff_review else "no",
-        )
-    console.print(table)
+        for name, spec in sorted(load_cli_agent_specs(root).items()):
+            table.add_row(
+                name,
+                "built-in" if spec.built_in else spec.kind,
+                " ".join(spec.base_command()),
+                spec.default_profile,
+                "yes" if spec.supports_mcp else "no",
+                "yes" if spec.supports_diff_review else "no",
+            )
+        console.print(table)
+        log_step("agents/complete", project_root=root, trace=True)
 
 
 @app.command("add")

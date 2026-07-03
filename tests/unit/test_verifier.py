@@ -579,3 +579,349 @@ def test_verifier_applies_global_and_task_baselines(tmp_path):
     )
 
     assert verifier.get_task_changed_files("TASK-001") == ["src/task_change.py"]
+
+
+def _rigor_config_yaml(**rigor_overrides) -> str:
+    lines = [
+        "project:\n  name: test\n",
+        "verification:\n  rigor:\n    enabled: true\n",
+    ]
+    for key, value in rigor_overrides.items():
+        if isinstance(value, bool):
+            lines.append(f"    {key}: {'true' if value else 'false'}\n")
+        elif isinstance(value, str):
+            lines.append(f"    {key}: {value}\n")
+        else:
+            lines.append(f"    {key}: {value}\n")
+    return "".join(lines)
+
+
+def test_verifier_stub_gate_blocks_on_hard_task(tmp_path):
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(_rigor_config_yaml(), encoding="utf-8")
+    task = _task()
+    task.difficulty = "hard"
+    diff = (
+        "diff --git a/src/auth.py b/src/auth.py\n"
+        "--- a/src/auth.py\n"
+        "+++ b/src/auth.py\n"
+        "@@ -1 +1,2 @@\n"
+        "+# TODO: finish token logic\n"
+    )
+    verifier = Verifier(tmp_path)
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: diff
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command, exit_code=0, stdout_path="", stderr_path="", summary="passed",
+    )
+
+    gaps, _ = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    stub = [g for g in gaps if g.gap_type == "stub_detected"]
+    assert stub and stub[0].blocking
+    assert verifier.last_outcome is not None
+    assert verifier.last_outcome.difficulty == "hard"
+    assert "stub_detection_blocking" in verifier.last_outcome.rigor_applied
+
+
+def test_verifier_stub_gate_advisory_on_easy_task(tmp_path):
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(_rigor_config_yaml(), encoding="utf-8")
+    task = _task()
+    task.difficulty = "easy"
+    diff = (
+        "diff --git a/src/auth.py b/src/auth.py\n"
+        "--- a/src/auth.py\n"
+        "+++ b/src/auth.py\n"
+        "@@ -1 +1,2 @@\n"
+        "+# TODO: finish token logic\n"
+    )
+    verifier = Verifier(tmp_path)
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: diff
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command, exit_code=0, stdout_path="", stderr_path="", summary="passed",
+    )
+
+    gaps, _ = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    stub = [g for g in gaps if g.gap_type == "stub_detected"]
+    assert stub and not stub[0].blocking
+
+
+def test_verifier_effort_gate_advisory_on_normal_task(tmp_path):
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(_rigor_config_yaml(), encoding="utf-8")
+    task = Task(
+        id="TASK-001",
+        title="Big scope",
+        description="Touch many files",
+        difficulty="normal",
+        acceptance_criterion_ids=["AC-001"],
+        planned_files=[
+            PlannedFile(path=f"src/f{i}.py", reason="edit", allowed_change="modify")
+            for i in range(4)
+        ],
+    )
+    diff = (
+        "diff --git a/src/f0.py b/src/f0.py\n"
+        "--- a/src/f0.py\n"
+        "+++ b/src/f0.py\n"
+        "@@ -0,0 +1,1 @@\n"
+        "+x = 1\n"
+    )
+    verifier = Verifier(tmp_path)
+    verifier.get_changed_files = lambda: ["src/f0.py"]
+    verifier.get_diff = lambda: diff
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command, exit_code=0, stdout_path="", stderr_path="", summary="passed",
+    )
+
+    gaps, _ = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    effort = [g for g in gaps if g.gap_type == "suspicious_effort"]
+    assert effort and not effort[0].blocking
+
+
+def test_verifier_effort_gate_blocks_on_hard_task(tmp_path):
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(_rigor_config_yaml(), encoding="utf-8")
+    task = Task(
+        id="TASK-001",
+        title="Big scope",
+        description="Touch many files",
+        difficulty="hard",
+        acceptance_criterion_ids=["AC-001"],
+        planned_files=[
+            PlannedFile(path=f"src/f{i}.py", reason="edit", allowed_change="modify")
+            for i in range(4)
+        ],
+    )
+    diff = (
+        "diff --git a/src/f0.py b/src/f0.py\n"
+        "--- a/src/f0.py\n"
+        "+++ b/src/f0.py\n"
+        "@@ -0,0 +1,1 @@\n"
+        "+x = 1\n"
+    )
+    verifier = Verifier(tmp_path)
+    verifier.get_changed_files = lambda: ["src/f0.py"]
+    verifier.get_diff = lambda: diff
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command, exit_code=0, stdout_path="", stderr_path="", summary="passed",
+    )
+
+    gaps, _ = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    effort = [g for g in gaps if g.gap_type == "suspicious_effort"]
+    assert effort and effort[0].blocking
+    assert "effort_heuristics_blocking" in verifier.last_outcome.rigor_applied
+
+
+def test_verifier_hard_task_enforces_coverage_on_rigor(tmp_path):
+    from devcouncil.verification import diff_coverage as dc
+
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(_rigor_config_yaml(), encoding="utf-8")
+    task = _task()
+    task.difficulty = "hard"
+    verifier = Verifier(tmp_path)
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    verifier._diff_coverage_override = (True, False, 0.0)
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command, exit_code=0, stdout_path="", stderr_path="", summary="passed",
+    )
+    verifier.measure_diff_coverage = lambda task, diff_content: dc.DiffCoverageResult(
+        measured=True,
+        tool="pytest",
+        changed_executable_lines=4,
+        covered_changed_lines=0,
+        uncovered_by_file={"src/auth.py": [10]},
+    )
+
+    gaps, _ = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    cov_gaps = [g for g in gaps if g.gap_type == "diff_not_exercised"]
+    assert cov_gaps and cov_gaps[0].blocking
+    assert verifier.last_outcome is not None
+    assert "coverage_enforced" in verifier.last_outcome.rigor_applied
+
+
+def test_verifier_reviewer_required_on_hard_blocks_critical(tmp_path):
+    from devcouncil.domain.gap import Gap
+    from devcouncil.verification.implementation_reviewer import ReviewOutput
+
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        _rigor_config_yaml(reviewer_required_on_hard=True),
+        encoding="utf-8",
+    )
+    task = _task()
+    task.difficulty = "hard"
+    verifier = Verifier(tmp_path)
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command, exit_code=0, stdout_path="", stderr_path="", summary="passed",
+    )
+
+    class _FakeReviewer:
+        async def review_changes(self, task, requirements, diff):
+            return ReviewOutput(
+                is_satisfactory=False,
+                findings=[
+                    Gap(
+                        id="REVIEW-1",
+                        severity="critical",
+                        gap_type="architecture_drift",
+                        task_id=task.id,
+                        description="Critical design mismatch",
+                        recommended_fix="Rework the module boundary",
+                        blocking=False,
+                    )
+                ],
+            )
+
+    verifier.reviewer = _FakeReviewer()
+
+    gaps, _ = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    review = [g for g in gaps if g.gap_type == "architecture_drift"]
+    assert review and review[0].blocking
+    assert "reviewer_required" in verifier.last_outcome.rigor_applied
+
+
+def test_assert_free_unplanned_test_file_stays_blocking_orphan(tmp_path):
+    """Trivial assert-free unplanned test files must not be demoted to advisory orphans."""
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_extra.py").write_text(
+        "def test_calls_only():\n    import mod\n    mod.run()\n",
+        encoding="utf-8",
+    )
+    task = _task()
+    verifier = Verifier(tmp_path)
+    verifier.get_changed_files = lambda: ["src/auth.py", "tests/test_extra.py"]
+    verifier.get_diff = lambda: (
+        "diff --git a/tests/test_extra.py b/tests/test_extra.py\n"
+        "--- /dev/null\n"
+        "+++ b/tests/test_extra.py\n"
+        "@@ -0,0 +1,3 @@\n"
+        "+def test_calls_only():\n"
+        "+    import mod\n"
+        "+    mod.run()\n"
+    )
+    verifier._classify_change_paths = lambda changed: (["tests/test_extra.py"], [])
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command, exit_code=0, stdout_path="", stderr_path="", summary="ok",
+    )
+
+    gaps, _ = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    orphans = {g.file: g for g in gaps if g.gap_type == "orphan_diff"}
+    assert orphans["tests/test_extra.py"].blocking
+
+
+def test_agent_appended_expected_test_cannot_coarse_prove_ac(tmp_path):
+    """Agent-appended expected_tests may run but must not coarse-prove acceptance criteria."""
+    task = _task()
+    task.expected_tests = ['python -c "assert True"']
+    task.agent_appended_expected_tests = ['python -c "assert True"']
+    verifier = Verifier(tmp_path)
+    verifier.acceptance_compiler = None
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command, exit_code=0, stdout_path="", stderr_path="", summary="passed",
+    )
+
+    gaps, _ = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    assert not any(g.gap_type == "coarse_acceptance_proof" for g in gaps)
+    unproven = [g for g in gaps if g.gap_type == "acceptance_criteria_unproven"]
+    assert unproven and unproven[0].blocking
+
+
+def test_coarse_acceptance_proof_blocks_on_hard_task(tmp_path):
+    """On hard tasks, coarse AC proof must block — not merely advise."""
+    task = _task()
+    task.difficulty = "hard"
+    task.expected_tests = ["pytest tests/test_auth.py"]
+    verifier = Verifier(tmp_path)
+    verifier.acceptance_compiler = None
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command, exit_code=0, stdout_path="", stderr_path="", summary="passed",
+    )
+
+    gaps, _ = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    coarse = [g for g in gaps if g.gap_type == "coarse_acceptance_proof"]
+    assert coarse and coarse[0].blocking
+    assert coarse[0].severity == "high"
+    assert not any(g.gap_type == "acceptance_criteria_unproven" for g in gaps)
+
+
+def test_planner_trivial_expected_test_cannot_coarse_prove(tmp_path):
+    """Planner-originated expected_tests without evidence keywords must not coarse-prove."""
+    task = _task()
+    task.expected_tests = ['python -c "print(\'ok\')"']
+    verifier = Verifier(tmp_path)
+    verifier.acceptance_compiler = None
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command, exit_code=0, stdout_path="", stderr_path="", summary="passed",
+    )
+
+    gaps, _ = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    assert not any(g.gap_type == "coarse_acceptance_proof" for g in gaps)
+    unproven = [g for g in gaps if g.gap_type == "acceptance_criteria_unproven"]
+    assert unproven and unproven[0].blocking
+
+
+def test_agent_appended_allowed_command_cannot_coarse_prove_ac(tmp_path):
+    """Agent-appended allowed_commands may run but must not coarse-prove acceptance
+    criteria — the same self-certification guard as agent_appended_expected_tests,
+    covering the side door of a task whose expected_tests is empty."""
+    task = _task()
+    task.expected_tests = []
+    task.allowed_commands = ["./run_tests.sh"]
+    task.agent_appended_allowed_commands = ["./run_tests.sh"]
+    verifier = Verifier(tmp_path)
+    verifier.acceptance_compiler = None
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command, exit_code=0, stdout_path="", stderr_path="", summary="passed",
+    )
+
+    gaps, _ = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    assert not any(g.gap_type == "coarse_acceptance_proof" for g in gaps)
+    unproven = [g for g in gaps if g.gap_type == "acceptance_criteria_unproven"]
+    assert unproven and unproven[0].blocking
+
+
+def test_planner_allowed_command_still_coarse_proves(tmp_path):
+    """The same command WITHOUT agent-append provenance keeps its evidential value —
+    the exclusion is provenance-based, not command-based."""
+    task = _task()
+    task.expected_tests = []
+    task.allowed_commands = ["./run_tests.sh"]
+    task.agent_appended_allowed_commands = []
+    verifier = Verifier(tmp_path)
+    verifier.acceptance_compiler = None
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command, exit_code=0, stdout_path="", stderr_path="", summary="passed",
+    )
+
+    gaps, _ = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    assert any(g.gap_type == "coarse_acceptance_proof" for g in gaps)
+    assert not any(g.gap_type == "acceptance_criteria_unproven" for g in gaps)

@@ -202,3 +202,83 @@ def test_repair_plan_scope_merged_into_manifest(tmp_path):
     assert "src/b.py" in manifest.allowed_repair_files  # repair-plan scope added
     assert "pytest tests/a" in manifest.commands_to_rerun
     assert "pytest tests/b" in manifest.commands_to_rerun
+
+
+def test_manifest_carries_repair_escalation_fields(tmp_path):
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "project:\n  name: test\nexecution:\n  max_repair_attempts: 2\n",
+        encoding="utf-8",
+    )
+    task = Task(
+        id="TASK-001",
+        title="T",
+        description="D",
+        planned_files=[PlannedFile(path="src/a.py", reason="x", allowed_change="modify")],
+        expected_tests=["pytest tests/"],
+    )
+    blocking = [
+        Gap(
+            id="GAP-1",
+            severity="high",
+            gap_type="test_failed",
+            task_id="TASK-001",
+            description="tests failed",
+            recommended_fix="fix",
+            blocking=True,
+        ),
+    ]
+    prior = build_correction_manifest(
+        tmp_path, task, blocking, prior_attempts=1,
+    )
+    manifest = build_correction_manifest(
+        tmp_path, task, blocking, prior_attempts=2, prior_manifest=prior,
+    )
+
+    assert len(manifest.attempt_history) == 1
+    assert "attempt 1" in manifest.attempt_history[0]
+    assert "identical blocking gaps" in manifest.attempt_history[0]
+    assert "Do NOT retry the same edit" in manifest.approach_guidance
+    assert "FINAL budgeted attempt" in manifest.approach_guidance
+
+
+def test_manifest_lists_stub_findings_from_blocking_gaps(tmp_path):
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text("project:\n  name: test\n", encoding="utf-8")
+    task = Task(id="TASK-001", title="T", description="D")
+    manifest = build_correction_manifest(
+        tmp_path,
+        task,
+        [Gap(
+            id="GAP-STUB",
+            severity="high",
+            gap_type="stub_detected",
+            task_id="TASK-001",
+            description="Placeholder at src/a.py:10",
+            recommended_fix="implement",
+            blocking=True,
+            file="src/a.py",
+            line=10,
+        )],
+    )
+    assert any("src/a.py:10" in s for s in manifest.stub_findings)
+
+
+def test_first_correction_manifest_has_empty_attempt_history(tmp_path):
+    from devcouncil.planning.correction_manifest import load_latest_correction_manifest, write_correction_manifest
+
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text("project:\n  name: test\n", encoding="utf-8")
+    db = Database(tmp_path / ".devcouncil" / "state.sqlite")
+    db.create_db_and_tables()
+    with db.get_session() as session:
+        TaskRepository(session).save(Task(id="TASK-001", title="T", description="D"))
+        GapRepository(session).save(Gap(
+            id="GAP-1", severity="high", gap_type="test_failed", task_id="TASK-001",
+            description="tests failed", recommended_fix="fix", blocking=True,
+        ))
+
+    write_correction_manifest(tmp_path, "TASK-001")
+    first = load_latest_correction_manifest(tmp_path, "TASK-001")
+    assert first is not None
+    assert first.attempt_history == []

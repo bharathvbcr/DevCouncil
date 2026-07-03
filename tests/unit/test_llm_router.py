@@ -499,3 +499,289 @@ async def test_role_override_to_openrouter_inherits_routing_prefs(tmp_path):
     # set ones reflect the config.
     assert p.provider_prefs["sort"] == "throughput"
     assert p.provider_prefs["data_collection"] == "deny"
+
+
+# --- benchmark-surfaced fixes: timeout fail-fast + schema-aware healing -------
+
+
+class TimeoutProvider(Provider):
+    """Every call raises an httpx timeout with an EMPTY message — the shape that
+    previously produced the useless "failed (attempt 1/3): ." log and a blind
+    600s-per-attempt retry loop."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def complete(self, model, messages, temperature=0.0, json_mode=False, run_id=None, **kwargs):
+        import httpx
+
+        self.calls += 1
+        raise httpx.ReadTimeout("")
+
+
+def test_timeout_fails_fast_without_blind_retries(tmp_path):
+    """A provider timeout must NOT be retried with the identical request: each
+    retry costs another full provider window (600s on local Ollama) and the
+    structured-output layers stack those stalls past external kill timeouts
+    (benchmark arms died at exit 124 without ever producing a verdict). It must
+    surface immediately as an actionable ProviderRequestError."""
+    import asyncio
+
+    from devcouncil.llm.provider import ProviderRequestError
+
+    provider = TimeoutProvider()
+    router = ModelRouter(provider, {"critic_a": {"model": "local/slow"}}, project_root=tmp_path)
+    with pytest.raises(ProviderRequestError) as excinfo:
+        asyncio.run(
+            router.complete_structured(
+                role="critic_a", messages=[{"role": "user", "content": "x"}], schema=RouterOutput
+            )
+        )
+    assert provider.calls == 1  # no blind identical-request retries
+    message = str(excinfo.value)
+    # Actionable: names the knobs that actually fix a too-slow local model.
+    assert "OLLAMA_TIMEOUT" in message and "OLLAMA_THINK" in message
+
+
+class MissingFieldThenHealedProvider(Provider):
+    """First response is valid JSON but omits a required field (the
+    gemini-2.5-flash failure mode on providers without grammar-constrained
+    decoding); the healing call — which must now carry the schema — succeeds."""
+
+    def __init__(self):
+        self.calls = 0
+        self.healing_messages = None
+
+    async def complete(self, model, messages, temperature=0.0, json_mode=False, run_id=None, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return LLMResponse(content=json.dumps({}), model=model,
+                               usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                               raw_response={})
+        self.healing_messages = messages
+        return LLMResponse(content=json.dumps({"value": "healed"}), model=model,
+                           usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                           raw_response={})
+
+
+@pytest.mark.anyio
+async def test_healing_call_includes_schema(tmp_path):
+    """The healing request must include the schema instruction: a "Field
+    required" repair is impossible when the model cannot see which fields the
+    schema requires (previously the healing prompt carried only the error text
+    and the bad content, so missing-field failures healed into the same
+    missing-field output and crashed planning runs)."""
+    provider = MissingFieldThenHealedProvider()
+    router = ModelRouter(provider, {"critic_a": {"model": "weak/cloud"}}, project_root=tmp_path)
+    result = await router.complete_structured("critic_a", [{"role": "user", "content": "x"}], RouterOutput)
+    assert result.value == "healed"
+    combined = "\n".join(m["content"] for m in provider.healing_messages)
+    assert "INSTANCE of this schema" in combined  # schema instruction present
+    assert '"value"' in combined  # the actual schema fields are visible
+
+
+def test_planning_schemas_tolerate_omitted_empty_lists():
+    """Models on non-grammar-constrained providers omit empty list fields instead
+    of sending []. That is not a planning failure: SpecOutput/ArbiterDecision/
+    PlanOutput must default such fields, while genuinely required content
+    (requirements / final_tasks / tasks) still fails validation when missing."""
+    from pydantic import ValidationError
+
+    from devcouncil.planning.arbiter_service import ArbiterDecision
+    from devcouncil.planning.plan_service import PlanOutput
+    from devcouncil.planning.spec_service import SpecOutput
+
+    req = {
+        "id": "REQ-1", "title": "t", "description": "d", "priority": "high",
+        # "source" omitted: defaults to "planner" (weak models drop provenance)
+    }
+    spec = SpecOutput.model_validate({"requirements": [req]})
+    assert spec.assumptions == [] and spec.blocking_questions == []
+    assert spec.requirements[0].source == "planner"
+
+    decision = ArbiterDecision.model_validate(
+        {"final_requirements": [req], "final_tasks": []}
+    )
+    assert decision.accepted_finding_ids == [] and decision.rejected_finding_ids == []
+
+    plan = PlanOutput.model_validate({"tasks": []})
+    assert plan.id == "PLAN" and plan.rationale == ""
+
+    with pytest.raises(ValidationError):
+        SpecOutput.model_validate({})  # requirements stays required
+    with pytest.raises(ValidationError):
+        ArbiterDecision.model_validate({"final_requirements": [req]})  # final_tasks required
+    with pytest.raises(ValidationError):
+        PlanOutput.model_validate({"id": "PLAN-A", "rationale": "r"})  # tasks required
+
+
+# --- OpenRouter structured outputs (json_schema response_format) ---------------
+
+
+class _FakeRespSeq:
+    """Fake client returning queued responses (status, body) in order."""
+
+    def __init__(self, calls, responses):
+        self._calls = calls
+        self._responses = responses
+
+    def __call__(self, timeout=None):
+        outer = self
+
+        class _C:
+            is_closed = False
+
+            async def post(self, url, headers, json):
+                import copy as _copy
+
+                # Snapshot: the degrade path mutates the payload dict in place,
+                # so appending the live reference would alias every entry.
+                outer._calls.append(_copy.deepcopy(json))
+                status, body = outer._responses.pop(0)
+                resp = _FakeResp()
+                resp.status_code = status
+                resp.text = "" if status < 400 else "unsupported response_format"
+                if body is not None:
+                    resp.json = lambda: body
+                return resp
+
+        return _C()
+
+
+_OK_BODY = {"choices": [{"message": {"content": "{}"}}], "model": "m", "usage": {}}
+
+
+@pytest.mark.anyio
+async def test_openrouter_sends_json_schema_response_format(tmp_path, monkeypatch):
+    # With a schema available, OpenRouter must request schema-CONSTRAINED output:
+    # on plain json_object, cloud models routinely omit fields that would be
+    # empty (gemini-2.5-flash dropping empty list fields crashed planning runs).
+    calls = []
+    monkeypatch.setattr(
+        "devcouncil.llm.provider.httpx.AsyncClient", _FakeRespSeq(calls, [(200, _OK_BODY)])
+    )
+    p = OpenRouterProvider("k", project_root=tmp_path)
+    schema = {"type": "object", "properties": {"value": {"type": "string"}}}
+    await p.complete("some/model", [{"role": "user", "content": "hi"}], json_mode=True, json_schema=schema)
+    rf = calls[0]["response_format"]
+    assert rf["type"] == "json_schema"
+    assert rf["json_schema"]["schema"] == schema
+    assert rf["json_schema"]["strict"] is True
+
+
+@pytest.mark.anyio
+async def test_openrouter_json_schema_rejected_degrades_and_is_remembered(tmp_path, monkeypatch):
+    # A model/route that rejects json_schema degrades once to json_object and
+    # never pays the retry again for that model; other models still try it.
+    calls = []
+    monkeypatch.setattr(
+        "devcouncil.llm.provider.httpx.AsyncClient",
+        _FakeRespSeq(calls, [(400, None), (200, _OK_BODY), (200, _OK_BODY), (200, _OK_BODY)]),
+    )
+    p = OpenRouterProvider("k", project_root=tmp_path)
+    schema = {"type": "object", "properties": {"value": {"type": "string"}}}
+    await p.complete("weak/model", [{"role": "user", "content": "hi"}], json_mode=True, json_schema=schema)
+    assert calls[0]["response_format"]["type"] == "json_schema"
+    assert calls[1]["response_format"]["type"] == "json_object"
+
+    await p.complete("weak/model", [{"role": "user", "content": "again"}], json_mode=True, json_schema=schema)
+    assert calls[2]["response_format"]["type"] == "json_object"  # remembered
+
+    await p.complete("strong/model", [{"role": "user", "content": "hi"}], json_mode=True, json_schema=schema)
+    assert calls[3]["response_format"]["type"] == "json_schema"  # per-model, not global
+
+
+@pytest.mark.anyio
+async def test_openrouter_json_mode_without_schema_unchanged(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "devcouncil.llm.provider.httpx.AsyncClient", _FakeRespSeq(calls, [(200, _OK_BODY)])
+    )
+    p = OpenRouterProvider("k", project_root=tmp_path)
+    await p.complete("some/model", [{"role": "user", "content": "hi"}], json_mode=True)
+    assert calls[0]["response_format"] == {"type": "json_object"}
+
+
+# --- degradable roles fall back on provider errors ------------------------------
+
+
+def test_provider_error_uses_fallback_for_degradable_role(tmp_path):
+    """A role with a fallback must degrade on a provider failure (fail-fast
+    timeout, exhausted retries) exactly as on unparseable output — a critique/
+    rebuttal role crashing an entire planning run over one slow monitor call is
+    the failure mode, not the feature."""
+    import asyncio
+
+    provider = TimeoutProvider()
+    router = ModelRouter(provider, {"critic_a": {"model": "local/slow"}}, project_root=tmp_path)
+    fallback = RouterOutput(value="degraded")
+    result = asyncio.run(
+        router.complete_structured(
+            role="critic_a",
+            messages=[{"role": "user", "content": "x"}],
+            schema=RouterOutput,
+            fallback=fallback,
+        )
+    )
+    assert result.value == "degraded"
+    assert provider.calls == 1  # no retry storm against a timing-out model
+
+
+# --- provider response-shape robustness ------------------------------------------
+
+
+class _ShapeResp:
+    """Response with a configurable body; status 200."""
+
+    def __init__(self, body=None, text=""):
+        self.status_code = 200
+        self.text = text
+        self._body = body
+
+    def json(self):
+        if self._body is None:
+            raise ValueError("not json")
+        return self._body
+
+
+def _client_returning(resp):
+    class _C:
+        def __init__(self, timeout=None):
+            self.is_closed = False
+
+        async def post(self, url, headers, json):
+            return resp
+
+    return _C
+
+
+@pytest.mark.anyio
+async def test_openrouter_error_body_without_choices_raises_actionable_error(tmp_path, monkeypatch):
+    """OpenRouter can return HTTP 200 whose body is an ``error`` object instead of
+    choices (upstream failure/moderation). That must surface as ProviderRequestError
+    (which the CLI catches gracefully) carrying the provider's message — not a raw
+    KeyError traceback."""
+    from devcouncil.llm.provider import ProviderRequestError
+
+    body = {"error": {"message": "upstream provider is overloaded", "code": 502}}
+    monkeypatch.setattr(
+        "devcouncil.llm.provider.httpx.AsyncClient", _client_returning(_ShapeResp(body=body))
+    )
+    p = OpenRouterProvider("k", project_root=tmp_path)
+    with pytest.raises(ProviderRequestError, match="overloaded"):
+        await p.complete("some/model", [{"role": "user", "content": "hi"}])
+
+
+@pytest.mark.anyio
+async def test_provider_non_json_body_raises_actionable_error(tmp_path, monkeypatch):
+    """A proxy HTML error page / empty body on HTTP 200 must become an actionable
+    ProviderRequestError, not a JSONDecodeError only debuggable from a traceback."""
+    from devcouncil.llm.provider import ProviderRequestError
+
+    monkeypatch.setattr(
+        "devcouncil.llm.provider.httpx.AsyncClient",
+        _client_returning(_ShapeResp(body=None, text="<html>Bad Gateway</html>")),
+    )
+    p = OpenRouterProvider("k", project_root=tmp_path)
+    with pytest.raises(ProviderRequestError, match="non-JSON"):
+        await p.complete("some/model", [{"role": "user", "content": "hi"}])

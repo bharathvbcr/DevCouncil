@@ -1,4 +1,5 @@
 import json
+import logging
 from pathlib import Path
 
 import typer
@@ -8,9 +9,11 @@ from devcouncil.cli.commands.init import initialize_project
 from devcouncil.indexing.repo_mapper import RepoMap, RepoMapper
 from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
 from devcouncil.storage.db import get_db
+from devcouncil.telemetry.stages import log_stage, log_step
 
 console = Console()
 status_console = Console(stderr=True)
+logger = logging.getLogger(__name__)
 
 AGENT_GUIDE_MARKER = "<!-- Managed by dev map: keep this file in sync with .devcouncil/repo_map.json. -->"
 
@@ -102,11 +105,17 @@ def map_repo(
 ):
     """Build the deterministic repository map without calling an LLM."""
     root = project_root.expanduser().resolve()
+    from devcouncil.telemetry.logging_setup import set_log_dir
+    set_log_dir(root)
+    logger.info("dev map: goal=%r scan_deps=%s", goal, scan_deps)
     initialize_project(root, quiet=True, with_map=False)
     if not get_db(root):
         raise typer.Exit(code=1)
 
-    output = output if output.is_absolute() else root / output
-    repo_map = generate_map_artifacts(root, output, goal, scan_dependencies=scan_deps)
-    typer.echo(json.dumps(repo_map.model_dump(), indent=2))
-    status_console.print(f"[green]Wrote repository map to {output}[/green]")
+    with log_stage("map", project_root=root, scan_deps=scan_deps):
+        log_step("map/1: generating repository map", project_root=root, trace=True)
+        output = output if output.is_absolute() else root / output
+        repo_map = generate_map_artifacts(root, output, goal, scan_dependencies=scan_deps)
+        typer.echo(json.dumps(repo_map.model_dump(), indent=2))
+        status_console.print(f"[green]Wrote repository map to {output}[/green]")
+        log_step("map/complete", project_root=root, trace=True)

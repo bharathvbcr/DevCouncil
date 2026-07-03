@@ -37,12 +37,17 @@ from devcouncil.storage.native import (
 )
 from devcouncil.domain.evidence import CommandResult, DiffEvidence, DiffCoverageEvidence, TestEvidence
 from devcouncil.verification.next_actions import split_next_actions
+from devcouncil.verification.command_evidence import (
+    command_has_acceptance_evidence,
+    command_is_trivial_evidence,
+)
 from devcouncil.reporting.report_builder import ReportBuilder
 from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
 from devcouncil.execution.hook_policy import HookPolicy
 from devcouncil.execution.prompt_builder import PromptBuilder
 from devcouncil.utils.subprocess_env import clean_subprocess_env
 from devcouncil.telemetry.traces import read_trace_events
+from devcouncil.telemetry.stages import log_step
 from devcouncil.indexing.ast_matcher import AstMatcher
 from devcouncil.indexing.lsp import LspInspector
 from devcouncil.app.project_status import compute_phase
@@ -1369,8 +1374,9 @@ async def get_prompt(name: str, arguments: dict | None) -> GetPromptResult:
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     arguments = _normalize_arguments(arguments)
-    logger.info("MCP call_tool: %s args=%s", name, sorted(arguments) if isinstance(arguments, dict) else arguments)
     root = _project_root()
+    log_step(f"mcp/{name}: invoked", project_root=root)
+    logger.info("MCP call_tool: %s args=%s", name, sorted(arguments) if isinstance(arguments, dict) else arguments)
     db = get_db(root)
     if name in _DB_REQUIRED_TOOLS and not db:
         logger.warning("MCP tool %s rejected: project not initialized at %s", name, root)
@@ -1837,18 +1843,40 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             task = task_repo.get_by_id(task_id)
             if not task:
                 return _error_text(f"Task {task_id} not found.", code="not_found", task_id=task_id)
+            # allowed_commands are build/test/lint commands the agent legitimately
+            # needs mid-task, so the filter is the permissive DENY-list (echo/true/
+            # --version and other provably-trivial commands are rejected; `make
+            # build` / `pip install -e .` pass). Every accepted append is recorded
+            # in agent_appended_allowed_commands so it can never coarse-prove an
+            # acceptance criterion (same self-certification guard as expected_tests).
+            rejected_commands: list[str] = []
             for cmd in allowed_commands:
-                if cmd not in task.allowed_commands:
-                    task.allowed_commands.append(cmd)
+                if cmd in task.allowed_commands:
+                    continue
+                if command_is_trivial_evidence(cmd):
+                    rejected_commands.append(cmd)
+                    continue
+                task.allowed_commands.append(cmd)
+                if cmd not in task.agent_appended_allowed_commands:
+                    task.agent_appended_allowed_commands.append(cmd)
+            rejected_tests: list[str] = []
             for test in expected_tests:
-                if test not in task.expected_tests:
-                    task.expected_tests.append(test)
+                if test in task.expected_tests:
+                    continue
+                if not command_has_acceptance_evidence(test):
+                    rejected_tests.append(test)
+                    continue
+                task.expected_tests.append(test)
+                if test not in task.agent_appended_expected_tests:
+                    task.agent_appended_expected_tests.append(test)
             task_repo.save(task)
             return _json_text({
                 "ok": True,
                 "task_id": task_id,
                 "allowed_commands": task.allowed_commands,
                 "expected_tests": task.expected_tests,
+                "rejected_expected_tests": rejected_tests,
+                "rejected_allowed_commands": rejected_commands,
             })
 
     elif name == "devcouncil_append_evidence":
@@ -2135,6 +2163,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "diff_empty": outcome.diff_empty if outcome else False,
                 "coverage_measured": outcome.coverage_measured if outcome else False,
                 "coverage_skipped_reason": outcome.coverage_skipped_reason if outcome else None,
+                # Anti-laziness rigor: the task's difficulty classification and which
+                # escalations (blocking stub/effort gates, enforced coverage) applied.
+                "difficulty": outcome.difficulty if outcome else None,
+                "rigor_applied": list(outcome.rigor_applied) if outcome else [],
             })
 
     elif name == "devcouncil_handoff_agent":

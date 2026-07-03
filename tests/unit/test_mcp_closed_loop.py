@@ -47,7 +47,11 @@ def _setup(tmp_path):
             id="TASK-001", title="T", description="D",
             requirement_ids=["REQ-001"], acceptance_criterion_ids=["AC-001"],
             planned_files=[PlannedFile(path="src/a.py", reason="logic", allowed_change="modify")],
-            expected_tests=["python --version"],
+            # Must be acceptance-capable evidence: command_has_acceptance_evidence now
+            # rejects trivia like `python --version` from coarse-proving a behavioral AC
+            # (the agent self-certification guard), so the pass-after-write leg must
+            # actually exercise the written code.
+            expected_tests=['python -c "from src.a import VALUE; assert VALUE == 1"'],
         ))
     return db
 

@@ -1,14 +1,14 @@
 openrouter:
-  spec_writer: anthropic/claude-sonnet-4.6
-  prompt_enhancer: anthropic/claude-sonnet-4.6
-  planner_a: anthropic/claude-sonnet-4.6
-  planner_b: google/gemini-2.5-pro
-  critic_a: openai/gpt-5.5
-  critic_b: anthropic/claude-opus-4.8
-  arbiter: openai/gpt-5.5
-  native_agent: anthropic/claude-sonnet-4.6
-  implementation_reviewer: openai/gpt-5.5
-  live_reviewer: openai/gpt-5.5
+  spec_writer: nvidia/nemotron-3-ultra-550b-a55b:free
+  prompt_enhancer: nvidia/nemotron-3-ultra-550b-a55b:free
+  planner_a: nvidia/nemotron-3-ultra-550b-a55b:free
+  planner_b: nvidia/nemotron-3-ultra-550b-a55b:free
+  critic_a: nvidia/nemotron-3-ultra-550b-a55b:free
+  critic_b: nvidia/nemotron-3-ultra-550b-a55b:free
+  arbiter: nvidia/nemotron-3-ultra-550b-a55b:free
+  native_agent: nvidia/nemotron-3-ultra-550b-a55b:free
+  implementation_reviewer: nvidia/nemotron-3-ultra-550b-a55b:free
+  live_reviewer: nvidia/nemotron-3-ultra-550b-a55b:free
 vertexai:
   spec_writer: google/gemini-2.5-flash
   prompt_enhancer: google/gemini-2.5-flash

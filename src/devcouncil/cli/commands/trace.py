@@ -1,3 +1,9 @@
+"""DELIBERATELY UNINSTRUMENTED: this command's subject *is* the trace/log
+stream. Emitting log records or trace events from here mutates what the user
+asked to inspect (``log_step`` appends to the very traces.jsonl being tailed)
+and pollutes the machine-readable JSONL/--json output consumers parse. An
+introspection command must not modify what it introspects."""
+
 import json
 import time
 from pathlib import Path
@@ -37,12 +43,12 @@ def tail(
     agent gets only the events appended after the cursor plus a ``next_cursor`` to
     pass back on the next poll, so each poll is O(new) rather than O(all).
     """
-    project_root = project_root.expanduser().resolve()
+    root = project_root.expanduser().resolve()
 
     # Incremental cursor mode: any of --since / --json / explicit --no-follow.
     incremental = since is not None or json_summary
     if incremental:
-        events, next_cursor = read_trace_events_since(project_root, since)
+        events, next_cursor = read_trace_events_since(root, since)
         if json_summary:
             typer.echo(
                 json.dumps(
@@ -67,7 +73,7 @@ def tail(
     printed = 0
 
     def emit_new(start_index: int) -> int:
-        events = list(read_trace_events(project_root))
+        events = list(read_trace_events(root))
         selected = events[start_index:]
         for event in selected:
             if jsonl:
@@ -79,7 +85,7 @@ def tail(
                 )
         return len(events)
 
-    events = list(read_trace_events(project_root))
+    events = list(read_trace_events(root))
     start = max(0, len(events) - limit)
     printed = emit_new(start)
 

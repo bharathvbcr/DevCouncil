@@ -78,6 +78,100 @@ def merge_intervals(intervals):
             out.append(list(iv))
     return out
 ''',
+    "eval_rpn": '''
+def eval_rpn(tokens):
+    stack = []
+    ops = {"+", "-", "*", "/"}
+    for tok in tokens:
+        if tok in ops:
+            if len(stack) < 2:
+                raise ValueError("too few operands")
+            b = stack.pop(); a = stack.pop()
+            if tok == "+": r = a + b
+            elif tok == "-": r = a - b
+            elif tok == "*": r = a * b
+            else: r = int(a / b)  # truncates toward zero; ZeroDivisionError propagates
+            stack.append(r)
+        else:
+            stack.append(int(tok))
+    if len(stack) != 1:
+        raise ValueError("leftover operands")
+    return stack[0]
+''',
+    "base_convert": '''
+def base_convert(number, from_base, to_base):
+    if not (2 <= from_base <= 36) or not (2 <= to_base <= 36):
+        raise ValueError("base out of range")
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    s = str(number).strip().lower()
+    if not s:
+        raise ValueError("empty")
+    value = 0
+    for ch in s:
+        d = digits.find(ch)
+        if d == -1 or d >= from_base:
+            raise ValueError("invalid digit")
+        value = value * from_base + d
+    if value == 0:
+        return "0"
+    out = []
+    while value:
+        out.append(digits[value % to_base])
+        value //= to_base
+    return "".join(reversed(out))
+''',
+    "parse_csv_line": '''
+def parse_csv_line(line):
+    fields, cur, in_quotes = [], [], False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if in_quotes:
+            if ch == '"':
+                if i + 1 < len(line) and line[i + 1] == '"':
+                    cur.append('"'); i += 1
+                else:
+                    in_quotes = False
+            else:
+                cur.append(ch)
+        elif ch == '"':
+            in_quotes = True
+        elif ch == ",":
+            fields.append("".join(cur)); cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    fields.append("".join(cur))
+    return fields
+''',
+    "flatten": '''
+def flatten(nested):
+    out = []
+    for item in nested:
+        if isinstance(item, list):
+            out.extend(flatten(item))
+        else:
+            out.append(item)
+    return out
+''',
+    "parse_duration": '''
+import re
+def parse_duration(s):
+    compact = re.sub(r"\\s+", "", s)
+    if not compact:
+        raise ValueError("empty")
+    matches = re.findall(r"(\\d+)([a-zA-Z])", compact)
+    if "".join(n + u for n, u in matches) != compact:
+        raise ValueError("bad format")
+    units = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+    total = 0
+    for num, unit in matches:
+        u = unit.lower()
+        if u not in units:
+            raise ValueError("unknown unit")
+        total += int(num) * units[u]
+    return total
+''',
 }
 
 # A buggy median: happy path only, no empty-input handling, integer even-average.

@@ -8,8 +8,11 @@ from devcouncil.llm.router import ModelRouter
 logger = logging.getLogger(__name__)
 
 class PlanOutput(BaseModel):
-    id: str
-    rationale: str
+    # id/rationale are descriptive metadata some models omit; don't fail an
+    # otherwise-valid plan over them. tasks stays required — a plan without
+    # tasks is a real failure the healing/retry path must surface.
+    id: str = "PLAN"
+    rationale: str = ""
     tasks: List[Task]
 
 

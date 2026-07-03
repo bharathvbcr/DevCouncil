@@ -72,6 +72,35 @@ def _find_tagged_handler(logger: logging.Logger, tag: str) -> Optional[logging.H
     return None
 
 
+class _CurrentStderrHandler(logging.StreamHandler):
+    """A stderr handler that resolves ``sys.stderr`` at EMIT time, not at creation.
+
+    The handler is installed once per process and reused. A plain
+    ``logging.StreamHandler()`` snapshots ``sys.stderr`` when constructed; in any
+    context that later replaces or closes that stream — test runners, an MCP server
+    re-pointing stdio, agents embedding the CLI — every subsequent record then hits a
+    dead stream and the logging module prints a ``--- Logging error ---`` report to
+    the *current* stderr, polluting agent-facing (e.g. ``--json``) output. Resolving
+    the stream per emit keeps console logging bound to whatever stderr is now."""
+
+    def __init__(self) -> None:
+        import sys
+
+        super().__init__(sys.stderr)
+
+    @property
+    def stream(self):  # type: ignore[override]
+        import sys
+
+        return sys.stderr
+
+    @stream.setter
+    def stream(self, value) -> None:  # noqa: ARG002 - always current sys.stderr
+        # Ignore assignments (StreamHandler.__init__ / setStream): this handler is
+        # permanently bound to the CURRENT sys.stderr by design.
+        pass
+
+
 def configure_logging(
     project_root: Optional[Path] = None,
     *,
@@ -97,7 +126,7 @@ def configure_logging(
     # --- Console handler (stderr) -------------------------------------------
     console = _find_tagged_handler(root, _CONSOLE_HANDLER_TAG)
     if console is None:
-        console = logging.StreamHandler()  # defaults to stderr, keeps stdout clean
+        console = _CurrentStderrHandler()  # emit-time stderr, keeps stdout clean
         console._devcouncil_tag = _CONSOLE_HANDLER_TAG  # type: ignore[attr-defined]
         console.setFormatter(formatter)
         root.addHandler(console)
