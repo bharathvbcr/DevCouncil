@@ -10,9 +10,11 @@ from the stated intent and runs them as evidence.
 from __future__ import annotations
 
 import asyncio
-import json
+from devcouncil.utils.json_persist import dump_json
 import logging
-import subprocess
+import os
+import time
+from datetime import datetime
 from pathlib import Path
 
 import typer
@@ -38,12 +40,9 @@ logger = logging.getLogger(__name__)
 def _diff(root: Path, base: str | None) -> str:
     if not base:
         return Verifier(root).get_diff()
-    try:
-        return subprocess.check_output(
-            ["git", "diff", base, "--"], cwd=root, text=True, encoding="utf-8", errors="replace"
-        )
-    except Exception:
-        return ""
+    from devcouncil.utils.proc import git_output
+
+    return git_output(["diff", base, "--"], cwd=root, default="")
 
 
 def check(
@@ -51,6 +50,7 @@ def check(
     base: str | None = typer.Option(None, "--base", help="Diff against this git ref instead of the uncommitted working tree."),
     test_commands: list[str] | None = typer.Option(None, "--test", "-t", help="A verification command proving the change works (repeatable). Switches to the deterministic evidence gate."),
     verify: bool = typer.Option(False, "--verify", help="Run the deterministic evidence gate (orphan-diff, acceptance evidence, diff↔coverage, next actions) instead of the LLM audit. No provider keys needed."),
+    watch: bool = typer.Option(False, "--watch", help="Keep watching the project tree and re-run the deterministic evidence gate on every change (implies --verify). Prints one compact verdict line per run; Ctrl-C to stop."),
     enforce_coverage: bool = typer.Option(False, "--enforce-coverage", help="Evidence gate: block when the tests do not exercise the changed lines."),
     min_coverage: float = typer.Option(0.0, "--min-coverage", help="Evidence gate: minimum fraction of changed lines that must be exercised (implies --enforce-coverage)."),
     json_format: bool = typer.Option(False, "--json", help="Machine-readable output."),
@@ -60,18 +60,20 @@ def check(
     root = project_root.expanduser().resolve()
     from devcouncil.telemetry.logging_setup import set_log_dir
     set_log_dir(root)
-    logger.info("dev check: verify=%s goal=%s base=%s", verify, bool(goal), base or "working-tree")
+    logger.info(
+        "dev check: verify=%s goal=%s base=%s watch=%s", verify, bool(goal), base or "working-tree", watch
+    )
     initialize_project(root, quiet=True)
 
     with log_stage("check", project_root=root, verify=verify):
         _run_check_body(
             root, goal, base, test_commands, verify, enforce_coverage,
-            min_coverage, json_format,
+            min_coverage, json_format, watch,
         )
 
 
 def _run_check_body(
-    root, goal, base, test_commands, verify, enforce_coverage, min_coverage, json_format,
+    root, goal, base, test_commands, verify, enforce_coverage, min_coverage, json_format, watch,
 ):
     log_step("check/1: resolving diff scope", project_root=root, trace=True)
 
@@ -83,6 +85,20 @@ def _run_check_body(
         if intent_note and not json_format:
             console.print(f"[dim]{intent_note}[/dim]")
         goal = expanded_goal
+
+    # Watch mode: run the deterministic gate, then re-run it whenever the project tree
+    # changes, printing one compact verdict line per run. Implies --verify — looping the
+    # LLM audit would burn provider tokens on every save.
+    if watch:
+        if json_format:
+            raise typer.BadParameter("--watch is interactive; it cannot be combined with --json.")
+        _watch_gate(
+            root, goal,
+            test_commands=list(test_commands or []),
+            enforce_coverage=enforce_coverage,
+            min_coverage=min_coverage,
+        )
+        return
 
     # Evidence-gate mode: deterministic verification of the working-tree diff against an
     # inline requirement (--goal), with the diff↔coverage gate and the typed next-actions
@@ -96,7 +112,7 @@ def _run_check_body(
             min_ratio=min_coverage,
         )
         if json_format:
-            typer.echo(json.dumps(result.to_dict(), indent=2))
+            typer.echo(dump_json(result.to_dict(), indent=2))
         else:
             _render_gate(result)
         raise typer.Exit(code=0 if result.passed else 1)
@@ -109,7 +125,7 @@ def _run_check_body(
     if not diff.strip():
         logger.info("dev check: clean working tree; nothing to audit")
         msg = "No changes to check (clean working tree)."
-        typer.echo(json.dumps({"ok": True, "message": msg}) if json_format else msg)
+        typer.echo(dump_json({"ok": True, "message": msg}) if json_format else msg)
         return
 
     changed_files = verifier.get_changed_files()
@@ -151,7 +167,7 @@ def _run_check_body(
     logger.info("dev check audit complete: %d secret finding(s), %d review finding(s)", len(secret_gaps), len(findings))
 
     if json_format:
-        typer.echo(json.dumps({
+        typer.echo(dump_json({
             "ok": not secret_gaps,
             "changed_files": changed_files,
             "secret_findings": [g.model_dump() for g in secret_gaps],
@@ -234,3 +250,87 @@ def _render_gate(result: AdHocCheckResult) -> None:
         console.print("\n[green]Verified with non-blocking signals only.[/green]")
     else:
         console.print("\n[red]Not verified: blocking gaps must be resolved.[/red]")
+
+
+# --watch plumbing. execution/fs_watcher.FilesystemWatcher was considered and rejected:
+# it exists to ATTRIBUTE changes to a leased task (needs a task_id; records file-change
+# events and orphan-diff gaps in the DB through the policy engine), not to signal
+# "something changed". A 2s mtime scan plus a short settle debounce is the genuinely
+# simpler fit here — no watchdog dependency, identical behavior on every platform.
+_WATCH_IGNORED_DIRS = frozenset({
+    ".git", ".hg", ".svn", ".devcouncil", "__pycache__", ".pytest_cache", ".mypy_cache",
+    ".ruff_cache", "node_modules", "dist", "build", "target", ".venv", "venv", ".tox",
+    ".idea", ".vscode",
+})
+_WATCH_POLL_SECONDS = 2.0
+_WATCH_DEBOUNCE_SECONDS = 1.5
+
+
+def _watch_snapshot(root: Path) -> dict:
+    """One cheap pass over the tree: ``{path: mtime_ns}`` for non-ignored files."""
+    snapshot: dict = {}
+    stack = [str(root)]
+    while stack:
+        directory = stack.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if entry.name not in _WATCH_IGNORED_DIRS:
+                                stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            snapshot[entry.path] = entry.stat(follow_symlinks=False).st_mtime_ns
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return snapshot
+
+
+def _watch_gate_once(root: Path, goal, test_commands, enforce_coverage, min_coverage) -> None:
+    """Run the deterministic gate once and print a compact one-line verdict."""
+    stamp = datetime.now().strftime("%H:%M:%S")
+    try:
+        result = run_working_tree_check(
+            root, goal,
+            test_commands=test_commands,
+            enforce_coverage=enforce_coverage,
+            min_ratio=min_coverage,
+        )
+    except Exception as exc:  # keep watching through transient failures (git hiccups, ...)
+        logger.warning("dev check --watch: run failed: %s", exc)
+        console.print(f"[dim]{stamp}[/dim] [red]ERROR[/red] — {str(exc)[:120]}")
+        return
+    verdict = "[green]PASS[/green]" if result.passed else "[red]FAIL[/red]"
+    blocking = len([g for g in result.gaps if g.blocking])
+    detail = f"{len(result.gaps)} gap(s)" + (f", {blocking} blocking" if blocking else "")
+    if result.reason == "no_changes":
+        detail = "no working-tree changes"
+    console.print(f"[dim]{stamp}[/dim] {verdict} — {detail}")
+
+
+def _watch_gate(root: Path, goal, *, test_commands, enforce_coverage, min_coverage) -> None:
+    """Initial gate run, then a poll/debounce loop re-running it until Ctrl-C."""
+    console.print(
+        f"[dim]Watching {root} — re-running the evidence gate on change "
+        f"(poll {_WATCH_POLL_SECONDS:.0f}s, debounce {_WATCH_DEBOUNCE_SECONDS:.1f}s). "
+        "Ctrl-C to stop. Run without --watch for full findings.[/dim]"
+    )
+    try:
+        _watch_gate_once(root, goal, test_commands, enforce_coverage, min_coverage)
+        baseline = _watch_snapshot(root)
+        while True:
+            time.sleep(_WATCH_POLL_SECONDS)
+            current = _watch_snapshot(root)
+            if current == baseline:
+                continue
+            # Debounce: let an editor save-storm settle before burning a run.
+            time.sleep(_WATCH_DEBOUNCE_SECONDS)
+            _watch_gate_once(root, goal, test_commands, enforce_coverage, min_coverage)
+            # Re-baseline AFTER the run so artifacts the gate itself writes (coverage
+            # data, logs outside .devcouncil/) can never re-trigger it. Trade-off:
+            # edits made while the gate was running are absorbed — save again.
+            baseline = _watch_snapshot(root)
+    except KeyboardInterrupt:
+        console.print("\n[dim]Watch stopped.[/dim]")

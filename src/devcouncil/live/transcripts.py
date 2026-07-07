@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any, Iterable, Literal
 
 from devcouncil.live.models import AgentSession, AgentTurn, session_id_from_path
+from devcouncil.utils.json_persist import read_json
 
 RoleName = Literal["user", "assistant", "system", "tool", "unknown"]
 KNOWN_ROLES: set[RoleName] = {"user", "assistant", "system", "tool"}
@@ -86,11 +88,76 @@ def latest_assistant_turn(path: Path, client: str = "generic") -> AgentTurn | No
     return result
 
 
+def claude_project_slug(project_root: Path | str) -> str:
+    """Encode a path the way Claude Code names dirs under ``~/.claude/projects/``."""
+    resolved = Path(project_root).expanduser().resolve()
+    return resolved.as_posix().replace("/", "-")
+
+
+def _read_claude_session_id(project_root: Path, task_id: str | None) -> str | None:
+    if not task_id:
+        return None
+    path = project_root / ".devcouncil" / "sessions" / f"{task_id}-claude.json"
+    if not path.is_file():
+        return None
+    try:
+        data = read_json(path) or {}
+    except (json.JSONDecodeError, OSError):
+        return None
+    session_id = str(data.get("session_id") or "").strip()
+    return session_id or None
+
+
+def claude_transcript_for_session(project_root: Path, session_id: str) -> Path | None:
+    """Return the native Claude JSONL for ``session_id`` in this project, if present."""
+    if not session_id:
+        return None
+    slug_dir = CLAUDE_TRANSCRIPT_ROOT / claude_project_slug(project_root)
+    direct = slug_dir / f"{session_id}.jsonl"
+    if direct.is_file():
+        return direct
+    for candidate in _claude_transcript_candidates(project_root):
+        if candidate.stem == session_id:
+            return candidate
+    return None
+
+
+def claude_transcript_for_task(project_root: Path, task_id: str) -> Path | None:
+    """Resolve the Claude transcript DevCouncil pinned for ``task_id``."""
+    session_id = _read_claude_session_id(project_root, task_id)
+    if session_id:
+        path = claude_transcript_for_session(project_root, session_id)
+        if path is not None:
+            return path
+    return None
+
+
+def mirror_claude_transcript(project_root: Path, session_id: str) -> Path | None:
+    """Copy the native Claude JSONL into ``.devcouncil/live/claude/`` for discovery.
+
+    Headless ``dev run``/``dev e2e`` pins a session id up front; mirroring the native
+    transcript into the project makes live review resilient even when Claude's global
+    project slug is slow to appear or ``discover_sessions`` would otherwise race."""
+    source = claude_transcript_for_session(project_root, session_id)
+    if source is None or not source.is_file():
+        return None
+    dest_dir = project_root / ".devcouncil" / "live" / "claude"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{session_id}.jsonl"
+    try:
+        shutil.copy2(source, dest)
+    except OSError:
+        return None
+    return dest
+
+
 def _claude_transcript_candidates(project_root: Path) -> list[Path]:
     local_runtime = project_root / ".devcouncil" / "live" / "claude"
     candidates = list(local_runtime.glob("*.jsonl"))
     if CLAUDE_TRANSCRIPT_ROOT.exists():
-        candidates.extend(CLAUDE_TRANSCRIPT_ROOT.rglob("*.jsonl"))
+        slug_dir = CLAUDE_TRANSCRIPT_ROOT / claude_project_slug(project_root)
+        if slug_dir.is_dir():
+            candidates.extend(slug_dir.glob("*.jsonl"))
     # Dedup, then sort by path for a deterministic, stat-free order. discover_sessions
     # re-sorts the resulting sessions by mtime; because that sort is stable, giving it a
     # deterministic input keeps the tie-break (equal-mtime sessions) stable across runs —

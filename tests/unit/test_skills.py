@@ -14,6 +14,7 @@ runner = CliRunner()
 def test_library_loads_core_and_domains():
     names = {s.name for s in load_skills()}
     assert {"core-engineering", "android", "ios", "windows", "web", "ai-training"} <= names
+    assert {"devcouncil", "devcouncil-hero-loop", "devcouncil-verification"} <= names
     always = [s.name for s in load_skills() if s.always]
     assert always == ["core-engineering"]
     # The contributor README has no skill frontmatter and must not load as a skill.
@@ -306,8 +307,56 @@ def test_repo_local_skill_overrides_packaged_by_name(tmp_path):
     assert by_name["android"].description == "OUR android house rules"
 
 
+def test_scaffold_writes_in_repo_packaged_library(tmp_path):
+    """Library skills under src/.../library/ must still scaffold to .claude/skills/."""
+    lib = tmp_path / "src" / "pkg" / "skills" / "library"
+    lib.mkdir(parents=True)
+    (lib / "demo.md").write_text(
+        "---\nname: demo\ndescription: demo skill\n---\n# Demo\n",
+        encoding="utf-8",
+    )
+    skill = load_skills(library_dir=lib)[0]
+    written = scaffold_skills(tmp_path, [skill])
+    assert (tmp_path / ".claude" / "skills" / "demo" / "SKILL.md") in written
+
+
+def test_scaffold_skips_repo_local_skill_sources(tmp_path):
+    skill_dir = tmp_path / ".claude" / "skills" / "custom"
+    skill_dir.mkdir(parents=True)
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text(
+        "---\nname: custom\ndescription: local\n---\n# Custom\n",
+        encoding="utf-8",
+    )
+    from devcouncil.skills.registry import discover_repo_skills
+
+    local = next(s for s in discover_repo_skills(tmp_path) if s.name == "custom")
+    assert scaffold_skills(tmp_path, [local]) == []
+
+
 def test_cli_skills_scaffold_all(tmp_path):
     result = runner.invoke(app, ["skills", "scaffold", "--all", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     scaffolded = {p.name for p in (tmp_path / ".claude" / "skills").iterdir()}
     assert {"core-engineering", "android", "ios", "windows", "web", "ai-training"} <= scaffolded
+    assert {"devcouncil", "devcouncil-hero-loop", "devcouncil-verification"} <= scaffolded
+
+
+def test_devcouncil_skills_select_in_initialized_repo(tmp_path):
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text("models:\n  provider: anthropic\n", encoding="utf-8")
+    selected = {s.name for s in select_skills(goal="", project_root=tmp_path)}
+    assert "core-engineering" in selected
+    assert {"devcouncil", "devcouncil-hero-loop", "devcouncil-verification"} <= selected
+
+
+def test_devcouncil_skills_select_by_keyword():
+    selected = {s.name for s in select_skills(goal="run the devcouncil hero loop on TASK-001")}
+    assert "devcouncil" in selected
+    assert "devcouncil-hero-loop" in selected
+
+
+def test_devcouncil_verification_skill_selects_on_gap_keywords():
+    selected = {s.name for s in select_skills(goal="fix blocking gap from diff coverage")}
+    assert "devcouncil-verification" in selected
+    assert "devcouncil-hero-loop" not in selected

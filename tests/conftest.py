@@ -11,7 +11,29 @@ a stale cached instance.
 
 from __future__ import annotations
 
+import os
+
 import pytest
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_devcouncil_logs(tmp_path_factory):
+    """Keep test logging out of the real repo's .devcouncil/logs/devcouncil.log.
+
+    Tests exercise deliberate failures (missing executors, invalid transitions,
+    fake GitHub 403s); without this, that noise lands in the developer's actual
+    log file and drowns out real errors. DEVCOUNCIL_LOG_DIR is honored by
+    devcouncil.telemetry.logging_setup for both initial configuration and
+    set_log_dir() re-pointing.
+    """
+    log_dir = tmp_path_factory.mktemp("devcouncil-test-logs")
+    previous = os.environ.get("DEVCOUNCIL_LOG_DIR")
+    os.environ["DEVCOUNCIL_LOG_DIR"] = str(log_dir)
+    yield
+    if previous is None:
+        os.environ.pop("DEVCOUNCIL_LOG_DIR", None)
+    else:
+        os.environ["DEVCOUNCIL_LOG_DIR"] = previous
 
 
 def _reset_all_caches() -> None:

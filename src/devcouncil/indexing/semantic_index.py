@@ -11,8 +11,10 @@ from pathlib import Path
 
 from devcouncil.indexing.ast_matcher import AstMatcher
 from devcouncil.indexing.lsp import LspInspector
+from devcouncil.indexing.walk import iter_project_files
 from devcouncil.storage.db import get_db
 from devcouncil.storage.native import SemanticDiffRepository
+from devcouncil.utils.json_persist import read_json, write_json
 
 _CONFIG_FILES = {
     "pyproject.toml",
@@ -39,7 +41,7 @@ class SemanticIndex:
         # matching, source-file hashing, import extraction, and LSP language detection);
         # each collector now filters this single in-memory list with its own predicate, so
         # the on-disk output is unchanged while the filesystem is walked a single time.
-        all_files = [path for path in self.project_root.rglob("*") if path.is_file()]
+        all_files = list(iter_project_files(self.project_root))
         rel_files = [str(path.relative_to(self.project_root)) for path in all_files]
         symbols = self._collect_symbols(all_files)
         source_files, imports = self._collect_source_data(all_files)
@@ -56,7 +58,7 @@ class SemanticIndex:
         }
         path = self.snapshot_path(task_id, stage)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        write_json(path, payload)
         return path
 
     def diff(self, task_id: str) -> dict:
@@ -64,8 +66,8 @@ class SemanticIndex:
         after_path = self.snapshot_path(task_id, "after")
         if not after_path.exists():
             self.create_snapshot(task_id, "after")
-        before = json.loads(before_path.read_text(encoding="utf-8")) if before_path.exists() else {}
-        after = json.loads(after_path.read_text(encoding="utf-8"))
+        before = read_json(before_path) if before_path.exists() else {}
+        after = read_json(after_path) if after_path.exists() else {}
         classifications = self._classify(before, after)
         summary = ", ".join(item["type"] for item in classifications) or "no semantic changes"
         db = get_db(self.project_root)
@@ -107,7 +109,7 @@ class SemanticIndex:
         exactly — source entries are still sorted by path, imports stay in traversal order.
         """
         if files is None:
-            files = [p for p in self.project_root.rglob("*") if p.is_file()]
+            files = list(iter_project_files(self.project_root))
         source_entries: list[dict] = []
         imports: list[dict] = []
         for path in files:

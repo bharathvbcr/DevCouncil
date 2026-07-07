@@ -227,6 +227,7 @@ class FilesystemWatcher:
         try:
             diff = self._verifier.get_diff()
         except Exception:
+            logger.debug("Live stub scan skipped: could not load diff", exc_info=True)
             return
         if not diff.strip():
             return

@@ -126,6 +126,35 @@ class AcceptanceCheckConfig(BaseModel):
             self.per_criterion if self.per_criterion is not None else d_per_criterion,
         )
 
+    def unsafe_override_warnings(self, local_monitor: bool) -> list[str]:
+        """Explicit overrides that disable the ensembling a LOCAL monitor needs.
+
+        Auto-resolution already picks safe local defaults; these warnings fire only
+        when a user has EXPLICITLY configured the settings calibration probes showed
+        to be unsafe on a local monitor (2026-07-03, Ornith-35B: ``samples=1``
+        rubber-stamped 1/6 buggy criteria as passing; ``samples=3`` +
+        ``per_criterion`` caught 6/6 with zero false passes). The config is honored
+        — explicit always wins — but never silently."""
+        if not local_monitor:
+            return []
+        warnings: list[str] = []
+        samples, _, per_criterion = self.resolved(local_monitor)
+        if self.samples is not None and samples < 3:
+            warnings.append(
+                f"verification.acceptance_checks.samples={samples} with a LOCAL monitor: "
+                "single/low-sample acceptance checks on a local model have rubber-stamped "
+                "real defects in calibration probes. Recommend samples>=3 (local sampling "
+                "is cost-free) or removing the override to use the auto default."
+            )
+        if self.per_criterion is False:
+            warnings.append(
+                "verification.acceptance_checks.per_criterion=false with a LOCAL monitor: "
+                "batched compilation on a local model routinely drops or mis-attributes "
+                "criteria (false 'incomplete'). Recommend per_criterion=true or removing "
+                "the override to use the auto default."
+            )
+        return warnings
+
 
 class ReviewerCheckConfig(BaseModel):
     """Self-consistency voting for the LLM live reviewer.
@@ -148,6 +177,22 @@ class ReviewerCheckConfig(BaseModel):
         if self.samples is not None:
             return max(1, self.samples)
         return 3 if local_reviewer else 1
+
+    def unsafe_override_warnings(self, local_reviewer: bool) -> list[str]:
+        """Explicit single-shot voting on a LOCAL reviewer — honored, never silent.
+
+        A lone local review can emit a mis-calibrated blocking verdict; voting over
+        >=3 samples is what de-escalates that (see class docstring)."""
+        if not local_reviewer or self.samples is None:
+            return []
+        resolved = self.resolved(local_reviewer)
+        if resolved >= 3:
+            return []
+        return [
+            f"verification.reviewer_checks.samples={resolved} with a LOCAL reviewer: a "
+            "single local review can falsely BLOCK on one mis-calibrated verdict. "
+            "Recommend samples>=3 (local sampling is cost-free) or removing the override."
+        ]
 
 
 class RigorConfig(BaseModel):
@@ -187,6 +232,13 @@ class VerificationConfig(BaseModel):
     acceptance_checks: AcceptanceCheckConfig = Field(default_factory=AcceptanceCheckConfig)
     reviewer_checks: ReviewerCheckConfig = Field(default_factory=ReviewerCheckConfig)
     rigor: RigorConfig = Field(default_factory=RigorConfig)
+    # Flaky-evidence retry: when an acceptance-capable verification command (planner
+    # expected_tests / config commands) genuinely fails, re-run it ONCE. If the re-run
+    # passes, the command counts as passed and its stored summary is tagged
+    # "[flaky: passed on retry 2/2]" so next-actions/reports can tell flaky from
+    # broken. Never applies to compiled per-criterion checks (they have their own
+    # repair/vote loop) or to diff-coverage instrumentation runs.
+    retry_flaky: bool = True
 
 
 class GatesConfig(BaseModel):
@@ -237,6 +289,19 @@ class PrivacyConfig(BaseModel):
     redact_env_vars: bool = True
     redact_secrets_in_logs: bool = True
     store_prompts_locally: bool = True
+
+
+class TelemetryConfig(BaseModel):
+    """Knobs for the local cost/usage telemetry (ledger lives under .devcouncil/logs/).
+
+    ``cost_budget_usd`` is an advisory spend budget in USD for cumulative model-call
+    cost. ``None`` (default) disables budgeting. WARN-ONLY by design: crossing the
+    budget emits a ``logger.warning`` when usage is recorded and is surfaced by
+    ``dev cost budget``, but it never blocks a run. Set/cleared via
+    ``dev cost budget --set X`` / ``dev cost budget --clear``.
+    """
+
+    cost_budget_usd: float | None = Field(default=None, ge=0.0)
 
 
 class AgentFlowIntegrationConfig(BaseModel):
@@ -303,6 +368,15 @@ class CliAgentProfileConfig(BaseModel):
     extra_args: List[str] = Field(default_factory=list)
     permission_mode: str | None = None
     model: str | None = None
+    # Per-profile environment overrides merged into the agent subprocess (and passed to
+    # the in-process claude-sdk executor). This is how a profile redirects the Claude
+    # Code harness at an alternative Anthropic-compatible endpoint (local proxy,
+    # LiteLLM-fronted Ollama, OpenRouter, ...) without touching the base agent spec:
+    #   env: {ANTHROPIC_BASE_URL: "http://127.0.0.1:4000", ANTHROPIC_AUTH_TOKEN: "..."}
+    # Values may hold secrets: manifests/logs record only the KEY NAMES, never values.
+    # DevCouncil's own variables (DEVCOUNCIL_*) are applied after these and cannot be
+    # masked by a profile.
+    env: Dict[str, str] = Field(default_factory=dict)
 
 
 class CustomCliAgentConfig(BaseModel):
@@ -367,6 +441,65 @@ class ProviderConfig(BaseModel):
     data_collection: str = "deny"
 
 
+class SemanticCacheConfig(BaseModel):
+    """Semantic similarity cache (FAISS + embeddings)."""
+
+    enabled: bool = True
+    backend: str = "faiss"
+    similarity_threshold: float = 0.92
+    ood_threshold: float = 0.75
+    margin_threshold: float = 0.03
+    ttl_seconds: int = 3600
+    max_entries: int = 10_000
+    namespace: str = "devcouncil"
+    exploration_rate: float = 0.02
+
+
+class SemanticRouterConfig(BaseModel):
+    """Complexity-based model tier routing (opt-in; local Ollama only today)."""
+
+    enabled: bool = False
+    complexity_threshold: float = 0.45
+    small_model: str | None = None
+    large_model: str | None = None
+
+
+class SemanticCompressorConfig(BaseModel):
+    """Long-context compression before LLM calls."""
+
+    enabled: bool = True
+    token_budget: int = 2048
+    top_k: int = 8
+    chunk_token_size: int = 256
+    chunk_overlap: int = 32
+    min_chunk_score: float = 0.35
+    mmr_lambda: float = 0.7
+    min_chars: int = 8000
+
+
+class SemanticEmbeddingConfig(BaseModel):
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    dimension: int = 384
+    device: str = "cpu"
+    batch_size: int = 32
+    normalize: bool = True
+
+
+class SemanticLayerConfig(BaseModel):
+    """Optional semantic cache / routing / compression for LLM calls.
+
+    Disabled by default. When ``enabled: true``, DevCouncil wraps the existing
+    ``ModelRouter`` path transparently — no caller changes required. Missing
+    optional deps (``uv sync --group semantic``) degrade to today's behavior.
+    """
+
+    enabled: bool = False
+    cache: SemanticCacheConfig = Field(default_factory=SemanticCacheConfig)
+    router: SemanticRouterConfig = Field(default_factory=SemanticRouterConfig)
+    compressor: SemanticCompressorConfig = Field(default_factory=SemanticCompressorConfig)
+    embedding: SemanticEmbeddingConfig = Field(default_factory=SemanticEmbeddingConfig)
+
+
 class DevCouncilConfig(BaseModel):
     """Top-level validated configuration."""
 
@@ -379,8 +512,10 @@ class DevCouncilConfig(BaseModel):
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     verification: VerificationConfig = Field(default_factory=VerificationConfig)
     privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
+    telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     integrations: IntegrationsConfig = Field(default_factory=IntegrationsConfig)
     knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
+    semantic_layer: SemanticLayerConfig = Field(default_factory=SemanticLayerConfig)
 
 
 # Memoized parsed configs keyed by resolved config path. Each entry stores the

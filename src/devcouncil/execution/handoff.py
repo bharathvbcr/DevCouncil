@@ -12,6 +12,7 @@ from devcouncil.execution.checkpoints import CheckpointService
 from devcouncil.storage.db import get_db
 from devcouncil.storage.native import AgentHandoffRepository, SemanticDiffRepository, TaskLeaseRepository
 from devcouncil.storage.repositories import EvidenceRepository, GapRepository, RequirementRepository, TaskRepository
+from devcouncil.utils.json_persist import write_model_json
 from devcouncil.verification.verifier import Verifier
 
 
@@ -78,7 +79,7 @@ class HandoffService:
             instruction=instruction,
             created_at=datetime.now(timezone.utc).isoformat(),
         )
-        manifest_path.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
+        write_model_json(manifest_path, manifest)
 
         status = "manifest_only"
         with db.get_session() as session:

@@ -1,4 +1,4 @@
-import json
+from devcouncil.utils.json_persist import dump_json
 import logging
 from typing import NoReturn
 
@@ -28,7 +28,7 @@ def handoff(
     """
     def _fail(message: str) -> NoReturn:
         if json_format:
-            typer.echo(json.dumps({"ok": False, "task_id": task_id, "error": message}, indent=2))
+            typer.echo(dump_json({"ok": False, "task_id": task_id, "error": message}, indent=2))
         else:
             console.print(f"[red]{message}[/red]")
         raise typer.Exit(code=1)
@@ -59,7 +59,7 @@ def handoff(
 
         next_command = f"dev run {task_id} --executor {to_name}"
         if json_format:
-            typer.echo(json.dumps({
+            typer.echo(dump_json({
                 "ok": True,
                 "task_id": task_id,
                 "from": from_name,

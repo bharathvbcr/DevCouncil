@@ -3,6 +3,7 @@ from pathlib import Path
 from devcouncil.artifacts.graph import ArtifactGraph
 from devcouncil.reporting.markdown_report import MarkdownReportGenerator
 from devcouncil.reporting.json_report import JsonReportGenerator
+from devcouncil.reporting.evidence_export import EvidenceExportGenerator
 
 class ReportBuilder:
     """Builds reports in various formats from the artifact graph."""
@@ -14,6 +15,11 @@ class ReportBuilder:
     @staticmethod
     def build_json(graph: ArtifactGraph, live_review: dict | None = None) -> str:
         return JsonReportGenerator.generate(graph, live_review=live_review)
+
+    @staticmethod
+    def build_evidence_export(graph: ArtifactGraph, live_review: dict | None = None) -> str:
+        """Reviewer-readable requirement→task→diff→evidence JSON (see evidence_export)."""
+        return EvidenceExportGenerator.generate(graph, live_review=live_review)
 
     @staticmethod
     def build_okf_bundle(

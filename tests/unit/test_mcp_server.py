@@ -376,14 +376,16 @@ async def test_mcp_cli_truncates_large_output(tmp_path, monkeypatch):
     def fake_run(*_args, **_kwargs):
         return subprocess.CompletedProcess(["devcouncil"], 0, stdout="x" * (server._CLI_OUTPUT_LIMIT + 10), stderr="")
 
-    monkeypatch.setattr(server.subprocess, "run", fake_run)
+    from devcouncil.integrations.mcp import util as mcp_util
+
+    monkeypatch.setattr(mcp_util.subprocess, "run", fake_run)
 
     result = await call_tool("devcouncil_cli", {"args": ["status", "--json"]})
     payload = json.loads(result[0].text)
 
     assert payload["returncode"] == 0
     assert payload["stdout_truncated"] is True
-    assert len(payload["stdout"]) > server._CLI_OUTPUT_LIMIT
+    assert len(payload["stdout"]) > mcp_util._CLI_OUTPUT_LIMIT
     assert "[truncated" in payload["stdout"]
 
 
@@ -394,7 +396,9 @@ async def test_mcp_cli_timeout_returns_structured_payload(tmp_path, monkeypatch)
     def fake_run(*_args, **_kwargs):
         raise subprocess.TimeoutExpired(["devcouncil"], timeout=server._CLI_TIMEOUT_SECONDS, output="partial", stderr="slow")
 
-    monkeypatch.setattr(server.subprocess, "run", fake_run)
+    from devcouncil.integrations.mcp import util as mcp_util
+
+    monkeypatch.setattr(mcp_util.subprocess, "run", fake_run)
 
     result = await call_tool("devcouncil_cli", {"args": ["status", "--json"]})
     payload = json.loads(result[0].text)

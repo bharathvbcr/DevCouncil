@@ -1,4 +1,3 @@
-import json
 import logging
 from pathlib import Path
 
@@ -7,8 +6,9 @@ from rich.console import Console
 
 from devcouncil.cli.commands.init import initialize_project
 from devcouncil.storage.db import get_db
-from devcouncil.verification.verifier import Verifier
 from devcouncil.telemetry.stages import log_stage, log_step
+from devcouncil.utils.json_persist import write_json
+from devcouncil.verification.verifier import Verifier
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -39,6 +39,6 @@ def baseline(
             "changed_files": changed_files,
             "note": "Files present in this snapshot are excluded from future task-scoped verification diffs.",
         }
-        baseline_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        write_json(baseline_path, payload)
         console.print(f"[green]Captured baseline with {len(changed_files)} changed file(s).[/green]")
         log_step("baseline/complete", project_root=root, file_count=len(changed_files), trace=True)

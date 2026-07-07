@@ -792,6 +792,50 @@ def test_verifier_reviewer_required_on_hard_blocks_critical(tmp_path):
     assert "reviewer_required" in verifier.last_outcome.rigor_applied
 
 
+def test_verifier_reviewer_critical_advisory_on_normal_task(tmp_path):
+    from devcouncil.domain.gap import Gap
+    from devcouncil.verification.implementation_reviewer import ReviewOutput
+
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        _rigor_config_yaml(reviewer_required_on_hard=True),
+        encoding="utf-8",
+    )
+    task = _task()
+    task.difficulty = "normal"
+    verifier = Verifier(tmp_path)
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    verifier._run_command = lambda command, task_id="verify": CommandResult(
+        command=command, exit_code=0, stdout_path="", stderr_path="", summary="passed",
+    )
+
+    class _FakeReviewer:
+        async def review_changes(self, task, requirements, diff):
+            return ReviewOutput(
+                is_satisfactory=False,
+                findings=[
+                    Gap(
+                        id="REVIEW-1",
+                        severity="critical",
+                        gap_type="architecture_drift",
+                        task_id=task.id,
+                        description="Critical design mismatch",
+                        recommended_fix="Rework the module boundary",
+                        blocking=False,
+                    )
+                ],
+            )
+
+    verifier.reviewer = _FakeReviewer()
+
+    gaps, _ = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    review = [g for g in gaps if g.gap_type == "architecture_drift" and "Critical design" in g.description]
+    assert review and not review[0].blocking
+    assert "reviewer_required" not in (verifier.last_outcome.rigor_applied or [])
+
+
 def test_assert_free_unplanned_test_file_stays_blocking_orphan(tmp_path):
     """Trivial assert-free unplanned test files must not be demoted to advisory orphans."""
     tests = tmp_path / "tests"
@@ -925,3 +969,19 @@ def test_planner_allowed_command_still_coarse_proves(tmp_path):
 
     assert any(g.gap_type == "coarse_acceptance_proof" for g in gaps)
     assert not any(g.gap_type == "acceptance_criteria_unproven" for g in gaps)
+
+
+def test_run_command_survives_unparseable_shell_syntax(tmp_path):
+    """A model-generated command with unbalanced quotes must surface as a
+    failed-to-RUN CommandResult (repairable via ac_repair_attempts), not raise
+    ValueError and abort the whole verify stage (observed: benchmark tasks
+    stranded in 'planned' on ValueError('No closing quotation'))."""
+    verifier = Verifier(tmp_path)
+
+    result = verifier._run_command('python -c "print(\'unbalanced)', task_id="TASK-001")
+
+    assert result.exit_code == -1
+    assert "Failed to run command" in result.summary
+    # The malformed-command detector must classify it as unrunnable so the
+    # acceptance repair loop can regenerate it.
+    assert verifier._command_is_malformed(result)

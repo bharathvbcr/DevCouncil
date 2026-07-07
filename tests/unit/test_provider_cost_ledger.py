@@ -5,6 +5,7 @@ from devcouncil.llm.provider import OpenRouterProvider, _log_model_call
 
 
 def test_log_model_call_writes_under_project_root(tmp_path, monkeypatch):
+    monkeypatch.delenv("DEVCOUNCIL_LOG_DIR", raising=False)
     other = tmp_path / "elsewhere"
     other.mkdir()
     monkeypatch.chdir(other)  # cwd deliberately different from the project root

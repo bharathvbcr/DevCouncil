@@ -1,7 +1,6 @@
 import asyncio
 import hashlib
 import logging
-import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,6 +26,7 @@ from devcouncil.integrations.github_intent import resolve_goal_intent
 from devcouncil.llm.provider import ProviderRequestError
 from devcouncil.llm.router import StructuredOutputError
 from devcouncil.storage.db import get_db
+from devcouncil.utils.proc import run_git
 from devcouncil.storage.repositories import ArtifactGraphRepository, GapRepository, StateRepository, TaskRepository
 from devcouncil.app.state_machine import ProjectPhase
 from devcouncil.gating.policy import topological_order
@@ -63,10 +63,7 @@ def _is_git_repo(root: Path) -> bool:
     non-git tree would spuriously flag unrelated files as orphan diffs.
     """
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--is-inside-work-tree"],
-            cwd=root, capture_output=True, text=True,
-        )
+        result = run_git(["rev-parse", "--is-inside-work-tree"], cwd=root)
     except Exception:
         return False
     return result.returncode == 0 and result.stdout.strip() == "true"
@@ -165,6 +162,61 @@ def _build_repair_service(root: Path):
         return None
 
 
+def _executor_run_failed(root: Path, task_id: str) -> bool:
+    """True when the latest coding-agent run for ``task_id`` exited non-zero."""
+    from devcouncil.planning.correction_manifest import _latest_agent_run
+
+    run = _latest_agent_run(root, task_id)
+    if not run:
+        return False
+    returncode = run.get("returncode")
+    return returncode is not None and returncode != 0
+
+
+def _executor_run_unavailable(root: Path, task_id: str) -> bool:
+    """True when the agent failed for infra reasons (session/rate limit), not code defects."""
+    from devcouncil.planning.correction_manifest import _latest_agent_run
+
+    run = _latest_agent_run(root, task_id)
+    if not run:
+        return False
+    returncode = run.get("returncode")
+    if returncode in (None, 0):
+        return False
+    parts: list[str] = [str(run.get("status") or "")]
+    for key in ("stderr_preview", "stdout_preview"):
+        val = run.get(key)
+        if isinstance(val, list):
+            parts.extend(str(x) for x in val)
+        elif val:
+            parts.append(str(val))
+    hay = " ".join(parts).lower()
+    return any(
+        needle in hay
+        for needle in (
+            "session limit",
+            "rate limit",
+            "too many requests",
+            "limit_rpm",
+            "429",
+        )
+    )
+
+
+def _reverify_task(root: Path, task_id: str) -> str:
+    """Re-run verification for one task without invoking the coding agent."""
+    db = get_db(root)
+    if not db:
+        return _task_status(root, task_id)
+    try:
+        verify_command._run_verify_body(root, task_id, "local", True, db)
+    except typer.Exit:
+        pass
+    except Exception as exc:  # pragma: no cover - verify should not abort the loop
+        logger.warning("Verify-only pass for %s failed: %s", task_id, exc)
+    return _task_status(root, task_id)
+
+
 def _execute_task_with_repair(
     root: Path,
     task,
@@ -213,6 +265,13 @@ def _execute_task_with_repair(
     status = _task_status(root, task.id)
     logger.info("Initial run of %s finished as %s (max_repairs=%d)", task.id, status, max_repairs)
 
+    if status in {"verified", "done"} and _remediable_incomplete_signature(root, task.id):
+        console.print(
+            f"[dim]{task.id}: re-verifying (incomplete acceptance criteria only)...[/dim]"
+        )
+        status = _reverify_task(root, task.id)
+        logger.info("After initial verify-only pass, %s is %s", task.id, status)
+
     attempt = 0
     last_signature: str | None = None
     while attempt < max_repairs:
@@ -230,13 +289,54 @@ def _execute_task_with_repair(
             # (e.g. the executor failed to start).
             break
         if signature == last_signature:
-            logger.warning("%s: repair made no progress (identical gaps) after attempt %d; stopping loop", task.id, attempt)
-            console.print(
-                f"[yellow]{task.id}: repair made no progress (identical blocking gaps); "
-                "stopping the self-repair loop.[/yellow]"
-            )
-            break
+            if _executor_run_failed(root, task.id):
+                logger.warning(
+                    "%s: identical gaps but the last executor run failed to complete; "
+                    "continuing the repair budget (infra failure is not no-progress)",
+                    task.id,
+                )
+                console.print(
+                    f"[yellow]{task.id}: executor failed on the last repair attempt; "
+                    "retrying while repair budget remains.[/yellow]"
+                )
+            else:
+                logger.warning("%s: repair made no progress (identical gaps) after attempt %d; stopping loop", task.id, attempt)
+                console.print(
+                    f"[yellow]{task.id}: repair made no progress (identical blocking gaps); "
+                    "stopping the self-repair loop.[/yellow]"
+                )
+                break
         last_signature = signature
+
+        incomplete_only = not blocked and bool(signature)
+        if incomplete_only or (_executor_run_unavailable(root, task.id) and not blocked):
+            console.print(
+                f"[dim]{task.id}: verify-only pass before repair "
+                f"(attempt {attempt + 1}/{max_repairs})...[/dim]"
+            )
+            prev_sig = signature
+            status = _reverify_task(root, task.id)
+            blocked = status not in {"verified", "done"}
+            new_sig = (
+                _blocking_gap_signature(root, task.id) if blocked
+                else _remediable_incomplete_signature(root, task.id)
+            )
+            if not new_sig:
+                break
+            if new_sig != prev_sig:
+                last_signature = None
+                continue
+            if _executor_run_unavailable(root, task.id) and incomplete_only:
+                logger.warning(
+                    "%s: executor unavailable and verify-only did not clear incomplete gaps; "
+                    "skipping further executor invocations",
+                    task.id,
+                )
+                console.print(
+                    f"[yellow]{task.id}: executor unavailable; incomplete gaps remain after "
+                    "verify-only.[/yellow]"
+                )
+                break
 
         # Record where history started before the first failed-attempt commit, so the
         # squash collapses exactly this task's intermediate commits and nothing earlier.
@@ -292,6 +392,11 @@ def _execute_task_with_repair(
             f"[yellow]{task.id}: gave up after {attempt} repair attempt(s); still {status}.[/yellow]"
         )
 
+    if _remediable_incomplete_signature(root, task.id):
+        console.print(f"[dim]{task.id}: final verify-only pass for remaining incomplete gaps...[/dim]")
+        status = _reverify_task(root, task.id)
+        logger.info("After final verify-only pass, %s is %s", task.id, status)
+
     # On success, squash the [blocked] attempt commits into one verified commit so the
     # user's history isn't littered with failed attempts. Only do this when the task
     # actually verified — a still-blocked task keeps its attempt commits so the work
@@ -310,10 +415,7 @@ def _execute_task_with_repair(
 def _current_head(root: Path) -> str | None:
     """Resolve the current HEAD commit, or None when there is no commit / no git."""
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=root, capture_output=True, text=True,
-        )
+        result = run_git(["rev-parse", "HEAD"], cwd=root)
     except Exception:
         return None
     if result.returncode != 0:
@@ -343,41 +445,31 @@ def _squash_repair_commits(root: Path, task_id: str, base: str, status: str) -> 
         head = _current_head(root)
         if not head or head == base:
             return False
-        base_ok = subprocess.run(
-            ["git", "rev-parse", "--verify", f"{base}^{{commit}}"],
-            cwd=root, capture_output=True, text=True,
-        )
+        base_ok = run_git(["rev-parse", "--verify", f"{base}^{{commit}}"], cwd=root)
         if base_ok.returncode != 0:
             return False
         # Soft reset keeps the working tree + index exactly as-is; only the branch
         # pointer moves back to base, so the next commit captures the whole task.
-        reset = subprocess.run(
-            ["git", "reset", "--soft", base],
-            cwd=root, capture_output=True, text=True,
-        )
+        reset = run_git(["reset", "--soft", base], cwd=root)
         if reset.returncode != 0:
             return False
         # Stage the FINAL (verified) attempt's still-uncommitted changes too, so they land
         # in this single squash commit. Without this they'd be committed separately by the
         # caller afterward, producing two commits for what the message calls "one verified
         # commit" (and leaving the squash to capture only the [blocked] diffs).
-        add = subprocess.run(
-            ["git", "add", "-A"],
-            cwd=root, capture_output=True, text=True,
-        )
+        add = run_git(["add", "-A"], cwd=root)
         if add.returncode != 0:
             return False
         # Re-commit the squashed tree. There may be nothing staged if every attempt's
         # changes cancelled out (unlikely for a verified task) — tolerate that.
-        commit = subprocess.run(
+        commit = run_git(
             [
-                "git",
                 "-c", "user.name=DevCouncil",
                 "-c", "user.email=devcouncil@local",
                 "commit", "--no-verify", "--allow-empty",
                 "-m", f"devcouncil(e2e): {task_id} [{status}]",
             ],
-            cwd=root, capture_output=True, text=True,
+            cwd=root,
         )
         return commit.returncode == 0
     except Exception:
@@ -394,22 +486,18 @@ def _commit_task_changes(root: Path, task_id: str, status: str) -> bool:
     and can be squashed or reset afterwards. Returns True if a commit was made.
     """
     try:
-        status_out = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=root, capture_output=True, text=True,
-        )
+        status_out = run_git(["status", "--porcelain"], cwd=root)
         if status_out.returncode != 0 or not status_out.stdout.strip():
             return False
-        subprocess.run(["git", "add", "-A"], cwd=root, check=True, capture_output=True)
-        commit = subprocess.run(
+        run_git(["add", "-A"], cwd=root, check=True)
+        commit = run_git(
             [
-                "git",
                 "-c", "user.name=DevCouncil",
                 "-c", "user.email=devcouncil@local",
                 "commit", "--no-verify",
                 "-m", f"devcouncil(e2e): {task_id} [{status}]",
             ],
-            cwd=root, capture_output=True, text=True,
+            cwd=root,
         )
         return commit.returncode == 0
     except Exception:
@@ -765,6 +853,8 @@ def go(
         github=False,
         github_pr_comment=False,
         gitlab_pr_comment=False,
+        evidence_json=None,
+        fail_on_blocking=False,
         project_root=root,
     )
     if report_file is not None:

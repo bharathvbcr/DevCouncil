@@ -35,6 +35,34 @@ class VerificationSandbox:
         raise NotImplementedError
 
 
+def _command_timeout(config: DevCouncilConfig) -> float:
+    """Per-command ceiling for sandboxed verification commands.
+
+    Reuses ``execution.command_timeout`` (same knob the task runner applies to
+    the commands it executes) so one config value bounds both surfaces."""
+    try:
+        return float(config.execution.command_timeout)
+    except Exception:
+        return 300.0
+
+
+def _run_sandboxed(argv: list[str], *, cwd: Path | None = None, timeout: float) -> subprocess.CompletedProcess:
+    """subprocess.run with capture + timeout; a timeout surfaces as returncode 124
+    (consistent with utils.proc.run_git) so callers' exit-code checks fail loudly
+    instead of the sandbox hanging verification forever."""
+    try:
+        return subprocess.run(
+            argv,
+            cwd=str(cwd) if cwd is not None else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("Sandbox command timed out after %.0fs: %s", timeout, " ".join(argv))
+        return subprocess.CompletedProcess(argv, returncode=124, stdout="", stderr=f"timed out after {timeout}s")
+
+
 def _save_run(
     project_root: Path,
     task: Task,
@@ -91,11 +119,11 @@ class DockerSandbox(VerificationSandbox):
         image = self.config.verification.sandbox.docker_image
         setup = self.config.verification.sandbox.docker_setup_commands
         results: list[dict] = []
+        timeout = _command_timeout(self.config)
         for setup_cmd in setup:
-            proc = subprocess.run(
+            proc = _run_sandboxed(
                 ["docker", "run", "--rm", "-v", f"{self.project_root}:/work", "-w", "/work", image, "sh", "-c", setup_cmd],
-                capture_output=True,
-                text=True,
+                timeout=timeout,
             )
             results.append({"command": setup_cmd, "exit_code": proc.returncode})
             if proc.returncode != 0:
@@ -103,10 +131,9 @@ class DockerSandbox(VerificationSandbox):
                 _save_run(self.project_root, task, "docker", result.environment, result.commands, result.status)
                 return result
         for cmd in commands:
-            proc = subprocess.run(
+            proc = _run_sandboxed(
                 ["docker", "run", "--rm", "-v", f"{self.project_root}:/work", "-w", "/work", image, "sh", "-c", cmd],
-                capture_output=True,
-                text=True,
+                timeout=timeout,
             )
             results.append({"command": cmd, "exit_code": proc.returncode})
             if proc.returncode != 0:
@@ -135,12 +162,12 @@ class NixSandbox(VerificationSandbox):
             return result
         attr = self.config.verification.sandbox.nix_flake_attr or "devShells.default"
         results: list[dict] = []
+        timeout = _command_timeout(self.config)
         for cmd in commands:
-            proc = subprocess.run(
+            proc = _run_sandboxed(
                 ["nix", "develop", f".#{attr}", "-c", "sh", "-c", cmd],
                 cwd=self.project_root,
-                capture_output=True,
-                text=True,
+                timeout=timeout,
             )
             results.append({"command": cmd, "exit_code": proc.returncode})
             if proc.returncode != 0:
@@ -162,9 +189,9 @@ def _environment_metadata(project_root: Path) -> dict[str, str]:
         "platform": platform.platform(),
     }
     try:
-        uv = subprocess.check_output(["uv", "--version"], text=True).strip()
+        uv = subprocess.check_output(["uv", "--version"], text=True, timeout=10).strip()
         env["uv"] = uv
-    except (FileNotFoundError, subprocess.CalledProcessError, OSError):
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
         pass
     lock = project_root / "uv.lock"
     if lock.exists():

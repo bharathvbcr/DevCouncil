@@ -1,6 +1,7 @@
 from sqlmodel import Session, col, delete, select
 from typing import List, Optional, Any
 import json
+from devcouncil.utils.json_persist import dump_json
 from devcouncil.storage.models import (
     RequirementModel,
     AssumptionModel,
@@ -45,7 +46,7 @@ class RequirementRepository:
             description=req.description,
             priority=req.priority,
             source=req.source,
-            acceptance_criteria_json=json.dumps([ac.model_dump() for ac in req.acceptance_criteria])
+            acceptance_criteria_json=dump_json([ac.model_dump() for ac in req.acceptance_criteria])
         )
         self.session.merge(model)
         self.session.commit()
@@ -80,7 +81,7 @@ class AssumptionRepository:
             impact=assumption.impact,
             reversible=assumption.reversible,
             requires_user_confirmation=assumption.requires_user_confirmation,
-            linked_requirement_ids_json=json.dumps(assumption.linked_requirement_ids),
+            linked_requirement_ids_json=dump_json(assumption.linked_requirement_ids),
             status=assumption.status,
         )
         self.session.merge(model)
@@ -114,6 +115,7 @@ class TaskRepository:
             ),
             "forbidden_changes": json.loads(m.forbidden_changes_json),
             "difficulty": getattr(m, "difficulty", None),
+            "priority": getattr(m, "priority", None),
             "status": m.status,
         })
 
@@ -140,6 +142,7 @@ class TaskRepository:
                 ),
                 "forbidden_changes": json.loads(m.forbidden_changes_json),
                 "difficulty": getattr(m, "difficulty", None),
+                "priority": getattr(m, "priority", None),
                 "status": m.status,
             }))
         return results
@@ -149,15 +152,16 @@ class TaskRepository:
             id=task.id,
             title=task.title,
             description=task.description,
-            requirement_ids_json=json.dumps(task.requirement_ids),
-            acceptance_criterion_ids_json=json.dumps(task.acceptance_criterion_ids),
-            planned_files_json=json.dumps([pf.model_dump() for pf in task.planned_files]),
-            expected_tests_json=json.dumps(task.expected_tests),
-            agent_appended_expected_tests_json=json.dumps(task.agent_appended_expected_tests),
-            allowed_commands_json=json.dumps(task.allowed_commands),
-            agent_appended_allowed_commands_json=json.dumps(task.agent_appended_allowed_commands),
-            forbidden_changes_json=json.dumps(task.forbidden_changes),
+            requirement_ids_json=dump_json(task.requirement_ids),
+            acceptance_criterion_ids_json=dump_json(task.acceptance_criterion_ids),
+            planned_files_json=dump_json([pf.model_dump() for pf in task.planned_files]),
+            expected_tests_json=dump_json(task.expected_tests),
+            agent_appended_expected_tests_json=dump_json(task.agent_appended_expected_tests),
+            allowed_commands_json=dump_json(task.allowed_commands),
+            agent_appended_allowed_commands_json=dump_json(task.agent_appended_allowed_commands),
+            forbidden_changes_json=dump_json(task.forbidden_changes),
             difficulty=task.difficulty,
+            priority=task.priority,
             status=task.status
         )
         self.session.merge(model)
@@ -213,7 +217,7 @@ class GapRepository:
             requirement_id=gap.requirement_id,
             task_id=gap.task_id,
             description=gap.description,
-            evidence_json=json.dumps(gap.evidence),
+            evidence_json=dump_json(gap.evidence),
             recommended_fix=gap.recommended_fix,
             blocking=gap.blocking,
             file=gap.file,
@@ -377,7 +381,7 @@ class PlanningStateRepository:
                 description=req.description,
                 priority=req.priority,
                 source=req.source,
-                acceptance_criteria_json=json.dumps([ac.model_dump() for ac in req.acceptance_criteria]),
+                acceptance_criteria_json=dump_json([ac.model_dump() for ac in req.acceptance_criteria]),
             ))
 
         for assumption in assumptions:
@@ -388,7 +392,7 @@ class PlanningStateRepository:
                 impact=assumption.impact,
                 reversible=assumption.reversible,
                 requires_user_confirmation=assumption.requires_user_confirmation,
-                linked_requirement_ids_json=json.dumps(assumption.linked_requirement_ids),
+                linked_requirement_ids_json=dump_json(assumption.linked_requirement_ids),
                 status=assumption.status,
             ))
 
@@ -397,14 +401,14 @@ class PlanningStateRepository:
                 id=task.id,
                 title=task.title,
                 description=task.description,
-                requirement_ids_json=json.dumps(task.requirement_ids),
-                acceptance_criterion_ids_json=json.dumps(task.acceptance_criterion_ids),
-                planned_files_json=json.dumps([pf.model_dump() for pf in task.planned_files]),
-                expected_tests_json=json.dumps(task.expected_tests),
-                agent_appended_expected_tests_json=json.dumps(task.agent_appended_expected_tests),
-                allowed_commands_json=json.dumps(task.allowed_commands),
-                agent_appended_allowed_commands_json=json.dumps(task.agent_appended_allowed_commands),
-                forbidden_changes_json=json.dumps(task.forbidden_changes),
+                requirement_ids_json=dump_json(task.requirement_ids),
+                acceptance_criterion_ids_json=dump_json(task.acceptance_criterion_ids),
+                planned_files_json=dump_json([pf.model_dump() for pf in task.planned_files]),
+                expected_tests_json=dump_json(task.expected_tests),
+                agent_appended_expected_tests_json=dump_json(task.agent_appended_expected_tests),
+                allowed_commands_json=dump_json(task.allowed_commands),
+                agent_appended_allowed_commands_json=dump_json(task.agent_appended_allowed_commands),
+                forbidden_changes_json=dump_json(task.forbidden_changes),
                 difficulty=task.difficulty,
                 status=task.status,
             ))
@@ -475,7 +479,7 @@ class StateRepository:
             state = ProjectStateModel(
                 id="singleton",
                 current_phase=state,
-                history_json=json.dumps(history or []),
+                history_json=dump_json(history or []),
             )
         self.session.merge(state)
         self.session.commit()

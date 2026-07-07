@@ -50,7 +50,7 @@ class NativeAgent(Executor):
             project_root=root,
             task_id=task.id,
         )
-        result = asyncio.run(self._run_task_async(task, requirements))
+        result = self._run_coroutine_from_sync(self._run_task_async(task, requirements))
         log_step(
             f"executor/native: finished task {task.id}",
             project_root=root,
@@ -58,6 +58,23 @@ class NativeAgent(Executor):
             success=result.success,
         )
         return result
+
+    @staticmethod
+    def _run_coroutine_from_sync(coro):
+        """Run async work from sync code without breaking nested event loops.
+
+        ``asyncio.run()`` fails when a loop is already running (pytest-asyncio,
+        Jupyter). With no running loop we use ``asyncio.run()``; otherwise we run
+        the coroutine on a fresh loop in a worker thread.
+        """
+        import concurrent.futures
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            return executor.submit(asyncio.run, coro).result()
 
     async def _run_task_async(self, task: Task, requirements: List[Requirement]) -> ExecutionResult:
         logger.info("Native agent starting for %s (max_steps=%d)", task.id, MAX_AGENT_STEPS)

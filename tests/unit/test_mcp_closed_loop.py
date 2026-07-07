@@ -8,6 +8,7 @@ or DB outside DevCouncil's gated tools.
 
 import json
 import subprocess
+import sys
 
 import pytest
 
@@ -36,6 +37,7 @@ def _setup(tmp_path):
 
     dev = tmp_path / ".devcouncil"
     dev.mkdir()
+    (dev / "config.yaml").write_text("project:\n  name: test\n", encoding="utf-8")
     db = Database(dev / "state.sqlite")
     db.create_db_and_tables()
     with db.get_session() as session:
@@ -51,7 +53,7 @@ def _setup(tmp_path):
             # rejects trivia like `python --version` from coarse-proving a behavioral AC
             # (the agent self-certification guard), so the pass-after-write leg must
             # actually exercise the written code.
-            expected_tests=['python -c "from src.a import VALUE; assert VALUE == 1"'],
+            expected_tests=[f'{sys.executable} -c "exec(open(\\"src/a.py\\").read()); assert VALUE == 1"'],
         ))
     return db
 
@@ -96,5 +98,77 @@ async def test_full_mcp_loop_blocks_without_work_then_passes_after_write(tmp_pat
     # 5. Provenance records the gated write; release frees the lease.
     prov = await _call("devcouncil_get_task_provenance", {"task_id": "TASK-001"})
     assert any(fc["path"] == "src/a.py" and fc["allowed"] for fc in prov["file_changes"])
+    rel = await _call("devcouncil_release_task", {"task_id": "TASK-001", "lease_token": token})
+    assert rel["ok"] and rel["released"] is True
+
+
+@pytest.mark.anyio
+async def test_hero_loop_repair_after_failing_evidence(tmp_path, monkeypatch):
+    """checkout -> write (wrong) -> verify (blocked) -> repair -> verify (pass) -> release."""
+    _setup(tmp_path)
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+
+    checkout = await _call("devcouncil_checkout_task", {"task_id": "TASK-001", "client_id": "repair-agent"})
+    token = checkout["lease_token"]
+
+    wrong = await _call("devcouncil_write_file", {
+        "task_id": "TASK-001", "lease_token": token, "path": "src/a.py", "content": "VALUE = 0\n",
+    })
+    assert wrong["ok"]
+
+    v_fail = await _call("devcouncil_verify_task", {"task_id": "TASK-001", "lease_token": token})
+    assert v_fail["passed"] is False
+    assert v_fail["diff_empty"] is False
+
+    na = await _call("devcouncil_get_next_actions", {"task_id": "TASK-001"})
+    assert na["next_actions"]
+
+    fix = await _call("devcouncil_write_file", {
+        "task_id": "TASK-001", "lease_token": token, "path": "src/a.py", "content": "VALUE = 1\n",
+    })
+    assert fix["ok"]
+
+    v_pass = await _call("devcouncil_verify_task", {"task_id": "TASK-001", "lease_token": token})
+    assert v_pass["passed"] is True
+
+    rel = await _call("devcouncil_release_task", {"task_id": "TASK-001", "lease_token": token})
+    assert rel["ok"] and rel["released"] is True
+
+
+@pytest.mark.anyio
+async def test_hero_loop_rollback_after_passing_verify(tmp_path, monkeypatch):
+    """checkout -> write -> verify (pass) -> rollback -> verify (blocked) -> release."""
+    from devcouncil.execution.checkpoints import CheckpointService
+
+    _setup(tmp_path)
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+
+    checkpoints = CheckpointService(tmp_path)
+    before = checkpoints.create_before("TASK-001")
+    assert before.git_ref_created or "created" in before.message.lower()
+
+    checkout = await _call("devcouncil_checkout_task", {"task_id": "TASK-001", "client_id": "rollback-agent"})
+    token = checkout["lease_token"]
+
+    write = await _call("devcouncil_write_file", {
+        "task_id": "TASK-001", "lease_token": token, "path": "src/a.py", "content": "VALUE = 1\n",
+    })
+    assert write["ok"]
+
+    v_pass = await _call("devcouncil_verify_task", {"task_id": "TASK-001", "lease_token": token})
+    assert v_pass["passed"] is True
+    assert (tmp_path / "src" / "a.py").read_text() == "VALUE = 1\n"
+
+    after = checkpoints.create_after("TASK-001")
+    assert after.git_ref_created or after.patch_path
+
+    rollback = checkpoints.rollback("TASK-001")
+    assert "Rolled back" in rollback.message or rollback.git_ref_created or rollback.patch_path
+    assert not (tmp_path / "src" / "a.py").exists()
+
+    v_blocked = await _call("devcouncil_verify_task", {"task_id": "TASK-001", "lease_token": token})
+    assert v_blocked["passed"] is False
+    assert v_blocked["diff_empty"] is True
+
     rel = await _call("devcouncil_release_task", {"task_id": "TASK-001", "lease_token": token})
     assert rel["ok"] and rel["released"] is True

@@ -3,14 +3,23 @@ cost attribution."""
 
 import json
 
+import pytest
 from typer.testing import CliRunner
 
 from devcouncil.cli.main import app
 from devcouncil.llm.provider import _log_model_call
-from devcouncil.telemetry.cost import UNATTRIBUTED, group_cost, read_cost_records
+from devcouncil.telemetry.cost import UNATTRIBUTED, _model_calls_file, group_cost, read_cost_records
 from devcouncil.telemetry.traces import TraceLogger, read_trace_events_since
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_cost_ledger(tmp_path, monkeypatch):
+    """Each test gets its own model_calls ledger (session DEVCOUNCIL_LOG_DIR is shared)."""
+    log_dir = tmp_path / ".devcouncil" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("DEVCOUNCIL_LOG_DIR", str(log_dir))
 
 
 # --------------------------------------------------------------------------- #
@@ -153,7 +162,7 @@ def test_group_cost_aggregates_by_task_and_run(tmp_path):
 
 
 def test_group_cost_handles_legacy_records_without_fields(tmp_path):
-    log_file = tmp_path / ".devcouncil" / "logs" / "model_calls.jsonl"
+    log_file = _model_calls_file(tmp_path)
     log_file.parent.mkdir(parents=True, exist_ok=True)
     # Old-style record with no task_id/run_id/timestamp keys at all.
     log_file.write_text(
@@ -174,9 +183,9 @@ def test_cost_show_command_json(tmp_path):
     _log(tmp_path, model="m", prompt=1000, completion=0, task_id="T1", run_id="R1")
 
     # A single-command Typer app exposes that command directly (no subcommand name).
-    result = runner.invoke(cost_app, ["--json", "--project-root", str(tmp_path)])
+    result = runner.invoke(cost_app, ["show", "--json", "--project-root", str(tmp_path)])
     assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["by_task"]["T1"]["calls"] == 1
     assert payload["by_run"]["R1"]["calls"] == 1
 

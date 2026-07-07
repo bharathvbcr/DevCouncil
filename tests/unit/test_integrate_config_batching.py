@@ -1,4 +1,5 @@
 from devcouncil.cli.commands import integrate
+from devcouncil.integrations.clients import common
 from devcouncil.cli.commands.init import initialize_project
 
 
@@ -6,13 +7,13 @@ def test_record_configs_inside_batch_save_yaml_once(tmp_path, monkeypatch):
     initialize_project(tmp_path, quiet=True)
 
     saves: list[int] = []
-    real_save = integrate._save_raw_config
+    real_save = common._save_raw_config
 
     def counting_save(project_root, config):
         saves.append(1)
         real_save(project_root, config)
 
-    monkeypatch.setattr(integrate, "_save_raw_config", counting_save)
+    monkeypatch.setattr(common, "_save_raw_config", counting_save)
 
     with integrate._batched_raw_config(tmp_path):
         integrate._record_cursor_config(tmp_path)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import subprocess
@@ -12,6 +11,10 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+from devcouncil.domain.checkpoint_refs import REF_BEFORE_TEMPLATE
+from devcouncil.utils.fsio import atomic_write_text
+from devcouncil.utils.proc import GIT_TIMEOUT
+from devcouncil.utils.json_persist import write_json
 from devcouncil.verification.verifier import Verifier
 
 logger = logging.getLogger(__name__)
@@ -27,7 +30,9 @@ class CheckpointResult(BaseModel):
 
 
 class CheckpointService:
-    REF_BEFORE = "refs/devcouncil/tasks/{task_id}/before"
+    # The before-ref layout lives in devcouncil.domain.checkpoint_refs because the
+    # Verifier reads it too; kept as a class attr for compat with .format() callers.
+    REF_BEFORE = REF_BEFORE_TEMPLATE
     REF_AFTER = "refs/devcouncil/tasks/{task_id}/after"
     REF_ATTEMPT = "refs/devcouncil/tasks/{task_id}/attempts/{attempt}"
 
@@ -60,6 +65,7 @@ class CheckpointService:
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    timeout=GIT_TIMEOUT,
                 )
                 if diff.strip():
                     subprocess.run(
@@ -68,6 +74,7 @@ class CheckpointService:
                         input=diff,
                         text=True,
                         check=True,
+                        timeout=GIT_TIMEOUT,
                     )
                     return CheckpointResult(
                         task_id=task_id,
@@ -75,7 +82,7 @@ class CheckpointService:
                         git_ref_created=True,
                         message="Rolled back using git refs.",
                     )
-            except subprocess.CalledProcessError as exc:
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
                 return CheckpointResult(
                     task_id=task_id,
                     message=f"Git ref rollback failed: {exc}",
@@ -86,13 +93,14 @@ class CheckpointService:
                 subprocess.check_call(
                     ["git", "apply", "-R", str(after_patch)],
                     cwd=self.project_root,
+                    timeout=GIT_TIMEOUT,
                 )
                 return CheckpointResult(
                     task_id=task_id,
                     patch_path=str(after_patch),
                     message="Rolled back using after patch.",
                 )
-            except subprocess.CalledProcessError as exc:
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
                 return CheckpointResult(
                     task_id=task_id,
                     patch_path=str(after_patch),
@@ -145,7 +153,7 @@ class CheckpointService:
         try:
             diff = verifier.get_diff()
             if diff:
-                patch_path.write_text(diff, encoding="utf-8")
+                atomic_write_text(patch_path, diff)
         except Exception as exc:
             # Without a patch (and if the ref also failed) rollback is impossible —
             # never let this fail silently.
@@ -157,7 +165,7 @@ class CheckpointService:
                 "changed_files": verifier.get_changed_files(),
             }
             snapshot_path = self.checkpoint_dir / f"{task_id}-before.json"
-            snapshot_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+            write_json(snapshot_path, snapshot)
             json_path = str(snapshot_path)
 
         # Routine bookkeeping (fires before+after every task and repair attempt) — DEBUG
@@ -188,15 +196,17 @@ class CheckpointService:
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    timeout=GIT_TIMEOUT,
                 ).strip()
             if not target:
                 return False
             subprocess.check_call(
                 ["git", "update-ref", ref, target],
                 cwd=self.project_root,
+                timeout=GIT_TIMEOUT,
             )
             return True
-        except (subprocess.CalledProcessError, FileNotFoundError):
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
             return False
 
     def _snapshot_commit(self) -> str | None:
@@ -218,14 +228,18 @@ class CheckpointService:
             subprocess.run(
                 ["git", "read-tree", "HEAD"],
                 cwd=self.project_root, env=env, check=True, capture_output=True, text=True,
+                timeout=GIT_TIMEOUT,
             )
+            # Staging the full tree scales with repo size — give it extra room.
             subprocess.run(
                 ["git", "add", "-A", "--", ".", ":(exclude).devcouncil"],
                 cwd=self.project_root, env=env, check=True, capture_output=True, text=True,
+                timeout=GIT_TIMEOUT * 2,
             )
             tree = subprocess.check_output(
                 ["git", "write-tree"],
                 cwd=self.project_root, env=env, text=True, encoding="utf-8", errors="replace",
+                timeout=GIT_TIMEOUT,
             ).strip()
             if not tree:
                 return None
@@ -233,9 +247,10 @@ class CheckpointService:
                 ["git", "-c", "user.name=DevCouncil", "-c", "user.email=devcouncil@local",
                  "commit-tree", tree, "-p", "HEAD", "-m", "devcouncil checkpoint"],
                 cwd=self.project_root, text=True, encoding="utf-8", errors="replace",
+                timeout=GIT_TIMEOUT,
             ).strip()
             return commit or None
-        except (subprocess.CalledProcessError, FileNotFoundError):
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
             return None
         finally:
             try:
@@ -250,7 +265,8 @@ class CheckpointService:
                 cwd=self.project_root,
                 stderr=subprocess.DEVNULL,
                 text=True,
+                timeout=GIT_TIMEOUT,
             )
             return True
-        except (subprocess.CalledProcessError, FileNotFoundError):
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
             return False

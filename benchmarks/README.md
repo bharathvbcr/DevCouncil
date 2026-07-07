@@ -57,16 +57,32 @@ export OPENROUTER_API_KEY=sk-or-...           # for DevCouncil planning (arm B)
 python benchmarks/run_bench.py \
     --arms A,B \
     --tasks all \
-    --model nvidia/nemotron-3-ultra-550b-a55b:free \  # free OpenRouter planner
+    --model z-ai/glm-5.2 \                      # OpenRouter planner
     --executor claude \                         # Claude Code
     --out benchmarks/results
 ```
 
-Defaults for arm B (OpenRouter planner + OpenRouter Nemotron monitor + Claude executor):
-- `--model nvidia/nemotron-3-ultra-550b-a55b:free` — free OpenRouter planner for all council roles.
+Defaults for arm B (OpenRouter planner + OpenRouter monitor + Claude executor):
+- `--model z-ai/glm-5.2` — OpenRouter planner for all council roles.
 - `--dc-timeout 2400` — generous e2e budget for planning + monitoring API calls.
-- `--monitor-model nvidia/nemotron-3-ultra-550b-a55b:free` with `--monitor-provider openrouter`
+- `--monitor-model z-ai/glm-5.2` with `--monitor-provider openrouter`
   (pass `--monitor-model ''` to skip per-role monitor routing).
+- `OPENROUTER_RPM=15` (unless set) — client-side request pacing so a run stays
+  under common ~20 RPM endpoint caps instead of tripping 429s mid-run; 429s that
+  still occur get their own retry budget (`DEVCOUNCIL_RATE_LIMIT_RETRIES`, default 8).
+- Executor infra failures (agent session/usage limits, exhausted credits, the
+  executor failing to launch) classify as `verdict=error`: retried on a fresh
+  workspace, and excluded from means/calibration — they measure the
+  infrastructure, not DevCouncil. Session/usage-limit errors are NOT retried
+  (an immediate retry fails identically after burning full planning cost).
+- Executor preflight & halt (`--executor-preflight`, on by default): one trivial
+  agent call before the sweep catches a session-limited/logged-out executor up
+  front; a mid-sweep executor infra failure re-probes the agent and halts the
+  sweep (results so far are kept, `"halted"` reason recorded in the JSON) if it
+  is still down. Disable with `--no-executor-preflight`.
+- A 429 response pushes a cooldown shared by ALL in-flight OpenRouter calls
+  (honoring `Retry-After`), so concurrent acceptance-check fan-out backs off
+  together instead of each call slamming the same exhausted window.
 - `--ac-samples 1` — single check per criterion (no per-criterion flag).
 - Loads `OPENROUTER_API_KEY` from `.devcouncil/secrets.env` when the env var is unset.
 - When `--monitor-provider ollama`, sets `OLLAMA_THINK=false` and `OLLAMA_TIMEOUT=900` unless

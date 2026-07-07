@@ -22,6 +22,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from devcouncil.knowledge.frontmatter import build_frontmatter_markdown, split_frontmatter
+from devcouncil.utils.fsio import atomic_write_text
 
 # Markdown inline links: [text](target). We only resolve relative, non-anchor, non-URL
 # targets into intra-bundle edges; external resources live in the `resource` field.
@@ -179,7 +180,7 @@ def write_bundle(bundle: OKFBundle, bundle_dir: Path) -> list[Path]:
             continue
         target = bundle_dir / doc.rel_path
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(doc.to_markdown(), encoding="utf-8")
+        atomic_write_text(target, doc.to_markdown())
         written.append(target)
     return written
 

@@ -8,13 +8,22 @@ instead.
 
 import json
 
-from devcouncil.telemetry.cost import group_cost
+import pytest
+
+from devcouncil.telemetry.cost import _model_calls_file, group_cost
+
+
+@pytest.fixture(autouse=True)
+def _isolated_cost_ledger(tmp_path, monkeypatch):
+    log_dir = tmp_path / ".devcouncil" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("DEVCOUNCIL_LOG_DIR", str(log_dir))
 
 
 def _write_ledger(root, records):
-    logs = root / ".devcouncil" / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
-    (logs / "model_calls.jsonl").write_text(
+    log_file = _model_calls_file(root)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text(
         "\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8"
     )
 

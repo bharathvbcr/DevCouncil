@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from rich.console import Console
+
+from devcouncil.utils.fsio import atomic_write_text
+from devcouncil.utils.json_persist import write_json
 
 if TYPE_CHECKING:
     from devcouncil.indexing.graph_index import GraphIndex
@@ -30,7 +34,10 @@ def _agent_guide_text() -> str:
             "Important surfaces:",
             "1. `src/devcouncil/cli/main.py` for CLI composition.",
             "2. `src/devcouncil/app/orchestrator.py` and `src/devcouncil/app/state_machine.py` for lifecycle control.",
-            "3. `src/devcouncil/artifacts/graph.py` and `src/devcouncil/storage/repositories.py` for persistence and evidence.",
+            (
+                "3. `src/devcouncil/artifacts/graph.py` and "
+                "`src/devcouncil/storage/repositories.py` for persistence and evidence."
+            ),
             "4. `src/devcouncil/execution/` and `src/devcouncil/executors/` for task execution.",
             "5. `src/devcouncil/verification/` and `src/devcouncil/gating/` for verification and policy gates.",
             "",
@@ -50,21 +57,37 @@ class GitNexusIntegration:
         nexus_dir = self.project_root / ".devcouncil" / "nexus"
         nexus_dir.mkdir(exist_ok=True)
         # Mock initialization logic
-        (nexus_dir / "index_config.json").write_text('{"mode": "structural", "version": "1.0"}')
+        atomic_write_text(nexus_dir / "index_config.json", '{"mode": "structural", "version": "1.0"}')
         for filename in ("AGENTS.md", "CLAUDE.md"):
             path = self.project_root / filename
             if path.exists():
                 existing = path.read_text(encoding="utf-8")
                 if AGENT_GUIDE_MARKER not in existing:
                     continue
-            path.write_text(_agent_guide_text() + "\n", encoding="utf-8")
+            atomic_write_text(path, _agent_guide_text() + "\n")
         console.print("  - GitNexus structural awareness active.")
 
     def sync_graph(self, graph_index: GraphIndex):
-        """
-        Export DevCouncil artifact graph to GitNexus.
-        """
-        # TODO: Consume graph_index to export the artifact graph. This is still a stub;
-        # the GraphIndex is intentionally not loaded/instantiated yet to avoid dead work.
-        # The import is kept under TYPE_CHECKING so module import does no eager work.
+        """Export DevCouncil artifact graph nodes/edges to GitNexus storage."""
         console.print("  - Syncing DevCouncil artifacts to GitNexus...")
+        nexus_dir = self.project_root / ".devcouncil" / "nexus"
+        nexus_dir.mkdir(parents=True, exist_ok=True)
+
+        nodes = [
+            {"id": node.id, "type": node.type, "metadata": node.metadata}
+            for node in graph_index.graph.nodes
+        ]
+        edges = [
+            {"source": edge.source, "target": edge.target, "relation": edge.relation}
+            for edge in graph_index.graph.edges
+        ]
+        payload = {
+            "exported_at": datetime.now(UTC).isoformat(),
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "nodes": nodes,
+            "edges": edges,
+        }
+        out_path = nexus_dir / "artifact_graph.json"
+        write_json(out_path, payload)
+        console.print(f"  - Wrote {len(nodes)} node(s) and {len(edges)} edge(s) to {out_path.name}.")

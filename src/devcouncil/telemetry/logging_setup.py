@@ -37,6 +37,27 @@ _CONSOLE_HANDLER_TAG = "devcouncil.console"
 _LOG_FORMAT = "%(asctime)s %(levelname)-7s [%(name)s] %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
+# Last (console_level, log_path) we announced, so repeat configure_logging()
+# calls in the same process don't spam identical "Logging configured" lines
+# into the DEBUG file (observed: ~16% of a real log was this one line).
+_last_announced_config: Optional[tuple] = None
+
+# Messages already emitted via warn_once() in this process.
+_warned_once: set = set()
+
+
+def warn_once(target_logger: logging.Logger, message: str) -> None:
+    """Emit ``message`` at WARNING at most once per process.
+
+    For per-task/per-call code paths that detect a PROCESS-level condition (e.g.
+    a risky config value): the first occurrence is signal, the 20th identical
+    line in one run is log spam that buries real warnings.
+    """
+    if message in _warned_once:
+        return
+    _warned_once.add(message)
+    target_logger.warning(message)
+
 # Default file location (relative to a project root) for the durable run log.
 LOG_RELATIVE_PATH = Path(".devcouncil") / "logs" / "devcouncil.log"
 
@@ -63,6 +84,21 @@ def _resolve_console_level(verbosity: int, quiet: bool, log_level: Optional[str]
         if isinstance(resolved, int):
             return resolved
     return _level_from_verbosity(verbosity, quiet)
+
+
+def _resolve_log_path(project_root: Optional[Path]) -> Path:
+    """Resolve the shared DEBUG log file location.
+
+    ``DEVCOUNCIL_LOG_DIR`` overrides everything — used by the test suite so
+    fixture noise (fake tasks, deliberate failures) never lands in a real
+    project's ``.devcouncil/logs/devcouncil.log``, and available to anyone who
+    wants logs outside the repo (CI, read-only checkouts).
+    """
+    override = os.environ.get("DEVCOUNCIL_LOG_DIR")
+    if override:
+        return Path(override) / "devcouncil.log"
+    base = Path(project_root) if project_root is not None else Path.cwd()
+    return base / LOG_RELATIVE_PATH
 
 
 def _find_tagged_handler(logger: logging.Logger, tag: str) -> Optional[logging.Handler]:
@@ -135,8 +171,7 @@ def configure_logging(
     # --- Rotating file handler (always DEBUG) -------------------------------
     log_path: Optional[Path] = None
     if _find_tagged_handler(root, _FILE_HANDLER_TAG) is None:
-        base = Path(project_root) if project_root is not None else Path.cwd()
-        log_path = base / LOG_RELATIVE_PATH
+        log_path = _resolve_log_path(project_root)
         try:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             file_handler = RotatingFileHandler(
@@ -154,8 +189,7 @@ def configure_logging(
             # than crashing the command the user actually asked for.
             log_path = None
     else:
-        base = Path(project_root) if project_root is not None else Path.cwd()
-        log_path = base / LOG_RELATIVE_PATH
+        log_path = _resolve_log_path(project_root)
 
     # Quieten chatty third-party loggers on the console; the file still gets them.
     for noisy in ("httpx", "httpcore", "urllib3", "asyncio"):
@@ -163,11 +197,15 @@ def configure_logging(
 
     _install_excepthook()
 
-    logging.getLogger(__name__).debug(
-        "Logging configured (console=%s, file=%s)",
-        logging.getLevelName(console_level),
-        log_path,
-    )
+    global _last_announced_config
+    config = (console_level, str(log_path))
+    if config != _last_announced_config:
+        _last_announced_config = config
+        logging.getLogger(__name__).debug(
+            "Logging configured (console=%s, file=%s)",
+            logging.getLevelName(console_level),
+            log_path,
+        )
     return log_path
 
 
@@ -208,7 +246,7 @@ def set_log_dir(project_root: Path) -> Optional[Path]:
     is a cheap no-op. Returns the (re)resolved log path, or ``None`` if it could not be
     created (logging then stays on the previous handler / console).
     """
-    target = Path(project_root) / LOG_RELATIVE_PATH
+    target = _resolve_log_path(project_root)
     root = logging.getLogger()
     existing = _find_tagged_handler(root, _FILE_HANDLER_TAG)
     if existing is not None:

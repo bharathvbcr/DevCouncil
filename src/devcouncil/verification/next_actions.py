@@ -43,6 +43,7 @@ _CATEGORY_BY_GAP_TYPE = {
     "stub_detected": "fix_code",
     "stub_declared": "review",
     "suspicious_effort": "review",
+    "coarse_acceptance_proof": "add_test",
 }
 
 
@@ -122,6 +123,12 @@ def _action_text(gap: Gap, file: Optional[str]) -> str:
         return (
             "The diff looks too small or superficial for the planned scope. Complete the "
             "planned work (or restore removed tests), then re-verify."
+        )
+    if gap.gap_type == "coarse_acceptance_proof":
+        return (
+            "Acceptance criteria were proven only by a coarse passing command, not a "
+            "per-criterion check. Add a verification command or test that exercises each "
+            "listed criterion specifically, then re-verify."
         )
     # Fall back to the gap's own recommended fix for anything unmapped.
     return gap.recommended_fix

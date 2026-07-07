@@ -1,4 +1,4 @@
-import json
+from devcouncil.utils.json_persist import dump_json
 from dataclasses import asdict
 
 import typer
@@ -17,7 +17,6 @@ from devcouncil.live.summary import live_review_summary
 import asyncio
 import logging
 import os
-import subprocess
 from pathlib import Path
 
 app = typer.Typer()
@@ -33,8 +32,10 @@ async def run_github_report(graph: ArtifactGraph, project_root: Path):
         return
 
     try:
-        # Detect current SHA
-        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=project_root).decode().strip()
+        # Detect current SHA (timeout-guarded; failure lands in the except below)
+        from devcouncil.utils.proc import git_output
+
+        sha = git_output(["rev-parse", "HEAD"], cwd=project_root).strip()
         integration = GitHubIntegration(token, repo, sha)
         await integration.report_verification(graph)
         console.print(f"[green]Successfully reported to GitHub PR Checks for {repo} at {sha[:7]}[/green]")
@@ -84,6 +85,12 @@ def report(
     github: bool = typer.Option(False, "--github", help="Post report to GitHub PR Checks"),
     github_pr_comment: bool = typer.Option(False, "--github-pr-comment", help="Post report as a GitHub PR comment"),
     gitlab_pr_comment: bool = typer.Option(False, "--gitlab-pr-comment", help="Post report as a GitLab merge request comment"),
+    evidence_json: Path = typer.Option(
+        None,
+        "--evidence-json",
+        help="Write the requirement→task→diff→evidence graph as reviewer-readable JSON to this path "
+        "(e.g. for a CI/PR artifact).",
+    ),
     fail_on_blocking: bool = typer.Option(
         False,
         "--fail-on-blocking",
@@ -96,6 +103,14 @@ def report(
     """
     if ctx.invoked_subcommand is not None:
         return
+
+    # Direct Python calls (e.g. from `dev go`) bypass Typer, leaving OptionInfo
+    # defaults in place of real values. Normalize them so `is not None` and
+    # truthiness checks behave as they do under CLI invocation.
+    if not isinstance(evidence_json, (Path, type(None))):
+        evidence_json = None
+    if not isinstance(fail_on_blocking, bool):
+        fail_on_blocking = False
 
     root = project_root.expanduser().resolve()
     from devcouncil.telemetry.logging_setup import set_log_dir
@@ -120,6 +135,7 @@ def report(
                     "github": github,
                     "github_pr_comment": github_pr_comment,
                     "gitlab_pr_comment": gitlab_pr_comment,
+                    "evidence_json": evidence_json is not None,
                     "planning_only": planning_only,
                 },
                 summary="Generated DevCouncil report",
@@ -138,6 +154,23 @@ def report(
             if gitlab_pr_comment:
                 log_step("report/2: posting GitLab MR comment", project_root=root)
                 asyncio.run(run_gitlab_mr_comment(graph, live_review=live_review))
+                return
+
+            if evidence_json is not None:
+                log_step("report/2: writing evidence-export JSON", project_root=root)
+                output_path = evidence_json.expanduser()
+                try:
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    output_path.write_text(
+                        ReportBuilder.build_evidence_export(graph, live_review=live_review) + "\n",
+                        encoding="utf-8",
+                    )
+                except OSError as exc:
+                    console.print(f"[red]Failed to write evidence export to {output_path}: {exc}[/red]")
+                    raise typer.Exit(code=1) from exc
+                console.print(f"[green]Wrote evidence export to {output_path}[/green]")
+                if fail_on_blocking and graph.blocking_gaps():
+                    raise typer.Exit(code=1)
                 return
 
             log_step(
@@ -174,6 +207,6 @@ def rigor_report(
     report = build_rigor_report(root)
 
     if json_format:
-        typer.echo(json.dumps(asdict(report), indent=2))
+        typer.echo(dump_json(asdict(report), indent=2))
     else:
         console.print(Markdown(report.to_markdown()))

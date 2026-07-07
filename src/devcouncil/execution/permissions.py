@@ -34,6 +34,7 @@ class PermissionManager:
                 lines = ignore_file.read_text().splitlines()
                 return [line.strip() for line in lines if line.strip() and not line.startswith("#")]
             except Exception:
+                logger.debug("Failed to read .devcouncilignore", exc_info=True)
                 pass
         return []
 

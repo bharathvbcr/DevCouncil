@@ -12,6 +12,7 @@ from pathlib import Path
 
 from rich.console import Console
 
+from devcouncil.app.config import load_config
 from devcouncil.domain.evidence import CommandResult
 from devcouncil.domain.task import Task
 from devcouncil.execution.checkpoints import CheckpointService
@@ -25,12 +26,26 @@ logger = logging.getLogger(__name__)
 
 
 class ShellBackend:
-    def run_command(self, command: str, cwd: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    def run_command(
+        self,
+        command: str,
+        cwd: Path,
+        env: dict[str, str] | None = None,
+        *,
+        timeout: int | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         raise NotImplementedError
 
 
 class CommandLoopBackend(ShellBackend):
-    def run_command(self, command: str, cwd: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    def run_command(
+        self,
+        command: str,
+        cwd: Path,
+        env: dict[str, str] | None = None,
+        *,
+        timeout: int | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         args = shlex.split(command, posix=(os.name != "nt"))
         return subprocess.run(
             args,
@@ -40,6 +55,7 @@ class CommandLoopBackend(ShellBackend):
             encoding="utf-8",
             errors="replace",
             env=env,
+            timeout=timeout,
         )
 
 
@@ -63,7 +79,14 @@ class ShellWrappedBackend(ShellBackend):
             raise ValueError(f"Shell '{launcher[0]}' is not installed or not on PATH.")
         self.launcher = launcher
 
-    def run_command(self, command: str, cwd: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    def run_command(
+        self,
+        command: str,
+        cwd: Path,
+        env: dict[str, str] | None = None,
+        *,
+        timeout: int | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [*self.launcher, command],
             cwd=cwd,
@@ -72,6 +95,7 @@ class ShellWrappedBackend(ShellBackend):
             encoding="utf-8",
             errors="replace",
             env=env,
+            timeout=timeout,
         )
 
 
@@ -81,10 +105,16 @@ console = Console()
 
 
 class GuardedShellSession:
-    def __init__(self, project_root: Path, task: Task, *, shell: str = "auto"):
+    def __init__(self, project_root: Path, task: Task, *, shell: str = "auto", command_timeout: int | None = None):
         self.project_root = project_root.resolve()
         self.task = task
         self.shell = shell
+        if command_timeout is None:
+            try:
+                command_timeout = load_config(self.project_root).execution.command_timeout
+            except Exception:
+                command_timeout = 300
+        self.command_timeout = max(1, int(command_timeout))
         # HookPolicy (not the bare TaskPolicyEngine) so a chained command is split into
         # its segments and EACH is allowlisted, plus git-safety denies (force-push,
         # --no-verify, protected-branch reset). Critical for the `--shell bash/zsh`
@@ -158,7 +188,18 @@ class GuardedShellSession:
 
         logger.info("Shell command for %s: %s", self.task.id, normalized)
         try:
-            result = self.backend.run_command(normalized, self.project_root)
+            result = self.backend.run_command(
+                normalized, self.project_root, timeout=self.command_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            reason = f"Command timed out after {self.command_timeout}s"
+            logger.warning("Shell command timed out for %s: %s", self.task.id, normalized)
+            self._record_command(normalized, "failed", reason=reason)
+            console.print(f"[red]Command timed out after {self.command_timeout}s:[/red] {normalized}")
+            console.print(
+                "[dim]Increase execution.command_timeout in .devcouncil/config.yaml or split the command.[/dim]"
+            )
+            return 1
         except (NotImplementedError, FileNotFoundError, OSError) as exc:
             logger.warning("Shell command could not run for %s: %s (%s)", self.task.id, normalized, exc)
             self._record_command(normalized, "denied", reason=str(exc))

@@ -68,6 +68,7 @@ def test_init_scaffolds_verification_rigor_defaults(tmp_path):
     assert rigor["enabled"] is True
     assert rigor["stub_detection"] == "hard"
     assert rigor["effort_heuristics"] == "hard"
+    assert rigor["coarse_acceptance_proof"] == "hard"
     assert rigor["enforce_coverage_on_hard"] is True
     assert rigor["extra_repair_attempts_on_hard"] == 1
 

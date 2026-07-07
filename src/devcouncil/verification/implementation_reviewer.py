@@ -47,6 +47,19 @@ Your task is to identify if the implementation is complete, correct, and follows
 - Identify architectural drift.
 - Identify security risks not caught by static scans.
 
+Review rules — follow them exactly:
+- The diff above IS the complete, authoritative record of the change. Review the CODE in it.
+  Do not ask for proof that the change was made, and do not report "no evidence of
+  implementation" — you are looking at the implementation.
+- Every finding must cite the specific file/hunk in the diff that demonstrates the problem
+  (in its 'evidence'). A concern you cannot tie to a concrete line in the diff is not a finding.
+- Do not review prose, commit-message style, response formatting, or your estimate of effort.
+- Severity rubric: 'critical' is reserved for a demonstrable correctness or security defect
+  visible in the diff (wrong behavior, data loss, injection, broken requirement). Missing
+  edge cases are 'high' at most; style and structure are 'low'.
+- If the diff implements the requirements correctly, return is_satisfactory=true and an
+  empty findings list. An empty review of correct code is a correct review.
+
 Return a JSON object with 'is_satisfactory' and a list of 'findings' (as Gap objects).
 """
         messages = [{"role": "user", "content": prompt}]

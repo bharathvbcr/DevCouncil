@@ -16,6 +16,8 @@ from devcouncil.executors.agent_registry import (
     load_cli_agent_specs,
     normalize_agent_name,
 )
+from devcouncil.utils.fsio import atomic_write_text
+from devcouncil.utils.json_persist import read_json, write_json
 
 
 DEFAULT_OBJECTIVE = (
@@ -156,7 +158,7 @@ def load_agent_eval_dataset(path: Path) -> list[dict[str, Any]]:
             if line.strip()
         ]
     else:
-        raw = json.loads(evals_path.read_text(encoding="utf-8"))
+        raw = read_json(evals_path)
         if isinstance(raw, dict):
             if isinstance(raw.get("examples"), list):
                 examples = raw["examples"]
@@ -304,7 +306,7 @@ def _default_artifact_path(project_root: Path, agent: str, profile_name: str) ->
 
 def _write_result_artifact(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    write_json(path, payload)
 
 
 def _apply_profile_preamble(project_root: Path, profile_name: str, best_preamble: str) -> None:
@@ -315,4 +317,4 @@ def _apply_profile_preamble(project_root: Path, profile_name: str, best_preamble
     profile = profiles.setdefault(profile_name, {})
     profile["prompt_preamble"] = best_preamble
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(yaml.safe_dump(raw_config, sort_keys=False), encoding="utf-8")
+    atomic_write_text(config_path, yaml.safe_dump(raw_config, sort_keys=False))

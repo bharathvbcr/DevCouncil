@@ -4,7 +4,6 @@ asked to inspect (``log_step`` appends to the very traces.jsonl being tailed)
 and pollutes the machine-readable JSONL/--json output consumers parse. An
 introspection command must not modify what it introspects."""
 
-import json
 import time
 from pathlib import Path
 from typing import Optional
@@ -13,6 +12,7 @@ import typer
 from rich.console import Console
 
 from devcouncil.telemetry.traces import read_trace_events, read_trace_events_since
+from devcouncil.utils.json_persist import dump_json
 
 app = typer.Typer(help="Inspect DevCouncil trace events.")
 console = Console()
@@ -51,7 +51,7 @@ def tail(
         events, next_cursor = read_trace_events_since(root, since)
         if json_summary:
             typer.echo(
-                json.dumps(
+                dump_json(
                     {
                         "events": [event.model_dump(by_alias=True) for event in events],
                         "next_cursor": next_cursor,
@@ -65,7 +65,7 @@ def tail(
             else:
                 console.print(
                     f"{event.timestamp} {event.type} "
-                    f"{event.task_id or '-'} {event.summary or json.dumps(event.details)}"
+                    f"{event.task_id or '-'} {event.summary or dump_json(event.details)}"
                 )
         console.print(f"[dim]next_cursor: {next_cursor}[/dim]")
         return
@@ -81,7 +81,7 @@ def tail(
             else:
                 console.print(
                     f"{event.timestamp} {event.type} "
-                    f"{event.task_id or '-'} {event.summary or json.dumps(event.details)}"
+                    f"{event.task_id or '-'} {event.summary or dump_json(event.details)}"
                 )
         return len(events)
 

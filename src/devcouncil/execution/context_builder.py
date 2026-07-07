@@ -44,12 +44,12 @@ class ContextBuilder:
     def get_structure_summary(self, task: Task | None = None) -> List[str]:
         """Simple list of files in the project for context."""
         try:
-            import subprocess
-            output = subprocess.check_output(
-                ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+            from devcouncil.utils.proc import git_output
+
+            output = git_output(
+                ["ls-files", "--cached", "--others", "--exclude-standard"],
                 cwd=self.project_root,
-                stderr=subprocess.DEVNULL
-            ).decode().splitlines()
+            ).splitlines()
             
             if task and task.planned_files:
                 planned_paths = {pf.path for pf in task.planned_files}

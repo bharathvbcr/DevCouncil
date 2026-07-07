@@ -114,6 +114,73 @@ def test_run_task_with_fake_sdk_gates_and_succeeds(tmp_path, monkeypatch):
     assert calls["options"].permission_mode == "default"
 
 
+def test_env_overrides_reach_sdk_options(tmp_path, monkeypatch):
+    """Provider redirection: env passed to the executor must land on the SDK options,
+    so the underlying Claude Code process targets the configured endpoint."""
+    _init_repo(tmp_path)
+    calls: dict = {}
+    _install_fake_sdk(monkeypatch, calls)
+
+    ex = ClaudeSdkExecutor(
+        tmp_path,
+        active_task=_task(),
+        env={"ANTHROPIC_BASE_URL": "http://127.0.0.1:4000", "ANTHROPIC_AUTH_TOKEN": "tok"},
+    )
+    result = ex.run_task(_task(), [])
+
+    assert result.success
+    assert calls["options"].env == {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:4000",
+        "ANTHROPIC_AUTH_TOKEN": "tok",
+    }
+
+
+def test_no_env_keeps_options_env_free(tmp_path, monkeypatch):
+    _init_repo(tmp_path)
+    calls: dict = {}
+    _install_fake_sdk(monkeypatch, calls)
+
+    result = ClaudeSdkExecutor(tmp_path, active_task=_task()).run_task(_task(), [])
+
+    assert result.success
+    assert not hasattr(calls["options"], "env")
+
+
+def test_env_degrades_gracefully_on_old_sdk(tmp_path, monkeypatch):
+    """An SDK whose options class rejects ``env`` must still receive cwd/model/permission_mode."""
+    _init_repo(tmp_path)
+    calls: dict = {}
+    _install_fake_sdk(monkeypatch, calls)
+    import sys as _sys
+
+    fake = _sys.modules["claude_agent_sdk"]
+
+    class StrictOptions:
+        can_use_tool = None  # slot the executor's fallback fills in
+
+        def __init__(self, cwd=None, permission_mode=None, model=None):
+            self.cwd = cwd
+            self.permission_mode = permission_mode
+            self.model = model
+
+    fake.ClaudeAgentOptions = StrictOptions
+
+    ex = ClaudeSdkExecutor(
+        tmp_path,
+        active_task=_task(),
+        model="claude-opus-4",
+        env={"ANTHROPIC_BASE_URL": "http://127.0.0.1:4000"},
+    )
+    result = ex.run_task(_task(), [])
+
+    assert result.success
+    options = calls["options"]
+    assert options.model == "claude-opus-4"
+    assert options.permission_mode == "default"
+    # env silently dropped rather than crashing the run.
+    assert not getattr(options, "env", None)
+
+
 def test_run_task_prepends_correction_manifest(tmp_path, monkeypatch):
     _init_repo(tmp_path)
     calls: dict = {}
@@ -134,3 +201,4 @@ def test_run_task_prepends_correction_manifest(tmp_path, monkeypatch):
     assert result.success
     assert "Correction Manifest" in calls["prompt"]
     assert "missing regression test" in calls["prompt"]
+    assert "Repair rules (non-negotiable)" in calls["prompt"]

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -45,9 +46,13 @@ def _resolve(name: str, *preferred: str) -> str | None:
 DEV = _resolve("dev", str(REPO_ROOT / ".venv" / "Scripts" / "dev.exe"), str(REPO_ROOT / ".venv" / "bin" / "dev"))
 CLAUDE = _resolve("claude", str(Path.home() / ".local" / "bin" / "claude.EXE"), str(Path.home() / ".local" / "bin" / "claude"))
 
-# Arm-B defaults: OpenRouter plans and monitors on the free Nemotron tier.
+# Arm-B defaults: OpenRouter plans and monitors on GLM-5.2. (Qwen3 Max's
+# endpoint is capped at ~20 RPM and tripped 429s mid-run; the earlier free
+# Nemotron default supported no ``response_format`` variant, which with
+# ``require_parameters: true`` 404'd every planning call — see the OpenRouter
+# provider's degrade chain. GLM-5.2 supports structured output.)
 DEFAULT_DC_TIMEOUT = 2400
-DEFAULT_OPENROUTER_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
+DEFAULT_OPENROUTER_MODEL = "z-ai/glm-5.2"
 DEFAULT_MONITOR_MODEL = DEFAULT_OPENROUTER_MODEL
 DEFAULT_MONITOR_PROVIDER = "openrouter"
 DEFAULT_OLLAMA_TIMEOUT = "900"  # per-call when --monitor-provider ollama
@@ -89,6 +94,12 @@ def _bench_env() -> dict:
     env.update(OLLAMA_ARG_OVERRIDES)
     env.setdefault("OLLAMA_THINK", "false")
     env.setdefault("OLLAMA_TIMEOUT", DEFAULT_OLLAMA_TIMEOUT)
+    env.setdefault("OPENROUTER_MAX_CONCURRENCY", "2")
+    # Client-side request pacing (requests/min). Keeps the whole run under the
+    # ~20 RPM caps common on OpenRouter endpoints instead of tripping 429s
+    # mid-run and burning the router's retry budget (observed: tasks dying
+    # blocked on limit_rpm). Override with OPENROUTER_RPM=off to disable.
+    env.setdefault("OPENROUTER_RPM", "15")
     return env
 
 
@@ -116,7 +127,19 @@ def _ollama_has_model(tag: str) -> bool:
     return any(n == tag or n.startswith(f"{tag}:") or n.split(":")[0] == base for n in names)
 
 
-def _preflight(arms: list[str], monitor_model: str, monitor_provider: str) -> None:
+def _preflight(arms: list[str], monitor_model: str, monitor_provider: str,
+               executor: str = "claude", probe_executor: bool = True, executor_model: str = "") -> None:
+    # The executor is the sweep's single point of failure every arm shares:
+    # verify it can actually complete a call before spending on planning.
+    uses_claude = "A" in arms or "C" in arms or ("B" in arms and executor == "claude")
+    if probe_executor and uses_claude and CLAUDE is not None:
+        ok, detail = _probe_executor(executor_model=executor_model)
+        if not ok:
+            sys.exit(
+                "Executor preflight failed — the coding agent cannot run right now "
+                f"(session/usage limit or login problem?):\n{detail.strip()[-300:]}\n"
+                "Fix the executor (or pass --no-executor-preflight to override) and rerun."
+            )
     if "B" not in arms:
         return
     if not _resolve_openrouter_key():
@@ -135,21 +158,191 @@ def _preflight(arms: list[str], monitor_model: str, monitor_provider: str) -> No
             )
 
 
-def _classify_verdict(code: int, out: str) -> str:
+def _normalize_cli_output(text: str) -> str:
+    """Strip ANSI and Rich markdown bold so stdout parsing matches report text."""
+    cleaned = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    return re.sub(r"\*\*([^*]+)\*\*", r"\1", cleaned)
+
+
+def _report_json(ws: Path, env: dict) -> dict | None:
+    rc, out = run([DEV, "report", "--json"], cwd=ws, timeout=60, env=env)
+    if rc != 0:
+        return None
+    try:
+        data = json.loads(out)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _classify_verdict_from_report(ws: Path, env: dict) -> str | None:
+    """Authoritative verdict from persisted graph state (immune to Rich formatting)."""
+    data = _report_json(ws, env)
+    if data is None:
+        return None
+    verdict = data.get("verdict")
+    return verdict if verdict in {"passed", "blocked", "incomplete"} else None
+
+
+def _blocking_gap_summary(ws: Path, env: dict) -> list[dict]:
+    """What actually blocked this run — gap types + trimmed descriptions.
+
+    A 400-char output tail cannot answer "WHY was correct code blocked?" (the
+    median false negative took source-diving to attribute). Persisting the
+    blocking gaps with each record makes every future false negative
+    self-diagnosing from the results JSON alone."""
+    data = _report_json(ws, env)
+    if data is None:
+        return []
+    gaps = data.get("blocking_gaps") or []
+    summary = []
+    for g in gaps[:10]:
+        if not isinstance(g, dict):
+            continue
+        summary.append({
+            "gap_type": g.get("gap_type", "?"),
+            "severity": g.get("severity", "?"),
+            "description": str(g.get("description", ""))[:300],
+        })
+    return summary
+
+
+# Markers that the EXECUTOR never (fully) ran — subscription session caps,
+# exhausted credits, or the agent failing to launch at all. A run like this
+# measures the infrastructure, not DevCouncil: the gate "blocking" an empty
+# workspace is not a calibration data point. Classified as ``error`` so the
+# harness retries it on a fresh workspace and, failing that, EXCLUDES it from
+# means/calibration instead of polluting them (observed: a session-limited
+# sweep reporting 8 tasks 0/N-blocked that never executed a single agent turn).
+_EXECUTOR_INFRA_PATTERNS = (
+    "failed to start or execute",   # dev run: the executor process never launched
+    "hit your session limit",       # claude CLI subscription session cap
+    "usage limit reached",
+    "credit balance is too low",
+    "out of credits",
+    # Executor prerequisites missing entirely — the sweep can never produce data
+    # (observed 2026-07-03: an 11-task sweep scored arm B 0/N on every task in
+    # ~8s each because claude-agent-sdk wasn't installed in the bench venv).
+    "agent sdk is not installed",
+    "not found on path",            # coding-CLI executable missing (gemini, codex, ...)
+    "unknown agent profile",        # executor misconfigured; never starts
+)
+
+
+def _executor_infra_failure(out: str) -> bool:
+    text = _normalize_cli_output(out).lower()
+    return any(p in text for p in _EXECUTOR_INFRA_PATTERNS)
+
+
+def _classify_verdict(code: int, out: str, *, ws: Path | None = None, env: dict | None = None) -> str:
     if code == 124 or out.startswith("TIMEOUT"):
         return "timeout"
-    if "Passed: Ready for release" in out:
-        return "passed"
-    if "Blocked:" in out:
-        return "blocked"
-    if "Incomplete:" in out:
-        return "incomplete"
-    return "error"
+    verdict: str | None = None
+    if ws is not None and env is not None:
+        verdict = _classify_verdict_from_report(ws, env)
+    if verdict is None:
+        text = _normalize_cli_output(out)
+        if re.search(r"Passed:\s*Ready for release", text, re.IGNORECASE):
+            verdict = "passed"
+        elif re.search(r"Blocked:\s*", text):
+            verdict = "blocked"
+        elif re.search(r"Incomplete:\s*", text):
+            verdict = "incomplete"
+        else:
+            verdict = "error"
+    # A "passed" survives (the pipeline demonstrably completed); any other
+    # verdict on a run whose executor failed to start is infrastructure noise.
+    if verdict != "passed" and _executor_infra_failure(out):
+        return "error"
+    return verdict
+
+
+# Infra failures that an IMMEDIATE retry cannot fix: a session/usage-limited or
+# out-of-credits executor fails identically on the next attempt while still
+# burning the full planning cost first (~$0.10 and ~3 min per wasted retry).
+# "failed to start or execute" alone stays retryable — a transient spawn
+# failure is exactly what a fresh-workspace retry exists for.
+_NONRETRYABLE_INFRA_PATTERNS = (
+    "hit your session limit",
+    "usage limit reached",
+    "credit balance is too low",
+    "out of credits",
+    # A missing package/executable/profile fails identically on a fresh
+    # workspace; retrying only doubles the wasted planning cost.
+    "agent sdk is not installed",
+    "not found on path",
+    "unknown agent profile",
+)
 
 
 def _is_retryable_error(run_info: dict) -> bool:
-    """Retry planner/setup flakiness only — not harness timeouts."""
-    return run_info.get("verdict") == "error"
+    """Retry planner/setup flakiness and transient provider limits — not harness
+    timeouts, and not executor limits that will fail identically on retry."""
+    verdict = run_info.get("verdict")
+    tail = (run_info.get("output_tail") or "").lower()
+    if verdict == "error":
+        return not any(p in tail for p in _NONRETRYABLE_INFRA_PATTERNS)
+    if verdict == "timeout":
+        return False
+    transient = (
+        "rate limit" in tail
+        or "limit_rpm" in tail
+        or "429" in tail
+        or "too many requests" in tail
+    )
+    # A blocked run with zero score that died on OpenRouter throttling is a planner/
+    # monitor infra flake, not a measured data point — retry on a fresh workspace.
+    if verdict == "blocked" and run_info.get("fraction", 1.0) == 0 and transient:
+        return True
+    return False
+
+
+def _probe_executor(timeout: int = 90, executor_model: str = "") -> tuple[bool, str]:
+    """One cheap agent call in an empty temp dir.
+
+    Catches session/usage limits, exhausted credits, and login problems for the
+    price of a single trivial completion — BEFORE a sweep burns full planning
+    cost on tasks whose executor can never run (observed: $1.13 across 8 tasks
+    that never executed a single agent turn). Probes on the SAME model the sweep
+    will actually use (``executor_model``) — a probe on the CLI's own default model
+    can pass or fail independently of whether the model the run is pinned to works."""
+    if CLAUDE is None:
+        return True, "claude not resolved; probe skipped"
+    tmp = tempfile.mkdtemp(prefix="dc_probe_")
+    cmd = [CLAUDE, "-p"]
+    if executor_model:
+        cmd += ["--model", executor_model]
+    cmd.append("Reply with exactly: ok")
+    try:
+        code, out = run(cmd, cwd=tmp, timeout=timeout)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    ok = code == 0 and not _executor_infra_failure(out)
+    return ok, out[-300:]
+
+
+def _sweep_halt_reason(arms_res: dict, probe=None) -> str | None:
+    """Decide, after a task, whether continuing the sweep can still produce data.
+
+    An executor stuck behind a session/usage limit poisons every subsequent task
+    too — each still pays full planning cost before dying. When the latest task
+    shows an executor infra failure, re-probe the executor once; if the probe
+    also fails, halt the sweep instead of marching through the remaining tasks.
+    Returns a human-readable reason to halt, or None to continue."""
+    tails: list[str] = []
+    b = arms_res.get("B")
+    if b is not None and b.get("verdict") == "error":
+        tails.append(b.get("output_tail") or "")
+    a = arms_res.get("A")
+    if a is not None and a.get("exit") not in (0, None):
+        tails.append(a.get("output_tail") or "")
+    if not any(_executor_infra_failure(t) for t in tails):
+        return None
+    probe = probe or _probe_executor
+    ok, detail = probe()
+    if ok:
+        return None
+    return f"executor unavailable: {detail.strip()[-200:]}"
 
 
 SCORE_SCAFFOLD = '''
@@ -306,11 +499,35 @@ def score(ws: Path, task, score_python: str) -> dict:
     return {"passed": passed, "total": total, "detail": detail, "note": note}
 
 
-def arm_raw(ws: Path, prompt: str, timeout: int) -> dict:
+def arm_raw(ws: Path, prompt: str, timeout: int, executor_model: str = "") -> dict:
     t0 = time.monotonic()
-    code, out = run([CLAUDE, "-p", "--permission-mode", "acceptEdits"], cwd=ws, timeout=timeout, input_text=prompt)
+    cmd = [CLAUDE, "-p", "--permission-mode", "acceptEdits"]
+    if executor_model:
+        cmd += ["--model", executor_model]
+    code, out = run(cmd, cwd=ws, timeout=timeout, input_text=prompt)
     return {"exit": code, "seconds": round(time.monotonic() - t0, 1), "verdict": None, "cost_usd": 0.0,
             "output_tail": out[-400:]}
+
+
+_EXECUTOR_PROFILE = "bench"
+
+
+def _apply_executor_model(ws: Path, model: str) -> None:
+    """Pin the ``claude`` executor's own ``--model`` flag for arm B.
+
+    Distinct from the OpenRouter planner/monitor ``model`` role config: this writes a
+    CLI-agent profile (``integrations.cli_agents.profiles.bench.model``) that
+    ``CodingCliExecutor`` injects as ``claude --model <value>`` (see
+    ``_apply_model_override`` in executors/coding_cli.py). ``dev e2e --profile bench``
+    then picks it up while ``models.roles.*`` (planning/monitoring) stays untouched.
+    """
+    import yaml
+
+    cfg_path = ws / ".devcouncil" / "config.yaml"
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    profiles = cfg.setdefault("integrations", {}).setdefault("cli_agents", {}).setdefault("profiles", {})
+    profiles.setdefault(_EXECUTOR_PROFILE, {})["model"] = model
+    cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
 
 
 def _apply_monitor_routing(ws: Path, roles: list[str], provider: str, model: str) -> None:
@@ -360,7 +577,7 @@ def arm_devcouncil(ws: Path, goal: str, model: str, executor: str, timeout: int,
                    monitor_model: str = "", monitor_provider: str = DEFAULT_MONITOR_PROVIDER,
                    monitor_roles: tuple[str, ...] = (),
                    ac_samples: int = 1, ac_repair_attempts: int = 1,
-                   ac_per_criterion: bool = False) -> dict:
+                   ac_per_criterion: bool = False, executor_model: str = "") -> dict:
     t0 = time.monotonic()
     bench_env = _bench_env()
     init_code, init_out = run([DEV, "init"], cwd=ws, timeout=120, env=bench_env)
@@ -383,33 +600,40 @@ def arm_devcouncil(ws: Path, goal: str, model: str, executor: str, timeout: int,
     if monitor_model and monitor_roles:
         _apply_monitor_routing(ws, list(monitor_roles), monitor_provider, monitor_model)
     _apply_acceptance_check_config(ws, ac_samples, ac_repair_attempts, ac_per_criterion)
-    code, out = run([DEV, "e2e", goal, "--executor", executor, "--force", "--continue-on-blocked"],
-                    cwd=ws, timeout=timeout, env=bench_env)
-    verdict = _classify_verdict(code, out)
+    e2e_cmd = [DEV, "e2e", goal, "--executor", executor, "--force", "--continue-on-blocked"]
+    if executor_model and executor == "claude":
+        _apply_executor_model(ws, executor_model)
+        e2e_cmd += ["--profile", _EXECUTOR_PROFILE]
+    code, out = run(e2e_cmd, cwd=ws, timeout=timeout, env=bench_env)
+    verdict = _classify_verdict(code, out, ws=ws, env=bench_env)
     cost = 0.0
     sc, so = run([DEV, "status", "--json"], cwd=ws, timeout=60, env=bench_env)
     try:
         cost = float(json.loads(so).get("total_cost", 0.0))
     except Exception:
         pass
+    # Persist WHAT blocked, not just THAT it blocked — false negatives must be
+    # attributable from the results JSON without re-running or source-diving.
+    blocking = _blocking_gap_summary(ws, bench_env) if verdict == "blocked" else []
     return {"exit": code, "seconds": round(time.monotonic() - t0, 1), "verdict": verdict,
-            "cost_usd": round(cost, 4), "output_tail": out[-400:]}
+            "cost_usd": round(cost, 4), "output_tail": out[-400:],
+            "blocking_gaps": blocking}
 
 
 def run_task(task, arms, model, executor, raw_timeout, dc_timeout, score_python, keep, base, dc_retries=1,
              monitor_model="", monitor_provider=DEFAULT_MONITOR_PROVIDER, monitor_roles=(),
-             ac_samples=1, ac_repair_attempts=1, ac_per_criterion=False):
+             ac_samples=1, ac_repair_attempts=1, ac_per_criterion=False, executor_model=""):
     results = {}
     for arm in arms:
         ws = make_workspace(base / arm, task)
         if arm == "A":
-            run_info = arm_raw(ws, task.goal, raw_timeout)
+            run_info = arm_raw(ws, task.goal, raw_timeout, executor_model)
         elif arm == "C":
-            run_info = arm_raw(ws, task.spec, raw_timeout)
+            run_info = arm_raw(ws, task.spec, raw_timeout, executor_model)
         elif arm == "B":
             run_info = arm_devcouncil(ws, task.goal, model, executor, dc_timeout,
                                       monitor_model, monitor_provider, monitor_roles,
-                                      ac_samples, ac_repair_attempts, ac_per_criterion)
+                                      ac_samples, ac_repair_attempts, ac_per_criterion, executor_model)
             run_info["attempts"] = 1
             # Planners occasionally emit malformed JSON for a non-degradable role,
             # which surfaces as verdict=error and no usable result. Retry a fresh
@@ -423,7 +647,7 @@ def run_task(task, arms, model, executor, raw_timeout, dc_timeout, score_python,
                 ws = make_workspace(base / f"{arm}_retry{attempt}", task)
                 retry_info = arm_devcouncil(ws, task.goal, model, executor, dc_timeout,
                                             monitor_model, monitor_provider, monitor_roles,
-                                            ac_samples, ac_repair_attempts, ac_per_criterion)
+                                            ac_samples, ac_repair_attempts, ac_per_criterion, executor_model)
                 retry_info["attempts"] = attempt + 1
                 # Total spend must include the failed attempt(s): the retried run's own
                 # cost alone under-reports what the data point actually cost.
@@ -471,12 +695,16 @@ def summarize(records: list[dict], arms: list[str]) -> str:
     silent_total = 0
     silent_surfaced = 0
     timeouts = 0
+    infra_errors = 0
+    false_neg_detail: list[str] = []  # task → what blocked its (actually correct) code
     for rec in records:
         row = [rec["task"]]
         for a in arms:
             r = rec["arms"].get(a, {})
             row.append(f"{r.get('score','?')}/{r.get('total','?')}")
-            if "fraction" in r:
+            # An arm-B infra error (executor never ran / setup failed) measured
+            # nothing — its 0-score must not drag the mean correctness down.
+            if "fraction" in r and not (a == "B" and r.get("verdict") == "error"):
                 agg[a].append(r["fraction"])
         if "B" in arms:
             b = rec["arms"].get("B", {})
@@ -484,10 +712,17 @@ def summarize(records: list[dict], arms: list[str]) -> str:
             full = b.get("fraction", 0) == 1.0
             if v == "timeout":
                 timeouts += 1
+            if v == "error":
+                infra_errors += 1
             if v == "blocked":
                 decisive += 1
                 if full:
                     false_neg += 1
+                    kinds = ", ".join(
+                        f"{g.get('gap_type', '?')} ({g.get('description', '')[:120]})"
+                        for g in (b.get("blocking_gaps") or [])[:3]
+                    ) or "no blocking-gap detail recorded"
+                    false_neg_detail.append(f"{rec['task']}: {kinds}")
                 else:
                     decisive_ok += 1
             elif v == "passed":
@@ -520,6 +755,7 @@ def summarize(records: list[dict], arms: list[str]) -> str:
                 "passed": "yes" if full else "NO",
                 "incomplete": "under" if full else "cautious",
                 "timeout": "timed out",
+                "error": "infra (excluded)",
             }.get(v, "—")
             row.append(v)
             row.append(note)
@@ -545,9 +781,16 @@ def summarize(records: list[dict], arms: list[str]) -> str:
         lines.append(f"- **Correctness lift (B − A):** {lift:+.2f}")
     if "B" in arms:
         lines.append(f"- **False negatives (blocked correct code):** {false_neg}  ← lower is better")
+        for detail in false_neg_detail:
+            lines.append(f"  - {detail}")
         lines.append(f"- **False positives (passed incorrect code):** {false_pos}")
         if timeouts:
             lines.append(f"- **Harness timeouts (arm B):** {timeouts}/{len(records)}")
+        if infra_errors:
+            lines.append(
+                f"- **Infra errors (arm B, excluded from means/calibration):** "
+                f"{infra_errors}/{len(records)} — executor/session/provider failures, not verdicts"
+            )
         if decisive:
             lines.append(f"- **Decisive-verdict accuracy (passed/blocked):** {decisive_ok}/{decisive} = {decisive_ok/decisive:.0%}")
         if covered:
@@ -575,17 +818,25 @@ def main():
     ap.add_argument("--tasks", default="all", help="'all' or comma list of task names.")
     ap.add_argument("--model", default=DEFAULT_OPENROUTER_MODEL, help="DevCouncil planner model (OpenRouter).")
     ap.add_argument("--executor", default="claude", help="DevCouncil executor (agent).")
+    ap.add_argument("--executor-model", default="sonnet",
+                    help="Model the Claude Code executor itself runs on (arms A/C's `claude -p` "
+                         "and arm B's `dev e2e --profile bench`), passed via `claude --model`. "
+                         "Independent of --model/--monitor-model, which are the OpenRouter "
+                         "planner/monitor. Pass '' to leave the executor on its own default.")
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--timeout", type=int, default=300, help="Per-arm raw-agent timeout (s).")
     ap.add_argument("--dc-timeout", type=int, default=DEFAULT_DC_TIMEOUT,
                     help="Per-task DevCouncil e2e timeout (s).")
-    ap.add_argument("--dc-retries", type=int, default=1, help="Retries when a DevCouncil run errors (planner flakiness).")
+    ap.add_argument("--dc-retries", type=int, default=2,
+                    help="Retries when a DevCouncil run errors or hits transient provider limits.")
+    ap.add_argument("--task-gap", type=int, default=15,
+                    help="Seconds to pause between arm-B tasks (spreads OpenRouter RPM).")
     ap.add_argument("--score-python", default=sys.executable, help="Interpreter used to run hidden tests.")
     ap.add_argument("--out", default=str(Path(__file__).parent / "results"))
     ap.add_argument("--keep-workspaces", action="store_true")
     ap.add_argument("--monitor-model", default=DEFAULT_MONITOR_MODEL,
                     help="Route execution-time review roles to this model on --monitor-provider "
-                         "(default: same free Nemotron on OpenRouter). Pass '' to disable.")
+                         f"(default: {DEFAULT_MONITOR_MODEL} on OpenRouter). Pass '' to disable.")
     ap.add_argument("--monitor-provider", default=DEFAULT_MONITOR_PROVIDER,
                     help="Provider for the execution-time review roles when --monitor-model is set.")
     ap.add_argument("--monitor-roles", default="implementation_reviewer,live_reviewer",
@@ -594,15 +845,15 @@ def main():
                          "verification gate that drives the self-repair loop (it can block a "
                          "task); live_reviewer critiques the agent's turn and records an "
                          "advisory card (non-gating).")
-    ap.add_argument("--ac-samples", type=int, default=1,
+    ap.add_argument("--ac-samples", type=int, default=3,
                     help="Arm B: independent per-criterion acceptance checks generated and "
                          "majority-voted. >1 outvotes a single mis-generated check (cuts false "
                          "blocks); cost-free on a local monitor, so raise it (e.g. 3) there.")
-    ap.add_argument("--ac-repair-attempts", type=int, default=1,
+    ap.add_argument("--ac-repair-attempts", type=int, default=2,
                     help="Arm B: times a compiled acceptance check that FAILED TO RUN "
                          "(wrong import / broken one-liner) is regenerated from its error and "
                          "re-run. Rescues the under-credited 'incomplete'; can't weaken the gate.")
-    ap.add_argument("--ac-per-criterion", action="store_true",
+    ap.add_argument("--ac-per-criterion", action=argparse.BooleanOptionalAction, default=True,
                     help="Arm B: compile ONE acceptance check per model call instead of batching "
                          "all criteria into one prompt. A weak/local monitor omits/mis-attributes "
                          "some when batched; focused per-criterion prompts are far more reliable "
@@ -612,6 +863,11 @@ def main():
                     help="Thinking mode/budget for the local monitor (sets OLLAMA_THINK for "
                          "arm B; low|medium|high are budget levels on models that support them, "
                          "Ollama >= 0.12). Default: false (latency).")
+    ap.add_argument("--executor-preflight", action=argparse.BooleanOptionalAction, default=True,
+                    help="Probe the coding agent with one trivial call before the sweep, and "
+                         "halt the sweep when a mid-run executor infra failure re-probes as "
+                         "still down. Catches session/usage limits before they burn the "
+                         "planning budget on tasks that can never run.")
     ap.add_argument("--monitor-num-predict", type=int, default=None,
                     help="Hard cap on monitor generation tokens (sets OLLAMA_NUM_PREDICT for "
                          "arm B). Bounds a runaway thinking spiral to a fast, healable "
@@ -629,7 +885,9 @@ def main():
         sys.exit("Could not find `claude`. Install it or pass a different --executor.")
 
     arms = [a.strip().upper() for a in args.arms.split(",") if a.strip()]
-    _preflight(arms, args.monitor_model, args.monitor_provider)
+    _preflight(arms, args.monitor_model, args.monitor_provider,
+               executor=args.executor, probe_executor=args.executor_preflight,
+               executor_model=args.executor_model)
     task_names = list(TASKS_BY_NAME) if args.tasks == "all" else [t.strip() for t in args.tasks.split(",")]
     tasks = [TASKS_BY_NAME[n] for n in task_names if n in TASKS_BY_NAME]
 
@@ -645,8 +903,17 @@ def main():
                   f"({', '.join(monitor_roles)})")
         print(f"  acceptance checks: samples={args.ac_samples} repair_attempts={args.ac_repair_attempts} "
               f"per_criterion={args.ac_per_criterion}")
+        if args.task_gap:
+            print(f"  task gap: {args.task_gap}s")
+    first = True
+    halt_reason: str | None = None
     for task in tasks:
+        if halt_reason:
+            break
         for rep in range(args.repeats):
+            if not first and "B" in arms and args.task_gap > 0:
+                time.sleep(args.task_gap)
+            first = False
             label = task.name + (f"#{rep+1}" if args.repeats > 1 else "")
             print(f"  -> {label} ...", flush=True)
             run_base = base / f"{task.name}_{rep}"
@@ -655,7 +922,7 @@ def main():
                                 monitor_model=args.monitor_model, monitor_provider=args.monitor_provider,
                                 monitor_roles=monitor_roles,
                                 ac_samples=args.ac_samples, ac_repair_attempts=args.ac_repair_attempts,
-                                ac_per_criterion=args.ac_per_criterion)
+                                ac_per_criterion=args.ac_per_criterion, executor_model=args.executor_model)
             for a, r in arms_res.items():
                 extra = ""
                 if a == "B":
@@ -664,12 +931,21 @@ def main():
                         extra += f"  attempts={r['attempts']}"
                 print(f"      arm {a}: {r['score']}/{r['total']}{extra}  {r['seconds']}s")
             records.append({"task": label, "arms": arms_res})
+            if args.executor_preflight:
+                halt_reason = _sweep_halt_reason(
+                    arms_res, probe=lambda: _probe_executor(executor_model=args.executor_model)
+                )
+                if halt_reason:
+                    print(f"  !! Halting sweep — {halt_reason}")
+                    print("     Completed tasks are kept; rerun the remaining tasks once the executor is back.")
+                    break
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     raw_path = out_dir / f"{ts}.json"
     raw_path.write_text(json.dumps({
         "model": args.model,
         "executor": args.executor,
+        "executor_model": args.executor_model,
         "dc_timeout": args.dc_timeout,
         "ollama_env": {
             "OLLAMA_THINK": _bench_env().get("OLLAMA_THINK"),
@@ -680,6 +956,7 @@ def main():
                      "roles": list(monitor_roles)} if args.monitor_model else None),
         "acceptance_checks": {"samples": args.ac_samples, "repair_attempts": args.ac_repair_attempts,
                               "per_criterion": args.ac_per_criterion},
+        "halted": halt_reason,
         "records": records,
     }, indent=2), encoding="utf-8")
     summary = summarize(records, arms)

@@ -15,6 +15,7 @@ always: false              # true = always selected (only core-engineering uses 
 triggers:                  # how this skill is auto-selected (omit for always-on)
   keywords: [foo, bar]     # matched against the goal text (case-insensitive substring)
   globs: ["*.foo", "build.bar"]   # matched against repo file basenames
+  markers: [.devcouncil/config.yaml]  # repo-relative paths that must exist (e.g. DevCouncil init)
 ---
 
 # Body

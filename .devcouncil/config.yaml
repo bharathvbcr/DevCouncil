@@ -1,27 +1,50 @@
+execution:
+  default_executor: claude
 models:
   provider: openrouter
   roles:
     arbiter:
-      model: nvidia/nemotron-3-ultra-550b-a55b:free
+      model: qwen/qwen3-max
     critic_a:
-      model: nvidia/nemotron-3-ultra-550b-a55b:free
+      model: qwen/qwen3-max
     critic_b:
-      model: nvidia/nemotron-3-ultra-550b-a55b:free
+      model: qwen/qwen3-max
     implementation_reviewer:
-      model: nvidia/nemotron-3-ultra-550b-a55b:free
+      model: qwen/qwen3-max
     live_reviewer:
-      model: nvidia/nemotron-3-ultra-550b-a55b:free
+      model: qwen/qwen3-max
     native_agent:
-      model: nvidia/nemotron-3-ultra-550b-a55b:free
+      model: qwen/qwen3-max
     planner_a:
-      model: nvidia/nemotron-3-ultra-550b-a55b:free
+      model: qwen/qwen3-max
     planner_b:
-      model: nvidia/nemotron-3-ultra-550b-a55b:free
+      model: qwen/qwen3-max
     prompt_enhancer:
-      model: nvidia/nemotron-3-ultra-550b-a55b:free
+      model: qwen/qwen3-max
     spec_writer:
-      model: nvidia/nemotron-3-ultra-550b-a55b:free
+      model: qwen/qwen3-max
 project:
   default_branch: main
   name: DevCouncil
   root: .
+verification:
+  diff_coverage:
+    enforce: false
+    measure: true
+    min_ratio: 0.0
+  rigor:
+    acceptance_samples_on_hard: 2
+    coarse_acceptance_proof: hard
+    effort_heuristics: hard
+    enabled: true
+    enforce_coverage_on_hard: true
+    extra_repair_attempts_on_hard: 1
+    min_added_lines_per_planned_file: 5
+    reviewer_required_on_hard: false
+    stub_detection: hard
+integrations:
+  claude:
+    enabled: true
+    scope: local
+    write_gate: false
+    settings_path: .claude/settings.local.json

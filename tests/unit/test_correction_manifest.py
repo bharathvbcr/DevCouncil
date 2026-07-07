@@ -264,6 +264,57 @@ def test_manifest_lists_stub_findings_from_blocking_gaps(tmp_path):
     assert any("src/a.py:10" in s for s in manifest.stub_findings)
 
 
+def test_coarse_acceptance_proof_outranks_orphan_in_manifest_order(tmp_path):
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text("project:\n  name: test\n", encoding="utf-8")
+    task = Task(id="TASK-001", title="T", description="D")
+    gaps = [
+        Gap(
+            id="GAP-ORPHAN",
+            severity="high",
+            gap_type="orphan_diff",
+            task_id="TASK-001",
+            description="Unplanned file changed",
+            recommended_fix="revert",
+            blocking=True,
+        ),
+        Gap(
+            id="GAP-COARSE",
+            severity="high",
+            gap_type="coarse_acceptance_proof",
+            task_id="TASK-001",
+            description="Coarse proof for AC-001",
+            recommended_fix="add per-criterion check",
+            blocking=True,
+        ),
+    ]
+    manifest = build_correction_manifest(tmp_path, task, gaps)
+    assert manifest.root_cause == "Coarse proof for AC-001"
+
+
+def test_repair_prompt_prefix_includes_repair_rules(tmp_path):
+    from devcouncil.planning.correction_manifest import repair_prompt_prefix, write_correction_manifest
+
+    _seed_task_with_gap(
+        tmp_path,
+        Gap(
+            id="GAP-1",
+            severity="high",
+            gap_type="test_failed",
+            task_id="TASK-001",
+            description="tests failed",
+            recommended_fix="fix",
+            blocking=True,
+        ),
+    )
+    write_correction_manifest(tmp_path, "TASK-001")
+    prefix = repair_prompt_prefix(tmp_path, "TASK-001")
+
+    assert "Correction Manifest" in prefix
+    assert "Repair rules (non-negotiable)" in prefix
+    assert "Never delete, skip, or weaken a test" in prefix
+
+
 def test_first_correction_manifest_has_empty_attempt_history(tmp_path):
     from devcouncil.planning.correction_manifest import load_latest_correction_manifest, write_correction_manifest
 

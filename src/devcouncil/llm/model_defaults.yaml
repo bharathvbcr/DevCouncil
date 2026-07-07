@@ -1,14 +1,14 @@
 openrouter:
-  spec_writer: nvidia/nemotron-3-ultra-550b-a55b:free
-  prompt_enhancer: nvidia/nemotron-3-ultra-550b-a55b:free
-  planner_a: nvidia/nemotron-3-ultra-550b-a55b:free
-  planner_b: nvidia/nemotron-3-ultra-550b-a55b:free
-  critic_a: nvidia/nemotron-3-ultra-550b-a55b:free
-  critic_b: nvidia/nemotron-3-ultra-550b-a55b:free
-  arbiter: nvidia/nemotron-3-ultra-550b-a55b:free
-  native_agent: nvidia/nemotron-3-ultra-550b-a55b:free
-  implementation_reviewer: nvidia/nemotron-3-ultra-550b-a55b:free
-  live_reviewer: nvidia/nemotron-3-ultra-550b-a55b:free
+  spec_writer: qwen/qwen3-max
+  prompt_enhancer: qwen/qwen3-max
+  planner_a: qwen/qwen3-max
+  planner_b: qwen/qwen3-max
+  critic_a: qwen/qwen3-max
+  critic_b: qwen/qwen3-max
+  arbiter: qwen/qwen3-max
+  native_agent: qwen/qwen3-max
+  implementation_reviewer: qwen/qwen3-max
+  live_reviewer: qwen/qwen3-max
 vertexai:
   spec_writer: google/gemini-2.5-flash
   prompt_enhancer: google/gemini-2.5-flash

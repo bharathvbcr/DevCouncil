@@ -30,6 +30,7 @@ verification:
     stub_detection: hard
     effort_heuristics: hard
     enforce_coverage_on_hard: true    # flips diff_coverage.enforce for hard tasks
+    coarse_acceptance_proof: hard     # block coarse AC proof on hard tasks
     reviewer_required_on_hard: false  # opt-in: implementation_reviewer pass on hard tasks
     extra_repair_attempts_on_hard: 1  # added to execution.max_repair_attempts
 ```

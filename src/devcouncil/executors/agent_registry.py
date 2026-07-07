@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from devcouncil.app.config import CliAgentProfileConfig, load_config
+
+logger = logging.getLogger(__name__)
 
 
 AGENT_ALIASES = {
@@ -243,6 +246,7 @@ def resolve_coding_cli_probe_order(project_root: Path) -> tuple[str, ...]:
         if configured:
             return tuple(normalize_agent_name(name) for name in configured)
     except Exception:
+        logger.debug("Could not load coding_cli_probe_order from config", exc_info=True)
         pass
     return CODING_CLI_PROBE_ORDER
 
@@ -289,6 +293,27 @@ def resolve_automated_executor(
         return configured
     detected = detect_available_coding_cli(project_root, probe_order=probe_order)
     return detected or configured
+
+
+RUN_EXECUTOR_SPECIAL = (
+    "manual",
+    "mini",
+    "openhands",
+    "claude-sdk",
+    "native",
+    "native-preview",
+)
+
+
+def list_run_executor_names(project_root: Path) -> list[str]:
+    """Executor names accepted by ``dev run --executor``."""
+    custom = {
+        name
+        for name, spec in load_cli_agent_specs(project_root).items()
+        if not spec.built_in
+    }
+    names = set(BUILTIN_AGENT_NAMES) | set(RUN_EXECUTOR_SPECIAL) | custom
+    return sorted(names)
 
 
 def is_reserved_agent_name(name: str) -> bool:

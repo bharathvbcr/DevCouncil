@@ -13,14 +13,16 @@ def _write_log(root, lines):
     return log
 
 
-def test_logs_path_reports_not_created(tmp_path):
+def test_logs_path_reports_not_created(tmp_path, monkeypatch):
+    monkeypatch.delenv("DEVCOUNCIL_LOG_DIR", raising=False)
     result = runner.invoke(app, ["logs", "path", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     # Rich may wrap the long path line, so normalize whitespace before matching.
     assert "not created yet" in " ".join(result.stdout.split())
 
 
-def test_logs_tail_limit(tmp_path):
+def test_logs_tail_limit(tmp_path, monkeypatch):
+    monkeypatch.delenv("DEVCOUNCIL_LOG_DIR", raising=False)
     _write_log(tmp_path, [f"line {i}" for i in range(10)])
     result = runner.invoke(app, ["logs", "tail", "-n", "3", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
@@ -28,7 +30,8 @@ def test_logs_tail_limit(tmp_path):
     assert "line 6" not in result.stdout  # only the last 3 lines
 
 
-def test_logs_tail_grep(tmp_path):
+def test_logs_tail_grep(tmp_path, monkeypatch):
+    monkeypatch.delenv("DEVCOUNCIL_LOG_DIR", raising=False)
     _write_log(tmp_path, ["alpha", "beta", "ALPHA again", "gamma"])
     result = runner.invoke(app, ["logs", "tail", "--grep", "alpha", "--project-root", str(tmp_path)])
     assert result.exit_code == 0

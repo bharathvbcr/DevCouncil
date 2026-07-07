@@ -1,4 +1,4 @@
-import json
+from devcouncil.utils.json_persist import dump_json
 import logging
 from typing import NoReturn
 import typer
@@ -32,7 +32,7 @@ def prompt(
 
     def _fail(message: str) -> NoReturn:
         if json_format:
-            typer.echo(json.dumps({"ok": False, "task_id": task_id, "error": message}, indent=2))
+            typer.echo(dump_json({"ok": False, "task_id": task_id, "error": message}, indent=2))
         else:
             console.print(f"[red]{message}[/red]")
         raise typer.Exit(code=1)
@@ -62,7 +62,7 @@ def prompt(
             task_prompt = builder.build_task_prompt(task, reqs)
 
             if json_format:
-                typer.echo(json.dumps({"ok": True, "task_id": task_id, "prompt": task_prompt}, indent=2))
+                typer.echo(dump_json({"ok": True, "task_id": task_id, "prompt": task_prompt}, indent=2))
             elif pretty:
                 console.print(Markdown(task_prompt))
             else:

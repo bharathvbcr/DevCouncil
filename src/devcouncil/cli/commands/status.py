@@ -2,9 +2,10 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from pathlib import Path
-import json
 import logging
+
 import typer
+from devcouncil.utils.json_persist import dump_json
 from devcouncil.cli.commands.init import initialize_project
 from devcouncil.app.project_status import compute_phase
 from devcouncil.storage.db import get_db
@@ -78,7 +79,7 @@ def status(
                 raise typer.Exit(code=1)
 
         if json_format:
-            typer.echo(json.dumps(payload, indent=2))
+            typer.echo(dump_json(payload, indent=2))
             _maybe_fail()
             log_step("status/complete", project_root=root, trace=True)
             return

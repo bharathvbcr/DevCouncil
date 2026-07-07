@@ -1,6 +1,5 @@
 import typer
 import asyncio
-import json
 import datetime
 import logging
 import sys
@@ -23,6 +22,11 @@ from devcouncil.planning.spec_service import SpecService
 from devcouncil.planning.prompt_enhancer_service import PromptEnhancerService, save_active_prompt_enhancement
 from devcouncil.planning.plan_service import PlanService, backfill_acceptance_criteria
 from devcouncil.planning.plan_difficulty import apply_plan_difficulty
+from devcouncil.planning.planned_files_reconcile import (
+    expand_scope_with_dependents,
+    reconcile_planned_files,
+    repo_files_from_map,
+)
 from devcouncil.planning.question_conversion import convert_blocking_questions_to_assumptions
 from devcouncil.planning.critique_service import CritiqueService
 from devcouncil.planning.arbiter_service import ArbiterDecision, ArbiterService
@@ -33,6 +37,7 @@ from devcouncil.app.config import ModelRoleConfig, load_config, get_api_key
 from devcouncil.cli.commands.init import initialize_project
 from devcouncil.telemetry.traces import TraceLogger
 from devcouncil.telemetry.stages import log_stage, log_step
+from devcouncil.utils.json_persist import dump_json
 
 app = typer.Typer()
 console = Console()
@@ -172,7 +177,7 @@ async def run_plan_flow(
 
         provider = MockProvider()
         provider.responses = {
-            "mock/prompt_enhancer": json.dumps({
+            "mock/prompt_enhancer": dump_json({
                 "original_goal": goal,
                 "enhanced_goal": (
                     f"Plan and implement {goal} using the mapped repository's "
@@ -182,26 +187,26 @@ async def run_plan_flow(
                 "debate_focus": ["Compare minimal implementation scope against production-readiness concerns."],
                 "constraints": [f"Do not broaden beyond: {goal}."]
             }),
-            "mock/spec_writer": json.dumps({
+            "mock/spec_writer": dump_json({
                 "requirements": [{"id": "REQ-001", "title": "Mock Req", "description": "Desc", "priority": "high", "source": "user", "acceptance_criteria": []}],
                 "assumptions": [],
                 "blocking_questions": []
             }),
             "mock/planner_a": [
-                json.dumps({
+                dump_json({
                     "id": "PLAN-A", "rationale": "Simple", "tasks": [{"id": "TASK-001", "title": "Mock Task", "description": "Desc", "requirement_ids": ["REQ-001"], "acceptance_criterion_ids": [], "planned_files": [], "expected_tests": [], "allowed_commands": [], "status": "planned"}]
                 }),
-                json.dumps({"rebuttals": []})
+                dump_json({"rebuttals": []})
             ],
             "mock/planner_b": [
-                json.dumps({
+                dump_json({
                     "id": "PLAN-B", "rationale": "Robust", "tasks": [{"id": "TASK-001", "title": "Mock Task", "description": "Desc", "requirement_ids": ["REQ-001"], "acceptance_criterion_ids": [], "planned_files": [], "expected_tests": [], "allowed_commands": [], "status": "planned"}]
                 }),
-                json.dumps({"rebuttals": []})
+                dump_json({"rebuttals": []})
             ],
             "mock/critic_a": '{"findings": []}',
             "mock/critic_b": '{"findings": []}',
-            "mock/arbiter": json.dumps({
+            "mock/arbiter": dump_json({
                 "accepted_finding_ids": [], "rejected_finding_ids": [], 
                 "final_requirements": [{"id": "REQ-001", "title": "Mock Req", "description": "Desc", "priority": "high", "source": "user", "acceptance_criteria": [{"id": "AC-1", "description": "Test it", "verification_method": "unit_test"}]}],
                 "final_tasks": [{"id": "TASK-001", "title": "Mock Task", "description": "Desc", "requirement_ids": ["REQ-001"], "acceptance_criterion_ids": ["AC-1"], "planned_files": [{"path": "test.py", "reason": "logic", "allowed_change": "modify"}], "expected_tests": [], "allowed_commands": [], "status": "planned"}]
@@ -302,7 +307,7 @@ async def _run_plan_body(
             console.print(Panel(f"Found {len(spec_output.requirements)} requirements.", title="Requirements Generated"))
             return []
 
-        requirements_json = json.dumps([r.model_dump() for r in spec_output.requirements])
+        requirements_json = dump_json([r.model_dump() for r in spec_output.requirements])
 
         if quick:
             # Rigor dial: single pragmatic plan, no A/B debate, critique, rebuttal,
@@ -408,6 +413,24 @@ async def _run_plan_body(
             f"[dim]Linked {len(backfilled_acs)} unmapped acceptance criterion(s) to owning task(s) "
             "so every elaborated behavior is verified.[/dim]"
         )
+    # Ground planner-named files in the real repo before they become the scope
+    # whitelist: repair a typo'd/renamed modify target to its true path so the
+    # agent's correct write isn't reverted for pointing at a path the planner
+    # misspelled. Only relaxes/repairs scope — never tightens it.
+    final_tasks, planned_file_warnings = reconcile_planned_files(
+        final_tasks, repo_files_from_map(repo_map)
+    )
+    for warning in planned_file_warnings:
+        console.print(f"[yellow]{warning}[/yellow]")
+
+    # The other half: add the real callers (repo-map dependents) of each writable
+    # file so a caller the planner omitted isn't reverted mid-run. Only widens scope.
+    final_tasks, scope_widen_warnings = expand_scope_with_dependents(
+        final_tasks, repo_map.dependents, repo_files_from_map(repo_map)
+    )
+    for warning in scope_widen_warnings:
+        console.print(f"[dim]{warning}[/dim]")
+
     final_tasks, difficulty_warnings = apply_plan_difficulty(final_tasks, decision.final_requirements)
     for warning in difficulty_warnings:
         console.print(f"[yellow]{warning}[/yellow]")

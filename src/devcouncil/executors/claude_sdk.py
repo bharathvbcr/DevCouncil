@@ -25,6 +25,7 @@ from devcouncil.domain.task import Task
 from devcouncil.execution.executor import ExecutionResult, Executor
 from devcouncil.execution.hook_policy import HookDecision, HookPolicy
 from devcouncil.execution.prompt_builder import PromptBuilder
+from devcouncil.executors.transient_retry import transient_error_in_text
 from devcouncil.telemetry.stages import log_step
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,7 @@ class ClaudeSdkExecutor(Executor):
         active_task: Task | None = None,
         model: str | None = None,
         permission_mode: str = "default",
+        env: dict[str, str] | None = None,
     ):
         # NOTE: default (not acceptEdits). acceptEdits auto-approves file edits, which would
         # skip the can_use_tool callback entirely and defeat the lease gate; "default" routes
@@ -51,6 +53,11 @@ class ClaudeSdkExecutor(Executor):
         self.active_task = active_task
         self.model = model
         self.permission_mode = permission_mode
+        # Extra environment for the SDK's underlying Claude Code process. Lets a run
+        # target an alternative Anthropic-compatible endpoint (ANTHROPIC_BASE_URL /
+        # ANTHROPIC_AUTH_TOKEN, e.g. a local proxy) — same knob the subprocess
+        # executor exposes via per-profile ``env`` overrides.
+        self.env = dict(env) if env else {}
         self.policy = HookPolicy(project_root=self.project_root)
         self.last_agent_session_id: str | None = None
         # (tool_name, reason) for every call the gate denied — surfaced in the result.
@@ -111,10 +118,8 @@ class ClaudeSdkExecutor(Executor):
             project_root=self.project_root,
             task_id=task.id,
         )
-        import asyncio
-
         try:
-            result = asyncio.run(self._run_async(task, requirements))
+            result = self._run_coroutine_from_sync(self._run_async(task, requirements))
             log_step(
                 f"executor/claude-sdk: finished task {task.id}",
                 project_root=self.project_root,
@@ -133,6 +138,24 @@ class ClaudeSdkExecutor(Executor):
                 error=str(exc),
             )
             return ExecutionResult(success=False, message=str(exc))
+
+    @staticmethod
+    def _run_coroutine_from_sync(coro):
+        """Run an async coroutine from sync code, including nested-loop contexts.
+
+        ``asyncio.run()`` raises when a loop is already running (pytest-asyncio,
+        Jupyter). With no running loop we use ``asyncio.run()``; otherwise we run
+        the coroutine on a fresh loop in a worker thread.
+        """
+        import asyncio
+        import concurrent.futures
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            return executor.submit(asyncio.run, coro).result()
 
     async def _run_async(self, task: Task, requirements: List[Requirement]) -> ExecutionResult:
         sdk = self._load_sdk()
@@ -154,22 +177,50 @@ class ClaudeSdkExecutor(Executor):
             return self._deny(sdk, decision.reason)
 
         options = self._build_options(sdk, can_use_tool)
-        result_text: Optional[str] = None
-        is_error = False
         try:
-            async for message in sdk.query(prompt=prompt, options=options):
-                session_id = self._message_session_id(message)
-                if session_id:
-                    self.last_agent_session_id = session_id
-                text, error = self._message_result(message)
-                if text is not None:
-                    result_text = text
-                if error:
-                    is_error = True
+            return await self._run_async_once(sdk, prompt, options, task)
         except Exception as exc:  # a mid-run SDK failure is a failed execution, not a crash
-            logger.exception("claude-sdk executor raised for %s", getattr(task, "id", "?"))
+            logger.exception(
+                "claude-sdk executor raised mid-run for %s: %s",
+                getattr(task, "id", "?"),
+                exc,
+            )
+            reason = transient_error_in_text(str(exc))
+            if reason is not None:
+                import time
+
+                logger.warning(
+                    "claude-sdk transient failure for %s (%s); retrying once in 5s",
+                    getattr(task, "id", "?"),
+                    reason,
+                )
+                time.sleep(5.0)
+                try:
+                    return await self._run_async_once(sdk, prompt, options, task)
+                except Exception as retry_exc:
+                    logger.exception(
+                        "claude-sdk retry failed for %s: %s",
+                        getattr(task, "id", "?"),
+                        retry_exc,
+                    )
+                    return ExecutionResult(
+                        success=False,
+                        message=f"Claude Agent SDK run failed after retry: {retry_exc}",
+                    )
             return ExecutionResult(success=False, message=f"Claude Agent SDK run failed: {exc}")
 
+    async def _run_async_once(self, sdk, prompt: str, options, task: Task) -> ExecutionResult:
+        result_text: Optional[str] = None
+        is_error = False
+        async for message in sdk.query(prompt=prompt, options=options):
+            session_id = self._message_session_id(message)
+            if session_id:
+                self.last_agent_session_id = session_id
+            text, error = self._message_result(message)
+            if text is not None:
+                result_text = text
+            if error:
+                is_error = True
         if self.denials:
             denied = "; ".join(f"{name} ({reason})" for name, reason in self.denials)
             suffix = f" Gate denied {len(self.denials)} out-of-scope call(s): {denied}."
@@ -187,6 +238,8 @@ class ClaudeSdkExecutor(Executor):
         }
         if self.model:
             kwargs["model"] = self.model
+        if self.env:
+            kwargs["env"] = dict(self.env)
         if options_cls is None:
             return kwargs
         # Only pass kwargs the SDK's options object actually accepts, so a version skew in
@@ -194,10 +247,17 @@ class ClaudeSdkExecutor(Executor):
         try:
             return options_cls(**kwargs)
         except TypeError:
-            safe = {k: v for k, v in kwargs.items() if k in {"cwd", "permission_mode", "model"}}
-            try:
-                obj = options_cls(**safe)
-            except TypeError:
+            # Progressively narrower kwarg sets: an SDK too old for ``env`` still gets
+            # cwd/permission_mode/model rather than losing all options.
+            obj = None
+            for keys in ({"cwd", "permission_mode", "model", "env"}, {"cwd", "permission_mode", "model"}):
+                safe = {k: v for k, v in kwargs.items() if k in keys}
+                try:
+                    obj = options_cls(**safe)
+                    break
+                except TypeError:
+                    continue
+            if obj is None:
                 obj = options_cls()
             if hasattr(obj, "can_use_tool"):
                 obj.can_use_tool = can_use_tool

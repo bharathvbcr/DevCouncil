@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+from devcouncil.utils.json_persist import dump_json
 import asyncio
 import logging
 import time
@@ -52,7 +52,7 @@ def sessions(
         log_step("watch/1: discovering sessions", project_root=root, trace=True)
         found = discover_sessions(root, client=client)
         if json_format:
-            typer.echo(json.dumps({"sessions": [item.model_dump() for item in found]}, indent=2))
+            typer.echo(dump_json({"sessions": [item.model_dump() for item in found]}, indent=2))
             log_step("watch/complete", project_root=root, count=len(found), trace=True)
             return
 
@@ -89,7 +89,7 @@ def review(
     if transcript_path is None:
         message = "No transcript selected. Use --transcript, --session, or --latest."
         if json_format:
-            typer.echo(json.dumps({"ok": False, "error": message}, indent=2))
+            typer.echo(dump_json({"ok": False, "error": message}, indent=2))
         else:
             console.print(f"[red]{message}[/red]")
         raise typer.Exit(code=2)
@@ -97,7 +97,7 @@ def review(
     if turn is None:
         message = f"No assistant turn found in {transcript_path}."
         if json_format:
-            typer.echo(json.dumps({"ok": False, "error": message}, indent=2))
+            typer.echo(dump_json({"ok": False, "error": message}, indent=2))
         else:
             console.print(f"[yellow]{message}[/yellow]")
         raise typer.Exit(code=1)
@@ -114,7 +114,7 @@ def review(
     payload["duplicate"] = duplicate
 
     if json_format:
-        typer.echo(json.dumps(payload, indent=2))
+        typer.echo(dump_json(payload, indent=2))
         return
 
     _print_card(card)
@@ -137,7 +137,7 @@ def cards(
     if limit < 1:
         message = "--limit must be greater than 0."
         if json_format:
-            typer.echo(json.dumps({"ok": False, "error": message}, indent=2))
+            typer.echo(dump_json({"ok": False, "error": message}, indent=2))
         else:
             console.print(f"[red]{message}[/red]")
         raise typer.Exit(code=2)
@@ -150,14 +150,14 @@ def cards(
     )
     if error:
         if json_format:
-            typer.echo(json.dumps({"ok": False, "error": error}, indent=2))
+            typer.echo(dump_json({"ok": False, "error": error}, indent=2))
         else:
             console.print(f"[red]{error}[/red]")
         raise typer.Exit(code=2)
     total = len(found)
     found = found[:limit]
     if json_format:
-        typer.echo(json.dumps({
+        typer.echo(dump_json({
             "cards": [item.model_dump() for item in found],
             "filters": {
                 "task_id": task_id,
@@ -183,7 +183,7 @@ def status(
     root = project_root.expanduser().resolve()
     payload = live_review_summary(root, task_id=task_id)
     if json_format:
-        typer.echo(json.dumps(payload, indent=2))
+        typer.echo(dump_json(payload, indent=2))
         return
     blockers = payload["blocking_cards"]
 
@@ -240,7 +240,7 @@ def resolve(
     if status not in {"resolved", "ignored"}:
         message = "--status must be resolved or ignored."
         if json_format:
-            typer.echo(json.dumps({"ok": False, "error": message}, indent=2))
+            typer.echo(dump_json({"ok": False, "error": message}, indent=2))
         else:
             console.print(f"[red]{message}[/red]")
         raise typer.Exit(code=2)
@@ -249,12 +249,12 @@ def resolve(
     if card is None:
         message = f"Critique card {card_id} not found."
         if json_format:
-            typer.echo(json.dumps({"ok": False, "error": message}, indent=2))
+            typer.echo(dump_json({"ok": False, "error": message}, indent=2))
         else:
             console.print(f"[red]{message}[/red]")
         raise typer.Exit(code=1)
     if json_format:
-        typer.echo(json.dumps({"ok": True, "card": card.model_dump()}, indent=2))
+        typer.echo(dump_json({"ok": True, "card": card.model_dump()}, indent=2))
         _log_card_resolved(root, card)
         return
     _log_card_resolved(root, card)
@@ -273,13 +273,13 @@ def repair(
     if card is None:
         message = f"Critique card {card_id} not found."
         if json_format:
-            typer.echo(json.dumps({"ok": False, "error": message}, indent=2))
+            typer.echo(dump_json({"ok": False, "error": message}, indent=2))
         else:
             console.print(f"[red]{message}[/red]")
         raise typer.Exit(code=1)
     prompt = build_live_repair_prompt(root, card)
     if json_format:
-        typer.echo(json.dumps({"ok": True, "card": card.model_dump(), "prompt": prompt}, indent=2))
+        typer.echo(dump_json({"ok": True, "card": card.model_dump(), "prompt": prompt}, indent=2))
         return
     typer.echo(prompt)
 
@@ -304,7 +304,7 @@ def repair_all(
     resolved_cards = [card for card in cards if card is not None]
     prompt = build_bulk_live_repair_prompt(root, resolved_cards)
     if json_format:
-        typer.echo(json.dumps({
+        typer.echo(dump_json({
             "ok": True,
             "scope_task_id": summary["scope_task_id"],
             "cards": [card.model_dump() for card in resolved_cards],
@@ -324,7 +324,7 @@ def signals(
     root = project_root.expanduser().resolve()
     found = _filtered_signals(root, client)
     if json_format:
-        typer.echo(json.dumps({"signals": [item.model_dump() for item in found]}, indent=2))
+        typer.echo(dump_json({"signals": [item.model_dump() for item in found]}, indent=2))
         return
     table = Table(title="DevCouncil Watch Signals")
     table.add_column("Client", style="cyan")
@@ -386,7 +386,7 @@ def pending(
 
     logger.info("dev watch pending complete: %d reviewed, %d skipped", len(reviewed), len(skipped))
     if json_format:
-        typer.echo(json.dumps({"reviewed": reviewed, "skipped": skipped}, indent=2))
+        typer.echo(dump_json({"reviewed": reviewed, "skipped": skipped}, indent=2))
         return
     for item in skipped:
         console.print(f"[yellow]Skipped signal:[/yellow] {item['reason']}")
@@ -449,7 +449,7 @@ def import_transcript(
     """Normalize a transcript into DevCouncil turn records without reviewing it."""
     turns = load_turns(transcript.expanduser().resolve(), client=client)
     if json_format:
-        typer.echo(json.dumps({"turns": [turn.model_dump() for turn in turns]}, indent=2))
+        typer.echo(dump_json({"turns": [turn.model_dump() for turn in turns]}, indent=2))
         return
     console.print(f"Loaded {len(turns)} turns from {transcript}")
 
@@ -500,12 +500,20 @@ def _resolve_transcript(
     transcript: Path | None = None,
     session: str | None = None,
     latest: bool = False,
+    task_id: str | None = None,
 ) -> Path | None:
     if transcript is not None:
         path = transcript.expanduser()
         if not path.is_absolute():
             path = root / path
         return path.resolve()
+
+    if client.lower() == "claude" and task_id:
+        from devcouncil.live.transcripts import claude_transcript_for_task
+
+        pinned = claude_transcript_for_task(root, task_id)
+        if pinned is not None:
+            return pinned
 
     selector = "latest" if latest else session
     if selector is None:
@@ -598,5 +606,8 @@ async def _review_turn(turn, root: Path, client: str, use_llm: bool, task_id: st
         logger.warning("Model-backed live review unavailable; using deterministic card: %s", exc)
         console.print(f"[yellow]Model-backed review unavailable; using deterministic card: {exc}[/yellow]")
         return review_turn(turn, root, client=client, task_id=task_id)
-    card = await LiveReviewService(router).review(turn, root, client=client, use_llm=True)
+    # task_id flows through so the LLM review is grounded in the task's recorded
+    # verification state (like the deterministic path), instead of judging the
+    # agent's prose in a vacuum.
+    card = await LiveReviewService(router).review(turn, root, client=client, use_llm=True, task_id=task_id)
     return card.model_copy(update={"task_id": task_id}) if task_id else card

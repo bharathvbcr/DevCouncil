@@ -152,6 +152,46 @@ def _slash_commands() -> list[_SlashCommand]:
             ),
             allowed_tools="Bash(dev report:*)",
         ),
+        _SlashCommand(
+            name="map",
+            description="Build or refresh the deterministic repository map (no LLM).",
+            argument_hint="[goal]",
+            bash="dev map $ARGUMENTS",
+            body=(
+                "Summarize the repository map above: languages, frameworks, test commands, and "
+                "the most relevant entry points for the stated goal (if any). Point the user at "
+                "`.devcouncil/repo_map.json` for the full index and recommend `/devcouncil:next` "
+                "or `/devcouncil:plan` as the next step."
+            ),
+            allowed_tools="Bash(dev map:*)",
+        ),
+        _SlashCommand(
+            name="wiki",
+            description="Consult the generated codebase wiki for a topic or subsystem.",
+            argument_hint="[topic]",
+            bash="dev wiki status",
+            body=(
+                "The codebase wiki status is shown above. Use "
+                "`mcp__devcouncil__devcouncil_wiki_page` with query \"$ARGUMENTS\" (or no "
+                "arguments for the index) to read the relevant subsystem page(s), and "
+                "summarize what they say about the topic before making changes. If pages "
+                "are stale, suggest running `dev wiki update`."
+            ),
+            allowed_tools="Bash(dev wiki:*)",
+        ),
+        _SlashCommand(
+            name="supervise",
+            description="Review a recorded agent run and decide keep/revert/repair.",
+            argument_hint="[RUN-ID or TASK-ID]",
+            bash="dev runs list",
+            body=(
+                "The recorded runs are listed above. For the run the user named (or the "
+                "newest relevant one), run `dev runs supervise $ARGUMENTS` and present the "
+                "verdict with its findings. If the verdict is revert, show `dev runs diff "
+                "$ARGUMENTS` and ask before running `dev runs revert $ARGUMENTS`."
+            ),
+            allowed_tools="Bash(dev runs:*)",
+        ),
     ]
 
 
@@ -167,6 +207,34 @@ def _slash_command_markdown(cmd: _SlashCommand) -> str:
         lines.append("")
     lines.append(cmd.body)
     return build_frontmatter_markdown(meta, "\n".join(lines))
+
+
+# Bash permission rules merged into .claude/settings.local.json so slash commands and
+# common hero-loop CLIs run without interactive approval. Kept here (with the slash
+# commands) so the allow-list stays in sync with generated command allowed-tools.
+_EXTRA_BASH_PERMISSIONS = (
+    "Bash(dev go:*)",
+    "Bash(dev check:*)",
+    "Bash(dev gaps:*)",
+    "Bash(dev export:*)",
+    "Bash(dev doctor:*)",
+    "Bash(devcouncil mcp-server)",
+)
+
+
+def claude_bash_permission_allow() -> list[str]:
+    """Ordered, de-duplicated Bash allow-rules for Claude Code settings merge."""
+    seen: set[str] = set()
+    rules: list[str] = []
+    for cmd in _slash_commands():
+        if cmd.allowed_tools and cmd.allowed_tools not in seen:
+            seen.add(cmd.allowed_tools)
+            rules.append(cmd.allowed_tools)
+    for rule in _EXTRA_BASH_PERMISSIONS:
+        if rule not in seen:
+            seen.add(rule)
+            rules.append(rule)
+    return rules
 
 
 def build_slash_commands(root: Path) -> list[GeneratedAsset]:

@@ -16,9 +16,9 @@ from devcouncil.executors.agent_registry import (
     resolve_automated_executor,
 )
 from devcouncil.llm.provider import SUPPORTED_MODEL_PROVIDERS, validate_model_provider
+from devcouncil.telemetry.stages import log_stage, log_step
 
 app = typer.Typer()
-from devcouncil.telemetry.stages import log_stage, log_step
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -98,8 +98,8 @@ def _knowledge_dir(project_root: Path, config=None) -> str:
     try:
         cfg = config if config is not None else load_config(project_root)
         directory = cfg.knowledge.directory
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to load knowledge directory from config, using default: %s", e)
     return directory
 
 
@@ -212,18 +212,224 @@ def check_ingested_knowledge(project_root: Path, config=None) -> list[tuple[str,
     return rows
 
 
+# Explicit map from an area row in docs/project-status.md to the tests/unit/<subsystem>/
+# directory expected to back a "Stable" claim. Deliberately small and in-code (see
+# IMPROVEMENTS.md: doc/status drift check) — extend it as areas graduate to Stable.
+STATUS_DOC_UNIT_TEST_DIRS: tuple[tuple[str, str], ...] = (
+    ("CLI & Storage", "storage"),
+    ("Artifact Graph", "artifacts"),
+    ("Council Debate", "council"),
+    ("Diff↔Coverage Gate", "verification"),
+    ("Cost & Run Telemetry", "telemetry"),
+)
+
+
+def _parse_status_doc_areas(status_doc: Path) -> dict[str, str]:
+    """Parse the docs/project-status.md maturity table into {area: status-cell text}.
+
+    Rows look like ``| **CLI & Storage** | Stable: SQLite + SQLModel, ... |``. The
+    header row and the ``| :--- |`` separator row are skipped. Best-effort by design;
+    the caller wraps this in try/except so a malformed doc never crashes doctor.
+    """
+    areas: dict[str, str] = {}
+    for line in status_doc.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if len(cells) < 2:
+            continue
+        area = cells[0].strip().strip("*").strip()
+        if not area or area.lower() == "area" or set(area) <= {":", "-", " "}:
+            continue
+        areas[area] = cells[1]
+    return areas
+
+
+def check_local_monitor_sampling(project_root: Path, config=None) -> list[tuple[str, str, str]]:
+    """Doctor rows for local-monitor verification safety.
+
+    Calibration probes (2026-07-03, benchmarks/results/local_monitor_*) showed a
+    local monitor with single-shot acceptance checks rubber-stamping real defects,
+    while samples>=3 + per-criterion compilation caught 6/6 with zero false passes.
+    Auto-resolution picks the safe local settings; these rows surface EXPLICIT
+    overrides that disable them — at setup time, where users actually look, rather
+    than only as mid-run log warnings. Cloud monitors produce no rows (single-shot
+    is their intended default). Never raises.
+    """
+    try:
+        from devcouncil.app.config import load_config, role_runs_on_local_provider
+
+        cfg = config if config is not None else load_config(project_root)
+        rows: list[tuple[str, str, str]] = []
+        warn = "[yellow]Risky[/yellow]"
+
+        local_monitor = role_runs_on_local_provider(cfg, "implementation_reviewer")
+        for message in cfg.verification.acceptance_checks.unsafe_override_warnings(local_monitor):
+            rows.append(("Local monitor (acceptance checks)", warn, message))
+        local_reviewer = role_runs_on_local_provider(cfg, "live_reviewer")
+        for message in cfg.verification.reviewer_checks.unsafe_override_warnings(local_reviewer):
+            rows.append(("Local reviewer (live review)", warn, message))
+
+        if not rows and (local_monitor or local_reviewer):
+            samples, repairs, per_criterion = cfg.verification.acceptance_checks.resolved(local_monitor)
+            votes = cfg.verification.reviewer_checks.resolved(local_reviewer)
+            rows.append((
+                "Local monitor ensembling",
+                "[green]OK[/green]",
+                f"Acceptance checks: samples={samples}, repair_attempts={repairs}, "
+                f"per_criterion={per_criterion}; reviewer votes={votes}.",
+            ))
+        return rows
+    except Exception:
+        return []  # config problems already surface via other doctor rows
+
+
+def check_status_doc_drift(project_root: Path) -> list[tuple[str, str, str]]:
+    """Doctor rows verifying docs/project-status.md "Stable" claims against tests/unit/.
+
+    For each mapped area (``STATUS_DOC_UNIT_TEST_DIRS``) whose status-table row claims
+    Stable, require a non-empty ``tests/unit/<subsystem>/`` directory (at least one
+    ``test_*.py``) to back the claim; mismatches become ``WARN`` rows so the status doc
+    cannot drift ahead of the test suite unnoticed. A mapped area missing from the doc
+    is also reported — that means the in-code mapping went stale.
+
+    Never raises: a missing status doc yields a neutral ``INFO`` row (most projects that
+    embed DevCouncil have no such doc), and any parse failure becomes a ``WARN`` row.
+    """
+    ok = "[green]OK[/green]"
+    warn = "[yellow]WARN[/yellow]"
+    info = "[cyan]INFO[/cyan]"
+
+    status_doc = project_root / "docs" / "project-status.md"
+    if not status_doc.is_file():
+        return [
+            (
+                "Status-doc drift",
+                info,
+                "No docs/project-status.md in this project; skipping status-vs-tests drift check.",
+            )
+        ]
+
+    try:
+        areas = _parse_status_doc_areas(status_doc)
+    except Exception as exc:  # never let a malformed status doc crash doctor
+        return [("Status-doc drift", warn, f"Could not parse docs/project-status.md: {exc}.")]
+
+    mismatches: list[str] = []
+    verified = 0
+    unit_root = project_root / "tests" / "unit"
+    for area, subsystem in STATUS_DOC_UNIT_TEST_DIRS:
+        status_text = areas.get(area)
+        if status_text is None:
+            mismatches.append(
+                f"'{area}' is in doctor's drift mapping but not in the status table "
+                "(update STATUS_DOC_UNIT_TEST_DIRS)"
+            )
+            continue
+        if not status_text.strip().lower().startswith("stable"):
+            continue  # only Stable rows claim unit-test-backed maturity
+        tests_dir = unit_root / subsystem
+        try:
+            has_tests = tests_dir.is_dir() and any(tests_dir.rglob("test_*.py"))
+        except Exception:
+            has_tests = False
+        if has_tests:
+            verified += 1
+        else:
+            try:
+                flat_matches = any(unit_root.glob(f"test_{subsystem}*.py"))
+            except Exception:
+                flat_matches = False
+            hint = (
+                f" (flat tests/unit/test_{subsystem}*.py files exist but no per-subsystem dir)"
+                if flat_matches
+                else ""
+            )
+            mismatches.append(
+                f"'{area}' claims Stable but tests/unit/{subsystem}/ is missing or empty{hint}"
+            )
+
+    if mismatches:
+        preview = "; ".join(mismatches[:5])
+        extra = "" if len(mismatches) <= 5 else f" (+{len(mismatches) - 5} more)"
+        return [
+            (
+                "Status-doc drift",
+                warn,
+                f"{len(mismatches)} mismatch(es) between docs/project-status.md and tests/unit/: "
+                f"{preview}{extra}.",
+            )
+        ]
+    return [
+        (
+            "Status-doc drift",
+            ok,
+            f"{verified} Stable claim(s) in docs/project-status.md backed by non-empty "
+            "tests/unit/<subsystem>/ directories.",
+        )
+    ]
+
+
 def _add_logging_row(table, project_root: Path) -> None:
     """Append a logging-health row: where the durable run log lives and how big it
     is, so a user chasing a recurring failure knows exactly where to look."""
-    from devcouncil.telemetry.logging_setup import LOG_RELATIVE_PATH
+    from devcouncil.telemetry.logging_setup import _resolve_log_path
 
-    log_path = project_root / LOG_RELATIVE_PATH
+    log_path = _resolve_log_path(project_root)
     if log_path.exists():
         size_kb = log_path.stat().st_size / 1024
         detail = f"{log_path} ({size_kb:.0f} KB). View: dev logs tail"
     else:
         detail = f"Will write to {log_path} on first command. View: dev logs tail"
     table.add_row("logging", "[green]OK[/green]", detail)
+
+
+def _subsystem_maturity_rows() -> list[tuple[str, str, str]]:
+    """Curated maturity tiers aligned with docs/project-status.md."""
+    return [
+        ("CLI & Storage", "stable", "SQLite + SQLModel; core workflow"),
+        ("Artifact Graph / Coverage", "stable", "Coverage engine and reports"),
+        ("Council Debate / Planning", "stable", "Multi-agent planning and critique"),
+        ("Manual Executor", "stable", "Sidecar mode"),
+        ("Diff↔Coverage Gate", "stable", "Signal-first; opt-in blocking"),
+        ("Next-Actions / dev check --verify", "stable", "Deterministic evidence gate"),
+        ("Ollama provider", "stable", "Offline planning without API keys"),
+        ("Engineering Skills", "stable", "dev skills listing/scaffolding"),
+        ("Cost & Run Telemetry", "stable", "dev cost show / dev runs"),
+        ("Security Scanning", "stable", "Secret redaction and detection"),
+        ("Coding CLI Executors", "preview", "Codex, Gemini, Claude, Cursor, OpenCode, …"),
+        ("Repair Loop (dev go)", "preview", "Bounded self-repair; correction manifest"),
+        ("MCP Server", "preview", "Lease-gated write path; verify loop maturing"),
+        ("OKF / design.md", "preview", "dev okf / dev design commands"),
+        ("CI Scaffolding", "preview", "dev scaffold-ci starter workflow"),
+        ("GitHub PR Checks / Comments", "preview", "dev report --github*"),
+        ("LSP / AST Indexing", "preview", "dev lsp inspect (detection-only) / dev ast"),
+        ("Live Dashboard", "preview", "dev dashboard --open"),
+        ("Coding CLI Hooks", "experimental", "Pre-tool-use starters; verify-only clients"),
+        ("Native Executor", "experimental", "native / native-preview"),
+    ]
+
+
+def _render_maturity_section(table) -> None:
+    """Append subsystem maturity rows so preview features are visible upfront."""
+    stable = "[green]Stable[/green]"
+    preview = "[yellow]Preview[/yellow]"
+    experimental = "[magenta]Experimental[/magenta]"
+    label_for = {"stable": stable, "preview": preview, "experimental": experimental}
+    for area, tier, notes in _subsystem_maturity_rows():
+        if tier == "preview":
+            notes = f"{notes} — API/output may change."
+        table.add_row(area, label_for.get(tier, tier), notes)
+
+
+def _print_maturity_table() -> None:
+    maturity = Table(title="DevCouncil Subsystem Maturity (see docs/project-status.md)")
+    maturity.add_column("Area", style="cyan")
+    maturity.add_column("Tier", style="magenta")
+    maturity.add_column("Notes", style="green")
+    _render_maturity_section(maturity)
+    console.print(maturity)
 
 
 def render_doctor_check(project_root: Path = Path(".")):
@@ -327,6 +533,22 @@ def render_doctor_check(project_root: Path = Path(".")):
     for component, status, notes in check_ingested_knowledge(project_root, config=config):
         table.add_row(component, status, notes)
 
+    from devcouncil.llm.semantic_bridge import check_semantic_layer
+
+    for component, status, notes in check_semantic_layer(project_root, config=config):
+        table.add_row(component, status, notes)
+
+    # Status-doc drift: keep docs/project-status.md "Stable" claims honest against the
+    # actual tests/unit/ layout. Placed with the knowledge rows so it also runs on the
+    # ollama / unsupported-provider early-return paths.
+    for component, status, notes in check_status_doc_drift(project_root):
+        table.add_row(component, status, notes)
+
+    # Local-monitor verification safety: flag explicit config that disables the
+    # ensembling a local monitor/reviewer needs (see check docstring for the data).
+    for component, status, notes in check_local_monitor_sampling(project_root, config=config):
+        table.add_row(component, status, notes)
+
     try:
         provider = config.models.provider if config is not None else "openrouter"
     except Exception:
@@ -342,6 +564,7 @@ def render_doctor_check(project_root: Path = Path(".")):
         )
         _add_logging_row(table, project_root)
         console.print(table)
+        _print_maturity_table()
         return
     if provider == "ollama":
         # Use the provider's own resolver so the displayed URL reflects OLLAMA_HOST
@@ -466,6 +689,7 @@ def render_doctor_check(project_root: Path = Path(".")):
 
         _add_logging_row(table, project_root)
         console.print(table)
+        _print_maturity_table()
         return
     env_var = provider_api_key_env_var(provider)
     local_secrets = load_local_secrets(project_root)
@@ -501,6 +725,7 @@ def render_doctor_check(project_root: Path = Path(".")):
 
     _add_logging_row(table, project_root)
     console.print(table)
+    _print_maturity_table()
 
 
 @app.callback(invoke_without_command=True)

@@ -6,6 +6,7 @@ loop is closable over MCP alone.
 """
 
 import json
+import os
 import subprocess
 
 import pytest
@@ -105,6 +106,18 @@ async def test_write_file_rejects_bad_lease(tmp_path, monkeypatch):
 
 
 def _git(root, *args):
+    if args and args[0] == "init":
+        env = {
+            **os.environ,
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "init.templateDir",
+            "GIT_CONFIG_VALUE_0": "/dev/null",
+        }
+        subprocess.run(
+            ["git", "init", "-b", "main"],
+            cwd=root, check=True, capture_output=True, text=True, env=env,
+        )
+        return
     subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True)
 
 

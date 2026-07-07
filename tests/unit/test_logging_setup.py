@@ -13,6 +13,16 @@ from devcouncil.telemetry.stages import log_stage, log_step
 
 
 @pytest.fixture(autouse=True)
+def _no_log_dir_override(monkeypatch):
+    """These tests assert the DEFAULT path resolution (root / LOG_RELATIVE_PATH).
+
+    The session-wide DEVCOUNCIL_LOG_DIR isolation fixture would otherwise win.
+    Each test here binds to its own tmp_path, so no repo pollution either way.
+    """
+    monkeypatch.delenv("DEVCOUNCIL_LOG_DIR", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _isolated_root_logger():
     """Give each test a clean root logger.
 

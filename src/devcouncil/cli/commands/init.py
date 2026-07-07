@@ -84,6 +84,7 @@ DEFAULT_CONFIG = {
             # never | hard | always — "hard" blocks stub/effort findings only on hard tasks
             "stub_detection": "hard",
             "effort_heuristics": "hard",
+            "coarse_acceptance_proof": "hard",
             "enforce_coverage_on_hard": True,
             "reviewer_required_on_hard": False,
             "extra_repair_attempts_on_hard": 1,
@@ -95,6 +96,11 @@ DEFAULT_CONFIG = {
         "redact_env_vars": True,
         "redact_secrets_in_logs": True,
         "store_prompts_locally": True
+    },
+    "telemetry": {
+        # Advisory model-spend budget in USD; null disables. Warn-only — crossing it
+        # logs a warning but never blocks a run. Manage via `dev cost budget`.
+        "cost_budget_usd": None,
     },
     "integrations": {
         "agent_flow": {

@@ -1,4 +1,4 @@
-import json
+from devcouncil.utils.json_persist import dump_json
 import logging
 from pathlib import Path
 
@@ -44,7 +44,11 @@ def show(
 
             task = task_repo.get_by_id(task_id)
             if not task:
-                console.print(f"[red]Task {task_id} not found.[/red]")
+                message = f"Task {task_id} not found."
+                if json_format:
+                    typer.echo(dump_json({"ok": False, "error": message, "task_id": task_id}, indent=2))
+                else:
+                    console.print(f"[red]{message}[/red]")
                 raise typer.Exit(code=1)
 
             reqs = req_repo.get_all()
@@ -56,7 +60,7 @@ def show(
                     for req_id in task.requirement_ids
                     if req_id in req_map
                 ]
-                typer.echo(json.dumps({
+                typer.echo(dump_json({
                     "task": task.model_dump(),
                     "linked_requirements": linked_requirements,
                 }, indent=2))

@@ -64,6 +64,68 @@ def test_mini_swe_executor_uses_task_scoped_instruction_file(tmp_path, monkeypat
     assert task_file.exists()
 
 
+def test_openhands_executor_includes_repair_rules_on_repair_run(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "devcouncil.planning.correction_manifest.repair_prompt_prefix",
+        lambda project_root, task_id: "# DevCouncil Correction Manifest\n\n{}\n\n## Repair rules (non-negotiable)\n".format(
+            '{"root_cause": "stub detected"}'
+        ),
+    )
+    task = Task(
+        id="TASK-001",
+        title="OpenHands",
+        description="Fix the stub",
+        planned_files=[
+            PlannedFile(path="src/app.py", reason="logic", allowed_change="modify"),
+        ],
+    )
+
+    result = OpenHandsExecutor(tmp_path).run_task(task, [])
+
+    assert result.success
+    prompt = (tmp_path / ".devcouncil" / "TASK-001-openhands-task.md").read_text(encoding="utf-8")
+    assert "Repair rules (non-negotiable)" in prompt
+    assert "stub detected" in prompt
+
+
+def test_mini_swe_executor_includes_repair_rules_on_repair_run(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "devcouncil.planning.correction_manifest.repair_prompt_prefix",
+        lambda project_root, task_id: "# DevCouncil Correction Manifest\n\n{}\n\n## Repair rules (non-negotiable)\n".format(
+            '{"root_cause": "effort gap"}'
+        ),
+    )
+    task = Task(
+        id="TASK-001",
+        title="mini",
+        description="Complete the work",
+        planned_files=[
+            PlannedFile(path="src/app.py", reason="logic", allowed_change="modify"),
+        ],
+    )
+
+    result = MiniSWEExecutor(tmp_path).run_task(task, [])
+
+    assert result.success
+    prompt = (tmp_path / ".devcouncil" / "TASK-001-mini-swe-task.md").read_text(encoding="utf-8")
+    assert "Repair rules (non-negotiable)" in prompt
+    assert "effort gap" in prompt
+
+
 def test_coding_cli_executor_uses_stdin_prompt(tmp_path, monkeypatch):
     captured = {}
 
@@ -1346,3 +1408,27 @@ def test_coding_cli_revert_handles_repo_with_no_commits(tmp_path):
     reverted = CodingCliExecutor(tmp_path, "codex")._enforce_file_scope(task)
     assert [p for p, _ in reverted] == ["src/orphan.py"]
     assert not (tmp_path / "src" / "orphan.py").exists()
+
+
+def test_openhands_retries_transient_failure(tmp_path, monkeypatch):
+    calls = {"count": 0}
+
+    def fake_run(cmd, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="rate limit exceeded")
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("devcouncil.executors.transient_retry.time.sleep", lambda _s: None)
+    task = Task(
+        id="TASK-001",
+        title="OpenHands retry",
+        description="desc",
+        planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
+    )
+
+    result = OpenHandsExecutor(tmp_path).run_task(task, [])
+
+    assert result.success
+    assert calls["count"] == 2

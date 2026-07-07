@@ -208,7 +208,11 @@ def _clone_git(url: str) -> FetchedBundle:
             ["git", "clone", "--depth", "1", url, str(target)],
             capture_output=True,
             text=True,
+            timeout=600,  # network clone; generous, but a stalled remote must not hang fetch
         )
+    except subprocess.TimeoutExpired as exc:
+        shutil.rmtree(parent, ignore_errors=True)
+        raise RuntimeError(f"git clone of {url!r} timed out after 600s") from exc
     except OSError as exc:  # pragma: no cover - git present but unexecutable
         shutil.rmtree(parent, ignore_errors=True)
         raise RuntimeError(f"git clone failed to start: {exc}") from exc

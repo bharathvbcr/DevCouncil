@@ -121,7 +121,10 @@ def test_permission_mode_ignored_for_unknown_client(tmp_path):
 
 def test_profile_override_summary_in_manifest(tmp_path):
     profile = CliAgentProfileConfig(
-        extra_args=["--foo"], permission_mode="gated", model="claude-opus-4"
+        extra_args=["--foo"],
+        permission_mode="gated",
+        model="claude-opus-4",
+        env={"ANTHROPIC_BASE_URL": "http://127.0.0.1:4000", "ANTHROPIC_AUTH_TOKEN": "sk-secret"},
     )
     executor = _executor(tmp_path, "claude", profile)
     summary = executor._profile_override_summary()
@@ -129,7 +132,55 @@ def test_profile_override_summary_in_manifest(tmp_path):
         "extra_args": ["--foo"],
         "permission_mode": "gated",
         "model": "claude-opus-4",
+        "env_keys": ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"],
     }
+    # The manifest summary must never leak env VALUES (tokens/keys).
+    assert "sk-secret" not in repr(summary)
+
+
+def test_profile_env_lands_in_subprocess_env(tmp_path):
+    profile = CliAgentProfileConfig(env={"ANTHROPIC_BASE_URL": "http://127.0.0.1:4000"})
+    executor = _executor(tmp_path, "claude", profile)
+    env = executor._build_env()
+    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:4000"
+    # DevCouncil's own variables are still present and derived from the run, not the profile.
+    assert env["DEVCOUNCIL_PROJECT_ROOT"] == str(tmp_path)
+    assert env["DEVCOUNCIL_AGENT_PROFILE"] == "custom"
+
+
+def test_profile_env_cannot_mask_devcouncil_vars(tmp_path):
+    profile = CliAgentProfileConfig(
+        env={"DEVCOUNCIL_PROJECT_ROOT": "/evil", "DEVCOUNCIL_AGENT_PROFILE": "spoof"}
+    )
+    executor = _executor(tmp_path, "claude", profile)
+    env = executor._build_env()
+    assert env["DEVCOUNCIL_PROJECT_ROOT"] == str(tmp_path)
+    assert env["DEVCOUNCIL_AGENT_PROFILE"] == "custom"
+
+
+def test_profile_env_overrides_spec_env(tmp_path):
+    import dataclasses
+
+    profile = CliAgentProfileConfig(env={"SHARED": "profile"})
+    executor = _executor(tmp_path, "claude", profile)
+    executor.spec = dataclasses.replace(executor.spec, env={"SHARED": "spec", "SPEC_ONLY": "yes"})
+    env = executor._build_env()
+    assert env["SHARED"] == "profile"
+    assert env["SPEC_ONLY"] == "yes"
+
+
+def test_empty_profile_env_reproduces_baseline_env(tmp_path):
+    """No env overrides → the subprocess env is exactly what today's code built."""
+    import os
+
+    executor = _executor(tmp_path, "claude", CliAgentProfileConfig())
+    expected = {
+        **dict(os.environ),
+        **executor.spec.env,
+        "DEVCOUNCIL_PROJECT_ROOT": str(tmp_path),
+        "DEVCOUNCIL_AGENT_PROFILE": "custom",
+    }
+    assert executor._build_env() == expected
 
 
 def test_default_profiles_distinguish_yolo_and_prod():

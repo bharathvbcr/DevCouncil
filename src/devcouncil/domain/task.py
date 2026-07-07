@@ -63,6 +63,10 @@ class Task(BaseModel):
             "the verification.rigor config."
         ),
     )
+    priority: Optional[Literal["high", "medium", "low"]] = Field(
+        default=None,
+        description="Optional human/planner priority hint (high/medium/low). Default None.",
+    )
     depends_on: List[str] = Field(
         default_factory=list,
         description=(
@@ -77,5 +81,6 @@ class Task(BaseModel):
         "running",
         "blocked",
         "verified",
-        "done"
+        "done",
+        "cancelled",
     ] = "planned"

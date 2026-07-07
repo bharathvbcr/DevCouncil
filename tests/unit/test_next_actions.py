@@ -74,6 +74,19 @@ def test_build_next_actions_blocking_only_and_ordered():
     assert {a.gap_id for a in all_actions} == {"A", "B", "C"}
 
 
+def test_coarse_acceptance_proof_maps_to_add_test():
+    gap = _gap(
+        gap_type="coarse_acceptance_proof",
+        description="Verification mode = COARSE for AC-001",
+        blocking=True,
+    )
+
+    action = next_action_for(gap)
+
+    assert action.category == "add_test"
+    assert "per-criterion check" in action.action
+
+
 def test_acceptance_unproven_surfaces_missing_evidence():
     gap = _gap(
         gap_type="acceptance_criteria_unproven",

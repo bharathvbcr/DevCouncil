@@ -31,7 +31,9 @@ def _init_repo(tmp_path):
 def test_slash_commands_have_valid_frontmatter(tmp_path):
     assets = claude_assets.build_slash_commands(tmp_path)
     names = {a.path.name for a in assets}
-    assert {"status.md", "verify.md", "repair.md", "next.md", "plan.md", "review.md", "report.md"} <= names
+    assert {
+        "status.md", "verify.md", "repair.md", "next.md", "plan.md", "review.md", "report.md", "map.md",
+    } <= names
     for asset in assets:
         assert asset.path.parent.name == "devcouncil"  # -> /devcouncil:<name>
         meta, body = split_frontmatter(asset.content)
@@ -41,6 +43,18 @@ def test_slash_commands_have_valid_frontmatter(tmp_path):
     meta, body = split_frontmatter(verify.content)
     assert "Bash(dev verify" in meta["allowed-tools"]
     assert "$ARGUMENTS" in body  # argument substitution wired through
+
+
+def test_claude_bash_permission_allow_covers_slash_commands_and_hero_loop():
+    rules = set(claude_assets.claude_bash_permission_allow())
+    assert "Bash(dev status:*)" in rules
+    assert "Bash(dev map:*)" in rules
+    assert "Bash(dev go:*)" in rules
+    assert "Bash(dev check:*)" in rules
+    assert "Bash(dev gaps:*)" in rules
+    assert "Bash(dev export:*)" in rules
+    assert "Bash(dev doctor:*)" in rules
+    assert "Bash(devcouncil mcp-server)" in rules
 
 
 def test_subagents_declare_name_description_and_mcp_tools(tmp_path):
@@ -143,8 +157,11 @@ def test_integrate_claude_assets_apply_writes_and_is_idempotent(tmp_path):
 
     settings = json.loads((tmp_path / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
     assert settings["statusLine"]["command"] == "devcouncil hook claude-statusline"
+    assert settings["outputStyle"] == "DevCouncil"
     assert "devcouncil" in settings["enabledMcpjsonServers"]
     assert "Bash(dev status:*)" in settings["permissions"]["allow"]
+    assert "Bash(dev map:*)" in settings["permissions"]["allow"]
+    assert "Bash(dev go:*)" in settings["permissions"]["allow"]
 
     second = runner.invoke(app, ["integrate", "claude-assets", "--apply", "--project-root", str(tmp_path)])
     assert second.exit_code == 0
@@ -164,6 +181,32 @@ def test_integrate_claude_assets_preserves_existing_settings(tmp_path):
     assert settings["model"] == "opus"  # not clobbered
     assert "Bash(ls)" in settings["permissions"]["allow"]  # preserved
     assert "Bash(dev status:*)" in settings["permissions"]["allow"]  # merged
+
+
+def test_record_claude_config_writes_integrations_section(tmp_path):
+    _init_repo(tmp_path)
+    from devcouncil.integrations.clients.claude import _record_claude_config
+
+    _record_claude_config(tmp_path, scope="project", write_gate=True)
+    import yaml
+
+    config = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
+    claude = config.get("integrations", {}).get("claude", {})
+    assert claude.get("enabled") is True
+    assert claude.get("scope") == "project"
+    assert claude.get("write_gate") is True
+    assert claude.get("settings_path") == ".claude/settings.local.json"
+
+
+def test_claude_config_status_detects_installed_assets(tmp_path):
+    from devcouncil.integrations.check import _claude_config_status
+
+    _init_repo(tmp_path)
+    runner.invoke(app, ["integrate", "claude-assets", "--apply", "--project-root", str(tmp_path)])
+    status, fixable, paths = _claude_config_status(tmp_path)
+    assert status == "ok"
+    assert fixable is False
+    assert any("settings.local.json" in path for path in paths)
 
 
 def test_integrate_claude_plugin_apply_builds_bundle(tmp_path):
@@ -304,6 +347,8 @@ def test_integrate_claude_uninstall_removes_everything(tmp_path):
         text = settings_path.read_text(encoding="utf-8")
         assert "devcouncil hook" not in text
         assert "devcouncil hook claude-statusline" not in text
+        settings = json.loads(text)
+        assert settings.get("outputStyle") != "DevCouncil"
 
 
 def test_integrate_claude_uninstall_preserves_user_settings(tmp_path):

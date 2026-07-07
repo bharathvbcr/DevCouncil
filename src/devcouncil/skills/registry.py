@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import fnmatch
 import functools
+import logging
 import os
 import re
 from pathlib import Path
@@ -18,6 +19,8 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from devcouncil.knowledge.frontmatter import build_frontmatter_markdown, split_frontmatter
+
+logger = logging.getLogger(__name__)
 
 LIBRARY_DIR = Path(__file__).resolve().parent / "library"
 
@@ -50,6 +53,7 @@ _MAX_WALK_FILES = 20_000
 class SkillTriggers(BaseModel):
     keywords: list[str] = Field(default_factory=list)
     globs: list[str] = Field(default_factory=list)
+    markers: list[str] = Field(default_factory=list)
 
 
 class Skill(BaseModel):
@@ -61,7 +65,12 @@ class Skill(BaseModel):
     body: str = ""
     source_path: Path | None = None
 
-    def matches(self, goal: str, repo_files_present: "set[str] | None" = None) -> bool:
+    def matches(
+        self,
+        goal: str,
+        repo_files_present: "set[str] | None" = None,
+        project_root: Path | None = None,
+    ) -> bool:
         """True if this skill applies to the given goal text / repo file basenames."""
         if self.always:
             return True
@@ -73,9 +82,18 @@ class Skill(BaseModel):
                 pat = pattern.lower()
                 if any(fnmatch.fnmatch(name, pat) for name in repo_files_present):
                     return True
+        if project_root is not None:
+            for marker in self.triggers.markers:
+                if (project_root / marker).exists():
+                    return True
         return False
 
-    def relevance_score(self, goal: str, repo_files_present: "set[str] | None" = None) -> int:
+    def relevance_score(
+        self,
+        goal: str,
+        repo_files_present: "set[str] | None" = None,
+        project_root: Path | None = None,
+    ) -> int:
         """How strongly this skill applies — used to rank which skills ride inline before
         the size budget truncates. Goal-text keyword hits weigh more than file-glob
         presence; always-on skills sort first regardless."""
@@ -88,6 +106,8 @@ class Skill(BaseModel):
                 1 for pattern in self.triggers.globs
                 if any(fnmatch.fnmatch(name, pattern.lower()) for name in repo_files_present)
             )
+        if project_root is not None:
+            score += sum(1 for marker in self.triggers.markers if (project_root / marker).exists())
         return score
 
     def to_skill_md(self) -> str:
@@ -113,6 +133,7 @@ def _skill_from_meta(path: Path, meta: dict, body: str) -> Skill:
         triggers=SkillTriggers(
             keywords=list(triggers.get("keywords") or []),
             globs=list(triggers.get("globs") or []),
+            markers=list(triggers.get("markers") or []),
         ),
         body=body.strip(),
         source_path=path,
@@ -240,7 +261,9 @@ def load_skills(
                 # selection metadata when it doesn't declare its own — otherwise
                 # scaffolding a skill silently strips its `always`/triggers and the
                 # skill stops being selected (selection would return nothing).
-                has_own_triggers = bool(skill.triggers.keywords or skill.triggers.globs)
+                has_own_triggers = bool(
+                    skill.triggers.keywords or skill.triggers.globs or skill.triggers.markers
+                )
                 skill = skill.model_copy(update={
                     "always": skill.always or base.always,
                     "triggers": skill.triggers if has_own_triggers else base.triggers,
@@ -256,8 +279,8 @@ def load_skills(
             try:
                 from devcouncil.app.config import load_config
                 knowledge_dir = load_config(project_root).knowledge.directory
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to load knowledge directory from config, using default: %s", e)
             for skill in load_okf_skills(project_root, directory=knowledge_dir):
                 # Only fill gaps: library + repo-local skills win on name conflict.
                 by_name.setdefault(skill.name, skill)
@@ -342,7 +365,7 @@ def select_skills(
     # Rank by relevance so the most applicable domain skill survives the inline budget on a
     # polyglot repo; always-on skills keep their leading position; ties break by name.
     scored = [
-        (s, score) for s in skills if (score := s.relevance_score(goal, repo_files)) > 0
+        (s, score) for s in skills if (score := s.relevance_score(goal, repo_files, project_root)) > 0
     ]
     scored.sort(key=lambda item: (not item[0].always, -item[1], item[0].name))
     return [skill for skill, _ in scored]
@@ -389,15 +412,24 @@ def scaffold_skills(project_root: Path, skills: list[Skill]) -> list[Path]:
     """
     written: list[Path] = []
     skills_root = project_root / ".claude" / "skills"
+    dev_skills_root = project_root / ".devcouncil" / "skills"
     proot = project_root.resolve()
     for skill in skills:
-        # Don't re-materialize a skill that already lives inside this repo.
+        # Don't re-materialize a skill that already lives in a repo-local skill dir.
+        # Packaged library files inside a monorepo (e.g. src/.../skills/library/) still
+        # scaffold to .claude/skills/ — only skip when the source IS the destination.
         if skill.source_path is not None:
-            try:
-                skill.source_path.resolve().relative_to(proot)
+            src = skill.source_path.resolve()
+            skip = False
+            for base in (skills_root, dev_skills_root):
+                try:
+                    src.relative_to(base.resolve())
+                    skip = True
+                    break
+                except ValueError:
+                    continue
+            if skip:
                 continue
-            except ValueError:
-                pass
         target = skills_root / skill.name / "SKILL.md"
         content = skill.to_skill_md()
         if target.exists() and target.read_text(encoding="utf-8") == content:

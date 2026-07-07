@@ -1,5 +1,7 @@
 import typer
 import json
+from devcouncil.utils.json_persist import dump_json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -14,13 +16,19 @@ from devcouncil.live.tasks import active_task_id
 
 app = typer.Typer()
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 def _project_root(project_root: Path | None = None) -> Path:
     if project_root:
-        return project_root.expanduser().resolve()
-    configured = os.environ.get("DEVCOUNCIL_PROJECT_ROOT")
-    return Path(configured).expanduser().resolve() if configured else Path(".").resolve()
+        root = project_root.expanduser().resolve()
+    else:
+        configured = os.environ.get("DEVCOUNCIL_PROJECT_ROOT")
+        root = Path(configured).expanduser().resolve() if configured else Path(".").resolve()
+    from devcouncil.telemetry.logging_setup import set_log_dir
+
+    set_log_dir(root)
+    return root
 
 
 def _active_task(root: Path):
@@ -46,7 +54,7 @@ def _emit_decision(client: str, action: str, reason: str) -> None:
         payload = {"decision": "allow", "reason": reason, "suppressOutput": True}
         if action == "warn":
             payload["systemMessage"] = f"DevCouncil Warning: {reason}"
-        print(json.dumps(payload, separators=(",", ":")))
+        print(dump_json(payload, separators=(",", ":")))
         return
 
     if action == "warn":
@@ -116,7 +124,7 @@ def post_tool_use(
     log_step(f"hook/post_tool_use: client={client}", project_root=root)
     _ = root
     if client.lower() in {"codex", "gemini"}:
-        print(json.dumps({"decision": "allow", "suppressOutput": True}, separators=(",", ":")))
+        print(dump_json({"decision": "allow", "suppressOutput": True}, separators=(",", ":")))
 
 @app.command()
 def agent_response(
@@ -127,24 +135,35 @@ def agent_response(
     """
     Coding CLI hook: records that an agent response is ready for DevCouncil watch review.
     """
-    payload_text = event_json if event_json is not None else sys.stdin.read()
-    root = _project_root(project_root)
+    # Best-effort, never-crash: this hook runs on EVERY agent response, so any
+    # uncaught exception here (e.g. a stale database schema before its migration
+    # ran) surfaces as a crash traceback inside the coding agent's session — the
+    # observed failure was sqlite "no such column" killing every response hook.
+    # A signal we fail to record is strictly better than a broken session.
     try:
-        payload = json.loads(payload_text) if payload_text.strip() else {}
-    except json.JSONDecodeError:
-        payload = {"raw": payload_text}
-    if isinstance(payload, dict) and not any(key in payload for key in ("task_id", "taskId", "task")):
-        active_id = active_task_id(root)
-        if active_id:
-            payload["task_id"] = active_id
-    signal_path = write_signal(root, client.lower(), payload)
-    TraceLogger(root).log_event(
-        "agent_response_ready",
-        {"client": client.lower(), "signal": str(signal_path)},
-        summary=f"{client} response ready for critique-card review.",
-    )
+        payload_text = event_json if event_json is not None else sys.stdin.read()
+        root = _project_root(project_root)
+        try:
+            payload = json.loads(payload_text) if payload_text.strip() else {}
+        except json.JSONDecodeError:
+            payload = {"raw": payload_text}
+        if isinstance(payload, dict) and not any(key in payload for key in ("task_id", "taskId", "task")):
+            try:
+                active_id = active_task_id(root)
+            except Exception:  # DB unavailable/stale schema — proceed without a task id
+                active_id = None
+            if active_id:
+                payload["task_id"] = active_id
+        signal_path = write_signal(root, client.lower(), payload)
+        TraceLogger(root).log_event(
+            "agent_response_ready",
+            {"client": client.lower(), "signal": str(signal_path)},
+            summary=f"{client} response ready for critique-card review.",
+        )
+    except Exception as exc:  # noqa: BLE001 - a hook must never break the session
+        print(f"DevCouncil agent-response hook error (ignored): {exc}", file=sys.stderr)
     if client.lower() in {"codex", "gemini"}:
-        print(json.dumps({"decision": "allow", "suppressOutput": True}, separators=(",", ":")))
+        print(dump_json({"decision": "allow", "suppressOutput": True}, separators=(",", ":")))
 
 def _status_line(root: Path) -> str | None:
     """A one-line DevCouncil status snapshot, or None when uninitialized/unavailable.
@@ -177,7 +196,7 @@ def _emit_additional_context(event_name: str, context: str | None) -> None:
     """Emit a Claude-Code hook result that injects additionalContext (exit 0)."""
     if not context:
         return
-    print(json.dumps({
+    print(dump_json({
         "hookSpecificOutput": {
             "hookEventName": event_name,
             "additionalContext": context,
@@ -203,12 +222,16 @@ def session_start(
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
 ):
     """Claude Code SessionStart hook: inject a DevCouncil status snapshot as context."""
-    _read_stdin_payload(event_json)
+    payload = _read_stdin_payload(event_json)
     root = _project_root(project_root)
     try:
-        TraceLogger(root).log_event("session_start", {"client": client.lower()}, summary="Claude session started.")
-    except Exception:
-        pass
+        # session_id lets trace consumers pair start/end events; ends are not
+        # guaranteed (Claude Code fires no SessionEnd on crash/kill — observed
+        # 34 starts vs 19 ends), so durations must treat unpaired starts as open.
+        details = {"client": client.lower(), "session_id": payload.get("session_id")}
+        TraceLogger(root).log_event("session_start", details, summary="Claude session started.")
+    except Exception as e:
+        logger.debug("Failed to record session_start trace event: %s", e)
     _emit_additional_context("SessionStart", _status_line(root))
 
 
@@ -231,12 +254,17 @@ def session_end(
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
 ):
     """Claude Code SessionEnd hook: record session teardown in the DevCouncil trace."""
-    _read_stdin_payload(event_json)
+    payload = _read_stdin_payload(event_json)
     root = _project_root(project_root)
     try:
-        TraceLogger(root).log_event("session_end", {"client": client.lower()}, summary="Claude session ended.")
-    except Exception:
-        pass
+        details = {
+            "client": client.lower(),
+            "session_id": payload.get("session_id"),
+            "reason": payload.get("reason"),
+        }
+        TraceLogger(root).log_event("session_end", details, summary="Claude session ended.")
+    except Exception as e:
+        logger.debug("Failed to record session_end trace event: %s", e)
 
 
 @app.command()
@@ -250,8 +278,8 @@ def pre_compact(
     root = _project_root(project_root)
     try:
         TraceLogger(root).log_event("pre_compact", {"client": client.lower()}, summary="Claude context compaction starting.")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to record pre_compact trace event: %s", e)
 
 
 @app.command()
@@ -274,8 +302,9 @@ def subagent_stop(
             {"client": client.lower(), "signal": str(signal_path)},
             summary=f"{client} subagent finished; signal recorded.",
         )
-    except Exception:
-        pass
+    except Exception as e:
+        # A dropped signal means the subagent's work silently escapes live review.
+        logger.warning("Failed to persist subagent-stop review signal: %s", e)
 
 
 @app.command()
@@ -288,13 +317,17 @@ def notification(
     payload = _read_stdin_payload(event_json)
     root = _project_root(project_root)
     try:
+        message = str(payload.get("message", ""))[:200]
         TraceLogger(root).log_event(
             "claude_notification",
-            {"client": client.lower(), "message": str(payload.get("message", ""))[:200]},
-            summary="Claude notification.",
+            {"client": client.lower(), "message": message},
+            # Put the message in the summary too — that's the field trace
+            # viewers render, and 18 consecutive "Claude notification." lines
+            # tell a reader nothing.
+            summary=f"Claude notification: {message}" if message else "Claude notification.",
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to record claude_notification trace event: %s", e)
 
 
 @app.command()
@@ -350,7 +383,7 @@ def post_task(
 
 def _emit_post_task_allow(client: str) -> None:
     if client.lower() in {"codex", "gemini"}:
-        print(json.dumps({"decision": "allow", "suppressOutput": True}, separators=(",", ":")))
+        print(dump_json({"decision": "allow", "suppressOutput": True}, separators=(",", ":")))
 
 
 def _verify_active_task(root: Path) -> str:

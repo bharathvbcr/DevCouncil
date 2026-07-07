@@ -17,6 +17,7 @@ from rich.console import Console
 from devcouncil.domain.requirement import Requirement
 from devcouncil.domain.task import Task
 from devcouncil.app.config import DevCouncilConfig, load_config
+from devcouncil.utils.json_persist import read_json, write_json
 from devcouncil.execution.executor import Executor, ExecutionResult
 from devcouncil.execution.prompt_builder import PromptBuilder
 from devcouncil.executors.agent_registry import (
@@ -290,9 +291,7 @@ class CodingCliExecutor(Executor):
         instruction_file.parent.mkdir(parents=True, exist_ok=True)
         instruction_file.write_text(prompt, encoding="utf-8")
 
-        custom_env = self.spec.env
-        env = {**dict(os.environ), **custom_env, "DEVCOUNCIL_PROJECT_ROOT": str(self.project_root)}
-        env["DEVCOUNCIL_AGENT_PROFILE"] = self.profile_name
+        env = self._build_env()
         log_prefix = f"{task.id}-{self.client}"
         run_id = str(uuid.uuid4())
         self.last_run_id = run_id
@@ -409,6 +408,7 @@ class CodingCliExecutor(Executor):
                     self._capture_claude_stream_json(run_id, result)
                 else:
                     result = self._capture_claude_json(run_id, result)
+                self._mirror_claude_transcript()
             if transcript_path and transcript_path.exists():
                 self._append_manifest_transcript(run_id, transcript_path)
                 self.last_transcript_path = transcript_path
@@ -517,6 +517,26 @@ class CodingCliExecutor(Executor):
         finally:
             run_log_cm.__exit__(None, None, None)
 
+    def _build_env(self) -> dict[str, str]:
+        """Environment for the agent subprocess.
+
+        Layering (later wins): parent process env → the agent spec's ``env`` (custom
+        agents) → the profile's ``env`` overrides → DevCouncil's own variables. The
+        profile layer is what lets a profile redirect the Claude Code harness at an
+        alternative Anthropic-compatible endpoint (``ANTHROPIC_BASE_URL`` /
+        ``ANTHROPIC_AUTH_TOKEN`` / ``ANTHROPIC_MODEL``, e.g. a local LiteLLM proxy in
+        front of Ollama or OpenRouter) — the same provider-redirection trick DevPrism's
+        loopback proxy uses — without editing the base spec. DevCouncil's variables are
+        applied last so no profile can mask them."""
+        profile_env = dict(self.profile.env) if (self.profile and self.profile.env) else {}
+        return {
+            **dict(os.environ),
+            **self.spec.env,
+            **profile_env,
+            "DEVCOUNCIL_PROJECT_ROOT": str(self.project_root),
+            "DEVCOUNCIL_AGENT_PROFILE": self.profile_name,
+        }
+
     def _scope_enforcement_enabled(self) -> bool:
         try:
             from devcouncil.app.config import load_config
@@ -587,8 +607,14 @@ class CodingCliExecutor(Executor):
             from devcouncil.verification.verifier import Verifier
 
             changed = Verifier(self.project_root).get_task_changed_files(task.id)
-        except Exception:
-            return []
+        except Exception as exc:
+            logger.exception(
+                "Scope enforcement failed for %s: could not load changed files",
+                task.id,
+            )
+            raise RuntimeError(
+                f"Scope enforcement failed for {task.id}: could not determine changed files ({exc})."
+            ) from exc
         engine = TaskPolicyEngine(self.project_root)
         reverted: list[tuple[str, str]] = []
         for path in changed:
@@ -599,31 +625,43 @@ class CodingCliExecutor(Executor):
             try:
                 decision = engine.evaluate_file_change(path, task, "write")
             except Exception:
+                logger.warning(
+                    "Scope enforcement skipped policy check for %s on %s",
+                    task.id,
+                    path,
+                    exc_info=True,
+                )
                 continue
             if decision.action == "deny" and self._revert_path(path):
                 reverted.append((path, decision.reason))
         return reverted
+
+    _GIT_REVERT_TIMEOUT_SECONDS = 120
 
     def _revert_path(self, rel_path: str) -> bool:
         """Undo an out-of-scope change. A file that exists in HEAD is restored to HEAD; a
         file the task newly added (absent from HEAD, or no HEAD at all) is unstaged and
         deleted. Best-effort — a failed revert returns False so the path is not reported as
         cleanly gated (and the caller does not claim it was reverted)."""
+        timeout = self._GIT_REVERT_TIMEOUT_SECONDS
         try:
             in_head = subprocess.run(
                 ["git", "cat-file", "-e", f"HEAD:{rel_path}"],
                 cwd=self.project_root, capture_output=True, text=True,
+                timeout=timeout,
             ).returncode == 0
             if in_head:
                 return subprocess.run(
                     ["git", "checkout", "HEAD", "--", rel_path],
                     cwd=self.project_root, capture_output=True, text=True,
+                    timeout=timeout,
                 ).returncode == 0
             # New file (incl. the no-HEAD case): unstage if staged, then remove the working
             # copy so it cannot be committed by the next repair attempt.
             subprocess.run(
                 ["git", "rm", "-f", "--cached", "--ignore-unmatch", rel_path],
                 cwd=self.project_root, capture_output=True, text=True,
+                timeout=timeout,
             )
             full = self.project_root / rel_path
             if full.is_file():
@@ -812,7 +850,7 @@ class CodingCliExecutor(Executor):
         path = self._cursor_session_path(task_id if mode == "task" else None)
         if path.exists():
             try:
-                data = json.loads(path.read_text(encoding="utf-8")) or {}
+                data = read_json(path) or {}
             except json.JSONDecodeError:
                 data = {}
             existing_chat_id = str(data.get("chat_id") or "").strip()
@@ -822,7 +860,7 @@ class CodingCliExecutor(Executor):
         if not ensured_chat_id:
             return None
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"chat_id": ensured_chat_id}, indent=2) + "\n", encoding="utf-8")
+        write_json(path, {"chat_id": ensured_chat_id})
         return ensured_chat_id
 
     def _ensure_cursor_chat_id(self) -> str | None:
@@ -883,7 +921,7 @@ class CodingCliExecutor(Executor):
         if not path.exists():
             return None
         try:
-            data = json.loads(path.read_text(encoding="utf-8")) or {}
+            data = read_json(path) or {}
         except json.JSONDecodeError:
             return None
         session_id = str(data.get("session_id") or "").strip()
@@ -902,10 +940,22 @@ class CodingCliExecutor(Executor):
         self.last_agent_session_id = session_id
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps({"session_id": session_id}, indent=2) + "\n", encoding="utf-8")
+            write_json(path, {"session_id": session_id})
         except OSError:
             # A non-persisted session only costs a cold repair next time; never fail the run.
             pass
+
+    def _mirror_claude_transcript(self) -> None:
+        """Best-effort copy of Claude's native JSONL into the project for live review."""
+        session_id = self.last_agent_session_id
+        if not session_id:
+            return
+        try:
+            from devcouncil.live.transcripts import mirror_claude_transcript
+
+            mirror_claude_transcript(self.project_root, session_id)
+        except Exception as exc:
+            logger.debug("Claude transcript mirror failed: %s", exc)
 
     def _capture_claude_json(
         self, run_id: str, result: subprocess.CompletedProcess[str]
@@ -1098,11 +1148,14 @@ class CodingCliExecutor(Executor):
         """Resolved per-profile CLI overrides recorded in the manifest so a
         supervisor can see exactly how the profile constrained the invocation."""
         if not self.profile:
-            return {"extra_args": [], "permission_mode": None, "model": None}
+            return {"extra_args": [], "permission_mode": None, "model": None, "env_keys": []}
         return {
             "extra_args": list(self.profile.extra_args or []),
             "permission_mode": self.profile.permission_mode,
             "model": self.profile.model,
+            # KEY NAMES only — profile env values may carry provider tokens and must
+            # never land in the manifest.
+            "env_keys": sorted((self.profile.env or {}).keys()),
         }
 
     def _update_run_manifest(self, run_id: str, **updates: object) -> None:
@@ -1110,11 +1163,11 @@ class CodingCliExecutor(Executor):
         if not manifest_path.exists():
             return
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8")) or {}
+            manifest = read_json(manifest_path) or {}
         except json.JSONDecodeError:
             return
         manifest.update(updates)
-        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        write_json(manifest_path, manifest)
 
     def _preview_lines(self, value: str | None, *, limit: int = 20) -> list[str]:
         lines = redact_text(value or "").splitlines()
@@ -1160,7 +1213,7 @@ class CodingCliExecutor(Executor):
             "finished_at": None,
             "duration_seconds": None,
         }
-        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        write_json(manifest_path, manifest)
         return manifest_path
 
     def _write_log(self, task_client: str, result: subprocess.CompletedProcess[str]) -> None:
@@ -1194,10 +1247,10 @@ class CodingCliExecutor(Executor):
         should_write = not path.exists()
         if path.exists():
             try:
-                existing = json.loads(path.read_text(encoding="utf-8")) or {}
+                existing = read_json(path) or {}
             except json.JSONDecodeError:
                 existing = {}
             should_write = "mcpServers" in existing and "devcouncil" not in existing
         if should_write:
-            path.write_text(json.dumps(desired, indent=2) + "\n", encoding="utf-8")
+            write_json(path, desired)
         return path

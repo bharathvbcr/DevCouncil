@@ -3,7 +3,7 @@
 from devcouncil.domain.evidence import CommandResult
 from devcouncil.execution.policy_engine import TaskPolicyEngine
 from devcouncil.indexing.repo_mapper import RepoMapper
-from devcouncil.integrations.mcp.server import _diff_target_paths
+from devcouncil.integrations.mcp.util import diff_target_paths as _diff_target_paths
 from devcouncil.verification.verifier import Verifier
 
 

@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 from devcouncil.llm.provider import LLMResponse
+from devcouncil.utils.json_persist import read_json, write_json
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +34,9 @@ class LLMCache:
         cache_file = self.cache_dir / f"{key}.json"
         if cache_file.exists():
             try:
-                with open(cache_file, "r") as f:
-                    data = json.load(f)
-                    logger.debug("LLM cache HIT model=%s key=%s", model, key[:12])
-                    return LLMResponse(**data)
+                data = read_json(cache_file)
+                logger.debug("LLM cache HIT model=%s key=%s", model, key[:12])
+                return LLMResponse(**data)
             except Exception as e:
                 logger.warning("LLM cache read failed for key=%s: %s", key[:12], e)
         logger.debug("LLM cache MISS model=%s key=%s", model, key[:12])
@@ -45,6 +45,5 @@ class LLMCache:
     def set(self, model: str, messages: list, temp: float, json_mode: bool, response: LLMResponse, provider_fingerprint: str = "", cache_key: Optional[str] = None):
         key = cache_key if cache_key is not None else self._get_key(model, messages, temp, json_mode, provider_fingerprint)
         cache_file = self.cache_dir / f"{key}.json"
-        with open(cache_file, "w") as f:
-            json.dump(response.model_dump(), f)
+        write_json(cache_file, response.model_dump())
         logger.debug("LLM cache STORE model=%s key=%s", model, key[:12])

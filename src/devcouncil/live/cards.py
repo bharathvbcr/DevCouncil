@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from devcouncil.live.models import AgentTurn, CardStatus, CritiqueCard, Verdict
+from devcouncil.utils.json_persist import read_model_json, write_model_json
 
 RISK_TERMS = (
     "skip tests",
@@ -239,7 +240,7 @@ def save_card(project_root: Path, card: CritiqueCard) -> Path:
     cards_dir = project_root / ".devcouncil" / "live" / "cards"
     cards_dir.mkdir(parents=True, exist_ok=True)
     path = cards_dir / f"{card.id}.json"
-    path.write_text(card.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    write_model_json(path, card)
     return path
 
 
@@ -254,7 +255,7 @@ def load_cards(project_root: Path) -> list[CritiqueCard]:
     cards: list[CritiqueCard] = []
     for path in sorted(cards_dir.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
         try:
-            cards.append(CritiqueCard.model_validate(json.loads(path.read_text(encoding="utf-8"))))
+            cards.append(read_model_json(path, CritiqueCard))
         except Exception:
             continue
     return cards
@@ -305,7 +306,7 @@ def load_card_by_id(project_root: Path, card_id: str) -> CritiqueCard | None:
     if not path.exists():
         return None
     try:
-        return CritiqueCard.model_validate(json.loads(path.read_text(encoding="utf-8")))
+        return read_model_json(path, CritiqueCard)
     except Exception:
         return None
 
@@ -319,9 +320,9 @@ def update_card_status(project_root: Path, card_id: str, status: CardStatus) -> 
     path = cards_dir / f"{card_id}.json"
     if not path.exists():
         return None
-    card = CritiqueCard.model_validate(json.loads(path.read_text(encoding="utf-8")))
+    card = read_model_json(path, CritiqueCard)
     updated = card.model_copy(update={"status": status})
-    path.write_text(updated.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    write_model_json(path, updated)
     return updated
 
 
@@ -334,7 +335,7 @@ def unresolved_blocking_cards(
     source = cards if cards is not None else load_cards(project_root)
     return [
         card for card in source
-        if card.status == "open" and card.verdict == "Critical Issues"
+        if card.status == "open" and card.verdict == "Critical Issues" and card.blocks_gate
         and (task_id is None or card.task_id in {None, task_id})
     ]
 

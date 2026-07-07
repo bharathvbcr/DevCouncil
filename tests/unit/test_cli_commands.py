@@ -1640,7 +1640,7 @@ def test_cli_watch_review_persists_critique_card(tmp_path, monkeypatch):
     result = runner.invoke(app, ["watch", "review", "--transcript", str(transcript), "--json"])
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["verdict"] == "Concerns"
     assert payload["duplicate"] is False
     assert (tmp_path / ".devcouncil" / "live" / "cards").exists()
@@ -1757,7 +1757,7 @@ def test_cli_watch_review_latest_discovered_session(tmp_path, monkeypatch):
     result = runner.invoke(app, ["watch", "review", "--client", "generic", "--latest", "--json"])
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["turn_id"] == "A-2"
     assert payload["verdict"] == "Concerns"
 
@@ -1775,7 +1775,7 @@ def test_cli_watch_review_named_discovered_session(tmp_path, monkeypatch):
     result = runner.invoke(app, ["watch", "review", "--client", "generic", "--session", "chosen", "--json"])
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["session_id"] == "chosen"
     assert payload["verdict"] == "Approved"
 
@@ -1786,7 +1786,7 @@ def test_cli_watch_review_requires_transcript_or_session(tmp_path, monkeypatch):
     result = runner.invoke(app, ["watch", "review", "--json"])
 
     assert result.exit_code == 2
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert "No transcript selected" in payload["error"]
 
 
@@ -2040,7 +2040,7 @@ def test_cli_watch_cards_filters_by_task_status_verdict_and_client(tmp_path, mon
     ])
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert len(payload["cards"]) == 1
     assert payload["cards"][0]["task_id"] == "TASK-001"
     assert payload["cards"][0]["status"] == "open"
@@ -2115,7 +2115,7 @@ def test_cli_watch_repair_all_outputs_blocking_cards_in_scope(tmp_path, monkeypa
     result = runner.invoke(app, ["watch", "repair-all", "--task-id", "TASK-001", "--json"])
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["scope_task_id"] == "TASK-001"
     assert len(payload["cards"]) == 2
     assert "Repair Blocking Live Review Cards" in payload["prompt"]
@@ -3337,6 +3337,46 @@ def test_cli_status_tasks_show_json_outputs(tmp_path, monkeypatch):
     assert json.loads(show.output)["task"]["id"] == "TASK-001"
 
 
+def test_cli_tasks_cancel_sets_status_and_refuses_done(tmp_path, monkeypatch):
+    from devcouncil.domain.task import Task
+    from devcouncil.storage.db import get_db
+    from devcouncil.storage.repositories import TaskRepository
+    from devcouncil.telemetry.traces import read_trace_events
+
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    db = get_db(tmp_path)
+    assert db is not None
+    with db.get_session() as session:
+        TaskRepository(session).save(Task(
+            id="TASK-001",
+            title="Planned task",
+            description="desc",
+            status="planned",
+        ))
+        TaskRepository(session).save(Task(
+            id="TASK-002",
+            title="Done task",
+            description="desc",
+            status="done",
+        ))
+
+    cancel_ok = runner.invoke(app, ["tasks", "cancel", "TASK-001", "--json"])
+    assert cancel_ok.exit_code == 0
+    payload = json.loads(cancel_ok.stdout)
+    assert payload["ok"] is True
+    assert payload["status"] == "cancelled"
+
+    with db.get_session() as session:
+        assert TaskRepository(session).get_by_id("TASK-001").status == "cancelled"
+
+    events = [e for e in read_trace_events(tmp_path) if e.type == "task_cancelled"]
+    assert events and events[-1].task_id == "TASK-001"
+
+    cancel_done = runner.invoke(app, ["tasks", "cancel", "TASK-002", "--json"])
+    assert cancel_done.exit_code == 2
+
+
 def test_cli_status_json_includes_live_review_summary(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     critical = tmp_path / "critical.jsonl"
@@ -3361,7 +3401,7 @@ def test_cli_status_json_includes_live_review_summary(tmp_path, monkeypatch):
     result = runner.invoke(app, ["status", "--json"])
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["live_review"]["pending_signals"] == 1
     assert payload["live_review"]["cards"]["critical_open"] == 1
     assert payload["live_review"]["blocking_cards"][0]["task_id"] == "TASK-001"
@@ -3441,7 +3481,7 @@ def test_cli_verify_json_output(tmp_path, monkeypatch):
     result = runner.invoke(app, ["verify", "TASK-001", "--json"])
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["ok"] is True
     assert payload["tasks"][0]["task_id"] == "TASK-001"
     # The verify response now reports the rigor of the run.
@@ -3476,7 +3516,7 @@ def test_cli_verify_blocks_empty_diff(tmp_path, monkeypatch):
     result = runner.invoke(app, ["verify", "TASK-001", "--json"])
 
     assert result.exit_code == 1
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["ok"] is False
     assert any(g["gap_type"] == "task_not_implemented" for g in payload["tasks"][0]["gaps"])
 
@@ -3696,4 +3736,5 @@ def test_cli_run_reports_unimplemented_executor(tmp_path, monkeypatch):
     result = runner.invoke(app, ["run", "TASK-001", "--executor", "experimental"])
 
     assert result.exit_code == 0
-    assert "Executor experimental not yet implemented." in result.output
+    assert "Unknown executor 'experimental'" in result.output
+    assert "Available executors:" in result.output

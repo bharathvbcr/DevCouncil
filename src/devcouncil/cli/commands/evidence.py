@@ -1,4 +1,4 @@
-import json
+from devcouncil.utils.json_persist import dump_json
 import logging
 import typer
 from pathlib import Path
@@ -14,6 +14,17 @@ from devcouncil.telemetry.stages import log_stage, log_step
 app = typer.Typer(help="Evidence suggestion utilities.")
 console = Console()
 logger = logging.getLogger(__name__)
+
+
+def _load_repo_map(root: Path) -> dict | None:
+    """Load `.devcouncil/repo_map.json` so test suggestions can use the map's
+    dependents/role_files index; returns None (name-based fallback) when absent."""
+    import json
+
+    try:
+        return json.loads((root / ".devcouncil" / "repo_map.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
 
 
 @app.command("suggest")
@@ -41,7 +52,7 @@ def suggest(
                 console.print(f"[red]Task {task_id} not found.[/red]")
                 raise typer.Exit(code=1)
             changed = Verifier(root).get_task_changed_files(task_id)
-            suggestions = TestResolver(root).suggest_for_task(task, changed)
+            suggestions = TestResolver(root, _load_repo_map(root)).suggest_for_task(task, changed)
             if not include_low_confidence:
                 suggestions = [s for s in suggestions if s.confidence != "low"]
             if apply:
@@ -49,7 +60,7 @@ def suggest(
                     if item.confidence == "high" and item.command not in task.expected_tests:
                         task.expected_tests.append(item.command)
                 TaskRepository(session).save(task)
-            typer.echo(json.dumps({
+            typer.echo(dump_json({
                 "task_id": task_id,
                 "suggestions": [s.model_dump() for s in suggestions],
                 "expected_tests": task.expected_tests,

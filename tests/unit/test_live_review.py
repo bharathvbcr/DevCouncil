@@ -191,6 +191,22 @@ def test_unresolved_blocking_cards_can_be_task_scoped(tmp_path):
     assert len(unresolved_blocking_cards(tmp_path, task_id="TASK-002")) == 1
 
 
+def test_unresolved_blocking_cards_ignore_advisory_e2e_cards(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        json.dumps({"role": "assistant", "id": "A-1", "content": "Run git reset --hard."}) + "\n",
+        encoding="utf-8",
+    )
+    turn = latest_assistant_turn(transcript)
+    assert turn is not None
+    save_card(
+        tmp_path,
+        review_turn(turn, tmp_path).model_copy(update={"task_id": "TASK-001", "blocks_gate": False}),
+    )
+
+    assert unresolved_blocking_cards(tmp_path, task_id="TASK-001") == []
+
+
 def test_save_card_rewrites_same_id_without_changing_id(tmp_path):
     transcript = tmp_path / "session.jsonl"
     transcript.write_text(
@@ -412,3 +428,84 @@ async def test_live_review_single_sample_calls_once(tmp_path, monkeypatch):
     card, provider = await _voted_card(tmp_path, ["Critical Issues"])
     assert provider.calls == 1
     assert card.verdict == "Critical Issues"
+
+
+class _PromptCapturingProvider(Provider):
+    """Returns an Approved card and records every prompt it was sent."""
+
+    def __init__(self):
+        self.prompts = []
+
+    async def complete(self, model, messages, temperature=0.0, json_mode=False, run_id=None, **kwargs):
+        self.prompts.append(messages[-1]["content"])
+        content = json.dumps({
+            "schema": "devcouncil.critique_card.v1",
+            "id": "CARD-x", "session_id": "S", "turn_id": "A", "client": "claude",
+            "verdict": "Approved", "summary": "ok",
+            "concerns": [], "alternatives": ["Proceed."],
+            "message_for_agent": "Proceed.", "evidence_requests": [],
+        })
+        return LLMResponse(content=content, model=model,
+                           usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                           raw_response={})
+
+
+@pytest.mark.anyio
+async def test_llm_review_prompt_is_grounded_in_recorded_verification_state(tmp_path, monkeypatch):
+    """The model-backed reviewer must see the task's RECORDED verification state.
+    Ungrounded, it reviews only the agent's prose and hallucinates 'no evidence
+    of implementation' against code whose criteria are already proven (the
+    median false negative: correct 4/4 code blocked on a prose critique)."""
+    monkeypatch.chdir(tmp_path)
+    from devcouncil.domain.evidence import TestEvidence
+
+    ev = TestEvidence(requirement_id="REQ-1", acceptance_criterion_id="AC-1",
+                      command="python -m pytest -q", status="passed", evidence_summary="ok")
+    _seed_task_state(tmp_path, status="verified", evidence=[ev])
+    turn = AgentTurn(session_id="S", turn_id="A", source="claude", role="assistant",
+                     content="Done — implemented and verified.")
+    provider = _PromptCapturingProvider()
+    router = ModelRouter(provider, {"live_reviewer": {"model": "mock/card", "temperature": 0.0}})
+
+    card = await LiveReviewService(router).review(
+        turn, tmp_path, client="claude", use_llm=True, task_id="TASK-1"
+    )
+
+    assert card.verdict == "Approved"
+    prompt = provider.prompts[0]
+    assert "Recorded verification state for task TASK-1" in prompt
+    assert "acceptance criteria with passing evidence: 1/1" in prompt
+    assert "CORROBORATES" in prompt  # satisfied state → told not to demand more proof
+    # And the standing rule against prose-based verdicts is always present.
+    assert "Never conclude" in prompt
+
+
+@pytest.mark.anyio
+async def test_llm_review_prompt_flags_mismatch_when_state_not_satisfied(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _seed_task_state(tmp_path, status="running")
+    turn = AgentTurn(session_id="S", turn_id="A", source="claude", role="assistant",
+                     content="Done!")
+    provider = _PromptCapturingProvider()
+    router = ModelRouter(provider, {"live_reviewer": {"model": "mock/card", "temperature": 0.0}})
+
+    await LiveReviewService(router).review(
+        turn, tmp_path, client="claude", use_llm=True, task_id="TASK-1"
+    )
+
+    prompt = provider.prompts[0]
+    assert "does NOT yet corroborate" in prompt
+    assert "acceptance criteria with passing evidence: 0/1" in prompt
+
+
+@pytest.mark.anyio
+async def test_llm_review_prompt_ungrounded_without_task_id(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    turn = AgentTurn(session_id="S", turn_id="A", source="claude", role="assistant",
+                     content="Done!")
+    provider = _PromptCapturingProvider()
+    router = ModelRouter(provider, {"live_reviewer": {"model": "mock/card", "temperature": 0.0}})
+
+    await LiveReviewService(router).review(turn, tmp_path, client="claude", use_llm=True)
+
+    assert "Recorded verification state" not in provider.prompts[0]

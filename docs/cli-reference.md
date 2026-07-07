@@ -7,7 +7,7 @@ dev init --provider doubleword --model YOUR_MODEL_ID # Doubleword drop-in OpenAI
 dev init --provider ollama --model qwen2.5-coder:32b # Local Ollama provider (no API key)
 dev init --role-model planner_b=YOUR_MODEL_ID # Override one role model during init
 dev setup                   # Initialize, run doctor, offer first-run integrations, and print next steps
-dev doctor                  # Check dependencies and environment
+dev doctor                  # Check dependencies and environment (includes subsystem maturity table)
 dev version                 # Display the installed DevCouncil version
 dev e2e "goal" --executor codex # Plan, execute, verify, and report in one command
 dev e2e "goal" --executor codex --agent # Agent preset: JSON plus .devcouncil/reports/latest.json
@@ -27,6 +27,17 @@ dev check --verify --enforce-coverage # Block when changed lines are not exercis
 dev check --json            # Machine-readable check output
 dev status                  # Show current project state and cost
 dev tasks                   # List planned tasks and statuses
+dev tasks cancel TASK-001   # Cancel a task that is not done or cancelled
+dev tasks edit TASK-001 --title "New title" # Edit task metadata (title, priority, scope fields)
+dev tasks reprioritize TASK-001 --priority high # Change task priority (high | medium | low)
+dev gaps                    # List all verification gaps (blocking and advisory)
+dev gaps --blocking-only --fail-on-blocking # Exit non-zero when blocking gaps remain
+dev gaps --json             # Machine-readable gap list
+dev requirements            # List requirements with derived status and linked task counts
+dev requirements --json     # Machine-readable requirements summary
+dev export                  # Write requirements, tasks, and gaps to .devcouncil/export/state.json
+dev export --json           # Print export payload to stdout
+dev export -o ./snapshot.json # Write export to a custom path
 dev show TASK-001           # Show task details and constraints
 dev prompt TASK-001         # Generate prompt for an external agent
 dev run TASK-001            # Execute task via selected executor
@@ -88,6 +99,7 @@ dev cost show --json        # Machine-readable cost report
 dev runs list               # List recorded coding-agent runs, newest first
 dev runs show RUN-ID        # Show a run manifest plus a redacted transcript tail
 dev lsp inspect             # Inspect optional language-server readiness
+dev lsp inspect --json        # Compact {mode, servers_detected, note} JSON for automation
 dev ast match "symbol"      # Search symbols with structural AST matching
 dev dashboard --open        # Serve the live local status dashboard and open a browser
 dev trace tail --follow     # Tail local DevCouncil trace events
@@ -98,6 +110,12 @@ dev logs runs               # List per-run logs, newest first
 dev <command> -v | -vv | -q # Raise/lower console log verbosity (file always DEBUG)
 dev artifacts validate      # Validate stored artifact integrity
 dev config                  # Inspect or update configuration
+dev config show             # Display key DevCouncil settings (executor, rigor, gates)
+dev config set semantic_layer.enabled true  # Enable semantic LLM cache/routing/compression (uv sync --group semantic)
+dev config set semantic_layer.cache.enabled true # Toggle FAISS semantic cache (default on when layer enabled)
+dev config set semantic_layer.router.enabled true # Opt-in complexity routing for local Ollama tiers
+dev config set semantic_layer.compressor.enabled true # Toggle long-context compression before LLM calls
+dev config set execution.command_timeout 600 # Set a common dotted config key
 dev config models --model YOUR_MODEL_ID # Update every configured model role
 dev config models --role-model critic_a=YOUR_MODEL_ID # Update one model role by name
 dev baseline                # Capture a verification baseline of current changes

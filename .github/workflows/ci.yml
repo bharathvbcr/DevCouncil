@@ -84,7 +84,7 @@ jobs:
       - name: Test
         run: |
           set +e
-          uv run --python 3.12 pytest 2>&1 | tee pytest.log
+          uv run --python 3.12 coverage run -m pytest 2>&1 | tee pytest.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
             {
@@ -97,6 +97,7 @@ jobs:
             echo "::error title=pytest failed::$msg"
             exit "$status"
           fi
+          uv run --python 3.12 coverage report
 
       - name: Package smoke
         run: |

@@ -4,6 +4,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from devcouncil.llm.router import ModelRouter
+from devcouncil.utils.json_persist import read_model_json, write_model_json
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,7 @@ def load_latest_prompt_enhancement(project_root: Path) -> "PromptEnhancement | N
 
     def _load(path: Path) -> "PromptEnhancement | None":
         try:
-            return PromptEnhancement.model_validate(json.loads(path.read_text(encoding="utf-8")))
+            return read_model_json(path, PromptEnhancement)
         except Exception:
             return None
 
@@ -125,9 +126,10 @@ def save_active_prompt_enhancement(project_root: Path, enhancement: "PromptEnhan
     try:
         path = project_root / ".devcouncil" / _ACTIVE_ENHANCEMENT_FILE
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(enhancement.model_dump_json(indent=2), encoding="utf-8")
-    except Exception:
-        pass
+        write_model_json(path, enhancement)
+    except Exception as e:
+        # If this persistence fails, executors silently run without (or with stale) guidance.
+        logger.warning("Failed to persist active prompt enhancement: %s", e)
 
 
 class PromptEnhancerService:

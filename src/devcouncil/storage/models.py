@@ -44,6 +44,7 @@ class TaskModel(SQLModel, table=True):
     forbidden_changes_json: str = Field(default="[]")
     # Manual/planner difficulty override ("easy"/"normal"/"hard"); None = estimator.
     difficulty: Optional[str] = Field(default=None)
+    priority: Optional[str] = Field(default=None)
     status: str = "planned"
 
 class EvidenceModel(SQLModel, table=True):

@@ -12,6 +12,8 @@ from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, select
 
+from devcouncil.utils.json_persist import dump_json
+
 from devcouncil.storage.models import (
     AgentHandoffModel,
     CorrectionManifestModel,
@@ -386,7 +388,7 @@ class SemanticDiffRepository:
             task_id=task_id,
             before_snapshot_path=before_snapshot_path,
             after_snapshot_path=after_snapshot_path,
-            classifications_json=json.dumps(classifications),
+            classifications_json=dump_json(classifications),
             summary=summary,
             created_at=_utc_now(),
         )
@@ -518,8 +520,8 @@ class VerificationRunRepository:
             id=rid,
             task_id=task_id,
             sandbox=sandbox,
-            environment_json=json.dumps(environment),
-            commands_json=json.dumps(commands),
+            environment_json=dump_json(environment),
+            commands_json=dump_json(commands),
             status=status,
             started_at=_utc_now(),
             finished_at=finished_at,

@@ -33,8 +33,8 @@ def _knowledge_okf_dir(root: Path) -> Path:
     directory = ".devcouncil/knowledge"
     try:
         directory = load_config(root).knowledge.directory
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to load knowledge directory from config, using default: %s", e)
     return root / directory / "okf"
 
 
@@ -49,8 +49,8 @@ def _knowledge_design_md(root: Path) -> Path | None:
     directory = ".devcouncil/knowledge"
     try:
         directory = load_config(root).knowledge.directory
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to load knowledge directory from config, using default: %s", e)
     candidates = [
         root / directory / "design" / "design.md",
         root / ".devcouncil" / "knowledge" / "design" / "design.md",
@@ -103,8 +103,8 @@ def _run_okf_export(root, db, output, skills, design):
         from devcouncil.app.config import load_config
 
         project_name = load_config(root).project.name or project_name
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to load project name from config, using directory name: %s", e)
 
     # Load the FULL skill set (packaged library + this repo's own skills) so the export is
     # complete; goal-driven selection would only emit the few skills that match a goal.
@@ -230,6 +230,27 @@ def validate(
     for p in problems:
         console.print(f"  - {p}")
     raise typer.Exit(code=1)
+
+
+@app.command("select")
+def select_knowledge(
+    goal: str = typer.Option(..., "--goal", "-g", help="Task goal used to rank ingested knowledge sources."),
+    project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Select OKF/design knowledge sources that match a goal."""
+    from devcouncil.knowledge.knowledge_select import select_knowledge_payload
+
+    root = project_root.expanduser().resolve()
+    payload = select_knowledge_payload(root, goal)
+    if json_output:
+        console.print_json(data=payload)
+        return
+    if payload.get("sources"):
+        for source in payload["sources"]:
+            console.print(f"- [{source['kind']}] {source['name']}: {source['description']}")
+    if payload.get("preamble"):
+        console.print("\n" + str(payload["preamble"]))
 
 
 @app.command("html")

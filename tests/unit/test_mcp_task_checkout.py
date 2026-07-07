@@ -240,18 +240,26 @@ async def test_mcp_verify_persists_gaps_evidence_and_task_status(tmp_path, monke
         TaskRepository(session).save(Task(id="TASK-001", title="T", description="D"))
     monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
 
-    async def fake_verify(self, task, requirements):
-        return [
+    def fake_verify_payload(project_root, *, task_id, lease_token, sandbox="local"):
+        from devcouncil.integrations.mcp.util import allowed_next_tools
+        from devcouncil.storage.db import get_db
+        from devcouncil.storage.native import TaskLeaseRepository
+        from devcouncil.storage.repositories import GapRepository, EvidenceRepository, TaskRepository
+        from devcouncil.verification.next_actions import split_next_actions
+
+        db = get_db(project_root)
+        gaps = [
             Gap(
                 id="GAP-1",
                 severity="high",
                 gap_type="test_failed",
-                task_id=task.id,
+                task_id=task_id,
                 description="failed",
                 recommended_fix="fix",
                 blocking=True,
             )
-        ], [
+        ]
+        evidence = [
             CommandResult(
                 command="pytest",
                 exit_code=1,
@@ -260,8 +268,66 @@ async def test_mcp_verify_persists_gaps_evidence_and_task_status(tmp_path, monke
                 summary="failed",
             )
         ]
+        with db.get_session() as session:
+            if not TaskLeaseRepository(session).validate(task_id, lease_token):
+                return {"ok": False, "error": "Invalid lease token.", "code": "invalid_lease", "task_id": task_id}
+            GapRepository(session).delete_for_task(task_id)
+            EvidenceRepository(session).delete_for_task(task_id)
+            for gap in gaps:
+                GapRepository(session).save(gap)
+            for ev in evidence:
+                EvidenceRepository(session).save_command_result(task_id, ev)
+            task = TaskRepository(session).get_by_id(task_id)
+            assert task is not None
+            task.status = "blocked"
+            TaskRepository(session).save(task)
+        blocking = [g.model_dump() for g in gaps if g.blocking]
+        blocking_actions, advisory_actions = split_next_actions(gaps)
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "status": "blocked",
+            "sandbox": sandbox,
+            "blocking_gaps": blocking,
+            "next_actions": [a.model_dump() for a in blocking_actions],
+            "advisory_actions": [a.model_dump() for a in advisory_actions],
+            "allowed_next_tools": allowed_next_tools("blocked", True),
+            "passed": False,
+            "verification_mode": "coarse",
+            "compiler_active": False,
+            "diff_empty": True,
+            "coverage_measured": False,
+            "coverage_skipped_reason": None,
+            "difficulty": None,
+            "rigor_applied": [],
+        }
 
-    monkeypatch.setattr("devcouncil.verification.verifier.Verifier.verify_task", fake_verify)
+    import devcouncil.integrations.mcp.util as mcp_util
+    from devcouncil.utils.json_persist import dump_json
+
+    real_run_cli = mcp_util.run_cli_command
+
+    def fake_run_cli(args, root):
+        if args and args[0] == "verify-leased":
+            payload = fake_verify_payload(
+                root,
+                task_id=args[1],
+                lease_token=args[args.index("--lease-token") + 1],
+                sandbox=args[args.index("--sandbox") + 1] if "--sandbox" in args else "local",
+            )
+            return {
+                "ok": payload.get("ok", True),
+                "returncode": 0 if payload.get("ok") else 1,
+                "stdout": dump_json(payload, indent=2),
+                "stderr": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "timed_out": False,
+            }
+        return real_run_cli(args, root)
+
+    monkeypatch.setattr(mcp_util, "run_cli_command", fake_run_cli)
+    monkeypatch.setattr("devcouncil.integrations.mcp.handlers.verify.run_cli_command", fake_run_cli)
     checkout = json.loads(
         (await call_tool("devcouncil_checkout_task", {"task_id": "TASK-001", "client_id": "a"}))[0].text
     )

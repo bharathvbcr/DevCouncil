@@ -53,10 +53,13 @@ class CritiqueCard(BaseModel):
     status: CardStatus = "open"
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     source_path: str | None = None
+    # When False the card is advisory (``dev run``/``dev e2e``); only ``dev watch`` cards
+    # with blocks_gate=True may block verification.
+    blocks_gate: bool = True
 
     @property
     def blocks_completion(self) -> bool:
-        return self.verdict == "Critical Issues"
+        return self.verdict == "Critical Issues" and self.blocks_gate
 
 
 def session_id_from_path(path: Path) -> str:

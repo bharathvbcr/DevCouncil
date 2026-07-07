@@ -21,14 +21,16 @@ from typing import Optional
 import typer
 from rich.console import Console
 
-from devcouncil.telemetry.logging_setup import LOG_RELATIVE_PATH
+from devcouncil.telemetry.logging_setup import _resolve_log_path
 
 app = typer.Typer(help="View DevCouncil runtime logs (shared and per-run).")
 console = Console()
 
 
 def _shared_log(root: Path) -> Path:
-    return root / LOG_RELATIVE_PATH
+    # Honors DEVCOUNCIL_LOG_DIR so `dev logs` inspects the same file the
+    # handlers actually write to.
+    return _resolve_log_path(root)
 
 
 def _runs_dir(root: Path) -> Path:

@@ -34,6 +34,10 @@ google/gemini-2.5-flash:
 nvidia/nemotron-3-ultra-550b-a55b:free:
   prompt_per_1k: 0.0
   completion_per_1k: 0.0
+# OpenRouter (Alibaba) Qwen3 Max — default planning/review model.
+qwen/qwen3-max:
+  prompt_per_1k: 0.00078
+  completion_per_1k: 0.0039
 # Local Ollama models run on-device and are free. Bare tags (no ``ollama/``
 # prefix) are listed here so the cost reporter shows $0; the cost.py prefix
 # guard covers any other ``ollama/`` or ``ollama:`` model id.

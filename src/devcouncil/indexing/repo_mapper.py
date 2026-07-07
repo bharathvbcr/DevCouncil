@@ -13,6 +13,7 @@ from typing import Dict, List, Set, Tuple
 from pydantic import BaseModel, Field
 
 from devcouncil.indexing.lsp import LspInspector
+from devcouncil.utils.json_persist import read_json
 
 logger = logging.getLogger(__name__)
 
@@ -939,44 +940,108 @@ class RepoMapper:
             comps = comps[:-1]  # `from pkg.mod import name` -> try pkg.mod, then pkg
         return None
 
+    # Version tag for the on-disk parse cache; bump when the cached payload changes
+    # shape so stale caches are discarded wholesale instead of misread.
+    _PARSE_CACHE_VERSION = 1
+
+    def _parse_cache_path(self) -> Path:
+        # Same .devcouncil/cache/ layout the LLM response cache uses.
+        return self.project_root / ".devcouncil" / "cache" / "repo_map_parse.json"
+
+    def _load_parse_cache(self) -> Dict[str, Dict[str, object]]:
+        """Load the sha256-keyed import-extraction cache. Best-effort: any missing,
+        corrupt, or version-mismatched cache just means a full re-parse."""
+        try:
+            data = read_json(self._parse_cache_path())
+            if data.get("version") == self._PARSE_CACHE_VERSION and isinstance(data.get("files"), dict):
+                return data["files"]
+        except Exception:
+            pass
+        return {}
+
+    def _save_parse_cache(self, files: Dict[str, Dict[str, object]]) -> None:
+        """Persist the import-extraction cache. Best-effort: a failed write only
+        costs the next run a re-parse, so it never raises."""
+        try:
+            path = self._parse_cache_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps({"version": self._PARSE_CACHE_VERSION, "files": files}),
+                encoding="utf-8",
+            )
+        except Exception:
+            logger.debug("Failed to write repo-map parse cache", exc_info=True)
+
+    def _extract_python_import_modules(self, rel: str, source: str) -> List[str]:
+        """Raw module strings referenced by ``rel``'s import statements, with relative
+        imports expanded against the file's package path. A pure function of the file's
+        path + content — which is what makes the result safe to cache by sha256."""
+        tree = ast.parse(source)
+        pkg_parts = rel[:-3].replace("/", ".").split(".")  # importer's dotted path
+        modules: List[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                modules.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    base = pkg_parts[: -node.level] if node.level <= len(pkg_parts) else []
+                    base_mod = ".".join(base + ([node.module] if node.module else []))
+                else:
+                    base_mod = node.module or ""
+                if base_mod:
+                    modules.append(base_mod)
+                # `from pkg import sub` / `from . import sub` may import a SUBMODULE
+                # file, not just a symbol — resolve each name as a candidate module so
+                # those edges aren't silently dropped.
+                for alias in node.names:
+                    if alias.name and alias.name != "*":
+                        modules.append(f"{base_mod}.{alias.name}" if base_mod else alias.name)
+        return modules
+
     def _python_import_edges(self, files: List[str]) -> List[Tuple[str, str]]:
-        """Resolve Python import statements into (importer, imported) file edges."""
+        """Resolve Python import statements into (importer, imported) file edges.
+
+        Extraction (ast.parse + walk) is cached in .devcouncil/cache/repo_map_parse.json
+        keyed by each file's sha256, so unchanged files skip re-parsing across runs.
+        Resolution against the module index always runs fresh — it depends on the
+        CURRENT file set, not on any single file's content."""
         py_files = [f for f in self._code_files(files) if f.endswith(".py")]
         if not py_files:
             return []
         index = self._module_suffix_index(py_files)
+        cache = self._load_parse_cache()
+        fresh: Dict[str, Dict[str, object]] = {}
         edges: List[Tuple[str, str]] = []
         seen: Set[Tuple[str, str]] = set()  # dedupe so in-degree isn't inflated by repeats
         for rel in py_files:
             try:
-                source = (self.project_root / rel).read_text(encoding="utf-8", errors="replace")
-                tree = ast.parse(source)
-            except (OSError, SyntaxError, ValueError):
+                raw = (self.project_root / rel).read_bytes()
+            except OSError:
                 continue
-            pkg_parts = rel[:-3].replace("/", ".").split(".")  # importer's dotted path
-            for node in ast.walk(tree):
-                modules: List[str] = []
-                if isinstance(node, ast.Import):
-                    modules = [alias.name for alias in node.names]
-                elif isinstance(node, ast.ImportFrom):
-                    if node.level:
-                        base = pkg_parts[: -node.level] if node.level <= len(pkg_parts) else []
-                        base_mod = ".".join(base + ([node.module] if node.module else []))
-                    else:
-                        base_mod = node.module or ""
-                    if base_mod:
-                        modules.append(base_mod)
-                    # `from pkg import sub` / `from . import sub` may import a SUBMODULE
-                    # file, not just a symbol — resolve each name as a candidate module so
-                    # those edges aren't silently dropped.
-                    for alias in node.names:
-                        if alias.name and alias.name != "*":
-                            modules.append(f"{base_mod}.{alias.name}" if base_mod else alias.name)
-                for module in modules:
-                    target = self._resolve_module(module, index)
-                    if target and target != rel and (rel, target) not in seen:
-                        seen.add((rel, target))
-                        edges.append((rel, target))
+            digest = hashlib.sha256(raw).hexdigest()
+            entry = cache.get(rel)
+            cached_modules = entry.get("modules") if isinstance(entry, dict) and entry.get("sha256") == digest else None
+            if isinstance(cached_modules, list):
+                modules = [m for m in cached_modules if isinstance(m, str)]
+            else:
+                try:
+                    modules = self._extract_python_import_modules(
+                        rel, raw.decode("utf-8", errors="replace")
+                    )
+                except (SyntaxError, ValueError):
+                    # Unparseable content contributes no edges; cache the empty result
+                    # so the same broken content isn't re-parsed every run.
+                    modules = []
+            fresh[rel] = {"sha256": digest, "modules": modules}
+            for module in modules:
+                target = self._resolve_module(module, index)
+                if target and target != rel and (rel, target) not in seen:
+                    seen.add((rel, target))
+                    edges.append((rel, target))
+        # Rewriting only on change keeps repeat runs read-only; building `fresh` from
+        # scratch also prunes entries for files that no longer exist.
+        if fresh != cache:
+            self._save_parse_cache(fresh)
         return edges
 
     # Module specifiers in import/require statements: import ... from "x"; require("x");
@@ -1063,7 +1128,7 @@ class RepoMapper:
 
     def _go_import_edges(self, files: List[str], file_set: Set[str]) -> List[Tuple[str, str]]:
         """Resolve Go import paths (under the module prefix) to package directories, then
-        to the .go files in those directories. Edges target every file in the package."""
+        to one representative .go file per package (main.go preferred)."""
         module = self._go_module_prefix(file_set)
         if not module:
             return []
@@ -1076,6 +1141,16 @@ class RepoMapper:
             if f.endswith("_test.go"):
                 continue
             pkg_files[Path(f).parent.as_posix()].append(f)
+
+        def _representative_file(pkg_paths: List[str]) -> str:
+            main_go = [p for p in pkg_paths if Path(p).name == "main.go"]
+            if main_go:
+                return sorted(main_go)[0]
+            return min(pkg_paths, key=lambda p: (len(p), p))
+
+        pkg_representative = {
+            pkg: _representative_file(paths) for pkg, paths in pkg_files.items()
+        }
         edges: List[Tuple[str, str]] = []
         seen: Set[Tuple[str, str]] = set()
         for rel in go_files:
@@ -1096,10 +1171,10 @@ class RepoMapper:
                     continue  # external/stdlib package
                 rel_pkg = spec[len(module):].lstrip("/")
                 target_dir = rel_pkg if rel_pkg else "."
-                for target in pkg_files.get(target_dir, []):
-                    if target != rel and (rel, target) not in seen:
-                        seen.add((rel, target))
-                        edges.append((rel, target))
+                target = pkg_representative.get(target_dir)
+                if target and target != rel and (rel, target) not in seen:
+                    seen.add((rel, target))
+                    edges.append((rel, target))
         return edges
 
     def _all_import_edges(self, files: List[str]) -> List[Tuple[str, str]]:
@@ -1221,12 +1296,9 @@ class RepoMapper:
         return False
 
     def _git_head(self) -> str:
-        try:
-            return subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], cwd=self.project_root, stderr=subprocess.DEVNULL
-            ).decode("utf-8", errors="replace").strip()
-        except Exception:
-            return ""
+        from devcouncil.utils.proc import git_output
+
+        return git_output(["rev-parse", "HEAD"], cwd=self.project_root, default="").strip()
 
     def _files_fingerprint(self, files: List[str]) -> str:
         return hashlib.sha1("\n".join(sorted(files)).encode("utf-8")).hexdigest()
@@ -1247,16 +1319,20 @@ class RepoMapper:
 
     def get_git_files(self) -> List[str]:
         try:
-            output = subprocess.check_output(
-                ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+            from devcouncil.utils.proc import git_output
+
+            output = git_output(
+                ["ls-files", "--cached", "--others", "--exclude-standard"],
                 cwd=self.project_root,
-                stderr=subprocess.DEVNULL
-            ).decode().splitlines()
+            ).splitlines()
             return [path for path in output if not self._is_runtime_or_generated_file(path)]
         except Exception:
             # Fallback to os.walk if not a git repo or git missing
+            from devcouncil.indexing.walk import IGNORED_DIR_NAMES
+
             files = []
-            for root, _, filenames in os.walk(self.project_root):
+            for root, dirnames, filenames in os.walk(self.project_root):
+                dirnames[:] = [name for name in dirnames if name not in IGNORED_DIR_NAMES]
                 for f in filenames:
                     rel_path = os.path.relpath(os.path.join(root, f), self.project_root)
                     if not rel_path.startswith(".") and not self._is_runtime_or_generated_file(rel_path):
@@ -1386,6 +1462,7 @@ class RepoMapper:
                     candidates.append({"path": line.strip(), "reason": f"ripgrep match for '{goal}'"})
                 return candidates
         except Exception:
+            logger.debug("ripgrep search failed; falling back to naive matching", exc_info=True)
             pass  # Fall back to naive matching
 
         # Naive keyword matching fallback

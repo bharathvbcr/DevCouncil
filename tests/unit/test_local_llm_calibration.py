@@ -299,6 +299,30 @@ def test_reviewer_check_auto_defaults_resolve_by_reviewer_locality():
     assert ReviewerCheckConfig(samples=2).resolved(local_reviewer=True) == 2
 
 
+def test_acceptance_check_unsafe_overrides_warn_only_on_local_monitor():
+    # Explicit single-shot + batched compilation on a LOCAL monitor: both flagged
+    # (calibration probes showed samples=1 rubber-stamping a real defect).
+    unsafe = AcceptanceCheckConfig(samples=1, per_criterion=False)
+    warnings = unsafe.unsafe_override_warnings(local_monitor=True)
+    assert len(warnings) == 2
+    assert any("samples" in w for w in warnings)
+    assert any("per_criterion" in w for w in warnings)
+    # Same explicit config on a cloud monitor is the intended default: no warnings.
+    assert unsafe.unsafe_override_warnings(local_monitor=False) == []
+    # Auto defaults (no explicit overrides) never warn — auto already picks safe values.
+    assert AcceptanceCheckConfig().unsafe_override_warnings(local_monitor=True) == []
+    # Explicit but safe values don't warn either.
+    safe = AcceptanceCheckConfig(samples=3, per_criterion=True)
+    assert safe.unsafe_override_warnings(local_monitor=True) == []
+
+
+def test_reviewer_check_unsafe_overrides_warn_only_on_local_reviewer():
+    assert len(ReviewerCheckConfig(samples=1).unsafe_override_warnings(local_reviewer=True)) == 1
+    assert ReviewerCheckConfig(samples=1).unsafe_override_warnings(local_reviewer=False) == []
+    assert ReviewerCheckConfig().unsafe_override_warnings(local_reviewer=True) == []
+    assert ReviewerCheckConfig(samples=3).unsafe_override_warnings(local_reviewer=True) == []
+
+
 def test_role_runs_on_local_provider_honors_role_override():
     cfg = DevCouncilConfig.model_validate({
         "models": {

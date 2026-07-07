@@ -1,11 +1,15 @@
 from abc import ABC, abstractmethod
+import contextlib
 import copy
 from functools import lru_cache
 from importlib import resources
 import logging
 import os
-from typing import List, Dict, Any, Optional
+from typing import TYPE_CHECKING, List, Dict, Any, Optional
 from pydantic import BaseModel, field_validator
+
+if TYPE_CHECKING:
+    import asyncio
 import httpx
 import json
 from pathlib import Path
@@ -40,9 +44,28 @@ DEFAULT_ROLE_MODELS_BY_PROVIDER = load_default_role_models_by_provider()
 class ProviderRequestError(RuntimeError):
     """A provider HTTP request failed, with an actionable, user-facing message."""
 
-    def __init__(self, message: str, status_code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        retry_after_seconds: float | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
+
+
+def _parse_retry_after(response: "httpx.Response") -> float | None:
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    raw = headers.get("retry-after") or headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return None
 
 
 def raise_for_provider_status(response: "httpx.Response", provider: str) -> None:
@@ -70,7 +93,11 @@ def raise_for_provider_status(response: "httpx.Response", provider: str) -> None
     if body:
         message = f"{message} Response: {body}"
     logger.error("Provider request failed: %s", message)
-    raise ProviderRequestError(message, status_code=status)
+    raise ProviderRequestError(
+        message,
+        status_code=status,
+        retry_after_seconds=_parse_retry_after(response) if status == 429 else None,
+    )
 
 
 def _parse_provider_json(response: "httpx.Response", provider: str) -> Dict[str, Any]:
@@ -326,7 +353,11 @@ def _log_model_call(
         from devcouncil.utils.redaction import redact_dict
         # Resolve against the provider's project root, not the process cwd — otherwise
         # running `dev` from another directory logged spend to the wrong project.
-        log_dir = project_root / ".devcouncil" / "logs"
+        # DEVCOUNCIL_LOG_DIR (set by the test suite, optionally by CI) overrides so
+        # test/mocked calls never pollute a real project's spend ledger — observed:
+        # 298 of 302 entries in a real model_calls.jsonl were test-fixture pings.
+        override = os.environ.get("DEVCOUNCIL_LOG_DIR")
+        log_dir = Path(override) if override else project_root / ".devcouncil" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / "model_calls.jsonl"
 
@@ -354,6 +385,10 @@ def _log_model_call(
 
 
 class OpenRouterProvider(Provider):
+    # Cap in-flight OpenRouter calls so acceptance-check fan-out stays under common
+    # ~20 RPM free-tier limits instead of tripping 429 mid-run.
+    DEFAULT_MAX_CONCURRENCY = 3
+
     def __init__(self, api_key: str, project_root: Path = Path("."), provider_prefs: Any = None):
         self.api_key = api_key
         self.base_url = "https://openrouter.ai/api/v1"
@@ -365,6 +400,115 @@ class OpenRouterProvider(Provider):
         # (per MODEL, not per instance: one router instance fans across models).
         # Remembered so each such model pays the degrade retry only once.
         self._schema_format_unsupported: set = set()
+        # Models whose endpoints reject ``response_format`` ENTIRELY (e.g. free-tier
+        # endpoints advertising no response_format/structured_outputs support: with
+        # ``require_parameters: true`` OpenRouter then 404s "no endpoints found" for
+        # BOTH json_schema and json_object). For these, JSON-mode requests rely on the
+        # prompt's JSON instruction + the router's extraction/healing path instead of
+        # failing the whole run.
+        self._response_format_unsupported: set = set()
+        self.max_concurrency = self._resolve_max_concurrency()
+        self._sem: "asyncio.Semaphore | None" = None
+        self._sem_loop = None
+        # Client-side RPM pacing (OPENROUTER_RPM). Concurrency capping alone does
+        # not bound the REQUEST RATE: 2-at-a-time short calls still exceed a ~20 RPM
+        # endpoint cap and trip 429s that then burn the router's retry budget
+        # mid-run. Pacing spaces request STARTS so the cap is never hit at all.
+        self.requests_per_minute = self._resolve_rpm()
+        self._pace_lock: "asyncio.Lock | None" = None
+        self._pace_loop = None
+        self._next_request_at = 0.0
+
+    @staticmethod
+    def _resolve_max_concurrency() -> int | None:
+        raw = os.environ.get("OPENROUTER_MAX_CONCURRENCY")
+        if raw is None:
+            return OpenRouterProvider.DEFAULT_MAX_CONCURRENCY
+        raw = raw.strip().lower()
+        if raw in {"0", "none", "off", ""}:
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            return OpenRouterProvider.DEFAULT_MAX_CONCURRENCY
+        return value if value > 0 else None
+
+    def _get_semaphore(self) -> "asyncio.Semaphore | None":
+        import asyncio
+
+        if not self.max_concurrency:
+            return None
+        loop = asyncio.get_running_loop()
+        sem = getattr(self, "_sem", None)
+        if sem is not None and getattr(self, "_sem_loop", None) is loop:
+            return sem
+        sem = asyncio.Semaphore(self.max_concurrency)
+        self._sem = sem
+        self._sem_loop = loop
+        return sem
+
+    @staticmethod
+    def _resolve_rpm() -> float | None:
+        """Requests-per-minute pacing from OPENROUTER_RPM; None/off disables."""
+        raw = os.environ.get("OPENROUTER_RPM")
+        if raw is None:
+            return None
+        raw = raw.strip().lower()
+        if raw in {"", "0", "none", "off"}:
+            return None
+        try:
+            value = float(raw)
+        except ValueError:
+            logger.warning("Ignoring invalid OPENROUTER_RPM=%r", raw)
+            return None
+        return value if value > 0 else None
+
+    async def _pace(self) -> None:
+        """Space request starts to at most ``requests_per_minute`` per minute,
+        and honor any active 429 cooldown (see ``_note_rate_limited``) even when
+        RPM pacing itself is disabled.
+
+        A short critical section reserves this request's start slot; the sleep
+        happens OUTSIDE the lock so waiting requests queue timestamps rather
+        than serializing their full durations."""
+        if not self.requests_per_minute and self._next_request_at <= 0.0:
+            return
+        import asyncio
+        import time
+
+        loop = asyncio.get_running_loop()
+        if self._pace_lock is None or self._pace_loop is not loop:
+            self._pace_lock = asyncio.Lock()
+            self._pace_loop = loop
+        interval = (60.0 / self.requests_per_minute) if self.requests_per_minute else 0.0
+        async with self._pace_lock:
+            now = time.monotonic()
+            wait = self._next_request_at - now
+            self._next_request_at = max(now, self._next_request_at) + interval
+        if wait > 0:
+            await asyncio.sleep(wait)
+
+    # Fallback cooldown after a 429 that carried no Retry-After header — matches
+    # the router's first 429 backoff step so both layers agree on the pause.
+    RATE_LIMIT_FALLBACK_COOLDOWN = 15.0
+
+    def _note_rate_limited(self, retry_after: float | None) -> None:
+        """Push the SHARED pacing slot past the provider-announced cooldown.
+
+        Without this, only the request that received the 429 backs off; its
+        concurrent siblings (acceptance-check fan-out) each slam into the same
+        exhausted window and burn their own retry budgets. Called from the
+        event-loop thread with no await between read and write, so the plain
+        max() update is safe without the pace lock."""
+        import time
+
+        delay = retry_after if retry_after and retry_after > 0 else self.RATE_LIMIT_FALLBACK_COOLDOWN
+        self._next_request_at = max(self._next_request_at, time.monotonic() + min(120.0, delay))
+
+    # Statuses that mean "this endpoint/parameter combination is rejected" — the only
+    # ones worth a degrade retry. 429/5xx are transient and must surface to the
+    # caller's retry/backoff instead of permanently disabling structured output.
+    _PARAM_REJECTED_STATUSES = frozenset({400, 404, 422})
 
     def cache_fingerprint(self) -> str:
         # Routing prefs change which upstream provider/model serves the request (and the
@@ -408,8 +552,11 @@ class OpenRouterProvider(Provider):
             # gemini-2.5-flash dropping empty ``blocking_questions``/``final_tasks``
             # lists), which crashes planning schemas; ``json_schema`` makes the
             # response structurally complete. Models/routes that reject it degrade
-            # to ``json_object`` below and are remembered per model.
-            if json_schema is not None and model not in self._schema_format_unsupported:
+            # to ``json_object`` (and, if even that is rejected, to NO
+            # response_format at all) below and are remembered per model.
+            if model in self._response_format_unsupported:
+                pass  # prompt-only JSON; the router's extraction/healing handles it
+            elif json_schema is not None and model not in self._schema_format_unsupported:
                 payload["response_format"] = {
                     "type": "json_schema",
                     "json_schema": {
@@ -427,45 +574,84 @@ class OpenRouterProvider(Provider):
         if self.provider_prefs:
             payload["provider"] = self.provider_prefs
 
-        client = self._get_async_client(180.0)
-        response = await client.post(
-            f"{self.base_url}/chat/completions",
-            headers=headers,
-            json=payload,
-        )
-        if (
-            payload.get("response_format", {}).get("type") == "json_schema"
-            and getattr(response, "status_code", 200) >= 400
-        ):
-            # The model/route rejected schema-constrained output (unsupported
-            # parameter, incompatible schema subset, ...). Degrade once to the
-            # plain json_object switch — the prompt still carries the schema
-            # instruction — and never pay this retry again for this model.
-            logger.info(
-                "OpenRouter rejected json_schema response_format for model %s "
-                "(HTTP %s); retrying with json_object",
-                model, response.status_code,
+        def _param_rejected(resp: "httpx.Response") -> bool:
+            return getattr(resp, "status_code", 200) in self._PARAM_REJECTED_STATUSES
+
+        import time as _time
+
+        started = _time.monotonic()
+        semaphore = self._get_semaphore()
+        async with semaphore if semaphore is not None else contextlib.nullcontext():
+            client = self._get_async_client(180.0)
+
+            async def _post_paced() -> "httpx.Response":
+                # Pace EVERY post (including degrade-chain retries): each one is
+                # a real request against the endpoint's RPM budget.
+                await self._pace()
+                return await client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+
+            response = await _post_paced()
+            if (
+                payload.get("response_format", {}).get("type") == "json_schema"
+                and _param_rejected(response)
+            ):
+                # The model/route rejected schema-constrained output (unsupported
+                # parameter, incompatible schema subset, ...). Degrade once to the
+                # plain json_object switch — the prompt still carries the schema
+                # instruction — and never pay this retry again for this model.
+                logger.info(
+                    "OpenRouter rejected json_schema response_format for model %s "
+                    "(HTTP %s); retrying with json_object",
+                    model, response.status_code,
+                )
+                self._schema_format_unsupported.add(model)
+                payload["response_format"] = {"type": "json_object"}
+                response = await _post_paced()
+            if "response_format" in payload and _param_rejected(response):
+                # Even ``json_object`` was rejected: some endpoints (commonly free
+                # tiers) support no ``response_format`` variant at all, and with
+                # ``provider.require_parameters: true`` OpenRouter answers 404
+                # "no endpoints found" rather than routing around the parameter —
+                # which previously killed planning outright (observed: every arm-B
+                # benchmark task erroring in ~8s on such a model). Drop the field,
+                # remember per model, and rely on the prompt's JSON instruction +
+                # the router's extraction/healing path.
+                logger.warning(
+                    "OpenRouter rejected response_format entirely for model %s "
+                    "(HTTP %s); retrying without structured output. JSON will be "
+                    "prompt-enforced only — prefer a model with response_format "
+                    "support for planning roles if this recurs.",
+                    model, response.status_code,
+                )
+                self._response_format_unsupported.add(model)
+                payload.pop("response_format", None)
+                response = await _post_paced()
+            if getattr(response, "status_code", None) == 429:
+                # Cooldown is shared across ALL in-flight callers so the whole
+                # process backs off together, not one request at a time.
+                self._note_rate_limited(_parse_retry_after(response))
+            raise_for_provider_status(response, "OpenRouter")
+            data = _parse_provider_json(response, "OpenRouter")
+
+            resp = LLMResponse(
+                content=_extract_chat_content(data, "OpenRouter", model),
+                model=data["model"],
+                usage=data.get("usage", {}),
+                raw_response=data
             )
-            self._schema_format_unsupported.add(model)
-            payload["response_format"] = {"type": "json_object"}
-            response = await client.post(
-                f"{self.base_url}/chat/completions",
-                headers=headers,
-                json=payload,
+
+            # Includes queue/pacing wait — the latency the caller experienced.
+            latency_ms = int((_time.monotonic() - started) * 1000)
+            _log_model_call(
+                payload, data, resp.usage, self.project_root,
+                task_id=task_id, run_id=run_id, provider="openrouter", latency_ms=latency_ms,
             )
-        raise_for_provider_status(response, "OpenRouter")
-        data = _parse_provider_json(response, "OpenRouter")
 
-        resp = LLMResponse(
-            content=_extract_chat_content(data, "OpenRouter", model),
-            model=data["model"],
-            usage=data.get("usage", {}),
-            raw_response=data
-        )
-
-        _log_model_call(payload, data, resp.usage, self.project_root, task_id=task_id, run_id=run_id)
-
-        return resp
+            return resp
 
 
 class DoublewordProvider(Provider):
@@ -502,6 +688,9 @@ class DoublewordProvider(Provider):
             if msgs[-1]["role"] == "user":
                 msgs[-1]["content"] += "\n\nOutput must be a valid JSON object."
 
+        import time as _time
+
+        started = _time.monotonic()
         client = self._get_async_client(180.0)
         response = await client.post(
             f"{self.base_url}/chat/completions",
@@ -509,6 +698,7 @@ class DoublewordProvider(Provider):
             json=payload,
         )
         raise_for_provider_status(response, "Doubleword")
+        latency_ms = int((_time.monotonic() - started) * 1000)
         data = _parse_provider_json(response, "Doubleword")
 
         resp = LLMResponse(
@@ -518,7 +708,10 @@ class DoublewordProvider(Provider):
             raw_response=data
         )
 
-        _log_model_call(payload, data, resp.usage, self.project_root, task_id=task_id, run_id=run_id)
+        _log_model_call(
+            payload, data, resp.usage, self.project_root,
+            task_id=task_id, run_id=run_id, provider="doubleword", latency_ms=latency_ms,
+        )
         return resp
 
 
@@ -1032,6 +1225,9 @@ class VertexAIProvider(Provider):
             if msgs[-1]["role"] == "user":
                 msgs[-1]["content"] += "\n\nOutput must be a valid JSON object."
 
+        import time as _time
+
+        started = _time.monotonic()
         client = self._get_async_client(180.0)
         response = await client.post(
             f"{self.base_url}/chat/completions",
@@ -1045,6 +1241,7 @@ class VertexAIProvider(Provider):
                 json=payload,
             )
         raise_for_provider_status(response, "Vertex AI")
+        latency_ms = int((_time.monotonic() - started) * 1000)
         data = _parse_provider_json(response, "Vertex AI")
 
         resp = LLMResponse(
@@ -1054,7 +1251,10 @@ class VertexAIProvider(Provider):
             raw_response=data
         )
 
-        _log_model_call(payload, data, resp.usage, self.project_root, task_id=task_id, run_id=run_id)
+        _log_model_call(
+            payload, data, resp.usage, self.project_root,
+            task_id=task_id, run_id=run_id, provider="vertexai", latency_ms=latency_ms,
+        )
         return resp
 
 class MockProvider(Provider):

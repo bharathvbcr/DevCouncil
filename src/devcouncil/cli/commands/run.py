@@ -10,6 +10,7 @@ from devcouncil.executors.coding_cli import CodingCliExecutor
 from devcouncil.executors.agent_registry import (
     AGENT_ALIASES,
     BUILTIN_CODING_EXECUTOR_NAMES,
+    list_run_executor_names,
     load_cli_agent_specs,
 )
 from devcouncil.executors.native.agent import NativeAgent
@@ -40,14 +41,59 @@ def _current_changed_files(project_root: Path = Path(".")) -> list[str]:
 
     return Verifier(project_root).get_changed_files()
 
+
+def _verify_executor_output_if_present(
+    session,
+    task,
+    reqs,
+    *,
+    root: Path,
+    executor_label: str,
+    cli_client: str | None = None,
+    cli_executor=None,
+) -> bool:
+    """Run verification when the executor failed but left implementable changes."""
+    if not _current_changed_files(root):
+        return False
+    console.print(
+        f"[yellow]{executor_label} failed, but the workspace has changes — "
+        f"verifying {task.id} against them anyway.[/yellow]"
+    )
+    verified = _verify_after_execution(
+        session, task, reqs, router=_build_verification_router(root), project_root=root
+    )
+    _record_project_phase(
+        session,
+        ProjectPhase.TASK_VERIFIED if verified else ProjectPhase.TASK_BLOCKED,
+    )
+    TaskRepository(session).save(task)
+    if cli_client:
+        _record_agent_verification(
+            root,
+            task.id,
+            cli_client,
+            getattr(cli_executor, "last_run_id", None) if cli_executor else None,
+            verified,
+        )
+        _run_live_review_after_execution(root, cli_client, task.id)
+    _log_exec_outcome(executor_label, task.id, verified=verified)
+    if verified:
+        console.print(f"\n[green]{executor_label} left verifiable work; {task.id} verified.[/green]")
+    else:
+        console.print(
+            f"\n[yellow]{executor_label} left changes, but {task.id} is blocked by verification gaps.[/yellow]"
+        )
+    return True
+
 def _capture_after_patch(task_id: str, project_root: Path = Path(".")):
     """Capture the diff after task execution for use by rollback."""
     try:
         from devcouncil.execution.checkpoints import CheckpointService
 
         CheckpointService(project_root).create_after(task_id)
-    except Exception:
-        pass  # Non-critical — don't block execution
+    except Exception as e:
+        # Non-critical — don't block execution, but a missing after checkpoint breaks rollback.
+        logger.warning("Failed to capture after checkpoint for %s: %s", task_id, e)
 
 def _capture_before_snapshot(task_id: str, project_root: Path = Path(".")):
     from devcouncil.execution.checkpoints import CheckpointService
@@ -154,13 +200,14 @@ def _run_live_review_after_execution(project_root: Path, client: str, task_id: s
         )
         from devcouncil.live.transcripts import latest_assistant_turn
 
-        transcript = _resolve_transcript(project_root, client, latest=True)
+        transcript = _resolve_transcript(project_root, client, latest=True, task_id=task_id)
         if transcript is None or not transcript.exists():
             return
         turn = latest_assistant_turn(transcript, client=client)
         if turn is None:
             return
         card = asyncio.run(_review_turn(turn, project_root, client, use_llm=True, task_id=task_id))
+        card = card.model_copy(update={"task_id": task_id, "blocks_gate": False})
         saved_path, duplicate = _save_card_once(project_root, card, persist=True, force=False)
         if saved_path:
             _log_card_reviewed(project_root, card, saved_path, duplicate=duplicate, source="e2e")
@@ -262,6 +309,38 @@ def _run_task_body(root, task_id, executor, profile, stream, db):
             console.print(f"[yellow]Warning: Failed to create git checkpoint: {e}[/yellow]")
 
         executor = executor.strip().lower().replace("_", "-")
+        if executor == "claude-sdk":
+            # Preflight the optional SDK BEFORE mutating any state: previously a
+            # missing claude-agent-sdk was only discovered inside run_task, after
+            # planning had already spent its budget — every such run failed at the
+            # finish line with "SDK is not installed" (observed repeatedly in logs).
+            # Degrade to the Claude Code CLI executor when it is available (same
+            # agent, hook-based gating instead of in-process gating); otherwise
+            # fail fast with the actionable install hint.
+            import importlib.util
+            import shutil as _shutil
+
+            if importlib.util.find_spec("claude_agent_sdk") is None:
+                if _shutil.which("claude"):
+                    logger.warning(
+                        "claude-agent-sdk is not installed; falling back to the "
+                        "'claude' CLI executor for %s (install claude-agent-sdk "
+                        "to restore in-process tool gating).", task_id,
+                    )
+                    console.print(
+                        "[yellow]claude-agent-sdk is not installed — falling back to the "
+                        "'claude' CLI executor. Install it with "
+                        "`pip install claude-agent-sdk` to use --executor claude-sdk.[/yellow]"
+                    )
+                    executor = "claude"
+                else:
+                    logger.error("claude-sdk executor unavailable for %s: claude-agent-sdk not installed", task_id)
+                    console.print(
+                        "[red]The Claude Agent SDK is not installed and no `claude` CLI was found. "
+                        "Install the SDK with `pip install claude-agent-sdk`, or use another "
+                        "executor (e.g. --executor claude).[/red]"
+                    )
+                    return
         custom_agents = _custom_cli_agents(root)
         if executor not in CODING_EXECUTORS and executor not in custom_agents:
             ignored = [flag for flag, value in (("--profile", profile), ("--stream", stream)) if value]
@@ -322,6 +401,16 @@ def _run_task_body(root, task_id, executor, profile, stream, db):
             else:
                 logger.error("%s failed to start or execute for %s: %s", executor, task_id, exec_result.message)
                 console.print(f"\n[red]{executor.upper()} failed to start or execute: {exec_result.message}[/red]")
+                if not _verify_executor_output_if_present(
+                    session,
+                    task,
+                    reqs,
+                    root=root,
+                    executor_label=executor.upper(),
+                    cli_client=cli_client,
+                    cli_executor=cli_executor,
+                ):
+                    task_repo.save(task)
         elif executor == "mini":
             log_step("run/2: executing with mini-SWE-agent", project_root=root, task_id=task_id)
             _record_project_phase(session, ProjectPhase.TASK_EXECUTING)
@@ -379,11 +468,23 @@ def _run_task_body(root, task_id, executor, profile, stream, db):
             # In-process Claude Agent SDK executor: every tool call is gated live against
             # this task's scope, so out-of-scope writes/commands are denied before they land.
             from devcouncil.executors.claude_sdk import ClaudeSdkExecutor
+            from devcouncil.executors.agent_registry import load_agent_profiles
 
             _record_project_phase(session, ProjectPhase.TASK_EXECUTING)
             req_repo = RequirementRepository(session)
             reqs = req_repo.get_all()
-            sdk_executor = ClaudeSdkExecutor(root, active_task=task)
+            # Honor --profile for model and env overrides (e.g. ANTHROPIC_BASE_URL to
+            # target an alternative Anthropic-compatible endpoint). permission_mode is
+            # deliberately NOT taken from the profile: the SDK executor's containment
+            # relies on "default" routing every tool call through can_use_tool; a
+            # profile's acceptEdits/auto would silently bypass the live scope gate.
+            sdk_profile = load_agent_profiles(root).get(profile or "default")
+            sdk_executor = ClaudeSdkExecutor(
+                root,
+                active_task=task,
+                model=(sdk_profile.model if sdk_profile else None),
+                env=(dict(sdk_profile.env) if sdk_profile and sdk_profile.env else None),
+            )
             exec_result = sdk_executor.run_task(task, reqs)
             _capture_after_patch(task_id, root)
             if exec_result.success:
@@ -458,6 +559,8 @@ def _run_task_body(root, task_id, executor, profile, stream, db):
                 logger.error("Native agent failed during execution for %s", task_id)
                 console.print("\n[red]Native agent failed during execution.[/red]")
         else:
-            logger.error("Executor %r not implemented", executor)
-            console.print(f"[red]Executor {executor} not yet implemented.[/red]")
+            available = ", ".join(list_run_executor_names(root))
+            logger.error("Executor %r not recognized; available: %s", executor, available)
+            console.print(f"[red]Unknown executor {executor!r}.[/red]")
+            console.print(f"[dim]Available executors: {available}[/dim]")
         log_step("run/complete", project_root=root, task_id=task_id, executor=executor, trace=True)

@@ -13,6 +13,7 @@ from devcouncil.app.project_status import compute_phase
 from devcouncil.integrations.actions import apply_integration_target
 from devcouncil.integrations.check import build_integration_check_report, integration_status_summary
 from devcouncil.storage.db import get_db
+from devcouncil.utils.json_persist import read_json
 from devcouncil.storage.repositories import ArtifactGraphRepository, StateRepository
 from devcouncil.telemetry.traces import TraceEvent, read_trace_events_since
 
@@ -38,7 +39,7 @@ def _load_run_manifest(manifest_path: Path) -> dict | None:
     if cached is not None and cached[0] == mtime:
         return dict(cached[1])
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8")) or {}
+        manifest = read_json(manifest_path) or {}
     except (json.JSONDecodeError, OSError):
         return None
     _RUN_MANIFEST_CACHE[key] = (mtime, manifest)

@@ -1,4 +1,4 @@
-import json
+from devcouncil.utils.json_persist import dump_json
 import logging
 import typer
 from pathlib import Path
@@ -36,7 +36,7 @@ def watch_fs(
         if once:
             events = watcher.scan_once()
             if json_format:
-                typer.echo(json.dumps({"events": events}, indent=2))
+                typer.echo(dump_json({"events": events}, indent=2))
             else:
                 for event in events:
                     status = "allowed" if event["allowed"] else "denied"

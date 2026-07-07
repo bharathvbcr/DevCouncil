@@ -129,7 +129,7 @@ class LspInspector:
             "mode": "detection-only",
             "note": self._DETECTION_ONLY_NOTE,
             "languages": self.detect_languages(files),
-            "detected_servers": [
+            "servers_detected": [
                 {
                     "language": candidate.language,
                     "command": candidate.command,
@@ -139,6 +139,15 @@ class LspInspector:
                 for candidate in candidates
             ],
             # Back-compat alias for "detected_servers" (older consumers/tests).
+            "detected_servers": [
+                {
+                    "language": candidate.language,
+                    "command": candidate.command,
+                    "available": candidate.available,
+                    "reason": candidate.reason,
+                }
+                for candidate in candidates
+            ],
             "servers": [
                 {
                     "language": candidate.language,

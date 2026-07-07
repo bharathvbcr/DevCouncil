@@ -17,6 +17,7 @@ from devcouncil.storage.db import get_db
 from devcouncil.storage.native import CorrectionManifestRepository
 from devcouncil.storage.repositories import EvidenceRepository, GapRepository, TaskRepository
 from devcouncil.utils.redaction import redact_text
+from devcouncil.utils.json_persist import read_json, read_model_json, write_model_json
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,7 @@ def remediable_incomplete_gaps(all_gaps: list[Gap]) -> list[Gap]:
 _GAP_TYPE_PRIORITY = {
     "test_failed": 0,
     "acceptance_criteria_unproven": 1,
+    "coarse_acceptance_proof": 1,
     "diff_not_exercised": 1,
     "stub_detected": 1,
     "stub_declared": 4,
@@ -137,7 +139,7 @@ def _latest_agent_run(project_root: Path, task_id: str) -> dict | None:
     candidates = sorted(runs_dir.glob("*/agent-run.json"), reverse=True)
     for path in candidates:
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = read_json(path)
         except Exception:
             continue
         if payload.get("task_id") == task_id:
@@ -346,8 +348,9 @@ def build_correction_manifest(
                     manifest.allowed_repair_files, [pf.path for pf in suggested.planned_files]
                 )
                 manifest.commands_to_rerun = _union(manifest.commands_to_rerun, suggested.expected_tests)
-        except Exception:
-            pass
+        except Exception as e:
+            # The manifest still ships, but without the repair plan's focused scope.
+            logger.warning("Repair plan generation failed, keeping heuristic manifest scope: %s", e)
     return manifest
 
 
@@ -397,7 +400,7 @@ def write_correction_manifest(
     run_dir = project_root / ".devcouncil" / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     path = run_dir / "correction-manifest.json"
-    path.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
+    write_model_json(path, manifest)
 
     with db.get_session() as session:
         CorrectionManifestRepository(session).save(
@@ -422,7 +425,7 @@ def load_latest_correction_manifest(project_root: Path, task_id: str) -> Correct
         path = Path(record.manifest_path)
         if not path.exists():
             return None
-        return CorrectionManifest.model_validate(json.loads(path.read_text(encoding="utf-8")))
+        return read_model_json(path, CorrectionManifest)
 
 
 def repair_prompt_prefix(project_root: Path, task_id: str) -> str:

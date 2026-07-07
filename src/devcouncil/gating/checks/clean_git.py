@@ -1,6 +1,7 @@
 import subprocess
 import logging
 from devcouncil.domain.gap import Gap
+from devcouncil.utils.proc import GIT_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +16,9 @@ class CleanGitCheck:
     
     def check(self, project_root, task_id: str) -> list[Gap]:
         try:
-            status = subprocess.check_output(["git", "status", "--porcelain"], cwd=project_root).decode()
+            status = subprocess.check_output(
+                ["git", "status", "--porcelain"], cwd=project_root, timeout=GIT_TIMEOUT
+            ).decode()
             dirty_lines = [line for line in status.splitlines() if line.strip() and not self._is_runtime_state(line)]
             if dirty_lines:
                 return [Gap(
@@ -38,7 +41,7 @@ class CleanGitCheck:
                 recommended_fix="Install git and ensure it is in your PATH.",
                 blocking=True
             )]
-        except subprocess.CalledProcessError as e:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             logger.warning("Git status check failed: %s", e)
             return [Gap(
                 id=f"GAP-{task_id}-GIT-ERROR",

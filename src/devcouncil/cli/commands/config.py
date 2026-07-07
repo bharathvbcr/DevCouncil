@@ -17,6 +17,129 @@ app = typer.Typer(help="Manage DevCouncil configuration")
 console = Console()
 logger = logging.getLogger(__name__)
 
+_CONFIG_SETTABLE_KEYS = {
+    "execution.default_executor": ("execution", "default_executor", str),
+    "execution.max_repair_attempts": ("execution", "max_repair_attempts", int),
+    "execution.command_timeout": ("execution", "command_timeout", int),
+    "execution.verify_on_post_task": ("execution", "verify_on_post_task", bool),
+    "verification.diff_coverage.enforce": ("verification", "diff_coverage", "enforce", bool),
+    "semantic_layer.enabled": ("semantic_layer", "enabled", bool),
+    "semantic_layer.cache.enabled": ("semantic_layer", "cache", "enabled", bool),
+    "semantic_layer.router.enabled": ("semantic_layer", "router", "enabled", bool),
+    "semantic_layer.compressor.enabled": ("semantic_layer", "compressor", "enabled", bool),
+}
+
+
+def _parse_config_value(raw: str, typ: type) -> object:
+    if typ is bool:
+        normalized = raw.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+        raise ValueError(f"Expected boolean (true/false), got {raw!r}")
+    if typ is int:
+        return int(raw)
+    return raw
+
+
+def _nested_get(raw: dict, path: tuple[str, ...]) -> object | None:
+    current: object = raw
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _nested_set(raw: dict, path: tuple[str, ...], value: object) -> None:
+    current = raw
+    for key in path[:-1]:
+        if key not in current or not isinstance(current[key], dict):
+            current[key] = {}
+        current = current[key]
+    current[path[-1]] = value
+
+
+@app.command("show")
+def show_config(
+    project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """Display key DevCouncil settings."""
+    root = project_root.expanduser().resolve()
+    from devcouncil.telemetry.logging_setup import set_log_dir
+    set_log_dir(root)
+
+    with log_stage("config", project_root=root, subcommand="show"):
+        try:
+            cfg = load_config(root)
+        except FileNotFoundError as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(code=1) from e
+
+        console.print("[bold]DevCouncil Settings[/bold]")
+        console.print(f"  [cyan]execution.default_executor[/cyan]: {cfg.execution.default_executor}")
+        console.print(f"  [cyan]execution.max_repair_attempts[/cyan]: {cfg.execution.max_repair_attempts}")
+        console.print(f"  [cyan]execution.command_timeout[/cyan]: {cfg.execution.command_timeout}")
+        console.print(f"  [cyan]execution.verify_on_post_task[/cyan]: {cfg.execution.verify_on_post_task}")
+        console.print(f"  [cyan]verification.diff_coverage.enforce[/cyan]: {cfg.verification.diff_coverage.enforce}")
+        console.print(f"  [cyan]verification.rigor.enabled[/cyan]: {cfg.verification.rigor.enabled}")
+        console.print(f"  [cyan]verification.rigor.stub_detection[/cyan]: {cfg.verification.rigor.stub_detection}")
+        console.print(f"  [cyan]gates.block_orphan_diffs[/cyan]: {cfg.gates.block_orphan_diffs}")
+        console.print(f"  [cyan]semantic_layer.enabled[/cyan]: {cfg.semantic_layer.enabled}")
+        if cfg.semantic_layer.enabled:
+            console.print(f"  [cyan]semantic_layer.cache.enabled[/cyan]: {cfg.semantic_layer.cache.enabled}")
+            console.print(f"  [cyan]semantic_layer.router.enabled[/cyan]: {cfg.semantic_layer.router.enabled}")
+            console.print(f"  [cyan]semantic_layer.compressor.enabled[/cyan]: {cfg.semantic_layer.compressor.enabled}")
+            console.print(
+                f"  [cyan]semantic_layer.embedding.model_name[/cyan]: {cfg.semantic_layer.embedding.model_name}"
+            )
+            console.print(
+                "  [dim]Enable: dev config set semantic_layer.enabled true "
+                "(requires uv sync --group semantic). "
+                "Check: dev doctor.[/dim]"
+            )
+
+
+@app.command("set")
+def set_config(
+    key: str = typer.Argument(..., help="Dotted config key (e.g. execution.command_timeout)."),
+    value: str = typer.Argument(..., help="New value."),
+    project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """Set a common DevCouncil config key."""
+    root = project_root.expanduser().resolve()
+    from devcouncil.telemetry.logging_setup import set_log_dir
+    set_log_dir(root)
+
+    mapping = _CONFIG_SETTABLE_KEYS.get(key)
+    if mapping is None:
+        supported = ", ".join(sorted(_CONFIG_SETTABLE_KEYS))
+        console.print(f"[red]Unsupported key {key!r}. Supported: {supported}[/red]")
+        raise typer.Exit(code=2)
+
+    config_path = root / ".devcouncil" / "config.yaml"
+    if not config_path.exists():
+        console.print(f"[red]Config not found at {config_path}[/red]")
+        raise typer.Exit(code=1)
+
+    typ = mapping[-1]
+    path = mapping[:-1]
+    try:
+        parsed = _parse_config_value(value, typ)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+    with log_stage("config", project_root=root, subcommand="set"):
+        with open(config_path) as f:
+            raw_config = yaml.safe_load(f) or {}
+        _nested_set(raw_config, path, parsed)
+        with open(config_path, "w") as f:
+            yaml.dump(raw_config, f, default_flow_style=False)
+        console.print(f"[green]Updated {key} = {parsed!r}[/green]")
+
+
 @app.command("models")
 def models(
     role: str = typer.Option(None, "--role", "-r", help="Specific role to show/edit"),

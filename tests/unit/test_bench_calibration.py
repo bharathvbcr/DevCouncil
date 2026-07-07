@@ -3,6 +3,7 @@ DevCouncil's 'incomplete' verdict (cautious-correct vs under-credit), not just
 decisive passed/blocked ones.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -56,8 +57,75 @@ def test_timeout_verdict_classification():
 
     assert _classify_verdict(124, "TIMEOUT\nkilled") == "timeout"
     assert _classify_verdict(0, "Passed: Ready for release") == "passed"
+    assert _classify_verdict(0, "**Passed**: Ready for release.\n") == "passed"
+    assert _classify_verdict(0, "\x1b[1mPassed\x1b[0m: Ready for release.") == "passed"
+    assert _classify_verdict(0, "**Blocked**: 2 high-severity gap(s) remain.") == "blocked"
+    assert _classify_verdict(0, "**Incomplete**: nothing is failing, but 1 acceptance") == "incomplete"
     assert not _is_retryable_error({"verdict": "timeout"})
     assert _is_retryable_error({"verdict": "error"})
+    assert _is_retryable_error({
+        "verdict": "blocked",
+        "fraction": 0.0,
+        "output_tail": "limit_rpm/qwen/qwen3-max rate limited 429",
+    })
+    assert not _is_retryable_error({
+        "verdict": "blocked",
+        "fraction": 0.0,
+        "output_tail": "claude exited with code 1",
+    })
+
+
+def test_executor_infra_failure_classifies_as_error():
+    """A run whose EXECUTOR never ran (session/usage limit, no credits, failed to
+    launch) measures the infrastructure, not DevCouncil: it must classify as
+    'error' (retried, excluded from calibration), not pollute blocked/incomplete
+    stats with 0-score non-runs."""
+    from run_bench import _classify_verdict
+
+    session_limited = (
+        "ERROR [devcouncil.cli.commands.run] claude failed to start or execute for TASK-1: "
+        "claude exited with code 1: You've hit your session limit · resets 2pm\n"
+        "WARNING [devcouncil.cli.commands.go] dev go finished with 1 unfinished task(s): TASK-1 (blocked)\n"
+        "Blocked: 1 task"
+    )
+    assert _classify_verdict(1, session_limited) == "error"
+    # Same failure but the pipeline still reached a genuine PASS → keep it.
+    assert _classify_verdict(
+        0, "You've hit your session limit\nPassed: Ready for release"
+    ) == "passed"
+    # A normal blocked run without infra markers stays blocked.
+    assert _classify_verdict(1, "**Blocked**: 2 high-severity gap(s) remain.") == "blocked"
+    # Timeout beats everything.
+    assert _classify_verdict(124, "TIMEOUT\nhit your session limit") == "timeout"
+
+
+def test_infra_errors_excluded_from_arm_b_mean():
+    records = [
+        _rec("good", 0.5, 1.0, "passed"),
+        _rec("infra", 0.5, 0.0, "error"),  # executor never ran: 0-score must not drag the mean
+    ]
+    out = summarize(records, ["A", "B"])
+    assert "Arm B mean correctness:** 1.00 (n=1)" in out
+    assert "Infra errors (arm B, excluded from means/calibration):** 1/2" in out
+
+
+def test_classify_verdict_prefers_json_report(tmp_path, monkeypatch):
+    from run_bench import _classify_verdict
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    captured = {}
+
+    def fake_run(cmd, cwd, timeout, env=None, input_text=None):
+        captured["cmd"] = cmd
+        return 0, json.dumps({"verdict": "passed", "coverage_summary": {}})
+
+    monkeypatch.setattr("run_bench.run", fake_run)
+    # stdout lacks the markdown verdict line (Rich/timeout misclassification case).
+    verdict = _classify_verdict(0, "Final DevCouncil report\n(no verdict line)", ws=ws, env={})
+    assert verdict == "passed"
+    assert captured["cmd"][-2:] == ["report", "--json"]
+    assert Path(captured["cmd"][0]).name in {"dev", "dev.exe"}
 
 
 def test_silent_failure_metric_ignores_error_and_timeout_verdicts():
@@ -117,3 +185,84 @@ def test_devcouncil_retry_accumulates_cost(monkeypatch, tmp_path):
     assert res["B"]["verdict"] == "passed"
     assert res["B"]["attempts"] == 2
     assert res["B"]["cost_usd"] == 0.08
+
+
+def test_session_limit_errors_are_not_retried():
+    """A session/usage-limited executor fails identically on an immediate retry
+    while still burning full planning cost first — don't retry those. Generic
+    errors (planner flakes, spawn failures) stay retryable."""
+    from run_bench import _is_retryable_error
+
+    assert not _is_retryable_error({
+        "verdict": "error",
+        "output_tail": "claude exited with code 1: You've hit your session limit · resets 2pm",
+    })
+    assert not _is_retryable_error({"verdict": "error", "output_tail": "usage limit reached"})
+    assert _is_retryable_error({"verdict": "error", "output_tail": ""})
+    assert _is_retryable_error({
+        "verdict": "error",
+        "output_tail": "claude failed to start or execute for TASK-1: spawn EAGAIN",
+    })
+
+
+def test_sweep_halts_when_executor_stays_down():
+    """A mid-sweep executor infra failure re-probes the executor; a failing
+    probe halts the sweep (each further task burns planning cost for nothing),
+    a passing probe continues, and non-infra errors never probe at all."""
+    from run_bench import _sweep_halt_reason
+
+    infra_b = {"B": {"verdict": "error",
+                     "output_tail": "claude failed to start or execute: hit your session limit"}}
+    # Probe confirms the executor is still down → halt with the probe's detail.
+    reason = _sweep_halt_reason(infra_b, probe=lambda: (False, "session limit resets 2pm"))
+    assert reason is not None and "session limit" in reason
+    # Probe succeeds (limit lifted / transient) → keep sweeping.
+    assert _sweep_halt_reason(infra_b, probe=lambda: (True, "ok")) is None
+    # A genuine verdict or a non-infra error must not even probe.
+    boom = lambda: (_ for _ in ()).throw(AssertionError("probe must not run"))
+    assert _sweep_halt_reason({"B": {"verdict": "blocked", "output_tail": "gaps remain"}},
+                              probe=boom) is None
+    assert _sweep_halt_reason({"B": {"verdict": "error", "output_tail": "planner emitted bad JSON"}},
+                              probe=boom) is None
+    # Arm A executor failure (nonzero exit + infra marker) also triggers the probe.
+    infra_a = {"A": {"exit": 1, "output_tail": "You've hit your session limit"}}
+    assert _sweep_halt_reason(infra_a, probe=lambda: (False, "still limited")) is not None
+
+
+def test_blocking_gap_summary_parses_report(monkeypatch, tmp_path):
+    """Blocked runs must record WHAT blocked them (gap types + descriptions) so a
+    false negative is attributable from the results JSON alone — the median
+    false negative took source-diving because only a 400-char tail was kept."""
+    import run_bench as rb
+
+    report = {
+        "verdict": "blocked",
+        "blocking_gaps": [
+            {"gap_type": "architecture_drift", "severity": "critical",
+             "description": "Open critical live-review card remains: " + "x" * 400},
+            {"gap_type": "test_failed", "severity": "high", "description": "check failed"},
+            "not-a-dict",
+        ],
+    }
+    monkeypatch.setattr(rb, "run", lambda *a, **k: (0, json.dumps(report)))
+    summary = rb._blocking_gap_summary(tmp_path, {})
+
+    assert [g["gap_type"] for g in summary] == ["architecture_drift", "test_failed"]
+    assert len(summary[0]["description"]) <= 300  # trimmed, not the whole card
+    # Broken report → empty summary, never an exception.
+    monkeypatch.setattr(rb, "run", lambda *a, **k: (1, "boom"))
+    assert rb._blocking_gap_summary(tmp_path, {}) == []
+
+
+def test_false_negative_detail_named_in_summary():
+    rec = _rec("median", 0.8, 1.0, "blocked")  # blocked but actually 1.0 → false negative
+    rec["arms"]["B"]["blocking_gaps"] = [
+        {"gap_type": "architecture_drift", "severity": "critical",
+         "description": "Open critical live-review card remains: vague response"},
+    ]
+    out = summarize([rec], ["A", "B"])
+    assert "False negatives (blocked correct code):** 1" in out
+    assert "median: architecture_drift" in out
+    # A false negative WITHOUT recorded detail still gets a line, flagged as such.
+    out2 = summarize([_rec("chunk", 0.8, 1.0, "blocked")], ["A", "B"])
+    assert "chunk: no blocking-gap detail recorded" in out2

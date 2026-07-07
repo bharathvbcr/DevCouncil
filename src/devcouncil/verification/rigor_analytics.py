@@ -7,13 +7,14 @@ recurring stub/effort failures and rough false-positive rates for advisory gaps.
 from __future__ import annotations
 
 import json
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List
 
 from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import GapRepository, TaskRepository
+from devcouncil.utils.json_persist import read_json
 
 
 @dataclass
@@ -63,7 +64,7 @@ def _manifest_attempts(project_root: Path) -> List[int]:
         if not path.exists():
             continue
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = read_json(path)
             attempts.append(int(data.get("prior_failed_attempts", 0)) + 1)
         except Exception:
             continue

@@ -43,6 +43,7 @@ from pydantic import BaseModel, Field
 # Reuse the small list-coercion helper from the agent-profile optimizer so both
 # optimizers share one eval-dataset field contract (required_terms, forbidden_terms…).
 from devcouncil.optimization.gepa_agent import _string_list
+from devcouncil.utils.json_persist import write_json
 
 logger = logging.getLogger(__name__)
 
@@ -670,4 +671,4 @@ def write_result_artifact(path: Path, result: SkillOptResult, *, objective: str,
         "applied": result.applied,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    write_json(path, payload)

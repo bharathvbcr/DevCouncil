@@ -6,6 +6,8 @@ from devcouncil.app.errors import ExecutionError
 
 logger = logging.getLogger(__name__)
 
+_GIT_APPLY_TIMEOUT_SECONDS = 120
+
 
 class PatchEngine:
     """Handles applying unified diff patches to the codebase."""
@@ -67,6 +69,7 @@ class PatchEngine:
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    timeout=_GIT_APPLY_TIMEOUT_SECONDS,
                 )
                 if proc.returncode == 0:
                     logger.info("Patch applied (git apply %s)", " ".join(extra_args) or "strict")

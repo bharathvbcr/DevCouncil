@@ -1,3 +1,4 @@
+import logging
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -10,6 +11,8 @@ from typing import Optional
 
 from devcouncil.storage.models import SchemaVersionModel
 
+logger = logging.getLogger(__name__)
+
 
 # v3: per-task indexes on the task/audit tables (task_id, lease status).
 # v4: machine-routable gap columns (file, line, suggested_command,
@@ -17,7 +20,13 @@ from devcouncil.storage.models import SchemaVersionModel
 # v5: partial unique index enforcing one ACTIVE lease per task (single-writer).
 # v6: gap column expected_verification_method (repair loop tells an executor-remediable
 #     "incomplete" from a manual/llm one across a reload).
-SCHEMA_VERSION = 6
+# v7: task columns agent_appended_expected_tests_json / agent_appended_allowed_commands_json
+#     (agent-negotiated scope extensions). These are NOT NULL with a scalar default, which
+#     the column migration now adds as ``ADD COLUMN ... NOT NULL DEFAULT <literal>`` —
+#     previously non-nullable additions were skipped entirely, so every SELECT on an
+#     existing database crashed with "no such column".
+# v8: optional task.priority column (high/medium/low planner hint).
+SCHEMA_VERSION = 8
 
 
 # Module-level caches keyed by *resolved* paths so distinct project roots stay
@@ -42,8 +51,9 @@ def reset_db_cache() -> None:
     for db in _db_instances.values():
         try:
             db.engine.dispose()
-        except Exception:
-            pass
+        except Exception as e:
+            # A failed dispose can leave the SQLite file locked for later rebuilds.
+            logger.debug("Failed to dispose cached engine for %s: %s", db.db_path, e)
     _db_instances.clear()
     _dedup_done.clear()
 
@@ -126,13 +136,38 @@ class Database:
                     )
         _dedup_done.add(key)
 
+    @staticmethod
+    def _scalar_default_literal(column) -> Optional[str]:
+        """SQL literal for a column's scalar Python-side default, or None.
+
+        Only simple scalars (str/bool/int/float) are rendered — anything callable,
+        context-sensitive, or exotic returns None so the caller can skip the column
+        rather than emit wrong DDL."""
+        default = getattr(column, "default", None)
+        if default is None or getattr(default, "is_callable", False):
+            return None
+        arg = getattr(default, "arg", None)
+        if isinstance(arg, bool):
+            return "1" if arg else "0"
+        if isinstance(arg, (int, float)):
+            return str(arg)
+        if isinstance(arg, str):
+            escaped = arg.replace("'", "''")
+            return f"'{escaped}'"
+        return None
+
     def _create_missing_columns(self):
         # create_all never alters an existing table, so columns added to a model
         # later (e.g. the v4 gap routing columns) are missing on databases created by
         # an older version — and a SELECT of the model would then fail. Add any
-        # missing column as a nullable ADD COLUMN (the only shape SQLite can add in
-        # place without a table rewrite); non-nullable additions are intentionally
-        # skipped because existing rows could not satisfy them.
+        # missing column in place via ADD COLUMN: nullable columns as-is, and
+        # NON-nullable columns with a scalar default as
+        # ``NOT NULL DEFAULT <literal>`` (the shape SQLite accepts without a table
+        # rewrite — existing rows take the default). Previously non-nullable
+        # additions were skipped entirely, so a model gaining a required column
+        # (v7's agent_appended_*_json) crashed every SELECT on an existing database
+        # with "no such column". Non-nullable columns WITHOUT a scalar default are
+        # still skipped: existing rows could not satisfy them.
         inspector = inspect(self.engine)
         existing_tables = set(inspector.get_table_names())
         for table in SQLModel.metadata.sorted_tables:
@@ -140,13 +175,22 @@ class Database:
                 continue
             existing_cols = {col["name"] for col in inspector.get_columns(table.name)}
             for column in table.columns:
-                if column.name in existing_cols or not column.nullable:
+                if column.name in existing_cols:
                     continue
                 ddl_type = column.type.compile(self.engine.dialect)
-                stmt = text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {ddl_type}')
+                if column.nullable:
+                    ddl = f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {ddl_type}'
+                else:
+                    literal = self._scalar_default_literal(column)
+                    if literal is None:
+                        continue
+                    ddl = (
+                        f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" '
+                        f"{ddl_type} NOT NULL DEFAULT {literal}"
+                    )
                 try:
                     with self.engine.begin() as conn:
-                        conn.execute(stmt)
+                        conn.execute(text(ddl))
                 except OperationalError as exc:
                     if "duplicate column name" not in str(exc).lower():
                         raise
@@ -194,8 +238,8 @@ def get_db(project_root: Path = Path(".")) -> Optional[Database]:
             return cached
         try:
             cached.engine.dispose()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to dispose stale cached engine for %s: %s", db_path, e)
 
     db = Database(db_path)
     db.ensure_schema_version()

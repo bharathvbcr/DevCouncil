@@ -8,6 +8,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from devcouncil.utils.json_persist import read_json, write_model_json
+
 
 class ReviewSignal(BaseModel):
     client: str = "generic"
@@ -47,7 +49,7 @@ def write_signal(project_root: Path, client: str, payload: dict[str, Any]) -> Pa
     digest = hashlib.sha256(key.encode("utf-8", errors="replace")).hexdigest()[:12]
     path = directory / f"{client.lower()}-{digest}.json"
     signal.path = str(path)
-    path.write_text(signal.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    write_model_json(path, signal)
     return path
 
 
@@ -58,7 +60,7 @@ def load_signals(project_root: Path) -> list[ReviewSignal]:
     signals: list[ReviewSignal] = []
     for path in sorted(directory.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw = read_json(path)
             signal = ReviewSignal.model_validate(raw)
             signal.path = str(path)
             signals.append(signal)

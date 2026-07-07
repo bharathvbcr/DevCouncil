@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -45,6 +46,9 @@ class CostEstimator:
 
 
 def _model_calls_file(project_root: Path) -> Path:
+    override = os.environ.get("DEVCOUNCIL_LOG_DIR")
+    if override:
+        return Path(override) / "model_calls.jsonl"
     return project_root / ".devcouncil" / "logs" / "model_calls.jsonl"
 
 
@@ -137,4 +141,6 @@ def group_cost(project_root: Path) -> Dict[str, Any]:
 
 def cost_by_task(project_root: Path) -> Dict[str, Dict[str, Any]]:
     """Convenience accessor for the per-task cost breakdown (used by ``dev status``)."""
-    return group_cost(project_root)["by_task"]
+    summary = group_cost(project_root)
+    by_task = summary.get("by_task", {})
+    return by_task if isinstance(by_task, dict) else {}

@@ -4,6 +4,7 @@ import functools
 import json
 import logging
 import asyncio
+import os
 import re
 import time
 from pathlib import Path
@@ -36,6 +37,32 @@ class StructuredOutputError(RuntimeError):
         self.model = model
 
 
+def _provider_retry_delay(exc: Exception, attempt: int) -> float:
+    """Seconds to wait before retrying a failed provider call."""
+    if isinstance(exc, ProviderRequestError):
+        if exc.retry_after_seconds is not None:
+            return min(120.0, max(1.0, exc.retry_after_seconds))
+        if exc.status_code == 429:
+            # OpenRouter tiers often cap at ~20 RPM; back off generously.
+            return min(90.0, 15.0 * (2 ** attempt))
+    return min(30.0, float(2 ** attempt))
+
+
+def _rate_limit_retry_budget() -> int:
+    """How many 429 responses to wait out per call (beyond the normal attempts).
+
+    Default 8: with the 429 backoff above that is ~7 minutes of patience —
+    enough to ride out an RPM-window burst, small enough that a hard quota
+    (daily cap) still fails the call in bounded time. Override with
+    DEVCOUNCIL_RATE_LIMIT_RETRIES; 0 disables the separate budget."""
+    raw = os.environ.get("DEVCOUNCIL_RATE_LIMIT_RETRIES", "")
+    try:
+        value = int(raw)
+    except ValueError:
+        return 8
+    return max(0, value)
+
+
 class ModelRouter:
     # Independent fresh attempts at producing valid structured output before
     # giving up. Even capable models occasionally emit malformed JSON; a second
@@ -48,6 +75,7 @@ class ModelRouter:
         provider: Provider,
         role_config: Dict[str, Dict[str, Any]],
         project_root: Path = Path("."),
+        semantic_adapter: Optional[Any] = None,
     ):
         self.provider = provider
         self.role_config = role_config
@@ -58,6 +86,15 @@ class ModelRouter:
         # concurrent-write safe.
         self._cache = LLMCache(self.project_root)
         self._traces = TraceLogger(self.project_root)
+        # Optional semantic cache / routing / compression (config-driven, lazy).
+        if semantic_adapter is not None:
+            self._semantic = semantic_adapter
+        else:
+            from devcouncil.llm.semantic_bridge import load_semantic_adapter
+
+            self._semantic = load_semantic_adapter(project_root)
+        if self._semantic is not None:
+            self._semantic.warm_up()
         # Lazily-built providers for roles that override ``models.provider`` with
         # their own ``provider:`` (e.g. live_reviewer on Ollama while planners run
         # on OpenRouter). Keyed by normalized provider name; the default provider
@@ -179,8 +216,8 @@ class ModelRouter:
         try:
             json.loads(text)
             return text
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Response is not directly parseable JSON, scanning balanced candidates: %s", e)
         for opener, closer in (("{", "}"), ("[", "]")):
             for candidate in cls._balanced_candidates(text, opener, closer):
                 try:
@@ -215,7 +252,7 @@ class ModelRouter:
         temperature: float,
         run_id: Optional[str],
         provider: Optional[Provider] = None,
-        attempts: int = 3,
+        attempts: int = 5,
         json_schema: Optional[Dict[str, Any]] = None,
     ) -> "LLMResponse":
         """Provider completion with bounded exponential-backoff retry. Used for BOTH the
@@ -225,6 +262,12 @@ class ModelRouter:
         per-role provider for roles that override ``models.provider``. ``json_schema``
         flows through to providers that support grammar-constrained structured output
         (Ollama); others ignore it."""
+        if run_id is None:
+            # Fall back to the orchestrator-declared run so model_calls.jsonl
+            # records stay attributable even when call sites don't thread run_id.
+            from devcouncil.telemetry.context import get_current_run_id
+
+            run_id = get_current_run_id()
         provider = provider or self.provider
         # Only pass json_schema to providers whose ``complete`` accepts it — duck-typed
         # or third-party Provider implementations may predate the parameter, and a
@@ -238,7 +281,15 @@ class ModelRouter:
                     extra_kwargs["json_schema"] = json_schema
             except (TypeError, ValueError):
                 pass
-        for attempt in range(attempts):
+        # Rate limiting (429) gets its OWN, larger budget: it is the provider
+        # telling us exactly when to come back (Retry-After), not a fault in the
+        # request — counting it against the shared ``attempts`` let a busy
+        # endpoint exhaust the budget and kill a run that only needed patience
+        # (observed: benchmark tasks dying blocked on limit_rpm mid-run).
+        max_rate_limit_retries = _rate_limit_retry_budget()
+        attempt = 0
+        rate_limit_retries = 0
+        while True:
             try:
                 return await provider.complete(
                     model=model,
@@ -265,18 +316,38 @@ class ModelRouter:
                     "thinking with OLLAMA_THINK=low or OLLAMA_THINK=false, or use a "
                     "smaller/faster model."
                 ) from exc
-            except Exception as exc:
-                if attempt == attempts - 1:
+            except ProviderRequestError as exc:
+                if exc.status_code == 429 and rate_limit_retries < max_rate_limit_retries:
+                    rate_limit_retries += 1
+                    delay = _provider_retry_delay(exc, rate_limit_retries)
+                    logger.warning(
+                        "LLM provider rate-limited (429, retry %d/%d): %r. Retrying in %.0fs...",
+                        rate_limit_retries, max_rate_limit_retries, exc, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                attempt += 1
+                if attempt >= attempts:
                     raise
+                delay = _provider_retry_delay(exc, attempt - 1)
+                logger.warning(
+                    "LLM provider request failed (attempt %d/%d): %r. Retrying in %.0fs...",
+                    attempt, attempts, exc, delay,
+                )
+                await asyncio.sleep(delay)
+            except Exception as exc:
+                attempt += 1
+                if attempt >= attempts:
+                    raise
+                delay = _provider_retry_delay(exc, attempt - 1)
                 # %r, not %s: common failures (httpx.ReadTimeout, CancelledError)
                 # stringify to an EMPTY message, which previously logged the useless
                 # "failed (attempt 1/3): ." and made timeouts undiagnosable from logs.
                 logger.warning(
-                    "LLM request failed (attempt %d/%d): %r. Retrying...",
-                    attempt + 1, attempts, exc,
+                    "LLM request failed (attempt %d/%d): %r. Retrying in %.0fs...",
+                    attempt, attempts, exc, delay,
                 )
-                await asyncio.sleep(2 ** attempt)
-        raise RuntimeError("unreachable")  # loop either returns or raises
+                await asyncio.sleep(delay)
 
     async def complete_structured(
         self,
@@ -295,9 +366,22 @@ class ModelRouter:
         model = config["model"]
         temp = temperature if temperature is not None else config.get("temperature", 0.0)
         provider = self._provider_for_role(config)
-        
+        role_provider = config.get("provider")
+
         # Deep-copy to avoid mutating the caller's messages list
         msgs = copy.deepcopy(messages)
+
+        # Optional long-context compression before schema injection.
+        if self._semantic is not None:
+            msgs = await self._semantic.maybe_compress_messages_async(msgs)
+
+        # Optional complexity-based model routing (local Ollama only when enabled).
+        if self._semantic is not None:
+            model = await self._semantic.maybe_route_model_async(
+                msgs,
+                configured_model=model,
+                role_provider=role_provider,
+            )
         
         # Add schema instructions to system or user message. Spell out "instance, not
         # the schema" explicitly: weaker/local models otherwise sometimes echo the schema
@@ -337,6 +421,13 @@ class ModelRouter:
         # Check cache first
         response = cache.get(model, msgs, temp, True, provider_fp)
         cache_hit = response is not None
+        semantic_cache_hit = False
+
+        if not cache_hit and self._semantic is not None:
+            response = await self._semantic.lookup_cache_async(msgs, model=model, role=role)
+            if response is not None:
+                cache_hit = True
+                semantic_cache_hit = True
 
         # Structured-output schema for providers with grammar-constrained decoding
         # (Ollama's native ``format: <schema>``): the model cannot emit invalid JSON,
@@ -378,21 +469,26 @@ class ModelRouter:
         if not cache_hit:
             tracker.log_usage(model, response.usage, local=provider_local)
 
+        cache_label = "cache_hit" if cache_hit else f"{elapsed:.1f}s"
+        if semantic_cache_hit:
+            cache_label = "semantic_cache_hit"
+
         # Include latency + cache status: on a slow (e.g. local) model this is what tells
         # you *which* call dominated a multi-minute planning/verification stage.
         logger.info(
             "LLM response: role=%s model=%s tokens=%s %s",
             role, response.model, response.usage,
-            "cache_hit" if cache_hit else f"{elapsed:.1f}s",
+            cache_label,
         )
         log_step(
-            f"llm/{role}: {response.model} {'cache_hit' if cache_hit else f'{elapsed:.1f}s'}",
+            f"llm/{role}: {response.model} {cache_label}",
             project_root=self.project_root,
             run_id=run_id,
             role=role,
             model=response.model,
             latency_s=round(elapsed, 2) if not cache_hit else 0,
             cache_hit=cache_hit,
+            semantic_cache_hit=semantic_cache_hit,
         )
         
         try:
@@ -402,6 +498,8 @@ class ModelRouter:
             result = schema.model_validate(data)
             if not cache_hit:
                 cache.set(model, msgs, temp, True, response, provider_fp)  # cache only validated output
+            if self._semantic is not None and not semantic_cache_hit:
+                await self._semantic.store_cache_async(msgs, response, model=model, role=role)
             return result
         except Exception as e:
             logger.warning(f"Initial parse failed for {role}, attempting healing: {e}")
@@ -467,6 +565,8 @@ Please return the corrected JSON object only. No prose.
                 data = json.loads(healed_content)
                 result = schema.model_validate(data)
                 cache.set(model, msgs, temp, True, healed_response, provider_fp)
+                if self._semantic is not None:
+                    await self._semantic.store_cache_async(msgs, healed_response, model=model, role=role)
                 return result
             except Exception as final_e:
                 logger.error(f"Healing failed for {role}: {final_e}")

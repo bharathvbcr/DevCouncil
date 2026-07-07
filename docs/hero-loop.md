@@ -89,14 +89,69 @@ It currently measures **Python** (via the target repo's `coverage.py`), includin
 path); a suite that exercises an installed *copy* of the package instead may under-report.
 This is one more reason enforcement is opt-in.
 
+On **hard** tasks, `verification.rigor.enforce_coverage_on_hard` (default `true`) promotes
+this gate to blocking even when `diff_coverage.enforce` is `false` — see [Anti-laziness
+rigor](#anti-laziness-rigor) below.
+
+## Anti-laziness rigor
+
+Coding agents routinely stub, undersize diffs, or claim "done" before tests actually prove
+the work. DevCouncil's **rigor layer** catches those patterns deterministically (no extra
+LLM calls for stub/effort detection) and scales strictness by **task difficulty**:
+
+| Difficulty | Default behavior |
+|---|---|
+| `easy` / `normal` | Stub/effort/coarse-proof findings are **advisory** — surfaced in gaps and `next_actions` but non-blocking |
+| `hard` | Same gates **block** verification; diff coverage is enforced; repair budget widens |
+
+Tasks are classified as `easy` / `normal` / `hard` by a deterministic scorer
+(`devcouncil.verification.difficulty`) from planned scope, acceptance-criteria count, and
+keywords. Planners and humans can override with `Task.difficulty`.
+
+**Verifier gates (on added diff lines only):**
+
+- **Stub/TODO detection** (`stub_detected`): placeholders, `NotImplementedError`, skipped
+  tests, assert-free tests, TODO/FIXME markers. Intentional scaffolding requires the task
+  description to mention "scaffolding" and the line to carry `devcouncil: allow-stub`.
+- **Effort heuristics** (`suspicious_effort`): undersized diff vs planned scope,
+  comment-only diffs, net test deletion in files referenced by `expected_tests`.
+- **Coarse acceptance proof** (`coarse_acceptance_proof`): a criterion "proven" only because
+  a generic passing command ran, not a per-criterion check — blocking on hard tasks.
+
+**Hard-task escalation** also injects a compact **Rigor** section into the executor prompt,
+adds `extra_repair_attempts_on_hard` to the `dev go` repair budget, and (opt-in) lets a
+**critical** implementation-reviewer finding block when
+`reviewer_required_on_hard: true`.
+
+```yaml
+# .devcouncil/config.yaml
+verification:
+  rigor:
+    enabled: true
+    stub_detection: hard           # never | hard | always
+    effort_heuristics: hard
+    coarse_acceptance_proof: hard  # block coarse AC proof on hard tasks
+    enforce_coverage_on_hard: true
+    reviewer_required_on_hard: false  # opt-in: critical review findings block
+    extra_repair_attempts_on_hard: 1
+    min_added_lines_per_planned_file: 5
+    acceptance_samples_on_hard: 2   # self-consistency voting on hard tasks
+```
+
+Repair runs carry a **correction manifest** with prior diff, failing output, attempt
+history, stub findings, and non-negotiable **repair rules** (never weaken tests, never
+stub around a gap). Tune thresholds from evidence with `dev report rigor`.
+
+See [anti-laziness-rigor.md](anti-laziness-rigor.md) for the full design.
+
 ## Setup
 
 ```bash
-# Register DevCouncil's MCP server with Claude Code (project scope by default).
+# One-shot: MCP server, assistive hooks, slash commands, subagents, output style, skills, statusline.
 dev integrate claude --apply
 
-# Install write/shell hooks so policy can block unauthorized actions before verification.
-dev integrate hooks --apply
+# Optional: add the blocking write-gate for autonomous runs.
+dev integrate claude --apply --write-gate
 
 # Confirm the wiring.
 dev integrate check

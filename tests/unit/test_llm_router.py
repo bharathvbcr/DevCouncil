@@ -204,10 +204,16 @@ def test_get_api_key_reports_gcloud_hint_for_missing_vertexai_token(tmp_path, mo
 
 
 def test_apply_provider_default_role_models_updates_only_previous_defaults():
+    # Reference the shipped defaults instead of hard-coding model ids, so the test
+    # keeps validating the swap behavior when the default models are rotated.
+    from devcouncil.llm.provider import DEFAULT_ROLE_MODELS_BY_PROVIDER
+
+    openrouter_default = DEFAULT_ROLE_MODELS_BY_PROVIDER["openrouter"]["spec_writer"]
+    vertexai_defaults = DEFAULT_ROLE_MODELS_BY_PROVIDER["vertexai"]
     raw_config = {
         "models": {
             "roles": {
-                "spec_writer": {"model": "anthropic/claude-sonnet-4.6"},
+                "spec_writer": {"model": openrouter_default},
                 "planner_a": {"model": "custom/model"},
             }
         }
@@ -217,9 +223,9 @@ def test_apply_provider_default_role_models_updates_only_previous_defaults():
 
     assert changed is True
     roles = raw_config["models"]["roles"]
-    assert roles["spec_writer"]["model"] == "google/gemini-2.5-flash"
+    assert roles["spec_writer"]["model"] == vertexai_defaults["spec_writer"]
     assert roles["planner_a"]["model"] == "custom/model"
-    assert roles["live_reviewer"]["model"] == "google/gemini-2.5-flash"
+    assert roles["live_reviewer"]["model"] == vertexai_defaults["live_reviewer"]
 
 
 def test_apply_provider_default_role_models_tolerates_unsupported_previous_provider():
@@ -785,3 +791,125 @@ async def test_provider_non_json_body_raises_actionable_error(tmp_path, monkeypa
     p = OpenRouterProvider("k", project_root=tmp_path)
     with pytest.raises(ProviderRequestError, match="non-JSON"):
         await p.complete("some/model", [{"role": "user", "content": "hi"}])
+
+
+def test_provider_retry_delay_backoff():
+    from devcouncil.llm.provider import ProviderRequestError
+    from devcouncil.llm.router import _provider_retry_delay
+
+    assert _provider_retry_delay(ProviderRequestError("x", status_code=429), 0) == 15.0
+    assert _provider_retry_delay(ProviderRequestError("x", status_code=429), 2) == 60.0
+    assert _provider_retry_delay(
+        ProviderRequestError("x", status_code=429, retry_after_seconds=45), 0
+    ) == 45.0
+    assert _provider_retry_delay(RuntimeError("other"), 1) == 2.0
+
+
+def test_openrouter_max_concurrency_from_env(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_MAX_CONCURRENCY", raising=False)
+    assert OpenRouterProvider._resolve_max_concurrency() == 3
+    monkeypatch.setenv("OPENROUTER_MAX_CONCURRENCY", "5")
+    assert OpenRouterProvider._resolve_max_concurrency() == 5
+    monkeypatch.setenv("OPENROUTER_MAX_CONCURRENCY", "0")
+    assert OpenRouterProvider._resolve_max_concurrency() is None
+
+
+@pytest.mark.anyio
+async def test_openrouter_concurrency_limits_in_flight(tmp_path, monkeypatch):
+    import asyncio
+
+    in_flight = 0
+    peak = 0
+
+    class SlowResp:
+        status_code = 200
+
+        def json(self):
+            return {
+                "model": "m",
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }
+
+        def raise_for_status(self):
+            return None
+
+    class SlowClient:
+        def __init__(self, timeout=None):
+            self.is_closed = False
+
+        async def post(self, url, headers, json):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.05)
+            in_flight -= 1
+            return SlowResp()
+
+    monkeypatch.setattr("devcouncil.llm.provider.httpx.AsyncClient", SlowClient)
+    monkeypatch.setenv("OPENROUTER_MAX_CONCURRENCY", "2")
+    p = OpenRouterProvider("k", project_root=tmp_path)
+    await asyncio.gather(*[
+        p.complete("m", [{"role": "user", "content": "hi"}])
+        for _ in range(6)
+    ])
+    assert peak <= 2
+
+
+# --- benchmark-surfaced fix: 429s get their own retry budget -------------------
+
+
+class RateLimitedThenOkProvider(Provider):
+    """Raises 429 more times than the generic attempt budget (5) allows, then
+    succeeds — the OpenRouter limit_rpm burst that previously killed runs."""
+
+    def __init__(self, failures: int):
+        self.calls = 0
+        self.failures = failures
+
+    async def complete(self, model, messages, temperature=0.0, json_mode=False, run_id=None, **kwargs):
+        from devcouncil.llm.provider import ProviderRequestError
+
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise ProviderRequestError(
+                "rate limited", status_code=429, retry_after_seconds=0.01
+            )
+        return LLMResponse(content=json.dumps({"value": "ok"}), model=model, usage={}, raw_response={})
+
+
+def test_rate_limits_have_their_own_retry_budget(tmp_path, monkeypatch):
+    """Six consecutive 429s exceed the generic 5-attempt budget but must still
+    succeed: rate limiting is the provider saying WHEN to come back, not a fault
+    in the request (observed: benchmark tasks dying blocked on limit_rpm)."""
+    import asyncio
+
+    provider = RateLimitedThenOkProvider(failures=6)
+    router = ModelRouter(provider, {"critic_a": {"model": "m"}}, project_root=tmp_path)
+    result = asyncio.run(
+        router.complete_structured(
+            role="critic_a", messages=[{"role": "user", "content": "x"}], schema=RouterOutput
+        )
+    )
+    assert result.value == "ok"
+    assert provider.calls == 7
+
+
+def test_rate_limit_budget_is_bounded(tmp_path, monkeypatch):
+    """A hard quota (429s that never stop) must still fail in bounded time."""
+    import asyncio
+
+    from devcouncil.llm.provider import ProviderRequestError
+
+    monkeypatch.setenv("DEVCOUNCIL_RATE_LIMIT_RETRIES", "1")
+    provider = RateLimitedThenOkProvider(failures=100)
+    router = ModelRouter(provider, {"critic_a": {"model": "m"}}, project_root=tmp_path)
+    with pytest.raises(ProviderRequestError):
+        asyncio.run(
+            router.complete_structured(
+                role="critic_a", messages=[{"role": "user", "content": "x"}], schema=RouterOutput
+            )
+        )
+    # 1 rate-limit retry, then the remaining 429s consume the generic budget
+    # (5 attempts); the exhausted error propagates without fresh structured passes.
+    assert provider.calls == 6

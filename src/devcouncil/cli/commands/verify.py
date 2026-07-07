@@ -1,6 +1,6 @@
 import typer
 import asyncio
-import json
+from devcouncil.utils.json_persist import dump_json
 import logging
 from rich.console import Console
 from rich.table import Table
@@ -65,7 +65,7 @@ def verify(
     db = get_db(root)
     if not db:
         if json_format:
-            typer.echo(json.dumps({"ok": False, "error": "DevCouncil state is unavailable in this directory."}, indent=2))
+            typer.echo(dump_json({"ok": False, "error": "DevCouncil state is unavailable in this directory."}, indent=2))
         else:
             console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
         return
@@ -94,7 +94,7 @@ def _run_verify_body(
         if not tasks:
             missing = f"Task {task_id} not found." if task_id else "No tasks found to verify."
             if json_format:
-                typer.echo(json.dumps({"ok": False, "error": missing}, indent=2))
+                typer.echo(dump_json({"ok": False, "error": missing}, indent=2))
             else:
                 console.print(f"[red]{missing}[/red]")
             return
@@ -110,8 +110,9 @@ def _run_verify_body(
             provider = create_provider(config.models.provider, api_key, project_root=root, provider_prefs=config.provider)
             role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
             router = ModelRouter(provider, role_config, project_root=root)
-        except Exception:
-            pass
+        except Exception as e:
+            # Verification still runs, but silently without the LLM review layer.
+            logger.warning("Failed to build model router, verifying without LLM review: %s", e)
 
         from devcouncil.verification.sandbox import get_sandbox
 
@@ -137,7 +138,7 @@ def _run_verify_body(
                 if sandbox_result.status == "unsupported":
                     message = f"Sandbox {sandbox} is unavailable."
                     if json_format:
-                        typer.echo(json.dumps({"ok": False, "error": message, "sandbox": sandbox}, indent=2))
+                        typer.echo(dump_json({"ok": False, "error": message, "sandbox": sandbox}, indent=2))
                     else:
                         console.print(f"[red]{message}[/red]")
                     return
@@ -154,7 +155,7 @@ def _run_verify_body(
                         "gaps": [],
                     })
                     if json_format:
-                        typer.echo(json.dumps({
+                        typer.echo(dump_json({
                             "ok": False,
                             "task_id": task.id,
                             "sandbox": sandbox,
@@ -300,7 +301,7 @@ def _run_verify_body(
         )
 
         if json_format:
-            typer.echo(json.dumps({
+            typer.echo(dump_json({
                 "ok": blocked_tasks == 0,
                 "verified_tasks": len(tasks),
                 "blocked_tasks": blocked_tasks,

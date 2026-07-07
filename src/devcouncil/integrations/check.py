@@ -19,6 +19,7 @@ from devcouncil.executors.agent_registry import (
     resolve_coding_cli_probe_order,
 )
 from devcouncil.utils.subprocess_env import clean_subprocess_env
+from devcouncil.utils.json_persist import read_json
 
 
 @dataclass(frozen=True)
@@ -127,10 +128,32 @@ def _load_json_file(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        loaded = json.loads(path.read_text(encoding="utf-8")) or {}
+        loaded = read_json(path) or {}
     except json.JSONDecodeError:
         return {}
     return loaded if isinstance(loaded, dict) else {}
+
+
+def _claude_config_status(project_root: Path) -> tuple[str, bool, list[str]]:
+    settings_path = project_root / ".claude" / "settings.local.json"
+    assets_dir = project_root / ".claude" / "commands" / "devcouncil"
+    data = _load_json_file(settings_path)
+    status_line = data.get("statusLine") if data else {}
+    status_line_ok = (
+        isinstance(status_line, dict)
+        and "devcouncil" in str(status_line.get("command", ""))
+    )
+    mcp_ok = "devcouncil" in (data.get("enabledMcpjsonServers") or [])
+    assets_ok = assets_dir.is_dir() and (assets_dir / "status.md").exists()
+    ok = (status_line_ok or mcp_ok) and assets_ok
+    paths = [str(settings_path)]
+    if assets_ok:
+        paths.append(str(assets_dir))
+    if ok:
+        return "ok", False, paths
+    if not settings_path.exists() and not assets_ok:
+        return "missing", True, paths
+    return "drifted", True, paths
 
 
 def _cursor_config_status(project_root: Path) -> tuple[str, bool, list[str]]:
@@ -205,6 +228,8 @@ def integration_capability_rows(project_root: Path) -> list[dict[str, object]]:
         paths: list[str] = []
         if client == "cursor":
             config_status, fixable, paths = _cursor_config_status(project_root)
+        elif client == "claude":
+            config_status, fixable, paths = _claude_config_status(project_root)
         elif client == "opencode":
             config_status, fixable, paths = _opencode_config_status(project_root)
         elif client == "antigravity":
@@ -320,7 +345,7 @@ def build_integration_check_report(project_root: Path, *, strict: bool = False) 
         hooks_ok = False
         if cursor_hooks.exists():
             try:
-                hooks_data = json.loads(cursor_hooks.read_text(encoding="utf-8")) or {}
+                hooks_data = read_json(cursor_hooks) or {}
                 hooks_ok = "preToolUse" in hooks_data.get("hooks", {})
             except json.JSONDecodeError:
                 hooks_ok = False
@@ -338,7 +363,7 @@ def build_integration_check_report(project_root: Path, *, strict: bool = False) 
         plugin_registered = False
         if plugin_ok and opencode_config.exists():
             try:
-                opencode_data = json.loads(opencode_config.read_text(encoding="utf-8")) or {}
+                opencode_data = read_json(opencode_config) or {}
                 plugin_registered = (
                     f"./.devcouncil/integrations/{integrate.OPENCODE_HOOK_PLUGIN_NAME}"
                     in (opencode_data.get("plugin") or [])

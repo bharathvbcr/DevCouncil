@@ -2,8 +2,9 @@ from pathlib import Path
 from datetime import datetime, timezone
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
-import json
 import logging
+
+from devcouncil.utils.json_persist import write_json
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,5 @@ class RunContext(BaseModel):
     def save_json_artifact(self, filename: str, data: Any):
         """Save a JSON artifact associated with this run."""
         path = self.run_dir / filename
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        write_json(path, data)
         logger.debug(f"Saved JSON artifact to {path}")

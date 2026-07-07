@@ -1,6 +1,8 @@
 import logging
 import subprocess
 from pathlib import Path
+
+from devcouncil.executors.transient_retry import run_subprocess_with_transient_retry
 from rich.console import Console
 from devcouncil.domain.task import Task
 from devcouncil.domain.requirement import Requirement
@@ -51,14 +53,22 @@ class OpenHandsExecutor(Executor):
         console.print("[yellow]Note: OpenHands must be installed and configured in the environment.[/yellow]")
         
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                cwd=self.project_root,
-                timeout=1800,
+            def _run_once():
+                return subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    cwd=self.project_root,
+                    timeout=1800,
+                )
+
+            result = run_subprocess_with_transient_retry(
+                self.project_root,
+                label="OpenHands",
+                task_id=task.id,
+                run_once=_run_once,
             )
             self._write_log(task.id, result)
             if result.returncode != 0:

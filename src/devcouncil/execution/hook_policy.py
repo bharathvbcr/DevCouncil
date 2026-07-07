@@ -1,4 +1,5 @@
 import fnmatch
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,8 @@ from devcouncil.execution.policy_engine import (
     normalize_repo_path,
 )
 from devcouncil.utils.redaction import SECRET_PATTERNS
+
+logger = logging.getLogger(__name__)
 
 # Splits a shell command into the segments a shell would execute independently, on
 # the chaining/pipe/sequence operators. We deliberately do NOT try to parse quoting
@@ -56,12 +59,23 @@ class HookPolicy:
         try:
             from devcouncil.app.config import load_config
 
-            execution = load_config(self.project_root).execution
-            configured = getattr(execution, "global_allowed_commands", None)
+            config = load_config(self.project_root)
+            # Same derivation as the run command's PermissionPolicy: the project's
+            # configured test/lint/typecheck commands are repo-wide allowed.
+            allowed = [
+                str(item)
+                for item in (config.commands.test + config.commands.lint + config.commands.typecheck)
+            ]
+            # Forward-compat: honor an explicit execution.global_allowed_commands
+            # if the config schema ever grows one.
+            configured = getattr(config.execution, "global_allowed_commands", None)
             if isinstance(configured, (list, tuple)):
-                return [str(item) for item in configured]
-        except Exception:
-            pass
+                allowed.extend(str(item) for item in configured)
+            return allowed
+        except Exception as e:
+            # Fail-closed is safe, but a silently dropped allowlist makes every
+            # configured command deny with no visible cause.
+            logger.warning("Failed to load global allowed commands from config, gate uses empty allowlist: %s", e)
         return []
 
     secret_path_patterns = SECRET_PATH_PATTERNS

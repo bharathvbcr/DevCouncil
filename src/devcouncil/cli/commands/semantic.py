@@ -1,4 +1,4 @@
-import json
+from devcouncil.utils.json_persist import dump_json
 import logging
 import typer
 from pathlib import Path
@@ -33,7 +33,7 @@ def snapshot(
         path = SemanticIndex(root).create_snapshot(task_id, stage)
         payload = {"task_id": task_id, "stage": stage, "path": str(path)}
         if json_format:
-            typer.echo(json.dumps(payload, indent=2))
+            typer.echo(dump_json(payload, indent=2))
         else:
             console.print(f"[green]Wrote semantic snapshot:[/green] {path}")
         log_step("semantic/complete", project_root=root, task_id=task_id, trace=True)
@@ -54,7 +54,7 @@ def semantic_diff(
         log_step("semantic/1: computing semantic diff", project_root=root, task_id=task_id, trace=True)
         result = SemanticIndex(root).diff(task_id)
         if json_format:
-            typer.echo(json.dumps(result, indent=2))
+            typer.echo(dump_json(result, indent=2))
         else:
             console.print(f"[cyan]Summary:[/cyan] {result['summary']}")
             for item in result["classifications"]:

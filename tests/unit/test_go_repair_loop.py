@@ -1,5 +1,6 @@
 """Batch B — `dev go` closes the loop with bounded, accountable self-repair."""
 
+import json
 from types import SimpleNamespace
 
 import devcouncil.cli.commands.go as go
@@ -22,6 +23,7 @@ def _wire(monkeypatch, tmp_path, *, statuses, signatures):
     monkeypatch.setattr(go, "_task_status", lambda root, tid: next(status_iter))
     sig_iter = iter(signatures)
     monkeypatch.setattr(go, "_blocking_gap_signature", lambda root, tid: next(sig_iter))
+    monkeypatch.setattr(go, "_remediable_incomplete_signature", lambda root, tid: "")
     monkeypatch.setattr(go, "_commit_task_changes", lambda root, tid, status: False)
     monkeypatch.setattr(
         "devcouncil.planning.correction_manifest.write_correction_manifest",
@@ -66,6 +68,21 @@ def test_repair_loop_stops_on_no_progress(monkeypatch, tmp_path):
     assert status == "blocked"
     assert attempts == 1  # gave up after the gaps reappeared unchanged
     assert len(calls) == 2
+
+
+def test_repair_loop_continues_when_executor_failed_with_same_gaps(monkeypatch, tmp_path):
+    calls = _wire(
+        monkeypatch, tmp_path,
+        statuses=["blocked", "blocked", "blocked"],
+        signatures=["same", "same", "same"],
+    )
+    monkeypatch.setattr(go, "_executor_run_failed", lambda root, tid: True)
+    status, attempts = go._execute_task_with_repair(
+        tmp_path, _task(), executor="codex", profile=None, stream=False, max_repairs=2, repair_service=None
+    )
+    assert status == "blocked"
+    assert attempts == 2
+    assert len(calls) == 3
 
 
 def test_manual_executor_does_not_repair(monkeypatch, tmp_path):
@@ -129,6 +146,74 @@ def test_task_max_repairs_widens_for_hard_tasks(tmp_path):
     hard = Task(id="TASK-H", title="H", description="hard", difficulty="hard")
     assert go._task_max_repairs(tmp_path, easy, 3) == 3
     assert go._task_max_repairs(tmp_path, hard, 3) == 5
+
+
+def test_repair_loop_clears_incomplete_via_verify_only(monkeypatch, tmp_path):
+    calls = []
+    verify_calls = []
+    incomplete = ["incomplete_sig"]
+
+    monkeypatch.setattr(run_command, "run", lambda task_id, **k: calls.append(task_id))
+    monkeypatch.setattr(go, "_task_status", lambda root, tid: "verified")
+    monkeypatch.setattr(go, "_blocking_gap_signature", lambda root, tid: "")
+
+    def reverify(root, tid):
+        verify_calls.append(tid)
+        incomplete[0] = ""
+        return "verified"
+
+    monkeypatch.setattr(go, "_reverify_task", reverify)
+    monkeypatch.setattr(go, "_remediable_incomplete_signature", lambda root, tid: incomplete[0])
+    monkeypatch.setattr(go, "_commit_task_changes", lambda root, tid, status: False)
+    monkeypatch.setattr(
+        "devcouncil.planning.correction_manifest.write_correction_manifest",
+        lambda root, tid, **k: tmp_path / "m.json",
+    )
+
+    status, attempts = go._execute_task_with_repair(
+        tmp_path, _task(), executor="codex", profile=None, stream=False, max_repairs=3, repair_service=None
+    )
+    assert status == "verified"
+    assert attempts == 0
+    assert len(calls) == 1
+    assert verify_calls == ["TASK-001"]
+
+
+def test_repair_skips_executor_when_unavailable_and_incomplete(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(run_command, "run", lambda task_id, **k: calls.append(task_id))
+    monkeypatch.setattr(go, "_task_status", lambda root, tid: "verified")
+    monkeypatch.setattr(go, "_blocking_gap_signature", lambda root, tid: "")
+    monkeypatch.setattr(go, "_remediable_incomplete_signature", lambda root, tid: "still_incomplete")
+    monkeypatch.setattr(go, "_reverify_task", lambda root, tid: "verified")
+    monkeypatch.setattr(go, "_executor_run_unavailable", lambda root, tid: True)
+    monkeypatch.setattr(go, "_commit_task_changes", lambda root, tid, status: False)
+    monkeypatch.setattr(
+        "devcouncil.planning.correction_manifest.write_correction_manifest",
+        lambda root, tid, **k: tmp_path / "m.json",
+    )
+
+    status, attempts = go._execute_task_with_repair(
+        tmp_path, _task(), executor="codex", profile=None, stream=False, max_repairs=3, repair_service=None
+    )
+    assert status == "verified"
+    assert attempts == 0
+    assert len(calls) == 1
+
+
+def test_executor_run_unavailable_detects_session_limit(tmp_path):
+    runs = tmp_path / ".devcouncil" / "runs" / "run-1"
+    runs.mkdir(parents=True)
+    (runs / "agent-run.json").write_text(
+        json.dumps({
+            "task_id": "TASK-001",
+            "returncode": 1,
+            "stderr_preview": ["You've hit your session limit"],
+        }),
+        encoding="utf-8",
+    )
+    assert go._executor_run_unavailable(tmp_path, "TASK-001") is True
+    assert go._executor_run_unavailable(tmp_path, "OTHER") is False
 
 
 def test_executor_exception_does_not_crash_run(monkeypatch, tmp_path):

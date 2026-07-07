@@ -43,6 +43,11 @@ class Orchestrator:
 
     async def start_run(self, run_id: str, goal: str) -> RunContext:
         """Start a new orchestration run."""
+        from devcouncil.telemetry.context import set_current_run_id
+
+        # Attribute every model call in this context to this run (the LLM
+        # router falls back to this when callers don't pass run_id explicitly).
+        set_current_run_id(run_id)
         self.current_run = RunContext(
             run_id=run_id,
             project_root=str(self.project_root),

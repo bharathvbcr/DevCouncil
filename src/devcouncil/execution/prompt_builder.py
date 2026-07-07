@@ -8,6 +8,7 @@ from typing import List
 from devcouncil.domain.requirement import Requirement
 from devcouncil.domain.task import Task
 from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
+from devcouncil.utils.json_persist import read_json
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,7 @@ _LANG_BY_EXT = {
 class PromptBuilder:
     def __init__(self, project_root: Path = Path(".")):
         self.project_root = project_root
+        self._file_text_cache: dict[str, str] = {}
 
     @staticmethod
     def _lang_for(path: str) -> str:
@@ -251,6 +253,7 @@ class PromptBuilder:
         new files are shown as headers only."""
         from devcouncil.utils.redaction import redact_string
 
+        self._file_text_cache.clear()
         blocks: List[str] = []
         budget = MAX_FILE_CONTEXT_CHARS
         omitted = 0
@@ -268,6 +271,7 @@ class PromptBuilder:
             except Exception:
                 blocks.append(f"### `{pf.path}` [{label}] — [error reading file]\n")
                 continue
+            self._file_text_cache[pf.path.replace("\\", "/")] = raw
             content = redact_string(raw)
             cap = min(MAX_PER_FILE_CHARS, budget)
             truncated = len(content) > cap
@@ -307,7 +311,7 @@ class PromptBuilder:
         if not map_path.exists():
             return None
         try:
-            data = json.loads(map_path.read_text(encoding="utf-8"))
+            data = read_json(map_path)
             return data if isinstance(data, dict) else None
         except Exception:
             return None
@@ -535,10 +539,13 @@ class PromptBuilder:
             if not importers:
                 continue
             src_path = self.project_root / pf.path
-            try:
-                src_text = src_path.read_text(encoding="utf-8", errors="replace")
-            except Exception:
-                continue
+            key = pf.path.replace("\\", "/")
+            src_text = self._file_text_cache.get(key)
+            if src_text is None:
+                try:
+                    src_text = src_path.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
             symbols = self._exported_symbol_names(pf.path, src_text)
             if not symbols:
                 continue
@@ -546,10 +553,13 @@ class PromptBuilder:
             for importer in importers[: self._CALL_SITES_MAX_DEP_FILES]:
                 if emitted >= self._CALL_SITES_MAX_TOTAL:
                     break
-                try:
-                    dep_text = (self.project_root / importer).read_text(encoding="utf-8", errors="replace")
-                except Exception:
-                    continue
+                importer_key = importer.replace("\\", "/")
+                dep_text = self._file_text_cache.get(importer_key)
+                if dep_text is None:
+                    try:
+                        dep_text = (self.project_root / importer).read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        continue
                 hits = 0
                 for lineno, raw in enumerate(dep_text.splitlines(), start=1):
                     if hits >= self._CALL_SITES_MAX_LINES_PER_FILE or emitted >= self._CALL_SITES_MAX_TOTAL:
