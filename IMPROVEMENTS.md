@@ -43,7 +43,7 @@ Prioritized findings from a full-codebase review (July 2026). File refs verified
 **Shipped this tick:**
 - **#8 (god-module trim, continued)** — `server.py` 1142→299 lines (thin dispatch). Extracted: `handlers/tool_specs.py` (~620 lines), `handlers/prompts.py`, `handlers/cli_gate.py`, `handlers/router_cache.py`.
 - **#10 (MCP service layer, continued)** — checkout/lease/write MCP tools now route through CLI (`dev checkout`, `dev release`, `dev lease list/renew`, `dev write`, `dev apply-patch --json`). Shared services: `execution/lease_ops.py`, `execution/gated_write.py`. Added `parse_cli_json()` for non-zero exit codes with JSON stdout.
-- **#11 (JSON persistence, migration)** — migrated 18 CLI modules to `dump_json()`: `tasks`, `watch`, `show`, `verify`, `check`, `lsp`, `export`, `requirements`, `prompt`, `handoff`, `evidence`, `ast`, `map`, `report`, `semantic`, `shogun`, `watch_fs`, `cost`.
+- **#11 (JSON persistence, migration)** — migrated 18 CLI modules to `dump_json()`: `tasks`, `watch`, `show`, `verify`, `check`, `lsp`, `export`, `requirements`, `prompt`, `handoff`, `evidence`, `ast`, `map`, `report`, `semantic`, `campaign`, `watch_fs`, `cost`.
 - **Tests:** full suite 1372 passed / 13 failed (12 pre-existing + 1 rollback e2e flake; improved from 14 failures). Ruff clean on touched files.
 
 **Still open:** #8 `verifier.py` still ~793 lines, #10 route remaining DB-direct MCP tools (verify/scope/evidence/policy/next_task/handoff/run_command), #11 migrate remaining CLI JSON sites (~15 modules: hook/plan/trace/watch partial), full-suite green (13 unrelated failures), full-repo `mypy`.
@@ -156,6 +156,109 @@ Prioritized findings from a full-codebase review (July 2026). File refs verified
 13. **Cache parsed ASTs in `indexing/repo_mapper.py`.** Full re-parse per invocation costs 2–8s on medium repos; key cache by file hash.
 14. **Lazy-import heavy deps in `cli/`** so `dev status` and other quick commands don't pay tree-sitter/SDK import cost.
 15. **Batch git invocations** in indexing/verification (single `git status --porcelain -z` + `git diff` pass instead of per-file calls).
+
+## Strategic product areas 4–8 (2026-07-08)
+
+Codebase gap analysis against the next product bets. Complements (does not reopen) the closed P0–P3 backlog above.
+
+### 4. CI/team evidence as first-class product
+
+**Exists:** `EvidenceExportGenerator` (`reporting/evidence_export.py`) via `dev report --evidence-json`; `GitHubCheckGenerator` fails only when `blocking_gaps > 0` (`reporting/github_check.py`, `integrations/github.py`); PR/MR markdown via `integrations/pr_comments.py`; `fail_on_blocking` on report/status; doctor lists Checks/Comments as preview.
+
+**Missing:** No PR-auto pipeline (scaffold CI in `repo/ci_scaffold.py` is lint/typecheck/test only); no HTML artifact; no install-free AC→evidence reviewer summary beyond raw JSON; Check/comment not in `.github/workflows/ci.yml`.
+
+**Next:**
+1. Extend `src/devcouncil/repo/ci_scaffold.py` (+ optional `.github/workflows/devcouncil-evidence.yml`) to run verify → `--evidence-json` → `actions/upload-artifact` → optional `--github` / `--github-pr-comment`.
+2. Add HTML renderer next to `evidence_export.py` (AC table + evidence links) for artifact preview.
+3. Keep Check conclusion blocking-only (already true); document advisory gaps as annotations/comment sections only.
+4. Smoke-test with env: `GITHUB_TOKEN`, `GITHUB_REPOSITORY`, `GITHUB_SHA`, `GITHUB_PR_NUMBER`.
+
+### 5. Incremental / smart verification
+
+**Exists:** `dev check --watch` full re-run on mtime (`cli/commands/check.py`); changed-file gates (coverage, orphan, planned files); git snapshot batching; repo-map AST parse cache.
+
+**Missing:** Path→gate selection; content-hash cache of green results; sub-second sidecar (watch still re-runs the full gate).
+
+**Next:**
+1. Add `verification/gate_selector.py` mapping changed paths → gates/commands (lint packages, dirty-module coverage).
+2. Persist `.devcouncil/cache/gate_results.json` keyed by file content hashes; skip green unchanged gates.
+3. Teach `--watch` to use selector + cache; keep full verify for release/`dev go`.
+4. Benchmark iterative edit → verdict; target sub-second when only cached gates apply.
+
+**Implemented (2026-07-08):**
+- **`verification/gate_selector.py`** — pure `select_gates(changed_files, {kind: [cmd]})` mapping. Drops a command whose stack (python vs js/ts, inferred from the resolved tool through `python -m`/`npm run`/`poetry run` wrappers) has no changed file; narrows broad-target linters/type-checkers (`ruff check .`, `mypy src`, `black --check src`, `eslint .`) to the touched files (subcommand-aware, e.g. `ruff check`), leaving `pytest`, explicit paths, and shell-operator commands untouched. Each `GateSpec` carries the `inputs` that key its cache.
+- **`verification/gate_cache.py`** — `GateResultCache` at `.devcouncil/cache/gate_results.json`, keyed by SHA-256 over the command string + byte content of the gate's inputs (missing files hash to a stable sentinel so create/delete invalidates). Only *passing* gates authorize a skip; failures always re-run. Atomic writes; a corrupt/absent cache degrades to "nothing cached".
+- **`verification/incremental_check.py`** — `run_incremental_gates(...)` ties selector + cache: selects, skips cached-green, runs the rest via an injectable `runner` seam, records, persists. Returns a compact `IncrementalResult` (ran/cached/skipped, per-gate timing).
+- **`cli/commands/check.py`** — `dev check --watch` now runs the incremental gate (one shared cache across iterations) and prints `PASS/FAIL — N run, M cached (Xms)`; falls back to the full evidence gate when no stack-relevant command applies to the change. The full `verify_task` / `dev go` path is unchanged and never consults this cache.
+- **Timing:** on a 2-gate change (`ruff check` + `mypy`), cold run ≈ 500 ms; a subsequent save that leaves those inputs byte-identical is served from cache in ≈ 0.4 ms (~1000× faster; no subprocess spawned).
+- **Tests:** `tests/unit/test_gate_selector.py` (10), `test_gate_cache.py` (8), `test_incremental_check.py` (7) — 25 tests.
+
+### 6. Native executor out of Experimental
+
+**Exists:** Preview `NativeAgent` (`executors/native/agent.py`) via `TaskRunner` + `PromptBuilder` + correction-manifest prefix; doctor tier Experimental.
+
+**Missing:** Not on MCP lease/`gated_write` + HookPolicy path; no shared `next_actions` repair contract with MCP verify; no coding-CLI timeout/sandbox parity.
+
+**Next:**
+1. Route native `apply_patch`/`write_file` through `execution/gated_write.py` (same policy as MCP).
+2. After verify, inject `verification.next_actions.split_next_actions` into the native loop (mirror MCP closed-loop).
+3. Honor `execution.command_timeout` + optional `verification/sandbox.py` docker/nix like coding-CLI profiles.
+4. Promote doctor tier only after e2e parity with `tests/unit/test_mcp_closed_loop.py`.
+
+**Implemented (2026-07-08):** All four shipped.
+- `NativeAgent` now acquires a task lease (`lease_ops.checkout_task_payload`) at the start of its loop and routes every write through `execution/gated_write.py` — `apply_patch` → `apply_patch_payload`, the path+content fallback → `write_file_payload` — so native writes hit the same lease + scope + `HookPolicy` gate as MCP (no more direct `TaskRunner` writes bypassing it). Lease is released in a `finally`.
+- Closed loop: on `finish`, the agent verifies through `task_gate_ops.verify_task_payload` (the exact surface MCP's `verify-leased` shells into, run via `asyncio.to_thread` to avoid nesting event loops). Blocking gaps are formatted from the shared `split_next_actions` blocking/advisory arrays and fed back into the message loop for bounded self-repair (`MAX_VERIFY_ROUNDS`), so repair guidance is byte-identical to MCP.
+- Sandbox/timeout parity: `run_command` already honors `execution.command_timeout` via `TaskRunner`; `sandbox="docker"|"nix"` routes verification through `verification/sandbox.py` (`get_sandbox`), whose per-command ceiling reuses the same `command_timeout` knob.
+- Doctor tier promoted **Experimental → Preview** (not Stable — the LLM loop itself is still preview quality; the *safety path* is now certified). Gated on `tests/unit/test_native_closed_loop.py`, which mirrors `test_mcp_closed_loop.py` (checkout→gated write→verify BLOCKED→next-actions repair→re-verify PASS), plus out-of-scope rejection, `command_timeout`, and docker/nix sandbox routing. `ruff check src tests` clean; native + MCP + doctor-maturity + go-repair subsets pass.
+
+### 7. Knowledge graph depth
+
+**Exists:** Blast radius / call sites / subsystem neighbors in `execution/prompt_builder.py`; optional `integrations/code_review_graph.py` + `dev graph-context`; orphan/planned-file gates; wiki incremental update + `dev wiki install-action`.
+
+**Missing:** No architecture-drift gate for mapped subsystem boundaries; wiki not a verify post-step for large refactors; impact text weak when map/graph absent.
+
+**Next:**
+1. Always inject dependents + neighbors ("changing X touches Y") from `repo_map.json` even without code-review-graph.
+2. Add `verification/checks/subsystem_boundary.py`: block/advisory when edits cross non-neighbor areas without plan coverage.
+3. After verify, if change spans N+ subsystems or M+ files, run `dev wiki update` (or flag stale wiki pages).
+4. Optionally treat stale repo map as blocking for hard-difficulty tasks.
+
+**Implemented (2026-07-08):**
+- **`indexing/subsystem_map.py`** — shared, pure helpers over a loaded `repo_map.json` (`area_for_path` longest-prefix + `files[].area` fallback, `neighbors_for_area`, `are_neighbors`, `dependents_of`, `areas_touched`, `cross_boundary_pairs`, `impact_targets`), used by both the prompt builder and the boundary gate so they agree on the area graph.
+- **`execution/prompt_builder.py`** — new always-on **`_impact_section`** ("Impact (changing X touches Y)") injected from `repo_map.json` dependents + subsystem neighbors, **independent of** the optional code-review-graph CLI (present on the common keyless path). High-priority/short segment ordered right after structural context; new files are marked "no importers yet". Complements the existing detailed `_dependents_section`/`_call_sites_section`.
+- **`verification/checks/subsystem_boundary.py`** — advisory `detect_subsystem_boundary_gaps(...)`: flags a change that edits two subsystems the map does NOT consider neighbors when the crossing was not declared by the task plan (both areas in `planned_files`). Emits `architecture_drift` gaps, **non-blocking by default** (`verification.subsystem_boundary.blocking` to enforce), degrades to a no-op without a `subsystems`/`neighbors` map. Wired into `verify_orchestration` alongside the semantic-diff/dependency checks (gated by `verification.subsystem_boundary.enabled`).
+- **`verification/wiki_refresh.py`** — post-verify `evaluate_wiki_refresh(...)`: when a verified change spans ≥ `min_subsystems` areas OR ≥ `min_files` files it flags the stale wiki pages a refresh would rewrite (cheap, no model calls) or, with `verification.wiki_refresh.auto_update`, runs `dev wiki update --no-llm`. Wired as a best-effort, non-blocking post-step in `verify_orchestration`.
+- **Config:** added `SubsystemBoundaryConfig` (`enabled`, `blocking`) and `WikiRefreshConfig` (`enabled`, `min_subsystems`, `min_files`, `auto_update`) under `verification`.
+- **Tests:** `tests/unit/test_subsystem_map.py` (7), `test_subsystem_boundary.py` (6), `test_prompt_impact.py` (4), `test_wiki_refresh.py` (6) — 23 tests.
+
+### 8. Type hygiene / dogfood
+
+**Exists:** CI mypy + `coverage run -m pytest` + `coverage report`; `check_status_doc_drift` in `cli/commands/doctor.py` (5 Stable areas); historical ~75 mypy errors / 36 files.
+
+**Missing:** No `fail_under` coverage floor; narrow status-doc mapping; mypy 1.20.2 currently INTERNAL ERROR locally (re-count after pin/fix).
+
+**Next:**
+1. Unblock mypy (pin or upgrade), then burn down full-repo errors to green.
+2. Add `[tool.coverage.report] fail_under = …` and fail CI on breach (start low, raise).
+3. Expand `STATUS_DOC_UNIT_TEST_DIRS` (gating, execution, indexing, reporting, executors) as areas claim Stable.
+4. Doctor rows for "mypy green" and "coverage floor configured".
+
+**Session checks (2026-07-08):** `ruff check src tests` clean; `mypy src` INTERNAL ERROR on 1.20.2 (prior count ~75 stands until re-measured).
+
+### Implemented (2026-07-08) — Area 4: CI/team evidence
+
+- **`reporting/evidence_html.py`** + `dev report --evidence-html PATH`: self-contained HTML AC→evidence table with task/diff links; advisory vs blocking gaps documented in-page.
+- **`repo/ci_scaffold.py`**: `render_evidence_workflow()` / `scaffold_evidence_ci()` emit `.github/workflows/devcouncil-evidence.yml` (verify → JSON/HTML artifacts → `upload-artifact` → optional `--github` / `--github-pr-comment` with `GITHUB_TOKEN`, `GITHUB_REPOSITORY`, `GITHUB_SHA`, `GITHUB_PR_NUMBER`).
+- **`dev scaffold-ci --evidence`**: writes the evidence workflow alongside the starter CI workflow.
+- **`dev report --github`**: prefers `GITHUB_SHA` when set (Actions-friendly).
+- GitHub Check conclusion remains blocking-only (`GitHubCheckGenerator` unchanged).
+
+### Implemented (2026-07-08) — Area 8: Type hygiene / dogfood
+
+- **mypy**: runs cleanly (no INTERNAL ERROR on current dev deps); reduced from ~82 to 42 errors (remaining in llm/provider, executors, semantic_layer, etc.).
+- **`[tool.coverage.report] fail_under = 18`** in pyproject.toml; CI `coverage report` now enforces the floor.
+- **`STATUS_DOC_UNIT_TEST_DIRS`** expanded (gating, executors, execution, reporting, indexing) with flat-test prefix map for subsystems without dedicated dirs.
+- **`dev doctor`** rows: **Coverage floor** and **mypy green**.
 
 ## Feature ideas
 

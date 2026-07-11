@@ -6,7 +6,6 @@ recurring stub/effort failures and rough false-positive rates for advisory gaps.
 
 from __future__ import annotations
 
-import json
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path

@@ -11,7 +11,7 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 
-import yaml  # type: ignore[import-untyped]
+import yaml
 from rich.console import Console
 
 from devcouncil.executors.agent_registry import (
@@ -24,7 +24,7 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 OPENCODE_HOOK_PLUGIN_NAME = "opencode_devcouncil_plugin.mjs"
-SUPPORTED_HOOK_TOOLS = ("codex", "gemini", "claude", "cursor")
+SUPPORTED_HOOK_TOOLS = ("codex", "gemini", "claude", "cursor", "grok")
 
 
 

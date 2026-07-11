@@ -98,7 +98,6 @@ def load_latest_prompt_enhancement(project_root: Path) -> "PromptEnhancement | N
     was persisted (so the executor gets the guidance tied to the plan it is running). Falls
     back to the most recent per-run artifact for plans persisted before that file existed.
     Best-effort: any read/parse failure returns None so prompt building never breaks."""
-    import json
 
     def _load(path: Path) -> "PromptEnhancement | None":
         try:

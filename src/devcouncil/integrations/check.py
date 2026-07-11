@@ -59,6 +59,7 @@ CODING_CLI_CHECK_LABELS: dict[str, str] = {
     "gemini": "Gemini CLI",
     "claude": "Claude Code",
     "cursor": "Cursor",
+    "grok": "Grok Build",
     "opencode": "OpenCode",
     "antigravity": "Google Antigravity CLI",
     "warp": "Warp / Oz",
@@ -171,6 +172,22 @@ def _cursor_config_status(project_root: Path) -> tuple[str, bool, list[str]]:
     return ("missing" if not path.exists() else "drifted"), True, [str(path)]
 
 
+def _grok_config_status(project_root: Path) -> tuple[str, bool, list[str]]:
+    path = project_root / ".grok" / "config.toml"
+    if not path.exists():
+        return "missing", True, [str(path)]
+    text = path.read_text(encoding="utf-8")
+    ok = (
+        "[mcp_servers.devcouncil]" in text
+        and "devcouncil" in text
+        and "mcp-server" in text
+        and str(project_root) in text
+    )
+    if ok:
+        return "ok", False, [str(path)]
+    return "drifted", True, [str(path)]
+
+
 def _opencode_config_status(project_root: Path) -> tuple[str, bool, list[str]]:
     path = project_root / "opencode.json"
     data = _load_json_file(path)
@@ -228,6 +245,8 @@ def integration_capability_rows(project_root: Path) -> list[dict[str, object]]:
         paths: list[str] = []
         if client == "cursor":
             config_status, fixable, paths = _cursor_config_status(project_root)
+        elif client == "grok":
+            config_status, fixable, paths = _grok_config_status(project_root)
         elif client == "claude":
             config_status, fixable, paths = _claude_config_status(project_root)
         elif client == "opencode":
@@ -282,6 +301,7 @@ def _hook_config_tamper_targets(project_root: Path) -> list[tuple[str, Path]]:
         ("Codex", project_root / ".codex" / "hooks.json"),
         ("Gemini", project_root / ".gemini" / "settings.json"),
         ("Cursor", project_root / ".cursor" / "hooks.json"),
+        ("Grok", project_root / ".grok" / "hooks" / "devcouncil.json"),
     ]
 
 
@@ -353,6 +373,26 @@ def build_integration_check_report(project_root: Path, *, strict: bool = False) 
             hooks_ok,
             "Cursor hooks",
             str(cursor_hooks) if hooks_ok else "Run dev integrate hooks --apply --tool cursor.",
+        )
+        from devcouncil.integrations.clients.cursor import probe_cursor_auth
+
+        auth_ok, auth_details = probe_cursor_auth()
+        add_optional(auth_ok, "Cursor auth", auth_details)
+
+    grok_hooks = root / ".grok" / "hooks" / "devcouncil.json"
+    grok_enabled = bool(raw_config.get("integrations", {}).get("grok", {}).get("enabled"))
+    if grok_enabled or grok_hooks.exists():
+        hooks_ok = False
+        if grok_hooks.exists():
+            try:
+                hooks_data = read_json(grok_hooks) or {}
+                hooks_ok = "PreToolUse" in hooks_data.get("hooks", {})
+            except json.JSONDecodeError:
+                hooks_ok = False
+        add(
+            hooks_ok,
+            "Grok hooks",
+            str(grok_hooks) if hooks_ok else "Run dev integrate hooks --apply --tool grok (then /hooks-trust in Grok).",
         )
 
     opencode_config = integrate._opencode_config_path(root)
@@ -427,11 +467,13 @@ def integration_status_summary(project_root: Path) -> dict[str, Any]:
         default_executor = execution.default_executor
         stream_cli_output = execution.stream_cli_output
         cursor_resume_mode = execution.cursor_resume_mode
+        grok_resume_mode = execution.grok_resume_mode
         custom_probe_order = list(execution.coding_cli_probe_order)
     except Exception:
         default_executor = "manual"
         stream_cli_output = False
         cursor_resume_mode = "off"
+        grok_resume_mode = "off"
         custom_probe_order = []
 
     resolved = resolve_automated_executor(project_root, None) if detected or default_executor != "manual" else "manual"
@@ -447,5 +489,6 @@ def integration_status_summary(project_root: Path) -> dict[str, Any]:
         "custom_probe_order": custom_probe_order,
         "stream_cli_output": stream_cli_output,
         "cursor_resume_mode": cursor_resume_mode,
+        "grok_resume_mode": grok_resume_mode,
         "capabilities": integration_capability_rows(project_root),
     }

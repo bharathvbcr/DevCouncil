@@ -18,6 +18,8 @@ from devcouncil.llm.provider import create_provider, validate_model_provider
 from devcouncil.llm.router import ModelRouter
 from devcouncil.app.config import load_config, get_api_key
 from devcouncil.domain.evidence import CommandResult, DiffEvidence, TestEvidence
+from devcouncil.domain.task import Task
+from devcouncil.domain.requirement import Requirement
 from devcouncil.storage.repositories import GapRepository, EvidenceRepository, StateRepository
 from devcouncil.verification.verifier import Verifier
 from devcouncil.app.state_machine import ProjectPhase
@@ -103,7 +105,13 @@ def _capture_before_snapshot(task_id: str, project_root: Path = Path(".")):
 def _record_project_phase(session, phase: ProjectPhase):
     StateRepository(session).record_phase(phase.value)
 
-def _verify_after_execution(session, task, reqs, router=None, project_root: Path = Path(".")) -> bool:
+def _verify_after_execution(
+    session,
+    task: Task,
+    reqs: list[Requirement],
+    router=None,
+    project_root: Path = Path("."),
+) -> bool:
     """Run deterministic verification after an automated executor finishes."""
     import asyncio
 
@@ -242,7 +250,7 @@ def run(
         "-e",
         help=(
             "Executor to use (manual, mini, openhands, native-preview, claude-sdk, "
-            "codex, gemini, claude, opencode, antigravity, warp, cursor, aider, "
+            "codex, gemini, claude, opencode, antigravity, warp, cursor, grok, aider, "
             "copilot, goose, amp, qwen, crush, or a configured agent)"
         ),
     ),

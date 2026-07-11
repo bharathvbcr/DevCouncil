@@ -4,22 +4,52 @@ from devcouncil.artifacts.graph import ArtifactGraph
 from devcouncil.reporting.markdown_report import MarkdownReportGenerator
 from devcouncil.reporting.json_report import JsonReportGenerator
 from devcouncil.reporting.evidence_export import EvidenceExportGenerator
+from devcouncil.reporting.evidence_html import EvidenceHtmlGenerator
 
 class ReportBuilder:
     """Builds reports in various formats from the artifact graph."""
 
     @staticmethod
-    def build_markdown(graph: ArtifactGraph, live_review: dict | None = None) -> str:
-        return MarkdownReportGenerator.generate(graph, live_review=live_review)
+    def build_markdown(
+        graph: ArtifactGraph,
+        live_review: dict | None = None,
+        wiki_refresh: dict | None = None,
+    ) -> str:
+        return MarkdownReportGenerator.generate(
+            graph, live_review=live_review, wiki_refresh=wiki_refresh
+        )
 
     @staticmethod
-    def build_json(graph: ArtifactGraph, live_review: dict | None = None) -> str:
-        return JsonReportGenerator.generate(graph, live_review=live_review)
+    def build_json(
+        graph: ArtifactGraph,
+        live_review: dict | None = None,
+        wiki_refresh: dict | None = None,
+    ) -> str:
+        return JsonReportGenerator.generate(
+            graph, live_review=live_review, wiki_refresh=wiki_refresh
+        )
 
     @staticmethod
-    def build_evidence_export(graph: ArtifactGraph, live_review: dict | None = None) -> str:
+    def build_evidence_export(
+        graph: ArtifactGraph,
+        live_review: dict | None = None,
+        wiki_refresh: dict | None = None,
+    ) -> str:
         """Reviewer-readable requirement→task→diff→evidence JSON (see evidence_export)."""
-        return EvidenceExportGenerator.generate(graph, live_review=live_review)
+        return EvidenceExportGenerator.generate(
+            graph, live_review=live_review, wiki_refresh=wiki_refresh
+        )
+
+    @staticmethod
+    def build_evidence_html(
+        graph: ArtifactGraph,
+        live_review: dict | None = None,
+        wiki_refresh: dict | None = None,
+    ) -> str:
+        """Self-contained HTML evidence report for CI artifact preview (see evidence_html)."""
+        return EvidenceHtmlGenerator.generate(
+            graph, live_review=live_review, wiki_refresh=wiki_refresh
+        )
 
     @staticmethod
     def build_okf_bundle(

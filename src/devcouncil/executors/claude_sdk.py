@@ -18,7 +18,7 @@ from __future__ import annotations
 import importlib
 import logging
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Coroutine, List, Optional, TypeVar
 
 from devcouncil.domain.requirement import Requirement
 from devcouncil.domain.task import Task
@@ -29,6 +29,8 @@ from devcouncil.executors.transient_retry import transient_error_in_text
 from devcouncil.telemetry.stages import log_step
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 
 class ClaudeSdkExecutor(Executor):
@@ -140,7 +142,7 @@ class ClaudeSdkExecutor(Executor):
             return ExecutionResult(success=False, message=str(exc))
 
     @staticmethod
-    def _run_coroutine_from_sync(coro):
+    def _run_coroutine_from_sync(coro: Coroutine[Any, Any, _T]) -> _T:
         """Run an async coroutine from sync code, including nested-loop contexts.
 
         ``asyncio.run()`` raises when a loop is already running (pytest-asyncio,

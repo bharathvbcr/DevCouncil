@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 from devcouncil.execution.hook_policy import HookPolicy
+from devcouncil.execution.lease_validation import require_valid_lease
 from devcouncil.integrations.mcp.util import (
     GIT_APPLY_TIMEOUT_SECONDS,
     diff_target_paths,
@@ -34,9 +35,11 @@ def write_file_payload(
         return {"ok": False, "error": "DevCouncil state is unavailable in this directory.", "code": "not_initialized"}
 
     with db.get_session() as session:
+        lease_error = require_valid_lease(session, task_id, lease_token)
+        if lease_error:
+            return lease_error
         lease_record = TaskLeaseRepository(session).active_for_task(task_id)
-        if lease_record is None or lease_record.lease_token != lease_token:
-            return {"ok": False, "error": "Invalid lease token.", "code": "invalid_lease", "task_id": task_id}
+        assert lease_record is not None
         task = TaskRepository(session).get_by_id(task_id)
         if not task:
             return {"ok": False, "error": f"Task {task_id} not found.", "code": "not_found", "task_id": task_id}
@@ -102,9 +105,11 @@ def apply_patch_payload(
         return {"ok": False, "error": "No target files found in the diff.", "code": "empty_patch", "task_id": task_id}
 
     with db.get_session() as session:
+        lease_error = require_valid_lease(session, task_id, lease_token)
+        if lease_error:
+            return lease_error
         lease_record = TaskLeaseRepository(session).active_for_task(task_id)
-        if lease_record is None or lease_record.lease_token != lease_token:
-            return {"ok": False, "error": "Invalid lease token.", "code": "invalid_lease", "task_id": task_id}
+        assert lease_record is not None
         task = TaskRepository(session).get_by_id(task_id)
         if not task:
             return {"ok": False, "error": f"Task {task_id} not found.", "code": "not_found", "task_id": task_id}

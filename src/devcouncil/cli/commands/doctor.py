@@ -221,7 +221,40 @@ STATUS_DOC_UNIT_TEST_DIRS: tuple[tuple[str, str], ...] = (
     ("Council Debate", "council"),
     ("Diff↔Coverage Gate", "verification"),
     ("Cost & Run Telemetry", "telemetry"),
+    ("Security Scanning", "gating"),
+    ("Manual Executor", "executors"),
+    ("Lite Check (`dev check --verify`)", "execution"),
+    ("Next-Actions Contract", "reporting"),
+    ("LSP / AST Indexing", "indexing"),
 )
+
+# Flat tests/unit/test_*.py prefixes that back a subsystem when no per-subsystem dir exists.
+STATUS_DOC_FLAT_TEST_PREFIXES: dict[str, tuple[str, ...]] = {
+    "artifacts": ("test_artifact_graph",),
+    "council": ("test_orchestrator", "test_state_machine"),
+    "verification": ("test_verification", "test_verifier", "test_diff_coverage"),
+    "telemetry": ("test_telemetry",),
+    "executors": ("test_executors", "test_executor_", "test_claude_sdk_executor"),
+    "execution": ("test_execution", "test_go_", "test_cli_check", "test_ad_hoc_check"),
+    "reporting": ("test_json_report", "test_export_command", "test_pr_comments"),
+    "indexing": ("test_indexing", "test_repo_mapper", "test_repo_map"),
+}
+
+
+def _subsystem_has_unit_tests(unit_root: Path, subsystem: str) -> bool:
+    """True when tests/unit/<subsystem>/ or mapped flat test files exist."""
+    tests_dir = unit_root / subsystem
+    try:
+        if tests_dir.is_dir() and any(tests_dir.rglob("test_*.py")):
+            return True
+        if any(unit_root.glob(f"test_{subsystem}*.py")):
+            return True
+        for prefix in STATUS_DOC_FLAT_TEST_PREFIXES.get(subsystem, ()):
+            if any(unit_root.glob(f"{prefix}*.py")):
+                return True
+    except Exception:
+        return False
+    return False
 
 
 def _parse_status_doc_areas(status_doc: Path) -> dict[str, str]:
@@ -285,6 +318,91 @@ def check_local_monitor_sampling(project_root: Path, config=None) -> list[tuple[
         return []  # config problems already surface via other doctor rows
 
 
+def check_coverage_floor(project_root: Path) -> list[tuple[str, str, str]]:
+    """Doctor row for ``[tool.coverage.report] fail_under`` in pyproject.toml."""
+    ok = "[green]OK[/green]"
+    warn = "[yellow]WARN[/yellow]"
+    pyproject = project_root / "pyproject.toml"
+    if not pyproject.is_file():
+        return [("Coverage floor", warn, "No pyproject.toml; cannot verify fail_under.")]
+    try:
+        import tomllib
+
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        fail_under = (
+            data.get("tool", {})
+            .get("coverage", {})
+            .get("report", {})
+            .get("fail_under")
+        )
+    except Exception as exc:
+        return [("Coverage floor", warn, f"Could not read pyproject.toml: {exc}.")]
+    if fail_under is None:
+        return [
+            (
+                "Coverage floor",
+                warn,
+                "No [tool.coverage.report] fail_under in pyproject.toml; CI will not enforce a coverage minimum.",
+            )
+        ]
+    return [
+        (
+            "Coverage floor",
+            ok,
+            f"fail_under={fail_under} configured in pyproject.toml (enforced by `coverage report`).",
+        )
+    ]
+
+
+def check_mypy_status(project_root: Path) -> list[tuple[str, str, str]]:
+    """Doctor row summarizing ``mypy src`` health for this repository."""
+    ok = "[green]OK[/green]"
+    warn = "[yellow]WARN[/yellow]"
+    pyproject = project_root / "pyproject.toml"
+    if not pyproject.is_file():
+        return [("mypy green", warn, "No pyproject.toml; skipping mypy probe.")]
+    src_root = project_root / "src"
+    if not src_root.is_dir():
+        return [("mypy green", warn, "No src/ directory; skipping mypy probe.")]
+    try:
+        proc = subprocess.run(
+            ["mypy", "src"],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
+    except FileNotFoundError:
+        return [("mypy green", warn, "mypy not on PATH; install dev dependencies.")]
+    except subprocess.TimeoutExpired:
+        return [("mypy green", warn, "mypy src timed out after 120s.")]
+    except Exception as exc:
+        return [("mypy green", warn, f"mypy probe failed: {exc}.")]
+
+    output = (proc.stdout or "") + (proc.stderr or "")
+    if "INTERNAL ERROR" in output:
+        return [
+            (
+                "mypy green",
+                warn,
+                "mypy crashed with INTERNAL ERROR; pin or upgrade mypy in dev dependencies.",
+            )
+        ]
+    if proc.returncode == 0:
+        return [("mypy green", ok, "mypy src passed with zero errors.")]
+    error_count = output.count(": error:")
+    preview = output.strip().splitlines()[-1] if output.strip() else "mypy failed"
+    return [
+        (
+            "mypy green",
+            warn,
+            f"mypy src reported {error_count} error(s). Last line: {preview}",
+        )
+    ]
+
+
 def check_status_doc_drift(project_root: Path) -> list[tuple[str, str, str]]:
     """Doctor rows verifying docs/project-status.md "Stable" claims against tests/unit/.
 
@@ -329,9 +447,8 @@ def check_status_doc_drift(project_root: Path) -> list[tuple[str, str, str]]:
             continue
         if not status_text.strip().lower().startswith("stable"):
             continue  # only Stable rows claim unit-test-backed maturity
-        tests_dir = unit_root / subsystem
         try:
-            has_tests = tests_dir.is_dir() and any(tests_dir.rglob("test_*.py"))
+            has_tests = _subsystem_has_unit_tests(unit_root, subsystem)
         except Exception:
             has_tests = False
         if has_tests:
@@ -400,14 +517,15 @@ def _subsystem_maturity_rows() -> list[tuple[str, str, str]]:
         ("Security Scanning", "stable", "Secret redaction and detection"),
         ("Coding CLI Executors", "preview", "Codex, Gemini, Claude, Cursor, OpenCode, …"),
         ("Repair Loop (dev go)", "preview", "Bounded self-repair; correction manifest"),
-        ("MCP Server", "preview", "Lease-gated write path; verify loop maturing"),
+        ("MCP Server (Claude hero loop)", "stable", "Certified checkout→verify loop; golden e2e"),
+        ("Multi-agent Campaign", "preview", "dev campaign — parallel DAG + Reviewer QC"),
         ("OKF / design.md", "preview", "dev okf / dev design commands"),
         ("CI Scaffolding", "preview", "dev scaffold-ci starter workflow"),
         ("GitHub PR Checks / Comments", "preview", "dev report --github*"),
         ("LSP / AST Indexing", "preview", "dev lsp inspect (detection-only) / dev ast"),
         ("Live Dashboard", "preview", "dev dashboard --open"),
-        ("Coding CLI Hooks", "experimental", "Pre-tool-use starters; verify-only clients"),
-        ("Native Executor", "experimental", "native / native-preview"),
+        ("Coding CLI Hooks", "experimental", "Starters; Claude hooks = certified path"),
+        ("Native Executor", "preview", "Lease-gated writes + shared verify/next-actions loop; sandbox/timeout parity"),
     ]
 
 
@@ -542,6 +660,12 @@ def render_doctor_check(project_root: Path = Path(".")):
     # actual tests/unit/ layout. Placed with the knowledge rows so it also runs on the
     # ollama / unsupported-provider early-return paths.
     for component, status, notes in check_status_doc_drift(project_root):
+        table.add_row(component, status, notes)
+
+    for component, status, notes in check_coverage_floor(project_root):
+        table.add_row(component, status, notes)
+
+    for component, status, notes in check_mypy_status(project_root):
         table.add_row(component, status, notes)
 
     # Local-monitor verification safety: flag explicit config that disables the

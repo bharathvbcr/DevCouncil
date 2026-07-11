@@ -8,7 +8,7 @@ import subprocess
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set, Tuple, cast
 
 from pydantic import BaseModel, Field
 
@@ -954,7 +954,7 @@ class RepoMapper:
         try:
             data = read_json(self._parse_cache_path())
             if data.get("version") == self._PARSE_CACHE_VERSION and isinstance(data.get("files"), dict):
-                return data["files"]
+                return cast(Dict[str, Dict[str, object]], data["files"])
         except Exception:
             pass
         return {}

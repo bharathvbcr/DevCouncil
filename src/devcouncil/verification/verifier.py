@@ -66,6 +66,7 @@ class VerificationOutcome:
     # be distinguished from "passed under strict gates".
     difficulty: Optional[str] = None
     rigor_applied: List[str] = field(default_factory=list)
+    wiki_refresh: Optional[Dict[str, Any]] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -169,6 +170,22 @@ class Verifier:
         except Exception as e:
             logger.warning("Failed to load verification snapshot %s: %s", path, e)
             return set()
+
+    def _load_repo_map(self) -> Optional[dict]:
+        """Parse ``.devcouncil/repo_map.json`` (None if absent/unreadable).
+
+        Used by structural gates (subsystem-boundary drift) and the wiki post-step.
+        Best-effort: any failure degrades to ``None`` so a missing/corrupt map never
+        breaks verification."""
+        map_path = self.project_root / ".devcouncil" / "repo_map.json"
+        if not map_path.exists():
+            return None
+        try:
+            data = read_json(map_path)
+            return data if isinstance(data, dict) else None
+        except Exception as e:
+            logger.debug("Failed to load repo map for verification: %s", e)
+            return None
 
     def _load_commands(self) -> Dict[str, List[str]]:
         try:

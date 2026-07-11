@@ -1,9 +1,8 @@
 import ast
-import json
 import logging
 import re
 from pathlib import Path
-from typing import List
+from typing import List, cast
 
 from devcouncil.domain.requirement import Requirement
 from devcouncil.domain.task import Task
@@ -123,7 +122,7 @@ class PromptBuilder:
         ``path``) so that if the file's content differs between the two reads, the outline
         is recomputed from the current text rather than served stale — and using the text
         directly (rather than its hash) means there is no collision risk."""
-        cache = getattr(self, "_outline_cache", None)
+        cache: dict[tuple[str, str], List[str]] | None = getattr(self, "_outline_cache", None)
         key = (path, text)
         if cache is not None and key in cache:
             return cache[key]
@@ -464,6 +463,67 @@ class PromptBuilder:
             )
         return design_block, knowledge_block
 
+    # Impact block bounds: this is a short, always-on summary — keep it tight so it can
+    # never crowd out the detailed file bodies it complements.
+    _IMPACT_MAX_FILES = 8
+    _IMPACT_MAX_DEPS = 5
+    _IMPACT_MAX_NEIGHBORS = 4
+
+    def _impact_section(self, task: Task, data: dict | None) -> str:
+        """A short "changing X touches Y" block sourced purely from ``repo_map.json``.
+
+        Unlike the optional code-review-graph structural section (which only appears when
+        that CLI is installed and enabled), this is ALWAYS emitted whenever the repo map
+        carries dependents or subsystem neighbors — so an agent always sees the blast
+        radius of its edits (who imports each changed file, and which neighboring
+        subsystems the change reaches) even on the common keyless path. Complements the
+        detailed ``_dependents_section``/``_call_sites_section`` with a one-line-per-file
+        orientation. Bounded and best-effort; never raises."""
+        if not data:
+            return ""
+        from devcouncil.indexing.subsystem_map import (
+            area_for_path,
+            dependents_of,
+            neighbors_for_area,
+        )
+
+        lines: List[str] = []
+        for pf in task.planned_files[: self._IMPACT_MAX_FILES]:
+            path = pf.path.replace("\\", "/")
+            is_new = pf.allowed_change == "create"
+            importers = [] if is_new else dependents_of(path, data)
+            area = area_for_path(path, data)
+            neighbors = neighbors_for_area(area, data)
+            if not importers and not neighbors and not area:
+                continue
+            parts: List[str] = []
+            if importers:
+                shown = importers[: self._IMPACT_MAX_DEPS]
+                more = f" (+{len(importers) - len(shown)})" if len(importers) > len(shown) else ""
+                parts.append(
+                    f"imported by {len(importers)} file(s): "
+                    + ", ".join(f"`{p}`" for p in shown) + more
+                )
+            elif is_new:
+                parts.append("new file (no importers yet)")
+            if area:
+                neighbor_txt = ""
+                if neighbors:
+                    shown_n = neighbors[: self._IMPACT_MAX_NEIGHBORS]
+                    neighbor_txt = "; neighbors: " + ", ".join(f"`{n}`" for n in shown_n)
+                parts.append(f"subsystem `{area}`{neighbor_txt}")
+            if parts:
+                lines.append(f"- `{path}` → " + "; ".join(parts))
+        if not lines:
+            return ""
+        return (
+            "\n## Impact (changing X touches Y)\n"
+            "_From the repo map — keep these call sites and neighboring subsystems working, "
+            "or update them in scope._\n"
+            + "\n".join(lines)
+            + "\n"
+        )
+
     def _dependents_section(self, task: Task, data: dict | None) -> str:
         """List, per planned file the agent will change, the files that import it — the
         blast radius. Sourced from repo_map.json's precomputed reverse-import index, so
@@ -660,7 +720,7 @@ class PromptBuilder:
             max_chars = MAX_PROMPT_CHARS
         # Per-task outline cache so a planned file's symbol outline is computed once even
         # though both the planned-files section and the call-sites section consume it.
-        self._outline_cache: dict[str, List[str]] = {}
+        self._outline_cache: dict[tuple[str, str], List[str]] = {}
         # Load the project config once and share it with the helpers that need it, instead
         # of each independently re-reading + re-parsing it. Best-effort: if it fails the
         # helpers fall back to loading it themselves (and degrade the same way).
@@ -781,39 +841,47 @@ class PromptBuilder:
                 "text": f"\n{self._NO_MAP_NOTE}",
             })
 
+        # Always-on impact block ("changing X touches Y") from the repo map — present
+        # even when the code-review-graph CLI is absent (the common case). High priority
+        # (1) and short, so it survives all but the tightest budgets; ordered right after
+        # structural context so the agent sees the blast radius before the file bodies.
+        impact_text = self._impact_section(task, repo_map_data)
+        if impact_text:
+            segments.append({"order": 2, "priority": 1, "name": "impact", "text": impact_text})
+
         files_text = self._planned_files_section(task)
         if files_text:
-            segments.append({"order": 2, "priority": 1, "name": "file contents", "text": files_text})
+            segments.append({"order": 3, "priority": 1, "name": "file contents", "text": files_text})
 
         dependents_section = self._dependents_section(task, repo_map_data)
         if dependents_section:
             prefix = f"\n{self._STALE_MAP_NOTE}" if (repo_map_stale and not struct_has_stale_note) else ""
-            segments.append({"order": 3, "priority": 2, "name": "dependents", "text": prefix + dependents_section})
+            segments.append({"order": 4, "priority": 2, "name": "dependents", "text": prefix + dependents_section})
 
         skills_text = self._skills_section(task)
         if skills_text:
-            segments.append({"order": 4, "priority": 3, "name": "engineering skills", "text": skills_text})
+            segments.append({"order": 5, "priority": 3, "name": "engineering skills", "text": skills_text})
 
         # Design system (a hard constraint for UI work) and OKF project knowledge. The
         # design system rides just above skills; OKF knowledge alongside them. Both are
         # bounded by config char budgets in `_knowledge_sections`.
         design_text, knowledge_text = self._knowledge_sections(task, cfg=cfg)
         if design_text:
-            segments.append({"order": 4, "priority": 2, "name": "design system", "text": design_text})
+            segments.append({"order": 5, "priority": 2, "name": "design system", "text": design_text})
         if knowledge_text:
-            segments.append({"order": 4, "priority": 3, "name": "project knowledge", "text": knowledge_text})
+            segments.append({"order": 5, "priority": 3, "name": "project knowledge", "text": knowledge_text})
 
         # Lowest priority (4): the budget drops call sites first. It only adds value once
         # the file bodies + dependents are present anyway.
         call_sites_text = self._call_sites_section(task, repo_map_data)
         if call_sites_text:
-            segments.append({"order": 5, "priority": 4, "name": "call sites", "text": call_sites_text})
+            segments.append({"order": 6, "priority": 4, "name": "call sites", "text": call_sites_text})
 
         # Lowest priority (5): dependency risks are opt-in, advisory context — the
         # budget drops them first so they never displace structural/file context.
         dependency_risks_text = self._dependency_risks_section(repo_map_data)
         if dependency_risks_text:
-            segments.append({"order": 6, "priority": 5, "name": "dependency risks", "text": dependency_risks_text})
+            segments.append({"order": 7, "priority": 5, "name": "dependency risks", "text": dependency_risks_text})
 
         # The core + instructions are never dropped; if they alone exceed the budget the
         # model's server will truncate them, so warn loudly instead of failing silently.

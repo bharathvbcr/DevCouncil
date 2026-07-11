@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from devcouncil.execution.prompt_builder import PromptBuilder
+from devcouncil.execution.lease_validation import diagnose_lease, lease_error_payload, LeaseCode
 from devcouncil.integrations.mcp.util import allowed_next_tools, lease_ttl_seconds
 from devcouncil.storage.native import TaskLeaseRepository
 from devcouncil.storage.repositories import GapRepository, RequirementRepository, TaskRepository
@@ -80,7 +81,10 @@ def release_task_payload(project_root: Path, *, task_id: str, lease_token: str) 
     with db.get_session() as session:
         released = TaskLeaseRepository(session).release(task_id, lease_token)
         if not released:
-            return {"ok": False, "error": "Invalid lease token.", "code": "invalid_lease", "task_id": task_id}
+            code, message = diagnose_lease(session, task_id, lease_token)
+            if code is LeaseCode.VALID:
+                return {"ok": False, "error": "Lease already released.", "code": "invalid_lease", "task_id": task_id}
+            return lease_error_payload(code, message, task_id)
         return {"ok": True, "task_id": task_id, "released": True}
 
 
@@ -103,7 +107,10 @@ def renew_lease_payload(
     with db.get_session() as session:
         renewed_lease = TaskLeaseRepository(session).renew(task_id, lease_token, ttl)
         if renewed_lease is None:
-            return {"ok": False, "error": "Invalid or expired lease.", "code": "invalid_lease", "task_id": task_id}
+            code, message = diagnose_lease(session, task_id, lease_token)
+            if code is LeaseCode.VALID:
+                return {"ok": False, "error": "Lease renew failed.", "code": "invalid_lease", "task_id": task_id}
+            return lease_error_payload(code, message, task_id)
         return {
             "ok": True,
             "task_id": task_id,

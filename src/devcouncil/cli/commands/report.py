@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
+from typing import Optional
 
 app = typer.Typer()
 console = Console()
@@ -32,10 +33,11 @@ async def run_github_report(graph: ArtifactGraph, project_root: Path):
         return
 
     try:
-        # Detect current SHA (timeout-guarded; failure lands in the except below)
-        from devcouncil.utils.proc import git_output
+        sha = os.environ.get("GITHUB_SHA", "").strip()
+        if not sha:
+            from devcouncil.utils.proc import git_output
 
-        sha = git_output(["rev-parse", "HEAD"], cwd=project_root).strip()
+            sha = git_output(["rev-parse", "HEAD"], cwd=project_root).strip()
         integration = GitHubIntegration(token, repo, sha)
         await integration.report_verification(graph)
         console.print(f"[green]Successfully reported to GitHub PR Checks for {repo} at {sha[:7]}[/green]")
@@ -85,11 +87,16 @@ def report(
     github: bool = typer.Option(False, "--github", help="Post report to GitHub PR Checks"),
     github_pr_comment: bool = typer.Option(False, "--github-pr-comment", help="Post report as a GitHub PR comment"),
     gitlab_pr_comment: bool = typer.Option(False, "--gitlab-pr-comment", help="Post report as a GitLab merge request comment"),
-    evidence_json: Path = typer.Option(
+    evidence_json: Optional[Path] = typer.Option(
         None,
         "--evidence-json",
         help="Write the requirement→task→diff→evidence graph as reviewer-readable JSON to this path "
         "(e.g. for a CI/PR artifact).",
+    ),
+    evidence_html: Optional[Path] = typer.Option(
+        None,
+        "--evidence-html",
+        help="Write a self-contained HTML evidence report (AC table + task/diff links) to this path.",
     ),
     fail_on_blocking: bool = typer.Option(
         False,
@@ -109,6 +116,8 @@ def report(
     # truthiness checks behave as they do under CLI invocation.
     if not isinstance(evidence_json, (Path, type(None))):
         evidence_json = None
+    if not isinstance(evidence_html, (Path, type(None))):
+        evidence_html = None
     if not isinstance(fail_on_blocking, bool):
         fail_on_blocking = False
 
@@ -136,6 +145,7 @@ def report(
                     "github_pr_comment": github_pr_comment,
                     "gitlab_pr_comment": gitlab_pr_comment,
                     "evidence_json": evidence_json is not None,
+                    "evidence_html": evidence_html is not None,
                     "planning_only": planning_only,
                 },
                 summary="Generated DevCouncil report",
@@ -169,6 +179,23 @@ def report(
                     console.print(f"[red]Failed to write evidence export to {output_path}: {exc}[/red]")
                     raise typer.Exit(code=1) from exc
                 console.print(f"[green]Wrote evidence export to {output_path}[/green]")
+                if fail_on_blocking and graph.blocking_gaps():
+                    raise typer.Exit(code=1)
+                return
+
+            if evidence_html is not None:
+                log_step("report/2: writing evidence-export HTML", project_root=root)
+                output_path = evidence_html.expanduser()
+                try:
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    output_path.write_text(
+                        ReportBuilder.build_evidence_html(graph, live_review=live_review) + "\n",
+                        encoding="utf-8",
+                    )
+                except OSError as exc:
+                    console.print(f"[red]Failed to write evidence HTML to {output_path}: {exc}[/red]")
+                    raise typer.Exit(code=1) from exc
+                console.print(f"[green]Wrote evidence HTML to {output_path}[/green]")
                 if fail_on_blocking and graph.blocking_gaps():
                     raise typer.Exit(code=1)
                 return

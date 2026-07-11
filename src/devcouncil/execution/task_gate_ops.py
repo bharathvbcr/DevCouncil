@@ -11,6 +11,7 @@ from typing import Any
 
 from devcouncil.domain.evidence import CommandResult, DiffCoverageEvidence, DiffEvidence, TestEvidence
 from devcouncil.execution.hook_policy import HookPolicy
+from devcouncil.execution.lease_validation import require_valid_lease
 from devcouncil.integrations.mcp.util import allowed_next_tools, read_log_file, truncate_text
 from devcouncil.storage.native import ShellCommandRepository, TaskLeaseRepository
 from devcouncil.storage.repositories import (
@@ -74,8 +75,9 @@ def verify_task_payload(
         return {"ok": False, "error": "DevCouncil state is unavailable in this directory.", "code": "not_initialized"}
 
     with db.get_session() as session:
-        if not TaskLeaseRepository(session).validate(task_id, lease_token):
-            return {"ok": False, "error": "Invalid lease token.", "code": "invalid_lease", "task_id": task_id}
+        lease_error = require_valid_lease(session, task_id, lease_token)
+        if lease_error:
+            return lease_error
         task_repo = TaskRepository(session)
         task = task_repo.get_by_id(task_id)
         if not task:
@@ -140,8 +142,9 @@ def update_task_scope_payload(
     expected_tests = expected_tests or []
     allowed_commands = allowed_commands or []
     with db.get_session() as session:
-        if not TaskLeaseRepository(session).validate(task_id, lease_token):
-            return {"ok": False, "error": "Invalid lease token.", "code": "invalid_lease", "task_id": task_id}
+        lease_error = require_valid_lease(session, task_id, lease_token)
+        if lease_error:
+            return lease_error
         task_repo = TaskRepository(session)
         task = task_repo.get_by_id(task_id)
         if not task:
@@ -191,8 +194,9 @@ def append_evidence_payload(
         return {"ok": False, "error": "DevCouncil state is unavailable in this directory.", "code": "not_initialized"}
 
     with db.get_session() as session:
-        if not TaskLeaseRepository(session).validate(task_id, lease_token):
-            return {"ok": False, "error": "Invalid lease token.", "code": "invalid_lease", "task_id": task_id}
+        lease_error = require_valid_lease(session, task_id, lease_token)
+        if lease_error:
+            return lease_error
         EvidenceRepository(session).save_command_result(
             task_id,
             CommandResult(
@@ -287,8 +291,9 @@ def record_command_payload(
         return {"ok": False, "error": "DevCouncil state is unavailable in this directory.", "code": "not_initialized"}
 
     with db.get_session() as session:
-        if not TaskLeaseRepository(session).validate(task_id, lease_token):
-            return {"ok": False, "error": "Invalid lease token.", "code": "invalid_lease", "task_id": task_id}
+        lease_error = require_valid_lease(session, task_id, lease_token)
+        if lease_error:
+            return lease_error
         ShellCommandRepository(session).record(
             task_id,
             command,
@@ -365,8 +370,9 @@ def run_command_payload(
         return {"ok": False, "error": "DevCouncil state is unavailable in this directory.", "code": "not_initialized"}
 
     with db.get_session() as session:
-        if not TaskLeaseRepository(session).validate(task_id, lease_token):
-            return {"ok": False, "error": "Invalid lease token.", "code": "invalid_lease", "task_id": task_id}
+        lease_error = require_valid_lease(session, task_id, lease_token)
+        if lease_error:
+            return lease_error
         task = TaskRepository(session).get_by_id(task_id)
         if not task:
             return {"ok": False, "error": f"Task {task_id} not found.", "code": "not_found", "task_id": task_id}
@@ -446,8 +452,9 @@ def handoff_agent_payload(
         return {"ok": False, "error": "DevCouncil state is unavailable in this directory.", "code": "not_initialized"}
 
     with db.get_session() as session:
-        if not TaskLeaseRepository(session).validate(task_id, lease_token):
-            return {"ok": False, "error": "Invalid lease token.", "code": "invalid_lease", "task_id": task_id}
+        lease_error = require_valid_lease(session, task_id, lease_token)
+        if lease_error:
+            return lease_error
     try:
         from devcouncil.execution.handoff import HandoffService
 

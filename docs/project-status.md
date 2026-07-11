@@ -13,8 +13,9 @@ autonomous Claude Code + MCP closed loop: `checkout_task → implement → verif
 next_actions → self-repair`, gated by deterministic verification including the
 diff↔coverage check. See [hero-loop.md](hero-loop.md). The underlying verifier, the
 diff↔coverage gate, the typed next-actions contract, and the lite `dev check --verify`
-on-ramp are Stable; the MCP transport and hooks that carry the loop are still maturing
-(Preview/Experimental as noted below).
+on-ramp are Stable; the **certified Claude Code MCP closed loop** (checkout → write →
+verify → repair → release) is Stable — see [certified-paths.md](certified-paths.md).
+Other coding CLI hooks remain Preview/Experimental as noted below.
 
 | Area | Status |
 | :--- | :--- |
@@ -34,9 +35,26 @@ on-ramp are Stable; the MCP transport and hooks that carry the loop are still ma
 | **Lite Check (`dev check --verify`)** | Stable: deterministic working-tree evidence gate with no planning and no provider keys |
 | **Repair Loop** | Preview: LLM-driven repair inference; `dev go`/`dev e2e` now drive a bounded, attempt-accounted self-repair loop (correction manifest + re-run, capped by `execution.max_repair_attempts`, with no-progress detection) for automated executors. The correction manifest is task-scoped — failed evidence is filtered to the task (no chasing another task's failures) and the repair plan's concrete files/tests are merged into the repair scope |
 | **Native Executor** | Experimental: exposed as `native` / `native-preview`; completion still requires verification |
-| **MCP Server** | Preview: typed argument validation, read tools, and the autonomous verify/next-actions closed loop; resumable repair contract (persisted gap routing fields + `get_gaps`/`get_next_actions` read tools), TTL-expiring leases with `renew`/`list`, and a lease-gated, policy-checked write path (`write_file`/`apply_patch`) so a pure-MCP agent can close the loop end to end |
-| **Coding CLI Hooks** | Experimental / starter: Codex, Gemini, Claude, Cursor (`.cursor/hooks.json`), OpenCode (bundled plugin) |
+| **MCP Server (Claude Code hero loop)** | Stable: certified closed loop with lease-gated writes, typed next-actions, renew/list leases, golden e2e fixtures |
+| **Multi-agent Campaign (`dev campaign`)** | Preview: parallel dependency-wave dispatch, Reviewer QC gate, per-task leases, cost budget + dashboard progress. Tasks that share writable `planned_files` are serialized when `--max-parallel` > 1 (one git working tree). |
+| **Coding CLI Hooks** | Experimental / starter: Codex, Gemini, OpenCode; Claude hooks are part of the certified path |
 | **GitHub PR Checks** | Preview: `dev report --github` |
 | **GitHub/GitLab PR Comments** | Preview: `dev report --github-pr-comment`, `dev report --gitlab-pr-comment` |
 | **LSP / AST Indexing** | Preview: `dev lsp inspect`, `dev ast match` |
 | **Live Dashboard** | Preview: `dev dashboard --open`, status panels, recent runs, and guarded local integration apply controls |
+
+## Watch mode (`dev check --watch`)
+
+**Status:** Preview — incremental gate selection re-runs only the lint/typecheck/test
+commands affected by each save, using a content-hash cache to skip unchanged inputs.
+
+**Known limitations:**
+
+- **Narrowed type-checking** — mypy/pyright gates are scoped to touched files plus
+  *direct import dependents* from `.devcouncil/repo_map.json`. Transitive or
+  dynamic-import type errors in other files can still be missed. Run full
+  `dev verify` (or `dev check --verify`) before commit when types matter.
+- **Config edits** — changing `pyproject.toml`, `ruff.toml`, `mypy.ini`, `tsconfig.json`,
+  and similar project config files now re-runs the matching stack gates (with the config
+  file in the cache inputs), but lockfile-only or toolchain-version changes outside that
+  set may still require a manual full verify.

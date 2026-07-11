@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from devcouncil.artifacts.graph import ArtifactGraph
+from devcouncil.reporting.verdict import classify_verdict
 
 _SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
@@ -22,20 +23,11 @@ class EvidenceExportGenerator:
     VERSION = 1
 
     @staticmethod
-    def generate(graph: ArtifactGraph, live_review: dict | None = None) -> str:
+    def generate(graph: ArtifactGraph, live_review: dict | None = None, wiki_refresh: dict | None = None) -> str:
         summary = graph.coverage_summary()
         live_blockers = len((live_review or {}).get("blocking_cards", []))
 
-        # Same three honest states as json_report/markdown_report:
-        #   blocked    - positive evidence of a problem.
-        #   incomplete - nothing failing, but not every AC has passing evidence.
-        #   passed     - no blocking gaps and every AC proven.
-        if summary["blocking_gaps"] > 0 or live_blockers > 0:
-            verdict = "blocked"
-        elif summary["ac_without_evidence"] > 0:
-            verdict = "incomplete"
-        else:
-            verdict = "passed"
+        verdict, incomplete_kind = classify_verdict(graph, live_blockers=live_blockers)
 
         # Index evidence and diffs once so requirements/tasks can nest their own slices.
         evidence_by_ac: Dict[str, List[Dict[str, Any]]] = {}
@@ -122,7 +114,11 @@ class EvidenceExportGenerator:
             "tasks": tasks,
             "gaps": gaps,
         }
+        if incomplete_kind is not None:
+            report["incomplete_kind"] = incomplete_kind
         if live_review is not None:
             report["live_review"] = live_review
+        if wiki_refresh is not None:
+            report["wiki_refresh"] = wiki_refresh
 
         return json.dumps(report, indent=2)

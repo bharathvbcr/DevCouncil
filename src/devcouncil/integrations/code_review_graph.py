@@ -37,7 +37,7 @@ class CodeReviewGraphAdapter:
 
     def is_enabled(self) -> bool:
         try:
-            return self._get_config().integrations.code_review_graph.enabled
+            return bool(self._get_config().integrations.code_review_graph.enabled)
         except Exception:
             return False
 
@@ -95,7 +95,7 @@ class CodeReviewGraphAdapter:
 
     def _configured_command(self) -> str:
         try:
-            return self._get_config().integrations.code_review_graph.command
+            return str(self._get_config().integrations.code_review_graph.command)
         except Exception:
             return "code-review-graph"
 

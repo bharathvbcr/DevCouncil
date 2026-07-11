@@ -71,6 +71,8 @@ Assistant response:
         samples = self._samples(project_root)
 
         async def _one_sample(attempt: int) -> CritiqueCard | None:
+            if self.router is None:
+                return None
             # Vary temperature so independent samples actually differ (and so the router
             # cache returns distinct generations). Attempt 0 stays deterministic.
             temperature = 0.0 if attempt == 0 else min(0.8, 0.3 + 0.2 * attempt)

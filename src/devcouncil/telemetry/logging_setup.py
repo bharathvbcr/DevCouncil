@@ -125,7 +125,7 @@ class _CurrentStderrHandler(logging.StreamHandler):
         super().__init__(sys.stderr)
 
     @property
-    def stream(self):  # type: ignore[override]
+    def stream(self):
         import sys
 
         return sys.stderr

@@ -25,7 +25,6 @@ from rich.table import Table
 
 from devcouncil.cli.commands.init import initialize_project
 from devcouncil.indexing.repo_mapper import RepoMap
-from devcouncil.telemetry.stages import log_stage, log_step
 
 app = typer.Typer(help="Generate and maintain the agent-facing codebase wiki (OKF bundle).")
 console = Console()
@@ -94,33 +93,10 @@ _GITIGNORE_UNIGNORE = """\
 """
 
 
-def _knowledge_dir(root: Path) -> Path:
-    """The configured knowledge directory (mirrors `dev okf`'s resolution)."""
-    from devcouncil.app.config import load_config
-
-    directory = ".devcouncil/knowledge"
-    try:
-        directory = load_config(root).knowledge.directory
-    except Exception as e:
-        logger.debug("Failed to load knowledge directory from config, using default: %s", e)
-    return root / directory
-
-
 def wiki_dir_for(root: Path) -> Path:
-    from devcouncil.knowledge.wiki import WIKI_SUBDIR
+    from devcouncil.knowledge.wiki import wiki_dir_for as _wiki_dir_for
 
-    return _knowledge_dir(root) / WIKI_SUBDIR
-
-
-def _project_name(root: Path) -> str:
-    from devcouncil.app.config import load_config
-
-    name = root.name or "Project"
-    try:
-        name = load_config(root).project.name or name
-    except Exception as e:
-        logger.debug("Failed to load project name from config, using directory name: %s", e)
-    return name
+    return _wiki_dir_for(root)
 
 
 def _load_repo_map(root: Path, *, remap: bool) -> RepoMap:
@@ -132,38 +108,6 @@ def _load_repo_map(root: Path, *, remap: bool) -> RepoMap:
         console.print("[dim]Building repository map...[/dim]")
         return generate_map_artifacts(root, map_path)
     return RepoMap.model_validate_json(map_path.read_text(encoding="utf-8"))
-
-
-def _build_router(root: Path):
-    """Best-effort ModelRouter for wiki enrichment; None degrades to the skeleton.
-
-    The ``wiki_writer`` role falls back to a capable existing role (arbiter/planner_a)
-    when the project config doesn't define a dedicated one, mirroring `dev skills`.
-    """
-    try:
-        from devcouncil.app.config import get_api_key, load_config
-        from devcouncil.llm.provider import create_provider, validate_model_provider
-        from devcouncil.llm.router import ModelRouter
-
-        config = load_config(root)
-        validate_model_provider(config.models.provider)
-        api_key = get_api_key(config.models.provider, root)
-        provider = create_provider(
-            config.models.provider, api_key, project_root=root, provider_prefs=config.provider
-        )
-        role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
-        if not role_config:
-            return None
-        capable = (
-            role_config.get("arbiter")
-            or role_config.get("planner_a")
-            or next(iter(role_config.values()))
-        )
-        role_config.setdefault("wiki_writer", dict(capable))
-        return ModelRouter(provider, role_config, project_root=root)
-    except Exception as exc:
-        logger.warning("Wiki enrichment unavailable (no model router): %s", exc)
-        return None
 
 
 def _print_result(result) -> None:
@@ -200,36 +144,10 @@ def _update(
     logger.info("dev wiki update: llm=%s force=%s remap=%s", llm, force, remap)
     initialize_project(root, quiet=True)
 
-    with log_stage("wiki", project_root=root, subcommand="update"):
-        log_step("wiki/1: loading repository map", project_root=root, trace=True)
-        repo_map = _load_repo_map(root, remap=remap)
+    from devcouncil.knowledge.wiki import refresh_wiki
 
-        router = _build_router(root) if llm else None
-        if llm and router is None:
-            console.print(
-                "[yellow]No usable model configuration; generating the deterministic "
-                "skeleton (re-run after `dev setup` for LLM-enriched prose).[/yellow]"
-            )
-
-        log_step("wiki/2: generating wiki pages", project_root=root, trace=True)
-        from devcouncil.knowledge.wiki import generate_wiki
-
-        result = generate_wiki(
-            root,
-            repo_map,
-            wiki_dir_for(root),
-            router=router,
-            force=force,
-            project_name=_project_name(root),
-        )
-        _print_result(result)
-        log_step(
-            "wiki/complete",
-            project_root=root,
-            created=len(result.created),
-            updated=len(result.updated),
-            trace=True,
-        )
+    result = refresh_wiki(root, llm=llm, force=force, remap=remap)
+    _print_result(result)
 
 
 @app.command("update")
@@ -275,8 +193,11 @@ def read(
         console.print(f"[red]{payload.get('error')}[/red]")
         raise typer.Exit(code=1)
     if "pages" in payload:
-        for item in payload["pages"]:
-            console.print(f"- {item['page']}: {item['title']}")
+        pages = payload["pages"]
+        if isinstance(pages, list):
+            for item in pages:
+                if isinstance(item, dict):
+                    console.print(f"- {item.get('page')}: {item.get('title')}")
         return
     console.print(payload.get("body") or "")
 

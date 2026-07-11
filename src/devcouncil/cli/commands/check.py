@@ -29,6 +29,8 @@ from devcouncil.integrations.github_intent import resolve_goal_intent
 from devcouncil.llm.provider import ProviderRequestError, create_provider, validate_model_provider
 from devcouncil.llm.router import ModelRouter, StructuredOutputError
 from devcouncil.verification.ad_hoc_check import AdHocCheckResult, run_working_tree_check
+from devcouncil.verification.gate_cache import GateResultCache
+from devcouncil.verification.incremental_check import run_incremental_gates
 from devcouncil.verification.implementation_reviewer import ImplementationReviewer
 from devcouncil.verification.verifier import Verifier
 from devcouncil.telemetry.stages import log_stage, log_step
@@ -288,9 +290,8 @@ def _watch_snapshot(root: Path) -> dict:
     return snapshot
 
 
-def _watch_gate_once(root: Path, goal, test_commands, enforce_coverage, min_coverage) -> None:
-    """Run the deterministic gate once and print a compact one-line verdict."""
-    stamp = datetime.now().strftime("%H:%M:%S")
+def _watch_evidence_once(root: Path, goal, test_commands, enforce_coverage, min_coverage, stamp) -> None:
+    """Full deterministic evidence gate — the fallback when no stack gate applies."""
     try:
         result = run_working_tree_check(
             root, goal,
@@ -307,18 +308,62 @@ def _watch_gate_once(root: Path, goal, test_commands, enforce_coverage, min_cove
     detail = f"{len(result.gaps)} gap(s)" + (f", {blocking} blocking" if blocking else "")
     if result.reason == "no_changes":
         detail = "no working-tree changes"
-    console.print(f"[dim]{stamp}[/dim] {verdict} — {detail}")
+    console.print(f"[dim]{stamp}[/dim] {verdict} — {detail} [dim](evidence gate)[/dim]")
+
+
+def _watch_gate_once(root: Path, goal, test_commands, enforce_coverage, min_coverage, cache) -> None:
+    """Run the incremental gate once and print a compact one-line verdict.
+
+    Only the gates whose inputs actually changed are executed; the rest are served from
+    the content-hash cache, so iterative edits stay sub-second. When no stack-relevant
+    gate is configured for the change, fall back to the full evidence gate so the user
+    still gets orphan/secret/coverage feedback."""
+    stamp = datetime.now().strftime("%H:%M:%S")
+    try:
+        result = run_incremental_gates(
+            root, extra_test_commands=test_commands, cache=cache,
+        )
+    except Exception as exc:  # keep watching through transient failures (git hiccups, ...)
+        logger.warning("dev check --watch: incremental run failed: %s", exc)
+        console.print(f"[dim]{stamp}[/dim] [red]ERROR[/red] — {str(exc)[:120]}")
+        return
+
+    if result.no_changes:
+        console.print(f"[dim]{stamp}[/dim] [dim]— no working-tree changes[/dim]")
+        return
+    if result.no_gates:
+        # No configured command targets the changed stack(s); give the full picture.
+        _watch_evidence_once(root, goal, test_commands, enforce_coverage, min_coverage, stamp)
+        return
+
+    verdict = "[green]PASS[/green]" if result.passed else "[red]FAIL[/red]"
+    ran, cached = len(result.ran), len(result.cached)
+    detail = f"{ran} gate(s) run, {cached} cached"
+    failing = [o for o in result.outcomes if not o.passed]
+    if failing:
+        detail += " — failed: " + ", ".join(o.kind for o in failing[:4])
+    ms = result.duration_s * 1000
+    console.print(f"[dim]{stamp}[/dim] {verdict} — {detail} [dim]({ms:.0f}ms)[/dim]")
+    if result.narrowed:
+        logger.info("dev check --watch: narrowed — full verify recommended before commit")
+        console.print(
+            "[dim]narrowed — full verify recommended before commit[/dim]"
+        )
 
 
 def _watch_gate(root: Path, goal, *, test_commands, enforce_coverage, min_coverage) -> None:
-    """Initial gate run, then a poll/debounce loop re-running it until Ctrl-C."""
+    """Initial gate run, then a poll/debounce loop re-running it until Ctrl-C.
+
+    A single :class:`GateResultCache` is shared across iterations so a gate whose inputs
+    did not change between saves is skipped rather than re-run."""
     console.print(
-        f"[dim]Watching {root} — re-running the evidence gate on change "
+        f"[dim]Watching {root} — re-running only the gates affected by each change "
         f"(poll {_WATCH_POLL_SECONDS:.0f}s, debounce {_WATCH_DEBOUNCE_SECONDS:.1f}s). "
         "Ctrl-C to stop. Run without --watch for full findings.[/dim]"
     )
+    cache = GateResultCache(root)
     try:
-        _watch_gate_once(root, goal, test_commands, enforce_coverage, min_coverage)
+        _watch_gate_once(root, goal, test_commands, enforce_coverage, min_coverage, cache)
         baseline = _watch_snapshot(root)
         while True:
             time.sleep(_WATCH_POLL_SECONDS)
@@ -327,7 +372,7 @@ def _watch_gate(root: Path, goal, *, test_commands, enforce_coverage, min_covera
                 continue
             # Debounce: let an editor save-storm settle before burning a run.
             time.sleep(_WATCH_DEBOUNCE_SECONDS)
-            _watch_gate_once(root, goal, test_commands, enforce_coverage, min_coverage)
+            _watch_gate_once(root, goal, test_commands, enforce_coverage, min_coverage, cache)
             # Re-baseline AFTER the run so artifacts the gate itself writes (coverage
             # data, logs outside .devcouncil/) can never re-trigger it. Trade-off:
             # edits made while the gate was running are absorbed — save again.

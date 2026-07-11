@@ -417,8 +417,11 @@ def test_coding_cli_executor_cursor_resume_uses_create_chat(tmp_path, monkeypatc
     result = CodingCliExecutor(tmp_path, "cursor").run_task(task, [])
 
     assert result.success
-    assert captured["cmd"][:6] == ["cursor-agent", "--print", "--trust", "--workspace", str(tmp_path), "--resume"]
-    assert captured["cmd"][6] == "chat-abc123"
+    assert captured["cmd"][:4] == ["cursor-agent", "--print", "--trust", "--workspace"]
+    assert captured["cmd"][4] == str(tmp_path)
+    assert captured["cmd"][5:7] == ["--output-format", "json"]
+    assert "--resume" in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("--resume") + 1] == "chat-abc123"
     session = json.loads((tmp_path / ".devcouncil" / "integrations" / "cursor-session.json").read_text(encoding="utf-8"))
     assert session["chat_id"] == "chat-abc123"
 
@@ -821,8 +824,190 @@ def test_coding_cli_executor_builtin_cursor_uses_cursor_agent_print_mode(tmp_pat
     assert captured["cmd"][0] == "cursor-agent"
     assert captured["cmd"][:4] == ["cursor-agent", "--print", "--trust", "--workspace"]
     assert captured["cmd"][4] == str(tmp_path)
-    assert captured["cmd"][5].endswith("TASK-001-cursor-task.md.")
+    assert captured["cmd"][5:7] == ["--output-format", "json"]
+    assert captured["cmd"][7].endswith("TASK-001-cursor-task.md.")
     assert captured["input"] is None
+
+
+def test_coding_cli_executor_cursor_yolo_profile_adds_force(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_which(command):
+        if command in {"cursor-agent", "agent"}:
+            return f"/usr/bin/{command}"
+        return None
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "integrations:\n  cli_agents:\n    profiles:\n      yolo:\n        permission_mode: auto\n",
+        encoding="utf-8",
+    )
+
+    task = Task(
+        id="TASK-001",
+        title="Cursor",
+        description="Implement feature",
+        planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
+    )
+
+    result = CodingCliExecutor(tmp_path, "cursor", profile="yolo").run_task(task, [])
+
+    assert result.success
+    assert captured["cmd"][1] == "--force"
+
+
+def test_coding_cli_executor_cursor_stream_uses_stream_json(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_which(command):
+        if command in {"cursor-agent", "agent"}:
+            return f"/usr/bin/{command}"
+        return None
+
+    class FakeStdout:
+        def readline(self):
+            return ""
+
+        def close(self):
+            return None
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdin = None
+            self.stdout = FakeStdout()
+            self.returncode = 0
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            return None
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProcess()
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    task = Task(
+        id="TASK-001",
+        title="Cursor",
+        description="Implement feature",
+        planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
+    )
+
+    result = CodingCliExecutor(tmp_path, "cursor", stream_output=True).run_task(task, [])
+
+    assert result.success
+    assert captured["cmd"][5:8] == ["--output-format", "stream-json", "--stream-partial-output"]
+
+
+def test_coding_cli_executor_grok_headless_command_shape(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_which(command):
+        if command == "grok":
+            return "/usr/bin/grok"
+        return None
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    task = Task(
+        id="TASK-001",
+        title="Grok",
+        description="Implement feature",
+        planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
+    )
+
+    result = CodingCliExecutor(tmp_path, "grok").run_task(task, [])
+
+    assert result.success
+    assert captured["cmd"][:2] == ["grok", "-p"]
+    assert captured["cmd"][3:5] == ["--directory", str(tmp_path)]
+    assert captured["cmd"][5:7] == ["--output-format", "json"]
+    assert any("TASK-001-grok-task.md" in part for part in captured["cmd"])
+
+
+def test_coding_cli_executor_grok_yolo_permission_mode(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_which(command):
+        if command == "grok":
+            return "/usr/bin/grok"
+        return None
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    task = Task(
+        id="TASK-001",
+        title="Grok",
+        description="Implement feature",
+        planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
+    )
+
+    result = CodingCliExecutor(tmp_path, "grok", profile="yolo").run_task(task, [])
+
+    assert result.success
+    assert "--permission-mode" in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("--permission-mode") + 1] == "acceptEdits"
+
+
+def test_coding_cli_executor_grok_resume_uses_project_session(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_which(command):
+        if command == "grok":
+            return "/usr/bin/grok"
+        return None
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    integrations = tmp_path / ".devcouncil" / "integrations"
+    integrations.mkdir(parents=True)
+    (integrations / "grok-session.json").write_text(
+        json.dumps({"session_id": "sess-xyz"}),
+        encoding="utf-8",
+    )
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "execution:\n  grok_resume_mode: project\n",
+        encoding="utf-8",
+    )
+
+    task = Task(
+        id="TASK-001",
+        title="Grok",
+        description="Implement feature",
+        planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
+    )
+
+    result = CodingCliExecutor(tmp_path, "grok").run_task(task, [])
+
+    assert result.success
+    assert "--resume" in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("--resume") + 1] == "sess-xyz"
 
 
 def test_coding_cli_executor_builtin_aider_uses_message_argument(tmp_path, monkeypatch):

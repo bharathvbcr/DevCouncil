@@ -1,4 +1,4 @@
-from typing import List, Dict, Any
+from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypeVar
 import asyncio
 import logging
 from rich.console import Console
@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 MAX_AGENT_STEPS = 10
 MAX_STRUCTURED_FAILURES = 2          # model can't produce a valid action -> give up cleanly
 MAX_CONSECUTIVE_PATCH_FAILURES = 3   # stop spinning on a patch the model can't fix
+# How many times the agent may signal "finish", get BLOCKED by verification, and be
+# handed the shared next-actions repair contract before we stop the closed loop. Mirrors
+# the bounded self-repair budget the MCP/dev-go loops apply so native cannot spin forever.
+MAX_VERIFY_ROUNDS = 3
+
+_T = TypeVar("_T")
 
 class ToolCall(BaseModel):
     tool: str
@@ -32,15 +38,23 @@ class AgentAction(BaseModel):
     finish: bool = False
 
 class NativeAgent(Executor):
-    def __init__(self, router: ModelRouter, task_runner: TaskRunner):
+    def __init__(self, router: ModelRouter, task_runner: TaskRunner, *, sandbox: str = "local"):
         self.router = router
         self.task_runner = task_runner
+        # Writes and verification are now routed through the SAME lease-gated policy path
+        # the MCP surface uses (execution/gated_write.py + HookPolicy, verification via the
+        # shared verify payload), so the native executor no longer bypasses the lease/scope
+        # gate with direct TaskRunner writes. task_runner is retained for run_command (which
+        # already honors execution.command_timeout).
+        self.project_root = task_runner.project_root
+        self.sandbox = sandbox
         # ContextBuilder is retained only for the cheap list_files file listing; the
         # implementation context itself uses the budgeted PromptBuilder so the native
         # executor gets the same repo-map orientation, symbol outlines, dependents and
         # context-window budgeting as the CLI executors (rather than a flat JSON dump).
         self.context_builder = ContextBuilder(task_runner.project_root)
         self.prompt_builder = PromptBuilder(task_runner.project_root)
+        self._lease_token: Optional[str] = None
 
     def run_task(self, task: Task, requirements: List[Requirement]) -> ExecutionResult:
         """Run the preview native executor behind the normal synchronous executor contract."""
@@ -60,7 +74,7 @@ class NativeAgent(Executor):
         return result
 
     @staticmethod
-    def _run_coroutine_from_sync(coro):
+    def _run_coroutine_from_sync(coro: Coroutine[Any, Any, _T]) -> _T:
         """Run async work from sync code without breaking nested event loops.
 
         ``asyncio.run()`` fails when a loop is already running (pytest-asyncio,
@@ -76,11 +90,148 @@ class NativeAgent(Executor):
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             return executor.submit(asyncio.run, coro).result()
 
+    # ------------------------------------------------------------------ lease-gated I/O
+    def _acquire_lease(self, task: Task) -> dict:
+        """Acquire a task lease so writes/verify run through the shared gated path."""
+        from devcouncil.execution.lease_ops import checkout_task_payload
+
+        return checkout_task_payload(self.project_root, task_id=task.id, client_id="native")
+
+    def _release_lease(self, task: Task, lease_token: str) -> None:
+        from devcouncil.execution.lease_ops import release_task_payload
+
+        try:
+            release_task_payload(self.project_root, task_id=task.id, lease_token=lease_token)
+        except Exception as exc:  # a failed release only costs a TTL wait; never fail the run
+            logger.debug("Native lease release failed for %s: %s", task.id, exc)
+
+    def _gated_apply_patch(self, task: Task, patch: str) -> None:
+        """Apply a unified diff through execution/gated_write.py (lease + scope + HookPolicy).
+
+        Raises ExecutionError on rejection so the loop's existing patch-failure handling
+        (retry guidance, consecutive-failure abort) applies unchanged.
+        """
+        from devcouncil.execution.gated_write import apply_patch_payload
+
+        payload = apply_patch_payload(
+            self.project_root,
+            task_id=task.id,
+            lease_token=self._lease_token or "",
+            unified_diff=patch,
+        )
+        if not payload.get("ok"):
+            raise ExecutionError(self._write_rejection_reason(payload))
+
+    def _gated_write_file(self, task: Task, path: str, content: str) -> None:
+        """Write a whole file through execution/gated_write.py (lease + scope + HookPolicy)."""
+        from devcouncil.execution.gated_write import write_file_payload
+
+        payload = write_file_payload(
+            self.project_root,
+            task_id=task.id,
+            lease_token=self._lease_token or "",
+            rel_path=path,
+            content=content,
+        )
+        if not payload.get("ok"):
+            raise ExecutionError(self._write_rejection_reason(payload))
+
+    @staticmethod
+    def _write_rejection_reason(payload: dict) -> str:
+        rejected = payload.get("rejected_files") or []
+        if rejected:
+            first = rejected[0]
+            return f"Write to {first.get('path')} rejected: {first.get('reason')}"
+        return payload.get("error") or "Write rejected by the lease/scope gate."
+
+    def _verify_task(
+        self, task: Task, requirements: List[Requirement]
+    ) -> Tuple[bool, List[dict], List[dict]]:
+        """Verify through the shared surface and return (passed, blocking, advisory).
+
+        Local sandbox uses the same ``verify_task_payload`` the MCP verify loop uses, so the
+        ``split_next_actions`` repair contract is byte-for-byte identical across surfaces.
+        docker/nix run through ``verification/sandbox.py`` for coding-CLI parity.
+        """
+        if self.sandbox in {"docker", "nix"}:
+            return self._verify_via_sandbox(task, requirements)
+        from devcouncil.execution.task_gate_ops import verify_task_payload
+
+        payload = verify_task_payload(
+            self.project_root,
+            task_id=task.id,
+            lease_token=self._lease_token or "",
+            sandbox="local",
+        )
+        if not payload.get("ok"):
+            # A verification setup error (e.g. lease lost) is treated as "not passed" with the
+            # error surfaced as the single next action, so the loop can react rather than crash.
+            return False, [{"action": payload.get("error", "Verification failed to run.")}], []
+        return (
+            bool(payload.get("passed")),
+            list(payload.get("next_actions") or []),
+            list(payload.get("advisory_actions") or []),
+        )
+
+    def _verify_via_sandbox(
+        self, task: Task, requirements: List[Requirement]
+    ) -> Tuple[bool, List[dict], List[dict]]:
+        """Run the task's expected commands in a docker/nix sandbox (command_timeout-bounded)."""
+        from devcouncil.verification.sandbox import get_sandbox
+
+        commands = task.expected_tests or task.allowed_commands
+        result = get_sandbox(self.sandbox, self.project_root).run(task, commands, requirements)
+        if result.status == "unsupported":
+            reason = f"Sandbox '{self.sandbox}' is unavailable in this environment."
+            return False, [{"action": reason}], []
+        return result.status == "passed", [], []
+
+    @staticmethod
+    def _format_next_actions(blocking: List[dict], advisory: List[dict]) -> str:
+        """Render the shared next-actions contract into the repair message fed back to the
+        model — the same guidance an MCP agent reads from devcouncil_verify_task."""
+        lines = ["[Verification BLOCKED] The change did not pass. Address these before finishing:"]
+        for i, action in enumerate(blocking, 1):
+            text = action.get("action") or action.get("gap_type") or "Resolve the blocking gap."
+            loc = action.get("file")
+            if loc and action.get("line"):
+                loc = f"{loc}:{action['line']}"
+            suffix = f" ({loc})" if loc else ""
+            cmd = action.get("suggested_command")
+            cmd_txt = f" Suggested command: {cmd}" if cmd else ""
+            lines.append(f"{i}. {text}{suffix}{cmd_txt}")
+        if advisory:
+            lines.append("Advisory (non-blocking) signals worth addressing:")
+            for action in advisory:
+                lines.append(f"- {action.get('action') or action.get('gap_type')}")
+        lines.append(
+            "Apply the fix through apply_patch, then set finish=true again to re-verify."
+        )
+        return "\n".join(lines)
+
     async def _run_task_async(self, task: Task, requirements: List[Requirement]) -> ExecutionResult:
         logger.info("Native agent starting for %s (max_steps=%d)", task.id, MAX_AGENT_STEPS)
         console.print(f"Starting [bold]Native Executor[/bold] for task {task.id}...")
         console.print("[yellow]Native executor is preview quality; DevCouncil verification remains the completion gate.[/yellow]")
-        
+
+        # Acquire a lease so every write and verify runs through the same lease/scope gate
+        # as the MCP surface. Without a lease the gated write path refuses the write.
+        lease = self._acquire_lease(task)
+        if not lease.get("ok"):
+            message = lease.get("error", "Could not acquire a task lease.")
+            logger.error("Native agent could not lease %s: %s", task.id, message)
+            console.print(f"[red]Native agent could not acquire a lease for {task.id}: {message}[/red]")
+            return ExecutionResult(success=False, message=f"Lease unavailable: {message}")
+        self._lease_token = lease["lease_token"]
+        try:
+            return await self._run_agent_loop(task, requirements)
+        finally:
+            token = self._lease_token
+            self._lease_token = None
+            if token:
+                self._release_lease(task, token)
+
+    async def _run_agent_loop(self, task: Task, requirements: List[Requirement]) -> ExecutionResult:
         # 1. Gather rich context (budgeted; includes repo-map orientation + symbol outlines)
         context_block = self.prompt_builder.build_task_prompt(task, requirements)
         from devcouncil.planning.correction_manifest import repair_prompt_prefix
@@ -107,7 +258,7 @@ Rules:
 4. Set 'finish' to true when you believe the task is complete and verified.
 """
         messages = [{"role": "system", "content": system_prompt}]
-        
+
         # Initial task prompt
         messages.append({"role": "user", "content": f"Begin implementing task {task.id} based on the context provided."})
 
@@ -116,6 +267,7 @@ Rules:
         # unfixable patch.
         structured_failures = 0
         consecutive_patch_failures = 0
+        verify_rounds = 0
         for step in range(MAX_AGENT_STEPS):
             try:
                 action = await self.router.complete_structured(
@@ -160,9 +312,33 @@ Rules:
             messages.append({"role": "assistant", "content": action.model_dump_json()})
 
             if action.finish:
-                logger.info("Native agent signaled completion for %s at step %d", task.id, step + 1)
-                console.print("[green]Native agent signaled completion.[/green]")
-                return ExecutionResult(success=True, message="Agent signaled completion; pending DevCouncil verification")
+                # Closed loop: instead of trusting the agent's self-report, verify through the
+                # same gate as MCP and, when BLOCKED, feed the shared next-actions repair
+                # contract back so the agent can self-repair and re-verify.
+                logger.info("Native agent signaled completion for %s at step %d; verifying", task.id, step + 1)
+                console.print("[green]Native agent signaled completion; verifying...[/green]")
+                # verify_task_payload runs the verifier via asyncio.run(); run it in a worker
+                # thread so it gets its own event loop instead of nesting inside this one.
+                passed, blocking, advisory = await asyncio.to_thread(
+                    self._verify_task, task, requirements
+                )
+                if passed:
+                    logger.info("Native agent %s verified after %d repair round(s)", task.id, verify_rounds)
+                    console.print("[green]Verification passed.[/green]")
+                    return ExecutionResult(success=True, message="Native agent completed and verification passed.")
+                verify_rounds += 1
+                if verify_rounds >= MAX_VERIFY_ROUNDS:
+                    logger.error("Native agent %s still blocked after %d verify round(s)", task.id, verify_rounds)
+                    return ExecutionResult(
+                        success=False,
+                        message=(
+                            f"Verification still blocked after {verify_rounds} repair round(s): "
+                            f"{len(blocking)} blocking gap(s)."
+                        ),
+                    )
+                console.print(f"[yellow]Verification blocked ({len(blocking)} gap(s)); handing back repair guidance.[/yellow]")
+                messages.append({"role": "user", "content": self._format_next_actions(blocking, advisory)})
+                continue
 
             if not action.tool_calls:
                 # No action and not finished — nudge instead of silently burning a step.
@@ -198,10 +374,10 @@ Rules:
                     elif tool_call.tool == "apply_patch":
                         if "path" in tool_call.args and "content" in tool_call.args:
                             # Fallback for when the model can't produce a valid unified
-                            # diff. Routes through write_file, which enforces the same
-                            # planned-files permission check — no widening of scope.
-                            self.task_runner.write_file(
-                                tool_call.args["path"], tool_call.args["content"], task
+                            # diff. Routes through the lease-gated write path, which enforces
+                            # the same planned-files/scope policy — no widening of scope.
+                            self._gated_write_file(
+                                task, tool_call.args["path"], tool_call.args["content"]
                             )
                             consecutive_patch_failures = 0
                             result_summary = f"Wrote {tool_call.args['path']} via path+content fallback."
@@ -213,7 +389,7 @@ Rules:
                                     "'diff --git a/<path> b/<path>', then '--- a/<path>' (or "
                                     "'--- /dev/null' for a new file), '+++ b/<path>', and '@@' hunks."
                                 )
-                            self.task_runner.apply_patch(patch, task)
+                            self._gated_apply_patch(task, patch)
                             consecutive_patch_failures = 0
                             result_summary = "Successfully applied patch."
                     elif tool_call.tool == "run_command":
@@ -221,7 +397,7 @@ Rules:
                         result_summary = f"Command finished with exit code {cmd_result.exit_code}."
                     else:
                         raise ValueError(f"Unknown tool: {tool_call.tool}")
-                    
+
                     messages.append({"role": "user", "content": f"[Tool Result] '{tool_call.tool}': {result_summary}"})
                 except Exception as e:
                     logger.warning("Native agent tool %s failed for %s: %s", tool_call.tool, task.id, e)

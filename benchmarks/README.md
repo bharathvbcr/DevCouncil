@@ -121,7 +121,18 @@ For calibrating a weak/local reviewer (not the default e2e pass), use
 `--ac-samples 3 --ac-repair-attempts 2 --ac-per-criterion` alongside a larger
 `--monitor-model`.
 
-## Local-monitor calibration probe (no cloud key / no agent)
+## Calibration dashboard
+
+Track false-positive / false-negative rates over time across saved result files:
+
+```bash
+python benchmarks/calibration_dashboard.py
+python benchmarks/calibration_dashboard.py benchmarks/results/<run>.json
+```
+
+Reports decisive accuracy (passed/blocked), overall calibration including `incomplete`
+verdicts, and infra-error exclusions per run.
+
 
 `local_monitor_probe.py` isolates the link the full benchmark showed failing on
 local monitors: can the `implementation_reviewer` model compile runnable,

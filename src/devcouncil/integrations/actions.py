@@ -18,6 +18,7 @@ VALID_INTEGRATION_TARGETS = {
     "gemini",
     "claude",
     "cursor",
+    "grok",
     "opencode",
     "antigravity",
     "agy",
@@ -104,6 +105,11 @@ def apply_integration_target(
         add_result(name, code == 0, None, "MCP registration command exited " + str(code))
 
     def apply_project_file(name: str) -> None:
+        if name == "grok":
+            ok = integrate._configure_grok(root, apply=True)
+            path = integrate._grok_config_path(root)
+            add_result(name, ok, path if path.exists() else None, "Grok MCP integration configured." if ok else "Grok MCP integration failed.")
+            return
         writers = {
             "cursor": integrate._write_cursor_config,
             "opencode": integrate._write_opencode_config,
@@ -143,7 +149,7 @@ def apply_integration_target(
         # and native hooks) into one load/save cycle. _batched_raw_config is
         # re-entrant, so apply_hooks()'s own batching participates in this one.
         with integrate._batched_raw_config(root):
-            for name in ("cursor", "opencode", "antigravity", "warp"):
+            for name in ("cursor", "grok", "opencode", "antigravity", "warp"):
                 apply_project_file(name)
             apply_aider()
             if include_hooks:
@@ -154,7 +160,7 @@ def apply_integration_target(
             apply_claude_assets()
     elif normalized in {"codex", "gemini", "claude"}:
         apply_first_party(normalized)
-    elif normalized in {"cursor", "opencode", "antigravity", "warp"}:
+    elif normalized in {"cursor", "grok", "opencode", "antigravity", "warp"}:
         apply_project_file(normalized)
     elif normalized == "aider":
         apply_aider()

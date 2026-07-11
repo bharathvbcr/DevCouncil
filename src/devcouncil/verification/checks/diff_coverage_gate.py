@@ -8,6 +8,7 @@ from typing import Callable, List, Optional
 from devcouncil.domain.evidence import DiffCoverageEvidence
 from devcouncil.domain.gap import Gap
 from devcouncil.domain.task import Task
+from devcouncil.verification import diff_coverage as dc
 
 
 @dataclass
@@ -26,7 +27,7 @@ def run_diff_coverage_gate(
     enforce_cov: bool,
     measure_cov: bool,
     min_ratio: float,
-    measure_diff_coverage: Callable[[Task, str], object],
+    measure_diff_coverage: Callable[[Task, str], dc.DiffCoverageResult],
     coverage_target_commands: Callable[[Task], List[str]],
     next_gap_id: Callable[[str, str], str],
 ) -> DiffCoverageGateResult:

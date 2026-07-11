@@ -35,6 +35,7 @@ from devcouncil.integrations.clients import (
     common,
     cursor as cursor_client,
     gemini as gemini_client,
+    grok as grok_client,
     hooks as hooks_client,
     opencode as opencode_client,
     warp as warp_client,
@@ -46,7 +47,7 @@ app.add_typer(setup_app, name="setup")
 console = Console()
 logger = logging.getLogger(__name__)
 
-SUPPORTED_TOOLS = ("codex", "gemini", "claude", "cursor", "opencode", "antigravity", "warp", "aider")
+SUPPORTED_TOOLS = ("codex", "gemini", "claude", "cursor", "grok", "opencode", "antigravity", "warp", "aider")
 SUPPORTED_HOOK_TOOLS = common.SUPPORTED_HOOK_TOOLS
 OPENCODE_HOOK_PLUGIN_NAME = common.OPENCODE_HOOK_PLUGIN_NAME
 PREFERRED_COMMAND = "dev integrate"
@@ -61,15 +62,18 @@ _gemini_command = gemini_client._gemini_command
 _claude_command = claude_client._claude_command
 _cursor_config_path = cursor_client._cursor_config_path
 _configure_cursor = cursor_client._configure_cursor
+_configure_grok = grok_client._configure_grok
 _configure_opencode = opencode_client._configure_opencode
 _configure_antigravity = antigravity_client._configure_antigravity
 _configure_warp = warp_client._configure_warp
 _configure_aider = aider_client._configure_aider
 _write_cursor_config = cursor_client._write_cursor_config
+_grok_config_path = grok_client._grok_config_path
 _write_opencode_config = opencode_client._write_opencode_config
 _write_antigravity_mcp_config = antigravity_client._write_antigravity_mcp_config
 _write_warp_mcp_config = warp_client._write_warp_mcp_config
 _record_cursor_config = cursor_client._record_cursor_config
+_record_grok_config = grok_client._record_grok_config
 _record_claude_config = claude_client._record_claude_config
 _record_opencode_config = opencode_client._record_opencode_config
 _record_antigravity_config = antigravity_client._record_antigravity_config
@@ -119,14 +123,15 @@ def overview(ctx: typer.Context):
         table.add_row("Claude assets", f"{PREFERRED_COMMAND} claude-assets --apply", "Slash commands, subagents, output style, statusline, permissions, skills (no MCP/hooks).")
         table.add_row("Claude plugin", f"{PREFERRED_COMMAND} claude-plugin --apply", "Self-contained Claude Code plugin + marketplace bundling everything for /plugin install.")
         table.add_row("Claude uninstall", f"{PREFERRED_COMMAND} claude --uninstall", "Remove DevCouncil hooks, statusline, MCP enablement, and generated assets from .claude/.")
-        table.add_row("Cursor", f"{PREFERRED_COMMAND} cursor --apply", "Writes project .cursor/mcp.json for Cursor editor and cursor-agent.")
+        table.add_row("Cursor", f"{PREFERRED_COMMAND} cursor --apply", "Writes project .cursor/mcp.json for Cursor editor and agent/cursor-agent.")
+        table.add_row("Grok Build", f"{PREFERRED_COMMAND} grok --apply", "Registers DevCouncil MCP via grok mcp add or .grok/config.toml fallback.")
         table.add_row("OpenCode", f"{PREFERRED_COMMAND} opencode --apply", "Adds DevCouncil as a project-scoped OpenCode MCP server and executor.")
         table.add_row("Google Antigravity CLI", f"{PREFERRED_COMMAND} antigravity --apply", "Writes project .agents/mcp_config.json and enables the agy executor.")
         table.add_row("Warp / Oz", f"{PREFERRED_COMMAND} warp --apply", "Writes a Warp-compatible MCP JSON file for local agents and Oz CLI.")
         table.add_row("Aider", f"{PREFERRED_COMMAND} aider --apply", "Enables the built-in Aider headless executor (no MCP).")
         table.add_row("Bring your own CLI", f"{PREFERRED_COMMAND} cli-agent NAME --command TOOL --apply", "Registers any prompt-taking CLI as a DevCouncil executor.")
         table.add_row("All", f"{PREFERRED_COMMAND} all --apply", "Runs MCP setup and installs native hooks.")
-        table.add_row("Native hooks", f"{PREFERRED_COMMAND} hooks --apply", "Installs Codex, Gemini, Claude, Cursor, and OpenCode hook files.")
+        table.add_row("Native hooks", f"{PREFERRED_COMMAND} hooks --apply", "Installs Codex, Gemini, Claude, Cursor, Grok, and OpenCode hook files.")
         table.add_row("Recommend", f"{PREFERRED_COMMAND} recommend", "Show the best executor for this machine and project.")
         table.add_row("Status", f"{PREFERRED_COMMAND} status", "Compact PATH + config summary (no MCP probe).")
         table.add_row("Matrix", f"{PREFERRED_COMMAND} matrix", "Print built-in coding CLI integration tiers.")
@@ -381,6 +386,27 @@ def cursor(
         raise typer.Exit(code=1)
 
 
+@app.command("grok")
+def grok(
+    apply: bool = typer.Option(False, "--apply", help="Register Grok MCP config instead of printing it."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """
+    Set up DevCouncil MCP tools for Grok Build.
+    """
+    root = _project_root(project_root)
+    if apply:
+        report = apply_integration_target(root, "grok")
+        if not report.ok:
+            console.print(report.to_json())
+            raise typer.Exit(code=1)
+        console.print("[green]Grok integration configured.[/green]")
+        return
+    ok = _configure_grok(root, apply)
+    if not ok and apply:
+        raise typer.Exit(code=1)
+
+
 @app.command("opencode")
 def opencode(
     apply: bool = typer.Option(False, "--apply", help="Write project OpenCode config instead of printing it."),
@@ -443,29 +469,6 @@ def warp(
         _warn_if_verify_only("warp")
         return
     _configure_warp(root, apply)
-
-
-def _record_aider_config(project_root: Path) -> None:
-    def mutate(config: dict) -> None:
-        config.setdefault("integrations", {}).setdefault("aider", {}).update({"enabled": True})
-
-    _mutate_raw_config(project_root, mutate)
-
-
-def _configure_aider(project_root: Path, apply: bool) -> bool:
-    command = ["aider", "--yes", "--no-show-model-warnings", "--message", "<task prompt>"]
-    if not apply:
-        console.print("[bold]Aider[/bold]")
-        console.print("Built-in executor: [dim]dev run TASK-001 --executor aider[/dim]")
-        console.print("Launch command: [dim]" + _format_command(command) + "[/dim]")
-        console.print("Aider does not expose a first-party DevCouncil MCP server.")
-        return True
-
-    if not shutil.which("aider"):
-        console.print("[yellow]Aider CLI not found on PATH. Install it before using `dev run --executor aider`.[/yellow]")
-    _record_aider_config(project_root)
-    console.print("[green]Aider executor enabled in .devcouncil/config.yaml.[/green]")
-    return True
 
 
 @app.command("aider")
@@ -612,6 +615,7 @@ def all_tools(
     for tool, command in commands:
         _configure(tool, command, apply)
     _configure_cursor(root, apply)
+    _configure_grok(root, apply)
     _configure_opencode(root, apply)
     _configure_antigravity(root, apply)
     _configure_warp(root, apply)

@@ -76,6 +76,7 @@ DEFAULT_CONFIG = {
         "checkpoint_before_each_task": True,
         "stream_cli_output": False,
         "cursor_resume_mode": "off",
+        "grok_resume_mode": "off",
         "coding_cli_probe_order": [],
     },
     "verification": {

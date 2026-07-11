@@ -436,7 +436,7 @@ class SemanticLayerAdapter:
             decision.tier.value,
             decision.model_name,
         )
-        return decision.model_name
+        return str(decision.model_name)
 
     def maybe_compress_messages(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
         """Compress long user/context payloads before an LLM call."""

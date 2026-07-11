@@ -102,7 +102,7 @@ async def test_write_file_rejects_bad_lease(tmp_path, monkeypatch):
         "task_id": "TASK-001", "lease_token": "wrong", "path": "src/a.py", "content": "x=1\n",
     }))[0].text)
     assert res["ok"] is False
-    assert res["code"] == "invalid_lease"
+    assert res["code"] == "lease_held_by_other"
 
 
 def _git(root, *args):

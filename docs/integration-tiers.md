@@ -4,7 +4,7 @@ DevCouncil assigns each supported coding CLI to one of three integration tiers. 
 
 ## Tier 1 — Headless executor
 
-**Tools:** Codex CLI, Gemini CLI, Claude Code, OpenCode, Google Antigravity CLI, Warp/Oz, Cursor Agent (`cursor-agent`), Aider, GitHub Copilot CLI, Goose, Amp (Sourcegraph), Qwen Code, Crush (Charm)
+**Tools:** Codex CLI, Gemini CLI, Claude Code, OpenCode, Google Antigravity CLI, Warp/Oz, Cursor Agent (`agent` / `cursor-agent`), Grok Build (`grok`), Aider, GitHub Copilot CLI, Goose, Amp (Sourcegraph), Qwen Code, Crush (Charm)
 
 **Capabilities:**
 
@@ -45,6 +45,7 @@ DevCouncil assigns each supported coding CLI to one of three integration tiers. 
 | :--- | :--- |
 | Codex, Gemini, Claude | Yes — project hook JSON + `devcouncil hook pre-tool-use` |
 | Cursor | Yes — `.cursor/hooks.json` (`preToolUse` / `postToolUse`) |
+| Grok Build | Yes — `.grok/hooks/devcouncil.json` (`PreToolUse` / `PostToolUse`; requires `/hooks-trust`) |
 | OpenCode | Yes — bundled plugin via `dev integrate hooks` |
 | Antigravity / Warp / Aider / Copilot / Goose / Amp / Qwen / Crush (executor only) | Verification-gated; hooks optional |
 | Unregistered BYO CLI | Verification-gated only |
@@ -54,7 +55,8 @@ DevCouncil assigns each supported coding CLI to one of three integration tiers. 
 | Tool | Target tier | Notes |
 | :--- | :--- | :--- |
 | Codex, Gemini, Claude, OpenCode, Antigravity, Warp | Tier 1 | Shipped |
-| Cursor | Tier 1 via `cursor-agent --print --trust` | Shipped |
+| Cursor | Tier 1 via `agent --print --trust` (+ `--force` on yolo profile) | Shipped |
+| Grok Build | Tier 1 via `grok -p` | Shipped |
 | Aider | Tier 1 via `aider --yes --message` | Shipped |
 | Copilot, Goose, Amp, Qwen, Crush | Tier 1 via headless CLI adapters | Shipped |
 | Editor-only Cursor | Tier 2 | MCP + manual prompt |
@@ -69,7 +71,9 @@ See [coding-cli-integration.md](coding-cli-integration.md) for commands and exam
 | Auto-pick coding CLI when `default_executor` is `manual` | Used by `dev go` — first CLI on PATH in probe order |
 | Custom probe order | `execution.coding_cli_probe_order` in `.devcouncil/config.yaml` |
 | Live CLI output | `dev run TASK --executor codex --stream` or `execution.stream_cli_output: true` |
-| Cursor session resume | `execution.cursor_resume_mode: project` or `task` (uses `cursor-agent create-chat` + `--resume`) |
+| Cursor session resume | `execution.cursor_resume_mode: project` or `task` (uses `agent create-chat` + `--resume`) |
+| Grok session resume | `execution.grok_resume_mode: project` or `task` (stores session id; passes `grok --resume`) |
+| Cursor CI auth | `CURSOR_API_KEY` (see Cursor headless docs) |
 | Strict integration doctor | `dev integrate check --strict` |
 | Pick best executor on this machine | `dev integrate recommend` |
 | View tier matrix | `dev integrate matrix` |

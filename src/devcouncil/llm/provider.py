@@ -5,7 +5,7 @@ from functools import lru_cache
 from importlib import resources
 import logging
 import os
-from typing import TYPE_CHECKING, List, Dict, Any, Optional
+from typing import TYPE_CHECKING, List, Dict, Any, Optional, cast
 from pydantic import BaseModel, field_validator
 
 if TYPE_CHECKING:
@@ -106,7 +106,7 @@ def _parse_provider_json(response: "httpx.Response", provider: str) -> Dict[str,
     ProviderRequestError instead of a raw JSONDecodeError traceback — the CLI's
     graceful-exit paths only catch ProviderRequestError/StructuredOutputError."""
     try:
-        return response.json()
+        return cast(Dict[str, Any], response.json())
     except Exception as exc:
         body = (getattr(response, "text", "") or "").strip()[:300]
         raise ProviderRequestError(
@@ -197,7 +197,7 @@ class Provider(ABC):
         loop = asyncio.get_running_loop()
         client = getattr(self, "_client", None)
         if client is not None and not client.is_closed and getattr(self, "_client_loop", None) is loop:
-            return client
+            return cast("httpx.AsyncClient", client)
         client = httpx.AsyncClient(timeout=timeout)
         self._client: Optional[httpx.AsyncClient] = client
         self._client_loop = loop
@@ -409,14 +409,14 @@ class OpenRouterProvider(Provider):
         self._response_format_unsupported: set = set()
         self.max_concurrency = self._resolve_max_concurrency()
         self._sem: "asyncio.Semaphore | None" = None
-        self._sem_loop = None
+        self._sem_loop: "asyncio.AbstractEventLoop | None" = None
         # Client-side RPM pacing (OPENROUTER_RPM). Concurrency capping alone does
         # not bound the REQUEST RATE: 2-at-a-time short calls still exceed a ~20 RPM
         # endpoint cap and trip 429s that then burn the router's retry budget
         # mid-run. Pacing spaces request STARTS so the cap is never hit at all.
         self.requests_per_minute = self._resolve_rpm()
         self._pace_lock: "asyncio.Lock | None" = None
-        self._pace_loop = None
+        self._pace_loop: "asyncio.AbstractEventLoop | None" = None
         self._next_request_at = 0.0
 
     @staticmethod
@@ -441,7 +441,7 @@ class OpenRouterProvider(Provider):
         loop = asyncio.get_running_loop()
         sem = getattr(self, "_sem", None)
         if sem is not None and getattr(self, "_sem_loop", None) is loop:
-            return sem
+            return cast("asyncio.Semaphore", sem)
         sem = asyncio.Semaphore(self.max_concurrency)
         self._sem = sem
         self._sem_loop = loop
@@ -595,8 +595,10 @@ class OpenRouterProvider(Provider):
                 )
 
             response = await _post_paced()
+            response_format = payload.get("response_format")
             if (
-                payload.get("response_format", {}).get("type") == "json_schema"
+                isinstance(response_format, dict)
+                and response_format.get("type") == "json_schema"
                 and _param_rejected(response)
             ):
                 # The model/route rejected schema-constrained output (unsupported
@@ -749,6 +751,8 @@ class OllamaProvider(Provider):
         # Set when a server rejects the ``think`` field (older Ollama / non-thinking
         # model) so subsequent calls skip it instead of paying a retry every time.
         self._think_unsupported = False
+        self._sem: "asyncio.Semaphore | None" = None
+        self._sem_loop: "asyncio.AbstractEventLoop | None" = None
 
     # Local generation latency is unbounded (cold loads, CPU-only hosts, large
     # ``num_ctx``) and is not a network failure, so Ollama gets a generous default
@@ -872,7 +876,7 @@ class OllamaProvider(Provider):
         loop = asyncio.get_running_loop()
         sem = getattr(self, "_sem", None)
         if sem is not None and getattr(self, "_sem_loop", None) is loop:
-            return sem
+            return cast("asyncio.Semaphore", sem)
         sem = asyncio.Semaphore(self.max_concurrency)
         self._sem = sem
         self._sem_loop = loop

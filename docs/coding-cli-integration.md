@@ -14,7 +14,8 @@ For the official tier definitions (headless executor vs MCP-only vs sidecar), se
 | **OpenCode** | Supported | Supported via `opencode run --file` | Supported via project `opencode.json` | Native via `dev integrate hooks` (bundled plugin) |
 | **Google Antigravity CLI** | Supported | Supported via `agy --print` | Supported via project `.agents/mcp_config.json` | Verification-gated sidecar |
 | **Warp / Oz** | Supported | Supported via `oz agent run` | Supported via Warp/Oz MCP JSON | Verification-gated sidecar |
-| **Cursor** | Supported | Supported via `cursor-agent --print --trust` | Supported via project `.cursor/mcp.json` | Native via `dev integrate hooks` (`.cursor/hooks.json`) |
+| **Cursor** | Supported | Supported via `agent`/`cursor-agent --print --trust` (yolo adds `--force`; JSON output) | Supported via project `.cursor/mcp.json` | Native via `dev integrate hooks` (`.cursor/hooks.json`) |
+| **Grok Build** | Supported | Supported via `grok -p` with `--directory` | Supported via `grok mcp add` or `.grok/config.toml` | Native via `dev integrate hooks --tool grok` (`.grok/hooks/devcouncil.json`; trust with `/hooks-trust`) |
 | **Aider** | Supported | Supported via `aider --yes --message` | Not a primary path | Verification-gated sidecar |
 | **GitHub Copilot CLI** | Supported | Supported via `copilot --allow-all-tools -p` | Tool-managed MCP config | Verification-gated sidecar |
 | **Goose** | Supported | Supported via `goose run -i <prompt-file>` | Tool-managed extensions | Verification-gated sidecar |
@@ -76,7 +77,7 @@ The dashboard can:
 
 - run the same readiness check as `dev integrate check --json`
 - apply project-local MCP files for Cursor, OpenCode, Antigravity, and Warp/Oz
-- install supported hook files for Codex, Gemini, Claude, Cursor, and OpenCode
+- install supported hook files for Codex, Gemini, Claude, Cursor, Grok, and OpenCode
 - re-run status after every action
 
 Dashboard mutations are local-only. The server accepts apply requests only from loopback clients and requires a per-server token embedded in the served page. The API accepts only known integration targets, not arbitrary shell commands.
@@ -213,7 +214,7 @@ DevCouncil also includes a native hook installer for hook-capable coding CLIs:
 dev integrate hooks --apply
 ```
 
-This writes project-local hook config for Codex CLI, Gemini CLI, Claude Code, Cursor (`.cursor/hooks.json`), and OpenCode (bundled `.devcouncil/integrations/opencode_devcouncil_plugin.mjs`). The hooks call `devcouncil hook pre-tool-use` before write/shell tools and `devcouncil hook post-tool-use` after tool execution, with `DEVCOUNCIL_PROJECT_ROOT` carried through the generated command.
+This writes project-local hook config for Codex CLI, Gemini CLI, Claude Code, Cursor (`.cursor/hooks.json`), Grok (`.grok/hooks/devcouncil.json` — run `/hooks-trust` in Grok after apply), and OpenCode (bundled `.devcouncil/integrations/opencode_devcouncil_plugin.mjs`). The hooks call `devcouncil hook pre-tool-use` before write/shell tools and `devcouncil hook post-tool-use` after tool execution, with `DEVCOUNCIL_PROJECT_ROOT` carried through the generated command.
 
 The lower-level hook command group remains available:
 
@@ -367,9 +368,11 @@ Headless execution with Cursor Agent CLI:
 ```bash
 dev integrate cursor --apply
 dev run TASK-001 --executor cursor
+dev run TASK-001 --executor cursor --profile yolo   # adds --force for unattended apply
+export CURSOR_API_KEY=...   # CI headless auth
 ```
 
-The executor launches `cursor-agent --print --trust --workspace <repo>` with a prompt that points at `.devcouncil/TASK-001-cursor-task.md`.
+The executor launches `agent` or `cursor-agent --print --trust --workspace <repo> --output-format json` with a prompt that points at `.devcouncil/TASK-001-cursor-task.md`. Use `--stream` (or `execution.stream_cli_output: true`) for `--output-format stream-json --stream-partial-output`.
 
 Manual sidecar flow (editor chat):
 
@@ -407,9 +410,39 @@ The command writes `.cursor/mcp.json` in the project so Cursor editor and `curso
 }
 ```
 
-Check Cursor CLI discovery with `cursor-agent mcp list`.
+Check Cursor CLI discovery with `agent mcp list` (or `cursor-agent mcp list`). `dev integrate check` probes auth via `agent status`/`about` and surfaces `CURSOR_API_KEY` for CI.
 
-Upstream reference: [Cursor CLI MCP](https://docs.cursor.com/cli/mcp).
+Upstream reference: [Cursor CLI MCP](https://docs.cursor.com/cli/mcp) and [Cursor headless](https://cursor.com/docs/cli/headless).
+
+## Grok Build
+
+Use DevCouncil as the planning and verification shell around Grok Build (xAI).
+
+Headless execution:
+
+```bash
+dev integrate grok --apply
+dev integrate hooks --apply --tool grok   # pre-action containment; then /hooks-trust in Grok
+dev run TASK-001 --executor grok
+dev run TASK-001 --executor grok --profile yolo   # --permission-mode acceptEdits
+```
+
+The executor launches `grok -p "<instruction>" --directory <repo> --output-format json` with the instruction pointing at `.devcouncil/TASK-001-grok-task.md`.
+
+MCP setup prefers `grok mcp add devcouncil --scope project` when `grok` is on PATH; otherwise DevCouncil merges into `.grok/config.toml`:
+
+```toml
+[mcp_servers.devcouncil]
+command = "devcouncil"
+args = ["mcp-server"]
+env = { DEVCOUNCIL_PROJECT_ROOT = "/path/to/project" }
+```
+
+Verify with `grok mcp list --json`. Session resume: `execution.grok_resume_mode: project` or `task` stores session ids under `.devcouncil/integrations/grok-session.json` or per-task sessions and passes `--resume`.
+
+Aliases: `grok-build`, `grok-cli`, `gork`, `gork-build`, `xai-grok`.
+
+Upstream reference: [Grok Build MCP](https://docs.x.ai/build/features/mcp-servers) and [Grok hooks](https://docs.x.ai/build/features/hooks).
 
 ## Warp / Oz
 
@@ -582,6 +615,6 @@ dev run TASK-001 --executor native-preview
 Use these only when the target executor is installed and configured locally. Automated executor mode lets DevCouncil launch the implementation loop itself, capture the post-run diff, and verify the task automatically.
 
 The live executor adapter values are `manual`, `mini`, `openhands`, `native-preview`, `native`, `codex`, `gemini`, `claude`, `opencode`, `antigravity`, `warp`, `cursor`, `aider`, `copilot`, `goose`, `amp`, `qwen`, `crush`, and configured custom CLI names.
-`codex-cli`, `gemini-cli`, `claude-code`, `claude-cli`, `opencode-cli`, `open-code`, `antigravity-cli`, `google-antigravity`, `agy`, `agy-cli`, `warp-cli`, `oz`, `oz-cli`, `cursor-agent`, `cursor-cli`, `copilot-cli`, `github-copilot`, `gh-copilot`, `goose-cli`, `block-goose`, `amp-cli`, `sourcegraph-amp`, `qwen-code`, `qwen-cli`, `crush-cli`, and `charm-crush` are accepted aliases for their canonical names.
+`codex-cli`, `gemini-cli`, `claude-code`, `claude-cli`, `opencode-cli`, `open-code`, `antigravity-cli`, `google-antigravity`, `agy`, `agy-cli`, `warp-cli`, `oz`, `oz-cli`, `cursor-agent`, `cursor-cli`, `grok-build`, `grok-cli`, `gork`, `gork-build`, `xai-grok`, `copilot-cli`, `github-copilot`, `gh-copilot`, `goose-cli`, `block-goose`, `amp-cli`, `sourcegraph-amp`, `qwen-code`, `qwen-cli`, `crush-cli`, and `charm-crush` are accepted aliases for their canonical names.
 
 Direct `dev run --executor <coding-client>` execution now runs the selected coding CLI and automatically runs verification after the tool returns.

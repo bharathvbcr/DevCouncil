@@ -356,7 +356,7 @@ async def _enrich_area(router: "ModelRouter", payload: dict) -> WikiProse:
         },
     ]
     return await router.complete_structured(
-        "wiki_writer", messages, WikiProse, fallback=WikiProse()
+        "wiki_writer", messages, WikiProse, fallback=WikiProse(overview="")
     )
 
 
@@ -475,4 +475,108 @@ def generate_wiki(
                            "generator_version": GENERATOR_VERSION})
 
     result.problems = validate_bundle(read_bundle(wiki_dir))
+    return result
+
+
+def _knowledge_dir(root: Path) -> Path:
+    """Resolve the configured knowledge directory (no CLI side effects)."""
+    directory = ".devcouncil/knowledge"
+    try:
+        from devcouncil.app.config import load_config
+
+        directory = load_config(root).knowledge.directory
+    except Exception as exc:
+        logger.debug("wiki refresh: knowledge directory unavailable, using default: %s", exc)
+    return root / directory
+
+
+def wiki_dir_for(root: Path) -> Path:
+    return _knowledge_dir(root) / WIKI_SUBDIR
+
+
+def _project_name(root: Path) -> str:
+    name = root.name or "Project"
+    try:
+        from devcouncil.app.config import load_config
+
+        name = load_config(root).project.name or name
+    except Exception as exc:
+        logger.debug("wiki refresh: project name unavailable, using directory name: %s", exc)
+    return name
+
+
+def _load_repo_map(root: Path, *, remap: bool) -> RepoMap:
+    map_path = root / ".devcouncil" / "repo_map.json"
+    if remap or not map_path.is_file():
+        from devcouncil.cli.commands.map import generate_map_artifacts
+
+        return generate_map_artifacts(root, map_path)
+    return RepoMap.model_validate_json(map_path.read_text(encoding="utf-8"))
+
+
+def _build_router(root: Path):
+    """Best-effort ModelRouter for wiki enrichment; None degrades to the skeleton."""
+    try:
+        from devcouncil.app.config import get_api_key, load_config
+        from devcouncil.llm.provider import create_provider, validate_model_provider
+        from devcouncil.llm.router import ModelRouter
+
+        config = load_config(root)
+        validate_model_provider(config.models.provider)
+        api_key = get_api_key(config.models.provider, root)
+        provider = create_provider(
+            config.models.provider, api_key, project_root=root, provider_prefs=config.provider
+        )
+        role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
+        if not role_config:
+            return None
+        capable = (
+            role_config.get("arbiter")
+            or role_config.get("planner_a")
+            or next(iter(role_config.values()))
+        )
+        role_config.setdefault("wiki_writer", dict(capable))
+        return ModelRouter(provider, role_config, project_root=root)
+    except Exception as exc:
+        logger.warning("Wiki enrichment unavailable (no model router): %s", exc)
+        return None
+
+
+def refresh_wiki(
+    project_root: Path,
+    *,
+    llm: bool = False,
+    force: bool = False,
+    remap: bool = False,
+) -> WikiResult:
+    """Refresh the codebase wiki without CLI/Rich side effects."""
+    from devcouncil.telemetry.logging_setup import set_log_dir
+    from devcouncil.telemetry.stages import log_stage, log_step
+
+    root = project_root.expanduser().resolve()
+    set_log_dir(root)
+    logger.info("wiki refresh: llm=%s force=%s remap=%s", llm, force, remap)
+
+    with log_stage("wiki", project_root=root, subcommand="update"):
+        log_step("wiki/1: loading repository map", project_root=root, trace=True)
+        repo_map = _load_repo_map(root, remap=remap)
+
+        router = _build_router(root) if llm else None
+
+        log_step("wiki/2: generating wiki pages", project_root=root, trace=True)
+        result = generate_wiki(
+            root,
+            repo_map,
+            wiki_dir_for(root),
+            router=router,
+            force=force,
+            project_name=_project_name(root),
+        )
+        log_step(
+            "wiki/complete",
+            project_root=root,
+            created=len(result.created),
+            updated=len(result.updated),
+            trace=True,
+        )
     return result

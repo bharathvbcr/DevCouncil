@@ -22,6 +22,7 @@ from devcouncil.cli.commands.integrate import (
     _codex_command,
     _configure_antigravity,
     _configure_cursor,
+    _configure_grok,
     _configure_native_hooks,
     _configure_opencode,
     _configure_warp,
@@ -193,6 +194,7 @@ def _configure_coding_cli_integrations(project_root: Path, apply: bool, gemini_s
             continue
         results.append(_configure(tool, command, apply))
     results.append(_configure_cursor(project_root, apply))
+    results.append(_configure_grok(project_root, apply))
     results.append(_configure_opencode(project_root, apply))
     results.append(_configure_antigravity(project_root, apply))
     results.append(_configure_warp(project_root, apply))

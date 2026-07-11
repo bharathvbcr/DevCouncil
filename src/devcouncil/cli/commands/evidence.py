@@ -20,9 +20,10 @@ def _load_repo_map(root: Path) -> dict | None:
     """Load `.devcouncil/repo_map.json` so test suggestions can use the map's
     dependents/role_files index; returns None (name-based fallback) when absent."""
     import json
+    from typing import Any, cast
 
     try:
-        return json.loads((root / ".devcouncil" / "repo_map.json").read_text(encoding="utf-8"))
+        return cast(dict[Any, Any], json.loads((root / ".devcouncil" / "repo_map.json").read_text(encoding="utf-8")))
     except (OSError, ValueError):
         return None
 

@@ -219,7 +219,8 @@ def test_sweep_halts_when_executor_stays_down():
     # Probe succeeds (limit lifted / transient) → keep sweeping.
     assert _sweep_halt_reason(infra_b, probe=lambda: (True, "ok")) is None
     # A genuine verdict or a non-infra error must not even probe.
-    boom = lambda: (_ for _ in ()).throw(AssertionError("probe must not run"))
+    def boom():
+        raise AssertionError("probe must not run")
     assert _sweep_halt_reason({"B": {"verdict": "blocked", "output_tail": "gaps remain"}},
                               probe=boom) is None
     assert _sweep_halt_reason({"B": {"verdict": "error", "output_tail": "planner emitted bad JSON"}},

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, cast
 
 from pydantic import BaseModel, Field
 
@@ -143,7 +143,7 @@ def _latest_agent_run(project_root: Path, task_id: str) -> dict | None:
         except Exception:
             continue
         if payload.get("task_id") == task_id:
-            return payload
+            return cast(dict[Any, Any], payload)
     return None
 
 

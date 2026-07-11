@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, cast
 
 from devcouncil.domain.requirement import Requirement
 from devcouncil.domain.task import Task
@@ -99,7 +99,7 @@ def estimate_difficulty(task: Task, requirements: Optional[List[Requirement]] = 
     """
     manual = getattr(task, "difficulty", None)
     if manual in ("easy", "normal", "hard"):
-        return manual  # type: ignore[return-value]
+        return cast(Literal["easy", "normal", "hard"], manual)
     try:
         score = difficulty_score(task, requirements)
     except Exception:  # pragma: no cover - defensive

@@ -6,7 +6,11 @@ class MarkdownReportGenerator:
     MAX_INLINE_GAPS = 25
     
     @staticmethod
-    def generate(graph: ArtifactGraph, live_review: dict | None = None) -> str:
+    def generate(
+        graph: ArtifactGraph,
+        live_review: dict | None = None,
+        wiki_refresh: dict | None = None,
+    ) -> str:
         summary = graph.coverage_summary()
         live_blockers = (live_review or {}).get("blocking_cards", [])
 
@@ -92,5 +96,14 @@ class MarkdownReportGenerator:
                     if card.get("task_id"):
                         md_output += f" (`{card['task_id']}`)"
                     md_output += f": {card['summary']}\n"
+
+        if wiki_refresh is not None and wiki_refresh.get("considered"):
+            md_output += "\n## Wiki Refresh\n"
+            md_output += f"- **Reason**: {wiki_refresh.get('reason', '')}\n"
+            stale = wiki_refresh.get("stale_pages") or []
+            if stale:
+                md_output += f"- **Stale pages**: {len(stale)}\n"
+                for page in stale[:10]:
+                    md_output += f"  - {page}\n"
                 
         return md_output

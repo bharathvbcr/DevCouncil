@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, List, TYPE_CHECKING
+from typing import Any, List, Literal, TYPE_CHECKING, cast
 
 from devcouncil.domain.evidence import CommandResult, DiffEvidence
 from devcouncil.domain.gap import Gap
@@ -108,6 +108,23 @@ async def run_verify_orchestration(
         next_gap_id=verifier._next_gap_id,
     ))
 
+    # Advisory architecture-drift gate: flag edits that cross non-neighbor subsystem
+    # boundaries the plan never declared. Non-blocking by default, reads only the repo
+    # map, and degrades to a no-op when the map is absent/stale.
+    boundary_cfg = getattr(getattr(_cfg, "verification", None), "subsystem_boundary", None)
+    if changed_files and (boundary_cfg is None or boundary_cfg.enabled):
+        from devcouncil.verification.checks.subsystem_boundary import (
+            detect_subsystem_boundary_gaps,
+        )
+
+        gaps.extend(detect_subsystem_boundary_gaps(
+            task=task,
+            changed_files=changed_files,
+            repo_map=verifier._load_repo_map(),
+            next_gap_id=verifier._next_gap_id,
+            blocking=bool(getattr(boundary_cfg, "blocking", False)),
+        ))
+
     log_step(
         "verify/4: semantic diff and dependency checks",
         project_root=verifier.project_root,
@@ -130,7 +147,7 @@ async def run_verify_orchestration(
         ):
             gaps.append(Gap(
                 id=verifier._next_gap_id(task.id, "EFFORT"),
-                severity=eff.severity,
+                severity=cast(Literal["low", "medium", "high", "critical"], eff.severity),
                 gap_type="suspicious_effort",
                 task_id=task.id,
                 description=eff.detail,
@@ -319,6 +336,34 @@ async def run_verify_orchestration(
             blocking=True,
         ))
 
+    # Post-step: a change spanning many subsystems / files likely stales the codebase
+    # wiki. Flag the stale pages (or auto-refresh, per config). Best-effort and never
+    # blocking — an orientation aid, not a gate.
+    wiki_refresh_outcome = None
+    try:
+        from devcouncil.verification.wiki_refresh import (
+            evaluate_wiki_refresh,
+            wiki_refresh_advisory_gap,
+        )
+
+        wiki_cfg = getattr(_cfg.verification, "wiki_refresh", None) if _cfg is not None else None
+        if changed_files and (wiki_cfg is None or wiki_cfg.enabled):
+            wiki_refresh_outcome = evaluate_wiki_refresh(
+                verifier.project_root,
+                changed_files,
+                repo_map=verifier._load_repo_map(),
+                config=wiki_cfg,
+            )
+            advisory = wiki_refresh_advisory_gap(
+                wiki_refresh_outcome,
+                task_id=task.id,
+                gap_id=verifier._next_gap_id(task.id, "WIKI"),
+            )
+            if advisory is not None:
+                gaps.append(advisory)
+    except Exception as exc:
+        logger.debug("wiki refresh post-step skipped: %s", exc)
+
     blocking_count = len([g for g in gaps if g.blocking])
     log_step(
         "verify/complete",
@@ -339,5 +384,6 @@ async def run_verify_orchestration(
         coverage_skipped_reason=coverage_skipped_reason,
         difficulty=rigor.difficulty,
         rigor_applied=list(rigor.applied),
+        wiki_refresh=wiki_refresh_outcome.to_dict() if wiki_refresh_outcome is not None else None,
     )
     return gaps, evidence_to_save

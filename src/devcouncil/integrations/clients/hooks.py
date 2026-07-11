@@ -181,6 +181,37 @@ def _install_cursor_hooks(project_root: Path) -> list[Path]:
     _mutate_raw_config(project_root, mutate)
     return [path]
 
+def _install_grok_hooks(project_root: Path) -> list[Path]:
+    hooks_dir = project_root / ".grok" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    path = hooks_dir / "devcouncil.json"
+    settings = _load_json(path)
+    matcher = "Bash|Write|Edit|MultiEdit|run_terminal_cmd|write_file|edit_file|apply_patch"
+    _upsert_hook(
+        settings,
+        "PreToolUse",
+        matcher,
+        _hook_command(project_root, "grok", "pre-tool-use"),
+        "devcouncil-pre-tool-use",
+    )
+    _upsert_hook(
+        settings,
+        "PostToolUse",
+        matcher,
+        _hook_command(project_root, "grok", "post-tool-use"),
+        "devcouncil-post-tool-use",
+    )
+    _save_json(path, settings)
+
+    def mutate(config: dict) -> None:
+        grok = config.setdefault("integrations", {}).setdefault("grok", {})
+        grok.update({
+            "hooks_path": str(path.relative_to(project_root)),
+        })
+
+    _mutate_raw_config(project_root, mutate)
+    return [path]
+
 def _install_opencode_hooks(project_root: Path) -> list[Path]:
     source = _opencode_plugin_source()
     if not source.exists():
@@ -298,6 +329,7 @@ def _preview_hook_paths(project_root: Path, tool: str) -> list[tuple[str, Path]]
         "gemini": [project_root / ".gemini" / "settings.json"],
         "claude": [project_root / ".claude" / "settings.local.json"],
         "cursor": [project_root / ".cursor" / "hooks.json"],
+        "grok": [project_root / ".grok" / "hooks" / "devcouncil.json"],
         "opencode": [_opencode_plugin_path(project_root), _opencode_config_path(project_root)],
     }
     selected: tuple[str, ...]
@@ -314,7 +346,7 @@ def _configure_native_hooks(
 ) -> None:
     allowed = {"all", *SUPPORTED_HOOK_TOOLS, "opencode"}
     if tool not in allowed:
-        console.print("[red]--tool must be one of: all, codex, gemini, claude, cursor, opencode.[/red]")
+        console.print("[red]--tool must be one of: all, codex, gemini, claude, cursor, grok, opencode.[/red]")
         raise typer.Exit(code=2)
 
     if not apply:
@@ -338,6 +370,7 @@ def _configure_native_hooks(
         # install their native pre/post hooks unconditionally as before.
         "claude": lambda root: _install_claude_hooks(root, write_gate=claude_write_gate),
         "cursor": _install_cursor_hooks,
+        "grok": _install_grok_hooks,
         "opencode": _install_opencode_hooks,
     }
     # Batch the per-installer config.yaml record updates (cursor/opencode)

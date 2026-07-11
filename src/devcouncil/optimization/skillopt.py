@@ -36,7 +36,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, Field
 
@@ -594,7 +594,7 @@ def make_llm_rollout(
         result = await router.complete_structured(
             role, messages, _AgentAnswer, fallback=_AgentAnswer(answer="")
         )
-        return result.answer
+        return str(result.answer)
 
     return rollout
 
@@ -633,8 +633,11 @@ def make_llm_optimizer(
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
-        return await router.complete_structured(
-            role, messages, SkillEditProposal, fallback=SkillEditProposal()
+        return cast(
+            SkillEditProposal,
+            await router.complete_structured(
+                role, messages, SkillEditProposal, fallback=SkillEditProposal()
+            ),
         )
 
     return optimizer

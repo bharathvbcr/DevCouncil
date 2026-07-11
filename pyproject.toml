@@ -69,6 +69,7 @@ source = ["src/devcouncil"]
 branch = true
 
 [tool.coverage.report]
+fail_under = 18
 exclude_lines = [
     "pragma: no cover",
     "if TYPE_CHECKING:",
@@ -99,3 +100,8 @@ packages = ["src/devcouncil", "src/semantic_layer"]
 "src/devcouncil/assets/devcouncil-logo.svg" = "devcouncil/assets/devcouncil-logo.svg"
 "src/devcouncil/assets/devcouncil_logo_premium.png" = "devcouncil/assets/devcouncil_logo_premium.png"
 "src/devcouncil/integrations/opencode_devcouncil_plugin.mjs" = "devcouncil/integrations/opencode_devcouncil_plugin.mjs"
+"src/devcouncil/campaign/prompts/coordinator.md" = "devcouncil/campaign/prompts/coordinator.md"
+"src/devcouncil/campaign/prompts/director.md" = "devcouncil/campaign/prompts/director.md"
+"src/devcouncil/campaign/prompts/protocol.md" = "devcouncil/campaign/prompts/protocol.md"
+"src/devcouncil/campaign/prompts/reviewer.md" = "devcouncil/campaign/prompts/reviewer.md"
+"src/devcouncil/campaign/prompts/worker.md" = "devcouncil/campaign/prompts/worker.md"

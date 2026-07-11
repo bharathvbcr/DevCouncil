@@ -94,8 +94,9 @@ def print_integration_status(root: Path, console: Console, *, as_json: bool) -> 
     table.add_row("Probe order", ", ".join(summary["probe_order"]))
     table.add_row("Stream CLI output", "yes" if summary["stream_cli_output"] else "no")
     table.add_row("Cursor resume mode", summary["cursor_resume_mode"])
+    table.add_row("Grok resume mode", summary.get("grok_resume_mode", "off"))
 
-    for name in ("cursor", "opencode", "antigravity", "warp", "aider"):
+    for name in ("cursor", "grok", "opencode", "antigravity", "warp", "aider"):
         enabled = bool(integrations.get(name, {}).get("enabled"))
         table.add_row(f"{name} integration", "[green]enabled[/green]" if enabled else "[dim]off[/dim]")
 

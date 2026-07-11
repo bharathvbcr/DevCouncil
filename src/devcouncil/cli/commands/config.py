@@ -1,5 +1,6 @@
 import logging
 import typer
+from typing import cast
 import yaml
 from pathlib import Path
 from rich.console import Console
@@ -123,8 +124,8 @@ def set_config(
         console.print(f"[red]Config not found at {config_path}[/red]")
         raise typer.Exit(code=1)
 
-    typ = mapping[-1]
-    path = mapping[:-1]
+    typ = cast(type, mapping[-1])
+    path = cast(tuple[str, ...], mapping[:-1])
     try:
         parsed = _parse_config_value(value, typ)
     except ValueError as exc:

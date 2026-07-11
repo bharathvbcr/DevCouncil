@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-import yaml  # type: ignore[import-untyped]
+import yaml
 
 from devcouncil.executors.agent_registry import (
     load_agent_profiles,

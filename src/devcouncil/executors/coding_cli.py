@@ -10,7 +10,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from rich.console import Console
 
@@ -104,6 +104,8 @@ class CodingCliExecutor(Executor):
             base = self._cursor_command(task_id)
         elif self.client == "claude":
             base = self._claude_command(task_id)
+        elif self.client == "grok":
+            base = self._grok_command(task_id)
         else:
             base = self.spec.base_command()
         return self._apply_profile_args(base)
@@ -115,6 +117,7 @@ class CodingCliExecutor(Executor):
         "codex": "--model",
         "gemini": "--model",
         "cursor": "--model",
+        "grok": "-m",
         "qwen": "--model",
         "opencode": "--model",
         "aider": "--model",
@@ -160,6 +163,10 @@ class CodingCliExecutor(Executor):
             return command
         if self.client == "claude":
             return self._apply_claude_permission_mode(command, mode)
+        if self.client == "grok":
+            return self._apply_grok_permission_mode(command, mode)
+        if self.client == "cursor":
+            return self._apply_cursor_permission_mode(command, mode)
         return command
 
     @staticmethod
@@ -183,6 +190,41 @@ class CodingCliExecutor(Executor):
                 return result
         return [*result, "--permission-mode", value]
 
+    @staticmethod
+    def _apply_grok_permission_mode(command: list[str], mode: str) -> list[str]:
+        """Translate an abstract permission mode into Grok Build's
+        ``--permission-mode`` value."""
+        translation = {
+            "auto": "acceptEdits",
+            "yolo": "acceptEdits",
+            "gated": "dontAsk",
+            "prod": "dontAsk",
+            "ask": "default",
+            "plan": "plan",
+        }
+        value = translation.get(mode.lower(), mode)
+        result = list(command)
+        for index, part in enumerate(result):
+            if part == "--permission-mode" and index + 1 < len(result):
+                result[index + 1] = value
+                return result
+        return [*result, "--permission-mode", value]
+
+    def _apply_cursor_permission_mode(self, command: list[str], mode: str) -> list[str]:
+        """Map profile permission modes to Cursor headless flags."""
+        normalized = mode.lower()
+        result = list(command)
+        if normalized in {"auto", "yolo"}:
+            if "--force" not in result and "--yolo" not in result:
+                result.insert(1, "--force")
+            return result
+        if normalized == "plan":
+            if "--mode=plan" not in result:
+                result.insert(1, "--mode=plan")
+            return result
+        # gated/prod: omit force; trust + verify loop contain edits.
+        return result
+
     def _cursor_command(self, task_id: str | None = None) -> list[str]:
         executable = resolve_cursor_agent_executable()
         if not executable:
@@ -194,10 +236,31 @@ class CodingCliExecutor(Executor):
             "--workspace",
             str(self.project_root),
         ]
+        if self.stream_output:
+            command.extend(["--output-format", "stream-json", "--stream-partial-output"])
+        else:
+            command.extend(["--output-format", "json"])
         chat_id = self._cursor_resume_chat_id(task_id)
         if chat_id:
             command.extend(["--resume", chat_id])
         command.append("Read and execute the DevCouncil task prompt at {prompt_file}.")
+        return command
+
+    def _grok_command(self, task_id: str | None = None) -> list[str]:
+        command = [
+            "grok",
+            "-p",
+            "Read and execute the DevCouncil task prompt at {prompt_file}.",
+            "--directory",
+            str(self.project_root),
+        ]
+        if self.stream_output:
+            command.extend(["--output-format", "stream-json"])
+        else:
+            command.extend(["--output-format", "json"])
+        session_id = self._grok_resume_session_id(task_id)
+        if session_id:
+            command.extend(["--resume", session_id])
         return command
 
     def _warp_command(self) -> list[str]:
@@ -409,6 +472,8 @@ class CodingCliExecutor(Executor):
                 else:
                     result = self._capture_claude_json(run_id, result)
                 self._mirror_claude_transcript()
+            if self.client == "grok":
+                self._capture_grok_session_from_result(task.id, result)
             if transcript_path and transcript_path.exists():
                 self._append_manifest_transcript(run_id, transcript_path)
                 self.last_transcript_path = transcript_path
@@ -838,6 +903,18 @@ class CodingCliExecutor(Executor):
             return "off"
         return mode
 
+    def _grok_resume_mode(self) -> str:
+        try:
+            if self._config is None:
+                mode = "off"
+            else:
+                mode = (self._config.execution.grok_resume_mode or "off").strip().lower()
+        except Exception:
+            mode = "off"
+        if mode not in {"off", "project", "task"}:
+            return "off"
+        return mode
+
     def _cursor_session_path(self, task_id: str | None = None) -> Path:
         if self._cursor_resume_mode() == "task" and task_id:
             return self.project_root / ".devcouncil" / "sessions" / f"{task_id}-cursor.json"
@@ -883,6 +960,71 @@ class CodingCliExecutor(Executor):
             return None
         chat_id = (result.stdout or result.stderr or "").strip().splitlines()[-1].strip()
         return chat_id or None
+
+    def _grok_session_path(self, task_id: str | None = None) -> Path:
+        if self._grok_resume_mode() == "task" and task_id:
+            return self.project_root / ".devcouncil" / "sessions" / f"{task_id}-grok.json"
+        return self.project_root / ".devcouncil" / "integrations" / "grok-session.json"
+
+    def _grok_resume_session_id(self, task_id: str | None) -> str | None:
+        mode = self._grok_resume_mode()
+        if mode == "off":
+            return None
+        path = self._grok_session_path(task_id if mode == "task" else None)
+        if path.exists():
+            try:
+                data = read_json(path) or {}
+            except json.JSONDecodeError:
+                data = {}
+            existing = str(data.get("session_id") or "").strip()
+            if existing:
+                return existing
+        return None
+
+    def _persist_grok_session(self, session_id: str, task_id: str | None) -> None:
+        mode = self._grok_resume_mode()
+        if mode == "off" or not session_id:
+            return
+        path = self._grok_session_path(task_id if mode == "task" else None)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_json(path, {"session_id": session_id})
+        except OSError:
+            pass
+
+    def _capture_grok_session_from_result(
+        self, task_id: str, result: subprocess.CompletedProcess[str]
+    ) -> None:
+        """Best-effort harvest of Grok session id from JSON output for resume."""
+        if self._grok_resume_mode() == "off":
+            return
+        raw = (result.stdout or "").strip()
+        if not raw:
+            return
+        payload: dict | None = None
+        for line in reversed(raw.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                candidate = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                payload = candidate
+                break
+        if payload is None:
+            try:
+                loaded = json.loads(raw)
+            except json.JSONDecodeError:
+                return
+            payload = loaded if isinstance(loaded, dict) else None
+        if payload is None:
+            return
+        session_id = str(payload.get("session_id") or payload.get("sessionId") or "").strip()
+        if session_id:
+            self.last_agent_session_id = session_id
+            self._persist_grok_session(session_id, task_id)
 
     def _claude_command(self, task_id: str | None = None) -> list[str]:
         """Build Claude Code's headless command with a stable session identity.
@@ -1005,7 +1147,8 @@ class CodingCliExecutor(Executor):
 
         Shared by the non-stream JSON path and the stream-json path; both surface the same
         terminal ``result`` object, just delivered as one blob vs. the last NDJSON line."""
-        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+        raw_usage = payload.get("usage")
+        usage: dict[Any, Any] = raw_usage if isinstance(raw_usage, dict) else {}
         session_id = str(payload.get("session_id") or "").strip() or None
         if session_id:
             self.last_agent_session_id = session_id
@@ -1064,7 +1207,8 @@ class CodingCliExecutor(Executor):
             return line
         etype = event.get("type")
         if etype == "assistant":
-            message = event.get("message") if isinstance(event.get("message"), dict) else {}
+            raw_message = event.get("message")
+            message: dict[Any, Any] = raw_message if isinstance(raw_message, dict) else {}
             parts: list[str] = []
             for block in (message.get("content") or []):
                 if not isinstance(block, dict):
@@ -1074,7 +1218,8 @@ class CodingCliExecutor(Executor):
                     parts.append(str(block["text"]).strip())
                 elif btype == "tool_use":
                     name = str(block.get("name") or "tool")
-                    tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+                    raw_input = block.get("input")
+                    tool_input: dict[Any, Any] = raw_input if isinstance(raw_input, dict) else {}
                     target = tool_input.get("file_path") or tool_input.get("path") or tool_input.get("command") or ""
                     parts.append(f"→ {name} {str(target)[:80]}".rstrip())
             text = "\n".join(p for p in parts if p)

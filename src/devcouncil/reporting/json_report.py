@@ -1,24 +1,18 @@
 import json
+from typing import Any
+
 from devcouncil.artifacts.graph import ArtifactGraph
+from devcouncil.reporting.verdict import classify_verdict
 
 class JsonReportGenerator:
     """Generates a JSON evidence report."""
     
     @staticmethod
-    def generate(graph: ArtifactGraph, live_review: dict | None = None) -> str:
+    def generate(graph: ArtifactGraph, live_review: dict | None = None, wiki_refresh: dict | None = None) -> str:
         summary = graph.coverage_summary()
         live_blockers = len((live_review or {}).get("blocking_cards", []))
         
-        # Three honest states (see markdown_report for rationale):
-        #   blocked    - positive evidence of a problem.
-        #   incomplete - nothing failing, but not every AC has passing evidence.
-        #   passed     - no blocking gaps and every AC proven.
-        if summary["blocking_gaps"] > 0 or live_blockers > 0:
-            verdict = "blocked"
-        elif summary["ac_without_evidence"] > 0:
-            verdict = "incomplete"
-        else:
-            verdict = "passed"
+        verdict, incomplete_kind = classify_verdict(graph, live_blockers=live_blockers)
         # Proof-rigor breakdown: of the criteria that ARE proven, how were they proven?
         # ``compiled``/``vote`` are precise per-criterion checks (trustworthy); ``coarse``
         # means proven only by a passing acceptance-capable command (weak). Surfacing this
@@ -29,13 +23,17 @@ class JsonReportGenerator:
             if getattr(ev, "status", "") == "passed":
                 key = getattr(ev, "mode", "") or "unspecified"
                 proof_modes[key] = proof_modes.get(key, 0) + 1
-        report = {
+        report: dict[str, Any] = {
             "verdict": verdict,
             "coverage_summary": summary,
             "proof_modes": proof_modes,
             "blocking_gaps": [g.model_dump() for g in graph.blocking_gaps()]
         }
+        if incomplete_kind is not None:
+            report["incomplete_kind"] = incomplete_kind
         if live_review is not None:
             report["live_review"] = live_review
+        if wiki_refresh is not None:
+            report["wiki_refresh"] = wiki_refresh
         
         return json.dumps(report, indent=2)

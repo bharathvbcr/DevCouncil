@@ -57,7 +57,7 @@ from devcouncil.cli.commands import (  # noqa: E402 - imports follow stdio recon
     run,
     runs,
     setup,
-    shogun,
+    campaign,
     show,
     status,
     gaps,
@@ -117,7 +117,7 @@ app.add_typer(skills.app, name="skills")
 app.add_typer(okf.app, name="okf")
 app.add_typer(design.app, name="design")
 app.add_typer(wiki.app, name="wiki")
-app.add_typer(shogun.app, name="shogun")
+app.add_typer(campaign.app, name="campaign")
 app.add_typer(provenance.resource_app, name="resource")
 app.add_typer(lease.lease_app, name="lease")
 app.add_typer(task_gate.scope_app, name="scope")

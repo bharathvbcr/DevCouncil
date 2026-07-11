@@ -1,6 +1,7 @@
 from devcouncil.utils.json_persist import dump_json
 import logging
 from pathlib import Path
+from typing import Literal, cast
 
 import typer
 from rich.console import Console
@@ -183,7 +184,7 @@ def reprioritize_task(
                     console.print(f"[red]{message}[/red]")
                 raise typer.Exit(code=1)
             previous = task.priority
-            task.priority = normalized
+            task.priority = cast(Literal["high", "medium", "low"], normalized)
             task_repo.save(task)
         payload = {
             "ok": True,

@@ -226,12 +226,44 @@ class RigorConfig(BaseModel):
     acceptance_samples_on_hard: int = 2
 
 
+class SubsystemBoundaryConfig(BaseModel):
+    """Advisory architecture-drift gate over the mapped subsystem graph.
+
+    Flags a change that edits files in two subsystems the repo map does NOT consider
+    neighbors, when the crossing was not declared in the task plan — a signal that an
+    edit is reaching across an architectural boundary it shouldn't. Advisory
+    (non-blocking) by default: set ``blocking`` to make an undeclared crossing block
+    verification. Needs a fresh ``repo_map.json`` with ``subsystems``/``neighbors`` to
+    have anything to check; degrades to a no-op otherwise.
+    """
+
+    enabled: bool = True
+    blocking: bool = False
+
+
+class WikiRefreshConfig(BaseModel):
+    """Post-verify wiki-freshness trigger for large refactors.
+
+    When a verified change spans at least ``min_subsystems`` subsystem areas OR touches
+    at least ``min_files`` files, the codebase wiki is likely stale. By default this
+    only FLAGS the stale pages (cheap, no model calls). Set ``auto_update`` to actually
+    run ``dev wiki update --no-llm`` as a post-step. Best-effort and never blocks.
+    """
+
+    enabled: bool = True
+    min_subsystems: int = 3
+    min_files: int = 8
+    auto_update: bool = False
+
+
 class VerificationConfig(BaseModel):
     sandbox: VerificationSandboxConfig = Field(default_factory=VerificationSandboxConfig)
     diff_coverage: DiffCoverageConfig = Field(default_factory=DiffCoverageConfig)
     acceptance_checks: AcceptanceCheckConfig = Field(default_factory=AcceptanceCheckConfig)
     reviewer_checks: ReviewerCheckConfig = Field(default_factory=ReviewerCheckConfig)
     rigor: RigorConfig = Field(default_factory=RigorConfig)
+    subsystem_boundary: SubsystemBoundaryConfig = Field(default_factory=SubsystemBoundaryConfig)
+    wiki_refresh: WikiRefreshConfig = Field(default_factory=WikiRefreshConfig)
     # Flaky-evidence retry: when an acceptance-capable verification command (planner
     # expected_tests / config commands) genuinely fails, re-run it ONCE. If the re-run
     # passes, the command counts as passed and its stored summary is tagged
@@ -270,6 +302,7 @@ class ExecutionConfig(BaseModel):
     # so hooks stay fast/cheap unless a team opts in.
     verify_on_post_task: bool = False
     cursor_resume_mode: str = "off"
+    grok_resume_mode: str = "off"
     coding_cli_probe_order: List[str] = Field(default_factory=list)
     # Opt-in scope gate for executors WITHOUT a pre-write hook (CLI subprocesses that write
     # directly to disk). When true, DevCouncil re-checks every file a coding-CLI subprocess
@@ -348,6 +381,12 @@ class CursorIntegrationConfig(BaseModel):
     enabled: bool = False
     config_path: str = ".cursor/mcp.json"
     hooks_path: str = ".cursor/hooks.json"
+    headless_force: bool | None = None
+
+
+class GrokIntegrationConfig(BaseModel):
+    enabled: bool = False
+    config_path: str = ".grok/config.toml"
 
 
 class AiderIntegrationConfig(BaseModel):
@@ -410,6 +449,7 @@ class IntegrationsConfig(BaseModel):
     code_review_graph: CodeReviewGraphIntegrationConfig = Field(default_factory=CodeReviewGraphIntegrationConfig)
     live_review: LiveReviewIntegrationConfig = Field(default_factory=LiveReviewIntegrationConfig)
     cursor: CursorIntegrationConfig = Field(default_factory=CursorIntegrationConfig)
+    grok: GrokIntegrationConfig = Field(default_factory=GrokIntegrationConfig)
     aider: AiderIntegrationConfig = Field(default_factory=AiderIntegrationConfig)
     antigravity: AntigravityIntegrationConfig = Field(default_factory=AntigravityIntegrationConfig)
     warp: WarpIntegrationConfig = Field(default_factory=WarpIntegrationConfig)
@@ -535,7 +575,7 @@ def load_config(project_root: Path = Path(".")) -> DevCouncilConfig:
     file's mtime/size changes, so repeated callers avoid redundant disk reads while
     still picking up a rewritten config.
     """
-    import yaml  # type: ignore[import-untyped]
+    import yaml
 
     config_path = project_root / ".devcouncil" / "config.yaml"
     try:

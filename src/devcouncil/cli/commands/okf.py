@@ -246,9 +246,13 @@ def select_knowledge(
     if json_output:
         console.print_json(data=payload)
         return
-    if payload.get("sources"):
-        for source in payload["sources"]:
-            console.print(f"- [{source['kind']}] {source['name']}: {source['description']}")
+    sources = payload.get("sources")
+    if isinstance(sources, list):
+        for source in sources:
+            if isinstance(source, dict):
+                console.print(
+                    f"- [{source.get('kind')}] {source.get('name')}: {source.get('description')}"
+                )
     if payload.get("preamble"):
         console.print("\n" + str(payload["preamble"]))
 

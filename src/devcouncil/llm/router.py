@@ -1,4 +1,4 @@
-from typing import List, Dict, Any, Type, Optional, TypeVar
+from typing import List, Dict, Any, Type, Optional, TypeVar, cast
 import copy
 import functools
 import json
@@ -41,10 +41,10 @@ def _provider_retry_delay(exc: Exception, attempt: int) -> float:
     """Seconds to wait before retrying a failed provider call."""
     if isinstance(exc, ProviderRequestError):
         if exc.retry_after_seconds is not None:
-            return min(120.0, max(1.0, exc.retry_after_seconds))
+            return float(min(120.0, max(1.0, exc.retry_after_seconds)))
         if exc.status_code == 429:
             # OpenRouter tiers often cap at ~20 RPM; back off generously.
-            return min(90.0, 15.0 * (2 ** attempt))
+            return float(min(90.0, 15.0 * (2 ** attempt)))
     return min(30.0, float(2 ** attempt))
 
 
@@ -222,7 +222,7 @@ class ModelRouter:
             for candidate in cls._balanced_candidates(text, opener, closer):
                 try:
                     json.loads(candidate)
-                    return candidate
+                    return cast(str, candidate)
                 except Exception:
                     continue
         return text

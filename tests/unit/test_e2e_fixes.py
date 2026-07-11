@@ -98,12 +98,23 @@ def _native(router, runner):
     agent = NativeAgent.__new__(NativeAgent)
     agent.router = router
     agent.task_runner = runner
+    agent.project_root = runner.project_root
+    agent.sandbox = "local"
+    agent._lease_token = None
     from devcouncil.execution.context_builder import ContextBuilder
     from devcouncil.execution.prompt_builder import PromptBuilder
     agent.context_builder = ContextBuilder(runner.project_root)
     # The native executor now assembles implementation context via the budgeted
     # PromptBuilder; stub it so these loop-behavior tests stay fast and isolated.
     agent.prompt_builder = PromptBuilder(runner.project_root)
+    # These loop-control tests exercise the tool loop, not the lease/gated-write/verify
+    # plumbing (that has its own end-to-end coverage in test_native_closed_loop.py), so
+    # stub those seams to route writes to the fake runner and treat verify as passing.
+    agent._acquire_lease = lambda task: {"ok": True, "lease_token": "tok"}
+    agent._release_lease = lambda task, token: None
+    agent._verify_task = lambda task, requirements: (True, [], [])
+    agent._gated_apply_patch = lambda task, patch: runner.apply_patch(patch, task) and None
+    agent._gated_write_file = lambda task, path, content: runner.write_file(path, content, task)
     return agent
 
 

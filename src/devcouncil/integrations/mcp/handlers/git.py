@@ -17,6 +17,7 @@ from devcouncil.integrations.mcp.util import (
     optional_string_list_argument,
     truncate_text,
 )
+from devcouncil.storage.db import Database
 from devcouncil.storage.repositories import TaskRepository
 
 
@@ -73,7 +74,7 @@ async def git_diff(root: Path, paths: list[str], staged: bool) -> dict[str, obje
     return {"ok": True, "files": files, "unified_diff": unified_diff, "truncated": truncated, "staged": staged}
 
 
-async def handle_get_diff(root: Path, db: object | None, arguments: dict) -> list[TextContent]:
+async def handle_get_diff(root: Path, db: Database | None, arguments: dict) -> list[TextContent]:
     if not is_git_repo(root):
         return error_text("get_diff requires a git repository.", code="not_a_git_repo")
     task_id = optional_string_argument(arguments, "task_id")
@@ -87,7 +88,7 @@ async def handle_get_diff(root: Path, db: object | None, arguments: dict) -> lis
         return error_text("staged must be a boolean", code="invalid_arguments", argument="staged")
     scope_paths: list[str] = list(explicit_paths)
     if task_id and db:
-        with db.get_session() as session:  # type: ignore[union-attr]
+        with db.get_session() as session:
             task = TaskRepository(session).get_by_id(task_id)
         if task is None:
             return error_text(f"Task {task_id} not found.", code="not_found", task_id=task_id)

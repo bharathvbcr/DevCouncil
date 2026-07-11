@@ -300,9 +300,11 @@ def _python_stub_bodies(
             continue
         body = node.body
         stmts = list(body)
-        if stmts and isinstance(stmts[0], ast.Expr) and isinstance(getattr(stmts[0], "value", None), ast.Constant) \
-                and isinstance(stmts[0].value.value, str):
-            stmts = stmts[1:]  # drop docstring
+        first = stmts[0] if stmts else None
+        if isinstance(first, ast.Expr):
+            val = first.value
+            if isinstance(val, ast.Constant) and isinstance(val.value, str):
+                stmts = stmts[1:]  # drop docstring
         if not stmts:
             trivial = True
         else:

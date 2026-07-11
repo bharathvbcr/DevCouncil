@@ -413,7 +413,6 @@ def scaffold_skills(project_root: Path, skills: list[Skill]) -> list[Path]:
     written: list[Path] = []
     skills_root = project_root / ".claude" / "skills"
     dev_skills_root = project_root / ".devcouncil" / "skills"
-    proot = project_root.resolve()
     for skill in skills:
         # Don't re-materialize a skill that already lives in a repo-local skill dir.
         # Packaged library files inside a monorepo (e.g. src/.../skills/library/) still

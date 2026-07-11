@@ -1,6 +1,6 @@
 import logging
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, cast
 
 from devcouncil.telemetry.pricing import pricing_for_model
 from devcouncil.utils.json_persist import read_json, write_json
@@ -21,7 +21,7 @@ class TelemetryTracker:
     def _load(self) -> Dict[str, Any]:
         if self.log_file.exists():
             try:
-                return read_json(self.log_file)
+                return cast(Dict[str, Any], read_json(self.log_file))
             except Exception as e:
                 # A corrupt ledger silently resets accumulated cost stats on the next save.
                 logger.warning("Failed to load telemetry ledger %s, starting fresh: %s", self.log_file, e)

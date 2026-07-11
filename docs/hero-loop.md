@@ -6,7 +6,8 @@ typed list of next actions, repairs, and re-verifies — **without a human pasti
 or test output back and forth.** Evidence, not model confidence, decides when the work is
 done.
 
-This is the one path DevCouncil certifies end to end. Other coding CLIs are supported (see
+This is the one path DevCouncil certifies end to end. See [certified-paths.md](certified-paths.md)
+for the agent × OS × transport matrix. Other coding CLIs are supported (see
 [coding-cli-integration.md](coding-cli-integration.md)), but the loop below is the one to
 reach for first.
 

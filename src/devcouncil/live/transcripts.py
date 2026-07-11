@@ -211,7 +211,7 @@ def _role(raw: dict[str, Any]) -> RoleName:
         if isinstance(nested, str):
             return nested if nested in KNOWN_ROLES else "unknown"
     record_type = raw.get("type")
-    if record_type in KNOWN_ROLES:
+    if isinstance(record_type, str) and record_type in KNOWN_ROLES:
         return record_type
     return "unknown"
 
