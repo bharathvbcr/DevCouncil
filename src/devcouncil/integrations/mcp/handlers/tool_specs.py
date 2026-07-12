@@ -219,8 +219,155 @@ def all_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="devcouncil_repo_map",
+            description=(
+                "Query the repo map summary (languages, subsystems) or one subsystem's "
+                "detail (entry_points, critical_files, neighbors, role_files). Optional "
+                "path resolves a file to its subsystem area. Includes stale freshness flag."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "subsystem": {
+                        "type": "string",
+                        "description": "Subsystem area prefix to return in detail.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Repository-relative file path; resolves to its subsystem area.",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="devcouncil_impact",
+            description=(
+                "Blast-radius impact for given paths: import dependents, neighbor "
+                "subsystem areas, and cross-boundary area pairs from the repo map. "
+                "Set precise=true to resolve dependents via live LSP references when "
+                "a language server is available (falls back to import-level dependents)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Repository-relative file paths to analyze.",
+                    },
+                    "precise": {
+                        "type": "boolean",
+                        "description": (
+                            "When true, use live LSP textDocument/references for "
+                            "dependents instead of import-level map edges."
+                        ),
+                        "default": False,
+                    },
+                },
+                "required": ["paths"],
+            },
+        ),
+        Tool(
+            name="devcouncil_liveness",
+            description=(
+                "Liveness debt from the repo map: unwired candidates, unreachable files, "
+                "dead-symbol candidates, and entry roots. Filterable by subsystem area or path prefix. "
+                "When a code graph exists, also returns structured confidence-tagged dead_code "
+                "(default min_confidence=inferred; pass ambiguous to include all tiers)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "area": {
+                        "type": "string",
+                        "description": "Optional subsystem area to filter results.",
+                    },
+                    "path_prefix": {
+                        "type": "string",
+                        "description": "Optional path prefix to filter results.",
+                    },
+                    "min_confidence": {
+                        "type": "string",
+                        "enum": ["extracted", "inferred", "ambiguous"],
+                        "description": (
+                            "Minimum dead_code confidence tier to include "
+                            "(default: inferred)."
+                        ),
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="devcouncil_graph_query",
+            description=(
+                "360° symbol/file query over the code knowledge graph: definition, callers, "
+                "callees, and importers. Requires `dev map` (writes .devcouncil/graph/code_graph.json)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name_or_path": {
+                        "type": "string",
+                        "description": "Symbol name, qualified id, or file path.",
+                    },
+                },
+                "required": ["name_or_path"],
+            },
+        ),
+        Tool(
+            name="devcouncil_graph_trace",
+            description=(
+                "Shortest path between two nodes in the code knowledge graph "
+                "(imports/calls/contains)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "from": {
+                        "type": "string",
+                        "description": "Start node (name or path).",
+                    },
+                    "to": {
+                        "type": "string",
+                        "description": "End node (name or path).",
+                    },
+                },
+                "required": ["from", "to"],
+            },
+        ),
+        Tool(
+            name="devcouncil_graph_impact",
+            description=(
+                "Symbol-level blast radius from the code knowledge graph: map paths "
+                "(or working-tree diff) to enclosing symbols, then inbound callers/"
+                "importers at depth 1/2/3 with confidence tiers. Distinct from "
+                "devcouncil_impact (file-level repo-map dependents)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Repository-relative file paths to analyze.",
+                    },
+                    "diff": {
+                        "type": "boolean",
+                        "description": (
+                            "When true, seed from working-tree changed files "
+                            "(optionally filtered by paths)."
+                        ),
+                        "default": False,
+                    },
+                },
+            },
+        ),
+        Tool(
             name="devcouncil_lsp_status",
-            description="Return detected language servers and starter LSP initialize payloads.",
+            description=(
+                "Return detected language servers and mode (detection-only or client). "
+                "Client mode reflects indexing.lsp_refs / live references capability."
+            ),
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
@@ -317,7 +464,11 @@ def all_tools() -> list[Tool]:
         ),
         Tool(
             name="devcouncil_update_task_scope",
-            description="Append unique expected tests or allowed commands for a leased task.",
+            description=(
+                "Append unique expected tests, allowed commands, or planned files "
+                "(modify-op only) for a leased task. Use planned_files to authorize "
+                "editing an intended caller when wiring a new module."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -325,6 +476,14 @@ def all_tools() -> list[Tool]:
                     "lease_token": {"type": "string"},
                     "expected_tests": {"type": "array", "items": {"type": "string"}},
                     "allowed_commands": {"type": "array", "items": {"type": "string"}},
+                    "planned_files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Paths to append as modify-op planned files "
+                            "(secret/restricted paths rejected)."
+                        ),
+                    },
                 },
                 "required": ["task_id", "lease_token"],
             },

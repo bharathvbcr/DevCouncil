@@ -63,6 +63,19 @@ def optional_string_argument(arguments: dict, name: str) -> str | None:
     return value if isinstance(value, str) else ""
 
 
+def optional_bool_argument(arguments: dict, name: str) -> tuple[bool | None, list[TextContent] | None]:
+    """Return ``(value, None)`` when absent/valid, or ``(None, error)`` when malformed.
+
+    Absent → ``(None, None)`` so callers can apply their own default.
+    """
+    if name not in arguments or arguments.get(name) is None:
+        return None, None
+    value = arguments.get(name)
+    if not isinstance(value, bool):
+        return None, error_text(f"{name} must be a boolean", code="invalid_arguments", argument=name)
+    return value, None
+
+
 def required_string_argument(arguments: dict, name: str) -> tuple[str | None, list[TextContent] | None]:
     value = arguments.get(name)
     if value is None or value == "":
@@ -163,6 +176,7 @@ def allowed_next_tools(status: str, has_blocking_gaps: bool) -> list[str]:
             "devcouncil_run_command",
             "devcouncil_apply_patch",
             "devcouncil_write_file",
+            "devcouncil_update_task_scope",
             "devcouncil_verify_task",
         ]
     return [

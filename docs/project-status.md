@@ -40,7 +40,8 @@ Other coding CLI hooks remain Preview/Experimental as noted below.
 | **Coding CLI Hooks** | Experimental / starter: Codex, Gemini, OpenCode; Claude hooks are part of the certified path |
 | **GitHub PR Checks** | Preview: `dev report --github` |
 | **GitHub/GitLab PR Comments** | Preview: `dev report --github-pr-comment`, `dev report --gitlab-pr-comment` |
-| **LSP / AST Indexing** | Preview: `dev lsp inspect`, `dev ast match` |
+| **LSP / AST Indexing** | Preview: `dev lsp inspect`, `dev ast match`; optional live refs via `indexing.lsp_refs` / `dev map --lsp-refs` |
+| **Repo Map & Code Graph** | Preview: `dev map` (liveness, incremental `--watch` / `--if-stale`) + `dev graph query|trace|dead|check|process|impact|html|export` — API/output may change |
 | **Live Dashboard** | Preview: `dev dashboard --open`, status panels, recent runs, and guarded local integration apply controls |
 
 ## Watch mode (`dev check --watch`)

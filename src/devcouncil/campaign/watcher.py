@@ -100,12 +100,6 @@ class MailboxWatcher:
             else:
                 self._last[agent] = 0
 
-    def add_agent(self, agent: str) -> None:
-        with self._lock:
-            if agent not in self.agents:
-                self.agents.append(agent)
-                self._last[agent] = 0
-
     # -- background operation --------------------------------------------------
 
     def start(self) -> None:

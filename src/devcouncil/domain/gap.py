@@ -25,6 +25,10 @@ class Gap(BaseModel):
         "stub_detected",
         "stub_declared",
         "suspicious_effort",
+        "unwired_file",
+        "dead_symbol",
+        "stranded_code",
+        "stale_map",
     ]
     requirement_id: Optional[str] = None
     task_id: Optional[str] = None

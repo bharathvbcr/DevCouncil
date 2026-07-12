@@ -109,3 +109,67 @@ def test_live_stub_scan_records_advisory_gap(tmp_path, monkeypatch):
     with Database(tmp_path / ".devcouncil" / "state.sqlite").get_session() as session:
         gaps = GapRepository(session).get_all()
         assert any(g.gap_type == "stub_detected" and not g.blocking for g in gaps)
+
+
+def test_notify_callback_invoked(tmp_path):
+    _setup(tmp_path)
+    (tmp_path / "src").mkdir()
+    target = tmp_path / "src" / "app.py"
+    target.write_text("x", encoding="utf-8")
+    events = []
+    watcher = FilesystemWatcher(tmp_path, "TASK-001", on_event=events.append)
+    watcher.handle_event(str(target), operation="modify")
+    assert len(events) == 1
+
+
+def test_debounced_evicts_stale_entries(tmp_path, monkeypatch):
+    _setup(tmp_path)
+    watcher = FilesystemWatcher(tmp_path, "TASK-001")
+    import devcouncil.execution.fs_watcher as fw
+
+    now = {"t": 100.0}
+    monkeypatch.setattr(fw.time, "monotonic", lambda: now["t"])
+
+    assert watcher._debounced("src/a.py") is False
+    now["t"] = 100.1
+    assert watcher._debounced("src/a.py") is True
+    now["t"] = 101.0
+    watcher._debounced("src/b.py")
+    assert "src/a.py" not in watcher._seen or watcher._seen["src/a.py"] == 101.0
+
+
+def test_task_cached_reuses_within_ttl(tmp_path):
+    _setup(tmp_path)
+    watcher = FilesystemWatcher(tmp_path, "TASK-001")
+    first = watcher._task_cached()
+    second = watcher._task_cached()
+    assert first is not None
+    assert second is first
+
+
+def test_scan_stubs_live_throttled_and_no_task(tmp_path, monkeypatch):
+    watcher = FilesystemWatcher(tmp_path, "TASK-001")
+    watcher._last_stub_scan = 9999999999.0
+    watcher._scan_stubs_live(None)
+
+    _setup(tmp_path)
+    watcher = FilesystemWatcher(tmp_path, "TASK-001")
+    monkeypatch.setattr(
+        "devcouncil.execution.fs_watcher.Verifier.get_diff",
+        lambda self: "",
+    )
+    watcher._scan_stubs_live(watcher._task_cached())
+
+
+def test_scan_stubs_live_get_diff_exception(tmp_path, monkeypatch):
+    _setup(tmp_path)
+    watcher = FilesystemWatcher(tmp_path, "TASK-001")
+
+    def _boom(self):
+        raise RuntimeError("no git")
+
+    monkeypatch.setattr(
+        "devcouncil.execution.fs_watcher.Verifier.get_diff",
+        _boom,
+    )
+    watcher._scan_stubs_live(watcher._task_cached())

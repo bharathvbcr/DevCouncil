@@ -659,26 +659,116 @@ def hooks(
         False,
         "--write-gate/--no-write-gate",
         "--contain/--no-contain",
-        help="Install Claude's blocking PreToolUse/PostToolUse write-gate too (off by default; "
+        help="Install Claude's blocking PreToolUse write-gate too (off by default; "
         "fail-closes an interactive session without a task lease).",
+    ),
+    git: bool = typer.Option(
+        True,
+        "--git/--no-git",
+        help="Install git post-commit/post-merge/post-checkout hooks that run "
+        "`dev map --if-stale` (on by default with --apply).",
+    ),
+    check: bool = typer.Option(
+        False,
+        "--check",
+        help="Report whether installed hook commands still point at the resolved project `dev` executable.",
     ),
 ):
     """
     Install DevCouncil hook configuration for Codex, Gemini, Claude, Cursor, and OpenCode.
 
-    Claude installs only assistive hooks by default; add --write-gate for pre-action
-    containment (intended for autonomous executor runs).
+    Claude installs assistive hooks plus refresh-only PostToolUse by default; add
+    --write-gate for pre-action PreToolUse containment (autonomous executor runs).
+    Git map-refresh hooks install by default with --apply (use --no-git to skip).
     """
     root = _project_root(project_root)
+    if check:
+        ok, details = common.check_hook_dev_executable(root)
+        current = common.resolve_dev_executable(root)
+        recorded = common.recorded_hook_dev_executable(root)
+        console.print(f"Resolved `dev`: [cyan]{current}[/cyan]")
+        console.print(f"Recorded for hooks: [cyan]{recorded or '(none)'}[/cyan]")
+        if ok:
+            console.print(f"[green]OK[/green] — {details}")
+            raise typer.Exit(code=0)
+        console.print(f"[red]MISMATCH[/red] — {details}")
+        console.print(
+            f"[dim]Re-run `{PREFERRED_COMMAND} hooks --apply` to retarget hook commands.[/dim]"
+        )
+        raise typer.Exit(code=1)
     if apply and tool == "all":
         report = apply_integration_target(root, "hooks", claude_write_gate=write_gate)
         if not report.ok:
             console.print(report.to_json())
             raise typer.Exit(code=1)
         console.print("[green]Native hooks configured.[/green]")
-        return
-    _configure_native_hooks(root, tool, apply, claude_write_gate=write_gate)
+    else:
+        _configure_native_hooks(root, tool, apply, claude_write_gate=write_gate)
+    if git:
+        written = _install_git_map_hooks(root, apply=apply)
+        for path in written:
+            console.print(f"[green]{'Wrote' if apply else 'Would write'} git hook:[/green] {path}")
 
+
+def _install_git_map_hooks(root: Path, *, apply: bool) -> list[str]:
+    """Install post-commit/post-merge/post-checkout hooks that refresh the map when stale."""
+    hooks_dir = root / ".git" / "hooks"
+    if not (root / ".git").exists():
+        console.print("[yellow]No .git directory; skipping git map hooks.[/yellow]")
+        return []
+    executable = common.resolve_dev_executable(root)
+    # Quote for POSIX shell; absolute path avoids PATH shadowing by a stale global install.
+    quoted = common._format_command([executable])
+    script = f"""#!/bin/sh
+# DevCouncil: refresh repo map after git operations (best-effort).
+{quoted} map --if-stale --no-wiki --project-root "$(git rev-parse --show-toplevel)" >/dev/null 2>&1 || true
+"""
+    written: list[str] = []
+    for name in ("post-commit", "post-merge", "post-checkout"):
+        path = hooks_dir / name
+        rel = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
+        written.append(rel)
+        if not apply:
+            continue
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+        marker = "# DevCouncil: refresh repo map"
+        if marker in existing:
+            # Retarget the executable if a previous install used a different path.
+            if quoted not in existing:
+                updated = _retarget_git_hook_script(existing, quoted)
+                path.write_text(updated, encoding="utf-8")
+            continue
+        if existing and not existing.endswith("\n"):
+            existing += "\n"
+        path.write_text(existing + script if existing else script, encoding="utf-8")
+        path.chmod(path.stat().st_mode | 0o111)
+    if apply:
+        common.record_hook_dev_executable(root, executable)
+    return written
+
+
+def _retarget_git_hook_script(existing: str, quoted_executable: str) -> str:
+    """Replace the DevCouncil map-refresh command line with the current executable."""
+    import re
+
+    pattern = re.compile(
+        r"(?m)^.*\bmap --if-stale\b.*$|^.*\bmap --no-wiki\b.*$",
+    )
+    replacement = (
+        f'{quoted_executable} map --if-stale --no-wiki '
+        f'--project-root "$(git rev-parse --show-toplevel)" >/dev/null 2>&1 || true'
+    )
+    if pattern.search(existing):
+        return pattern.sub(replacement, existing, count=1)
+    # Marker present but no recognizable command line — append a fresh one.
+    suffix = existing if existing.endswith("\n") else existing + "\n"
+    return (
+        suffix
+        + "# DevCouncil: refresh repo map after git operations (best-effort).\n"
+        + replacement
+        + "\n"
+    )
 
 @app.command("uninstall")
 def uninstall(

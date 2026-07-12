@@ -39,9 +39,11 @@ dev --help
 From a local checkout:
 
 ```bash
-uv tool install --force .
+uv tool install --force --reinstall --editable .
 devcouncil --help
 ```
+
+`--editable` keeps the global `dev` / `devcouncil` shims pointed at this tree (useful while developing map/graph features). Omit `--editable` for a frozen install of the current tree.
 
 For local npm wrapper testing before publishing a new package version:
 

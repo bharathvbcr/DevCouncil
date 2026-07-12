@@ -72,6 +72,39 @@ def dependents_of(path: str, data: Mapping | None) -> list[str]:
     return [str(p) for p in (dependents.get(_norm(path)) or [])]
 
 
+def unwired_candidates_of(data: Mapping | None) -> list[str]:
+    """Files with zero inbound edges that aren't entry roots/exempt (capped list)."""
+    vals = (data or {}).get("unwired_candidates") or []
+    if not isinstance(vals, list):
+        return []
+    return [str(p) for p in vals]
+
+
+def unreachable_of(data: Mapping | None) -> list[str]:
+    """Files not reachable by BFS from any entry root (capped list)."""
+    vals = (data or {}).get("unreachable_files") or []
+    if not isinstance(vals, list):
+        return []
+    return [str(p) for p in vals]
+
+
+def dead_symbol_candidates_of(data: Mapping | None) -> list[str]:
+    """``path:line name`` entries for unused public top-level symbols (capped)."""
+    vals = (data or {}).get("dead_symbol_candidates") or []
+    if not isinstance(vals, list):
+        return []
+    return [str(p) for p in vals]
+
+
+def is_entry_root(path: str, data: Mapping | None) -> bool:
+    """True when ``path`` is listed in the map's ``entry_roots``."""
+    roots = (data or {}).get("entry_roots") or []
+    if not isinstance(roots, list):
+        return False
+    norm = _norm(path)
+    return any(_norm(str(r)) == norm for r in roots)
+
+
 def areas_touched(paths: Iterable[str], data: Mapping | None) -> list[str]:
     """The distinct subsystem areas the given paths live in (sorted)."""
     seen: set[str] = set()

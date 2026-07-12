@@ -30,7 +30,10 @@ from devcouncil.llm.provider import ProviderRequestError, create_provider, valid
 from devcouncil.llm.router import ModelRouter, StructuredOutputError
 from devcouncil.verification.ad_hoc_check import AdHocCheckResult, run_working_tree_check
 from devcouncil.verification.gate_cache import GateResultCache
-from devcouncil.verification.incremental_check import run_incremental_gates
+from devcouncil.verification.incremental_check import (
+    run_incremental_gates,
+    selected_gate_specs,
+)
 from devcouncil.verification.implementation_reviewer import ImplementationReviewer
 from devcouncil.verification.verifier import Verifier
 from devcouncil.telemetry.stages import log_stage, log_step
@@ -53,6 +56,7 @@ def check(
     test_commands: list[str] | None = typer.Option(None, "--test", "-t", help="A verification command proving the change works (repeatable). Switches to the deterministic evidence gate."),
     verify: bool = typer.Option(False, "--verify", help="Run the deterministic evidence gate (orphan-diff, acceptance evidence, diff↔coverage, next actions) instead of the LLM audit. No provider keys needed."),
     watch: bool = typer.Option(False, "--watch", help="Keep watching the project tree and re-run the deterministic evidence gate on every change (implies --verify). Prints one compact verdict line per run; Ctrl-C to stop."),
+    list_gates: bool = typer.Option(False, "--list-gates", help="Preview which incremental stack gates would run for the current working-tree changes (no execution)."),
     enforce_coverage: bool = typer.Option(False, "--enforce-coverage", help="Evidence gate: block when the tests do not exercise the changed lines."),
     min_coverage: float = typer.Option(0.0, "--min-coverage", help="Evidence gate: minimum fraction of changed lines that must be exercised (implies --enforce-coverage)."),
     json_format: bool = typer.Option(False, "--json", help="Machine-readable output."),
@@ -63,15 +67,58 @@ def check(
     from devcouncil.telemetry.logging_setup import set_log_dir
     set_log_dir(root)
     logger.info(
-        "dev check: verify=%s goal=%s base=%s watch=%s", verify, bool(goal), base or "working-tree", watch
+        "dev check: verify=%s goal=%s base=%s watch=%s list_gates=%s",
+        verify, bool(goal), base or "working-tree", watch, list_gates,
     )
     initialize_project(root, quiet=True)
 
     with log_stage("check", project_root=root, verify=verify):
+        if list_gates:
+            _list_gates(root, test_commands, json_format)
+            return
         _run_check_body(
             root, goal, base, test_commands, verify, enforce_coverage,
             min_coverage, json_format, watch,
         )
+
+
+def _list_gates(root: Path, test_commands: list[str] | None, json_format: bool) -> None:
+    """Dry-run: show incremental gates for the current working-tree diff."""
+    from devcouncil.verification.incremental_check import (
+        _default_changed_files,
+        _default_commands,
+    )
+
+    changed = _default_changed_files(root)
+    cmds = _default_commands(root)
+    if test_commands:
+        cmds = {**cmds, "test": list(cmds.get("test") or []) + list(test_commands)}
+    gates = selected_gate_specs(root, changed, commands=cmds, narrow=True)
+    payload = {
+        "changed_files": changed,
+        "gates": [
+            {
+                "name": g.name,
+                "kind": g.kind,
+                "command": list(g.command),
+                "narrowed": g.narrowed,
+            }
+            for g in gates
+        ],
+    }
+    if json_format:
+        typer.echo(dump_json(payload, indent=2))
+        return
+    if not changed:
+        console.print("[dim]No working-tree changes — no gates selected.[/dim]")
+        return
+    if not gates:
+        console.print(f"[dim]{len(changed)} changed file(s), no matching stack gates.[/dim]")
+        return
+    console.print(f"[bold]{len(gates)}[/bold] gate(s) for {len(changed)} changed file(s):")
+    for g in gates:
+        narrow = " [narrowed]" if g.narrowed else ""
+        console.print(f"  • {g.kind}/{g.name}{narrow}: {' '.join(g.command)}")
 
 
 def _run_check_body(

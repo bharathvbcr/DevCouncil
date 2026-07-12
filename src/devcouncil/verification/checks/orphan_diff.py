@@ -9,6 +9,7 @@ from typing import Callable, List, Tuple
 
 from devcouncil.domain.gap import Gap
 from devcouncil.domain.task import Task
+from devcouncil.indexing.wiring import is_test_path
 from devcouncil.verification.stub_detector import detect_stubs
 
 logger = logging.getLogger(__name__)
@@ -45,23 +46,6 @@ def classify_change_paths(
     except Exception as e:
         logger.debug("Failed to classify changed files: %s", e)
     return sorted(added & changed_set), sorted(deleted & changed_set)
-
-
-def is_test_path(path: str) -> bool:
-    """True when path is a test file by common conventions."""
-    norm = path.replace("\\", "/").lower()
-    name = norm.rsplit("/", 1)[-1]
-    parts = norm.split("/")
-    in_test_dir = any(p in {"tests", "test", "__tests__", "spec"} for p in parts[:-1])
-    looks_like_test = (
-        name.startswith("test_")
-        or name == "conftest.py"
-        or any(name.endswith(suffix) for suffix in (
-            "_test.py", "_test.go", ".test.js", ".test.ts", ".test.jsx", ".test.tsx",
-            ".spec.js", ".spec.ts", ".spec.jsx", ".spec.tsx", "_spec.rb",
-        ))
-    )
-    return looks_like_test or (in_test_dir and not name.startswith("."))
 
 
 def detect_orphan_diff_gaps(
@@ -108,9 +92,11 @@ def detect_orphan_diff_gaps(
                 ),
                 evidence=[cf],
                 recommended_fix=(
-                    f"Add {cf} to the task's planned files (or fold the tests into a planned test file)."
+                    f"Append {cf} with `dev scope update <task_id> --lease-token <token> "
+                    f"--planned-file {cf}` (or fold the tests into a planned test file)."
                     if new_test_file else
-                    f"Revert changes to {cf} or add it to the task's planned files."
+                    f"Revert changes to {cf} or append it with "
+                    f"`dev scope update <task_id> --lease-token <token> --planned-file {cf}`."
                 ),
                 blocking=not new_test_file,
                 file=cf,

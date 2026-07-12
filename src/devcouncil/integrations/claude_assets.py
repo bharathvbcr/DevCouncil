@@ -432,13 +432,15 @@ def _marketplace_json(version: str) -> str:
 def _plugin_hooks_json(*, write_gate: bool = False) -> str:
     """hooks.json for the plugin, resolving the project root via ${CLAUDE_PROJECT_DIR}.
 
-    Assist-mode by default (no blocking write-gate) so installing the plugin into an
-    interactive session never fail-closes it. The blocking PreToolUse/PostToolUse gate is
-    included only when ``write_gate`` is True."""
+    Assist-mode by default installs refresh-only PostToolUse (never gates writes) plus
+    lifecycle hooks. The blocking PreToolUse write-gate is included only when
+    ``write_gate`` is True."""
     def cmd(event: str) -> str:
         return f'devcouncil hook {event} --client claude --project-root "${{CLAUDE_PROJECT_DIR}}"'
 
+    tool_matcher = "Bash|Write|Edit|MultiEdit"
     hooks: dict[str, list] = {
+        "PostToolUse": [{"matcher": tool_matcher, "hooks": [{"type": "command", "command": cmd("post-tool-use"), "timeout": 10000}]}],
         "Stop": [{"hooks": [{"type": "command", "command": cmd("agent-response"), "timeout": 10000}]}],
         "SessionStart": [{"matcher": "startup|resume", "hooks": [{"type": "command", "command": cmd("session-start"), "timeout": 10000}]}],
         "UserPromptSubmit": [{"hooks": [{"type": "command", "command": cmd("user-prompt-submit"), "timeout": 10000}]}],
@@ -446,9 +448,7 @@ def _plugin_hooks_json(*, write_gate: bool = False) -> str:
         "Notification": [{"hooks": [{"type": "command", "command": cmd("notification"), "timeout": 10000}]}],
     }
     if write_gate:
-        tool_matcher = "Bash|Write|Edit|MultiEdit"
         hooks["PreToolUse"] = [{"matcher": tool_matcher, "hooks": [{"type": "command", "command": cmd("pre-tool-use"), "timeout": 10000}]}]
-        hooks["PostToolUse"] = [{"matcher": tool_matcher, "hooks": [{"type": "command", "command": cmd("post-tool-use"), "timeout": 10000}]}]
     return json.dumps({"hooks": hooks}, indent=2) + "\n"
 
 

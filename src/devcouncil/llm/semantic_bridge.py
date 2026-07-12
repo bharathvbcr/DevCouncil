@@ -374,32 +374,6 @@ class SemanticLayerAdapter:
         except Exception as exc:
             logger.debug("Semantic cache store failed: %s", exc)
 
-    def maybe_route_model(
-        self,
-        messages: list[dict[str, str]],
-        *,
-        configured_model: str,
-        role_provider: str | None,
-    ) -> str:
-        """Optionally override the configured model based on query complexity."""
-        if not self.router_enabled or not self._ensure_initialized():
-            return configured_model
-        assert self._router is not None and self._embedder is not None
-
-        if (role_provider or "").strip().lower() not in {"ollama", "ollama-local", "ollama_local"}:
-            return configured_model
-
-        prompt = prompt_text_from_messages(messages)
-        if not prompt.strip():
-            return configured_model
-
-        try:
-            query_vec = self._embedder.embed_one(prompt)
-            return self._route_with_vector(prompt, query_vec, configured_model=configured_model)
-        except Exception as exc:
-            logger.debug("Semantic routing failed: %s", exc)
-            return configured_model
-
     async def maybe_route_model_async(
         self,
         messages: list[dict[str, str]],
@@ -437,24 +411,6 @@ class SemanticLayerAdapter:
             decision.model_name,
         )
         return str(decision.model_name)
-
-    def maybe_compress_messages(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
-        """Compress long user/context payloads before an LLM call."""
-        if not self.compressor_enabled or not self._ensure_initialized():
-            return messages
-        assert self._compressor is not None and self._embedder is not None
-
-        prepared = self._compression_inputs(messages)
-        if prepared is None:
-            return messages
-        query, context_docs = prepared
-
-        try:
-            query_vec = self._embedder.embed_one(query)
-            return self._compress_with_vector(messages, query, context_docs, query_vec)
-        except Exception as exc:
-            logger.debug("Semantic compression failed: %s", exc)
-            return messages
 
     async def maybe_compress_messages_async(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
         """Async message compression; embedding runs in a worker thread."""

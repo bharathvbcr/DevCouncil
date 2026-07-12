@@ -45,7 +45,19 @@ def get_lsp_inspector(root: Path) -> LspInspector:
 
 async def handle_lsp_status(root: Path, arguments: dict) -> list[TextContent]:
     _ = arguments
-    return [TextContent(type="text", text=get_lsp_inspector(root).summary_json())]
+    client_enabled = False
+    try:
+        from devcouncil.indexing.lsp_client import lsp_refs_enabled
+
+        client_enabled = lsp_refs_enabled(root)
+    except Exception:
+        client_enabled = False
+    return [
+        TextContent(
+            type="text",
+            text=get_lsp_inspector(root).summary_json(client_enabled=client_enabled),
+        )
+    ]
 
 
 async def handle_ast_match(root: Path, arguments: dict) -> list[TextContent]:

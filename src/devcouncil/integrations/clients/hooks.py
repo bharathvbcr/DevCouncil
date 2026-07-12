@@ -25,6 +25,9 @@ _batched_raw_config = _common._batched_raw_config
 _probe_mcp_tools = _common._probe_mcp_tools
 _print_command = _common._print_command
 _configure = _common._configure
+resolve_dev_executable = _common.resolve_dev_executable
+record_hook_dev_executable = _common.record_hook_dev_executable
+check_hook_dev_executable = _common.check_hook_dev_executable
 
 console = _common.console
 OPENCODE_HOOK_PLUGIN_NAME = _common.OPENCODE_HOOK_PLUGIN_NAME
@@ -37,8 +40,11 @@ _opencode_plugin_path = _opencode._opencode_plugin_path
 _opencode_plugin_source = _opencode._opencode_plugin_source
 _record_opencode_config = _opencode._record_opencode_config
 def _hook_command(project_root: Path, client: str, event: str) -> str:
+    # Absolute path to project-venv (or PATH) `dev` so a stale global install cannot
+    # shadow the repo's CLI from PostToolUse / PreToolUse hooks.
+    executable = resolve_dev_executable(project_root)
     return _format_command([
-        "devcouncil",
+        executable,
         "hook",
         event,
         "--client",
@@ -239,20 +245,28 @@ def _install_opencode_hooks(project_root: Path) -> list[Path]:
 def _install_claude_hooks(project_root: Path, *, write_gate: bool = False) -> list[Path]:
     """Install DevCouncil's Claude Code hooks into .claude/settings.local.json.
 
-    By default this installs only the *assistive* lifecycle hooks (status injection on
-    SessionStart/UserPromptSubmit, the live-review Stop signal, and the SessionEnd/
-    PreCompact/SubagentStop/Notification trace hooks). These never block a tool call.
+    By default this installs *assistive* lifecycle hooks plus a refresh-only
+    **PostToolUse** hook (map auto-refresh; never gates writes). These never block
+    a tool call.
 
-    The blocking pre-action **write-gate** (PreToolUse/PostToolUse, which denies any
+    The blocking pre-action **write-gate** (**PreToolUse**, which denies any
     Bash/Write/Edit not authorized by an active task lease) is installed ONLY when
     ``write_gate`` is True. It is meant for autonomous executor runs, not interactive
     human sessions — in an interactive session there is no task lease, so the gate would
     fail-closed and deny every command. (``dev run --executor claude`` does its own
-    post-hoc scope enforcement and does not depend on this hook, so leaving it off by
-    default loses no containment.)"""
+    post-hoc scope enforcement and does not depend on this hook, so leaving PreToolUse
+    off by default loses no containment.)"""
     path = project_root / ".claude" / "settings.local.json"
     settings = _load_json(path)
     matcher = "Bash|Write|Edit|MultiEdit"
+    # Refresh-only PostToolUse is always installed so assist mode keeps the map warm.
+    _upsert_hook(
+        settings,
+        "PostToolUse",
+        matcher,
+        _hook_command(project_root, "claude", "post-tool-use"),
+        "devcouncil-post-tool-use",
+    )
     if write_gate:
         _upsert_hook(
             settings,
@@ -260,13 +274,6 @@ def _install_claude_hooks(project_root: Path, *, write_gate: bool = False) -> li
             matcher,
             _hook_command(project_root, "claude", "pre-tool-use"),
             "devcouncil-pre-tool-use",
-        )
-        _upsert_hook(
-            settings,
-            "PostToolUse",
-            matcher,
-            _hook_command(project_root, "claude", "post-tool-use"),
-            "devcouncil-post-tool-use",
         )
     _upsert_hook(
         settings,
@@ -383,3 +390,4 @@ def _configure_native_hooks(
                 console.print(f"[red]{client} hook setup failed: {exc}[/red]")
                 raise typer.Exit(code=1) from exc
             console.print(f"[green]{client} native hooks configured:[/green] {', '.join(str(path) for path in written)}")
+    record_hook_dev_executable(project_root)

@@ -101,10 +101,11 @@ def test_plugin_bundle_is_self_contained(tmp_path):
     mcp_cfg = json.loads(mcp.content)
     assert mcp_cfg["mcpServers"]["devcouncil"]["env"]["DEVCOUNCIL_PROJECT_ROOT"] == "${CLAUDE_PROJECT_DIR}"
 
-    # Assist-mode by default: lifecycle hooks present, blocking write-gate absent.
+    # Assist-mode by default: lifecycle hooks + refresh-only PostToolUse; no PreToolUse gate.
     hooks = json.loads(next(a for a in bundle if a.path.name == "hooks.json").content)
     assert "SessionStart" in hooks["hooks"] and "UserPromptSubmit" in hooks["hooks"]
-    assert "PreToolUse" not in hooks["hooks"] and "PostToolUse" not in hooks["hooks"]
+    assert "PostToolUse" in hooks["hooks"]
+    assert "PreToolUse" not in hooks["hooks"]
 
 
 def test_plugin_bundle_write_gate_includes_blocking_hooks():
@@ -306,14 +307,14 @@ def test_claude_statusline_falls_back_when_uninitialized(tmp_path):
 
 def test_claude_native_hooks_assist_mode_default_has_no_write_gate(tmp_path):
     _init_repo(tmp_path)
-    result = runner.invoke(app, ["integrate", "hooks", "--tool", "claude", "--apply", "--project-root", str(tmp_path)])
+    result = runner.invoke(app, ["integrate", "hooks", "--tool", "claude", "--apply", "--no-git", "--project-root", str(tmp_path)])
     assert result.exit_code == 0, result.output
     settings = json.loads((tmp_path / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
     events = set(settings["hooks"].keys())
-    # Assistive lifecycle hooks present...
-    assert {"Stop", "SessionStart", "UserPromptSubmit", "SessionEnd", "PreCompact", "SubagentStop", "Notification"} <= events
-    # ...but the blocking write-gate is NOT installed by default.
-    assert "PreToolUse" not in events and "PostToolUse" not in events
+    # Assistive lifecycle hooks + refresh-only PostToolUse present...
+    assert {"Stop", "SessionStart", "UserPromptSubmit", "SessionEnd", "PreCompact", "SubagentStop", "Notification", "PostToolUse"} <= events
+    # ...but the blocking PreToolUse write-gate is NOT installed by default.
+    assert "PreToolUse" not in events
 
 
 def test_claude_native_hooks_write_gate_flag_adds_blocking_gate(tmp_path):

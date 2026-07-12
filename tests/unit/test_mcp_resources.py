@@ -1,73 +1,104 @@
-"""Rank 18 — DevCouncil corpus is browsable as MCP resources."""
+"""Coverage for reporting.mcp_resources (resource read/list helpers)."""
+
+from __future__ import annotations
 
 import json
 
 import pytest
-from pydantic import AnyUrl
 
-from devcouncil.domain.gap import Gap
-from devcouncil.domain.task import Task
-from devcouncil.integrations.mcp.server import list_resources, read_resource
-from devcouncil.storage.db import Database
-from devcouncil.storage.repositories import GapRepository, TaskRepository
+from devcouncil.cli.commands.init import initialize_project
+from devcouncil.domain.task import PlannedFile, Task
+from devcouncil.reporting.mcp_resources import list_mcp_resource_uris, read_mcp_resource
+from devcouncil.storage.db import get_db
+from devcouncil.storage.repositories import TaskRepository
 
 
 @pytest.fixture
-def anyio_backend():
-    return "asyncio"
+def project(tmp_path):
+    initialize_project(tmp_path, quiet=True, with_map=False, with_skills=False)
+    return tmp_path
 
 
-def _seed(tmp_path):
-    dev = tmp_path / ".devcouncil"
-    dev.mkdir()
-    db = Database(dev / "state.sqlite")
-    db.create_db_and_tables()
+def _add_task(tmp_path, task_id="TASK-001"):
+    db = get_db(tmp_path)
+    assert db is not None
     with db.get_session() as session:
-        TaskRepository(session).save(Task(id="TASK-001", title="Build it", description="d"))
-        GapRepository(session).save(Gap(
-            id="GAP-1", severity="high", gap_type="test_failed", task_id="TASK-001",
-            description="boom", recommended_fix="fix", blocking=True,
-        ))
+        TaskRepository(session).save(
+            Task(
+                id=task_id,
+                title="A task",
+                description="desc",
+                planned_files=[PlannedFile(path="src/app.py", reason="x", allowed_change="modify")],
+            )
+        )
 
 
-@pytest.mark.anyio
-async def test_list_resources_includes_corpus_and_tasks(tmp_path, monkeypatch):
-    _seed(tmp_path)
-    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
-    uris = {str(r.uri).rstrip("/") for r in await list_resources()}
+def test_read_report_resource(project):
+    body = read_mcp_resource(project, "devcouncil://report")
+    assert isinstance(body, str)
+    assert body.strip()  # markdown report
+
+
+def test_read_tasks_empty(project):
+    body = read_mcp_resource(project, "devcouncil://tasks")
+    data = json.loads(body)
+    assert data == {"tasks": []}
+
+
+def test_read_tasks_with_task(project):
+    _add_task(project)
+    data = json.loads(read_mcp_resource(project, "devcouncil://tasks"))
+    ids = {t["id"] for t in data["tasks"]}
+    assert "TASK-001" in ids
+
+
+def test_read_gaps_empty(project):
+    data = json.loads(read_mcp_resource(project, "devcouncil://gaps"))
+    assert data == {"gaps": []}
+
+
+def test_read_cards_resource(project):
+    data = json.loads(read_mcp_resource(project, "devcouncil://cards"))
+    assert isinstance(data, dict)
+
+
+def test_read_specific_task_resource(project):
+    _add_task(project, "TASK-XYZ")
+    data = json.loads(read_mcp_resource(project, "devcouncil://task/TASK-XYZ"))
+    assert data["task"]["id"] == "TASK-XYZ"
+    assert "gaps" in data
+
+
+def test_read_missing_task_resource(project):
+    data = json.loads(read_mcp_resource(project, "devcouncil://task/NOPE"))
+    assert data["ok"] is False
+    assert "not found" in data["error"].lower()
+
+
+def test_read_knowledge_index_empty(project):
+    body = read_mcp_resource(project, "devcouncil://knowledge")
+    assert "No OKF" in body or "knowledge" in body.lower()
+
+
+def test_read_unknown_resource_raises(project):
+    with pytest.raises(ValueError):
+        read_mcp_resource(project, "devcouncil://bogus")
+
+
+def test_trailing_slash_normalized(project):
+    data = json.loads(read_mcp_resource(project, "devcouncil://tasks/"))
+    assert data == {"tasks": []}
+
+
+def test_list_resource_uris_includes_core_and_tasks(project):
+    _add_task(project, "TASK-LIST")
+    resources = list_mcp_resource_uris(project)
+    uris = {r["uri"] for r in resources}
     assert "devcouncil://report" in uris
     assert "devcouncil://tasks" in uris
     assert "devcouncil://gaps" in uris
-    assert "devcouncil://task/TASK-001" in uris
-
-
-@pytest.mark.anyio
-async def test_read_resource_tasks_and_task_detail(tmp_path, monkeypatch):
-    _seed(tmp_path)
-    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
-
-    tasks = json.loads(await read_resource(AnyUrl("devcouncil://tasks")))
-    assert tasks["tasks"][0]["id"] == "TASK-001"
-
-    detail = json.loads(await read_resource(AnyUrl("devcouncil://task/TASK-001")))
-    assert detail["task"]["id"] == "TASK-001"
-    assert detail["gaps"][0]["id"] == "GAP-1"
-
-    gaps = json.loads(await read_resource(AnyUrl("devcouncil://gaps")))
-    assert any(g["id"] == "GAP-1" for g in gaps["gaps"])
-
-
-@pytest.mark.anyio
-async def test_read_resource_report_is_markdown(tmp_path, monkeypatch):
-    _seed(tmp_path)
-    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
-    report = await read_resource(AnyUrl("devcouncil://report"))
-    assert isinstance(report, str) and report.strip()
-
-
-@pytest.mark.anyio
-async def test_read_resource_unknown_uri_raises(tmp_path, monkeypatch):
-    _seed(tmp_path)
-    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
-    with pytest.raises(ValueError):
-        await read_resource(AnyUrl("devcouncil://nope"))
+    assert "devcouncil://cards" in uris
+    assert "devcouncil://task/TASK-LIST" in uris
+    # each descriptor has the expected shape
+    for r in resources:
+        assert {"uri", "name", "description", "mimeType"} <= set(r)

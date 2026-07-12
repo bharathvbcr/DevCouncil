@@ -22,6 +22,7 @@ DevCouncil does not replace coding agents. It sits beside tools like Codex CLI, 
 - [Coding CLI integration](docs/coding-cli-integration.md): Codex, Gemini, Claude Code, OpenCode, Antigravity, Cursor, Grok Build, Aider, MCP, hooks, and automated executors.
 - [Integration tiers](docs/integration-tiers.md): headless executor vs MCP-only vs sidecar definitions.
 - [CLI command reference](docs/cli-reference.md): available `dev` commands.
+- [Repo map & code graph](docs/code-graph.md): `dev map` / `dev graph` — navigation, dead code, blast radius, HTML visualizer.
 - [Hero loop](docs/hero-loop.md): autonomous Claude Code + MCP closed loop and `dev check --verify` on-ramp.
 - [Architecture](docs/architecture.md): components, artifact graph, state machine, and gated execution.
 - [Executor adapters](docs/executor-adapters.md): manual, coding CLI, native-preview, Mini-SWE, and OpenHands execution paths.
@@ -156,7 +157,7 @@ DevCouncil is an application layer around coding agents. It does not just emit p
 ### Workflow Features
 
 - **Repository onboarding:** `dev setup` initializes `.devcouncil/`, generates the repo map + `AGENTS.md`/`CLAUDE.md` guides, scaffolds applicable engineering skills, runs environment checks, offers integration setup, and prints the next useful commands. Use `--skip-map` / `--skip-skills` to opt out, or `--scaffold-ci` to also write a starter GitHub Actions workflow.
-- **Repository mapping:** `dev map` writes `.devcouncil/repo_map.json`, identifies important files and subsystems, filters generated/temp files, and keeps managed `AGENTS.md` / `CLAUDE.md` workspace guides synchronized. Subsystems, entry points, neighbors, and important surfaces are now inferred generically for **any** repository — grouped from the directory tree and ranked by an import-graph in-degree — so the map (and the structural context it feeds into prompts) is meaningful outside DevCouncil's own tree, not just within it. The map records the git HEAD and tracked-file fingerprint it was built from; when prompts reuse a map that has fallen behind the current code, they flag it as stale (run `dev map` to refresh) rather than silently feeding wrong structure. The map is also generated automatically on first init.
+- **Repository mapping:** `dev map` writes `.devcouncil/repo_map.json` and a symbol-level `.devcouncil/graph/code_graph.json`, identifies important files and subsystems, filters generated/temp files, and keeps managed `AGENTS.md` / `CLAUDE.md` workspace guides synchronized. Subsystems, entry points, neighbors, and important surfaces are inferred generically for **any** repository — grouped from the directory tree and ranked by an import-graph in-degree. Freshness uses git HEAD, tracked-file hash, and a content fingerprint so plain edits mark the map stale; post-tool-use hooks and `dev map --watch` refresh incrementally. Query the graph with `dev graph query|trace|dead|html`. The map is also generated automatically on first init.
 - **Engineering skills:** `dev skills` lists the bundled skills and shows which apply to the repository; `dev skills scaffold` writes them into `.claude/skills/<name>/SKILL.md`. A merged always-on `core-engineering` skill (think-before-coding, simplicity, surgical changes, goal-driven execution, evidence-grounded communication) plus domain skills (Android, iOS, Windows, web, AI training) that brief the agent on current SDKs, deprecations, and tooling before coding. Applicable skills are also embedded into `dev prompt` output.
 - **CI scaffolding:** `dev scaffold-ci` writes a starter `.github/workflows/devcouncil.yml` derived from the configured test/lint/typecheck commands, filtered to the detected language stack; it never overwrites existing CI unless `--force`. Run `dev scaffold-ci --evidence` to generate `.github/workflows/devcouncil-evidence.yml` which automates verifying PRs and uploading evidence JSON and HTML reports.
 - **Planning council:** `dev plan` turns a goal into requirements, acceptance criteria, assumptions, critique findings, and executable tasks. When advisory gaps remain, the project stays in `AWAITING_USER_DECISIONS` until you run `dev approve` (or `dev e2e`/`dev go --force`).
@@ -236,6 +237,7 @@ DevCouncil stores local workflow state in the target repository:
 - `.devcouncil/config.yaml`: provider, executor, command, integration, and workflow settings.
 - `.devcouncil/secrets.env`: local provider secrets such as API keys or Vertex AI project/location values. Git-ignored; copy `.devcouncil/secrets.env.example` and fill in real values. Environment variables take precedence over this file.
 - `.devcouncil/repo_map.json`: generated repository map and subsystem navigation index.
+- `.devcouncil/graph/code_graph.json`: symbol-level knowledge graph (imports, calls, dead-code tiers); visualize with `dev graph html`.
 - `.devcouncil/state.sqlite`: SQLite state for requirements, assumptions, tasks, evidence, gaps, critique findings, and project phase history.
 - `.devcouncil/checkpoints/`: task snapshots used by verification and rollback.
 - `.devcouncil/logs/`: the durable run log (`devcouncil.log`, rotating, DEBUG-level) plus redacted stdout/stderr from verification commands.
@@ -256,7 +258,7 @@ Every command logs each stage and step. The full DEBUG trail always lands in `.d
 
 ### Maturity
 
-The stable daily workflow is planning, manual sidecar execution, verification, repair, rollback, and reporting. The **certified Claude Code MCP closed loop** (checkout → write → verify → repair → release) is **Stable** (see [certified-paths.md](docs/certified-paths.md)). Coding CLI executors, multi-agent campaigns, watch mode, live review, dashboard, PR comments, LSP/AST tools, and GitHub check surfaces are preview features. The native autonomous executor has been promoted to **Preview** status and is no longer experimental, but still requires DevCouncil verification before work is considered complete.
+The stable daily workflow is planning, manual sidecar execution, verification, repair, rollback, and reporting. The **certified Claude Code MCP closed loop** (checkout → write → verify → repair → release) is **Stable** (see [certified-paths.md](docs/certified-paths.md)). Coding CLI executors, multi-agent campaigns, watch mode, live review, dashboard, PR comments, LSP/AST tools, repo map/code graph (`dev map` / `dev graph`), and GitHub check surfaces are preview features. The native autonomous executor has been promoted to **Preview** status and is no longer experimental, but still requires DevCouncil verification before work is considered complete.
 
 ## Core Flow
 
@@ -327,10 +329,14 @@ uv run dev --help
 For a global install from this repository:
 
 ```bash
-uv tool install --force .
+uv tool install --force --reinstall --editable .
 dev --help
 devcouncil --help
 ```
+
+`--editable` keeps `~/.local/bin/dev` pointed at this checkout so map/graph and other WIP features stay current without reinstalling after every edit. Use `uv tool install --force .` (without `--editable`) for a frozen snapshot of the tree at install time.
+
+See [docs/code-graph.md](docs/code-graph.md) for `dev map` / `dev graph` usage (dead code, blast radius, HTML visualizer).
 
 ## Project Shape
 

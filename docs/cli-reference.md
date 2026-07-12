@@ -14,7 +14,23 @@ dev e2e "goal" --executor codex --agent # Agent preset: JSON plus .devcouncil/re
 dev e2e "goal" --executor codex --force  # Proceed past advisory planning gaps automatically
 dev e2e "goal" --executor codex --json --report-file .devcouncil/reports/latest.json # Write machine-readable report
 dev go "goal" --executor codex # Short alias for dev e2e
-dev map                     # Build the deterministic repository map (no LLM)
+dev map                     # Build the deterministic repository map + code graph (no LLM)
+dev map --if-stale          # Skip rebuild when the on-disk map fingerprint is still fresh
+dev map --no-liveness       # Skip entry_roots / unwired / unreachable / dead_symbol lists
+dev map --lsp-refs          # Confirm dead-symbol candidates via live LSP references
+dev map --wiki / --no-wiki  # Refresh codebase-wiki skeletons after map (default on)
+dev map --scan-deps         # Opt-in SCA auditors → dependency_risks (off by default)
+dev map --watch             # Incrementally refresh the map on code edits
+dev graph query NAME        # 360° symbol view: definition, callers, callees, importers
+dev graph trace A B         # Shortest path between two graph nodes
+dev graph dead              # Dead-code report with confidence tiers (extracted|inferred|ambiguous); uncapped
+dev graph dead --min-confidence inferred  # Filter to inferred+extracted only
+dev graph check             # God nodes (top-connected) and circular-import detection
+dev graph process [ENTRY]   # BFS call-flows from entry roots
+dev graph impact PATH...    # Blast radius for paths (or --diff for working-tree changes)
+dev graph html              # Write interactive .devcouncil/graph/graph.html (not written by default on dev map)
+dev graph view              # Serve/open the graph HTML via a local HTTP server
+dev graph export -o out.graphml  # Export GraphML (or --format okf / okf-links)
 dev scaffold-ci             # Write a starter .github/workflows/devcouncil.yml from configured commands
 dev scaffold-ci --force     # Overwrite an existing devcouncil.yml workflow
 dev plan "goal"             # Run the full planning council debate
@@ -118,6 +134,11 @@ dev config set semantic_layer.compressor.enabled true # Toggle long-context comp
 dev config set execution.command_timeout 600 # Set a common dotted config key
 dev config models --model YOUR_MODEL_ID # Update every configured model role
 dev config models --role-model critic_a=YOUR_MODEL_ID # Update one model role by name
+dev wiki update             # Generate/refresh the agent-facing codebase wiki (OKF bundle)
+dev wiki status             # Report wiki freshness vs the current repo map
+dev campaign run            # Parallel multi-agent campaign over the planned task graph
+dev campaign roster         # Show campaign role hierarchy
+dev campaign inbox          # Inspect the on-disk campaign mailbox
 dev baseline                # Capture a verification baseline of current changes
 dev optimize --agent codex --profile yolo --evals .devcouncil/evals/agent-profile.jsonl # Alias for dev agents optimize
 dev reset-demo-state        # Clear demo planning artifacts from the local DevCouncil state

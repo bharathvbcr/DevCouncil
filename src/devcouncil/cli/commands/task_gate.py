@@ -55,10 +55,15 @@ def scope_update(
     lease_token: str = typer.Option(..., "--lease-token"),
     expected_test: list[str] = typer.Option([], "--expected-test", help="Repeatable expected test command."),
     allowed_command: list[str] = typer.Option([], "--allowed-command", help="Repeatable allowed command."),
+    planned_file: list[str] = typer.Option(
+        [],
+        "--planned-file",
+        help="Repeatable path to append as modify-op planned file (lease-gated).",
+    ),
     json_format: bool = typer.Option(False, "--json"),
     project_root: Path = typer.Option(Path("."), "--project-root"),
 ) -> None:
-    """Append expected tests or allowed commands to a leased task's scope."""
+    """Append expected tests, allowed commands, or planned files to a leased task's scope."""
     root = project_root.expanduser().resolve()
     set_log_dir(root)
     payload = update_task_scope_payload(
@@ -67,6 +72,7 @@ def scope_update(
         lease_token=lease_token,
         expected_tests=expected_test,
         allowed_commands=allowed_command,
+        planned_files=planned_file,
     )
     if json_format:
         typer.echo(dump_json(payload, indent=2))

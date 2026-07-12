@@ -67,6 +67,8 @@ class VerificationOutcome:
     difficulty: Optional[str] = None
     rigor_applied: List[str] = field(default_factory=list)
     wiki_refresh: Optional[Dict[str, Any]] = None
+    # Liveness ratchet baseline status for this verify run: "ok" | "missing".
+    liveness_baseline: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)

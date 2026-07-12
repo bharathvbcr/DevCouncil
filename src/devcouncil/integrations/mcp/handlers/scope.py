@@ -30,6 +30,9 @@ async def handle_update_task_scope(root: Path, db: object, arguments: dict) -> l
     allowed_commands, arg_error = optional_string_list_argument(arguments, "allowed_commands")
     if arg_error:
         return arg_error
+    planned_files, arg_error = optional_string_list_argument(arguments, "planned_files")
+    if arg_error:
+        return arg_error
     cli_args = [
         "scope", "update", task_id,
         "--lease-token", lease_token,
@@ -39,6 +42,8 @@ async def handle_update_task_scope(root: Path, db: object, arguments: dict) -> l
         cli_args.extend(["--expected-test", test])
     for cmd in allowed_commands:
         cli_args.extend(["--allowed-command", cmd])
+    for path in planned_files:
+        cli_args.extend(["--planned-file", path])
     payload, cli_error = parse_cli_json(run_cli_command(cli_args, root))
     if cli_error:
         return cli_error

@@ -113,6 +113,9 @@ class TaskRepository:
             "agent_appended_allowed_commands": json.loads(
                 getattr(m, "agent_appended_allowed_commands_json", None) or "[]"
             ),
+            "agent_appended_planned_files": json.loads(
+                getattr(m, "agent_appended_planned_files_json", None) or "[]"
+            ),
             "forbidden_changes": json.loads(m.forbidden_changes_json),
             "difficulty": getattr(m, "difficulty", None),
             "priority": getattr(m, "priority", None),
@@ -140,6 +143,9 @@ class TaskRepository:
                 "agent_appended_allowed_commands": json.loads(
                     getattr(m, "agent_appended_allowed_commands_json", None) or "[]"
                 ),
+                "agent_appended_planned_files": json.loads(
+                    getattr(m, "agent_appended_planned_files_json", None) or "[]"
+                ),
                 "forbidden_changes": json.loads(m.forbidden_changes_json),
                 "difficulty": getattr(m, "difficulty", None),
                 "priority": getattr(m, "priority", None),
@@ -159,6 +165,7 @@ class TaskRepository:
             agent_appended_expected_tests_json=dump_json(task.agent_appended_expected_tests),
             allowed_commands_json=dump_json(task.allowed_commands),
             agent_appended_allowed_commands_json=dump_json(task.agent_appended_allowed_commands),
+            agent_appended_planned_files_json=dump_json(task.agent_appended_planned_files),
             forbidden_changes_json=dump_json(task.forbidden_changes),
             difficulty=task.difficulty,
             priority=task.priority,
@@ -408,6 +415,7 @@ class PlanningStateRepository:
                 agent_appended_expected_tests_json=dump_json(task.agent_appended_expected_tests),
                 allowed_commands_json=dump_json(task.allowed_commands),
                 agent_appended_allowed_commands_json=dump_json(task.agent_appended_allowed_commands),
+                agent_appended_planned_files_json=dump_json(task.agent_appended_planned_files),
                 forbidden_changes_json=dump_json(task.forbidden_changes),
                 difficulty=task.difficulty,
                 status=task.status,

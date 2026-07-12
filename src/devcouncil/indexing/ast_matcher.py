@@ -29,7 +29,7 @@ class AstMatch:
 
 
 class AstMatcher:
-    """Tree-sitter-style structural search with optional tree_sitter and deterministic fallbacks."""
+    """Structural symbol search with tree-sitter when available, regex/AST fallbacks."""
 
     _EXT_LANGUAGE = {
         ".py": "python",
@@ -59,10 +59,11 @@ class AstMatcher:
 
     def _has_tree_sitter(self) -> bool:
         try:
-            import tree_sitter  # noqa: F401
+            from devcouncil.indexing.ts_imports import tree_sitter_available
+
+            return tree_sitter_available()
         except Exception:
             return False
-        return True
 
     def match(
         self,
@@ -118,6 +119,38 @@ class AstMatcher:
     def _match_file(self, rel: str, language: str, text: str, *, query: str, kind: str | None) -> list[AstMatch]:
         if language == "python":
             return self._match_python(rel, text, query=query, kind=kind)
+        if self.tree_sitter_available and language in self._SYMBOL_PATTERNS:
+            ts_hits = self._match_tree_sitter(rel, language, text, query=query, kind=kind)
+            if ts_hits is not None:
+                return ts_hits
+        return self._match_regex(rel, language, text, query=query, kind=kind)
+
+    def _match_tree_sitter(
+        self, rel: str, language: str, text: str, *, query: str, kind: str | None
+    ) -> list[AstMatch] | None:
+        try:
+            from devcouncil.indexing.ts_imports import extract_symbols
+
+            hits = extract_symbols(language, text)
+        except Exception:
+            return None
+        if hits is None:
+            return None
+        results: list[AstMatch] = []
+        q = query.lower() if query else ""
+        for symbol_kind, symbol_name, lineno, source in hits:
+            if kind and kind != symbol_kind:
+                continue
+            if q and q not in symbol_name.lower() and q not in source.lower():
+                continue
+            results.append(
+                AstMatch(rel, language, symbol_kind, symbol_name, lineno, source, "tree-sitter")
+            )
+        return sorted(results, key=lambda item: (item.path, item.line))
+
+    def _match_regex(
+        self, rel: str, language: str, text: str, *, query: str, kind: str | None
+    ) -> list[AstMatch]:
         pattern = self._SYMBOL_PATTERNS.get(language)
         if not pattern:
             return []
@@ -132,7 +165,9 @@ class AstMatcher:
                 continue
             if query and query.lower() not in symbol_name.lower() and query.lower() not in line.lower():
                 continue
-            results.append(AstMatch(rel, language, symbol_kind, symbol_name, lineno, line.strip(), self._engine()))
+            results.append(
+                AstMatch(rel, language, symbol_kind, symbol_name, lineno, line.strip(), self._engine())
+            )
         return results
 
     def _match_python(self, rel: str, text: str, *, query: str, kind: str | None) -> list[AstMatch]:
@@ -175,4 +210,6 @@ class AstMatcher:
         return "function"
 
     def _engine(self) -> str:
+        # Python always uses the stdlib AST; other languages report tree-sitter when
+        # the optional extra is installed even if a given file fell back to regex.
         return "tree-sitter-optional" if self.tree_sitter_available else "fallback-ast"

@@ -125,6 +125,34 @@ async def run_verify_orchestration(
             blocking=bool(getattr(boundary_cfg, "blocking", False)),
         ))
 
+    # Stale-map gate: advisory on easy/normal, blocking on hard. Runs before
+    # map-consuming gates so agents refresh before trusting neighbors/dependents.
+    if rigor.stale_map_enabled:
+        try:
+            from devcouncil.verification.checks.stale_map import detect_stale_map_gaps
+
+            gaps.extend(detect_stale_map_gaps(
+                task=task,
+                project_root=verifier.project_root,
+                next_gap_id=verifier._next_gap_id,
+                stale_map_enabled=rigor.stale_map_enabled,
+                stale_map_blocking=rigor.stale_map_blocking,
+                repo_map=verifier._load_repo_map(),
+            ))
+        except Exception:
+            logger.warning("stale-map gate failed; skipping", exc_info=True)
+            if rigor.stale_map_blocking:
+                gaps.append(Gap(
+                    id=verifier._next_gap_id(task.id, "QGFAIL"),
+                    severity="medium",
+                    gap_type="quality_gate_failed",
+                    task_id=task.id,
+                    description="Stale-map verification gate crashed; results are incomplete.",
+                    evidence=["gate:stale_map"],
+                    recommended_fix="Re-run verify after fixing the gate error; do not treat this pass as proven.",
+                    blocking=False,
+                ))
+
     log_step(
         "verify/4: semantic diff and dependency checks",
         project_root=verifier.project_root,
@@ -139,6 +167,124 @@ async def run_verify_orchestration(
         stub_blocking=rigor.stub_blocking,
         next_gap_id=verifier._next_gap_id,
     ))
+
+    # Unwired-file + dead-symbol gates (liveness): run right after placeholder scan so
+    # reachability findings sit next to incomplete-code findings in the repair loop.
+    # Failures on hard rigor emit an advisory quality_gate_failed so agents see
+    # the swallow instead of a silent pass.
+    unwired_files_flagged: set[str] = set()
+    liveness_baseline_status: str | None = None
+    try:
+        from devcouncil.verification.checks.wiring import detect_unwired_file_gaps
+
+        unwired_gaps = detect_unwired_file_gaps(
+            task=task,
+            project_root=verifier.project_root,
+            changed_files=changed_files,
+            diff_content=diff_content,
+            get_untracked_files=verifier._get_untracked_files,
+            next_gap_id=verifier._next_gap_id,
+            unwired_enabled=rigor.unwired_enabled,
+            unwired_blocking=rigor.unwired_blocking,
+            classify_fn=verifier._classify_change_paths,
+        )
+        for g in unwired_gaps:
+            if g.file and g.gap_type == "unwired_file":
+                unwired_files_flagged.add(g.file)
+        gaps.extend(unwired_gaps)
+    except Exception:
+        logger.warning("unwired-file gate failed; skipping", exc_info=True)
+        if rigor.unwired_blocking:
+            gaps.append(Gap(
+                id=verifier._next_gap_id(task.id, "QGFAIL"),
+                severity="medium",
+                gap_type="quality_gate_failed",
+                task_id=task.id,
+                description="Unwired-file verification gate crashed; results are incomplete.",
+                evidence=["gate:unwired_file"],
+                recommended_fix="Re-run verify after fixing the gate error; do not treat this pass as proven.",
+                blocking=False,
+            ))
+
+    try:
+        from devcouncil.verification.checks.dead_symbols import detect_dead_symbol_gaps
+
+        gaps.extend(detect_dead_symbol_gaps(
+            task=task,
+            project_root=verifier.project_root,
+            diff_content=diff_content,
+            next_gap_id=verifier._next_gap_id,
+            dead_symbol_enabled=rigor.dead_symbol_enabled,
+            dead_symbol_blocking=rigor.dead_symbol_blocking,
+            requirements=requirements,
+            unwired_files=unwired_files_flagged,
+        ))
+    except Exception:
+        logger.warning("dead-symbol gate failed; skipping", exc_info=True)
+        if rigor.dead_symbol_blocking:
+            gaps.append(Gap(
+                id=verifier._next_gap_id(task.id, "QGFAIL"),
+                severity="medium",
+                gap_type="quality_gate_failed",
+                task_id=task.id,
+                description="Dead-symbol verification gate crashed; results are incomplete.",
+                evidence=["gate:dead_symbol"],
+                recommended_fix="Re-run verify after fixing the gate error; do not treat this pass as proven.",
+                blocking=False,
+            ))
+
+    # Liveness ratchet: existing code newly stranded vs checkout baseline.
+    if rigor.liveness_ratchet_enabled:
+        try:
+            from devcouncil.indexing.repo_mapper import RepoMapper
+            from devcouncil.verification.checks.liveness_ratchet import (
+                detect_liveness_regressions,
+                load_liveness_baseline,
+            )
+            from devcouncil.verification.checks.wiring import collect_added_files
+            from devcouncil.verification.stub_detector import added_lines_by_file
+
+            baseline = load_liveness_baseline(verifier.project_root, task.id)
+            if baseline is None:
+                liveness_baseline_status = "missing"
+            else:
+                liveness_baseline_status = "ok"
+                mapper = RepoMapper(verifier.project_root)
+                current = mapper.liveness_snapshot()
+                added = collect_added_files(
+                    project_root=verifier.project_root,
+                    changed_files=changed_files,
+                    diff_content=diff_content,
+                    get_untracked_files=verifier._get_untracked_files,
+                    classify_fn=verifier._classify_change_paths,
+                )
+                by_file = added_lines_by_file(diff_content or "")
+                diff_lines = {
+                    path: {ln for ln, _ in lines}
+                    for path, lines in by_file.items()
+                }
+                gaps.extend(detect_liveness_regressions(
+                    baseline,
+                    current,
+                    added,
+                    task=task,
+                    next_gap_id=verifier._next_gap_id,
+                    blocking=rigor.liveness_ratchet_blocking,
+                    diff_added_lines=diff_lines,
+                ))
+        except Exception:
+            logger.warning("liveness-ratchet gate failed; skipping", exc_info=True)
+            if rigor.liveness_ratchet_blocking:
+                gaps.append(Gap(
+                    id=verifier._next_gap_id(task.id, "QGFAIL"),
+                    severity="medium",
+                    gap_type="quality_gate_failed",
+                    task_id=task.id,
+                    description="Liveness-ratchet verification gate crashed; results are incomplete.",
+                    evidence=["gate:liveness_ratchet"],
+                    recommended_fix="Re-run verify after fixing the gate error; do not treat this pass as proven.",
+                    blocking=False,
+                ))
 
     if rigor.effort_enabled and diff_content:
         for eff in detect_effort_anomalies(
@@ -385,5 +531,6 @@ async def run_verify_orchestration(
         difficulty=rigor.difficulty,
         rigor_applied=list(rigor.applied),
         wiki_refresh=wiki_refresh_outcome.to_dict() if wiki_refresh_outcome is not None else None,
+        liveness_baseline=liveness_baseline_status,
     )
     return gaps, evidence_to_save

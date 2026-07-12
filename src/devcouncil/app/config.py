@@ -224,6 +224,15 @@ class RigorConfig(BaseModel):
     # On hard tasks, compile at least this many independent acceptance checks per
     # criterion (input variation) so agents cannot hardcode a single probe value.
     acceptance_samples_on_hard: int = 2
+    # New files/symbols never imported or referenced: advisory on easy/normal,
+    # blocking on hard by default (same posture as placeholder/effort gates).
+    unwired_files: str = "hard"   # never | hard | always
+    dead_symbols: str = "hard"    # never | hard | always
+    # Existing code newly stranded vs checkout baseline (lost last importer/caller).
+    liveness_ratchet: str = "hard"  # never | hard | always
+    # On-disk repo_map.json lags git HEAD / tracked file set: advisory on easy/normal,
+    # blocking on hard by default.
+    stale_map: str = "hard"  # never | hard | always
 
 
 class SubsystemBoundaryConfig(BaseModel):
@@ -288,6 +297,29 @@ class PlanningConfig(BaseModel):
     auto_convert_blocking_questions_in_noninteractive: bool = True
 
 
+class IndexingConfig(BaseModel):
+    """Repo-map / symbol-index enhancements.
+
+    ``lsp_refs`` opts into spawning detected language servers (pyright, tsserver,
+    gopls, rust-analyzer) for dead-symbol confirmation and precise MCP impact.
+    Off by default — process cost and server variance make this opt-in only.
+
+    ``auto_refresh`` enables best-effort incremental map refresh from the
+    post-tool-use hook after agent file edits (never blocks the agent on failure).
+    ``auto_refresh_max_files`` skips refresh when a single hook reports more
+    changed paths than this guard (large refactors should run ``dev map``).
+
+    ``write_graph_html`` writes the interactive graph visualizer alongside the
+    code graph during ``dev map`` (off by default — HTML can be large).
+    """
+
+    lsp_refs: bool = False
+    auto_refresh: bool = True
+    auto_refresh_max_files: int = 40
+    # When true, ``dev map`` also writes ``.devcouncil/graph/graph.html``.
+    write_graph_html: bool = False
+
+
 class ExecutionConfig(BaseModel):
     default_executor: str = "manual"
     max_repair_attempts: int = 3
@@ -316,6 +348,10 @@ class ExecutionConfig(BaseModel):
     # says nothing about the task; without a retry it ends the task `blocked` and
     # burns a repair attempt on a non-code problem. 0 disables the retry.
     transient_retry_attempts: int = 2
+    # At task checkout, regenerate ``.devcouncil/repo_map.json`` when it is stale
+    # (HEAD / file-set fingerprint mismatch) before the prompt and liveness baseline
+    # are built. Disable to keep checkout cheap on huge repos where remap is costly.
+    refresh_stale_map_on_checkout: bool = True
 
 
 class PrivacyConfig(BaseModel):
@@ -550,6 +586,7 @@ class DevCouncilConfig(BaseModel):
     gates: GatesConfig = Field(default_factory=GatesConfig)
     planning: PlanningConfig = Field(default_factory=PlanningConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    indexing: IndexingConfig = Field(default_factory=IndexingConfig)
     verification: VerificationConfig = Field(default_factory=VerificationConfig)
     privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)

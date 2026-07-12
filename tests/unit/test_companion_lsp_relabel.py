@@ -21,6 +21,15 @@ def test_lsp_summary_is_labelled_detection_only(tmp_path):
     assert summary["detected_servers"][0]["language"] == "python"
 
 
+def test_lsp_summary_client_mode_when_enabled(tmp_path):
+    (tmp_path / "app.py").write_text("def hello():\n    return 1\n", encoding="utf-8")
+
+    summary = LspInspector(tmp_path).summary(["app.py"], client_enabled=True)
+
+    assert summary["mode"] == "client"
+    assert "textDocument/references" in summary["note"]
+
+
 def test_lsp_initialize_payloads_are_marked_not_sent(tmp_path):
     (tmp_path / "app.py").write_text("def hello():\n    return 1\n", encoding="utf-8")
 

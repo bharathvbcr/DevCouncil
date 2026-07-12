@@ -33,12 +33,6 @@ class EmbeddingService:
                 cls._instance = cls(config)
             return cls._instance
 
-    @classmethod
-    def reset_instance(cls) -> None:
-        """Clear the singleton — intended for tests only."""
-        with cls._lock:
-            cls._instance = None
-
     def _load_model(self) -> None:
         if self._model is not None:
             return
@@ -73,7 +67,3 @@ class EmbeddingService:
 
     def embed_one(self, text: str) -> FloatVector:
         return self.embed([text])[0]
-
-    @staticmethod
-    def cosine_similarity(a: FloatVector, b: FloatVector) -> float:
-        return float(np.dot(a, b))  # assumes L2-normalized vectors

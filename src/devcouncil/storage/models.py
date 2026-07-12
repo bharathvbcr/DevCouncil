@@ -41,6 +41,7 @@ class TaskModel(SQLModel, table=True):
     agent_appended_expected_tests_json: str = Field(default="[]")
     allowed_commands_json: str = Field(default="[]")
     agent_appended_allowed_commands_json: str = Field(default="[]")
+    agent_appended_planned_files_json: str = Field(default="[]")
     forbidden_changes_json: str = Field(default="[]")
     # Manual/planner difficulty override ("easy"/"normal"/"hard"); None = estimator.
     difficulty: Optional[str] = Field(default=None)

@@ -4,22 +4,32 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from devcouncil.optimization.skillopt import (
     GUIDANCE,
     SKILL,
+    EpochRecord,
     SkillEdit,
     SkillEditProposal,
     SkillOptConfig,
+    SkillOptResult,
+    _apply_one,
+    _compose_context,
     _edit_signature,
     _is_permanently_redundant,
+    _pick_role,
+    _reflect,
     _split_dataset,
     apply_edits,
+    default_artifact_path,
     default_score,
     make_llm_optimizer,
+    make_llm_rollout,
     optimize_skill,
+    write_result_artifact,
 )
 
 
@@ -430,3 +440,112 @@ def test_scores_are_clamped_to_unit_interval():
         )
     )
     assert low.seed_val_score == 0.0
+
+
+# ---------------------------------------------------------------------------
+# _apply_one / helper-level branches
+# ---------------------------------------------------------------------------
+
+
+def test_apply_one_add_with_anchor_and_missing_anchor():
+    body = "line one\nline two"
+    out = _apply_one(body, SkillEdit(op="add", target=SKILL, find="line one", text="inserted"))
+    assert "inserted" in out and out.index("inserted") > out.index("line one")
+    assert _apply_one(body, SkillEdit(op="add", target=SKILL, find="absent", text="x")) is None
+    assert _apply_one(body, SkillEdit(op="add", target=SKILL, find="", text="\n")) is None
+    assert _apply_one("keep DROP keep", SkillEdit(op="delete", target=SKILL, find="DROP ")) == "keep keep"
+
+
+def test_default_score_expected_terms_branch():
+    task = {"expected": ["alpha", "beta"]}
+    assert default_score(task, "alpha and beta present") == pytest.approx(1.0)
+    assert 0.0 < default_score(task, "only alpha") < 1.0
+
+
+def test_reflect_skips_perfect_rollouts():
+    rollouts = [
+        ({"id": "a", "prompt": "p"}, "traj", 1.0),
+        ({"id": "b", "prompt": "q", "required_terms": ["x"]}, "no match here", 0.0),
+    ]
+    feedback = _reflect(rollouts)
+    assert len(feedback) == 1
+    assert feedback[0]["task"] == "q"
+    assert feedback[0]["missing_required"] == ["x"]
+
+
+def test_loop_breaks_on_no_failing_train_tasks():
+    dataset = [{"id": f"t{i}", "prompt": "p"} for i in range(6)]
+    train, _val = _split_dataset(dataset, 0.5, seed=0)
+    train_ids = {t["id"] for t in train}
+
+    def score(task, traj):
+        return 1.0 if task["id"] in train_ids else 0.4
+
+    result = asyncio.run(
+        optimize_skill(
+            skill_name="demo",
+            docs={GUIDANCE: "", SKILL: "base"},
+            dataset=dataset,
+            rollout=_compose_rollout,
+            optimizer=_queued_optimizer([SkillEditProposal(edits=[])]),
+            score=score,
+            config=SkillOptConfig(epochs=3, val_fraction=0.5, seed=0),
+        )
+    )
+    assert result.epochs and result.epochs[-1].note == "no failing train tasks"
+
+
+def test_compose_context_includes_all_doc_blocks():
+    out = _compose_context({GUIDANCE: "g body", SKILL: "s body", "extra": "e body", "empty": "  "})
+    assert "<guidance>\ng body\n</guidance>" in out
+    assert "<skill>\ns body\n</skill>" in out
+    assert "<extra>\ne body\n</extra>" in out
+    assert "empty" not in out
+
+
+def test_pick_role_prefers_then_falls_back_then_raises():
+    assert _pick_role({"a": 1, "b": 2}, ("b", "a")) == "b"
+    assert _pick_role({"only": 1}, ("missing",)) == "only"
+    with pytest.raises(ValueError):
+        _pick_role({}, ("x",))
+
+
+def test_make_llm_rollout_runs_target_agent():
+    class FakeRouter:
+        role_config = {"skill_target": {"model": "m"}}
+
+        async def complete_structured(self, role, messages, model, fallback=None):
+            assert "guidance body" in messages[0]["content"]
+            return SimpleNamespace(answer="agent produced this")
+
+    rollout = make_llm_rollout(FakeRouter())
+    out = asyncio.run(rollout({GUIDANCE: "guidance body", SKILL: "skill body"}, {"prompt": "do x"}))
+    assert out == "agent produced this"
+
+
+def test_default_artifact_path_sanitizes(tmp_path):
+    path = default_artifact_path(tmp_path, "team/skill\\x")
+    assert "team-skill-x" in path.name
+    assert path.parent == tmp_path / ".devcouncil" / "optimizations"
+
+
+def test_write_result_artifact_roundtrip(tmp_path):
+    result = SkillOptResult(
+        skill_name="demo",
+        seed_docs={SKILL: "s"},
+        best_docs={SKILL: "s2"},
+        seed_val_score=0.1,
+        best_val_score=0.9,
+        epochs=[EpochRecord(1, 0.5, 0.1, 0.9, 2, 1, [SKILL], True, "accepted")],
+        accepted_edit_count=1,
+        train_size=3,
+        val_size=2,
+    )
+    path = tmp_path / "artifact.json"
+    write_result_artifact(path, result, objective="obj", dataset_path="data.jsonl")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["skill"] == "demo"
+    assert data["objective"] == "obj"
+    assert data["best_val_score"] == 0.9
+    assert data["improved"] is True
+    assert data["epochs"][0]["note"] == "accepted"

@@ -34,7 +34,6 @@ class CheckpointService:
     # Verifier reads it too; kept as a class attr for compat with .format() callers.
     REF_BEFORE = REF_BEFORE_TEMPLATE
     REF_AFTER = "refs/devcouncil/tasks/{task_id}/after"
-    REF_ATTEMPT = "refs/devcouncil/tasks/{task_id}/attempts/{attempt}"
 
     def __init__(self, project_root: Path):
         self.project_root = project_root.resolve()
@@ -46,10 +45,6 @@ class CheckpointService:
 
     def create_after(self, task_id: str) -> CheckpointResult:
         return self._create(task_id, stage="after")
-
-    def create_attempt(self, task_id: str, attempt: int) -> CheckpointResult:
-        ref_template = self.REF_ATTEMPT.format(task_id=task_id, attempt=attempt)
-        return self._create(task_id, stage="attempt", ref_name=ref_template)
 
     def rollback(self, task_id: str) -> CheckpointResult:
         logger.info("Rollback requested for %s", task_id)
@@ -110,23 +105,6 @@ class CheckpointService:
         return CheckpointResult(
             task_id=task_id,
             message="No checkpoint refs or after patch found.",
-        )
-
-    def import_legacy_patch(self, task_id: str) -> CheckpointResult:
-        before_patch = self.checkpoint_dir / f"{task_id}-before.patch"
-        if not before_patch.exists():
-            return CheckpointResult(
-                task_id=task_id,
-                message="No legacy before patch to import.",
-            )
-        ref = self.REF_BEFORE.format(task_id=task_id)
-        created = self._update_ref(ref)
-        return CheckpointResult(
-            task_id=task_id,
-            ref=ref if created else None,
-            patch_path=str(before_patch),
-            git_ref_created=created,
-            message="Imported legacy before patch ref when possible.",
         )
 
     def _create(

@@ -203,13 +203,6 @@ class Provider(ABC):
         self._client_loop = loop
         return client
 
-    async def aclose(self) -> None:
-        """Close the reused AsyncClient if one was created."""
-        client = getattr(self, "_client", None)
-        if client is not None:
-            self._client = None
-            await client.aclose()
-
     def cache_fingerprint(self) -> str:
         """Provider-specific options that change the model's output and therefore must
         be part of the LLM cache key. Empty for providers whose output depends only on

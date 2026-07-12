@@ -16,15 +16,17 @@ class LspServerCandidate:
 
 
 class LspInspector:
-    """Language-server *detection* only — DevCouncil does not run an LSP client.
+    """Language-server detection, with optional live client mode.
 
-    This inspector exists to answer one honest question: which language servers
-    for the repo's languages are installed on PATH? It does NOT spawn a server,
-    does NOT speak the LSP wire protocol, and does NOT send the ``initialize``
-    handshake. ``starter_initialize_payload`` builds the JSON-RPC ``initialize``
-    request a *future* client would send, but it is never transmitted — it is
-    surfaced purely as a reference/starter payload, clearly labelled as such, so
-    no consumer mistakes detection for a live LSP capability.
+    By default this inspector only answers: which language servers for the repo's
+    languages are installed on PATH? It does NOT spawn a server or speak the wire
+    protocol. When ``client_enabled=True`` (config ``indexing.lsp_refs`` / ``dev map
+    --lsp-refs``), summaries report ``mode: "client"`` — the optional
+    :mod:`devcouncil.indexing.lsp_client` can then run ``initialize``,
+    ``textDocument/references``, and ``textDocument/definition``.
+
+    ``starter_initialize_payload`` remains a never-sent reference payload for
+    detection-only mode.
     """
 
     _LANGUAGE_SERVERS: dict[str, list[list[str]]] = {
@@ -86,12 +88,11 @@ class LspInspector:
         return candidates
 
     def starter_initialize_payload(self, language: str) -> dict[str, Any]:
-        """Build the JSON-RPC ``initialize`` request a future LSP client *would* send.
+        """Build the JSON-RPC ``initialize`` request a client would send.
 
-        This payload is NEVER sent — DevCouncil has no LSP client. It is provided
-        only as a reference/starter for anyone wiring up real LSP support. See the
-        ``initialize_requests`` block in :meth:`summary`, which carries the same
-        non-sent payloads under an explicit ``"_note"`` disclaimer.
+        In detection-only mode this payload is NEVER sent — it is a reference for
+        wiring. When ``mode: "client"``, :mod:`devcouncil.indexing.lsp_client`
+        sends an equivalent initialize over stdio.
         """
         return {
             "jsonrpc": "2.0",
@@ -113,21 +114,38 @@ class LspInspector:
             },
         }
 
-    # Made explicit in every summary so no consumer reads this as a live LSP feature.
     _DETECTION_ONLY_NOTE = (
         "Detection only: DevCouncil checks which language servers are installed on "
-        "PATH; it does not run an LSP client or send any requests."
+        "PATH; it does not run an LSP client or send any requests. Enable live "
+        "references via indexing.lsp_refs or `dev map --lsp-refs`."
+    )
+    _CLIENT_MODE_NOTE = (
+        "Client mode: DevCouncil may spawn detected language servers for "
+        "textDocument/references and textDocument/definition (dead-symbol "
+        "confirmation and precise MCP impact). Still opt-in per run/config."
     )
     _STARTER_PAYLOAD_NOTE = (
-        "Starter payloads only — these initialize requests are NEVER sent. They are "
-        "a reference for wiring up a real LSP client later."
+        "Starter payloads only — these initialize requests are NEVER sent in "
+        "detection-only mode. In client mode, lsp_client sends initialize live."
+    )
+    _CLIENT_PAYLOAD_NOTE = (
+        "Reference initialize shapes; the live client sends equivalent requests "
+        "when indexing.lsp_refs / --lsp-refs is enabled."
     )
 
-    def summary(self, files: list[str] | None = None) -> dict[str, Any]:
+    def summary(
+        self,
+        files: list[str] | None = None,
+        *,
+        client_enabled: bool = False,
+    ) -> dict[str, Any]:
         candidates = self.server_candidates(files)
+        mode = "client" if client_enabled else "detection-only"
+        note = self._CLIENT_MODE_NOTE if client_enabled else self._DETECTION_ONLY_NOTE
+        init_note = self._CLIENT_PAYLOAD_NOTE if client_enabled else self._STARTER_PAYLOAD_NOTE
         return {
-            "mode": "detection-only",
-            "note": self._DETECTION_ONLY_NOTE,
+            "mode": mode,
+            "note": note,
             "languages": self.detect_languages(files),
             "servers_detected": [
                 {
@@ -158,7 +176,7 @@ class LspInspector:
                 for candidate in candidates
             ],
             "initialize_requests": {
-                "_note": self._STARTER_PAYLOAD_NOTE,
+                "_note": init_note,
                 **{
                     language: self.starter_initialize_payload(language)
                     for language in sorted({candidate.language for candidate in candidates})
@@ -166,5 +184,10 @@ class LspInspector:
             },
         }
 
-    def summary_json(self, files: list[str] | None = None) -> str:
-        return json.dumps(self.summary(files), indent=2)
+    def summary_json(
+        self,
+        files: list[str] | None = None,
+        *,
+        client_enabled: bool = False,
+    ) -> str:
+        return json.dumps(self.summary(files, client_enabled=client_enabled), indent=2)

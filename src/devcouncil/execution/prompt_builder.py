@@ -2,7 +2,7 @@ import ast
 import logging
 import re
 from pathlib import Path
-from typing import List, cast
+from typing import List
 
 from devcouncil.domain.requirement import Requirement
 from devcouncil.domain.task import Task
@@ -478,7 +478,8 @@ class PromptBuilder:
         radius of its edits (who imports each changed file, and which neighboring
         subsystems the change reaches) even on the common keyless path. Complements the
         detailed ``_dependents_section``/``_call_sites_section`` with a one-line-per-file
-        orientation. Bounded and best-effort; never raises."""
+        orientation. When a code graph exists, also appends symbol-level inbound blast
+        (depth 1) for planned modify paths. Bounded and best-effort; never raises."""
         if not data:
             return ""
         from devcouncil.indexing.subsystem_map import (
@@ -494,7 +495,7 @@ class PromptBuilder:
             importers = [] if is_new else dependents_of(path, data)
             area = area_for_path(path, data)
             neighbors = neighbors_for_area(area, data)
-            if not importers and not neighbors and not area:
+            if not importers and not neighbors and not area and not is_new:
                 continue
             parts: List[str] = []
             if importers:
@@ -505,7 +506,7 @@ class PromptBuilder:
                     + ", ".join(f"`{p}`" for p in shown) + more
                 )
             elif is_new:
-                parts.append("new file (no importers yet)")
+                parts.append("new file — plan its importer before finishing")
             if area:
                 neighbor_txt = ""
                 if neighbors:
@@ -514,15 +515,122 @@ class PromptBuilder:
                 parts.append(f"subsystem `{area}`{neighbor_txt}")
             if parts:
                 lines.append(f"- `{path}` → " + "; ".join(parts))
-        if not lines:
+
+        graph_lines = self._graph_impact_lines(task)
+        if not lines and not graph_lines:
             return ""
+        body = "\n".join(lines) if lines else ""
+        if graph_lines:
+            extra = "\n".join(graph_lines)
+            body = f"{body}\n{extra}" if body else extra
         return (
             "\n## Impact (changing X touches Y)\n"
             "_From the repo map — keep these call sites and neighboring subsystems working, "
             "or update them in scope._\n"
-            + "\n".join(lines)
+            + body
             + "\n"
         )
+
+    def _graph_impact_lines(self, task: Task) -> List[str]:
+        """Optional symbol-level inbound blast (depth 1) from the code graph."""
+        try:
+            from devcouncil.indexing.graph.build import load_code_graph
+            from devcouncil.indexing.graph.intel import diff_impact
+
+            graph = load_code_graph(self.project_root)
+            if graph is None:
+                return []
+            paths = [
+                pf.path.replace("\\", "/")
+                for pf in task.planned_files[: self._IMPACT_MAX_FILES]
+                if pf.allowed_change != "create"
+            ]
+            if not paths:
+                return []
+            result = diff_impact(
+                self.project_root, graph, paths=paths, use_diff=False, max_depth=1
+            )
+            out: List[str] = []
+            for item in result.get("paths") or []:
+                layers = (item.get("blast") or {}).get("layers") or []
+                depth1 = next((L for L in layers if L.get("depth") == 1), None)
+                nodes = (depth1 or {}).get("nodes") or []
+                if not nodes:
+                    continue
+                shown = nodes[: self._IMPACT_MAX_DEPS]
+                more = f" (+{len(nodes) - len(shown)})" if len(nodes) > len(shown) else ""
+                out.append(
+                    f"- `{item['path']}` symbol callers (depth 1): "
+                    + ", ".join(f"`{n}`" for n in shown)
+                    + more
+                )
+            return out
+        except Exception:
+            logger.debug("graph impact lines skipped", exc_info=True)
+            return []
+
+    def _liveness_debt_section(self, task: Task, data: dict | None) -> str:
+        """Surface map unwired/dead-symbol candidates that overlap the task's subsystems."""
+        if not data:
+            return ""
+        try:
+            from devcouncil.indexing.subsystem_map import (
+                area_for_path,
+                areas_touched,
+                dead_symbol_candidates_of,
+                unreachable_of,
+                unwired_candidates_of,
+            )
+
+            planned = [pf.path.replace("\\", "/") for pf in task.planned_files]
+            task_areas = set(areas_touched(planned, data))
+            if not task_areas:
+                return ""
+
+            unwired_hits: list[str] = []
+            for cand in unwired_candidates_of(data)[:40]:
+                area = area_for_path(cand, data)
+                if area and area in task_areas:
+                    unwired_hits.append(cand)
+                if len(unwired_hits) >= 6:
+                    break
+
+            unreachable_hits: list[str] = []
+            for cand in unreachable_of(data)[:40]:
+                area = area_for_path(cand, data)
+                if area and area in task_areas:
+                    unreachable_hits.append(cand)
+                if len(unreachable_hits) >= 6:
+                    break
+
+            dead_hits: list[str] = []
+            for cand in dead_symbol_candidates_of(data)[:40]:
+                path = cand.split(":", 1)[0]
+                area = area_for_path(path, data)
+                if area and area in task_areas:
+                    dead_hits.append(cand)
+                if len(dead_hits) >= 6:
+                    break
+
+            if not unwired_hits and not unreachable_hits and not dead_hits:
+                return ""
+            lines = [
+                "\n## Nearby liveness debt (from repo map)",
+                "_Existing unwired / unreachable files and unused symbols near your "
+                "subsystems — do not add to this debt; wire what you create._",
+                "_Verify same-task island rule: a new file imported only by other files "
+                "added in this task still needs a pre-existing non-test caller._",
+            ]
+            for p in unwired_hits:
+                lines.append(f"- unwired: `{p}`")
+            for p in unreachable_hits:
+                lines.append(f"- unreachable: `{p}`")
+            for p in dead_hits:
+                lines.append(f"- dead symbol: `{p}`")
+            return "\n".join(lines) + "\n"
+        except Exception:
+            logger.debug("liveness debt section skipped", exc_info=True)
+            return ""
 
     def _dependents_section(self, task: Task, data: dict | None) -> str:
         """List, per planned file the agent will change, the files that import it — the
@@ -795,8 +903,13 @@ class PromptBuilder:
    acceptance criteria require. Do NOT remove, rename, or alter the signature of an
    existing public symbol the task did not ask you to touch — verification flags an
    unrequested public-API change as scope drift and blocks it.
-5. Run the allowed commands to verify your work.
-6. Provide evidence of passing tests.
+5. Wire every created file and every new public symbol into its intended caller
+   (import, register, or call it) before claiming done. A file nothing imports, or a
+   public function nothing calls, fails verification. If the caller is outside the
+   current planned files, append it with `dev scope update <task_id> --lease-token
+   <token> --planned-file <caller>` (modify-op only), then edit.
+6. Run the allowed commands to verify your work.
+7. Provide evidence of passing tests.
 """
 
         # Hard-task rigor: when the task classifies as hard, verification runs in
@@ -848,6 +961,10 @@ class PromptBuilder:
         impact_text = self._impact_section(task, repo_map_data)
         if impact_text:
             segments.append({"order": 2, "priority": 1, "name": "impact", "text": impact_text})
+
+        liveness_text = self._liveness_debt_section(task, repo_map_data)
+        if liveness_text:
+            segments.append({"order": 2, "priority": 2, "name": "liveness debt", "text": liveness_text})
 
         files_text = self._planned_files_section(task)
         if files_text:

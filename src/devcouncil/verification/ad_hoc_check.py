@@ -114,6 +114,7 @@ def run_working_tree_check(
             for path in changed_files
         ],
         expected_tests=list(test_commands or []),
+        difficulty="easy",
     )
 
     # Always measure diff coverage in lite mode; block on it only when asked. A positive

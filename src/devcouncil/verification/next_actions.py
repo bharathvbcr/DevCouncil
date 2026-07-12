@@ -44,6 +44,10 @@ _CATEGORY_BY_GAP_TYPE = {
     "stub_declared": "review",
     "suspicious_effort": "review",
     "coarse_acceptance_proof": "add_test",
+    "unwired_file": "fix_code",
+    "dead_symbol": "fix_code",
+    "stranded_code": "fix_code",
+    "stale_map": "refresh_map",
 }
 
 
@@ -89,7 +93,10 @@ def _derive_file(gap: Gap) -> Optional[str]:
 def _action_text(gap: Gap, file: Optional[str]) -> str:
     target = file or "the affected file"
     if gap.gap_type == "orphan_diff":
-        return f"Revert changes to {target} or add it to the task's planned files."
+        return (
+            f"Revert changes to {target} or append it with "
+            f"`dev scope update <task_id> --lease-token <token> --planned-file {target}`."
+        )
     if gap.gap_type == "planned_file_not_changed":
         return f"Modify {target} as planned, or remove it from the task's planned files."
     if gap.gap_type == "dependency_risk":
@@ -130,6 +137,32 @@ def _action_text(gap: Gap, file: Optional[str]) -> str:
             "per-criterion check. Add a verification command or test that exercises each "
             "listed criterion specifically, then re-verify."
         )
+    if gap.gap_type == "unwired_file":
+        return (
+            f"Import or register `{target}` from its intended non-test caller "
+            f"(append the caller with `dev scope update <task_id> --lease-token <token> "
+            f"--planned-file <caller>` if needed), or delete the unused file."
+        )
+    if gap.gap_type == "dead_symbol":
+        loc = f"{target}{':' + str(gap.line) if gap.line else ''}"
+        name = ""
+        for item in gap.evidence:
+            if isinstance(item, str) and item.startswith("symbol:"):
+                name = item.split(":", 1)[1].strip()
+                break
+        symbol = name or "the new symbol"
+        return (
+            f"Call or register `{symbol}` at {loc} from the code that needs it "
+            f"(use `dev scope update ... --planned-file <caller>` if the caller is "
+            f"out of scope), or remove it."
+        )
+    if gap.gap_type == "stranded_code":
+        return (
+            f"Restore the import/call that kept `{target}` live, or delete the "
+            "stranded module if it is intentionally unused."
+        )
+    if gap.gap_type == "stale_map":
+        return "Run `dev map` to regenerate the repository map, then re-verify."
     # Fall back to the gap's own recommended fix for anything unmapped.
     return gap.recommended_fix
 

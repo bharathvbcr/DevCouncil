@@ -53,6 +53,16 @@ class Task(BaseModel):
             "mirroring agent_appended_expected_tests)."
         ),
     )
+    agent_appended_planned_files: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Paths appended to planned_files at runtime by a leased agent via "
+            "devcouncil_update_task_scope / `dev scope update --planned-file`. "
+            "Always added as modify-op only; secret/restricted paths are rejected. "
+            "Lets an agent wire an unwired file into its intended caller without "
+            "hitting orphan_diff / write-policy deadlock."
+        ),
+    )
     forbidden_changes: List[str] = Field(default_factory=list)
     difficulty: Optional[Literal["easy", "normal", "hard"]] = Field(
         default=None,

@@ -24,8 +24,6 @@ FloatMatrix = NDArray[np.float32]
 class EmbedderProtocol(Protocol):
     def embed_one(self, text: str) -> FloatVector: ...
 
-    def embed(self, texts: list[str]) -> FloatMatrix: ...
-
 
 @dataclass
 class CacheEntry:
@@ -238,18 +236,6 @@ class SemanticCache:
             self._faiss_row_to_id[row] = entry_id
             self._entries[entry_id] = entry
             return entry_id
-
-    def invalidate_expired(self) -> int:
-        """Remove expired entries from metadata (FAISS rows remain stale)."""
-        with self._lock:
-            now = time.time()
-            expired = [
-                eid for eid, e in self._entries.items()
-                if e.is_expired(self.config.ttl_seconds, now)
-            ]
-            for eid in expired:
-                del self._entries[eid]
-            return len(expired)
 
     @property
     def hit_rate(self) -> float:

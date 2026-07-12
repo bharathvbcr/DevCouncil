@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 import types
+from types import SimpleNamespace
 
 from devcouncil.domain.task import PlannedFile, Task
 from devcouncil.executors.claude_sdk import ClaudeSdkExecutor
@@ -202,3 +203,237 @@ def test_run_task_prepends_correction_manifest(tmp_path, monkeypatch):
     assert "Correction Manifest" in calls["prompt"]
     assert "missing regression test" in calls["prompt"]
     assert "Repair rules (non-negotiable)" in calls["prompt"]
+
+
+# ---- _allow / _deny permission result construction ----------------------------
+
+
+def test_allow_prefers_typed_class_then_falls_back():
+    class Allow:
+        def __init__(self, updated_input=None):
+            self.updated_input = updated_input
+
+    sdk = SimpleNamespace(PermissionResultAllow=Allow)
+    out = ClaudeSdkExecutor._allow(sdk, {"a": 1})
+    assert isinstance(out, Allow)
+    assert out.updated_input == {"a": 1}
+
+
+def test_allow_typeerror_falls_back_to_no_arg_class():
+    class Allow:
+        def __init__(self):
+            self.updated_input = None
+
+    sdk = SimpleNamespace(PermissionResultAllow=Allow)
+    out = ClaudeSdkExecutor._allow(sdk, {"a": 1})
+    assert isinstance(out, Allow)
+
+
+def test_allow_dict_fallback_without_class():
+    out = ClaudeSdkExecutor._allow(SimpleNamespace(), {"a": 1})
+    assert out == {"behavior": "allow", "updatedInput": {"a": 1}}
+
+
+def test_deny_typed_then_positional_then_dict():
+    class Deny:
+        def __init__(self, message=None):
+            self.message = message
+
+    assert ClaudeSdkExecutor._deny(SimpleNamespace(PermissionResultDeny=Deny), "no").message == "no"
+
+    class DenyPositional:
+        def __init__(self, reason):  # rejects keyword 'message'
+            self.reason = reason
+
+    out = ClaudeSdkExecutor._deny(SimpleNamespace(PermissionResultDeny=DenyPositional), "why")
+    assert out.reason == "why"
+
+    assert ClaudeSdkExecutor._deny(SimpleNamespace(), "because") == {
+        "behavior": "deny",
+        "message": "because",
+    }
+
+
+# ---- _run_coroutine_from_sync nested-loop path --------------------------------
+
+def test_run_coroutine_from_sync_nested_loop():
+    import asyncio
+
+    async def outer():
+        async def inner():
+            return 42
+
+        # Called while a loop is already running -> worker-thread path.
+        return ClaudeSdkExecutor._run_coroutine_from_sync(inner())
+
+    assert asyncio.run(outer()) == 42
+
+
+# ---- _build_options fallbacks -------------------------------------------------
+
+def test_build_options_without_options_class(tmp_path):
+    _init_repo(tmp_path)
+    ex = ClaudeSdkExecutor(tmp_path, active_task=_task(), model="m", env={"K": "V"})
+    kwargs = ex._build_options(SimpleNamespace(), can_use_tool=lambda *a: None)
+    assert kwargs["cwd"] == str(tmp_path)
+    assert kwargs["model"] == "m"
+    assert kwargs["env"] == {"K": "V"}
+
+
+def test_build_options_all_kwargs_rejected_falls_back_to_bare(tmp_path):
+    _init_repo(tmp_path)
+
+    class Bare:
+        def __init__(self):  # rejects every kwarg combination
+            self.constructed = True
+
+    ex = ClaudeSdkExecutor(tmp_path, active_task=_task(), model="m", env={"K": "V"})
+    obj = ex._build_options(SimpleNamespace(ClaudeAgentOptions=Bare), can_use_tool=lambda *a: None)
+    assert isinstance(obj, Bare)
+    # No can_use_tool attribute to fill -> returned as-is.
+    assert not hasattr(obj, "can_use_tool")
+
+
+# ---- _message_session_id / _message_result -----------------------------------
+
+def test_message_session_id_variants():
+    assert ClaudeSdkExecutor._message_session_id(SimpleNamespace(session_id="s1")) == "s1"
+    assert ClaudeSdkExecutor._message_session_id({"session_id": "s2"}) == "s2"
+    assert ClaudeSdkExecutor._message_session_id(SimpleNamespace(data={"session_id": "s3"})) == "s3"
+    assert ClaudeSdkExecutor._message_session_id({}) is None
+
+
+def test_message_result_non_result_message():
+    assert ClaudeSdkExecutor._message_result(SimpleNamespace(type="assistant")) == (None, False)
+
+
+def test_message_result_success_and_error():
+    ok = SimpleNamespace(type="result", subtype="success", result="done", is_error=False)
+    assert ClaudeSdkExecutor._message_result(ok) == ("done", False)
+
+    err = SimpleNamespace(type="result", subtype="error_max_turns", result="bad", is_error=True)
+    assert ClaudeSdkExecutor._message_result(err) == ("bad", True)
+
+
+def test_message_result_dict_and_derived_error():
+    # Dict form; is_error absent -> derived from a non-success subtype.
+    msg = {"type": "result", "subtype": "error_during_execution", "result": "x"}
+    text, is_error = ClaudeSdkExecutor._message_result(msg)
+    assert text == "x" and is_error is True
+
+    # ResultMessage-by-classname path with no explicit error and a success subtype.
+    class ResultMessage:
+        subtype = "success"
+        result = "final"
+
+    text2, err2 = ClaudeSdkExecutor._message_result(ResultMessage())
+    assert text2 == "final" and err2 is False
+
+
+def test_message_result_no_result_text():
+    msg = SimpleNamespace(type="result", subtype="success", result=None, is_error=False)
+    assert ClaudeSdkExecutor._message_result(msg) == (None, False)
+
+
+# ---- run loop: no denials suffix and mid-run failures -------------------------
+
+def _install_sdk_with_query(monkeypatch, query_fn):
+    fake = types.ModuleType("claude_agent_sdk")
+
+    class ClaudeAgentOptions:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    class PermissionResultAllow:
+        def __init__(self, updated_input=None):
+            self.updated_input = updated_input
+            self.behavior = "allow"
+
+    class PermissionResultDeny:
+        def __init__(self, message=None):
+            self.message = message
+            self.behavior = "deny"
+
+    fake.ClaudeAgentOptions = ClaudeAgentOptions
+    fake.PermissionResultAllow = PermissionResultAllow
+    fake.PermissionResultDeny = PermissionResultDeny
+    fake.query = query_fn
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake)
+    return fake
+
+
+def test_run_task_success_without_denials(tmp_path, monkeypatch):
+    _init_repo(tmp_path)
+
+    class ResultMessage:
+        type = "result"
+        subtype = "success"
+
+        def __init__(self, result):
+            self.result = result
+            self.is_error = False
+            self.session_id = "sess-1"
+
+    async def query(prompt=None, options=None):
+        yield ResultMessage("All good.")
+
+    _install_sdk_with_query(monkeypatch, query)
+    result = ClaudeSdkExecutor(tmp_path, active_task=_task()).run_task(_task(), [])
+    assert result.success
+    assert result.message == "All good."  # no gate-denial suffix
+    assert "Gate denied" not in result.message
+
+
+def test_run_task_non_transient_failure(tmp_path, monkeypatch):
+    _init_repo(tmp_path)
+
+    async def query(prompt=None, options=None):
+        raise ValueError("hard failure")
+        yield  # pragma: no cover - marks this an async generator
+
+    _install_sdk_with_query(monkeypatch, query)
+    result = ClaudeSdkExecutor(tmp_path, active_task=_task()).run_task(_task(), [])
+    assert not result.success
+    assert "run failed" in result.message.lower()
+    assert "hard failure" in result.message
+
+
+def test_run_task_transient_failure_retries_then_succeeds(tmp_path, monkeypatch):
+    _init_repo(tmp_path)
+    state = {"n": 0}
+
+    class ResultMessage:
+        type = "result"
+        subtype = "success"
+
+        def __init__(self):
+            self.result = "recovered"
+            self.is_error = False
+            self.session_id = "s"
+
+    async def query(prompt=None, options=None):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise RuntimeError("connection reset by peer")
+        yield ResultMessage()
+
+    _install_sdk_with_query(monkeypatch, query)
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+    result = ClaudeSdkExecutor(tmp_path, active_task=_task()).run_task(_task(), [])
+    assert result.success
+    assert "recovered" in result.message
+    assert state["n"] == 2
+
+
+def test_run_task_transient_failure_retry_also_fails(tmp_path, monkeypatch):
+    _init_repo(tmp_path)
+
+    async def query(prompt=None, options=None):
+        raise RuntimeError("connection reset by peer")
+        yield  # pragma: no cover
+
+    _install_sdk_with_query(monkeypatch, query)
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+    result = ClaudeSdkExecutor(tmp_path, active_task=_task()).run_task(_task(), [])
+    assert not result.success
+    assert "after retry" in result.message

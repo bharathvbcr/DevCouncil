@@ -334,7 +334,7 @@ def unresolved_blocking_cards(
     source = cards if cards is not None else load_cards(project_root)
     return [
         card for card in source
-        if card.status == "open" and card.verdict == "Critical Issues" and card.blocks_gate
+        if card.status == "open" and card.blocks_completion
         and (task_id is None or card.task_id in {None, task_id})
     ]
 

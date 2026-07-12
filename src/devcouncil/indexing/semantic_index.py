@@ -1,4 +1,8 @@
-"""Semantic snapshots and diff classification."""
+"""Semantic snapshots and diff classification.
+
+NOTE (Phase 4 legacy audit): task-scoped semantic diffs for verification — distinct
+from the code symbol graph in ``indexing/graph/``. Keep; not overlapping dead-code.
+"""
 
 from __future__ import annotations
 

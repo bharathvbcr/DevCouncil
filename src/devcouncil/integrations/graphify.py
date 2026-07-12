@@ -9,10 +9,15 @@ from devcouncil.utils.json_persist import write_json
 
 console = Console()
 
+
 class GraphifyIntegration:
     """
-    Integration for graphify: Always-on graph context and multi-agent integration.
+    Thin companion for graphify-style always-on graph context.
+
+    Does not write AGENTS.md / CLAUDE.md — those are owned by ``dev map``.
+    ``initialize`` writes a small config and ensures the real map/graph pipeline runs.
     """
+
     def __init__(self, project_root: Path):
         self.project_root = project_root
 
@@ -20,7 +25,6 @@ class GraphifyIntegration:
         console.print("[magenta]Initializing Graphify engine...[/magenta]")
         graphify_config = self.project_root / ".devcouncil" / "graphify.yaml"
         graphify_config.parent.mkdir(parents=True, exist_ok=True)
-        # Create a default graphify config
         content = """
 graph:
   engine: internal
@@ -31,7 +35,15 @@ hooks:
   enabled: true
 """
         atomic_write_text(graphify_config, content.strip())
-        console.print("  - Graphify engine configured and ready.")
+        # Agent guides are owned by ``dev map`` only — never write AGENTS.md/CLAUDE.md here.
+        map_path = self.project_root / ".devcouncil" / "repo_map.json"
+        if map_path.is_file():
+            console.print("  - Graphify engine configured (using existing repo map).")
+        else:
+            console.print(
+                "  - Graphify config ready. Run [bold]dev map[/bold] to build the code graph "
+                "and agent guides (map.py owns AGENTS.md/CLAUDE.md)."
+            )
 
     def apply_rules(self):
         """Apply graph-based rules from ``.devcouncil/graphify.yaml``."""

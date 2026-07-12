@@ -132,7 +132,8 @@ def apply_integration_target(
 
     def apply_hooks() -> None:
         integrate._configure_native_hooks(root, "all", apply=True, claude_write_gate=claude_write_gate)
-        add_result("hooks", True, None, "Native hook files configured.")
+        integrate._install_git_map_hooks(root, apply=True)
+        add_result("hooks", True, None, "Native hook files configured (incl. git map --if-stale).")
 
     def apply_claude_assets() -> None:
         try:

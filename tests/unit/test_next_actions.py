@@ -104,3 +104,45 @@ def test_acceptance_unproven_surfaces_missing_evidence():
     assert action.expected_verification_method == "unit_test"
     assert "AC-001" in action.missing_evidence
     assert "unit_test" in action.missing_evidence
+
+
+def test_unwired_file_maps_to_fix_code():
+    gap = _gap(gap_type="unwired_file", file="pkg/orphan.py")
+    action = next_action_for(gap)
+    assert action.category == "fix_code"
+    assert "pkg/orphan.py" in action.action
+    assert "non-test caller" in action.action
+
+
+def test_dead_symbol_maps_to_fix_code():
+    gap = _gap(
+        gap_type="dead_symbol",
+        file="pkg/mod.py",
+        line=4,
+        evidence=["pkg/mod.py:4", "symbol:helper"],
+    )
+    action = next_action_for(gap)
+    assert action.category == "fix_code"
+    assert "helper" in action.action
+    assert action.file == "pkg/mod.py"
+    assert action.line == 4
+
+
+def test_stranded_code_maps_to_fix_code():
+    gap = _gap(gap_type="stranded_code", file="pkg/stranded.py")
+    action = next_action_for(gap)
+    assert action.category == "fix_code"
+    assert "pkg/stranded.py" in action.action
+    assert "Restore the import/call" in action.action
+
+
+def test_stale_map_maps_to_refresh_map():
+    gap = _gap(
+        gap_type="stale_map",
+        suggested_command="dev map",
+        evidence=[".devcouncil/repo_map.json"],
+    )
+    action = next_action_for(gap)
+    assert action.category == "refresh_map"
+    assert "dev map" in action.action
+    assert action.suggested_command == "dev map"

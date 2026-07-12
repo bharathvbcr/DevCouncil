@@ -8,10 +8,11 @@ import subprocess
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, List, Set, Tuple, cast
+from typing import Dict, List, Optional, Set, Tuple, cast
 
 from pydantic import BaseModel, Field
 
+from devcouncil.indexing.graph.cache import PARSE_CACHE_VERSION
 from devcouncil.indexing.lsp import LspInspector
 from devcouncil.utils.json_persist import read_json
 
@@ -60,11 +61,21 @@ class RepoMap(BaseModel):
     # detect a stale map before trusting its structure.
     generated_head: str = ""
     indexed_hash: str = ""
+    # sha1 over sorted (path, size, mtime_ns) so plain content edits mark the map stale.
+    # Legacy maps without this field stay non-stale (no false alarms).
+    content_fingerprint: str = ""
     lsp: Dict[str, object] = Field(default_factory=dict)
     # Optional dependency-vulnerability findings. Populated only when `dev map` is
     # run with SCA explicitly enabled (off by default so the map stays fast and
     # offline-by-default); empty otherwise.
     dependency_risks: List[Dict[str, str]] = Field(default_factory=list)
+    # Liveness artifact (computed by default; omit with --no-liveness).
+    entry_roots: List[str] = Field(default_factory=list)
+    unwired_candidates: List[str] = Field(default_factory=list)
+    unreachable_files: List[str] = Field(default_factory=list)
+    dead_symbol_candidates: List[str] = Field(default_factory=list)
+    # Top call-flow processes from the code graph (entry-root BFS), when available.
+    processes: List[Dict[str, object]] = Field(default_factory=list)
 
 class RepoMapper:
     def __init__(self, project_root: Path):
@@ -90,6 +101,7 @@ class RepoMapper:
         return self._config_file_cache[name]
 
     _DEPENDENTS_MAX = 12  # cap dependents listed per file to bound repo_map.json size
+    _LIVENESS_CAP = 200  # cap on each liveness candidate list
 
     _LANGUAGE_BY_EXTENSION = {
         ".py": "python",
@@ -174,12 +186,14 @@ class RepoMapper:
             ],
         ),
         "src/devcouncil/indexing": (
-            "Repo mapping, AST matching, semantic snapshots, and language-server detection (no live LSP client).",
+            "Repo mapping, AST matching, semantic snapshots, and optional live LSP client.",
             [
                 "src/devcouncil/indexing/repo_mapper.py",
+                "src/devcouncil/indexing/wiring.py",
                 "src/devcouncil/indexing/ast_matcher.py",
                 "src/devcouncil/indexing/semantic_index.py",
                 "src/devcouncil/indexing/lsp.py",
+                "src/devcouncil/indexing/lsp_client.py",
             ],
         ),
         "src/devcouncil/integrations": (
@@ -506,10 +520,10 @@ class RepoMapper:
             ("mapping", ["indexing/repo_mapper.py"]),
             ("ast", ["indexing/ast_matcher.py"]),
             ("semantic", ["indexing/semantic_index.py"]),
-            # Detection-only LSP helper (no live client); see lsp.py docstring.
-            ("lsp", ["indexing/lsp.py"]),
-            # GraphIndex is consumed by integrations/gitnexus.py — kept, not dead.
-            ("graph", ["indexing/graph_index.py"]),
+            # Detection + optional live client (lsp_client.py); off by default.
+            ("lsp", ["indexing/lsp.py", "indexing/lsp_client.py"]),
+            # GraphIndex is consumed by integrations/gitnexus.py — kept as a thin compat shim.
+            ("graph", ["indexing/graph_index.py", "indexing/graph/"]),
         ],
         "src/devcouncil/integrations": [
             ("vcs", ["integrations/github.py"]),
@@ -534,8 +548,8 @@ class RepoMapper:
         ],
         "src/devcouncil/artifacts": [
             ("graph", ["artifacts/graph.py"]),
-            ("coverage", ["artifacts/coverage.py", "artifacts/serializer.py"]),
-            ("schema", ["artifacts/schemas.py", "artifacts/migrations.py"]),
+            ("coverage", ["artifacts/coverage.py", "artifacts/validators.py"]),
+            ("schema", ["artifacts/graph.py", "artifacts/coverage.py"]),
             ("validation", ["artifacts/validators.py"]),
         ],
         "src/devcouncil/executors": [
@@ -940,37 +954,64 @@ class RepoMapper:
             comps = comps[:-1]  # `from pkg.mod import name` -> try pkg.mod, then pkg
         return None
 
-    # Version tag for the on-disk parse cache; bump when the cached payload changes
-    # shape so stale caches are discarded wholesale instead of misread.
-    _PARSE_CACHE_VERSION = 1
+    def _ancestor_init_files(self, target: str, py_file_set: Set[str]) -> List[str]:
+        """Existing ancestor package ``__init__.py`` files between ``target`` and repo root.
+
+        Importing a submodule executes each ancestor package ``__init__``; emit those
+        inbound edges so package inits are not falsely flagged unwired/unreachable.
+        """
+        parts = target.replace("\\", "/").split("/")
+        if not parts:
+            return []
+        if parts[-1] == "__init__.py":
+            dir_parts = parts[:-2]  # ancestors above this package
+        else:
+            dir_parts = parts[:-1]
+        out: List[str] = []
+        for i in range(len(dir_parts), 0, -1):
+            init = "/".join(dir_parts[:i]) + "/__init__.py"
+            if init in py_file_set and init != target:
+                out.append(init)
+        return out
+
+    # Single owner: graph.cache.PARSE_CACHE_VERSION (v4 = + import_details).
+    _PARSE_CACHE_VERSION = PARSE_CACHE_VERSION
+    _JS_SUFFIXES = frozenset({".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"})
 
     def _parse_cache_path(self) -> Path:
-        # Same .devcouncil/cache/ layout the LLM response cache uses.
-        return self.project_root / ".devcouncil" / "cache" / "repo_map_parse.json"
+        from devcouncil.indexing.graph.cache import cache_path
+
+        return cache_path(self.project_root)
 
     def _load_parse_cache(self) -> Dict[str, Dict[str, object]]:
-        """Load the sha256-keyed import-extraction cache. Best-effort: any missing,
-        corrupt, or version-mismatched cache just means a full re-parse."""
-        try:
-            data = read_json(self._parse_cache_path())
-            if data.get("version") == self._PARSE_CACHE_VERSION and isinstance(data.get("files"), dict):
-                return cast(Dict[str, Dict[str, object]], data["files"])
-        except Exception:
-            pass
-        return {}
+        """Delegate to graph.cache (single version + merge policy)."""
+        from devcouncil.indexing.graph.cache import load_parse_cache
+
+        return cast(Dict[str, Dict[str, object]], load_parse_cache(self.project_root))
 
     def _save_parse_cache(self, files: Dict[str, Dict[str, object]]) -> None:
-        """Persist the import-extraction cache. Best-effort: a failed write only
-        costs the next run a re-parse, so it never raises."""
-        try:
-            path = self._parse_cache_path()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps({"version": self._PARSE_CACHE_VERSION, "files": files}),
-                encoding="utf-8",
-            )
-        except Exception:
-            logger.debug("Failed to write repo-map parse cache", exc_info=True)
+        """Delegate to graph.cache."""
+        from devcouncil.indexing.graph.cache import save_parse_cache
+
+        save_parse_cache(self.project_root, cast(Dict[str, Dict[str, object]], files))
+
+    @staticmethod
+    def _is_js_source_path(path: str) -> bool:
+        return Path(path).suffix.lower() in RepoMapper._JS_SUFFIXES
+
+    def _merge_parse_cache(
+        self,
+        updates: Dict[str, Dict[str, object]],
+        managed: Set[str],
+    ) -> None:
+        """Delegate to graph.cache merge (preserves sibling language/field keys)."""
+        from devcouncil.indexing.graph.cache import merge_parse_cache
+
+        merge_parse_cache(
+            self.project_root,
+            cast(Dict[str, Dict[str, object]], updates),
+            managed,
+        )
 
     def _extract_python_import_modules(self, rel: str, source: str) -> List[str]:
         """Raw module strings referenced by ``rel``'s import statements, with relative
@@ -1008,6 +1049,7 @@ class RepoMapper:
         py_files = [f for f in self._code_files(files) if f.endswith(".py")]
         if not py_files:
             return []
+        py_file_set = set(py_files)
         index = self._module_suffix_index(py_files)
         cache = self._load_parse_cache()
         fresh: Dict[str, Dict[str, object]] = {}
@@ -1035,13 +1077,16 @@ class RepoMapper:
             fresh[rel] = {"sha256": digest, "modules": modules}
             for module in modules:
                 target = self._resolve_module(module, index)
-                if target and target != rel and (rel, target) not in seen:
-                    seen.add((rel, target))
-                    edges.append((rel, target))
-        # Rewriting only on change keeps repeat runs read-only; building `fresh` from
-        # scratch also prunes entries for files that no longer exist.
-        if fresh != cache:
-            self._save_parse_cache(fresh)
+                if not target:
+                    continue
+                targets = [target, *self._ancestor_init_files(target, py_file_set)]
+                for dest in targets:
+                    if dest != rel and (rel, dest) not in seen:
+                        seen.add((rel, dest))
+                        edges.append((rel, dest))
+        # Preserve JS/TS cache entries; prune deleted Python files from this pass.
+        managed = {k for k in cache if k.endswith(".py")} | set(py_files)
+        self._merge_parse_cache(fresh, managed)
         return edges
 
     # Module specifiers in import/require statements: import ... from "x"; require("x");
@@ -1058,18 +1103,18 @@ class RepoMapper:
     _GO_MODULE_RE = re.compile(r"^\s*module\s+(?P<mod>\S+)", re.MULTILINE)
 
     def _resolve_js_spec(self, importer: str, spec: str, file_set: Set[str]) -> str | None:
-        """Resolve a relative TS/JS import specifier (``./x`` / ``../y``) to a repo file.
-        Bare specifiers (node_modules packages) are intentionally not resolved."""
-        if not spec.startswith("."):
-            return None
-        base = Path(importer).parent
-        try:
-            target = (base / spec).as_posix()
-        except Exception:
-            return None
-        # Normalize away any ".." segments without touching the filesystem.
+        """Resolve a TS/JS import specifier to a repo file.
+
+        Handles relative specs (``./x`` / ``../y``) and tsconfig/jsconfig path
+        aliases (``@/x``, ``~/x``, custom). Bare node_modules packages return None.
+        """
+        if spec.startswith("."):
+            return self._resolve_js_relative(importer, spec, file_set)
+        return self._resolve_js_alias(spec, file_set)
+
+    def _normalize_js_path(self, target: str) -> str:
         parts: List[str] = []
-        for comp in target.split("/"):
+        for comp in target.replace("\\", "/").split("/"):
             if comp in ("", "."):
                 continue
             if comp == "..":
@@ -1077,7 +1122,29 @@ class RepoMapper:
                     parts.pop()
                 continue
             parts.append(comp)
-        norm = "/".join(parts)
+        return "/".join(parts)
+
+    def _normalize_js_alias_target(self, target: str) -> str:
+        """Like ``_normalize_js_path`` but keeps leading ``../`` segments intact."""
+        parts: List[str] = []
+        leading_dots = 0
+        for comp in target.replace("\\", "/").split("/"):
+            if comp in ("", "."):
+                continue
+            if comp == "..":
+                if parts:
+                    parts.pop()
+                else:
+                    leading_dots += 1
+                continue
+            parts.append(comp)
+        prefix = "/".join([".."] * leading_dots)
+        rest = "/".join(parts)
+        if prefix and rest:
+            return f"{prefix}/{rest}"
+        return prefix or rest
+
+    def _probe_js_candidates(self, norm: str, file_set: Set[str]) -> str | None:
         if not norm:
             return None
         candidates = [norm]
@@ -1088,30 +1155,337 @@ class RepoMapper:
                 return cand
         return None
 
+    def _resolve_js_relative(self, importer: str, spec: str, file_set: Set[str]) -> str | None:
+        base = Path(importer).parent
+        try:
+            target = (base / spec).as_posix()
+        except Exception:
+            return None
+        return self._probe_js_candidates(self._normalize_js_path(target), file_set)
+
+    def _load_js_path_aliases(self) -> List[Tuple[str, List[str]]]:
+        """Parse tsconfig/jsconfig path aliases across extends + project references.
+
+        Merges ``compilerOptions.paths`` (and ``baseUrl``) from:
+        - Root ``tsconfig.json`` / ``jsconfig.json`` / ``tsconfig.base.json``
+        - Each config's ``extends`` chain (child overrides parent)
+        - ``references[].path`` project configs (and their extends)
+
+        Returns ``(pattern_prefix, [target_prefixes])`` sorted longest-key first.
+        Cached per mapper instance. Never raises.
+        """
+        cached = getattr(self, "_js_alias_cache", None)
+        if cached is not None:
+            return cast(List[Tuple[str, List[str]]], cached)
+        rules: List[Tuple[str, List[str]]] = []
+        seen_configs: Set[str] = set()
+
+        def _strip_json_comments(raw: str) -> str:
+            raw = re.sub(r"/\*.*?\*/", "", raw, flags=re.DOTALL)
+            return re.sub(r"(?m)^\s*//.*?$", "", raw)
+
+        def _read_config(path: Path) -> dict | None:
+            try:
+                key = path.resolve().as_posix()
+            except OSError:
+                key = path.as_posix()
+            if key in seen_configs:
+                return None
+            seen_configs.add(key)
+            if not path.is_file():
+                return None
+            try:
+                raw = _strip_json_comments(path.read_text(encoding="utf-8", errors="replace"))
+                data = json.loads(raw)
+            except Exception:
+                return None
+            return data if isinstance(data, dict) else None
+
+        def _merge_extends(path: Path, data: dict) -> dict:
+            """Return compilerOptions with parent ``extends`` merged under child."""
+            extends = data.get("extends")
+            parent_co: dict = {}
+            if isinstance(extends, str) and extends:
+                # Node-style: bare @scoped packages ignored; relative/absolute only.
+                if extends.startswith("."):
+                    parent_path = (path.parent / extends).resolve()
+                    if not parent_path.suffix:
+                        # extends may omit .json
+                        for suffix in (".json", ""):
+                            candidate = Path(str(parent_path) + suffix) if suffix else parent_path
+                            if candidate.is_file():
+                                parent_path = candidate
+                                break
+                    parent_data = _read_config(parent_path)
+                    if parent_data:
+                        parent_co = _merge_extends(parent_path, parent_data)
+            child_co = data.get("compilerOptions") or {}
+            if not isinstance(child_co, dict):
+                child_co = {}
+            merged = dict(parent_co)
+            for k, v in child_co.items():
+                if k == "paths" and isinstance(v, dict) and isinstance(merged.get("paths"), dict):
+                    paths = dict(merged["paths"])
+                    paths.update(v)
+                    merged["paths"] = paths
+                else:
+                    merged[k] = v
+            return merged
+
+        def _rules_from_co(co: dict, config_dir: Path) -> None:
+            if not isinstance(co, dict):
+                return
+            base_url = str(co.get("baseUrl") or ".").replace("\\", "/").rstrip("/")
+            if base_url in (".", ""):
+                base_url = ""
+            # Paths are relative to the config file's directory (TS spec), then baseUrl.
+            try:
+                config_rel = config_dir.relative_to(self.project_root).as_posix()
+            except ValueError:
+                config_rel = ""
+            if config_rel in (".", ""):
+                config_prefix = ""
+            else:
+                config_prefix = config_rel
+
+            paths = co.get("paths") or {}
+            if not isinstance(paths, dict):
+                return
+            for key, targets in paths.items():
+                if not isinstance(key, str):
+                    continue
+                target_list = targets if isinstance(targets, list) else [targets]
+                resolved_targets: List[str] = []
+                for t in target_list:
+                    if not isinstance(t, str):
+                        continue
+                    t_norm = t.replace("\\", "/")
+                    if t_norm.endswith("/*"):
+                        t_norm = t_norm[:-2]
+                    elif t_norm.endswith("*"):
+                        t_norm = t_norm[:-1]
+                    # Resolve relative to config dir + baseUrl. Preserve leading
+                    # ``../`` (Phase 0: never lstrip/collapse away parent refs).
+                    pieces: List[str] = []
+                    if config_prefix:
+                        pieces.append(config_prefix)
+                    if base_url:
+                        pieces.append(base_url)
+                    if t_norm:
+                        pieces.append(t_norm)
+                    joined = "/".join(p for p in pieces if p)
+                    joined = self._normalize_js_alias_target(joined)
+                    while joined.startswith("./"):
+                        joined = joined[2:]
+                    resolved_targets.append(joined.rstrip("/"))
+                if not resolved_targets:
+                    continue
+                pattern = key
+                if pattern.endswith("/*"):
+                    pattern = pattern[:-2]
+                elif pattern.endswith("*"):
+                    pattern = pattern[:-1]
+                rules.append((pattern, resolved_targets))
+
+        def _ingest(path: Path) -> None:
+            data = _read_config(path)
+            if not data:
+                return
+            co = _merge_extends(path, data)
+            _rules_from_co(co, path.parent)
+            refs = data.get("references") or []
+            if isinstance(refs, list):
+                for ref in refs:
+                    if not isinstance(ref, dict):
+                        continue
+                    ref_path = ref.get("path")
+                    if not isinstance(ref_path, str) or not ref_path:
+                        continue
+                    target = (path.parent / ref_path).resolve()
+                    if target.is_dir():
+                        for name in ("tsconfig.json", "jsconfig.json"):
+                            candidate = target / name
+                            if candidate.is_file():
+                                _ingest(candidate)
+                                break
+                    elif target.is_file():
+                        _ingest(target)
+                    else:
+                        # path may omit .json
+                        for suffix in (".json", "/tsconfig.json"):
+                            candidate = Path(str(target) + suffix) if suffix.startswith(".") else Path(str(target) + suffix)
+                            if candidate.is_file():
+                                _ingest(candidate)
+                                break
+
+        try:
+            for name in ("tsconfig.json", "jsconfig.json", "tsconfig.base.json"):
+                root_cfg = self.project_root / name
+                if root_cfg.is_file():
+                    _ingest(root_cfg)
+            # package.json name → source dir (best-effort monorepo/workspace).
+            try:
+                pkg_text = (self.project_root / "package.json").read_text(
+                    encoding="utf-8", errors="replace"
+                )
+                pkg = json.loads(pkg_text)
+                pkg_name = pkg.get("name")
+                if isinstance(pkg_name, str) and pkg_name:
+                    for candidate in ("src", "lib", "app", "."):
+                        probe = "src" if candidate == "src" else candidate
+                        if any(
+                            f == probe or f.startswith(probe + "/")
+                            for f in getattr(self, "_last_file_set", set())
+                        ) or (self.project_root / probe).is_dir():
+                            rules.append((pkg_name, [probe if probe != "." else ""]))
+                            break
+            except Exception:
+                pass
+            # Deduplicate identical (pattern, targets) preserving longest-first sort.
+            dedup: Dict[str, List[str]] = {}
+            for pattern, targets in rules:
+                existing = dedup.get(pattern)
+                if existing is None:
+                    dedup[pattern] = list(targets)
+                else:
+                    for t in targets:
+                        if t not in existing:
+                            existing.append(t)
+            rules = [(p, ts) for p, ts in dedup.items()]
+            rules.sort(key=lambda r: len(r[0]), reverse=True)
+        except Exception:
+            logger.debug("JS path-alias load failed", exc_info=True)
+            rules = []
+        self._js_alias_cache = rules
+        return rules
+
+    def _resolve_js_alias(self, spec: str, file_set: Set[str]) -> str | None:
+        rules = self._load_js_path_aliases()
+        for pattern, targets in rules:
+            rest = ""
+            if spec == pattern:
+                rest = ""
+            elif pattern and spec.startswith(pattern + "/"):
+                rest = spec[len(pattern) + 1 :]
+            else:
+                continue
+            for target_base in targets:
+                if rest:
+                    candidate = f"{target_base}/{rest}" if target_base else rest
+                else:
+                    candidate = target_base
+                hit = self._probe_js_candidates(self._normalize_js_path(candidate), file_set)
+                if hit:
+                    return hit
+        return None
+
+    def _extract_js_import_specs(self, source: str) -> List[str]:
+        """Raw import/require/export-from specifiers in ``source``. Pure function of
+        content — safe to cache by sha256. Resolution against the file set runs fresh."""
+        specs: List[str] = []
+        for m in self._JS_IMPORT_RE.finditer(source):
+            spec = m.group("spec") or m.group("spec2")
+            if spec:
+                specs.append(spec)
+        for line in source.splitlines():
+            bare = self._JS_BARE_IMPORT_RE.match(line)
+            if bare:
+                specs.append(bare.group("spec"))
+        return specs
+
+    _JS_REEXPORT_RE = re.compile(
+        r"""export\s+(?:\*|\{[^}]*\})\s+from\s*['"](?P<spec>[^'"]+)['"]"""
+    )
+
+    def _extract_js_reexport_specs(self, source: str) -> List[str]:
+        """``export * from`` / ``export {…} from`` targets (barrel re-exports)."""
+        return [m.group("spec") for m in self._JS_REEXPORT_RE.finditer(source)]
+
+    def _follow_js_reexports(
+        self,
+        importer: str,
+        target: str,
+        file_set: Set[str],
+        *,
+        depth: int = 0,
+        seen: Set[str] | None = None,
+    ) -> List[str]:
+        """Follow barrel re-exports from ``target`` up to a small hop limit.
+
+        Returns additional files reachable via ``export … from`` so an importer of
+        a barrel also depends on the re-exported modules.
+        """
+        if depth >= 4:
+            return []
+        visited = seen if seen is not None else set()
+        if target in visited:
+            return []
+        visited.add(target)
+        try:
+            source = (self.project_root / target).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
+        extra: List[str] = []
+        for spec in self._extract_js_reexport_specs(source):
+            resolved = self._resolve_js_spec(target, spec, file_set)
+            if not resolved or resolved == importer or resolved == target:
+                continue
+            extra.append(resolved)
+            extra.extend(
+                self._follow_js_reexports(
+                    importer, resolved, file_set, depth=depth + 1, seen=visited
+                )
+            )
+        return extra
+
     def _js_import_edges(self, files: List[str], file_set: Set[str]) -> List[Tuple[str, str]]:
-        """Resolve TS/JS relative import/require/export-from edges to repo files."""
-        js_files = [f for f in files if Path(f).suffix.lower() in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}]
+        """Resolve TS/JS relative + alias import/require/export-from edges to repo files.
+
+        Specifier extraction is cached in ``.devcouncil/cache/repo_map_parse.json``
+        keyed by each file's sha256 (same store as Python ``modules``). Resolution
+        against the current file set always runs fresh. Barrel ``export * from`` /
+        ``export {x} from`` targets are followed so importers of an index also
+        depend on the re-exported modules.
+        """
+        self._last_file_set = file_set
+        js_files = [f for f in files if self._is_js_source_path(f)]
+        if not js_files:
+            return []
+        cache = self._load_parse_cache()
+        fresh: Dict[str, Dict[str, object]] = {}
         edges: List[Tuple[str, str]] = []
         seen: Set[Tuple[str, str]] = set()
         for rel in js_files:
             try:
-                source = (self.project_root / rel).read_text(encoding="utf-8", errors="replace")
+                raw = (self.project_root / rel).read_bytes()
             except OSError:
                 continue
-            specs: List[str] = []
-            for m in self._JS_IMPORT_RE.finditer(source):
-                spec = m.group("spec") or m.group("spec2")
-                if spec:
-                    specs.append(spec)
-            for line in source.splitlines():
-                bare = self._JS_BARE_IMPORT_RE.match(line)
-                if bare:
-                    specs.append(bare.group("spec"))
+            digest = hashlib.sha256(raw).hexdigest()
+            entry = cache.get(rel)
+            cached_specs = (
+                entry.get("specs")
+                if isinstance(entry, dict) and entry.get("sha256") == digest
+                else None
+            )
+            if isinstance(cached_specs, list):
+                specs = [s for s in cached_specs if isinstance(s, str)]
+            else:
+                specs = self._extract_js_import_specs(
+                    raw.decode("utf-8", errors="replace")
+                )
+            fresh[rel] = {"sha256": digest, "specs": specs}
             for spec in specs:
                 target = self._resolve_js_spec(rel, spec, file_set)
-                if target and target != rel and (rel, target) not in seen:
-                    seen.add((rel, target))
-                    edges.append((rel, target))
+                if not target or target == rel:
+                    continue
+                to_add = [target]
+                to_add.extend(self._follow_js_reexports(rel, target, file_set))
+                for dest in to_add:
+                    if dest != rel and (rel, dest) not in seen:
+                        seen.add((rel, dest))
+                        edges.append((rel, dest))
+        managed = {k for k in cache if self._is_js_source_path(k)} | set(js_files)
+        self._merge_parse_cache(fresh, managed)
         return edges
 
     def _go_module_prefix(self, file_set: Set[str]) -> str | None:
@@ -1126,55 +1500,169 @@ class RepoMapper:
                 return m.group("mod").strip()
         return None
 
+    def _extract_go_import_specs_fallback(self, source: str) -> List[str]:
+        specs: List[str] = []
+        for block in self._GO_IMPORT_BLOCK_RE.finditer(source):
+            for sm in self._GO_IMPORT_SPEC_RE.finditer(block.group("body")):
+                specs.append(sm.group("spec"))
+        for line in source.splitlines():
+            single = self._GO_IMPORT_SINGLE_RE.match(line)
+            if single:
+                specs.append(single.group("spec"))
+        return specs
+
     def _go_import_edges(self, files: List[str], file_set: Set[str]) -> List[Tuple[str, str]]:
-        """Resolve Go import paths (under the module prefix) to package directories, then
-        to one representative .go file per package (main.go preferred)."""
+        """Resolve Go import paths under the module prefix to *all* package .go files.
+
+        File-level (not representative-file) so liveness/dependents treat each
+        member of an imported package as wired. Prefer tree-sitter extraction
+        when available; fall back to regex.
+        """
         module = self._go_module_prefix(file_set)
         if not module:
             return []
         go_files = [f for f in files if f.endswith(".go")]
         if not go_files:
             return []
-        # package dir -> .go files in it (excluding _test.go, which aren't imported).
         pkg_files: Dict[str, List[str]] = defaultdict(list)
         for f in go_files:
             if f.endswith("_test.go"):
                 continue
             pkg_files[Path(f).parent.as_posix()].append(f)
 
-        def _representative_file(pkg_paths: List[str]) -> str:
-            main_go = [p for p in pkg_paths if Path(p).name == "main.go"]
-            if main_go:
-                return sorted(main_go)[0]
-            return min(pkg_paths, key=lambda p: (len(p), p))
+        from devcouncil.indexing.ts_imports import extract_go_import_specs
 
-        pkg_representative = {
-            pkg: _representative_file(paths) for pkg, paths in pkg_files.items()
-        }
         edges: List[Tuple[str, str]] = []
         seen: Set[Tuple[str, str]] = set()
+
+        # Same-package co-membership: Go compiles all files in a directory as one
+        # package, so members wire each other even without import statements.
+        for members in pkg_files.values():
+            if len(members) < 2:
+                continue
+            for a in members:
+                for b in members:
+                    if a != b and (a, b) not in seen:
+                        seen.add((a, b))
+                        edges.append((a, b))
+
         for rel in go_files:
             try:
                 source = (self.project_root / rel).read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            specs: List[str] = []
-            for block in self._GO_IMPORT_BLOCK_RE.finditer(source):
-                for sm in self._GO_IMPORT_SPEC_RE.finditer(block.group("body")):
-                    specs.append(sm.group("spec"))
-            for line in source.splitlines():
-                single = self._GO_IMPORT_SINGLE_RE.match(line)
-                if single:
-                    specs.append(single.group("spec"))
+            ts_specs = extract_go_import_specs(source)
+            specs = ts_specs if ts_specs is not None else self._extract_go_import_specs_fallback(source)
             for spec in specs:
                 if spec != module and not spec.startswith(module + "/"):
                     continue  # external/stdlib package
                 rel_pkg = spec[len(module):].lstrip("/")
                 target_dir = rel_pkg if rel_pkg else "."
-                target = pkg_representative.get(target_dir)
-                if target and target != rel and (rel, target) not in seen:
-                    seen.add((rel, target))
-                    edges.append((rel, target))
+                for target in sorted(pkg_files.get(target_dir, ())):
+                    if target != rel and (rel, target) not in seen:
+                        seen.add((rel, target))
+                        edges.append((rel, target))
+        return edges
+
+    def _rust_crate_root(self, importer: str, file_set: Set[str]) -> str:
+        """Directory containing lib.rs/main.rs for ``importer``, or its parent."""
+        parts = Path(importer).parts
+        for i in range(len(parts) - 1, -1, -1):
+            prefix = "/".join(parts[:i]) if i else ""
+            for name in ("lib.rs", "main.rs"):
+                candidate = f"{prefix}/{name}" if prefix else name
+                if candidate in file_set:
+                    return prefix if prefix else "."
+        parent = Path(importer).parent.as_posix()
+        return parent if parent != "." else "."
+
+    def _probe_rust_module(self, base_dir: str, segments: List[str], file_set: Set[str]) -> List[str]:
+        """Resolve module path segments under ``base_dir`` to existing .rs files."""
+        if not segments:
+            return []
+        hits: List[str] = []
+        cur = base_dir if base_dir not in (".", "") else ""
+        for i, seg in enumerate(segments):
+            if seg in {"crate", "super", "self", "Self"}:
+                continue
+            # Try path-so-far as a module file at each segment (last may be an item).
+            prefix = f"{cur}/{seg}" if cur else seg
+            candidates = [
+                f"{prefix}.rs",
+                f"{prefix}/mod.rs",
+            ]
+            found = None
+            for cand in candidates:
+                norm = self._normalize_js_path(cand)
+                if norm in file_set:
+                    found = norm
+                    break
+            if found:
+                hits.append(found)
+                cur = prefix
+            elif i < len(segments) - 1:
+                # Intermediate segment must exist as a directory module.
+                cur = prefix
+            # else: final segment may be a type/fn name — keep prior hits only
+        return hits
+
+    def _rust_import_edges(self, files: List[str], file_set: Set[str]) -> List[Tuple[str, str]]:
+        """Rust ``mod`` / ``use`` → module files via optional tree-sitter layer.
+
+        No edges when tree-sitter is unavailable (degrades to pre-Phase-3 output).
+        """
+        from devcouncil.indexing.ts_imports import extract_rust_import_refs, tree_sitter_available
+
+        if not tree_sitter_available():
+            return []
+        rust_files = [f for f in files if f.endswith(".rs")]
+        if not rust_files:
+            return []
+        edges: List[Tuple[str, str]] = []
+        seen: Set[Tuple[str, str]] = set()
+        for rel in rust_files:
+            try:
+                source = (self.project_root / rel).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            refs = extract_rust_import_refs(source)
+            if not refs:
+                continue
+            importer_dir = Path(rel).parent.as_posix()
+            if importer_dir == ".":
+                importer_dir = ""
+            crate_root = self._rust_crate_root(rel, file_set)
+            crate_dir = "" if crate_root in (".", "") else crate_root
+            for ref in refs:
+                targets: List[str] = []
+                if ref.get("kind") == "mod":
+                    name = ref.get("name")
+                    if isinstance(name, str) and name:
+                        targets = self._probe_rust_module(importer_dir, [name], file_set)
+                elif ref.get("kind") == "use":
+                    segments = ref.get("segments") or []
+                    if not isinstance(segments, list) or not segments:
+                        continue
+                    segs = [s for s in segments if isinstance(s, str)]
+                    if not segs:
+                        continue
+                    if segs[0] == "crate":
+                        targets = self._probe_rust_module(crate_dir, segs[1:], file_set)
+                    elif segs[0] == "super":
+                        parent = Path(rel).parent.parent.as_posix()
+                        parent_dir = "" if parent == "." else parent
+                        targets = self._probe_rust_module(parent_dir, segs[1:], file_set)
+                    elif segs[0] == "self":
+                        targets = self._probe_rust_module(importer_dir, segs[1:], file_set)
+                    else:
+                        # Relative / bare path — try from importer dir then crate root.
+                        targets = self._probe_rust_module(importer_dir, segs, file_set)
+                        if not targets:
+                            targets = self._probe_rust_module(crate_dir, segs, file_set)
+                for target in targets:
+                    if target != rel and (rel, target) not in seen:
+                        seen.add((rel, target))
+                        edges.append((rel, target))
         return edges
 
     def _all_import_edges(self, files: List[str]) -> List[Tuple[str, str]]:
@@ -1190,6 +1678,10 @@ class RepoMapper:
             edges.extend(self._go_import_edges(files, file_set))
         except Exception:
             logger.debug("Go import-edge resolution failed", exc_info=True)
+        try:
+            edges.extend(self._rust_import_edges(files, file_set))
+        except Exception:
+            logger.debug("Rust import-edge resolution failed", exc_info=True)
         return edges
 
     def _rank_area_files(self, area_files: List[str], in_degree: Counter) -> List[str]:
@@ -1237,6 +1729,18 @@ class RepoMapper:
             entry_points = [p for p in critical_files if in_degree.get(p, 0) > 0][:3] or critical_files[:1]
             stems = ", ".join(Path(p).stem for p in critical_files[:3])
             summary = f"{Path(area).name or area}: {stems}" if stems else f"{area} ({len(area_files)} files)"
+            # Optional community label from code graph (generic repos).
+            community = ""
+            cg = getattr(self, "_last_code_graph", None)
+            if cg is not None:
+                try:
+                    from devcouncil.indexing.graph.intel import community_label_for_area
+
+                    community = community_label_for_area(cg, area)
+                    if community and community not in summary:
+                        summary = f"{summary} [{community}]"
+                except Exception:
+                    community = ""
             subsystems.append(
                 RepoSubsystem(
                     area=area,
@@ -1272,6 +1776,327 @@ class RepoMapper:
             if importers
         }
 
+    def import_edges_for(self, files: List[str] | None = None) -> List[Tuple[str, str]]:
+        """Public uncapped forward import edges for the given files (or whole repo).
+
+        Verify gates need live edges — the persisted map won't include brand-new
+        files until the next ``dev map``. Never raises.
+        """
+        try:
+            if files is None:
+                files = self.get_git_files()
+            return self._all_import_edges(files)
+        except Exception:
+            logger.debug("import_edges_for failed", exc_info=True)
+            return []
+
+    def dependents_for(self, files: List[str] | None = None) -> Dict[str, Set[str]]:
+        """Uncapped reverse index (imported -> set of importers) for presence checks.
+
+        Unlike :meth:`build_dependents`, this includes zero-importer keys only when
+        asked about specific files via the returned dict's ``.get``, and never caps
+        the importer lists. Never raises.
+        """
+        try:
+            edges = self.import_edges_for(files)
+            reverse: Dict[str, Set[str]] = defaultdict(set)
+            for importer, imported in edges:
+                reverse[imported].add(importer)
+            return dict(reverse)
+        except Exception:
+            logger.debug("dependents_for failed", exc_info=True)
+            return {}
+
+    def _compute_liveness(
+        self,
+        files: List[str],
+        edges: List[Tuple[str, str]],
+        *,
+        cap: Optional[int] = None,
+        lsp_refs: bool = False,
+    ) -> Tuple[List[str], List[str], List[str], List[str], List[str]]:
+        """Compute entry_roots, unwired_candidates, unreachable_files, dead_symbol_candidates.
+
+        Also returns ``symbol_index`` (``path::name`` keys) as the fifth element.
+
+        ``cap`` defaults to ``_LIVENESS_CAP`` for the stored map debt lists. Pass ``0``
+        (or any non-positive) for uncapped lists used by the liveness ratchet baseline.
+
+        Stored ``entry_roots`` are production-only and never capped (only debt lists
+        are). Structural exemptions are a skip-list, not BFS seeds. Never raises;
+        returns empty lists on failure.
+
+        When ``lsp_refs`` is True, dead-symbol candidates are confirmed via the
+        optional live LSP client (external references clear false positives).
+        """
+        try:
+            from devcouncil.indexing.wiring import (
+                build_dynamic_import_index,
+                entry_roots,
+                has_allow_unwired,
+                is_liveness_code_file,
+                is_test_path,
+                reference_cleared,
+                structural_exemptions,
+            )
+
+            limit: Optional[int]
+            if cap is None:
+                limit = self._LIVENESS_CAP
+            elif cap <= 0:
+                limit = None
+            else:
+                limit = cap
+
+            # Config + convention seeds only; production-only for stored roots + BFS.
+            roots = entry_roots(self.project_root, files)
+            prod_roots = entry_roots(self.project_root, files, production_only=True)
+            root_set = set(roots)
+            prod_root_set = set(prod_roots)
+            dyn_index = build_dynamic_import_index(self.project_root, files)
+
+            # Inbound (imported -> importers)
+            inbound: Dict[str, Set[str]] = defaultdict(set)
+            outbound: Dict[str, Set[str]] = defaultdict(set)
+            for importer, imported in edges:
+                inbound[imported].add(importer)
+                outbound[importer].add(imported)
+
+            unwired: List[str] = []
+            for f in sorted(files):
+                if not is_liveness_code_file(f):
+                    continue
+                if f in root_set or structural_exemptions(f):
+                    continue
+                if has_allow_unwired(self.project_root, f):
+                    continue
+                # Align with verify gate: test-only importers do not clear unwired.
+                non_test_importers = {
+                    i for i in inbound.get(f, ()) if not is_test_path(i)
+                }
+                if non_test_importers:
+                    continue
+                if reference_cleared(
+                    self.project_root,
+                    f,
+                    skip_files=set(),
+                    git_files=files,
+                    dynamic_index=dyn_index,
+                ):
+                    continue
+                unwired.append(f)
+                if limit is not None and len(unwired) >= limit:
+                    break
+
+            # BFS reachability from production entry roots over forward edges.
+            reachable: Set[str] = set()
+            queue = list(prod_roots)
+            seen_q: Set[str] = set(queue)
+            while queue:
+                cur = queue.pop()
+                reachable.add(cur)
+                for nxt in outbound.get(cur, ()):
+                    if nxt not in seen_q:
+                        seen_q.add(nxt)
+                        queue.append(nxt)
+
+            unreachable: List[str] = []
+            for f in sorted(files):
+                if not is_liveness_code_file(f):
+                    continue
+                if f in prod_root_set or f in root_set or structural_exemptions(f):
+                    continue
+                if f in reachable:
+                    continue
+                unreachable.append(f)
+                if limit is not None and len(unreachable) >= limit:
+                    break
+
+            dead_cap = limit if limit is not None else 0
+            dead_symbols, symbol_index = self._dead_symbol_candidates(
+                files, cap=dead_cap, with_index=True, lsp_refs=lsp_refs,
+            )
+            # Never cap stored entry roots — only debt lists above are limited.
+            return (
+                prod_roots,
+                unwired,
+                unreachable,
+                dead_symbols,
+                symbol_index,
+            )
+        except Exception:
+            logger.debug("liveness computation failed", exc_info=True)
+            return [], [], [], [], []
+
+    def liveness_snapshot(self) -> Dict[str, object]:
+        """Uncapped liveness lists for ratchet baseline / verify-side current.
+
+        Always recomputes import edges (never reuses a stale ``self._edges`` cache).
+        Includes ``symbol_index`` (``path::name`` keys) so the ratchet can require
+        a symbol to have existed at baseline before calling it stranded.
+        Never raises; returns empty lists on failure.
+        """
+        try:
+            files = self.get_git_files()
+            # Invalidate any prior edge cache — snapshot must reflect current tree.
+            self._edges = None
+            edges = self._all_import_edges(files)
+            use_lsp = False
+            try:
+                from devcouncil.indexing.lsp_client import lsp_refs_enabled
+
+                use_lsp = lsp_refs_enabled(self.project_root)
+            except Exception:
+                use_lsp = False
+            roots, unwired, unreachable, dead, symbol_index = self._compute_liveness(
+                files, edges, cap=0, lsp_refs=use_lsp,
+            )
+            return {
+                "entry_roots": roots,
+                "unwired_candidates": unwired,
+                "unreachable_files": unreachable,
+                "dead_symbol_candidates": dead,
+                "symbol_index": symbol_index,
+            }
+        except Exception:
+            logger.debug("liveness_snapshot failed", exc_info=True)
+            return {
+                "entry_roots": [],
+                "unwired_candidates": [],
+                "unreachable_files": [],
+                "dead_symbol_candidates": [],
+                "symbol_index": [],
+            }
+
+    def _dead_symbol_candidates(
+        self,
+        files: List[str],
+        *,
+        cap: int = 200,
+        with_index: bool = False,
+        lsp_refs: bool = False,
+    ):
+        """Public top-level symbols never referenced outside their own definition span.
+
+        Format: ``path:line name``. Python + JS/TS only. Best-effort; never raises.
+        Same-file uses outside the symbol's span clear it; recursive self-references
+        inside the span do not. Test-file references clear a symbol (parity with the
+        verify gate); test files themselves are not scanned for definitions.
+        ``cap <= 0`` means uncapped.
+
+        When ``with_index`` is True, returns ``(dead_list, symbol_index)`` where
+        ``symbol_index`` is sorted ``path::name`` keys for all scanned definitions.
+        Otherwise returns just the dead list (legacy callers).
+
+        When ``lsp_refs`` is True, candidates are confirmed via the optional live
+        LSP client before inclusion (external references clear false positives).
+        """
+        empty: List[str] = []
+        try:
+            from devcouncil.indexing.wiring import (
+                decorator_names,
+                is_liveness_code_file,
+                is_private_symbol,
+                is_test_path,
+                is_vendored_path,
+                is_wiring_decorated,
+                iter_js_export_symbols,
+                parse_python_all_exports,
+                strip_js_comments,
+                strip_py_comments,
+                strip_string_literals,
+            )
+
+            # path, start, end, name
+            definitions: List[Tuple[str, int, int, str]] = []
+            token_files: Dict[str, Set[str]] = defaultdict(set)
+            token_lines: Dict[str, Dict[str, Set[int]]] = defaultdict(lambda: defaultdict(set))
+            ident_re = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
+
+            for rel in sorted(files):
+                if not is_liveness_code_file(rel):
+                    continue
+                if is_vendored_path(rel):
+                    continue
+                try:
+                    source = (self.project_root / rel).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                suffix = Path(rel).suffix.lower()
+                if suffix == ".py":
+                    cleaned = strip_string_literals(strip_py_comments(source))
+                else:
+                    cleaned = strip_string_literals(strip_js_comments(source))
+
+                # Index tokens from all code files including tests so a test
+                # reference clears a production symbol (verify-gate parity).
+                for lineno, line in enumerate(cleaned.splitlines(), 1):
+                    for tok in ident_re.findall(line):
+                        if len(tok) < 2:
+                            continue
+                        token_files[tok].add(rel)
+                        token_lines[tok][rel].add(lineno)
+
+                if is_test_path(rel):
+                    continue
+
+                if suffix == ".py":
+                    try:
+                        tree = ast.parse(source)
+                        protected = parse_python_all_exports(source)
+                        for node in tree.body:
+                            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                                name = node.name
+                                if is_private_symbol(name):
+                                    continue
+                                if name in protected:
+                                    continue
+                                if is_wiring_decorated(decorator_names(node)):
+                                    continue
+                                start = getattr(node, "lineno", 1) or 1
+                                end = getattr(node, "end_lineno", start) or start
+                                definitions.append((rel, start, end, name))
+                    except SyntaxError:
+                        pass
+                else:
+                    for line, name in iter_js_export_symbols(source):
+                        prev_lines = source.splitlines()[: max(0, line - 1)]
+                        if prev_lines:
+                            prev = prev_lines[-1].strip()
+                            if prev.startswith("@"):
+                                continue
+                        definitions.append((rel, line, line, name))
+
+            symbol_index = sorted({f"{path}::{name}" for path, _s, _e, name in definitions})
+            out: List[str] = []
+            for path, start, end, name in definitions:
+                refs = token_files.get(name, set())
+                if refs - {path}:
+                    continue
+                same_lines = token_lines.get(name, {}).get(path, set())
+                if any(ln < start or ln > end for ln in same_lines):
+                    continue
+                out.append(f"{path}:{start} {name}")
+                if cap > 0 and len(out) >= cap:
+                    break
+            if lsp_refs and out:
+                try:
+                    from devcouncil.indexing.lsp_client import filter_dead_symbols_with_lsp
+
+                    out = filter_dead_symbols_with_lsp(self.project_root, out)
+                    if cap > 0:
+                        out = out[:cap]
+                except Exception:
+                    logger.debug("LSP dead-symbol confirmation failed", exc_info=True)
+            if with_index:
+                return out, symbol_index
+            return out
+        except Exception:
+            logger.debug("dead_symbol_candidates failed", exc_info=True)
+            if with_index:
+                return empty, empty
+            return empty
+
     def describe_file(self, path: str) -> RepoFileEntry:
         return RepoFileEntry(
             path=path,
@@ -1303,10 +2128,23 @@ class RepoMapper:
     def _files_fingerprint(self, files: List[str]) -> str:
         return hashlib.sha1("\n".join(sorted(files)).encode("utf-8")).hexdigest()
 
+    def _content_fingerprint(self, files: List[str]) -> str:
+        from devcouncil.indexing.graph.build import content_fingerprint
+
+        return content_fingerprint(self.project_root, files)
+
     def map_is_stale(self, repo_map: Dict[str, object]) -> bool:
-        """True when the stored map no longer matches the repo's current git HEAD or
-        tracked file set — i.e. commits or file add/removes happened since ``dev map``
-        last ran. Returns False for maps written before fingerprinting (no false alarms)."""
+        """True when the stored map no longer matches the repo's current git HEAD,
+        tracked file set, or content fingerprint — i.e. commits, file add/removes, or
+        plain edits happened since ``dev map`` last ran.
+
+        Fail-closed: exceptions from ``get_git_files`` / content fingerprinting
+        return True (stale) so ``--if-stale`` / verify rebuild rather than trusting
+        an unverifiable map.
+
+        Returns False for maps written before fingerprinting (no false alarms).
+        Legacy maps without ``content_fingerprint`` skip the content check.
+        """
         stored_head = str(repo_map.get("generated_head") or "")
         stored_hash = str(repo_map.get("indexed_hash") or "")
         if not stored_head and not stored_hash:
@@ -1314,8 +2152,19 @@ class RepoMapper:
         try:
             files = self.get_git_files()
         except Exception:
+            # Fail closed: cannot prove freshness → treat as stale so --if-stale /
+            # verify rebuild rather than trusting a possibly outdated map.
+            return True
+        if self._git_head() != stored_head or self._files_fingerprint(files) != stored_hash:
+            return True
+        stored_content = str(repo_map.get("content_fingerprint") or "")
+        if not stored_content:
+            # Legacy maps without content_fingerprint skip the content check.
             return False
-        return self._git_head() != stored_head or self._files_fingerprint(files) != stored_hash
+        try:
+            return self._content_fingerprint(files) != stored_content
+        except Exception:
+            return True
 
     def get_git_files(self) -> List[str]:
         try:
@@ -1325,7 +2174,13 @@ class RepoMapper:
                 ["ls-files", "--cached", "--others", "--exclude-standard"],
                 cwd=self.project_root,
             ).splitlines()
-            return [path for path in output if not self._is_runtime_or_generated_file(path)]
+            # Skip index entries whose working-tree file was deleted but not staged.
+            return [
+                path
+                for path in output
+                if not self._is_runtime_or_generated_file(path)
+                and (self.project_root / path).is_file()
+            ]
         except Exception:
             # Fallback to os.walk if not a git repo or git missing
             from devcouncil.indexing.walk import IGNORED_DIR_NAMES
@@ -1489,23 +2344,71 @@ class RepoMapper:
             logger.debug("Dependency-risk scan failed", exc_info=True)
             return []
 
-    def map_repo(self, goal: str = "", *, scan_dependencies: bool = False) -> RepoMap:
+    def map_repo(
+        self,
+        goal: str = "",
+        *,
+        scan_dependencies: bool = False,
+        liveness: bool = True,
+        lsp_refs: bool = False,
+    ) -> RepoMap:
         """Build the repo map.
 
         ``scan_dependencies`` is opt-in (default off) so the common ``dev map`` path
         stays fast and never shells out to a vulnerability auditor. When enabled, a
         best-effort SCA scan runs locally (only if an auditor is installed) and its
         findings are attached as ``dependency_risks``.
+
+        ``liveness`` (default on) computes entry_roots / unwired / unreachable /
+        dead_symbol candidate lists. Pass False (``--no-liveness``) to skip.
+
+        ``lsp_refs`` (default off) confirms dead-symbol candidates via the optional
+        live LSP client when a language server is available.
+
+        Builds the symbol-level code knowledge graph first, writes
+        ``.devcouncil/graph/code_graph.json``, then derives the summary ``RepoMap``.
         """
         files = self.get_git_files()
         # Decide DevCouncil-vs-generic and the source root BEFORE describing files, so
         # area bucketing and subsystem inference agree within a single run.
         self._use_generic = not any(path.startswith("src/devcouncil/") for path in files)
         self._source_root = self.detect_source_root(files)
-        # Compute the import graph once; reused by subsystem inference, important-file
-        # ranking, and the dependents (blast-radius) index. Spans Python, TS/JS, and Go
-        # so non-Python repos get dependents/neighbors too.
-        self._edges = self._all_import_edges(files)
+
+        # Single-pass: extract + resolve + liveness/token-scan once; derive map lists
+        # and graph dead_code from that pass (no second _token_scan_dead).
+        changed = getattr(self, "_graph_changed_paths", None)
+        code_graph = None
+        try:
+            from devcouncil.indexing.graph.build import build_code_graph, write_code_graph
+
+            code_graph = build_code_graph(
+                self.project_root,
+                files,
+                changed_paths=changed,
+                liveness=liveness,
+                lsp_refs=lsp_refs,
+                mapper=self,
+            )
+            self._last_code_graph = code_graph
+            # File→file import edges only (named-import edges target symbols).
+            self._edges = [
+                (e.source, e.target)
+                for e in code_graph.edges
+                if e.kind == "imports" and "::" not in e.source and "::" not in e.target
+            ]
+        except Exception:
+            logger.warning(
+                "code graph build failed; falling back to import edges only "
+                "(dead_symbol_candidates will be omitted — refusing token-only flood)",
+                exc_info=True,
+            )
+            code_graph = None
+            self._last_code_graph = None
+            self._edges = self._all_import_edges(files)
+
+        if self._edges is None:
+            self._edges = self._all_import_edges(files)
+
         file_entries = [self.describe_file(path) for path in sorted(files)]
         file_set = set(files)
 
@@ -1537,6 +2440,55 @@ class RepoMapper:
         if goal:
             candidates = self._ripgrep_search(goal, files)
 
+        entry_roots_list: List[str] = []
+        unwired: List[str] = []
+        unreachable: List[str] = []
+        dead_syms: List[str] = []
+        if liveness and code_graph is not None:
+            entry_roots_list = list(code_graph.entry_roots)
+            # Caps apply only when serializing repo_map.json (graph stays uncapped).
+            cap = self._LIVENESS_CAP
+            unwired = list(code_graph.unwired_candidates)[:cap]
+            unreachable = list(code_graph.unreachable_files)[:cap]
+            dead_syms = list(code_graph.meta.get("legacy_dead_symbol_candidates") or [])[:cap]
+        elif liveness:
+            # Graph assemble failed: keep file-level liveness from import edges,
+            # but do NOT run the token-only dead-symbol scan (misleading flood).
+            logger.warning(
+                "code graph unavailable; leaving dead_symbol_candidates empty"
+            )
+            try:
+                from devcouncil.indexing.graph.liveness import file_liveness
+
+                cap = self._LIVENESS_CAP
+                entry_roots_list, unwired, unreachable = file_liveness(
+                    self.project_root,
+                    files,
+                    self._edges or [],
+                    cap=cap,
+                )
+            except Exception:
+                logger.debug("file_liveness fallback after graph failure failed", exc_info=True)
+                entry_roots_list, unwired, unreachable = [], [], []
+            dead_syms = []
+
+        if code_graph is not None:
+            try:
+                from devcouncil.indexing.graph.build import write_code_graph
+
+                code_graph.generated_head = self._git_head()
+                code_graph.indexed_hash = self._files_fingerprint(files)
+                code_graph.content_fingerprint = self._content_fingerprint(files)
+                write_code_graph(self.project_root, code_graph)
+            except Exception:
+                logger.debug("failed to write code graph", exc_info=True)
+
+        processes: List[Dict[str, object]] = []
+        if code_graph is not None:
+            raw_procs = code_graph.meta.get("processes") or []
+            if isinstance(raw_procs, list):
+                processes = [p for p in raw_procs[:12] if isinstance(p, dict)]
+
         return RepoMap(
             languages=self.detect_languages(files),
             frameworks=self.detect_frameworks(files),
@@ -1549,6 +2501,12 @@ class RepoMapper:
             dependents=self.build_dependents(self._edges or []),
             generated_head=self._git_head(),
             indexed_hash=self._files_fingerprint(files),
-            lsp=LspInspector(self.project_root).summary(files),
+            content_fingerprint=self._content_fingerprint(files),
+            lsp=LspInspector(self.project_root).summary(files, client_enabled=lsp_refs),
             dependency_risks=self._scan_dependency_risks() if scan_dependencies else [],
+            entry_roots=entry_roots_list,
+            unwired_candidates=unwired,
+            unreachable_files=unreachable,
+            dead_symbol_candidates=dead_syms,
+            processes=processes,
         )

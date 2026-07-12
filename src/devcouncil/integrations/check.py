@@ -452,8 +452,22 @@ def build_integration_check_report(project_root: Path, *, strict: bool = False) 
             str(hook_path) if references else f"{hook_path} no longer references devcouncil (tampered/disarmed).",
         )
 
+    from devcouncil.integrations.clients.common import check_hook_dev_executable
+
+    hook_exe_ok, hook_exe_details = check_hook_dev_executable(root)
+    if common_recorded_hook_exe(root) is not None:
+        add(hook_exe_ok, "Hook `dev` executable", hook_exe_details)
+    else:
+        add_skip("Hook `dev` executable", hook_exe_details)
+
     recommended = resolve_automated_executor(root, None) if detected else None
     return IntegrationCheckReport(tuple(rows), recommended, failures)
+
+
+def common_recorded_hook_exe(project_root: Path) -> str | None:
+    from devcouncil.integrations.clients.common import recorded_hook_dev_executable
+
+    return recorded_hook_dev_executable(project_root)
 
 
 def integration_status_summary(project_root: Path) -> dict[str, Any]:

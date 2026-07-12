@@ -163,10 +163,46 @@ def _bullets(items: list[str], code: bool = True) -> list[str]:
     return [fmt.format(item) for item in items]
 
 
+def _wired_to_links(project_root: Path | None, subsystem: RepoSubsystem) -> list[str]:
+    """Graph-derived import neighbors for wiki 'Wired to' sections (OKF-style links).
+
+    Link targets use the same ``files/<path>.md`` layout as
+    ``dev graph export --format okf``, via :mod:`export_links`, so wiki pages can
+    cross-link into a sibling graph OKF bundle under ``../graph/``.
+    """
+    if project_root is None:
+        return []
+    try:
+        from devcouncil.indexing.graph.build import load_code_graph
+        from devcouncil.indexing.graph.export_links import subsystem_doc_path, wired_to_bullets
+
+        graph = load_code_graph(project_root)
+        if graph is None:
+            return []
+        # Collect files in this area from critical/entry/role lists
+        area_files = set(subsystem.entry_points + subsystem.critical_files)
+        for paths in (subsystem.role_files or {}).values():
+            area_files.update(paths)
+        targets: set[str] = set()
+        for e in graph.edges:
+            if e.kind != "imports":
+                continue
+            if "::" in e.source or "::" in e.target:
+                continue
+            if e.source in area_files and e.target not in area_files:
+                targets.add(e.target)
+        from_rel = subsystem_doc_path(subsystem.area)
+        return wired_to_bullets(targets, from_rel=from_rel, link_to_graph=True)
+    except Exception:
+        return []
+
+
 def _subsystem_body(
     subsystem: RepoSubsystem,
     slug_by_area: dict[str, str],
     prose: Optional[WikiProse] = None,
+    *,
+    project_root: Path | None = None,
 ) -> str:
     lines: list[str] = [f"# {subsystem.area}", "", subsystem.summary.strip()]
 
@@ -197,6 +233,10 @@ def _subsystem_body(
                 lines.append(f"- `{neighbor}`")
     if subsystem.handoff_paths:
         lines += ["", "## Handoff paths", ""] + _bullets(subsystem.handoff_paths)
+
+    wired = _wired_to_links(project_root, subsystem)
+    if wired:
+        lines += ["", "## Wired to", ""] + wired
 
     if prose and prose.agent_guidance:
         lines += ["", "## Guidance for agents", ""] + _bullets(prose.agent_guidance, code=False)
@@ -250,6 +290,8 @@ def _build_skeleton(
     project_name: str,
     timestamp: str,
     prose_by_area: dict[str, WikiProse],
+    *,
+    project_root: Path | None = None,
 ) -> list[OKFDocument]:
     slug_by_area = {s.area: slugify(s.area) for s in repo_map.subsystems}
     docs: list[OKFDocument] = [
@@ -282,7 +324,12 @@ def _build_skeleton(
                 resource=subsystem.area,
                 tags=["subsystem"] + _area_tags(subsystem.area),
                 timestamp=timestamp,
-                body=_subsystem_body(subsystem, slug_by_area, prose_by_area.get(subsystem.area)),
+                body=_subsystem_body(
+                    subsystem,
+                    slug_by_area,
+                    prose_by_area.get(subsystem.area),
+                    project_root=project_root,
+                ),
                 rel_path=f"subsystems/{slug}.md",
             )
         )
@@ -454,7 +501,9 @@ def generate_wiki(
                 if prose.overview or prose.key_flows or prose.agent_guidance:
                     result.enriched.append(f"subsystems/{slugify(area)}.md")
 
-    docs = _build_skeleton(repo_map, project_name, timestamp, prose_by_area)
+    docs = _build_skeleton(
+        repo_map, project_name, timestamp, prose_by_area, project_root=project_root
+    )
     bundle = OKFBundle(documents=[d for d in docs if d.rel_path in to_write])
     write_bundle(bundle, wiki_dir)
 

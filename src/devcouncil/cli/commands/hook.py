@@ -118,13 +118,360 @@ def post_tool_use(
 ):
     """
     Coding CLI hook: Records a post-tool-use checkpoint for native hook clients.
+
+    Best-effort: when ``indexing.auto_refresh`` is enabled, incrementally refreshes
+    the repo map for files written by the tool call. Never blocks the agent on
+    refresh failure.
     """
-    _ = tool_call_json if tool_call_json is not None else sys.stdin.read()
+    payload_text = tool_call_json if tool_call_json is not None else sys.stdin.read()
     root = _project_root(project_root)
     log_step(f"hook/post_tool_use: client={client}", project_root=root)
-    _ = root
+    try:
+        _maybe_refresh_map(root, payload_text)
+    except Exception as exc:  # noqa: BLE001 — hooks must never break the session
+        print(f"DevCouncil map refresh error (ignored): {exc}", file=sys.stderr)
     if client.lower() in {"codex", "gemini"}:
         print(dump_json({"decision": "allow", "suppressOutput": True}, separators=(",", ":")))
+
+
+def _extract_written_paths(payload: object) -> list[str]:
+    """Best-effort path extraction from Write/Edit/MultiEdit-style hook payloads."""
+    paths: list[str] = []
+    if not isinstance(payload, dict):
+        return paths
+
+    def _add(value: object) -> None:
+        if isinstance(value, str) and value.strip():
+            paths.append(value.strip())
+        elif isinstance(value, list):
+            for item in value:
+                _add(item)
+
+    for key in (
+        "file_path",
+        "filePath",
+        "path",
+        "file",
+        "target_file",
+        "targetFile",
+    ):
+        if key in payload:
+            _add(payload[key])
+
+    tool_input = payload.get("tool_input") or payload.get("toolInput") or payload.get("input")
+    if isinstance(tool_input, dict):
+        paths.extend(_extract_written_paths(tool_input))
+    elif isinstance(tool_input, str):
+        try:
+            parsed = json.loads(tool_input)
+            paths.extend(_extract_written_paths(parsed))
+        except json.JSONDecodeError:
+            pass
+
+    # Claude-style: tool_name + tool_input
+    tool_name = str(payload.get("tool_name") or payload.get("toolName") or payload.get("name") or "").lower()
+    if tool_name in {"write", "edit", "multiedit", "create", "notebookedit"} or "edit" in tool_name or "write" in tool_name:
+        for key in ("file_path", "filePath", "path", "target_file"):
+            if key in payload:
+                _add(payload[key])
+
+    edits = payload.get("edits")
+    if isinstance(edits, list):
+        for edit in edits:
+            paths.extend(_extract_written_paths(edit))
+
+    # Dedupe preserving order
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in paths:
+        norm = p.replace("\\", "/")
+        if norm.startswith("./"):
+            norm = norm[2:]
+        if norm and norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out
+
+
+# Debounce burst edits; reclaim a lock left by a crashed refresher after TTL.
+MAP_REFRESH_DEBOUNCE_S = 0.3
+MAP_REFRESH_LOCK_TTL_S = 120.0
+_MAP_REFRESH_QUEUE_REL = Path(".devcouncil") / "cache" / "map_refresh_queue.json"
+_MAP_REFRESH_LOCK_REL = Path(".devcouncil") / "cache" / "map_refresh.lock"
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but we cannot signal it — treat as alive.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_lock_meta(lock: Path) -> tuple[int | None, float | None]:
+    """Return (pid, started_at) from lockfile contents, or (None, None) if unreadable."""
+    try:
+        raw = lock.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None, None
+    if not raw:
+        return None, None
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            pid = data.get("pid")
+            started = data.get("started_at")
+            return (
+                int(pid) if pid is not None else None,
+                float(started) if started is not None else None,
+            )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    # Legacy / plain text: first line pid, optional second line timestamp
+    lines = raw.splitlines()
+    try:
+        pid = int(lines[0].strip())
+    except ValueError:
+        return None, None
+    started = None
+    if len(lines) > 1:
+        try:
+            started = float(lines[1].strip())
+        except ValueError:
+            started = None
+    return pid, started
+
+
+def _lock_is_reclaimable(lock: Path, *, now: float | None = None) -> bool:
+    """True when the lock owner is gone or the lock is older than the TTL."""
+    import time
+
+    if not lock.exists():
+        return True
+    pid, started = _read_lock_meta(lock)
+    if pid is not None and not _pid_alive(pid):
+        return True
+    ts = started
+    if ts is None:
+        try:
+            ts = lock.stat().st_mtime
+        except OSError:
+            return True
+    clock = now if now is not None else time.time()
+    return (clock - ts) > MAP_REFRESH_LOCK_TTL_S
+
+
+def _try_acquire_refresh_lock(lock: Path) -> bool:
+    """Create the lockfile exclusively, reclaiming a dead/stale owner first."""
+    import time
+
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    payload = dump_json({"pid": os.getpid(), "started_at": time.time()}, separators=(",", ":"))
+    try:
+        fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(fd, payload.encode("utf-8"))
+        finally:
+            os.close(fd)
+        return True
+    except FileExistsError:
+        if not _lock_is_reclaimable(lock):
+            return False
+        try:
+            lock.unlink(missing_ok=True)
+        except OSError:
+            return False
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, payload.encode("utf-8"))
+            finally:
+                os.close(fd)
+            return True
+        except (FileExistsError, OSError):
+            return False
+    except OSError:
+        return False
+
+
+def _enqueue_refresh_paths(queue_path: Path, paths: list[str]) -> None:
+    """Append paths to the durable refresh queue (never drop a pending refresh).
+
+    Uses temp+replace. Safe concurrent with rename-to-drain: if the holder
+    renames the queue away mid-read, we create a fresh queue the holder
+    re-checks after drain.
+    """
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    existing: list[str] = []
+    if queue_path.is_file():
+        try:
+            data = json.loads(queue_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                existing = [str(p) for p in (data.get("paths") or []) if p]
+            elif isinstance(data, list):
+                existing = [str(p) for p in data if p]
+        except (json.JSONDecodeError, OSError):
+            existing = []
+    seen = set(existing)
+    for p in paths:
+        if p not in seen:
+            existing.append(p)
+            seen.add(p)
+    tmp = queue_path.with_suffix(".tmp")
+    tmp.write_text(dump_json({"paths": existing}, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(queue_path)
+
+
+def _parse_queue_file(path: Path) -> list[str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return [str(p) for p in (data.get("paths") or []) if p]
+        if isinstance(data, list):
+            return [str(p) for p in data if p]
+    except (json.JSONDecodeError, OSError):
+        pass
+    return []
+
+
+def _take_queued_paths(queue_path: Path) -> list[str]:
+    """Rename-to-drain the queue; merge any file recreated during drain.
+
+    Avoids the lose-on-drain race where unlink after read drops paths that
+    were enqueued between the read and the unlink.
+    """
+    collected: list[str] = []
+    seen: set[str] = set()
+
+    def _absorb(paths: list[str]) -> None:
+        for p in paths:
+            if p not in seen:
+                seen.add(p)
+                collected.append(p)
+
+    # Bound retries against pathological enqueue churn during drain.
+    for _ in range(8):
+        if not queue_path.is_file():
+            break
+        drained = queue_path.with_name(queue_path.name + ".draining")
+        try:
+            os.replace(str(queue_path), str(drained))
+        except OSError:
+            break
+        _absorb(_parse_queue_file(drained))
+        try:
+            drained.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return collected
+
+
+def _maybe_refresh_map(root: Path, payload_text: str) -> None:
+    """Config-gated, queue+drain map refresh with debounce and PID/TTL lock reclaim."""
+    import time
+
+    try:
+        from devcouncil.app.config import load_config
+
+        cfg = load_config(root).indexing
+        if not getattr(cfg, "auto_refresh", True):
+            return
+        max_files = int(getattr(cfg, "auto_refresh_max_files", 40) or 40)
+    except Exception:
+        max_files = 40
+
+    try:
+        payload = json.loads(payload_text) if payload_text.strip() else {}
+    except json.JSONDecodeError:
+        return
+    paths = _extract_written_paths(payload)
+    if not paths:
+        return
+    if len(paths) > max_files:
+        logger.debug(
+            "Skipping map auto-refresh: %d paths > max %d", len(paths), max_files
+        )
+        return
+
+    # Only refresh code-ish paths under the project
+    code_exts = {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".rs"}
+    rels: list[str] = []
+    for p in paths:
+        candidate = Path(p)
+        if candidate.is_absolute():
+            try:
+                rel = candidate.relative_to(root).as_posix()
+            except ValueError:
+                continue
+        else:
+            rel = p.replace("\\", "/")
+            if rel.startswith("./"):
+                rel = rel[2:]
+        if Path(rel).suffix.lower() in code_exts:
+            rels.append(rel)
+    if not rels:
+        return
+
+    cache_dir = root / ".devcouncil" / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    lock = root / _MAP_REFRESH_LOCK_REL
+    queue_path = root / _MAP_REFRESH_QUEUE_REL
+
+    if not _try_acquire_refresh_lock(lock):
+        # Another refresher holds the lock — enqueue so the holder drains us.
+        _enqueue_refresh_paths(queue_path, rels)
+        logger.debug("map refresh in progress; queued %d path(s)", len(rels))
+        return
+
+    try:
+        # Debounce burst edits so a multi-file edit lands as one refresh.
+        time.sleep(MAP_REFRESH_DEBOUNCE_S)
+        pending = set(rels)
+        pending.update(_take_queued_paths(queue_path))
+        from devcouncil.indexing.graph.build import refresh_map_for_paths
+
+        while pending:
+            batch = sorted(pending)
+            pending.clear()
+            refresh_map_for_paths(root, batch)
+            log_step(
+                f"hook/post_tool_use: refreshed map for {len(batch)} path(s)",
+                project_root=root,
+            )
+            # Drain anything enqueued while we were refreshing.
+            pending.update(_take_queued_paths(queue_path))
+    except Exception:
+        logger.debug("incremental map refresh failed", exc_info=True)
+    finally:
+        try:
+            lock.unlink(missing_ok=True)
+        except OSError:
+            pass
+        # If anything arrived after we released but before unlink races settle,
+        # a subsequent PostToolUse will pick it up; also try a best-effort drain
+        # by re-acquiring if the queue is non-empty.
+        if queue_path.is_file() and _try_acquire_refresh_lock(lock):
+            try:
+                leftover = _take_queued_paths(queue_path)
+                if leftover:
+                    from devcouncil.indexing.graph.build import refresh_map_for_paths
+
+                    refresh_map_for_paths(root, leftover)
+            except Exception:
+                logger.debug("map refresh leftover drain failed", exc_info=True)
+            finally:
+                try:
+                    lock.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
 
 @app.command()
 def agent_response(

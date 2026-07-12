@@ -26,7 +26,9 @@ logger = logging.getLogger(__name__)
 #     previously non-nullable additions were skipped entirely, so every SELECT on an
 #     existing database crashed with "no such column".
 # v8: optional task.priority column (high/medium/low planner hint).
-SCHEMA_VERSION = 8
+# v9: task column agent_appended_planned_files_json (lease-gated modify-op scope
+#     expansion so unwired_file / orphan_diff repairs can append the intended caller).
+SCHEMA_VERSION = 9
 
 
 # Module-level caches keyed by *resolved* paths so distinct project roots stay

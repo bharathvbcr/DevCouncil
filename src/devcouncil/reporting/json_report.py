@@ -1,6 +1,10 @@
 import json
 from typing import Any
 
+from devcouncil.artifacts.coverage import (
+    acceptance_criteria_evidence_matrix,
+    requirement_task_matrix,
+)
 from devcouncil.artifacts.graph import ArtifactGraph
 from devcouncil.reporting.verdict import classify_verdict
 
@@ -27,6 +31,8 @@ class JsonReportGenerator:
             "verdict": verdict,
             "coverage_summary": summary,
             "proof_modes": proof_modes,
+            "requirement_task_matrix": requirement_task_matrix(graph),
+            "acceptance_criteria_evidence_matrix": acceptance_criteria_evidence_matrix(graph),
             "blocking_gaps": [g.model_dump() for g in graph.blocking_gaps()]
         }
         if incomplete_kind is not None:

@@ -128,6 +128,14 @@ class RigorPolicy:
     effort_blocking: bool = False
     coarse_acceptance_enabled: bool = True
     coarse_acceptance_blocking: bool = False
+    unwired_enabled: bool = True
+    unwired_blocking: bool = False
+    dead_symbol_enabled: bool = True
+    dead_symbol_blocking: bool = False
+    liveness_ratchet_enabled: bool = True
+    liveness_ratchet_blocking: bool = False
+    stale_map_enabled: bool = True
+    stale_map_blocking: bool = False
     enforce_coverage: bool = False
     reviewer_required: bool = False
     extra_repair_attempts: int = 0
@@ -170,6 +178,10 @@ def resolve_rigor_policy(
         if not enabled:
             policy.stub_enabled = False
             policy.effort_enabled = False
+            policy.unwired_enabled = False
+            policy.dead_symbol_enabled = False
+            policy.liveness_ratchet_enabled = False
+            policy.stale_map_enabled = False
             return policy
 
         is_hard = difficulty == "hard"
@@ -183,6 +195,18 @@ def resolve_rigor_policy(
         policy.coarse_acceptance_enabled, policy.coarse_acceptance_blocking = _mode_flags(
             coarse_mode, is_hard
         )
+        unwired_mode = "hard" if rigor_cfg is None else getattr(rigor_cfg, "unwired_files", "hard")
+        dead_mode = "hard" if rigor_cfg is None else getattr(rigor_cfg, "dead_symbols", "hard")
+        ratchet_mode = "hard" if rigor_cfg is None else getattr(
+            rigor_cfg, "liveness_ratchet", "hard"
+        )
+        stale_mode = "hard" if rigor_cfg is None else getattr(rigor_cfg, "stale_map", "hard")
+        policy.unwired_enabled, policy.unwired_blocking = _mode_flags(unwired_mode, is_hard)
+        policy.dead_symbol_enabled, policy.dead_symbol_blocking = _mode_flags(dead_mode, is_hard)
+        policy.liveness_ratchet_enabled, policy.liveness_ratchet_blocking = _mode_flags(
+            ratchet_mode, is_hard
+        )
+        policy.stale_map_enabled, policy.stale_map_blocking = _mode_flags(stale_mode, is_hard)
 
         enforce_cov_on_hard = True if rigor_cfg is None else bool(
             getattr(rigor_cfg, "enforce_coverage_on_hard", True)
@@ -214,6 +238,14 @@ def resolve_rigor_policy(
             policy.applied.append("effort_heuristics_blocking")
         if policy.coarse_acceptance_blocking:
             policy.applied.append("coarse_acceptance_proof_blocking")
+        if policy.unwired_blocking:
+            policy.applied.append("unwired_files_blocking")
+        if policy.dead_symbol_blocking:
+            policy.applied.append("dead_symbols_blocking")
+        if policy.liveness_ratchet_blocking:
+            policy.applied.append("liveness_ratchet_blocking")
+        if policy.stale_map_blocking:
+            policy.applied.append("stale_map_blocking")
         if policy.enforce_coverage:
             policy.applied.append("coverage_enforced")
         if policy.reviewer_required:

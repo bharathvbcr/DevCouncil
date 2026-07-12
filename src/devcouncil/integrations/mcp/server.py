@@ -18,6 +18,7 @@ from devcouncil.integrations.mcp.handlers import graph as graph_handlers
 from devcouncil.integrations.mcp.handlers import handoff as handoff_handlers
 from devcouncil.integrations.mcp.handlers import knowledge as knowledge_handlers
 from devcouncil.integrations.mcp.handlers import live as live_handlers
+from devcouncil.integrations.mcp.handlers import map as map_handlers
 from devcouncil.integrations.mcp.handlers import next_task as next_task_handlers
 from devcouncil.integrations.mcp.handlers import policy as policy_handlers
 from devcouncil.integrations.mcp.handlers import prompts as prompt_handlers
@@ -185,6 +186,24 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     if name == "devcouncil_graph_context":
         return await graph_handlers.handle_graph_context(root, arguments)
+
+    if name == "devcouncil_repo_map":
+        return await map_handlers.handle_repo_map(root, arguments)
+
+    if name == "devcouncil_impact":
+        return await map_handlers.handle_impact(root, arguments)
+
+    if name == "devcouncil_liveness":
+        return await map_handlers.handle_liveness(root, arguments)
+
+    if name == "devcouncil_graph_query":
+        return await map_handlers.handle_graph_query(root, arguments)
+
+    if name == "devcouncil_graph_trace":
+        return await map_handlers.handle_graph_trace(root, arguments)
+
+    if name == "devcouncil_graph_impact":
+        return await map_handlers.handle_graph_impact(root, arguments)
 
     if name == "devcouncil_lsp_status":
         return await ast_lsp_handlers.handle_lsp_status(root, arguments)

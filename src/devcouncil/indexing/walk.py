@@ -1,4 +1,8 @@
-"""Shared project-tree walk helpers with standard ignore rules."""
+"""Shared project-tree walk helpers with standard ignore rules.
+
+NOTE (Phase 4 legacy audit): still used by ``semantic_index`` and
+``repo_mapper`` — not superseded by ``indexing/graph/``. Keep.
+"""
 
 from __future__ import annotations
 

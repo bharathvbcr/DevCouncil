@@ -36,6 +36,9 @@ def test_json_report_surfaces_proof_mode_breakdown():
     report = json.loads(JsonReportGenerator.generate(_graph_with_evidence("vote", "compiled", "coarse")))
     assert report["proof_modes"] == {"vote": 1, "compiled": 1, "coarse": 1}
     assert report["verdict"] == "passed"  # every AC has passing evidence
+    assert "requirement_task_matrix" in report
+    assert "acceptance_criteria_evidence_matrix" in report
+    assert len(report["acceptance_criteria_evidence_matrix"]) == 3
 
 
 def test_json_report_proof_modes_counts_unspecified_legacy_evidence():

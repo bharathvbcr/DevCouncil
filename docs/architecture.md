@@ -9,7 +9,8 @@ DevCouncil is a gated orchestrator for AI-assisted software development. It ensu
 - **Artifact Graph**: Directed graph linking requirements, tasks, files, evidence, and gaps. See [artifact graph](architecture/artifact-graph.md).
 - **Planning Council**: Multi-agent LLM debate for planning and critique.
 - **Executors**: Adapters to run tasks via manual sidecar, mini-SWE-agent, OpenHands, native-preview, coding CLI execution, and registered bring-your-own CLI agents. See [executor adapters](executor-adapters.md).
-- **Verifier & Gating**: Git cleanliness, authorized file modifications, test evidence, diff↔coverage, and secret scanning.
+- **Verifier & Gating**: Git cleanliness, authorized file modifications, test evidence, diff↔coverage, and secret scanning. Map/graph checks also surface unwired files, stale maps, wiring gaps, and dead-symbol candidates.
+- **Repository map & code graph**: `dev map` writes `.devcouncil/repo_map.json` (subsystems, entry roots, liveness lists) and a symbol-level `.devcouncil/graph/code_graph.json`. Query with `dev graph query|trace|dead|check|process|impact|html`. See [code-graph.md](code-graph.md).
 - **Knowledge formats**: Open Knowledge Format (OKF) export/ingest and `design.md` design-system lint/check, injected into planning and coding prompts. See [knowledge formats](knowledge-formats.md).
 - **Engineering skills**: Bundled domain skills scaffolded into `.claude/skills/` and embedded in `dev prompt` output.
 
@@ -25,6 +26,7 @@ DevCouncil is a gated orchestrator for AI-assisted software development. It ensu
 | Coding CLI integration tiers | [integration-tiers.md](integration-tiers.md) |
 | Gating policy | [gating-policy.md](gating-policy.md) |
 | Hero loop (Claude Code + MCP) | [hero-loop.md](hero-loop.md) |
+| Repo map & code graph | [code-graph.md](code-graph.md) |
 
 ## Executors
 

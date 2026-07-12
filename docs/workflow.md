@@ -27,6 +27,16 @@ dev plan "Add password reset with expiring single-use tokens"
 
 DevCouncil maps the repository, drafts requirements, runs planner and critic roles, and stores the task graph locally. If all plan gates pass, the project moves to `PLAN_APPROVED` automatically. When advisory gaps remain, the phase stays `AWAITING_USER_DECISIONS` until you approve the plan.
 
+Before planning (or after large refactors), refresh navigation artifacts:
+
+```bash
+dev map                 # repo_map.json + code_graph.json + AGENTS.md/CLAUDE.md
+dev graph query SYMBOL  # callers / callees
+dev graph dead          # dead-code tiers
+```
+
+See [code-graph.md](code-graph.md) for the full map/graph surface.
+
 Inspect the plan:
 
 ```bash

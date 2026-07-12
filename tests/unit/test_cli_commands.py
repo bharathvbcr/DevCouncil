@@ -1464,10 +1464,11 @@ def test_cli_integrate_hooks_apply_writes_native_hook_files(tmp_path):
     cursor_hooks = json.loads((tmp_path / ".cursor" / "hooks.json").read_text(encoding="utf-8"))
     assert "PreToolUse" in codex_hooks["hooks"]
     assert "BeforeTool" in gemini_settings["hooks"]
-    # Claude installs assist-mode hooks by default (no blocking write-gate). The lifecycle
-    # hooks are present; PreToolUse/PostToolUse only land with --write-gate.
+    # Claude installs assist-mode hooks by default (no blocking PreToolUse write-gate).
+    # Lifecycle hooks + refresh-only PostToolUse are present.
     assert "Stop" in claude_settings["hooks"]
     assert "SessionStart" in claude_settings["hooks"]
+    assert "PostToolUse" in claude_settings["hooks"]
     assert "PreToolUse" not in claude_settings["hooks"]
     assert "agent-response" in json.dumps(claude_settings)
     assert "preToolUse" in cursor_hooks["hooks"]
@@ -3738,3 +3739,48 @@ def test_cli_run_reports_unimplemented_executor(tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert "Unknown executor 'experimental'" in result.output
     assert "Available executors:" in result.output
+
+
+def test_cli_graph_dead_defaults_to_inferred(tmp_path, monkeypatch):
+    from devcouncil.indexing.graph.schema import CodeGraph, Confidence, DeadCodeEntry
+    from devcouncil.utils.json_persist import write_model_json
+
+    monkeypatch.chdir(tmp_path)
+    graph_dir = tmp_path / ".devcouncil" / "graph"
+    graph_dir.mkdir(parents=True)
+    graph = CodeGraph(
+        schema_version=2,
+        dead_code=[
+            DeadCodeEntry(
+                id="a.py::keep",
+                path="a.py",
+                line=1,
+                kind="function",
+                confidence=Confidence.INFERRED,
+                reason="no inbound call edges (method)",
+            ),
+            DeadCodeEntry(
+                id="b.py::hide",
+                path="b.py",
+                line=2,
+                kind="function",
+                confidence=Confidence.AMBIGUOUS,
+                reason="graph-dead but token-scan cleared (possible name collision)",
+            ),
+        ],
+    )
+    write_model_json(graph_dir / "code_graph.json", graph)
+
+    result = runner.invoke(app, ["graph", "dead", "--project-root", str(tmp_path)])
+    assert result.exit_code == 0
+    assert "a.py::keep" in result.output
+    assert "b.py::hide" not in result.output
+    assert "1 lower-confidence entries hidden" in result.output
+
+    all_tiers = runner.invoke(
+        app,
+        ["graph", "dead", "--project-root", str(tmp_path), "--min-confidence", "ambiguous"],
+    )
+    assert all_tiers.exit_code == 0
+    assert "b.py::hide" in all_tiers.output
+    assert "lower-confidence entries hidden" not in all_tiers.output

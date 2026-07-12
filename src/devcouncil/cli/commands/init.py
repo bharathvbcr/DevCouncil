@@ -78,6 +78,14 @@ DEFAULT_CONFIG = {
         "cursor_resume_mode": "off",
         "grok_resume_mode": "off",
         "coding_cli_probe_order": [],
+        "refresh_stale_map_on_checkout": True,
+    },
+    "indexing": {
+        # Opt-in live LSP client for dead-symbol confirmation / precise impact.
+        "lsp_refs": False,
+        # Best-effort incremental map refresh from post-tool-use hooks.
+        "auto_refresh": True,
+        "auto_refresh_max_files": 40,
     },
     "verification": {
         "rigor": {
@@ -91,6 +99,10 @@ DEFAULT_CONFIG = {
             "extra_repair_attempts_on_hard": 1,
             "min_added_lines_per_planned_file": 5,
             "acceptance_samples_on_hard": 2,
+            "unwired_files": "hard",
+            "dead_symbols": "hard",
+            "liveness_ratchet": "hard",
+            "stale_map": "hard",
         },
     },
     "privacy": {
@@ -167,7 +179,11 @@ def _generate_initial_map(project_root: Path, quiet: bool) -> None:
     try:
         from devcouncil.cli.commands.map import generate_map_artifacts
 
-        generate_map_artifacts(project_root, project_root / ".devcouncil" / "repo_map.json")
+        generate_map_artifacts(
+            project_root,
+            project_root / ".devcouncil" / "repo_map.json",
+            quiet=quiet,
+        )
         if not quiet:
             console.print("[green]Generated .devcouncil/repo_map.json and agent guides (AGENTS.md, CLAUDE.md).[/green]")
     except Exception as exc:  # mapping is best-effort, never fatal

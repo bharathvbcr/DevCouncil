@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from devcouncil.execution.prompt_builder import PromptBuilder
@@ -10,6 +11,51 @@ from devcouncil.integrations.mcp.util import allowed_next_tools, lease_ttl_secon
 from devcouncil.storage.native import TaskLeaseRepository
 from devcouncil.storage.repositories import GapRepository, RequirementRepository, TaskRepository
 from devcouncil.utils.json_persist import read_json
+
+logger = logging.getLogger(__name__)
+
+
+def _refresh_stale_map_if_needed(project_root: Path) -> bool:
+    """Regenerate ``repo_map.json`` when stale, before prompt/baseline.
+
+    Honors ``execution.refresh_stale_map_on_checkout`` (default on). Best-effort:
+    never raises; returns True when a remap ran successfully.
+    """
+    try:
+        from devcouncil.app.config import load_config
+
+        try:
+            cfg = load_config(project_root)
+            enabled = bool(
+                getattr(cfg.execution, "refresh_stale_map_on_checkout", True)
+            )
+        except Exception:
+            enabled = True
+        if not enabled:
+            return False
+
+        map_path = project_root / ".devcouncil" / "repo_map.json"
+        if not map_path.is_file():
+            # No map yet — generate one so checkout prompt/baseline have a baseline.
+            data: dict = {}
+        else:
+            loaded = read_json(map_path)
+            data = loaded if isinstance(loaded, dict) else {}
+
+        from devcouncil.indexing.repo_mapper import RepoMapper
+
+        mapper = RepoMapper(project_root)
+        # Missing fingerprints → not stale (legacy maps); still generate if absent.
+        if map_path.is_file() and not mapper.map_is_stale(data):
+            return False
+
+        from devcouncil.cli.commands.map import generate_map_artifacts
+
+        generate_map_artifacts(project_root, map_path, quiet=True)
+        return True
+    except Exception:
+        logger.debug("checkout map refresh failed", exc_info=True)
+        return False
 
 
 def checkout_task_payload(
@@ -46,11 +92,26 @@ def checkout_task_payload(
             )
         except ValueError as exc:
             return {"ok": False, "error": str(exc), "code": "lease_conflict", "task_id": task_id}
+        # Refresh stale map BEFORE prompt + liveness baseline so both see fresh
+        # fingerprints. Write-once baseline semantics are unchanged (snapshot still
+        # skips when a complete baseline already exists).
+        _refresh_stale_map_if_needed(project_root)
         prompt = PromptBuilder(project_root).build_task_prompt(task, RequirementRepository(session).get_all())
         semantic = None
         semantic_path = project_root / ".devcouncil" / "semantic" / task_id / "before.json"
         if semantic_path.exists():
             semantic = read_json(semantic_path)
+        # Snapshot liveness at checkout so verify can ratchet against stranded
+        # pre-existing code. Write-once (skip if complete baseline exists).
+        # Best-effort; never blocks checkout.
+        try:
+            from devcouncil.verification.checks.liveness_ratchet import (
+                snapshot_liveness_baseline,
+            )
+
+            snapshot_liveness_baseline(project_root, task_id, reset=False)
+        except Exception:
+            pass
         return {
             "ok": True,
             "lease_token": lease.lease_token,
@@ -85,6 +146,14 @@ def release_task_payload(project_root: Path, *, task_id: str, lease_token: str) 
             if code is LeaseCode.VALID:
                 return {"ok": False, "error": "Lease already released.", "code": "invalid_lease", "task_id": task_id}
             return lease_error_payload(code, message, task_id)
+        try:
+            from devcouncil.verification.checks.liveness_ratchet import (
+                delete_liveness_baseline,
+            )
+
+            delete_liveness_baseline(project_root, task_id)
+        except Exception:
+            pass
         return {"ok": True, "task_id": task_id, "released": True}
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shlex
 import shutil
 import subprocess
@@ -26,6 +27,74 @@ logger = logging.getLogger(__name__)
 OPENCODE_HOOK_PLUGIN_NAME = "opencode_devcouncil_plugin.mjs"
 SUPPORTED_HOOK_TOOLS = ("codex", "gemini", "claude", "cursor", "grok")
 
+# Recorded when hooks are installed so `dev integrate hooks --check` can detect drift
+# between a stale global CLI and the project venv.
+HOOK_DEV_EXECUTABLE_REL = Path(".devcouncil") / "cache" / "hook_dev_executable"
+
+
+def resolve_dev_executable(project_root: Path) -> str:
+    """Resolve the ``dev`` CLI to invoke from hooks (project venv first, then PATH).
+
+    Preferring the project ``.venv`` avoids a globally installed stale ``dev`` silently
+    fighting the working tree over cache versions and map schema.
+    """
+    root = project_root.expanduser().resolve()
+    candidates: list[Path] = []
+    if sys.platform == "win32":
+        candidates.extend(
+            [
+                root / ".venv" / "Scripts" / "dev.exe",
+                root / ".venv" / "Scripts" / "devcouncil.exe",
+                root / "venv" / "Scripts" / "dev.exe",
+            ]
+        )
+    else:
+        candidates.extend(
+            [
+                root / ".venv" / "bin" / "dev",
+                root / ".venv" / "bin" / "devcouncil",
+                root / "venv" / "bin" / "dev",
+                root / "venv" / "bin" / "devcouncil",
+            ]
+        )
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate.resolve())
+    for name in ("dev", "devcouncil"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return "dev"
+
+
+def record_hook_dev_executable(project_root: Path, executable: str | None = None) -> Path:
+    """Persist the resolved ``dev`` path used in installed hook commands."""
+    root = project_root.expanduser().resolve()
+    path = root / HOOK_DEV_EXECUTABLE_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    resolved = executable or resolve_dev_executable(root)
+    path.write_text(resolved + "\n", encoding="utf-8")
+    return path
+
+
+def recorded_hook_dev_executable(project_root: Path) -> str | None:
+    path = project_root.expanduser().resolve() / HOOK_DEV_EXECUTABLE_REL
+    if not path.is_file():
+        return None
+    text = path.read_text(encoding="utf-8").strip()
+    return text or None
+
+
+def check_hook_dev_executable(project_root: Path) -> tuple[bool, str]:
+    """Compare recorded hook executable against the currently resolved one."""
+    root = project_root.expanduser().resolve()
+    current = resolve_dev_executable(root)
+    recorded = recorded_hook_dev_executable(root)
+    if recorded is None:
+        return True, f"No recorded hook executable (current: {current})"
+    if Path(recorded).resolve() == Path(current).resolve() or recorded == current:
+        return True, f"Hook executable matches: {current}"
+    return False, f"Hook executable mismatch: recorded={recorded} current={current}"
 
 
 def _project_root(path: str | Path | None) -> Path:

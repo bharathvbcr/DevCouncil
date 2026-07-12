@@ -1,3 +1,7 @@
+from devcouncil.artifacts.coverage import (
+    acceptance_criteria_evidence_matrix,
+    requirement_task_matrix,
+)
 from devcouncil.artifacts.graph import ArtifactGraph
 
 class MarkdownReportGenerator:
@@ -60,15 +64,27 @@ class MarkdownReportGenerator:
         md_output += "\n"
 
         md_output += "## Requirements Coverage Table\n"
-        md_output += "| Requirement | Task Mapping | Status |\n"
+        md_output += "| Requirement | Task | Task status |\n"
         md_output += "|---|---|---|\n"
-        
-        for req in graph.requirements.values():
-            linked_tasks = [t for t in graph.tasks.values() if req.id in t.requirement_ids]
-            task_str = ", ".join([t.id for t in linked_tasks]) if linked_tasks else "*None*"
-            status_str = "Covered" if linked_tasks else "**Unmapped**"
-            md_output += f"| {req.id} {req.title} | {task_str} | {status_str} |\n"
-                    
+        for row in requirement_task_matrix(graph):
+            title = row.get("title") or ""
+            task = row.get("task") or "(none)"
+            status = row.get("task_status") or ""
+            if task == "(none)":
+                task = "*None*"
+                status = "**Unmapped**"
+            md_output += f"| {row['requirement']} {title} | {task} | {status} |\n"
+
+        ac_rows = acceptance_criteria_evidence_matrix(graph)
+        if ac_rows:
+            md_output += "\n## Acceptance Criteria Evidence\n"
+            md_output += "| Requirement | AC | Status |\n"
+            md_output += "|---|---|---|\n"
+            for row in ac_rows:
+                md_output += (
+                    f"| {row['requirement_id']} | {row['ac_id']} | {row['status']} |\n"
+                )
+
         md_output += "\n## Blocking Gaps\n"
         blocking_gaps = graph.blocking_gaps()
         if not blocking_gaps:

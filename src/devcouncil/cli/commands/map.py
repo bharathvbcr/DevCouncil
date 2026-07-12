@@ -62,6 +62,7 @@ def _agent_guide_text(repo_map_path: Path, repo_root: Path, repo_map: RepoMap) -
             "",
             "Use `.devcouncil/repo_map.json` as the primary file index for this workspace.",
             f"Repo map: `{repo_map_path.relative_to(repo_root).as_posix() if repo_map_path.is_relative_to(repo_root) else repo_map_path}`",
+            "Code graph: `.devcouncil/graph/code_graph.json` (symbol-level; query with `dev graph`).",
             *wiki_lines,
             "",
             "Workflow for agents:",
@@ -71,7 +72,11 @@ def _agent_guide_text(repo_map_path: Path, repo_root: Path, repo_map: RepoMap) -
             "4. In `subsystems`, use `entry_points` + `critical_files` for entry points and starting context.",
             "5. Use `role_files` in `subsystems` for subsystem role buckets (entry, runtime, policy, adapters, etc.).",
             "6. Use `neighbors` and `handoff_paths` in `subsystems` to follow cross-subsystem flow.",
-            "7. Run `dev map` again after large refactors to refresh the map.",
+            "7. Check `unwired_candidates` / `unreachable_files` / `dead_symbol_candidates` "
+            "before creating new modules — wire what you create into a real caller.",
+            "8. Use `dev graph query <name>` / `dev graph trace <a> <b>` / `dev graph dead` "
+            "for symbol callers, paths, and dead-code tiers; `dev graph html` for the visualizer.",
+            "9. Run `dev map` (or rely on post-tool-use auto-refresh) after large refactors.",
             "",
             "Important surfaces:",
             *_important_surfaces(repo_map),
@@ -88,28 +93,87 @@ def _write_agent_guides(repo_root: Path, repo_map_path: Path, repo_map: RepoMap)
             existing = path.read_text(encoding="utf-8")
             if AGENT_GUIDE_MARKER not in existing:
                 continue
-        path.write_text(_agent_guide_text(repo_map_path, repo_root, repo_map) + "\n", encoding="utf-8")
+        text = _agent_guide_text(repo_map_path, repo_root, repo_map) + "\n"
+        # Skip rewrite when unchanged so content_fingerprint (size+mtime) stays stable
+        # across consecutive identical `dev map` runs.
+        if path.exists() and path.read_text(encoding="utf-8") == text:
+            continue
+        path.write_text(text, encoding="utf-8")
 
 
-def generate_map_artifacts(root: Path, output: Path, goal: str = "", *, scan_dependencies: bool = False) -> RepoMap:
+def generate_map_artifacts(
+    root: Path,
+    output: Path,
+    goal: str = "",
+    *,
+    scan_dependencies: bool = False,
+    liveness: bool = True,
+    lsp_refs: bool = False,
+    quiet: bool = False,
+) -> RepoMap:
     """Build the repo map and write repo_map.json + agent guides (no LLM, no re-init).
 
     Assumes ``.devcouncil/`` already exists. Shared by the ``dev map`` command and
     by project initialization so a freshly set-up repo is immediately navigable.
     ``scan_dependencies`` is opt-in (off for init and default mapping) because it can
     shell out to dependency auditors.
+    ``lsp_refs`` opts into live LSP confirmation of dead-symbol candidates.
+    ``quiet`` suppresses stderr status lines (for ``dev status --json`` auto-init).
     """
-    repo_map = RepoMapper(root).map_repo(goal, scan_dependencies=scan_dependencies)
+    import time
+
+    t0 = time.perf_counter()
+    repo_map = RepoMapper(root).map_repo(
+        goal,
+        scan_dependencies=scan_dependencies,
+        liveness=liveness,
+        lsp_refs=lsp_refs,
+    )
+    elapsed = time.perf_counter() - t0
+    if not quiet:
+        status_console.print(f"[dim]map completed in {elapsed:.2f}s[/dim]")
     graph_context = CodeReviewGraphAdapter(root).get_context()
     output = output if output.is_absolute() else root / output
     output.parent.mkdir(parents=True, exist_ok=True)
     write_model_json(output, repo_map)
     _write_agent_guides(root, output, repo_map)
+    # Agent guides can add/change tracked files after the fingerprint was taken;
+    # re-stamp so the on-disk map is not immediately stale for checkout/verify.
+    mapper = RepoMapper(root)
+    try:
+        files = mapper.get_git_files()
+        repo_map.generated_head = mapper._git_head()
+        repo_map.indexed_hash = mapper._files_fingerprint(files)
+        repo_map.content_fingerprint = mapper._content_fingerprint(files)
+        write_model_json(output, repo_map)
+    except Exception:
+        logger.debug("Failed to re-stamp map fingerprints after agent guides", exc_info=True)
     if graph_context.available:
         graph_output = output.with_name("code_review_graph_context.json")
         write_model_json(graph_output, graph_context)
-        status_console.print(f"[green]Wrote code-review-graph context to {graph_output}[/green]")
+        if not quiet:
+            status_console.print(f"[green]Wrote code-review-graph context to {graph_output}[/green]")
     return repo_map
+
+
+def _liveness_summary(repo_map: RepoMap) -> str | None:
+    if not (
+        repo_map.entry_roots
+        or repo_map.unwired_candidates
+        or repo_map.unreachable_files
+        or repo_map.dead_symbol_candidates
+    ):
+        return None
+    samples = repo_map.unwired_candidates[:3] + repo_map.dead_symbol_candidates[:2]
+    sample_txt = (", " + ", ".join(samples)) if samples else ""
+    return (
+        f"liveness: {len(repo_map.entry_roots)} entry roots, "
+        f"{len(repo_map.unwired_candidates)} unwired, "
+        f"{len(repo_map.unreachable_files)} unreachable, "
+        f"{len(repo_map.dead_symbol_candidates)} dead symbols"
+        f"{sample_txt}"
+        " (map clears on any non-test importer; verify requires a pre-existing caller)"
+    )
 
 
 def map_repo(
@@ -126,30 +190,103 @@ def map_repo(
         "--scan-deps",
         help="Run available dependency auditors (pip-audit/npm audit/osv-scanner) and record dependency_risks in the map. Off by default.",
     ),
+    liveness: bool = typer.Option(
+        True,
+        "--liveness/--no-liveness",
+        help="Compute entry_roots / unwired / unreachable / dead_symbol candidate lists (on by default).",
+    ),
+    lsp_refs: bool = typer.Option(
+        False,
+        "--lsp-refs/--no-lsp-refs",
+        help=(
+            "Confirm dead-symbol candidates via live LSP references when a language "
+            "server is on PATH. Also set indexing.lsp_refs in config.yaml. Off by default."
+        ),
+    ),
     refresh_wiki: bool = typer.Option(
         True,
         "--wiki/--no-wiki",
         help="After mapping, refresh stale codebase-wiki page skeletons when a wiki exists (no LLM calls).",
+    ),
+    watch: bool = typer.Option(
+        False,
+        "--watch",
+        help="After the initial map, watch the tree and incrementally refresh on code edits (Ctrl-C to stop).",
+    ),
+    if_stale: bool = typer.Option(
+        False,
+        "--if-stale",
+        help="Fingerprint-check first and exit 0 without rebuilding when the on-disk map is still fresh.",
     ),
 ):
     """Build the deterministic repository map without calling an LLM."""
     root = project_root.expanduser().resolve()
     from devcouncil.telemetry.logging_setup import set_log_dir
     set_log_dir(root)
-    logger.info("dev map: goal=%r scan_deps=%s", goal, scan_deps)
+    # CLI flag OR config; flag alone is enough without rewriting config.
+    use_lsp = lsp_refs
+    if not use_lsp:
+        try:
+            from devcouncil.app.config import load_config
+
+            use_lsp = bool(load_config(root).indexing.lsp_refs)
+        except Exception:
+            use_lsp = False
+    logger.info(
+        "dev map: goal=%r scan_deps=%s liveness=%s lsp_refs=%s if_stale=%s",
+        goal, scan_deps, liveness, use_lsp, if_stale,
+    )
     initialize_project(root, quiet=True, with_map=False)
     if not get_db(root):
         raise typer.Exit(code=1)
 
+    output = output if output.is_absolute() else root / output
+    if if_stale and output.is_file():
+        try:
+            from devcouncil.utils.json_persist import read_json
+
+            data = read_json(output) or {}
+            if isinstance(data, dict) and not RepoMapper(root).map_is_stale(data):
+                status_console.print(f"[dim]Map is fresh; skipping rebuild ({output})[/dim]")
+                raise typer.Exit(code=0)
+        except typer.Exit:
+            raise
+        except Exception:
+            logger.debug("if-stale freshness check failed; rebuilding", exc_info=True)
+
     with log_stage("map", project_root=root, scan_deps=scan_deps):
         log_step("map/1: generating repository map", project_root=root, trace=True)
-        output = output if output.is_absolute() else root / output
-        repo_map = generate_map_artifacts(root, output, goal, scan_dependencies=scan_deps)
+        repo_map = generate_map_artifacts(
+            root,
+            output,
+            goal,
+            scan_dependencies=scan_deps,
+            liveness=liveness,
+            lsp_refs=use_lsp,
+        )
         typer.echo(dump_json(repo_map.model_dump(), indent=2))
         status_console.print(f"[green]Wrote repository map to {output}[/green]")
+        graph_out = root / ".devcouncil" / "graph" / "code_graph.json"
+        if graph_out.is_file():
+            status_console.print(f"[green]Wrote code graph to {graph_out}[/green]")
+            try:
+                from devcouncil.app.config import load_config
+
+                if bool(load_config(root).indexing.write_graph_html):
+                    from devcouncil.indexing.viz import write_graph_html
+
+                    html_out = write_graph_html(root, open_browser=False)
+                    status_console.print(f"[green]Wrote graph HTML to {html_out}[/green]")
+            except Exception as exc:
+                logger.warning("Failed to write graph.html after map: %s", exc)
+        summary = _liveness_summary(repo_map)
+        if summary:
+            status_console.print(f"[cyan]{summary}[/cyan]")
         if refresh_wiki:
             _refresh_wiki_skeletons(root, repo_map)
         log_step("map/complete", project_root=root, trace=True)
+        if watch:
+            _watch_map(root, liveness=liveness)
 
 
 def graph_context_cmd(
@@ -181,8 +318,12 @@ def _refresh_wiki_skeletons(root: Path, repo_map: RepoMap) -> None:
     refreshed pages.
     """
     try:
-        from devcouncil.cli.commands.wiki import _project_name, wiki_dir_for
-        from devcouncil.knowledge.wiki import generate_wiki, wiki_stale_pages
+        from devcouncil.cli.commands.wiki import wiki_dir_for
+        from devcouncil.knowledge.wiki import (
+            _project_name,
+            generate_wiki,
+            wiki_stale_pages,
+        )
 
         wiki_dir = wiki_dir_for(root)
         if not (wiki_dir / "index.md").is_file():
@@ -198,3 +339,68 @@ def _refresh_wiki_skeletons(root: Path, repo_map: RepoMap) -> None:
     except Exception as exc:
         # The wiki is a convenience layer; never let it fail `dev map`.
         logger.warning("Wiki refresh after map failed: %s", exc)
+
+
+def _watch_map(root: Path, *, liveness: bool = True) -> None:
+    """Debounced incremental refresh via watchdog (already a runtime dependency)."""
+    import threading
+    import time
+
+    try:
+        from watchdog.events import FileSystemEventHandler
+        from watchdog.observers import Observer
+    except ImportError:
+        status_console.print("[red]watchdog is required for `dev map --watch`[/red]")
+        raise typer.Exit(code=1)
+
+    code_exts = {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".rs"}
+    pending: set[str] = set()
+    lock = threading.Lock()
+    debounce_s = 0.8
+
+    class Handler(FileSystemEventHandler):
+        def on_any_event(self, event):  # noqa: ANN001
+            if getattr(event, "is_directory", False):
+                return
+            src = getattr(event, "dest_path", None) or getattr(event, "src_path", None)
+            if not src:
+                return
+            try:
+                rel = Path(src).resolve().relative_to(root).as_posix()
+            except Exception:
+                return
+            if rel.startswith(".devcouncil/") or rel.startswith(".git/"):
+                return
+            if Path(rel).suffix.lower() not in code_exts:
+                return
+            with lock:
+                pending.add(rel)
+
+    observer = Observer()
+    observer.schedule(Handler(), str(root), recursive=True)
+    observer.start()
+    status_console.print(
+        f"[cyan]Watching {root} for code edits (debounce {debounce_s}s). Ctrl-C to stop.[/cyan]"
+    )
+    try:
+        while True:
+            time.sleep(debounce_s)
+            with lock:
+                batch = sorted(pending)
+                pending.clear()
+            if not batch:
+                continue
+            try:
+                from devcouncil.indexing.graph.build import refresh_map_for_paths
+
+                refresh_map_for_paths(root, batch, liveness=liveness)
+                status_console.print(
+                    f"[green]Refreshed map for {len(batch)} path(s)[/green]"
+                )
+            except Exception as exc:
+                status_console.print(f"[yellow]Watch refresh failed (ignored): {exc}[/yellow]")
+    except KeyboardInterrupt:
+        status_console.print("Stopped watching.")
+    finally:
+        observer.stop()
+        observer.join(timeout=2)

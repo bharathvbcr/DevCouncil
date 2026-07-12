@@ -46,6 +46,7 @@ from devcouncil.cli.commands import (  # noqa: E402 - imports follow stdio recon
     logs,
     lsp,
     map,
+    graph_cmd,
     mcp_server,
     okf,
     plan,
@@ -128,6 +129,7 @@ app.command(name="baseline")(baseline.baseline)
 app.command(name="e2e")(go.go)
 app.command(name="go")(go.go)
 app.command(name="map")(map.map_repo)
+app.add_typer(graph_cmd.app, name="graph")
 app.command(name="graph-context")(map.graph_context_cmd)
 app.command(name="scaffold-ci")(scaffold.scaffold_ci_command)
 app.command(name="plan")(plan.plan)
