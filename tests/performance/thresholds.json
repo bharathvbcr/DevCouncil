@@ -1,0 +1,36 @@
+{
+  "fast": {
+    "file_count": 256,
+    "package_count": 8,
+    "query_iterations": 7,
+    "cold_wall_seconds_max": 10.0,
+    "one_file_wall_seconds_max": 3.0,
+    "peak_rss_bytes_max": 536870912,
+    "database_to_compatibility_ratio_max": 5.5,
+    "freelist_ratio_max": 0.2,
+    "incremental_payload_rows_max": 8,
+    "affected_files_max": 1,
+    "query_p95_ms_max": {
+      "search": 25.0,
+      "explore": 250.0,
+      "dead": 250.0
+    }
+  },
+  "heavy": {
+    "file_count": 10000,
+    "package_count": 40,
+    "query_iterations": 11,
+    "cold_wall_seconds_max": 300.0,
+    "one_file_wall_seconds_max": 60.0,
+    "peak_rss_bytes_max": 2147483648,
+    "database_to_compatibility_ratio_max": 5.25,
+    "freelist_ratio_max": 0.15,
+    "incremental_payload_rows_max": 8,
+    "affected_files_max": 1,
+    "query_p95_ms_max": {
+      "search": 50.0,
+      "explore": 5000.0,
+      "dead": 5000.0
+    }
+  }
+}

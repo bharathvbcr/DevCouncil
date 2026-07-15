@@ -32,6 +32,10 @@ def _as_str_set(values: Any) -> Set[str]:
     return {_norm(str(v)) for v in values if v is not None and str(v).strip()}
 
 
+def _as_list(value: object) -> list[Any]:
+    return list(value) if isinstance(value, list) else []
+
+
 def _symbol_key(entry: str) -> str:
     """Normalize ``path:line name`` / ``path:line:name`` to a stable identity key.
 
@@ -77,6 +81,18 @@ def baseline_is_complete(baseline: Mapping[str, Any] | None) -> bool:
     return bool(baseline and isinstance(baseline, Mapping) and baseline.get("complete") is True)
 
 
+def _liveness_roots_unreliable(snap: Mapping[str, Any] | None) -> bool:
+    """True when unreachable lists must not be trusted (empty roots / flag)."""
+    if not snap or not isinstance(snap, Mapping):
+        return True
+    if snap.get("liveness_unreachable_unreliable") is True:
+        return True
+    roots = snap.get("entry_roots")
+    if not isinstance(roots, list) or not roots:
+        return True
+    return False
+
+
 def detect_liveness_regressions(
     baseline: Mapping[str, Any] | None,
     current: Mapping[str, Any] | None,
@@ -94,6 +110,8 @@ def detect_liveness_regressions(
     — a brand-new unused def in an existing file is not ``stranded_code``.
 
     Returns an empty list when ``baseline`` is missing or incomplete.
+    When either side has empty entry roots / unreliable unreachable, skip
+    unreachable diffs (avoids empty-root stranded floods).
     """
     gaps: List[Gap] = []
     if not baseline_is_complete(baseline):
@@ -116,7 +134,14 @@ def detect_liveness_regressions(
         cur_unreachable = _as_str_set(current.get("unreachable_files"))
 
         newly_unwired = (cur_unwired - base_unwired) - added
-        newly_unreachable = (cur_unreachable - base_unreachable) - added
+        skip_unreachable = (
+            _liveness_roots_unreliable(baseline) or _liveness_roots_unreliable(current)
+        )
+        newly_unreachable = (
+            set()
+            if skip_unreachable
+            else (cur_unreachable - base_unreachable) - added
+        )
         stranded_files = sorted(newly_unwired | newly_unreachable)
 
         for path in stranded_files:
@@ -287,19 +312,25 @@ def snapshot_liveness_baseline(
         snap = mapper.liveness_snapshot()
         from devcouncil.indexing.wiring import LIVENESS_SCAN_VERSION
 
+        unreliable = bool(snap.get("liveness_unreachable_unreliable")) or not _as_list(
+            snap.get("entry_roots")
+        )
+        # Empty-root scans must not become ratchet baselines (would flood or
+        # falsely look "clean" after fail-soft unreachable=[]).
         payload: dict[str, Any] = {
-            "unwired_candidates": list(snap.get("unwired_candidates") or []),
-            "unreachable_files": list(snap.get("unreachable_files") or []),
-            "dead_symbol_candidates": list(snap.get("dead_symbol_candidates") or []),
-            "entry_roots": list(snap.get("entry_roots") or []),
-            "symbol_index": list(snap.get("symbol_index") or []),
+            "unwired_candidates": _as_list(snap.get("unwired_candidates")),
+            "unreachable_files": _as_list(snap.get("unreachable_files")),
+            "dead_symbol_candidates": _as_list(snap.get("dead_symbol_candidates")),
+            "entry_roots": _as_list(snap.get("entry_roots")),
+            "symbol_index": _as_list(snap.get("symbol_index")),
+            "liveness_unreachable_unreliable": unreliable,
             "generated_head": mapper._git_head(),
             "source": "fresh_scan",
             "scan_version": LIVENESS_SCAN_VERSION,
-            "complete": True,
+            "complete": not unreliable,
         }
         write_json(out_path, payload)
-        return out_path
+        return out_path if not unreliable else None
     except Exception:
         logger.debug("snapshot_liveness_baseline failed for %s", task_id, exc_info=True)
         return None

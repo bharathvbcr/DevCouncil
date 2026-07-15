@@ -242,7 +242,12 @@ def test_snapshot_and_load_baseline(tmp_path):
 
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "cli.py").write_text("def main():\n    pass\n", encoding="utf-8")
     (tmp_path / "pkg" / "orphan.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname="x"\nversion="0"\n[project.scripts]\ncli="pkg.cli:main"\n',
+        encoding="utf-8",
+    )
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(
         ["git", "-c", "user.email=t@t", "-c", "user.name=t", "add", "-A"],
@@ -265,6 +270,55 @@ def test_snapshot_and_load_baseline(tmp_path):
     from devcouncil.indexing.wiring import LIVENESS_SCAN_VERSION
 
     assert loaded.get("scan_version") == LIVENESS_SCAN_VERSION
+
+
+def test_ratchet_skips_unreachable_when_current_empty_roots():
+    """Healthy baseline + empty-root current must not flood stranded_code."""
+    baseline = {
+        "complete": True,
+        "entry_roots": ["pkg/cli.py"],
+        "unwired_candidates": [],
+        "unreachable_files": [],
+        "dead_symbol_candidates": [],
+        "symbol_index": [],
+        "liveness_unreachable_unreliable": False,
+    }
+    current = {
+        "entry_roots": [],
+        "unwired_candidates": [],
+        "unreachable_files": ["pkg/a.py", "pkg/b.py", "pkg/c.py"],
+        "dead_symbol_candidates": [],
+        "liveness_unreachable_unreliable": True,
+    }
+    gaps = detect_liveness_regressions(
+        baseline,
+        current,
+        set(),
+        task=_task(),
+        next_gap_id=_gap_id,
+        blocking=True,
+    )
+    assert gaps == []
+
+
+def test_snapshot_empty_roots_not_complete(tmp_path):
+    import subprocess
+
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "orphan.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "add", "-A"],
+        cwd=tmp_path, check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init"],
+        cwd=tmp_path, check=True, capture_output=True,
+    )
+    out = snapshot_liveness_baseline(tmp_path, "TASK-EMPTY")
+    assert out is None
+    assert load_liveness_baseline(tmp_path, "TASK-EMPTY") is None
 
 
 def test_load_missing_baseline_returns_none(tmp_path):
