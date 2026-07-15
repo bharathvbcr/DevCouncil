@@ -793,4 +793,10 @@ def test_profile_override_summary_no_profile(tmp_path, monkeypatch):
     ex = _codex_executor(tmp_path, monkeypatch)
     ex.profile = None
     summary = ex._profile_override_summary()
-    assert summary == {"extra_args": [], "permission_mode": None, "model": None, "env_keys": []}
+    assert summary == {
+        "extra_args": [],
+        "permission_mode": None,
+        "model": None,
+        "advisor_model": None,
+        "env_keys": [],
+    }

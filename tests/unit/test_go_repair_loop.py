@@ -201,6 +201,44 @@ def test_repair_skips_executor_when_unavailable_and_incomplete(monkeypatch, tmp_
     assert len(calls) == 1
 
 
+def test_repair_stops_when_blocked_and_unavailable(monkeypatch, tmp_path):
+    """P0: advisor/infra unavailability must not burn repair budget while blocked."""
+    calls = []
+    monkeypatch.setattr(run_command, "run", lambda task_id, **k: calls.append(task_id))
+    monkeypatch.setattr(go, "_task_status", lambda root, tid: "blocked")
+    monkeypatch.setattr(go, "_blocking_gap_signature", lambda root, tid: "gapA")
+    monkeypatch.setattr(go, "_remediable_incomplete_signature", lambda root, tid: "")
+    monkeypatch.setattr(go, "_reverify_task", lambda root, tid: "blocked")
+    monkeypatch.setattr(go, "_executor_run_unavailable", lambda root, tid: True)
+    monkeypatch.setattr(go, "_executor_run_failed", lambda root, tid: True)
+    monkeypatch.setattr(go, "_commit_task_changes", lambda root, tid, status: False)
+    monkeypatch.setattr(
+        "devcouncil.planning.correction_manifest.write_correction_manifest",
+        lambda root, tid, **k: tmp_path / "m.json",
+    )
+
+    status, attempts = go._execute_task_with_repair(
+        tmp_path, _task(), executor="claude", profile=None, stream=False, max_repairs=3, repair_service=None
+    )
+    assert status == "blocked"
+    assert attempts == 0
+    assert len(calls) == 1
+
+
+def test_executor_run_unavailable_detects_advisor_markers(tmp_path):
+    runs = tmp_path / ".devcouncil" / "runs" / "run-adv"
+    runs.mkdir(parents=True)
+    (runs / "agent-run.json").write_text(
+        json.dumps({
+            "task_id": "TASK-001",
+            "returncode": 1,
+            "stderr_preview": ["Error: model does not support the advisor tool"],
+        }),
+        encoding="utf-8",
+    )
+    assert go._executor_run_unavailable(tmp_path, "TASK-001") is True
+
+
 def test_executor_run_unavailable_detects_session_limit(tmp_path):
     runs = tmp_path / ".devcouncil" / "runs" / "run-1"
     runs.mkdir(parents=True)

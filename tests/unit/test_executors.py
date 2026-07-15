@@ -585,6 +585,15 @@ def test_render_claude_stream_event_summarizes_events():
     })
     assert render(tool_event) == "→ Edit src/app.py\n"
 
+    # Advisor server tool surfaces as an Advising line.
+    advisor_event = json.dumps({
+        "type": "assistant",
+        "message": {"content": [
+            {"type": "server_tool_use", "name": "advisor", "input": {"model": "opus"}},
+        ]},
+    })
+    assert render(advisor_event) == "Advising (opus)\n"
+
     # The terminal result event shows turns and cost.
     result_event = json.dumps({"type": "result", "num_turns": 2, "total_cost_usd": 0.0512})
     assert render(result_event) == "✓ 2 turns, $0.0512\n"

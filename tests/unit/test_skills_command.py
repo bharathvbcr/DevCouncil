@@ -200,7 +200,6 @@ def test_skill_to_markdown_includes_triggers_and_always():
 
 
 def test_write_skill_body_library_materializes_under_devcouncil(tmp_path):
-    from pathlib import Path
     from devcouncil.skills.registry import Skill
 
     lib_skill = Skill(name="libskill", source_path=Path("/opt/pkg/skills/libskill/SKILL.md"))

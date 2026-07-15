@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 from devcouncil.indexing.wiring import _pyproject_script_targets, _package_json_entry_targets
 

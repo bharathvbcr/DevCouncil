@@ -175,6 +175,7 @@ def _executor_run_failed(root: Path, task_id: str) -> bool:
 
 def _executor_run_unavailable(root: Path, task_id: str) -> bool:
     """True when the agent failed for infra reasons (session/rate limit), not code defects."""
+    from devcouncil.executors.advisor_tool import ADVISOR_INFRA_FAILURE_MARKERS
     from devcouncil.planning.correction_manifest import _latest_agent_run
 
     run = _latest_agent_run(root, task_id)
@@ -191,16 +192,15 @@ def _executor_run_unavailable(root: Path, task_id: str) -> bool:
         elif val:
             parts.append(str(val))
     hay = " ".join(parts).lower()
-    return any(
-        needle in hay
-        for needle in (
-            "session limit",
-            "rate limit",
-            "too many requests",
-            "limit_rpm",
-            "429",
-        )
+    needles = (
+        "session limit",
+        "rate limit",
+        "too many requests",
+        "limit_rpm",
+        "429",
+        *ADVISOR_INFRA_FAILURE_MARKERS,
     )
+    return any(needle in hay for needle in needles)
 
 
 def _reverify_task(root: Path, task_id: str) -> str:
@@ -289,6 +289,18 @@ def _execute_task_with_repair(
             # (e.g. the executor failed to start).
             break
         if signature == last_signature:
+            if _executor_run_unavailable(root, task.id):
+                # Advisor/session/rate-limit failures are not code gaps — do not burn
+                # the remaining repair budget on identical executor invocations.
+                logger.warning(
+                    "%s: executor unavailable (infra); stopping self-repair loop",
+                    task.id,
+                )
+                console.print(
+                    f"[yellow]{task.id}: executor unavailable (infra failure); "
+                    "stopping the self-repair loop.[/yellow]"
+                )
+                break
             if _executor_run_failed(root, task.id):
                 logger.warning(
                     "%s: identical gaps but the last executor run failed to complete; "
@@ -309,7 +321,9 @@ def _execute_task_with_repair(
         last_signature = signature
 
         incomplete_only = not blocked and bool(signature)
-        if incomplete_only or (_executor_run_unavailable(root, task.id) and not blocked):
+        unavailable = _executor_run_unavailable(root, task.id)
+        # Verify-only when incomplete-only OR any infra unavailability (blocked or not).
+        if incomplete_only or unavailable:
             console.print(
                 f"[dim]{task.id}: verify-only pass before repair "
                 f"(attempt {attempt + 1}/{max_repairs})...[/dim]"
@@ -326,15 +340,15 @@ def _execute_task_with_repair(
             if new_sig != prev_sig:
                 last_signature = None
                 continue
-            if _executor_run_unavailable(root, task.id) and incomplete_only:
+            if unavailable:
                 logger.warning(
-                    "%s: executor unavailable and verify-only did not clear incomplete gaps; "
+                    "%s: executor unavailable and verify-only did not clear gaps; "
                     "skipping further executor invocations",
                     task.id,
                 )
                 console.print(
-                    f"[yellow]{task.id}: executor unavailable; incomplete gaps remain after "
-                    "verify-only.[/yellow]"
+                    f"[yellow]{task.id}: executor unavailable; gaps remain after "
+                    "verify-only — not burning more repair budget.[/yellow]"
                 )
                 break
 

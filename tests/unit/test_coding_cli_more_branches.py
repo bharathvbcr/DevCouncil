@@ -1,14 +1,9 @@
-import json
-import queue
 import subprocess
-import sys
-from pathlib import Path
 import pytest
 from rich.console import Console
 
 from devcouncil.executors.coding_cli import CodingCliExecutor
 from devcouncil.domain.task import Task
-from devcouncil.app.config import DevCouncilConfig
 from devcouncil.verification.verifier import Verifier
 from devcouncil.execution.policy_engine import TaskPolicyEngine
 

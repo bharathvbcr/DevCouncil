@@ -1,4 +1,3 @@
-from pathlib import Path
 
 from devcouncil.integrations.graphify import GraphifyIntegration
 

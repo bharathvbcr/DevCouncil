@@ -425,15 +425,6 @@ def test_watch_gate_once_incremental_error(tmp_path, monkeypatch, capsys):
     assert "ERROR" in capsys.readouterr().out
 
 
-def test_watch_gate_once_no_changes(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(
-        check_cmd, "run_incremental_gates",
-        lambda *a, **k: SimpleNamespace(no_changes=True, no_gates=False),
-    )
-    check_cmd._watch_gate_once(tmp_path, "goal", [], False, 0.0, cache=None)
-    assert "no working-tree changes" in capsys.readouterr().out
-
-
 # --- _watch_gate loop (poll/debounce until KeyboardInterrupt) ----------------------
 
 

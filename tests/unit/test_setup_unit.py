@@ -1,8 +1,6 @@
 """Unit tests for setup command helpers."""
 
-import sys
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 import yaml

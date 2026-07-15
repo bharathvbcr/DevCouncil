@@ -279,20 +279,28 @@ def integration_capability_rows(project_root: Path) -> list[dict[str, object]]:
 def _hook_config_references_devcouncil(path: Path) -> bool | None:
     """Return whether a client hook config still wires DevCouncil's gate.
 
-    ``True``  -> the file exists and references ``devcouncil`` somewhere in its hooks.
+    ``True``  -> the file exists and still invokes the DevCouncil pre/post-tool gate.
     ``False`` -> the file exists but no longer references it (tampered/disarmed).
     ``None``  -> the file does not exist (client was never integrated here).
 
     Reads the raw text rather than parsing each client's bespoke schema so it works
     uniformly across JSON hook files and is resilient to format drift; the goal is a
-    tamper tripwire, not full schema validation."""
+    tamper tripwire, not full schema validation.
+
+    Accepts either an explicit ``devcouncil`` marker (named hooks / ``devcouncil`` CLI)
+    or the project-venv ``dev hook …`` command Cursor installs (no named hook id).
+    """
     if not path.exists():
         return None
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return False
-    return "devcouncil" in text.lower()
+    lower = text.lower()
+    if "devcouncil" in lower:
+        return True
+    # Cursor flat hooks: ``…/bin/dev hook pre-tool-use --client cursor …``
+    return "hook pre-tool-use" in lower or "hook post-tool-use" in lower
 
 
 def _hook_config_tamper_targets(project_root: Path) -> list[tuple[str, Path]]:

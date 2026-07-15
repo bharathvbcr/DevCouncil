@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 from typer.testing import CliRunner
 
@@ -9,9 +10,6 @@ from devcouncil.storage.native import TaskLeaseRepository
 from devcouncil.storage.repositories import TaskRepository
 
 runner = CliRunner()
-
-
-import sys
 
 def _setup_gate_env(tmp_path: Path, monkeypatch) -> tuple[Path, str, str]:
     reset_db_cache()

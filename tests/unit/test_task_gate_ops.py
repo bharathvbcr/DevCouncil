@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
 from devcouncil.domain.evidence import (
     CommandResult,
@@ -22,7 +21,7 @@ from devcouncil.domain.gap import Gap
 from devcouncil.domain.task import PlannedFile, Task
 from devcouncil.execution import task_gate_ops as ops
 from devcouncil.storage.db import Database, reset_db_cache
-from devcouncil.storage.native import ShellCommandRepository, TaskLeaseRepository
+from devcouncil.storage.native import TaskLeaseRepository
 from devcouncil.storage.repositories import EvidenceRepository, TaskRepository
 
 
@@ -74,7 +73,6 @@ def test_not_initialized_branches(tmp_path, monkeypatch):
 
 def test_build_router_success(tmp_path, monkeypatch):
     """Cover the happy path where config + provider + router all construct."""
-    import types
 
     class _Role:
         def model_dump(self):

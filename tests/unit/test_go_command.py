@@ -159,6 +159,15 @@ def test_executor_run_unavailable_detects_limits(tmp_path, monkeypatch):
     assert go._executor_run_unavailable(tmp_path, "T1") is False
     monkeypatch.setattr(cm, "_latest_agent_run", lambda root, tid: {"returncode": 0})
     assert go._executor_run_unavailable(tmp_path, "T1") is False
+    monkeypatch.setattr(
+        cm, "_latest_agent_run",
+        lambda root, tid: {
+            "returncode": 1,
+            "status": "error",
+            "stderr_preview": ["Invalid --advisor pairing"],
+        },
+    )
+    assert go._executor_run_unavailable(tmp_path, "T1") is True
 
 
 # --- _reverify_task ---------------------------------------------------------------
@@ -339,7 +348,6 @@ def test_go_no_tasks_without_force_aborts(tmp_path, monkeypatch):
 
 
 def test_custom_cli_agents(tmp_path, monkeypatch):
-    import devcouncil.executors.agent_registry as reg
     monkeypatch.setattr(
         go, "load_cli_agent_specs",
         lambda root: {

@@ -596,12 +596,19 @@ class PromptBuilder:
                     break
 
             unreachable_hits: list[str] = []
-            for cand in unreachable_of(data)[:40]:
-                area = area_for_path(cand, data)
-                if area and area in task_areas:
-                    unreachable_hits.append(cand)
-                if len(unreachable_hits) >= 6:
-                    break
+            roots = data.get("entry_roots") or []
+            unreachable_unreliable = (
+                data.get("liveness_unreachable_unreliable") is True
+                or not isinstance(roots, list)
+                or not roots
+            )
+            if not unreachable_unreliable:
+                for cand in unreachable_of(data)[:40]:
+                    area = area_for_path(cand, data)
+                    if area and area in task_areas:
+                        unreachable_hits.append(cand)
+                    if len(unreachable_hits) >= 6:
+                        break
 
             dead_hits: list[str] = []
             for cand in dead_symbol_candidates_of(data)[:40]:
@@ -620,6 +627,9 @@ class PromptBuilder:
                 "subsystems — do not add to this debt; wire what you create._",
                 "_Verify same-task island rule: a new file imported only by other files "
                 "added in this task still needs a pre-existing non-test caller._",
+                "_Prefer `dev graph dead --confidence extracted` + greps; treat inferred "
+                "as unconfirmed. If entry_roots are empty / liveness_unreachable_unreliable, "
+                "ignore unreachable_files and mass inferred dead._",
             ]
             for p in unwired_hits:
                 lines.append(f"- unwired: `{p}`")
@@ -639,6 +649,9 @@ class PromptBuilder:
         dependents = (data or {}).get("dependents") or {}
         if not isinstance(dependents, dict) or not dependents:
             return ""
+        totals = (data or {}).get("dependents_total") or {}
+        if not isinstance(totals, dict):
+            totals = {}
         lines: List[str] = []
         for pf in task.planned_files:
             # New files have no dependents yet; only existing code carries blast radius.
@@ -647,18 +660,22 @@ class PromptBuilder:
             # Normalize the planned path to posix before the lookup — the map keys are
             # always posix, so a backslash planned path on Windows would otherwise miss
             # and silently drop the whole blast-radius entry (see _repo_map_section).
-            importers = dependents.get(pf.path.replace("\\", "/")) or []
+            key = pf.path.replace("\\", "/")
+            importers = dependents.get(key) or []
             if not importers:
                 continue
             shown = importers[:8]
-            more = f" (+{len(importers) - len(shown)} more)" if len(importers) > len(shown) else ""
+            full_n = int(totals.get(key) or len(importers))
+            hidden = max(0, full_n - len(shown))
+            more = f" (+{hidden} more; {full_n} total)" if hidden else ""
             lines.append(f"- `{pf.path}` is imported by: " + ", ".join(f"`{p}`" for p in shown) + more)
         if not lines:
             return ""
         return (
             "\n## Dependents (blast radius)\n"
             "_These files import the files you're changing — keep their call sites working, "
-            "or update them in scope._\n"
+            "or update them in scope. Counts may exceed the listed sample when the map "
+            "truncated dependents._\n"
             + "\n".join(lines)
             + "\n"
         )

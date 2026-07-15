@@ -119,6 +119,32 @@ def test_check_passes_when_hook_config_references_devcouncil(tmp_path):
     assert integrity and integrity[0].status == "ok"
 
 
+def test_check_passes_when_cursor_hooks_use_dev_cli(tmp_path):
+    """Cursor installs flat ``dev hook …`` commands (no ``devcouncil`` name field)."""
+    _init_repo(tmp_path)
+    cursor_dir = tmp_path / ".cursor"
+    cursor_dir.mkdir()
+    (cursor_dir / "hooks.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "hooks": {
+                    "preToolUse": [
+                        {
+                            "command": "/tmp/.venv/bin/dev hook pre-tool-use --client cursor",
+                            "matcher": "Shell|Write",
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    report = build_integration_check_report(tmp_path)
+    integrity = [r for r in report.checks if r.name == "Cursor hook integrity"]
+    assert integrity and integrity[0].status == "ok"
+
+
 def test_check_skips_integrity_when_no_hook_config(tmp_path):
     _init_repo(tmp_path)
     report = build_integration_check_report(tmp_path)

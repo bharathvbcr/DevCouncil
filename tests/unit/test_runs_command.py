@@ -6,7 +6,6 @@ import time
 
 from typer.testing import CliRunner
 
-import devcouncil.cli.commands.runs as runs_cmd
 import devcouncil.execution.run_trace as run_trace
 from devcouncil.cli.main import app
 from devcouncil.execution.run_trace import RunCheckpoint, RunTimeline, SupervisorVerdict

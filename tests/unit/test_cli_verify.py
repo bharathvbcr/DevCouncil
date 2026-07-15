@@ -2,7 +2,6 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 from typer.testing import CliRunner
 
 import devcouncil.cli.commands.verify as verify_cmd

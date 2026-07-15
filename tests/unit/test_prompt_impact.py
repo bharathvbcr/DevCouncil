@@ -286,6 +286,7 @@ def test_liveness_debt_section_lists_all_kinds(tmp_path):
             {"path": "src/core/a.py", "area": "src/core"},
         ],
         "subsystems": [{"area": "src/core"}],
+        "entry_roots": ["src/core/a.py"],
         "unwired_candidates": ["src/core/orphan.py"],
         "unreachable_files": ["src/core/lost.py"],
         "dead_symbol_candidates": ["src/core/a.py:10 unused_fn"],

@@ -1,6 +1,5 @@
 """Unit tests for MarkdownReportGenerator."""
 
-import json
 
 from devcouncil.artifacts.graph import ArtifactGraph
 from devcouncil.domain.evidence import TestEvidence

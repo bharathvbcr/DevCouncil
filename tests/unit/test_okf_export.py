@@ -11,10 +11,8 @@ from devcouncil.domain.requirement import AcceptanceCriterion, Requirement
 from devcouncil.domain.task import PlannedFile, Task
 from devcouncil.indexing.graph.build import build_code_graph
 from devcouncil.indexing.graph.export import (
-    build_code_graph_okf,
     export_graphml,
     file_doc_rel,
-    write_code_graph_okf,
 )
 from devcouncil.indexing.graph.export_links import (
     GRAPH_FROM_WIKI,

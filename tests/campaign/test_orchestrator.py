@@ -299,8 +299,6 @@ def test_overlapping_planned_files_run_sequentially(tmp_path):
 
     class _TrackingFactory:
         def __call__(self, owner: str):
-            factory = self
-
             class _Exec:
                 def run_task(self, task: Task, requirements):
                     with exec_lock:

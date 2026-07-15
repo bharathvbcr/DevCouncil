@@ -26,6 +26,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from devcouncil.executors.advisor_tool import ADVISOR_STEERING_NUDGE
 from devcouncil.knowledge.frontmatter import build_frontmatter_markdown
 
 # Tools a DevCouncil subagent should be allowed to use: the standard read/edit/run set
@@ -90,7 +91,8 @@ def _slash_commands() -> list[_SlashCommand]:
                 "MCP tools to implement it: call `mcp__devcouncil__devcouncil_next_task`, then "
                 "`mcp__devcouncil__devcouncil_checkout_task` to acquire a lease, make changes only "
                 "through the policy-gated write tools, run tests, then "
-                "`mcp__devcouncil__devcouncil_verify_task` and release the lease when verified."
+                "`mcp__devcouncil__devcouncil_verify_task` and release the lease when verified. "
+                f"{ADVISOR_STEERING_NUDGE}"
             ),
             allowed_tools="Bash(dev tasks:*)",
         ),
@@ -113,7 +115,7 @@ def _slash_commands() -> list[_SlashCommand]:
             body=(
                 "Work through the repair guidance above. Apply the smallest changes that close the "
                 "blocking gaps via the policy-gated DevCouncil write tools, then re-run "
-                "`/devcouncil:verify` until the task is clean."
+                f"`/devcouncil:verify` until the task is clean. {ADVISOR_STEERING_NUDGE}"
             ),
             allowed_tools="Bash(dev repair:*)",
         ),
@@ -305,8 +307,9 @@ def _subagents() -> list[_Subagent]:
                 "and `devcouncil_get_diff` to inspect.\n"
                 "3. Change files only via `devcouncil_write_file` / `devcouncil_apply_patch` (the gate "
                 "rejects out-of-scope or protected paths) and run tests via `devcouncil_run_command`.\n"
-                "4. `devcouncil_verify_task`; fix any blocking gaps and re-verify.\n"
-                "5. `devcouncil_release_task` when verified.\n\n"
+                f"4. {ADVISOR_STEERING_NUDGE}\n"
+                "5. `devcouncil_verify_task`; fix any blocking gaps and re-verify.\n"
+                "6. `devcouncil_release_task` when verified.\n\n"
                 "Never touch files outside the task scope. Report the final status and remaining gaps."
             ),
         ),
@@ -382,6 +385,7 @@ def build_output_style(root: Path) -> list[GeneratedAsset]:
         "`file:line`. Do not call work done while blocking gaps remain.\n"
         "- When unsure of project conventions, consult `.devcouncil/repo_map.json` and the "
         "applicable skills before writing code.\n"
+        f"- {ADVISOR_STEERING_NUDGE}\n"
         "- Be concise: report what changed, what was verified, and what is still blocking."
     )
     return [GeneratedAsset(root / ".claude" / "output-styles" / "devcouncil.md", build_frontmatter_markdown(meta, body))]

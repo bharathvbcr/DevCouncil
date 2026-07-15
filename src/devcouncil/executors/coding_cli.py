@@ -20,6 +20,14 @@ from devcouncil.app.config import DevCouncilConfig, load_config
 from devcouncil.utils.json_persist import read_json, write_json
 from devcouncil.execution.executor import Executor, ExecutionResult
 from devcouncil.execution.prompt_builder import PromptBuilder
+from devcouncil.executors.advisor_tool import (
+    advisor_steering_text,
+    advisor_user_cost_trim,
+    claude_supports_append_system_prompt,
+    decide_advisor_attach,
+    strip_duplicate_advisor_args,
+    warn_advisor_preflight,
+)
 from devcouncil.executors.agent_registry import (
     VALID_INPUT_MODES,
     CliAgentSpec,
@@ -76,6 +84,8 @@ class CodingCliExecutor(Executor):
         # native ~/.claude transcript for a headless run and resume it for repairs.
         self.last_agent_session_id: str | None = None
         self._pending_claude_session: tuple[Path, str] | None = None
+        # True when this run's argv includes ``--advisor`` (Claude only).
+        self._advisor_attached: bool = False
         self.stream_output = self._resolve_stream_output(stream_output)
 
     def _normalize_client(self, client: str) -> str:
@@ -137,11 +147,56 @@ class CodingCliExecutor(Executor):
         result = list(command)
         result = self._apply_permission_mode(result)
         result = self._apply_model_override(result)
+        result = self._apply_advisor(result)
         # NOTE: extra_args are NOT appended here. For argument/prompt-file CLIs the prompt
         # (and sometimes its flag, e.g. warp --prompt / aider --message) is appended last
         # by _invocation; appending extra_args at the tail here would slot them between the
         # prompt flag and its value. _invocation places them correctly instead.
         return result
+
+    def _apply_advisor(self, command: list[str]) -> list[str]:
+        """Attach ``--advisor`` for Claude when the profile opts in and pairing looks safe.
+
+        Soft-skips clear bad main/advisor pairs and non-Anthropic provider envs so Claude
+        does not hard-exit and burn the go-loop repair budget. Non-Claude clients ignore
+        ``advisor_model``.
+        """
+        self._advisor_attached = False
+        if self.client != "claude" or not self.profile:
+            return command
+        advisor = (self.profile.advisor_model or "").strip()
+        if not advisor:
+            return command
+        # Prefer profile env overrides, then process env, for provider soft-skip.
+        env_for_decision: dict[str, str] = {**os.environ}
+        if self.profile.env:
+            env_for_decision.update({str(k): str(v) for k, v in self.profile.env.items()})
+        decision, resolved, reason = decide_advisor_attach(
+            main_model=self.profile.model,
+            advisor_model=advisor,
+            env=env_for_decision,
+        )
+        if decision != "attach" or not resolved:
+            if reason:
+                logger.warning(
+                    "Skipping --advisor %s for profile %s: %s",
+                    advisor,
+                    self.profile_name,
+                    reason,
+                )
+                console.print(
+                    f"[yellow]Skipping --advisor {advisor}: {reason}. "
+                    "Run continues without the advisor tool.[/yellow]"
+                )
+            return command
+        result = list(command)
+        for index, part in enumerate(result):
+            if part == "--advisor" and index + 1 < len(result):
+                result[index + 1] = resolved
+                self._advisor_attached = True
+                return result
+        self._advisor_attached = True
+        return [*result, "--advisor", resolved]
 
     def _apply_model_override(self, command: list[str]) -> list[str]:
         model = (self.profile.model or "").strip() if self.profile else ""
@@ -350,11 +405,21 @@ class CodingCliExecutor(Executor):
         if prefix:
             prompt = f"{prefix}{prompt}"
         prompt = self._apply_profile_prompt(prompt)
+        # Claude-only advisor steering (not PromptBuilder — shared by all executors).
+        prompt, advisor_system = self._apply_advisor_steering(prompt, repair=bool(prefix))
         instruction_file = self.project_root / ".devcouncil" / f"{task.id}-{self.client}-task.md"
         instruction_file.parent.mkdir(parents=True, exist_ok=True)
         instruction_file.write_text(prompt, encoding="utf-8")
 
         env = self._build_env()
+        if self.client == "claude" and self._advisor_attached:
+            for warning in warn_advisor_preflight(
+                env=env,
+                main_model=self.profile.model if self.profile else None,
+                advisor_model=self.profile.advisor_model if self.profile else None,
+            ):
+                logger.warning("%s", warning)
+                console.print(f"[yellow]{warning}[/yellow]")
         log_prefix = f"{task.id}-{self.client}"
         run_id = str(uuid.uuid4())
         self.last_run_id = run_id
@@ -371,6 +436,8 @@ class CodingCliExecutor(Executor):
         started = time.monotonic()
         try:
             invocation, input_text = self._invocation(command, prompt, instruction_file)
+            if advisor_system:
+                invocation = self._inject_append_system_prompt(invocation, advisor_system, prompt)
             display_invocation = self._display_invocation(invocation, prompt)
             # Print the resolved command (placeholders like {prompt_file} already
             # substituted, prompt redacted) rather than the raw template.
@@ -1216,10 +1283,22 @@ class CodingCliExecutor(Executor):
                 btype = block.get("type")
                 if btype == "text" and str(block.get("text") or "").strip():
                     parts.append(str(block["text"]).strip())
-                elif btype == "tool_use":
+                elif btype in {"tool_use", "server_tool_use"}:
                     name = str(block.get("name") or "tool")
+                    if name == "advisor" or (
+                        btype == "server_tool_use" and "advisor" in name.lower()
+                    ):
+                        raw_input = block.get("input")
+                        tool_input: dict[Any, Any] = raw_input if isinstance(raw_input, dict) else {}
+                        model = str(
+                            tool_input.get("model")
+                            or block.get("model")
+                            or ""
+                        ).strip()
+                        parts.append(f"Advising{f' ({model})' if model else ''}")
+                        continue
                     raw_input = block.get("input")
-                    tool_input: dict[Any, Any] = raw_input if isinstance(raw_input, dict) else {}
+                    tool_input = raw_input if isinstance(raw_input, dict) else {}
                     target = tool_input.get("file_path") or tool_input.get("path") or tool_input.get("command") or ""
                     parts.append(f"→ {name} {str(target)[:80]}".rstrip())
             text = "\n".join(p for p in parts if p)
@@ -1247,6 +1326,9 @@ class CodingCliExecutor(Executor):
             for part in command
         ]
         extra = list(self.profile.extra_args) if (self.profile and self.profile.extra_args) else []
+        # Avoid a second --advisor when DevCouncil already attached one from advisor_model.
+        if self._advisor_attached and extra:
+            extra = strip_duplicate_advisor_args(extra)
 
         def _place(base: list[str]) -> list[str]:
             """Insert profile extra_args after the base flags but before a trailing prompt
@@ -1277,6 +1359,30 @@ class CodingCliExecutor(Executor):
     def _display_invocation(self, invocation: list[str], prompt: str) -> list[str]:
         return [part.replace(prompt, "<task prompt>") for part in invocation]
 
+    @staticmethod
+    def _inject_append_system_prompt(
+        invocation: list[str], system_prompt: str, user_prompt: str
+    ) -> list[str]:
+        """Insert ``--append-system-prompt`` without splitting a trailing prompt value."""
+        if invocation and invocation[-1] == user_prompt:
+            return [*invocation[:-1], "--append-system-prompt", system_prompt, user_prompt]
+        return [*invocation, "--append-system-prompt", system_prompt]
+
+    def _apply_advisor_steering(self, prompt: str, *, repair: bool) -> tuple[str, str | None]:
+        """Claude-only advisor steering. Prefer ``--append-system-prompt``; else prompt prefix.
+
+        Injects steering **only** when ``--advisor`` actually attached. Soft-skipped and
+        non-Claude clients get no nudge. Returns ``(prompt, append_system_or_none)``.
+        """
+        if self.client != "claude" or not self.profile or not self._advisor_attached:
+            return prompt, None
+        steer = advisor_steering_text(repair=repair)
+        cost_trim = advisor_user_cost_trim()
+        # Prefer system append when the flag is available; keep soft cost trim in user prompt.
+        if claude_supports_append_system_prompt():
+            return f"{cost_trim}\n\n{prompt}", steer
+        return f"# DevCouncil Advisor\n{steer}\n\n{cost_trim}\n\n{prompt}", None
+
     def _apply_profile_prompt(self, prompt: str) -> str:
         if not self.profile:
             return prompt
@@ -1293,11 +1399,18 @@ class CodingCliExecutor(Executor):
         """Resolved per-profile CLI overrides recorded in the manifest so a
         supervisor can see exactly how the profile constrained the invocation."""
         if not self.profile:
-            return {"extra_args": [], "permission_mode": None, "model": None, "env_keys": []}
+            return {
+                "extra_args": [],
+                "permission_mode": None,
+                "model": None,
+                "advisor_model": None,
+                "env_keys": [],
+            }
         return {
             "extra_args": list(self.profile.extra_args or []),
             "permission_mode": self.profile.permission_mode,
             "model": self.profile.model,
+            "advisor_model": self.profile.advisor_model,
             # KEY NAMES only — profile env values may carry provider tokens and must
             # never land in the manifest.
             "env_keys": sorted((self.profile.env or {}).keys()),

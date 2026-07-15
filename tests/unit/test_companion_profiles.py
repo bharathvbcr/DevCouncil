@@ -132,6 +132,7 @@ def test_profile_override_summary_in_manifest(tmp_path):
         "extra_args": ["--foo"],
         "permission_mode": "gated",
         "model": "claude-opus-4",
+        "advisor_model": None,
         "env_keys": ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"],
     }
     # The manifest summary must never leak env VALUES (tokens/keys).

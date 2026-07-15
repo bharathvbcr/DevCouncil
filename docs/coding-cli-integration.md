@@ -254,6 +254,39 @@ Use `--scope local`, `--scope project`, or `--scope user` to choose where Claude
 - **Skills** — the applicable engineering skills scaffolded into `.claude/skills/`.
 - **Statusline + permissions** — a `statusLine` showing phase/tasks/gaps and an allow-list for the read-only `dev` commands the slash commands shell out to, merged into `.claude/settings.local.json` (existing keys are preserved).
 
+#### Anthropic advisor tool
+
+Claude Code can pair a faster main model with a stronger **advisor** that Claude consults
+mid-task (server-side Anthropic API tool — not live review, not the planning council, not
+`opusplan`). Requires Claude Code ≥ 2.1.98 (Fable main/advisor needs ≥ 2.1.170) and the
+Anthropic API. Soft pairing skips clear mismatches (haiku advisor, weaker family,
+fable+non-fable); Claude Code validates the full versioned matrix at launch. Recommended:
+`sonnet` + `opus`.
+
+**When not to use:** mechanical one-liners, pure orientation/lookup turns, or Bedrock /
+Vertex / Foundry Claude Code (advisor is Anthropic API only — DevCouncil soft-skips attach).
+
+```yaml
+# .devcouncil/config.yaml
+integrations:
+  cli_agents:
+    profiles:
+      default:
+        model: sonnet
+        advisor_model: opus
+```
+
+| Path | Enablement |
+|---|---|
+| `dev run/go/e2e --executor claude` | `--advisor` on every spawn, including `--resume` repairs |
+| `dev run --executor claude-sdk` | SDK `extra_args={"advisor": ...}` (not a settings dict) |
+| Interactive MCP hero loop | `advisorModel` merged into `.claude/settings.local.json` on integrate when the **default** profile sets a pairing-safe `advisor_model`; left alone when unset |
+
+Soft pairing preflight skips clear bad pairs so Claude does not hard-exit and burn repair
+budget. On repair/`--resume`, the correction manifest overrides prior session/advisor
+advice. Set `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1` to disable (Claude accepts `--advisor` /
+`advisorModel` but ignores them). See [hero-loop.md](hero-loop.md).
+
 #### Assist mode vs. the write-gate (important)
 
 By **default** `dev integrate claude --apply` installs *assist mode* — everything above **except** the blocking pre-action write-gate (`PreToolUse`/`PostToolUse`). That write-gate denies any `Bash`/`Write`/`Edit` not authorized by an active task **lease**, so in an interactive human session (where there is no lease) it would fail-closed and block every command. Assist mode keeps DevCouncil's assistance without locking down your own shell.
@@ -266,7 +299,9 @@ dev integrate claude --apply --write-gate     # alias: --contain
 
 You lose no containment by leaving it off: `dev run --executor claude` performs its own post-hoc scope enforcement (out-of-scope changes are reverted before verify), independent of this hook.
 
-Remove everything DevCouncil installed (hooks, statusline, MCP enablement, permission rules, and the generated commands/subagents/output style — your own settings are preserved):
+Remove everything DevCouncil installed (hooks, statusline, MCP enablement, permission rules,
+DevCouncil-written `advisorModel` when it matches the default profile, and the generated
+commands/subagents/output style — your own settings are preserved):
 
 ```bash
 dev integrate claude --uninstall      # or: dev integrate uninstall --target claude

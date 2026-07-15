@@ -55,7 +55,7 @@ def test_cli_cost_show_with_data(tmp_path, monkeypatch):
 
 
 def test_cli_cost_budget(tmp_path, monkeypatch):
-    root = _setup_cost_env(tmp_path, monkeypatch)
+    _setup_cost_env(tmp_path, monkeypatch)
     
     # Set budget
     res = runner.invoke(app, ["cost", "budget", "--set", "10.00"])

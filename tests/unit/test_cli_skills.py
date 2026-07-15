@@ -1,9 +1,7 @@
-from pathlib import Path
 from typer.testing import CliRunner
 
 from devcouncil.cli.main import app
-from devcouncil.skills import registry
-from devcouncil.skills.registry import Skill, SkillTriggers
+from devcouncil.skills.registry import Skill
 
 runner = CliRunner()
 

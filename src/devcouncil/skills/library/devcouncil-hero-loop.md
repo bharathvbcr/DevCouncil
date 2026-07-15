@@ -47,6 +47,9 @@ another task or wait for release.
 Stay inside the task's **planned files** and **allowed commands**. Do not expand scope
 silently — use `devcouncil_update_task_scope` only when the task genuinely requires it.
 
+When the advisor tool is available, consult it before committing to an approach, when
+stuck on a recurring error, and before declaring the task complete.
+
 ### 3. Verify
 
 ```

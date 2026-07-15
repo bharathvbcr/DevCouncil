@@ -76,12 +76,55 @@ def _record_claude_config(
     _mutate_raw_config(project_root, mutate)
 
 
+def _configured_advisor_model(project_root: Path) -> str | None:
+    """Return pairing-safe advisor_model from the **default** CLI profile, if any.
+
+    Interactive Claude settings use the default profile only (not an arbitrary
+    first-matching profile) so ``advisorModel`` matches the usual integrate path.
+    Soft-skips clear bad pairs the CLI would also skip.
+    """
+    try:
+        from devcouncil.executors.advisor_tool import advisor_pairing_ok
+        from devcouncil.executors.agent_registry import load_agent_profiles
+
+        profiles = load_agent_profiles(project_root)
+    except Exception:
+        return None
+    profile = profiles.get("default")
+    if profile is None:
+        return None
+    advisor = (getattr(profile, "advisor_model", None) or "").strip()
+    if not advisor:
+        return None
+    ok, _reason = advisor_pairing_ok(getattr(profile, "model", None), advisor)
+    if not ok:
+        return None
+    return advisor
+
+
+def _default_profile_advisor_raw(project_root: Path) -> str | None:
+    """Raw default-profile advisor_model (no pairing filter) for uninstall matching."""
+    try:
+        from devcouncil.executors.agent_registry import load_agent_profiles
+
+        profiles = load_agent_profiles(project_root)
+    except Exception:
+        return None
+    profile = profiles.get("default")
+    if profile is None:
+        return None
+    advisor = (getattr(profile, "advisor_model", None) or "").strip()
+    return advisor or None
+
+
 def _install_claude_settings(project_root: Path) -> tuple[Path, bool]:
     """Write the statusLine, MCP enablement, and permission allow-list into Claude settings.
 
     Merges into .claude/settings.local.json without clobbering existing user entries.
-    Returns (path, changed); only rewrites the file when the merge changes something so
-    re-running integration is a true no-op."""
+    When the default CLI profile configures a pairing-safe ``advisor_model``, merges
+    ``advisorModel``; when unset or soft-skipped, leaves any existing ``advisorModel``
+    alone. Returns (path, changed); only rewrites the file when the merge changes
+    something so re-running integration is a true no-op."""
     from devcouncil.integrations.claude_assets import claude_bash_permission_allow
 
     path = project_root / ".claude" / "settings.local.json"
@@ -107,6 +150,10 @@ def _install_claude_settings(project_root: Path) -> tuple[Path, bool]:
             for rule in claude_bash_permission_allow():
                 if rule not in allow:
                     allow.append(rule)
+
+    advisor = _configured_advisor_model(project_root)
+    if advisor:
+        settings["advisorModel"] = advisor
 
     changed = json.dumps(settings, sort_keys=True) != before
     if changed:
@@ -170,10 +217,11 @@ def _uninstall_claude(project_root: Path) -> list[str]:
     """Remove everything DevCouncil installed into a Claude Code project. Idempotent.
 
     Strips DevCouncil's hooks (every event), the DevCouncil statusLine, the MCP enablement
-    and permission rules from .claude/settings.local.json (leaving any user-authored
-    entries untouched), deletes the generated commands/subagents/output-style files, and
-    best-effort de-registers the MCP server via `claude mcp remove`. Returns a list of the
-    changes made. The recoverable, in-band counterpart to a fail-closed write-gate."""
+    and permission rules from .claude/settings.local.json, pops DevCouncil-written
+    ``advisorModel`` when it matches the default profile value, deletes the generated
+    commands/subagents/output-style files, and best-effort de-registers the MCP server
+    via `claude mcp remove`. Returns a list of the changes made. The recoverable,
+    in-band counterpart to a fail-closed write-gate."""
     removed: list[str] = []
     path = project_root / ".claude" / "settings.local.json"
     settings = _load_json(path)
@@ -234,6 +282,22 @@ def _uninstall_claude(project_root: Path) -> list[str]:
             permissions.pop("allow", None)
         if not permissions:
             settings.pop("permissions")
+
+    # Pop DevCouncil-written advisorModel when it matches the default profile value
+    # (pairing-safe or raw) that integrate would have written.
+    current_advisor = settings.get("advisorModel")
+    if isinstance(current_advisor, str) and current_advisor.strip():
+        candidates = {
+            value
+            for value in (
+                _configured_advisor_model(project_root),
+                _default_profile_advisor_raw(project_root),
+            )
+            if value
+        }
+        if current_advisor.strip() in candidates:
+            settings.pop("advisorModel", None)
+            removed.append("advisorModel")
 
     if json.dumps(settings, sort_keys=True) != before:
         if settings:

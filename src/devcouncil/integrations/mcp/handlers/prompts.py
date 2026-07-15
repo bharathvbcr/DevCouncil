@@ -8,6 +8,7 @@ from typing import NamedTuple
 from mcp.types import GetPromptResult, Prompt, PromptArgument, PromptMessage, TextContent
 
 from devcouncil.app.project_status import compute_phase
+from devcouncil.executors.advisor_tool import ADVISOR_STEERING_NUDGE
 from devcouncil.integrations.mcp.util import normalize_arguments
 from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import ArtifactGraphRepository, StateRepository
@@ -98,8 +99,9 @@ def render_prompt_text(name: str, arguments: dict, root: Path) -> str:
             f"2. Call `devcouncil_checkout_task` with that task_id and client_id='{client_id}' to acquire a lease.\n"
             "3. Read the task scope with `devcouncil_get_task` and `devcouncil_get_prompt`; inspect files with `devcouncil_read_file` and `devcouncil_get_diff`.\n"
             "4. Make changes ONLY through `devcouncil_write_file` / `devcouncil_apply_patch` (the policy gate rejects out-of-scope or protected paths) and run tests with `devcouncil_run_command`.\n"
-            "5. Call `devcouncil_verify_task`; if it reports blocking gaps, fix them and re-verify.\n"
-            "6. When verified, call `devcouncil_release_task` with the lease token.\n\n"
+            f"5. {ADVISOR_STEERING_NUDGE}\n"
+            "6. Call `devcouncil_verify_task`; if it reports blocking gaps, fix them and re-verify.\n"
+            "7. When verified, call `devcouncil_release_task` with the lease token.\n\n"
             "Never edit files outside the task scope. If a write is rejected, call `devcouncil_update_task_scope` only when the change is legitimately in-scope."
         )
     if name == "devcouncil_repair_task":
@@ -110,7 +112,8 @@ def render_prompt_text(name: str, arguments: dict, root: Path) -> str:
             "1. Call `devcouncil_get_gaps` (blocking_only=true) and `devcouncil_get_next_actions` for the task.\n"
             "2. Inspect the relevant files and evidence with `devcouncil_read_file` and `devcouncil_get_evidence`.\n"
             "3. Apply minimal fixes via `devcouncil_apply_patch` / `devcouncil_write_file`.\n"
-            "4. Re-run `devcouncil_verify_task` until no blocking gaps remain, then `devcouncil_release_task`."
+            f"4. {ADVISOR_STEERING_NUDGE}\n"
+            "5. Re-run `devcouncil_verify_task` until no blocking gaps remain, then `devcouncil_release_task`."
         )
     if name == "devcouncil_verify_task":
         task_id = arguments.get("task_id") or "(the active task)"

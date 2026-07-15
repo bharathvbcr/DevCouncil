@@ -5,7 +5,6 @@ from __future__ import annotations
 import sys
 import types
 
-import pytest
 
 from devcouncil.campaign.notify import NullNotifier, Notifier
 

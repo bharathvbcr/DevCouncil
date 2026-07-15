@@ -491,6 +491,7 @@ def _run_task_body(root, task_id, executor, profile, stream, db):
                 root,
                 active_task=task,
                 model=(sdk_profile.model if sdk_profile else None),
+                advisor_model=(sdk_profile.advisor_model if sdk_profile else None),
                 env=(dict(sdk_profile.env) if sdk_profile and sdk_profile.env else None),
             )
             exec_result = sdk_executor.run_task(task, reqs)

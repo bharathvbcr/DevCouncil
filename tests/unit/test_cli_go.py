@@ -1,13 +1,9 @@
-import asyncio
-import json
 from pathlib import Path
 import subprocess
 from typer.testing import CliRunner
 
 from devcouncil.cli.main import app
-from devcouncil.domain.task import Task
-from devcouncil.storage.db import Database, reset_db_cache
-from devcouncil.storage.repositories import TaskRepository
+from devcouncil.storage.db import reset_db_cache
 
 runner = CliRunner()
 

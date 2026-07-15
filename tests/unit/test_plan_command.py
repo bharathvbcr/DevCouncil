@@ -7,10 +7,8 @@ the approve command, planning-error rendering, and the small reconciliation/role
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 from typer.testing import CliRunner
 
 import devcouncil.cli.commands.plan as plan_cmd

@@ -165,6 +165,46 @@ automated executor run it:
 dev e2e "Describe the implementation goal" --executor claude
 ```
 
+## Anthropic advisor tool (Claude Code only)
+
+Pair a faster main model with a stronger advisor that Claude consults mid-task (planning,
+stuck loops, completion checks). This is **not** live review, the planning council, or
+`opusplan` — it is Anthropic's server-side advisor tool on Claude Code / the Anthropic API.
+
+**Requirements:** Claude Code ≥ 2.1.98 (Fable main/advisor needs ≥ 2.1.170), Anthropic API
+(not Bedrock/Vertex/Foundry), compatible main/advisor pairing. Recommended: `sonnet` main +
+`opus` advisor. DevCouncil soft-filters clear mismatches only; Claude Code validates the
+full versioned pairing matrix at launch.
+
+**When not to use:** skip advisor for mechanical one-line fixes, pure lookup/grep turns, or
+when you are on Bedrock/Vertex/Foundry (Claude Code ignores `--advisor` there — DevCouncil
+soft-skips attach). Prefer live review / verification for evidence gates, not the advisor.
+
+Enable via profile config:
+
+```yaml
+# .devcouncil/config.yaml
+integrations:
+  cli_agents:
+    profiles:
+      default:
+        model: sonnet
+        advisor_model: opus
+```
+
+| Path | How advisor enables |
+|---|---|
+| `dev run/go/e2e --executor claude` | `--advisor` on every spawn (including `--resume` repairs) |
+| `dev run --executor claude-sdk` | SDK `extra_args={"advisor": ...}` |
+| Interactive MCP hero loop | `advisorModel` written by `dev integrate claude` when the default profile sets a pairing-safe `advisor_model` |
+
+Repair/`--resume` runs treat the correction manifest as authoritative over prior session
+or prior advisor advice. Soft pairing preflight skips clearly bad pairs so Claude does
+not hard-exit and burn the repair budget. Set `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1` to
+disable the tool entirely (Claude still accepts `--advisor` / `advisorModel` but ignores them).
+
+See [coding-cli-integration.md](coding-cli-integration.md) for more detail.
+
 ## The lite on-ramp
 
 Before committing to the full planning council, you can taste the evidence gate on whatever

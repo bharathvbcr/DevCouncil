@@ -42,6 +42,7 @@ class ClaudeSdkExecutor(Executor):
         *,
         active_task: Task | None = None,
         model: str | None = None,
+        advisor_model: str | None = None,
         permission_mode: str = "default",
         env: dict[str, str] | None = None,
     ):
@@ -54,6 +55,7 @@ class ClaudeSdkExecutor(Executor):
         # why this can enforce interactively where the shell PreToolUse gate cannot).
         self.active_task = active_task
         self.model = model
+        self.advisor_model = (advisor_model or "").strip() or None
         self.permission_mode = permission_mode
         # Extra environment for the SDK's underlying Claude Code process. Lets a run
         # target an alternative Anthropic-compatible endpoint (ANTHROPIC_BASE_URL /
@@ -170,6 +172,10 @@ class ClaudeSdkExecutor(Executor):
         if prefix:
             prompt = f"{prefix}{prompt}"
 
+        # Claude-only advisor: resolve attach, build options (old SDKs may drop
+        # extra_args), then steer only when the advisor flag actually landed.
+        advisor_extra = self._resolved_advisor_extra_args()
+
         async def can_use_tool(tool_name: str, tool_input: dict[str, Any], *args: Any, **kwargs: Any):
             decision = self.permission_decision(tool_name, tool_input or {})
             if decision.allowed:
@@ -178,7 +184,23 @@ class ClaudeSdkExecutor(Executor):
             logger.info("claude-sdk gate denied %s: %s", tool_name, decision.reason)
             return self._deny(sdk, decision.reason)
 
-        options = self._build_options(sdk, can_use_tool)
+        options = self._build_options(sdk, can_use_tool, advisor_extra=advisor_extra)
+        if self._options_have_advisor(options, advisor_extra):
+            from devcouncil.executors.advisor_tool import (
+                advisor_steering_text,
+                advisor_user_cost_trim,
+                warn_advisor_preflight,
+            )
+
+            for warning in warn_advisor_preflight(
+                env=self.env or None,
+                main_model=self.model,
+                advisor_model=self.advisor_model,
+            ):
+                logger.warning("%s", warning)
+            nudge = advisor_steering_text(repair=bool(prefix))
+            cost_trim = advisor_user_cost_trim()
+            prompt = f"{nudge}\n\n{cost_trim}\n\n{prompt}"
         try:
             return await self._run_async_once(sdk, prompt, options, task)
         except Exception as exc:  # a mid-run SDK failure is a failed execution, not a crash
@@ -231,7 +253,41 @@ class ClaudeSdkExecutor(Executor):
         message = (result_text or "Claude Agent SDK run finished.") + suffix
         return ExecutionResult(success=not is_error, message=message)
 
-    def _build_options(self, sdk, can_use_tool):
+    def _resolved_advisor_extra_args(self) -> dict[str, str] | None:
+        """Build SDK ``extra_args={"advisor": ...}`` when pairing looks safe."""
+        if not self.advisor_model:
+            return None
+        from devcouncil.executors.advisor_tool import decide_advisor_attach
+
+        decision, resolved, reason = decide_advisor_attach(
+            main_model=self.model,
+            advisor_model=self.advisor_model,
+            env=self.env,
+        )
+        if decision != "attach" or not resolved:
+            if reason:
+                logger.warning(
+                    "Skipping SDK advisor %s: %s",
+                    self.advisor_model,
+                    reason,
+                )
+            return None
+        return {"advisor": resolved}
+
+    @staticmethod
+    def _options_have_advisor(options: Any, advisor_extra: dict[str, str] | None) -> bool:
+        """True when advisor was requested and survived into the SDK options object."""
+        if not advisor_extra:
+            return False
+        if isinstance(options, dict):
+            extra = options.get("extra_args") or {}
+        else:
+            extra = getattr(options, "extra_args", None) or {}
+        if not isinstance(extra, dict):
+            return False
+        return bool(extra.get("advisor"))
+
+    def _build_options(self, sdk, can_use_tool, *, advisor_extra: dict[str, str] | None = None):
         options_cls = getattr(sdk, "ClaudeAgentOptions", None)
         kwargs: dict[str, Any] = {
             "cwd": str(self.project_root),
@@ -242,6 +298,8 @@ class ClaudeSdkExecutor(Executor):
             kwargs["model"] = self.model
         if self.env:
             kwargs["env"] = dict(self.env)
+        if advisor_extra:
+            kwargs["extra_args"] = dict(advisor_extra)
         if options_cls is None:
             return kwargs
         # Only pass kwargs the SDK's options object actually accepts, so a version skew in
@@ -249,18 +307,35 @@ class ClaudeSdkExecutor(Executor):
         try:
             return options_cls(**kwargs)
         except TypeError:
-            # Progressively narrower kwarg sets: an SDK too old for ``env`` still gets
-            # cwd/permission_mode/model rather than losing all options.
+            # Progressively narrower kwarg sets: an SDK too old for ``env`` / ``extra_args``
+            # still gets cwd/permission_mode/model rather than losing all options.
             obj = None
-            for keys in ({"cwd", "permission_mode", "model", "env"}, {"cwd", "permission_mode", "model"}):
+            dropped_extra = bool(advisor_extra)
+            for keys in (
+                {"cwd", "permission_mode", "model", "env", "extra_args"},
+                {"cwd", "permission_mode", "model", "env"},
+                {"cwd", "permission_mode", "model"},
+            ):
                 safe = {k: v for k, v in kwargs.items() if k in keys}
                 try:
                     obj = options_cls(**safe)
+                    if dropped_extra and "extra_args" not in safe:
+                        logger.warning(
+                            "claude-agent-sdk ClaudeAgentOptions rejected extra_args; "
+                            "advisor_model=%r will not be applied. Upgrade claude-agent-sdk.",
+                            self.advisor_model,
+                        )
                     break
                 except TypeError:
                     continue
             if obj is None:
                 obj = options_cls()
+                if dropped_extra:
+                    logger.warning(
+                        "claude-agent-sdk ClaudeAgentOptions could not accept advisor "
+                        "extra_args; advisor_model=%r dropped.",
+                        self.advisor_model,
+                    )
             if hasattr(obj, "can_use_tool"):
                 obj.can_use_tool = can_use_tool
             return obj
