@@ -164,6 +164,20 @@ def test_pyproject_scripts_entry_clears(tmp_path):
     assert not any(g.file == "pkg/cli.py" and g.blocking for g in gaps)
 
 
+def test_hatch_custom_hook_registration_clears(tmp_path):
+    _write(tmp_path, {
+        "packages/grammars/pyproject.toml": (
+            "[tool.hatch.build.hooks.custom]\npath = \"hatch_build.py\"\n"
+        ),
+        "packages/grammars/hatch_build.py": (
+            "class CustomBuildHook:\n    marker = True\n"
+        ),
+    })
+    _commit(tmp_path)
+    gaps = _run(tmp_path, added_paths=["packages/grammars/hatch_build.py"])
+    assert not any(g.file == "packages/grammars/hatch_build.py" and g.blocking for g in gaps)
+
+
 def test_tsconfig_alias_import_clears(tmp_path):
     _write(tmp_path, {
         "tsconfig.json": (

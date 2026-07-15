@@ -57,6 +57,7 @@ def test_not_initialized_branches(tmp_path, monkeypatch):
     monkeypatch.setattr(ops, "_db", lambda root: None)
     root = tmp_path
     assert ops.verify_task_payload(root, task_id="T", lease_token="x")["code"] == "not_initialized"
+    assert ops.attach_committed_range_payload(root, task_id="T", lease_token="x", base="a")["code"] == "not_initialized"
     assert ops.update_task_scope_payload(root, task_id="T", lease_token="x")["code"] == "not_initialized"
     assert ops.append_evidence_payload(root, task_id="T", lease_token="x", command="c", summary="s")["code"] == "not_initialized"
     assert ops.get_evidence_payload(root, task_id="T")["code"] == "not_initialized"
@@ -65,6 +66,32 @@ def test_not_initialized_branches(tmp_path, monkeypatch):
     assert ops.next_task_payload(root)["code"] == "not_initialized"
     assert ops.run_command_payload(root, task_id="T", lease_token="x", command="echo hi")["code"] == "not_initialized"
     assert ops.handoff_agent_payload(root, task_id="T", lease_token="x", from_agent="a", to_agent="b")["code"] == "not_initialized"
+
+
+def test_attach_committed_range_sets_bounded_refs(tmp_path, monkeypatch):
+    _db, token = _setup(tmp_path)
+    updates: list[list[str]] = []
+
+    def fake_output(command, **_kwargs):
+        return "base-sha\n" if command[-1].startswith("base") else "head-sha\n"
+
+    def fake_run(command, **_kwargs):
+        updates.append(command)
+        return None
+
+    monkeypatch.setattr(ops.subprocess, "check_output", fake_output)
+    monkeypatch.setattr(ops.subprocess, "run", fake_run)
+    payload = ops.attach_committed_range_payload(
+        tmp_path, task_id="TASK-1", lease_token=token, base="base", head="head"
+    )
+
+    assert payload["ok"] is True
+    assert payload["range"] == "base-sha..head-sha"
+    assert [command[:2] for command in updates] == [
+        ["git", "merge-base"],
+        ["git", "update-ref"],
+        ["git", "update-ref"],
+    ]
 
 
 # --------------------------------------------------------------------------- #

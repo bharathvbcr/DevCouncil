@@ -7,6 +7,8 @@ from pathlib import Path
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 from packaging.tags import sys_tags
 
+__all__ = ["CustomBuildHook"]
+
 
 class CustomBuildHook(BuildHookInterface):
     def initialize(self, version: str, build_data: dict) -> None:

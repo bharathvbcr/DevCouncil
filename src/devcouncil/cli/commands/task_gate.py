@@ -8,6 +8,7 @@ from pathlib import Path
 import typer
 
 from devcouncil.execution.task_gate_ops import (
+    attach_committed_range_payload,
     append_evidence_payload,
     get_evidence_payload,
     handoff_agent_payload,
@@ -157,6 +158,35 @@ def run_cmd(
             raise typer.Exit(code=1)
         typer.echo(f"exit {payload.get('exit_code')}")
         log_step("run-cmd/complete", project_root=root, task_id=task_id, trace=True)
+
+
+def attach_committed_range(
+    task_id: str = typer.Argument(...),
+    lease_token: str = typer.Option(..., "--lease-token"),
+    base: str = typer.Option(..., "--base"),
+    head: str = typer.Option("HEAD", "--head"),
+    json_format: bool = typer.Option(False, "--json"),
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+) -> None:
+    """Associate post-commit verification with an existing commit range."""
+    root = project_root.expanduser().resolve()
+    set_log_dir(root)
+    payload = attach_committed_range_payload(
+        root,
+        task_id=task_id,
+        lease_token=lease_token,
+        base=base,
+        head=head,
+    )
+    if json_format:
+        typer.echo(dump_json(payload, indent=2))
+        if not payload.get("ok"):
+            raise typer.Exit(code=1)
+        return
+    if not payload.get("ok"):
+        typer.echo(payload.get("error", "committed range attachment failed"))
+        raise typer.Exit(code=1)
+    typer.echo(f"Attached {payload['range']} to {task_id}")
 
 
 def verify_leased(

@@ -94,10 +94,9 @@ def resolve_verify_context(
     verifier._command_timeout_cache = command_timeout
     changed_files = verifier.get_task_changed_files(task.id)
     diff_content = verifier.get_diff()
-    if not diff_content.strip():
-        committed_diff = verifier._committed_task_diff(task.id)
-        if committed_diff.strip():
-            diff_content = committed_diff
+    committed_diff = verifier._committed_task_diff(task.id)
+    if committed_diff.strip():
+        diff_content = committed_diff
     diff_empty = not bool(diff_content.strip())
     log_step(
         "verify/2: collected diff and changed files",

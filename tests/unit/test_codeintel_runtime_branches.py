@@ -1045,7 +1045,7 @@ def test_debug_module_entrypoints_and_broker_cleanup(
             assert poll_interval == 0.25
 
         def server_close(self):
-            pass
+            return None
 
     monkeypatch.setattr(broker, "BrokerServer", Server)
     monkeypatch.setattr(broker.secrets, "token_urlsafe", lambda _size: "token")
@@ -1473,7 +1473,7 @@ def test_mcp_codeintel_dispatch_all_handlers_and_errors(
 ) -> None:
     class Engine:
         def __init__(self, _root):
-            pass
+            return None
 
         def explore(self, query, limit):
             return {"operation": "explore", "query": query, "limit": limit}
@@ -1625,7 +1625,7 @@ def test_graph_cli_remaining_output_branches(
 
     class Engine:
         def __init__(self, _root):
-            pass
+            return None
 
         def explore(self, _query, limit):
             return {
@@ -1827,13 +1827,13 @@ def test_sync_observer_events_start_and_stop(
             scheduled.append(handler)
 
         def start(self):
-            pass
+            return None
 
         def stop(self):
-            pass
+            return None
 
         def join(self, timeout=None):
-            pass
+            return None
 
     monkeypatch.setattr("watchdog.observers.Observer", Observer)
     try:

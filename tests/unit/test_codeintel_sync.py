@@ -84,7 +84,7 @@ def test_watcher_polling_fallback_is_reported_separately(tmp_path: Path, monkeyp
         emitters: list[object] = []
 
         def __init__(self, **_kwargs):
-            pass
+            return None
 
         def schedule(self, *_args, **_kwargs):
             return None

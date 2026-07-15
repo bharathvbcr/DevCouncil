@@ -34,7 +34,8 @@ def _db(project_root: Path):
     from devcouncil.cli.commands.init import initialize_project
     from devcouncil.storage.db import get_db
 
-    initialize_project(project_root, quiet=True)
+    if not (project_root / ".devcouncil" / "state.sqlite").is_file():
+        initialize_project(project_root, quiet=True)
     return get_db(project_root)
 
 
@@ -125,6 +126,34 @@ def verify_task_payload(
             "difficulty": outcome.difficulty if outcome else None,
             "rigor_applied": list(outcome.rigor_applied) if outcome else [],
         }
+
+
+def attach_committed_range_payload(project_root: Path, *, task_id: str, lease_token: str, base: str, head: str = "HEAD") -> dict[str, Any]:
+    """Attach an existing committed range to a leased task's checkpoint refs."""
+    db = _db(project_root)
+    if not db:
+        return {"ok": False, "error": "DevCouncil state is unavailable in this directory.", "code": "not_initialized"}
+
+    with db.get_session() as session:
+        lease_error = require_valid_lease(session, task_id, lease_token)
+        if lease_error:
+            return lease_error
+        if not TaskRepository(session).get_by_id(task_id):
+            return {"ok": False, "error": f"Task {task_id} not found.", "code": "not_found", "task_id": task_id}
+
+    try:
+        base_sha = subprocess.check_output(["git", "rev-parse", "--verify", f"{base}^{{commit}}"], cwd=project_root, text=True, timeout=CLI_TIMEOUT_SECONDS).strip()
+        head_sha = subprocess.check_output(["git", "rev-parse", "--verify", f"{head}^{{commit}}"], cwd=project_root, text=True, timeout=CLI_TIMEOUT_SECONDS).strip()
+        subprocess.run(["git", "merge-base", "--is-ancestor", base_sha, head_sha], cwd=project_root, check=True, timeout=CLI_TIMEOUT_SECONDS)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return {"ok": False, "code": "invalid_commit_range", "error": "--base and --head must resolve to an ancestor commit range.", "task_id": task_id}
+    if base_sha == head_sha:
+        return {"ok": False, "code": "invalid_commit_range", "error": "--base must be a strict ancestor of --head.", "task_id": task_id}
+
+    refs = {"before": f"refs/devcouncil/tasks/{task_id}/before", "after": f"refs/devcouncil/tasks/{task_id}/after"}
+    subprocess.run(["git", "update-ref", refs["before"], base_sha], cwd=project_root, check=True, timeout=CLI_TIMEOUT_SECONDS)
+    subprocess.run(["git", "update-ref", refs["after"], head_sha], cwd=project_root, check=True, timeout=CLI_TIMEOUT_SECONDS)
+    return {"ok": True, "task_id": task_id, "base": base_sha, "head": head_sha, "range": f"{base_sha}..{head_sha}", "refs": refs}
 
 
 def update_task_scope_payload(

@@ -32,6 +32,9 @@ _IMPORTLIB_RE = re.compile(
     r"""(?:importlib(?:\.import_module)?|__import__)\s*\(\s*['"]([^'"]+)['"]"""
 )
 _DYNAMIC_IMPORT_RE = re.compile(r"""import\s*\(\s*['"]([^'"]+)['"]\s*\)""")
+_HATCH_CUSTOM_HOOK_RE = re.compile(
+    r"""(?ms)^\[tool\.hatch\.build\.hooks\.custom\]\s*$.*?^path\s*=\s*['"]([^'"]+)['"]"""
+)
 _CODE_CONFIG_SUFFIXES = {
     ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
     ".toml", ".json", ".yaml", ".yml", ".cfg", ".ini",
@@ -819,6 +822,10 @@ def build_dynamic_import_index(
                 spec = m.group(1)
                 if not spec.startswith("."):
                     specs.append(spec)
+            if path.suffix.lower() == ".toml":
+                for match in _HATCH_CUSTOM_HOOK_RE.finditer(text):
+                    hook_path = (Path(norm).parent / match.group(1)).with_suffix("")
+                    specs.append(hook_path.as_posix())
             for spec in specs:
                 for form in _module_forms(spec):
                     index.setdefault(form, set()).add(norm)
