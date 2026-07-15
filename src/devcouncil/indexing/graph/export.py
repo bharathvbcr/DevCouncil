@@ -58,7 +58,8 @@ def export_graphml(graph: CodeGraph) -> str:
     """GraphML with node/edge attributes (kind, confidence, area, community, dead)."""
     dead = _dead_ids(graph)
     unwired = set(graph.unwired_candidates)
-    unreachable = set(graph.unreachable_files)
+    unreliable = bool(graph.meta.get("liveness_unreachable_unreliable"))
+    unreachable = set() if unreliable else set(graph.unreachable_files)
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<graphml xmlns="http://graphml.graphdrawing.org/xmlns">',
@@ -148,7 +149,8 @@ def build_code_graph_okf(
     calls_of = _call_targets(graph)
     dead = _dead_ids(graph)
     unwired = set(graph.unwired_candidates)
-    unreachable = set(graph.unreachable_files)
+    unreliable = bool(graph.meta.get("liveness_unreachable_unreliable"))
+    unreachable = set() if unreliable else set(graph.unreachable_files)
 
     index_rel = "index.md"
     sub_links = "\n".join(

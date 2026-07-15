@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import weakref
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
 
+from devcouncil.codeintel.languages.registry import LANGUAGE_SPECS
 from devcouncil.indexing.graph.cache import (
     PARSE_CACHE_VERSION,
     extract_cached,
@@ -15,6 +17,7 @@ from devcouncil.indexing.graph.cache import (
 )
 from devcouncil.indexing.graph.extract_python import FileExtraction
 from devcouncil.indexing.graph.liveness import (
+    build_liveness_shard,
     file_liveness,
     legacy_dead_strings,
     symbol_reachability_dead,
@@ -35,11 +38,14 @@ from devcouncil.indexing.graph.schema import CodeGraph, SCHEMA_VERSION
 from devcouncil.utils.json_persist import read_json, write_model_json
 
 logger = logging.getLogger(__name__)
+_PENDING_ANALYSIS_SHARDS: dict[int, dict[str, dict[str, object]]] = {}
 
 GRAPH_REL = Path(".devcouncil") / "graph" / "code_graph.json"
 
 _CODE_SUFFIXES = {
-    ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".rs",
+    extension.lower()
+    for spec in LANGUAGE_SPECS
+    for extension in spec.extensions
 }
 
 
@@ -85,7 +91,7 @@ def _area_fn_for(root: Path, mapper: Optional[Any] = None):
     def _area(path: str) -> str:
         try:
             if mapper is not None:
-                return mapper._area_for_file(path)
+                return str(mapper._area_for_file(path))
             from devcouncil.indexing.repo_mapper import RepoMapper
 
             return RepoMapper(root)._area_for_file(path)
@@ -173,6 +179,29 @@ def extract_all(
     return extractions
 
 
+def extract_paths(
+    root: Path,
+    paths: Iterable[str],
+) -> Dict[str, FileExtraction]:
+    """Extract only existing changed paths and evict deleted cache entries."""
+    selected = {
+        path.replace("\\", "/")
+        for path in paths
+        if Path(path).suffix.lower() in _CODE_SUFFIXES
+    }
+    cache = load_parse_cache(root)
+    updates: Dict[str, dict] = {}
+    extractions: Dict[str, FileExtraction] = {}
+    for rel in sorted(selected):
+        if not (root / rel).is_file():
+            continue
+        extraction, entry = extract_cached(root, rel, cache=cache, force=True)
+        extractions[rel] = extraction
+        updates[rel] = entry
+    merge_parse_cache(root, updates, selected)
+    return extractions
+
+
 def assemble_graph(
     root: Path,
     files: List[str],
@@ -202,14 +231,30 @@ def assemble_graph(
         resolve_calls(extractions, symbol_index, file_edges, class_ids=class_ids)
     )
 
+    semantic_meta: Dict[str, Any] = {}
+    try:
+        from devcouncil.codeintel.resolution import enrich_semantic_edges
+
+        semantic_graph = CodeGraph(nodes=nodes, edges=edges)
+        enrich_semantic_edges(semantic_graph, root=root, extractions=extractions)
+        nodes = semantic_graph.nodes
+        edges = semantic_graph.edges
+        semantic_meta = semantic_graph.meta
+    except Exception:
+        logger.debug("semantic graph enrichment failed", exc_info=True)
+
     entry_roots: List[str] = []
     unwired: List[str] = []
     unreachable: List[str] = []
+    unreachable_unreliable = False
     dead_code = []
     if liveness:
-        entry_roots, unwired, unreachable = file_liveness(
+        entry_roots, unwired, unreachable, unreachable_unreliable = file_liveness(
             root, files, file_edges, cap=0
         )
+        # Empty prod roots → fail-soft empty unreachable (already); keep symbol
+        # reachability from treating every file as unreachable.
+        reach_unreachable = [] if unreachable_unreliable else unreachable
         token_dead, _idx, token_keys = _token_scan_dead(
             root, files, cap=0, lsp_refs=lsp_refs, mapper=mapper
         )
@@ -222,7 +267,7 @@ def assemble_graph(
             entry_roots,
             token_dead_keys=token_keys,
             file_edges=file_edges,
-            unreachable=unreachable,
+            unreachable=reach_unreachable,
         )
         # Uncapped in code_graph meta; repo_map.json applies _LIVENESS_CAP on write.
         legacy = legacy_dead_strings(dead_code, token_dead, cap=None)
@@ -246,6 +291,8 @@ def assemble_graph(
             "legacy_dead_symbol_candidates": legacy,
             "file_edge_count": len(file_edges),
             "token_dead_count": len(token_dead) if liveness else 0,
+            "liveness_unreachable_unreliable": unreachable_unreliable,
+            **semantic_meta,
         },
     )
     try:
@@ -276,7 +323,7 @@ def build_code_graph(
         files = mapper.get_git_files()
     changed = {p.replace("\\", "/") for p in changed_paths} if changed_paths else None
     extractions = extract_all(root, files, changed_paths=changed)
-    return assemble_graph(
+    graph = assemble_graph(
         root,
         files,
         extractions,
@@ -284,17 +331,71 @@ def build_code_graph(
         lsp_refs=lsp_refs,
         mapper=mapper,
     )
+    _PENDING_ANALYSIS_SHARDS[id(graph)] = {
+        path: build_liveness_shard(root, extraction)
+        for path, extraction in extractions.items()
+    }
+    weakref.finalize(graph, _PENDING_ANALYSIS_SHARDS.pop, id(graph), None)
+    return graph
 
 
-def write_code_graph(root: Path, graph: CodeGraph) -> Path:
+def write_code_graph(
+    root: Path,
+    graph: CodeGraph,
+    *,
+    changed_paths: Set[str] | None = None,
+    analysis_shards: dict[str, dict[str, object]] | None = None,
+) -> Path:
+    # SQLite is the canonical store. Keep the deterministic JSON artifact as a
+    # compatibility/export boundary for existing consumers and older clients.
+    from devcouncil.codeintel import get_codeintel_service
+
+    root = root.expanduser().resolve()
+    shards = analysis_shards or _PENDING_ANALYSIS_SHARDS.pop(id(graph), None)
+    get_codeintel_service(root).persist(
+        graph,
+        changed_paths=changed_paths,
+        analysis_shards=shards,
+    )
     path = graph_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_model_json(path, graph)
+    get_codeintel_service(root).store.record_compatibility_export(path, graph)
     return path
 
 
 def load_code_graph(root: Path) -> Optional[CodeGraph]:
+    from devcouncil.codeintel import get_codeintel_service
+
+    root = root.expanduser().resolve()
     path = graph_path(root)
+    service = get_codeintel_service(root)
+    # Compatibility clients may still replace the documented JSON artifact.
+    # The export handshake distinguishes an external replacement from our own
+    # post-commit JSON write without repeatedly parsing a large artifact.
+    try:
+        recorded_digest, recorded_mtime = service.store.compatibility_export_state()
+        if path.is_file() and path.stat().st_mtime_ns != recorded_mtime:
+            data = read_json(path)
+            exported = CodeGraph.model_validate(data)
+            from devcouncil.codeintel.store.sqlite import compatibility_graph_digest
+
+            if not service.store.exists() or compatibility_graph_digest(exported) != recorded_digest:
+                service.persist(exported)
+                service.store.record_compatibility_export(path, exported)
+                return exported
+            service.store.record_compatibility_export(path, exported)
+    except Exception:
+        logger.debug("Failed to import newer compatibility graph export", exc_info=True)
+    try:
+        graph = service.load()
+        if graph is not None:
+            return graph
+    except Exception:
+        # A corrupt/newer database must not strand users who still have the
+        # versioned JSON export. ``dev graph doctor`` reports the store failure;
+        # compatibility reads remain available until it is repaired/rebuilt.
+        logger.debug("Failed to load canonical code-intelligence store", exc_info=True)
     if not path.is_file():
         return None
     try:

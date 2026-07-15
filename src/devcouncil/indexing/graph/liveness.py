@@ -6,11 +6,18 @@ devcouncil: allow-unwired — package-private; reached only via graph.build / CL
 from __future__ import annotations
 
 import logging
+import re
 from collections import defaultdict
+from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, cast
 
-from devcouncil.indexing.graph.extract_python import FileExtraction
+from devcouncil.indexing.graph.extract_python import (
+    ExtractedCall,
+    ExtractedImport,
+    ExtractedSymbol,
+    FileExtraction,
+)
 from devcouncil.indexing.graph.schema import (
     Confidence,
     DeadCodeEntry,
@@ -37,11 +44,15 @@ def file_liveness(
     file_edges: List[Tuple[str, str]],
     *,
     cap: Optional[int] = None,
-) -> Tuple[List[str], List[str], List[str]]:
-    """Return (entry_roots, unwired, unreachable) using wiring.py conventions.
+) -> Tuple[List[str], List[str], List[str], bool]:
+    """Return (entry_roots, unwired, unreachable, unreachable_unreliable).
 
     ``cap`` defaults to uncapped (``None`` / ``<= 0``). Caps belong on
     ``repo_map.json`` serialization, not the in-memory / ``code_graph.json`` lists.
+
+    When production entry roots are empty, unreachable BFS would flood every
+    non-root file. Fail soft: ``unreachable=[]`` and
+    ``unreachable_unreliable=True`` (still compute unwired).
     """
     from devcouncil.indexing.wiring import (
         build_dynamic_import_index,
@@ -59,6 +70,7 @@ def file_liveness(
     root_set = set(roots)
     prod_root_set = set(prod_roots)
     dyn_index = build_dynamic_import_index(root, files)
+    unreachable_unreliable = not bool(prod_roots)
 
     inbound: Dict[str, Set[str]] = defaultdict(set)
     outbound: Dict[str, Set[str]] = defaultdict(set)
@@ -85,30 +97,31 @@ def file_liveness(
         if limit is not None and len(unwired) >= limit:
             break
 
-    reachable: Set[str] = set()
-    queue = list(prod_roots)
-    seen_q: Set[str] = set(queue)
-    while queue:
-        cur = queue.pop()
-        reachable.add(cur)
-        for nxt in outbound.get(cur, ()):
-            if nxt not in seen_q:
-                seen_q.add(nxt)
-                queue.append(nxt)
-
     unreachable: List[str] = []
-    for f in sorted(files):
-        if not is_liveness_code_file(f):
-            continue
-        if f in prod_root_set or f in root_set or structural_exemptions(f):
-            continue
-        if f in reachable:
-            continue
-        unreachable.append(f)
-        if limit is not None and len(unreachable) >= limit:
-            break
+    if not unreachable_unreliable:
+        reachable: Set[str] = set()
+        queue = list(prod_roots)
+        seen_q: Set[str] = set(queue)
+        while queue:
+            cur = queue.pop()
+            reachable.add(cur)
+            for nxt in outbound.get(cur, ()):
+                if nxt not in seen_q:
+                    seen_q.add(nxt)
+                    queue.append(nxt)
 
-    return prod_roots, unwired, unreachable
+        for f in sorted(files):
+            if not is_liveness_code_file(f):
+                continue
+            if f in prod_root_set or f in root_set or structural_exemptions(f):
+                continue
+            if f in reachable:
+                continue
+            unreachable.append(f)
+            if limit is not None and len(unreachable) >= limit:
+                break
+
+    return prod_roots, unwired, unreachable, unreachable_unreliable
 
 
 def _token_scan_dead(
@@ -125,8 +138,8 @@ def _token_scan_dead(
     """
     from devcouncil.indexing.repo_mapper import RepoMapper
 
-    m = mapper if mapper is not None else RepoMapper(root)
-    dead, index = m._dead_symbol_candidates(  # type: ignore[union-attr]
+    m = cast(RepoMapper, mapper) if mapper is not None else RepoMapper(root)
+    dead, index = m._dead_symbol_candidates(
         files, cap=cap if cap > 0 else 0, with_index=True, lsp_refs=lsp_refs
     )
     keys: Set[str] = set()
@@ -153,6 +166,125 @@ def _reference_index(
         for name in getattr(ext, "references", None) or ():
             index[name].add(path)
     return index
+
+
+def build_liveness_shard(root: Path, extraction: FileExtraction) -> dict[str, object]:
+    """Compact persisted reference shard used by one-file liveness updates."""
+    from devcouncil.indexing.wiring import strip_js_comments, strip_py_comments, strip_string_literals
+
+    try:
+        source = (root / extraction.path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        source = ""
+    cleaned = (
+        strip_py_comments(source)
+        if Path(extraction.path).suffix.lower() == ".py"
+        else strip_js_comments(source)
+    )
+    cleaned = strip_string_literals(cleaned)
+    token_lines: dict[str, list[int]] = defaultdict(list)
+    for lineno, line in enumerate(cleaned.splitlines(), 1):
+        for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", line):
+            if len(token) >= 2:
+                token_lines[token].append(lineno)
+    return {
+        "extraction": asdict(extraction),
+        "token_lines": dict(token_lines),
+        "allow_unwired": "devcouncil: allow-unwired" in source,
+    }
+
+
+def extraction_from_liveness_shard(shard: dict[str, object]) -> FileExtraction:
+    extraction = shard.get("extraction")
+    raw = dict(extraction) if isinstance(extraction, dict) else {}
+    return FileExtraction(
+        path=str(raw.get("path") or ""),
+        language=str(raw.get("language") or ""),
+        imports=list(raw.get("imports") or []),
+        import_details=[ExtractedImport(**row) for row in raw.get("import_details") or []],
+        symbols=[ExtractedSymbol(**row) for row in raw.get("symbols") or []],
+        calls=[ExtractedCall(**row) for row in raw.get("calls") or []],
+        all_exports=list(raw.get("all_exports") or []),
+        reexports=list(raw.get("reexports") or []),
+        references=list(raw.get("references") or []),
+    )
+
+
+def token_dead_from_shards(
+    nodes: List[GraphNode],
+    shards: dict[str, dict[str, object]],
+) -> Tuple[List[str], List[str], Set[str]]:
+    """Compute token agreement from persisted per-file token occurrence shards."""
+    token_files: Dict[str, Set[str]] = defaultdict(set)
+    token_lines: Dict[str, Dict[str, Set[int]]] = defaultdict(lambda: defaultdict(set))
+    for path, shard in shards.items():
+        raw_token_lines = shard.get("token_lines")
+        rows = raw_token_lines if isinstance(raw_token_lines, dict) else {}
+        for name, lines in rows.items():
+            token_files[str(name)].add(path)
+            if isinstance(lines, list):
+                token_lines[str(name)][path].update(int(line) for line in lines)
+    definitions = [
+        node for node in nodes
+        if node.kind in {NodeKind.FUNCTION, NodeKind.CLASS}
+        and "." not in str(node.extras.get("qualname") or node.name)
+    ]
+    dead: List[str] = []
+    keys: Set[str] = set()
+    for node in definitions:
+        refs = token_files.get(node.name, set())
+        same_lines = token_lines.get(node.name, {}).get(node.path, set())
+        if refs - {node.path} or any(
+            line < node.line or line > node.end_line for line in same_lines
+        ):
+            continue
+        dead.append(f"{node.path}:{node.line} {node.name}")
+        keys.add(f"{node.path}::{node.name}")
+    return dead, sorted(f"{node.path}::{node.name}" for node in definitions), keys
+
+
+def file_liveness_from_shards(
+    files: List[str],
+    file_edges: List[Tuple[str, str]],
+    shards: dict[str, dict[str, object]],
+    *,
+    entry_roots: List[str],
+) -> Tuple[List[str], List[str], List[str], bool]:
+    """Recompute file reachability from persisted adjacency without source scans."""
+    from devcouncil.indexing.wiring import is_liveness_code_file, is_test_path, structural_exemptions
+
+    roots = [path for path in entry_roots if path in set(files)]
+    unreliable = not bool(roots)
+    root_set = set(roots)
+    inbound: Dict[str, Set[str]] = defaultdict(set)
+    outbound: Dict[str, Set[str]] = defaultdict(set)
+    for importer, imported in file_edges:
+        inbound[imported].add(importer)
+        outbound[importer].add(imported)
+    unwired = [
+        path for path in sorted(files)
+        if is_liveness_code_file(path)
+        and path not in root_set
+        and not structural_exemptions(path)
+        and not bool(shards.get(path, {}).get("allow_unwired"))
+        and not {item for item in inbound.get(path, ()) if not is_test_path(item)}
+    ]
+    reachable: Set[str] = set()
+    queue = list(roots)
+    while queue:
+        path = queue.pop()
+        if path in reachable:
+            continue
+        reachable.add(path)
+        queue.extend(outbound.get(path, ()))
+    unreachable = [] if unreliable else [
+        path for path in sorted(files)
+        if is_liveness_code_file(path)
+        and path not in root_set
+        and not structural_exemptions(path)
+        and path not in reachable
+    ]
+    return roots, unwired, unreachable, unreliable
 
 
 def _resolve_reexport_targets(
@@ -205,14 +337,13 @@ def _resolve_reexport_targets(
     return protected
 
 
-# Framework / observer entry methods that are invoked by name outside the repo.
-_FRAMEWORK_CALLBACK_NAMES = frozenset({
-    "on_any_event",
-    "on_created",
-    "on_modified",
-    "on_deleted",
-    "on_moved",
-    "on_closed",
+# Framework targets are live only through a reachable registration owner.
+_FRAMEWORK_LIVENESS_EDGE_KINDS = frozenset({
+    "registers",
+    "routes_to",
+    "listens",
+    "provides",
+    "reflects_to",
 })
 
 
@@ -274,10 +405,6 @@ def _live_seeds(
         if is_wiring_decorated(decs):
             live.add(node.id)
             continue
-        # Watchdog / observer callbacks invoked by the framework, not by us.
-        if node.kind == NodeKind.METHOD and node.name in _FRAMEWORK_CALLBACK_NAMES:
-            live.add(node.id)
-
     # Test-referenced: inbound call/named-import from a test file seeds live
     for e in edges:
         if e.kind not in {"calls", "imports"}:
@@ -352,6 +479,7 @@ def symbol_reachability_dead(
     token_dead_keys: Optional[Set[str]] = None,
     file_edges: Optional[List[Tuple[str, str]]] = None,
     unreachable: Optional[List[str]] = None,
+    dynamic_index: Optional[dict[str, Set[str]]] = None,
 ) -> List[DeadCodeEntry]:
     """Symbol-level dead code with fixed-point live propagation and confidence tiers.
 
@@ -381,7 +509,11 @@ def symbol_reachability_dead(
 
     protected = _resolve_reexport_targets(extractions, file_edges)
     ref_index = _reference_index(extractions)
-    dyn_index = build_dynamic_import_index(root, files)
+    dyn_index = (
+        build_dynamic_import_index(root, files)
+        if dynamic_index is None
+        else dynamic_index
+    )
     getattr_names = {
         k[len(GETATTR_INDEX_PREFIX) :]
         for k in dyn_index
@@ -396,7 +528,15 @@ def symbol_reachability_dead(
     inbound_live_edges: Dict[str, List[GraphEdge]] = defaultdict(list)
     overrides_of: Dict[str, List[str]] = defaultdict(list)  # child -> parent method ids
     for e in edges:
-        if e.kind in {"calls", "imports"}:
+        if e.kind in {"calls", "imports"} | _FRAMEWORK_LIVENESS_EDGE_KINDS:
+            if e.kind in _FRAMEWORK_LIVENESS_EDGE_KINDS:
+                confidence = (
+                    e.confidence.value
+                    if hasattr(e.confidence, "value")
+                    else str(e.confidence)
+                )
+                if confidence == Confidence.AMBIGUOUS.value:
+                    continue
             # Ignore file→file imports for symbol liveness; named imports target symbols
             if e.kind == "imports" and "::" not in e.target:
                 continue

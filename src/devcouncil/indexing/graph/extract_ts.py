@@ -75,7 +75,8 @@ _RUST_TRAIT_RE = re.compile(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?trait\s+([A-Za-z_
 _RUST_USE_RE = re.compile(r"(?m)^\s*(?:pub\s+)?use\s+([^;]+);")
 _RUST_MOD_RE = re.compile(r"(?m)^\s*(?:pub\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;")
 _RUST_CALL_RE = re.compile(
-    r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*\("
+    r"\b([A-Za-z_][A-Za-z0-9_]*)\s*::\s*([A-Za-z_][A-Za-z0-9_]*)\s*\("
+    r"|\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*\("
     r"|\b([A-Za-z_][A-Za-z0-9_]*)\s*\("
 )
 _RUST_RATIONALE_RE = re.compile(
@@ -417,7 +418,9 @@ def _extract_js_calls(root, source: bytes) -> List[ExtractedCall]:
                 continue
             calls.append(ExtractedCall(name=name, line=line, qualname_hint=name))
         elif func.type == "member_expression":
-            prop = _first_child(func, {"property_identifier", "identifier"})
+            prop = _first_child(func, {"property_identifier"}) or _first_child(
+                func, {"identifier"}
+            )
             if prop is None:
                 continue
             name = _node_text(prop, source)
@@ -991,12 +994,35 @@ def _extract_rust_tree_sitter(path: str, source: str) -> Optional[FileExtraction
                 continue
             out.calls.append(ExtractedCall(name=name, line=line, qualname_hint=name))
         elif func.type == "field_expression":
-            field = _first_child(func, {"field_identifier", "identifier"})
+            field = _first_child(func, {"field_identifier"}) or _first_child(
+                func, {"identifier"}
+            )
             if field is None:
                 continue
             name = _node_text(field, raw)
             recv = func.children[0] if func.children else None
             receiver = _node_text(recv, raw) if recv is not None else ""
+            out.calls.append(
+                ExtractedCall(
+                    name=name,
+                    line=line,
+                    receiver=receiver,
+                    qualname_hint=f"{receiver}.{name}" if receiver else name,
+                )
+            )
+        elif func.type in {"scoped_identifier", "scoped_type_identifier"}:
+            # Type::method / path::func
+            name_node = _first_child(func, {"identifier"})
+            # Prefer the rightmost identifier as the called name
+            ids = [c for c in func.children if c.type in {"identifier", "type_identifier"}]
+            if not ids:
+                continue
+            name = _node_text(ids[-1], raw)
+            if name in _RUST_CALL_SKIP:
+                continue
+            receiver = _node_text(ids[-2], raw) if len(ids) >= 2 else ""
+            if not receiver and name_node is not None:
+                name = _node_text(name_node, raw)
             out.calls.append(
                 ExtractedCall(
                     name=name,
@@ -1039,6 +1065,7 @@ def _extract_rust_regex(path: str, source: str) -> FileExtraction:
             )
     for m in _RUST_CALL_RE.finditer(source):
         if m.group(1) and m.group(2):
+            # Type::method
             out.calls.append(
                 ExtractedCall(
                     name=m.group(2),
@@ -1047,8 +1074,17 @@ def _extract_rust_regex(path: str, source: str) -> FileExtraction:
                     qualname_hint=f"{m.group(1)}.{m.group(2)}",
                 )
             )
-        elif m.group(3):
-            name = m.group(3)
+        elif m.group(3) and m.group(4):
+            out.calls.append(
+                ExtractedCall(
+                    name=m.group(4),
+                    line=source[: m.start()].count("\n") + 1,
+                    receiver=m.group(3),
+                    qualname_hint=f"{m.group(3)}.{m.group(4)}",
+                )
+            )
+        elif m.group(5):
+            name = m.group(5)
             if name in _RUST_CALL_SKIP:
                 continue
             out.calls.append(
@@ -1104,4 +1140,6 @@ def extract_file(path: str, source: str) -> FileExtraction:
         return extract_go(path, source)
     if lower.endswith(".rs"):
         return extract_rust(path, source)
-    return FileExtraction(path=path, language="")
+    from devcouncil.codeintel.languages.generic_extractor import extract_generic
+
+    return extract_generic(path, source)

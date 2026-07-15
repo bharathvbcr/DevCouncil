@@ -16,6 +16,9 @@ SCHEMA_VERSION = 2
 
 class NodeKind(str, Enum):
     FILE = "file"
+    MODULE = "module"
+    NAMESPACE = "namespace"
+    PACKAGE = "package"
     FUNCTION = "function"
     CLASS = "class"
     METHOD = "method"
@@ -24,6 +27,14 @@ class NodeKind(str, Enum):
     STRUCT = "struct"
     ENUM = "enum"
     TRAIT = "trait"
+    PROPERTY = "property"
+    VARIABLE = "variable"
+    ROUTE = "route"
+    EVENT = "event"
+    STATE = "state"
+    PROVIDER = "provider"
+    COMPONENT = "component"
+    DYNAMIC = "dynamic"
     RATIONALE = "rationale"
 
 

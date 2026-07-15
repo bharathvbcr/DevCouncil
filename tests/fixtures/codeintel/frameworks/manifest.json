@@ -1,0 +1,32 @@
+{
+  "routing": [
+    {"framework": "decorator", "source": "@app.get('/decorator')"},
+    {"framework": "django", "source": "path('/django', handler)"},
+    {"framework": "spring", "source": "@GetMapping('/spring')"},
+    {"framework": "nest", "source": "@Get('/nest')"},
+    {"framework": "aspnet", "source": "app.MapGet('/aspnet', handler)"},
+    {"framework": "laravel", "source": "Route::get('/laravel', handler);"},
+    {"framework": "router", "source": "router.GET('/router', handler)"},
+    {"framework": "rails", "source": "get '/rails', handler"},
+    {"framework": "axum", "source": ".route('/axum', get(handler))"},
+    {"framework": "play", "source": "GET /play handler"},
+    {"framework": "react-router", "source": "<Route path='/react' component={handler} />"},
+    {"framework": "vue-router", "source": "{ path: '/vue', component: handler }"},
+    {"framework": "drupal", "source": "path: '/drupal'"}
+  ],
+  "dependency-injection": [
+    {"framework": "python-di", "source": "Depends(Service)"},
+    {"framework": "jvm-di", "source": "Provides(Service)"},
+    {"framework": "dotnet-di", "source": "services.AddSingleton<IService, Service>()"},
+    {"framework": "container-di", "source": "container.bind(Service)"},
+    {"framework": "wire-di", "source": "wire.Build(Service)"},
+    {"framework": "fx-di", "source": "fx.Provide(Service)"}
+  ],
+  "event": [
+    {"framework": "node-event-emitter", "source": "bus.emit('ready')"},
+    {"framework": "react-native-event-emitter", "source": "bus.sendEventWithName('ready')"},
+    {"framework": "node-event-listener", "source": "bus.on('ready', handler)"},
+    {"framework": "dom-event-listener", "source": "node.addEventListener('ready', handler)"},
+    {"framework": "watchdog-observer", "source": "observer.schedule(handler, '/tmp')"}
+  ]
+}

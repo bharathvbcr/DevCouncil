@@ -45,6 +45,32 @@ def _lang_family(path: str) -> str:
     return suffix or "other"
 
 
+def _same_package_dir(path: str) -> str:
+    """Parent directory used as same-package / sibling-module scope."""
+    return str(Path(path).parent).replace("\\", "/")
+
+
+def _method_name_hits(
+    by_name: Dict[str, List[Tuple[str, str, str]]],
+    name: str,
+    *,
+    caller_fam: str,
+    path_filter: Optional[Set[str]] = None,
+) -> List[Tuple[str, str, str]]:
+    """Symbols whose qualname is ``*.{name}`` (methods), same language family."""
+    suffix = f".{name}"
+    out: List[Tuple[str, str, str]] = []
+    for p, q, i in by_name.get(name, []):
+        if _lang_family(p) != caller_fam:
+            continue
+        if "." not in q or not q.endswith(suffix):
+            continue
+        if path_filter is not None and p not in path_filter:
+            continue
+        out.append((p, q, i))
+    return out
+
+
 def module_suffix_index(py_files: List[str]) -> Dict[str, str]:
     """Map every dotted suffix of each module path to its file (pure).
 
@@ -150,7 +176,7 @@ def resolve_import_edges(
     # --- JS/TS ---
     js_files = [f for f in files if _is_js_path(f)]
     if js_files:
-        mapper._last_file_set = file_set  # type: ignore[attr-defined]
+        mapper._last_file_set = file_set
         for rel in js_files:
             ext = extractions.get(rel)
             specs = list(ext.imports) if ext else []
@@ -168,8 +194,8 @@ def resolve_import_edges(
     # --- Go (specs from extractions + same-package co-membership) ---
     go_files = [f for f in files if f.endswith(".go")]
     if go_files:
-        module = mapper._go_module_prefix(file_set)
-        if module:
+        go_module = mapper._go_module_prefix(file_set)
+        if go_module:
             pkg_files: Dict[str, List[str]] = defaultdict(list)
             for f in go_files:
                 if f.endswith("_test.go"):
@@ -187,9 +213,9 @@ def resolve_import_edges(
                 ext = extractions.get(rel)
                 specs = list(ext.imports) if ext else []
                 for spec in specs:
-                    if spec != module and not spec.startswith(module + "/"):
+                    if spec != go_module and not spec.startswith(go_module + "/"):
                         continue
-                    rel_pkg = spec[len(module) :].lstrip("/")
+                    rel_pkg = spec[len(go_module) :].lstrip("/")
                     target_dir = rel_pkg if rel_pkg else "."
                     for target in sorted(pkg_files.get(target_dir, ())):
                         if target != rel and (rel, target) not in seen:
@@ -252,6 +278,8 @@ def build_file_and_symbol_nodes(
                 "struct": NodeKind.STRUCT,
                 "enum": NodeKind.ENUM,
                 "trait": NodeKind.TRAIT,
+                "property": NodeKind.PROPERTY,
+                "variable": NodeKind.VARIABLE,
                 "rationale": NodeKind.RATIONALE,
             }.get(sym.kind, NodeKind.FUNCTION)
             extras = {
@@ -662,6 +690,52 @@ def resolve_calls(
                         confidence = Confidence.AMBIGUOUS
                         reason = f"attribute-call ambiguous ({len(pool)} candidates)"
                         ambig_candidates = [i for _p, _q, i in pool]
+
+            # 0b) Unique *.{name} method when receiver is a variable (not a type name).
+            # Prefer same-file, then same-package / imported (same language family).
+            if (
+                target_id is None
+                and not ambig_candidates
+                and call.receiver
+                and call.receiver not in ("self", "cls", "this")
+                and call.name
+            ):
+                caller_fam = _lang_family(path)
+                same_file = _method_name_hits(
+                    by_name, call.name, caller_fam=caller_fam, path_filter={path}
+                )
+                if len(same_file) == 1:
+                    target_id = same_file[0][2]
+                    confidence = Confidence.INFERRED
+                    reason = "unique same-file method"
+                elif len(same_file) > 1:
+                    confidence = Confidence.AMBIGUOUS
+                    reason = f"ambiguous same-file method ({len(same_file)} candidates)"
+                    ambig_candidates = [i for _p, _q, i in same_file]
+                else:
+                    pkg = _same_package_dir(path)
+                    imported = imports_of.get(path, set())
+                    scope = {
+                        p
+                        for p, q, _i in by_name.get(call.name, [])
+                        if _lang_family(p) == caller_fam
+                        and "." in q
+                        and q.endswith(f".{call.name}")
+                        and (_same_package_dir(p) == pkg or p in imported)
+                    }
+                    scoped = _method_name_hits(
+                        by_name, call.name, caller_fam=caller_fam, path_filter=scope
+                    )
+                    if len(scoped) == 1:
+                        target_id = scoped[0][2]
+                        confidence = Confidence.INFERRED
+                        reason = "unique package/imported method"
+                    elif len(scoped) > 1:
+                        confidence = Confidence.AMBIGUOUS
+                        reason = (
+                            f"ambiguous package/imported method ({len(scoped)} candidates)"
+                        )
+                        ambig_candidates = [i for _p, _q, i in scoped]
 
             # 1) same-file exact qualname / name (``this`` covers TS/JS methods)
             if call.receiver in ("self", "cls", "this") and call.name:

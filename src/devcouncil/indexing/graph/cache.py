@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, cast
@@ -230,6 +231,24 @@ def extract_cached(
             "import_details": [],
         }
     digest = hashlib.sha256(raw).hexdigest()
+    grammar = _grammar_identity(path)
+    config_hash = f"parse-cache-v{PARSE_CACHE_VERSION}"
+    try:
+        from devcouncil.codeintel import get_codeintel_service
+
+        store = get_codeintel_service(root).store
+        payload = store.get_extraction(
+            content_hash=digest,
+            language=grammar[0],
+            grammar_version=grammar[1],
+            config_hash=config_hash,
+        )
+        if payload is not None and not force:
+            stored_entry = json.loads(payload.decode("utf-8"))
+            if isinstance(stored_entry, dict):
+                return extraction_from_cache_entry(path, stored_entry), stored_entry
+    except Exception:
+        logger.debug("SQLite extraction-cache read failed", exc_info=True)
     entry = cache.get(path)
     if (
         not force
@@ -243,4 +262,31 @@ def extract_cached(
     source = raw.decode("utf-8", errors="replace")
     ext = extract_file(path, source)
     fresh = extraction_to_cache_entry(ext, digest)
+    try:
+        from devcouncil.codeintel import get_codeintel_service
+
+        get_codeintel_service(root).store.put_extraction(
+            content_hash=digest,
+            language=grammar[0],
+            grammar_version=grammar[1],
+            config_hash=config_hash,
+            payload=json.dumps(fresh, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        )
+    except Exception:
+        logger.debug("SQLite extraction-cache write failed", exc_info=True)
     return ext, fresh
+
+
+def _grammar_identity(path: str) -> tuple[str, str]:
+    from devcouncil.codeintel.languages import detect_language
+
+    spec = detect_language(path)
+    language = spec.grammar if spec is not None else Path(path).suffix.lower().lstrip(".")
+    if language == "python":
+        return language, "stdlib-ast"
+    try:
+        import tree_sitter_language_pack as pack
+
+        return language, str(getattr(pack, "__version__", "unknown"))
+    except ImportError:
+        return language, "unavailable"

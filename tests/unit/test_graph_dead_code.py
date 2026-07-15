@@ -491,3 +491,248 @@ def test_js_bare_name_cannot_bind_python_symbol(tmp_path):
     assert not any(
         e.target == "pkg/bus.py::emit" and "app.js" in e.source for e in edges
     )
+
+
+def test_go_method_call_via_receiver_not_extracted_dead(tmp_path):
+    """s.Helper() should resolve to unique same-file method (not missing-call FP)."""
+    _write(tmp_path, {
+        "go.mod": "module example.com/app\n\ngo 1.21\n",
+        "main.go": (
+            "package main\n\n"
+            "type Svc struct{}\n\n"
+            "func (s *Svc) Helper() int { return 1 }\n\n"
+            "func main() {\n"
+            "\tvar s Svc\n"
+            "\t_ = s.Helper()\n"
+            "}\n"
+        ),
+    })
+    _commit(tmp_path)
+    graph = build_code_graph(tmp_path)
+    assert any(
+        e.kind == "calls" and "Helper" in e.target for e in graph.edges
+    ), [(e.source, e.target, e.reason) for e in graph.edges if e.kind == "calls"]
+    # Resolve gap would leave "no inbound call edges (method)" — must not.
+    assert not any(
+        d.kind == "method"
+        and "Helper" in d.id
+        and "no inbound call" in (d.reason or "")
+        for d in graph.dead_code
+    ), graph.dead_code
+    assert not any(
+        d.confidence == Confidence.EXTRACTED and "Helper" in d.id for d in graph.dead_code
+    )
+
+
+def test_rust_method_and_scoped_calls_not_extracted_dead(tmp_path):
+    """obj.foo() + T::f() should resolve (not missing-call / extracted-dead FPs)."""
+    _write(tmp_path, {
+        "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+        "src/main.rs": (
+            "struct T;\n\n"
+            "impl T {\n"
+            "    fn foo(&self) -> i32 { 1 }\n"
+            "    fn f() -> i32 { 2 }\n"
+            "}\n\n"
+            "fn main() {\n"
+            "    let obj = T;\n"
+            "    let _a = obj.foo();\n"
+            "    let _b = T::f();\n"
+            "}\n"
+        ),
+    })
+    _commit(tmp_path)
+    graph = build_code_graph(tmp_path)
+    call_tgts = [e.target for e in graph.edges if e.kind == "calls"]
+    assert any("foo" in t for t in call_tgts), call_tgts
+    assert any(t.endswith(".f") or t.endswith("::f") or ".f" in t for t in call_tgts), call_tgts
+    assert not any(
+        d.kind == "method"
+        and (d.id.endswith(".foo") or d.id.endswith(".f"))
+        and "no inbound call" in (d.reason or "")
+        for d in graph.dead_code
+    ), graph.dead_code
+    assert not any(
+        d.confidence == Confidence.EXTRACTED
+        and ("foo" in d.id or d.id.endswith(".f") or d.id.endswith("::f"))
+        for d in graph.dead_code
+    )
+
+
+def test_ts_svc_run_method_not_extracted_dead(tmp_path):
+    """svc.run() unique same-file method should stay live."""
+    _write(tmp_path, {
+        "package.json": '{"name":"app","main":"src/index.ts"}\n',
+        "src/index.ts": (
+            "class Svc {\n"
+            "  run(): number { return 1; }\n"
+            "  unused(): number { return 2; }\n"
+            "}\n"
+            "export function main() {\n"
+            "  const svc = new Svc();\n"
+            "  return svc.run();\n"
+            "}\n"
+        ),
+    })
+    _commit(tmp_path)
+    graph = build_code_graph(tmp_path)
+    assert not any(
+        d.kind == "method" and (d.id.endswith(".run") or "Svc.run" in d.id)
+        for d in graph.dead_code
+    ), graph.dead_code
+    unused = [d for d in graph.dead_code if "unused" in d.id]
+    assert unused, "unused method should still be detected dead"
+
+
+def test_framework_bindings_keep_route_event_and_di_targets_live(tmp_path):
+    """Resolved framework registrations are external liveness roots."""
+    _write(tmp_path, {
+        "package.json": '{"name":"app","main":"src/index.ts"}\n',
+        "src/index.ts": (
+            "function routeHandler() { return 1; }\n"
+            "function eventHandler() { return 2; }\n"
+            "class Service {}\n"
+            "function trulyUnused() { return 3; }\n"
+            "app.get('/items', routeHandler);\n"
+            "bus.on('ready', eventHandler);\n"
+            "container.bind(Service);\n"
+        ),
+    })
+    _commit(tmp_path)
+
+    graph = build_code_graph(tmp_path)
+
+    assert {"routes_to", "listens", "provides"} <= {
+        edge.kind for edge in graph.edges
+    }
+    dead_ids = {entry.id for entry in graph.dead_code}
+    assert not any(
+        name in dead_id
+        for name in ("routeHandler", "eventHandler", "Service")
+        for dead_id in dead_ids
+    )
+    assert any("trulyUnused" in dead_id for dead_id in dead_ids)
+
+
+def test_ambiguous_framework_binding_does_not_prove_target_live(tmp_path):
+    from devcouncil.indexing.graph.extract_python import extract_python
+    from devcouncil.indexing.graph.liveness import _live_seeds
+    from devcouncil.indexing.graph.schema import GraphEdge, GraphNode, NodeKind
+
+    source = "def handler():\n    return 1\n"
+    (tmp_path / "handler.py").write_text(source, encoding="utf-8")
+    extraction = extract_python("handler.py", source)
+    nodes = [
+        GraphNode(
+            id="handler.py::handler",
+            kind=NodeKind.FUNCTION,
+            path="handler.py",
+            name="handler",
+        ),
+        GraphNode(id="route::GET:/items", kind=NodeKind.ROUTE),
+    ]
+    ambiguous = GraphEdge(
+        source="route::GET:/items",
+        target="handler.py::handler",
+        kind="routes_to",
+        confidence=Confidence.AMBIGUOUS,
+    )
+
+    live = _live_seeds(
+        tmp_path,
+        ["handler.py"],
+        nodes,
+        [ambiguous],
+        {"handler.py": extraction},
+        set(),
+    )
+    assert "handler.py::handler" not in live
+
+    resolved = ambiguous.model_copy(update={"confidence": Confidence.INFERRED})
+    live = _live_seeds(
+        tmp_path,
+        ["handler.py"],
+        nodes,
+        [resolved],
+        {"handler.py": extraction},
+        set(),
+    )
+    assert "handler.py::handler" not in live
+
+
+def test_framework_registration_inside_dead_function_does_not_keep_target_live(
+    tmp_path,
+):
+    _write(tmp_path, {
+        "package.json": '{"name":"app","main":"src/index.ts"}\n',
+        "src/index.ts": (
+            "function configure() {\n"
+            "  app.get('/items', routeHandler);\n"
+            "}\n"
+            "function routeHandler() { return 1; }\n"
+            "export function main() { return 0; }\n"
+        ),
+    })
+    _commit(tmp_path)
+
+    graph = build_code_graph(tmp_path)
+
+    assert any(
+        edge.kind == "registers" and edge.source.endswith("::configure")
+        for edge in graph.edges
+    )
+    dead_ids = {entry.id for entry in graph.dead_code}
+    assert any(dead_id.endswith("::configure") for dead_id in dead_ids)
+    assert any(dead_id.endswith("::routeHandler") for dead_id in dead_ids)
+
+
+def test_watchdog_callbacks_require_reachable_registration_owner(tmp_path):
+    _write(tmp_path, {
+        "pyproject.toml": '[project]\nname="t"\nversion="0"\n[project.scripts]\ncli="pkg.main:main"\n',
+        "pkg/__init__.py": "",
+        "pkg/main.py": (
+            "class Handler:\n"
+            "    def on_created(self, event):\n"
+            "        return event\n"
+            "def configure():\n"
+            "    handler = Handler()\n"
+            "    observer.schedule(handler, '/tmp')\n"
+            "def main():\n"
+            "    return 0\n"
+        ),
+    })
+    _commit(tmp_path)
+
+    graph = build_code_graph(tmp_path)
+
+    assert any(
+        edge.kind == "registers" and edge.source.endswith("::configure")
+        for edge in graph.edges
+    )
+    assert any(entry.id.endswith("::configure") for entry in graph.dead_code)
+    assert any("on_created" in entry.id for entry in graph.dead_code)
+
+
+def test_reachable_watchdog_registration_keeps_callbacks_live(tmp_path):
+    _write(tmp_path, {
+        "pyproject.toml": '[project]\nname="t"\nversion="0"\n[project.scripts]\ncli="pkg.main:main"\n',
+        "pkg/__init__.py": "",
+        "pkg/main.py": (
+            "class Handler:\n"
+            "    def on_created(self, event):\n"
+            "        return event\n"
+            "handler = Handler()\n"
+            "observer.schedule(handler, '/tmp')\n"
+            "def main():\n"
+            "    return 0\n"
+        ),
+    })
+    _commit(tmp_path)
+
+    graph = build_code_graph(tmp_path)
+
+    assert any(
+        edge.kind == "listens" and "on_created" in edge.target
+        for edge in graph.edges
+    )
+    assert not any("on_created" in entry.id for entry in graph.dead_code)
