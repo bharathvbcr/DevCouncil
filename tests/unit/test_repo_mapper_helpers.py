@@ -7,6 +7,7 @@ freshness helpers directly, avoiding the expensive ``map_repo`` graph build.
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -251,9 +252,18 @@ def test_detect_test_commands_node(tmp_path):
 
 def test_build_dependents(mapper):
     edges = [("a.py", "b.py"), ("c.py", "b.py"), ("a.py", "d.py")]
-    deps = mapper.build_dependents(edges)
+    deps, totals = mapper.build_dependents(edges)
     assert sorted(deps["b.py"]) == ["a.py", "c.py"]
     assert deps["d.py"] == ["a.py"]
+    assert totals == {}
+
+
+def test_build_dependents_records_totals_when_truncated(mapper, monkeypatch):
+    monkeypatch.setattr(mapper, "_DEPENDENTS_MAX", 2)
+    edges = [(f"i{n}.py", "target.py") for n in range(5)]
+    deps, totals = mapper.build_dependents(edges)
+    assert deps["target.py"] == ["i0.py", "i1.py"]
+    assert totals["target.py"] == 5
 
 
 def test_files_fingerprint_stable(mapper):
@@ -555,6 +565,7 @@ def test_liveness_snapshot_small_repo(tmp_path):
         "unreachable_files",
         "dead_symbol_candidates",
         "symbol_index",
+        "liveness_unreachable_unreliable",
     }
     assert "pkg/orphan.py" in snap["unwired_candidates"]
     assert any("never_used" in s for s in snap["dead_symbol_candidates"])
@@ -685,9 +696,95 @@ def test_ripgrep_search_uses_ripgrep(mapper, monkeypatch):
         returncode = 0
         stdout = "auth/token.py\n"
 
-    monkeypatch.setattr(rm.subprocess, "run", lambda *a, **k: _Result())
+    seen = {}
+
+    def fake_run(cmd, **k):
+        seen["cmd"] = cmd
+        return _Result()
+
+    monkeypatch.setattr(rm.subprocess, "run", fake_run)
     hits = mapper._ripgrep_search("token", ["auth/token.py"])
     assert hits and hits[0]["path"] == "auth/token.py"
+    assert "-e" in seen["cmd"]
+    assert "token" in seen["cmd"]
+
+
+def test_ripgrep_search_ors_multiword_tokens(mapper, monkeypatch):
+    import devcouncil.indexing.repo_mapper as rm
+
+    class _Result:
+        returncode = 0
+        stdout = "src/devcouncil/indexing/graph/liveness.py\n"
+
+    seen = {}
+
+    def fake_run(cmd, **k):
+        seen["cmd"] = list(cmd)
+        return _Result()
+
+    monkeypatch.setattr(rm.subprocess, "run", fake_run)
+    files = ["src/devcouncil/indexing/graph/liveness.py", "README.md"]
+    hits = mapper._ripgrep_search("liveness_unreachable_unreliable file_liveness", files)
+    assert hits and hits[0]["path"].endswith("liveness.py")
+    # Each goal token passed as its own -e pattern (OR), not one spaced phrase.
+    assert seen["cmd"].count("-e") >= 2
+    assert "-F" in seen["cmd"]
+    assert "liveness_unreachable_unreliable" in seen["cmd"]
+    assert "file_liveness" in seen["cmd"]
+    assert "liveness_unreachable_unreliable file_liveness" not in seen["cmd"]
+
+
+def test_ripgrep_search_strips_call_punctuation(mapper, monkeypatch):
+    import devcouncil.indexing.repo_mapper as rm
+
+    class _Result:
+        returncode = 0
+        stdout = "src/devcouncil/indexing/graph/liveness.py\n"
+
+    seen = {}
+
+    def fake_run(cmd, **k):
+        seen["cmd"] = list(cmd)
+        return _Result()
+
+    monkeypatch.setattr(rm.subprocess, "run", fake_run)
+    files = ["src/devcouncil/indexing/graph/liveness.py"]
+    hits = mapper._ripgrep_search("file_liveness(", files)
+    assert hits
+    assert "file_liveness" in seen["cmd"]
+    assert "file_liveness(" not in seen["cmd"]
+
+
+def test_ripgrep_search_treats_rg_exit_1_as_no_match(mapper, monkeypatch):
+    import devcouncil.indexing.repo_mapper as rm
+
+    class _Result:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(rm.subprocess, "run", lambda *a, **k: _Result())
+    # Fall back to naive path match.
+    hits = mapper._ripgrep_search("token", ["auth/token.py", "other.py"])
+    assert any(h["path"] == "auth/token.py" for h in hits)
+
+
+def test_get_git_files_includes_unicode_paths(tmp_path):
+    """Non-ASCII paths must not be dropped via git C-quoting."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "café.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text('[project]\nname="u"\nversion="0"\n', encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "i"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    files = RepoMapper(tmp_path).get_git_files()
+    assert any(p.endswith("café.py") or "caf" in p for p in files)
+    assert not any(p.startswith('"') or "\\303" in p for p in files)
 
 
 def test_scan_dependency_risks_never_raises(mapper, monkeypatch):
@@ -1002,12 +1099,13 @@ def test_compute_liveness_respects_cap_and_lsp_flag(tmp_path, monkeypatch):
     (tmp_path / "orphan.py").write_text("x = 1\n", encoding="utf-8")
     m = RepoMapper(tmp_path)
     files = ["orphan.py"]
-    roots, unwired, unreachable, dead, index = m._compute_liveness(
+    roots, unwired, unreachable, dead, index, unreliable = m._compute_liveness(
         files, [], cap=1, lsp_refs=False
     )
     assert isinstance(roots, list)
     assert len(unwired) <= 1
     assert isinstance(index, list)
+    assert isinstance(unreliable, bool)
 
 
 def test_dead_symbol_candidates_lsp_and_decorator_skips(tmp_path, monkeypatch):
@@ -1069,7 +1167,7 @@ def test_get_git_files_skips_missing_worktree_entries(tmp_path, monkeypatch):
     m = RepoMapper(tmp_path)
 
     def fake_git_output(args, cwd=None, default=""):
-        return "present.py\ndeleted.py\n"
+        return "present.py\0deleted.py\0"
 
     monkeypatch.setattr("devcouncil.utils.proc.git_output", fake_git_output)
     files = m.get_git_files()

@@ -7,6 +7,10 @@ resolution-markers = [
 ]
 
 [manifest]
+members = [
+    "devcouncil",
+    "devcouncil-codeintel-grammars",
+]
 constraints = [
     { name = "cryptography", specifier = ">=48.0.1" },
     { name = "idna", specifier = ">=3.15" },
@@ -313,34 +317,34 @@ wheels = [
 
 [package.optional-dependencies]
 cudart = [
-    { name = "nvidia-cuda-runtime", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cuda-runtime" },
 ]
 cufft = [
-    { name = "nvidia-cufft", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cufft" },
 ]
 cufile = [
-    { name = "nvidia-cufile", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cufile" },
 ]
 cupti = [
-    { name = "nvidia-cuda-cupti", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cuda-cupti" },
 ]
 curand = [
-    { name = "nvidia-curand", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-curand" },
 ]
 cusolver = [
-    { name = "nvidia-cusolver", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cusolver" },
 ]
 cusparse = [
-    { name = "nvidia-cusparse", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cusparse" },
 ]
 nvjitlink = [
-    { name = "nvidia-nvjitlink", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-nvjitlink" },
 ]
 nvrtc = [
-    { name = "nvidia-cuda-nvrtc", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cuda-nvrtc" },
 ]
 nvtx = [
-    { name = "nvidia-nvtx", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-nvtx" },
 ]
 
 [[package]]
@@ -363,6 +367,11 @@ dependencies = [
     { name = "watchdog" },
 ]
 
+[package.optional-dependencies]
+codeintel-full = [
+    { name = "devcouncil-codeintel-grammars" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "coverage" },
@@ -382,6 +391,7 @@ semantic = [
 
 [package.metadata]
 requires-dist = [
+    { name = "devcouncil-codeintel-grammars", marker = "extra == 'codeintel-full'", editable = "packages/codeintel-grammars" },
     { name = "gepa", specifier = ">=0.1.1" },
     { name = "gitpython", specifier = ">=3.1.49" },
     { name = "httpx", specifier = ">=0.27.0" },
@@ -392,10 +402,11 @@ requires-dist = [
     { name = "rich", specifier = ">=13.7.1" },
     { name = "sqlmodel", specifier = ">=0.0.19" },
     { name = "tree-sitter", specifier = ">=0.23.0" },
-    { name = "tree-sitter-language-pack", specifier = ">=0.5.0" },
+    { name = "tree-sitter-language-pack", specifier = ">=1.12.5" },
     { name = "typer", specifier = ">=0.12.3" },
     { name = "watchdog", specifier = ">=4.0.0" },
 ]
+provides-extras = ["codeintel-full"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -413,6 +424,17 @@ semantic = [
     { name = "sentence-transformers", specifier = ">=3.0.0" },
     { name = "torch", specifier = ">=2.2.0" },
 ]
+
+[[package]]
+name = "devcouncil-codeintel-grammars"
+version = "0.3.1"
+source = { editable = "packages/codeintel-grammars" }
+dependencies = [
+    { name = "tree-sitter-language-pack" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "tree-sitter-language-pack", specifier = ">=1.12.5" }]
 
 [[package]]
 name = "faiss-cpu"

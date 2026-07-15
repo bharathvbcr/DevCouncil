@@ -65,11 +65,34 @@ def are_neighbors(area_a: str | None, area_b: str | None, data: Mapping | None) 
 
 
 def dependents_of(path: str, data: Mapping | None) -> list[str]:
-    """Files that import ``path`` (reverse-import blast radius), from the map."""
+    """Files that import ``path`` (reverse-import blast radius), from the map.
+
+    The list may be truncated by the mapper's ``_DEPENDENTS_MAX``; see
+    :func:`dependents_total_of` for the full importer count when truncated.
+    """
     dependents = (data or {}).get("dependents") or {}
     if not isinstance(dependents, dict):
         return []
     return [str(p) for p in (dependents.get(_norm(path)) or [])]
+
+
+def dependents_total_of(path: str, data: Mapping | None) -> int | None:
+    """Full importer count when ``dependents`` was truncated; else ``None``.
+
+    When this returns an int greater than ``len(dependents_of(...))``, the listed
+    dependents are a sample — not the complete blast radius.
+    """
+    totals = (data or {}).get("dependents_total") or {}
+    if not isinstance(totals, dict):
+        return None
+    raw = totals.get(_norm(path))
+    if raw is None:
+        return None
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
 
 
 def unwired_candidates_of(data: Mapping | None) -> list[str]:

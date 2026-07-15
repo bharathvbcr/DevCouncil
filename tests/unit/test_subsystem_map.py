@@ -50,6 +50,18 @@ def test_dependents_and_impact_targets():
     assert neighbors == ["src/ui", "src/storage"]
 
 
+def test_dependents_total_of_when_truncated():
+    from devcouncil.indexing.subsystem_map import dependents_total_of
+
+    data = {
+        "dependents": {"src/lib.py": ["a.py", "b.py"]},
+        "dependents_total": {"src/lib.py": 99},
+    }
+    assert dependents_total_of("src/lib.py", data) == 99
+    assert dependents_total_of("src/other.py", data) is None
+    assert dependents_total_of("src/lib.py", {}) is None
+
+
 def test_areas_touched_and_cross_boundary_pairs():
     paths = ["src/ui/a.py", "src/storage/b.py", "src/api/c.py"]
     assert areas_touched(paths, _MAP) == ["src/api", "src/storage", "src/ui"]

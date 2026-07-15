@@ -1,4 +1,3 @@
-from pathlib import Path
 from devcouncil.indexing.repo_mapper import RepoMapper
 
 def test_go_import_edges(tmp_path, monkeypatch):

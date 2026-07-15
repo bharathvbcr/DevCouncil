@@ -16,9 +16,15 @@ dependencies = [
     "gepa>=0.1.1",
     "watchdog>=4.0.0",
     "tree-sitter>=0.23.0",
-    "tree-sitter-language-pack>=0.5.0",
+    "tree-sitter-language-pack>=1.12.5",
     "networkx>=3.3",
 ]
+
+[project.optional-dependencies]
+# Platform wheel containing the complete, checksum-manifested Tree-sitter cache.
+# The core package remains useful with locally installed grammars; release builds
+# install this extra to guarantee the full code-intelligence language matrix.
+codeintel-full = ["devcouncil-codeintel-grammars==0.3.1"]
 
 [project.urls]
 Homepage = "https://github.com/bharathvbcr/DevCouncil"
@@ -62,6 +68,12 @@ constraint-dependencies = [
     "pydantic-settings>=2.14.2",
     "idna>=3.15",
 ]
+
+[tool.uv.workspace]
+members = ["packages/codeintel-grammars"]
+
+[tool.uv.sources]
+devcouncil-codeintel-grammars = { workspace = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

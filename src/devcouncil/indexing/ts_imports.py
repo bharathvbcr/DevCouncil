@@ -224,7 +224,7 @@ def _line_of(node) -> int:
 def _first_named(node, types: Sequence[str]) -> Optional[str]:
     for c in node.children:
         if c.type in types:
-            return c.text.decode("utf-8", errors="replace")
+            return str(c.text.decode("utf-8", errors="replace"))
     return None
 
 

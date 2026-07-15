@@ -13,8 +13,8 @@ from typing import Dict, List, Optional, Set, Tuple, cast
 from pydantic import BaseModel, Field
 
 from devcouncil.indexing.graph.cache import PARSE_CACHE_VERSION
+from devcouncil.indexing.graph.schema import CodeGraph
 from devcouncil.indexing.lsp import LspInspector
-from devcouncil.utils.json_persist import read_json
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,10 @@ class RepoMap(BaseModel):
     # file -> the files that import it (reverse import edges, capped per file). Lets a
     # prompt show the blast radius of changing a file without re-parsing the repo.
     dependents: Dict[str, List[str]] = Field(default_factory=dict)
+    # Full importer counts when ``dependents[path]`` was truncated by ``_DEPENDENTS_MAX``.
+    # Absent / empty when no path was truncated. Agents must treat listed dependents as a
+    # sample whenever ``dependents_total[path] > len(dependents[path])``.
+    dependents_total: Dict[str, int] = Field(default_factory=dict)
     # Freshness fingerprints captured at generation: the git HEAD the map was built from
     # and a hash of the tracked file set. Consumers compare against the current repo to
     # detect a stale map before trusting its structure.
@@ -74,6 +78,9 @@ class RepoMap(BaseModel):
     unwired_candidates: List[str] = Field(default_factory=list)
     unreachable_files: List[str] = Field(default_factory=list)
     dead_symbol_candidates: List[str] = Field(default_factory=list)
+    # True when production entry roots were empty — unreachable BFS was skipped
+    # (fail-soft) so unreachable_files is not meaningful.
+    liveness_unreachable_unreliable: bool = False
     # Top call-flow processes from the code graph (entry-root BFS), when available.
     processes: List[Dict[str, object]] = Field(default_factory=list)
 
@@ -90,6 +97,7 @@ class RepoMapper:
         # Import edges (importer -> imported), computed once per map_repo run and reused
         # by subsystem inference, important-file ranking, and the dependents index.
         self._edges: List[Tuple[str, str]] | None = None
+        self._last_code_graph: CodeGraph | None = None
         # Cache of config-file contents (package.json, pyproject.toml, ...) so framework
         # and test-command detection don't each re-read the same files from disk.
         self._config_file_cache: Dict[str, str] = {}
@@ -100,7 +108,7 @@ class RepoMapper:
             self._config_file_cache[name] = (self.project_root / name).read_text()
         return self._config_file_cache[name]
 
-    _DEPENDENTS_MAX = 12  # cap dependents listed per file to bound repo_map.json size
+    _DEPENDENTS_MAX = 48  # cap dependents listed per file to bound repo_map.json size
     _LIVENESS_CAP = 200  # cap on each liveness candidate list
 
     _LANGUAGE_BY_EXTENSION = {
@@ -144,6 +152,10 @@ class RepoMapper:
         "src/devcouncil/ui": "Dashboard and lightweight UI helpers",
         "src/devcouncil/utils": "Shared utilities and redaction helpers",
         "src/devcouncil/verification": "Verification gates and implementation review",
+        "src/devcouncil/campaign": "Multi-agent campaign orchestration and roles",
+        "src/devcouncil/knowledge": "Knowledge sources, OKF, and design docs",
+        "src/devcouncil/skills": "Skill registry and matching",
+        "src/devcouncil/optimization": "Prompt and skill optimization",
         "docs": "Repository documentation",
         "tests": "Automated tests",
         "scripts": "Maintenance and smoke-test scripts",
@@ -313,6 +325,37 @@ class RepoMapper:
                 "src/devcouncil/utils/redaction.py",
             ],
         ),
+        "src/devcouncil/campaign": (
+            "Multi-agent campaign orchestration, roles, mailbox, and watchers.",
+            [
+                "src/devcouncil/campaign/orchestrator.py",
+                "src/devcouncil/campaign/roles.py",
+                "src/devcouncil/campaign/mailbox.py",
+                "src/devcouncil/campaign/watcher.py",
+            ],
+        ),
+        "src/devcouncil/knowledge": (
+            "Knowledge sources, OKF bundles, design docs, and skill bridging.",
+            [
+                "src/devcouncil/knowledge/sources.py",
+                "src/devcouncil/knowledge/okf.py",
+                "src/devcouncil/knowledge/knowledge_select.py",
+                "src/devcouncil/knowledge/design.py",
+            ],
+        ),
+        "src/devcouncil/skills": (
+            "Skill registry and matching for agent capability selection.",
+            [
+                "src/devcouncil/skills/registry.py",
+            ],
+        ),
+        "src/devcouncil/optimization": (
+            "Prompt/skill optimization loops (GEPA, SkillOpt).",
+            [
+                "src/devcouncil/optimization/gepa_agent.py",
+                "src/devcouncil/optimization/skillopt.py",
+            ],
+        ),
     }
 
     _SUBSYSTEM_CRITICAL_MAX = 6
@@ -426,6 +469,27 @@ class RepoMapper:
             "src/devcouncil/executors",
             "src/devcouncil/llm",
         ],
+        "src/devcouncil/campaign": [
+            "src/devcouncil/cli",
+            "src/devcouncil/execution",
+            "src/devcouncil/llm",
+            "src/devcouncil/skills",
+        ],
+        "src/devcouncil/knowledge": [
+            "src/devcouncil/indexing",
+            "src/devcouncil/skills",
+            "src/devcouncil/cli",
+        ],
+        "src/devcouncil/skills": [
+            "src/devcouncil/knowledge",
+            "src/devcouncil/campaign",
+            "src/devcouncil/execution",
+        ],
+        "src/devcouncil/optimization": [
+            "src/devcouncil/skills",
+            "src/devcouncil/llm",
+            "src/devcouncil/campaign",
+        ],
     }
 
     _SUBSYSTEM_HANDOFFS: Dict[str, List[str]] = {
@@ -498,6 +562,24 @@ class RepoMapper:
         ],
         "src/devcouncil/ui": [
             "ui/dashboard.py -> live/summary.py",
+        ],
+        "src/devcouncil/campaign": [
+            "campaign/orchestrator.py -> campaign/mailbox.py",
+            "campaign/orchestrator.py -> execution/task_runner.py",
+            "campaign/roles.py -> skills/registry.py",
+        ],
+        "src/devcouncil/knowledge": [
+            "knowledge/okf.py -> indexing/graph/export.py",
+            "knowledge/sources.py -> skills/registry.py",
+            "knowledge/knowledge_select.py -> execution/prompt_builder.py",
+        ],
+        "src/devcouncil/skills": [
+            "skills/registry.py -> knowledge/sources.py",
+            "skills/registry.py -> campaign/roles.py",
+        ],
+        "src/devcouncil/optimization": [
+            "optimization/skillopt.py -> skills/registry.py",
+            "optimization/gepa_agent.py -> llm/router.py",
         ],
     }
 
@@ -620,6 +702,25 @@ class RepoMapper:
         ],
         "src/devcouncil/utils": [
             ("redaction", ["utils/redaction.py"]),
+        ],
+        "src/devcouncil/campaign": [
+            ("orchestration", ["campaign/orchestrator.py"]),
+            ("roles", ["campaign/roles.py"]),
+            ("mailbox", ["campaign/mailbox.py"]),
+            ("watch", ["campaign/watcher.py", "campaign/notify.py"]),
+        ],
+        "src/devcouncil/knowledge": [
+            ("sources", ["knowledge/sources.py"]),
+            ("okf", ["knowledge/okf.py"]),
+            ("design", ["knowledge/design.py", "knowledge/design_conformance.py"]),
+            ("select", ["knowledge/knowledge_select.py", "knowledge/skill_bridge.py"]),
+        ],
+        "src/devcouncil/skills": [
+            ("registry", ["skills/registry.py"]),
+        ],
+        "src/devcouncil/optimization": [
+            ("gepa", ["optimization/gepa_agent.py"]),
+            ("skillopt", ["optimization/skillopt.py"]),
         ],
     }
 
@@ -1717,6 +1818,13 @@ class RepoMapper:
                 if len(area_handoffs[a]) < 3:
                     area_handoffs[a].append(f"{importer} -> {imported}")
 
+        graph_roots: List[str] = []
+        cg = getattr(self, "_last_code_graph", None)
+        if cg is not None:
+            roots_attr = getattr(cg, "entry_roots", None)
+            if roots_attr is not None:
+                graph_roots = [str(r) for r in roots_attr]
+
         subsystems: List[RepoSubsystem] = []
         for area in sorted(by_area):
             area_files = by_area[area]
@@ -1724,14 +1832,54 @@ class RepoMapper:
             # but keep every real source subsystem.
             if len(area_files) < 2 and area.split("/")[0] in _AUX_AREA_ROOTS:
                 continue
+            area_file_set = set(area_files)
+            area_roots = [r for r in graph_roots if r in area_file_set]
             ranked = self._rank_area_files(area_files, in_degree)
-            critical_files = ranked[: self._SUBSYSTEM_CRITICAL_MAX]
-            entry_points = [p for p in critical_files if in_degree.get(p, 0) > 0][:3] or critical_files[:1]
+
+            def _entry_named(path: str) -> bool:
+                name = Path(path).stem.lower()
+                return any(name == hint for hint in _ENTRY_NAME_HINTS)
+
+            # Prefer real production entry roots + imported hubs over zero-degree
+            # orphans when filling critical_files (avoids listing dead.py as critical).
+            critical_files: List[str] = []
+            for p in area_roots + ranked:
+                if p in critical_files:
+                    continue
+                if p in area_roots or in_degree.get(p, 0) > 0 or _entry_named(p):
+                    critical_files.append(p)
+                if len(critical_files) >= self._SUBSYSTEM_CRITICAL_MAX:
+                    break
+            # Only pad with remaining files when the area is tiny / has no hubs yet.
+            if len(critical_files) < 2:
+                for p in ranked:
+                    if p not in critical_files:
+                        critical_files.append(p)
+                    if len(critical_files) >= min(2, self._SUBSYSTEM_CRITICAL_MAX):
+                        break
+            for p in ranked:
+                if len(critical_files) >= self._SUBSYSTEM_CRITICAL_MAX:
+                    break
+                if p not in critical_files and (
+                    in_degree.get(p, 0) > 0 or _entry_named(p) or p in area_roots
+                ):
+                    critical_files.append(p)
+
+            entry_points = list(area_roots)
+            for p in critical_files:
+                if p in entry_points:
+                    continue
+                if in_degree.get(p, 0) > 0 or _entry_named(p):
+                    entry_points.append(p)
+                if len(entry_points) >= 3:
+                    break
+            if not entry_points:
+                entry_points = critical_files[:1]
+
             stems = ", ".join(Path(p).stem for p in critical_files[:3])
             summary = f"{Path(area).name or area}: {stems}" if stems else f"{area} ({len(area_files)} files)"
             # Optional community label from code graph (generic repos).
             community = ""
-            cg = getattr(self, "_last_code_graph", None)
             if cg is not None:
                 try:
                     from devcouncil.indexing.graph.intel import community_label_for_area
@@ -1745,7 +1893,7 @@ class RepoMapper:
                 RepoSubsystem(
                     area=area,
                     summary=summary,
-                    entry_points=entry_points,
+                    entry_points=entry_points[:3],
                     critical_files=critical_files,
                     neighbors=sorted(area_neighbors.get(area, set()))[:6],
                     handoff_paths=area_handoffs.get(area, []),
@@ -1764,17 +1912,29 @@ class RepoMapper:
         ranked = [path for path, _ in in_degree.most_common()]
         return ranked[:8]
 
-    def build_dependents(self, edges: List[Tuple[str, str]]) -> Dict[str, List[str]]:
+    def build_dependents(
+        self, edges: List[Tuple[str, str]]
+    ) -> Tuple[Dict[str, List[str]], Dict[str, int]]:
         """Reverse the import edges into a file -> dependents map (who imports each file),
-        capped per file. This is the blast radius an agent needs before changing a file."""
+        capped per file. Returns ``(capped_dependents, totals_when_truncated)``.
+
+        ``totals_when_truncated[path]`` is the full importer count when the listed
+        sample was truncated by ``_DEPENDENTS_MAX`` — so agents know the blast radius
+        is incomplete rather than silently missing importers.
+        """
         reverse: Dict[str, Set[str]] = defaultdict(set)
         for importer, imported in edges:
             reverse[imported].add(importer)
-        return {
-            path: sorted(importers)[: self._DEPENDENTS_MAX]
-            for path, importers in sorted(reverse.items())
-            if importers
-        }
+        capped: Dict[str, List[str]] = {}
+        totals: Dict[str, int] = {}
+        for path, importers in sorted(reverse.items()):
+            if not importers:
+                continue
+            full = sorted(importers)
+            capped[path] = full[: self._DEPENDENTS_MAX]
+            if len(full) > self._DEPENDENTS_MAX:
+                totals[path] = len(full)
+        return capped, totals
 
     def import_edges_for(self, files: List[str] | None = None) -> List[Tuple[str, str]]:
         """Public uncapped forward import edges for the given files (or whole repo).
@@ -1814,10 +1974,14 @@ class RepoMapper:
         *,
         cap: Optional[int] = None,
         lsp_refs: bool = False,
-    ) -> Tuple[List[str], List[str], List[str], List[str], List[str]]:
+    ) -> Tuple[List[str], List[str], List[str], List[str], List[str], bool]:
         """Compute entry_roots, unwired_candidates, unreachable_files, dead_symbol_candidates.
 
-        Also returns ``symbol_index`` (``path::name`` keys) as the fifth element.
+        Also returns ``symbol_index`` (``path::name`` keys) as the fifth element and
+        ``liveness_unreachable_unreliable`` as the sixth.
+
+        File lists delegate to ``graph.liveness.file_liveness`` so map vs ratchet
+        cannot drift on empty-root guards / caps.
 
         ``cap`` defaults to ``_LIVENESS_CAP`` for the stored map debt lists. Pass ``0``
         (or any non-positive) for uncapped lists used by the liveness ratchet baseline.
@@ -1830,103 +1994,34 @@ class RepoMapper:
         optional live LSP client (external references clear false positives).
         """
         try:
-            from devcouncil.indexing.wiring import (
-                build_dynamic_import_index,
-                entry_roots,
-                has_allow_unwired,
-                is_liveness_code_file,
-                is_test_path,
-                reference_cleared,
-                structural_exemptions,
+            from devcouncil.indexing.graph.liveness import file_liveness
+
+            if cap is None:
+                file_cap: Optional[int] = self._LIVENESS_CAP
+            elif cap <= 0:
+                file_cap = 0
+            else:
+                file_cap = cap
+
+            prod_roots, unwired, unreachable, unreliable = file_liveness(
+                self.project_root, files, edges, cap=file_cap,
             )
 
-            limit: Optional[int]
-            if cap is None:
-                limit = self._LIVENESS_CAP
-            elif cap <= 0:
-                limit = None
-            else:
-                limit = cap
-
-            # Config + convention seeds only; production-only for stored roots + BFS.
-            roots = entry_roots(self.project_root, files)
-            prod_roots = entry_roots(self.project_root, files, production_only=True)
-            root_set = set(roots)
-            prod_root_set = set(prod_roots)
-            dyn_index = build_dynamic_import_index(self.project_root, files)
-
-            # Inbound (imported -> importers)
-            inbound: Dict[str, Set[str]] = defaultdict(set)
-            outbound: Dict[str, Set[str]] = defaultdict(set)
-            for importer, imported in edges:
-                inbound[imported].add(importer)
-                outbound[importer].add(imported)
-
-            unwired: List[str] = []
-            for f in sorted(files):
-                if not is_liveness_code_file(f):
-                    continue
-                if f in root_set or structural_exemptions(f):
-                    continue
-                if has_allow_unwired(self.project_root, f):
-                    continue
-                # Align with verify gate: test-only importers do not clear unwired.
-                non_test_importers = {
-                    i for i in inbound.get(f, ()) if not is_test_path(i)
-                }
-                if non_test_importers:
-                    continue
-                if reference_cleared(
-                    self.project_root,
-                    f,
-                    skip_files=set(),
-                    git_files=files,
-                    dynamic_index=dyn_index,
-                ):
-                    continue
-                unwired.append(f)
-                if limit is not None and len(unwired) >= limit:
-                    break
-
-            # BFS reachability from production entry roots over forward edges.
-            reachable: Set[str] = set()
-            queue = list(prod_roots)
-            seen_q: Set[str] = set(queue)
-            while queue:
-                cur = queue.pop()
-                reachable.add(cur)
-                for nxt in outbound.get(cur, ()):
-                    if nxt not in seen_q:
-                        seen_q.add(nxt)
-                        queue.append(nxt)
-
-            unreachable: List[str] = []
-            for f in sorted(files):
-                if not is_liveness_code_file(f):
-                    continue
-                if f in prod_root_set or f in root_set or structural_exemptions(f):
-                    continue
-                if f in reachable:
-                    continue
-                unreachable.append(f)
-                if limit is not None and len(unreachable) >= limit:
-                    break
-
-            dead_cap = limit if limit is not None else 0
+            dead_cap = 0 if file_cap is None or file_cap <= 0 else file_cap
             dead_symbols, symbol_index = self._dead_symbol_candidates(
                 files, cap=dead_cap, with_index=True, lsp_refs=lsp_refs,
             )
-            # Never cap stored entry roots — only debt lists above are limited.
             return (
                 prod_roots,
                 unwired,
                 unreachable,
                 dead_symbols,
                 symbol_index,
+                unreliable,
             )
         except Exception:
             logger.debug("liveness computation failed", exc_info=True)
-            return [], [], [], [], []
+            return [], [], [], [], [], True
 
     def liveness_snapshot(self) -> Dict[str, object]:
         """Uncapped liveness lists for ratchet baseline / verify-side current.
@@ -1948,8 +2043,8 @@ class RepoMapper:
                 use_lsp = lsp_refs_enabled(self.project_root)
             except Exception:
                 use_lsp = False
-            roots, unwired, unreachable, dead, symbol_index = self._compute_liveness(
-                files, edges, cap=0, lsp_refs=use_lsp,
+            roots, unwired, unreachable, dead, symbol_index, unreliable = (
+                self._compute_liveness(files, edges, cap=0, lsp_refs=use_lsp)
             )
             return {
                 "entry_roots": roots,
@@ -1957,6 +2052,7 @@ class RepoMapper:
                 "unreachable_files": unreachable,
                 "dead_symbol_candidates": dead,
                 "symbol_index": symbol_index,
+                "liveness_unreachable_unreliable": unreliable,
             }
         except Exception:
             logger.debug("liveness_snapshot failed", exc_info=True)
@@ -1966,6 +2062,7 @@ class RepoMapper:
                 "unreachable_files": [],
                 "dead_symbol_candidates": [],
                 "symbol_index": [],
+                "liveness_unreachable_unreliable": True,
             }
 
     def _dead_symbol_candidates(
@@ -2059,13 +2156,13 @@ class RepoMapper:
                     except SyntaxError:
                         pass
                 else:
-                    for line, name in iter_js_export_symbols(source):
-                        prev_lines = source.splitlines()[: max(0, line - 1)]
+                    for line_no, name in iter_js_export_symbols(source):
+                        prev_lines = source.splitlines()[: max(0, line_no - 1)]
                         if prev_lines:
                             prev = prev_lines[-1].strip()
                             if prev.startswith("@"):
                                 continue
-                        definitions.append((rel, line, line, name))
+                        definitions.append((rel, line_no, line_no, name))
 
             symbol_index = sorted({f"{path}::{name}" for path, _s, _e, name in definitions})
             out: List[str] = []
@@ -2170,14 +2267,17 @@ class RepoMapper:
         try:
             from devcouncil.utils.proc import git_output
 
+            # ``-z`` avoids C-quoting of non-ASCII paths (otherwise ``café.py`` becomes
+            # ``"src/caf\303\251.py"`` and fails the ``is_file()`` existence filter).
             output = git_output(
-                ["ls-files", "--cached", "--others", "--exclude-standard"],
+                ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
                 cwd=self.project_root,
-            ).splitlines()
+            )
+            paths = [p.replace("\\", "/") for p in output.split("\0") if p]
             # Skip index entries whose working-tree file was deleted but not staged.
             return [
                 path
-                for path in output
+                for path in paths
                 if not self._is_runtime_or_generated_file(path)
                 and (self.project_root / path).is_file()
             ]
@@ -2304,24 +2404,108 @@ class RepoMapper:
         return commands
 
     def _ripgrep_search(self, goal: str, files: List[str]) -> List[Dict[str, str]]:
-        """Use ripgrep for goal-keyword search if available, else fall back to naive matching."""
-        candidates: List[Dict[str, str]] = []
+        """Rank candidate files for ``goal`` via ripgrep content search, else path tokens.
+
+        Multi-word goals are OR'd as separate ``-e`` patterns (a single quoted phrase
+        almost never appears in source). Search is scoped to roots present in ``files``
+        so unscoped ``rg`` cannot hang on huge trees or miss the tree entirely.
+        Results are intersected with ``files`` so untracked noise cannot appear.
+        """
+        file_set = {f.replace("\\", "/") for f in files}
+        # Split on whitespace and ``|``; strip call/index punctuation so goals like
+        # ``file_liveness(`` or ``(unwired|unreachable)`` still match identifiers.
+        raw_parts: List[str] = []
+        for part in goal.replace("|", " ").split():
+            raw_parts.append(part)
+        tokens: List[str] = []
+        for raw in raw_parts:
+            t = raw.strip().strip("()[]{}<>,:;\"'`")
+            while t and t[-1] in "+*?^$\\.":
+                t = t[:-1]
+            while t and t[0] in "+*?^$\\.":
+                t = t[1:]
+            if len(t) >= 2:
+                tokens.append(t)
+        if not tokens and goal.strip():
+            tokens = [goal.strip()]
+        if not tokens:
+            return []
+
         try:
-            # Try ripgrep first for better matching
-            result = subprocess.run(
-                ["rg", "--files-with-matches", "--ignore-case", "--glob", "!.git", goal],
-                capture_output=True, text=True, cwd=self.project_root, timeout=10,
+            # Prefer real source/test roots so alphabetical tops like `.github` /
+            # README.md cannot crowd `src`/`tests` out of a small roots budget.
+            preferred = (
+                "src", "tests", "test", "benchmarks", "scripts", "docs", "bin",
+                "packages", "lib", "app", "apps", "services", "cmd", "internal",
             )
-            if result.returncode == 0:
-                for line in sorted(result.stdout.strip().splitlines())[:10]:
-                    candidates.append({"path": line.strip(), "reason": f"ripgrep match for '{goal}'"})
-                return candidates
+            tops_in_files: set[str] = set()
+            for f in file_set:
+                top = f.split("/", 1)[0]
+                if top:
+                    tops_in_files.add(top)
+
+            roots: List[str] = []
+            for top in preferred:
+                if top in tops_in_files and (self.project_root / top).is_dir():
+                    roots.append(top)
+            for top in sorted(tops_in_files):
+                if top in roots:
+                    continue
+                if top.startswith("."):
+                    continue
+                if not (self.project_root / top).is_dir():
+                    continue
+                roots.append(top)
+                if len(roots) >= 16:
+                    break
+            if not roots:
+                roots = ["."]
+
+            cmd = [
+                "rg",
+                "--files-with-matches",
+                "--ignore-case",
+                # Goal tokens are keywords/identifiers, not regex. Without -F,
+                # trailing meta like ``file_liveness(`` or ``foo[`` silently miss.
+                "-F",
+                "--glob", "!**/.git/**",
+                "--glob", "!**/.devcouncil/**",
+                "--glob", "!**/.venv/**",
+                "--glob", "!**/node_modules/**",
+            ]
+            for token in tokens:
+                cmd.extend(["-e", token])
+            cmd.extend(roots)
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=self.project_root,
+                timeout=10,
+            )
+            # rg exits 1 when no matches — still a successful run.
+            if result.returncode in (0, 1):
+                hits: List[Dict[str, str]] = []
+                for line in sorted(result.stdout.strip().splitlines()):
+                    path = line.strip().replace("\\", "/")
+                    if path.startswith("./"):
+                        path = path[2:]
+                    if not path or path not in file_set:
+                        continue
+                    hits.append({
+                        "path": path,
+                        "reason": f"ripgrep match for '{goal}'",
+                    })
+                    if len(hits) >= 10:
+                        break
+                if hits:
+                    return hits
         except Exception:
             logger.debug("ripgrep search failed; falling back to naive matching", exc_info=True)
-            pass  # Fall back to naive matching
 
-        # Naive keyword matching fallback
-        goal_words = set(goal.lower().split())
+        # Naive keyword matching fallback (path tokens only).
+        goal_words = set(t.lower() for t in tokens)
         scored_candidates: list[tuple[int, str]] = []
         for f in files:
             f_lower = f.lower()
@@ -2377,7 +2561,7 @@ class RepoMapper:
         # Single-pass: extract + resolve + liveness/token-scan once; derive map lists
         # and graph dead_code from that pass (no second _token_scan_dead).
         changed = getattr(self, "_graph_changed_paths", None)
-        code_graph = None
+        code_graph: CodeGraph | None = None
         try:
             from devcouncil.indexing.graph.build import build_code_graph, write_code_graph
 
@@ -2444,6 +2628,7 @@ class RepoMapper:
         unwired: List[str] = []
         unreachable: List[str] = []
         dead_syms: List[str] = []
+        unreachable_unreliable = False
         if liveness and code_graph is not None:
             entry_roots_list = list(code_graph.entry_roots)
             # Caps apply only when serializing repo_map.json (graph stays uncapped).
@@ -2451,6 +2636,9 @@ class RepoMapper:
             unwired = list(code_graph.unwired_candidates)[:cap]
             unreachable = list(code_graph.unreachable_files)[:cap]
             dead_syms = list(code_graph.meta.get("legacy_dead_symbol_candidates") or [])[:cap]
+            unreachable_unreliable = bool(
+                code_graph.meta.get("liveness_unreachable_unreliable")
+            )
         elif liveness:
             # Graph assemble failed: keep file-level liveness from import edges,
             # but do NOT run the token-only dead-symbol scan (misleading flood).
@@ -2461,15 +2649,18 @@ class RepoMapper:
                 from devcouncil.indexing.graph.liveness import file_liveness
 
                 cap = self._LIVENESS_CAP
-                entry_roots_list, unwired, unreachable = file_liveness(
-                    self.project_root,
-                    files,
-                    self._edges or [],
-                    cap=cap,
+                entry_roots_list, unwired, unreachable, unreachable_unreliable = (
+                    file_liveness(
+                        self.project_root,
+                        files,
+                        self._edges or [],
+                        cap=cap,
+                    )
                 )
             except Exception:
                 logger.debug("file_liveness fallback after graph failure failed", exc_info=True)
                 entry_roots_list, unwired, unreachable = [], [], []
+                unreachable_unreliable = True
             dead_syms = []
 
         if code_graph is not None:
@@ -2489,6 +2680,9 @@ class RepoMapper:
             if isinstance(raw_procs, list):
                 processes = [p for p in raw_procs[:12] if isinstance(p, dict)]
 
+        dependents, dependents_total = self.build_dependents(self._edges or [])
+        subsystems = self._build_subsystem_index(files)
+
         return RepoMap(
             languages=self.detect_languages(files),
             frameworks=self.detect_frameworks(files),
@@ -2497,8 +2691,9 @@ class RepoMapper:
             important_files=important_files,
             candidate_files=candidates,
             files=file_entries,
-            subsystems=self._build_subsystem_index(files),
-            dependents=self.build_dependents(self._edges or []),
+            subsystems=subsystems,
+            dependents=dependents,
+            dependents_total=dependents_total,
             generated_head=self._git_head(),
             indexed_hash=self._files_fingerprint(files),
             content_fingerprint=self._content_fingerprint(files),
@@ -2508,5 +2703,6 @@ class RepoMapper:
             unwired_candidates=unwired,
             unreachable_files=unreachable,
             dead_symbol_candidates=dead_syms,
+            liveness_unreachable_unreliable=unreachable_unreliable,
             processes=processes,
         )

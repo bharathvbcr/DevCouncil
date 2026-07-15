@@ -143,6 +143,7 @@ core.[0-9]*
 *_results.txt
 *_log.txt
 *_output.txt
+t.jsonl
 
 # =============================================================================
 # DevCouncil local workspace state
