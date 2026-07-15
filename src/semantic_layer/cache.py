@@ -68,7 +68,7 @@ class SemanticCache:
         self.config = config or CacheConfig()
         self.embedder = embedder or EmbeddingService.get_instance()
         self.dimension = dimension
-        self._index = faiss.IndexFlatIP(dimension)
+        self._index: faiss.Index = faiss.IndexFlatIP(dimension)
         self._entries: OrderedDict[str, CacheEntry] = OrderedDict()
         self._id_to_faiss_row: dict[str, int] = {}
         self._faiss_row_to_id: dict[int, str] = {}

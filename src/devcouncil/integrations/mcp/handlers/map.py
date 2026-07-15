@@ -12,6 +12,7 @@ from devcouncil.indexing.subsystem_map import (
     area_for_path,
     cross_boundary_pairs,
     dead_symbol_candidates_of,
+    dependents_total_of,
     impact_targets,
     is_entry_root,
     unreachable_of,
@@ -272,6 +273,9 @@ async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
                 "dependents": dependents,
                 "neighbors": neighbors,
             }
+            dep_total = dependents_total_of(path, data)
+            if dep_total is not None and dep_total > len(dependents):
+                item["dependents_total"] = dep_total
             if precise:
                 item["resolution"] = resolution
             items.append(item)
@@ -348,7 +352,18 @@ async def handle_liveness(root: Path, arguments: dict) -> list[TextContent]:
         path_prefix=path_prefix,
         min_confidence=min_confidence,
     )
-    return json_text({
+    unreachable_unreliable = (
+        data.get("liveness_unreachable_unreliable") is True
+        or not entry_roots
+    )
+    warn = None
+    if unreachable_unreliable:
+        unreachable = []
+        warn = (
+            "entry_roots empty or liveness_unreachable_unreliable: "
+            "unreachable_files omitted; ignore mass inferred dead"
+        )
+    payload: dict[str, object] = {
         "ok": True,
         "stale": stale,
         "area": area,
@@ -360,7 +375,11 @@ async def handle_liveness(root: Path, arguments: dict) -> list[TextContent]:
         "dead_symbol_candidates": dead_symbols,
         "dead_code": dead_code,
         "dead_code_hidden": hidden,
-    })
+        "unreachable_unreliable": unreachable_unreliable,
+    }
+    if warn:
+        payload["warning"] = warn
+    return json_text(payload)
 
 
 def _structured_dead_code(

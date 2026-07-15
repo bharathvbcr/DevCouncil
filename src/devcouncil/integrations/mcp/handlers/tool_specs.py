@@ -6,7 +6,12 @@ from mcp.types import Tool
 
 
 def all_tools() -> list[Tool]:
+    from devcouncil.integrations.mcp.handlers.codeintel import tools as codeintel_tools
+    from devcouncil.integrations.mcp.handlers.debug import tools as debug_tools
+
     return [
+        *codeintel_tools(),
+        *debug_tools(),
         Tool(
             name="devcouncil_status",
             description="Get the current status of the DevCouncil project, including phase, tasks, and gaps.",
@@ -273,7 +278,10 @@ def all_tools() -> list[Tool]:
                 "Liveness debt from the repo map: unwired candidates, unreachable files, "
                 "dead-symbol candidates, and entry roots. Filterable by subsystem area or path prefix. "
                 "When a code graph exists, also returns structured confidence-tagged dead_code "
-                "(default min_confidence=inferred; pass ambiguous to include all tiers)."
+                "(default min_confidence=inferred; pass ambiguous to include all tiers). "
+                "Prefer extracted confidence + greps; treat inferred as unconfirmed. "
+                "If entry_roots are empty or unreachable_unreliable is true, ignore unreachable_files "
+                "and mass inferred dead."
             ),
             inputSchema={
                 "type": "object",
@@ -291,7 +299,7 @@ def all_tools() -> list[Tool]:
                         "enum": ["extracted", "inferred", "ambiguous"],
                         "description": (
                             "Minimum dead_code confidence tier to include "
-                            "(default: inferred)."
+                            "(default: inferred). Prefer extracted for deletion decisions."
                         ),
                     },
                 },

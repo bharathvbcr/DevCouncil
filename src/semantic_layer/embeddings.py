@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Sequence
+from typing import Sequence, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -66,4 +66,4 @@ class EmbeddingService:
         return vectors
 
     def embed_one(self, text: str) -> FloatVector:
-        return self.embed([text])[0]
+        return cast(FloatVector, self.embed([text])[0])

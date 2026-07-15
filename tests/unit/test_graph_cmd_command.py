@@ -3,6 +3,8 @@ missing-graph guard on graph-backed subcommands)."""
 
 import json
 
+import devcouncil.codeintel as codeintel
+import devcouncil.codeintel.languages as codeintel_languages
 import devcouncil.indexing.graph as graph_pkg
 import devcouncil.indexing.graph.build as graph_build
 import devcouncil.indexing.viz as viz
@@ -10,6 +12,44 @@ from devcouncil.cli.main import app
 from typer.testing import CliRunner
 
 runner = CliRunner()
+
+
+def test_graph_doctor_reports_actionable_embedded_grammar_gaps(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        codeintel,
+        "get_codeintel_service",
+        lambda root: SimpleNamespace(
+            status=lambda: {"state": "committed", "schema_version": 1}
+        ),
+    )
+    monkeypatch.setattr(
+        codeintel_languages,
+        "grammar_status",
+        lambda: {
+            "ok": False,
+            "available_count": 34,
+            "required_count": 35,
+            "languages": [{
+                "language": "Svelte",
+                "available": False,
+                "missing_grammars": ["css", "html"],
+            }],
+            "action": (
+                "Install the platform-matched devcouncil-codeintel-grammars wheel; "
+                "runtime grammar downloads are disabled."
+            ),
+        },
+    )
+
+    result = runner.invoke(
+        app,
+        ["graph", "doctor", "--project-root", str(tmp_path)],
+    )
+
+    assert result.exit_code == 1
+    assert "Svelte (css, html)" in result.output
+    assert "platform-matched devcouncil-codeintel-grammars" in result.output
+    assert "runtime grammar downloads are disabled" in result.output
 
 
 # --- query ------------------------------------------------------------------------
@@ -148,7 +188,6 @@ def test_graph_html_missing_graph(tmp_path, monkeypatch):
 from types import SimpleNamespace  # noqa: E402
 
 import devcouncil.indexing.graph.intel as intel_mod  # noqa: E402
-import devcouncil.indexing.graph.liveness as liveness_mod  # noqa: E402
 import devcouncil.indexing.graph.export as export_mod  # noqa: E402
 
 

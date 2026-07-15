@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from mcp.server import Server
@@ -11,6 +12,8 @@ from pydantic import AnyUrl
 from devcouncil.integrations.check import integration_status_summary
 from devcouncil.integrations.mcp.handlers import ast_lsp as ast_lsp_handlers
 from devcouncil.integrations.mcp.handlers import checkout as checkout_handlers
+from devcouncil.integrations.mcp.handlers import codeintel as codeintel_handlers
+from devcouncil.integrations.mcp.handlers import debug as debug_handlers
 from devcouncil.integrations.mcp.handlers import cli_gate as cli_gate_handlers
 from devcouncil.integrations.mcp.handlers import evidence as evidence_handlers
 from devcouncil.integrations.mcp.handlers import git as git_handlers
@@ -52,7 +55,38 @@ _allowed_next_tools = _mcp_util.allowed_next_tools
 
 logger = logging.getLogger(__name__)
 
-app = Server("devcouncil")
+
+@asynccontextmanager
+async def _lifespan(_server):  # noqa: ANN001
+    """Keep one native watcher alive for the MCP process lifecycle."""
+    coordinator = None
+    root = _project_root().expanduser().resolve()
+    try:
+        from devcouncil.app.config import load_config
+        from devcouncil.codeintel import get_codeintel_service
+        from devcouncil.codeintel.sync import get_sync_coordinator
+
+        config = load_config(root).code_intelligence
+        service = get_codeintel_service(root)
+        graph_export = root / ".devcouncil" / "graph" / "code_graph.json"
+        if config.enabled and config.auto_sync and (service.store.exists() or graph_export.is_file()):
+            coordinator = get_sync_coordinator(
+                root,
+                debounce_seconds=config.debounce_ms / 1000.0,
+                reconcile_seconds=float(config.reconcile_seconds),
+                allow_polling_fallback=config.allow_polling_fallback,
+            )
+            coordinator.start()
+    except Exception:
+        logger.warning("MCP code-intelligence watcher did not start", exc_info=True)
+    try:
+        yield {"codeintel": coordinator}
+    finally:
+        if coordinator is not None:
+            coordinator.stop()
+
+
+app = Server("devcouncil", lifespan=_lifespan)
 
 _DB_REQUIRED_TOOLS = {
     "devcouncil_status",
@@ -129,6 +163,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if name in _DB_REQUIRED_TOOLS and not db:
         logger.warning("MCP tool %s rejected: project not initialized at %s", name, root)
         return _error_text("DevCouncil not initialized in this directory.", code="not_initialized")
+
+    registered = await codeintel_handlers.dispatch(name, root, arguments)
+    if registered is not None:
+        return registered
+    registered = await debug_handlers.dispatch(name, root, arguments)
+    if registered is not None:
+        return registered
 
     if name == "devcouncil_integration_status":
         return _json_text(integration_status_summary(root))

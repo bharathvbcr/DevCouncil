@@ -87,6 +87,20 @@ DEFAULT_CONFIG = {
         "auto_refresh": True,
         "auto_refresh_max_files": 40,
     },
+    "code_intelligence": {
+        "enabled": True,
+        "auto_sync": True,
+        "debounce_ms": 750,
+        "reconcile_seconds": 60,
+        "query_freshness_timeout_ms": 2000,
+        "allow_polling_fallback": True,
+        "debug": {
+            # Adapter discovery and all debugger execution require opt-in.
+            "auto_discover": False,
+            "redact_values": True,
+            "max_value_chars": 4096,
+        },
+    },
     "verification": {
         "rigor": {
             "enabled": True,
@@ -136,7 +150,10 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "profiles": {
                 "default": {
-                    "description": "Balanced local execution with DevCouncil verification.",
+                    "description": (
+                        "Balanced local execution with DevCouncil verification. "
+                        "Claude Code advisor (optional): set model: sonnet and advisor_model: opus."
+                    ),
                 },
                 "yolo": {
                     "description": "Faster local execution; DevCouncil still verifies the final diff.",

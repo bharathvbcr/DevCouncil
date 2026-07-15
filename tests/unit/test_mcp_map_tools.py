@@ -155,7 +155,34 @@ async def test_impact_dependents_neighbors_and_crossings(tmp_path, monkeypatch):
     assert "src/billing" in models["neighbors"]
     assert models["is_entry_root"] is False
     assert same["cross_boundary_pairs"] == []
+    assert "dependents_total" not in models  # no truncation metadata when complete
 
+
+@pytest.mark.anyio
+async def test_impact_includes_dependents_total_when_truncated(tmp_path, monkeypatch):
+    _write_repo_map(
+        tmp_path,
+        dependents={"src/payments/models.py": ["src/payments/gateway.py"]},
+        dependents_total={"src/payments/models.py": 40},
+    )
+    monkeypatch.setattr(
+        "devcouncil.integrations.mcp.handlers.map.RepoMapper.map_is_stale",
+        lambda self, data: False,
+    )
+    result = await mapmod.handle_impact(tmp_path, {"paths": ["src/payments/models.py"]})
+    out = _parse(result)
+    item = out["paths"][0]
+    assert item["dependents"] == ["src/payments/gateway.py"]
+    assert item["dependents_total"] == 40
+
+
+@pytest.mark.anyio
+async def test_impact_cross_boundary_force(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        "devcouncil.integrations.mcp.handlers.map.RepoMapper.map_is_stale",
+        lambda self, data: False,
+    )
     # Force a cross-boundary by removing neighbor links in a custom map.
     _write_repo_map(
         tmp_path,

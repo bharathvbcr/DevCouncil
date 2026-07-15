@@ -320,3 +320,34 @@ def test_production_only_unreachable_ignores_test_seeds(tmp_path):
     repo_map = RepoMapper(tmp_path).map_repo()
     assert "pkg/island_mod.py" in repo_map.unreachable_files
     assert "pkg/island_mod.py" in repo_map.unwired_candidates
+
+
+def test_empty_entry_roots_fail_soft_unreachable(tmp_path):
+    """No config/convention entry roots → unreachable=[] + unreliable flag."""
+    _write(tmp_path, {
+        "pkg/__init__.py": "",
+        "pkg/a.py": "x = 1\n",
+        "pkg/b.py": "from pkg.a import x\ny = x\n",
+    })
+    _commit(tmp_path)
+    repo_map = RepoMapper(tmp_path).map_repo()
+    assert repo_map.entry_roots == []
+    assert repo_map.unreachable_files == []
+    assert repo_map.liveness_unreachable_unreliable is True
+    # Unwired still computed
+    assert "pkg/a.py" in repo_map.unwired_candidates or "pkg/b.py" in repo_map.unwired_candidates
+
+
+def test_test_only_main_prod_roots_empty_fail_soft(tmp_path):
+    """Only test-path __main__ seeds → production roots empty → fail-soft."""
+    _write(tmp_path, {
+        "pkg/__init__.py": "",
+        "pkg/lib.py": "def f():\n    return 1\n",
+        "tests/__main__.py": "print('test runner')\n",
+        "tests/test_lib.py": "from pkg.lib import f\ndef test_f():\n    assert f() == 1\n",
+    })
+    _commit(tmp_path)
+    repo_map = RepoMapper(tmp_path).map_repo()
+    assert repo_map.entry_roots == []
+    assert repo_map.unreachable_files == []
+    assert repo_map.liveness_unreachable_unreliable is True

@@ -72,8 +72,11 @@ def _agent_guide_text(repo_map_path: Path, repo_root: Path, repo_map: RepoMap) -
             "4. In `subsystems`, use `entry_points` + `critical_files` for entry points and starting context.",
             "5. Use `role_files` in `subsystems` for subsystem role buckets (entry, runtime, policy, adapters, etc.).",
             "6. Use `neighbors` and `handoff_paths` in `subsystems` to follow cross-subsystem flow.",
-            "7. Check `unwired_candidates` / `unreachable_files` / `dead_symbol_candidates` "
-            "before creating new modules — wire what you create into a real caller.",
+            "7. Prefer `dev graph dead --confidence extracted` + file greps for dead code. "
+            "Treat `inferred` as unconfirmed. If `entry_roots` are empty / "
+            "`liveness_unreachable_unreliable`, ignore `unreachable_files` and mass inferred dead. "
+            "Check `unwired_candidates` / `dead_symbol_candidates` before creating new modules — "
+            "wire what you create into a real caller.",
             "8. Use `dev graph query <name>` / `dev graph trace <a> <b>` / `dev graph dead` "
             "for symbol callers, paths, and dead-code tiers; `dev graph html` for the visualizer.",
             "9. Run `dev map` (or rely on post-tool-use auto-refresh) after large refactors.",
@@ -157,13 +160,23 @@ def generate_map_artifacts(
 
 
 def _liveness_summary(repo_map: RepoMap) -> str | None:
+    unreliable = bool(getattr(repo_map, "liveness_unreachable_unreliable", False))
     if not (
         repo_map.entry_roots
         or repo_map.unwired_candidates
         or repo_map.unreachable_files
         or repo_map.dead_symbol_candidates
+        or unreliable
     ):
         return None
+    if not repo_map.entry_roots or unreliable:
+        import sys
+
+        print(
+            "warning: entry_roots empty — unreachable_files unreliable "
+            "(liveness_unreachable_unreliable); ignore unreachable / mass inferred dead",
+            file=sys.stderr,
+        )
     samples = repo_map.unwired_candidates[:3] + repo_map.dead_symbol_candidates[:2]
     sample_txt = (", " + ", ".join(samples)) if samples else ""
     return (
@@ -221,6 +234,11 @@ def map_repo(
 ):
     """Build the deterministic repository map without calling an LLM."""
     root = project_root.expanduser().resolve()
+    # Reject missing roots before set_log_dir / initialize_project mkdir(parents=True)
+    # silently creates an empty project and maps zero files with exit 0.
+    if not root.is_dir():
+        status_console.print(f"[red]Project root does not exist: {root}[/red]")
+        raise typer.Exit(code=1)
     from devcouncil.telemetry.logging_setup import set_log_dir
     set_log_dir(root)
     # CLI flag OR config; flag alone is enough without rewriting config.
@@ -342,65 +360,32 @@ def _refresh_wiki_skeletons(root: Path, repo_map: RepoMap) -> None:
 
 
 def _watch_map(root: Path, *, liveness: bool = True) -> None:
-    """Debounced incremental refresh via watchdog (already a runtime dependency)."""
-    import threading
+    """Run the shared code-intelligence coordinator for map compatibility."""
     import time
 
-    try:
-        from watchdog.events import FileSystemEventHandler
-        from watchdog.observers import Observer
-    except ImportError:
-        status_console.print("[red]watchdog is required for `dev map --watch`[/red]")
-        raise typer.Exit(code=1)
+    from devcouncil.codeintel.sync import get_sync_coordinator
+    from devcouncil.indexing.graph.build import refresh_map_for_paths
 
-    code_exts = {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".rs"}
-    pending: set[str] = set()
-    lock = threading.Lock()
-    debounce_s = 0.8
-
-    class Handler(FileSystemEventHandler):
-        def on_any_event(self, event):  # noqa: ANN001
-            if getattr(event, "is_directory", False):
-                return
-            src = getattr(event, "dest_path", None) or getattr(event, "src_path", None)
-            if not src:
-                return
-            try:
-                rel = Path(src).resolve().relative_to(root).as_posix()
-            except Exception:
-                return
-            if rel.startswith(".devcouncil/") or rel.startswith(".git/"):
-                return
-            if Path(rel).suffix.lower() not in code_exts:
-                return
-            with lock:
-                pending.add(rel)
-
-    observer = Observer()
-    observer.schedule(Handler(), str(root), recursive=True)
-    observer.start()
+    coordinator = get_sync_coordinator(
+        root,
+        debounce_seconds=0.8,
+        sync_callback=lambda paths: refresh_map_for_paths(root, paths, liveness=liveness),
+    )
+    state = coordinator.start()
     status_console.print(
-        f"[cyan]Watching {root} for code edits (debounce {debounce_s}s). Ctrl-C to stop.[/cyan]"
+        f"[cyan]Watching {root} with {state.backend or 'reconciliation'} "
+        f"(state={state.state}, debounce 0.8s). Ctrl-C to stop.[/cyan]"
     )
     try:
         while True:
-            time.sleep(debounce_s)
-            with lock:
-                batch = sorted(pending)
-                pending.clear()
-            if not batch:
-                continue
-            try:
-                from devcouncil.indexing.graph.build import refresh_map_for_paths
-
-                refresh_map_for_paths(root, batch, liveness=liveness)
-                status_console.print(
-                    f"[green]Refreshed map for {len(batch)} path(s)[/green]"
-                )
-            except Exception as exc:
-                status_console.print(f"[yellow]Watch refresh failed (ignored): {exc}[/yellow]")
+            time.sleep(0.8)
+            before = coordinator.status().pending
+            if before and not coordinator.sync_now():
+                failure = coordinator.status().last_error or coordinator.status().degraded_reason
+                status_console.print(f"[yellow]Watch refresh failed (ignored): {failure}[/yellow]")
+            elif before:
+                status_console.print(f"[green]Refreshed map for {len(before)} path(s)[/green]")
     except KeyboardInterrupt:
         status_console.print("Stopped watching.")
     finally:
-        observer.stop()
-        observer.join(timeout=2)
+        coordinator.stop(timeout=2)

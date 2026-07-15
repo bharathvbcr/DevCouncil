@@ -403,12 +403,21 @@ def dashboard_html(token: str = "") -> str:
 </html>"""
 
 
-def run_dashboard(project_root: Path, host: str = "127.0.0.1", port: int = 8765) -> None:
+def run_dashboard(
+    project_root: Path,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    *,
+    server_factory: type[ThreadingHTTPServer] | None = None,
+) -> None:
     dashboard_token = secrets.token_urlsafe(24)
 
-    class DashboardServer(ThreadingHTTPServer):
-        allow_reuse_address = True
-        daemon_threads = True
+    if server_factory is None:
+        class DashboardServer(ThreadingHTTPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        server_factory = DashboardServer
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
@@ -484,5 +493,5 @@ def run_dashboard(project_root: Path, host: str = "127.0.0.1", port: int = 8765)
         def log_message(self, format, *args):  # noqa: A002
             return
 
-    server = DashboardServer((host, port), Handler)
+    server = server_factory((host, port), Handler)
     server.serve_forever()

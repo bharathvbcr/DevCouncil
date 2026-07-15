@@ -20,8 +20,16 @@ def _git(root, *args):
 
 
 def _seed_project(tmp_path: Path) -> None:
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+    # Include a declared entry root so liveness baselines can be marked complete
+    # (empty-root scans are intentionally incomplete / non-ratcheting).
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "cli.py").write_text("def main():\n    pass\n", encoding="utf-8")
+    (tmp_path / "pkg" / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname="x"\nversion="0"\n[project.scripts]\ncli="pkg.cli:main"\n',
+        encoding="utf-8",
+    )
     _git(tmp_path, "init")
     _git(tmp_path, "-c", "user.email=t@t", "-c", "user.name=t", "add", "-A")
     _git(tmp_path, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init")

@@ -242,8 +242,14 @@ def test_ratchet_skips_symbol_whose_def_line_in_diff():
 
 
 def test_baseline_write_once(tmp_path):
+    # Declared entry root required: empty-root scans are incomplete by design.
     _write(tmp_path, {
+        "pyproject.toml": (
+            '[project]\nname = "x"\nversion = "0"\n'
+            '[project.scripts]\ncli = "pkg.cli:main"\n'
+        ),
         "pkg/__init__.py": "",
+        "pkg/cli.py": "def main():\n    pass\n",
         "pkg/orphan.py": "x = 1\n",
     })
     _commit(tmp_path)
@@ -277,7 +283,15 @@ def test_baseline_incomplete_treated_as_missing(tmp_path):
 
 
 def test_delete_baseline_on_demand(tmp_path):
-    _write(tmp_path, {"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
+    _write(tmp_path, {
+        "pyproject.toml": (
+            '[project]\nname = "x"\nversion = "0"\n'
+            '[project.scripts]\ncli = "pkg.cli:main"\n'
+        ),
+        "pkg/__init__.py": "",
+        "pkg/cli.py": "def main():\n    pass\n",
+        "pkg/a.py": "x = 1\n",
+    })
     _commit(tmp_path)
     snapshot_liveness_baseline(tmp_path, "TASK-1")
     assert load_liveness_baseline(tmp_path, "TASK-1") is not None

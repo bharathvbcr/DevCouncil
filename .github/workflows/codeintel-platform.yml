@@ -1,0 +1,128 @@
+name: Code Intelligence Platforms
+
+on:
+  pull_request:
+  push:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      build_grammar_wheels:
+        description: "Explicitly download, build, and sign full grammar wheels"
+        type: boolean
+        default: false
+      run_heavy_profile:
+        description: "Run the explicit 10,000-file performance profile"
+        type: boolean
+        default: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  platform:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-13, macos-14, windows-latest]
+        python: ["3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+      - run: uv sync --all-groups --python ${{ matrix.python }}
+      - name: Install runtime debug adapters explicitly
+        run: |
+          uv pip install --python .venv debugpy
+          uv run python -c "import gzip, hashlib, io, os, urllib.request, zipfile; from pathlib import Path; url='https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-vscode/vsextensions/node-debug2/1.42.5/vspackage'; data=urllib.request.urlopen(url, timeout=60).read(); expected='a4d4017994eca3dea0aa605de5cf7c48e757bbce6a81514297bb1432c435e026'; actual=hashlib.sha256(data).hexdigest(); assert actual == expected, (actual, expected); root=Path(os.environ['RUNNER_TEMP'])/'node-debug2'; root.mkdir(parents=True, exist_ok=True); zipfile.ZipFile(io.BytesIO(gzip.decompress(data))).extractall(root); env=Path(os.environ['GITHUB_ENV']); env.open('a', encoding='utf-8').write(f'DEVCOUNCIL_NODE_DEBUG2_PATH={root / \"extension/out/src/nodeDebug.js\"}\nDEVCOUNCIL_NODE_DEBUG2_VERSION=1.42.5\n')"
+      - name: Focused cross-platform code-intelligence tests
+        run: >-
+          uv run pytest -q
+          tests/unit/test_codeintel_store.py
+          tests/unit/test_codeintel_semantics.py
+          tests/unit/test_codeintel_sync.py
+          tests/unit/test_codeintel_debug.py
+          tests/unit/test_codeintel_generic_extractor.py
+          tests/unit/test_mcp_codeintel_tools.py
+          tests/unit/test_mcp_debug_tools.py
+      - name: Native watcher and real DAP/runtime integration
+        env:
+          DEVCOUNCIL_UNSANDBOXED_SOCKET_TESTS: "1"
+        run: uv run pytest -q tests/integration/test_codeintel_platform_runtime.py
+      - name: Fast performance ratchets
+        run: uv run pytest -q tests/performance
+      - name: Build main wheel
+        run: uv build --wheel --out-dir dist
+      - name: Install and smoke main wheel
+        shell: bash
+        run: uv run python scripts/smoke-wheel.py dist/devcouncil-*.whl
+      - name: Native observer selection
+        run: uv run python -c "from watchdog.observers import Observer; print(Observer.__name__)"
+
+  grammar-wheel:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-13, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-groups --python 3.12
+      - uses: actions/cache@v4
+        with:
+          path: .grammar-cache
+          key: grammar-cache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('uv.lock', 'src/devcouncil/codeintel/languages/registry.py') }}
+      - name: Explicitly prefetch every grammar for packaging
+        run: >-
+          uv run python scripts/build-codeintel-grammar-wheel.py
+          --cache-dir .grammar-cache
+          --prefetch
+      - name: Build platform wheel
+        run: uv build --wheel --project packages/codeintel-grammars --out-dir dist
+      - name: Install and verify platform wheel
+        shell: bash
+        run: uv run python scripts/smoke-wheel.py --grammar dist/devcouncil_codeintel_grammars-*.whl
+      - name: Install Sigstore
+        if: github.event_name == 'workflow_dispatch' && inputs.build_grammar_wheels
+        run: uv tool install sigstore
+      - name: Sign wheel with GitHub OIDC identity
+        if: github.event_name == 'workflow_dispatch' && inputs.build_grammar_wheels
+        shell: bash
+        run: sigstore sign --bundle dist/grammar-wheel.sigstore.json dist/*.whl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codeintel-grammars-${{ matrix.os }}
+          path: dist/*
+
+  heavy-performance:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_heavy_profile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-groups --python 3.12
+      - name: Run 10,000-file performance profile
+        run: >-
+          uv run python scripts/codeintel-benchmark.py
+          --profile heavy
+          --output artifacts/codeintel-heavy.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codeintel-heavy-${{ github.run_id }}
+          path: artifacts/codeintel-heavy.*

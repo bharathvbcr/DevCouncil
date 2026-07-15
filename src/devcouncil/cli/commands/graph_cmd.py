@@ -14,6 +14,8 @@ app = typer.Typer(
     help="Query and visualize the symbol-level code knowledge graph.",
     add_completion=False,
 )
+hooks_app = typer.Typer(name="hooks", help="Optional Git hook integration.", add_completion=False)
+app.add_typer(hooks_app, name="hooks")
 console = Console()
 status = Console(stderr=True)
 
@@ -34,6 +36,236 @@ def _require_graph(root: Path):
         status.print("[red]No code graph; run `dev map` first.[/red]")
         raise typer.Exit(code=1)
     return graph
+
+
+@app.command("init")
+def graph_init(
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    no_liveness: bool = typer.Option(False, "--no-liveness"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Build the canonical SQLite graph and deterministic compatibility exports."""
+    from devcouncil.cli.commands.map import generate_map_artifacts
+    from devcouncil.codeintel import get_codeintel_service
+
+    root = _root(project_root)
+    generate_map_artifacts(
+        root,
+        root / ".devcouncil" / "repo_map.json",
+        liveness=not no_liveness,
+        quiet=True,
+    )
+    result = get_codeintel_service(root).status()
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+    else:
+        status.print(
+            f"[green]Indexed generation {result.get('generation')} — "
+            f"{result.get('node_count')} nodes, {result.get('edge_count')} edges[/green]"
+        )
+
+
+@app.command("status")
+def graph_status(
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Show canonical generation, watcher health, and pending files."""
+    from devcouncil.codeintel import get_codeintel_service
+    from devcouncil.codeintel.sync import get_sync_coordinator
+
+    root = _root(project_root)
+    result = get_codeintel_service(root).status()
+    result["sync"] = get_sync_coordinator(root).status().as_dict()
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+        return
+    console.print(f"state: {result['state']}")
+    console.print(f"generation: {result.get('generation') or '(none)'}")
+    console.print(f"nodes/edges: {result.get('node_count', 0)}/{result.get('edge_count', 0)}")
+    sync = result["sync"]
+    console.print(f"watcher: {sync['state']} ({sync.get('backend') or 'not started'})")
+    if sync.get("pending"):
+        console.print("pending: " + ", ".join(sync["pending"]))
+    if sync.get("degraded_reason"):
+        console.print(f"degraded: {sync['degraded_reason']}")
+
+
+@app.command("sync")
+def graph_sync(
+    paths: Optional[List[str]] = typer.Argument(None, help="Optional paths; otherwise reconcile the project."),
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Reconcile and commit pending filesystem changes now."""
+    from devcouncil.codeintel.sync import get_sync_coordinator
+
+    root = _root(project_root)
+    coordinator = get_sync_coordinator(root)
+    changed = list(paths or coordinator.reconcile())
+    ok = coordinator.sync_now(changed)
+    result = coordinator.status().as_dict()
+    result["ok"] = ok
+    result["reconciled"] = changed
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+    else:
+        color = "green" if ok else "yellow"
+        status.print(f"[{color}]Synced {len(changed)} path(s); state={result['state']}[/{color}]")
+    if not ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("watch")
+def graph_watch(
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+) -> None:
+    """Run native auto-sync in the foreground until interrupted."""
+    import time
+
+    from devcouncil.codeintel.sync import get_sync_coordinator
+
+    root = _root(project_root)
+    coordinator = get_sync_coordinator(root)
+    state = coordinator.start()
+    status.print(
+        f"[cyan]Watching {root} with {state.backend or 'reconciliation'} "
+        f"(state={state.state}); Ctrl-C to stop.[/cyan]"
+    )
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        status.print("Stopped watching.")
+    finally:
+        coordinator.stop()
+
+
+@app.command("doctor")
+def graph_doctor(
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Verify SQLite, native watcher selection, and installed grammar assets."""
+    from watchdog.observers import Observer
+
+    from devcouncil.codeintel import get_codeintel_service
+    from devcouncil.codeintel.languages import grammar_status
+
+    root = _root(project_root)
+    service = get_codeintel_service(root)
+    store = service.status()
+    grammars = grammar_status()
+    watcher_backend = getattr(Observer, "__name__", type(Observer).__name__)
+    result = {
+        "ok": store["state"] == "committed" and grammars["ok"],
+        "store": store,
+        "watcher_backend": watcher_backend,
+        "grammars": grammars,
+    }
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+        if not result["ok"]:
+            raise typer.Exit(code=1)
+        return
+    console.print(f"store: {store['state']} (schema {store['schema_version']})")
+    console.print(f"watcher backend: {watcher_backend}")
+    console.print(
+        f"grammars: {grammars['available_count']}/{grammars['required_count']} available locally"
+    )
+    for row in grammars["languages"]:
+        if not row["available"]:
+            console.print(
+                f"  missing: {row['language']} "
+                f"({', '.join(row['missing_grammars'])})"
+            )
+    if grammars["action"]:
+        console.print(f"grammar action: {grammars['action']}")
+    if not result["ok"]:
+        raise typer.Exit(code=1)
+
+
+@app.command("search")
+def graph_search(
+    query: str = typer.Argument(...),
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    limit: int = typer.Option(50, "--limit"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Full-text symbol and path search over the committed generation."""
+    from devcouncil.codeintel.query import CodeIntelQueryEngine
+
+    result = CodeIntelQueryEngine(_root(project_root)).search(query, limit=limit)
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+        return
+    for match in result["matches"]:
+        console.print(f"{match['path']}:{match['line']}  {match['id']}  [{match['kind']}]")
+
+
+@app.command("explore")
+def graph_explore(
+    query: str = typer.Argument(...),
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    limit: int = typer.Option(20, "--limit"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Return source, related symbols, paths, and blast radius in one query."""
+    from devcouncil.codeintel.query import CodeIntelQueryEngine
+
+    result = CodeIntelQueryEngine(_root(project_root)).explore(query, limit=limit)
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+        return
+    for definition in result["definitions"]:
+        console.print(f"[bold]{definition['id']}[/bold] {definition['path']}:{definition['line']}")
+        if definition["source"]:
+            console.print(definition["source"])
+        console.print(
+            f"  callers={len(definition['callers'])} callees={len(definition['callees'])}"
+        )
+
+
+@app.command("affected")
+def graph_affected(
+    targets: List[str] = typer.Argument(..., help="Symbol or path targets."),
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Find tests reachable through the inbound blast radius."""
+    from devcouncil.codeintel.query import CodeIntelQueryEngine
+
+    result = CodeIntelQueryEngine(_root(project_root)).affected_tests(targets)
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+        return
+    if not result["tests"]:
+        console.print("No affected tests found.")
+        return
+    for test in result["tests"]:
+        console.print(test)
+
+
+@hooks_app.command("install")
+def graph_hooks_install(
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+) -> None:
+    """Install an opt-in post-checkout/post-merge reconciliation hook."""
+    root = _root(project_root)
+    git_dir = root / ".git"
+    if not git_dir.is_dir():
+        status.print("[red]Git hook installation requires a normal .git directory.[/red]")
+        raise typer.Exit(code=1)
+    hook_body = "#!/bin/sh\nexec dev graph sync --project-root \"$(git rev-parse --show-toplevel)\" >/dev/null 2>&1\n"
+    for name in ("post-checkout", "post-merge"):
+        path = git_dir / "hooks" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and "dev graph sync" not in path.read_text(encoding="utf-8", errors="replace"):
+            status.print(f"[red]Refusing to overwrite existing hook: {path}[/red]")
+            raise typer.Exit(code=1)
+        path.write_text(hook_body, encoding="utf-8")
+        path.chmod(0o755)
+    status.print("[green]Installed post-checkout and post-merge code-intelligence hooks.[/green]")
 
 
 @app.command("query")

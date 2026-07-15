@@ -2,11 +2,10 @@
 
 import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
-from devcouncil.domain.gap import Gap
 from devcouncil.domain.requirement import AcceptanceCriterion, Requirement
 from devcouncil.domain.task import PlannedFile, Task
 from devcouncil.verification.checks import semantic_diff as sd

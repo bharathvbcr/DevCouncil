@@ -230,40 +230,42 @@ def test_refresh_wiki_skeletons_swallows_errors(tmp_path, monkeypatch):
 
 
 def test_watch_map_processes_batch_then_stops(tmp_path, monkeypatch):
-    import watchdog.events as wd_events
-    import watchdog.observers as wd_observers
+    import devcouncil.codeintel.sync as sync_mod
     import devcouncil.indexing.graph.build as graph_build
 
     root = tmp_path.resolve()
-
-    class _FakeObserver:
-        def __init__(self):
-            self._handler = None
-
-        def schedule(self, handler, path, recursive=True):
-            self._handler = handler
-
-        def start(self):
-            # Fire a synthetic code-file event so `pending` is non-empty.
-            event = SimpleNamespace(is_directory=False, src_path=str(root / "a.py"), dest_path=None)
-            self._handler.on_any_event(event)
-            # Also fire ignored events to exercise the guards.
-            self._handler.on_any_event(SimpleNamespace(is_directory=True, src_path=str(root / "d")))
-            self._handler.on_any_event(SimpleNamespace(is_directory=False, src_path=str(root / ".git" / "x.py"), dest_path=None))
-            self._handler.on_any_event(SimpleNamespace(is_directory=False, src_path=str(root / "notcode.txt"), dest_path=None))
-
-        def stop(self):
-            pass
-
-        def join(self, timeout=None):
-            pass
-
-    monkeypatch.setattr(wd_observers, "Observer", _FakeObserver)
+    (root / "a.py").write_text("x = 1\n", encoding="utf-8")
 
     refreshed = {}
     monkeypatch.setattr(
         graph_build, "refresh_map_for_paths",
         lambda root, batch, liveness=True: refreshed.setdefault("batch", batch),
+    )
+
+    class _FakeCoordinator:
+        pending = ["a.py"]
+
+        def __init__(self, callback):
+            self.callback = callback
+
+        def start(self):
+            return SimpleNamespace(backend="FakeObserver", state="healthy")
+
+        def status(self):
+            return SimpleNamespace(pending=list(self.pending), last_error="", degraded_reason="")
+
+        def sync_now(self):
+            self.callback(list(self.pending))
+            self.pending = []
+            return True
+
+        def stop(self, timeout=2):
+            return None
+
+    monkeypatch.setattr(
+        sync_mod,
+        "get_sync_coordinator",
+        lambda root, **kwargs: _FakeCoordinator(kwargs["sync_callback"]),
     )
 
     counter = {"n": 0}
@@ -282,41 +284,29 @@ def test_watch_map_processes_batch_then_stops(tmp_path, monkeypatch):
 
 
 def test_watch_map_refresh_error_is_ignored(tmp_path, monkeypatch):
-    import watchdog.observers as wd_observers
-    import devcouncil.indexing.graph.build as graph_build
+    import devcouncil.codeintel.sync as sync_mod
 
     root = tmp_path.resolve()
+    (root / "a.py").write_text("x = 1\n", encoding="utf-8")
 
-    class _FakeObserver:
-        def __init__(self):
-            self._handler = None
-
-        def schedule(self, handler, path, recursive=True):
-            self._handler = handler
-
+    class _FakeCoordinator:
         def start(self):
-            self._handler.on_any_event(
-                SimpleNamespace(is_directory=False, src_path=str(root / "a.py"), dest_path=None)
+            return SimpleNamespace(backend="FakeObserver", state="healthy")
+
+        def status(self):
+            return SimpleNamespace(
+                pending=["a.py"],
+                last_error="RuntimeError: refresh exploded",
+                degraded_reason="",
             )
-            # An event outside the root exercises the relative_to guard.
-            self._handler.on_any_event(
-                SimpleNamespace(is_directory=False, src_path="/tmp/outside/x.py", dest_path=None)
-            )
-            # An event with no path exercises that guard too.
-            self._handler.on_any_event(SimpleNamespace(is_directory=False, src_path=None, dest_path=None))
 
-        def stop(self):
-            pass
+        def sync_now(self):
+            return False
 
-        def join(self, timeout=None):
-            pass
+        def stop(self, timeout=2):
+            return None
 
-    monkeypatch.setattr(wd_observers, "Observer", _FakeObserver)
-
-    def boom(root, batch, liveness=True):
-        raise RuntimeError("refresh exploded")
-
-    monkeypatch.setattr(graph_build, "refresh_map_for_paths", boom)
+    monkeypatch.setattr(sync_mod, "get_sync_coordinator", lambda root, **kwargs: _FakeCoordinator())
 
     counter = {"n": 0}
 

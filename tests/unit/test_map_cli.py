@@ -66,3 +66,14 @@ def test_cli_map_no_liveness(tmp_path, monkeypatch):
     data = json.loads(map_file.read_text(encoding="utf-8"))
     # entry_roots and dead_symbol_candidates should be empty or not computed
     assert len(data.get("entry_roots", [])) == 0
+
+
+def test_cli_map_rejects_missing_project_root(tmp_path, monkeypatch):
+    """Missing --project-root must exit non-zero without mkdir'ing an empty project."""
+    missing = tmp_path / "does-not-exist"
+    assert not missing.exists()
+    res = runner.invoke(app, ["map", "--project-root", str(missing), "--no-wiki"])
+    assert res.exit_code != 0
+    assert not missing.exists()
+    combined = (res.stdout or "") + (res.stderr or "")
+    assert "does not exist" in combined.lower() or "does not exist" in str(res)

@@ -301,24 +301,21 @@ def test_json_response_writes_body():
     assert json.loads(written["body"].decode("utf-8")) == {"ok": True}
 
 
-# ---- HTTP server end-to-end ---------------------------------------------------
+# ---- Injected HTTP transport --------------------------------------------------
 
-def test_run_dashboard_serves_all_routes(tmp_path, monkeypatch):
-    import socket
-    import threading
-    import time
-    import urllib.error
-    import urllib.request
+def test_run_dashboard_serves_all_routes_without_binding_socket(tmp_path, monkeypatch):
+    from io import BytesIO
 
     created: dict = {}
-    real_server = dash.ThreadingHTTPServer
 
-    class RecordingServer(real_server):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            created["server"] = self
+    class RecordingServer:
+        def __init__(self, address, handler):
+            created["address"] = address
+            created["handler"] = handler
 
-    monkeypatch.setattr(dash, "ThreadingHTTPServer", RecordingServer)
+        def serve_forever(self):
+            created["served"] = True
+
     monkeypatch.setattr(dash, "get_db", lambda root: None)
     monkeypatch.setattr(
         dash, "integration_status_summary", lambda root: {"default_executor": "manual", "capabilities": []}
@@ -328,52 +325,39 @@ def test_run_dashboard_serves_all_routes(tmp_path, monkeypatch):
         "build_integration_check_report",
         lambda root: SimpleNamespace(as_dict=lambda: {"ok": True}),
     )
+    dash.run_dashboard(tmp_path, "127.0.0.1", 8765, server_factory=RecordingServer)
+    handler_class = created["handler"]
 
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
+    def request(path, *, method="GET", body=b""):
+        class FakeHandler(handler_class):
+            def __init__(self):
+                self.path = path
+                self.headers = {"Content-Length": str(len(body))}
+                self.rfile = BytesIO(body)
+                self.wfile = BytesIO()
+                self.status = None
+                self.client_address = ("127.0.0.1", 12345)
 
-    thread = threading.Thread(
-        target=dash.run_dashboard, args=(tmp_path, "127.0.0.1", port), daemon=True
-    )
-    thread.start()
+            def send_response(self, code):
+                self.status = code
 
-    base = f"http://127.0.0.1:{port}"
+            def send_header(self, key, value):
+                return None
 
-    def get(path):
-        for _ in range(100):
-            try:
-                return urllib.request.urlopen(base + path, timeout=2)
-            except (urllib.error.URLError, ConnectionError):
-                time.sleep(0.02)
-        raise AssertionError(f"server never came up for {path}")
+            def end_headers(self):
+                return None
 
-    try:
-        assert b"DevCouncil Dashboard" in get("/").read()
-        assert b"UNINITIALIZED" in get("/api/status").read()
-        assert b"ok" in get("/api/integrations/check").read()
-        assert get(f"/assets/{dash.LOGO_ASSET}").read()[:4] == b"\x89PNG"
-        assert get(f"/assets/{dash.LEGACY_LOGO_ASSET}").read().strip().startswith(b"<")
+        handler = FakeHandler()
+        getattr(handler, f"do_{method}")()
+        return handler.status, handler.wfile.getvalue()
 
-        # Unknown /api/ path -> 404.
-        with pytest.raises(urllib.error.HTTPError) as exc:
-            urllib.request.urlopen(base + "/api/unknown", timeout=2)
-        assert exc.value.code == 404
-
-        # POST to apply with no/invalid token -> 403 (loopback allowed, token rejected).
-        req = urllib.request.Request(
-            base + "/api/integrations/apply", data=b"{}", method="POST"
-        )
-        with pytest.raises(urllib.error.HTTPError) as exc_post:
-            urllib.request.urlopen(req, timeout=2)
-        assert exc_post.value.code == 403
-
-        # POST to an unknown path -> 404.
-        req2 = urllib.request.Request(base + "/api/nope", data=b"{}", method="POST")
-        with pytest.raises(urllib.error.HTTPError) as exc_post2:
-            urllib.request.urlopen(req2, timeout=2)
-        assert exc_post2.value.code == 404
-    finally:
-        created["server"].shutdown()
-        thread.join(timeout=5)
+    assert created["address"] == ("127.0.0.1", 8765)
+    assert created["served"] is True
+    assert b"DevCouncil Dashboard" in request("/")[1]
+    assert b"UNINITIALIZED" in request("/api/status")[1]
+    assert b"ok" in request("/api/integrations/check")[1]
+    assert request(f"/assets/{dash.LOGO_ASSET}")[1][:4] == b"\x89PNG"
+    assert request(f"/assets/{dash.LEGACY_LOGO_ASSET}")[1].strip().startswith(b"<")
+    assert request("/api/unknown")[0] == 404
+    assert request("/api/integrations/apply", method="POST", body=b"{}")[0] == 403
+    assert request("/api/nope", method="POST", body=b"{}")[0] == 404

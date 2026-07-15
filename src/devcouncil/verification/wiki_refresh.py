@@ -17,9 +17,12 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, List, Mapping, Optional, Sequence
 
 from devcouncil.indexing.subsystem_map import areas_touched
+
+if TYPE_CHECKING:
+    from devcouncil.domain.gap import Gap
 
 logger = logging.getLogger(__name__)
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import abc
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -34,7 +34,7 @@ class OllamaBackend(LLMBackend):
             payload["system"] = system
         resp = self._client.post("/api/generate", json=payload)
         resp.raise_for_status()
-        return resp.json()["response"]
+        return cast(str, resp.json()["response"])
 
     def close(self) -> None:
         self._client.close()
@@ -57,7 +57,7 @@ class LlamaCppBackend(LLMBackend):
             json={"model": model, "messages": messages, "stream": False},
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        return cast(str, resp.json()["choices"][0]["message"]["content"])
 
     def close(self) -> None:
         self._client.close()
@@ -85,7 +85,7 @@ class HuggingFaceBackend(LLMBackend):
         pipe = self._get_pipeline(model)
         full_prompt = f"{system}\n\n{prompt}" if system else prompt
         out = pipe(full_prompt, max_new_tokens=512, do_sample=False)
-        return out[0]["generated_text"][len(full_prompt):]
+        return cast(str, out[0]["generated_text"])[len(full_prompt):]
 
 
 def create_backend(config: LLMConfig | None = None) -> LLMBackend:
