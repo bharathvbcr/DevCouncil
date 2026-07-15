@@ -37,6 +37,7 @@ from devcouncil.cli.commands import (  # noqa: E402 - imports follow stdio recon
     cost,
     ast,
     dashboard,
+    debug_cmd,
     design,
     doctor,
     go,
@@ -111,6 +112,7 @@ app.add_typer(setup.app, name="setup")
 app.add_typer(lsp.app, name="lsp")
 app.add_typer(ast.app, name="ast")
 app.add_typer(dashboard.app, name="dashboard")
+app.add_typer(debug_cmd.app, name="debug")
 app.add_typer(watch.app, name="watch")
 app.add_typer(semantic.app, name="semantic")
 app.add_typer(evidence.app, name="evidence")

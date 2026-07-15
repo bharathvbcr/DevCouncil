@@ -320,6 +320,26 @@ class IndexingConfig(BaseModel):
     write_graph_html: bool = False
 
 
+class CodeIntelligenceDebugConfig(BaseModel):
+    """Debugger discovery/execution consent and output safety."""
+
+    auto_discover: bool = False
+    redact_values: bool = True
+    max_value_chars: int = 4096
+
+
+class CodeIntelligenceConfig(BaseModel):
+    """Transactional code graph, native synchronization, and debugger settings."""
+
+    enabled: bool = True
+    auto_sync: bool = True
+    debounce_ms: int = 750
+    reconcile_seconds: int = 60
+    query_freshness_timeout_ms: int = 2000
+    allow_polling_fallback: bool = True
+    debug: CodeIntelligenceDebugConfig = Field(default_factory=CodeIntelligenceDebugConfig)
+
+
 class ExecutionConfig(BaseModel):
     default_executor: str = "manual"
     max_repair_attempts: int = 3
@@ -443,6 +463,11 @@ class CliAgentProfileConfig(BaseModel):
     extra_args: List[str] = Field(default_factory=list)
     permission_mode: str | None = None
     model: str | None = None
+    # Claude Code only: enable Anthropic's advisor server tool via ``--advisor`` /
+    # SDK ``extra_args={"advisor": ...}`` / interactive ``advisorModel``. Opt-in;
+    # recommended pairing is main ``sonnet`` + ``advisor_model: opus``. Ignored for
+    # non-Claude executors. Requires Claude Code >= 2.1.98 and the Anthropic API.
+    advisor_model: str | None = None
     # Per-profile environment overrides merged into the agent subprocess (and passed to
     # the in-process claude-sdk executor). This is how a profile redirects the Claude
     # Code harness at an alternative Anthropic-compatible endpoint (local proxy,
@@ -587,6 +612,7 @@ class DevCouncilConfig(BaseModel):
     planning: PlanningConfig = Field(default_factory=PlanningConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     indexing: IndexingConfig = Field(default_factory=IndexingConfig)
+    code_intelligence: CodeIntelligenceConfig = Field(default_factory=CodeIntelligenceConfig)
     verification: VerificationConfig = Field(default_factory=VerificationConfig)
     privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
