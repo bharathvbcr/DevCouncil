@@ -30,6 +30,8 @@ IGNORED_CHANGE_PATTERNS = (
     ".mypy_cache/*",
     ".ruff_cache/*",
     ".devcouncil/*",
+    "AGENTS.md",
+    "CLAUDE.md",
     ".gitignore",
 )
 

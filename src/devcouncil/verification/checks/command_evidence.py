@@ -67,6 +67,7 @@ def run_verification_commands(
                 retry_flaky
                 and can_prove
                 and cmd_result.exit_code > 0
+                and not cmd_result.timed_out
                 and not command_is_malformed(cmd_result)
             ):
                 # Flaky-evidence retry: one immediate re-run of a genuinely failing
@@ -107,10 +108,17 @@ def run_verification_commands(
                     ))
                 else:
                     is_quality_gate = cmd_type in {"lint", "typecheck"} or is_quality_only_command(cmd)
-                    blocking = (not compiler_active) and not is_quality_gate
+                    blocking = cmd_result.timed_out or (
+                        (not compiler_active) and not is_quality_gate
+                    )
                     if blocking:
                         result.genuine_failure = True
                     fail_file, fail_line = failure_location(cmd_result)
+                    failure_label = (
+                        "timed out after running for the configured limit"
+                        if cmd_result.timed_out
+                        else f"failed with exit code {cmd_result.exit_code}"
+                    )
                     gap = Gap(
                         id=next_gap_id(task.id, cmd_type.upper()),
                         severity="high" if blocking else "medium",
@@ -118,8 +126,12 @@ def run_verification_commands(
                         task_id=task.id,
                         description=(
                             f"{'Quality gate' if is_quality_gate else 'Command'} '{cmd}' "
-                            f"failed with exit code {cmd_result.exit_code}"
-                            + (" (advisory: style/type, not a correctness gate)." if is_quality_gate else ".")
+                            f"{failure_label}"
+                            + (
+                                " (advisory: style/type, not a correctness gate)."
+                                if is_quality_gate and not cmd_result.timed_out
+                                else "."
+                            )
                         ),
                         evidence=[cmd_result.summary[:500]],
                         recommended_fix=f"Fix the issues reported by '{cmd}'.",

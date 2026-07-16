@@ -3,6 +3,7 @@ mypy probe, coverage floor, status-doc drift, ollama probes)."""
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -180,22 +181,61 @@ def _prep_mypy_repo(tmp_path):
     (tmp_path / "src").mkdir()
 
 
+def test_mypy_prefers_uv_project_environment(tmp_path, monkeypatch):
+    _prep_mypy_repo(tmp_path)
+    invocation = {}
+
+    monkeypatch.setattr(doctor.shutil, "which", lambda command: "/opt/bin/uv" if command == "uv" else None)
+
+    def capture(command, **kwargs):
+        invocation["command"] = command
+        invocation["cwd"] = kwargs["cwd"]
+        return SimpleNamespace(returncode=0, stdout="Success: no issues", stderr="")
+
+    monkeypatch.setattr(doctor.subprocess, "run", capture)
+    doctor.check_mypy_status(tmp_path)
+
+    assert invocation == {
+        "command": ["uv", "run", "--python", "3.12", "mypy", "src"],
+        "cwd": tmp_path,
+    }
+
+
+def test_mypy_falls_back_to_current_interpreter_without_uv(tmp_path, monkeypatch):
+    _prep_mypy_repo(tmp_path)
+    invocation = {}
+    monkeypatch.setattr(doctor.shutil, "which", lambda command: None)
+
+    def capture(command, **kwargs):
+        invocation["command"] = command
+        return SimpleNamespace(returncode=0, stdout="Success: no issues", stderr="")
+
+    monkeypatch.setattr(doctor.subprocess, "run", capture)
+    doctor.check_mypy_status(tmp_path)
+
+    assert invocation["command"] == [sys.executable, "-m", "mypy", "src"]
+
+
 def test_mypy_not_on_path(tmp_path, monkeypatch):
     _prep_mypy_repo(tmp_path)
+    monkeypatch.setattr(doctor.shutil, "which", lambda command: "/opt/bin/uv")
     def boom(*a, **k):
         raise FileNotFoundError
     monkeypatch.setattr(doctor.subprocess, "run", boom)
     rows = doctor.check_mypy_status(tmp_path)
-    assert "not on PATH" in rows[0][2]
+    assert "is unavailable" in rows[0][2]
+    assert "uv run --python 3.12 mypy src" in rows[0][2]
 
 
 def test_mypy_timeout(tmp_path, monkeypatch):
     _prep_mypy_repo(tmp_path)
+    monkeypatch.setattr(doctor.shutil, "which", lambda command: "/opt/bin/uv")
     def boom(*a, **k):
         raise doctor.subprocess.TimeoutExpired(cmd="mypy", timeout=120)
     monkeypatch.setattr(doctor.subprocess, "run", boom)
     rows = doctor.check_mypy_status(tmp_path)
     assert "timed out" in rows[0][2]
+    assert "uv run --python 3.12 mypy src" in rows[0][2]
 
 
 def test_mypy_internal_error(tmp_path, monkeypatch):

@@ -2207,13 +2207,16 @@ class RepoMapper:
         normalized = path.replace("\\", "/")
         parts = set(normalized.split("/"))
         name = Path(normalized).name
+        lower_name = name.lower()
         if "__pycache__" in parts or normalized.endswith(".pyc"):
             return True
         if parts.intersection({".git", ".devcouncil", ".pytest_cache", ".ruff_cache", ".mypy_cache", ".venv"}):
             return True
         if normalized.startswith("dist/") or normalized.startswith("build/"):
             return True
-        if name.startswith(("tmp", "temp", ".tmp", "debug")) or name.endswith("~"):
+        if lower_name.endswith((".tgz", ".whl", ".tar.gz")):
+            return True
+        if name.startswith(("tmp", "temp", ".tmp")) or name.endswith("~"):
             return True
         return False
 

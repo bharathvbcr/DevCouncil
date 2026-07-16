@@ -259,6 +259,7 @@ def test_graph_check_human(tmp_path, monkeypatch):
         lambda graph, top_n=15: {
             "god_nodes": [{"degree": 9, "id": "m.big", "kind": "function"}],
             "circular_imports": [{"nodes": ["a", "b"]}],
+            "package_init_count": 2,
         },
     )
     result = runner.invoke(app, ["graph", "check", "--project-root", str(tmp_path)])
@@ -266,6 +267,7 @@ def test_graph_check_human(tmp_path, monkeypatch):
     assert "God nodes" in result.output
     assert "m.big" in result.output
     assert "Circular imports" in result.output
+    assert "2 package-__init__ component(s) suppressed" in result.output
 
 
 def test_graph_check_json_no_cycles(tmp_path, monkeypatch):

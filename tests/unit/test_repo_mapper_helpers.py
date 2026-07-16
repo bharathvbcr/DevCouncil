@@ -74,6 +74,11 @@ def test_is_runtime_or_generated_file(mapper):
     assert mapper._is_runtime_or_generated_file(".git/config")
     assert mapper._is_runtime_or_generated_file("dist/bundle.js")
     assert mapper._is_runtime_or_generated_file("tmpfile")
+    assert mapper._is_runtime_or_generated_file("devcouncil-0.3.1.tgz")
+    assert mapper._is_runtime_or_generated_file("dist-copy/package.whl")
+    assert mapper._is_runtime_or_generated_file("archives/source.tar.gz")
+    assert not mapper._is_runtime_or_generated_file("src/pkg/debugger.py")
+    assert not mapper._is_runtime_or_generated_file("src/pkg/debug_tools.py")
     assert not mapper._is_runtime_or_generated_file("pkg/mod.py")
 
 
@@ -619,11 +624,15 @@ def test_map_is_stale_git_failure_is_stale(monkeypatch, mapper):
 
 def test_get_git_files_walk_fallback(tmp_path):
     (tmp_path / "keep.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "debug_runtime.py").write_text("x = 2\n", encoding="utf-8")
+    (tmp_path / "package.tgz").write_text("archive", encoding="utf-8")
     (tmp_path / "__pycache__").mkdir()
     (tmp_path / "__pycache__" / "junk.pyc").write_text("", encoding="utf-8")
     m = RepoMapper(tmp_path)
     files = m.get_git_files()
     assert "keep.py" in files
+    assert "debug_runtime.py" in files
+    assert "package.tgz" not in files
     assert not any("junk.pyc" in f for f in files)
 
 

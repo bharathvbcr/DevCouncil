@@ -135,7 +135,11 @@ def overview(ctx: typer.Context):
         table.add_row("Recommend", f"{PREFERRED_COMMAND} recommend", "Show the best executor for this machine and project.")
         table.add_row("Status", f"{PREFERRED_COMMAND} status", "Compact PATH + config summary (no MCP probe).")
         table.add_row("Matrix", f"{PREFERRED_COMMAND} matrix", "Print built-in coding CLI integration tiers.")
-        table.add_row("Check", f"{PREFERRED_COMMAND} check", "Verify MCP, hooks, and optional CLIs (--strict, --json for CI).")
+        table.add_row(
+            "Check",
+            f"{PREFERRED_COMMAND} check",
+            "Verify MCP, hooks, and integrations (--strict fails on real defects; optional coding CLIs stay warnings).",
+        )
         console.print(table)
         console.print(f"\nIf your install exposes only the setup flow, use: {LEGACY_COMMAND} --apply")
         console.print("\nRun without [bold]--apply[/bold] to preview the exact commands first.")
@@ -577,7 +581,7 @@ def all_tools(
     strict: bool = typer.Option(
         False,
         "--strict",
-        help="After --apply, run dev integrate check --strict and fail on missing optional CLIs.",
+        help="After --apply, run dev integrate check --strict (fails on real integration defects; missing optional coding CLIs stay warnings).",
     ),
 ):
     """
@@ -798,7 +802,7 @@ def check(
     strict: bool = typer.Option(
         False,
         "--strict",
-        help="Treat missing optional coding CLIs as failures instead of warnings.",
+        help="Fail on real project/integration defects (broken state, hooks, MCP, configured-client auth). Missing optional coding CLIs stay warnings.",
     ),
     as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON for CI."),
     report_file: Path | None = typer.Option(

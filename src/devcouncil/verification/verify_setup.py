@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_AD_HOC_TASK_ID = "CHECK"
+
 
 @dataclass
 class VerifyRunContext:
@@ -92,11 +94,19 @@ def resolve_verify_context(
         rigor_applied=list(rigor.applied),
     )
     verifier._command_timeout_cache = command_timeout
-    changed_files = verifier.get_task_changed_files(task.id)
+    is_ad_hoc_check = task.id == _AD_HOC_TASK_ID
+    # CHECK represents the live working tree, including edits recorded in the global
+    # baseline. Baseline/checkpoint subtraction only applies to persisted workflow tasks.
+    changed_files = (
+        verifier.get_changed_files()
+        if is_ad_hoc_check
+        else verifier.get_task_changed_files(task.id)
+    )
     diff_content = verifier.get_diff()
-    committed_diff = verifier._committed_task_diff(task.id)
-    if committed_diff.strip():
-        diff_content = committed_diff
+    if not is_ad_hoc_check:
+        committed_diff = verifier._committed_task_diff(task.id)
+        if committed_diff.strip():
+            diff_content = committed_diff
     diff_empty = not bool(diff_content.strip())
     log_step(
         "verify/2: collected diff and changed files",

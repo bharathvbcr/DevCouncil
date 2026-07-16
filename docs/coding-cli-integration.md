@@ -56,7 +56,7 @@ Verify that DevCouncil is ready to expose MCP tools:
 
 ```bash
 dev integrate check
-dev integrate check --strict   # Fail when optional CLIs are missing (CI)
+dev integrate check --strict   # Fail on real integration defects (optional coding CLIs stay warnings)
 dev integrate check --json     # Machine-readable report (ok, recommended_executor, checks)
 dev integrate check --report-file report.json  # Write the same JSON report to a file
 dev integrate check -o report.json             # Alias for --report-file / --output

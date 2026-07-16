@@ -7,6 +7,7 @@ class CommandResult(BaseModel):
     stdout_path: str
     stderr_path: str
     summary: str
+    timed_out: bool = False
 
 class DiffEvidence(BaseModel):
     task_id: str

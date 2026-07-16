@@ -392,7 +392,7 @@ def graph_check_cmd(
     json_output: bool = typer.Option(False, "--json"),
     top: int = typer.Option(15, "--top", help="How many god nodes to list."),
 ) -> None:
-    """God nodes (top-connected) and circular-import detection."""
+    """God nodes (top-connected) and circular-import component detection."""
     from devcouncil.indexing.graph.intel import graph_check
 
     root = _root(project_root)
@@ -407,11 +407,18 @@ def graph_check_cmd(
             f"  {g.get('degree'):>4}  {g.get('id')}  ({g.get('kind')})"
         )
     cycles = report.get("circular_imports") or []
-    console.print(f"\n[bold]Circular imports[/bold] ({len(cycles)})")
+    console.print(
+        f"\n[bold]Circular imports — strongly connected components[/bold] ({len(cycles)})"
+    )
     if not cycles:
         console.print("  (none)")
     for c in cycles[:30]:
-        console.print("  " + " → ".join(c.get("nodes") or []) + " → …")
+        console.print("  " + " ↔ ".join(c.get("nodes") or []))
+    package_init_count = report.get("package_init_count", 0)
+    if package_init_count:
+        console.print(
+            f"  {package_init_count} package-__init__ component(s) suppressed as barrel noise"
+        )
 
 
 @app.command("process")

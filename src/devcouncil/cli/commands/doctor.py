@@ -3,6 +3,7 @@ import typer
 import subprocess
 import os
 import shutil
+import sys
 from pathlib import Path
 from rich.console import Console
 from rich.table import Table
@@ -354,8 +355,15 @@ def check_coverage_floor(project_root: Path) -> list[tuple[str, str, str]]:
     ]
 
 
+def _mypy_command() -> list[str]:
+    """Resolve mypy through the project environment used by CI."""
+    if shutil.which("uv"):
+        return ["uv", "run", "--python", "3.12", "mypy", "src"]
+    return [sys.executable, "-m", "mypy", "src"]
+
+
 def check_mypy_status(project_root: Path) -> list[tuple[str, str, str]]:
-    """Doctor row summarizing ``mypy src`` health for this repository."""
+    """Doctor row summarizing canonical mypy health for this repository."""
     ok = "[green]OK[/green]"
     warn = "[yellow]WARN[/yellow]"
     pyproject = project_root / "pyproject.toml"
@@ -364,9 +372,11 @@ def check_mypy_status(project_root: Path) -> list[tuple[str, str, str]]:
     src_root = project_root / "src"
     if not src_root.is_dir():
         return [("mypy green", warn, "No src/ directory; skipping mypy probe.")]
+    command = _mypy_command()
+    command_text = subprocess.list2cmdline(command)
     try:
         proc = subprocess.run(
-            ["mypy", "src"],
+            command,
             cwd=project_root,
             capture_output=True,
             text=True,
@@ -375,30 +385,38 @@ def check_mypy_status(project_root: Path) -> list[tuple[str, str, str]]:
             timeout=120,
         )
     except FileNotFoundError:
-        return [("mypy green", warn, "mypy not on PATH; install dev dependencies.")]
+        return [("mypy green", warn, f"{command_text} is unavailable; install uv and development dependencies.")]
     except subprocess.TimeoutExpired:
-        return [("mypy green", warn, "mypy src timed out after 120s.")]
+        return [("mypy green", warn, f"{command_text} timed out after 120s.")]
     except Exception as exc:
-        return [("mypy green", warn, f"mypy probe failed: {exc}.")]
+        return [("mypy green", warn, f"{command_text} probe failed: {exc}.")]
 
     output = (proc.stdout or "") + (proc.stderr or "")
+    if "No module named mypy" in output or "No module named 'mypy'" in output:
+        return [
+            (
+                "mypy green",
+                warn,
+                f"{command_text} is unavailable; install uv and development dependencies.",
+            )
+        ]
     if "INTERNAL ERROR" in output:
         return [
             (
                 "mypy green",
                 warn,
-                "mypy crashed with INTERNAL ERROR; pin or upgrade mypy in dev dependencies.",
+                f"{command_text} crashed with INTERNAL ERROR; pin or upgrade mypy in dev dependencies.",
             )
         ]
     if proc.returncode == 0:
-        return [("mypy green", ok, "mypy src passed with zero errors.")]
+        return [("mypy green", ok, f"{command_text} passed with zero errors.")]
     error_count = output.count(": error:")
     preview = output.strip().splitlines()[-1] if output.strip() else "mypy failed"
     return [
         (
             "mypy green",
             warn,
-            f"mypy src reported {error_count} error(s). Last line: {preview}",
+            f"{command_text} reported {error_count} error(s). Last line: {preview}",
         )
     ]
 

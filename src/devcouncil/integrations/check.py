@@ -326,6 +326,13 @@ def build_integration_check_report(project_root: Path, *, strict: bool = False) 
             failures += 1
 
     def add_optional(ok: bool, name: str, details: str) -> None:
+        # Coding CLIs (and similar optional probes) stay informational even under
+        # --strict. Absence is never a failure; --strict still elevates real
+        # project/integration defects via add() / add_soft().
+        rows.append(IntegrationCheckRow(name=name, status="ok" if ok else "missing", details=details))
+
+    def add_soft(ok: bool, name: str, details: str) -> None:
+        """Warn when not strict; count as a failure under --strict."""
         if strict and not ok:
             add(False, name, details)
             return
@@ -385,7 +392,7 @@ def build_integration_check_report(project_root: Path, *, strict: bool = False) 
         from devcouncil.integrations.clients.cursor import probe_cursor_auth
 
         auth_ok, auth_details = probe_cursor_auth()
-        add_optional(auth_ok, "Cursor auth", auth_details)
+        add_soft(auth_ok, "Cursor auth", auth_details)
 
     grok_hooks = root / ".grok" / "hooks" / "devcouncil.json"
     grok_enabled = bool(raw_config.get("integrations", {}).get("grok", {}).get("enabled"))

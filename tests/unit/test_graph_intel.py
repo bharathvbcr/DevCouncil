@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 from devcouncil.cli.commands.graph_cmd import app as graph_app
 from devcouncil.indexing.graph.build import build_code_graph, write_code_graph
 from devcouncil.indexing.graph.intel import (
+    circular_imports,
     compute_communities,
     diff_impact,
     extract_processes,
@@ -121,10 +122,47 @@ def test_circular_import_detected(tmp_path):
     graph = build_code_graph(tmp_path)
     report = graph_check(graph)
     cycles = report["circular_imports"]
-    # Cycle detection may find a↔b depending on resolve; assert structure either way.
-    assert isinstance(cycles, list)
-    if cycles:
-        assert any(len(c["nodes"]) >= 2 for c in cycles)
+    assert cycles == [{"nodes": ["a.py", "b.py"], "length": 2}]
+
+
+def test_circular_import_sccs_are_deterministic():
+    nodes = [
+        GraphNode(id=path, kind=NodeKind.FILE, path=path)
+        for path in ("d.py", "b.py", "c.py", "a.py")
+    ]
+    edges = [
+        GraphEdge(source="d.py", target="c.py", kind="imports"),
+        GraphEdge(source="b.py", target="a.py", kind="imports"),
+        GraphEdge(source="c.py", target="d.py", kind="imports"),
+        GraphEdge(source="a.py", target="b.py", kind="imports"),
+    ]
+    graph = CodeGraph(nodes=nodes, edges=edges)
+
+    expected = [
+        {"nodes": ["a.py", "b.py"], "length": 2},
+        {"nodes": ["c.py", "d.py"], "length": 2},
+    ]
+    assert circular_imports(graph) == expected
+    graph.edges.reverse()
+    assert circular_imports(graph) == expected
+
+
+def test_package_init_cycle_noise_is_separated():
+    nodes = [
+        GraphNode(id=path, kind=NodeKind.FILE, path=path)
+        for path in ("pkg/__init__.py", "pkg/a.py")
+    ]
+    edges = [
+        GraphEdge(source="pkg/__init__.py", target="pkg/a.py", kind="imports"),
+        GraphEdge(source="pkg/a.py", target="pkg/__init__.py", kind="imports"),
+    ]
+    report = graph_check(CodeGraph(nodes=nodes, edges=edges))
+
+    assert report["circular_imports"] == []
+    assert report["package_init_count"] == 1
+    assert report["package_init_imports"] == [
+        {"nodes": ["pkg/__init__.py", "pkg/a.py"], "length": 2}
+    ]
 
 
 def test_extract_processes(call_chain):

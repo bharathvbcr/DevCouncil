@@ -137,10 +137,3 @@ def group_cost(project_root: Path) -> Dict[str, Any]:
         "by_task": _group(records, "task_id"),
         "by_run": _group(records, "run_id"),
     }
-
-
-def cost_by_task(project_root: Path) -> Dict[str, Dict[str, Any]]:
-    """Convenience accessor for the per-task cost breakdown (used by ``dev status``)."""
-    summary = group_cost(project_root)
-    by_task = summary.get("by_task", {})
-    return by_task if isinstance(by_task, dict) else {}

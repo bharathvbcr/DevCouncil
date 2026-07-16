@@ -20,6 +20,13 @@ from devcouncil.utils.subprocess_env import clean_subprocess_env
 logger = logging.getLogger(__name__)
 
 
+def _timeout_stream(content: str | bytes | None) -> str:
+    """Normalize partial output attached to ``TimeoutExpired``."""
+    if isinstance(content, bytes):
+        return content.decode("utf-8", errors="replace")
+    return content or ""
+
+
 def split_command(command: str) -> List[str]:
     # Use POSIX splitting so quotes are interpreted, not preserved. With
     # posix=False, `python -c "assert x"` keeps the surrounding quotes, so the
@@ -120,6 +127,25 @@ def run_verification_command(
                 f"stderr: {stderr_summary}. "
                 f"stdout: {stdout_summary}"
             ),
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = _timeout_stream(exc.stdout)
+        stderr = _timeout_stream(exc.stderr)
+        stdout_path = save_command_log(project_root, task_id, command, "stdout", stdout)
+        stderr_path = save_command_log(project_root, task_id, command, "stderr", stderr)
+        stdout_summary = redact_string(summarize_stream(stdout))
+        stderr_summary = redact_string(summarize_stream(stderr))
+        return CommandResult(
+            command=command,
+            exit_code=124,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            summary=(
+                f"Verification command timed out after {timeout} seconds. "
+                f"stderr: {stderr_summary}. "
+                f"stdout: {stdout_summary}"
+            ),
+            timed_out=True,
         )
     except Exception as e:
         logger.debug("Command run failed for %r: %s", command, e)

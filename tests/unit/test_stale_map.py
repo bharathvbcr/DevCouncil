@@ -51,6 +51,20 @@ def test_fresh_map_produces_no_gap(tmp_path):
     assert gaps == []
 
 
+def test_generated_archive_does_not_change_map_or_freshness(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "debug_runtime.py").write_text("x = 1\n", encoding="utf-8")
+    _commit(tmp_path)
+    mapper = RepoMapper(tmp_path)
+    repo_map = mapper.map_repo(liveness=False)
+
+    assert any(item.path == "src/debug_runtime.py" for item in repo_map.files)
+    archive = tmp_path / "devcouncil-0.3.1.tgz"
+    archive.write_text("generated archive", encoding="utf-8")
+    assert "devcouncil-0.3.1.tgz" not in mapper.get_git_files()
+    assert not mapper.map_is_stale(repo_map.model_dump())
+
+
 def test_stale_map_flagged_blocking_on_hard(tmp_path):
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")

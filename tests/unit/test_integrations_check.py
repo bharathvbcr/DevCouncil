@@ -68,6 +68,41 @@ def test_build_integration_check_report_returns_rows(tmp_path, monkeypatch):
     assert any(row.name == "Recommended coding CLI" for row in report.checks)
 
 
+def test_build_integration_check_report_strict_does_not_fail_on_missing_coding_clis(tmp_path, monkeypatch):
+    (tmp_path / ".devcouncil").mkdir()
+    monkeypatch.setattr("devcouncil.integrations.check.shutil.which", lambda _cmd: None)
+    monkeypatch.setattr("devcouncil.cli.commands.integrate._run_capture", lambda _cmd: (0, "help"))
+    monkeypatch.setattr(
+        "devcouncil.cli.commands.integrate._probe_mcp_tools",
+        lambda _root: ["devcouncil_status", "devcouncil_report", "devcouncil_get_task"],
+    )
+
+    report = build_integration_check_report(tmp_path, strict=True)
+
+    assert report.ok is True
+    assert report.failures == 0
+    missing = [row for row in report.checks if row.status == "missing"]
+    assert any(row.name == "Recommended coding CLI" for row in missing)
+    assert any(row.name.endswith("CLI") or row.name in {"OpenCode", "Aider", "Goose", "Warp / Oz"} for row in missing)
+    assert not any(row.status == "fail" for row in report.checks)
+
+
+def test_build_integration_check_report_strict_still_fails_on_broken_project_state(tmp_path, monkeypatch):
+    # No .devcouncil/ → project state is a real defect under any mode.
+    monkeypatch.setattr("devcouncil.integrations.check.shutil.which", lambda _cmd: None)
+    monkeypatch.setattr("devcouncil.cli.commands.integrate._run_capture", lambda _cmd: (0, "help"))
+    monkeypatch.setattr(
+        "devcouncil.cli.commands.integrate._probe_mcp_tools",
+        lambda _root: ["devcouncil_status", "devcouncil_report", "devcouncil_get_task"],
+    )
+
+    report = build_integration_check_report(tmp_path, strict=True)
+
+    assert report.ok is False
+    assert any(row.name == "Project state" and row.status == "fail" for row in report.checks)
+    assert any(row.name == "Recommended coding CLI" and row.status == "missing" for row in report.checks)
+
+
 def test_integration_status_summary_marks_configured_project_files(tmp_path):
     (tmp_path / ".devcouncil").mkdir()
     (tmp_path / ".devcouncil" / "config.yaml").write_text(

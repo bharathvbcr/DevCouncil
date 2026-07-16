@@ -233,8 +233,16 @@ def hotspots(
     return scored[:top_n]
 
 
-def circular_imports(graph: CodeGraph, *, max_cycles: int = 50) -> List[Dict[str, Any]]:
-    """Detect circular import chains among file nodes."""
+def _is_package_init(path: str) -> bool:
+    return Path(path.replace("\\", "/")).name == "__init__.py"
+
+
+def _import_components(
+    graph: CodeGraph,
+    *,
+    include_package_inits: bool,
+) -> List[Dict[str, Any]]:
+    """Deterministic strongly connected components in the file import graph."""
     try:
         import networkx as nx
     except ImportError:
@@ -247,36 +255,48 @@ def circular_imports(graph: CodeGraph, *, max_cycles: int = 50) -> List[Dict[str
         src, tgt = e.source, e.target
         if "::" in src or "::" in tgt:
             continue
+        if not include_package_inits and (
+            _is_package_init(src) or _is_package_init(tgt)
+        ):
+            continue
         if src != tgt:
             G.add_edge(src, tgt)
 
-    cycles: List[Dict[str, Any]] = []
     try:
-        for cycle in nx.simple_cycles(G):
-            if len(cycle) < 2:
-                continue
-            start = min(range(len(cycle)), key=lambda i: cycle[i])
-            rotated = cycle[start:] + cycle[:start]
-            cycles.append({"nodes": rotated, "length": len(rotated)})
-            if len(cycles) >= max_cycles:
-                break
+        components = [
+            sorted(component)
+            for component in nx.strongly_connected_components(G)
+            if len(component) >= 2
+        ]
     except Exception:
         logger.debug("cycle detection failed", exc_info=True)
         return []
 
-    cycles.sort(key=lambda c: (c["length"], c["nodes"]))
-    return cycles
+    components.sort(key=lambda nodes: (len(nodes), nodes))
+    return [{"nodes": nodes, "length": len(nodes)} for nodes in components]
+
+
+def circular_imports(graph: CodeGraph, *, max_cycles: int = 50) -> List[Dict[str, Any]]:
+    """Report actionable import SCCs, excluding Python package-init barrel noise."""
+    return _import_components(graph, include_package_inits=False)[:max_cycles]
 
 
 def graph_check(graph: CodeGraph, *, top_n: int = 15) -> Dict[str, Any]:
     """God nodes + circular imports report (``dev graph check``)."""
     gods = god_nodes(graph, top_n=top_n)
     cycles = circular_imports(graph)
+    package_init_components = [
+        component
+        for component in _import_components(graph, include_package_inits=True)
+        if any(_is_package_init(node) for node in component["nodes"])
+    ]
     return {
         "god_nodes": gods,
         "circular_imports": cycles,
+        "package_init_imports": package_init_components,
         "god_count": len(gods),
         "cycle_count": len(cycles),
+        "package_init_count": len(package_init_components),
     }
 
 
@@ -513,6 +533,10 @@ def enrich_graph_intel(
     meta["processes"] = processes[:12]
     meta["god_nodes"] = god_nodes(graph)[:15]
     meta["circular_imports"] = circular_imports(graph)[:30]
+    meta["package_init_import_count"] = sum(
+        any(_is_package_init(node) for node in component["nodes"])
+        for component in _import_components(graph, include_package_inits=True)
+    )
     if root is not None:
         meta["hotspots"] = hotspots(root, graph)
     graph.meta = meta

@@ -1480,11 +1480,21 @@ def test_cli_integrate_hooks_apply_writes_native_hook_files(tmp_path):
     assert "codex_hooks = true" in (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
 
 
-def test_cli_integrate_check_strict_fails_when_optional_cli_missing(tmp_path):
+def test_cli_integrate_check_strict_keeps_missing_optional_cli_as_warning(tmp_path, monkeypatch):
     (tmp_path / ".devcouncil").mkdir()
+    monkeypatch.setattr("devcouncil.integrations.check.shutil.which", lambda _cmd: None)
+    monkeypatch.setattr("devcouncil.cli.commands.integrate._run_capture", lambda _cmd: (0, "help"))
+    monkeypatch.setattr(
+        "devcouncil.cli.commands.integrate._probe_mcp_tools",
+        lambda _root: ["devcouncil_status", "devcouncil_report", "devcouncil_get_task"],
+    )
     result = runner.invoke(app, ["integrate", "check", "--strict", "--project-root", str(tmp_path)])
-    assert result.exit_code == 1
-    assert "Missing" not in result.output or "FAIL" in result.output
+    assert result.exit_code == 0
+    assert "Missing" in result.output
+    assert "Gemini CLI" in result.output
+    assert "Recommended coding CLI" in result.output
+    # Optional coding CLI absence must not surface as FAIL under --strict.
+    assert "FAIL" not in result.output
 
 
 def test_cli_go_auto_detects_coding_cli_when_default_is_manual(tmp_path, monkeypatch):

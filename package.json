@@ -41,7 +41,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "install:dev": "uv tool install --force .",
+    "install:dev": "uv tool install --force '.[codeintel-full]'",
     "install:editable": "uv pip install -e .",
     "dev": "uv run devcouncil",
     "pack:check": "npm pack --dry-run",

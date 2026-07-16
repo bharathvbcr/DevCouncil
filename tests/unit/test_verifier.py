@@ -107,6 +107,36 @@ def test_verifier_real_test_failure_stays_test_failed(tmp_path):
     assert not [g for g in gaps if g.gap_type == "invalid_verification_command"]
 
 
+def test_verifier_timeout_blocks_without_flaky_retry(tmp_path):
+    task = _task()
+    task.expected_tests = ['python -c "import time; time.sleep(60)"']
+    verifier = Verifier(tmp_path)
+    verifier.get_changed_files = lambda: ["src/auth.py"]
+    verifier.get_diff = lambda: "diff --git a/src/auth.py b/src/auth.py\n+token logic"
+    calls = []
+
+    def timed_out(command, task_id="verify"):
+        calls.append(command)
+        return CommandResult(
+            command=command,
+            exit_code=124,
+            stdout_path="",
+            stderr_path="",
+            summary="Verification command timed out after 1 seconds.",
+            timed_out=True,
+        )
+
+    verifier._run_command = timed_out
+
+    gaps, _ = asyncio.run(verifier.verify_task(task, [_requirement()]))
+
+    timeout_gaps = [g for g in gaps if g.gap_type == "test_failed" and g.blocking]
+    assert timeout_gaps
+    assert "timed out" in timeout_gaps[0].description
+    assert not [g for g in gaps if g.gap_type == "invalid_verification_command"]
+    assert calls == [task.expected_tests[0]]
+
+
 def test_verifier_uses_compiled_acceptance_checks_per_criterion(tmp_path):
     # When an acceptance compiler is available, the verifier runs DevCouncil-owned
     # per-criterion checks and maps evidence 1:1 — a passing check proves exactly

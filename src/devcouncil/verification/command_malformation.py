@@ -138,6 +138,8 @@ def failure_location(project_root: Path, result: CommandResult) -> Tuple[Optiona
 
 def command_is_malformed(result: CommandResult) -> bool:
     """True when a non-zero exit reflects a broken/unrunnable command."""
+    if result.timed_out:
+        return False
     is_pytest = "pytest" in (result.command or "")
     if is_pytest and result.exit_code in PYTEST_NONRUN_EXIT_CODES:
         return True
