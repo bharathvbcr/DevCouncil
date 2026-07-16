@@ -25,7 +25,7 @@ For machine-readable integration, add `--agent` with the selected automated exec
 dev plan "Add password reset with expiring single-use tokens"
 ```
 
-DevCouncil maps the repository, drafts requirements, runs planner and critic roles, and stores an approved task graph locally.
+DevCouncil maps the repository, drafts requirements, runs planner and critic roles, and stores an approved task graph locally. To preview the interactive code-graph UI before mapping, run `dev graph demo` (writes `.devcouncil/graph/demo.html` with a synthetic import graph).
 
 Inspect the plan:
 

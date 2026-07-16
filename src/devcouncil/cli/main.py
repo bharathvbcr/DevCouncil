@@ -40,6 +40,7 @@ from devcouncil.cli.commands import (  # noqa: E402 - imports follow stdio recon
     design,
     doctor,
     go,
+    graph_cmd,
     hook,
     init,
     integrate,
@@ -107,6 +108,7 @@ app.add_typer(evidence.app, name="evidence")
 app.add_typer(skills.app, name="skills")
 app.add_typer(okf.app, name="okf")
 app.add_typer(design.app, name="design")
+app.add_typer(graph_cmd.app, name="graph")
 watch.app.command("fs")(watch_fs)
 
 # Direct command registrations (those defined as def cmd())
