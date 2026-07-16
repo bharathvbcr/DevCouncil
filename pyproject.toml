@@ -12,7 +12,7 @@ dependencies = [
     "sqlmodel>=0.0.19",
     "httpx>=0.27.0",
     "gitpython>=3.1.49",
-    "mcp>=1.27.0",
+    "mcp>=1.28.1",
     "gepa>=0.1.1",
     "watchdog>=4.0.0",
 ]
