@@ -61,7 +61,7 @@ def detect_planned_file_gaps(
     for pf in task.planned_files:
         if pf.path not in changed_set and pf.allowed_change != "read_only":
             gaps.append(Gap(
-                id=next_gap_id(task.id, "FILE"),
+                id=next_gap_id(task.id, f"FILE-{pf.path}"),
                 severity="medium",
                 gap_type="planned_file_not_changed",
                 task_id=task.id,
@@ -85,7 +85,7 @@ def detect_dependency_risk_gaps(
     for dep_file in dependency_files_changed(changed_files):
         if dep_file not in planned_paths:
             gaps.append(Gap(
-                id=next_gap_id(task.id, "DEP"),
+                id=next_gap_id(task.id, f"DEP-{dep_file}"),
                 severity="high",
                 gap_type="dependency_risk",
                 task_id=task.id,

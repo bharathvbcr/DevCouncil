@@ -246,6 +246,27 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if name == "devcouncil_graph_impact":
         return await map_handlers.handle_graph_impact(root, arguments)
 
+    if name == "devcouncil_graph_ingest":
+        return await map_handlers.handle_graph_ingest(root, arguments)
+
+    if name == "devcouncil_graph_cypher":
+        return await map_handlers.handle_graph_cypher(root, arguments)
+
+    if name == "devcouncil_pdg_query":
+        return await map_handlers.handle_pdg_query(root, arguments)
+
+    if name == "devcouncil_explain":
+        return await map_handlers.handle_explain(root, arguments)
+
+    if name == "devcouncil_route_map":
+        return await map_handlers.handle_route_map(root, arguments)
+
+    if name == "devcouncil_shape_check":
+        return await map_handlers.handle_shape_check(root, arguments)
+
+    if name == "devcouncil_api_impact":
+        return await map_handlers.handle_api_impact(root, arguments)
+
     if name == "devcouncil_lsp_status":
         return await ast_lsp_handlers.handle_lsp_status(root, arguments)
 

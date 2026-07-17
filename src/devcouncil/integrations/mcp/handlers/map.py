@@ -411,6 +411,59 @@ def _structured_dead_code(
         return [], 0
 
 
+async def handle_graph_ingest(root: Path, arguments: dict) -> list[TextContent]:
+    paths, _ = optional_string_list_argument(arguments, "paths")
+    from devcouncil.cli.commands.map import generate_map_artifacts
+    from devcouncil.codeintel.sync import get_sync_coordinator
+    from devcouncil.indexing.graph.embeddings import build_embeddings
+
+    coordinator = get_sync_coordinator(root)
+    changed = list(paths or coordinator.reconcile())
+    coordinator.sync_now(changed)
+    map_path = root / ".devcouncil" / "repo_map.json"
+    generate_map_artifacts(root, map_path, quiet=True)
+    embedded = build_embeddings(root)
+    return json_text({"ok": True, "paths": changed, "embeddings_built": embedded})
+
+
+async def handle_graph_cypher(root: Path, arguments: dict) -> list[TextContent]:
+    query = optional_string_argument(arguments, "query")
+    if not query:
+        return error_text("Missing query", code="missing_argument", argument="query")
+    from devcouncil.indexing.graph.cypher import run_cypher
+
+    return json_text(run_cypher(root, query))
+
+
+async def handle_pdg_query(root: Path, arguments: dict) -> list[TextContent]:
+    mode = optional_string_argument(arguments, "mode")
+    target = optional_string_argument(arguments, "target")
+    if not mode:
+        return error_text("Missing mode", code="missing_argument", argument="mode")
+    if not target:
+        return error_text("Missing target", code="missing_argument", argument="target")
+    variable = optional_string_argument(arguments, "variable")
+    from devcouncil.indexing.graph.query import query_pdg_controls, query_pdg_flows
+
+    if mode == "controls":
+        return json_text(query_pdg_controls(root, target))
+    if mode == "flows":
+        return json_text(query_pdg_flows(root, target, variable=variable or None))
+    return error_text(
+        "mode must be controls or flows",
+        code="invalid_arguments",
+        argument="mode",
+    )
+
+
+async def handle_explain(root: Path, arguments: dict) -> list[TextContent]:
+    path = optional_string_argument(arguments, "path")
+    category = optional_string_argument(arguments, "category")
+    from devcouncil.indexing.graph.query import explain_pdg_taint
+
+    return json_text(explain_pdg_taint(root, path=path or None, category=category or None))
+
+
 async def handle_graph_query(root: Path, arguments: dict) -> list[TextContent]:
     name = optional_string_argument(arguments, "name_or_path")
     if not name:
@@ -467,3 +520,52 @@ async def handle_graph_impact(root: Path, arguments: dict) -> list[TextContent]:
         max_depth=3,
     )
     return json_text({"ok": True, **result})
+
+
+async def handle_route_map(root: Path, arguments: dict) -> list[TextContent]:
+    from devcouncil.indexing.graph.api_routes import route_map
+    from devcouncil.indexing.graph.build import load_code_graph
+
+    graph = load_code_graph(root)
+    if graph is None:
+        return error_text(
+            "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
+            code="graph_missing",
+        )
+    return json_text({"ok": True, **route_map(root, graph)})
+
+
+async def handle_shape_check(root: Path, arguments: dict) -> list[TextContent]:
+    route = optional_string_argument(arguments, "route")
+    if route == "":
+        return error_text("route must be a string", code="invalid_arguments", argument="route")
+    from devcouncil.indexing.graph.api_routes import shape_check
+    from devcouncil.indexing.graph.build import load_code_graph
+
+    graph = load_code_graph(root)
+    if graph is None:
+        return error_text(
+            "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
+            code="graph_missing",
+        )
+    return json_text({"ok": True, **shape_check(root, graph, route_filter=route)})
+
+
+async def handle_api_impact(root: Path, arguments: dict) -> list[TextContent]:
+    route_or_path = optional_string_argument(arguments, "route_or_path")
+    if not route_or_path:
+        return error_text(
+            "Missing route_or_path",
+            code="missing_argument",
+            argument="route_or_path",
+        )
+    from devcouncil.indexing.graph.api_routes import api_impact
+    from devcouncil.indexing.graph.build import load_code_graph
+
+    graph = load_code_graph(root)
+    if graph is None:
+        return error_text(
+            "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
+            code="graph_missing",
+        )
+    return json_text({"ok": True, **api_impact(root, route_or_path, graph)})

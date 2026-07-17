@@ -9,6 +9,7 @@ from rich.table import Table
 from devcouncil.telemetry.stages import log_stage, log_step
 
 from devcouncil.executors.agent_registry import (
+    GEMINI_DEPRECATION_MESSAGE,
     VALID_INPUT_MODES,
     agent_config_entry,
     is_reserved_agent_name,
@@ -47,7 +48,7 @@ app.add_typer(setup_app, name="setup")
 console = Console()
 logger = logging.getLogger(__name__)
 
-SUPPORTED_TOOLS = ("codex", "gemini", "claude", "cursor", "grok", "opencode", "antigravity", "warp", "aider")
+SUPPORTED_TOOLS = ("claude", "codex", "cursor", "grok", "opencode", "antigravity", "warp", "aider", "gemini")
 SUPPORTED_HOOK_TOOLS = common.SUPPORTED_HOOK_TOOLS
 OPENCODE_HOOK_PLUGIN_NAME = common.OPENCODE_HOOK_PLUGIN_NAME
 PREFERRED_COMMAND = "dev integrate"
@@ -94,6 +95,7 @@ _probe_mcp_tools = common._probe_mcp_tools
 _cursor_mcp_config = cursor_client._cursor_mcp_config
 _opencode_plugin_source = opencode_client._opencode_plugin_source
 _install_claude_hooks = hooks_client._install_claude_hooks
+_install_codex_hooks = hooks_client._install_codex_hooks
 _install_claude_assets = claude_client._install_claude_assets
 _install_claude_plugin = claude_client._install_claude_plugin
 _uninstall_claude = claude_client._uninstall_claude
@@ -117,9 +119,9 @@ def overview(ctx: typer.Context):
         table.add_column("Tool", style="cyan")
         table.add_column("Setup command", style="green")
         table.add_column("Notes")
-        table.add_row("Codex CLI", f"{PREFERRED_COMMAND} codex --apply", "Adds DevCouncil as a stdio MCP server.")
-        table.add_row("Gemini CLI", f"{PREFERRED_COMMAND} gemini --apply", "Adds DevCouncil as a project-scoped stdio MCP server.")
         table.add_row("Claude Code", f"{PREFERRED_COMMAND} claude --apply", "MCP + assistive hooks + slash commands, subagents, output style, skills, statusline. Add --write-gate for blocking containment.")
+        table.add_row("Codex CLI", f"{PREFERRED_COMMAND} codex --apply", "MCP + native lifecycle hooks. Review project hooks with /hooks after setup.")
+        table.add_row("Gemini CLI (deprecated)", f"{PREFERRED_COMMAND} gemini --apply", "Deprecated — use dev integrate antigravity --apply instead.")
         table.add_row("Claude assets", f"{PREFERRED_COMMAND} claude-assets --apply", "Slash commands, subagents, output style, statusline, permissions, skills (no MCP/hooks).")
         table.add_row("Claude plugin", f"{PREFERRED_COMMAND} claude-plugin --apply", "Self-contained Claude Code plugin + marketplace bundling everything for /plugin install.")
         table.add_row("Claude uninstall", f"{PREFERRED_COMMAND} claude --uninstall", "Remove DevCouncil hooks, statusline, MCP enablement, and generated assets from .claude/.")
@@ -131,7 +133,7 @@ def overview(ctx: typer.Context):
         table.add_row("Aider", f"{PREFERRED_COMMAND} aider --apply", "Enables the built-in Aider headless executor (no MCP).")
         table.add_row("Bring your own CLI", f"{PREFERRED_COMMAND} cli-agent NAME --command TOOL --apply", "Registers any prompt-taking CLI as a DevCouncil executor.")
         table.add_row("All", f"{PREFERRED_COMMAND} all --apply", "Runs MCP setup and installs native hooks.")
-        table.add_row("Native hooks", f"{PREFERRED_COMMAND} hooks --apply", "Installs Codex, Gemini, Claude, Cursor, Grok, and OpenCode hook files.")
+        table.add_row("Native hooks", f"{PREFERRED_COMMAND} hooks --apply", "Installs Codex, Claude, Cursor, Grok, and OpenCode hook files.")
         table.add_row("Recommend", f"{PREFERRED_COMMAND} recommend", "Show the best executor for this machine and project.")
         table.add_row("Status", f"{PREFERRED_COMMAND} status", "Compact PATH + config summary (no MCP probe).")
         table.add_row("Matrix", f"{PREFERRED_COMMAND} matrix", "Print built-in coding CLI integration tiers.")
@@ -161,11 +163,22 @@ def codex(
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
 ):
     """
-    Set up DevCouncil MCP tools for Codex CLI.
+    Set up DevCouncil MCP tools and native lifecycle hooks for Codex CLI.
     """
     root = _project_root(project_root)
     command = _codex_command(root)
     ok = _configure("Codex CLI", command, apply)
+    if apply and ok:
+        try:
+            written = _install_codex_hooks(root)
+            common.record_hook_dev_executable(root)
+        except (ValueError, FileNotFoundError, OSError) as exc:
+            console.print(f"[red]Codex hook setup failed: {exc}[/red]")
+            raise typer.Exit(code=1) from exc
+        console.print(
+            f"[green]Codex integration installed[/green] ({len(written)} hook/config file(s)): MCP + native hooks."
+        )
+        console.print("[yellow]Open Codex in this project and run /hooks to review and trust the generated hooks.[/yellow]")
     if not ok and apply:
         raise typer.Exit(code=1)
 
@@ -184,8 +197,9 @@ def gemini(
         raise typer.Exit(code=2)
 
     root = _project_root(project_root)
+    console.print(f"[yellow]{GEMINI_DEPRECATION_MESSAGE}[/yellow]")
     command = _gemini_command(root, scope)
-    ok = _configure("Gemini CLI", command, apply)
+    ok = _configure("Gemini CLI (deprecated)", command, apply)
     if not ok and apply:
         raise typer.Exit(code=1)
 
@@ -612,9 +626,8 @@ def all_tools(
         return
 
     commands = [
-        ("Codex CLI", _codex_command(root)),
-        ("Gemini CLI", _gemini_command(root, gemini_scope)),
         ("Claude Code", _claude_command(root, claude_scope)),
+        ("Codex CLI", _codex_command(root)),
     ]
     for tool, command in commands:
         _configure(tool, command, apply)

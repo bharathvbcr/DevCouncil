@@ -25,7 +25,26 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 OPENCODE_HOOK_PLUGIN_NAME = "opencode_devcouncil_plugin.mjs"
-SUPPORTED_HOOK_TOOLS = ("codex", "gemini", "claude", "cursor", "grok")
+SUPPORTED_HOOK_TOOLS = ("claude", "codex", "cursor", "grok")
+# Clients whose native hook installers wire Stop/SubagentStop handlers.
+STOP_HOOK_TOOLS = frozenset({"claude", "codex"})
+
+
+def seed_stop_gate_assist_if_unset(config: dict) -> None:
+    """Default ``execution.stop_gate.mode`` to ``assist`` when hooks are installed.
+
+    Code default remains ``off`` (``StopGateConfig.mode``); integrate/first-run setup
+    for Stop-hook clients opts into assistive warnings without blocking completion.
+    """
+    execution = config.setdefault("execution", {})
+    stop_gate = execution.setdefault("stop_gate", {})
+    if not isinstance(stop_gate, dict):
+        stop_gate = {}
+        execution["stop_gate"] = stop_gate
+    if not stop_gate.get("mode"):
+        stop_gate["mode"] = "assist"
+    stop_gate.setdefault("check_claims", True)
+    stop_gate.setdefault("verify_active_task", True)
 
 # Recorded when hooks are installed so `dev integrate hooks --check` can detect drift
 # between a stale global CLI and the project venv.
@@ -118,7 +137,13 @@ def _warn_if_verify_only(client: str) -> None:
         )
 
 def _server_args(project_root: Path) -> list[str]:
-    return ["devcouncil", "mcp-server"]
+    """Return the exact MCP server command clients should persist.
+
+    Project integrations must execute the checkout they were generated from.  A
+    bare ``devcouncil`` command can resolve to an older global installation and
+    silently serve a different schema than the working tree.
+    """
+    return [resolve_dev_executable(project_root), "mcp-server"]
 
 _PENDING_RAW_CONFIG: dict | None = None
 
@@ -182,9 +207,10 @@ def _probe_mcp_tools(root: Path, *, timeout_seconds: float = 30.0) -> list[str]:
     async def _list_tools() -> list[str]:
         env = os.environ.copy()
         env["DEVCOUNCIL_PROJECT_ROOT"] = str(root)
+        command = _server_args(root)
         params = StdioServerParameters(
-            command=sys.executable,
-            args=["-m", "devcouncil", "mcp-server"],
+            command=command[0],
+            args=command[1:],
             cwd=str(root),
             env=env,
         )

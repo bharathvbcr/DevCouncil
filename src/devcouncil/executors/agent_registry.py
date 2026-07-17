@@ -65,6 +65,12 @@ BUILTIN_AGENT_NAMES = {
 BUILTIN_CODING_EXECUTOR_NAMES = tuple(sorted(BUILTIN_AGENT_NAMES))
 VALID_INPUT_MODES = {"stdin", "argument", "prompt-file"}
 
+DEPRECATED_CODING_CLIS = frozenset({"gemini"})
+GEMINI_DEPRECATION_MESSAGE = (
+    "Gemini CLI is deprecated (Google replaced it with Antigravity CLI). "
+    "Use: dev integrate antigravity --apply"
+)
+
 
 @dataclass(frozen=True)
 class CliAgentSpec:
@@ -116,9 +122,8 @@ def resolve_cursor_agent_executable() -> str | None:
 
 
 CODING_CLI_PROBE_ORDER: tuple[str, ...] = (
-    "codex",
-    "gemini",
     "claude",
+    "codex",
     "cursor",
     "grok",
     "opencode",
@@ -142,14 +147,17 @@ class CodingCliIntegrationInfo:
     hooks: bool
     launcher_shim: bool
     notes: str
+    blocking_hooks: bool = False
+    deprecated: bool = False
 
     @property
     def enforcement(self) -> str:
-        """Honest containment posture: ``pre-action`` when a native hook blocks
-        unauthorized writes/commands before they happen, else ``verify-only`` — for
-        which "forbidden changes" are caught only post-hoc by verification, not blocked
-        up front. Surfaced so users aren't misled into assuming hard containment."""
-        return "pre-action" if self.hooks else "verify-only"
+        """Honest containment posture for the client's current native API."""
+        if self.blocking_hooks:
+            return "pre-action"
+        if self.hooks:
+            return "advisory+verify"
+        return "verify-only"
 
 
 # Tier 1 = headless executor + verify; tier 2 = MCP companion; hooks = native pre-tool policy.
@@ -158,10 +166,19 @@ CODING_CLI_INTEGRATION_INFO: dict[str, CodingCliIntegrationInfo] = {
         "codex", "Codex CLI", 1, True, True, True, True, "dev integrate codex --apply"
     ),
     "gemini": CodingCliIntegrationInfo(
-        "gemini", "Gemini CLI", 1, True, True, True, True, "dev integrate gemini --apply"
+        "gemini",
+        "Gemini CLI (deprecated)",
+        1,
+        True,
+        True,
+        True,
+        True,
+        "Deprecated — migrate to: dev integrate antigravity --apply",
+        blocking_hooks=True,
+        deprecated=True,
     ),
     "claude": CodingCliIntegrationInfo(
-        "claude", "Claude Code", 1, True, True, True, True, "dev integrate claude --apply"
+        "claude", "Claude Code", 1, True, True, True, True, "dev integrate claude --apply", blocking_hooks=True
     ),
     "cursor": CodingCliIntegrationInfo(
         "cursor",
@@ -172,6 +189,7 @@ CODING_CLI_INTEGRATION_INFO: dict[str, CodingCliIntegrationInfo] = {
         True,
         True,
         "dev integrate cursor --apply; agent/cursor-agent for headless",
+        blocking_hooks=True,
     ),
     "grok": CodingCliIntegrationInfo(
         "grok",
@@ -182,9 +200,10 @@ CODING_CLI_INTEGRATION_INFO: dict[str, CodingCliIntegrationInfo] = {
         True,
         True,
         "dev integrate grok --apply",
+        blocking_hooks=True,
     ),
     "opencode": CodingCliIntegrationInfo(
-        "opencode", "OpenCode", 1, True, True, True, True, "dev integrate opencode --apply"
+        "opencode", "OpenCode", 1, True, True, True, True, "dev integrate opencode --apply", blocking_hooks=True
     ),
     "antigravity": CodingCliIntegrationInfo(
         "antigravity",
@@ -269,6 +288,31 @@ def resolve_coding_cli_probe_order(project_root: Path) -> tuple[str, ...]:
     return CODING_CLI_PROBE_ORDER
 
 
+def _configured_probe_order(project_root: Path) -> tuple[str, ...] | None:
+    try:
+        configured = load_config(project_root).execution.coding_cli_probe_order
+        if configured:
+            return tuple(normalize_agent_name(name) for name in configured)
+    except Exception:
+        logger.debug("Could not load coding_cli_probe_order from config", exc_info=True)
+    return None
+
+
+def _deprecated_allowed_in_probe(
+    project_root: Path,
+    client: str,
+    *,
+    probe_order: tuple[str, ...] | None,
+) -> bool:
+    normalized = normalize_agent_name(client)
+    if normalized not in DEPRECATED_CODING_CLIS:
+        return False
+    if probe_order is not None:
+        return normalized in {normalize_agent_name(name) for name in probe_order}
+    configured = _configured_probe_order(project_root)
+    return configured is not None and normalized in configured
+
+
 def detect_available_coding_cli(
     project_root: Path,
     probe_order: tuple[str, ...] | None = None,
@@ -278,8 +322,14 @@ def detect_available_coding_cli(
     # table and re-parse config.yaml). Resolution below mirrors
     # resolve_coding_cli_executable() exactly, just against the prebuilt table.
     specs = load_cli_agent_specs(project_root)
-    for client in probe_order or resolve_coding_cli_probe_order(project_root):
+    order = probe_order or resolve_coding_cli_probe_order(project_root)
+    for client in order:
         normalized = normalize_agent_name(client)
+        if (
+            normalized in DEPRECATED_CODING_CLIS
+            and not _deprecated_allowed_in_probe(project_root, normalized, probe_order=probe_order)
+        ):
+            continue
         if normalized == "cursor":
             if resolve_cursor_agent_executable():
                 return client
@@ -362,11 +412,11 @@ def builtin_agent_specs(project_root: Path) -> dict[str, CliAgentSpec]:
         ),
         "claude": CliAgentSpec(
             name="claude",
-            # `-p` runs headless; `--permission-mode acceptEdits` lets Claude Code
-            # actually apply file edits without an interactive approval prompt
-            # (otherwise it only describes the change and the diff stays empty).
+            # `-p` runs headless. Permission mode is profile-driven: yolo/auto adds
+            # `--permission-mode acceptEdits`; default/prod stay gated (no blanket
+            # auto-apply baked into the base spec).
             command="claude",
-            args=["-p", "--permission-mode", "acceptEdits"],
+            args=["-p"],
             display_name="Claude Code",
             kind="coding-cli",
             supports_mcp=True,

@@ -2,7 +2,7 @@
 
 This is the shortest path for a new developer who wants to install DevCouncil, initialize a repository, connect a coding CLI, and run the first gated task.
 
-Run DevCouncil commands in a normal terminal from the root of the repository you want DevCouncil to manage. Do not run these commands inside the coding CLI chat. Later, you paste the generated `dev prompt TASK-ID` output into Codex, Gemini, Claude Code, OpenCode, Antigravity, Warp, Cursor, Aider, Copilot, Goose, Amp, Qwen, Crush, or another registered CLI agent.
+Run DevCouncil commands in a normal terminal from the root of the repository you want DevCouncil to manage. Do not run these commands inside the coding CLI chat. Later, you paste the generated `dev prompt TASK-ID` output into Codex, Claude Code, OpenCode, Antigravity, Warp, Cursor, Aider, Copilot, Goose, Amp, Qwen, Crush, or another registered CLI agent. (The legacy Gemini CLI is deprecated — use Antigravity instead.)
 
 ## Where To Run Commands
 
@@ -133,7 +133,7 @@ dev setup --integrate
 
 Fresh interactive setup prompts to apply supported coding CLI integrations immediately. Use `dev setup --skip-integrations` to defer that step.
 
-`dev run --executor <client>` can be used for supported direct CLI execution modes (`codex`, `gemini`, `claude`, `opencode`, `antigravity`, `warp`, `cursor`, `aider`, `copilot`, `goose`, `amp`, `qwen`, `crush`, configured custom CLI agents, and their aliases), and it now performs verification after the tool exits.
+`dev run --executor <client>` can be used for supported direct CLI execution modes (`codex`, `claude`, `opencode`, `antigravity`, `warp`, `cursor`, `aider`, `copilot`, `goose`, `amp`, `qwen`, `crush`, configured custom CLI agents, and their aliases). **`gemini` / `gemini-cli` remain as deprecated compat only** — prefer `antigravity`. Verification runs after the tool exits.
 
 To apply supported MCP integrations for detected clients:
 
@@ -155,7 +155,16 @@ For a coding agent or CI-style integration with a supported executor installed, 
 dev e2e "Add password reset with expiring single-use tokens" --executor codex
 ```
 
-This is equivalent to `dev go`: it auto-initializes DevCouncil state if needed, plans the goal, executes approved tasks with the selected executor, verifies each task, and prints the final report. If `--executor` is omitted, DevCouncil uses `execution.default_executor` from `.devcouncil/config.yaml`. Use `--executor gemini`, `--executor claude`, `--executor opencode`, `--executor antigravity`, `--executor warp`, `--executor cursor`, `--executor aider`, `--executor copilot`, `--executor goose`, `--executor amp`, `--executor qwen`, `--executor crush`, `--executor native-preview`, `--executor mini`, or `--executor openhands` when that executor is installed and configured.
+This is equivalent to `dev go`: it auto-initializes DevCouncil state if needed, plans the goal, executes approved tasks with the selected executor, verifies each task, and prints the final report.
+
+**One-command onboarding:** `dev boot "goal"` runs first-run setup, applies `dev integrate --apply` (unless you pass `--skip-integrations`), optionally scaffolds CI with `--scaffold-ci` / `--scaffold-ci-evidence`, and hands off to `dev go` with the same goal. On non-interactive terminals it skips API-key prompts automatically; pass `--skip-api-key` explicitly when needed.
+
+```bash
+dev boot "Add password reset with expiring single-use tokens" --executor codex
+dev boot "Add feature X" --skip-integrations --scaffold-ci-evidence
+```
+
+If `--executor` is omitted, DevCouncil uses `execution.default_executor` from `.devcouncil/config.yaml` and auto-detects the first non-deprecated CLI on PATH (Gemini is skipped). Use `--executor antigravity`, `--executor claude`, `--executor opencode`, `--executor warp`, `--executor cursor`, etc. when that executor is installed and configured. `--executor gemini` still works but prints a deprecation warning.
 
 If planning raises advisory gaps and `dev e2e` stops with no approved tasks, review `dev status` and run `dev approve` (or re-run with `--force` to proceed past advisory planning gaps automatically).
 
@@ -180,7 +189,7 @@ dev approve              # accept the generated plan and unblock tasks
 dev approve --force      # approve even when blocking gate gaps remain
 ```
 
-Pick one task:
+Pick one task (`dev tasks` shows a **Lease** column when an agent holds an active checkout):
 
 ```bash
 dev tasks
@@ -198,7 +207,10 @@ Paste the output of that command into your coding CLI, or run directly through D
 
 ```bash
 dev run TASK-001 --executor codex
+# Deprecated — prefer Antigravity:
 dev run TASK-001 --executor gemini
+# Recommended:
+dev run TASK-001 --executor antigravity
 dev run TASK-001 --executor claude
 dev run TASK-001 --executor opencode
 dev run TASK-001 --executor antigravity
@@ -241,13 +253,20 @@ dev check --verify --goal "password reset tokens are single-use" --test "pytest 
 Optional live inspection surfaces:
 
 ```bash
-dev dashboard --open
+dev graph demo              # sample code-graph UI + SVG (no map required)
+dev map && dev graph view   # repo map + interactive code graph (default :8765)
+dev graph html --open       # write/open graph.html once
+dev dashboard --open        # status dashboard with gaps panel (use --port if graph view is running)
 dev cost show
 dev runs list
+dev runs timeline RUN-ID    # inspect checkpoints, trace events, and diff stat
+dev runs diff RUN-ID        # see exactly what a run changed
+dev runs supervise RUN-ID   # keep | revert | repair verdict (--apply to revert from CLI)
 dev lsp inspect
 dev ast match "target_symbol"
 dev skills
 dev scaffold-ci
+dev scaffold-ci --evidence  # also write devcouncil-evidence.yml for PR verify + artifacts
 ```
 
 To publish the final report back to a review thread, set the provider environment variables and run one of:

@@ -147,7 +147,7 @@ def detect_semantic_diff_gaps(
             moved = name in readded_public
             intended = bool(name) and name.lower() in intent_text
             gaps.append(Gap(
-                id=next_gap_id(task.id, "DRIFT"),
+                id=next_gap_id(task.id, f"DRIFT-{path}:{name}"),
                 severity="high",
                 gap_type="architecture_drift",
                 task_id=task.id,
@@ -166,7 +166,7 @@ def detect_semantic_diff_gaps(
             ))
         elif change_type == "public_api_change" and path not in planned_paths:
             gaps.append(Gap(
-                id=next_gap_id(task.id, "SEM"),
+                id=next_gap_id(task.id, f"SEM-{path}"),
                 severity="high",
                 gap_type="architecture_drift",
                 task_id=task.id,
@@ -177,7 +177,7 @@ def detect_semantic_diff_gaps(
             ))
         elif change_type == "public_api_change" and path in planned_paths:
             gaps.append(Gap(
-                id=next_gap_id(task.id, "SIGDRIFT"),
+                id=next_gap_id(task.id, f"SIGDRIFT-{path}:{item.get('name', '')}"),
                 severity="medium",
                 gap_type="architecture_drift",
                 task_id=task.id,
@@ -199,7 +199,7 @@ def detect_semantic_diff_gaps(
             new_third_party = is_new_third_party_import(top, project_deps=project_deps)
             if new_third_party:
                 gaps.append(Gap(
-                    id=next_gap_id(task.id, "DEPADD"),
+                    id=next_gap_id(task.id, f"DEPADD-{path}:{top}"),
                     severity="high",
                     gap_type="dependency_risk",
                     task_id=task.id,
@@ -218,7 +218,7 @@ def detect_semantic_diff_gaps(
                 ))
             elif path not in planned_paths:
                 gaps.append(Gap(
-                    id=next_gap_id(task.id, "IMP"),
+                    id=next_gap_id(task.id, f"IMP-{path}"),
                     severity="medium",
                     gap_type="dependency_risk",
                     task_id=task.id,
@@ -229,7 +229,7 @@ def detect_semantic_diff_gaps(
                 ))
         elif change_type == "config_schema_dependency_change" and path not in planned_paths:
             gaps.append(Gap(
-                id=next_gap_id(task.id, "CFG"),
+                id=next_gap_id(task.id, f"CFG-{path}"),
                 severity="high",
                 gap_type="dependency_risk",
                 task_id=task.id,

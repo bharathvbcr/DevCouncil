@@ -1,8 +1,7 @@
-"""Stale-map gate: flag when ``repo_map.json`` lags the current git HEAD / file set.
+"""Stale-map gate: flag when ``repo_map.json`` is missing or lags git HEAD.
 
-Advisory on easy/normal rigor; blocking on hard (same posture as unwired/dead_symbol).
-Never raises — degrades to zero gaps when the map is absent or fingerprinting is
-unavailable (legacy maps without ``generated_head``/``indexed_hash`` are never stale).
+Missing map is always stale (fail-closed on hard rigor). Advisory on easy/normal;
+blocking on hard. Never raises.
 """
 
 from __future__ import annotations
@@ -34,7 +33,20 @@ def detect_stale_map_gaps(
         if data is None:
             map_path = project_root / ".devcouncil" / "repo_map.json"
             if not map_path.is_file():
-                return []
+                return [Gap(
+                    id=next_gap_id(task.id, "STALEMAP-MISSING"),
+                    severity="high" if stale_map_blocking else "medium",
+                    gap_type="stale_map",
+                    task_id=task.id,
+                    description=(
+                        "Repository map ``.devcouncil/repo_map.json`` is missing. "
+                        "Subsystem neighbors, dependents, and liveness gates cannot run."
+                    ),
+                    evidence=[".devcouncil/repo_map.json"],
+                    recommended_fix="Run `dev map` to generate the repository map, then re-verify.",
+                    blocking=stale_map_blocking,
+                    suggested_command="dev map",
+                )]
             from devcouncil.utils.json_persist import read_json
 
             loaded = read_json(map_path)

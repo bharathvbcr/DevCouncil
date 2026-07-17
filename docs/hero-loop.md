@@ -6,10 +6,38 @@ typed list of next actions, repairs, and re-verifies — **without a human pasti
 or test output back and forth.** Evidence, not model confidence, decides when the work is
 done.
 
-This is the one path DevCouncil certifies end to end. See [certified-paths.md](certified-paths.md)
-for the agent × OS × transport matrix. Other coding CLIs are supported (see
+This is the one path DevCouncil certifies end to end. Other coding CLIs are supported (see
 [coding-cli-integration.md](coding-cli-integration.md)), but the loop below is the one to
 reach for first.
+
+## Certified path (Stable)
+
+| Agent | OS | Transport | Status |
+| --- | --- | --- | --- |
+| **Claude Code** | macOS, Linux | MCP (`devcouncil_*` tools) + optional hooks | **Certified / Stable** |
+| **Claude Code** | macOS, Linux | Slash commands (`/devcouncil:*`) shelling to MCP | **Certified / Stable** |
+| **Claude Code** | macOS, Linux | Subagent `devcouncil-implementer` | **Certified / Stable** |
+
+Golden coverage: `tests/unit/test_mcp_closed_loop.py` and `tests/unit/test_hero_loop_golden.py`.
+
+### Deterministic self-repair (`dev go`)
+
+Stable repair contract (no LLM required): correction manifest from blocking gaps + next-actions; bounded re-runs (`execution.max_repair_attempts`); stop on unchanged blocking-gap fingerprint; optional LLM `RepairService` when a provider key is configured (Preview). See `tests/unit/test_go_repair_loop.py`.
+
+### Lease contract (long runs)
+
+| Failure | Code | Recovery |
+| --- | --- | --- |
+| TTL not yet expired | — | `devcouncil_renew_lease` before `expires_at` |
+| TTL expired | `lease_expired` | `devcouncil_checkout_task` again |
+| Wrong token / no lease | `invalid_lease` | Checkout with correct `client_id` |
+| Another agent holds task | `lease_held_by_other` | `devcouncil_next_task` or wait |
+
+### Best-effort adapters (Preview)
+
+Codex, Antigravity, Cursor Agent, Grok, OpenCode, Warp/Aider/Copilot/others reuse the same verifier and next-actions contract but are not certified for the full MCP closed loop. Gemini CLI is **deprecated** (use Antigravity). Prefer the Claude Code MCP path for production agent loops; confirm wiring with `dev integrate check`.
+
+Large multi-agent goals with dependency DAGs should use **`dev campaign`** (Director → Coordinator → Worker pool + Reviewer QC), not the retired feudal-theme naming.
 
 ## The loop
 
@@ -143,8 +171,6 @@ Repair runs carry a **correction manifest** with prior diff, failing output, att
 history, stub findings, and non-negotiable **repair rules** (never weaken tests, never
 stub around a gap). Tune thresholds from evidence with `dev report rigor`.
 
-See [anti-laziness-rigor.md](anti-laziness-rigor.md) for the full design.
-
 ## Setup
 
 ```bash
@@ -203,7 +229,8 @@ or prior advisor advice. Soft pairing preflight skips clearly bad pairs so Claud
 not hard-exit and burn the repair budget. Set `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1` to
 disable the tool entirely (Claude still accepts `--advisor` / `advisorModel` but ignores them).
 
-See [coding-cli-integration.md](coding-cli-integration.md) for more detail.
+See [coding-cli-integration.md](coding-cli-integration.md) for more detail, including the
+unified **stop gate** (claim checks + optional active-task verify on Claude/Codex Stop hooks).
 
 ## The lite on-ramp
 

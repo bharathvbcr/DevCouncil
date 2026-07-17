@@ -47,7 +47,7 @@ def run_verification_commands(
             applicable, skip_reason = command_applicable(cmd)
             if not applicable:
                 result.gaps.append(Gap(
-                    id=next_gap_id(task.id, "SKIP"),
+                    id=next_gap_id(task.id, f"SKIP-{cmd}"),
                     severity="low",
                     gap_type="skipped_verification_command",
                     task_id=task.id,
@@ -87,7 +87,7 @@ def run_verification_commands(
                 if command_is_malformed(cmd_result):
                     result.had_unrunnable = True
                     result.gaps.append(Gap(
-                        id=next_gap_id(task.id, "BADCMD"),
+                        id=next_gap_id(task.id, f"BADCMD-{cmd}"),
                         severity="medium",
                         gap_type="invalid_verification_command",
                         task_id=task.id,
@@ -120,7 +120,7 @@ def run_verification_commands(
                         else f"failed with exit code {cmd_result.exit_code}"
                     )
                     gap = Gap(
-                        id=next_gap_id(task.id, cmd_type.upper()),
+                        id=next_gap_id(task.id, f"{cmd_type.upper()}-{cmd}"),
                         severity="high" if blocking else "medium",
                         gap_type="quality_gate_failed" if is_quality_gate else "test_failed",
                         task_id=task.id,

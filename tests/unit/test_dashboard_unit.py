@@ -158,6 +158,45 @@ def test_dashboard_apply_payload_value_error(tmp_path, monkeypatch):
     assert "unknown target" in out["error"]
 
 
+def test_dashboard_gaps_summary_blocking_first_and_cap(tmp_path, monkeypatch):
+    from devcouncil.domain.gap import Gap
+    from devcouncil.storage.repositories import GapRepository
+
+    class FakeSession:
+        pass
+
+    saved = []
+
+    class FakeGapRepo:
+        def __init__(self, session):
+            self.session = session
+
+        def get_all(self):
+            return list(saved)
+
+    monkeypatch.setattr(dash, "GapRepository", FakeGapRepo)
+
+    for i in range(60):
+        saved.append(
+            Gap(
+                id=f"GAP-{i}",
+                severity="low",
+                gap_type="stub_detected",
+                task_id=f"TASK-{i}",
+                description=f"Gap {i}",
+                recommended_fix="fix",
+                blocking=i < 5,
+            )
+        )
+
+    summary = dash._dashboard_gaps_summary(FakeSession())
+    assert summary["total"] == 60
+    assert summary["blocking"] == 5
+    assert len(summary["items"]) == 50
+    assert all(item["blocking"] for item in summary["items"][:5])
+    assert not any(item["blocking"] for item in summary["items"][5:])
+
+
 def test_dashboard_html_embeds_token_and_sections():
     html = dash.dashboard_html('tok"en')
     # Quote is stripped so the meta attribute stays well-formed.
@@ -262,6 +301,7 @@ def test_dashboard_payload_initialized(tmp_path, monkeypatch):
     monkeypatch.setattr(dash, "_recent_trace_events_cached", lambda root: [])
     monkeypatch.setattr(dash, "_integration_summary_cached", lambda root: {"capabilities": []})
     monkeypatch.setattr(dash, "recent_run_artifacts", lambda root: [])
+    monkeypatch.setattr(dash, "_dashboard_gaps_summary", lambda session: {"total": 0, "blocking": 0, "items": []})
 
     payload = dash.dashboard_payload(tmp_path)
     assert payload["initialized"] is True

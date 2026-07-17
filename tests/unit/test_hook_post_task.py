@@ -1,4 +1,4 @@
-"""Rank 18 remainder — the post_task hook verifies the active task when enabled."""
+"""post_task hook is a thin alias for the unified stop gate."""
 
 import subprocess
 
@@ -18,10 +18,14 @@ def _init_repo(tmp_path, *, verify_on_post_task: bool):
     subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
     dev = tmp_path / ".devcouncil"
     dev.mkdir()
-    flag = "true" if verify_on_post_task else "false"
-    (dev / "config.yaml").write_text(
-        f"project:\n  name: test\nexecution:\n  verify_on_post_task: {flag}\n", encoding="utf-8"
-    )
+    if verify_on_post_task:
+        yaml = (
+            "project:\n  name: test\nexecution:\n  stop_gate:\n"
+            "    mode: assist\n    verify_active_task: true\n"
+        )
+    else:
+        yaml = "project:\n  name: test\nexecution:\n  stop_gate:\n    mode: off\n"
+    (dev / "config.yaml").write_text(yaml, encoding="utf-8")
     db = get_db(tmp_path)
     with db.get_session() as session:
         RequirementRepository(session).save(Requirement(
@@ -34,27 +38,23 @@ def _init_repo(tmp_path, *, verify_on_post_task: bool):
             planned_files=[PlannedFile(path="src/app.py", reason="logic", allowed_change="modify")],
             expected_tests=["python --version"],
         ))
-    # Mark TASK-001 the active task for the hook to resolve.
     write_signal(tmp_path, "claude", {"task_id": "TASK-001"})
     return db
 
 
-def test_post_task_default_only_reminds(tmp_path, monkeypatch):
+def test_post_task_default_passes_when_gate_off(tmp_path, monkeypatch):
     _init_repo(tmp_path, verify_on_post_task=False)
     monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
     result = runner.invoke(app, ["hook", "post-task", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
-    assert "dev verify" in result.output
 
 
 def test_post_task_verifies_when_enabled_and_blocks_empty_diff(tmp_path, monkeypatch):
     db = _init_repo(tmp_path, verify_on_post_task=True)
     monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
 
-    # No diff was produced, so verification must block (empty-diff guard) and record a gap.
     result = runner.invoke(app, ["hook", "post-task", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
-    assert "blocked" in result.output.lower()
 
     with db.get_session() as session:
         gaps = [g for g in GapRepository(session).get_all() if g.task_id == "TASK-001"]

@@ -17,6 +17,27 @@ from devcouncil.telemetry.stages import log_step
 logger = logging.getLogger(__name__)
 
 
+class MapPolicyError(Exception):
+    """Raised when repository mapping validation fails (fail-closed)."""
+
+
+class FailClosedMapPolicy:
+    """Fail-closed map policy: block execution when mapping is missing or invalid."""
+
+    def validate_repo_map(self, project_root: Path) -> None:
+        """Ensure the on-disk repo map exists and is readable (fail-closed)."""
+        map_path = project_root / ".devcouncil" / "repo_map.json"
+        if not map_path.is_file():
+            raise MapPolicyError(
+                "Repository map missing: .devcouncil/repo_map.json"
+            )
+        from devcouncil.utils.json_persist import read_json
+
+        loaded = read_json(map_path)
+        if not isinstance(loaded, dict):
+            raise MapPolicyError("Repository map is unreadable")
+
+
 def _log_gate(name: str, gaps: List[Gap], *, routine: bool = False, **context: Any) -> bool:
     """Log a gate decision and return whether it passed (no blocking gaps).
 
@@ -116,6 +137,7 @@ class GatePolicy:
         self.req_coverage = RequirementCoverageCheck()
         self.planned_files = PlannedFilesCheck()
         self.clean_git = CleanGitCheck()
+        self.map_policy = FailClosedMapPolicy()
 
     def check_plan_approval(
         self,
@@ -315,7 +337,21 @@ class GatePolicy:
         # 2. Check planned files
         gaps.extend(self.planned_files.check(task))
 
-        # 3. Surface a missing execution/verification contract — but do NOT block
+        # 3. Fail-closed map policy — block when the repo map is missing/unreadable.
+        try:
+            self.map_policy.validate_repo_map(project_root)
+        except MapPolicyError as exc:
+            gaps.append(Gap(
+                id=f"GAP-{task.id}-MAP-POLICY",
+                severity="high",
+                gap_type="requirement_not_planned",
+                task_id=task.id,
+                description=f"Map policy blocked task readiness: {exc}",
+                recommended_fix="Run `dev map` to generate a valid repository map, then retry.",
+                blocking=True,
+            ))
+
+        # 4. Surface a missing execution/verification contract — but do NOT block
         # execution on it. The executor still needs to run to implement the code,
         # and the evidence requirement is genuinely enforced at verify time
         # (acceptance_criteria_unproven / NOAC gaps). Blocking here only prevents

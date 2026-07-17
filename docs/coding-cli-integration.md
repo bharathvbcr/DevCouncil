@@ -2,15 +2,43 @@
 
 DevCouncil works with any tool that can accept a prompt and edit files in the same repository.
 
-For the official tier definitions (headless executor vs MCP-only vs sidecar), see [integration-tiers.md](integration-tiers.md).
+## Integration tiers
+
+Each supported coding CLI falls into one of three tiers:
+
+| Tier | Meaning | Examples |
+| :--- | :--- | :--- |
+| **1 — Headless executor** | `dev run TASK --executor <client>` launches non-interactively; post-run `dev verify`; run manifests under `.devcouncil/runs/` | Claude Code, Codex, OpenCode, Antigravity, Warp, Cursor Agent, Grok, Aider, Copilot, Goose, Amp, Qwen, Crush |
+| **2 — MCP companion** | Interactive MCP tools without a headless executor (editor-only Cursor) | Cursor MCP via `.cursor/mcp.json` |
+| **3 — Sidecar only** | `dev prompt` paste + `dev verify`; optional `dev integrate cli-agent` | Unregistered BYO CLIs |
+
+**Gemini CLI is deprecated** — migrate to Antigravity; explicit `--executor gemini` remains compat only.
+
+Setup: `dev integrate <client> --apply` for MCP where supported; executors work once the CLI is on `PATH`. Helpers: `dev integrate recommend`, `dev integrate matrix`, `dev integrate status`, `dev integrate check --strict`. Auto-pick when `default_executor` is `manual` uses `execution.coding_cli_probe_order`.
+
+### Hooks and policy by client
+
+| Client | Native write/shell hooks |
+| :--- | :--- |
+| Claude | Yes — opt-in blocking PreToolUse write gate + lifecycle/Stop hooks |
+| Codex | Advisory PreToolUse + blocking Stop/SubagentStop; sandbox + verification are the write boundary |
+| Cursor | Yes — `.cursor/hooks.json` |
+| Grok Build | Yes — `.grok/hooks/devcouncil.json` (requires `/hooks-trust`) |
+| OpenCode | Yes — bundled plugin via `dev integrate hooks` |
+| Antigravity / Warp / Aider / Copilot / Goose / Amp / Qwen / Crush | Verification-gated; hooks optional |
+| Unregistered BYO | Verification-gated only |
+
+### Executor hardening parity
+
+Safety policy is the same across coding CLIs; enforcement differs by runtime. Hook-aware clients (`dev run --executor codex|claude`, etc.) evaluate policy against the active task: writes are denied with no active run or outside planned files. Claude can block unplanned writes, secret paths, force pushes, `--no-verify` / `--no-gpg-sign`, and protected-branch hard resets before execution. Codex PreToolUse is advisory, so DevCouncil combines hook guidance with Codex sandbox and post-action verification. Claude/Codex **Stop** / **SubagentStop** run the unified stop gate. Clients without hooks get the task contract in prompts and fail non-compliant output at verification.
 
 ## Compatibility Matrix
 
 | Tool | Manual sidecar prompts | Headless prompt handoff | DevCouncil MCP tools | Write-blocking hooks |
 | :--- | :---: | :---: | :---: | :---: |
-| **Codex CLI** | Supported | Supported via `codex exec` | Supported via `codex mcp` | Native via `dev integrate hooks` |
-| **Gemini CLI** | Supported | Supported via `gemini -p` or stdin | Supported via `gemini mcp` | Native via `dev integrate hooks` |
 | **Claude Code** | Supported | Tool-dependent | Tools + resources + prompts via `claude mcp` | Assistive hooks + slash commands, subagents, output style, statusline, installable plugin (opt-in `--write-gate` for blocking containment) |
+| **Codex CLI** | Supported | Supported via `codex exec` | Supported via `codex mcp` | Advisory PreToolUse + native Stop gate; sandbox and verify contain writes |
+| **Gemini CLI** | Deprecated | Deprecated (compat only) | Deprecated — use Antigravity | Explicit `--tool gemini` only |
 | **OpenCode** | Supported | Supported via `opencode run --file` | Supported via project `opencode.json` | Native via `dev integrate hooks` (bundled plugin) |
 | **Google Antigravity CLI** | Supported | Supported via `agy --print` | Supported via project `.agents/mcp_config.json` | Verification-gated sidecar |
 | **Warp / Oz** | Supported | Supported via `oz agent run` | Supported via Warp/Oz MCP JSON | Verification-gated sidecar |
@@ -77,7 +105,7 @@ The dashboard can:
 
 - run the same readiness check as `dev integrate check --json`
 - apply project-local MCP files for Cursor, OpenCode, Antigravity, and Warp/Oz
-- install supported hook files for Codex, Gemini, Claude, Cursor, Grok, and OpenCode
+- install supported hook files for Codex, Claude, Cursor, Grok, and OpenCode (Gemini excluded from `--tool all`; use Antigravity instead)
 - re-run status after every action
 
 Dashboard mutations are local-only. The server accepts apply requests only from loopback clients and requires a per-server token embedded in the served page. The API accepts only known integration targets, not arbitrary shell commands.
@@ -85,9 +113,9 @@ Dashboard mutations are local-only. The server accepts apply requests only from 
 Set up one first-party integration at a time, or install native hooks separately:
 
 ```bash
+dev integrate claude --apply
 dev integrate codex --apply
 dev integrate gemini --apply
-dev integrate claude --apply
 dev integrate opencode --apply
 dev integrate antigravity --apply
 dev integrate cursor --apply
@@ -153,44 +181,98 @@ MCP setup:
 dev integrate codex --apply
 ```
 
+This is a one-shot MCP + native-hook install. The MCP registration persists the
+checkout's project-venv `dev` executable instead of a potentially stale global
+package. Codex hooks use second-based timeouts and the canonical
+`[features].hooks = true` flag. After installation, open Codex in the project and
+run `/hooks` to review and trust the exact generated hook definitions.
+
+Codex's current PreToolUse output contract supports `systemMessage`, but not a
+portable deny decision. DevCouncil therefore reports this posture as
+`advisory+verify`: successful hooks are silent, warnings use `systemMessage`, the
+executor maps `plan` to a read-only sandbox and normal automation to
+`workspace-write`, and the lease/scope verifier remains authoritative. Stop and
+SubagentStop can block completion through Codex's native `continue: false` and
+`stopReason` fields.
+
 If Codex launches MCP servers outside the target repository root, set `DEVCOUNCIL_PROJECT_ROOT` to the repository path in the MCP server environment.
 
-## Gemini CLI
+### Stop gate: `assist` vs `block` (`execution.stop_gate`)
 
-Manual sidecar flow:
+Claude and Codex install **Stop** / **SubagentStop** hooks that run the unified stop gate
+(claim checks against configured commands plus optional active-task verify). Cursor and Grok
+hooks do **not** wire Stop handlers — their integrate paths leave `stop_gate.mode` at the
+code default (`off`).
 
-```bash
-cd path/to/project
-dev run TASK-001 --executor manual
-dev prompt TASK-001
+| Setting | Behavior |
+| --- | --- |
+| `off` | Stop hooks are no-ops (code default; safe when hooks are not installed). |
+| `assist` | Failures surface as `systemMessage` / Codex `stopReason`; the agent may continue. **Seeded on `dev integrate claude/codex --apply`** (and `dev integrate hooks --apply --tool claude\|codex`) when `mode` is unset. |
+| `block` | Failures return a blocking decision (Claude `{"decision":"block"}`; Codex `continue: false`). Opt in after hooks are trusted — DevCouncil does **not** default to `block`. |
+
+```yaml
+# .devcouncil/config.yaml — promote to block after dogfooding assist
+execution:
+  stop_gate:
+    mode: block          # assist | block | off
+    check_claims: true
+    verify_active_task: true
+    per_command_timeout: 90
+    total_timeout: 120
+    max_blocks: 2
+    verify_cache_minutes: 5
 ```
 
-Paste the prompt into Gemini CLI, then verify:
+Bare repos without Stop hooks stay on `off` unless you set `mode` explicitly.
+Override for a session with `DEVCOUNCIL_STOP_GATE=off|assist|block`.
+
+#### Claim checks (`check_claims`)
+
+When enabled, the stop gate extracts the last assistant turn, maps it to up to five
+assertions (`verification/claims/`), and runs independent probes:
+
+| Kind | Typical phrasing | Check |
+| --- | --- | --- |
+| `tests_pass` | "tests pass", "suite is green" | Configured test command(s) |
+| `build_succeeds` | "build succeeds", "compiles cleanly" | Configured build command(s) |
+| `lint_clean` | "lint passes", "no type errors" | Configured lint/typecheck command(s) |
+| `file_created` / `file_updated` | "created `path`", "updated `path`" | Filesystem probe |
+| `command_succeeded` | "ran `cmd` successfully" | Re-run quoted command under budget |
+| `generic_done` | "done", "task is complete" | Weak signal; suppressed when specific assertions exist |
+
+Hedged or negated sentences are skipped. Claim commands reuse the project `commands`
+block in config. Maturity: **Preview** — see [project-status.md](project-status.md).
+
+#### Active-task verify (`verify_active_task`)
+
+When a leased/active task exists, the stop gate runs (or reuses a short TTL cache of)
+`dev verify` and surfaces blocking gaps + next-actions in the stop message. Combined
+with claim checks, this is the completion lie-detector for Stop hooks.
+
+## Gemini CLI (deprecated)
+
+Google replaced the consumer Gemini CLI with **Antigravity CLI**. Prefer:
 
 ```bash
-dev verify TASK-001
+dev integrate antigravity --apply
+dev run TASK-001 --executor antigravity
 ```
 
-Headless handoff:
+The Gemini adapter remains for explicit `--executor gemini` / `gemini-cli` compatibility only. It is excluded from `dev integrate all`, default probe order, and `dev integrate hooks --tool all`.
+
+Legacy manual flow (deprecated):
 
 ```bash
 dev prompt TASK-001 | gemini
 dev verify TASK-001
 ```
 
-Or:
-
-```bash
-gemini -p "$(dev prompt TASK-001)"
-```
-
-MCP setup:
+Explicit MCP/hooks (deprecated, prints a migration banner):
 
 ```bash
 dev integrate gemini --apply
+dev integrate hooks --apply --tool gemini
 ```
-
-If Gemini launches MCP servers outside the target repository root, configure the server with `DEVCOUNCIL_PROJECT_ROOT` pointing at the repository that contains `.devcouncil/`.
 
 ## Claude Code
 
@@ -214,7 +296,7 @@ DevCouncil also includes a native hook installer for hook-capable coding CLIs:
 dev integrate hooks --apply
 ```
 
-This writes project-local hook config for Codex CLI, Gemini CLI, Claude Code, Cursor (`.cursor/hooks.json`), Grok (`.grok/hooks/devcouncil.json` — run `/hooks-trust` in Grok after apply), and OpenCode (bundled `.devcouncil/integrations/opencode_devcouncil_plugin.mjs`). The hooks call `devcouncil hook pre-tool-use` before write/shell tools and `devcouncil hook post-tool-use` after tool execution, with `DEVCOUNCIL_PROJECT_ROOT` carried through the generated command.
+This writes project-local hook config for Claude Code, Codex CLI, Cursor (`.cursor/hooks.json`), Grok (`.grok/hooks/devcouncil.json` — run `/hooks-trust` in Grok after apply), and OpenCode (bundled `.devcouncil/integrations/opencode_devcouncil_plugin.mjs`). Gemini hooks are available only via explicit `--tool gemini` (deprecated). Generated commands use the checkout's resolved project `dev` executable and carry an explicit project root.
 
 The lower-level hook command group remains available:
 
@@ -232,7 +314,7 @@ dev run TASK-001 --executor claude
 
 Those modes launch the corresponding client with the task prompt and return to DevCouncil for checkpointing and verification.
 
-The intended hook integration is to call `dev hook pre-tool-use` before file-writing tools and block unauthorized writes with a non-zero exit. DevCouncil normalizes Claude, Codex, and Gemini tool-event payload shapes before applying the same policy.
+Claude's opt-in write gate calls `dev hook pre-tool-use` before file-writing tools and blocks unauthorized writes with a non-zero exit. Codex receives the same policy evaluation but its current PreToolUse schema is advisory; do not treat it as a blocking boundary. DevCouncil's lease-gated MCP writes and post-run verification remain blocking boundaries for both clients.
 
 MCP setup:
 
@@ -247,12 +329,22 @@ Use `--scope local`, `--scope project`, or `--scope user` to choose where Claude
 `dev integrate claude --apply` is a one-shot that installs the entire Claude Code surface, not just the MCP server:
 
 - **MCP server** — registered via `claude mcp add`, exposing DevCouncil's tools, resources, and **prompts** (the prompts surface as `/mcp__devcouncil__*` slash commands, e.g. `/mcp__devcouncil__implement_next_task`).
-- **Assistive hooks** — `Stop`, `SessionStart`, `UserPromptSubmit`, `SessionEnd`, `PreCompact`, `SubagentStop`, and `Notification` are wired into `.claude/settings.local.json`. `SessionStart`/`UserPromptSubmit` inject a live DevCouncil status snapshot as context. These never block a tool call.
+- **Assistive hooks** — `Stop`, `SessionStart`, `UserPromptSubmit`, `SessionEnd`, `PreCompact`, `PostCompact`, `SubagentStop`, and `Notification` are wired into `.claude/settings.local.json`. `SessionStart`/`UserPromptSubmit` inject a live DevCouncil status snapshot as context. When Claude compacts context, **`SessionStart` with `source=compact`** (matcher includes `compact|clear`) injects a **slim** `compact_briefing()` built from the on-disk snapshot — not the full status dump. **`PreCompact`** atomically writes `.devcouncil/state/compact_snapshot.json` (task, gaps, stop-gate summary) and may emit a user-only `systemMessage` toast; it does **not** inject model context. **`PostCompact`** is trace-only (no `additionalContext`). **`UserPromptSubmit`** skips redundant status when a compact briefing fired within ~60s (`execution.skip_prompt_status_after_compact_seconds`, default 60). **`Stop` / `SubagentStop`** run the unified **stop gate** (`execution.stop_gate`): claim checks against configured commands plus optional active-task verify. In `assist` mode failures surface as `systemMessage`; in `block` mode Claude receives `{"decision":"block","reason":...}`. **`post_task`** is a deprecated alias for the same handler; **`execution.verify_on_post_task`** is a deprecated alias for `stop_gate.mode != off` with `verify_active_task`.
 - **Slash commands** — `.claude/commands/devcouncil/*.md` (`/devcouncil:status`, `/devcouncil:next`, `/devcouncil:verify`, `/devcouncil:repair`, `/devcouncil:plan`, `/devcouncil:review`, `/devcouncil:report`).
 - **Subagents** — `.claude/agents/devcouncil-implementer.md`, `devcouncil-verifier.md`, and `devcouncil-reviewer.md`, each scoped to the relevant DevCouncil MCP tools.
 - **Output style** — `.claude/output-styles/devcouncil.md` for evidence-first engineering discipline.
 - **Skills** — the applicable engineering skills scaffolded into `.claude/skills/`.
 - **Statusline + permissions** — a `statusLine` showing phase/tasks/gaps and an allow-list for the read-only `dev` commands the slash commands shell out to, merged into `.claude/settings.local.json` (existing keys are preserved).
+
+#### Compaction continuity — deferred
+
+The shipped path is SessionStart(`source=compact`) + PreCompact disk snapshot; these items were scoped out of the hardening pass:
+
+- **Blocking PreCompact when gaps exist** — PreCompact can `decision:block`, but blocking compaction on open gaps risks stalling long sessions; durable graph + slim briefing is the default.
+- **InstructionsLoaded(compact) beyond optional trace** — fires when CLAUDE.md reloads after compact; observability only (no model context channel).
+- **Cursor/Grok lifecycle** — no PreCompact/PostCompact/SessionStart(compact) host events yet; parity waits on host support.
+- **Stop-hook invisible `additionalContext`** — orthogonal to compaction; stop gate uses `systemMessage` / `decision:block`, not hidden model context.
+- **Full transcript archival on PreCompact** — snapshot already carries task, gaps, and stop-gate summary; full transcript archive is heavier and may lag pre-summary text.
 
 #### Anthropic advisor tool
 
@@ -653,3 +745,32 @@ The live executor adapter values are `manual`, `mini`, `openhands`, `native-prev
 `codex-cli`, `gemini-cli`, `claude-code`, `claude-cli`, `opencode-cli`, `open-code`, `antigravity-cli`, `google-antigravity`, `agy`, `agy-cli`, `warp-cli`, `oz`, `oz-cli`, `cursor-agent`, `cursor-cli`, `grok-build`, `grok-cli`, `gork`, `gork-build`, `xai-grok`, `copilot-cli`, `github-copilot`, `gh-copilot`, `goose-cli`, `block-goose`, `amp-cli`, `sourcegraph-amp`, `qwen-code`, `qwen-cli`, `crush-cli`, and `charm-crush` are accepted aliases for their canonical names.
 
 Direct `dev run --executor <coding-client>` execution now runs the selected coding CLI and automatically runs verification after the tool returns.
+
+## Run supervision
+
+Each coding-agent launch writes `.devcouncil/runs/<run-id>/agent-run.json` plus trace events and optional git checkpoints. A supervisor (human or meta-agent) can inspect and reverse a run without reading raw JSON.
+
+**CLI (Preview):**
+
+```bash
+dev runs list [--json] [--status running] [--limit N]
+dev runs show RUN-ID [--json]
+dev runs timeline <run-or-task> [--json] [--limit 40]
+dev runs diff <run-or-task> [--stat]
+dev runs revert <run-or-task> [--yes]
+dev runs supervise <run-or-task> [--llm/--no-llm] [--apply] [--json]
+```
+
+- `timeline` joins manifest, trace events, checkpoints, and diff stat; accepts a run id or task id.
+- `diff` prints the workspace patch from recorded checkpoints (`--stat` for summary only).
+- `revert` restores the pre-run state when before/after checkpoints exist; `--yes` skips confirmation.
+- `supervise` returns a **keep**, **revert**, or **repair** verdict. Default uses the `run_supervisor` model role with deterministic heuristics as fallback (`--no-llm` forces heuristics). **`--apply` is CLI-only:** when the verdict is `revert` and the run is reversible, the CLI reverts immediately.
+
+**MCP tools (read-only verdict for supervise):**
+
+| Tool | Purpose |
+| :--- | :--- |
+| `devcouncil_run_timeline` | Same timeline payload as `dev runs timeline --json` (`reference`, optional `limit`). Read-only. |
+| `devcouncil_run_supervise` | Same verdict as `dev runs supervise --json` (`reference`). **Never modifies the workspace** — reverting stays an explicit separate step (`dev runs revert` or CLI `dev runs supervise --apply`). |
+
+Use these from an MCP-connected coding agent to review a run before deciding whether to keep, repair, or revert its workspace effects.

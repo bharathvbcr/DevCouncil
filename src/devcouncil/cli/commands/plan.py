@@ -256,6 +256,11 @@ async def _run_plan_body(
         log_step("plan/1: mapping repository", project_root=root, run_id=run_id, trace=True)
         progress.add_task(description="Mapping repository...", total=None)
         repo_map = mapper.map_repo(goal)
+        try:
+            from devcouncil.utils.json_persist import write_model_json
+            write_model_json(root / ".devcouncil" / "repo_map.json", repo_map)
+        except Exception:
+            pass
         repo_map_json = repo_map.model_dump_json(indent=2)
         # save_run_artifact re-serializes via json.dump, so pass the dict directly
         # instead of round-tripping the already-serialized JSON back through json.loads.

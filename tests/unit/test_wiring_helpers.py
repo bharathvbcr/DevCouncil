@@ -633,3 +633,50 @@ def test_reference_cleared_fallback_dynamic_import_relative_skipped(tmp_path):
     assert wiring.reference_cleared(
         tmp_path, "impl.ts", git_files=["impl.ts", "loader.ts"]
     ) is False
+
+
+def test_config_yaml_entry_roots_merged(tmp_path):
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "indexing:\n  entry_roots:\n    - pkg/seed.py\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "seed.py").write_text("def run():\n    pass\n", encoding="utf-8")
+    files = ["pkg/seed.py", "pkg/other.py"]
+    assert "pkg/seed.py" in wiring.entry_roots(tmp_path, files, production_only=True)
+
+
+# ----------------------------------------------------------------------
+# advisory corpus index
+# ----------------------------------------------------------------------
+
+
+def test_build_corpus_markdown_headings_and_links(tmp_path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "guide.md").write_text(
+        "# Overview\n\nSee [map](../README.md) and `src/devcouncil/cli/main.py`.\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "README.md").write_text("# Root\n", encoding="utf-8")
+    graph = wiring.build_corpus(tmp_path)
+    assert any(n.kind == "document" for n in graph.nodes)
+    assert any(n.kind == "section" and n.label == "Overview" for n in graph.nodes)
+    assert any(n.kind == "code_ref" for n in graph.nodes)
+    assert wiring.corpus_graph_path(tmp_path).is_file()
+
+
+def test_query_corpus_matches(tmp_path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "alpha.md").write_text("# Alpha topic\n", encoding="utf-8")
+    wiring.build_corpus(tmp_path)
+    result = wiring.query_corpus(tmp_path, "alpha")
+    assert result["count"] >= 1
+    assert any("alpha" in (m["label"] or "").lower() for m in result["matches"])
+
+
+def test_corpus_status_before_build(tmp_path):
+    status = wiring.corpus_status(tmp_path)
+    assert status["enabled"] is True
+    assert status["verify_gates"] is False
+    assert status["node_count"] == 0

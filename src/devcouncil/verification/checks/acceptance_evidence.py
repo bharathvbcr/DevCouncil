@@ -12,6 +12,8 @@ from devcouncil.domain.task import Task
 from devcouncil.verification.command_evidence import command_is_trivial_evidence
 from devcouncil.verification.difficulty import RigorPolicy
 
+_AD_HOC_TASK_ID = "CHECK"
+
 
 @dataclass
 class AcceptanceEvidenceResult:
@@ -24,6 +26,29 @@ def requirement_id_for_ac(requirements: List[Requirement], ac_id: str) -> Option
         if any(ac.id == ac_id for ac in req.acceptance_criteria):
             return req.id
     return None
+
+
+def _declared_test_proves_ac(
+    task: Task,
+    ac_id: str,
+    successful_commands: List[CommandResult],
+) -> bool:
+    """True when a user/planner declared test command proves this criterion.
+
+    For ad-hoc ``CHECK`` runs, ``--test`` commands are criterion-specific by
+    construction (one inline AC). They must not fall through to the coarse
+    "any passing command" bucket.
+    """
+    declared = list(task.expected_tests or [])
+    if not declared:
+        return False
+    passing_declared = [r.command for r in successful_commands if r.command in declared]
+    if not passing_declared:
+        return False
+    # Only ad-hoc CHECK treats inline --test commands as per-criterion proof.
+    # Workflow tasks with a single expected_test still use the coarse bucket so
+    # hard-rigor coarse_acceptance_proof blocking remains meaningful.
+    return task.id == _AD_HOC_TASK_ID
 
 
 def map_acceptance_criteria_evidence(
@@ -65,8 +90,11 @@ def map_acceptance_criteria_evidence(
             proven: Optional[bool] = compiled_pass.get(ac_id)
             coarse = False
             if proven is None:
-                proven = coarse_proof_available
-                coarse = proven
+                if _declared_test_proves_ac(task, ac_id, successful_commands):
+                    proven = True
+                else:
+                    proven = coarse_proof_available
+                    coarse = proven
             if proven:
                 if coarse:
                     coarse_proven_acs.append(ac_id)
@@ -79,6 +107,12 @@ def map_acceptance_criteria_evidence(
                             "not precisely verified."
                         )
                         proof_mode = "coarse"
+                    elif task.id == _AD_HOC_TASK_ID and task.expected_tests:
+                        proof_mode = "compiled"
+                        proof_summary = (
+                            "Acceptance criterion proven by user-supplied verification "
+                            "command(s) for this check."
+                        )
                     else:
                         passes_n, decisive_n, was_repaired = compiled_vote.get(ac_id, (1, 1, False))
                         proof_mode = "vote" if decisive_n > 1 else "compiled"
@@ -174,7 +208,7 @@ def map_acceptance_criteria_evidence(
                         f"(expected verification method: {method})"
                     )
                 result.gaps.append(Gap(
-                    id=next_gap_id(task.id, "AC"),
+                    id=next_gap_id(task.id, f"AC-{ac_id}"),
                     severity="high" if blocks else "medium",
                     gap_type="acceptance_criteria_unproven",
                     requirement_id=requirement_id_for_ac(requirements, ac_id),

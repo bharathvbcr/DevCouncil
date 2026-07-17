@@ -27,7 +27,6 @@ from devcouncil.cli.commands.integrate import (
     _configure_opencode,
     _configure_warp,
     _configure,
-    _gemini_command,
 )
 from devcouncil.llm.provider import apply_provider_default_role_models, build_role_model_config, validate_model_provider
 from devcouncil.telemetry.stages import log_stage, log_step
@@ -184,7 +183,6 @@ def _configure_coding_cli_integrations(project_root: Path, apply: bool, gemini_s
     console.print("[bold]Coding CLI integration[/bold]")
     commands = [
         ("Codex CLI", _codex_command(project_root)),
-        ("Gemini CLI", _gemini_command(project_root, gemini_scope)),
         ("Claude Code", _claude_command(project_root, "local")),
     ]
     results = []

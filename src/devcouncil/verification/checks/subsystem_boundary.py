@@ -76,7 +76,7 @@ def detect_subsystem_boundary_gaps(
         if files_b:
             evidence.append(f"{area_b}: " + ", ".join(files_b[:5]))
         gaps.append(Gap(
-            id=next_gap_id(task.id, "BOUNDARY"),
+            id=next_gap_id(task.id, f"BOUNDARY-{area_a}-{area_b}"),
             severity="medium",
             gap_type="architecture_drift",
             task_id=task.id,

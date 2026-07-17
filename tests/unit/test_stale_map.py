@@ -33,6 +33,19 @@ def _gap_id(task_id: str, kind: str) -> str:
     return f"{task_id}-{kind}-1"
 
 
+def test_missing_map_flagged_blocking(tmp_path):
+    gaps = detect_stale_map_gaps(
+        task=_task(difficulty="hard"),
+        project_root=tmp_path,
+        next_gap_id=_gap_id,
+        stale_map_blocking=True,
+    )
+    assert len(gaps) == 1
+    assert gaps[0].gap_type == "stale_map"
+    assert gaps[0].blocking is True
+    assert "missing" in gaps[0].description.lower()
+
+
 def test_fresh_map_produces_no_gap(tmp_path):
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")

@@ -10,6 +10,7 @@ import logging
 import shlex
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import List
 
@@ -94,7 +95,12 @@ def run_verification_command(
             stderr_path="",
             summary=f"Failed to run command: unparseable shell syntax ({e})",
         )
-    if argv:
+    if argv and argv[0] in {"python", "python3"}:
+        # Planner-generated checks use portable launcher names, but macOS may have
+        # no ``python`` and its system ``python3`` does not contain project deps.
+        # Verification must run under the interpreter hosting DevCouncil.
+        argv = [sys.executable, *argv[1:]]
+    elif argv:
         resolved = shutil.which(argv[0], path=env.get("PATH"))
         if resolved:
             argv = [resolved, *argv[1:]]

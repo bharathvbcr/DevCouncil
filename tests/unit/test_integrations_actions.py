@@ -53,3 +53,46 @@ def test_apply_cursor_writes_project_config(tmp_path, monkeypatch):
     assert server["command"] == "devcouncil"
     assert server["args"] == ["mcp-server"]
     assert server["env"]["DEVCOUNCIL_PROJECT_ROOT"] == str(tmp_path)
+
+
+def test_apply_all_skips_gemini_mcp_registration(tmp_path, monkeypatch):
+    gemini_invoked: list[list[str]] = []
+
+    def fake_run(command):
+        if command and command[0] == "gemini":
+            gemini_invoked.append(list(command))
+        return 0
+
+    monkeypatch.setattr("devcouncil.integrations.actions.shutil.which", lambda cmd: f"/usr/bin/{cmd}")
+    monkeypatch.setattr("devcouncil.cli.commands.integrate._run", fake_run)
+    monkeypatch.setattr("devcouncil.cli.commands.integrate._configure_grok", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        "devcouncil.cli.commands.integrate._grok_config_path",
+        lambda root: root / ".grok" / "config.toml",
+    )
+    for writer in (
+        "_write_cursor_config",
+        "_write_opencode_config",
+        "_write_antigravity_mcp_config",
+        "_write_warp_mcp_config",
+    ):
+        monkeypatch.setattr(
+            f"devcouncil.cli.commands.integrate.{writer}",
+            lambda root, _w=writer: root / ".devcouncil" / f"{_w}.json",
+        )
+    for recorder in (
+        "_record_cursor_config",
+        "_record_opencode_config",
+        "_record_antigravity_config",
+        "_record_warp_config",
+        "_record_aider_config",
+    ):
+        monkeypatch.setattr(f"devcouncil.cli.commands.integrate.{recorder}", lambda *_a, **_k: None)
+    monkeypatch.setattr("devcouncil.cli.commands.integrate._configure_native_hooks", lambda *_a, **_k: None)
+    monkeypatch.setattr("devcouncil.cli.commands.integrate._install_git_map_hooks", lambda *_a, **_k: [])
+    monkeypatch.setattr("devcouncil.cli.commands.integrate._install_claude_assets", lambda *_a, **_k: [])
+
+    report = apply_integration_target(tmp_path, "all", include_hooks=False)
+
+    assert report.ok is True
+    assert gemini_invoked == []

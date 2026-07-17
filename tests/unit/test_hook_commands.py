@@ -65,17 +65,16 @@ def test_emit_decision_deny_raises_exit_2(capsys):
     assert "blocked write" in capsys.readouterr().err
 
 
-def test_emit_decision_codex_allow_emits_json(capsys):
+def test_emit_decision_codex_allow_is_silent(capsys):
     _emit_decision("codex", "allow", "fine")
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["decision"] == "allow"
-    assert payload["suppressOutput"] is True
+    assert capsys.readouterr().out == ""
 
 
 def test_emit_decision_codex_warn_includes_system_message(capsys):
-    _emit_decision("gemini", "warn", "heads up")
+    _emit_decision("codex", "warn", "heads up")
     payload = json.loads(capsys.readouterr().out)
     assert payload["systemMessage"] == "DevCouncil Warning: heads up"
+    assert set(payload) == {"systemMessage"}
 
 
 def test_emit_decision_claude_warn_prints_console(capsys):
@@ -132,14 +131,14 @@ def test_pre_tool_use_policy_deny_blocks(tmp_path, patch_policy):
     assert "not in lease" in result.output
 
 
-def test_pre_tool_use_codex_allow_emits_json(tmp_path, patch_policy):
+def test_pre_tool_use_codex_allow_is_silent(tmp_path, patch_policy):
     patch_policy("allow", "ok")
     payload = json.dumps({"tool_name": "Read"})
     result = runner.invoke(
         hook_app, ["pre-tool-use", payload, "--client", "codex", "--project-root", str(tmp_path)]
     )
     assert result.exit_code == 0
-    assert '"decision":"allow"' in result.output
+    assert result.output == ""
 
 
 def test_pre_tool_use_policy_crash_is_contained(tmp_path, monkeypatch):
@@ -180,13 +179,13 @@ def test_post_tool_use_refresh_error_is_swallowed(tmp_path, monkeypatch):
     assert "map refresh error" in result.output
 
 
-def test_post_tool_use_codex_emits_allow_json(tmp_path, monkeypatch):
+def test_post_tool_use_codex_is_silent(tmp_path, monkeypatch):
     monkeypatch.setattr(hook, "_maybe_refresh_map", lambda root, text: None)
     result = runner.invoke(
         hook_app, ["post-tool-use", "{}", "--client", "codex", "--project-root", str(tmp_path)]
     )
     assert result.exit_code == 0
-    assert '"decision":"allow"' in result.output
+    assert result.output == ""
 
 
 # ---- agent_response -----------------------------------------------------------
@@ -201,7 +200,7 @@ def test_agent_response_writes_signal(tmp_path, monkeypatch):
     assert seen["payload"]["task_id"] == "TASK-9"
 
 
-def test_agent_response_codex_emits_allow_json(tmp_path, monkeypatch):
+def test_agent_response_codex_pass_is_silent(tmp_path, monkeypatch):
     monkeypatch.setattr(hook, "active_task_id", lambda root: None)
     monkeypatch.setattr(hook, "write_signal", lambda *a, **k: tmp_path / "sig.json")
     monkeypatch.setattr(hook, "TraceLogger", lambda root: SimpleNamespace(log_event=lambda *a, **k: None))
@@ -209,7 +208,25 @@ def test_agent_response_codex_emits_allow_json(tmp_path, monkeypatch):
         hook_app, ["agent-response", "{}", "--client", "codex", "--project-root", str(tmp_path)]
     )
     assert result.exit_code == 0
-    assert '"decision":"allow"' in result.output
+    assert result.output == ""
+
+
+def test_agent_response_codex_block_uses_native_stop_schema(tmp_path, monkeypatch):
+    from devcouncil.execution.stop_gate import StopGateResult
+
+    monkeypatch.setattr(hook, "active_task_id", lambda root: None)
+    monkeypatch.setattr(hook, "write_signal", lambda *a, **k: tmp_path / "sig.json")
+    monkeypatch.setattr(hook, "TraceLogger", lambda root: SimpleNamespace(log_event=lambda *a, **k: None))
+    monkeypatch.setattr(
+        "devcouncil.execution.stop_gate.evaluate_stop",
+        lambda root, payload: StopGateResult(decision="block", reason="verification failed", mode="enforce"),
+    )
+    result = runner.invoke(
+        hook_app, ["agent-response", "{}", "--client", "codex", "--project-root", str(tmp_path)]
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload == {"continue": False, "stopReason": "verification failed"}
 
 
 def test_agent_response_never_raises_on_signal_error(tmp_path, monkeypatch):
@@ -219,9 +236,13 @@ def test_agent_response_never_raises_on_signal_error(tmp_path, monkeypatch):
         raise OSError("cannot write")
 
     monkeypatch.setattr(hook, "write_signal", boom)
+    monkeypatch.setattr(
+        "devcouncil.execution.stop_gate.evaluate_stop",
+        lambda root, payload: SimpleNamespace(decision="pass"),
+    )
     result = runner.invoke(hook_app, ["agent-response", "{}", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
-    assert "agent-response hook error" in result.output
+    assert "stop hook signal error" in result.output
 
 
 # ---- session lifecycle hooks --------------------------------------------------
@@ -316,28 +337,31 @@ def test_claude_statusline_trims_guidance(tmp_path, monkeypatch):
 # ---- post_task ----------------------------------------------------------------
 
 def test_post_task_verify_disabled_prints_reminder(tmp_path, monkeypatch):
-    # load_config is imported lazily inside post_task; patch at source module.
-    import devcouncil.app.config as config_mod
+    from devcouncil.execution.stop_gate import StopGateResult
+
     monkeypatch.setattr(
-        config_mod, "load_config",
-        lambda root: SimpleNamespace(execution=SimpleNamespace(verify_on_post_task=False)),
+        "devcouncil.execution.stop_gate.evaluate_stop",
+        lambda root, payload: StopGateResult(decision="pass", mode="off"),
     )
     result = runner.invoke(hook_app, ["post-task", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
-    assert "dev verify" in result.output
 
 
 def test_post_task_verify_enabled_runs_verification(tmp_path, monkeypatch):
-    import devcouncil.app.config as config_mod
+    from devcouncil.execution.stop_gate import StopGateResult
+
     monkeypatch.setattr(
-        config_mod, "load_config",
-        lambda root: SimpleNamespace(execution=SimpleNamespace(verify_on_post_task=True)),
+        "devcouncil.execution.stop_gate.evaluate_stop",
+        lambda root, payload: StopGateResult(
+            decision="assist",
+            system_message="verified summary",
+            mode="assist",
+        ),
     )
-    monkeypatch.setattr(hook, "_verify_active_task", lambda root: "[green]verified summary[/green]")
     result = runner.invoke(hook_app, ["post-task", "--client", "codex", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert "verified summary" in result.output
-    assert '"decision":"allow"' in result.output
+    assert json.loads(result.output) == {"systemMessage": "verified summary"}
 
 
 # ---- metadata helpers ---------------------------------------------------------
@@ -380,3 +404,125 @@ def test_parse_queue_file_dict_and_list(tmp_path):
 def test_status_line_none_when_uninitialized(tmp_path):
     # No DB in an empty tmp dir -> best-effort None, never raises.
     assert _status_line(tmp_path) is None
+
+
+# --- compaction survival -------------------------------------------------------
+
+
+def test_build_and_write_compact_snapshot(tmp_path, monkeypatch):
+    from devcouncil.execution.stop_gate import (
+        build_compact_snapshot,
+        compact_snapshot_path,
+        read_compact_snapshot,
+        write_compact_snapshot,
+    )
+
+    monkeypatch.setattr("devcouncil.execution.stop_gate.active_task_id", lambda root: "TASK-9")
+    monkeypatch.setattr("devcouncil.execution.stop_gate._project_phase", lambda root: "implement")
+    monkeypatch.setattr(
+        "devcouncil.execution.stop_gate._task_blocking_summary",
+        lambda root, tid: (2, ["fix tests", "wire caller"]),
+    )
+    monkeypatch.setattr(
+        "devcouncil.execution.stop_gate.last_event",
+        lambda root: {"decision": "assist", "claim": "tests pass", "blocking_gaps": 2},
+    )
+    payload = {"session_id": "sess-1", "transcript_path": str(tmp_path / "missing.jsonl")}
+    snap = build_compact_snapshot(tmp_path, payload)
+    assert snap["task_id"] == "TASK-9"
+    write_compact_snapshot(tmp_path, payload)
+    on_disk = read_compact_snapshot(tmp_path)
+    assert on_disk is not None and on_disk["task_id"] == "TASK-9"
+    assert compact_snapshot_path(tmp_path).is_file()
+
+
+def test_session_start_compact_uses_slim_briefing(tmp_path, monkeypatch):
+    import devcouncil.cli.commands.hook as hook_mod
+
+    slim = "DevCouncil compact continuity — Active task: T1."
+    monkeypatch.setattr(hook_mod, "_status_line", lambda root: "FULL STATUS LINE")
+    monkeypatch.setattr("devcouncil.execution.stop_gate.compact_briefing", lambda root, payload: slim)
+    monkeypatch.setattr(hook_mod, "TraceLogger", lambda root: type("T", (), {"log_event": lambda *a, **k: None})())
+    result = runner.invoke(
+        hook_app,
+        ["session-start", json.dumps({"source": "compact"}), "--project-root", str(tmp_path)],
+    )
+    assert result.exit_code == 0
+    ctx = json.loads(result.output)["hookSpecificOutput"]["additionalContext"]
+    assert ctx == slim
+    assert "FULL STATUS" not in ctx
+
+
+def test_session_start_non_compact_keeps_status_and_briefing(tmp_path, monkeypatch):
+    import devcouncil.cli.commands.hook as hook_mod
+
+    monkeypatch.setattr(hook_mod, "_status_line", lambda root: "DevCouncil status snapshot")
+    monkeypatch.setattr(
+        "devcouncil.execution.stop_gate.session_briefing",
+        lambda root, payload: "DevCouncil continuity — Where you left off: last stop-gate was `pass`.",
+    )
+    monkeypatch.setattr(hook_mod, "TraceLogger", lambda root: type("T", (), {"log_event": lambda *a, **k: None})())
+    result = runner.invoke(
+        hook_app,
+        ["session-start", json.dumps({"source": "startup"}), "--project-root", str(tmp_path)],
+    )
+    assert result.exit_code == 0
+    ctx = json.loads(result.output)["hookSpecificOutput"]["additionalContext"]
+    assert "snapshot" in ctx
+    assert "continuity" in ctx
+
+
+def test_pre_compact_writes_snapshot_trace_and_toast(tmp_path, monkeypatch):
+    import devcouncil.cli.commands.hook as hook_mod
+
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text("project:\n  name: t\n", encoding="utf-8")
+    written = {}
+    monkeypatch.setattr(
+        "devcouncil.execution.stop_gate.write_compact_snapshot",
+        lambda root, payload: written.setdefault("payload", payload),
+    )
+    monkeypatch.setattr(hook_mod, "TraceLogger", lambda root: type("T", (), {"log_event": lambda *a, **k: None})())
+    result = runner.invoke(
+        hook_app,
+        ["pre-compact", json.dumps({"session_id": "s9"}), "--project-root", str(tmp_path)],
+    )
+    assert result.exit_code == 0
+    assert written["payload"]["session_id"] == "s9"
+    assert "systemMessage" in result.output
+    assert "additionalContext" not in result.output
+
+
+def test_post_compact_trace_only(tmp_path, monkeypatch):
+    import devcouncil.cli.commands.hook as hook_mod
+
+    logged = {}
+
+    class _Trace:
+        def log_event(self, name, details, **kwargs):
+            logged["name"] = name
+
+    monkeypatch.setattr(hook_mod, "TraceLogger", lambda root: _Trace())
+    result = runner.invoke(
+        hook_app,
+        ["post-compact", json.dumps({"session_id": "s1"}), "--project-root", str(tmp_path)],
+    )
+    assert result.exit_code == 0
+    assert logged["name"] == "post_compact"
+    assert result.output.strip() == ""
+
+
+def test_user_prompt_submit_skips_status_after_compact_brief(tmp_path, monkeypatch):
+    import devcouncil.cli.commands.hook as hook_mod
+    from devcouncil.execution.stop_gate import record_compact_brief
+
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "project:\n  name: t\nexecution:\n  skip_prompt_status_after_compact_seconds: 60\n",
+        encoding="utf-8",
+    )
+    record_compact_brief(tmp_path, "s1")
+    monkeypatch.setattr(hook_mod, "_status_line", lambda root: (_ for _ in ()).throw(AssertionError("skipped")))
+    result = runner.invoke(hook_app, ["user-prompt-submit", "{}", "--project-root", str(tmp_path)])
+    assert result.exit_code == 0
+    assert result.output.strip() == ""

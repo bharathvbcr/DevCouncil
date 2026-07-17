@@ -8,7 +8,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Set
 
 from devcouncil.indexing.graph.build import graph_path, load_code_graph
-from devcouncil.indexing.graph.schema import CodeGraph
+from devcouncil.indexing.graph.schema import (
+    CodeGraph,
+    Confidence,
+    DeadCodeEntry,
+    GraphEdge,
+    GraphNode,
+    NodeKind,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -751,3 +758,203 @@ def write_graph_html(
 
         webbrowser.open(out.resolve().as_uri())
     return out
+
+
+def sample_demo_graph() -> CodeGraph:
+    """Return a deterministic graph that exercises every visualizer surface."""
+    nodes = [
+        GraphNode(
+            id="src/devcouncil/cli/main.py",
+            kind=NodeKind.FILE,
+            path="src/devcouncil/cli/main.py",
+            name="main.py",
+            area="cli",
+            language="python",
+            community="demo-community",
+        ),
+        GraphNode(
+            id="src/devcouncil/execution/task_runner.py",
+            kind=NodeKind.FILE,
+            path="src/devcouncil/execution/task_runner.py",
+            name="task_runner.py",
+            area="execution",
+            language="python",
+            community="demo-community",
+        ),
+        GraphNode(
+            id="src/devcouncil/verification/verifier.py",
+            kind=NodeKind.FILE,
+            path="src/devcouncil/verification/verifier.py",
+            name="verifier.py",
+            area="verification",
+            language="python",
+            community="verification",
+        ),
+        GraphNode(
+            id="src/devcouncil/verification/unused_check.py",
+            kind=NodeKind.FILE,
+            path="src/devcouncil/verification/unused_check.py",
+            name="unused_check.py",
+            area="verification",
+            language="python",
+            community="verification",
+        ),
+        GraphNode(
+            id="src/devcouncil/cli/main.py::main",
+            kind=NodeKind.FUNCTION,
+            path="src/devcouncil/cli/main.py",
+            name="main",
+            line=20,
+            end_line=34,
+            area="cli",
+            language="python",
+            community="demo-community",
+        ),
+        GraphNode(
+            id="src/devcouncil/execution/task_runner.py::run_task",
+            kind=NodeKind.FUNCTION,
+            path="src/devcouncil/execution/task_runner.py",
+            name="run_task",
+            line=42,
+            end_line=78,
+            area="execution",
+            language="python",
+            community="demo-community",
+        ),
+        GraphNode(
+            id="src/devcouncil/verification/verifier.py::verify",
+            kind=NodeKind.FUNCTION,
+            path="src/devcouncil/verification/verifier.py",
+            name="verify",
+            line=55,
+            end_line=92,
+            area="verification",
+            language="python",
+            community="verification",
+        ),
+        GraphNode(
+            id="src/devcouncil/verification/unused_check.py::unused_check",
+            kind=NodeKind.FUNCTION,
+            path="src/devcouncil/verification/unused_check.py",
+            name="unused_check",
+            line=8,
+            end_line=12,
+            area="verification",
+            language="python",
+            community="verification",
+        ),
+    ]
+    edges = [
+        GraphEdge(
+            source="src/devcouncil/cli/main.py",
+            target="src/devcouncil/execution/task_runner.py",
+            kind="imports",
+        ),
+        GraphEdge(
+            source="src/devcouncil/execution/task_runner.py",
+            target="src/devcouncil/verification/verifier.py",
+            kind="imports",
+        ),
+        GraphEdge(
+            source="src/devcouncil/cli/main.py::main",
+            target="src/devcouncil/execution/task_runner.py::run_task",
+            kind="calls",
+        ),
+        GraphEdge(
+            source="src/devcouncil/execution/task_runner.py::run_task",
+            target="src/devcouncil/verification/verifier.py::verify",
+            kind="calls",
+        ),
+    ]
+    return CodeGraph(
+        nodes=nodes,
+        edges=edges,
+        dead_code=[
+            DeadCodeEntry(
+                id="src/devcouncil/verification/unused_check.py::unused_check",
+                path="src/devcouncil/verification/unused_check.py",
+                line=8,
+                kind="function",
+                confidence=Confidence.EXTRACTED,
+                reason="no inbound calls and token-scan agrees",
+            )
+        ],
+        entry_roots=["src/devcouncil/cli/main.py"],
+        unwired_candidates=["src/devcouncil/verification/unused_check.py"],
+        meta={
+            "processes": [
+                {
+                    "name": "entry_flow",
+                    "entry": "src/devcouncil/cli/main.py",
+                    "steps": [
+                        "src/devcouncil/cli/main.py::main",
+                        "src/devcouncil/execution/task_runner.py::run_task",
+                        "src/devcouncil/verification/verifier.py::verify",
+                    ],
+                }
+            ]
+        },
+    )
+
+
+def render_graph_preview_svg(graph: CodeGraph | None = None) -> str:
+    """Render a small dependency-flow preview without browser or JS support."""
+    from html import escape
+
+    demo = graph or sample_demo_graph()
+    files = [node for node in demo.nodes if node.kind == NodeKind.FILE][:4]
+    positions = {
+        node.id: (90 + index * 210, 150 + (index % 2) * 95)
+        for index, node in enumerate(files)
+    }
+    edge_lines: list[str] = []
+    for edge in demo.edges:
+        if edge.kind != "imports" or edge.source not in positions or edge.target not in positions:
+            continue
+        x1, y1 = positions[edge.source]
+        x2, y2 = positions[edge.target]
+        edge_lines.append(
+            f'<path d="M{x1 + 66},{y1} L{x2 - 66},{y2}" stroke="#64748b" '
+            'stroke-width="3" fill="none" marker-end="url(#arrow)"/>'
+        )
+    node_groups: list[str] = []
+    dead_paths = {entry.path for entry in demo.dead_code}
+    for node in files:
+        x, y = positions[node.id]
+        color = "#e35d6a" if node.path in dead_paths else "#3d8bfd"
+        label = escape(node.name or node.path)
+        node_groups.append(
+            f'<g><rect x="{x - 68}" y="{y - 28}" width="136" height="56" rx="10" '
+            f'fill="{color}"/><text x="{x}" y="{y + 5}" text-anchor="middle" '
+            f'font-family="ui-sans-serif,system-ui" font-size="13" fill="#ffffff">{label}</text></g>'
+        )
+    return "\n".join(
+        [
+            '<svg xmlns="http://www.w3.org/2000/svg" width="860" height="360" viewBox="0 0 860 360" role="img" aria-labelledby="title desc">',
+            '<title id="title">DevCouncil Code Graph</title>',
+            '<desc id="desc">Sample entry, execution, verification, and dead-code dependency flow.</desc>',
+            '<rect width="860" height="360" fill="#0f1419"/>',
+            '<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#64748b"/></marker></defs>',
+            '<text x="36" y="48" font-family="ui-sans-serif,system-ui" font-size="24" font-weight="700" fill="#e7ecf3">DevCouncil Code Graph</text>',
+            '<text x="36" y="75" font-family="ui-sans-serif,system-ui" font-size="13" fill="#8b9bb4">Native dependency and liveness preview</text>',
+            *edge_lines,
+            *node_groups,
+            '</svg>',
+        ]
+    )
+
+
+def write_graph_demo(root: Path, *, open_browser: bool = False) -> dict[str, Path]:
+    """Write deterministic HTML and SVG demo artifacts without requiring a map."""
+    out_dir = root / ".devcouncil" / "graph"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    graph = sample_demo_graph()
+    html_path = out_dir / "demo.html"
+    svg_path = out_dir / "demo.svg"
+    html_path.write_text(render_graph_html(graph), encoding="utf-8")
+    svg_path.write_text(render_graph_preview_svg(graph), encoding="utf-8")
+    if open_browser:
+        import webbrowser
+
+        webbrowser.open(html_path.resolve().as_uri())
+    return {"html": html_path, "svg": svg_path}

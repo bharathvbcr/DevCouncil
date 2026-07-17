@@ -351,3 +351,25 @@ def test_test_only_main_prod_roots_empty_fail_soft(tmp_path):
     assert repo_map.entry_roots == []
     assert repo_map.unreachable_files == []
     assert repo_map.liveness_unreachable_unreliable is True
+
+
+def test_liveness_meta_reports_truncation(tmp_path, monkeypatch):
+    """Ranked caps expose total/shown/truncated in liveness_meta."""
+    scripts = "\n".join(f'cli{i} = "pkg.cli{i}:main"' for i in range(220))
+    files = {
+        "pyproject.toml": (
+            f"[project]\nname = \"x\"\nversion = \"0\"\n[project.scripts]\n{scripts}\n"
+        ),
+        "pkg/__init__.py": "",
+    }
+    for i in range(220):
+        files[f"pkg/orphan{i}.py"] = "x = 1\n"
+        files[f"pkg/cli{i}.py"] = "def main():\n    pass\n"
+    _write(tmp_path, files)
+    _commit(tmp_path)
+    monkeypatch.setattr(RepoMapper, "_LIVENESS_CAP", 50)
+    repo_map = RepoMapper(tmp_path).map_repo()
+    meta = repo_map.liveness_meta.get("unwired") or {}
+    assert meta.get("total", 0) > RepoMapper(tmp_path)._LIVENESS_CAP
+    assert meta.get("shown") == RepoMapper(tmp_path)._LIVENESS_CAP
+    assert meta.get("truncated", 0) > 0

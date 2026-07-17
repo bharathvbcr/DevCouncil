@@ -38,9 +38,7 @@ jobs:
           node-version: "20"
       - run: uv sync --all-groups --python ${{ matrix.python }}
       - name: Install runtime debug adapters explicitly
-        run: |
-          uv pip install --python .venv debugpy
-          uv run python -c "import gzip, hashlib, io, os, urllib.request, zipfile; from pathlib import Path; url='https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-vscode/vsextensions/node-debug2/1.42.5/vspackage'; data=urllib.request.urlopen(url, timeout=60).read(); expected='a4d4017994eca3dea0aa605de5cf7c48e757bbce6a81514297bb1432c435e026'; actual=hashlib.sha256(data).hexdigest(); assert actual == expected, (actual, expected); root=Path(os.environ['RUNNER_TEMP'])/'node-debug2'; root.mkdir(parents=True, exist_ok=True); zipfile.ZipFile(io.BytesIO(gzip.decompress(data))).extractall(root); env=Path(os.environ['GITHUB_ENV']); env.open('a', encoding='utf-8').write(f'DEVCOUNCIL_NODE_DEBUG2_PATH={root / \"extension/out/src/nodeDebug.js\"}\nDEVCOUNCIL_NODE_DEBUG2_VERSION=1.42.5\n')"
+        run: uv run python scripts/install-node-debug-adapter.py
       - name: Focused cross-platform code-intelligence tests
         run: >-
           uv run pytest -q

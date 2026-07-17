@@ -130,7 +130,7 @@ async def run_compiled_acceptance_checks(
                 if decisive > 1 else ""
             )
             result.gaps.append(Gap(
-                id=next_gap_id(task.id, "ACCHK"),
+                id=next_gap_id(task.id, f"ACCHK-{ac_id}"),
                 severity="high",
                 gap_type="test_failed",
                 task_id=task.id,

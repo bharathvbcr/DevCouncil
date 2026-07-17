@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import subprocess
 from pathlib import Path
@@ -16,6 +17,17 @@ from devcouncil.integrations.mcp.util import (
 )
 from devcouncil.storage.native import FileChangeRepository, TaskLeaseRepository
 from devcouncil.storage.repositories import TaskRepository
+
+
+def _explicitly_planned(path: str, task) -> bool:  # noqa: ANN001
+    normalized = path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return any(
+        normalized == planned.path.replace("\\", "/")
+        or fnmatch.fnmatch(normalized, planned.path.replace("\\", "/"))
+        for planned in task.planned_files
+    )
 
 
 def write_file_payload(
@@ -44,17 +56,28 @@ def write_file_payload(
         if not task:
             return {"ok": False, "error": f"Task {task_id} not found.", "code": "not_found", "task_id": task_id}
 
-        decision = HookPolicy(project_root=project_root).evaluate_file_write(rel_path, task, content=content)
         target = within_root(project_root, rel_path)
         if target is None:
+            reason = "path escapes the project root"
             FileChangeRepository(session).record(
-                rel_path, "write", False, task_id=task_id, lease_id=lease_record.id,
-                reason="path escapes the project root",
+                rel_path, "write", False, task_id=task_id, lease_id=lease_record.id, reason=reason,
             )
             return {
                 "ok": False, "task_id": task_id, "applied_files": [],
-                "rejected_files": [{"path": rel_path, "reason": "path escapes the project root"}],
+                "rejected_files": [{"path": rel_path, "reason": reason}],
             }
+
+        if not _explicitly_planned(rel_path, task):
+            reason = f"Task {task_id} does not explicitly authorize changes to {rel_path}."
+            FileChangeRepository(session).record(
+                rel_path, "write", False, task_id=task_id, lease_id=lease_record.id, reason=reason,
+            )
+            return {
+                "ok": False, "task_id": task_id, "applied_files": [],
+                "rejected_files": [{"path": rel_path, "reason": reason}],
+            }
+
+        decision = HookPolicy(project_root=project_root).evaluate_file_write(rel_path, task, content=content)
         if not decision.allowed:
             FileChangeRepository(session).record(
                 rel_path, "write", False, task_id=task_id, lease_id=lease_record.id, reason=decision.reason,
@@ -119,6 +142,12 @@ def apply_patch_payload(
         for path in targets:
             if within_root(project_root, path) is None:
                 rejected.append({"path": path, "reason": "path escapes the project root"})
+                continue
+            if not _explicitly_planned(path, task):
+                rejected.append({
+                    "path": path,
+                    "reason": f"Task {task_id} does not explicitly authorize changes to {path}.",
+                })
                 continue
             decision = policy.evaluate_file_write(path, task)
             if not decision.allowed:

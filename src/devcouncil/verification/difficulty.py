@@ -136,6 +136,12 @@ class RigorPolicy:
     liveness_ratchet_blocking: bool = False
     stale_map_enabled: bool = True
     stale_map_blocking: bool = False
+    corpus_stale_enabled: bool = True
+    corpus_stale_blocking: bool = False
+    doc_code_ref_enabled: bool = True
+    doc_code_ref_blocking: bool = False
+    acceptance_corpus_enabled: bool = True
+    acceptance_corpus_blocking: bool = False
     enforce_coverage: bool = False
     reviewer_required: bool = False
     extra_repair_attempts: int = 0
@@ -152,6 +158,19 @@ def _mode_flags(mode: str, is_hard: bool) -> tuple[bool, bool]:
     if normalized == "always":
         return True, True
     # "hard" (and anything unrecognized, defensively) -> run always, block on hard.
+    return True, is_hard
+
+
+def _soft_mode_flags(mode: str, is_hard: bool) -> tuple[bool, bool]:
+    """Map ``never`` / ``soft`` / ``hard`` / ``always`` to (enabled, blocking)."""
+    normalized = (mode or "soft").strip().lower()
+    if normalized == "never":
+        return False, False
+    if normalized == "always":
+        return True, True
+    if normalized == "hard":
+        return True, is_hard
+    # soft: run on all difficulties, block only on hard tasks
     return True, is_hard
 
 
@@ -182,6 +201,9 @@ def resolve_rigor_policy(
             policy.dead_symbol_enabled = False
             policy.liveness_ratchet_enabled = False
             policy.stale_map_enabled = False
+            policy.corpus_stale_enabled = False
+            policy.doc_code_ref_enabled = False
+            policy.acceptance_corpus_enabled = False
             return policy
 
         is_hard = difficulty == "hard"
@@ -207,6 +229,20 @@ def resolve_rigor_policy(
             ratchet_mode, is_hard
         )
         policy.stale_map_enabled, policy.stale_map_blocking = _mode_flags(stale_mode, is_hard)
+        corpus_mode = "soft" if rigor_cfg is None else getattr(rigor_cfg, "corpus_stale", "soft")
+        doc_ref_mode = "soft" if rigor_cfg is None else getattr(rigor_cfg, "doc_code_ref", "soft")
+        policy.corpus_stale_enabled, policy.corpus_stale_blocking = _soft_mode_flags(
+            corpus_mode, is_hard
+        )
+        policy.doc_code_ref_enabled, policy.doc_code_ref_blocking = _soft_mode_flags(
+            doc_ref_mode, is_hard
+        )
+        ac_corpus_mode = "soft" if rigor_cfg is None else getattr(
+            rigor_cfg, "acceptance_corpus", "soft"
+        )
+        policy.acceptance_corpus_enabled, policy.acceptance_corpus_blocking = _soft_mode_flags(
+            ac_corpus_mode, is_hard
+        )
 
         enforce_cov_on_hard = True if rigor_cfg is None else bool(
             getattr(rigor_cfg, "enforce_coverage_on_hard", True)

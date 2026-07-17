@@ -32,6 +32,42 @@ def test_allow_read_only_commands_without_task(tmp_path: Path):
     assert decision.action == "allow"
 
 
+def test_allow_lease_bootstrap_commands_without_task(tmp_path: Path):
+    engine = TaskPolicyEngine(tmp_path)
+    for command in (
+        "dev checkout TASK-001 --client-id cursor --json",
+        "uv run dev checkout TASK-001 --client-id cursor --json",
+        "dev next-task --json",
+        "uv run dev next-task --json",
+    ):
+        decision = engine.evaluate_command(command, None)
+        assert decision.action == "allow", command
+
+
+def test_allow_lease_lifecycle_commands_with_or_without_task(tmp_path: Path):
+    engine = TaskPolicyEngine(tmp_path)
+    task = _task(allowed_commands=["pytest tests/**"])
+    for command in (
+        "dev release TASK-001 --lease-token abc --json",
+        "uv run dev release TASK-001 --lease-token abc --json",
+        "dev lease renew TASK-001 --lease-token abc --json",
+        "uv run dev lease list --json",
+        "dev map",
+        "uv run dev map",
+        "dev doctor",
+        "uv run dev doctor",
+    ):
+        assert engine.evaluate_command(command, None).action == "allow", command
+        assert engine.evaluate_command(command, task).action == "allow", command
+
+
+def test_lease_lifecycle_does_not_bypass_task_command_gate_for_other_commands(tmp_path: Path):
+    engine = TaskPolicyEngine(tmp_path)
+    task = _task(allowed_commands=[])
+    decision = engine.evaluate_command("npm test", task)
+    assert decision.action == "deny"
+
+
 def test_allow_task_command_matching_allowed_commands(tmp_path: Path):
     engine = TaskPolicyEngine(tmp_path)
     task = _task()
@@ -51,6 +87,27 @@ def test_deny_unplanned_file_write(tmp_path: Path):
     task = _task()
     decision = engine.evaluate_file_change("src/other.py", task)
     assert decision.action == "deny"
+
+
+def test_allow_neighbor_subsystem_write(tmp_path: Path, monkeypatch):
+    engine = TaskPolicyEngine(tmp_path)
+    task = _task(
+        planned_files=[
+            PlannedFile(path="src/devcouncil/cli/main.py", reason="cli", allowed_change="modify"),
+        ],
+    )
+    repo_map = {
+        "subsystems": [
+            {"area": "src/devcouncil/cli", "neighbors": ["src/devcouncil/indexing"]},
+            {"area": "src/devcouncil/indexing", "neighbors": ["src/devcouncil/cli"]},
+        ],
+        "files": [],
+    }
+    map_path = tmp_path / ".devcouncil" / "repo_map.json"
+    map_path.parent.mkdir(parents=True)
+    map_path.write_text(__import__("json").dumps(repo_map), encoding="utf-8")
+    decision = engine.evaluate_file_change("src/devcouncil/indexing/wiring.py", task)
+    assert decision.action == "allow"
 
 
 def test_deny_forbidden_changes_even_when_planned(tmp_path: Path):

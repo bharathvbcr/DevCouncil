@@ -64,6 +64,7 @@ def test_gemini_preview_ok(monkeypatch, tmp_path):
     monkeypatch.setattr(integrate, "_configure", lambda *a, **k: True)
     result = runner.invoke(integrate.app, ["gemini", "--scope", "user", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
+    assert "Antigravity" in result.output
 
 
 def test_claude_invalid_scope_exits_2(tmp_path):
@@ -282,7 +283,7 @@ def test_all_preview_configures_each_tool(monkeypatch, tmp_path):
     monkeypatch.setattr(integrate, "_configure_native_hooks", lambda *a, **k: None)
     result = runner.invoke(integrate.app, ["all", "--no-hooks", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
-    assert counter["configure"] == 3
+    assert counter["configure"] == 2
     assert counter["cursor"] == 1
 
 

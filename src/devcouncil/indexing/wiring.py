@@ -16,8 +16,14 @@ import ast
 import json
 import logging
 import re
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, Iterator, List, Literal, Optional, Set, Tuple
+
+from pydantic import BaseModel, Field
+
+from devcouncil.indexing.walk import IGNORED_DIR_NAMES, should_skip_path
+from devcouncil.utils.json_persist import read_model_json, write_model_json
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +64,7 @@ _WIRING_DECORATOR_HINTS = (
 
 # Bumped when dead-symbol / token-scan semantics change so ratchet baselines
 # skip stale symbol diffs instead of firing false stranded_code regressions.
-LIVENESS_SCAN_VERSION = 1
+LIVENESS_SCAN_VERSION = 2
 
 _VENDOR_DIR_NAMES = frozenset({"vendor", "vendored", "node_modules"})
 
@@ -634,6 +640,35 @@ def _package_json_entry_targets(root: Path, file_set: Set[str]) -> Set[str]:
     return found
 
 
+def _config_declared_entry_roots(root: Path, file_set: Set[str]) -> Set[str]:
+    """Paths from ``indexing.entry_roots`` that exist in the tracked file set."""
+    declared: list = []
+    try:
+        from devcouncil.app.config import load_config
+
+        cfg = load_config(root)
+        raw_declared = getattr(cfg.indexing, "entry_roots", None)
+        if isinstance(raw_declared, list):
+            declared = raw_declared
+    except Exception:
+        logger.debug("config entry_roots load failed", exc_info=True)
+    if not declared:
+        try:
+            import yaml
+
+            cfg_path = root / ".devcouncil" / "config.yaml"
+            if cfg_path.is_file():
+                payload = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+                indexing = payload.get("indexing")
+                if isinstance(indexing, dict):
+                    yaml_roots = indexing.get("entry_roots")
+                    if isinstance(yaml_roots, list):
+                        declared = yaml_roots
+        except Exception:
+            logger.debug("yaml entry_roots load failed", exc_info=True)
+    return {_norm(str(p)) for p in declared if p and _norm(str(p)) in file_set}
+
+
 def entry_roots(
     root: Path,
     files: Iterable[str],
@@ -655,6 +690,7 @@ def entry_roots(
     try:
         file_set = {_norm(f) for f in files}
         roots: Set[str] = set()
+        roots |= _config_declared_entry_roots(root, file_set)
         roots |= _pyproject_script_targets(root, file_set)
         roots |= _package_json_entry_targets(root, file_set)
 
@@ -782,6 +818,32 @@ def has_allow_unwired(project_root: Path, path: str) -> bool:
     return ALLOW_UNWIRED in text
 
 
+def dynamic_import_keys(path: str, source: str) -> Set[str]:
+    """Return normalized dynamic-import and ``getattr`` keys for one file."""
+    norm = _norm(path)
+    suffix = Path(norm).suffix.lower()
+    if suffix not in _CODE_CONFIG_SUFFIXES:
+        return set()
+    specs: List[str] = [match.group(1) for match in _IMPORTLIB_RE.finditer(source)]
+    specs.extend(
+        spec
+        for match in _DYNAMIC_IMPORT_RE.finditer(source)
+        if (spec := match.group(1)) and not spec.startswith(".")
+    )
+    if suffix == ".toml":
+        specs.extend(
+            (Path(norm).parent / match.group(1)).with_suffix("").as_posix()
+            for match in _HATCH_CUSTOM_HOOK_RE.finditer(source)
+        )
+    keys = {form for spec in specs for form in _module_forms(spec)}
+    keys.update(
+        f"{GETATTR_INDEX_PREFIX}{match.group(1)}"
+        for match in _GETATTR_NAME_RE.finditer(source)
+        if match.group(1)
+    )
+    return keys
+
+
 def build_dynamic_import_index(
     project_root: Path,
     git_files: Optional[List[str]] = None,
@@ -815,25 +877,8 @@ def build_dynamic_import_index(
                 text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            specs: List[str] = []
-            for m in _IMPORTLIB_RE.finditer(text):
-                specs.append(m.group(1))
-            for m in _DYNAMIC_IMPORT_RE.finditer(text):
-                spec = m.group(1)
-                if not spec.startswith("."):
-                    specs.append(spec)
-            if path.suffix.lower() == ".toml":
-                for match in _HATCH_CUSTOM_HOOK_RE.finditer(text):
-                    hook_path = (Path(norm).parent / match.group(1)).with_suffix("")
-                    specs.append(hook_path.as_posix())
-            for spec in specs:
-                for form in _module_forms(spec):
-                    index.setdefault(form, set()).add(norm)
-            # getattr(x, "name") string literals — symbol names, not modules.
-            for m in _GETATTR_NAME_RE.finditer(text):
-                name = m.group(1)
-                if name:
-                    index.setdefault(f"{GETATTR_INDEX_PREFIX}{name}", set()).add(norm)
+            for key in dynamic_import_keys(norm, text):
+                index.setdefault(key, set()).add(norm)
     except Exception:
         logger.debug("build_dynamic_import_index failed", exc_info=True)
     return index
@@ -909,3 +954,517 @@ def reference_cleared(
     except Exception:
         logger.debug("reference scan failed for %s", target, exc_info=True)
     return False
+
+
+# ---------------------------------------------------------------------------
+# Advisory corpus index (docs / PDF / image side graph)
+# ---------------------------------------------------------------------------
+# Separate from the deterministic code graph — never wired into verify gates.
+# Artifacts: ``.devcouncil/corpus/graph.json`` (+ optional ``graph.html``).
+
+CorpusNodeKind = Literal[
+    "document",
+    "section",
+    "concept",
+    "link",
+    "code_ref",
+    "pdf",
+    "pdf_page",
+    "image",
+]
+CorpusEdgeKind = Literal[
+    "contains",
+    "links_to",
+    "references",
+    "cites",
+    "parent_of",
+    "mentions",
+]
+
+_CORPUS_TEXT_EXTS = frozenset({".md", ".markdown", ".txt", ".rst"})
+_CORPUS_PDF_EXTS = frozenset({".pdf"})
+_CORPUS_IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"})
+_MD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
+_CODE_PATH_RE = re.compile(
+    r"`([^`]+)`|(?:^|\s)((?:src|docs|tests)/[\w./-]+\.(?:py|ts|tsx|js|md|rst|yaml|yml))(?:\s|$)"
+)
+_RST_HEADING_RE = re.compile(
+    r"^(?P<title>.+)\n(?P<uline>[=\-`:~^_*+#]+)\s*$",
+    re.MULTILINE,
+)
+
+
+class CorpusNode(BaseModel):
+    id: str
+    kind: CorpusNodeKind
+    label: str
+    path: Optional[str] = None
+    content: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CorpusEdge(BaseModel):
+    id: str
+    source: str
+    target: str
+    kind: CorpusEdgeKind
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CorpusGraph(BaseModel):
+    version: int = 1
+    advisory: bool = True
+    built_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+    source_roots: List[str] = Field(default_factory=list)
+    nodes: List[CorpusNode] = Field(default_factory=list)
+    edges: List[CorpusEdge] = Field(default_factory=list)
+
+
+class CorpusSettings(BaseModel):
+    enabled: bool = True
+    paths: List[str] = Field(default_factory=lambda: ["docs", "README.md"])
+    llm_enrichment: bool = False
+    vision_captions: bool = False
+    write_html: bool = False
+    auto_refresh_on_verify: bool = True
+    extensions: List[str] = Field(
+        default_factory=lambda: sorted(
+            _CORPUS_TEXT_EXTS | _CORPUS_PDF_EXTS | _CORPUS_IMAGE_EXTS
+        )
+    )
+
+
+def corpus_dir(project_root: Path) -> Path:
+    return project_root / ".devcouncil" / "corpus"
+
+
+def corpus_graph_path(project_root: Path) -> Path:
+    return corpus_dir(project_root) / "graph.json"
+
+
+def corpus_html_path(project_root: Path) -> Path:
+    return corpus_dir(project_root) / "graph.html"
+
+
+def load_corpus_settings(project_root: Path) -> CorpusSettings:
+    merged: dict = {}
+    try:
+        from devcouncil.app.config import load_config
+
+        merged.update(load_config(project_root).indexing.corpus.model_dump())
+    except FileNotFoundError:
+        pass
+    return CorpusSettings.model_validate(merged)
+
+
+def load_corpus_graph(project_root: Path) -> Optional[CorpusGraph]:
+    path = corpus_graph_path(project_root)
+    if not path.is_file():
+        return None
+    return read_model_json(path, CorpusGraph)
+
+
+def write_corpus_graph(project_root: Path, graph: CorpusGraph) -> Path:
+    out = corpus_graph_path(project_root)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    write_model_json(out, graph)
+    return out
+
+
+def _slug_id(prefix: str, label: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "node"
+    return f"{prefix}:{slug}"
+
+
+def _edge_id(source: str, target: str, kind: str) -> str:
+    return f"{source}->{kind}->{target}"
+
+
+def _iter_corpus_files(
+    project_root: Path,
+    roots: List[str],
+    extensions: List[str],
+) -> Iterator[Path]:
+    ext_set = {e.lower() if e.startswith(".") else f".{e.lower()}" for e in extensions}
+    root = project_root.resolve()
+    for rel in roots:
+        target = (root / rel).resolve()
+        if not str(target).startswith(str(root)):
+            continue
+        if target.is_file():
+            if target.suffix.lower() in ext_set:
+                yield target
+            continue
+        if not target.is_dir():
+            continue
+        for dirpath, dirnames, filenames in target.walk(on_error=lambda _: None):
+            dirnames[:] = [n for n in dirnames if n not in IGNORED_DIR_NAMES]
+            for name in filenames:
+                file_path = dirpath / name
+                if file_path.suffix.lower() not in ext_set:
+                    continue
+                rel_path = file_path.relative_to(root)
+                if should_skip_path(rel_path):
+                    continue
+                yield file_path
+
+
+def _extract_text_doc(
+    rel: str,
+    text: str,
+    *,
+    suffix: str,
+) -> Tuple[List[CorpusNode], List[CorpusEdge]]:
+    doc_id = f"doc:{rel}"
+    nodes: List[CorpusNode] = [
+        CorpusNode(id=doc_id, kind="document", label=rel, path=rel, content=text[:8000])
+    ]
+    edges: List[CorpusEdge] = []
+    parent_stack: List[Tuple[int, str]] = [(0, doc_id)]
+
+    if suffix in _CORPUS_TEXT_EXTS and suffix != ".rst":
+        for match in _MD_HEADING_RE.finditer(text):
+            level = len(match.group(1))
+            title = match.group(2).strip()
+            sec_id = f"section:{rel}:{level}:{title[:48]}"
+            nodes.append(
+                CorpusNode(
+                    id=sec_id,
+                    kind="section",
+                    label=title,
+                    path=rel,
+                    metadata={"level": level},
+                )
+            )
+            while parent_stack and parent_stack[-1][0] >= level:
+                parent_stack.pop()
+            parent_id = parent_stack[-1][1] if parent_stack else doc_id
+            edges.append(
+                CorpusEdge(
+                    id=_edge_id(parent_id, sec_id, "contains"),
+                    source=parent_id,
+                    target=sec_id,
+                    kind="contains",
+                )
+            )
+            parent_stack.append((level, sec_id))
+
+        for match in _MD_LINK_RE.finditer(text):
+            label, href = match.group(1).strip(), match.group(2).strip()
+            link_id = _slug_id(f"link:{rel}", label)
+            nodes.append(
+                CorpusNode(
+                    id=link_id,
+                    kind="link",
+                    label=label,
+                    path=rel,
+                    metadata={"href": href},
+                )
+            )
+            edges.append(
+                CorpusEdge(
+                    id=_edge_id(doc_id, link_id, "mentions"),
+                    source=doc_id,
+                    target=link_id,
+                    kind="mentions",
+                )
+            )
+            if href and not href.startswith(("http://", "https://", "#", "mailto:")):
+                target = href.split("#", 1)[0].lstrip("./")
+                edges.append(
+                    CorpusEdge(
+                        id=_edge_id(link_id, f"doc:{target}", "links_to"),
+                        source=link_id,
+                        target=f"doc:{target}",
+                        kind="links_to",
+                    )
+                )
+
+        for match in _WIKILINK_RE.finditer(text):
+            target = match.group(1).strip()
+            label = (match.group(2) or target).strip()
+            link_id = _slug_id(f"wiki:{rel}", target)
+            nodes.append(
+                CorpusNode(id=link_id, kind="link", label=label, path=rel, metadata={"wiki": target})
+            )
+            edges.append(
+                CorpusEdge(
+                    id=_edge_id(doc_id, link_id, "mentions"),
+                    source=doc_id,
+                    target=link_id,
+                    kind="mentions",
+                )
+            )
+
+    if suffix == ".rst":
+        for match in _RST_HEADING_RE.finditer(text):
+            title = match.group("title").strip()
+            sec_id = f"section:{rel}:rst:{title[:48]}"
+            nodes.append(CorpusNode(id=sec_id, kind="section", label=title, path=rel))
+            edges.append(
+                CorpusEdge(
+                    id=_edge_id(doc_id, sec_id, "contains"),
+                    source=doc_id,
+                    target=sec_id,
+                    kind="contains",
+                )
+            )
+
+    for match in _CODE_PATH_RE.finditer(text):
+        code_path = (match.group(1) or match.group(2) or "").strip()
+        if not code_path or "/" not in code_path:
+            continue
+        ref_id = f"code:{code_path}"
+        nodes.append(
+            CorpusNode(id=ref_id, kind="code_ref", label=code_path, path=rel, metadata={"ref": code_path})
+        )
+        edges.append(
+            CorpusEdge(
+                id=_edge_id(doc_id, ref_id, "references"),
+                source=doc_id,
+                target=ref_id,
+                kind="references",
+            )
+        )
+
+    return nodes, edges
+
+
+def _extract_pdf(rel: str, file_path: Path) -> Tuple[List[CorpusNode], List[CorpusEdge]]:
+    doc_id = f"pdf:{rel}"
+    nodes: List[CorpusNode] = [
+        CorpusNode(id=doc_id, kind="pdf", label=rel, path=rel, metadata={"pages": 0})
+    ]
+    edges: List[CorpusEdge] = []
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        logger.debug("pypdf not installed; PDF %s indexed as metadata-only", rel)
+        return nodes, edges
+
+    try:
+        reader = PdfReader(str(file_path))
+        nodes[0].metadata["pages"] = len(reader.pages)
+        for idx, page in enumerate(reader.pages[:200]):
+            try:
+                page_text = page.extract_text() or ""
+            except Exception:
+                page_text = ""
+            page_id = f"pdf-page:{rel}:{idx + 1}"
+            nodes.append(
+                CorpusNode(
+                    id=page_id,
+                    kind="pdf_page",
+                    label=f"{rel} p.{idx + 1}",
+                    path=rel,
+                    content=page_text[:4000],
+                    metadata={"page": idx + 1},
+                )
+            )
+            edges.append(
+                CorpusEdge(
+                    id=_edge_id(doc_id, page_id, "contains"),
+                    source=doc_id,
+                    target=page_id,
+                    kind="contains",
+                )
+            )
+            for match in _MD_LINK_RE.finditer(page_text):
+                href = match.group(2).strip()
+                if href.startswith(("http://", "https://")):
+                    cite_id = _slug_id(f"cite:{rel}:{idx}", href)
+                    nodes.append(
+                        CorpusNode(
+                            id=cite_id,
+                            kind="link",
+                            label=match.group(1).strip(),
+                            path=rel,
+                            metadata={"href": href},
+                        )
+                    )
+                    edges.append(
+                        CorpusEdge(
+                            id=_edge_id(page_id, cite_id, "cites"),
+                            source=page_id,
+                            target=cite_id,
+                            kind="cites",
+                        )
+                    )
+    except Exception:
+        logger.debug("PDF extract failed for %s", rel, exc_info=True)
+    return nodes, edges
+
+
+def _extract_image(
+    rel: str,
+    file_path: Path,
+    *,
+    vision_captions: bool,
+    project_root: Path,
+) -> Tuple[List[CorpusNode], List[CorpusEdge]]:
+    img_id = f"image:{rel}"
+    stat = file_path.stat()
+    meta: Dict[str, Any] = {
+        "size_bytes": stat.st_size,
+        "suffix": file_path.suffix.lower(),
+    }
+    caption: Optional[str] = None
+    if vision_captions:
+        try:
+            from devcouncil.app.config import load_config
+
+            cfg = load_config(project_root)
+            if cfg.models.roles:
+                caption = _optional_vision_caption(project_root, file_path)
+        except Exception:
+            logger.debug("vision caption skipped for %s", rel, exc_info=True)
+    if caption:
+        meta["caption"] = caption
+    return (
+        [CorpusNode(id=img_id, kind="image", label=rel, path=rel, content=caption, metadata=meta)],
+        [],
+    )
+
+
+def _optional_vision_caption(project_root: Path, file_path: Path) -> Optional[str]:
+    """Best-effort caption when a vision-capable model is configured (opt-in)."""
+    # ModelRouter does not yet expose a standardized multimodal request API.
+    # Keep the opt-in deterministic and advisory until that contract exists.
+    return None
+
+
+def _optional_llm_enrich(project_root: Path, graph: CorpusGraph) -> CorpusGraph:
+    settings = load_corpus_settings(project_root)
+    if not settings.llm_enrichment:
+        return graph
+    try:
+        from devcouncil.app.config import load_config
+
+        cfg = load_config(project_root)
+        if not cfg.models.roles:
+            return graph
+    except Exception:
+        return graph
+    # Placeholder: deterministic graph is authoritative; LLM enrichment is optional.
+    return graph
+
+
+def build_corpus(
+    project_root: Path,
+    *,
+    path: Optional[str] = None,
+) -> CorpusGraph:
+    """Build the advisory corpus graph under ``.devcouncil/corpus/``."""
+    settings = load_corpus_settings(project_root)
+    roots = [path] if path else list(settings.paths)
+    nodes: List[CorpusNode] = []
+    edges: List[CorpusEdge] = []
+    seen_nodes: set[str] = set()
+    seen_edges: set[str] = set()
+
+    for file_path in _iter_corpus_files(project_root, roots, settings.extensions):
+        rel = file_path.relative_to(project_root.resolve()).as_posix()
+        suffix = file_path.suffix.lower()
+        if suffix in _CORPUS_TEXT_EXTS:
+            try:
+                text = file_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            n, e = _extract_text_doc(rel, text, suffix=suffix)
+        elif suffix in _CORPUS_PDF_EXTS:
+            n, e = _extract_pdf(rel, file_path)
+        elif suffix in _CORPUS_IMAGE_EXTS:
+            n, e = _extract_image(
+                rel,
+                file_path,
+                vision_captions=settings.vision_captions,
+                project_root=project_root,
+            )
+        else:
+            continue
+        for node in n:
+            if node.id not in seen_nodes:
+                seen_nodes.add(node.id)
+                nodes.append(node)
+        for edge in e:
+            if edge.id not in seen_edges:
+                seen_edges.add(edge.id)
+                edges.append(edge)
+
+    graph = CorpusGraph(source_roots=roots, nodes=nodes, edges=edges)
+    graph = _optional_llm_enrich(project_root, graph)
+    write_corpus_graph(project_root, graph)
+    if settings.write_html:
+        write_corpus_html(project_root, graph)
+    return graph
+
+
+def write_corpus_html(project_root: Path, graph: CorpusGraph) -> Path:
+    """Self-contained advisory corpus listing (not the code-graph visualizer)."""
+    rows = []
+    for node in sorted(graph.nodes, key=lambda n: (n.kind, n.label)):
+        rows.append(
+            f"<tr><td>{node.kind}</td><td>{node.label}</td><td>{node.path or ''}</td></tr>"
+        )
+    html = (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<title>DevCouncil Corpus Index</title>"
+        "<style>body{font-family:system-ui;margin:1.5rem}"
+        "table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:.4rem}"
+        "</style></head><body>"
+        "<h1>DevCouncil Corpus Index (advisory)</h1>"
+        f"<p>Built {graph.built_at} — {len(graph.nodes)} nodes, {len(graph.edges)} edges</p>"
+        "<table><thead><tr><th>Kind</th><th>Label</th><th>Path</th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table></body></html>"
+    )
+    out = corpus_html_path(project_root)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html, encoding="utf-8")
+    return out
+
+
+def query_corpus(project_root: Path, query: str, *, limit: int = 20) -> Dict[str, Any]:
+    graph = load_corpus_graph(project_root)
+    if graph is None:
+        return {"error": "No corpus graph; run `dev corpus build` first.", "matches": []}
+    needle = query.strip().lower()
+    if not needle:
+        return {"error": "Empty query.", "matches": []}
+    scored: List[Tuple[int, CorpusNode]] = []
+    for node in graph.nodes:
+        hay = " ".join(
+            filter(None, [node.label, node.content or "", str(node.metadata)])
+        ).lower()
+        if needle in hay:
+            scored.append((hay.count(needle), node))
+    scored.sort(key=lambda item: (-item[0], item[1].label))
+    matches = [
+        {
+            "id": node.id,
+            "kind": node.kind,
+            "label": node.label,
+            "path": node.path,
+            "score": score,
+        }
+        for score, node in scored[:limit]
+    ]
+    return {"query": query, "matches": matches, "count": len(matches)}
+
+
+def corpus_status(project_root: Path) -> Dict[str, Any]:
+    settings = load_corpus_settings(project_root)
+    path = corpus_graph_path(project_root)
+    graph = load_corpus_graph(project_root)
+    return {
+        "enabled": settings.enabled,
+        "graph_path": str(path.relative_to(project_root.resolve())) if path.is_file() else None,
+        "built_at": graph.built_at if graph else None,
+        "node_count": len(graph.nodes) if graph else 0,
+        "edge_count": len(graph.edges) if graph else 0,
+        "source_roots": graph.source_roots if graph else settings.paths,
+        "advisory": True,
+        "verify_gates": False,
+    }

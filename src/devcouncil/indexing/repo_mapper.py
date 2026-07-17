@@ -81,12 +81,27 @@ class RepoMap(BaseModel):
     # True when production entry roots were empty — unreachable BFS was skipped
     # (fail-soft) so unreachable_files is not meaningful.
     liveness_unreachable_unreliable: bool = False
+    liveness_meta: Dict[str, object] = Field(default_factory=dict)
     # Top call-flow processes from the code graph (entry-root BFS), when available.
     processes: List[Dict[str, object]] = Field(default_factory=list)
 
 class RepoMapper:
-    def __init__(self, project_root: Path):
-        self.project_root = project_root
+    def __init__(self, project_root: Path | None = None):
+        self.project_root = project_root or Path.cwd()
+        self._DEPENDENTS_MAX = type(self)._DEPENDENTS_MAX
+        self._LIVENESS_CAP = type(self)._LIVENESS_CAP
+        try:
+            from devcouncil.app.config import load_config
+
+            indexing = load_config(self.project_root).indexing
+            self._DEPENDENTS_MAX = min(
+                int(indexing.repo_map_dependents_cap), self.max_dependents_per_file
+            )
+            self._LIVENESS_CAP = min(
+                int(indexing.repo_map_liveness_cap), self.max_map_size
+            )
+        except Exception:
+            logger.debug("using default repository-map caps", exc_info=True)
         # Common source-root prefix of the repo's primary code (e.g. "src/pkg"),
         # computed once per map_repo run. Drives generic, non-DevCouncil subsystem
         # inference. None until computed.
@@ -108,8 +123,10 @@ class RepoMapper:
             self._config_file_cache[name] = (self.project_root / name).read_text()
         return self._config_file_cache[name]
 
-    _DEPENDENTS_MAX = 48  # cap dependents listed per file to bound repo_map.json size
-    _LIVENESS_CAP = 200  # cap on each liveness candidate list
+    _DEPENDENTS_MAX = 1_024  # serialized dependents per file
+    _LIVENESS_CAP = 20_000  # serialized entries per liveness debt list
+    max_dependents_per_file = 4_096
+    max_map_size = 100_000  # hard safety ceiling for each liveness debt list
 
     _LANGUAGE_BY_EXTENSION = {
         ".py": "python",
@@ -211,8 +228,6 @@ class RepoMapper:
         "src/devcouncil/integrations": (
             "External system integrations and MCP/Graph adapters.",
             [
-                "src/devcouncil/integrations/gitnexus.py",
-                "src/devcouncil/integrations/graphify.py",
                 "src/devcouncil/integrations/mcp/server.py",
                 "src/devcouncil/integrations/github.py",
             ],
@@ -531,7 +546,6 @@ class RepoMapper:
         "src/devcouncil/integrations": [
             "integrations/mcp/server.py -> live/reviewer.py",
             "integrations/code_review_graph.py -> live/cards.py",
-            "integrations/gitnexus.py -> reporting/report_builder.py",
         ],
         "src/devcouncil/live": [
             "live/summary.py -> live/cards.py",
@@ -604,16 +618,14 @@ class RepoMapper:
             ("semantic", ["indexing/semantic_index.py"]),
             # Detection + optional live client (lsp_client.py); off by default.
             ("lsp", ["indexing/lsp.py", "indexing/lsp_client.py"]),
-            # GraphIndex is consumed by integrations/gitnexus.py — kept as a thin compat shim.
+            # graph_index.py is a deprecated artifact-graph shim; live graph is indexing/graph/.
             ("graph", ["indexing/graph_index.py", "indexing/graph/"]),
         ],
         "src/devcouncil/integrations": [
             ("vcs", ["integrations/github.py"]),
-            ("graphify", ["integrations/graphify.py"]),
             ("code_review", ["integrations/code_review_graph.py"]),
             ("comments", ["integrations/pr_comments.py"]),
             ("mcp", ["integrations/mcp/server.py"]),
-            ("third_party", ["integrations/gitnexus.py"]),
         ],
         "src/devcouncil/cli": [
             ("entrypoints", ["cli/main.py"]),
@@ -762,11 +774,15 @@ class RepoMapper:
         "README.md": "Project overview and usage entrypoint",
         "architecture.md": "Top-level architecture overview",
         "cli-reference.md": "CLI command reference",
+        "coding-cli-integration.md": "Coding CLI tiers, hooks, and stop gate",
+        "hero-loop.md": "Certified Claude Code MCP closed loop",
+        "code-graph.md": "Repo map and symbol code graph",
+        "corpus.md": "Corpus side index and verify gates",
+        "model-routing.md": "Provider and model routing setup",
         "quickstart.md": "First-run installation and workflow",
         "workflow.md": "Manual sidecar workflow guide",
         "security.md": "Security and privacy model",
         "project-status.md": "Subsystem maturity snapshot",
-        "roadmap.md": "Planned work and roadmap",
     }
 
     def _language_for_file(self, path: str) -> str | None:
@@ -848,10 +864,6 @@ class RepoMapper:
             return "Trace logging and event persistence"
         if normalized == "src/devcouncil/live/reviewer.py":
             return "Live review service"
-        if normalized == "src/devcouncil/integrations/gitnexus.py":
-            return "GitNexus integration shim"
-        if normalized == "src/devcouncil/integrations/graphify.py":
-            return "Graphify integration shim"
         if normalized.startswith("src/devcouncil/"):
             area = "/".join(parts[:3]) if len(parts) >= 3 else "src/devcouncil"
             return self._AREA_SUMMARIES.get(area, f"{area} subsystem")
@@ -2632,13 +2644,17 @@ class RepoMapper:
         unreachable: List[str] = []
         dead_syms: List[str] = []
         unreachable_unreliable = False
+        liveness_meta: Dict[str, object] = {}
         if liveness and code_graph is not None:
             entry_roots_list = list(code_graph.entry_roots)
             # Caps apply only when serializing repo_map.json (graph stays uncapped).
+            from devcouncil.indexing.graph.liveness import apply_liveness_cap
+
             cap = self._LIVENESS_CAP
-            unwired = list(code_graph.unwired_candidates)[:cap]
-            unreachable = list(code_graph.unreachable_files)[:cap]
-            dead_syms = list(code_graph.meta.get("legacy_dead_symbol_candidates") or [])[:cap]
+            unwired, um = apply_liveness_cap(list(code_graph.unwired_candidates), cap)
+            unreachable, rm = apply_liveness_cap(list(code_graph.unreachable_files), cap)
+            dead_syms, dm = apply_liveness_cap(list(code_graph.meta.get("legacy_dead_symbol_candidates") or []), cap)
+            liveness_meta = {"unwired": um, "unreachable": rm, "dead_symbol": dm}
             unreachable_unreliable = bool(
                 code_graph.meta.get("liveness_unreachable_unreliable")
             )
@@ -2707,5 +2723,8 @@ class RepoMapper:
             unreachable_files=unreachable,
             dead_symbol_candidates=dead_syms,
             liveness_unreachable_unreliable=unreachable_unreliable,
+            liveness_meta=liveness_meta,
             processes=processes,
         )
+
+RepositoryMapper = RepoMapper

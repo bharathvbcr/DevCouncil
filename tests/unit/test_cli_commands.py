@@ -1396,7 +1396,7 @@ def test_cli_integrate_prints_coding_cli_setup_commands(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert "codex mcp add devcouncil" in result.output
-    assert "gemini mcp add --scope project" in result.output
+    assert "gemini mcp add" not in result.output
     assert "claude mcp add --scope local" in result.output
     assert ".cursor" in result.output
     assert '"mcpServers":{"devcouncil"' in result.output
@@ -1447,7 +1447,7 @@ def test_cli_integrate_hooks_previews_native_hook_files(tmp_path):
 
     assert result.exit_code == 0
     assert ".codex" in result.output
-    assert ".gemini" in result.output
+    assert ".grok" in result.output
     assert ".claude" in result.output
     assert ".cursor" in result.output
     assert "opencode_devcouncil_plugin.mjs" in result.output
@@ -1459,11 +1459,20 @@ def test_cli_integrate_hooks_apply_writes_native_hook_files(tmp_path):
 
     assert result.exit_code == 0
     codex_hooks = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
-    gemini_settings = json.loads((tmp_path / ".gemini" / "settings.json").read_text(encoding="utf-8"))
+    grok_hooks = json.loads((tmp_path / ".grok" / "hooks" / "devcouncil.json").read_text(encoding="utf-8"))
     claude_settings = json.loads((tmp_path / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
     cursor_hooks = json.loads((tmp_path / ".cursor" / "hooks.json").read_text(encoding="utf-8"))
     assert "PreToolUse" in codex_hooks["hooks"]
-    assert "BeforeTool" in gemini_settings["hooks"]
+    assert "Stop" in codex_hooks["hooks"]
+    assert "SubagentStop" in codex_hooks["hooks"]
+    assert all(
+        hook["timeout"] <= 150
+        for groups in codex_hooks["hooks"].values()
+        for group in groups
+        for hook in group["hooks"]
+        if hook.get("name", "").startswith("devcouncil-")
+    )
+    assert "PreToolUse" in grok_hooks["hooks"]
     # Claude installs assist-mode hooks by default (no blocking PreToolUse write-gate).
     # Lifecycle hooks + refresh-only PostToolUse are present.
     assert "Stop" in claude_settings["hooks"]
@@ -1477,7 +1486,21 @@ def test_cli_integrate_hooks_apply_writes_native_hook_files(tmp_path):
     assert (tmp_path / ".devcouncil" / "integrations" / "opencode_devcouncil_plugin.mjs").exists()
     opencode_config = json.loads((tmp_path / "opencode.json").read_text(encoding="utf-8"))
     assert "./.devcouncil/integrations/opencode_devcouncil_plugin.mjs" in opencode_config["plugin"]
-    assert "codex_hooks = true" in (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
+    config_text = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
+    assert "hooks = true" in config_text
+    assert "codex_hooks" not in config_text
+
+
+def test_claude_assist_reapply_removes_prior_write_gate(tmp_path):
+    from devcouncil.integrations.clients.hooks import _install_claude_hooks
+
+    _install_claude_hooks(tmp_path, write_gate=True)
+    before = json.loads((tmp_path / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
+    assert "PreToolUse" in before["hooks"]
+
+    _install_claude_hooks(tmp_path, write_gate=False)
+    after = json.loads((tmp_path / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
+    assert "PreToolUse" not in after["hooks"]
 
 
 def test_cli_integrate_check_strict_keeps_missing_optional_cli_as_warning(tmp_path, monkeypatch):
@@ -1583,7 +1606,8 @@ def test_cli_integrate_all_apply_writes_native_hook_files_when_clients_missing(t
     assert result.exit_code == 0
     assert "Skipping optional integration" in result.output
     assert (tmp_path / ".codex" / "hooks.json").exists()
-    assert (tmp_path / ".gemini" / "settings.json").exists()
+    assert (tmp_path / ".grok" / "hooks" / "devcouncil.json").exists()
+    assert not (tmp_path / ".gemini" / "settings.json").exists()
     assert (tmp_path / ".claude" / "settings.local.json").exists()
 
 
@@ -2302,7 +2326,7 @@ def test_cli_integrate_supports_custom_project_root_and_gemini_scope(tmp_path):
     )
 
     assert result.exit_code == 0
-    assert "gemini mcp add --scope user" in result.output
+    assert "Antigravity" in result.output
     assert f"DEVCOUNCIL_PROJECT_ROOT={tmp_path}" in result.output
 
 
@@ -3124,7 +3148,7 @@ def test_cli_setup_can_preview_integrations(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert "codex mcp add devcouncil" in result.output
-    assert "gemini mcp add --scope project" in result.output
+    assert "gemini mcp add" not in result.output
     assert "claude mcp add --scope local" in result.output
     assert ".cursor" in result.output
     assert '"mcpServers":{"devcouncil"' in result.output

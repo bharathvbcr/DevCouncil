@@ -14,7 +14,8 @@ from devcouncil.integrations.actions import apply_integration_target
 from devcouncil.integrations.check import build_integration_check_report, integration_status_summary
 from devcouncil.storage.db import get_db
 from devcouncil.utils.json_persist import read_json
-from devcouncil.storage.repositories import ArtifactGraphRepository, StateRepository
+from devcouncil.storage.repositories import ArtifactGraphRepository, GapRepository, StateRepository
+from devcouncil.execution.stop_gate_history import read_events as read_stop_gate_events
 from devcouncil.telemetry.traces import TraceEvent, read_trace_events_since
 
 if TYPE_CHECKING:
@@ -133,6 +134,9 @@ def _invalidate_artifact_graph(project_root: Path) -> None:
 _TRACE_EVENTS_LIMIT = 50
 _TRACE_EVENTS_CACHE: dict[str, tuple[int, list[TraceEvent]]] = {}
 
+_DASHBOARD_GAPS_CAP = 50
+_EMPTY_GAPS_SUMMARY = {"total": 0, "blocking": 0, "items": []}
+
 
 def _recent_trace_events_cached(project_root: Path) -> list[TraceEvent]:
     key = str(project_root)
@@ -145,6 +149,28 @@ def _recent_trace_events_cached(project_root: Path) -> list[TraceEvent]:
         buffer = (buffer + new_events)[-_TRACE_EVENTS_LIMIT:]
     _TRACE_EVENTS_CACHE[key] = (next_cursor, buffer)
     return buffer
+
+
+def _dashboard_gaps_summary(session) -> dict:
+    all_gaps = GapRepository(session).get_all()
+    blocking = [gap for gap in all_gaps if gap.blocking]
+    non_blocking = [gap for gap in all_gaps if not gap.blocking]
+    items = []
+    for gap in blocking + non_blocking:
+        if len(items) >= _DASHBOARD_GAPS_CAP:
+            break
+        description = gap.description
+        if len(description) > 200:
+            description = description[:197] + "..."
+        items.append(
+            {
+                "blocking": gap.blocking,
+                "task_id": gap.task_id or "",
+                "gap_type": gap.gap_type,
+                "description": description,
+            }
+        )
+    return {"total": len(all_gaps), "blocking": len(blocking), "items": items}
 
 
 def logo_svg() -> str:
@@ -166,6 +192,8 @@ def dashboard_payload(project_root: Path) -> dict:
             "events": [],
             "integrations": _integration_summary_cached(project_root),
             "recent_runs": recent_run_artifacts(project_root),
+            "stop_gate_events": read_stop_gate_events(project_root, limit=30),
+            "gaps": dict(_EMPTY_GAPS_SUMMARY),
         }
     with db.get_session() as session:
         graph = _artifact_graph_cached(project_root, session)
@@ -180,6 +208,8 @@ def dashboard_payload(project_root: Path) -> dict:
             "events": [event.model_dump(by_alias=True) for event in _recent_trace_events_cached(project_root)],
             "integrations": _integration_summary_cached(project_root),
             "recent_runs": recent_run_artifacts(project_root),
+            "stop_gate_events": read_stop_gate_events(project_root, limit=30),
+            "gaps": _dashboard_gaps_summary(session),
         }
 
 
@@ -288,6 +318,21 @@ def dashboard_html(token: str = "") -> str:
         <tbody id="runs"></tbody>
       </table>
     </section>
+    <section style="grid-column: 1 / -1;">
+      <h2>Verification Gaps</h2>
+      <p id="gaps-summary" style="font-size: 13px; margin: 0 0 12px;"></p>
+      <table>
+        <thead><tr><th>Blocking</th><th>Task</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody id="gaps"></tbody>
+      </table>
+    </section>
+    <section style="grid-column: 1 / -1;">
+      <h2>Stop Gate History</h2>
+      <table>
+        <thead><tr><th>When</th><th>Session</th><th>Decision</th><th>Task</th><th>Claim</th></tr></thead>
+        <tbody id="stop-gate"></tbody>
+      </table>
+    </section>
     <section style="grid-column: 1 / -1;"><h2>Recent Trace Events</h2><pre id="events"></pre></section>
   </main>
   <script>
@@ -383,6 +428,37 @@ def dashboard_html(token: str = "") -> str:
       }}));
 
       document.getElementById('events').textContent = JSON.stringify(data.events || [], null, 2);
+
+      const gapsSummary = data.gaps || {{}};
+      document.getElementById('gaps-summary').textContent =
+        `${{gapsSummary.blocking || 0}} blocking / ${{gapsSummary.total || 0}} total` +
+        ((gapsSummary.total || 0) > (gapsSummary.items || []).length
+          ? ` (showing first ${{(gapsSummary.items || []).length}})`
+          : '');
+
+      const gapsBody = document.getElementById('gaps');
+      gapsBody.replaceChildren(...(gapsSummary.items || []).map(gap => {{
+        const row = document.createElement('tr');
+        row.appendChild(setText(document.createElement('td'), gap.blocking ? 'yes' : 'no'));
+        row.appendChild(setText(document.createElement('td'), gap.task_id || ''));
+        row.appendChild(setText(document.createElement('td'), gap.gap_type || ''));
+        const desc = (gap.description || '').slice(0, 120);
+        row.appendChild(setText(document.createElement('td'), desc));
+        return row;
+      }}));
+
+      const stopGateBody = document.getElementById('stop-gate');
+      stopGateBody.replaceChildren(...(data.stop_gate_events || []).map(ev => {{
+        const row = document.createElement('tr');
+        const when = ev.ts ? new Date(ev.ts * 1000).toLocaleString() : '';
+        row.appendChild(setText(document.createElement('td'), when));
+        row.appendChild(setText(document.createElement('td'), ev.session_id || ''));
+        row.appendChild(setText(document.createElement('td'), ev.decision || ''));
+        row.appendChild(setText(document.createElement('td'), ev.task_id || ''));
+        const claim = (ev.claim || '').slice(0, 120);
+        row.appendChild(setText(document.createElement('td'), claim));
+        return row;
+      }}));
     }}
 
     document.addEventListener('click', event => {{

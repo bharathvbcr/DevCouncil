@@ -61,6 +61,11 @@ def scope_update(
         "--planned-file",
         help="Repeatable path to append as modify-op planned file (lease-gated).",
     ),
+    planned_file_create: list[str] = typer.Option(
+        [],
+        "--planned-file-create",
+        help="Repeatable path to append as create-op planned file (lease-gated).",
+    ),
     json_format: bool = typer.Option(False, "--json"),
     project_root: Path = typer.Option(Path("."), "--project-root"),
 ) -> None:
@@ -74,6 +79,7 @@ def scope_update(
         expected_tests=expected_test,
         allowed_commands=allowed_command,
         planned_files=planned_file,
+        create_planned_files=planned_file_create,
     )
     if json_format:
         typer.echo(dump_json(payload, indent=2))

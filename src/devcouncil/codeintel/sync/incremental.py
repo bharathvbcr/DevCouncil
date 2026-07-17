@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 from devcouncil.codeintel.resolution import enrich_semantic_edges
 from devcouncil.codeintel.service import CodeIntelService
@@ -19,6 +18,7 @@ from devcouncil.indexing.graph.build import (
 )
 from devcouncil.indexing.graph.liveness import (
     build_liveness_shard,
+    dynamic_import_index_from_shards,
     extraction_from_liveness_shard,
     file_liveness_from_shards,
     legacy_dead_strings,
@@ -36,8 +36,8 @@ from devcouncil.indexing.graph.resolve import (
     resolve_import_edges,
 )
 from devcouncil.indexing.graph.schema import CodeGraph, NodeKind
-from devcouncil.indexing.repo_mapper import RepoMap, RepoMapper
-from devcouncil.utils.json_persist import read_json, write_model_json
+from devcouncil.indexing.map_refresh import refresh_repo_map_from_graph
+from devcouncil.indexing.repo_mapper import RepoMapper
 
 logger = logging.getLogger(__name__)
 # Kept as a patch point for existing correctness tests; this is the shard-based
@@ -133,8 +133,15 @@ def sync_affected_paths(
     replacement_edges.extend(decorator_edges(selected, symbol_index))
     replacement_edges.extend(import_graph_edges(file_edges))
     replacement_edges.extend(named_import_edges(selected, symbol_index, file_edges))
+    unresolved_refs: list[dict[str, object]] = []
     replacement_edges.extend(
-        resolve_calls(selected, symbol_index, file_edges, class_ids=class_ids)
+        resolve_calls(
+            selected,
+            symbol_index,
+            file_edges,
+            class_ids=class_ids,
+            unresolved_out=unresolved_refs,
+        )
     )
 
     graph = current.model_copy(deep=True)
@@ -148,11 +155,27 @@ def sync_affected_paths(
     )
 
     if liveness:
-        entry_roots, unwired, unreachable, unreliable = file_liveness_from_shards(
+        from devcouncil.indexing.wiring import build_dynamic_import_index, entry_roots
+
+        fresh_roots = entry_roots(root, files, production_only=True)
+        if any("dynamic_import_keys" not in shard for shard in shards.values()):
+            dynamic_index = build_dynamic_import_index(root, files)
+            for shard in shards.values():
+                shard["dynamic_import_keys"] = []
+            for key, referencing_paths in dynamic_index.items():
+                for referencing_path in referencing_paths:
+                    target_shard = shards.get(referencing_path)
+                    if target_shard is not None:
+                        raw_keys = target_shard.setdefault("dynamic_import_keys", [])
+                        if isinstance(raw_keys, list):
+                            raw_keys.append(key)
+        else:
+            dynamic_index = dynamic_import_index_from_shards(shards)
+        entry_roots_list, unwired, unreachable, unreliable = file_liveness_from_shards(
             files,
             file_edges,
             shards,
-            entry_roots=current.entry_roots,
+            entry_roots=fresh_roots,
         )
         token_dead, _token_index, token_keys = _token_scan_dead(
             graph.nodes, shards
@@ -163,17 +186,19 @@ def sync_affected_paths(
             graph.nodes,
             graph.edges,
             extractions,
-            entry_roots,
+            entry_roots_list,
             token_dead_keys=token_keys,
             file_edges=file_edges,
             unreachable=[] if unreliable else unreachable,
-            dynamic_index={},
+            dynamic_index=dynamic_index,
         )
-        graph.entry_roots = entry_roots
+        graph.entry_roots = entry_roots_list
         graph.unwired_candidates = unwired
         graph.unreachable_files = unreachable
         graph.meta["liveness_unreachable_unreliable"] = unreliable
         graph.meta["token_dead_count"] = len(token_dead)
+        graph.meta["unresolved_references"] = unresolved_refs[:200]
+        graph.meta["unresolved_total"] = len(unresolved_refs)
         graph.meta["legacy_dead_symbol_candidates"] = legacy_dead_strings(
             graph.dead_code,
             token_dead,
@@ -223,7 +248,13 @@ def sync_affected_paths(
         changed_paths=persistence_paths,
         analysis_shards=shards,
     )
-    _refresh_repo_map(root, mapper, graph, affected, files)
+    refresh_repo_map_from_graph(
+        root,
+        graph,
+        affected,
+        files,
+        mapper=mapper,
+    )
     return service.load() or graph
 
 
@@ -285,41 +316,6 @@ def _symbol_index(nodes) -> dict[str, str]:  # noqa: ANN001
         qualname = str(node.extras.get("qualname") or node.id.split("::", 1)[-1].split("#", 1)[0])
         index[f"{node.path}::{qualname}"] = node.id
     return index
-
-
-def _refresh_repo_map(
-    root: Path,
-    mapper: RepoMapper,
-    graph: CodeGraph,
-    affected: set[str],
-    files: list[str],
-) -> None:
-    path = root / ".devcouncil" / "repo_map.json"
-    if not path.is_file():
-        return
-    try:
-        repo_map = RepoMap.model_validate(read_json(path))
-        by_path = {entry.path: entry for entry in repo_map.files if entry.path not in affected}
-        file_set = set(files)
-        for rel in affected:
-            if rel in file_set and (root / rel).is_file():
-                by_path[rel] = mapper.describe_file(rel)
-        repo_map.files = [by_path[rel] for rel in sorted(by_path)]
-        repo_map.entry_roots = list(graph.entry_roots)
-        repo_map.unwired_candidates = list(graph.unwired_candidates)[: mapper._LIVENESS_CAP]
-        repo_map.unreachable_files = list(graph.unreachable_files)[: mapper._LIVENESS_CAP]
-        repo_map.liveness_unreachable_unreliable = bool(
-            graph.meta.get("liveness_unreachable_unreliable")
-        )
-        repo_map.dead_symbol_candidates = list(
-            graph.meta.get("legacy_dead_symbol_candidates") or []
-        )[: mapper._LIVENESS_CAP]
-        repo_map.generated_head = graph.generated_head
-        repo_map.indexed_hash = graph.indexed_hash
-        repo_map.content_fingerprint = graph.content_fingerprint
-        write_model_json(path, repo_map)
-    except Exception:
-        logger.warning("incremental repo-map compatibility refresh failed", exc_info=True)
 
 
 def _normal(path: str) -> str:

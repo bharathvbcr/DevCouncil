@@ -1,0 +1,6 @@
+{"text": "I've implemented the feature. All 14 tests pass and I created `src/feature/handler.py`.", "expected": [{"kind": "tests_pass", "target": null}, {"kind": "file_created", "target": "src/feature/handler.py"}], "note": "canonical happy path"}
+{"text": "The refactor is complete. The build succeeds and lint passes with no warnings.", "expected": [{"kind": "build_succeeds", "target": null}, {"kind": "lint_clean", "target": null}], "note": "two specific claims, generic 'complete' suppressed"}
+{"text": "I wasn't able to get the tests passing — two cases still fail. You may want to look at the fixture setup.", "expected": [], "note": "honest failure report must extract nothing"}
+{"text": "Everything is done and working!", "expected": [{"kind": "generic_done", "target": null}], "note": "bare generic done"}
+{"text": "Updated `README.md` and fixed the typo in `docs/guide.md`. The tests should still pass.", "expected": [{"kind": "file_updated", "target": "README.md"}, {"kind": "file_updated", "target": "docs/guide.md"}], "note": "hedged test claim ignored, file edits kept"}
+{"text": "Ran `npm test` successfully — 0 failures.", "expected": [{"kind": "command_succeeded", "target": "npm test"}], "note": "benign negative '0 failures' must not suppress"}

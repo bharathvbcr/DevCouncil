@@ -29,6 +29,7 @@ from devcouncil.executors.advisor_tool import (
     warn_advisor_preflight,
 )
 from devcouncil.executors.agent_registry import (
+    GEMINI_DEPRECATION_MESSAGE,
     VALID_INPUT_MODES,
     CliAgentSpec,
     get_cli_agent_spec,
@@ -74,6 +75,9 @@ class CodingCliExecutor(Executor):
             self._config = None
         self.client = self._normalize_client(client)
         self.timeout_seconds = timeout_seconds
+        if self.client == "gemini":
+            logger.warning(GEMINI_DEPRECATION_MESSAGE)
+            console.print(f"[yellow]{GEMINI_DEPRECATION_MESSAGE}[/yellow]")
         self.spec = self._resolve_spec()
         self.profile_name = profile or self.spec.default_profile or "default"
         self.profile = load_agent_profiles(project_root).get(self.profile_name)
@@ -214,10 +218,23 @@ class CodingCliExecutor(Executor):
 
     def _apply_permission_mode(self, command: list[str]) -> list[str]:
         mode = (self.profile.permission_mode or "").strip() if self.profile else ""
+        if not mode and self.client == "cursor" and self._config is not None:
+            headless_force = self._config.integrations.cursor.headless_force
+            if headless_force is True:
+                return self._apply_cursor_permission_mode(command, "auto")
+            if headless_force is False:
+                return command
         if not mode:
             return command
+        if mode.lower() == "bypasspermissions":
+            logger.warning(
+                "Profile %r uses bypassPermissions — file edits bypass all CLI gates.",
+                self.profile_name,
+            )
         if self.client == "claude":
             return self._apply_claude_permission_mode(command, mode)
+        if self.client == "codex":
+            return self._apply_codex_permission_mode(command, mode)
         if self.client == "grok":
             return self._apply_grok_permission_mode(command, mode)
         if self.client == "cursor":
@@ -244,6 +261,38 @@ class CodingCliExecutor(Executor):
                 result[index + 1] = value
                 return result
         return [*result, "--permission-mode", value]
+
+    @staticmethod
+    def _apply_codex_permission_mode(command: list[str], mode: str) -> list[str]:
+        """Translate DevCouncil profiles into current ``codex exec`` flags.
+
+        ``auto`` remains sandboxed to the workspace, ``plan`` is read-only, and
+        only an explicit bypass mode disables both approvals and the sandbox.
+        """
+        normalized = mode.lower()
+        result = list(command)
+        dangerous = "--dangerously-bypass-approvals-and-sandbox"
+        if normalized in {"bypasspermissions", "danger-full-access", "yolo"}:
+            if dangerous not in result:
+                result.append(dangerous)
+            return result
+
+        sandbox = {
+            "auto": "workspace-write",
+            "gated": "workspace-write",
+            "ask": "workspace-write",
+            "prod": "workspace-write",
+            "plan": "read-only",
+            "read-only": "read-only",
+            "workspace-write": "workspace-write",
+        }.get(normalized)
+        if sandbox is None:
+            return result
+        for index, part in enumerate(result):
+            if part in {"--sandbox", "-s"} and index + 1 < len(result):
+                result[index + 1] = sandbox
+                return result
+        return [*result, "--sandbox", sandbox]
 
     @staticmethod
     def _apply_grok_permission_mode(command: list[str], mode: str) -> list[str]:

@@ -45,12 +45,105 @@ def _active_task(root: Path):
         return TaskRepository(session).get_by_id(active_id)
 
 
+def _emit_stop_result(client: str, result) -> None:
+    """Emit the client's native Stop result schema."""
+    from devcouncil.execution.stop_gate import StopGateResult
+
+    if not isinstance(result, StopGateResult):
+        return
+    normalized = client.lower()
+    if result.decision == "block" and result.reason:
+        if normalized == "codex":
+            payload: dict[str, object] = {
+                "continue": False,
+                "stopReason": result.reason,
+            }
+            if result.system_message:
+                payload["systemMessage"] = result.system_message
+            print(dump_json(payload, separators=(",", ":")))
+            return
+        payload = {"decision": "block", "reason": result.reason}
+        if result.system_message:
+            payload["systemMessage"] = result.system_message
+        print(dump_json(payload, separators=(",", ":")))
+        return
+    if normalized == "gemini":
+        payload = {"decision": "allow", "suppressOutput": True}
+        if result.system_message:
+            payload["systemMessage"] = result.system_message
+        print(dump_json(payload, separators=(",", ":")))
+        return
+    if result.system_message:
+        print(dump_json({"systemMessage": result.system_message}, separators=(",", ":")))
+
+
+def _handle_unified_stop(
+    event_json: str | None,
+    *,
+    client: str,
+    project_root: Path | None,
+    hook_kind: str,
+) -> None:
+    """Shared Stop / SubagentStop / post_task orchestrator."""
+    payload_text = event_json if event_json is not None else sys.stdin.read()
+    root = _project_root(project_root)
+    try:
+        payload = json.loads(payload_text) if payload_text.strip() else {}
+    except json.JSONDecodeError:
+        payload = {"raw": payload_text}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    if not any(key in payload for key in ("task_id", "taskId", "task")):
+        try:
+            active_id = active_task_id(root)
+        except Exception:
+            active_id = None
+        if active_id:
+            payload["task_id"] = active_id
+
+    try:
+        signal_path = write_signal(root, client.lower(), payload)
+        trace_type = "agent_response_ready" if hook_kind == "stop" else "subagent_stop"
+        summary = (
+            f"{client} response ready for critique-card review."
+            if hook_kind == "stop"
+            else f"{client} subagent finished; signal recorded."
+        )
+        TraceLogger(root).log_event(
+            trace_type,
+            {"client": client.lower(), "signal": str(signal_path), "hook": hook_kind},
+            summary=summary,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"DevCouncil stop hook signal error (ignored): {exc}", file=sys.stderr)
+
+    try:
+        from devcouncil.execution.stop_gate import evaluate_stop
+
+        result = evaluate_stop(root, payload)
+        _emit_stop_result(client, result)
+    except Exception as exc:  # noqa: BLE001
+        print(f"DevCouncil stop hook gate error (fail-open): {exc}", file=sys.stderr)
+        if client.lower() == "gemini":
+            print(dump_json({"decision": "allow", "suppressOutput": True}, separators=(",", ":")))
+
+
 def _emit_decision(client: str, action: str, reason: str) -> None:
     if action == "deny":
         print(reason, file=sys.stderr)
         raise typer.Exit(code=2)
 
-    if client in {"codex", "gemini"}:
+    if client == "codex":
+        # Codex PreToolUse currently accepts only systemMessage.  Emitting the
+        # legacy decision/suppressOutput fields marks the hook failed and the tool
+        # proceeds, so successful checks stay silent and warnings use the one
+        # supported field.
+        if action == "warn":
+            print(dump_json({"systemMessage": f"DevCouncil Warning: {reason}"}, separators=(",", ":")))
+        return
+
+    if client == "gemini":
         payload = {"decision": "allow", "reason": reason, "suppressOutput": True}
         if action == "warn":
             payload["systemMessage"] = f"DevCouncil Warning: {reason}"
@@ -130,7 +223,7 @@ def post_tool_use(
         _maybe_refresh_map(root, payload_text)
     except Exception as exc:  # noqa: BLE001 — hooks must never break the session
         print(f"DevCouncil map refresh error (ignored): {exc}", file=sys.stderr)
-    if client.lower() in {"codex", "gemini"}:
+    if client.lower() == "gemini":
         print(dump_json({"decision": "allow", "suppressOutput": True}, separators=(",", ":")))
 
 
@@ -480,37 +573,9 @@ def agent_response(
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
 ):
     """
-    Coding CLI hook: records that an agent response is ready for DevCouncil watch review.
+    Coding CLI Stop hook: live-review signal + unified stop gate (claims + verify).
     """
-    # Best-effort, never-crash: this hook runs on EVERY agent response, so any
-    # uncaught exception here (e.g. a stale database schema before its migration
-    # ran) surfaces as a crash traceback inside the coding agent's session — the
-    # observed failure was sqlite "no such column" killing every response hook.
-    # A signal we fail to record is strictly better than a broken session.
-    try:
-        payload_text = event_json if event_json is not None else sys.stdin.read()
-        root = _project_root(project_root)
-        try:
-            payload = json.loads(payload_text) if payload_text.strip() else {}
-        except json.JSONDecodeError:
-            payload = {"raw": payload_text}
-        if isinstance(payload, dict) and not any(key in payload for key in ("task_id", "taskId", "task")):
-            try:
-                active_id = active_task_id(root)
-            except Exception:  # DB unavailable/stale schema — proceed without a task id
-                active_id = None
-            if active_id:
-                payload["task_id"] = active_id
-        signal_path = write_signal(root, client.lower(), payload)
-        TraceLogger(root).log_event(
-            "agent_response_ready",
-            {"client": client.lower(), "signal": str(signal_path)},
-            summary=f"{client} response ready for critique-card review.",
-        )
-    except Exception as exc:  # noqa: BLE001 - a hook must never break the session
-        print(f"DevCouncil agent-response hook error (ignored): {exc}", file=sys.stderr)
-    if client.lower() in {"codex", "gemini"}:
-        print(dump_json({"decision": "allow", "suppressOutput": True}, separators=(",", ":")))
+    _handle_unified_stop(event_json, client=client, project_root=project_root, hook_kind="stop")
 
 def _status_line(root: Path) -> str | None:
     """A one-line DevCouncil status snapshot, or None when uninitialized/unavailable.
@@ -551,6 +616,13 @@ def _emit_additional_context(event_name: str, context: str | None) -> None:
     }, separators=(",", ":")))
 
 
+def _emit_system_message(message: str) -> None:
+    """Emit a user-visible systemMessage (exit 0). PreCompact toast uses this."""
+    if not message:
+        return
+    print(dump_json({"systemMessage": message}, separators=(",", ":")))
+
+
 def _read_stdin_payload(event_json: str | None) -> dict:
     text = event_json if event_json is not None else sys.stdin.read()
     if not text or not text.strip():
@@ -579,7 +651,26 @@ def session_start(
         TraceLogger(root).log_event("session_start", details, summary="Claude session started.")
     except Exception as e:
         logger.debug("Failed to record session_start trace event: %s", e)
-    _emit_additional_context("SessionStart", _status_line(root))
+    _emit_additional_context("SessionStart", _session_start_context(root, payload))
+
+
+def _session_start_context(root: Path, payload: dict) -> str | None:
+    if payload.get("source") == "compact":
+        from devcouncil.execution.stop_gate import compact_briefing, record_compact_brief
+
+        session_id = payload.get("session_id")
+        record_compact_brief(root, str(session_id) if session_id else None)
+        return compact_briefing(root, payload)
+    base = _status_line(root)
+    try:
+        from devcouncil.execution.stop_gate import session_briefing
+
+        extra = session_briefing(root, payload)
+    except Exception:
+        extra = None
+    if base and extra:
+        return f"{base}\n{extra}"
+    return base or extra
 
 
 @app.command()
@@ -591,6 +682,15 @@ def user_prompt_submit(
     """Claude Code UserPromptSubmit hook: surface the current DevCouncil status as context."""
     _read_stdin_payload(event_json)
     root = _project_root(project_root)
+    try:
+        from devcouncil.app.config import load_config
+        from devcouncil.execution.stop_gate import recent_compact_brief
+
+        skip_secs = load_config(root).execution.skip_prompt_status_after_compact_seconds
+        if recent_compact_brief(root, skip_secs):
+            return
+    except Exception:
+        pass
     _emit_additional_context("UserPromptSubmit", _status_line(root))
 
 
@@ -620,13 +720,46 @@ def pre_compact(
     client: str = typer.Option("claude", "--client", help="Hook client (claude)."),
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
 ):
-    """Claude Code PreCompact hook: record that context compaction is about to run."""
-    _read_stdin_payload(event_json)
+    """Claude Code PreCompact hook: write continuity snapshot + trace (no model context)."""
+    payload = _read_stdin_payload(event_json)
     root = _project_root(project_root)
     try:
-        TraceLogger(root).log_event("pre_compact", {"client": client.lower()}, summary="Claude context compaction starting.")
+        from devcouncil.execution.stop_gate import write_compact_snapshot
+
+        write_compact_snapshot(root, payload)
+    except Exception as e:
+        logger.debug("Failed to write compact snapshot: %s", e)
+    try:
+        TraceLogger(root).log_event(
+            "pre_compact",
+            {"client": client.lower(), "session_id": payload.get("session_id")},
+            summary="Claude context compaction starting.",
+        )
     except Exception as e:
         logger.debug("Failed to record pre_compact trace event: %s", e)
+    try:
+        from devcouncil.app.config import load_config
+
+        if load_config(root).execution.compact_snapshot_toast:
+            _emit_system_message("DevCouncil: continuity snapshot saved before compaction.")
+    except Exception:
+        pass
+
+
+@app.command()
+def post_compact(
+    event_json: str | None = typer.Argument(None, help="The JSON hook payload from Claude Code."),
+    client: str = typer.Option("claude", "--client", help="Hook client (claude)."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """Claude Code PostCompact hook: trace only — never injects additionalContext."""
+    payload = _read_stdin_payload(event_json)
+    root = _project_root(project_root)
+    try:
+        details = {"client": client.lower(), "session_id": payload.get("session_id")}
+        TraceLogger(root).log_event("post_compact", details, summary="Claude context compaction finished.")
+    except Exception as e:
+        logger.debug("Failed to record post_compact trace event: %s", e)
 
 
 @app.command()
@@ -635,23 +768,8 @@ def subagent_stop(
     client: str = typer.Option("claude", "--client", help="Hook client (claude)."),
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
 ):
-    """Claude Code SubagentStop hook: write a review signal when a subagent finishes."""
-    payload = _read_stdin_payload(event_json)
-    root = _project_root(project_root)
-    if not any(key in payload for key in ("task_id", "taskId", "task")):
-        active_id = active_task_id(root)
-        if active_id:
-            payload["task_id"] = active_id
-    try:
-        signal_path = write_signal(root, client.lower(), payload)
-        TraceLogger(root).log_event(
-            "subagent_stop",
-            {"client": client.lower(), "signal": str(signal_path)},
-            summary=f"{client} subagent finished; signal recorded.",
-        )
-    except Exception as e:
-        # A dropped signal means the subagent's work silently escapes live review.
-        logger.warning("Failed to persist subagent-stop review signal: %s", e)
+    """Claude Code SubagentStop hook: same unified stop gate as Stop."""
+    _handle_unified_stop(event_json, client=client, project_root=project_root, hook_kind="subagent")
 
 
 @app.command()
@@ -690,46 +808,48 @@ def claude_statusline(
     # Prefer the cwd Claude reports so the line reflects the active workspace.
     cwd = payload.get("cwd") if isinstance(payload, dict) else None
     root = _project_root(Path(cwd) if isinstance(cwd, str) and cwd else project_root)
-    line = _status_line(root)
-    if not line:
+    session_id = payload.get("session_id") if isinstance(payload, dict) else None
+    line1 = _status_line(root)
+    if not line1:
         print("DevCouncil: not initialized")
         return
-    # statusLine wants a short line; drop the trailing guidance sentence.
-    print(line.split(". Use the")[0])
+    line1 = line1.split(". Use the")[0]
+    try:
+        from devcouncil.execution.stop_gate import statusline_tally
+
+        tally = statusline_tally(root, str(session_id) if session_id else None)
+    except Exception:
+        tally = None
+    model = payload.get("model") if isinstance(payload, dict) else None
+    extras: list[str] = []
+    if tally:
+        extras.append(tally)
+    if isinstance(model, str) and model.strip():
+        extras.append(model.strip())
+    if extras:
+        print(line1)
+        print(" | ".join(extras))
+    else:
+        print(line1)
 
 
 @app.command()
 def post_task(
+    event_json: str | None = typer.Argument(None, help="Optional JSON hook payload."),
     client: str = typer.Option("claude", "--client", help="Hook client: claude, codex, gemini, cursor, or generic."),
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
 ):
     """
-    Coding CLI hook: Runs after a task is completed.
+    Deprecated alias for the unified Stop handler (``execution.stop_gate``).
 
-    When ``execution.verify_on_post_task`` is enabled, this runs deterministic
-    verification of the active task and records gaps; otherwise it just reminds the
-    user to run ``dev verify`` (the default, to keep hooks fast/cheap).
+    ``execution.verify_on_post_task`` is a deprecated alias for
+    ``stop_gate.mode != off`` with ``verify_active_task``.
     """
-    root = _project_root(project_root)
-    try:
-        from devcouncil.app.config import load_config
-        verify_enabled = load_config(root).execution.verify_on_post_task
-    except Exception:
-        verify_enabled = False
-
-    if not verify_enabled:
-        console.print("[cyan]DevCouncil: coding agent finished task.[/cyan]")
-        console.print("Run [bold]dev verify[/bold] to finalize implementation evidence.")
-        _emit_post_task_allow(client)
-        return
-
-    summary = _verify_active_task(root)
-    console.print(summary)
-    _emit_post_task_allow(client)
+    _handle_unified_stop(event_json, client=client, project_root=project_root, hook_kind="post_task")
 
 
 def _emit_post_task_allow(client: str) -> None:
-    if client.lower() in {"codex", "gemini"}:
+    if client.lower() == "gemini":
         print(dump_json({"decision": "allow", "suppressOutput": True}, separators=(",", ":")))
 
 

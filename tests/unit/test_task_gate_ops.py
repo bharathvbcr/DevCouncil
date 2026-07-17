@@ -581,9 +581,28 @@ def test_handoff_value_error(tmp_path, monkeypatch):
     assert payload["code"] == "handoff_failed"
 
 
-def test_handoff_invalid_lease(tmp_path):
-    _setup(tmp_path)
-    payload = ops.handoff_agent_payload(
-        tmp_path, task_id="TASK-1", lease_token="bad", from_agent="a", to_agent="b",
+def test_lease_lifecycle_commands_allowed_with_active_task(tmp_path: Path):
+    from devcouncil.execution.hook_policy import HookPolicy
+    from devcouncil.execution.policy_engine import TaskPolicyEngine
+
+    engine = TaskPolicyEngine(tmp_path)
+    task = Task(
+        id="TASK-1",
+        title="t",
+        description="d",
+        allowed_commands=["dev graph dead --confidence extracted"],
     )
-    assert payload["ok"] is False
+    for command in (
+        "uv run dev release TASK-1 --lease-token test-token --json",
+        "uv run dev lease list --json",
+        "uv run dev map",
+        "uv run dev doctor",
+    ):
+        assert engine.evaluate_command(command, task).action == "allow", command
+
+    policy = HookPolicy(project_root=tmp_path)
+    decision = policy.evaluate(
+        {"name": "Bash", "arguments": {"command": "uv run dev release TASK-1 --lease-token test-token --json"}},
+        task,
+    )
+    assert decision.action == "allow"

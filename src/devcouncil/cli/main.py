@@ -32,6 +32,7 @@ from devcouncil.cli.commands import (  # noqa: E402 - imports follow stdio recon
     artifacts,
     agents,
     baseline,
+    boot,
     check,
     config,
     cost,
@@ -128,10 +129,12 @@ watch.app.command("fs")(watch_fs)
 
 # Direct command registrations (those defined as def cmd())
 app.command(name="baseline")(baseline.baseline)
+app.command(name="boot")(boot.boot)
 app.command(name="e2e")(go.go)
 app.command(name="go")(go.go)
 app.command(name="map")(map.map_repo)
 app.add_typer(graph_cmd.app, name="graph")
+app.add_typer(graph_cmd.corpus_app, name="corpus")
 app.command(name="graph-context")(map.graph_context_cmd)
 app.command(name="scaffold-ci")(scaffold.scaffold_ci_command)
 app.command(name="plan")(plan.plan)

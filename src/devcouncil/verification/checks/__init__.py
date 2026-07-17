@@ -2,6 +2,11 @@
 
 from devcouncil.verification.checks.acceptance import coarse_proven_acceptance_ids, unproven_acceptance_ids
 from devcouncil.verification.checks.command_evidence import run_verification_commands
+from devcouncil.verification.checks.corpus_verification import (
+    detect_acceptance_corpus_gaps,
+    detect_corpus_stale_gaps,
+    detect_doc_code_ref_gaps,
+)
 from devcouncil.verification.checks.dead_symbols import detect_dead_symbol_gaps
 from devcouncil.verification.checks.diff_coverage_gate import DiffCoverageGateResult, run_diff_coverage_gate
 from devcouncil.verification.checks.liveness_ratchet import detect_liveness_regressions
@@ -17,6 +22,9 @@ from devcouncil.verification.checks.wiring import detect_unwired_file_gaps
 
 __all__ = [
     "DiffCoverageGateResult",
+    "detect_acceptance_corpus_gaps",
+    "detect_corpus_stale_gaps",
+    "detect_doc_code_ref_gaps",
     "coarse_proven_acceptance_ids",
     "detect_dead_symbol_gaps",
     "detect_dependency_risk_gaps",

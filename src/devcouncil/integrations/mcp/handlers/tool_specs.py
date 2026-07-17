@@ -306,6 +306,77 @@ def all_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="devcouncil_graph_ingest",
+            description="Unified native ingest: codeintel sync, graph export, repo map write.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional repository-relative paths; full reconcile when omitted.",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="devcouncil_graph_cypher",
+            description="Run a supported Cypher subset over the native code graph store.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "MATCH … RETURN … query."},
+                },
+                "required": ["query"],
+            },
+        ),
+        Tool(
+            name="devcouncil_pdg_query",
+            description=(
+                "Query opt-in PDG control or data dependence for a symbol qualname or file path. "
+                "Requires `dev map --pdg` or `dev graph pdg build` first."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["controls", "flows"],
+                        "description": "controls = CDG edges; flows = reaching-def edges.",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Symbol qualname or repository-relative file path.",
+                    },
+                    "variable": {
+                        "type": "string",
+                        "description": "Optional variable filter when mode=flows.",
+                    },
+                },
+                "required": ["mode", "target"],
+            },
+        ),
+        Tool(
+            name="devcouncil_explain",
+            description=(
+                "Report heuristic PDG taint findings (source→sink) from the opt-in PDG layer. "
+                "Filter by file path and/or taint category."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Optional repository-relative file path filter.",
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Optional taint category filter (e.g. command-injection).",
+                    },
+                },
+            },
+        ),
+        Tool(
             name="devcouncil_graph_query",
             description=(
                 "360° symbol/file query over the code knowledge graph: definition, callers, "
@@ -368,6 +439,47 @@ def all_tools() -> list[Tool]:
                         "default": False,
                     },
                 },
+            },
+        ),
+        Tool(
+            name="devcouncil_route_map",
+            description=(
+                "Map HTTP routes (ROUTE nodes) to handlers, registration owners, "
+                "and client fetch/axios/requests/httpx consumers from the code graph."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="devcouncil_shape_check",
+            description=(
+                "Compare handler return dict keys vs keys accessed by API consumers "
+                "after fetch calls; flags shape mismatches."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "route": {
+                        "type": "string",
+                        "description": "Optional route path or id filter.",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="devcouncil_api_impact",
+            description=(
+                "API route blast radius: consumers, middleware (registers edges), "
+                "response-shape mismatches, and risk tier (high/medium/low/none)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "route_or_path": {
+                        "type": "string",
+                        "description": "Route path, graph id, or normalized segment.",
+                    },
+                },
+                "required": ["route_or_path"],
             },
         ),
         Tool(

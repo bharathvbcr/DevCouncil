@@ -13,7 +13,6 @@ from pathlib import Path
 
 from devcouncil.cli.commands.init import initialize_project
 from devcouncil.domain.task import Task
-from devcouncil.execution import lease_ops
 from devcouncil.execution.lease_ops import (
     _refresh_stale_map_if_needed,
     checkout_task_payload,
@@ -222,7 +221,10 @@ def test_refresh_swallows_errors(tmp_path, monkeypatch):
         raise RuntimeError("config blew up")
 
     # Force an exception deep in the refresh path; it must be swallowed -> False.
-    monkeypatch.setattr(lease_ops, "read_json", lambda p: (_ for _ in ()).throw(RuntimeError("io")))
+    monkeypatch.setattr(
+        "devcouncil.indexing.map_refresh.read_json",
+        lambda p: (_ for _ in ()).throw(RuntimeError("io")),
+    )
     # read_json only runs when the map exists; ensure it does.
     assert (tmp_path / ".devcouncil" / "repo_map.json").exists()
     assert _refresh_stale_map_if_needed(tmp_path) is False

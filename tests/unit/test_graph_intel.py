@@ -258,3 +258,115 @@ def test_synthetic_blast_radius():
     procs = extract_processes(g, entry="a.py", max_depth=5)
     assert procs
     assert any("c.py::c" in p["steps"] for p in procs)
+
+
+# --- PDG layer (opt-in) ---
+
+
+def test_pdg_package_imports():
+    from devcouncil.indexing.graph.pdg import (
+        CFGResult,
+        PDG_VERSION,
+        analyze_taint,
+        build_cfg_for_function,
+        build_pdg_for_paths,
+        compute_reaching_defs,
+        explain_pdg_taint,
+        load_pdg_layer,
+        merge_pdg_into_graph,
+        query_pdg_controls,
+    )
+
+    assert CFGResult is not None
+    assert PDG_VERSION >= 1
+    assert callable(build_cfg_for_function)
+    assert callable(build_pdg_for_paths)
+    assert callable(merge_pdg_into_graph)
+    assert callable(load_pdg_layer)
+    assert callable(explain_pdg_taint)
+    assert callable(query_pdg_controls)
+    assert callable(analyze_taint)
+    assert callable(compute_reaching_defs)
+
+
+def test_pdg_cfg_if_else():
+    import ast
+    from devcouncil.indexing.graph.pdg.cfg import build_cfg_for_function
+
+    source = "def fn():\n    if x:\n        a = 1\n    else:\n        b = 2\n"
+    tree = ast.parse(source)
+    fn = tree.body[0]
+    cfg = build_cfg_for_function("t.py", "fn", fn, source.splitlines())
+    assert any(e.kind == "true" for e in cfg.edges)
+    assert any(e.kind == "false" for e in cfg.edges)
+
+
+def test_pdg_reaching_def_chain():
+    import ast
+    from devcouncil.indexing.graph.pdg.cfg import build_cfg_for_function
+    from devcouncil.indexing.graph.pdg.reaching_def import compute_reaching_defs
+
+    source = "def fn():\n    x = 1\n    y = x + 1\n"
+    tree = ast.parse(source)
+    fn = tree.body[0]
+    cfg = build_cfg_for_function("t.py", "fn", fn, source.splitlines())
+    edges = compute_reaching_defs(cfg, fn)
+    assert any(e.variable == "x" and e.def_line == 2 and e.use_line == 3 for e in edges)
+
+
+def test_pdg_taint_command_injection():
+    import ast
+    from devcouncil.indexing.graph.pdg.cfg import build_cfg_for_function
+    from devcouncil.indexing.graph.pdg.reaching_def import compute_reaching_defs
+    from devcouncil.indexing.graph.pdg.taint import analyze_taint
+
+    source = "import os\n\ndef fn():\n    os.system(input())\n"
+    tree = ast.parse(source)
+    fn = tree.body[1]
+    cfg = build_cfg_for_function("t.py", "fn", fn, source.splitlines())
+    reaching = compute_reaching_defs(cfg, fn)
+    findings = analyze_taint("t.py", "fn", fn, reaching)
+    assert any(f.category == "command-injection" for f in findings)
+
+
+def test_pdg_build_merge_meta(tmp_path):
+    from devcouncil.indexing.graph.build import build_code_graph, build_pdg_for_paths, merge_pdg_into_graph, write_code_graph
+
+    _write(
+        tmp_path,
+        {
+            "pyproject.toml": '[project]\nname="t"\nversion="0"\n',
+            "pkg/__init__.py": "",
+            "pkg/run.py": "import os\n\ndef run():\n    os.system(input())\n",
+        },
+    )
+    _commit(tmp_path)
+    graph = build_code_graph(tmp_path)
+    layer = build_pdg_for_paths(tmp_path, graph, paths=["pkg/run.py"])
+    shards = merge_pdg_into_graph(graph, layer)
+    write_code_graph(tmp_path, graph, analysis_shards=shards)
+    assert graph.meta.get("pdg")
+    assert graph.meta["pdg"]["stats"]["taint_count"] >= 0
+
+
+def test_pdg_cli_explain_json(tmp_path):
+    from devcouncil.indexing.graph.build import build_code_graph, build_pdg_for_paths, merge_pdg_into_graph, write_code_graph
+
+    _write(
+        tmp_path,
+        {
+            "pyproject.toml": '[project]\nname="t"\nversion="0"\n',
+            "pkg/__init__.py": "",
+            "pkg/run.py": "def run():\n    return 1\n",
+        },
+    )
+    _commit(tmp_path)
+    graph = build_code_graph(tmp_path)
+    layer = build_pdg_for_paths(tmp_path, graph, paths=["pkg/run.py"])
+    shards = merge_pdg_into_graph(graph, layer)
+    write_code_graph(tmp_path, graph, analysis_shards=shards)
+    runner = CliRunner()
+    result = runner.invoke(graph_app, ["explain", "--project-root", str(tmp_path), "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload.get("ok") is True

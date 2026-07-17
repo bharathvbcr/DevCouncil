@@ -91,7 +91,6 @@ class SyncCoordinator:
         self._start_observer()
         self._worker = threading.Thread(target=self._run, name="devcouncil-codeintel-sync", daemon=True)
         self._worker.start()
-        self.reconcile()
         return self.status()
 
     def stop(self, *, timeout: float = 5.0) -> None:
@@ -145,8 +144,15 @@ class SyncCoordinator:
             if rel not in indexed or values != indexed[rel][:2]
         }
         changed.update(set(indexed) - set(current))
-        for rel in changed:
-            self.mark_pending(rel)
+        if changed:
+            # Every item came from IndexScope.files() or the persisted index, so
+            # repeating per-path git ignore probes through mark_pending() is both
+            # redundant and expensive.
+            with self._condition:
+                self._pending.update(changed)
+                self._pending_since = self._pending_since or time.monotonic()
+                self._state.state = "pending"
+                self._condition.notify_all()
         self._state.last_reconcile_at = time.time()
         return sorted(changed)
 
@@ -193,6 +199,15 @@ class SyncCoordinator:
         return not self.status().pending
 
     def _run(self) -> None:
+        # Initial reconciliation is intentionally asynchronous.  MCP clients must
+        # be able to complete initialize/list_tools immediately while the index is
+        # brought current in the background.
+        try:
+            self.reconcile()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("initial code-intelligence reconciliation failed")
+            self._state.state = "degraded"
+            self._state.last_error = f"{type(exc).__name__}: {exc}"
         next_reconcile = time.monotonic() + self.reconcile_seconds
         while not self._stop.is_set():
             with self._condition:

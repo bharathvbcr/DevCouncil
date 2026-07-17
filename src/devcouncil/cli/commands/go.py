@@ -143,9 +143,11 @@ def _remediable_incomplete_signature(root: Path, task_id: str) -> str:
 
 
 def _build_repair_service(root: Path):
-    """Best-effort LLM repair service used to sharpen the correction manifest's root
-    cause. Returns None when no provider key is configured — the manifest still has a
-    deterministic, task-scoped fallback (allowed files, commands, forbidden changes)."""
+    """Optional LLM advisory layer for sharpening correction-manifest root cause.
+
+    Returns None when no provider key is configured — the Stable repair contract
+    does not require this: ``write_correction_manifest`` still builds a deterministic,
+    task-scoped manifest from blocking gaps, next-actions, and task scope."""
     try:
         from devcouncil.app.config import get_api_key
         from devcouncil.llm.provider import create_provider, validate_model_provider
@@ -231,12 +233,17 @@ def _execute_task_with_repair(
     """Run a task, then self-repair in a bounded loop until it verifies or the budget
     is exhausted. Returns ``(final_status, repair_attempts_used)``.
 
-    Each repair attempt writes a correction manifest (which the coding-CLI executor
-    folds into its prompt) and re-runs the executor. Between attempts the prior work
-    is committed so the readiness gate's clean-tree requirement holds and the next
-    attempt builds on it; verification still recognises the committed work via the
-    task's checkpoint. The loop stops early when an attempt makes no progress (the
-    same blocking gaps reappear) so it never spins on an unfixable gate.
+    **Stable contract:** each repair attempt writes a deterministic correction manifest
+    (blocking gaps, next-actions, task scope, prior-attempt context), re-runs the
+    executor, respects ``max_repairs``, and stops on no-progress (identical gap
+    fingerprint). Optional ``repair_service`` LLM inference may sharpen the manifest but
+    is not required for the loop to function.
+
+    Between attempts the prior work is committed so the readiness gate's clean-tree
+    requirement holds and the next attempt builds on it; verification still recognises
+    the committed work via the task's checkpoint. The loop stops early when an attempt
+    makes no progress (the same blocking gaps reappear) so it never spins on an
+    unfixable gate.
 
     When the task ultimately verifies, the intermediate ``[blocked]`` commits made
     between attempts are squashed into a single verified commit (see

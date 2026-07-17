@@ -400,6 +400,7 @@ def build_output_style(root: Path) -> list[GeneratedAsset]:
 PLUGIN_ROOT_REL = Path(".devcouncil") / "claude-plugin"
 _PLUGIN_NAME = "devcouncil"
 _MARKETPLACE_NAME = "devcouncil-local"
+SESSION_START_MATCHER = "startup|resume|clear|compact"
 
 
 def _plugin_dir(root: Path) -> Path:
@@ -445,10 +446,13 @@ def _plugin_hooks_json(*, write_gate: bool = False) -> str:
     tool_matcher = "Bash|Write|Edit|MultiEdit"
     hooks: dict[str, list] = {
         "PostToolUse": [{"matcher": tool_matcher, "hooks": [{"type": "command", "command": cmd("post-tool-use"), "timeout": 10000}]}],
-        "Stop": [{"hooks": [{"type": "command", "command": cmd("agent-response"), "timeout": 10000}]}],
-        "SessionStart": [{"matcher": "startup|resume", "hooks": [{"type": "command", "command": cmd("session-start"), "timeout": 10000}]}],
+        "Stop": [{"hooks": [{"type": "command", "command": cmd("agent-response"), "timeout": 150000}]}],
+        "SessionStart": [{"matcher": SESSION_START_MATCHER, "hooks": [{"type": "command", "command": cmd("session-start"), "timeout": 10000}]}],
         "UserPromptSubmit": [{"hooks": [{"type": "command", "command": cmd("user-prompt-submit"), "timeout": 10000}]}],
-        "SubagentStop": [{"hooks": [{"type": "command", "command": cmd("subagent-stop"), "timeout": 10000}]}],
+        "SessionEnd": [{"hooks": [{"type": "command", "command": cmd("session-end"), "timeout": 10000}]}],
+        "PreCompact": [{"hooks": [{"type": "command", "command": cmd("pre-compact"), "timeout": 10000}]}],
+        "PostCompact": [{"hooks": [{"type": "command", "command": cmd("post-compact"), "timeout": 10000}]}],
+        "SubagentStop": [{"hooks": [{"type": "command", "command": cmd("subagent-stop"), "timeout": 150000}]}],
         "Notification": [{"hooks": [{"type": "command", "command": cmd("notification"), "timeout": 10000}]}],
     }
     if write_gate:

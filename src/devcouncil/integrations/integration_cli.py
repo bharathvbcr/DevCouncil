@@ -63,7 +63,7 @@ def print_recommendations(root: Path, console: Console) -> None:
         console.print(f"Setup: [dim]{PREFERRED_COMMAND} {resolved} --apply[/dim]")
     else:
         console.print("\n[yellow]No built-in coding CLI was found on PATH.[/yellow]")
-        console.print("Install Codex, Gemini, Claude Code, Cursor Agent, OpenCode, or register a custom CLI:")
+        console.print("Install Codex, Claude Code, Cursor Agent, OpenCode, Antigravity, or register a custom CLI:")
         console.print(f"[dim]{PREFERRED_COMMAND} cli-agent NAME --command TOOL --apply[/dim]")
 
 
@@ -123,7 +123,10 @@ def print_integration_matrix(console: Console) -> None:
     for client in sorted(BUILTIN_CODING_EXECUTOR_NAMES):
         info = CODING_CLI_INTEGRATION_INFO.get(client)
         posture = info.enforcement if info else "verify-only"
-        posture_render = "[green]pre-action[/green]" if posture == "pre-action" else "[yellow]verify-only[/yellow]"
+        posture_render = {
+            "pre-action": "[green]pre-action[/green]",
+            "advisory+verify": "[cyan]advisory+verify[/cyan]",
+        }.get(posture, "[yellow]verify-only[/yellow]")
         table.add_row(
             client,
             integration_tier_label(client),
@@ -136,9 +139,10 @@ def print_integration_matrix(console: Console) -> None:
     console.print(table)
     console.print(
         "\n[dim]Enforcement:[/dim] [green]pre-action[/green] blocks forbidden writes/commands "
-        "before they happen; [yellow]verify-only[/yellow] catches them only at verify time."
+        "before they happen; [cyan]advisory+verify[/cyan] warns in native hooks and "
+        "contains through sandbox/verification; [yellow]verify-only[/yellow] catches them at verify time."
     )
-    console.print("\nSee [dim]docs/integration-tiers.md[/dim] for workflow guidance.")
+    console.print("\nSee [dim]docs/coding-cli-integration.md[/dim] for workflow guidance.")
 
 
 def run_integration_check(

@@ -231,6 +231,11 @@ def map_repo(
         "--if-stale",
         help="Fingerprint-check first and exit 0 without rebuilding when the on-disk map is still fresh.",
     ),
+    pdg: bool = typer.Option(
+        False,
+        "--pdg/--no-pdg",
+        help="Build opt-in PDG/CFG/taint layer after map (Python-only, intra-procedural).",
+    ),
 ):
     """Build the deterministic repository map without calling an LLM."""
     root = project_root.expanduser().resolve()
@@ -287,6 +292,37 @@ def map_repo(
         graph_out = root / ".devcouncil" / "graph" / "code_graph.json"
         if graph_out.is_file():
             status_console.print(f"[green]Wrote code graph to {graph_out}[/green]")
+            if pdg:
+                try:
+                    from devcouncil.indexing.graph.build import (
+                        build_pdg_for_paths,
+                        load_code_graph,
+                        merge_pdg_into_graph,
+                        write_code_graph,
+                    )
+
+                    graph = load_code_graph(root)
+                    if graph is not None:
+                        layer = build_pdg_for_paths(root, graph)
+                        shards = merge_pdg_into_graph(graph, layer)
+                        merged: dict = {}
+                        try:
+                            from devcouncil.codeintel import get_codeintel_service
+
+                            merged = dict(get_codeintel_service(root).store.analysis_shards())
+                        except Exception:
+                            pass
+                        for path, payload in shards.items():
+                            merged.setdefault(path, {}).update(payload)
+                        write_code_graph(root, graph, analysis_shards=merged)
+                        stats = (graph.meta.get("pdg") or {}).get("stats") or {}
+                        status_console.print(
+                            f"[green]Wrote PDG layer[/green] "
+                            f"({stats.get('function_count', 0)} functions, "
+                            f"{stats.get('taint_count', 0)} taint findings)"
+                        )
+                except Exception as exc:
+                    logger.warning("PDG build after map failed: %s", exc)
             try:
                 from devcouncil.app.config import load_config
 

@@ -53,10 +53,52 @@ def normalize_repo_path(project_root: Path, raw_path: str) -> tuple[str, bool]:
 
 _NO_TASK_ALLOWED_COMMANDS = (
     "dev status",
+    "dev status *",
+    "uv run dev status",
+    "uv run dev status *",
     "dev tasks",
+    "dev tasks *",
+    "uv run dev tasks",
+    "uv run dev tasks *",
+    # Lease bootstrap: agents must acquire a task lease before any other shell.
+    "dev approve",
+    "dev approve *",
+    "uv run dev approve",
+    "uv run dev approve *",
+    "dev checkout *",
+    "uv run dev checkout *",
+    "dev next-task",
+    "dev next-task *",
+    "uv run dev next-task",
+    "uv run dev next-task *",
     "git status",
     "git diff",
     "git diff *",
+)
+
+# Lease lifecycle and repo maintenance commands are always allowed for the lease
+# holder (or when no task is bound), independent of task-specific allowed_commands.
+_LEASE_LIFECYCLE_ALLOWED_COMMANDS = (
+    "dev release *",
+    "uv run dev release *",
+    "dev lease *",
+    "uv run dev lease *",
+    "dev scope *",
+    "uv run dev scope *",
+    "dev map",
+    "dev map *",
+    "uv run dev map",
+    "uv run dev map *",
+    "dev doctor",
+    "dev doctor *",
+    "uv run dev doctor",
+    "uv run dev doctor *",
+    "dev run-cmd *",
+    "uv run dev run-cmd *",
+    "python -m pytest *",
+    "uv run python -m pytest *",
+    "uv run pytest *",
+    "pytest *",
 )
 
 # Shared with HookPolicy — keep these as the single source of truth for
@@ -152,13 +194,25 @@ class TaskPolicyEngine:
                 task_id=task.id if task else None,
             )
 
+        if any(
+            fnmatch.fnmatch(normalized, allowed) for allowed in _LEASE_LIFECYCLE_ALLOWED_COMMANDS
+        ):
+            return PolicyDecision(
+                action="allow",
+                reason="Lease lifecycle or repo maintenance command allowed.",
+                target=normalized,
+                task_id=task.id if task else None,
+            )
+
+        if any(fnmatch.fnmatch(normalized, allowed) for allowed in _NO_TASK_ALLOWED_COMMANDS):
+            return PolicyDecision(
+                action="allow",
+                reason="Bootstrap or read-only command allowed.",
+                target=normalized,
+                task_id=task.id if task else None,
+            )
+
         if task is None:
-            if any(fnmatch.fnmatch(normalized, allowed) for allowed in _NO_TASK_ALLOWED_COMMANDS):
-                return PolicyDecision(
-                    action="allow",
-                    reason="Read-only command allowed without active task.",
-                    target=normalized,
-                )
             return PolicyDecision(
                 action="deny",
                 reason="Shell commands require an active task lease.",
@@ -238,6 +292,9 @@ class TaskPolicyEngine:
 
         planned = self._planned_file_for(normalized, task)
         if planned is None:
+            neighbor_decision = self._neighbor_policy_decision(normalized, task)
+            if neighbor_decision is not None:
+                return neighbor_decision
             return PolicyDecision(
                 action="deny",
                 reason=f"Task {task.id} does not authorize changes to {normalized}.",
@@ -332,6 +389,62 @@ class TaskPolicyEngine:
             if path == planned_path or fnmatch.fnmatch(path, planned_path):
                 return planned
         return None
+
+    def _neighbor_policy_decision(self, path: str, task: Task) -> PolicyDecision | None:
+        """Soft-block writes outside planned files unless same subsystem or a neighbor."""
+        try:
+            from devcouncil.indexing.subsystem_map import (
+                area_for_path,
+                are_neighbors,
+            )
+            from devcouncil.utils.json_persist import read_json
+
+            map_path = self.project_root / ".devcouncil" / "repo_map.json"
+            if not map_path.is_file():
+                return None
+            loaded = read_json(map_path)
+            if not isinstance(loaded, dict):
+                return None
+            data = loaded
+            target_area = area_for_path(path, data)
+            if not target_area:
+                return None
+            planned_areas = {
+                area_for_path(pf.path.replace("\\", "/"), data)
+                for pf in task.planned_files
+            }
+            planned_areas.discard(None)
+            if not planned_areas:
+                return None
+            if target_area in planned_areas:
+                return PolicyDecision(
+                    action="allow",
+                    reason="File is in the same subsystem as a planned file.",
+                    target=path,
+                    task_id=task.id,
+                )
+            if any(
+                are_neighbors(target_area, planned_area, data)
+                for planned_area in planned_areas
+            ):
+                return PolicyDecision(
+                    action="allow",
+                    reason="File is in a neighboring subsystem of a planned file.",
+                    target=path,
+                    task_id=task.id,
+                )
+            return PolicyDecision(
+                action="deny",
+                reason=(
+                    f"Task {task.id} does not authorize changes to {path} "
+                    f"(subsystem `{target_area}` is outside planned files and not a "
+                    f"declared neighbor). Expand scope with `dev scope update`."
+                ),
+                target=path,
+                task_id=task.id,
+            )
+        except Exception:
+            return None
 
     def _matches_forbidden(self, path: str, task: Task) -> bool:
         for forbidden in task.forbidden_changes:

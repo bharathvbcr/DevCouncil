@@ -468,7 +468,7 @@ def decorator_edges(
     extractions: Dict[str, FileExtraction],
     symbol_index: Dict[str, str],
 ) -> List[GraphEdge]:
-    """``decorator -> decorated symbol`` edges (GitNexus-style DECORATES).
+    """``decorator -> decorated symbol`` edges (DECORATES).
 
     Resolved same-file first, then unique-global by bare name. Purely additive:
     liveness of decorator functions is handled via the bare-decorator calls
@@ -595,6 +595,7 @@ def resolve_calls(
     file_edges: List[Tuple[str, str]],
     *,
     class_ids: Optional[Set[str]] = None,
+    unresolved_out: Optional[List[Dict[str, Any]]] = None,
 ) -> List[GraphEdge]:
     """Confidence ladder: same-file → import-resolved → unique-global → ambiguous.
 
@@ -890,6 +891,21 @@ def resolve_calls(
                             extras=extras,
                         )
                     )
+                if unresolved_out is not None:
+                    unresolved_out.append(
+                        {
+                            "source_id": caller_id,
+                            "path": path,
+                            "line": call.line,
+                            "name": call.name,
+                            "kind": "ambiguous_call",
+                            "reason": reason,
+                            "evidence": {
+                                "candidates": list(ambig_candidates),
+                                "receiver": call.receiver,
+                            },
+                        }
+                    )
                 continue
 
             if target_id and (caller_id, target_id) not in seen:
@@ -908,5 +924,20 @@ def resolve_calls(
                         reason=reason,
                         extras=extras,
                     )
+                )
+            elif unresolved_out is not None and target_id is None:
+                unresolved_out.append(
+                    {
+                        "source_id": caller_id,
+                        "path": path,
+                        "line": call.line,
+                        "name": call.name,
+                        "kind": "call",
+                        "reason": reason,
+                        "evidence": {
+                            "receiver": call.receiver,
+                            "qualname_hint": call.qualname_hint,
+                        },
+                    }
                 )
     return edges

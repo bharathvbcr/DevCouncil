@@ -80,8 +80,8 @@ def test_repo_mapper_role_files_have_no_symbol_index_reference():
     assert not any("symbol_index" in p for p in entry_points)
 
 
-def test_graph_index_kept_because_referenced():
-    # GraphIndex is consumed by integrations/gitnexus.py, so it must remain importable.
+def test_graph_index_kept_as_deprecated_compat_shim():
+    # graph_index.py is a legacy artifact-graph shim; real graph lives in indexing/graph/.
     from devcouncil.indexing.graph_index import GraphIndex
 
     assert GraphIndex is not None

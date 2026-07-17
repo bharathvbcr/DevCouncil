@@ -53,3 +53,32 @@ def test_scaffold_evidence_ci_writes_and_respects_force(tmp_path):
     yaml.safe_load(target.read_text(encoding="utf-8"))
     assert scaffold_evidence_ci(tmp_path) is None
     assert scaffold_evidence_ci(tmp_path, force=True) == target
+
+
+def test_render_evidence_workflow_uses_uv_when_uv_lock_present(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    (tmp_path / "uv.lock").write_text("", encoding="utf-8")
+    _init(tmp_path)
+    text = render_evidence_workflow(tmp_path)
+    assert "astral-sh/setup-uv" in text
+    assert "uv sync --all-groups" in text
+    assert "uv run --python" in text
+    assert "dev check --verify" in text
+    assert "pip install -e ." not in text
+
+
+def test_render_evidence_workflow_uses_verify_base_diff(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    _init(tmp_path)
+    text = render_evidence_workflow(tmp_path)
+    assert "fetch-depth: 0" in text
+    assert "VERIFY_BASE" in text
+    assert "github.event.pull_request.base.sha" in text
+    assert "github.event.before" in text
+    assert "check --verify --base" in text
+    assert "--persist" in text
+    assert "--fail-on-blocking" in text
+    assert "0000000000000000000000000000000000000000" in text
+    assert "Skipping DevCouncil verify" in text
+    assert "check --verify --persist --project-root" not in text
+    assert "env.GITHUB_TOKEN" not in text

@@ -31,7 +31,7 @@ def build_integrations_doctor_table(root: Path) -> Table:
         ("code-review-graph", "code-review-graph", "Optional structural graph context adapter."),
         ("Claude Code", "claude", "Optional MCP client and native hook runtime for pre-tool-use enforcement."),
         ("Codex CLI", "codex", "Optional MCP client, headless executor companion, and native hook runtime."),
-        ("Gemini CLI", "gemini", "Optional MCP client companion and native hook runtime."),
+        ("Gemini CLI (deprecated)", "gemini", "Deprecated — migrate to Google Antigravity CLI (dev integrate antigravity --apply)."),
         ("Cursor", "cursor-agent", "Optional MCP client, agent/cursor-agent executor, and native hooks."),
         ("Grok Build", "grok", "Optional MCP client, grok headless executor, and native hooks."),
         ("OpenCode", "opencode", "Optional MCP client and headless coding-agent executor."),

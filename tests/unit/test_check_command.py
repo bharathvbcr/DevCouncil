@@ -157,7 +157,7 @@ def test_check_llm_audit_human_reports_secrets_and_note(tmp_path, monkeypatch):
 def test_render_gate_no_changes(capsys):
     check_cmd._render_gate(AdHocCheckResult(requirement="", reason="no_changes"))
     out = capsys.readouterr().out
-    assert "No working-tree changes" in out
+    assert "No changes to verify" in out
 
 
 def test_render_gate_clean_verified(capsys):

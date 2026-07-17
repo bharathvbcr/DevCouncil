@@ -23,15 +23,52 @@ dev map --wiki / --no-wiki  # Refresh codebase-wiki skeletons after map (on by d
 dev map --scan-deps         # Opt-in SCA (pip-audit / npm audit / osv-scanner) → dependency_risks
 dev map --watch             # Debounced incremental refresh on edits
 dev graph init              # Build canonical SQLite + compatibility exports
+dev graph ingest            # Unified analyze: codeintel sync → graph export → repo map write
+dev graph ingest src/foo    # Path-scoped ingest (full reconcile when paths omitted)
 dev graph status            # Generation, pending paths, watcher/degraded state
 dev graph sync              # Reconcile and commit now
 dev graph watch             # Native FSEvents/inotify/ReadDirectoryChangesW foreground watcher
 dev graph doctor            # SQLite, watcher, and offline grammar verification
 ```
 
-Freshness uses git HEAD, a tracked-file hash, and a content fingerprint so plain edits mark the map stale. Fingerprint / git errors fail closed (treat as stale). Post-tool-use hooks and `dev map --watch` refresh incrementally; incremental extract still verifies parse-cache sha256 so a concurrent edit to an unlisted path cannot stamp a fresh fingerprint over stale symbols.
+Freshness uses git HEAD, a tracked-file hash, and a content fingerprint so plain edits mark the map stale. Fingerprint / git errors fail closed (treat as stale). A **missing** `.devcouncil/repo_map.json` is also stale — hard rigor blocks checkout/verify until `dev map` or `dev graph ingest` runs. Post-tool-use hooks and `dev map --watch` refresh incrementally; incremental extract still verifies parse-cache sha256 so a concurrent edit to an unlisted path cannot stamp a fresh fingerprint over stale symbols.
 
 HTML visualizer: set `indexing.write_graph_html: true` in config if you want `dev map` to also write `graph.html`. Otherwise use `dev graph html` / `dev graph view` explicitly.
+
+## PDG / CFG / taint (opt-in)
+
+Program-dependence analysis is **off by default** and does not run during normal `dev map` unless you pass `--pdg`. It is Python-only and intra-procedural in the MVP.
+
+| Layer | Scope | Artifact |
+| :--- | :--- | :--- |
+| CFG | per function | basic blocks + branch/fallthrough edges |
+| Reaching-def | intra-procedural | def line → use line per variable |
+| CDG | intra-procedural | controller block → dependent block (+ `guard` on early return) |
+| Taint | heuristic | source→sink findings by category |
+
+**Persistence**
+
+- Summary + capped findings (≤500): `graph.meta["pdg"]` in `code_graph.json`
+- Full per-file payload: `analysis_shards[path]["pdg"]` in `codeintel/index.sqlite`
+
+**CLI**
+
+```bash
+dev map --pdg                                    # map + PDG in one shot
+dev graph pdg build --path src/foo/bar.py        # on-demand for paths
+dev graph explain --category command-injection
+dev graph pdg-query --mode controls --target my_fn
+dev graph pdg-query --mode flows --target my_fn --variable x
+```
+
+**Limitations (MVP)**
+
+1. Intra-procedural only — no cross-function or inter-file taint.
+2. Python-first — TS/JS deferred.
+3. No field-sensitive or alias analysis.
+4. CDG branch sense is coarse (`if`/`while` only; `match` arms treated uniformly).
+5. Taint uses pattern tables — expect false positives/negatives.
+6. Opt-in — default `dev map` unchanged without `--pdg`.
 
 ## Query the graph
 
@@ -48,6 +85,8 @@ dev graph html                     # write graph.html
 dev graph view                     # serve/open the HTML
 dev graph export -o out.graphml    # GraphML (or --format okf)
 dev graph search request_handler   # FTS5 symbol/path search
+dev graph search "auth flow" --semantic  # Opt-in local embeddings (indexing.embeddings.enabled)
+dev graph cypher 'MATCH (a)-[r:CALLS]->(b) RETURN a.id, b.id LIMIT 20'
 dev graph explore request_handler  # source + semantic paths + blast radius
 dev graph affected src/foo.py      # tests in the inbound impact closure
 ```
@@ -107,25 +146,30 @@ Prefer `dev graph dead --confidence extracted` plus file greps before deleting a
 Treat `inferred` as **unconfirmed**. If `entry_roots` are empty or
 `liveness_unreachable_unreliable` is set, **ignore** `unreachable_files` and mass inferred dead.
 
-`dev map` stores a **capped** (200) `dead_symbol_candidates` list for agents:
+`dev map` stores a **capped** (5000) `dead_symbol_candidates` list for agents:
 **extracted ∩ token-scan** (methods excluded). `dev graph dead` reports the **uncapped**
 graph tiers with reasons. Prefer reviewing `ambiguous` before deleting anything. If graph
 assemble fails, the map omits dead-symbol candidates rather than falling back to a token-only flood.
 
+Map liveness lists (`unwired_candidates`, `unreachable_files`, `dead_symbol_candidates`) are
+capped at **5000** each; `dependents[path]` is capped at **256** per file. When a list hits
+its cap, metadata records `*_truncated` plus totals — use `dev graph dead` for uncapped tiers.
+
 ## Liveness lists on the map
 
 - **entry_roots** — configured + convention entry points (CLI mains, `__main__`, etc.)
-- **unwired_candidates** — code files with no non-test importers (capped at 200)
-- **unreachable_files** — not reachable via imports from production entry roots (capped at 200).
+- **unwired_candidates** — code files with no non-test importers (capped at 5000)
+- **unreachable_files** — not reachable via imports from production entry roots (capped at 5000).
   Empty / unreliable when production entry roots are missing (`liveness_unreachable_unreliable`)
-- **dead_symbol_candidates** — extracted ∩ token-scan (methods excluded; capped at 200)
+- **dead_symbol_candidates** — extracted ∩ token-scan (methods excluded; capped at 5000)
 - **liveness_unreachable_unreliable** — true when unreachable BFS was skipped (empty prod roots)
+- **dependents** — reverse-import index per file (capped at 256 importers per path)
 
 ### Map ↔ verify asymmetry (same-task island)
 
 Map unwired lists treat **any** non-test importer as clearing unwired. Verify’s unwired gate for *new* files is stricter: a file imported only by other files added in the same task still fails (same-task island rule) until a **pre-existing** non-test caller imports it. Map lists are navigation hints; verify is the gate.
 
-Verification can also enforce wiring / stale-map / dead-symbol / liveness-ratchet checks when those gates are enabled.
+Verification can also enforce wiring / stale-map / dead-symbol / liveness-ratchet checks when those gates are enabled. **Write policy** soft-blocks edits outside `planned_files` unless the target is in the same subsystem or a map `neighbors` area — escape via `dev scope update` / `devcouncil_update_task_scope`.
 
 ## Agent workflow
 
@@ -136,3 +180,34 @@ Verification can also enforce wiring / stale-map / dead-symbol / liveness-ratche
    Check `unwired_candidates` / `dead_symbol_candidates` before adding modules.
 4. Use `dev graph query` / `trace` / `dead` for symbol-level navigation.
 5. Run `dev map` after large refactors (or rely on hooks / `--watch`).
+
+## API route mapping
+
+Native HTTP surface tools over `ROUTE` nodes and `routes_to` /
+`registers` edges (no external graph service):
+
+```bash
+dev graph routes --json
+dev graph shape-check --json
+dev graph shape-check --route /api/items --json
+dev graph api-impact /api/items --json
+```
+
+- **`routes`** — handlers, registration owners, and client fetch sites
+  (`fetch`, `axios`, `requests`, `httpx`) matched by normalized path
+  (`:param`, `{id}`, `[id]` → `*`).
+- **`shape-check`** — handler return dict keys (Python AST / TS regex) vs keys
+  accessed on the response variable in a short post-fetch window.
+- **`api-impact`** — consumers, middleware registrations, shape mismatches, and
+  a risk tier (`high` / `medium` / `low` / `none`).
+
+MCP equivalents: `devcouncil_route_map`, `devcouncil_shape_check`,
+`devcouncil_api_impact`, `devcouncil_graph_ingest`, `devcouncil_graph_cypher`,
+`devcouncil_pdg_query`, `devcouncil_explain`.
+
+## Corpus side index
+
+For navigation over docs, PDFs, and images — separate from the
+deterministic code graph but able to feed opt-in verify gates — see
+[docs/corpus.md](corpus.md) and run `dev corpus build`, `dev corpus query`, and
+`dev corpus status`.

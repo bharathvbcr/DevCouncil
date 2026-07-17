@@ -36,6 +36,7 @@ def test_cli_tasks_list(tmp_path, monkeypatch):
     assert res.exit_code == 0
     assert "TASK-1" in res.output
     assert "Original Title" in res.output
+    assert "Lease" in res.output
     
     # JSON list
     res_json = runner.invoke(app, ["tasks", "--json"])
@@ -43,6 +44,31 @@ def test_cli_tasks_list(tmp_path, monkeypatch):
     data = json.loads(res_json.output)
     assert data["total"] == 1
     assert data["tasks"][0]["id"] == "TASK-1"
+    assert data["tasks"][0]["lease"] is None
+
+
+def test_cli_tasks_list_includes_active_lease(tmp_path, monkeypatch):
+    tmp_path, task_id = _setup_tasks_db(tmp_path, monkeypatch)
+    from devcouncil.storage.db import Database
+    from devcouncil.storage.native import TaskLeaseRepository
+
+    db = Database(tmp_path / ".devcouncil" / "state.sqlite")
+    with db.get_session() as session:
+        TaskLeaseRepository(session).acquire(task_id, owner="agent:codex", agent="codex", ttl_seconds=600)
+
+    res_json = runner.invoke(app, ["tasks", "--json"])
+    assert res_json.exit_code == 0
+    data = json.loads(res_json.output)
+    lease = data["tasks"][0]["lease"]
+    assert lease is not None
+    assert lease["owner"] == "agent:codex"
+    assert lease["agent"] == "codex"
+    assert lease["expired"] is False
+    assert "lease_token" not in lease
+
+    res = runner.invoke(app, ["tasks"])
+    assert res.exit_code == 0
+    assert "agent:codex" in res.output
 
 
 def test_cli_tasks_cancel(tmp_path, monkeypatch):
@@ -128,6 +154,7 @@ def test_cli_tasks_empty_list_text_mode(tmp_path, monkeypatch):
 
     monkeypatch.setattr(tasks_cmd, "get_db", lambda root: _Db())
     monkeypatch.setattr(tasks_cmd, "TaskRepository", lambda session: _Repo())
+    monkeypatch.setattr(tasks_cmd, "_active_leases_by_task", lambda session: {})
 
     res = runner.invoke(app, ["tasks"])
     assert res.exit_code == 0

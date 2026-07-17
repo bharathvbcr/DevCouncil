@@ -186,3 +186,17 @@ Output: a `results/<timestamp>.json` (raw per-run data, including the
   arm-to-arm comparison is the trustworthy signal, not the absolute numbers.
 
 See `tasks.py` for the task suite and each task's hidden checks.
+
+## Code-intelligence performance ratchets
+
+Separate from this effectiveness harness: `tests/performance` and
+`scripts/codeintel-benchmark.py` ratchet cold-build, one-file sync, RSS, and
+query latency for the schema-v2 code graph (`fast` = PR ratchet ~256 files;
+`heavy` = explicit 10k-file profile). Thresholds live in
+`tests/performance/thresholds.json`. Run:
+
+```bash
+uv run pytest tests/performance -q
+uv run python scripts/codeintel-benchmark.py --profile heavy \
+  --output artifacts/codeintel-heavy.json
+```

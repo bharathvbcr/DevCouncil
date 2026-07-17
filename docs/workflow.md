@@ -15,7 +15,9 @@ For coding agents that need one entrypoint instead of the task-by-task sidecar l
 dev e2e "Describe the implementation goal" --executor codex
 ```
 
-`dev e2e` and `dev go` share the same end-to-end implementation: plan, execute, verify, report. If `--executor` is omitted, they use `execution.default_executor` from `.devcouncil/config.yaml`. When planning leaves advisory gaps, `dev e2e` stops until you run `dev approve` or re-run with `--force`.
+`dev e2e` and `dev go` share the same end-to-end implementation: plan, execute, verify, report. If `--executor` is omitted, they use `execution.default_executor` from `.devcouncil/config.yaml`.
+
+**One-command onboarding:** `dev boot "goal"` runs setup, applies integrations (unless `--skip-integrations`), optionally scaffolds CI, then hands off to `dev go`. See [quickstart.md](quickstart.md).
 
 For machine-readable integration, add `--agent` with the selected automated executor. It enables JSON report output and writes `.devcouncil/reports/latest.json`.
 
@@ -25,17 +27,27 @@ For machine-readable integration, add `--agent` with the selected automated exec
 dev plan "Add password reset with expiring single-use tokens"
 ```
 
-DevCouncil maps the repository, drafts requirements, runs planner and critic roles, and stores the task graph locally. If all plan gates pass, the project moves to `PLAN_APPROVED` automatically. When advisory gaps remain, the phase stays `AWAITING_USER_DECISIONS` until you approve the plan.
+DevCouncil maps the repository, drafts requirements, runs planner and critic roles, and stores an approved task graph locally.
 
-Before planning (or after large refactors), refresh navigation artifacts:
+Before planning (or after large refactors), refresh navigation artifacts and preview the graph UI:
 
 ```bash
 dev map                 # repo_map.json + code_graph.json + AGENTS.md/CLAUDE.md
+dev graph ingest        # unified analyze entry (alias path: sync + map + optional embeddings)
 dev graph query SYMBOL  # callers / callees
 dev graph dead          # dead-code tiers
+dev graph demo          # sample visualizer UI (no map) + SVG preview
+dev graph view          # serve interactive graph.html for this repo
+dev corpus build        # advisory docs/PDF/image index (optional verify gates)
 ```
 
-See [code-graph.md](code-graph.md) for the full map/graph surface.
+A missing or stale map fails closed on hard rigor — run `dev map` or `dev graph ingest`
+before `dev verify` on strict tasks. Write policy soft-blocks edits outside planned
+files unless the target is in the same subsystem or a map neighbor (`dev scope update`
+to widen scope).
+
+See [code-graph.md](code-graph.md) for the full map/graph surface and [corpus.md](corpus.md)
+for the documentation side index.
 
 Inspect the plan:
 
@@ -43,13 +55,6 @@ Inspect the plan:
 dev status
 dev tasks
 dev show TASK-001
-```
-
-If `dev status` shows `AWAITING_USER_DECISIONS`, approve before running tasks:
-
-```bash
-dev approve              # accept the generated plan
-dev approve --force      # approve even when blocking gate gaps remain
 ```
 
 ## 2. Start One Task
@@ -77,12 +82,6 @@ dev verify TASK-001
 ```
 
 Verification records evidence and marks the task as either `verified` or `blocked`.
-
-For a quick deterministic gate without a planned task (no provider keys):
-
-```bash
-dev check --verify --goal "reset tokens are single-use" --test "pytest tests/test_auth.py -q"
-```
 
 Inspect the result:
 
@@ -129,3 +128,19 @@ Recommended working rules:
 - Use `dev repair` for follow-up fixes instead of free-form retry prompts.
 - Use `dev rollback TASK-ID` if a task needs to be reverted from its checkpoint.
 - Treat `.devcouncil/` as local project state and the audit trail for the gated run.
+- With Claude/Codex hooks installed, Stop runs claim checks + optional task verify (`execution.stop_gate`); treat those messages as completion evidence, not just chat noise.
+
+## 7. Live review (`dev watch`)
+
+Optional Sage-style sidecar while verification remains the final authority:
+
+```bash
+dev watch sessions --client claude
+dev watch review --client claude --latest
+dev watch follow --client claude --latest
+dev watch pending --client claude
+dev watch cards
+dev watch status --task-id TASK-001
+```
+
+`dev watch review` normalizes Claude-style or generic JSONL transcripts, writes critique cards under `.devcouncil/live/cards/`, and can block `dev verify` on open `Critical Issues` until `dev watch resolve CARD-ID`. Deterministic local reviewer by default; add `--llm` for the configured live-reviewer role. MCP: `devcouncil_live_review`, `devcouncil_live_cards`, `devcouncil_live_repair_prompt`.

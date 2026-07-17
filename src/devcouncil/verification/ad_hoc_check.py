@@ -45,6 +45,7 @@ class AdHocCheckResult:
     diff_coverage: Optional[DiffCoverageEvidence] = None
     passed: bool = True
     reason: str = ""
+    verification_mode: str = "coarse"
 
     def to_dict(self) -> dict:
         return {
@@ -53,6 +54,7 @@ class AdHocCheckResult:
             "requirement": self.requirement,
             "changed_files": self.changed_files,
             "reason": self.reason,
+            "verification_mode": self.verification_mode,
             "gap_count": len(self.gaps),
             "blocking_gap_count": len([g for g in self.gaps if g.blocking]),
             "gaps": [g.model_dump() for g in self.gaps],
@@ -61,13 +63,79 @@ class AdHocCheckResult:
         }
 
 
+def _load_verify_router(project_root: Path) -> Optional[ModelRouter]:
+    """Best-effort router for compiled acceptance checks during ad-hoc verify."""
+    try:
+        from devcouncil.app.config import get_api_key, load_config
+        from devcouncil.llm.provider import create_provider, validate_model_provider
+
+        config = load_config(project_root)
+        validate_model_provider(config.models.provider)
+        api_key = get_api_key(config.models.provider, project_root)
+        provider = create_provider(
+            config.models.provider,
+            api_key,
+            project_root=project_root,
+            provider_prefs=config.provider,
+        )
+        role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
+        return ModelRouter(provider, role_config, project_root=project_root)
+    except Exception as exc:
+        logger.debug("Ad-hoc check: no model router (%s)", exc)
+        return None
+
+
+def _persist_ad_hoc_result(
+    project_root: Path,
+    *,
+    requirement: Requirement,
+    task: Task,
+    gaps: List[Gap],
+    evidence: list,
+) -> None:
+    """Write CHECK task gaps/evidence so ``dev report`` can export CI artifacts."""
+    from devcouncil.domain.evidence import CommandResult, DiffEvidence, TestEvidence
+    from devcouncil.storage.db import get_db
+    from devcouncil.storage.repositories import (
+        EvidenceRepository,
+        GapRepository,
+        RequirementRepository,
+        TaskRepository,
+    )
+
+    db = get_db(project_root)
+    if not db:
+        return
+    with db.get_session() as session:
+        RequirementRepository(session).save(requirement)
+        gap_repo = GapRepository(session)
+        ev_repo = EvidenceRepository(session)
+        gap_repo.delete_for_task(task.id)
+        ev_repo.delete_for_task(task.id)
+        for gap in gaps:
+            gap_repo.save(gap)
+        for ev in evidence:
+            if isinstance(ev, CommandResult):
+                ev_repo.save_command_result(task.id, ev)
+            elif isinstance(ev, DiffCoverageEvidence):
+                ev_repo.save_diff_coverage_evidence(ev)
+            elif isinstance(ev, DiffEvidence):
+                ev_repo.save_diff_evidence(ev)
+            elif isinstance(ev, TestEvidence):
+                ev_repo.save_test_evidence(ev, task.id)
+        task.status = "blocked" if any(g.blocking for g in gaps) else "verified"
+        TaskRepository(session).save(task)
+
+
 def run_working_tree_check(
     project_root: Path,
     requirement: Optional[str] = None,
     *,
+    base: Optional[str] = None,
     test_commands: Optional[List[str]] = None,
     enforce_coverage: bool = False,
     min_ratio: float = 0.0,
+    persist: bool = False,
     router: Optional[ModelRouter] = None,
     verifier: Optional[Verifier] = None,
 ) -> AdHocCheckResult:
@@ -77,14 +145,25 @@ def run_working_tree_check(
     result is about evidence, not scope noise) and whose expected tests are
     ``test_commands``. Diff coverage is always measured; pass ``enforce_coverage`` (or a
     positive ``min_ratio``) to make an unexercised diff blocking.
+
+    When ``base`` is set, the diff is ``git diff <base>`` (PR/base scope) instead of
+    uncommitted changes vs HEAD. Pass ``persist=True`` to write gaps/evidence for
+    ``dev report`` artifact export (typical in CI).
     """
-    verifier = verifier or Verifier(project_root, router=router)
+    verifier = verifier or Verifier(project_root, router=router or _load_verify_router(project_root))
+    if base:
+        verifier._git_fallback.diff_base = base
 
     diff = verifier.get_diff()
     changed_files = verifier.get_changed_files()
     if not diff or not changed_files:
-        logger.info("Ad-hoc check: no working-tree changes; passing trivially")
-        return AdHocCheckResult(requirement="", passed=True, reason="no_changes")
+        scope = f"against {base}" if base else "in working tree"
+        logger.info("Ad-hoc check: no changes %s; passing trivially", scope)
+        return AdHocCheckResult(
+            requirement=requirement or "",
+            passed=True,
+            reason="no_changes",
+        )
     logger.info("Ad-hoc check: %d changed file(s), enforce_coverage=%s", len(changed_files), enforce_coverage or min_ratio > 0)
 
     criterion = requirement or _DEFAULT_CRITERION
@@ -125,6 +204,17 @@ def run_working_tree_check(
     gaps, evidence = asyncio.run(verifier.verify_task(task, [req]))
     coverage = next((ev for ev in evidence if isinstance(ev, DiffCoverageEvidence)), None)
     blocking = [g for g in gaps if g.blocking]
+    outcome_mode = verifier.last_outcome.mode if verifier.last_outcome else (
+        "compiled" if verifier.acceptance_compiler else "coarse"
+    )
+    if persist:
+        _persist_ad_hoc_result(
+            project_root,
+            requirement=req,
+            task=task,
+            gaps=gaps,
+            evidence=evidence,
+        )
     logger.info("Ad-hoc check result: passed=%s (%d gap(s), %d blocking)", not blocking, len(gaps), len(blocking))
     return AdHocCheckResult(
         requirement=criterion,
@@ -133,4 +223,5 @@ def run_working_tree_check(
         next_actions=build_next_actions(gaps),
         diff_coverage=coverage,
         passed=not blocking,
+        verification_mode=outcome_mode,
     )

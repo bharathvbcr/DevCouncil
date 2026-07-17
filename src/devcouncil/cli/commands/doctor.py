@@ -13,6 +13,8 @@ from devcouncil.executors.agent_registry import (
     CODING_CLI_INTEGRATION_INFO,
     CODING_CLI_PROBE_ORDER,
     CODING_CLI_VERSION_COMMANDS,
+    DEPRECATED_CODING_CLIS,
+    GEMINI_DEPRECATION_MESSAGE,
     detect_available_coding_cli,
     resolve_automated_executor,
 )
@@ -280,6 +282,167 @@ def _parse_status_doc_areas(status_doc: Path) -> dict[str, str]:
     return areas
 
 
+def check_liveness_reliability(project_root: Path) -> list[tuple[str, str, str]]:
+    """Warn when map liveness used empty/unreliable entry roots."""
+    ok = "[green]OK[/green]"
+    warn = "[yellow]WARN[/yellow]"
+    rows: list[tuple[str, str, str]] = []
+    try:
+        from devcouncil.utils.json_persist import read_json
+
+        map_path = project_root / ".devcouncil" / "repo_map.json"
+        if not map_path.is_file():
+            return rows
+        data = read_json(map_path)
+        payload = data if isinstance(data, dict) else {}
+        unreliable = bool(payload.get("liveness_unreachable_unreliable"))
+        roots = payload.get("entry_roots") or []
+        if unreliable or not roots:
+            rows.append((
+                "Map liveness",
+                warn,
+                "Production entry roots are empty or unreachable BFS was skipped. "
+                "Add `indexing.entry_roots` in `.devcouncil/config.yaml` (repo-relative "
+                "paths) and run `dev map`.",
+            ))
+        else:
+            rows.append((
+                "Map liveness",
+                ok,
+                f"{len(roots)} production entry root(s); unreachable lists are reliable.",
+            ))
+    except Exception:
+        logger.debug("check_liveness_reliability failed", exc_info=True)
+    return rows
+
+
+def check_mapping_stack(project_root: Path) -> list[tuple[str, str, str]]:
+    """Doctor rows for repo map + code graph freshness (native mapping stack)."""
+    rows: list[tuple[str, str, str]] = []
+    ok = "[green]OK[/green]"
+    warn = "[yellow]WARN[/yellow]"
+    graphify_legacy = project_root / ".devcouncil" / "graphify.yaml"
+    if graphify_legacy.is_file():
+        rows.append((
+            "Legacy graphify.yaml",
+            warn,
+            "``.devcouncil/graphify.yaml`` is deprecated. Move ``corpus:`` settings into "
+            "``.devcouncil/config.yaml`` under ``indexing.corpus`` and remove the file.",
+        ))
+    rows.extend(check_repo_map_freshness(project_root))
+    rows.extend(check_liveness_reliability(project_root))
+    graph_path = project_root / ".devcouncil" / "graph" / "code_graph.json"
+    if not graph_path.is_file():
+        rows.append((
+            "Code graph",
+            warn,
+            "Missing ``.devcouncil/graph/code_graph.json``. Run ``dev map`` or ``dev graph ingest``.",
+        ))
+    else:
+        try:
+            from devcouncil.indexing.graph.build import load_code_graph
+
+            if load_code_graph(project_root) is None:
+                rows.append(("Code graph", warn, "Unreadable or empty code graph export."))
+            else:
+                rows.append(("Code graph", ok, "Present and loadable."))
+        except Exception:
+            rows.append(("Code graph", warn, "Could not load code graph export."))
+    return rows
+
+
+def check_repo_map_freshness(project_root: Path) -> list[tuple[str, str, str]]:
+    """Doctor rows for ``.devcouncil/repo_map.json`` fingerprint freshness."""
+    try:
+        from devcouncil.indexing.repo_mapper import RepoMapper
+        from devcouncil.utils.json_persist import read_json
+
+        map_path = project_root / ".devcouncil" / "repo_map.json"
+        ok = "[green]OK[/green]"
+        warn = "[yellow]Stale[/yellow]"
+        if not map_path.is_file():
+            return [(
+                "Repo map",
+                warn,
+                "Missing `.devcouncil/repo_map.json`. Run `dev map` before verify or checkout.",
+            )]
+        loaded = read_json(map_path)
+        data = loaded if isinstance(loaded, dict) else {}
+        mapper = RepoMapper(project_root)
+        if mapper.map_is_stale(data):
+            head = str(data.get("generated_head") or "(unknown)")[:12]
+            current = mapper._git_head()[:12]
+            return [(
+                "Repo map",
+                warn,
+                f"Behind current code (map HEAD {head}, repo HEAD {current}). "
+                "Run `dev map` or rely on auto-refresh at checkout/verify.",
+            )]
+        return [("Repo map", ok, "Fresh — fingerprints match the current repository.")]
+    except Exception:
+        return []
+
+
+def check_execution_containment(project_root: Path, config=None) -> list[tuple[str, str, str]]:
+    """Doctor rows for YOLO/containment posture (scope gate, write hooks, risky profiles)."""
+    try:
+        from devcouncil.app.config import load_config
+        from devcouncil.executors.agent_registry import load_agent_profiles
+
+        cfg = config if config is not None else load_config(project_root)
+        rows: list[tuple[str, str, str]] = []
+        ok = "[green]OK[/green]"
+        warn = "[yellow]Risky[/yellow]"
+
+        if cfg.execution.enforce_file_scope_pre_verify:
+            rows.append((
+                "Pre-verify scope gate",
+                ok,
+                "execution.enforce_file_scope_pre_verify is enabled — OOS CLI writes are reverted before verify.",
+            ))
+        else:
+            rows.append((
+                "Pre-verify scope gate",
+                warn,
+                "Off by default. Enable execution.enforce_file_scope_pre_verify for battle-test containment.",
+            ))
+
+        write_gate = bool(getattr(cfg.integrations.claude, "write_gate", False))
+        if write_gate:
+            rows.append((
+                "Claude write-gate",
+                ok,
+                "integrations.claude.write_gate is enabled. Run `dev integrate hooks --apply` if hooks are missing.",
+            ))
+        else:
+            rows.append((
+                "Claude write-gate",
+                warn,
+                "Disabled. Run `dev integrate claude --apply --write-gate` for PreToolUse containment.",
+            ))
+
+        for name, profile in load_agent_profiles(project_root).items():
+            mode = (profile.permission_mode or "").strip().lower()
+            if mode == "bypasspermissions":
+                rows.append((
+                    f"Profile {name}",
+                    warn,
+                    "permission_mode bypassPermissions bypasses all CLI edit gates.",
+                ))
+            extra = profile.extra_args or []
+            for index, arg in enumerate(extra):
+                if arg == "--permission-mode" and index + 1 < len(extra):
+                    if str(extra[index + 1]).lower() == "bypasspermissions":
+                        rows.append((
+                            f"Profile {name}",
+                            warn,
+                            "extra_args include --permission-mode bypassPermissions.",
+                        ))
+        return rows
+    except Exception:
+        return []
+
+
 def check_local_monitor_sampling(project_root: Path, config=None) -> list[tuple[str, str, str]]:
     """Doctor rows for local-monitor verification safety.
 
@@ -355,8 +518,11 @@ def check_coverage_floor(project_root: Path) -> list[tuple[str, str, str]]:
     ]
 
 
-def _mypy_command() -> list[str]:
-    """Resolve mypy through the project environment used by CI."""
+def _mypy_command(project_root: Path) -> list[str]:
+    """Resolve mypy without making a doctor check depend on network access."""
+    project_mypy = project_root / ".venv" / "bin" / "mypy"
+    if project_mypy.is_file():
+        return [str(project_mypy), "src"]
     if shutil.which("uv"):
         return ["uv", "run", "--python", "3.12", "mypy", "src"]
     return [sys.executable, "-m", "mypy", "src"]
@@ -372,7 +538,7 @@ def check_mypy_status(project_root: Path) -> list[tuple[str, str, str]]:
     src_root = project_root / "src"
     if not src_root.is_dir():
         return [("mypy green", warn, "No src/ directory; skipping mypy probe.")]
-    command = _mypy_command()
+    command = _mypy_command(project_root)
     command_text = subprocess.list2cmdline(command)
     try:
         proc = subprocess.run(
@@ -533,16 +699,21 @@ def _subsystem_maturity_rows() -> list[tuple[str, str, str]]:
         ("Engineering Skills", "stable", "dev skills listing/scaffolding"),
         ("Cost & Run Telemetry", "stable", "dev cost show / dev runs"),
         ("Security Scanning", "stable", "Secret redaction and detection"),
-        ("Coding CLI Executors", "preview", "Codex, Gemini, Claude, Cursor, OpenCode, …"),
-        ("Repair Loop (dev go)", "preview", "Bounded self-repair; correction manifest"),
+        ("Coding CLI Executors", "preview", "Codex, Claude, OpenCode, Antigravity, Warp, Cursor, …; Gemini deprecated"),
+        ("Repair Loop (dev go)", "stable", "Bounded self-repair; correction manifest + no-progress"),
+        ("LLM repair inference", "preview", "Optional RepairService manifest sharpening"),
         ("MCP Server (Claude hero loop)", "stable", "Certified checkout→verify loop; golden e2e"),
         ("Multi-agent Campaign", "preview", "dev campaign — parallel DAG + Reviewer QC"),
         ("OKF / design.md", "preview", "dev okf / dev design commands"),
         ("CI Scaffolding", "preview", "dev scaffold-ci starter workflow"),
+        ("One-command onboarding (dev boot)", "preview", "setup + integrate --apply + go"),
         ("GitHub PR Checks / Comments", "preview", "dev report --github*"),
         ("LSP / AST Indexing", "preview", "dev lsp inspect (detection-only) / dev ast"),
         ("Live Dashboard", "preview", "dev dashboard --open"),
-        ("Coding CLI Hooks", "experimental", "Starters; Claude hooks = certified path"),
+        ("Coding CLI Hooks", "preview", "Stop gate on Claude/Codex Stop hooks; assist seeded on integrate"),
+        ("Stop gate & claim checks", "preview", "Completion-claim mapper + optional active-task verify"),
+        ("Corpus side index", "preview", "dev corpus + optional corpus/doc-ref rigor gates"),
+        ("PDG / CFG / taint", "preview", "Opt-in Python PDG; off by default"),
         ("Native Executor", "preview", "Lease-gated writes + shared verify/next-actions loop; sandbox/timeout parity"),
     ]
 
@@ -649,6 +820,18 @@ def render_doctor_check(project_root: Path = Path(".")):
                 f"Optional. Install {info.label}, then use: {info.notes}.",
             )
 
+    for name in sorted(DEPRECATED_CODING_CLIS):
+        if name in CODING_CLI_PROBE_ORDER:
+            continue
+        info = CODING_CLI_INTEGRATION_INFO.get(name)
+        if info is None:
+            continue
+        table.add_row(
+            info.label,
+            "[dim]Deprecated[/dim]",
+            GEMINI_DEPRECATION_MESSAGE,
+        )
+
     detected = detect_available_coding_cli(project_root)
     resolved = resolve_automated_executor(project_root, None)
     if detected:
@@ -684,6 +867,12 @@ def render_doctor_check(project_root: Path = Path(".")):
         table.add_row(component, status, notes)
 
     for component, status, notes in check_mypy_status(project_root):
+        table.add_row(component, status, notes)
+
+    for component, status, notes in check_mapping_stack(project_root):
+        table.add_row(component, status, notes)
+
+    for component, status, notes in check_execution_containment(project_root, config=config):
         table.add_row(component, status, notes)
 
     # Local-monitor verification safety: flag explicit config that disables the

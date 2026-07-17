@@ -6,8 +6,6 @@ import yaml
 from rich.console import Console
 from pathlib import Path
 from devcouncil.storage.db import Database
-from devcouncil.integrations.gitnexus import GitNexusIntegration
-from devcouncil.integrations.graphify import GraphifyIntegration
 from devcouncil.llm.provider import build_role_model_config, validate_model_provider
 from devcouncil.repo.gitignore import ensure_gitignore
 
@@ -79,6 +77,7 @@ DEFAULT_CONFIG = {
         "grok_resume_mode": "off",
         "coding_cli_probe_order": [],
         "refresh_stale_map_on_checkout": True,
+        "refresh_stale_map_on_verify": True,
     },
     "indexing": {
         # Opt-in live LSP client for dead-symbol confirmation / precise impact.
@@ -86,6 +85,14 @@ DEFAULT_CONFIG = {
         # Best-effort incremental map refresh from post-tool-use hooks.
         "auto_refresh": True,
         "auto_refresh_max_files": 40,
+        "corpus": {
+            "enabled": True,
+            "paths": ["docs", "README.md"],
+            "auto_refresh_on_verify": True,
+        },
+        "embeddings": {
+            "enabled": False,
+        },
     },
     "code_intelligence": {
         "enabled": True,
@@ -117,6 +124,9 @@ DEFAULT_CONFIG = {
             "dead_symbols": "hard",
             "liveness_ratchet": "hard",
             "stale_map": "hard",
+            "corpus_stale": "soft",
+            "doc_code_ref": "soft",
+            "acceptance_corpus": "soft",
         },
     },
     "privacy": {
@@ -233,8 +243,6 @@ def initialize_project(
     model_provider: str = "openrouter",
     model: str | None = None,
     role_models: dict[str, str] | None = None,
-    with_gitnexus: bool = False,
-    with_graphify: bool = False,
     with_map: bool = True,
     with_skills: bool = True,
     quiet: bool = False,
@@ -289,14 +297,6 @@ def initialize_project(
         if with_skills:
             _scaffold_initial_skills(project_root, quiet)
 
-    if with_gitnexus:
-        nexus = GitNexusIntegration(project_root)
-        nexus.initialize()
-
-    if with_graphify:
-        graphify = GraphifyIntegration(project_root)
-        graphify.initialize()
-
     ensure_gitignore(project_root)
     return created
 
@@ -312,8 +312,6 @@ def init(
         "--role-model",
         help="Per-role model override in ROLE=MODEL form. Can be repeated.",
     ),
-    with_gitnexus: bool = typer.Option(False, "--gitnexus", help="Initialize GitNexus structural awareness"),
-    with_graphify: bool = typer.Option(False, "--graphify", help="Initialize Graphify knowledge graph engine"),
     skip_map: bool = typer.Option(False, "--skip-map", help="Skip generating repo_map.json and agent guides on init."),
     skip_skills: bool = typer.Option(False, "--skip-skills", help="Skip scaffolding engineering skills into .claude/skills/ on init."),
 ):
@@ -326,9 +324,8 @@ def init(
     dev_dir = Path(".devcouncil")
     # "Already initialized" means a config.yaml exists — not merely the .devcouncil/
     # directory, which the logging setup pre-creates (.devcouncil/logs/) on startup.
-    if (dev_dir / "config.yaml").exists() and not (with_gitnexus or with_graphify):
+    if (dev_dir / "config.yaml").exists():
         console.print("[yellow]DevCouncil is already initialized in this directory.[/yellow]")
-        console.print("Use --gitnexus or --graphify to add upgrade paths.")
         raise typer.Exit()
 
     try:
@@ -341,7 +338,7 @@ def init(
     root = Path(".").expanduser().resolve()
     from devcouncil.telemetry.logging_setup import set_log_dir
     set_log_dir(root)
-    logger.info("dev init: provider=%s gitnexus=%s graphify=%s", provider, with_gitnexus, with_graphify)
+    logger.info("dev init: provider=%s", provider)
     with log_stage("init", project_root=root, provider=provider):
         log_step("init/1: scaffolding project", project_root=root, trace=True)
         initialize_project(
@@ -350,8 +347,6 @@ def init(
             model_provider=model_provider,
             model=model,
             role_models=role_models,
-            with_gitnexus=with_gitnexus,
-            with_graphify=with_graphify,
             with_map=not skip_map,
             with_skills=not skip_skills,
         )

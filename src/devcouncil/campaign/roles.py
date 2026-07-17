@@ -85,9 +85,6 @@ class Role:
     def forbidden(self) -> FrozenSet[Action]:
         return frozenset(Action) - self.allowed
 
-    def instructions(self) -> str:
-        return load_role_instructions(self.rank)
-
 
 ROLES: Dict[Rank, Role] = {
     Rank.DIRECTOR: Role(

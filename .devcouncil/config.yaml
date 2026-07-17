@@ -1,5 +1,10 @@
 execution:
   default_executor: claude
+  enforce_file_scope_pre_verify: true
+  stop_gate:
+    mode: assist
+    check_claims: true
+    verify_active_task: true
 models:
   provider: openrouter
   roles:
@@ -46,5 +51,24 @@ integrations:
   claude:
     enabled: true
     scope: local
-    write_gate: false
+    write_gate: true
     settings_path: .claude/settings.local.json
+  cursor:
+    enabled: true
+    config_path: .cursor/mcp.json
+    hooks_path: .cursor/hooks.json
+  grok:
+    enabled: true
+    config_path: .grok/config.toml
+    hooks_path: .grok/hooks/devcouncil.json
+  opencode:
+    enabled: false
+    config_path: opencode.json
+  antigravity:
+    enabled: true
+    mcp_config_path: .agents/mcp_config.json
+  warp:
+    enabled: true
+    command: oz
+    run_mode: local
+    mcp_config_path: .devcouncil/integrations/warp-mcp.json

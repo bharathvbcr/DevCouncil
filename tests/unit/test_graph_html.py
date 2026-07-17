@@ -8,7 +8,14 @@ import subprocess
 
 from devcouncil.indexing.graph.build import build_code_graph, write_code_graph
 from devcouncil.indexing.graph.schema import DeadCodeEntry, Confidence
-from devcouncil.indexing.viz import _payload_from_graph, render_graph_html, write_graph_html
+from devcouncil.indexing.viz import (
+    _payload_from_graph,
+    render_graph_html,
+    render_graph_preview_svg,
+    sample_demo_graph,
+    write_graph_demo,
+    write_graph_html,
+)
 
 
 def _git(root, *args):
@@ -144,3 +151,22 @@ def test_write_graph_html_symbols_flag(tmp_path):
     out = write_graph_html(tmp_path, symbols=True)
     text = out.read_text(encoding="utf-8")
     assert '"mode":"symbol"' in text or '"mode": "symbol"' in text
+
+
+def test_sample_demo_graph_and_preview_svg(tmp_path):
+    graph = sample_demo_graph()
+    assert any(n.path.endswith("cli/main.py") for n in graph.nodes)
+    assert graph.entry_roots
+    assert graph.dead_code
+    html = render_graph_html(graph)
+    assert "DevCouncil Code Graph" in html
+    assert "cli/main.py" in html or "main.py" in html
+    svg = render_graph_preview_svg()
+    assert svg.lstrip().startswith("<svg")
+    assert "#0f1419" in svg and "#3d8bfd" in svg
+    assert "DevCouncil Code Graph" in svg
+    paths = write_graph_demo(tmp_path, open_browser=False)
+    assert paths["html"].is_file()
+    assert paths["svg"].is_file()
+    assert "ForceGraph" in paths["html"].read_text(encoding="utf-8")
+    assert paths["svg"].read_text(encoding="utf-8").startswith("<svg")

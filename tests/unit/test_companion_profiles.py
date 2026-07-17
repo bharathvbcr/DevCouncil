@@ -79,10 +79,13 @@ def test_model_override_rewrites_in_place_for_codex(tmp_path):
     assert command[command.index("--model") + 1] == "gpt-5"
 
 
-def test_permission_mode_gated_drops_accept_edits(tmp_path):
+def test_default_claude_base_has_no_accept_edits(tmp_path):
     baseline = CodingCliExecutor(tmp_path, "claude", profile="default")
-    assert "acceptEdits" in baseline.spec.base_command()
+    assert "acceptEdits" not in baseline.spec.base_command()
+    assert "--permission-mode" not in baseline._command()
 
+
+def test_permission_mode_gated_adds_default_mode(tmp_path):
     profile = CliAgentProfileConfig(permission_mode="gated")
     executor = _executor(tmp_path, "claude", profile)
     command = executor._command()
@@ -109,6 +112,20 @@ def test_prod_and_yolo_produce_different_invocations(tmp_path):
     yolo = _executor(tmp_path, "claude", CliAgentProfileConfig(permission_mode="auto"))
     prod = _executor(tmp_path, "claude", CliAgentProfileConfig(permission_mode="gated"))
     assert yolo._command() != prod._command()
+
+
+def test_codex_permission_modes_map_to_native_sandbox_flags(tmp_path):
+    auto = _executor(tmp_path, "codex", CliAgentProfileConfig(permission_mode="auto"))
+    plan = _executor(tmp_path, "codex", CliAgentProfileConfig(permission_mode="plan"))
+    bypass = _executor(
+        tmp_path,
+        "codex",
+        CliAgentProfileConfig(permission_mode="bypassPermissions"),
+    )
+
+    assert auto._command()[-2:] == ["--sandbox", "workspace-write"]
+    assert plan._command()[-2:] == ["--sandbox", "read-only"]
+    assert "--dangerously-bypass-approvals-and-sandbox" in bypass._command()
 
 
 def test_permission_mode_ignored_for_unknown_client(tmp_path):

@@ -83,6 +83,7 @@ def verify_task_payload(
         task = task_repo.get_by_id(task_id)
         if not task:
             return {"ok": False, "error": f"Task {task_id} not found.", "code": "not_found", "task_id": task_id}
+        from devcouncil.execution.stop_gate_verify_cache import record_verify_cache
         from devcouncil.verification.verifier import Verifier
 
         GapRepository(session).delete_for_task(task_id)
@@ -107,6 +108,14 @@ def verify_task_payload(
         task_repo.save(task)
         blocking = [g.model_dump() for g in gaps if g.blocking]
         blocking_actions, advisory_actions = split_next_actions(gaps)
+        record_verify_cache(
+            project_root,
+            task_id=task_id,
+            status=task.status,
+            blocking_gaps=len(blocking),
+            next_actions=[a.model_dump() for a in blocking_actions[:20]],
+            passed=len(blocking) == 0,
+        )
         outcome = verifier.last_outcome
         return {
             "ok": True,
@@ -164,6 +173,7 @@ def update_task_scope_payload(
     expected_tests: list[str] | None = None,
     allowed_commands: list[str] | None = None,
     planned_files: list[str] | None = None,
+    create_planned_files: list[str] | None = None,
 ) -> dict[str, Any]:
     db = _db(project_root)
     if not db:
@@ -172,6 +182,7 @@ def update_task_scope_payload(
     expected_tests = expected_tests or []
     allowed_commands = allowed_commands or []
     planned_files = planned_files or []
+    create_planned_files = create_planned_files or []
     with db.get_session() as session:
         lease_error = require_valid_lease(session, task_id, lease_token)
         if lease_error:
@@ -234,6 +245,38 @@ def update_task_scope_payload(
                     path=normalized,
                     reason="agent-appended scope (wire caller)",
                     allowed_change="modify",
+                ))
+                existing.add(normalized)
+                if normalized not in task.agent_appended_planned_files:
+                    task.agent_appended_planned_files.append(normalized)
+        if create_planned_files:
+            from fnmatch import fnmatch
+
+            from devcouncil.domain.task import PlannedFile
+            from devcouncil.execution.policy_engine import (
+                SECRET_PATH_PATTERNS,
+                TaskPolicyEngine,
+            )
+
+            engine = TaskPolicyEngine(project_root)
+            existing = {pf.path.replace("\\", "/") for pf in task.planned_files}
+            for raw in create_planned_files:
+                path = raw.replace("\\", "/")
+                if path.startswith("./"):
+                    path = path[2:]
+                if not path or path in existing:
+                    continue
+                normalized = engine._normalize_path(path)
+                if any(fnmatch(normalized, pat) for pat in SECRET_PATH_PATTERNS):
+                    rejected_planned_files.append(raw)
+                    continue
+                if engine._matches_restricted(normalized):
+                    rejected_planned_files.append(raw)
+                    continue
+                task.planned_files.append(PlannedFile(
+                    path=normalized,
+                    reason="agent-appended scope (create)",
+                    allowed_change="create",
                 ))
                 existing.add(normalized)
                 if normalized not in task.agent_appended_planned_files:

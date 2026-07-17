@@ -16,46 +16,10 @@ logger = logging.getLogger(__name__)
 
 
 def _refresh_stale_map_if_needed(project_root: Path) -> bool:
-    """Regenerate ``repo_map.json`` when stale, before prompt/baseline.
+    """Regenerate ``repo_map.json`` when stale, before prompt/baseline."""
+    from devcouncil.indexing.map_refresh import refresh_stale_map_if_needed
 
-    Honors ``execution.refresh_stale_map_on_checkout`` (default on). Best-effort:
-    never raises; returns True when a remap ran successfully.
-    """
-    try:
-        from devcouncil.app.config import load_config
-
-        try:
-            cfg = load_config(project_root)
-            enabled = bool(
-                getattr(cfg.execution, "refresh_stale_map_on_checkout", True)
-            )
-        except Exception:
-            enabled = True
-        if not enabled:
-            return False
-
-        map_path = project_root / ".devcouncil" / "repo_map.json"
-        if not map_path.is_file():
-            # No map yet — generate one so checkout prompt/baseline have a baseline.
-            data: dict = {}
-        else:
-            loaded = read_json(map_path)
-            data = loaded if isinstance(loaded, dict) else {}
-
-        from devcouncil.indexing.repo_mapper import RepoMapper
-
-        mapper = RepoMapper(project_root)
-        # Missing fingerprints → not stale (legacy maps); still generate if absent.
-        if map_path.is_file() and not mapper.map_is_stale(data):
-            return False
-
-        from devcouncil.cli.commands.map import generate_map_artifacts
-
-        generate_map_artifacts(project_root, map_path, quiet=True)
-        return True
-    except Exception:
-        logger.debug("checkout map refresh failed", exc_info=True)
-        return False
+    return refresh_stale_map_if_needed(project_root, on_checkout=True, on_verify=False)
 
 
 def checkout_task_payload(

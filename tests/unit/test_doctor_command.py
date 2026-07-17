@@ -201,6 +201,25 @@ def test_mypy_prefers_uv_project_environment(tmp_path, monkeypatch):
     }
 
 
+def test_mypy_prefers_existing_project_venv(tmp_path, monkeypatch):
+    _prep_mypy_repo(tmp_path)
+    project_mypy = tmp_path / ".venv" / "bin" / "mypy"
+    project_mypy.parent.mkdir(parents=True)
+    project_mypy.touch()
+    invocation = {}
+
+    monkeypatch.setattr(doctor.shutil, "which", lambda command: "/opt/bin/uv")
+
+    def capture(command, **kwargs):
+        invocation["command"] = command
+        return SimpleNamespace(returncode=0, stdout="Success: no issues", stderr="")
+
+    monkeypatch.setattr(doctor.subprocess, "run", capture)
+    doctor.check_mypy_status(tmp_path)
+
+    assert invocation["command"] == [str(project_mypy), "src"]
+
+
 def test_mypy_falls_back_to_current_interpreter_without_uv(tmp_path, monkeypatch):
     _prep_mypy_repo(tmp_path)
     invocation = {}
@@ -432,3 +451,49 @@ def test_doctor_vertexai_provider(tmp_path, monkeypatch):
     result = runner.invoke(app, ["doctor", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert "VERTEXAI" in result.output
+
+
+def test_check_repo_map_freshness_reports_stale(tmp_path):
+    import json
+    import subprocess
+
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "add", "-A"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    map_path = tmp_path / ".devcouncil" / "repo_map.json"
+    map_path.parent.mkdir(parents=True)
+    map_path.write_text(
+        json.dumps({"generated_head": "deadbeef", "indexed_hash": "old", "subsystems": []}),
+        encoding="utf-8",
+    )
+    rows = doctor.check_repo_map_freshness(tmp_path)
+    assert rows and rows[0][0] == "Repo map"
+    assert "Stale" in rows[0][1]
+    assert "dev map" in rows[0][2]
+
+
+def test_check_liveness_reliability_warns_when_unreliable(tmp_path):
+    import json
+
+    map_path = tmp_path / ".devcouncil" / "repo_map.json"
+    map_path.parent.mkdir(parents=True)
+    map_path.write_text(
+        json.dumps({"entry_roots": [], "liveness_unreachable_unreliable": True}),
+        encoding="utf-8",
+    )
+    rows = doctor.check_liveness_reliability(tmp_path)
+    assert rows
+    assert rows[0][0] == "Map liveness"
+    assert "WARN" in rows[0][1]
+    assert "indexing.entry_roots" in rows[0][2]

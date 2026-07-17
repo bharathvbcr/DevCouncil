@@ -9,12 +9,37 @@ from rich.table import Table
 from devcouncil.cli.commands.init import initialize_project
 from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import TaskRepository
+from devcouncil.storage.native import TaskLeaseRepository
 from devcouncil.telemetry.stages import log_stage, log_step
 from devcouncil.telemetry.traces import TraceLogger
 
 app = typer.Typer()
 console = Console()
 logger = logging.getLogger(__name__)
+
+
+def _lease_public_view(lease, *, expired: bool) -> dict:
+    return {
+        "owner": lease.owner,
+        "agent": lease.agent,
+        "expires_at": lease.expires_at,
+        "expired": expired,
+    }
+
+
+def _active_leases_by_task(session) -> dict[str, tuple[object, bool]]:
+    return {
+        lease.task_id: (lease, expired)
+        for lease, expired in TaskLeaseRepository(session).list_leases(active_only=True)
+    }
+
+
+def _task_row_payload(task, leases_by_task: dict[str, tuple[object, bool]]) -> dict:
+    payload = task.model_dump()
+    lease_pair = leases_by_task.get(task.id)
+    payload["lease"] = _lease_public_view(lease_pair[0], expired=lease_pair[1]) if lease_pair else None
+    return payload
+
 
 @app.callback(invoke_without_command=True)
 def tasks(
@@ -50,10 +75,11 @@ def tasks(
                 tasks_list = [t for t in tasks_list if t.status == status]
             total = len(tasks_list)
             window = tasks_list[offset:offset + limit]
+            leases_by_task = _active_leases_by_task(session)
 
             if json_format:
                 typer.echo(dump_json({
-                    "tasks": [task.model_dump() for task in window],
+                    "tasks": [_task_row_payload(task, leases_by_task) for task in window],
                     "total": total,
                     "offset": offset,
                     "limit": limit,
@@ -74,12 +100,15 @@ def tasks(
             table.add_column("Title", style="white")
             table.add_column("Status", style="magenta")
             table.add_column("Priority", style="yellow")
+            table.add_column("Lease", style="blue")
             table.add_column("Linked Reqs", style="green")
 
             for t in tasks_list:
                 reqs = ", ".join(t.requirement_ids)
                 priority = t.priority or "-"
-                table.add_row(t.id, t.title, t.status, priority, reqs)
+                lease_pair = leases_by_task.get(t.id)
+                lease_label = lease_pair[0].owner if lease_pair else "—"
+                table.add_row(t.id, t.title, t.status, priority, lease_label, reqs)
 
             console.print(table)
         log_step("tasks/complete", project_root=root, count=len(tasks_list), trace=True)

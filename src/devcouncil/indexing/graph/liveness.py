@@ -170,7 +170,12 @@ def _reference_index(
 
 def build_liveness_shard(root: Path, extraction: FileExtraction) -> dict[str, object]:
     """Compact persisted reference shard used by one-file liveness updates."""
-    from devcouncil.indexing.wiring import strip_js_comments, strip_py_comments, strip_string_literals
+    from devcouncil.indexing.wiring import (
+        dynamic_import_keys,
+        strip_js_comments,
+        strip_py_comments,
+        strip_string_literals,
+    )
 
     try:
         source = (root / extraction.path).read_text(encoding="utf-8", errors="replace")
@@ -190,8 +195,27 @@ def build_liveness_shard(root: Path, extraction: FileExtraction) -> dict[str, ob
     return {
         "extraction": asdict(extraction),
         "token_lines": dict(token_lines),
+        "dynamic_import_keys": sorted(dynamic_import_keys(extraction.path, source)),
         "allow_unwired": "devcouncil: allow-unwired" in source,
     }
+
+
+def dynamic_import_index_from_shards(
+    shards: dict[str, dict[str, object]],
+) -> dict[str, Set[str]]:
+    """Rebuild the dynamic-reference index without rescanning repository files."""
+    from devcouncil.indexing.wiring import is_test_path
+
+    index: dict[str, Set[str]] = defaultdict(set)
+    for path, shard in shards.items():
+        if is_test_path(path):
+            continue
+        raw_keys = shard.get("dynamic_import_keys")
+        keys = raw_keys if isinstance(raw_keys, list) else []
+        for key in keys:
+            if isinstance(key, str) and key:
+                index[key].add(path)
+    return dict(index)
 
 
 def extraction_from_liveness_shard(shard: dict[str, object]) -> FileExtraction:
@@ -779,3 +803,10 @@ def confidence_at_least(conf: object, minimum: str) -> bool:
         conf = conf.value
     have = _CONFIDENCE_RANK.get(str(conf), 0)
     return have >= want
+
+def apply_liveness_cap(items: list, cap: int | None) -> tuple[list, dict]:
+    total = len(items)
+    if cap is None or cap <= 0 or total <= cap:
+        return list(items), {"total": total, "shown": total, "truncated": 0}
+    shown = list(items)[:cap]
+    return shown, {"total": total, "shown": len(shown), "truncated": total - len(shown)}

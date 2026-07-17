@@ -749,7 +749,9 @@ def _route_handler_id(
     following = [
         node
         for node in nodes
-        if node.path == path and node.kind != NodeKind.FILE and line <= node.line <= line + 8
+        if node.path == path
+        and node.kind in {NodeKind.FUNCTION, NodeKind.METHOD, NodeKind.CLASS}
+        and line <= node.line <= line + 8
     ]
     return min(following, key=lambda node: node.line).id if following else None
 

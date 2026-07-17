@@ -1,5 +1,4 @@
 import logging
-import uuid
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
@@ -77,7 +76,6 @@ class VerificationOutcome:
 class Verifier:
     def __init__(self, project_root: Path, router: Optional[ModelRouter] = None):
         self.project_root = project_root
-        self._gap_counter = 0
         self.secret_scanner = SecretScanner()
         self.reviewer = ImplementationReviewer(router) if router else None
         self.acceptance_compiler = AcceptanceTestCompiler(router) if router else None
@@ -108,9 +106,10 @@ class Verifier:
         return self._coverage_measurer
 
     def _next_gap_id(self, task_id: str, suffix: str) -> str:
-        """Generate unique gap IDs to prevent SQLite overwrites."""
-        self._gap_counter += 1
-        return f"GAP-{task_id}-{suffix}-{uuid.uuid4().hex[:6]}-{self._gap_counter:03d}"
+        """Generate stable gap IDs from task + suffix identity (deterministic across runs)."""
+        from devcouncil.verification.gap_ids import stable_gap_id
+
+        return stable_gap_id(task_id, suffix)
 
     def get_diff(self) -> str:
         return self._git_fallback.get_diff()
@@ -252,7 +251,9 @@ class Verifier:
 
     async def verify_task(self, task: Task, requirements: List[Requirement]) -> Tuple[List[Gap], List[Any]]:
         logger.info("verify_task: task=%s requirements=%d", task.id, len(requirements))
-        self._gap_counter = 0
+        from devcouncil.indexing.map_refresh import refresh_stale_map_if_needed
+
+        refresh_stale_map_if_needed(self.project_root, on_checkout=False, on_verify=True)
         prime_verify_memos(self)
         ctx = resolve_verify_context(self, task, requirements)
         compile_future, review_future = start_verify_futures(

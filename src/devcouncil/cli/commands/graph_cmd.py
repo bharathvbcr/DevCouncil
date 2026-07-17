@@ -190,17 +190,87 @@ def graph_search(
     query: str = typer.Argument(...),
     project_root: Path = typer.Option(Path("."), "--project-root"),
     limit: int = typer.Option(50, "--limit"),
+    semantic: bool = typer.Option(False, "--semantic", help="Use opt-in local embeddings when enabled."),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Full-text symbol and path search over the committed generation."""
-    from devcouncil.codeintel.query import CodeIntelQueryEngine
+    """Full-text (or semantic) symbol and path search over the committed generation."""
+    root = _root(project_root)
+    if semantic:
+        from devcouncil.indexing.graph.embeddings import semantic_search
 
-    result = CodeIntelQueryEngine(_root(project_root)).search(query, limit=limit)
+        result = semantic_search(root, query, limit=limit)
+        if not result.get("ok"):
+            from devcouncil.codeintel.query import CodeIntelQueryEngine
+
+            result = CodeIntelQueryEngine(root).search(query, limit=limit)
+    else:
+        from devcouncil.codeintel.query import CodeIntelQueryEngine
+
+        result = CodeIntelQueryEngine(root).search(query, limit=limit)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
-    for match in result["matches"]:
-        console.print(f"{match['path']}:{match['line']}  {match['id']}  [{match['kind']}]")
+    for match in result.get("matches", []):
+        if "line" in match:
+            console.print(f"{match['path']}:{match['line']}  {match['id']}  [{match['kind']}]")
+        else:
+            console.print(f"{match['path']}  {match.get('label', match['id'])}  score={match.get('score')}")
+
+
+@app.command("ingest")
+def graph_ingest(
+    paths: Optional[List[str]] = typer.Argument(None, help="Optional paths; full rebuild when omitted."),
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    no_liveness: bool = typer.Option(False, "--no-liveness"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Unified analyze entry: codeintel sync → graph export → repo map write."""
+    from devcouncil.cli.commands.map import generate_map_artifacts
+    from devcouncil.codeintel.sync import get_sync_coordinator
+    from devcouncil.indexing.graph.embeddings import build_embeddings
+
+    root = _root(project_root)
+    coordinator = get_sync_coordinator(root)
+    changed = list(paths or coordinator.reconcile())
+    coordinator.sync_now(changed)
+    map_path = root / ".devcouncil" / "repo_map.json"
+    generate_map_artifacts(root, map_path, liveness=not no_liveness, quiet=True)
+    embedded = build_embeddings(root)
+    payload = {
+        "ok": True,
+        "paths": changed,
+        "map": str(map_path.relative_to(root)),
+        "embeddings_built": embedded,
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2))
+    else:
+        status.print(
+            f"[green]Ingested {len(changed)} path(s); map at {payload['map']}"
+            f"{f'; {embedded} embeddings' if embedded else ''}[/green]"
+        )
+
+
+@app.command("cypher")
+def graph_cypher(
+    query: str = typer.Argument(..., help="Supported MATCH … RETURN subset."),
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Run a supported Cypher subset over the native SQLite graph store."""
+    from devcouncil.indexing.graph.cypher import run_cypher
+
+    result = run_cypher(_root(project_root), query)
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+        if not result.get("ok"):
+            raise typer.Exit(code=1)
+        return
+    if not result.get("ok"):
+        status.print(f"[red]{result.get('error', 'cypher failed')}[/red]")
+        raise typer.Exit(code=1)
+    for row in result.get("rows", []):
+        console.print(" ".join(f"{k}={v}" for k, v in row.items()))
 
 
 @app.command("explore")
@@ -516,6 +586,23 @@ def graph_html(
     status.print(f"[green]Wrote {out}[/green]")
 
 
+@app.command("demo")
+def graph_demo(
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    open_browser: bool = typer.Option(False, "--open", help="Open the interactive demo."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Write sample graph HTML and SVG artifacts without requiring a repo map."""
+    from devcouncil.indexing.viz import write_graph_demo
+
+    paths = write_graph_demo(_root(project_root), open_browser=open_browser)
+    payload = {name: str(path) for name, path in paths.items()}
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2))
+        return
+    status.print(f"[green]Wrote {payload['html']} and {payload['svg']}[/green]")
+
+
 @app.command("view")
 def graph_view(
     project_root: Path = typer.Option(Path("."), "--project-root"),
@@ -609,3 +696,280 @@ def graph_export(
         return
     status.print(f"[red]Unknown format: {format}[/red]")
     raise typer.Exit(code=1)
+
+
+@app.command("routes")
+def graph_routes(
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Map HTTP routes to handlers and client fetch consumers."""
+    from devcouncil.indexing.graph.api_routes import route_map
+
+    root = _root(project_root)
+    graph = _require_graph(root)
+    result = route_map(root, graph)
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+        return
+    routes = result.get("routes") or []
+    if not routes:
+        console.print("No routes found.")
+        return
+    for route in routes:
+        console.print(
+            f"[bold]{route.get('verb')} {route.get('path')}[/bold] "
+            f"({route.get('framework') or 'unknown'})"
+        )
+        handlers = route.get("handlers") or []
+        if handlers:
+            console.print("  handlers: " + ", ".join(h.get("id", "?") for h in handlers[:4]))
+        consumers = route.get("consumers") or []
+        if consumers:
+            console.print(f"  consumers: {len(consumers)}")
+
+
+@app.command("shape-check")
+def graph_shape_check(
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    json_output: bool = typer.Option(False, "--json"),
+    route: Optional[str] = typer.Option(None, "--route", help="Filter to one route path or id."),
+) -> None:
+    """Compare handler response keys vs client accessed keys."""
+    from devcouncil.indexing.graph.api_routes import shape_check
+
+    root = _root(project_root)
+    graph = _require_graph(root)
+    result = shape_check(root, graph, route_filter=route)
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+        return
+    mismatches = result.get("mismatches") or []
+    if not mismatches:
+        console.print("[green]No shape mismatches.[/green]")
+        return
+    for item in mismatches:
+        console.print(
+            f"[yellow]{item.get('verb')} {item.get('route')}[/yellow] — "
+            f"missing in handler: {', '.join(item.get('missing_in_handler') or [])}"
+        )
+
+
+@app.command("api-impact")
+def graph_api_impact(
+    route_or_path: str = typer.Argument(..., help="Route path, id, or normalized segment."),
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """API blast radius: consumers, middleware, shape mismatches, risk tier."""
+    from devcouncil.indexing.graph.api_routes import api_impact
+
+    root = _root(project_root)
+    graph = _require_graph(root)
+    result = api_impact(root, route_or_path, graph)
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+        return
+    if not result.get("found"):
+        console.print(f"[red]Route not found:[/red] {route_or_path}")
+        raise typer.Exit(code=1)
+    console.print(
+        f"[bold]{result.get('verb')} {result.get('route')}[/bold] "
+        f"risk={result.get('risk')}"
+    )
+    console.print(f"  consumers: {len(result.get('consumers') or [])}")
+    console.print(f"  middleware: {len(result.get('middleware') or [])}")
+    mismatches = result.get("shape_mismatches") or []
+    if mismatches:
+        console.print(f"  shape mismatches: {len(mismatches)}")
+
+
+corpus_app = typer.Typer(
+    name="corpus",
+    help="Advisory mixed-corpus index for docs, PDFs, and images (never verify gates).",
+    add_completion=False,
+)
+
+
+@corpus_app.command("build")
+def corpus_build(
+    path: Optional[str] = typer.Option(None, "--path", help="Root file or directory to index."),
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Build ``.devcouncil/corpus/graph.json`` from docs, PDFs, and images."""
+    from devcouncil.indexing.wiring import build_corpus, corpus_status
+
+    root = _root(project_root)
+    build_corpus(root, path=path)
+    result = corpus_status(root)
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+        return
+    status.print(
+        f"[green]Corpus indexed — {result['node_count']} nodes, "
+        f"{result['edge_count']} edges → {result.get('graph_path')}[/green]"
+    )
+
+
+@corpus_app.command("query")
+def corpus_query(
+    query: str = typer.Argument(..., help="Search string."),
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    json_output: bool = typer.Option(False, "--json"),
+    limit: int = typer.Option(20, "--limit"),
+) -> None:
+    """Search the advisory corpus graph."""
+    from devcouncil.indexing.wiring import query_corpus
+
+    root = _root(project_root)
+    result = query_corpus(root, query, limit=limit)
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+        if result.get("error"):
+            raise typer.Exit(code=1)
+        return
+    if result.get("error"):
+        status.print(f"[red]{result['error']}[/red]")
+        raise typer.Exit(code=1)
+    matches = result.get("matches") or []
+    if not matches:
+        console.print(f"No matches for {query!r}")
+        return
+    for item in matches:
+        console.print(
+            f"[bold]{item['label']}[/bold]  ({item['kind']})  "
+            f"{item.get('path') or ''}  score={item.get('score')}"
+        )
+
+
+@corpus_app.command("status")
+def corpus_status_cmd(
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Show corpus artifact freshness and counts."""
+    from devcouncil.indexing.wiring import corpus_status
+
+    root = _root(project_root)
+    result = corpus_status(root)
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+        return
+    console.print(f"enabled: {result['enabled']}")
+    console.print(f"graph: {result.get('graph_path') or '(not built)'}")
+    console.print(f"built_at: {result.get('built_at') or '(none)'}")
+    console.print(f"nodes/edges: {result.get('node_count', 0)}/{result.get('edge_count', 0)}")
+    console.print("advisory: yes (does not feed verify gates)")
+
+
+pdg_app = typer.Typer(
+    name="pdg",
+    help="Opt-in CFG / reaching-def / CDG / taint analysis (Python, intra-procedural).",
+    add_completion=False,
+)
+app.add_typer(pdg_app, name="pdg")
+
+
+@pdg_app.command("build")
+def graph_pdg_build(
+    paths: List[str] = typer.Option([], "--path", help="Limit analysis to these repo-relative files."),
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Build or refresh the PDG layer for Python files."""
+    from devcouncil.indexing.graph.build import (
+        build_pdg_for_paths,
+        merge_pdg_into_graph,
+        write_code_graph,
+    )
+
+    root = _root(project_root)
+    graph = _require_graph(root)
+    layer = build_pdg_for_paths(root, graph, paths=paths or None)
+    shards = merge_pdg_into_graph(graph, layer)
+    merged: dict = {}
+    try:
+        from devcouncil.codeintel import get_codeintel_service
+
+        merged = dict(get_codeintel_service(root).store.analysis_shards())
+    except Exception:
+        pass
+    for path, payload in shards.items():
+        merged.setdefault(path, {}).update(payload)
+    write_code_graph(root, graph, analysis_shards=merged)
+    stats = (graph.meta.get("pdg") or {}).get("stats") or {}
+    payload = {"ok": True, "stats": stats, "files": sorted(layer.files.keys())}
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2))
+        return
+    console.print(
+        f"PDG: {stats.get('function_count', 0)} functions, "
+        f"{stats.get('taint_count', 0)} taint findings across {stats.get('file_count', 0)} files"
+    )
+
+
+@app.command("explain")
+def graph_explain(
+    path: Optional[str] = typer.Option(None, "--path", help="Filter by file path."),
+    category: Optional[str] = typer.Option(None, "--category", help="Filter by taint category."),
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Report heuristic taint findings from the opt-in PDG layer."""
+    from devcouncil.indexing.graph.query import explain_pdg_taint
+
+    root = _root(project_root)
+    result = explain_pdg_taint(root, path=path, category=category)
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+        if not result.get("ok"):
+            raise typer.Exit(code=1)
+        return
+    if not result.get("ok"):
+        status.print(f"[red]{result.get('error')}[/red]")
+        raise typer.Exit(code=1)
+    findings = result.get("findings") or []
+    if not findings:
+        console.print("No taint findings.")
+        return
+    for item in findings:
+        console.print(
+            f"{item.get('path')}:{item.get('sink_line')}  "
+            f"[{item.get('category')}]  {item.get('function')}  "
+            f"{item.get('source_expr')} -> {item.get('sink_expr')}"
+        )
+
+
+@app.command("pdg-query")
+def graph_pdg_query(
+    mode: str = typer.Option(..., "--mode", help="controls or flows"),
+    target: str = typer.Option(..., "--target", help="Symbol qualname or file path."),
+    variable: Optional[str] = typer.Option(None, "--variable", help="Filter flows by variable."),
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Query control or data dependence for an anchored target."""
+    from devcouncil.indexing.graph.query import query_pdg_controls, query_pdg_flows
+
+    root = _root(project_root)
+    if mode == "controls":
+        result = query_pdg_controls(root, target)
+    elif mode == "flows":
+        result = query_pdg_flows(root, target, variable=variable)
+    else:
+        status.print("[red]--mode must be controls or flows[/red]")
+        raise typer.Exit(code=2)
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+        if not result.get("ok"):
+            raise typer.Exit(code=1)
+        return
+    if not result.get("ok"):
+        status.print(f"[red]{result.get('error')}[/red]")
+        raise typer.Exit(code=1)
+    for fn in result.get("functions") or []:
+        console.print(f"[bold]{fn.get('qualname')}[/bold]  ({fn.get('path')})")
+        key = "cdg" if mode == "controls" else "reaching_def"
+        for edge in fn.get(key) or []:
+            console.print(f"  {edge}")

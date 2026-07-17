@@ -154,16 +154,22 @@ def report(
             if github:
                 log_step("report/2: posting to GitHub checks", project_root=root)
                 asyncio.run(run_github_report(graph, root))
+                if fail_on_blocking and graph.blocking_gaps():
+                    raise typer.Exit(code=1)
                 return
 
             if github_pr_comment:
                 log_step("report/2: posting GitHub PR comment", project_root=root)
                 asyncio.run(run_github_pr_comment(graph, live_review=live_review))
+                if fail_on_blocking and graph.blocking_gaps():
+                    raise typer.Exit(code=1)
                 return
 
             if gitlab_pr_comment:
                 log_step("report/2: posting GitLab MR comment", project_root=root)
                 asyncio.run(run_gitlab_mr_comment(graph, live_review=live_review))
+                if fail_on_blocking and graph.blocking_gaps():
+                    raise typer.Exit(code=1)
                 return
 
             if evidence_json is not None:

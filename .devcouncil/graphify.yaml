@@ -1,7 +1,0 @@
-graph:
-  engine: internal
-  persist: true
-agents:
-  shared_context: true
-hooks:
-  enabled: true

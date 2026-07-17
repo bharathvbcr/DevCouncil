@@ -233,6 +233,9 @@ class RigorConfig(BaseModel):
     # On-disk repo_map.json lags git HEAD / tracked file set: advisory on easy/normal,
     # blocking on hard by default.
     stale_map: str = "hard"  # never | hard | always
+    corpus_stale: str = "soft"  # never | soft | hard | always
+    doc_code_ref: str = "soft"  # never | soft | hard | always
+    acceptance_corpus: str = "soft"  # never | soft | hard | always
 
 
 class SubsystemBoundaryConfig(BaseModel):
@@ -297,6 +300,24 @@ class PlanningConfig(BaseModel):
     auto_convert_blocking_questions_in_noninteractive: bool = True
 
 
+class CorpusConfig(BaseModel):
+    """Advisory mixed-corpus side index (docs, PDFs, images)."""
+
+    enabled: bool = True
+    paths: List[str] = Field(default_factory=lambda: ["docs", "README.md"])
+    llm_enrichment: bool = False
+    vision_captions: bool = False
+    write_html: bool = False
+    auto_refresh_on_verify: bool = True
+
+
+class EmbeddingsConfig(BaseModel):
+    """Opt-in local symbol embeddings for semantic graph search."""
+
+    enabled: bool = False
+    model_name: str = "hash-v1"
+
+
 class IndexingConfig(BaseModel):
     """Repo-map / symbol-index enhancements.
 
@@ -316,8 +337,16 @@ class IndexingConfig(BaseModel):
     lsp_refs: bool = False
     auto_refresh: bool = True
     auto_refresh_max_files: int = 40
+    # Serialized liveness debt is bounded independently from the uncapped graph.
+    # The defaults support large repositories while the validation ceilings prevent
+    # accidental multi-hundred-megabyte repo_map.json artifacts.
+    repo_map_liveness_cap: int = Field(default=20_000, ge=1, le=100_000)
+    repo_map_dependents_cap: int = Field(default=1_024, ge=1, le=4_096)
     # When true, ``dev map`` also writes ``.devcouncil/graph/graph.html``.
     write_graph_html: bool = False
+    entry_roots: List[str] = Field(default_factory=list)
+    corpus: CorpusConfig = Field(default_factory=CorpusConfig)
+    embeddings: EmbeddingsConfig = Field(default_factory=EmbeddingsConfig)
 
 
 class CodeIntelligenceDebugConfig(BaseModel):
@@ -340,6 +369,23 @@ class CodeIntelligenceConfig(BaseModel):
     debug: CodeIntelligenceDebugConfig = Field(default_factory=CodeIntelligenceDebugConfig)
 
 
+class StopGateConfig(BaseModel):
+    """Unified Stop / SubagentStop gate (claim checks + active-task verify).
+
+    ``mode``: ``off`` disables the gate; ``assist`` surfaces failures in
+    ``systemMessage`` but allows stop; ``block`` reinjects corrective JSON.
+    """
+
+    mode: str = "off"
+    check_claims: bool = True
+    verify_active_task: bool = True
+    max_blocks: int = 2
+    per_command_timeout: int = 90
+    total_timeout: int = 120
+    notify_on_pass: bool = False
+    verify_cache_minutes: int = 5
+
+
 class ExecutionConfig(BaseModel):
     default_executor: str = "manual"
     max_repair_attempts: int = 3
@@ -349,9 +395,9 @@ class ExecutionConfig(BaseModel):
     # Default lifetime of an MCP task lease. A crashed/disconnected agent's lease
     # auto-expires after this, so the task frees up without a human running force.
     lease_ttl_seconds: int = 1800
-    # When true, the post-task coding-CLI hook runs deterministic verification of the
-    # active task (and records gaps) instead of only printing a reminder. Off by default
-    # so hooks stay fast/cheap unless a team opts in.
+    stop_gate: StopGateConfig = Field(default_factory=StopGateConfig)
+    # Deprecated alias: true iff stop_gate.mode != off and verify_active_task.
+    # Migrated in load_config; kept for hook compatibility.
     verify_on_post_task: bool = False
     cursor_resume_mode: str = "off"
     grok_resume_mode: str = "off"
@@ -372,6 +418,12 @@ class ExecutionConfig(BaseModel):
     # (HEAD / file-set fingerprint mismatch) before the prompt and liveness baseline
     # are built. Disable to keep checkout cheap on huge repos where remap is costly.
     refresh_stale_map_on_checkout: bool = True
+    refresh_stale_map_on_verify: bool = True
+    # UserPromptSubmit skips the status line when a compact briefing was injected
+    # within this many seconds (0 disables dedupe).
+    skip_prompt_status_after_compact_seconds: int = 60
+    # PreCompact emits a user-only systemMessage when the disk snapshot is saved.
+    compact_snapshot_toast: bool = True
 
 
 class PrivacyConfig(BaseModel):
@@ -449,6 +501,13 @@ class AiderIntegrationConfig(BaseModel):
     enabled: bool = False
 
 
+class ClaudeIntegrationConfig(BaseModel):
+    enabled: bool = False
+    scope: str = "local"
+    write_gate: bool = False
+    settings_path: str = ".claude/settings.local.json"
+
+
 class CliAgentProfileConfig(BaseModel):
     description: str = ""
     timeout_seconds: int | None = None
@@ -509,6 +568,7 @@ class IntegrationsConfig(BaseModel):
     agent_flow: AgentFlowIntegrationConfig = Field(default_factory=AgentFlowIntegrationConfig)
     code_review_graph: CodeReviewGraphIntegrationConfig = Field(default_factory=CodeReviewGraphIntegrationConfig)
     live_review: LiveReviewIntegrationConfig = Field(default_factory=LiveReviewIntegrationConfig)
+    claude: ClaudeIntegrationConfig = Field(default_factory=ClaudeIntegrationConfig)
     cursor: CursorIntegrationConfig = Field(default_factory=CursorIntegrationConfig)
     grok: GrokIntegrationConfig = Field(default_factory=GrokIntegrationConfig)
     aider: AiderIntegrationConfig = Field(default_factory=AiderIntegrationConfig)
@@ -668,9 +728,30 @@ def load_config(project_root: Path = Path(".")) -> DevCouncilConfig:
             ) from exc
 
     config = DevCouncilConfig.model_validate(raw)
+    _migrate_verify_on_post_task(config, raw)
     _CONFIG_CACHE[cache_key] = (signature, config)
     logger.debug("Config loaded: provider=%s", config.models.provider)
     return config
+
+
+def _migrate_verify_on_post_task(config: DevCouncilConfig, raw: dict) -> None:
+    """Sync deprecated ``verify_on_post_task`` with ``execution.stop_gate``."""
+    raw_execution = raw.get("execution")
+    execution_raw: dict = raw_execution if isinstance(raw_execution, dict) else {}
+    stop_raw = execution_raw.get("stop_gate") if isinstance(execution_raw.get("stop_gate"), dict) else {}
+    has_stop_gate = bool(stop_raw)
+    sg = config.execution.stop_gate
+
+    if has_stop_gate:
+        # Canonical knob is stop_gate; derive alias for legacy readers.
+        config.execution.verify_on_post_task = (
+            sg.mode.strip().lower() != "off" and sg.verify_active_task
+        )
+        return
+
+    if config.execution.verify_on_post_task:
+        sg.mode = "assist"
+        sg.verify_active_task = True
 
 
 def role_runs_on_local_provider(config: DevCouncilConfig, role: str) -> bool:
@@ -754,7 +835,7 @@ def get_gcloud_access_token() -> str | None:
     if not executable:
         return None
     try:
-        token = subprocess.check_output(
+        gcloud_output = subprocess.check_output(
             [executable, "auth", "print-access-token"],
             stderr=subprocess.STDOUT,
             text=True,
@@ -764,7 +845,7 @@ def get_gcloud_access_token() -> str | None:
         ).strip()
     except Exception:
         return None
-    return token or None
+    return gcloud_output or None
 
 
 # Cached gcloud access token + monotonic expiry. gcloud tokens last ~60 min, so the
@@ -792,10 +873,10 @@ def get_cached_gcloud_access_token() -> str | None:
     if cached is not None and time.monotonic() < cached[1]:
         return cached[0]
 
-    token = get_gcloud_access_token()
-    if token:
-        _gcloud_token_cache = (token, time.monotonic() + _GCLOUD_TOKEN_TTL_SECONDS)
-    return token
+    fresh = get_gcloud_access_token()
+    if fresh:
+        _gcloud_token_cache = (fresh, time.monotonic() + _GCLOUD_TOKEN_TTL_SECONDS)
+    return fresh
 
 
 def get_api_key(provider: str = "openrouter", project_root: Path = Path(".")) -> str:

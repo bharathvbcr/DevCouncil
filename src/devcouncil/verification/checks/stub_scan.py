@@ -30,7 +30,7 @@ def detect_stub_gaps(
     scaffolding_ok = task_allows_scaffolding(task)
     for finding in detect_stubs(project_root, diff_content, honor_allow_stub=scaffolding_ok):
         gaps.append(Gap(
-            id=next_gap_id(task.id, "STUB"),
+            id=next_gap_id(task.id, f"STUB-{finding.file}:{finding.line}"),
             severity="high" if stub_blocking else "medium",
             gap_type="stub_detected",
             task_id=task.id,
@@ -51,7 +51,7 @@ def detect_stub_gaps(
         ))
     for decl in detect_stub_declarations(diff_content):
         gaps.append(Gap(
-            id=next_gap_id(task.id, "STUBDECL"),
+            id=next_gap_id(task.id, f"STUBDECL-{decl.file}:{decl.line}"),
             severity="medium",
             gap_type="stub_declared",
             task_id=task.id,

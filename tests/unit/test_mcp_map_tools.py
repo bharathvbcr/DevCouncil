@@ -77,6 +77,10 @@ async def test_mcp_lists_map_tools():
     assert "devcouncil_graph_impact" in names
     assert "devcouncil_graph_query" in names
     assert "devcouncil_graph_trace" in names
+    assert "devcouncil_graph_ingest" in names
+    assert "devcouncil_graph_cypher" in names
+    assert "devcouncil_pdg_query" in names
+    assert "devcouncil_explain" in names
 
 
 @pytest.mark.anyio
@@ -605,3 +609,43 @@ async def test_graph_impact_ok(tmp_path, monkeypatch):
     )
     out = _parse(await mapmod.handle_graph_impact(tmp_path, {"diff": True}))
     assert out["ok"] is True and out["diff"] is True
+
+
+@pytest.mark.anyio
+async def test_pdg_query_missing_and_ok(tmp_path, monkeypatch):
+    missing = _parse(await mapmod.handle_pdg_query(tmp_path, {"target": "fn"}))
+    assert missing["code"] == "missing_argument"
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.query.query_pdg_controls",
+        lambda root, target: {"ok": True, "target": target},
+    )
+    ok = _parse(await mapmod.handle_pdg_query(tmp_path, {"mode": "controls", "target": "fn"}))
+    assert ok["ok"] is True and ok["target"] == "fn"
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.query.query_pdg_flows",
+        lambda root, target, variable=None: {"ok": True, "target": target, "variable": variable},
+    )
+    flows = _parse(
+        await mapmod.handle_pdg_query(
+            tmp_path, {"mode": "flows", "target": "fn", "variable": "x"}
+        )
+    )
+    assert flows["ok"] is True and flows["variable"] == "x"
+    bad = _parse(await mapmod.handle_pdg_query(tmp_path, {"mode": "bad", "target": "fn"}))
+    assert bad["code"] == "invalid_arguments"
+
+
+@pytest.mark.anyio
+async def test_explain_ok(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.query.explain_pdg_taint",
+        lambda root, path=None, category=None: {
+            "ok": True,
+            "count": 1,
+            "findings": [{"path": path, "category": category}],
+        },
+    )
+    out = _parse(
+        await mapmod.handle_explain(tmp_path, {"path": "src/a.py", "category": "sql-injection"})
+    )
+    assert out["ok"] is True and out["count"] == 1

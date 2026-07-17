@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from devcouncil.integrations.check import build_integration_check_report
+from devcouncil.executors.agent_registry import GEMINI_DEPRECATION_MESSAGE
 
 logger = logging.getLogger(__name__)
 
@@ -141,10 +142,15 @@ def apply_integration_target(
         except (ValueError, FileNotFoundError, OSError) as exc:
             add_result("claude-assets", False, None, f"Claude asset setup failed: {exc}")
             return
+        integrate._record_claude_config(
+            root,
+            scope=claude_scope,
+            write_gate=claude_write_gate,
+        )
         add_result("claude-assets", True, None, f"Claude assets installed ({len(written)} file(s)).")
 
     if normalized == "all":
-        for name in ("codex", "gemini", "claude"):
+        for name in ("claude", "codex"):
             apply_first_party(name)
         # Batch the per-tool config.yaml record updates (project files, aider,
         # and native hooks) into one load/save cycle. _batched_raw_config is
@@ -160,7 +166,17 @@ def apply_integration_target(
             # the claude CLI is on PATH, since these are plain files.
             apply_claude_assets()
     elif normalized in {"codex", "gemini", "claude"}:
+        if normalized == "gemini":
+            warnings.append(GEMINI_DEPRECATION_MESSAGE)
+            integrate.console.print(f"[yellow]{GEMINI_DEPRECATION_MESSAGE}[/yellow]")
         apply_first_party(normalized)
+        if include_hooks and normalized == "codex":
+            integrate._configure_native_hooks(root, "codex", apply=True)
+            add_result("codex-hooks", True, root / ".codex" / "hooks.json", "Codex native hooks configured; review trust with /hooks.")
+        elif include_hooks and normalized == "claude":
+            integrate._install_claude_hooks(root, write_gate=claude_write_gate)
+            apply_claude_assets()
+            add_result("claude-hooks", True, root / ".claude" / "settings.local.json", "Claude native hooks configured.")
     elif normalized in {"cursor", "grok", "opencode", "antigravity", "warp"}:
         apply_project_file(normalized)
     elif normalized == "aider":

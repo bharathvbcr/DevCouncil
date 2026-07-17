@@ -248,6 +248,8 @@ def detect_dead_symbol_gaps(
         if not candidates:
             return gaps
 
+        candidates.sort(key=lambda item: (item[0], item[1], item[3]))
+
         if git_files is None:
             try:
                 from devcouncil.indexing.repo_mapper import RepoMapper
@@ -292,7 +294,7 @@ def detect_dead_symbol_gaps(
                     source = ""
                 if ALLOW_UNWIRED in line_text or ALLOW_UNWIRED in source:
                     gaps.append(Gap(
-                        id=next_gap_id(task.id, "DEADDECL"),
+                        id=next_gap_id(task.id, f"DEADDECL-{path}:{start}:{name}"),
                         severity="medium",
                         gap_type="dead_symbol",
                         task_id=task.id,
@@ -314,6 +316,14 @@ def detect_dead_symbol_gaps(
                 if _symbol_is_referenced(name, path, start, end, token_index, lines_index):
                     continue
 
+                try:
+                    from devcouncil.indexing.graph.query import symbol_has_non_test_inbound
+
+                    if symbol_has_non_test_inbound(project_root, path, name):
+                        continue
+                except Exception:
+                    logger.debug("graph inbound check failed for %s", name, exc_info=True)
+
                 if lsp_pool is not None:
                     try:
                         confirmed = lsp_pool.confirm_unreferenced(path, start, name)
@@ -323,7 +333,7 @@ def detect_dead_symbol_gaps(
                         logger.debug("LSP dead-symbol confirm failed for %s", name, exc_info=True)
 
                 gaps.append(Gap(
-                    id=next_gap_id(task.id, "DEAD"),
+                    id=next_gap_id(task.id, f"DEAD-{path}:{start}:{name}"),
                     severity="high" if dead_symbol_blocking else "medium",
                     gap_type="dead_symbol",
                     task_id=task.id,

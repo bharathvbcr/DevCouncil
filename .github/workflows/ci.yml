@@ -24,8 +24,16 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+
       - name: Install dependencies
         run: uv sync --all-groups --python 3.12
+
+      - name: Install pinned Node debug adapter
+        run: uv run --python 3.12 python scripts/install-node-debug-adapter.py
 
       - name: Lint
         run: |
@@ -82,6 +90,8 @@ jobs:
           # check on them is vacuous. Stability is enforced by the two cmp checks above.
 
       - name: Test
+        env:
+          DEVCOUNCIL_UNSANDBOXED_SOCKET_TESTS: "1"
         run: |
           set +e
           uv run --python 3.12 coverage run -m pytest 2>&1 | tee pytest.log

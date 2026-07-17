@@ -6,6 +6,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,8 @@ from typing import Any
 from devcouncil.executors.agent_registry import (
     CODING_CLI_INTEGRATION_INFO,
     CODING_CLI_VERSION_COMMANDS,
+    DEPRECATED_CODING_CLIS,
+    GEMINI_DEPRECATION_MESSAGE,
     detect_available_coding_cli,
     resolve_automated_executor,
     resolve_coding_cli_executable,
@@ -142,7 +145,7 @@ def _claude_config_status(project_root: Path) -> tuple[str, bool, list[str]]:
     status_line = data.get("statusLine") if data else {}
     status_line_ok = (
         isinstance(status_line, dict)
-        and "devcouncil" in str(status_line.get("command", ""))
+        and "hook claude-statusline" in str(status_line.get("command", ""))
     )
     mcp_ok = "devcouncil" in (data.get("enabledMcpjsonServers") or [])
     assets_ok = assets_dir.is_dir() and (assets_dir / "status.md").exists()
@@ -155,6 +158,78 @@ def _claude_config_status(project_root: Path) -> tuple[str, bool, list[str]]:
     if not settings_path.exists() and not assets_ok:
         return "missing", True, paths
     return "drifted", True, paths
+
+
+def _codex_config_status(project_root: Path) -> tuple[str, bool, list[str]]:
+    """Check the client-persisted MCP registration, not just repo hook files."""
+    executable = resolve_coding_cli_executable(project_root, "codex")
+    logical_path = "codex mcp:devcouncil"
+    if not executable:
+        return "missing", True, [logical_path]
+    try:
+        result = subprocess.run(
+            [executable, "mcp", "get", "devcouncil", "--json"],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            env=clean_subprocess_env(),
+        )
+        data = json.loads(result.stdout) if result.returncode == 0 else {}
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        data = {}
+
+    from devcouncil.integrations.clients.common import _server_args
+
+    expected = _server_args(project_root)
+    transport = data.get("transport") if isinstance(data, dict) else {}
+    transport = transport if isinstance(transport, dict) else {}
+    env = transport.get("env") or {}
+    ok = (
+        data.get("enabled") is True
+        and transport.get("type") == "stdio"
+        and transport.get("command") == expected[0]
+        and transport.get("args") == expected[1:]
+        and isinstance(env, dict)
+        and env.get("DEVCOUNCIL_PROJECT_ROOT") == str(project_root)
+    )
+    return ("ok" if ok else "drifted"), not ok, [logical_path, str(project_root / ".codex" / "hooks.json")]
+
+
+def _codex_hook_schema_status(project_root: Path) -> tuple[bool, str]:
+    """Validate the repository Codex hook schema and canonical feature flag."""
+    hooks_path = project_root / ".codex" / "hooks.json"
+    config_path = project_root / ".codex" / "config.toml"
+    try:
+        data = read_json(hooks_path)
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, tomllib.TOMLDecodeError) as exc:
+        return False, f"Invalid Codex hook configuration: {exc}"
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    required = {"PreToolUse", "PostToolUse", "SessionStart", "Stop", "SubagentStop"}
+    if not isinstance(hooks, dict) or not required.issubset(hooks):
+        missing = sorted(required - set(hooks or {}))
+        return False, f"Missing Codex hook events: {', '.join(missing)}"
+    for event, groups in hooks.items():
+        if not isinstance(groups, list):
+            return False, f"Codex hook event {event} must contain a list"
+        for group in groups:
+            for hook in group.get("hooks", []) if isinstance(group, dict) else []:
+                if not isinstance(hook, dict) or not str(hook.get("name", "")).startswith("devcouncil-"):
+                    continue
+                timeout = hook.get("timeout")
+                if not isinstance(timeout, int) or not 1 <= timeout <= 600:
+                    return False, f"Codex hook {hook.get('name')} timeout must be 1..600 seconds"
+                if "--client codex" not in str(hook.get("command", "")):
+                    return False, f"Codex hook {hook.get('name')} does not select the Codex schema"
+    features = config.get("features") if isinstance(config, dict) else {}
+    if not isinstance(features, dict) or features.get("hooks") is not True:
+        return False, "[features].hooks must be true"
+    if "codex_hooks" in features:
+        return False, "Deprecated [features].codex_hooks is still present"
+    return True, f"{hooks_path}; hook trust must be reviewed in Codex with /hooks"
 
 
 def _cursor_config_status(project_root: Path) -> tuple[str, bool, list[str]]:
@@ -243,7 +318,9 @@ def integration_capability_rows(project_root: Path) -> list[dict[str, object]]:
         config_status = "not_applicable"
         fixable = bool(info.mcp or info.hooks or info.launcher_shim)
         paths: list[str] = []
-        if client == "cursor":
+        if client == "codex":
+            config_status, fixable, paths = _codex_config_status(project_root)
+        elif client == "cursor":
             config_status, fixable, paths = _cursor_config_status(project_root)
         elif client == "grok":
             config_status, fixable, paths = _grok_config_status(project_root)
@@ -331,33 +408,35 @@ def build_integration_check_report(project_root: Path, *, strict: bool = False) 
         # project/integration defects via add() / add_soft().
         rows.append(IntegrationCheckRow(name=name, status="ok" if ok else "missing", details=details))
 
-    def add_soft(ok: bool, name: str, details: str) -> None:
-        """Warn when not strict; count as a failure under --strict."""
-        if strict and not ok:
-            add(False, name, details)
-            return
-        rows.append(IntegrationCheckRow(name=name, status="ok" if ok else "missing", details=details))
-
     def add_skip(name: str, details: str) -> None:
         rows.append(IntegrationCheckRow(name=name, status="skip", details=details))
 
     root = project_root.expanduser().resolve()
     detected = detect_available_coding_cli(root)
     add((root / ".devcouncil").exists(), "Project state", str(root / ".devcouncil"))
-    devcouncil_path = shutil.which("devcouncil")
+    from devcouncil.integrations.clients.common import resolve_dev_executable
+
+    devcouncil_path = resolve_dev_executable(root)
+    resolved_dev = Path(devcouncil_path).exists() or shutil.which(devcouncil_path) is not None
+    devcouncil_launch = [devcouncil_path] if resolved_dev else [sys.executable, "-m", "devcouncil"]
     add(
-        devcouncil_path is not None or Path(sys.executable).exists(),
+        resolved_dev or Path(sys.executable).exists(),
         "devcouncil CLI",
-        devcouncil_path or f"{sys.executable} -m devcouncil",
+        " ".join(devcouncil_launch),
     )
 
-    devcouncil_launch = [devcouncil_path] if devcouncil_path else [sys.executable, "-m", "devcouncil"]
     code, output = integrate._run_capture([*devcouncil_launch, "--help"])
     add(code == 0, "devcouncil command", output.splitlines()[0] if output else "No output")
 
-    for client in resolve_coding_cli_probe_order(root):
+    probe_order = resolve_coding_cli_probe_order(root)
+    for client in probe_order:
         cli_ok, cli_details = probe_coding_cli_version(client)
         add_optional(cli_ok, CODING_CLI_CHECK_LABELS.get(client, client), cli_details)
+    for client in sorted(DEPRECATED_CODING_CLIS):
+        if client in probe_order:
+            continue
+        label = CODING_CLI_CHECK_LABELS.get(client, client)
+        add_skip(label, GEMINI_DEPRECATION_MESSAGE)
 
     rec_ok, rec_details = recommended_executor_status(root, detected)
     add_optional(rec_ok, "Recommended coding CLI", rec_details)
@@ -392,7 +471,10 @@ def build_integration_check_report(project_root: Path, *, strict: bool = False) 
         from devcouncil.integrations.clients.cursor import probe_cursor_auth
 
         auth_ok, auth_details = probe_cursor_auth()
-        add_soft(auth_ok, "Cursor auth", auth_details)
+        # Authentication for an optional, non-selected client is machine/user
+        # state, not a broken repository integration.  Keep it informational even
+        # under --strict, matching missing optional CLI handling.
+        add_optional(auth_ok, "Cursor auth", auth_details)
 
     grok_hooks = root / ".grok" / "hooks" / "devcouncil.json"
     grok_enabled = bool(raw_config.get("integrations", {}).get("grok", {}).get("enabled"))
@@ -466,6 +548,12 @@ def build_integration_check_report(project_root: Path, *, strict: bool = False) 
             f"{label} hook integrity",
             str(hook_path) if references else f"{hook_path} no longer references devcouncil (tampered/disarmed).",
         )
+
+    codex_hooks_path = root / ".codex" / "hooks.json"
+    if codex_hooks_path.exists():
+        codex_schema_ok, codex_schema_details = _codex_hook_schema_status(root)
+        add(codex_schema_ok, "Codex hook schema", codex_schema_details)
+        add_skip("Codex hook trust", "Open Codex in this project and run /hooks after any hook change.")
 
     from devcouncil.integrations.clients.common import check_hook_dev_executable
 

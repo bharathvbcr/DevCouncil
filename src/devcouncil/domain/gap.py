@@ -29,6 +29,9 @@ class Gap(BaseModel):
         "dead_symbol",
         "stranded_code",
         "stale_map",
+        "corpus_stale",
+        "doc_code_ref",
+        "acceptance_corpus",
     ]
     requirement_id: Optional[str] = None
     task_id: Optional[str] = None

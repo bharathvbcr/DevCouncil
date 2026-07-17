@@ -188,6 +188,7 @@ def test_coding_cli_executor_updates_gitignore_for_runtime_artifacts(tmp_path, m
         ".agents/",
         ".codex/",
         ".aider*",
+        ".grok/",
         "logs/",
         "tmp/",
         "scratch/",
@@ -375,12 +376,12 @@ def test_detect_available_coding_cli_prefers_probe_order(tmp_path, monkeypatch):
 
 def test_resolve_automated_executor_falls_back_to_detected_cli(tmp_path, monkeypatch):
     def fake_which(command):
-        return "/usr/bin/gemini" if command == "gemini" else None
+        return "/usr/bin/antigravity" if command == "agy" else None
 
     monkeypatch.setattr("shutil.which", fake_which)
     from devcouncil.executors.agent_registry import resolve_automated_executor
 
-    assert resolve_automated_executor(tmp_path, None) == "gemini"
+    assert resolve_automated_executor(tmp_path, None) == "antigravity"
 
 
 def test_coding_cli_executor_cursor_resume_uses_create_chat(tmp_path, monkeypatch):
@@ -451,7 +452,8 @@ def test_coding_cli_executor_claude_assigns_and_persists_session_id(tmp_path, mo
 
     assert result.success
     cmd = captured["cmd"]
-    assert cmd[:4] == ["claude", "-p", "--permission-mode", "acceptEdits"]
+    assert cmd[:2] == ["claude", "-p"]
+    assert "--permission-mode" not in cmd
     assert "--resume" not in cmd
     assert "--session-id" in cmd
     session_id = cmd[cmd.index("--session-id") + 1]
@@ -541,7 +543,8 @@ def test_coding_cli_executor_claude_captures_json_result(tmp_path, monkeypatch):
 
     assert result.success
     cmd = captured["cmd"]
-    assert cmd[:6] == ["claude", "-p", "--permission-mode", "acceptEdits", "--output-format", "json"]
+    assert cmd[:4] == ["claude", "-p", "--output-format", "json"]
+    assert "--permission-mode" not in cmd
 
     # The reported session id wins over the pre-assigned one and is recorded.
     assert executor.last_agent_session_id == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -668,7 +671,8 @@ def test_coding_cli_executor_claude_stream_captures_telemetry(tmp_path, monkeypa
 
     assert result.success
     cmd = captured["cmd"]
-    assert cmd[:7] == ["claude", "-p", "--permission-mode", "acceptEdits", "--output-format", "stream-json", "--verbose"]
+    assert cmd[:5] == ["claude", "-p", "--output-format", "stream-json", "--verbose"]
+    assert "--permission-mode" not in cmd
 
     run_dirs = list((tmp_path / ".devcouncil" / "runs").iterdir())
     transcript = run_dirs[0] / "transcript.txt"

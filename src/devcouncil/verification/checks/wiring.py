@@ -139,7 +139,7 @@ def detect_unwired_file_gaps(
                 # Marker always clears the blocking gap; still emit an advisory so
                 # intentional unwired files stay visible in the repair loop.
                 gaps.append(Gap(
-                    id=next_gap_id(task.id, "UNWIREDDECL"),
+                    id=next_gap_id(task.id, f"UNWIREDDECL-{path}"),
                     severity="medium",
                     gap_type="unwired_file",
                     task_id=task.id,
@@ -196,7 +196,7 @@ def detect_unwired_file_gaps(
                 desc = f"New file {path} is never imported by any other module."
 
             gaps.append(Gap(
-                id=next_gap_id(task.id, "UNWIRED"),
+                id=next_gap_id(task.id, f"UNWIRED-{path}"),
                 severity="high" if unwired_blocking else "medium",
                 gap_type="unwired_file",
                 task_id=task.id,

@@ -108,6 +108,15 @@ def test_plugin_bundle_is_self_contained(tmp_path):
     assert "PreToolUse" not in hooks["hooks"]
 
 
+def test_plugin_session_start_matcher_includes_compact():
+    hooks = json.loads(claude_assets._plugin_hooks_json())
+    matcher = hooks["hooks"]["SessionStart"][0]["matcher"]
+    assert "compact" in matcher
+    assert "clear" in matcher
+    events = set(hooks["hooks"])
+    assert {"PreCompact", "PostCompact", "SessionEnd"} <= events
+
+
 def test_plugin_bundle_write_gate_includes_blocking_hooks():
     bundle = claude_assets.build_plugin_bundle(pathlib.Path("/tmp/x"), version="1.0.0", skill_assets=[], write_gate=True)
     hooks = json.loads(next(a for a in bundle if a.path.name == "hooks.json").content)
@@ -157,7 +166,8 @@ def test_integrate_claude_assets_apply_writes_and_is_idempotent(tmp_path):
     assert (tmp_path / ".claude" / "output-styles" / "devcouncil.md").exists()
 
     settings = json.loads((tmp_path / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
-    assert settings["statusLine"]["command"] == "devcouncil hook claude-statusline"
+    assert "hook claude-statusline" in settings["statusLine"]["command"]
+    assert "--project-root" in settings["statusLine"]["command"]
     assert settings["outputStyle"] == "DevCouncil"
     assert "devcouncil" in settings["enabledMcpjsonServers"]
     assert "Bash(dev status:*)" in settings["permissions"]["allow"]
@@ -197,6 +207,34 @@ def test_record_claude_config_writes_integrations_section(tmp_path):
     assert claude.get("scope") == "project"
     assert claude.get("write_gate") is True
     assert claude.get("settings_path") == ".claude/settings.local.json"
+    stop_gate = config.get("execution", {}).get("stop_gate", {})
+    assert stop_gate.get("mode") == "assist"
+    assert stop_gate.get("check_claims") is True
+    assert stop_gate.get("verify_active_task") is True
+
+
+def test_codex_hooks_apply_seeds_stop_gate_assist(tmp_path):
+    _init_repo(tmp_path)
+    from devcouncil.integrations.clients.hooks import _configure_native_hooks
+    import yaml
+
+    _configure_native_hooks(tmp_path, tool="codex", apply=True)
+    config = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
+    stop_gate = config.get("execution", {}).get("stop_gate", {})
+    assert stop_gate.get("mode") == "assist"
+    assert stop_gate.get("check_claims") is True
+    assert stop_gate.get("verify_active_task") is True
+
+
+def test_stop_gate_assist_not_seeded_for_cursor_hooks(tmp_path):
+    _init_repo(tmp_path)
+    from devcouncil.integrations.clients.hooks import _configure_native_hooks
+    import yaml
+
+    _configure_native_hooks(tmp_path, tool="cursor", apply=True)
+    config = yaml.safe_load((tmp_path / ".devcouncil" / "config.yaml").read_text(encoding="utf-8"))
+    stop_gate = config.get("execution", {}).get("stop_gate")
+    assert stop_gate is None or not stop_gate.get("mode")
 
 
 def test_claude_config_status_detects_installed_assets(tmp_path):
@@ -294,7 +332,7 @@ def test_user_prompt_submit_hook_emits_context(tmp_path):
 
 def test_lifecycle_hooks_exit_zero_without_db(tmp_path):
     # No .devcouncil: status snapshot is None, hooks must still exit 0 and emit nothing.
-    for sub in ("session-end", "pre-compact", "subagent-stop", "notification"):
+    for sub in ("session-end", "pre-compact", "post-compact", "subagent-stop", "notification"):
         result = runner.invoke(app, ["hook", sub, "{}", "--project-root", str(tmp_path)])
         assert result.exit_code == 0, f"{sub}: {result.output}"
 
@@ -312,7 +350,7 @@ def test_claude_native_hooks_assist_mode_default_has_no_write_gate(tmp_path):
     settings = json.loads((tmp_path / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
     events = set(settings["hooks"].keys())
     # Assistive lifecycle hooks + refresh-only PostToolUse present...
-    assert {"Stop", "SessionStart", "UserPromptSubmit", "SessionEnd", "PreCompact", "SubagentStop", "Notification", "PostToolUse"} <= events
+    assert {"Stop", "SessionStart", "UserPromptSubmit", "SessionEnd", "PreCompact", "PostCompact", "SubagentStop", "Notification", "PostToolUse"} <= events
     # ...but the blocking PreToolUse write-gate is NOT installed by default.
     assert "PreToolUse" not in events
 

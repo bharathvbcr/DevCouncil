@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import logging
 import weakref
@@ -463,3 +464,107 @@ def refresh_map_for_paths(
             logger.debug("agent guide rewrite after topology change failed", exc_info=True)
 
     return load_code_graph(root) or build_code_graph(root, liveness=liveness)
+
+
+# --- Opt-in PDG layer (CFG / reaching-def / CDG / taint) ---
+
+
+def build_pdg_for_paths(
+    root: Path,
+    graph: CodeGraph,
+    *,
+    paths: Optional[Iterable[str]] = None,
+):
+    """Analyze Python files and return a PDG layer."""
+    from devcouncil.indexing.graph.pdg.cdg import build_cdg
+    from devcouncil.indexing.graph.pdg.cfg import build_cfg_for_function
+    from devcouncil.indexing.graph.pdg.reaching_def import compute_reaching_defs
+    from devcouncil.indexing.graph.pdg.schema import FilePDG, FunctionPDG, PDGLayer, PDG_VERSION
+    from devcouncil.indexing.graph.pdg.taint import analyze_taint
+
+    root = root.expanduser().resolve()
+    if paths is None:
+        paths = sorted({n.path for n in graph.nodes if n.path.endswith(".py")})
+
+    def _python_functions(tree: ast.AST) -> List[tuple[str, ast.AST]]:
+        out: List[tuple[str, ast.AST]] = []
+        if isinstance(tree, ast.Module):
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    out.append((node.name, node))
+                elif isinstance(node, ast.ClassDef):
+                    for item in node.body:
+                        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            out.append((f"{node.name}.{item.name}", item))
+        seen: Set[str] = set()
+        unique: List[tuple[str, ast.AST]] = []
+        for qual, fn in out:
+            if qual in seen:
+                continue
+            seen.add(qual)
+            unique.append((qual, fn))
+        return unique
+
+    layer = PDGLayer(version=PDG_VERSION)
+    for raw in paths:
+        rel = raw.replace("\\", "/")
+        path = root / rel
+        if path.suffix.lower() != ".py":
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=rel)
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            logger.debug("PDG skip %s", rel, exc_info=True)
+            continue
+        lines = source.splitlines()
+        functions: List[FunctionPDG] = []
+        for qualname, fn_node in _python_functions(tree):
+            start_line = int(getattr(fn_node, "lineno", 0) or 0)
+            end_line = int(getattr(fn_node, "end_lineno", start_line) or start_line)
+            cfg = build_cfg_for_function(rel, qualname, fn_node, lines)
+            reaching = compute_reaching_defs(cfg, fn_node)
+            cdg = build_cdg(cfg, fn_node)
+            taint = analyze_taint(rel, qualname, fn_node, reaching)
+            functions.append(
+                FunctionPDG(
+                    path=rel,
+                    qualname=qualname,
+                    start_line=start_line,
+                    end_line=end_line,
+                    blocks=cfg.blocks,
+                    cfg_edges=cfg.edges,
+                    reaching_def=reaching,
+                    cdg=cdg,
+                    taint=taint,
+                )
+            )
+        if functions:
+            file_pdg = FilePDG(path=rel, language="python", functions=functions)
+            layer.files[rel] = file_pdg
+            for fn in functions:
+                layer.taint_findings.extend(fn.taint)
+    return layer
+
+def merge_pdg_into_graph(graph: CodeGraph, layer) -> Dict[str, dict[str, object]]:
+    """Persist PDG summary in graph.meta and return analysis shards."""
+    graph.meta["pdg"] = layer.to_meta()
+    shards: Dict[str, dict[str, object]] = {}
+    for path in layer.files:
+        payload = layer.shard_payload(path)
+        if payload is not None:
+            shards[path] = payload
+    return shards
+
+
+def load_pdg_layer(graph: CodeGraph):
+    from devcouncil.indexing.graph.pdg.schema import PDGLayer, PDG_VERSION, TaintFinding
+
+    raw = graph.meta.get("pdg")
+    if not isinstance(raw, dict):
+        return None
+    layer = PDGLayer(version=int(raw.get("version") or PDG_VERSION))
+    for item in raw.get("taint_findings") or []:
+        if isinstance(item, dict):
+            layer.taint_findings.append(TaintFinding.from_dict(item))
+    return layer

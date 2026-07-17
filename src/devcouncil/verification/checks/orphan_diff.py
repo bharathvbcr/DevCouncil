@@ -80,7 +80,7 @@ def detect_orphan_diff_gaps(
                 and cf not in assert_free_test_files
             )
             gaps.append(Gap(
-                id=next_gap_id(task.id, "ORPHAN"),
+                id=next_gap_id(task.id, f"ORPHAN-{cf}"),
                 severity="medium" if new_test_file else "high",
                 gap_type="orphan_diff",
                 task_id=task.id,

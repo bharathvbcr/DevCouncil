@@ -34,6 +34,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _verification_mode_label(evidence_to_save: list[Any], *, compiler_active: bool) -> str:
+    """Derive reported verification mode from TestEvidence proof modes, not compiler presence."""
+    from devcouncil.domain.evidence import TestEvidence
+
+    test_evidence = [item for item in evidence_to_save if isinstance(item, TestEvidence)]
+    if not test_evidence:
+        return "compiled" if compiler_active else "coarse"
+    modes = {item.mode for item in test_evidence if item.mode}
+    if modes & {"compiled", "vote"}:
+        return "compiled"
+    if "coarse" in modes:
+        return "compiled" if compiler_active else "coarse"
+    return "compiled" if compiler_active else "coarse"
+
+
 async def run_verify_orchestration(
     verifier: "Verifier",
     task: Task,
@@ -143,7 +158,7 @@ async def run_verify_orchestration(
             logger.warning("stale-map gate failed; skipping", exc_info=True)
             if rigor.stale_map_blocking:
                 gaps.append(Gap(
-                    id=verifier._next_gap_id(task.id, "QGFAIL"),
+                    id=verifier._next_gap_id(task.id, "QGFAIL-stale_map"),
                     severity="medium",
                     gap_type="quality_gate_failed",
                     task_id=task.id,
@@ -152,6 +167,57 @@ async def run_verify_orchestration(
                     recommended_fix="Re-run verify after fixing the gate error; do not treat this pass as proven.",
                     blocking=False,
                 ))
+
+    if rigor.corpus_stale_enabled or rigor.doc_code_ref_enabled:
+        try:
+            from devcouncil.verification.checks.corpus_stale import (
+                detect_corpus_stale_gaps,
+                refresh_corpus_on_verify_if_needed,
+            )
+
+            refresh_corpus_on_verify_if_needed(verifier.project_root)
+            gaps.extend(detect_corpus_stale_gaps(
+                task=task,
+                project_root=verifier.project_root,
+                changed_files=changed_files,
+                next_gap_id=verifier._next_gap_id,
+                corpus_stale_enabled=rigor.corpus_stale_enabled,
+                corpus_stale_blocking=rigor.corpus_stale_blocking,
+            ))
+        except Exception:
+            logger.warning("corpus-stale gate failed; skipping", exc_info=True)
+        try:
+            from devcouncil.verification.checks.doc_code_ref import detect_doc_code_ref_gaps
+
+            gaps.extend(detect_doc_code_ref_gaps(
+                task=task,
+                project_root=verifier.project_root,
+                changed_files=changed_files,
+                diff_content=diff_content,
+                next_gap_id=verifier._next_gap_id,
+                doc_code_ref_enabled=rigor.doc_code_ref_enabled,
+                doc_code_ref_blocking=rigor.doc_code_ref_blocking,
+            ))
+        except Exception:
+            logger.warning("doc-code-ref gate failed; skipping", exc_info=True)
+    if rigor.acceptance_corpus_enabled:
+        try:
+            from devcouncil.verification.checks.acceptance_corpus import (
+                detect_acceptance_corpus_gaps,
+            )
+
+            gaps.extend(detect_acceptance_corpus_gaps(
+                task=task,
+                requirements=requirements,
+                project_root=verifier.project_root,
+                changed_files=changed_files,
+                diff_content=diff_content,
+                next_gap_id=verifier._next_gap_id,
+                acceptance_corpus_enabled=rigor.acceptance_corpus_enabled,
+                acceptance_corpus_blocking=rigor.acceptance_corpus_blocking,
+            ))
+        except Exception:
+            logger.warning("acceptance-corpus gate failed; skipping", exc_info=True)
 
     log_step(
         "verify/4: semantic diff and dependency checks",
@@ -196,7 +262,7 @@ async def run_verify_orchestration(
         logger.warning("unwired-file gate failed; skipping", exc_info=True)
         if rigor.unwired_blocking:
             gaps.append(Gap(
-                id=verifier._next_gap_id(task.id, "QGFAIL"),
+                id=verifier._next_gap_id(task.id, "QGFAIL-unwired_file"),
                 severity="medium",
                 gap_type="quality_gate_failed",
                 task_id=task.id,
@@ -223,7 +289,7 @@ async def run_verify_orchestration(
         logger.warning("dead-symbol gate failed; skipping", exc_info=True)
         if rigor.dead_symbol_blocking:
             gaps.append(Gap(
-                id=verifier._next_gap_id(task.id, "QGFAIL"),
+                id=verifier._next_gap_id(task.id, "QGFAIL-dead_symbol"),
                 severity="medium",
                 gap_type="quality_gate_failed",
                 task_id=task.id,
@@ -276,7 +342,7 @@ async def run_verify_orchestration(
             logger.warning("liveness-ratchet gate failed; skipping", exc_info=True)
             if rigor.liveness_ratchet_blocking:
                 gaps.append(Gap(
-                    id=verifier._next_gap_id(task.id, "QGFAIL"),
+                    id=verifier._next_gap_id(task.id, "QGFAIL-liveness_ratchet"),
                     severity="medium",
                     gap_type="quality_gate_failed",
                     task_id=task.id,
@@ -292,7 +358,7 @@ async def run_verify_orchestration(
             min_added_lines_per_planned_file=rigor.min_added_lines_per_planned_file,
         ):
             gaps.append(Gap(
-                id=verifier._next_gap_id(task.id, "EFFORT"),
+                id=verifier._next_gap_id(task.id, f"EFFORT-{eff.file or eff.reason[:40]}"),
                 severity=cast(Literal["low", "medium", "high", "critical"], eff.severity),
                 gap_type="suspicious_effort",
                 task_id=task.id,
@@ -453,7 +519,12 @@ async def run_verify_orchestration(
         try:
             review_result = await review_future
             for finding in review_result.findings:
-                finding.id = verifier._next_gap_id(task.id, "REVIEW")
+                review_key = (
+                    f"{getattr(finding, 'file', '') or ''}:"
+                    f"{getattr(finding, 'line', '') or ''}:"
+                    f"{finding.description[:48]}"
+                )
+                finding.id = verifier._next_gap_id(task.id, f"REVIEW-{review_key}")
                 finding.blocking = bool(
                     rigor.reviewer_required and finding.severity == "critical"
                 )
@@ -469,7 +540,7 @@ async def run_verify_orchestration(
     )
     for card in unresolved_blocking_cards(verifier.project_root, task_id=task.id):
         gaps.append(Gap(
-            id=verifier._next_gap_id(task.id, "LIVE"),
+            id=verifier._next_gap_id(task.id, f"LIVE-{card.id}"),
             severity="critical",
             gap_type="architecture_drift",
             task_id=task.id,
@@ -510,6 +581,10 @@ async def run_verify_orchestration(
     except Exception as exc:
         logger.debug("wiki refresh post-step skipped: %s", exc)
 
+    from devcouncil.verification.gap_ids import normalize_verify_gaps
+    from devcouncil.verification.verifier import VerificationOutcome
+
+    gaps = normalize_verify_gaps(gaps)
     blocking_count = len([g for g in gaps if g.blocking])
     log_step(
         "verify/complete",
@@ -520,10 +595,9 @@ async def run_verify_orchestration(
         evidence_items=len(evidence_to_save),
         trace=True,
     )
-    from devcouncil.verification.verifier import VerificationOutcome
 
     verifier.last_outcome = VerificationOutcome(
-        mode="compiled" if verifier.acceptance_compiler else "coarse",
+        mode=_verification_mode_label(evidence_to_save, compiler_active=compiler_active),
         compiler_active=compiler_active,
         diff_empty=diff_empty,
         coverage_measured=coverage_measured,

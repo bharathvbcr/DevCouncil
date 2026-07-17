@@ -23,6 +23,10 @@ _CONFIG_SETTABLE_KEYS = {
     "execution.max_repair_attempts": ("execution", "max_repair_attempts", int),
     "execution.command_timeout": ("execution", "command_timeout", int),
     "execution.verify_on_post_task": ("execution", "verify_on_post_task", bool),
+    "execution.stop_gate.mode": ("execution", "stop_gate", "mode", str),
+    "execution.stop_gate.check_claims": ("execution", "stop_gate", "check_claims", bool),
+    "execution.stop_gate.verify_active_task": ("execution", "stop_gate", "verify_active_task", bool),
+    "execution.stop_gate.max_blocks": ("execution", "stop_gate", "max_blocks", int),
     "verification.diff_coverage.enforce": ("verification", "diff_coverage", "enforce", bool),
     "semantic_layer.enabled": ("semantic_layer", "enabled", bool),
     "semantic_layer.cache.enabled": ("semantic_layer", "cache", "enabled", bool),
@@ -82,7 +86,12 @@ def show_config(
         console.print(f"  [cyan]execution.default_executor[/cyan]: {cfg.execution.default_executor}")
         console.print(f"  [cyan]execution.max_repair_attempts[/cyan]: {cfg.execution.max_repair_attempts}")
         console.print(f"  [cyan]execution.command_timeout[/cyan]: {cfg.execution.command_timeout}")
-        console.print(f"  [cyan]execution.verify_on_post_task[/cyan]: {cfg.execution.verify_on_post_task}")
+        console.print(f"  [cyan]execution.verify_on_post_task[/cyan]: {cfg.execution.verify_on_post_task} [dim](deprecated alias)[/dim]")
+        sg = cfg.execution.stop_gate
+        console.print(f"  [cyan]execution.stop_gate.mode[/cyan]: {sg.mode}")
+        console.print(f"  [cyan]execution.stop_gate.check_claims[/cyan]: {sg.check_claims}")
+        console.print(f"  [cyan]execution.stop_gate.verify_active_task[/cyan]: {sg.verify_active_task}")
+        console.print(f"  [cyan]execution.stop_gate.max_blocks[/cyan]: {sg.max_blocks}")
         console.print(f"  [cyan]verification.diff_coverage.enforce[/cyan]: {cfg.verification.diff_coverage.enforce}")
         console.print(f"  [cyan]verification.rigor.enabled[/cyan]: {cfg.verification.rigor.enabled}")
         console.print(f"  [cyan]verification.rigor.stub_detection[/cyan]: {cfg.verification.rigor.stub_detection}")

@@ -45,6 +45,8 @@ class GitDiffFallback:
     project_root: Path
     git_snapshot: Optional["GitWorktreeSnapshot"] = None
     untracked_cache: Optional[List[str]] = field(default=None, repr=False)
+    # When set, diff/changed-files use ``git diff <ref>`` (PR/base scope) instead of HEAD/worktree.
+    diff_base: Optional[str] = None
 
     def has_head(self) -> bool:
         if self.git_snapshot is not None:
@@ -185,6 +187,16 @@ class GitDiffFallback:
         return any(fnmatch.fnmatch(path, pattern) for pattern in IGNORED_CHANGE_PATTERNS)
 
     def get_diff(self) -> str:
+        if self.diff_base:
+            try:
+                return subprocess.check_output(
+                    ["git", "diff", self.diff_base],
+                    cwd=self.project_root,
+                    timeout=GIT_TIMEOUT,
+                ).decode("utf-8", errors="replace")
+            except Exception as e:
+                logger.warning("Failed to get git diff against %s: %s", self.diff_base, e)
+                return ""
         snap = self.git_snapshot
         try:
             if snap is not None:
@@ -206,6 +218,17 @@ class GitDiffFallback:
             return ""
 
     def get_changed_files(self) -> List[str]:
+        if self.diff_base:
+            try:
+                output = subprocess.check_output(
+                    ["git", "diff", self.diff_base, "--name-only"],
+                    cwd=self.project_root,
+                    timeout=GIT_TIMEOUT,
+                ).decode("utf-8", errors="replace").splitlines()
+                return self.filter_change_paths(output)
+            except Exception as e:
+                logger.warning("Failed to get changed files against %s: %s", self.diff_base, e)
+                return []
         snap = self.git_snapshot
         try:
             if snap is not None:

@@ -59,6 +59,7 @@ def check(
     list_gates: bool = typer.Option(False, "--list-gates", help="Preview which incremental stack gates would run for the current working-tree changes (no execution)."),
     enforce_coverage: bool = typer.Option(False, "--enforce-coverage", help="Evidence gate: block when the tests do not exercise the changed lines."),
     min_coverage: float = typer.Option(0.0, "--min-coverage", help="Evidence gate: minimum fraction of changed lines that must be exercised (implies --enforce-coverage)."),
+    persist: bool = typer.Option(False, "--persist", help="Evidence gate: persist gaps/evidence for dev report (typical in CI)."),
     json_format: bool = typer.Option(False, "--json", help="Machine-readable output."),
     project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root."),
 ):
@@ -78,7 +79,7 @@ def check(
             return
         _run_check_body(
             root, goal, base, test_commands, verify, enforce_coverage,
-            min_coverage, json_format, watch,
+            min_coverage, json_format, watch, persist,
         )
 
 
@@ -122,7 +123,7 @@ def _list_gates(root: Path, test_commands: list[str] | None, json_format: bool) 
 
 
 def _run_check_body(
-    root, goal, base, test_commands, verify, enforce_coverage, min_coverage, json_format, watch,
+    root, goal, base, test_commands, verify, enforce_coverage, min_coverage, json_format, watch, persist,
 ):
     log_step("check/1: resolving diff scope", project_root=root, trace=True)
 
@@ -156,9 +157,11 @@ def _run_check_body(
         result = run_working_tree_check(
             root,
             goal,
+            base=base,
             test_commands=list(test_commands or []),
             enforce_coverage=enforce_coverage,
             min_ratio=min_coverage,
+            persist=persist,
         )
         if json_format:
             typer.echo(dump_json(result.to_dict(), indent=2))
@@ -266,7 +269,9 @@ def _run_check_body(
 def _render_gate(result: AdHocCheckResult) -> None:
     """Render the deterministic evidence-gate result for humans."""
     if result.reason == "no_changes":
-        console.print("[yellow]No working-tree changes to verify. Make a change first, then re-run.[/yellow]")
+        console.print(
+            "[yellow]No changes to verify. Make a change or pass --base for PR-scoped diff.[/yellow]"
+        )
         return
 
     console.print(f"[bold]Checking:[/bold] {result.requirement}")

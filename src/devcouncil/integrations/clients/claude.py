@@ -72,6 +72,7 @@ def _record_claude_config(
             "write_gate": write_gate,
             "settings_path": ".claude/settings.local.json",
         })
+        _common.seed_stop_gate_assist_if_unset(config)
 
     _mutate_raw_config(project_root, mutate)
 
@@ -133,7 +134,13 @@ def _install_claude_settings(project_root: Path) -> tuple[Path, bool]:
 
     settings["statusLine"] = {
         "type": "command",
-        "command": "devcouncil hook claude-statusline",
+        "command": _format_command([
+            _common.resolve_dev_executable(project_root),
+            "hook",
+            "claude-statusline",
+            "--project-root",
+            str(project_root),
+        ]),
     }
     if settings.get("outputStyle") != _CLAUDE_OUTPUT_STYLE:
         settings["outputStyle"] = _CLAUDE_OUTPUT_STYLE

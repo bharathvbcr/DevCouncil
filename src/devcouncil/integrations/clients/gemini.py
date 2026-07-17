@@ -1,11 +1,16 @@
-"""Gemini integration adapter."""
+"""Gemini integration adapter (deprecated).
+
+Google replaced Gemini CLI with Antigravity CLI. Prefer ``dev integrate antigravity --apply``.
+Explicit ``dev integrate gemini`` remains for compatibility only.
+"""
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
-
-
+from devcouncil.executors.agent_registry import GEMINI_DEPRECATION_MESSAGE
 from devcouncil.integrations.clients import common as _common
+
 _project_root = _common._project_root
 _warn_if_verify_only = _common._warn_if_verify_only
 _server_args = _common._server_args
@@ -26,7 +31,11 @@ _print_command = _common._print_command
 _configure = _common._configure
 
 console = _common.console
+
+
 def _gemini_command(project_root: Path, scope: str) -> list[str]:
+    warnings.warn(GEMINI_DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=2)
+    console.print(f"[yellow]{GEMINI_DEPRECATION_MESSAGE}[/yellow]")
     return [
         "gemini",
         "mcp",

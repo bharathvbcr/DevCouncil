@@ -9,6 +9,7 @@ def test_dashboard_payload_handles_uninitialized_project(tmp_path):
 
     assert payload["initialized"] is False
     assert payload["phase"] == "UNINITIALIZED"
+    assert payload["gaps"] == {"total": 0, "blocking": 0, "items": []}
     assert "integrations" in payload
     assert "recent_runs" in payload
 
@@ -28,7 +29,8 @@ def test_dashboard_payload_includes_integrations_and_recent_runs(tmp_path):
 
 
 def test_dashboard_payload_reads_initialized_project(tmp_path):
-    from devcouncil.storage.repositories import StateRepository
+    from devcouncil.domain.gap import Gap
+    from devcouncil.storage.repositories import GapRepository, StateRepository
 
     dev_dir = tmp_path / ".devcouncil"
     dev_dir.mkdir()
@@ -36,11 +38,37 @@ def test_dashboard_payload_reads_initialized_project(tmp_path):
     db.create_db_and_tables()
     with db.get_session() as session:
         StateRepository(session).record_phase("TASK_VERIFYING")
+        GapRepository(session).save(
+            Gap(
+                id="GAP-BLOCK-1",
+                severity="high",
+                gap_type="orphan_diff",
+                task_id="TASK-001",
+                description="Blocking orphan diff",
+                recommended_fix="Revert",
+                blocking=True,
+            )
+        )
+        GapRepository(session).save(
+            Gap(
+                id="GAP-ADV-1",
+                severity="medium",
+                gap_type="stub_detected",
+                task_id="TASK-002",
+                description="Advisory stub",
+                recommended_fix="Remove stub",
+                blocking=False,
+            )
+        )
 
     payload = dashboard_payload(tmp_path)
 
     assert payload["initialized"] is True
     assert payload["phase"] == "TASK_VERIFYING"
+    assert payload["gaps"]["total"] == 2
+    assert payload["gaps"]["blocking"] == 1
+    assert payload["gaps"]["items"][0]["blocking"] is True
+    assert payload["gaps"]["items"][0]["task_id"] == "TASK-001"
 
 
 def test_dashboard_html_contains_live_status_endpoint():
@@ -58,8 +86,10 @@ def test_dashboard_html_contains_integration_sections():
 
     assert "CLI Integrations" in html
     assert "Recent Agent Runs" in html
+    assert "Verification Gaps" in html
     assert "integrations" in html
     assert "recent_runs" in html
+    assert "gaps" in html
     assert "innerHTML" not in html
 
 

@@ -254,6 +254,51 @@ def test_executor_run_unavailable_detects_session_limit(tmp_path):
     assert go._executor_run_unavailable(tmp_path, "OTHER") is False
 
 
+def test_deterministic_repair_succeeds_without_repair_service(monkeypatch, tmp_path):
+    """Stable contract: bounded repair loop + manifest work without LLM RepairService."""
+    from devcouncil.planning.correction_manifest import load_latest_correction_manifest
+
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "project:\n  name: test\nexecution:\n  max_repair_attempts: 3\n", encoding="utf-8"
+    )
+    db = Database(tmp_path / ".devcouncil" / "state.sqlite")
+    db.create_db_and_tables()
+    with db.get_session() as session:
+        TaskRepository(session).save(Task(
+            id="TASK-001", title="T", description="D",
+            planned_files=[PlannedFile(path="src/a.py", reason="x", allowed_change="modify")],
+            expected_tests=["pytest tests/test_a.py -q"],
+        ))
+        GapRepository(session).save(Gap(
+            id="GAP-1", severity="high", gap_type="test_failed", task_id="TASK-001",
+            description="pytest failed", recommended_fix="fix test", blocking=True,
+            suggested_command="pytest tests/test_a.py -q",
+        ))
+
+    calls = []
+    status_iter = iter(["blocked", "verified"])
+    sig_iter = iter(["sigA"])
+    monkeypatch.setattr(run_command, "run", lambda task_id, **k: calls.append(task_id))
+    monkeypatch.setattr(go, "_task_status", lambda root, tid: next(status_iter))
+    monkeypatch.setattr(go, "_blocking_gap_signature", lambda root, tid: next(sig_iter))
+    monkeypatch.setattr(go, "_remediable_incomplete_signature", lambda root, tid: "")
+    monkeypatch.setattr(go, "_commit_task_changes", lambda root, tid, status: False)
+
+    status, attempts = go._execute_task_with_repair(
+        tmp_path, _task(), executor="codex", profile=None, stream=False,
+        max_repairs=3, repair_service=None,
+    )
+    assert status == "verified"
+    assert attempts == 1
+    assert len(calls) == 2
+
+    manifest = load_latest_correction_manifest(tmp_path, "TASK-001")
+    assert manifest is not None
+    assert manifest.root_cause == "pytest failed"
+    assert "pytest tests/test_a.py -q" in manifest.commands_to_rerun
+
+
 def test_executor_exception_does_not_crash_run(monkeypatch, tmp_path):
     # An executor that raises must be caught: the task ends non-verified and the run
     # continues, rather than the exception aborting the whole `dev go`.

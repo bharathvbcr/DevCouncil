@@ -21,6 +21,8 @@ dev map --lsp-refs          # Confirm dead-symbol candidates via live LSP refere
 dev map --wiki / --no-wiki  # Refresh codebase-wiki skeletons after map (default on)
 dev map --scan-deps         # Opt-in SCA auditors → dependency_risks (off by default)
 dev map --watch             # Incrementally refresh the map on code edits
+dev graph ingest            # Unified analyze: codeintel sync → graph export → repo map write
+dev graph ingest PATH...    # Path-scoped ingest (full reconcile when paths omitted)
 dev graph query NAME        # 360° symbol view: definition, callers, callees, importers
 dev graph trace A B         # Shortest path between two graph nodes
 dev graph dead              # Dead-code report with confidence tiers (extracted|inferred|ambiguous); uncapped
@@ -28,11 +30,21 @@ dev graph dead --min-confidence inferred  # Filter to inferred+extracted only
 dev graph check             # God nodes (top-connected) and circular-import detection
 dev graph process [ENTRY]   # BFS call-flows from entry roots
 dev graph impact PATH...    # Blast radius for paths (or --diff for working-tree changes)
+dev graph search QUERY      # FTS5 symbol/path search over the committed generation
+dev graph search QUERY --semantic  # Opt-in local embeddings when indexing.embeddings.enabled
+dev graph cypher 'MATCH … RETURN …'  # Supported Cypher subset over native SQLite graph store
+dev graph explain --category command-injection  # PDG taint findings (opt-in PDG layer)
+dev graph pdg-query --mode controls --target SYMBOL  # PDG control dependence
+dev graph pdg-query --mode flows --target SYMBOL --variable x  # PDG data flows
 dev graph html              # Write interactive .devcouncil/graph/graph.html (not written by default on dev map)
 dev graph view              # Serve/open the graph HTML via a local HTTP server
+dev graph demo              # Sample visualizer + SVG preview (no map required); see docs/code-graph.md
 dev graph export -o out.graphml  # Export GraphML (or --format okf / okf-links)
 dev scaffold-ci             # Write a starter .github/workflows/devcouncil.yml from configured commands
 dev scaffold-ci --force     # Overwrite an existing devcouncil.yml workflow
+dev scaffold-ci --evidence  # Also write .github/workflows/devcouncil-evidence.yml (verify → evidence artifacts)
+dev boot "goal"             # One-command setup + integrate --apply + go (see quickstart)
+dev boot "goal" --skip-integrations --scaffold-ci-evidence --executor codex # Opt out of integration apply; optional CI scaffold; pass executor to go
 dev plan "goal"             # Run the full planning council debate
 dev approve                 # Approve the latest generated plan (AWAITING_USER_DECISIONS -> PLAN_APPROVED)
 dev approve --force         # Approve even if blocking gate gaps remain
@@ -42,7 +54,7 @@ dev check --verify -t "pytest -q" # Deterministic evidence gate on the working t
 dev check --verify --enforce-coverage # Block when changed lines are not exercised by tests
 dev check --json            # Machine-readable check output
 dev status                  # Show current project state and cost
-dev tasks                   # List planned tasks and statuses
+dev tasks                   # List planned tasks, statuses, and active lease owners (Lease column)
 dev tasks cancel TASK-001   # Cancel a task that is not done or cancelled
 dev tasks edit TASK-001 --title "New title" # Edit task metadata (title, priority, scope fields)
 dev tasks reprioritize TASK-001 --priority high # Change task priority (high | medium | low)
@@ -57,7 +69,7 @@ dev export -o ./snapshot.json # Write export to a custom path
 dev show TASK-001           # Show task details and constraints
 dev prompt TASK-001         # Generate prompt for an external agent
 dev run TASK-001            # Execute task via selected executor
-dev run TASK-001 --executor copilot # Built-in executors: codex, gemini, claude, opencode, antigravity, warp, cursor, aider, copilot, goose, amp, qwen, crush
+dev run TASK-001 --executor copilot # Built-in executors: codex, claude, opencode, antigravity, warp, cursor, aider, copilot, goose, amp, qwen, crush (gemini deprecated — compat only)
 dev verify TASK-001         # Verify diff, commands, and evidence
 dev verify TASK-001 --sandbox local|docker|nix # Run verification in a sandbox
 dev shell TASK-001 --command "pytest tests/" # Run one guarded shell command
@@ -80,7 +92,7 @@ dev design show              # Summarize design tokens and sections
 dev design check [files...]  # Fail on hardcoded color/spacing/typography literals that bypass design.md tokens (CI-friendly, exits non-zero)
 dev rollback TASK-001       # Revert changes using task checkpoint
 dev mcp-server              # Start DevCouncil MCP server over stdio
-dev integrate hooks --apply # Install Codex, Gemini, Claude, Cursor, and OpenCode hooks
+dev integrate hooks --apply # Install Codex, Claude, Cursor, Grok, and OpenCode hooks (Gemini excluded from --tool all; deprecated explicit --tool gemini)
 dev integrate aider --apply   # Enable built-in Aider headless executor
 dev hook --help             # Show lower-level hook commands
 dev integrate all --apply   # Configure supported coding CLI integrations
@@ -113,7 +125,20 @@ dev skills scaffold         # Write applicable skills to .claude/skills/<name>/S
 dev cost show               # Report estimated model-call cost grouped by task and run
 dev cost show --json        # Machine-readable cost report
 dev runs list               # List recorded coding-agent runs, newest first
+dev runs list --json        # Machine-readable run summaries (includes orphaned flag)
+dev runs list --status running --limit 10 # Filter by status; default limit 20
 dev runs show RUN-ID        # Show a run manifest plus a redacted transcript tail
+dev runs show RUN-ID --json # Full manifest, orphaned flag, and redacted transcript tail
+dev runs timeline REF       # Full reversible trace for a run id or task id (events, checkpoints, diff stat)
+dev runs timeline REF --json --limit 40 # JSON timeline; default limit 40 events
+dev runs diff REF           # Workspace changes the run produced (from git checkpoints)
+dev runs diff REF --stat    # Diff stat only
+dev runs revert REF         # Reverse workspace effects (prompts for confirmation)
+dev runs revert REF --yes   # Skip confirmation (-y)
+dev runs supervise REF      # Supervisor verdict: keep | revert | repair (default --llm)
+dev runs supervise REF --no-llm # Deterministic heuristics only (no run_supervisor model role)
+dev runs supervise REF --apply  # CLI-only: revert immediately when verdict is revert
+dev runs supervise REF --json   # Machine-readable verdict payload
 dev lsp inspect             # Inspect optional language-server readiness
 dev lsp inspect --json        # Compact {mode, servers_detected, note} JSON for automation
 dev ast match "symbol"      # Search symbols with structural AST matching
@@ -132,6 +157,10 @@ dev config set semantic_layer.cache.enabled true # Toggle FAISS semantic cache (
 dev config set semantic_layer.router.enabled true # Opt-in complexity routing for local Ollama tiers
 dev config set semantic_layer.compressor.enabled true # Toggle long-context compression before LLM calls
 dev config set execution.command_timeout 600 # Set a common dotted config key
+dev config set execution.stop_gate.mode assist # Stop-hook claim+verify gate (off|assist|block); see coding-cli-integration.md
+dev corpus build            # Build advisory doc/PDF/image corpus graph (config.yaml paths)
+dev corpus query "topic"    # Search corpus concepts
+dev corpus status           # Corpus freshness vs doc fingerprints
 dev config models --model YOUR_MODEL_ID # Update every configured model role
 dev config models --role-model critic_a=YOUR_MODEL_ID # Update one model role by name
 dev wiki update             # Generate/refresh the agent-facing codebase wiki (OKF bundle)

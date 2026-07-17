@@ -33,11 +33,15 @@ class IndexScope:
             rel = self.relative(path)
         except ValueError:
             return False
-        if any(rel == prefix.rstrip("/") or rel.startswith(prefix) for prefix in _IGNORED_PREFIXES):
-            return False
-        if detect_language(rel) is None:
+        if not self._language_and_prefix_included(rel):
             return False
         return not self._git_ignored(rel)
+
+    @staticmethod
+    def _language_and_prefix_included(rel: str) -> bool:
+        if any(rel == prefix.rstrip("/") or rel.startswith(prefix) for prefix in _IGNORED_PREFIXES):
+            return False
+        return detect_language(rel) is not None
 
     def relative(self, path: str | Path) -> str:
         candidate = Path(path)
@@ -56,7 +60,14 @@ class IndexScope:
             )
             if proc.returncode == 0:
                 values = proc.stdout.decode("utf-8", errors="replace").split("\0")
-                return sorted({value for value in values if value and self.includes(value)})
+                # git ls-files --exclude-standard has already applied repository
+                # ignore rules.  Calling check-ignore again for every returned path
+                # made MCP startup O(files) subprocesses.
+                return sorted({
+                    value
+                    for value in values
+                    if value and self._language_and_prefix_included(value)
+                })
         except (OSError, subprocess.SubprocessError):
             pass
         return sorted(

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
+import threading
+import time
 
 from devcouncil.codeintel.service import get_codeintel_service
 from devcouncil.codeintel.sync import IndexScope, SyncCoordinator
@@ -28,6 +31,43 @@ def test_index_scope_uses_language_manifest_and_ignores_state(tmp_path: Path) ->
     assert scope.includes("src/a.py")
     assert not scope.includes("src/note.txt")
     assert not scope.includes(".devcouncil/x.py")
+
+
+def test_index_scope_files_does_not_recheck_git_ignored_paths(tmp_path: Path, monkeypatch) -> None:
+    scope = IndexScope(tmp_path)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, stdout=b"a.py\0note.txt\0"),
+    )
+    monkeypatch.setattr(
+        scope,
+        "_git_ignored",
+        lambda _rel: (_ for _ in ()).throw(AssertionError("redundant check-ignore")),
+    )
+
+    assert scope.files() == ["a.py"]
+
+
+def test_coordinator_start_does_not_block_on_initial_reconcile(tmp_path: Path, monkeypatch) -> None:
+    coordinator = SyncCoordinator(get_codeintel_service(tmp_path), sync_callback=lambda _paths: None)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_reconcile():
+        entered.set()
+        release.wait(timeout=2)
+        return []
+
+    monkeypatch.setattr(coordinator, "_start_observer", lambda: None)
+    monkeypatch.setattr(coordinator, "reconcile", slow_reconcile)
+    started_at = time.monotonic()
+    coordinator.start()
+
+    assert time.monotonic() - started_at < 0.2
+    assert entered.wait(timeout=1)
+    release.set()
+    coordinator.stop()
 
 
 def test_reconcile_detects_modify_create_and_delete(tmp_path: Path) -> None:

@@ -276,3 +276,23 @@ def test_vendor_tokens_do_not_clear_verify_scan(tmp_path):
         git_files=[path, "assets/vendor/bundle.min.js"],
     )
     assert any(g.gap_type == "dead_symbol" and "lonely_helper" in g.description for g in gaps)
+
+
+def test_graph_inbound_call_clears_dead_symbol(tmp_path, monkeypatch):
+    path = "mod.py"
+    body = "def wired_helper():\n    return 1\n"
+    (tmp_path / path).write_text(body, encoding="utf-8")
+    (tmp_path / "caller.py").write_text("x = 1\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.query.symbol_has_non_test_inbound",
+        lambda _root, p, name, graph=None: p == path and name == "wired_helper",
+    )
+    gaps = detect_dead_symbol_gaps(
+        task=_task(),
+        project_root=tmp_path,
+        diff_content=_diff_for(path, body),
+        next_gap_id=_gap_id,
+        dead_symbol_blocking=True,
+    )
+    assert not any(g.gap_type == "dead_symbol" and g.blocking for g in gaps)

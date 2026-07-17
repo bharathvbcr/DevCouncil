@@ -10,7 +10,6 @@ GITIGNORE_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
             ".devcouncil/*",
             "!.devcouncil/",
             "!.devcouncil/config.yaml",
-            "!.devcouncil/graphify.yaml",
         ),
     ),
     (
@@ -28,7 +27,7 @@ GITIGNORE_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
             ".conducor/",
             ".antigravity/",
             ".warp/",
-            ".gitnexus",
+            ".grok/",
         ),
     ),
     (
