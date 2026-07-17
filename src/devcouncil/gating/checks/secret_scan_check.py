@@ -36,8 +36,8 @@ class SecretScanner:
                     if pattern.search(line):
                         counter += 1
                         logger.warning(
-                            "Potential %s secret detected in %s:%d (task %s)",
-                            key_type, current_file, new_line_no, task_id,
+                            "Potential sensitive pattern detected in %s:%d (task %s)",
+                            current_file, new_line_no, task_id,
                         )
                         gaps.append(Gap(
                             id=f"GAP-{task_id}-SECRET-{key_type.upper()}-{new_line_no}-{counter}",
