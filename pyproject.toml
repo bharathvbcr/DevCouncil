@@ -54,6 +54,15 @@ constraint-dependencies = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.coverage.run]
+source = ["src/devcouncil"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = false
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
