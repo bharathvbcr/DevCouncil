@@ -27,6 +27,7 @@ from devcouncil.executors.agent_registry import (
     resolve_coding_cli_probe_order,
 )
 from devcouncil.integrations.actions import apply_integration_target
+from devcouncil.integrations.clients.hooks import SESSION_START_MATCHER
 from devcouncil.utils.subprocess_env import clean_subprocess_env
 from devcouncil.integrations.check import (
     build_integration_check_report,
@@ -742,7 +743,7 @@ def _install_claude_hooks(project_root: Path, *, write_gate: bool = False) -> li
     _upsert_hook(
         settings,
         "SessionStart",
-        "startup|resume",
+        SESSION_START_MATCHER,
         _hook_command(project_root, "claude", "session-start"),
         "devcouncil-session-start",
     )
@@ -766,6 +767,13 @@ def _install_claude_hooks(project_root: Path, *, write_gate: bool = False) -> li
         "",
         _hook_command(project_root, "claude", "pre-compact"),
         "devcouncil-pre-compact",
+    )
+    _upsert_hook(
+        settings,
+        "PostCompact",
+        "",
+        _hook_command(project_root, "claude", "post-compact"),
+        "devcouncil-post-compact",
     )
     _upsert_hook(
         settings,

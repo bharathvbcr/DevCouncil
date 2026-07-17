@@ -7,6 +7,14 @@ from rich.console import Console
 from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import TaskRepository
 from devcouncil.execution.hook_policy import HookPolicy
+from devcouncil.execution.stop_gate import (
+    build_compact_snapshot,
+    compact_briefing,
+    compact_snapshot_path,
+    compact_snapshot_recent,
+    session_briefing,
+    write_json,
+)
 from devcouncil.telemetry.traces import TraceLogger
 from devcouncil.live.signals import write_signal
 from devcouncil.live.tasks import active_task_id
@@ -181,6 +189,25 @@ def _emit_additional_context(event_name: str, context: str | None) -> None:
     }, separators=(",", ":")))
 
 
+def _emit_system_message(event_name: str, message: str) -> None:
+    """Emit a Claude-Code hook result with a user-visible systemMessage (exit 0)."""
+    if not message:
+        return
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": event_name,
+            "systemMessage": message,
+        }
+    }, separators=(",", ":")))
+
+
+def _session_start_context(root: Path, payload: dict) -> str | None:
+    """Choose full session briefing or slim compact briefing based on SessionStart source."""
+    if payload.get("source") == "compact":
+        return compact_briefing(root, payload)
+    return session_briefing(root)
+
+
 def _read_stdin_payload(event_json: str | None) -> dict:
     text = event_json if event_json is not None else sys.stdin.read()
     if not text or not text.strip():
@@ -199,13 +226,17 @@ def session_start(
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
 ):
     """Claude Code SessionStart hook: inject a DevCouncil status snapshot as context."""
-    _read_stdin_payload(event_json)
+    payload = _read_stdin_payload(event_json)
     root = _project_root(project_root)
     try:
-        TraceLogger(root).log_event("session_start", {"client": client.lower()}, summary="Claude session started.")
+        TraceLogger(root).log_event(
+            "session_start",
+            {"client": client.lower(), "source": payload.get("source")},
+            summary="Claude session started.",
+        )
     except Exception:
         pass
-    _emit_additional_context("SessionStart", _status_line(root))
+    _emit_additional_context("SessionStart", _session_start_context(root, payload))
 
 
 @app.command()
@@ -217,6 +248,14 @@ def user_prompt_submit(
     """Claude Code UserPromptSubmit hook: surface the current DevCouncil status as context."""
     _read_stdin_payload(event_json)
     root = _project_root(project_root)
+    try:
+        from devcouncil.app.config import load_config
+
+        skip_seconds = load_config(root).execution.skip_prompt_status_after_compact_seconds
+    except Exception:
+        skip_seconds = 60
+    if skip_seconds > 0 and compact_snapshot_recent(root, skip_seconds):
+        return
     _emit_additional_context("UserPromptSubmit", _status_line(root))
 
 
@@ -241,11 +280,46 @@ def pre_compact(
     client: str = typer.Option("claude", "--client", help="Hook client (claude)."),
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
 ):
-    """Claude Code PreCompact hook: record that context compaction is about to run."""
+    """Claude Code PreCompact hook: persist a compact snapshot before context compaction."""
+    payload = _read_stdin_payload(event_json)
+    root = _project_root(project_root)
+    try:
+        snapshot = build_compact_snapshot(root, payload)
+        write_json(compact_snapshot_path(root), snapshot)
+        TraceLogger(root).log_event(
+            "pre_compact",
+            {"client": client.lower(), "session_id": snapshot.get("session_id"), "task_id": snapshot.get("task_id")},
+            summary="Claude context compaction starting.",
+        )
+    except Exception:
+        pass
+    try:
+        from devcouncil.app.config import load_config
+
+        if load_config(root).execution.compact_snapshot_toast:
+            _emit_system_message(
+                "PreCompact",
+                "DevCouncil saved a compact snapshot (phase, task, gaps) before context compaction.",
+            )
+    except Exception:
+        pass
+
+
+@app.command()
+def post_compact(
+    event_json: str | None = typer.Argument(None, help="The JSON hook payload from Claude Code."),
+    client: str = typer.Option("claude", "--client", help="Hook client (claude)."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """Claude Code PostCompact hook: trace-only record that compaction finished."""
     _read_stdin_payload(event_json)
     root = _project_root(project_root)
     try:
-        TraceLogger(root).log_event("pre_compact", {"client": client.lower()}, summary="Claude context compaction starting.")
+        TraceLogger(root).log_event(
+            "post_compact",
+            {"client": client.lower()},
+            summary="Claude context compaction finished.",
+        )
     except Exception:
         pass
 
