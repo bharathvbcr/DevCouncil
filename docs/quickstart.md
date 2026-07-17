@@ -112,6 +112,14 @@ If `VERTEXAI_ACCESS_TOKEN` is not configured, DevCouncil can use `gcloud auth pr
 
 Most other entry commands (`dev map`, `dev plan`, `dev run`, `dev status`, `dev verify`, etc.) now auto-initialize the project state if `.devcouncil/` is missing.
 
+To preview the interactive code-graph HTML UI (synthetic import graph, no `dev map` required):
+
+```bash
+dev graph demo
+```
+
+This writes `.devcouncil/graph/demo.html` and opens it in your default browser.
+
 To preview coding CLI integration commands:
 
 ```bash

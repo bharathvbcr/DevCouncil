@@ -13,6 +13,7 @@ dev e2e "goal" --executor codex --agent # Agent preset: JSON plus .devcouncil/re
 dev e2e "goal" --executor codex --json --report-file .devcouncil/reports/latest.json # Write machine-readable report
 dev go "goal" --executor codex # Short alias for dev e2e
 dev map "goal"              # Map repo context for a goal
+dev graph demo              # Open sample code-graph HTML (synthetic graph; no dev map required)
 dev plan "goal"             # Run the full planning council debate
 dev approve                 # Approve the latest generated plan (AWAITING_USER_DECISIONS -> PLAN_APPROVED)
 dev approve --force         # Approve even if blocking gate gaps remain
