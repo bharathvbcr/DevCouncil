@@ -160,7 +160,6 @@ def test_dashboard_apply_payload_value_error(tmp_path, monkeypatch):
 
 def test_dashboard_gaps_summary_blocking_first_and_cap(tmp_path, monkeypatch):
     from devcouncil.domain.gap import Gap
-    from devcouncil.storage.repositories import GapRepository
 
     class FakeSession:
         pass

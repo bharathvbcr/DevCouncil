@@ -1,7 +1,7 @@
 from devcouncil.utils.json_persist import dump_json
 import logging
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, cast, Any
 
 import typer
 from rich.console import Console
@@ -18,7 +18,7 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 
-def _lease_public_view(lease, *, expired: bool) -> dict:
+def _lease_public_view(lease, *, expired: bool) -> dict[str, Any]:
     return {
         "owner": lease.owner,
         "agent": lease.agent,
@@ -27,14 +27,14 @@ def _lease_public_view(lease, *, expired: bool) -> dict:
     }
 
 
-def _active_leases_by_task(session) -> dict[str, tuple[object, bool]]:
+def _active_leases_by_task(session) -> dict[str, tuple[Any, bool]]:
     return {
         lease.task_id: (lease, expired)
         for lease, expired in TaskLeaseRepository(session).list_leases(active_only=True)
     }
 
 
-def _task_row_payload(task, leases_by_task: dict[str, tuple[object, bool]]) -> dict:
+def _task_row_payload(task, leases_by_task: dict[str, tuple[Any, bool]]) -> Any:
     payload = task.model_dump()
     lease_pair = leases_by_task.get(task.id)
     payload["lease"] = _lease_public_view(lease_pair[0], expired=lease_pair[1]) if lease_pair else None

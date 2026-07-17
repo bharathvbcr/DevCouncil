@@ -6,7 +6,7 @@ import time
 from importlib import resources
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from devcouncil.app.project_status import compute_phase
@@ -155,7 +155,7 @@ def _dashboard_gaps_summary(session) -> dict:
     all_gaps = GapRepository(session).get_all()
     blocking = [gap for gap in all_gaps if gap.blocking]
     non_blocking = [gap for gap in all_gaps if not gap.blocking]
-    items = []
+    items: list[dict[str, Any]] = []
     for gap in blocking + non_blocking:
         if len(items) >= _DASHBOARD_GAPS_CAP:
             break

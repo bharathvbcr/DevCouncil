@@ -1,6 +1,3 @@
-import json
-from pathlib import Path
-
 from typer.testing import CliRunner
 
 from devcouncil.cli.main import app

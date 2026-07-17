@@ -256,7 +256,7 @@ def render_evidence_workflow(
         "          # pull_request → base branch SHA; push → previous commit (github.event.before).",
         "          # New branch / first push: before is all zeros — skip verify (no diff base).",
         "          VERIFY_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}",
-        f"        run: |",
+        "        run: |",
         '          ZERO_SHA="0000000000000000000000000000000000000000"',
         '          if [ "$VERIFY_BASE" = "$ZERO_SHA" ]; then',
         '            VERIFY_BASE=""',
