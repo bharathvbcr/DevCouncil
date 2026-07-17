@@ -250,12 +250,13 @@ def arm_devcouncil(ws: Path, goal: str, model: str, executor: str, timeout: int,
                    ac_samples: int = 1, ac_repair_attempts: int = 1,
                    ac_per_criterion: bool = False) -> dict:
     t0 = time.monotonic()
-    init_code, init_out = run([DEV, "init"], cwd=ws, timeout=120)
-    key = os.environ.get("OPENROUTER_API_KEY", "")
+    # Propagate provider credentials via subprocess environment only — never write
+    # API keys to disk in clear text (benchmark workspaces are ephemeral git repos).
+    dev_env = os.environ.copy()
+    init_code, init_out = run([DEV, "init"], cwd=ws, env=dev_env, timeout=120)
     dc_dir = ws / ".devcouncil"
     dc_dir.mkdir(parents=True, exist_ok=True)  # defensive: never fail on a missing dir
-    (dc_dir / "secrets.env").write_text(f"OPENROUTER_API_KEY={key}\n", encoding="utf-8")
-    cfg_code, cfg_out = run([DEV, "config", "models", "--provider", "openrouter", "-m", model], cwd=ws, timeout=120)
+    cfg_code, cfg_out = run([DEV, "config", "models", "--provider", "openrouter", "-m", model], cwd=ws, env=dev_env, timeout=120)
     # If config.yaml was not produced, `dev init`/`dev config models` failed. Fail loudly
     # with their output instead of crashing cryptically later when the routing/AC helpers
     # try to read a non-existent config (e.g. the init regression where logging pre-created
@@ -271,7 +272,7 @@ def arm_devcouncil(ws: Path, goal: str, model: str, executor: str, timeout: int,
         _apply_monitor_routing(ws, list(monitor_roles), monitor_provider, monitor_model)
     _apply_acceptance_check_config(ws, ac_samples, ac_repair_attempts, ac_per_criterion)
     code, out = run([DEV, "e2e", goal, "--executor", executor, "--force", "--continue-on-blocked"],
-                    cwd=ws, timeout=timeout)
+                    cwd=ws, env=dev_env, timeout=timeout)
     if "Passed: Ready for release" in out:
         verdict = "passed"
     elif "Blocked:" in out:
@@ -281,7 +282,7 @@ def arm_devcouncil(ws: Path, goal: str, model: str, executor: str, timeout: int,
     else:
         verdict = "error"
     cost = 0.0
-    sc, so = run([DEV, "status", "--json"], cwd=ws, timeout=60)
+    sc, so = run([DEV, "status", "--json"], cwd=ws, env=dev_env, timeout=60)
     try:
         cost = float(json.loads(so).get("total_cost", 0.0))
     except Exception:

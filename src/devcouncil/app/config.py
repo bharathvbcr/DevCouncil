@@ -481,7 +481,7 @@ def get_api_key(provider: str = "openrouter", project_root: Path = Path(".")) ->
         # OLLAMA_API_KEY still flows through above if present.
         return ""
     if not key:
-        logger.warning("API key not found for provider %s (env var %s)", provider, env_var)
+        logger.warning("Provider credentials not configured for %s", provider)
         extra = (
             " You can also authenticate with 'gcloud auth login' for vertexai."
             if _normalized_provider_name(provider) == "vertexai"
