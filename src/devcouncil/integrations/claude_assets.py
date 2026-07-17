@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from devcouncil.knowledge.frontmatter import build_frontmatter_markdown
+from devcouncil.integrations.clients.hooks import SESSION_START_MATCHER
 
 # Tools a DevCouncil subagent should be allowed to use: the standard read/edit/run set
 # plus the DevCouncil MCP tools it drives the task loop with. Listing the MCP tools keeps
@@ -372,8 +373,11 @@ def _plugin_hooks_json(*, write_gate: bool = False) -> str:
 
     hooks: dict[str, list] = {
         "Stop": [{"hooks": [{"type": "command", "command": cmd("agent-response"), "timeout": 10000}]}],
-        "SessionStart": [{"matcher": "startup|resume", "hooks": [{"type": "command", "command": cmd("session-start"), "timeout": 10000}]}],
+        "SessionStart": [{"matcher": SESSION_START_MATCHER, "hooks": [{"type": "command", "command": cmd("session-start"), "timeout": 10000}]}],
         "UserPromptSubmit": [{"hooks": [{"type": "command", "command": cmd("user-prompt-submit"), "timeout": 10000}]}],
+        "SessionEnd": [{"hooks": [{"type": "command", "command": cmd("session-end"), "timeout": 10000}]}],
+        "PreCompact": [{"hooks": [{"type": "command", "command": cmd("pre-compact"), "timeout": 10000}]}],
+        "PostCompact": [{"hooks": [{"type": "command", "command": cmd("post-compact"), "timeout": 10000}]}],
         "SubagentStop": [{"hooks": [{"type": "command", "command": cmd("subagent-stop"), "timeout": 10000}]}],
         "Notification": [{"hooks": [{"type": "command", "command": cmd("notification"), "timeout": 10000}]}],
     }

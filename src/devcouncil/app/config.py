@@ -159,6 +159,12 @@ class ExecutionConfig(BaseModel):
     # of only being flagged post-verify by orphan_diff. Off by default (it reverts the
     # agent's writes; teams opt in once their plans declare planned_files reliably).
     enforce_file_scope_pre_verify: bool = False
+    # After Claude Code context compaction, SessionStart injects a slim compact briefing.
+    # UserPromptSubmit skips the status line for this window to avoid duplicate context.
+    skip_prompt_status_after_compact_seconds: int = 60
+    # When true, PreCompact emits an optional user-facing toast (systemMessage) after
+    # writing the compact snapshot. Never blocks compaction.
+    compact_snapshot_toast: bool = True
 
 
 class PrivacyConfig(BaseModel):

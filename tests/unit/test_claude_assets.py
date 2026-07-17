@@ -90,6 +90,8 @@ def test_plugin_bundle_is_self_contained(tmp_path):
     # Assist-mode by default: lifecycle hooks present, blocking write-gate absent.
     hooks = json.loads(next(a for a in bundle if a.path.name == "hooks.json").content)
     assert "SessionStart" in hooks["hooks"] and "UserPromptSubmit" in hooks["hooks"]
+    assert "PreCompact" in hooks["hooks"] and "PostCompact" in hooks["hooks"]
+    assert hooks["hooks"]["SessionStart"][0]["matcher"] == "startup|resume|clear|compact"
     assert "PreToolUse" not in hooks["hooks"] and "PostToolUse" not in hooks["hooks"]
 
 
@@ -200,7 +202,7 @@ def test_claude_native_hooks_assist_mode_default_has_no_write_gate(tmp_path):
     settings = json.loads((tmp_path / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
     events = set(settings["hooks"].keys())
     # Assistive lifecycle hooks present...
-    assert {"Stop", "SessionStart", "UserPromptSubmit", "SessionEnd", "PreCompact", "SubagentStop", "Notification"} <= events
+    assert {"Stop", "SessionStart", "UserPromptSubmit", "SessionEnd", "PreCompact", "PostCompact", "SubagentStop", "Notification"} <= events
     # ...but the blocking write-gate is NOT installed by default.
     assert "PreToolUse" not in events and "PostToolUse" not in events
 
