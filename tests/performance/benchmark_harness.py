@@ -50,7 +50,15 @@ def load_thresholds(profile: str) -> dict[str, Any]:
     if profile not in all_thresholds:
         choices = ", ".join(sorted(all_thresholds))
         raise ValueError(f"unknown benchmark profile {profile!r}; choose {choices}")
-    return dict(all_thresholds[profile])
+    config = dict(all_thresholds[profile])
+    if sys.platform == "win32":
+        # Windows CI runners' file I/O and fsync are ~2x slower than the
+        # Linux/macOS runners the budgets were tuned on. The scaled one-file
+        # budget still catches a fall-back-to-full-rebuild regression, which
+        # measured 7.4s against the scaled 6.0s limit.
+        for key in ("cold_wall_seconds_max", "one_file_wall_seconds_max"):
+            config[key] = float(config[key]) * 2.0
+    return config
 
 
 def fixture_paths(spec: FixtureSpec) -> list[str]:
