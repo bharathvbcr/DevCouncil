@@ -644,8 +644,11 @@ def _emit_additional_context(event_name: str, context: str | None) -> None:
     }, separators=(",", ":")))
 
 
-def _emit_system_message(event_name: str, message: str) -> None:
+def _emit_system_message(event_name: str, message: str | None = None) -> None:
     """Emit a Claude-Code hook result with a user-visible systemMessage (exit 0)."""
+    if message is None:
+        message = event_name
+        event_name = ""
     if not message:
         return
     import json
@@ -655,6 +658,7 @@ def _emit_system_message(event_name: str, message: str) -> None:
             "systemMessage": message,
         }
     }, separators=(",", ":")))
+
 
 
 def _read_stdin_payload(event_json: str | None) -> dict:

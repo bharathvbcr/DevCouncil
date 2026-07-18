@@ -131,6 +131,7 @@ def test_plan_gate_blocks_unknown_task_links():
 def test_task_ready_warns_but_allows_missing_commands_and_expected_evidence(monkeypatch):
     policy = GatePolicy()
     monkeypatch.setattr(policy.clean_git, "check", lambda project_root, task_id: [])
+    monkeypatch.setattr(policy.map_policy, "validate_repo_map", lambda project_root: None)
 
     result = policy.check_task_ready(_task(), Path("."))
 
@@ -148,6 +149,7 @@ def test_task_ready_warns_but_allows_missing_commands_and_expected_evidence(monk
 def test_task_ready_passes_with_commands_and_expected_evidence(monkeypatch):
     policy = GatePolicy()
     monkeypatch.setattr(policy.clean_git, "check", lambda project_root, task_id: [])
+    monkeypatch.setattr(policy.map_policy, "validate_repo_map", lambda project_root: None)
     task = _task()
     task.allowed_commands = ["pytest tests/test_auth.py"]
     task.expected_tests = ["pytest tests/test_auth.py"]
@@ -155,3 +157,4 @@ def test_task_ready_passes_with_commands_and_expected_evidence(monkeypatch):
     result = policy.check_task_ready(task, Path("."))
 
     assert result.passed
+

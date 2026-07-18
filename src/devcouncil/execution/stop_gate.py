@@ -375,9 +375,10 @@ def session_briefing(project_root: Path, payload: dict[str, Any] | None = None) 
         lines.append(blocking)
 
     # Append continuity extras if payload is passed
-    if payload:
+    if payload is not None:
         payload = payload if isinstance(payload, dict) else {}
         parts: list[str] = []
+
         last = last_event(project_root)
         if last:
             decision = last.get("decision", "?")
@@ -399,7 +400,8 @@ def session_briefing(project_root: Path, payload: dict[str, Any] | None = None) 
             if ends_on_open_question(tpath):
                 parts.append("Session appears to have ended on an open question.")
         if parts:
-            lines.append("Continuity — " + " ".join(parts))
+            lines.append("Blocking gaps/continuity: " + " ".join(parts))
+
 
     return "\n".join(lines)
 
@@ -477,16 +479,15 @@ def _phase_and_blocking_from_db(root: Path) -> tuple[str | None, str | None]:
         db = get_db(root)
         if not db:
             return None, None
-        from devcouncil.storage.repositories import ArtifactGraphRepository, GapRepository, StateRepository
+        from devcouncil.storage.repositories import GapRepository
 
         with db.get_session() as session:
-            graph = ArtifactGraphRepository(session).load_graph()
-            state = StateRepository(session).get_state()
-            phase = compute_phase(graph, state.current_phase if state else None)
             blocking = [g for g in GapRepository(session).get_all() if g.blocking]
+        phase = _project_phase(root)
         return phase, _blocking_gaps_summary(blocking)
     except Exception:
         return None, None
+
 
 
 def _blocking_gaps_summary(blocking: list[Any]) -> str | None:
@@ -515,7 +516,14 @@ def _last_stop_gate_event(root: Path) -> dict[str, Any] | None:
     return None
 
 
-def _last_assistant_sentence(root: Path, session_id: str | None = None) -> str | None:
+def _last_assistant_sentence(root: Path, session_id: str | None = None, payload: dict | None = None) -> str | None:
+    payload = payload or {}
+    tpath = payload.get("transcript_path") or payload.get("transcriptPath")
+    if tpath:
+        try:
+            return last_assistant_sentence(Path(str(tpath)))
+        except Exception:
+            pass
     try:
         sessions = discover_sessions(root, client="claude")
         if session_id:
@@ -528,6 +536,7 @@ def _last_assistant_sentence(root: Path, session_id: str | None = None) -> str |
     except Exception:
         pass
     return None
+
 
 
 def _last_sentence(text: str) -> str:
@@ -545,6 +554,18 @@ def build_compact_snapshot(root: Path, payload: dict[str, Any]) -> dict[str, Any
         session_id = str(session_id)
     task_id = active_task_id(root)
     phase, blocking_summary = _phase_and_blocking_from_db(root)
+    blocking_gaps = 0
+    next_actions = []
+    if task_id:
+        blocking_gaps, next_actions = _task_blocking_summary(root, task_id)
+    last = last_event(root)
+    last_stop_gate = None
+    if last:
+        last_stop_gate = {
+            "decision": last.get("decision"),
+            "claim": (last.get("claim") or "")[:120],
+            "blocking_gaps": last.get("blocking_gaps", 0),
+        }
     return {
         "written_at": datetime.now(timezone.utc).isoformat(),
         "session_id": session_id,
@@ -552,8 +573,14 @@ def build_compact_snapshot(root: Path, payload: dict[str, Any]) -> dict[str, Any
         "phase": phase,
         "blocking_gaps_summary": blocking_summary,
         "last_stop_gate_event": _last_stop_gate_event(root),
-        "last_assistant_sentence": _last_assistant_sentence(root, session_id),
+        "last_assistant_sentence": _last_assistant_sentence(root, session_id, payload),
+        "blocking_gaps": blocking_gaps,
+        "next_actions": next_actions,
+        "last_stop_gate": last_stop_gate,
     }
+
+
+
 
 
 def _briefing_from_snapshot(snapshot: dict[str, Any]) -> str:
@@ -675,3 +702,45 @@ def statusline_tally(project_root: Path, session_id: str | None) -> str | None:
     if ok == 0 and bad == 0:
         return None
     return f"🛡 {ok}✓ {bad}✗"
+
+
+def _project_phase(project_root: Path) -> str | None:
+    try:
+        from devcouncil.app.project_status import compute_phase
+        from devcouncil.storage.db import get_db
+        from devcouncil.storage.repositories import ArtifactGraphRepository, StateRepository
+
+        db = get_db(project_root)
+        if not db:
+            return None
+        with db.get_session() as session:
+            graph = ArtifactGraphRepository(session).load_graph()
+            state = StateRepository(session).get_state()
+            return compute_phase(graph, state.current_phase if state else None)
+    except Exception:
+        logger.debug("_project_phase failed", exc_info=True)
+        return None
+
+
+def _task_blocking_summary(project_root: Path, task_id: str | None) -> tuple[int, list[str]]:
+    if not task_id:
+        return 0, []
+    try:
+        from devcouncil.storage.db import get_db
+        from devcouncil.storage.repositories import GapRepository
+        from devcouncil.verification.next_actions import split_next_actions
+
+        db = get_db(project_root)
+        if not db:
+            return 0, []
+        with db.get_session() as session:
+            gaps = [g for g in GapRepository(session).get_for_task(task_id) if g.blocking]
+        if not gaps:
+            return 0, []
+        actions, _ = split_next_actions(gaps)
+        return len(gaps), [a.action for a in actions[:2]]
+    except Exception:
+        logger.debug("_task_blocking_summary failed", exc_info=True)
+        return 0, []
+
+

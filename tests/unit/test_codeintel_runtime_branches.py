@@ -1964,7 +1964,7 @@ def test_sync_observer_events_start_and_stop(
     monkeypatch.setattr("watchdog.observers.Observer", Observer)
     try:
         import watchdog.observers.kqueue as kqueue
-    except ImportError:
+    except (ImportError, AttributeError):
         pass
     else:
         monkeypatch.setattr(kqueue, "KqueueObserver", Observer)

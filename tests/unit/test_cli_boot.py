@@ -8,10 +8,13 @@ runner = CliRunner()
 def test_cli_boot_help():
     result = runner.invoke(app, ["boot", "--help"])
     assert result.exit_code == 0
-    assert "Initialize the repo" in result.output
-    assert "--skip-integrations" in result.output
-    assert "--scaffold-ci-evidence" in result.output
-    assert "--executor" in result.output
+    import re
+    clean_output = re.sub(r'\x1b\[[0-9;]*[mK]', '', result.output)
+    assert "Initialize the repo" in clean_output
+    assert "--skip-integrations" in clean_output
+    assert "--scaffold-ci-evidence" in clean_output
+    assert "--executor" in clean_output
+
 
 
 def test_cli_boot_runs_setup_integrate_and_go(tmp_path, monkeypatch):

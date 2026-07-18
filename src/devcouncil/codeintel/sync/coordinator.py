@@ -336,8 +336,9 @@ class SyncCoordinator:
 
                 if KqueueObserver is not Observer:
                     candidates.append(("native-fallback", KqueueObserver))
-            except ImportError:
+            except (ImportError, AttributeError):
                 pass
+
             if self.allow_polling_fallback:
                 candidates.append((
                     "polling",

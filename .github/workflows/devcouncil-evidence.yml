@@ -59,7 +59,6 @@ jobs:
             .devcouncil/evidence.html
           if-no-files-found: error
       - name: Post GitHub Check (blocking gaps only)
-        if: ${{ secrets.GITHUB_TOKEN != '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}

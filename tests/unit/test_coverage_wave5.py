@@ -329,7 +329,9 @@ def test_emit_additional_context_and_system_message(capsys):
     assert capsys.readouterr().out == ""
 
     hook_cmd._emit_system_message("toast")
-    assert json.loads(capsys.readouterr().out)["systemMessage"] == "toast"
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["hookSpecificOutput"]["systemMessage"] == "toast"
+
 
 
 def test_session_start_context_compact_branch(tmp_path, monkeypatch):

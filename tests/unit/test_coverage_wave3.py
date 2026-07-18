@@ -36,7 +36,8 @@ def test_logs_cli_paths(tmp_path, monkeypatch):
 
     path = runner.invoke(logs_cmd.app, ["path", "--project-root", str(root)])
     assert path.exit_code == 0
-    assert "devcouncil.log" in path.output
+    assert "devcouncil.log" in path.output.replace("\n", "").replace("\r", "")
+
 
     empty_runs = runner.invoke(logs_cmd.app, ["runs", "--project-root", str(root)])
     assert empty_runs.exit_code == 0
@@ -307,6 +308,7 @@ def test_stop_gate_compact_snapshot_paths(tmp_path, monkeypatch):
             return False
 
     monkeypatch.setattr("devcouncil.storage.db.get_db", lambda _p: FakeDB())
+    monkeypatch.setattr(sg, "_status_line", lambda _p: "DevCouncil status")
     monkeypatch.setattr(
         "devcouncil.storage.repositories.GapRepository",
         lambda session: SimpleNamespace(get_for_task=lambda _tid: [GapObj()]),
@@ -317,6 +319,7 @@ def test_stop_gate_compact_snapshot_paths(tmp_path, monkeypatch):
     )
     brief2 = sg.session_briefing(root, {})
     assert brief2 and "Blocking gaps" in brief2
+
 
 
 def test_campaign_execute_lease_and_qc_errors(tmp_path, monkeypatch):

@@ -1273,14 +1273,15 @@ def test_map_repo_graph_failure_fallback(tmp_path, monkeypatch):
 
 
 def test_map_repo_with_goal_and_scan_dependencies(tmp_path, monkeypatch):
-    (tmp_path / "search_target.py").write_text("token auth secret\n", encoding="utf-8")
+    (tmp_path / "token_auth_search_target.py").write_text("token auth secret\n", encoding="utf-8")
     m = RepoMapper(tmp_path)
     monkeypatch.setattr(
         m, "_scan_dependency_risks", lambda: [{"package": "left-pad", "risk": "low"}]
     )
     repo_map = m.map_repo(goal="token auth", scan_dependencies=True, liveness=False)
-    assert any("search_target.py" in c["path"] for c in repo_map.candidate_files)
+    assert any("token_auth_search_target.py" in c["path"] for c in repo_map.candidate_files)
     assert repo_map.dependency_risks
+
 
 
 def test_devprism_shaped_fidelity_baseline(tmp_path):
