@@ -2399,7 +2399,12 @@ class RepoMapper:
             for root, dirnames, filenames in os.walk(self.project_root):
                 dirnames[:] = [name for name in dirnames if name not in IGNORED_DIR_NAMES]
                 for f in filenames:
-                    rel_path = os.path.relpath(os.path.join(root, f), self.project_root)
+                    # Normalize to forward slashes like the git branch above —
+                    # backslash paths make every stored (posix) path look
+                    # non-live downstream and defeat incremental sync.
+                    rel_path = os.path.relpath(
+                        os.path.join(root, f), self.project_root
+                    ).replace(os.sep, "/")
                     if not rel_path.startswith(".") and not self._is_runtime_or_generated_file(rel_path):
                         files.append(rel_path)
             return files
