@@ -2,6 +2,10 @@
 
 DevCouncil builds a deterministic repository map and a symbol-level knowledge graph without calling an LLM. Agents use these artifacts to navigate, find callers, and spot unwired or dead code before inventing new modules.
 
+<p align="center">
+  <img src="graph_preview.png" alt="Code Graph Preview" width="600">
+</p>
+
 ## Artifacts
 
 | Path | Role |

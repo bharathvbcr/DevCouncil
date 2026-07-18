@@ -172,3 +172,11 @@ benchmarks/results/
 
 # Environment, dependency, and cache directories
 .env.local
+
+# =============================================================================
+# Local personal / marketing drafts (keep on disk, do not push)
+# =============================================================================
+RESUME_PORTFOLIO_POINTS_2026.md
+DevCouncil-blog.md
+DevCouncil-linkedin.md
+examples/password-reset/
