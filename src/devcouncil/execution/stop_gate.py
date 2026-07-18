@@ -18,7 +18,7 @@ from devcouncil.live.transcripts import discover_sessions, latest_assistant_turn
 from devcouncil.storage.db import get_db
 from devcouncil.telemetry.traces import read_trace_events
 
-from devcouncil.execution.stop_gate_history import append_event, build_event, last_event
+from devcouncil.execution.stop_gate_history import append_event, build_event, last_event, session_tally
 from devcouncil.execution.stop_gate_state import get_block_count, increment_block_count
 from devcouncil.execution.stop_gate_verify_cache import load_verify_cache, record_verify_cache
 from devcouncil.live.tasks import active_task_id
@@ -665,3 +665,13 @@ def recent_compact_brief(project_root: Path, within_seconds: int) -> bool:
             except Exception:
                 pass
     return False
+
+
+def statusline_tally(project_root: Path, session_id: str | None) -> str | None:
+    """Compact shield tally ``🛡 2✓ 1✗`` for the current session."""
+    if not session_id:
+        return None
+    ok, bad = session_tally(project_root, session_id)
+    if ok == 0 and bad == 0:
+        return None
+    return f"🛡 {ok}✓ {bad}✗"
