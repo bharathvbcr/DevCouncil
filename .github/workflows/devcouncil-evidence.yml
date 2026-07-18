@@ -41,7 +41,7 @@ jobs:
             VERIFY_BASE=""
           fi
           if [ -n "$VERIFY_BASE" ]; then
-            uv run --python 3.12 dev check --verify --base "$VERIFY_BASE" --persist --project-root .
+            uv run --python 3.12 dev check --verify --base "$VERIFY_BASE" --test "uv run pytest -q tests/unit" --persist --project-root .
           else
             echo "::notice::Skipping DevCouncil verify — no diff base (first push / new branch). Push again or open a PR for scoped verify."
             exit 0

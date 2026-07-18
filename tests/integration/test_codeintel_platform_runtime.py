@@ -52,14 +52,19 @@ def test_dashboard_real_loopback_socket_smoke(tmp_path: Path, monkeypatch: pytes
             created["server"] = self
 
     monkeypatch.setattr(dashboard, "get_db", lambda root: None)
-    thread = threading.Thread(
-        target=dashboard.run_dashboard,
-        args=(tmp_path, "127.0.0.1", 0),
-        kwargs={"server_factory": RecordingServer},
-        daemon=True,
-    )
+    errors: list[BaseException] = []
+
+    def _serve() -> None:
+        try:
+            dashboard.run_dashboard(tmp_path, "127.0.0.1", 0, server_factory=RecordingServer)
+        except BaseException as exc:  # noqa: BLE001 — surface thread failures in the test
+            errors.append(exc)
+
+    thread = threading.Thread(target=_serve, daemon=True)
     thread.start()
-    _wait_until(lambda: "server" in created)
+    _wait_until(lambda: "server" in created or bool(errors), timeout=30.0)
+    if errors:
+        raise AssertionError(f"run_dashboard raised: {errors[0]!r}") from errors[0]
     server = created["server"]
     host, port = server.server_address
     try:

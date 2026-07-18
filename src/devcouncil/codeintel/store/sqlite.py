@@ -252,16 +252,19 @@ class CodeIntelStore:
             conn = sqlite3.connect(uri, uri=True, timeout=5.0)
         else:
             conn = sqlite3.connect(self.path, timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=5000")
-        if not readonly:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
         try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=5000")
+            if not readonly:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
             yield conn
         finally:
+            # Close even when pragma setup raises (e.g. a corrupt file): a
+            # leaked handle keeps the file open, which blocks the Windows
+            # rename in quarantine().
             conn.close()
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
