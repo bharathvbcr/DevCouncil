@@ -480,18 +480,26 @@ def dashboard_html(token: str = "") -> str:
 </html>"""
 
 
-class DashboardHTTPServer(ThreadingHTTPServer):
-    allow_reuse_address = True
-    daemon_threads = True
+if TYPE_CHECKING:
+    _MixinBase = ThreadingHTTPServer
+else:
+    _MixinBase = object
 
+
+class _LoopbackBindMixin(_MixinBase):
+    # HTTPServer.server_bind resolves socket.getfqdn(), which can hang for
+    # tens of seconds on hosts with slow reverse DNS (seen on macOS CI
+    # runners). The dashboard serves loopback only, so skip the lookup.
     def server_bind(self) -> None:
-        # HTTPServer.server_bind resolves socket.getfqdn(), which can hang for
-        # tens of seconds on hosts with slow reverse DNS (seen on macOS CI
-        # runners). The dashboard serves loopback only, so skip the lookup.
         socketserver.TCPServer.server_bind(self)
         host, port = self.server_address[:2]
         self.server_name = str(host)
         self.server_port = int(port)
+
+
+class DashboardHTTPServer(_LoopbackBindMixin, ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
 
 
 def run_dashboard(
@@ -504,7 +512,14 @@ def run_dashboard(
     dashboard_token = secrets.token_urlsafe(24)
 
     if server_factory is None:
-        server_factory = DashboardHTTPServer
+        # Derive the default at call time from the module-global
+        # ThreadingHTTPServer so tests that monkeypatch it still take effect;
+        # real use gets the loopback bind that skips the getfqdn hang.
+        server_factory = type(
+            "DashboardHTTPServer",
+            (_LoopbackBindMixin, ThreadingHTTPServer),
+            {"allow_reuse_address": True, "daemon_threads": True},
+        )
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802

@@ -6,17 +6,13 @@
 
 **Description:**
 
-DevCouncil turns AI-assisted coding from black-box generation into a plan → scope → verify → repair workflow, where every change is authorized, tested, and traceable back to a requirement, and evidence, not model confidence, decides what counts as "done."
+DevCouncil turns AI-assisted coding from black-box generation into a plan → scope → verify → repair workflow where every change is authorized, tested, and traceable to a requirement — and evidence, not model confidence, decides what counts as "done."
 
-It sits *beside* coding agents (Claude Code, Codex, Cursor, Aider, and more) and owns what they're weakest at. A symbol-level code map (`dev map` / `dev graph`) parses the repo with tree-sitter into files, symbols, imports, call sites, and subsystems with entry points, neighbors, and handoff paths. That map grounds every plan in real files, keeps `AGENTS.md` / `CLAUDE.md` in sync, fails closed when stale, and hands the agent the blast radius (every file that imports the one it's editing) before a line changes. You can query callers, trace paths, flag dead code by confidence tier, and open an interactive graph view. From the same foundation it builds an agent-facing wiki per subsystem.
+It sits beside coding agents (Claude Code, Codex, Cursor, Aider) and owns what they're weakest at. It maps your repo into a symbol-level code graph (`dev map`), so plans reference real files and the agent gets the *blast radius* — every file that imports the one it's editing — before it changes a line. It debates a one-line goal into scoped tasks, then gates completion on four-tier verification (scope, tests, diff-coverage, rigor): if the evidence isn't there, the task is blocked with a specific gap, not a green checkmark it didn't earn.
 
-Around that map: a multi-role planning council that debates a one-line goal into typed requirements and a scoped task graph; gated execution with scoped writes, command allowlists, and clean rollback; a four-tier verification gate (scope, tests, diff-coverage, rigor) whose acceptance-check compiler turns each criterion into a runnable, majority-voted check; a bounded self-repair loop when evidence is missing; live review cards via `dev watch`; an MCP server so an agent can drive checkout → write → verify → repair itself; plus a local gaps dashboard, run timelines you can revert, and CI that uploads evidence reports.
+Also included: parallel multi-agent campaigns, a self-repair loop, live review, an MCP server, reversible run timelines, and an auto-generated codebase wiki — across ~48 CLI commands on a 1,385-test suite. Built in Python; routes across OpenRouter, Vertex AI, Doubleword, and local Ollama (fully offline at zero cost).
 
-Also in the box: parallel multi-agent campaigns (director → coordinator → workers → reviewer) with file-overlap serialization, cost budgets, and a progress dashboard; deeper code intelligence (`dev graph cypher`, an opt-in program-dependence graph, AST structural search, a semantic index, LSP detection, all behind a sha256-keyed parse cache); a corpus index for docs, PDFs, and images with their own verify gates; task-level provenance and an audit trail; secret redaction with local-only state; a design-token conformance gate; and GEPA prompt-profile optimization for custom agents, across ~48 CLI commands on a green 1,385-test suite the tool dogfoods on itself.
-
-Built in Python (Typer CLI, asyncio), with provider-agnostic model routing across OpenRouter, Vertex AI, Doubleword, and local Ollama. It runs fully offline at zero cost.
-
-In a controlled adversarial benchmark with hidden ground-truth tests, the gated loop lifted code correctness **+0.14 (0.94 vs. 0.81) with zero false negatives**, an early, deliberately small result I keep honestly caveated rather than oversold.
+In a controlled adversarial benchmark with hidden ground-truth tests, the gated loop lifted correctness **+0.14 (0.94 vs. 0.81) with zero false negatives** — an early, deliberately small result I keep honestly caveated.
 
 Apache 2.0 · `npm install -g devcouncil` · github.com/bharathvbcr/DevCouncil
 
