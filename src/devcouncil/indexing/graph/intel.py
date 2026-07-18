@@ -17,6 +17,25 @@ logger = logging.getLogger(__name__)
 _STRUCTURAL_KINDS = frozenset({"imports", "calls"})
 _FILE_EDGE_KINDS = frozenset({"imports"})
 _CALL_KINDS = frozenset({"calls"})
+# Ambiguous call/import edges fan out to every candidate and inflate hubs,
+# PageRank, process walks, and blast radius. Keep them in the store for
+# explanation UIs, but exclude them from those ranked/BFS surfaces.
+_METRIC_CONFIDENCE = frozenset({"extracted", "inferred"})
+
+
+def _edge_confidence(edge: object) -> str:
+    conf = getattr(edge, "confidence", None)
+    if conf is None:
+        return "extracted"
+    return conf.value if hasattr(conf, "value") else str(conf)
+
+
+def _metric_edge(edge: object) -> bool:
+    """True when an edge should influence god-node / PageRank / process / impact."""
+    kind = getattr(edge, "kind", "")
+    if kind not in _STRUCTURAL_KINDS:
+        return False
+    return _edge_confidence(edge) in _METRIC_CONFIDENCE
 
 
 def _is_file_node(n: GraphNode) -> bool:
@@ -74,21 +93,49 @@ def compute_communities(
         if key in seen:
             continue
         seen.add(key)
-        file_edges.append((a, b))
+        file_edges.append(key)
 
     import networkx as nx
 
     G = nx.Graph()
-    G.add_edges_from(file_edges)
+    G.add_edges_from(sorted(file_edges))
     # Include isolated file nodes so every file gets a community id.
-    for n in graph.nodes:
-        if _is_file_node(n) and n.id not in G:
-            G.add_node(_file_id(n.id))
+    isolated_file_ids = sorted(
+        {_file_id(n.id) for n in graph.nodes if _is_file_node(n)}
+    )
+    for node_id in isolated_file_ids:
+        if node_id not in G:
+            G.add_node(node_id)
 
     if G.number_of_nodes() == 0:
         return {"communities": [], "count": 0}
 
-    raw = louvain_communities(G, seed=seed, weight=None)
+    # Bound Louvain so pathological graphs cannot stall a full map/graph build.
+    timeout_seconds = 15.0
+
+    def _run_louvain() -> list:
+        return list(louvain_communities(G, seed=seed, weight=None))
+
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            raw = pool.submit(_run_louvain).result(timeout=timeout_seconds)
+    except FuturesTimeout:
+        logger.warning(
+            "community detection timed out after %.1fs (%d nodes); skipping",
+            timeout_seconds,
+            G.number_of_nodes(),
+        )
+        return {
+            "communities": [],
+            "count": 0,
+            "skipped": True,
+            "reason": f"louvain_timeout_{timeout_seconds:.0f}s",
+        }
+    except Exception:
+        logger.warning("community detection failed; skipping", exc_info=True)
+        return {"communities": [], "count": 0, "skipped": True, "reason": "louvain_error"}
     # Deterministic order: sort communities by sorted member list.
     ordered = sorted(
         (sorted(c) for c in raw),
@@ -123,32 +170,89 @@ def compute_communities(
     return {"communities": communities, "count": len(communities)}
 
 
+def _pagerank_power_iteration(
+    edges: List[tuple],
+    *,
+    alpha: float = 0.85,
+    max_iter: int = 100,
+    tol: float = 1.0e-8,
+) -> Dict[str, float]:
+    """Deterministic pure-Python PageRank (networkx semantics, no numpy/scipy).
+
+    networkx's pagerank imports scipy→numpy at call time; installs without them
+    raise and previously zeroed every score. Fine for code-graph sizes.
+    """
+    nodes = sorted({n for pair in edges for n in pair})
+    if not nodes:
+        return {}
+    out_links: Dict[str, List[str]] = {n: [] for n in nodes}
+    for src, dst in edges:
+        out_links[src].append(dst)
+    count = len(nodes)
+    rank = dict.fromkeys(nodes, 1.0 / count)
+    for _ in range(max_iter):
+        prev = rank
+        dangling = sum(prev[n] for n in nodes if not out_links[n])
+        base = (1.0 - alpha) / count + alpha * dangling / count
+        rank = dict.fromkeys(nodes, base)
+        for src in nodes:
+            targets = out_links[src]
+            if not targets:
+                continue
+            share = alpha * prev[src] / len(targets)
+            for dst in targets:
+                rank[dst] += share
+        if sum(abs(rank[n] - prev[n]) for n in nodes) < count * tol:
+            break
+    return rank
+
+
 def pagerank_scores(graph: CodeGraph) -> Dict[str, float]:
-    """PageRank over the directed import+call graph (empty when networkx absent)."""
+    """PageRank over the directed import+call graph.
+
+    Prefers networkx; falls back to a pure-Python power iteration when
+    networkx (or its numpy/scipy solver deps) is unavailable. Ambiguous
+    edges are excluded so name-collision fan-out cannot dominate ranks.
+    """
+    structural = sorted(
+        {
+            (e.source, e.target)
+            for e in graph.edges
+            if _metric_edge(e) and e.source != e.target
+        }
+    )
+    if not structural:
+        return {}
+    raw: Dict[str, float] = {}
     try:
         import networkx as nx
-    except ImportError:
-        return {}
-    G = nx.DiGraph()
-    for e in graph.edges:
-        if e.kind in _STRUCTURAL_KINDS and e.source != e.target:
-            G.add_edge(e.source, e.target)
-    if G.number_of_nodes() == 0:
-        return {}
-    try:
-        return dict(nx.pagerank(G, alpha=0.85, max_iter=100))
+
+        G = nx.DiGraph()
+        G.add_edges_from(structural)
+        raw = dict(nx.pagerank(G, alpha=0.85, max_iter=100, tol=1.0e-8))
     except Exception:
-        logger.debug("pagerank failed", exc_info=True)
-        return {}
+        logger.debug(
+            "networkx pagerank unavailable; using pure-Python fallback", exc_info=True
+        )
+        raw = _pagerank_power_iteration(structural)
+    # Fixed precision so tiny solver/order noise cannot flip JSON bytes.
+    return {nid: round(float(score), 4) for nid, score in raw.items()}
 
 
 def god_nodes(graph: CodeGraph, *, top_n: int = 15) -> List[Dict[str, Any]]:
-    """Top-connected symbols/files: degree, fan-in/fan-out split, PageRank."""
+    """Top-connected production symbols/files: degree, fan-in/fan-out, PageRank.
+
+    Test-path nodes are excluded from the ranking — shared mocks and fixture
+    helpers accumulate huge fan-in and would otherwise crowd out real hubs.
+    Ambiguous edges are excluded for the same reason (collision fan-out).
+    """
+    from devcouncil.indexing.wiring import is_test_path
+
     degree: Counter[str] = Counter()
     fan_in: Counter[str] = Counter()
     fan_out: Counter[str] = Counter()
     for e in graph.edges:
-        if e.kind not in _STRUCTURAL_KINDS:
+        if not _metric_edge(e):
             continue
         degree[e.source] += 1
         degree[e.target] += 1
@@ -156,8 +260,17 @@ def god_nodes(graph: CodeGraph, *, top_n: int = 15) -> List[Dict[str, Any]]:
         fan_in[e.target] += 1
     pr = pagerank_scores(graph)
     by_id = graph.node_by_id()
+
+    def _is_test_node(nid: str) -> bool:
+        n = by_id.get(nid)
+        return is_test_path(n.path if n and n.path else _file_id(nid))
+
+    ranked = sorted(
+        ((nid, deg) for nid, deg in degree.items() if not _is_test_node(nid)),
+        key=lambda item: (-item[1], item[0]),
+    )[:top_n]
     out: List[Dict[str, Any]] = []
-    for nid, deg in degree.most_common(top_n):
+    for nid, deg in ranked:
         n = by_id.get(nid)
         out.append(
             {
@@ -165,7 +278,7 @@ def god_nodes(graph: CodeGraph, *, top_n: int = 15) -> List[Dict[str, Any]]:
                 "degree": deg,
                 "fan_in": fan_in.get(nid, 0),
                 "fan_out": fan_out.get(nid, 0),
-                "pagerank": round(pr.get(nid, 0.0), 6),
+                "pagerank": pr.get(nid, 0.0),
                 "kind": (
                     n.kind.value if n and hasattr(n.kind, "value") else (n.kind if n else "")
                 ),
@@ -303,7 +416,7 @@ def graph_check(graph: CodeGraph, *, top_n: int = 15) -> Dict[str, Any]:
 def _call_adjacency(graph: CodeGraph) -> Dict[str, List[str]]:
     adj: Dict[str, List[str]] = defaultdict(list)
     for e in graph.edges:
-        if e.kind in _CALL_KINDS:
+        if e.kind in _CALL_KINDS and _edge_confidence(e) in _METRIC_CONFIDENCE:
             adj[e.source].append(e.target)
     return {k: sorted(set(v)) for k, v in adj.items()}
 
@@ -401,10 +514,13 @@ def _enclosing_symbols(graph: CodeGraph, path: str) -> List[GraphNode]:
 
 
 def _inbound_adj(graph: CodeGraph) -> Dict[str, List[str]]:
-    """Callers/importers → reverse edges for blast radius."""
+    """Callers/importers → reverse edges for blast radius.
+
+    Ambiguous edges are omitted so collision fan-out does not inflate impact.
+    """
     rev: Dict[str, List[str]] = defaultdict(list)
     for e in graph.edges:
-        if e.kind in _STRUCTURAL_KINDS:
+        if _metric_edge(e):
             rev[e.target].append(e.source)
     return {k: sorted(set(v)) for k, v in rev.items()}
 
@@ -415,7 +531,12 @@ def blast_radius(
     *,
     max_depth: int = 3,
 ) -> Dict[str, Any]:
-    """Inbound blast radius at depths 1/2/3 with confidence tiers."""
+    """Inbound blast radius at depths 1/2/3 with confidence tiers.
+
+    Traversal follows extracted/inferred import+call edges only. Layer labels
+    remain depth-based (depth 1 extracted … depth 3 ambiguous) as a distance
+    heuristic, not a claim about edge confidence.
+    """
     rev = _inbound_adj(graph)
     by_depth: Dict[int, List[str]] = {1: [], 2: [], 3: []}
     confidence_for_depth = {1: "extracted", 2: "inferred", 3: "ambiguous"}
@@ -455,9 +576,9 @@ def blast_radius(
 def working_tree_changed_paths(root: Path) -> List[str]:
     """Repository-relative paths changed in the working tree (unstaged+staged)."""
     try:
-        from devcouncil.verification.verifier import Verifier
+        from devcouncil.verification.git_diff_fallback import GitDiffFallback
 
-        return [p.replace("\\", "/") for p in Verifier(root).get_changed_files()]
+        return [p.replace("\\", "/") for p in GitDiffFallback(root).get_changed_files()]
     except Exception:
         logger.debug("working tree paths failed", exc_info=True)
         return []
@@ -543,17 +664,5 @@ def enrich_graph_intel(
     return graph
 
 
-def community_label_for_area(graph: CodeGraph, area: str) -> str:
-    """Dominant community label among file nodes under ``area`` (generic subsystems)."""
-    counts: Counter[str] = Counter()
-    prefix = area.replace("\\", "/").rstrip("/") + "/"
-    for n in graph.nodes:
-        if not _is_file_node(n):
-            continue
-        path = (n.path or n.id).replace("\\", "/")
-        if path == area or path.startswith(prefix):
-            if n.community:
-                counts[n.community] += 1
-    if not counts:
-        return ""
-    return counts.most_common(1)[0][0]
+# Re-export leaf helper for callers that still import from intel.
+from devcouncil.indexing.graph.communities import community_label_for_area  # noqa: E402,F401

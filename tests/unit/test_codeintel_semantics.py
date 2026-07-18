@@ -510,3 +510,101 @@ def test_query_engine_returns_generation_source_path_and_impact(tmp_path: Path) 
     assert result["generation"] == 1
     assert "1: def target():" in result["definitions"][0]["source"]
     assert engine.search("target")["matches"][0]["name"] == "target"
+
+
+def test_semantic_owner_lookup_receives_only_path_local_nodes(tmp_path, monkeypatch) -> None:
+    import devcouncil.codeintel.resolution.semantic as semantic
+    from devcouncil.indexing.graph.build import build_code_graph
+
+    (tmp_path / "a.py").write_text("def a():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("def b():\n    return a()\n", encoding="utf-8")
+    original = semantic._enclosing
+
+    def checked(nodes, path, line):
+        assert all(node.path == path for node in nodes)
+        return original(nodes, path, line)
+
+    monkeypatch.setattr(semantic, "_enclosing", checked)
+    graph = build_code_graph(tmp_path)
+    assert {node.path for node in graph.nodes if node.path} == {"a.py", "b.py"}
+
+
+def test_semantic_enrich_budget_keeps_partial_and_records_meta(tmp_path: Path) -> None:
+    """An exhausted wall-clock budget stops the loop, keeps results, sets meta."""
+    for idx in range(3):
+        (tmp_path / f"m{idx}.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    nodes = [
+        GraphNode(id=f"m{idx}.py", kind=NodeKind.FILE, path=f"m{idx}.py", name=f"m{idx}.py")
+        for idx in range(3)
+    ]
+    graph = CodeGraph(nodes=nodes, edges=[])
+    enrich_semantic_edges(graph, root=tmp_path, budget_seconds=1e-9)
+    partial = graph.meta.get("semantic_enrich_partial")
+    assert partial is not None
+    assert partial["files_total"] == 3
+    assert partial["files_done"] < 3
+    # Untouched (or partially touched) graph still valid and returned intact.
+    assert len(graph.nodes) >= 3
+
+
+def test_semantic_enrich_no_budget_processes_all_files(tmp_path: Path) -> None:
+    (tmp_path / "m.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    nodes = [GraphNode(id="m.py", kind=NodeKind.FILE, path="m.py", name="m.py")]
+    graph = CodeGraph(nodes=nodes, edges=[])
+    enrich_semantic_edges(graph, root=tmp_path)
+    assert "semantic_enrich_partial" not in graph.meta
+
+
+def test_incremental_enrichment_does_not_resolve_to_persisted_pathless_bridges(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "bridge.ts").write_text(
+        "function invoke() { NativeModules.Camera.open(); }\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "setter.py").write_text(
+        "def configure(obj, handler):\n    setattr(obj, 'open', handler)\n",
+        encoding="utf-8",
+    )
+    graph = CodeGraph(nodes=[
+        GraphNode(id="bridge.ts", kind=NodeKind.FILE, path="bridge.ts", name="bridge.ts"),
+        GraphNode(
+            id="bridge.ts::invoke",
+            kind=NodeKind.FUNCTION,
+            path="bridge.ts",
+            name="invoke",
+            line=1,
+            end_line=1,
+        ),
+        GraphNode(id="setter.py", kind=NodeKind.FILE, path="setter.py", name="setter.py"),
+        GraphNode(
+            id="setter.py::configure",
+            kind=NodeKind.FUNCTION,
+            path="setter.py",
+            name="configure",
+            line=1,
+            end_line=2,
+        ),
+        GraphNode(
+            id="other.py::dynamic:setattr:1:0",
+            kind=NodeKind.DYNAMIC,
+            path="other.py",
+            name="open",
+            line=1,
+            end_line=1,
+        ),
+    ])
+
+    enrich_semantic_edges(graph, root=tmp_path)
+    assert any(node.id == "bridge::native-method:open" for node in graph.nodes)
+    enrich_semantic_edges(graph, root=tmp_path, paths={"setter.py"})
+
+    assert not any(
+        edge.kind == "reflects_to"
+        and edge.target
+        in {
+            "bridge::native-method:open",
+            "other.py::dynamic:setattr:1:0",
+        }
+        for edge in graph.edges
+    )

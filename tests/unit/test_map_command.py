@@ -28,26 +28,26 @@ def _git_repo(tmp_path: Path):
 
 
 def test_wiki_index_rel_none_when_absent(tmp_path, monkeypatch):
-    import devcouncil.cli.commands.wiki as wiki_cmd
-    monkeypatch.setattr(wiki_cmd, "wiki_dir_for", lambda root: tmp_path / "wiki")
+    import devcouncil.knowledge.wiki as wiki_mod
+    monkeypatch.setattr(wiki_mod, "wiki_dir_for", lambda root: tmp_path / "wiki")
     assert map_cmd._wiki_index_rel(tmp_path) is None
 
 
 def test_wiki_index_rel_returns_relative(tmp_path, monkeypatch):
-    import devcouncil.cli.commands.wiki as wiki_cmd
+    import devcouncil.knowledge.wiki as wiki_mod
     wiki = tmp_path / "wiki"
     wiki.mkdir()
     (wiki / "index.md").write_text("# wiki", encoding="utf-8")
-    monkeypatch.setattr(wiki_cmd, "wiki_dir_for", lambda root: wiki)
+    monkeypatch.setattr(wiki_mod, "wiki_dir_for", lambda root: wiki)
     assert map_cmd._wiki_index_rel(tmp_path) == "wiki/index.md"
 
 
 def test_wiki_index_rel_absolute_when_outside_root(tmp_path, monkeypatch):
-    import devcouncil.cli.commands.wiki as wiki_cmd
+    import devcouncil.knowledge.wiki as wiki_mod
     outside = tmp_path.parent / f"{tmp_path.name}_wiki_outside"
     outside.mkdir()
     (outside / "index.md").write_text("# wiki", encoding="utf-8")
-    monkeypatch.setattr(wiki_cmd, "wiki_dir_for", lambda root: outside)
+    monkeypatch.setattr(wiki_mod, "wiki_dir_for", lambda root: outside)
     # index.md is not under `root` → ValueError → returns the absolute string.
     result = map_cmd._wiki_index_rel(tmp_path)
     assert result == str(outside / "index.md")
@@ -191,20 +191,19 @@ def test_graph_context_unavailable(tmp_path, monkeypatch):
 
 
 def test_refresh_wiki_skeletons_no_wiki_is_noop(tmp_path, monkeypatch):
-    import devcouncil.cli.commands.wiki as wiki_cmd
-    monkeypatch.setattr(wiki_cmd, "wiki_dir_for", lambda root: tmp_path / "wiki")
+    import devcouncil.knowledge.wiki as wiki_mod
+    monkeypatch.setattr(wiki_mod, "wiki_dir_for", lambda root: tmp_path / "wiki")
     # No index.md → returns quietly.
     map_cmd._refresh_wiki_skeletons(tmp_path, SimpleNamespace())
 
 
 def test_refresh_wiki_skeletons_refreshes_stale(tmp_path, monkeypatch):
-    import devcouncil.cli.commands.wiki as wiki_cmd
     import devcouncil.knowledge.wiki as wiki_mod
 
     wiki = tmp_path / "wiki"
     wiki.mkdir()
     (wiki / "index.md").write_text("# wiki", encoding="utf-8")
-    monkeypatch.setattr(wiki_cmd, "wiki_dir_for", lambda root: wiki)
+    monkeypatch.setattr(wiki_mod, "wiki_dir_for", lambda root: wiki)
     monkeypatch.setattr(wiki_mod, "wiki_stale_pages", lambda root, repo_map, wiki_dir: ["page1"])
     monkeypatch.setattr(wiki_mod, "_project_name", lambda root: "Proj")
     monkeypatch.setattr(
@@ -218,10 +217,10 @@ def test_refresh_wiki_skeletons_refreshes_stale(tmp_path, monkeypatch):
 
 
 def test_refresh_wiki_skeletons_swallows_errors(tmp_path, monkeypatch):
-    import devcouncil.cli.commands.wiki as wiki_cmd
+    import devcouncil.knowledge.wiki as wiki_mod
     def boom(root):
         raise RuntimeError("wiki dir failed")
-    monkeypatch.setattr(wiki_cmd, "wiki_dir_for", boom)
+    monkeypatch.setattr(wiki_mod, "wiki_dir_for", boom)
     # Must never raise — wiki refresh is a convenience layer.
     map_cmd._refresh_wiki_skeletons(tmp_path, SimpleNamespace())
 

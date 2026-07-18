@@ -45,6 +45,18 @@ def test_js_regex_fallback_symbols_and_calls(force_regex):
     assert any(c.name == "method" and c.receiver == "obj" for c in ext.calls)
 
 
+def test_js_regex_jsx_component_references(force_regex):
+    src = (
+        "import { Card } from './card';\n"
+        "export function Page() {\n"
+        "  return <Card><Nested.Thing /></Card>;\n"
+        "}\n"
+    )
+    ext = extract_ts_js("src/page.tsx", src)
+    assert "Card" in ext.references
+    assert "Thing" in ext.references
+
+
 def test_js_regex_skips_keyword_calls(force_regex):
     src = "function run() { if (x) {} return y(); }\n"
     ext = extract_ts_js("a.js", src)

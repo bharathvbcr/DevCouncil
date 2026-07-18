@@ -74,6 +74,11 @@ _NO_TASK_ALLOWED_COMMANDS = (
     "git status",
     "git diff",
     "git diff *",
+    # Harmless status probes agents chain after allowlisted commands.
+    "echo",
+    "echo *",
+    "true",
+    ":",
 )
 
 # Lease lifecycle and repo maintenance commands are always allowed for the lease
@@ -93,6 +98,11 @@ _LEASE_LIFECYCLE_ALLOWED_COMMANDS = (
     "dev doctor *",
     "uv run dev doctor",
     "uv run dev doctor *",
+    # Orientation / graph inspection without a lease (MCP substitute path).
+    "dev graph",
+    "dev graph *",
+    "uv run dev graph",
+    "uv run dev graph *",
     "dev run-cmd *",
     "uv run dev run-cmd *",
     "python -m pytest *",
@@ -100,6 +110,52 @@ _LEASE_LIFECYCLE_ALLOWED_COMMANDS = (
     "uv run pytest *",
     "pytest *",
 )
+
+# Path-prefixed project CLIs (``.venv/bin/dev``, absolute hook paths) and ``uv run
+# --project …`` wrappers must match the same allowlist entries as bare ``dev …``.
+_UV_RUN_DIR_FLAG_RE = re.compile(
+    r"^(?P<head>uv\s+run)(?:\s+(?:--project|--directory|-p)\s+\S+)+(?P<tail>\s+.+)$"
+)
+_DEV_BINARIES = frozenset({"dev", "dev.exe", "devcouncil", "devcouncil.exe"})
+_CD_SEGMENT_RE = re.compile(r"^(?:cd|pushd|popd)(?:\s|$)")
+# Trailing shell redirections break fnmatch against ``dev map *``; strip for matching only.
+_REDIRECT_TAIL_RE = re.compile(
+    r"(?:\s+(?:\d*)(?:>>|>|<|&>|&>>)\s*\S+|\s+\d*>&\d+)+\s*$"
+)
+
+
+def normalize_allowlist_command(command: str) -> str:
+    """Collapse path-prefixed ``dev``/``devcouncil`` and ``uv run`` dir flags.
+
+    Hooks install absolute ``.venv/bin/dev`` paths; agents often copy that form into
+    Shell. Without normalization those commands miss ``dev map`` / ``dev status``
+    allowlist entries and fail closed until checkout.
+
+    Only rewrites bare ``dev``/``devcouncil`` tokens or executables under a ``bin`` /
+    ``Scripts`` directory — never a repo folder whose basename happens to be
+    ``DevCouncil``.
+    """
+    normalized = " ".join(command.split())
+    if not normalized:
+        return normalized
+    normalized = _REDIRECT_TAIL_RE.sub("", normalized).rstrip()
+    flagged = _UV_RUN_DIR_FLAG_RE.match(normalized)
+    if flagged is not None:
+        normalized = f"{flagged.group('head')}{flagged.group('tail')}"
+    tokens = normalized.split()
+    rewritten: list[str] = []
+    for token in tokens:
+        posix = token.replace("\\", "/")
+        path = Path(posix)
+        name = path.name.lower()
+        parent = path.parent.name.lower()
+        bare = "/" not in posix and name in _DEV_BINARIES
+        under_bin = name in _DEV_BINARIES and parent in {"bin", "scripts"}
+        if bare or under_bin:
+            rewritten.append("dev")
+        else:
+            rewritten.append(token)
+    return " ".join(rewritten)
 
 # Shared with HookPolicy — keep these as the single source of truth for
 # protected/secret path patterns.
@@ -185,12 +241,23 @@ class TaskPolicyEngine:
         self.global_allowed_commands = global_allowed_commands or []
 
     def evaluate_command(self, command: str, task: Task | None) -> PolicyDecision:
-        normalized = " ".join(command.split())
+        raw = " ".join(command.split())
+        normalized = normalize_allowlist_command(raw)
         if not normalized:
             return PolicyDecision(
                 action="deny",
                 reason="Empty command is not allowed.",
                 target=command,
+                task_id=task.id if task else None,
+            )
+
+        # ``cd`` / ``pushd`` / ``popd`` alone cannot write; agents chain them before
+        # allowlisted ``dev map`` (e.g. ``cd repo && .venv/bin/dev map``).
+        if _CD_SEGMENT_RE.match(normalized):
+            return PolicyDecision(
+                action="allow",
+                reason="Working-directory change is not gated.",
+                target=normalized,
                 task_id=task.id if task else None,
             )
 
@@ -215,18 +282,33 @@ class TaskPolicyEngine:
         if task is None:
             return PolicyDecision(
                 action="deny",
-                reason="Shell commands require an active task lease.",
+                reason=(
+                    "Shell commands require an active task lease. "
+                    "Bootstrap with `dev checkout <TASK>`, or use allowlisted "
+                    "orientation commands (`dev status`, `dev map`, `dev doctor`, "
+                    "`dev graph …`)."
+                ),
                 target=normalized,
             )
 
-        if any(fnmatch.fnmatch(normalized, allowed) for allowed in task.allowed_commands):
+        # Match allowlist entries against both raw and normalized forms so a task
+        # that lists `.venv/bin/dev *` still works, while path-prefixed `dev map`
+        # continues to hit lifecycle patterns after normalization.
+        task_patterns = list(task.allowed_commands)
+        if any(
+            fnmatch.fnmatch(normalized, allowed) or fnmatch.fnmatch(raw, allowed)
+            for allowed in task_patterns
+        ):
             return PolicyDecision(
                 action="allow",
                 reason="Command matches task allowed_commands.",
                 target=normalized,
                 task_id=task.id,
             )
-        if any(fnmatch.fnmatch(normalized, allowed) for allowed in self.global_allowed_commands):
+        if any(
+            fnmatch.fnmatch(normalized, allowed) or fnmatch.fnmatch(raw, allowed)
+            for allowed in self.global_allowed_commands
+        ):
             return PolicyDecision(
                 action="allow",
                 reason="Command matches global allowed commands.",

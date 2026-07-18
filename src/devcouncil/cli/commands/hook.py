@@ -595,11 +595,39 @@ def _status_line(root: Path) -> str | None:
             summary = graph.coverage_summary()
             state = StateRepository(session).get_state()
             phase = compute_phase(graph, state.current_phase if state else None)
-        return (
+        base = (
             f"DevCouncil — phase: {phase}; tasks: {summary['total_tasks']}; "
             f"gaps: {summary['total_gaps']} ({summary['blocking_gaps']} blocking). "
             "Use the devcouncil_* MCP tools and `dev` CLI to stay inside the verify loop."
         )
+        hints: list[str] = []
+        try:
+            from devcouncil.indexing.repo_mapper import RepoMapper
+            from devcouncil.utils.json_persist import read_json
+
+            map_path = root / ".devcouncil" / "repo_map.json"
+            if map_path.is_file():
+                loaded = read_json(map_path)
+                data = loaded if isinstance(loaded, dict) else {}
+                if RepoMapper(root).map_is_stale(data):
+                    hints.append("repo map stale — run `dev map` (or MCP graph_ingest)")
+            else:
+                hints.append("no repo map — run `dev map`")
+        except Exception:
+            pass
+        try:
+            from devcouncil.integrations.check import _cursor_config_status
+
+            status, fixable, _ = _cursor_config_status(root)
+            if status != "ok" and fixable:
+                hints.append(
+                    f"Cursor MCP {status} — run `dev integrate cursor --apply`"
+                )
+        except Exception:
+            pass
+        if hints:
+            return f"{base} Continuity — {'; '.join(hints)}."
+        return base
     except Exception:
         return None
 

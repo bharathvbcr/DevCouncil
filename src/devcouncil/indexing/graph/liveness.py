@@ -10,7 +10,7 @@ import re
 from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, cast
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, cast
 
 from devcouncil.indexing.graph.extract_python import (
     ExtractedCall,
@@ -28,6 +28,27 @@ from devcouncil.indexing.graph.schema import (
 
 logger = logging.getLogger(__name__)
 
+# React class lifecycle methods — framework-invoked; no inbound call edges.
+_REACT_LIFECYCLE_METHODS = frozenset(
+    {
+        "render",
+        "componentDidMount",
+        "componentDidUpdate",
+        "componentWillUnmount",
+        "shouldComponentUpdate",
+        "getSnapshotBeforeUpdate",
+        "componentDidCatch",
+        "getDerivedStateFromProps",
+        "getDerivedStateFromError",
+        "UNSAFE_componentWillMount",
+        "UNSAFE_componentWillReceiveProps",
+        "UNSAFE_componentWillUpdate",
+        "componentWillMount",
+        "componentWillReceiveProps",
+        "componentWillUpdate",
+    }
+)
+
 _CONFIDENCE_RANK = {
     Confidence.AMBIGUOUS: 0,
     Confidence.INFERRED: 1,
@@ -36,6 +57,54 @@ _CONFIDENCE_RANK = {
     "inferred": 1,
     "extracted": 2,
 }
+
+# Default: if unreachable covers ≥25% of liveness code files, static BFS is
+# too blind (dynamic imports / routers / JSX) — omit the flood.
+_DEFAULT_UNREACHABLE_UNRELIABLE_RATIO = 0.25
+# Ratio alone misreads small repos: 1 dead file out of 3 is real signal, not
+# analysis blindness. Only gate when the absolute flood is at least this big.
+_MIN_UNREACHABLE_FOR_RATIO_GATE = 5
+
+
+def _unreachable_unreliable_ratio(root: Path) -> float:
+    try:
+        from devcouncil.app.config import load_config
+
+        return float(load_config(root).indexing.unreachable_unreliable_ratio)
+    except Exception:
+        return _DEFAULT_UNREACHABLE_UNRELIABLE_RATIO
+
+
+def _apply_unreachable_ratio_gate(
+    root: Path,
+    files: List[str],
+    unreachable: List[str],
+    unreliable: bool,
+) -> Tuple[List[str], bool, dict]:
+    """Fail-soft when unreachable density indicates analysis blind spots."""
+    from devcouncil.indexing.wiring import is_liveness_code_file
+
+    code_files = sum(1 for f in files if is_liveness_code_file(f))
+    ratio = (len(unreachable) / code_files) if code_files else 0.0
+    threshold = _unreachable_unreliable_ratio(root)
+    meta: Dict[str, Any] = {
+        "unreachable_total": len(unreachable),
+        "liveness_code_files": code_files,
+        "unreachable_ratio": round(ratio, 4),
+        "unreachable_ratio_threshold": threshold,
+    }
+    if unreliable:
+        meta["unreachable_unreliable_reason"] = "empty_production_entry_roots"
+        return [], True, meta
+    if (
+        threshold > 0
+        and code_files > 0
+        and len(unreachable) >= _MIN_UNREACHABLE_FOR_RATIO_GATE
+        and ratio >= threshold
+    ):
+        meta["unreachable_unreliable_reason"] = "high_unreachable_ratio"
+        return [], True, meta
+    return unreachable, False, meta
 
 
 def file_liveness(
@@ -53,6 +122,9 @@ def file_liveness(
     When production entry roots are empty, unreachable BFS would flood every
     non-root file. Fail soft: ``unreachable=[]`` and
     ``unreachable_unreliable=True`` (still compute unwired).
+
+    When unreachable density exceeds ``indexing.unreachable_unreliable_ratio``
+    (default 0.25), also fail soft — treat the list as low-confidence noise.
     """
     from devcouncil.indexing.wiring import (
         build_dynamic_import_index,
@@ -117,10 +189,20 @@ def file_liveness(
                 continue
             if f in reachable:
                 continue
+            # Dynamic entrypoints / markers clear unwired; keep unreachable in parity.
+            if has_allow_unwired(root, f):
+                continue
+            if reference_cleared(
+                root, f, skip_files=set(), git_files=files, dynamic_index=dyn_index
+            ):
+                continue
             unreachable.append(f)
             if limit is not None and len(unreachable) >= limit:
                 break
 
+    unreachable, unreachable_unreliable, _ratio_meta = _apply_unreachable_ratio_gate(
+        root, files, unreachable, unreachable_unreliable
+    )
     return prod_roots, unwired, unreachable, unreachable_unreliable
 
 
@@ -239,6 +321,13 @@ def token_dead_from_shards(
     shards: dict[str, dict[str, object]],
 ) -> Tuple[List[str], List[str], Set[str]]:
     """Compute token agreement from persisted per-file token occurrence shards."""
+    from devcouncil.indexing.wiring import (
+        is_private_symbol,
+        is_test_path,
+        is_vendored_path,
+        is_wiring_decorated,
+    )
+
     token_files: Dict[str, Set[str]] = defaultdict(set)
     token_lines: Dict[str, Dict[str, Set[int]]] = defaultdict(lambda: defaultdict(set))
     for path, shard in shards.items():
@@ -248,11 +337,35 @@ def token_dead_from_shards(
             token_files[str(name)].add(path)
             if isinstance(lines, list):
                 token_lines[str(name)][path].update(int(line) for line in lines)
-    definitions = [
-        node for node in nodes
-        if node.kind in {NodeKind.FUNCTION, NodeKind.CLASS}
-        and "." not in str(node.extras.get("qualname") or node.name)
-    ]
+    # Read all_exports from the raw shard payload: rebuilding a FileExtraction
+    # here would instantiate every symbol/call dataclass in the repo per sync.
+    protected_by_path: Dict[str, Set[str]] = {}
+    for path, shard in shards.items():
+        raw_extraction = shard.get("extraction")
+        exports = (
+            raw_extraction.get("all_exports") if isinstance(raw_extraction, dict) else None
+        )
+        protected_by_path[path] = set(exports or [])
+    definitions: List[GraphNode] = []
+    for node in nodes:
+        suffix = Path(node.path).suffix.lower()
+        if node.kind not in {NodeKind.FUNCTION, NodeKind.CLASS}:
+            continue
+        if suffix not in {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+            continue
+        if is_test_path(node.path) or is_vendored_path(node.path):
+            continue
+        if "." in str(node.extras.get("qualname") or node.name):
+            continue
+        if is_private_symbol(node.name):
+            continue
+        if node.name in protected_by_path.get(node.path, set()):
+            continue
+        if is_wiring_decorated(list(node.extras.get("decorators") or [])):
+            continue
+        if suffix != ".py" and not node.exported:
+            continue
+        definitions.append(node)
     dead: List[str] = []
     keys: Set[str] = set()
     for node in definitions:
@@ -267,19 +380,57 @@ def token_dead_from_shards(
     return dead, sorted(f"{node.path}::{node.name}" for node in definitions), keys
 
 
+def project_call_edges_to_files(edges: Iterable[Any]) -> Set[Tuple[str, str]]:
+    """Confidently-resolved cross-file call edges collapsed to file pairs.
+
+    Import edges alone miss languages where files call across the same package
+    without importing (Go); union these pairs into file-level liveness edges so
+    a called file counts as wired. Ambiguous resolutions are excluded — an
+    uncertain call must not mark a file live. Shared by the full build and the
+    incremental sync so the two paths cannot diverge.
+    """
+    out: Set[Tuple[str, str]] = set()
+    for e in edges:
+        if getattr(e, "kind", None) != "calls":
+            continue
+        if getattr(e.confidence, "value", e.confidence) == "ambiguous":
+            continue
+        src_file = e.source.split("::", 1)[0]
+        dst_file = e.target.split("::", 1)[0]
+        if src_file != dst_file:
+            out.add((src_file, dst_file))
+    return out
+
+
 def file_liveness_from_shards(
     files: List[str],
     file_edges: List[Tuple[str, str]],
     shards: dict[str, dict[str, object]],
     *,
+    root: Path,
     entry_roots: List[str],
+    production_entry_roots: List[str],
+    dynamic_index: Optional[dict[str, Set[str]]] = None,
 ) -> Tuple[List[str], List[str], List[str], bool]:
     """Recompute file reachability from persisted adjacency without source scans."""
-    from devcouncil.indexing.wiring import is_liveness_code_file, is_test_path, structural_exemptions
+    from devcouncil.indexing.wiring import (
+        is_liveness_code_file,
+        is_test_path,
+        reference_cleared,
+        structural_exemptions,
+    )
 
-    roots = [path for path in entry_roots if path in set(files)]
-    unreliable = not bool(roots)
+    file_set = set(files)
+    roots = [path for path in entry_roots if path in file_set]
+    production_roots = [path for path in production_entry_roots if path in file_set]
+    unreliable = not bool(production_roots)
     root_set = set(roots)
+    production_root_set = set(production_roots)
+    effective_dynamic_index = (
+        dynamic_import_index_from_shards(shards)
+        if dynamic_index is None
+        else dynamic_index
+    )
     inbound: Dict[str, Set[str]] = defaultdict(set)
     outbound: Dict[str, Set[str]] = defaultdict(set)
     for importer, imported in file_edges:
@@ -292,9 +443,10 @@ def file_liveness_from_shards(
         and not structural_exemptions(path)
         and not bool(shards.get(path, {}).get("allow_unwired"))
         and not {item for item in inbound.get(path, ()) if not is_test_path(item)}
+        and not reference_cleared(root, path, dynamic_index=effective_dynamic_index)
     ]
     reachable: Set[str] = set()
-    queue = list(roots)
+    queue = list(production_roots)
     while queue:
         path = queue.pop()
         if path in reachable:
@@ -305,10 +457,16 @@ def file_liveness_from_shards(
         path for path in sorted(files)
         if is_liveness_code_file(path)
         and path not in root_set
+        and path not in production_root_set
         and not structural_exemptions(path)
         and path not in reachable
+        and not bool(shards.get(path, {}).get("allow_unwired"))
+        and not reference_cleared(root, path, dynamic_index=effective_dynamic_index)
     ]
-    return roots, unwired, unreachable, unreliable
+    unreachable, unreliable, _ratio_meta = _apply_unreachable_ratio_gate(
+        root, files, unreachable, unreliable
+    )
+    return production_roots, unwired, unreachable, unreliable
 
 
 def _resolve_reexport_targets(
@@ -611,6 +769,16 @@ def symbol_reachability_dead(
     changed = True
     while changed:
         changed = False
+        for node in nodes:
+            alias = str(node.extras.get("identity_alias") or "")
+            if not alias:
+                continue
+            if node.id in live and alias not in live:
+                live.add(alias)
+                changed = True
+            elif alias in live and node.id not in live:
+                live.add(node.id)
+                changed = True
         for target, srcs in inbound_live_edges.items():
             if target in live:
                 continue
@@ -670,6 +838,8 @@ def symbol_reachability_dead(
         if node.kind == NodeKind.METHOD:
             if is_dunder_symbol(node.name):
                 continue
+            if node.name in _REACT_LIFECYCLE_METHODS:
+                continue
             if referenced_by_name:
                 dead.append(
                     DeadCodeEntry(
@@ -683,14 +853,23 @@ def symbol_reachability_dead(
                 )
                 continue
             if only_dead_callers:
+                # Reachable file + "dead" callers usually means incomplete call
+                # edges (JSX/React), not a real cascade from a dead root.
+                file_reachable = node.path.replace("\\", "/") not in unreachable_set
                 dead.append(
                     DeadCodeEntry(
                         id=node.id,
                         path=node.path,
                         line=node.line,
                         kind="method",
-                        confidence=Confidence.INFERRED,
-                        reason="only callers are dead",
+                        confidence=(
+                            Confidence.AMBIGUOUS if file_reachable else Confidence.INFERRED
+                        ),
+                        reason=(
+                            "only callers look dead (reachable file; possible incomplete call graph)"
+                            if file_reachable
+                            else "only callers are dead"
+                        ),
                     )
                 )
                 continue
@@ -708,14 +887,21 @@ def symbol_reachability_dead(
 
         # Top-level function/class
         if only_dead_callers:
+            file_reachable = node.path.replace("\\", "/") not in unreachable_set
             dead.append(
                 DeadCodeEntry(
                     id=node.id,
                     path=node.path,
                     line=node.line,
                     kind=node.kind.value,
-                    confidence=Confidence.INFERRED,
-                    reason="only callers are dead",
+                    confidence=(
+                        Confidence.AMBIGUOUS if file_reachable else Confidence.INFERRED
+                    ),
+                    reason=(
+                        "only callers look dead (reachable file; possible incomplete call graph)"
+                        if file_reachable
+                        else "only callers are dead"
+                    ),
                 )
             )
             continue
@@ -768,29 +954,23 @@ def legacy_dead_strings(
     Preserves ``path:line name`` strings for verify-gate / ratchet compatibility.
     Methods (inferred) are excluded from the legacy list.
     ``cap`` defaults to uncapped; apply caps only when serializing ``repo_map.json``.
+
+    When the graph has no extracted-tier dead symbols, return an empty list rather
+    than flooding agents with token-only false positives.
     """
     extracted_paths_names = {
         (d.path, d.id.split("::")[-1].split(".")[-1])
         for d in dead_code
         if d.confidence == Confidence.EXTRACTED
     }
+    if not extracted_paths_names:
+        return []
     out: List[str] = []
     for entry in token_dead:
         loc, _, name = entry.partition(" ")
         path, _, _line = loc.rpartition(":")
         if (path, name) in extracted_paths_names:
             out.append(entry)
-        elif not extracted_paths_names:
-            # Graph had nothing — fall back to full token list (keep tests green
-            # when graph extraction is empty / disabled).
-            out.append(entry)
-    # If intersection emptied everything but token had hits and graph had
-    # extracted entries that didn't match format — keep token list for safety.
-    if not out and token_dead and not any(
-        d.confidence == Confidence.EXTRACTED for d in dead_code
-    ):
-        out = list(token_dead)
-
     if cap is not None and cap > 0:
         return out[:cap]
     return out

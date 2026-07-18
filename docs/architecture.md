@@ -10,12 +10,12 @@ DevCouncil is a gated orchestrator for AI-assisted software development. It ensu
 - **Planning Council**: Multi-agent LLM debate for planning and critique.
 - **Executors**: Adapters to run tasks via manual sidecar, mini-SWE-agent, OpenHands, native-preview, coding CLI execution, and registered bring-your-own CLI agents. See [coding-cli-integration.md](coding-cli-integration.md) for tiers and adapters.
 - **Verifier & Gating**: Git cleanliness, authorized file modifications, test evidence, diff↔coverage, and secret scanning. Map/graph checks also surface unwired files, stale maps (missing map is stale — fail-closed on hard rigor), wiring gaps, dead-symbol candidates, and corpus/doc-ref gates when enabled. Stop-gate claim checks map completion text to independent command/filesystem probes (see [Claim verification](#claim-verification-preview)). Write policy soft-blocks paths outside planned files unless same subsystem or map `neighbors`.
-- **Repository map & code graph**: `dev map` writes `.devcouncil/repo_map.json` (subsystems, entry roots, liveness lists capped at 5000/256) and a symbol-level `.devcouncil/graph/code_graph.json`. Unified ingest: `dev graph ingest`. Query with `dev graph query|trace|dead|check|process|impact|search|cypher|html|view|demo`. Opt-in PDG/taint: `dev map --pdg`, `dev graph pdg-query` / `explain`. Preview: `dev graph demo` (sample UI) or `dev map && dev graph view` (your repo). See [code-graph.md](code-graph.md).
+- **Repository map & code graph** (Stable): `dev map` writes `.devcouncil/repo_map.json` (subsystems, entry roots, liveness lists capped at 5000/256) and a symbol-level `.devcouncil/graph/code_graph.json`. Unified ingest: `dev graph ingest`. Query with `dev graph query|trace|dead|check|process|impact|search|cypher|html|view|demo`. Opt-in PDG/taint remains Preview: `dev map --pdg`, `dev graph pdg-query` / `explain`. Sample UI: `dev graph demo` or `dev map && dev graph view`. See [code-graph.md](code-graph.md).
 - **Corpus side index**: Advisory doc/PDF/image graph via `dev corpus build`/`query`/`status`, with optional rigor gates. See [corpus.md](corpus.md).
 - **Knowledge formats**: Open Knowledge Format (OKF) export/ingest/validate/html and `design.md` design-system lint/export/check, injected into planning and coding prompts. Bidirectional OKF ↔ skills bridge via `dev okf export --skills` / `dev okf ingest`. Commands: `dev okf *`, `dev design *`.
 - **Engineering skills**: Bundled domain skills scaffolded into `.claude/skills/` and embedded in `dev prompt` output.
 
-### Code graph visualizer (preview)
+### Code graph visualizer
 
 ```mermaid
 flowchart LR

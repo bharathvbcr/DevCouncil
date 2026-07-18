@@ -168,6 +168,20 @@ def test_probe_and_resolve_js_relative(mapper):
     assert mapper._resolve_js_spec("src/app.ts", "lodash", file_set) is None
 
 
+def test_probe_js_candidates_rewrites_js_suffix_to_ts(mapper):
+    """TypeScript ESM: import './auth.js' must resolve to auth.ts on disk."""
+    file_set = {"src/server/auth.ts", "src/server/index.ts", "src/ui/Button.tsx"}
+    assert mapper._probe_js_candidates("src/server/auth.js", file_set) == "src/server/auth.ts"
+    assert (
+        mapper._resolve_js_spec("src/server/index.ts", "./auth.js", file_set)
+        == "src/server/auth.ts"
+    )
+    assert (
+        mapper._resolve_js_spec("src/app.ts", "./ui/Button.js", file_set)
+        == "src/ui/Button.tsx"
+    )
+
+
 def test_extract_js_import_and_reexport_specs(mapper):
     src = (
         "import { a } from './a';\n"
@@ -222,6 +236,17 @@ def test_detect_frameworks(tmp_path):
     fw = m.detect_frameworks(["package.json", "pyproject.toml"])
     assert "nextjs" in fw and "react" in fw
     assert "fastapi" in fw and "flask" in fw
+
+
+def test_detect_frameworks_survives_unreadable_and_non_utf8_configs(tmp_path):
+    # package.json listed but absent on disk (racing checkout) → no crash.
+    m = RepoMapper(tmp_path)
+    assert m.detect_frameworks(["package.json"]) == []
+
+    # Non-UTF8 bytes in a config file must not fail the map either.
+    (tmp_path / "package.json").write_bytes(b'{"dependencies": {"react": "\xff"}}')
+    m2 = RepoMapper(tmp_path)
+    assert "react" in m2.detect_frameworks(["package.json"])
 
 
 def test_detect_package_managers(mapper):
@@ -1087,7 +1112,7 @@ def test_build_generic_subsystems_skips_trivial_aux_and_adds_community(tmp_path,
 
     m._last_code_graph = _CG()
     monkeypatch.setattr(
-        "devcouncil.indexing.graph.intel.community_label_for_area",
+        "devcouncil.indexing.graph.communities.community_label_for_area",
         lambda cg, area: "auth-flow",
     )
     subs2 = m._build_generic_subsystems(files)
@@ -1230,3 +1255,117 @@ def test_map_repo_with_goal_and_scan_dependencies(tmp_path, monkeypatch):
     repo_map = m.map_repo(goal="token auth", scan_dependencies=True, liveness=False)
     assert any("search_target.py" in c["path"] for c in repo_map.candidate_files)
     assert repo_map.dependency_risks
+
+
+def test_devprism_shaped_fidelity_baseline(tmp_path):
+    """Pre-fix baseline for nested @/ aliases, dynamic imports, Worker URL, Tauri lib.rs, cold start."""
+    import json
+    import subprocess
+
+    from typer.testing import CliRunner
+
+    from devcouncil.cli.commands import graph_cmd
+    from devcouncil.indexing.graph.schema import CodeGraph, GraphNode, NodeKind
+    from devcouncil.indexing.wiring import entry_roots
+
+    files = {
+        "apps/desktop/tsconfig.json": json.dumps(
+            {
+                "compilerOptions": {"paths": {"@/*": ["./src/*"]}},
+                "include": ["src"],
+            }
+        ),
+        "apps/desktop/vite.config.ts": (
+            "export default { resolve: { alias: { '@': './src' } } }\n"
+        ),
+        "apps/desktop/package.json": json.dumps({"name": "desktop"}),
+        "apps/desktop/src/main.tsx": "import App from './App'\n",
+        "apps/desktop/src/App.tsx": (
+            "import { Button } from '@/components/ui/button'\n"
+            "const Layout = () => import('@/components/workspace/workspace-layout')\n"
+            "export default function App(){ return null }\n"
+        ),
+        "apps/desktop/src/components/ui/button.tsx": "export const Button = () => null\n",
+        "apps/desktop/src/components/workspace/workspace-layout.tsx": (
+            "export default function W(){ return null }\n"
+        ),
+        "apps/desktop/src/lib/mupdf/mupdf-client.ts": (
+            "const worker = new Worker(new URL('./mupdf-worker.ts', import.meta.url))\n"
+        ),
+        "apps/desktop/src/lib/mupdf/mupdf-worker.ts": "self.onmessage = () => {}\n",
+        "apps/desktop/src-tauri/Cargo.toml": (
+            "[package]\nname = \"claude-prism-desktop\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n"
+            "[lib]\nname = \"claude_prism_desktop_lib\"\n"
+            "crate-type = [\"staticlib\", \"cdylib\", \"rlib\"]\n"
+        ),
+        "apps/desktop/src-tauri/src/main.rs": (
+            "fn main() {\n    claude_prism_desktop_lib::run()\n}\n"
+        ),
+        "apps/desktop/src-tauri/src/lib.rs": "mod claude;\npub fn run() {}\n",
+        "apps/desktop/src-tauri/src/claude.rs": "#[tauri::command]\npub fn cmd() {}\n",
+    }
+    for rel, content in files.items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "add", "-A"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    mapper = RepoMapper(tmp_path)
+    file_list = sorted(files)
+    file_set = set(file_list)
+    rules = mapper._load_js_path_aliases()
+    hit = mapper._resolve_js_alias("@/components/ui/button", file_set)
+    edges = mapper._js_import_edges(file_list, file_set)
+    roots = entry_roots(tmp_path, file_list)
+
+    cg = tmp_path / ".devcouncil" / "graph"
+    cg.mkdir(parents=True, exist_ok=True)
+    (cg / "code_graph.json").write_text(
+        CodeGraph(
+            nodes=[
+                GraphNode(
+                    id="apps/desktop/src/main.tsx",
+                    kind=NodeKind.FILE,
+                    path="apps/desktop/src/main.tsx",
+                    name="main.tsx",
+                )
+            ]
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+    result = CliRunner().invoke(
+        graph_cmd.app, ["status", "--project-root", str(tmp_path), "--json"]
+    )
+    try:
+        status_state = json.loads(result.stdout or result.output or "{}").get("state")
+    except Exception:
+        status_state = None
+
+    assert hit == "apps/desktop/src/components/ui/button.tsx"
+    assert (
+        "apps/desktop/src/App.tsx",
+        "apps/desktop/src/components/ui/button.tsx",
+    ) in edges
+    assert (
+        "apps/desktop/src/App.tsx",
+        "apps/desktop/src/components/workspace/workspace-layout.tsx",
+    ) in edges
+    assert (
+        "apps/desktop/src/lib/mupdf/mupdf-client.ts",
+        "apps/desktop/src/lib/mupdf/mupdf-worker.ts",
+    ) in edges
+    assert any(r.endswith("lib.rs") for r in roots)
+    assert any(r.endswith("main.rs") for r in roots)
+    assert status_state == "committed"

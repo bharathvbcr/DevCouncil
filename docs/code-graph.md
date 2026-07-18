@@ -7,7 +7,7 @@ DevCouncil builds a deterministic repository map and a symbol-level knowledge gr
 | Path | Role |
 | :--- | :--- |
 | `.devcouncil/repo_map.json` | File inventory, subsystems, entry roots, unwired/unreachable/dead-symbol candidate lists, reverse-import dependents |
-| `.devcouncil/graph/code_graph.json` | Symbol nodes + edges (imports, named imports, calls, inherits, contains) and tiered `dead_code` |
+| `.devcouncil/graph/code_graph.json` | Compact compatibility export of symbol nodes + edges (imports, named imports, calls, inherits, contains) and tiered `dead_code`. **SQLite is canonical**; this JSON is a size-sensitive export (`indexing.compact_graph_json`, default on; 128 MiB default limit). Oversized graphs fall back through slim → compact → stub tiers so a pointer JSON is still written; prefer SQLite-backed `dev graph` commands when the stub tier is used. |
 | `.devcouncil/codeintel/index.sqlite` | Canonical WAL-mode graph, source cache, FTS, generations, unresolved references, diagnostics, and fingerprinted runtime observations |
 | `.devcouncil/graph/graph.html` | Self-contained interactive visualizer (`dev graph html`; **not** written by default on `dev map`) |
 | `AGENTS.md` / `CLAUDE.md` | Marker-guarded workspace guides kept in sync with the map |
@@ -81,6 +81,11 @@ dev graph check                    # god nodes + circular imports
 dev graph process                  # BFS call-flows from entry roots
 dev graph impact src/foo.py        # blast radius
 dev graph impact --diff            # blast radius for working-tree changes
+```
+
+`dev graph check` / `process` / `impact` (and PageRank inside god-node ranking) follow **extracted** and **inferred** import/call edges only. Ambiguous call fan-out stays in the store for explanation UIs but does not invent hubs or inflate blast radius.
+
+```bash
 dev graph html                     # write graph.html
 dev graph view                     # serve/open the HTML
 dev graph export -o out.graphml    # GraphML (or --format okf)
@@ -95,7 +100,9 @@ dev graph affected src/foo.py      # tests in the inbound impact closure
 
 SQLite is canonical; graph v2 JSON remains a deterministic compatibility export. A refresh writes a complete generation in one transaction and advances the current-generation pointer only after every file, node, edge, liveness record, and FTS row is committed. Readers therefore see the complete previous or complete next graph. The store retains two committed generations for rollback/debugging and caches compressed source and extraction facts by content, grammar, analyzer, and configuration hashes.
 
-MCP starts one project watcher for its server lifespan. Queries wait up to two seconds for a pending batch; if syncing cannot finish, responses retain the last committed generation and identify pending/degraded state. The same Git-aware scope filter handles the initial index, FSEvents/inotify/ReadDirectoryChangesW events, reconciliation, ignored directories, atomic saves, and deletes. Incremental sync replaces changed files plus their reverse-import closure, unresolved-reference candidates, and matching framework registries; unaffected static edges are copied forward without re-resolution. New subsystem topology or a scope above 20% of indexed code files deliberately falls back to a clean rebuild.
+MCP starts one project watcher for its server lifespan. Queries wait up to two seconds for a pending batch without blocking the async server; if syncing cannot finish, responses retain the last committed generation and identify pending/degraded state. Full builds run in a supervised child that **acquires the per-project writer lease itself**; the parent releases any held lease while supervising so an orphaned worker still serializes against watchers/MCP writers. Lease acquisition uses bounded exponential backoff (`code_intelligence.writer_lease_timeout_seconds`, default 30s for builds / re-acquire; `writer_lease_sync_timeout_seconds`, default 5s for watch `sync_now`) so multi-watcher contention does not stamp lean/degraded maps over a healthy SQLite generation. After the child commits, the parent reloads the graph under the re-acquired lease. The parent terminates a build after 90 seconds without progress or 15 minutes total, preserving the last committed generation. `dev graph status` / `dev graph doctor` expose phase, progress, worker PID, and compatibility-export health (missing/drift/degraded/corrupt). External edits to `code_graph.json` do **not** clobber SQLite — the store wins unless the store is empty. `dev graph watch` and `dev map --watch` both refresh graph **and** rebuild `repo_map.json` subsystems/dependents.
+
+Incremental sync is deliberately conservative. Body-only edits with an unchanged declaration/import resolution surface replace the affected closure in-process. Creates, deletes, renames, or changes to symbols, bases, decorators, exports, imports, re-exports, or aliases trigger a full resolve from warm extraction caches. Persisted analysis shards are pruned to the current non-vendored code-file set before either path. Configure the boundaries with `indexing.build_isolation: hybrid`, `indexing.build_stall_timeout_seconds`, `indexing.build_total_timeout_seconds`, and `indexing.graph_json_max_bytes`.
 
 The 35-language grammar matrix is delivered through platform-specific
 `devcouncil-codeintel-grammars` wheels. Every pull request and push explicitly

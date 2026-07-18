@@ -60,12 +60,22 @@ def refresh_stale_map_if_needed(
         if map_path.is_file() and not mapper.map_is_stale(data):
             return False
 
-        from devcouncil.cli.commands.map import generate_map_artifacts
+        from devcouncil.indexing.map_artifacts import generate_map_artifacts
 
         generate_map_artifacts(project_root, map_path, quiet=True)
         return True
-    except Exception:
-        logger.debug("map refresh failed", exc_info=True)
+    except Exception as exc:
+        # Concurrent MCP/watcher builds commonly hold the writer lease during
+        # checkout/verify. Defer quietly — map stays stale until the next
+        # successful refresh rather than failing the lease acquisition path.
+        try:
+            from devcouncil.codeintel.build_control import GraphBuildBusy
+        except Exception:
+            GraphBuildBusy = ()  # type: ignore[misc, assignment]
+        if isinstance(exc, GraphBuildBusy):
+            logger.info("map refresh deferred (writer lease busy): %s", exc)
+            return False
+        logger.warning("map refresh failed", exc_info=True)
         return False
 
 
@@ -119,9 +129,10 @@ def refresh_repo_map_from_graph(
         repo_map.dead_symbol_candidates = list(
             graph.meta.get("legacy_dead_symbol_candidates") or []
         )[:cap]
-        repo_map.generated_head = graph.generated_head
-        repo_map.indexed_hash = graph.indexed_hash
-        repo_map.content_fingerprint = graph.content_fingerprint
+        # Do NOT stamp fingerprints or clear graph_degraded here. A later
+        # ``mapper.map_repo`` failure in ``refresh_map_artifacts`` would otherwise
+        # leave a fingerprint-fresh, non-degraded map while subsystems are stale.
+        # Full map writes own the freshness handshake.
         write_model_json(path, repo_map)
     except Exception:
         logger.warning("incremental repo-map compatibility refresh failed", exc_info=True)

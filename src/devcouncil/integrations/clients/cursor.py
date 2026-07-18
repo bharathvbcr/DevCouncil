@@ -39,14 +39,45 @@ def _cursor_config_path(project_root: Path) -> Path:
     return project_root / ".cursor" / "mcp.json"
 
 
+def _cursor_mcp_command(project_root: Path) -> str:
+    """Prefer the project venv ``devcouncil`` binary for Cursor MCP stdio.
+
+    Absolute paths survive Cursor sessions that lack the project venv on PATH;
+    bare ``devcouncil`` still works when PATH is set. Status checks accept both.
+    """
+    from devcouncil.integrations.clients.common import resolve_dev_executable
+
+    resolved = Path(resolve_dev_executable(project_root))
+    name = resolved.name.lower()
+    if name in {"dev", "dev.exe"}:
+        sibling = resolved.with_name("devcouncil.exe" if name.endswith(".exe") else "devcouncil")
+        if sibling.is_file():
+            return str(sibling)
+    if name in {"devcouncil", "devcouncil.exe"}:
+        return str(resolved)
+    # Fall back to PATH name when no local binary exists.
+    return "devcouncil"
+
+
 def _cursor_mcp_config(project_root: Path) -> dict:
+    root = project_root.expanduser().resolve()
+    if os.name == "nt":
+        venv_bin = root / ".venv" / "Scripts"
+    else:
+        venv_bin = root / ".venv" / "bin"
+    path_prefix = str(venv_bin) if venv_bin.is_dir() else ""
+    existing_path = os.environ.get("PATH", "/usr/bin:/bin")
+    env_path = f"{path_prefix}{os.pathsep}{existing_path}" if path_prefix else existing_path
     return {
         "mcpServers": {
             "devcouncil": {
                 "type": "stdio",
-                "command": "devcouncil",
+                "command": _cursor_mcp_command(root),
                 "args": ["mcp-server"],
-                "env": {"DEVCOUNCIL_PROJECT_ROOT": str(project_root)},
+                "env": {
+                    "DEVCOUNCIL_PROJECT_ROOT": str(root),
+                    "PATH": env_path,
+                },
             }
         }
     }

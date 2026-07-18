@@ -7,7 +7,7 @@ from typing import Any
 
 
 def wiki_dir_for(root: Path) -> Path:
-    from devcouncil.cli.commands.wiki import wiki_dir_for as _wiki_dir_for
+    from devcouncil.knowledge.wiki import wiki_dir_for as _wiki_dir_for
 
     return _wiki_dir_for(root)
 

@@ -56,9 +56,33 @@ def test_allow_lease_lifecycle_commands_with_or_without_task(tmp_path: Path):
         "uv run dev map",
         "dev doctor",
         "uv run dev doctor",
+        "dev graph status",
+        "uv run dev graph dead --confidence extracted",
+        ".venv/bin/dev map",
+        str(tmp_path / ".venv" / "bin" / "dev") + " map --force",
+        "uv run --project /tmp/repo dev map",
+        "cd /tmp/repo",
     ):
         assert engine.evaluate_command(command, None).action == "allow", command
         assert engine.evaluate_command(command, task).action == "allow", command
+
+
+def test_normalize_path_prefixed_dev_commands(tmp_path: Path):
+    from devcouncil.execution.policy_engine import normalize_allowlist_command
+
+    assert normalize_allowlist_command(".venv/bin/dev map") == "dev map"
+    assert normalize_allowlist_command("/abs/.venv/bin/devcouncil map") == "dev map"
+    assert (
+        normalize_allowlist_command("uv run --project /x --directory /y dev map")
+        == "uv run dev map"
+    )
+    assert normalize_allowlist_command("dev map --help >/dev/null") == "dev map --help"
+    assert normalize_allowlist_command("dev status 2>&1") == "dev status"
+    # Repo folder named DevCouncil must NOT be treated as the CLI binary.
+    assert (
+        normalize_allowlist_command("cd /Users/bharath/Code/DevCouncil")
+        == "cd /Users/bharath/Code/DevCouncil"
+    )
 
 
 def test_lease_lifecycle_does_not_bypass_task_command_gate_for_other_commands(tmp_path: Path):

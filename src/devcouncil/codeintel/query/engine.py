@@ -18,6 +18,10 @@ class CodeIntelQueryEngine:
         graph = self.service.load()
         if graph is None:
             raise FileNotFoundError("no code-intelligence index; run `dev graph init`")
+        # Fingerprinting shells out to git (diff + untracked hashing) — only pay
+        # that per-query cost when runtime evidence actually exists to match.
+        if not self.service.store.has_runtime_observations():
+            return graph
         from devcouncil.codeintel.debug.fingerprint import source_fingerprint
 
         fingerprint = source_fingerprint(self.service.project_root)
@@ -52,6 +56,19 @@ class CodeIntelQueryEngine:
 
         status = self.service.status()
         sync = get_sync_coordinator(self.service.project_root).status().as_dict()
+        graph_degraded = False
+        graph_degraded_reason = ""
+        try:
+            from devcouncil.utils.json_persist import read_json
+
+            map_path = self.service.project_root / ".devcouncil" / "repo_map.json"
+            if map_path.is_file():
+                data = read_json(map_path)
+                if isinstance(data, dict) and data.get("graph_degraded"):
+                    graph_degraded = True
+                    graph_degraded_reason = str(data.get("graph_degraded_reason") or "")
+        except Exception:
+            pass
         return {
             "ok": True,
             "project_root": str(self.service.project_root),
@@ -59,6 +76,8 @@ class CodeIntelQueryEngine:
             "schema_version": status.get("schema_version"),
             "analyzer_version": status.get("analyzer_version"),
             "sync": sync,
+            "graph_degraded": graph_degraded,
+            "graph_degraded_reason": graph_degraded_reason,
             **payload,
         }
 

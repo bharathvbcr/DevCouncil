@@ -338,6 +338,31 @@ def test_empty_entry_roots_fail_soft_unreachable(tmp_path):
     assert "pkg/a.py" in repo_map.unwired_candidates or "pkg/b.py" in repo_map.unwired_candidates
 
 
+def test_high_unreachable_ratio_fail_soft(tmp_path, monkeypatch):
+    """When most code files are unreachable from sparse roots, omit the flood."""
+    from devcouncil.indexing.graph import liveness as liv
+
+    monkeypatch.setattr(liv, "_unreachable_unreliable_ratio", lambda _root: 0.25)
+    files = {
+        "pyproject.toml": (
+            "[project]\nname = \"x\"\nversion = \"0\"\n"
+            "[project.scripts]\nmycli = \"pkg.cli:main\"\n"
+        ),
+        "pkg/__init__.py": "",
+        "pkg/cli.py": "def main():\n    pass\n",
+    }
+    for i in range(20):
+        files[f"pkg/orphan_{i}.py"] = f"x = {i}\n"
+    _write(tmp_path, files)
+    _commit(tmp_path)
+    repo_map = RepoMapper(tmp_path).map_repo()
+    assert repo_map.entry_roots
+    assert repo_map.unreachable_files == []
+    assert repo_map.liveness_unreachable_unreliable is True
+    # Unwired still surfaces the real signal.
+    assert any(p.startswith("pkg/orphan_") for p in repo_map.unwired_candidates)
+
+
 def test_test_only_main_prod_roots_empty_fail_soft(tmp_path):
     """Only test-path __main__ seeds → production roots empty → fail-soft."""
     _write(tmp_path, {
@@ -373,3 +398,34 @@ def test_liveness_meta_reports_truncation(tmp_path, monkeypatch):
     assert meta.get("total", 0) > RepoMapper(tmp_path)._LIVENESS_CAP
     assert meta.get("shown") == RepoMapper(tmp_path)._LIVENESS_CAP
     assert meta.get("truncated", 0) > 0
+
+
+def _go_grammar_available() -> bool:
+    try:
+        from devcouncil.codeintel.languages import grammar_status
+
+        return not any(
+            row.get("missing_grammars")
+            for row in grammar_status().get("languages", [])
+            if row.get("language") == "go"
+        )
+    except Exception:
+        return False
+
+
+def test_go_same_package_callee_is_wired_via_call_edges(tmp_path):
+    """A Go file called from main (no import statement) must not read as unwired."""
+    import pytest
+
+    if not _go_grammar_available():
+        pytest.skip("go grammar not installed")
+    _write(tmp_path, {
+        "cmd/server/main.go": "package main\n\nfunc main() {\n\thandle()\n}\n",
+        "cmd/server/handlers.go": "package main\n\nfunc handle() {}\n",
+    })
+    _commit(tmp_path)
+    repo_map = RepoMapper(tmp_path).map_repo()
+    assert "cmd/server/main.go" in repo_map.entry_roots
+    assert "cmd/server/handlers.go" not in repo_map.unwired_candidates
+    assert "cmd/server/handlers.go" not in repo_map.unreachable_files
+    assert not repo_map.liveness_unreachable_unreliable

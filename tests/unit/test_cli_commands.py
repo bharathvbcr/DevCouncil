@@ -1416,7 +1416,9 @@ def test_cli_integrate_cursor_preview_uses_project_mcp_json(tmp_path):
 
     server = config["mcpServers"]["devcouncil"]
     assert server["type"] == "stdio"
-    assert server["command"] == "devcouncil"
+    # Absolute venv path when a local binary resolves, bare name otherwise —
+    # both are valid per _cursor_mcp_command; pin the binary, not its location.
+    assert Path(server["command"]).name in {"devcouncil", "devcouncil.exe"}
     assert server["args"] == ["mcp-server"]
     assert server["env"]["DEVCOUNCIL_PROJECT_ROOT"] == str(tmp_path)
 

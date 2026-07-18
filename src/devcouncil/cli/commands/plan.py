@@ -14,7 +14,6 @@ from devcouncil.storage.repositories import (
     GapRepository,
     PlanningStateRepository,
 )
-from devcouncil.indexing.repo_mapper import RepoMapper
 from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
 from devcouncil.llm.provider import Provider, MockProvider, ProviderRequestError, build_role_model_config, create_provider, validate_model_provider
 from devcouncil.llm.router import ModelRouter, StructuredOutputError
@@ -230,14 +229,12 @@ async def run_plan_flow(
     plan_service = PlanService(router)
     critique_service = CritiqueService(router)
     arbiter_service = ArbiterService(router)
-    mapper = RepoMapper(root)
-
     with log_stage("plan", project_root=root, run_id=run_id, goal=goal, quick=quick, dry_run=dry_run):
         return await _run_plan_body(
             root, goal, requirements_only, dry_run, persist, quick,
             orchestrator, run_id, db, config, router,
             prompt_enhancer, spec_service, plan_service, critique_service,
-            arbiter_service, mapper,
+            arbiter_service,
         )
 
 
@@ -245,7 +242,7 @@ async def _run_plan_body(
     root, goal, requirements_only, dry_run, persist, quick,
     orchestrator, run_id, db, config, router,
     prompt_enhancer, spec_service, plan_service, critique_service,
-    arbiter_service, mapper,
+    arbiter_service,
 ):
     with Progress(
         SpinnerColumn(),
@@ -255,12 +252,14 @@ async def _run_plan_body(
         # 1. Repo Map
         log_step("plan/1: mapping repository", project_root=root, run_id=run_id, trace=True)
         progress.add_task(description="Mapping repository...", total=None)
-        repo_map = mapper.map_repo(goal)
-        try:
-            from devcouncil.utils.json_persist import write_model_json
-            write_model_json(root / ".devcouncil" / "repo_map.json", repo_map)
-        except Exception:
-            pass
+        from devcouncil.indexing.map_artifacts import refresh_map_artifacts
+
+        repo_map = refresh_map_artifacts(
+            root,
+            root / ".devcouncil" / "repo_map.json",
+            goal,
+            quiet=True,
+        ).repo_map
         repo_map_json = repo_map.model_dump_json(indent=2)
         # save_run_artifact re-serializes via json.dump, so pass the dict directly
         # instead of round-tripping the already-serialized JSON back through json.loads.

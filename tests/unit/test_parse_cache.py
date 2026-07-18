@@ -127,3 +127,23 @@ def test_save_parse_cache_is_atomic(tmp_path, monkeypatch):
     assert calls[0][1]["files"] == files
     loaded = load_parse_cache(tmp_path)
     assert loaded == files
+
+
+def test_extract_cached_survives_extractor_crash_without_poisoning_cache(tmp_path, monkeypatch):
+    """A file that crashes its extractor is indexed as opaque and never cached."""
+    from devcouncil.indexing.graph import cache as cache_mod
+
+    target = tmp_path / "hostile.py"
+    target.write_text("x = 1\n", encoding="utf-8")
+
+    def exploding(path, source):  # noqa: ANN001
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(cache_mod, "extract_file", exploding)
+    extraction, entry = cache_mod.extract_cached(tmp_path, "hostile.py", cache={})
+
+    assert extraction.path == "hostile.py"
+    assert extraction.symbols == []
+    # sha256 stays empty so this entry can never satisfy a warm-cache hit and
+    # the file is retried once the extractor is fixed.
+    assert entry["sha256"] == ""

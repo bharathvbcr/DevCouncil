@@ -145,3 +145,37 @@ def test_log_accumulates_entries_newest_first(tmp_path: Path):
 def test_slugify():
     assert slugify("src/pkg/cli/") == "src-pkg-cli"
     assert slugify("") == "root"
+
+
+def test_corrupt_log_restarts_instead_of_crashing(tmp_path: Path):
+    """A corrupt (non-UTF8 / malformed) log.md must not fail wiki generation."""
+    wiki_dir = tmp_path / "wiki"
+    generate_wiki(tmp_path, _repo_map(), wiki_dir, project_name="Demo")
+    (wiki_dir / "log.md").write_bytes(b"\xff\xfe garbage \x00\x9c")
+    changed = _repo_map()
+    changed.subsystems[1].summary = "Core engine v3."
+    result = generate_wiki(tmp_path, changed, wiki_dir, project_name="Demo")
+    assert result is not None
+    log = (wiki_dir / "log.md").read_text(encoding="utf-8", errors="replace")
+    assert "# Wiki change log" in log
+
+
+def test_load_repo_map_regenerates_on_corrupt_json(tmp_path: Path, monkeypatch):
+    from devcouncil.knowledge import wiki as wiki_mod
+
+    dev = tmp_path / ".devcouncil"
+    dev.mkdir()
+    (dev / "repo_map.json").write_text("{not json", encoding="utf-8")
+    sentinel = _repo_map()
+    called = {}
+
+    def _fake_generate(root, map_path, *args, **kwargs):
+        called["ran"] = True
+        return sentinel
+
+    monkeypatch.setattr(
+        "devcouncil.indexing.map_artifacts.generate_map_artifacts", _fake_generate
+    )
+    result = wiki_mod._load_repo_map(tmp_path, remap=False)
+    assert called.get("ran") is True
+    assert result is sentinel

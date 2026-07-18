@@ -93,6 +93,41 @@ def test_tsconfig_project_references_merge_paths(tmp_path):
     )
 
 
+def test_nested_tsconfig_without_root_references(tmp_path):
+    """Monorepo apps/*/tsconfig.json must load even when root has no references."""
+    _write(tmp_path, {
+        "apps/desktop/tsconfig.json": (
+            '{"compilerOptions": {"baseUrl": ".", "paths": {"@/*": ["./src/*"]}}}\n'
+        ),
+        "package.json": '{"name": "root", "private": true}\n',
+        "apps/desktop/package.json": '{"name": "@app/desktop"}\n',
+        "apps/desktop/src/components/Button.ts": "export const Button = 1;\n",
+        "apps/desktop/src/App.ts": "import { Button } from '@/components/Button';\n",
+        "apps/desktop/src/main.ts": "import('./App');\n",
+    })
+    _commit(tmp_path)
+    m = RepoMapper(tmp_path)
+    files = {
+        "apps/desktop/tsconfig.json",
+        "apps/desktop/src/components/Button.ts",
+        "apps/desktop/src/App.ts",
+        "apps/desktop/src/main.ts",
+        "apps/desktop/package.json",
+        "package.json",
+    }
+    m._last_file_set = files
+    # Clear any prior empty alias cache from construction.
+    m._js_alias_cache = None
+    assert (
+        m._resolve_js_spec(
+            "apps/desktop/src/App.ts", "@/components/Button", files
+        )
+        == "apps/desktop/src/components/Button.ts"
+    )
+    edges = m._js_import_edges(sorted(files), files)
+    assert ("apps/desktop/src/App.ts", "apps/desktop/src/components/Button.ts") in edges
+
+
 def test_graph_ts_named_export_list_marks_exported():
     from devcouncil.indexing.graph.extract_ts import extract_ts_js
     ext = extract_ts_js(

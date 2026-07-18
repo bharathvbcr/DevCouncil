@@ -77,6 +77,20 @@ def test_readonly_no_task_command_still_allowed(tmp_path: Path):
     assert decision.action == "allow"
 
 
+def test_path_prefixed_dev_map_allowed_without_task(tmp_path: Path):
+    policy = HookPolicy(project_root=tmp_path)
+    for command in (
+        ".venv/bin/dev map",
+        f"{tmp_path}/.venv/bin/dev map --force",
+        "cd /tmp/work && .venv/bin/dev map",
+    ):
+        decision = policy.evaluate(
+            {"name": "Shell", "arguments": {"command": command}},
+            None,
+        )
+        assert decision.action == "allow", command
+
+
 def test_no_task_write_command_denied(tmp_path: Path):
     policy = HookPolicy(project_root=tmp_path)
     decision = policy.evaluate(

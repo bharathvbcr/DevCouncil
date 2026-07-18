@@ -68,6 +68,10 @@ class RepoMap(BaseModel):
     # sha1 over sorted (path, size, mtime_ns) so plain content edits mark the map stale.
     # Legacy maps without this field stay non-stale (no false alarms).
     content_fingerprint: str = ""
+    # True when the last map write used lean/degraded graph fallback. Consumers must
+    # treat this as stale until a successful graph-backed refresh clears it.
+    graph_degraded: bool = False
+    graph_degraded_reason: str = ""
     lsp: Dict[str, object] = Field(default_factory=dict)
     # Optional dependency-vulnerability findings. Populated only when `dev map` is
     # run with SCA explicitly enabled (off by default so the map stays fast and
@@ -118,9 +122,17 @@ class RepoMapper:
         self._config_file_cache: Dict[str, str] = {}
 
     def _read_config_file(self, name: str) -> str:
-        """Read a repo-root config file once and cache its contents for reuse."""
+        """Read a repo-root config file once and cache its contents for reuse.
+
+        Unreadable or non-UTF-8 config files must not fail the whole map.
+        """
         if name not in self._config_file_cache:
-            self._config_file_cache[name] = (self.project_root / name).read_text()
+            try:
+                self._config_file_cache[name] = (self.project_root / name).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                self._config_file_cache[name] = ""
         return self._config_file_cache[name]
 
     _DEPENDENTS_MAX = 1_024  # serialized dependents per file
@@ -1208,6 +1220,11 @@ class RepoMapper:
         r"""(?:import|export)\s[^'"]*?from\s*['"](?P<spec>[^'"]+)['"]"""
         r"""|(?:require|import)\s*\(\s*['"](?P<spec2>[^'"]+)['"]\s*\)"""
     )
+    # Vite/webpack worker + import.meta.url asset loads (e.g. mupdf-worker.ts).
+    _JS_WORKER_URL_RE = re.compile(
+        r"""(?:new\s+(?:Worker|SharedWorker)\s*\(\s*)?"""
+        r"""new\s+URL\s*\(\s*['"](?P<spec>[^'"]+)['"]\s*,\s*import\.meta\.url"""
+    )
     _JS_BARE_IMPORT_RE = re.compile(r"""^\s*import\s*['"](?P<spec>[^'"]+)['"]""")
     _JS_RESOLVE_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
     _GO_IMPORT_BLOCK_RE = re.compile(r"import\s*\((?P<body>[^)]*)\)", re.DOTALL)
@@ -1258,11 +1275,22 @@ class RepoMapper:
         return prefix or rest
 
     def _probe_js_candidates(self, norm: str, file_set: Set[str]) -> str | None:
+        """Resolve a normalized path against ``file_set``.
+
+        Handles extensionless specs (``./auth`` → ``auth.ts``) and TypeScript
+        ESM suffix rewriting (``./auth.js`` → ``auth.ts`` / ``auth.tsx``).
+        """
         if not norm:
             return None
         candidates = [norm]
         candidates += [f"{norm}{ext}" for ext in self._JS_RESOLVE_EXTS]
         candidates += [f"{norm}/index{ext}" for ext in self._JS_RESOLVE_EXTS]
+        # TS/Node ESM: import './foo.js' resolves to foo.ts / foo.tsx on disk.
+        suffix = Path(norm).suffix.lower()
+        if suffix in self._JS_SUFFIXES:
+            stem = norm[: -len(suffix)]
+            candidates += [f"{stem}{ext}" for ext in self._JS_RESOLVE_EXTS]
+            candidates += [f"{stem}/index{ext}" for ext in self._JS_RESOLVE_EXTS]
         for cand in candidates:
             if cand in file_set:
                 return cand
@@ -1436,6 +1464,55 @@ class RepoMapper:
                 root_cfg = self.project_root / name
                 if root_cfg.is_file():
                     _ingest(root_cfg)
+            # Nested package tsconfigs (monorepos without root project references).
+            # Caps keep large trees bounded; node_modules / dist are skipped.
+            _TSCONFIG_NAMES = {
+                "tsconfig.json",
+                "jsconfig.json",
+                "tsconfig.base.json",
+                "tsconfig.app.json",
+                "tsconfig.node.json",
+            }
+            file_set = getattr(self, "_last_file_set", None) or set()
+            nested_manifests: List[str] = []
+            if file_set:
+                nested_manifests = sorted(
+                    p
+                    for p in file_set
+                    if p.rsplit("/", 1)[-1] in _TSCONFIG_NAMES
+                )[:200]
+            # Always also walk the tree: git file lists often omit tsconfig.json,
+            # which previously left monorepo ``apps/*/tsconfig.json`` undiscovered.
+            try:
+                for path in sorted(self.project_root.rglob("tsconfig*.json"))[:200]:
+                    if any(
+                        part in {"node_modules", "dist", "build", ".git", "target"}
+                        for part in path.parts
+                    ):
+                        continue
+                    try:
+                        rel = path.relative_to(self.project_root).as_posix()
+                    except ValueError:
+                        continue
+                    if rel not in nested_manifests:
+                        nested_manifests.append(rel)
+                for path in sorted(self.project_root.rglob("jsconfig.json"))[:50]:
+                    if any(
+                        part in {"node_modules", "dist", "build", ".git"}
+                        for part in path.parts
+                    ):
+                        continue
+                    try:
+                        rel = path.relative_to(self.project_root).as_posix()
+                    except ValueError:
+                        continue
+                    if rel not in nested_manifests:
+                        nested_manifests.append(rel)
+            except Exception:
+                logger.debug("nested tsconfig walk failed", exc_info=True)
+            nested_manifests = nested_manifests[:200]
+            for rel in nested_manifests:
+                _ingest(self.project_root / rel)
             # package.json name → source dir (best-effort monorepo/workspace).
             try:
                 pkg_text = (self.project_root / "package.json").read_text(
@@ -1493,11 +1570,18 @@ class RepoMapper:
         return None
 
     def _extract_js_import_specs(self, source: str) -> List[str]:
-        """Raw import/require/export-from specifiers in ``source``. Pure function of
-        content — safe to cache by sha256. Resolution against the file set runs fresh."""
+        """Raw import/require/export-from/worker-URL specifiers in ``source``.
+
+        Pure function of content — safe to cache by sha256. Resolution against
+        the file set runs fresh.
+        """
         specs: List[str] = []
         for m in self._JS_IMPORT_RE.finditer(source):
             spec = m.group("spec") or m.group("spec2")
+            if spec:
+                specs.append(spec)
+        for m in self._JS_WORKER_URL_RE.finditer(source):
+            spec = m.group("spec")
             if spec:
                 specs.append(spec)
         for line in source.splitlines():
@@ -1561,6 +1645,9 @@ class RepoMapper:
         depend on the re-exported modules.
         """
         self._last_file_set = file_set
+        # Alias rules may have been cached before the file set was known (root-only
+        # tsconfigs). Force a reload so nested apps/*/tsconfig.json are included.
+        self._js_alias_cache = None
         js_files = [f for f in files if self._is_js_source_path(f)]
         if not js_files:
             return []
@@ -1894,7 +1981,7 @@ class RepoMapper:
             community = ""
             if cg is not None:
                 try:
-                    from devcouncil.indexing.graph.intel import community_label_for_area
+                    from devcouncil.indexing.graph.communities import community_label_for_area
 
                     community = community_label_for_area(cg, area)
                     if community and community not in summary:
@@ -2261,6 +2348,10 @@ class RepoMapper:
         stored_hash = str(repo_map.get("indexed_hash") or "")
         if not stored_head and not stored_hash:
             return False
+        # Lean/degraded maps re-stamp fingerprints but lack a trustworthy graph —
+        # fail closed so --if-stale / watch / verify keep retrying until healthy.
+        if bool(repo_map.get("graph_degraded")):
+            return True
         try:
             files = self.get_git_files()
         except Exception:
@@ -2576,34 +2667,47 @@ class RepoMapper:
         # Single-pass: extract + resolve + liveness/token-scan once; derive map lists
         # and graph dead_code from that pass (no second _token_scan_dead).
         changed = getattr(self, "_graph_changed_paths", None)
-        code_graph: CodeGraph | None = None
-        try:
-            from devcouncil.indexing.graph.build import build_code_graph, write_code_graph
-
-            code_graph = build_code_graph(
-                self.project_root,
-                files,
-                changed_paths=changed,
-                liveness=liveness,
-                lsp_refs=lsp_refs,
-                mapper=self,
-            )
+        code_graph: CodeGraph | None = getattr(self, "_prebuilt_code_graph", None)
+        prebuilt_graph = code_graph is not None
+        skip_graph_build = bool(getattr(self, "_skip_code_graph_build", False))
+        if code_graph is not None:
             self._last_code_graph = code_graph
-            # File→file import edges only (named-import edges target symbols).
             self._edges = [
                 (e.source, e.target)
                 for e in code_graph.edges
                 if e.kind == "imports" and "::" not in e.source and "::" not in e.target
             ]
-        except Exception:
-            logger.warning(
-                "code graph build failed; falling back to import edges only "
-                "(dead_symbol_candidates will be omitted — refusing token-only flood)",
-                exc_info=True,
-            )
-            code_graph = None
+        elif skip_graph_build:
             self._last_code_graph = None
             self._edges = self._all_import_edges(files)
+        else:
+            try:
+                from devcouncil.indexing.graph.build import build_code_graph, write_code_graph
+
+                code_graph = build_code_graph(
+                    self.project_root,
+                    files,
+                    changed_paths=changed,
+                    liveness=liveness,
+                    lsp_refs=lsp_refs,
+                    mapper=self,
+                )
+                self._last_code_graph = code_graph
+                # File→file import edges only (named-import edges target symbols).
+                self._edges = [
+                    (e.source, e.target)
+                    for e in code_graph.edges
+                    if e.kind == "imports" and "::" not in e.source and "::" not in e.target
+                ]
+            except Exception:
+                logger.warning(
+                    "code graph build failed; falling back to import edges only "
+                    "(dead_symbol_candidates will be omitted — refusing token-only flood)",
+                    exc_info=True,
+                )
+                code_graph = None
+                self._last_code_graph = None
+                self._edges = self._all_import_edges(files)
 
         if self._edges is None:
             self._edges = self._all_import_edges(files)
@@ -2682,7 +2786,7 @@ class RepoMapper:
                 unreachable_unreliable = True
             dead_syms = []
 
-        if code_graph is not None:
+        if code_graph is not None and not prebuilt_graph:
             try:
                 from devcouncil.indexing.graph.build import write_code_graph
 
@@ -2691,7 +2795,12 @@ class RepoMapper:
                 code_graph.content_fingerprint = self._content_fingerprint(files)
                 write_code_graph(self.project_root, code_graph)
             except Exception:
-                logger.debug("failed to write code graph", exc_info=True)
+                # A missing/stale code_graph.json silently degrades every graph
+                # consumer — this must be visible, not a DEBUG-only whisper.
+                logger.warning(
+                    "failed to write code graph export (.devcouncil/graph/code_graph.json)",
+                    exc_info=True,
+                )
 
         processes: List[Dict[str, object]] = []
         if code_graph is not None:

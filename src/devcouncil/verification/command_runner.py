@@ -81,7 +81,7 @@ def run_verification_command(
     command: str,
     *,
     task_id: str = "verify",
-    timeout: int = 300,
+    timeout: int = 900,
 ) -> CommandResult:
     """Execute one evidence command in the target repo with a cleaned environment."""
     env = clean_subprocess_env()

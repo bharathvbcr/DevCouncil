@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 from devcouncil.codeintel.languages import detect_language
+from devcouncil.indexing.wiring import is_vendored_path
 
 _IGNORED_PREFIXES = (
     ".git/",
@@ -40,6 +41,10 @@ class IndexScope:
     @staticmethod
     def _language_and_prefix_included(rel: str) -> bool:
         if any(rel == prefix.rstrip("/") or rel.startswith(prefix) for prefix in _IGNORED_PREFIXES):
+            return False
+        # Match graph ingestion: nested ``vendor/`` / ``.min.js`` must stay out of
+        # watch/reconcile scope or they remain perpetually "changed".
+        if is_vendored_path(rel):
             return False
         return detect_language(rel) is not None
 

@@ -4,159 +4,24 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from devcouncil.cli.commands.init import initialize_project
+from devcouncil.indexing.map_artifacts import (
+    _important_surfaces as _important_surfaces,
+    _wiki_index_rel as _wiki_index_rel,
+    generate_map_artifacts,
+    write_agent_guides,
+)
 from devcouncil.indexing.repo_mapper import RepoMap, RepoMapper
 from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
 from devcouncil.storage.db import get_db
 from devcouncil.telemetry.stages import log_stage, log_step
-from devcouncil.utils.json_persist import dump_json, write_model_json
+from devcouncil.utils.json_persist import dump_json
+
+# Back-compat aliases for tests / external importers.
+_write_agent_guides = write_agent_guides
 
 console = Console()
 status_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
-
-AGENT_GUIDE_MARKER = "<!-- Managed by dev map: keep this file in sync with .devcouncil/repo_map.json. -->"
-
-
-def _important_surfaces(repo_map: RepoMap) -> list[str]:
-    """Derive the 'important surfaces' list from the computed map, so the guide points
-    at THIS repo's real subsystems instead of hardcoded DevCouncil paths."""
-    lines: list[str] = []
-    for index, subsystem in enumerate(repo_map.subsystems[:6], start=1):
-        lines.append(f"{index}. `{subsystem.area}/` — {subsystem.summary}")
-    if not lines:
-        for index, path in enumerate(repo_map.important_files[:6], start=1):
-            lines.append(f"{index}. `{path}`")
-    return lines or ["1. See `.devcouncil/repo_map.json` for the file index."]
-
-
-def _wiki_index_rel(repo_root: Path) -> str | None:
-    """Relative path to the codebase wiki index, when a generated wiki exists."""
-    from devcouncil.cli.commands.wiki import wiki_dir_for
-
-    index = wiki_dir_for(repo_root) / "index.md"
-    if not index.is_file():
-        return None
-    try:
-        return index.relative_to(repo_root).as_posix()
-    except ValueError:
-        return str(index)
-
-
-def _agent_guide_text(repo_map_path: Path, repo_root: Path, repo_map: RepoMap) -> str:
-    wiki_index = _wiki_index_rel(repo_root)
-    wiki_lines = (
-        [
-            "",
-            f"Codebase wiki: `{wiki_index}` — agent-facing subsystem docs (OKF bundle). "
-            "Read the relevant subsystem page before working in it; refresh with `dev wiki update`.",
-        ]
-        if wiki_index
-        else []
-    )
-    return "\n".join(
-        [
-            AGENT_GUIDE_MARKER,
-            "",
-            "# Agent Workspace Guide",
-            "",
-            "Use `.devcouncil/repo_map.json` as the primary file index for this workspace.",
-            f"Repo map: `{repo_map_path.relative_to(repo_root).as_posix() if repo_map_path.is_relative_to(repo_root) else repo_map_path}`",
-            "Code graph: `.devcouncil/graph/code_graph.json` (symbol-level; query with `dev graph`).",
-            *wiki_lines,
-            "",
-            "Workflow for agents:",
-            "1. Open `.devcouncil/repo_map.json` before guessing at file locations.",
-            "2. Use the `files` list to resolve module ownership and nearby siblings.",
-            "3. Use `subsystems` for subsystem-level navigation.",
-            "4. In `subsystems`, use `entry_points` + `critical_files` for entry points and starting context.",
-            "5. Use `role_files` in `subsystems` for subsystem role buckets (entry, runtime, policy, adapters, etc.).",
-            "6. Use `neighbors` and `handoff_paths` in `subsystems` to follow cross-subsystem flow.",
-            "7. Prefer `dev graph dead --confidence extracted` + file greps for dead code. "
-            "Treat `inferred` as unconfirmed. If `entry_roots` are empty / "
-            "`liveness_unreachable_unreliable`, ignore `unreachable_files` and mass inferred dead. "
-            "Check `unwired_candidates` / `dead_symbol_candidates` before creating new modules — "
-            "wire what you create into a real caller.",
-            "8. Use `dev graph query <name>` / `dev graph trace <a> <b>` / `dev graph dead` "
-            "for symbol callers, paths, and dead-code tiers; `dev graph html` for the visualizer.",
-            "9. Run `dev map` (or rely on post-tool-use auto-refresh) after large refactors.",
-            "",
-            "Important surfaces:",
-            *_important_surfaces(repo_map),
-            "",
-            "If the map and source disagree, trust the source and regenerate the map.",
-        ]
-    )
-
-
-def _write_agent_guides(repo_root: Path, repo_map_path: Path, repo_map: RepoMap) -> None:
-    for filename in ("AGENTS.md", "CLAUDE.md"):
-        path = repo_root / filename
-        if path.exists():
-            existing = path.read_text(encoding="utf-8")
-            if AGENT_GUIDE_MARKER not in existing:
-                continue
-        text = _agent_guide_text(repo_map_path, repo_root, repo_map) + "\n"
-        # Skip rewrite when unchanged so content_fingerprint (size+mtime) stays stable
-        # across consecutive identical `dev map` runs.
-        if path.exists() and path.read_text(encoding="utf-8") == text:
-            continue
-        path.write_text(text, encoding="utf-8")
-
-
-def generate_map_artifacts(
-    root: Path,
-    output: Path,
-    goal: str = "",
-    *,
-    scan_dependencies: bool = False,
-    liveness: bool = True,
-    lsp_refs: bool = False,
-    quiet: bool = False,
-) -> RepoMap:
-    """Build the repo map and write repo_map.json + agent guides (no LLM, no re-init).
-
-    Assumes ``.devcouncil/`` already exists. Shared by the ``dev map`` command and
-    by project initialization so a freshly set-up repo is immediately navigable.
-    ``scan_dependencies`` is opt-in (off for init and default mapping) because it can
-    shell out to dependency auditors.
-    ``lsp_refs`` opts into live LSP confirmation of dead-symbol candidates.
-    ``quiet`` suppresses stderr status lines (for ``dev status --json`` auto-init).
-    """
-    import time
-
-    t0 = time.perf_counter()
-    repo_map = RepoMapper(root).map_repo(
-        goal,
-        scan_dependencies=scan_dependencies,
-        liveness=liveness,
-        lsp_refs=lsp_refs,
-    )
-    elapsed = time.perf_counter() - t0
-    if not quiet:
-        status_console.print(f"[dim]map completed in {elapsed:.2f}s[/dim]")
-    graph_context = CodeReviewGraphAdapter(root).get_context()
-    output = output if output.is_absolute() else root / output
-    output.parent.mkdir(parents=True, exist_ok=True)
-    write_model_json(output, repo_map)
-    _write_agent_guides(root, output, repo_map)
-    # Agent guides can add/change tracked files after the fingerprint was taken;
-    # re-stamp so the on-disk map is not immediately stale for checkout/verify.
-    mapper = RepoMapper(root)
-    try:
-        files = mapper.get_git_files()
-        repo_map.generated_head = mapper._git_head()
-        repo_map.indexed_hash = mapper._files_fingerprint(files)
-        repo_map.content_fingerprint = mapper._content_fingerprint(files)
-        write_model_json(output, repo_map)
-    except Exception:
-        logger.debug("Failed to re-stamp map fingerprints after agent guides", exc_info=True)
-    if graph_context.available:
-        graph_output = output.with_name("code_review_graph_context.json")
-        write_model_json(graph_output, graph_context)
-        if not quiet:
-            status_console.print(f"[green]Wrote code-review-graph context to {graph_output}[/green]")
-    return repo_map
 
 
 def _liveness_summary(repo_map: RepoMap) -> str | None:
@@ -173,19 +38,25 @@ def _liveness_summary(repo_map: RepoMap) -> str | None:
         import sys
 
         print(
-            "warning: entry_roots empty — unreachable_files unreliable "
-            "(liveness_unreachable_unreliable); ignore unreachable / mass inferred dead",
+            "warning: unreachable_files low-confidence "
+            "(liveness_unreachable_unreliable); prefer unwired_candidates / "
+            "dead_symbol_candidates and `dev graph dead --confidence extracted`",
             file=sys.stderr,
         )
     samples = repo_map.unwired_candidates[:3] + repo_map.dead_symbol_candidates[:2]
     sample_txt = (", " + ", ".join(samples)) if samples else ""
+    unreachable_txt = (
+        "omitted (unreliable)"
+        if unreliable
+        else str(len(repo_map.unreachable_files))
+    )
     return (
         f"liveness: {len(repo_map.entry_roots)} entry roots, "
         f"{len(repo_map.unwired_candidates)} unwired, "
-        f"{len(repo_map.unreachable_files)} unreachable, "
+        f"{unreachable_txt} unreachable, "
         f"{len(repo_map.dead_symbol_candidates)} dead symbols"
         f"{sample_txt}"
-        " (map clears on any non-test importer; verify requires a pre-existing caller)"
+        " (prefer unwired + extracted dead; map clears on any non-test importer)"
     )
 
 
@@ -244,6 +115,15 @@ def map_repo(
     if not root.is_dir():
         status_console.print(f"[red]Project root does not exist: {root}[/red]")
         raise typer.Exit(code=1)
+    # `dev map /some/repo` parses the path as the GOAL and maps the CWD repo with
+    # exit 0 — surface the likely intent instead of silently mapping the wrong repo.
+    if goal and project_root == Path("."):
+        goal_path = Path(goal).expanduser()
+        if goal_path.is_absolute() and goal_path.is_dir() and goal_path.resolve() != root:
+            status_console.print(
+                f"[yellow]Goal argument is a directory ({goal}). Did you mean "
+                f"`dev map --project-root {goal}`? Mapping {root} with it as goal text.[/yellow]"
+            )
     from devcouncil.telemetry.logging_setup import set_log_dir
     set_log_dir(root)
     # CLI flag OR config; flag alone is enough without rewriting config.
@@ -259,6 +139,8 @@ def map_repo(
         "dev map: goal=%r scan_deps=%s liveness=%s lsp_refs=%s if_stale=%s",
         goal, scan_deps, liveness, use_lsp, if_stale,
     )
+    from devcouncil.cli.commands.init import initialize_project
+
     initialize_project(root, quiet=True, with_map=False)
     if not get_db(root):
         raise typer.Exit(code=1)
@@ -279,17 +161,63 @@ def map_repo(
 
     with log_stage("map", project_root=root, scan_deps=scan_deps):
         log_step("map/1: generating repository map", project_root=root, trace=True)
-        repo_map = generate_map_artifacts(
-            root,
-            output,
-            goal,
-            scan_dependencies=scan_deps,
-            liveness=liveness,
-            lsp_refs=use_lsp,
-        )
-        typer.echo(dump_json(repo_map.model_dump(), indent=2))
+        from devcouncil.codeintel.build_control import GraphBuildBusy
+
+        try:
+            from devcouncil.indexing.map_artifacts import refresh_map_artifacts
+
+            refresh = refresh_map_artifacts(
+                root,
+                output,
+                goal,
+                scan_dependencies=scan_deps,
+                liveness=liveness,
+                lsp_refs=use_lsp,
+            )
+            repo_map = refresh.repo_map
+        except GraphBuildBusy as exc:
+            status_console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1) from exc
+        if refresh.degraded:
+            status_console.print(
+                f"[red]Map wrote lean/degraded artifacts: {refresh.reason or refresh.mode}[/red]"
+            )
+            raise typer.Exit(code=1)
+        if refresh.compatibility_export_degraded:
+            status_console.print(
+                f"[yellow]Compatibility export degraded (canonical SQLite ok): "
+                f"{refresh.reason}[/yellow]"
+            )
+        try:
+            typer.echo(dump_json(repo_map.model_dump(), indent=2))
+        except BrokenPipeError:
+            # Consumer closed stdout early (`dev map | head`). The artifacts are
+            # already written — a closed pipe must not turn the stage red.
+            import os
+            import sys
+
+            logger.debug("stdout pipe closed while streaming repo map JSON")
+            try:
+                os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+            except OSError:
+                pass
         status_console.print(f"[green]Wrote repository map to {output}[/green]")
         graph_out = root / ".devcouncil" / "graph" / "code_graph.json"
+        if not graph_out.is_file():
+            # The export write failed or an external cleanup removed the JSON
+            # while SQLite (canonical) still holds the graph — re-export instead
+            # of exiting green without the documented artifact.
+            from devcouncil.indexing.graph.build import export_code_graph_json
+
+            if export_code_graph_json(root) is not None:
+                status_console.print(
+                    f"[yellow]Code graph JSON was missing; re-exported from store to {graph_out}[/yellow]"
+                )
+            else:
+                status_console.print(
+                    f"[yellow]Code graph JSON missing and store re-export failed ({graph_out}); "
+                    "run `dev graph doctor`[/yellow]"
+                )
         if graph_out.is_file():
             status_console.print(f"[green]Wrote code graph to {graph_out}[/green]")
             if pdg:
@@ -372,10 +300,10 @@ def _refresh_wiki_skeletons(root: Path, repo_map: RepoMap) -> None:
     refreshed pages.
     """
     try:
-        from devcouncil.cli.commands.wiki import wiki_dir_for
         from devcouncil.knowledge.wiki import (
             _project_name,
             generate_wiki,
+            wiki_dir_for,
             wiki_stale_pages,
         )
 

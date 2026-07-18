@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import logging
+import os
+import tempfile
 import weakref
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
 from devcouncil.codeintel.languages.registry import LANGUAGE_SPECS
 from devcouncil.indexing.graph.cache import (
@@ -36,7 +39,7 @@ from devcouncil.indexing.graph.resolve import (
 )
 from devcouncil.indexing.graph.schema import NodeKind
 from devcouncil.indexing.graph.schema import CodeGraph, SCHEMA_VERSION
-from devcouncil.utils.json_persist import read_json, write_model_json
+from devcouncil.utils.json_persist import read_json
 
 logger = logging.getLogger(__name__)
 _PENDING_ANALYSIS_SHARDS: dict[int, dict[str, dict[str, object]]] = {}
@@ -48,6 +51,10 @@ _CODE_SUFFIXES = {
     for spec in LANGUAGE_SPECS
     for extension in spec.extensions
 }
+
+
+class CompatibilityGraphTooLarge(ValueError):
+    """Compatibility JSON exceeded the configured import/export boundary."""
 
 
 def graph_path(root: Path) -> Path:
@@ -79,11 +86,11 @@ def _files_fingerprint(files: List[str]) -> str:
 def _code_files(files: Iterable[str]) -> List[str]:
     from devcouncil.indexing.wiring import is_vendored_path
 
-    return [
+    return sorted(
         f
         for f in files
         if Path(f).suffix.lower() in _CODE_SUFFIXES and not is_vendored_path(f)
-    ]
+    )
 
 
 def _area_fn_for(root: Path, mapper: Optional[Any] = None):
@@ -137,6 +144,7 @@ def extract_all(
     files: List[str],
     *,
     changed_paths: Optional[Set[str]] = None,
+    progress: Callable[[str, int, int], None] | None = None,
 ) -> Dict[str, FileExtraction]:
     """Extract (cache v5) all code files; only force-reparse ``changed_paths`` when set.
 
@@ -150,7 +158,9 @@ def extract_all(
     updates: Dict[str, dict] = {}
     force_set = changed_paths if changed_paths is not None else None
 
-    for rel in code:
+    for index, rel in enumerate(code, start=1):
+        if progress is not None:
+            progress("extract", index - 1, len(code))
         force = force_set is not None and rel in force_set
         # When incremental: prefer warm cache for non-listed paths, but never
         # trust an entry whose digests no longer match disk.
@@ -169,10 +179,15 @@ def extract_all(
                 # prunes managed paths absent from updates, so omitting them
                 # would evict every unchanged file from the warm cache.
                 updates[rel] = entry
+                if progress is not None:
+                    progress("extract", index, len(code))
                 continue
         ext, entry = extract_cached(root, rel, cache=cache, force=bool(force))
         extractions[rel] = ext
         updates[rel] = entry
+
+        if progress is not None:
+            progress("extract", index, len(code))
 
     managed = {k for k in cache if Path(k).suffix.lower() in _CODE_SUFFIXES} | set(code)
     if updates:
@@ -211,12 +226,15 @@ def assemble_graph(
     liveness: bool = True,
     lsp_refs: bool = False,
     mapper: Optional[Any] = None,
+    progress: Callable[[str, int, int], None] | None = None,
 ) -> CodeGraph:
     """Resolve + liveness over extractions; always full resolve."""
     from devcouncil.indexing.repo_mapper import RepoMapper
 
     if mapper is None:
         mapper = RepoMapper(root)
+    if progress is not None:
+        progress("assemble_nodes", 0, 1)
     area_fn = _area_fn_for(root, mapper=mapper)
     nodes, symbol_index = build_file_and_symbol_nodes(extractions, area_fn=area_fn)
     class_ids = {n.id for n in nodes if n.kind == NodeKind.CLASS}
@@ -231,13 +249,31 @@ def assemble_graph(
     edges.extend(
         resolve_calls(extractions, symbol_index, file_edges, class_ids=class_ids)
     )
+    if progress is not None:
+        progress("assemble_nodes", 1, 1)
 
     semantic_meta: Dict[str, Any] = {}
     try:
         from devcouncil.codeintel.resolution import enrich_semantic_edges
 
+        enrich_budget = 120.0
+        try:
+            from devcouncil.app.config import load_config
+
+            enrich_budget = float(
+                load_config(root).indexing.semantic_enrich_timeout_seconds
+            )
+        except Exception:
+            logger.debug("semantic enrich budget config load failed", exc_info=True)
+
         semantic_graph = CodeGraph(nodes=nodes, edges=edges)
-        enrich_semantic_edges(semantic_graph, root=root, extractions=extractions)
+        enrich_semantic_edges(
+            semantic_graph,
+            root=root,
+            extractions=extractions,
+            progress=progress,
+            budget_seconds=enrich_budget,
+        )
         nodes = semantic_graph.nodes
         edges = semantic_graph.edges
         semantic_meta = semantic_graph.meta
@@ -250,8 +286,13 @@ def assemble_graph(
     unreachable_unreliable = False
     dead_code = []
     if liveness:
+        if progress is not None:
+            progress("liveness", 0, 1)
+        from devcouncil.indexing.graph.liveness import project_call_edges_to_files
+
+        liveness_edges = sorted(set(file_edges) | project_call_edges_to_files(edges))
         entry_roots, unwired, unreachable, unreachable_unreliable = file_liveness(
-            root, files, file_edges, cap=0
+            root, files, liveness_edges, cap=0
         )
         # Empty prod roots → fail-soft empty unreachable (already); keep symbol
         # reachability from treating every file as unreachable.
@@ -272,6 +313,8 @@ def assemble_graph(
         )
         # Uncapped in code_graph meta; repo_map.json applies _LIVENESS_CAP on write.
         legacy = legacy_dead_strings(dead_code, token_dead, cap=None)
+        if progress is not None:
+            progress("liveness", 1, 1)
     else:
         legacy = []
         token_dead = []
@@ -313,6 +356,7 @@ def build_code_graph(
     liveness: bool = True,
     lsp_refs: bool = False,
     mapper: Optional[Any] = None,
+    progress: Callable[[str, int, int], None] | None = None,
 ) -> CodeGraph:
     """Full (or incremental-extract) graph build."""
     from devcouncil.indexing.repo_mapper import RepoMapper
@@ -323,7 +367,7 @@ def build_code_graph(
     if files is None:
         files = mapper.get_git_files()
     changed = {p.replace("\\", "/") for p in changed_paths} if changed_paths else None
-    extractions = extract_all(root, files, changed_paths=changed)
+    extractions = extract_all(root, files, changed_paths=changed, progress=progress)
     graph = assemble_graph(
         root,
         files,
@@ -331,6 +375,7 @@ def build_code_graph(
         liveness=liveness,
         lsp_refs=lsp_refs,
         mapper=mapper,
+        progress=progress,
     )
     _PENDING_ANALYSIS_SHARDS[id(graph)] = {
         path: build_liveness_shard(root, extraction)
@@ -340,13 +385,215 @@ def build_code_graph(
     return graph
 
 
+def _slim_graph_export(graph: CodeGraph) -> CodeGraph:
+    """Copy for JSON export: drop bulky meta already recoverable elsewhere.
+
+    ``node_communities`` duplicates per-node ``community``; legacy dead strings
+    remain uncapped on the in-memory/SQLite graph for repo_map consumers.
+    Volatile PageRank floats are stripped from ``god_nodes`` (degree/fan metrics
+    remain); incremental bookkeeping keys stay but no longer re-inflate via
+    pretty-indent or duplicated community maps.
+    """
+    meta = dict(graph.meta or {})
+    meta.pop("node_communities", None)
+    meta.pop("legacy_dead_symbol_candidates", None)
+    gods = meta.get("god_nodes")
+    if isinstance(gods, list):
+        cleaned: list[dict[str, object]] = []
+        for row in gods:
+            if not isinstance(row, dict):
+                continue
+            item = dict(row)
+            item.pop("pagerank", None)
+            cleaned.append(item)
+        meta["god_nodes"] = cleaned
+    meta["compatibility_export_tier"] = "slim"
+    return graph.model_copy(update={"meta": meta})
+
+
+def _compact_graph_export(graph: CodeGraph) -> CodeGraph:
+    """Aggressive slim: strip node/edge extras and cap noisy liveness lists."""
+    slim = _slim_graph_export(graph)
+    nodes = [
+        n.model_copy(update={"extras": {}})
+        for n in slim.nodes
+    ]
+    edges = [
+        e.model_copy(update={"extras": {}, "reason": ""})
+        for e in slim.edges
+    ]
+    meta = dict(slim.meta or {})
+    meta["compatibility_export_tier"] = "compact"
+    meta["unreachable_omitted"] = len(slim.unreachable_files or [])
+    meta["unwired_omitted"] = max(0, len(slim.unwired_candidates or []) - 200)
+    return slim.model_copy(
+        update={
+            "nodes": nodes,
+            "edges": edges,
+            "unreachable_files": [],
+            "unwired_candidates": list(slim.unwired_candidates or [])[:200],
+            "dead_code": list(slim.dead_code or [])[:500],
+            "meta": meta,
+        }
+    )
+
+
+def _stub_graph_export(graph: CodeGraph) -> CodeGraph:
+    """Pointer-only compatibility JSON when even compact export exceeds the limit."""
+    return CodeGraph(
+        schema_version=graph.schema_version,
+        nodes=[],
+        edges=[],
+        dead_code=[],
+        entry_roots=list(graph.entry_roots or [])[:200],
+        unwired_candidates=list(graph.unwired_candidates or [])[:100],
+        unreachable_files=[],
+        generated_head=graph.generated_head,
+        indexed_hash=graph.indexed_hash,
+        content_fingerprint=graph.content_fingerprint,
+        meta={
+            "compatibility_export_tier": "stub",
+            "sqlite_canonical": True,
+            "node_count": len(graph.nodes),
+            "edge_count": len(graph.edges),
+            "dead_code_count": len(graph.dead_code or []),
+            "unwired_count": len(graph.unwired_candidates or []),
+            "unreachable_count": len(graph.unreachable_files or []),
+            "liveness_unreachable_unreliable": bool(
+                (graph.meta or {}).get("liveness_unreachable_unreliable")
+            ),
+            "compatibility_export_reason": (
+                "exceeded indexing.graph_json_max_bytes; prefer SQLite-backed "
+                "`dev graph` commands"
+            ),
+        },
+    )
+
+
+def _graph_json_indent(root: Path) -> int | None:
+    """Compact JSON by default; honor ``indexing.compact_graph_json``."""
+    try:
+        from devcouncil.app.config import load_config
+
+        if bool(load_config(root).indexing.compact_graph_json):
+            return None
+        return 2
+    except Exception:
+        return None
+
+
+def _graph_json_max_bytes(root: Path) -> int:
+    try:
+        from devcouncil.app.config import load_config
+
+        return int(load_config(root).indexing.graph_json_max_bytes)
+    except Exception:
+        return 128 * 1024 * 1024
+
+
+def _write_graph_json_bounded(
+    path: Path,
+    graph: CodeGraph,
+    *,
+    indent: int | None,
+    max_bytes: int,
+) -> None:
+    """Stream JSON to a sibling temporary file and atomically publish it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoder = json.JSONEncoder(
+        indent=indent,
+        ensure_ascii=False,
+        separators=(",", ":") if indent is None else None,
+    )
+    payload = graph.model_dump(mode="json")
+    fd, raw_temp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp = Path(raw_temp)
+    written = 0
+    try:
+        os.chmod(temp, (path.stat().st_mode & 0o777) if path.exists() else 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            for chunk in encoder.iterencode(payload):
+                encoded = chunk.encode("utf-8")
+                written += len(encoded)
+                if written + 1 > max_bytes:
+                    raise CompatibilityGraphTooLarge(
+                        f"compatibility graph export exceeds {max_bytes} bytes"
+                    )
+                handle.write(encoded)
+            handle.write(b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def _write_compatibility_export_tiers(root: Path, path: Path, graph: CodeGraph) -> str:
+    """Try slim → compact → stub until the size cap fits. Returns the tier used.
+
+    Raises ``CompatibilityGraphTooLarge`` only when even the stub cannot be written
+    (misconfigured tiny limit). When the stub tier is used, still raises after a
+    successful write so callers mark ``compatibility_export=degraded`` while
+    leaving a usable pointer JSON on disk.
+    """
+    from devcouncil.codeintel import get_codeintel_service
+
+    indent = _graph_json_indent(root)
+    max_bytes = _graph_json_max_bytes(root)
+    # The stub is a bounded pointer JSON (~1 KB floor plus capped entry lists);
+    # always leave it on disk even under a tiny configured cap, backstopped at
+    # 1 MiB against pathological entry-root lists.
+    stub_cap = max(max_bytes, 1024 * 1024)
+    tiers: list[tuple[str, CodeGraph, int]] = [
+        ("slim", _slim_graph_export(graph), max_bytes),
+        ("compact", _compact_graph_export(graph), max_bytes),
+        ("stub", _stub_graph_export(graph), stub_cap),
+    ]
+    last_err: CompatibilityGraphTooLarge | None = None
+    for tier_name, export_graph, tier_cap in tiers:
+        try:
+            _write_graph_json_bounded(
+                path, export_graph, indent=indent, max_bytes=tier_cap
+            )
+        except CompatibilityGraphTooLarge as exc:
+            last_err = exc
+            logger.warning(
+                "compatibility export tier %s exceeded %s bytes; trying next",
+                tier_name,
+                max_bytes,
+            )
+            continue
+        get_codeintel_service(root).store.record_compatibility_export(path, export_graph)
+        if tier_name == "stub":
+            raise CompatibilityGraphTooLarge(
+                f"compatibility graph export exceeded {max_bytes} bytes; "
+                "wrote stub JSON (SQLite remains canonical)"
+            )
+        return tier_name
+    raise last_err or CompatibilityGraphTooLarge(
+        f"compatibility graph export exceeds {max_bytes} bytes"
+    )
+
+
 def write_code_graph(
     root: Path,
     graph: CodeGraph,
     *,
     changed_paths: Set[str] | None = None,
     analysis_shards: dict[str, dict[str, object]] | None = None,
+    _lease_held: bool = False,
 ) -> Path:
+    if not _lease_held:
+        from devcouncil.codeintel.build_control import graph_build_session
+
+        with graph_build_session(root):
+            return write_code_graph(
+                root,
+                graph,
+                changed_paths=changed_paths,
+                analysis_shards=analysis_shards,
+                _lease_held=True,
+            )
     # SQLite is the canonical store. Keep the deterministic JSON artifact as a
     # compatibility/export boundary for existing consumers and older clients.
     from devcouncil.codeintel import get_codeintel_service
@@ -360,9 +607,37 @@ def write_code_graph(
     )
     path = graph_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_model_json(path, graph)
-    get_codeintel_service(root).store.record_compatibility_export(path, graph)
+    _write_compatibility_export_tiers(root, path, graph)
     return path
+
+
+def export_code_graph_json(root: Path) -> Optional[Path]:
+    """Rewrite the compatibility ``code_graph.json`` from the canonical store.
+
+    Self-heal for a deleted or failed JSON export: loads from SQLite only (no
+    re-persist) and rewrites the artifact + export handshake. Returns the path,
+    or None when the store has no graph or the write fails.
+    """
+    from devcouncil.codeintel import get_codeintel_service
+
+    root = root.expanduser().resolve()
+    try:
+        service = get_codeintel_service(root)
+        graph = service.load()
+        if graph is None:
+            return None
+        path = graph_path(root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            _write_compatibility_export_tiers(root, path, graph)
+        except CompatibilityGraphTooLarge:
+            # Stub may still be on disk — treat as healed when the file exists.
+            if not path.is_file():
+                raise
+        return path
+    except Exception:
+        logger.warning("code graph JSON re-export failed", exc_info=True)
+        return None
 
 
 def load_code_graph(root: Path) -> Optional[CodeGraph]:
@@ -371,27 +646,54 @@ def load_code_graph(root: Path) -> Optional[CodeGraph]:
     root = root.expanduser().resolve()
     path = graph_path(root)
     service = get_codeintel_service(root)
-    # Compatibility clients may still replace the documented JSON artifact.
-    # The export handshake distinguishes an external replacement from our own
-    # post-commit JSON write without repeatedly parsing a large artifact.
+    # SQLite is canonical. Import the JSON compatibility artifact only when the
+    # store is empty/missing — never let an external JSON rewrite clobber a
+    # committed generation (accidental or malicious mtime/digest churn).
     try:
-        recorded_digest, recorded_mtime = service.store.compatibility_export_state()
-        if path.is_file() and path.stat().st_mtime_ns != recorded_mtime:
+        if not service.store.exists() and path.is_file():
+            if path.stat().st_size > _graph_json_max_bytes(root):
+                raise CompatibilityGraphTooLarge(
+                    f"compatibility graph import exceeds {_graph_json_max_bytes(root)} bytes"
+                )
             data = read_json(path)
             exported = CodeGraph.model_validate(data)
-            from devcouncil.codeintel.store.sqlite import compatibility_graph_digest
+            # Import is a store write: hold the writer lease like every other
+            # persist path. GraphBuildBusy lands in the except below and the
+            # read falls through to whatever generation the builder commits.
+            from devcouncil.codeintel.build_control import graph_build_session
 
-            if not service.store.exists() or compatibility_graph_digest(exported) != recorded_digest:
+            with graph_build_session(root):
                 service.persist(exported)
                 service.store.record_compatibility_export(path, exported)
-                return exported
-            service.store.record_compatibility_export(path, exported)
+            return _annotate_graph_degraded(root, exported)
+        recorded_digest, recorded_mtime = service.store.compatibility_export_state()
+        if (
+            path.is_file()
+            and recorded_mtime is not None
+            and path.stat().st_mtime_ns != recorded_mtime
+        ):
+            # Refresh the handshake when the on-disk export matches the store;
+            # otherwise leave SQLite authoritative and let ``dev graph doctor``
+            # / export self-heal report drift.
+            from devcouncil.codeintel.store.sqlite import compatibility_graph_digest
+
+            if path.stat().st_size <= _graph_json_max_bytes(root):
+                data = read_json(path)
+                exported = CodeGraph.model_validate(data)
+                if compatibility_graph_digest(exported) == recorded_digest:
+                    service.store.record_compatibility_export(path, exported)
+                else:
+                    logger.info(
+                        "ignoring external compatibility graph that diverges from "
+                        "canonical store (sqlite wins); re-export with "
+                        "`dev graph export` / map refresh if JSON must catch up"
+                    )
     except Exception:
-        logger.debug("Failed to import newer compatibility graph export", exc_info=True)
+        logger.debug("Failed to reconcile compatibility graph export", exc_info=True)
     try:
         graph = service.load()
         if graph is not None:
-            return graph
+            return _annotate_graph_degraded(root, graph)
     except Exception:
         # A corrupt/newer database must not strand users who still have the
         # versioned JSON export. ``dev graph doctor`` reports the store failure;
@@ -400,11 +702,31 @@ def load_code_graph(root: Path) -> Optional[CodeGraph]:
     if not path.is_file():
         return None
     try:
+        if path.stat().st_size > _graph_json_max_bytes(root):
+            raise CompatibilityGraphTooLarge(
+                f"compatibility graph import exceeds {_graph_json_max_bytes(root)} bytes"
+            )
         data = read_json(path)
-        return CodeGraph.model_validate(data)
+        return _annotate_graph_degraded(root, CodeGraph.model_validate(data))
     except Exception:
         logger.debug("Failed to load code graph", exc_info=True)
         return None
+
+
+def _annotate_graph_degraded(root: Path, graph: CodeGraph) -> CodeGraph:
+    """Surface repo_map lean/degraded handshake on graph payloads for consumers."""
+    map_path = root / ".devcouncil" / "repo_map.json"
+    if not map_path.is_file():
+        return graph
+    try:
+        data = read_json(map_path)
+        if not isinstance(data, dict) or not data.get("graph_degraded"):
+            return graph
+        graph.meta["graph_degraded"] = True
+        graph.meta["graph_degraded_reason"] = str(data.get("graph_degraded_reason") or "")
+    except Exception:
+        logger.debug("graph_degraded annotation failed", exc_info=True)
+    return graph
 
 
 def refresh_map_for_paths(
@@ -412,58 +734,28 @@ def refresh_map_for_paths(
     paths: List[str],
     *,
     liveness: bool = True,
-) -> CodeGraph:
-    """Re-extract only ``paths``, full re-resolve, rewrite graph + repo_map artifacts.
+    fail_on_degraded: bool = True,
+) -> CodeGraph | None:
+    """Refresh graph and repo map once; never retry a failed graph assembly.
 
-    When subsystem topology (area set) changes, also rewrites marker-guarded
-    ``AGENTS.md`` / ``CLAUDE.md`` and re-stamps map fingerprints.
-
-    Target: warm refresh well under 1s on this repo's size.
+    When ``fail_on_degraded`` is True (default for watch/sync), a lean/degraded
+    refresh raises so ``sync_now`` returns False and pending work is not cleared
+    as healthy. One-shot CLI callers that intentionally accept lean maps should
+    pass ``fail_on_degraded=False`` or call ``refresh_map_artifacts`` directly.
     """
-    from devcouncil.indexing.repo_mapper import RepoMapper
-    from devcouncil.utils.json_persist import read_json, write_model_json
+    from devcouncil.indexing.map_artifacts import refresh_map_artifacts
 
     root = root.expanduser().resolve()
-    norm_paths = [
-        p.replace("\\", "/")[2:] if p.replace("\\", "/").startswith("./") else p.replace("\\", "/")
-        for p in paths
-    ]
-    out = root / ".devcouncil" / "repo_map.json"
-    prev_areas: set[str] = set()
-    if out.is_file():
-        try:
-            prev = read_json(out) or {}
-            prev_areas = {
-                str(s.get("area") or "")
-                for s in (prev.get("subsystems") or [])
-                if isinstance(s, dict) and s.get("area")
-            }
-        except Exception:
-            prev_areas = set()
-
-    mapper = RepoMapper(root)
-    # Facade map_repo builds + writes the graph; pass changed paths via env-ish attr.
-    mapper._graph_changed_paths = set(norm_paths)  # type: ignore[attr-defined]
-    repo_map = mapper.map_repo(liveness=liveness)
-
-    out.parent.mkdir(parents=True, exist_ok=True)
-    write_model_json(out, repo_map)
-
-    new_areas = {s.area for s in repo_map.subsystems if s.area}
-    if new_areas != prev_areas:
-        try:
-            from devcouncil.cli.commands.map import _write_agent_guides
-
-            _write_agent_guides(root, out, repo_map)
-            files = mapper.get_git_files()
-            repo_map.generated_head = mapper._git_head()
-            repo_map.indexed_hash = mapper._files_fingerprint(files)
-            repo_map.content_fingerprint = mapper._content_fingerprint(files)
-            write_model_json(out, repo_map)
-        except Exception:
-            logger.debug("agent guide rewrite after topology change failed", exc_info=True)
-
-    return load_code_graph(root) or build_code_graph(root, liveness=liveness)
+    result = refresh_map_artifacts(
+        root,
+        root / ".devcouncil" / "repo_map.json",
+        paths=paths,
+        liveness=liveness,
+        quiet=True,
+    )
+    if fail_on_degraded and result.degraded:
+        raise RuntimeError(result.reason or "graph refresh degraded")
+    return result.graph
 
 
 # --- Opt-in PDG layer (CFG / reaching-def / CDG / taint) ---

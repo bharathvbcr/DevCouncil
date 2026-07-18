@@ -72,7 +72,9 @@ def test_cli_graph_dead(mapped):
     )
     assert result.exit_code == 0
     data = json.loads(result.stdout)
-    assert isinstance(data, list)
+    assert isinstance(data, dict)
+    assert isinstance(data.get("dead_code"), list)
+    assert data.get("graph_degraded") is False
 
 
 def test_mcp_graph_query(mapped):
@@ -191,3 +193,143 @@ def test_mcp_route_map(api_repo):
     payload = json.loads(contents[0].text)
     assert payload["ok"] is True
     assert payload.get("count", 0) >= 1
+
+
+def test_cli_graph_demo_cypher_corpus_and_text_outputs(mapped, api_repo):
+    runner = CliRunner()
+    demo = runner.invoke(graph_app, ["demo", "--project-root", str(mapped), "--json"])
+    assert demo.exit_code == 0
+    demo_payload = json.loads(demo.stdout)
+    assert "html" in demo_payload
+
+    cypher = runner.invoke(
+        graph_app,
+        ["cypher", "MATCH (n) RETURN n LIMIT 1", "--project-root", str(mapped), "--json"],
+    )
+    assert cypher.exit_code in {0, 1}
+
+    cypher_text = runner.invoke(
+        graph_app,
+        ["cypher", "MATCH (n) RETURN n LIMIT 1", "--project-root", str(mapped)],
+    )
+    assert cypher_text.exit_code in {0, 1}
+
+    search = runner.invoke(
+        graph_app, ["search", "run", "--project-root", str(mapped), "--json"]
+    )
+    assert search.exit_code == 0
+
+    search_text = runner.invoke(
+        graph_app, ["search", "run", "--project-root", str(mapped)]
+    )
+    assert search_text.exit_code == 0
+
+    explore = runner.invoke(
+        graph_app, ["explore", "run", "--project-root", str(mapped), "--json"]
+    )
+    assert explore.exit_code == 0
+
+    routes_text = runner.invoke(
+        graph_app, ["routes", "--project-root", str(api_repo)]
+    )
+    assert routes_text.exit_code == 0
+
+    shape = runner.invoke(
+        graph_app,
+        ["shape-check", "--project-root", str(api_repo), "--json", "--route", "/api/items"],
+    )
+    assert shape.exit_code == 0
+
+    shape_text = runner.invoke(
+        graph_app, ["shape-check", "--project-root", str(api_repo)]
+    )
+    assert shape_text.exit_code == 0
+
+    impact = runner.invoke(
+        graph_app,
+        ["api-impact", "/api/items", "--project-root", str(api_repo), "--json"],
+    )
+    assert impact.exit_code == 0
+
+    impact_text = runner.invoke(
+        graph_app, ["api-impact", "/api/items", "--project-root", str(api_repo)]
+    )
+    assert impact_text.exit_code == 0
+
+    impact_missing = runner.invoke(
+        graph_app, ["api-impact", "/nope", "--project-root", str(api_repo)]
+    )
+    assert impact_missing.exit_code == 1
+
+    from devcouncil.cli.commands.graph_cmd import corpus_app
+
+    corpus_status = runner.invoke(
+        corpus_app, ["status", "--project-root", str(mapped), "--json"]
+    )
+    assert corpus_status.exit_code == 0
+
+    corpus_status_text = runner.invoke(
+        corpus_app, ["status", "--project-root", str(mapped)]
+    )
+    assert corpus_status_text.exit_code == 0
+
+    corpus_query = runner.invoke(
+        corpus_app, ["query", "readme", "--project-root", str(mapped), "--json"]
+    )
+    assert corpus_query.exit_code in {0, 1}
+
+    explain = runner.invoke(
+        graph_app, ["explain", "--project-root", str(mapped), "--json"]
+    )
+    assert explain.exit_code in {0, 1}
+
+    pdg_bad = runner.invoke(
+        graph_app,
+        ["pdg-query", "--mode", "nope", "--target", "x", "--project-root", str(mapped)],
+    )
+    assert pdg_bad.exit_code == 2
+
+    pdg_controls = runner.invoke(
+        graph_app,
+        [
+            "pdg-query",
+            "--mode",
+            "controls",
+            "--target",
+            "run",
+            "--project-root",
+            str(mapped),
+            "--json",
+        ],
+    )
+    assert pdg_controls.exit_code in {0, 1}
+
+    ingest = runner.invoke(
+        graph_app, ["ingest", "--project-root", str(mapped), "--json"]
+    )
+    assert ingest.exit_code in {0, 1}
+
+    demo_text = runner.invoke(graph_app, ["demo", "--project-root", str(mapped)])
+    assert demo_text.exit_code == 0
+
+    explain_text = runner.invoke(graph_app, ["explain", "--project-root", str(mapped)])
+    assert explain_text.exit_code in {0, 1}
+
+    corpus_build = runner.invoke(
+        corpus_app, ["build", "--project-root", str(mapped), "--json"]
+    )
+    assert corpus_build.exit_code in {0, 1}
+
+    pdg_flows = runner.invoke(
+        graph_app,
+        [
+            "pdg-query",
+            "--mode",
+            "flows",
+            "--target",
+            "run",
+            "--project-root",
+            str(mapped),
+        ],
+    )
+    assert pdg_flows.exit_code in {0, 1}

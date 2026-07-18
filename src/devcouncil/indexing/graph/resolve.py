@@ -27,8 +27,55 @@ from devcouncil.indexing.graph.schema import (
 
 logger = logging.getLogger(__name__)
 
+# Match SQLite ``AMBIGUOUS_EVIDENCE_LIMIT`` — keep JSON extras bounded.
+AMBIGUOUS_CANDIDATES_CAP = 8
+
 _JS_SUFFIXES = frozenset({".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"})
 _PY_SUFFIXES = frozenset({".py"})
+
+
+def _stable_candidate_ids(candidates: List[str]) -> List[str]:
+    """Deduplicate and sort symbol ids for stable fan-out / extras ordering."""
+    return sorted(dict.fromkeys(candidates))
+
+
+def _capped_candidate_extras(candidates: List[str]) -> Dict[str, Any]:
+    """Bounded ``candidates`` extras fragment (omit when empty)."""
+    if not candidates:
+        return {}
+    ordered = _stable_candidate_ids(candidates)
+    capped = ordered[:AMBIGUOUS_CANDIDATES_CAP]
+    extras: Dict[str, Any] = {"candidates": capped}
+    truncated = len(ordered) - len(capped)
+    if truncated > 0:
+        extras["candidates_truncated"] = truncated
+    return extras
+
+
+def _module_file_match(module: str, fpath: str) -> bool:
+    """True when ``fpath`` is a plausible resolution of dotted ``module``.
+
+    Accepts both ``pkg.mod`` → ``pkg/mod.py`` and ``pkg.mod.func`` aliases by
+    also trying the parent dotted path.
+    """
+    if not module:
+        return False
+    parts = [p for p in module.replace("\\", "/").replace("/", ".").split(".") if p]
+    candidates = [".".join(parts)]
+    if len(parts) > 1:
+        candidates.append(".".join(parts[:-1]))
+    norm = fpath[:-3] if fpath.endswith(".py") else fpath
+    norm = norm.replace("\\", "/")
+    dotted_path = norm.replace("/", ".")
+    stem = Path(fpath).stem
+    for cand in candidates:
+        if not cand:
+            continue
+        if dotted_path.endswith(cand) or norm.endswith(cand.replace(".", "/")):
+            return True
+        if stem == cand.split(".")[-1]:
+            return True
+    return False
 
 
 def _lang_family(path: str) -> str:
@@ -177,6 +224,7 @@ def resolve_import_edges(
     js_files = [f for f in files if _is_js_path(f)]
     if js_files:
         mapper._last_file_set = file_set
+        mapper._js_alias_cache = None
         for rel in js_files:
             ext = extractions.get(rel)
             specs = list(ext.imports) if ext else []
@@ -317,7 +365,7 @@ def contains_and_defines_edges(
     extractions: Dict[str, FileExtraction],
 ) -> List[GraphEdge]:
     edges: List[GraphEdge] = []
-    for path, ext in extractions.items():
+    for path, ext in sorted(extractions.items()):
         fid = file_node_id(path)
         for sym in ext.symbols:
             sid = symbol_node_id(path, sym.qualname)
@@ -381,7 +429,7 @@ def inherit_edges(extractions: Dict[str, FileExtraction], symbol_index: Dict[str
 
     def _resolve_base(path: str, base: str) -> tuple[Optional[str], Confidence, str, List[str]]:
         base_name = base.split(".")[-1].split("<", 1)[0]
-        candidates = by_name.get(base_name, [])
+        candidates = _stable_candidate_ids(by_name.get(base_name, []))
         same = [c for c in candidates if c.startswith(f"{path}::")]
         if len(same) == 1:
             return same[0], Confidence.EXTRACTED, "same-file base", []
@@ -398,7 +446,7 @@ def inherit_edges(extractions: Dict[str, FileExtraction], symbol_index: Dict[str
 
     edges: List[GraphEdge] = []
     type_kinds = {"class", "interface", "struct", "enum", "trait", "type"}
-    for path, ext in extractions.items():
+    for path, ext in sorted(extractions.items()):
         for sym in ext.symbols:
             if sym.kind not in type_kinds:
                 continue
@@ -414,7 +462,7 @@ def inherit_edges(extractions: Dict[str, FileExtraction], symbol_index: Dict[str
                         kind="inherits",
                         confidence=conf,
                         reason=reason,
-                        extras={"candidates": cands} if cands else {},
+                        extras=_capped_candidate_extras(cands),
                     )
                 )
             for iface in getattr(sym, "implements", []) or []:
@@ -428,7 +476,7 @@ def inherit_edges(extractions: Dict[str, FileExtraction], symbol_index: Dict[str
                         kind="implements",
                         confidence=conf,
                         reason=reason.replace("base", "interface"),
-                        extras={"candidates": cands} if cands else {},
+                        extras=_capped_candidate_extras(cands),
                     )
                 )
 
@@ -484,7 +532,7 @@ def decorator_edges(
 
     edges: List[GraphEdge] = []
     seen: Set[Tuple[str, str]] = set()
-    for path, ext in extractions.items():
+    for path, ext in sorted(extractions.items()):
         for sym in ext.symbols:
             if not sym.decorators:
                 continue
@@ -497,7 +545,7 @@ def decorator_edges(
                 conf = Confidence.EXTRACTED
                 reason = "same-file decorator"
                 if not src:
-                    cands = by_name.get(bare, [])
+                    cands = _stable_candidate_ids(by_name.get(bare, []))
                     if len(cands) != 1:
                         continue
                     src = cands[0]
@@ -551,30 +599,49 @@ def named_import_edges(
 
     edges: List[GraphEdge] = []
     seen: Set[Tuple[str, str]] = set()
-    for path, ext in extractions.items():
+    for path, ext in sorted(extractions.items()):
         src = file_node_id(path)
-        imported_files = imports_of.get(path, set())
+        imported_files = sorted(imports_of.get(path, set()))
         for detail in ext.import_details:
+            module = str(detail.module or "")
             for name in detail.names:
                 bare = name.split(".")[-1]
                 if not bare or bare == "*":
                     continue
-                # Prefer a symbol in an imported file
+                # ``from pkg import show`` where show is a submodule: file-level
+                # import edges already keep the module live. Do not bind the
+                # bare name to a same-named function in a sibling module
+                # (hash-order set iteration previously flipped those targets).
+                alias_target = ""
+                if isinstance(detail.alias_map, dict):
+                    alias_target = str(
+                        detail.alias_map.get(bare) or detail.alias_map.get(name) or ""
+                    )
+                module_hint = alias_target or (
+                    f"{module}.{bare}" if module and bare not in module.split(".") else module
+                )
+                if any(Path(f).stem == bare for f in imported_files):
+                    continue
+
+                # Prefer symbols in files matching the import module / alias.
+                scoped = [
+                    fpath
+                    for fpath in imported_files
+                    if by_path_name.get(f"{fpath}::{bare}")
+                    and (not module_hint or _module_file_match(module_hint, fpath))
+                ]
+                pool = scoped if scoped else [
+                    fpath
+                    for fpath in imported_files
+                    if by_path_name.get(f"{fpath}::{bare}")
+                ]
+                matches = _stable_candidate_ids(
+                    [by_path_name[f"{fpath}::{bare}"] for fpath in pool]
+                )
                 target: Optional[str] = None
-                for fpath in imported_files:
-                    cand = by_path_name.get(f"{fpath}::{bare}")
-                    if cand:
-                        target = cand
-                        break
-                if target is None:
-                    # Fallback: unique global top-level with that name in imported files
-                    matches = [
-                        by_path_name[k]
-                        for k in by_path_name
-                        if k.endswith(f"::{bare}") and k.split("::", 1)[0] in imported_files
-                    ]
-                    if len(matches) == 1:
-                        target = matches[0]
+                if matches:
+                    # Unique or stable pick among remaining collisions.
+                    target = matches[0]
                 if target and (src, target) not in seen:
                     seen.add((src, target))
                     edges.append(
@@ -605,11 +672,13 @@ def resolve_calls(
     """
     # name -> list of (path, qualname, id)
     by_name: Dict[str, List[Tuple[str, str, str]]] = defaultdict(list)
-    for key, sid in symbol_index.items():
+    for key, sid in sorted(symbol_index.items()):
         path, _, qual = key.partition("::")
         by_name[qual.split(".")[-1]].append((path, qual, sid))
         if "." in qual:
             by_name[qual].append((path, qual, sid))
+    for name in by_name:
+        by_name[name].sort(key=lambda item: item[2])
 
     # importer -> imported files
     imports_of: Dict[str, Set[str]] = defaultdict(set)
@@ -618,7 +687,7 @@ def resolve_calls(
 
     # Local alias maps from extractions (import as)
     alias_of: Dict[str, Dict[str, str]] = {}
-    for path, ext in extractions.items():
+    for path, ext in sorted(extractions.items()):
         amap: Dict[str, str] = {}
         for detail in ext.import_details:
             amap.update(detail.alias_map)
@@ -630,7 +699,7 @@ def resolve_calls(
     edges: List[GraphEdge] = []
     seen: Set[Tuple[str, str]] = set()
 
-    for path, ext in extractions.items():
+    for path, ext in sorted(extractions.items()):
         # Caller context: prefer enclosing function/method by line
         enclosing: List[Tuple[int, int, str]] = []
         for sym in ext.symbols:
@@ -690,7 +759,7 @@ def resolve_calls(
                         target_id = None
                         confidence = Confidence.AMBIGUOUS
                         reason = f"attribute-call ambiguous ({len(pool)} candidates)"
-                        ambig_candidates = [i for _p, _q, i in pool]
+                        ambig_candidates = _stable_candidate_ids([i for _p, _q, i in pool])
 
             # 0b) Unique *.{name} method when receiver is a variable (not a type name).
             # Prefer same-file, then same-package / imported (same language family).
@@ -712,7 +781,7 @@ def resolve_calls(
                 elif len(same_file) > 1:
                     confidence = Confidence.AMBIGUOUS
                     reason = f"ambiguous same-file method ({len(same_file)} candidates)"
-                    ambig_candidates = [i for _p, _q, i in same_file]
+                    ambig_candidates = _stable_candidate_ids([i for _p, _q, i in same_file])
                 else:
                     pkg = _same_package_dir(path)
                     imported = imports_of.get(path, set())
@@ -736,7 +805,7 @@ def resolve_calls(
                         reason = (
                             f"ambiguous package/imported method ({len(scoped)} candidates)"
                         )
-                        ambig_candidates = [i for _p, _q, i in scoped]
+                        ambig_candidates = _stable_candidate_ids([i for _p, _q, i in scoped])
 
             # 1) same-file exact qualname / name (``this`` covers TS/JS methods)
             if call.receiver in ("self", "cls", "this") and call.name:
@@ -775,7 +844,7 @@ def resolve_calls(
                 alias_files: List[str] = []
                 if alias_target:
                     dotted = alias_target.replace(".", "/")
-                    for f in imported_files:
+                    for f in sorted(imported_files):
                         norm = f[:-3] if f.endswith(".py") else f
                         if norm.replace("\\", "/").endswith(dotted) or norm.replace(
                             "/", "."
@@ -808,7 +877,7 @@ def resolve_calls(
                             target_id = None
                             confidence = Confidence.AMBIGUOUS
                             reason = f"import-alias ambiguous ({len(pool)} candidates)"
-                            ambig_candidates = [i for _p, _q, i in pool]
+                            ambig_candidates = _stable_candidate_ids([i for _p, _q, i in pool])
                 elif len(candidates) == 1:
                     target_id = candidates[0][2]
                     confidence = Confidence.INFERRED
@@ -857,7 +926,7 @@ def resolve_calls(
                         target_id = None
                         confidence = Confidence.AMBIGUOUS
                         reason = f"ambiguous ({len(cands)} candidates)"
-                        ambig_candidates = [i for _p, _q, i in cands]
+                        ambig_candidates = _stable_candidate_ids([i for _p, _q, i in cands])
                 else:
                     if len(cands) == 1:
                         target_id = cands[0][2]
@@ -867,18 +936,24 @@ def resolve_calls(
                         target_id = None
                         confidence = Confidence.AMBIGUOUS
                         reason = f"ambiguous ({len(cands)} candidates)"
-                        ambig_candidates = [i for _p, _q, i in cands]
+                        ambig_candidates = _stable_candidate_ids([i for _p, _q, i in cands])
 
             # Ambiguous name → fan-out edges to every candidate so liveness does
             # not drop real callees when the resolver cannot pick a unique target
             # (e.g. ``result.to_dict()`` among many ``to_dict`` methods).
+            # Attach capped ``candidates`` once (not on every fan-out edge).
             if target_id is None and ambig_candidates:
-                extras_base: Dict[str, Any] = {"candidates": list(ambig_candidates)}
+                ambig_candidates = _stable_candidate_ids(ambig_candidates)
+                cand_extras = _capped_candidate_extras(ambig_candidates)
+                attached_candidates = False
                 for cand_id in ambig_candidates:
                     if (caller_id, cand_id) in seen:
                         continue
                     seen.add((caller_id, cand_id))
-                    extras = dict(extras_base)
+                    extras: Dict[str, Any] = {}
+                    if not attached_candidates:
+                        extras.update(cand_extras)
+                        attached_candidates = True
                     if class_ids and cand_id in class_ids:
                         extras["instantiates"] = True
                     edges.append(
@@ -901,7 +976,9 @@ def resolve_calls(
                             "kind": "ambiguous_call",
                             "reason": reason,
                             "evidence": {
-                                "candidates": list(ambig_candidates),
+                                "candidates": _stable_candidate_ids(ambig_candidates)[
+                                    :AMBIGUOUS_CANDIDATES_CAP
+                                ],
                                 "receiver": call.receiver,
                             },
                         }
@@ -912,7 +989,7 @@ def resolve_calls(
                 seen.add((caller_id, target_id))
                 extras = {}
                 if confidence == Confidence.AMBIGUOUS and ambig_candidates:
-                    extras["candidates"] = list(ambig_candidates)
+                    extras.update(_capped_candidate_extras(ambig_candidates))
                 if class_ids and target_id in class_ids:
                     extras["instantiates"] = True
                 edges.append(

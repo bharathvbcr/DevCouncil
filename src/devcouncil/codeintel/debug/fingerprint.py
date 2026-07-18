@@ -18,21 +18,35 @@ def executable_hash(path: str | Path) -> str:
         return ""
 
 
+_GIT_TIMEOUT_SECONDS = 15.0
+_FALLBACK_SKIP_PARTS = frozenset({
+    ".git", ".devcouncil", "node_modules", "vendor", ".venv", "venv",
+    "dist", "build", "target", "__pycache__",
+})
+
+
 def source_fingerprint(root: Path) -> str:
     root = root.expanduser().resolve()
     head = b""
     dirty = b""
     try:
-        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, stderr=subprocess.DEVNULL)
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            stderr=subprocess.DEVNULL,
+            timeout=_GIT_TIMEOUT_SECONDS,
+        )
         dirty = subprocess.check_output(
             ["git", "diff", "--no-ext-diff", "--binary", "HEAD"],
             cwd=root,
             stderr=subprocess.DEVNULL,
+            timeout=_GIT_TIMEOUT_SECONDS,
         )
         untracked = subprocess.check_output(
             ["git", "ls-files", "--others", "--exclude-standard", "-z"],
             cwd=root,
             stderr=subprocess.DEVNULL,
+            timeout=_GIT_TIMEOUT_SECONDS,
         )
         for raw_path in sorted(value for value in untracked.split(b"\0") if value):
             path = root / raw_path.decode("utf-8", errors="surrogateescape")
@@ -42,7 +56,7 @@ def source_fingerprint(root: Path) -> str:
                 continue
     except (OSError, subprocess.SubprocessError):
         for path in sorted(root.rglob("*")):
-            if not path.is_file() or ".git" in path.parts or ".devcouncil" in path.parts:
+            if not path.is_file() or _FALLBACK_SKIP_PARTS.intersection(path.parts):
                 continue
             try:
                 stat = path.stat()

@@ -34,9 +34,11 @@ def _setup_graph_env(tmp_path: Path, monkeypatch) -> Path:
         dead_code=dead,
     )
     
-    graph_file = tmp_path / ".devcouncil" / "graph" / "code_graph.json"
-    graph_file.parent.mkdir(parents=True, exist_ok=True)
-    graph_file.write_text(cg.model_dump_json(indent=2), encoding="utf-8")
+    # Persist via canonical SQLite path — writing JSON alone is ignored when a
+    # store already exists from ``dev init``.
+    from devcouncil.indexing.graph.build import write_code_graph
+
+    write_code_graph(tmp_path, cg)
     
     return tmp_path
 
@@ -78,8 +80,8 @@ def test_cli_graph_dead(tmp_path, monkeypatch):
     res_json = runner.invoke(app, ["graph", "dead", "--json"])
     assert res_json.exit_code == 0
     data = json.loads(res_json.output)
-    assert len(data) == 1
-    assert data[0]["id"] == "src/a.py::func_a"
+    assert len(data["dead_code"]) == 1
+    assert data["dead_code"][0]["id"] == "src/a.py::func_a"
 
 
 def test_cli_graph_check(tmp_path, monkeypatch):

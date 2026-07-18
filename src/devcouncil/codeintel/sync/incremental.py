@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import asdict
+from pathlib import Path
 
 from devcouncil.codeintel.resolution import enrich_semantic_edges
 from devcouncil.codeintel.service import CodeIntelService
+from devcouncil.codeintel.build_control import (
+    graph_build_session,
+    record_inline_build_status,
+    run_isolated_full_build,
+)
 from devcouncil.indexing.graph.build import (
+    _CODE_SUFFIXES,
     _code_files,
     _files_fingerprint,
     _git_head,
     content_fingerprint,
     extract_all,
     extract_paths,
-    refresh_map_for_paths,
     write_code_graph,
 )
 from devcouncil.indexing.graph.liveness import (
@@ -22,6 +29,7 @@ from devcouncil.indexing.graph.liveness import (
     extraction_from_liveness_shard,
     file_liveness_from_shards,
     legacy_dead_strings,
+    project_call_edges_to_files,
     symbol_reachability_dead,
     token_dead_from_shards,
 )
@@ -52,10 +60,29 @@ def sync_affected_paths(
     liveness: bool = True,
 ) -> CodeGraph:
     """Replace affected rows and dependent resolution as one committed generation."""
+    with graph_build_session(service.project_root):
+        return _sync_affected_paths_locked(service, paths, liveness=liveness)
+
+
+def _sync_affected_paths_locked(
+    service: CodeIntelService,
+    paths: list[str],
+    *,
+    liveness: bool,
+) -> CodeGraph:
     root = service.project_root
     current = service.load()
     if current is None:
-        return refresh_map_for_paths(root, paths, liveness=liveness)
+        result = run_isolated_full_build(
+            root,
+            changed_paths={_normal(path) for path in paths},
+            liveness=liveness,
+        )
+        return result.graph
+    previous_communities = {
+        (node.id, node.path, node.line, node.kind.value): node.community
+        for node in current.nodes
+    }
 
     mapper = RepoMapper(root)
     files = mapper.get_git_files()
@@ -72,6 +99,31 @@ def sync_affected_paths(
             path: build_liveness_shard(root, extraction)
             for path, extraction in migrated.items()
         }
+    live_paths = set(code_files)
+    stale_shard_paths = set(shards) - live_paths
+    shards = {
+        path: shard
+        for path, shard in shards.items()
+        if path in live_paths
+    }
+    code_changed = {
+        path for path in changed
+        if path in live_paths or path in shards or Path(path).suffix.lower() in _CODE_SUFFIXES
+    }
+    if not _incremental_surface_is_stable(code_changed, shards, selected):
+        result = run_isolated_full_build(
+            root,
+            changed_paths=code_changed,
+            liveness=liveness,
+        )
+        refresh_repo_map_from_graph(
+            root,
+            result.graph,
+            changed,
+            files,
+            mapper=mapper,
+        )
+        return result.graph
     for path in affected:
         shards.pop(path, None)
     shards.update({
@@ -88,7 +140,6 @@ def sync_affected_paths(
     )
 
     old_ids = {node.id for node in current.nodes if node.path in affected}
-    live_paths = set(code_files)
     nodes = [
         node for node in current.nodes
         if node.path not in affected and (not node.path or node.path in live_paths)
@@ -100,9 +151,7 @@ def sync_affected_paths(
     kept_edges = [
         edge for edge in current.edges
         if edge.source not in old_ids
-        and edge.target not in old_ids
         and edge.source not in affected
-        and edge.target not in affected
     ]
     old_file_edges = {
         (edge.source, edge.target)
@@ -147,16 +196,36 @@ def sync_affected_paths(
     graph = current.model_copy(deep=True)
     graph.nodes = nodes
     graph.edges = kept_edges + replacement_edges
+    enrich_budget = 120.0
+    try:
+        from devcouncil.app.config import load_config
+
+        enrich_budget = float(load_config(root).indexing.semantic_enrich_timeout_seconds)
+    except Exception:
+        logger.debug("semantic enrich budget config load failed", exc_info=True)
     enrich_semantic_edges(
         graph,
         root=root,
         paths=affected,
         extractions=extractions,
+        budget_seconds=enrich_budget,
     )
+    referenced_ids = {
+        identifier
+        for edge in graph.edges
+        for identifier in (edge.source, edge.target)
+    }
+    graph.nodes = [
+        node for node in graph.nodes
+        if node.path
+        or node.kind not in {NodeKind.EVENT, NodeKind.DYNAMIC}
+        or node.id in referenced_ids
+    ]
 
     if liveness:
         from devcouncil.indexing.wiring import build_dynamic_import_index, entry_roots
 
+        all_roots = entry_roots(root, files)
         fresh_roots = entry_roots(root, files, production_only=True)
         if any("dynamic_import_keys" not in shard for shard in shards.values()):
             dynamic_index = build_dynamic_import_index(root, files)
@@ -171,11 +240,25 @@ def sync_affected_paths(
                             raw_keys.append(key)
         else:
             dynamic_index = dynamic_import_index_from_shards(shards)
+            unsharded_files = [path for path in files if path not in shards]
+            for key, referencing_paths in build_dynamic_import_index(
+                root, unsharded_files
+            ).items():
+                dynamic_index.setdefault(key, set()).update(referencing_paths)
+        # Same call-edge projection as the full build (see assemble_graph) so a
+        # Go same-package callee doesn't flip back to unwired on the first
+        # incremental refresh after a full map said it was live.
+        liveness_file_edges = sorted(
+            set(file_edges) | project_call_edges_to_files(graph.edges)
+        )
         entry_roots_list, unwired, unreachable, unreliable = file_liveness_from_shards(
             files,
-            file_edges,
+            liveness_file_edges,
             shards,
-            entry_roots=fresh_roots,
+            root=root,
+            entry_roots=all_roots,
+            production_entry_roots=fresh_roots,
+            dynamic_index=dynamic_index,
         )
         token_dead, _token_index, token_keys = _token_scan_dead(
             graph.nodes, shards
@@ -197,8 +280,14 @@ def sync_affected_paths(
         graph.unreachable_files = unreachable
         graph.meta["liveness_unreachable_unreliable"] = unreliable
         graph.meta["token_dead_count"] = len(token_dead)
-        graph.meta["unresolved_references"] = unresolved_refs[:200]
-        graph.meta["unresolved_total"] = len(unresolved_refs)
+        prior_unresolved = [
+            ref
+            for ref in (current.meta.get("unresolved_references") or [])
+            if isinstance(ref, dict) and str(ref.get("path") or "") not in affected
+        ]
+        merged_unresolved = prior_unresolved + unresolved_refs
+        graph.meta["unresolved_references"] = merged_unresolved[:200]
+        graph.meta["unresolved_total"] = len(merged_unresolved)
         graph.meta["legacy_dead_symbol_candidates"] = legacy_dead_strings(
             graph.dead_code,
             token_dead,
@@ -240,13 +329,49 @@ def sync_affected_paths(
         entry.path for entry in current.dead_code
         if entry.id in dead_changed_ids and entry.path
     }
-    persistence_paths = affected | liveness_changed_paths
+    community_changed_paths = {
+        node.path
+        for node in graph.nodes
+        if node.path
+        and previous_communities.get(
+            (node.id, node.path, node.line, node.kind.value)
+        ) != node.community
+    }
+    # Pathless semantic channel/bridge nodes must be replaced as a group; SQLite
+    # otherwise copies them from the prior generation as "unaffected".
+    persistence_paths = (
+        affected
+        | liveness_changed_paths
+        | community_changed_paths
+        | stale_shard_paths
+        | {""}
+    )
     graph.meta["liveness_changed_paths"] = sorted(liveness_changed_paths)
-    write_code_graph(
+    graph.meta["community_changed_paths"] = sorted(community_changed_paths)
+    from devcouncil.indexing.graph.build import CompatibilityGraphTooLarge
+
+    generation_before = service.store.current_generation()
+    compatibility_reason = ""
+    try:
+        write_code_graph(
+            root,
+            graph,
+            changed_paths=persistence_paths,
+            analysis_shards=shards,
+        )
+    except CompatibilityGraphTooLarge as exc:
+        compatibility_reason = str(exc)
+        logger.warning("graph committed but compatibility export was skipped: %s", exc)
+    generation_after = service.store.current_generation()
+    record_inline_build_status(
         root,
-        graph,
-        changed_paths=persistence_paths,
-        analysis_shards=shards,
+        state="degraded" if compatibility_reason else "complete",
+        mode="incremental",
+        phase="complete",
+        generation_before=generation_before,
+        generation_after=generation_after,
+        reason=compatibility_reason,
+        compatibility_export="degraded" if compatibility_reason else "healthy",
     )
     refresh_repo_map_from_graph(
         root,
@@ -256,6 +381,42 @@ def sync_affected_paths(
         mapper=mapper,
     )
     return service.load() or graph
+
+
+def _resolution_surface(extraction) -> dict[str, object]:  # noqa: ANN001
+    """Fields whose changes can alter resolution outside the edited file."""
+    return {
+        "language": extraction.language,
+        "imports": list(extraction.imports),
+        "import_details": [asdict(value) for value in extraction.import_details],
+        "symbols": [
+            {
+                key: value
+                for key, value in asdict(symbol).items()
+                if key not in {"line", "end_line"}
+            }
+            for symbol in extraction.symbols
+        ],
+        "all_exports": list(extraction.all_exports),
+        "reexports": list(extraction.reexports),
+    }
+
+
+def _incremental_surface_is_stable(
+    changed: set[str],
+    shards: dict[str, dict[str, object]],
+    selected: dict,
+) -> bool:
+    """Only existing files with an unchanged external resolution surface are safe."""
+    for path in changed:
+        old_shard = shards.get(path)
+        new_extraction = selected.get(path)
+        if old_shard is None or new_extraction is None:
+            return False
+        old_extraction = extraction_from_liveness_shard(old_shard)
+        if _resolution_surface(old_extraction) != _resolution_surface(new_extraction):
+            return False
+    return True
 
 
 def _affected_closure(

@@ -69,9 +69,8 @@ def is_large_change(
 def _stale_pages(project_root: Path) -> List[str]:
     """Pages a refresh would rewrite, or ``[]`` when the wiki/map is unavailable."""
     try:
-        from devcouncil.cli.commands.wiki import wiki_dir_for
         from devcouncil.indexing.repo_mapper import RepoMap
-        from devcouncil.knowledge.wiki import wiki_stale_pages
+        from devcouncil.knowledge.wiki import wiki_dir_for, wiki_stale_pages
 
         map_path = project_root / ".devcouncil" / "repo_map.json"
         wiki_dir = wiki_dir_for(project_root)

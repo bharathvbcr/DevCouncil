@@ -1,5 +1,7 @@
 """Legacy artifact knowledge graph — deprecated compat shim.
 
+devcouncil: allow-unwired — deprecated compat shim; real graph is indexing/graph/.
+
 This module holds a minimal Pydantic model for requirements/tasks/files used by
 older integration experiments. It is **not** the symbol-level code graph in
 ``indexing/graph/`` (built by ``dev map``).

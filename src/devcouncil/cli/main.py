@@ -207,5 +207,23 @@ def main(
     configure_logging(verbosity=verbose, quiet=quiet, log_level=log_level)
     return
 
+def run_cli() -> None:
+    """Console-script entry: run the CLI with EPIPE-safe stdout.
+
+    ``dev map | head`` (or any consumer closing the pipe early) must exit with
+    the conventional SIGPIPE status instead of a BrokenPipeError traceback.
+    """
+    import os
+
+    try:
+        app()
+    except BrokenPipeError:
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        sys.exit(128 + 13)
+
+
 if __name__ == "__main__":
-    app()
+    run_cli()

@@ -46,8 +46,8 @@ Other coding CLI hooks remain Preview as noted below.
 | **GitHub PR Checks** | Preview: `dev report --github` |
 | **GitHub/GitLab PR Comments** | Preview: `dev report --github-pr-comment`, `dev report --gitlab-pr-comment` |
 | **LSP / AST Indexing** | Preview: `dev lsp inspect`, `dev ast match`; optional live refs via `indexing.lsp_refs` / `dev map --lsp-refs` |
-| **Repo Map & Code Graph** | Preview: `dev map` (liveness, incremental `--watch` / `--if-stale`) + `dev graph query|trace|dead|check|process|impact|html|view|demo|export|ingest|search|cypher` — sample UI via `dev graph demo` (see [code-graph.md](code-graph.md)) — API/output may change |
-| **Live Dashboard** | Preview: `dev dashboard --open`, status panels, blocking-first gaps table, recent runs, and guarded local integration apply controls |
+| **Repo Map & Code Graph** | Stable: `dev map` (liveness, incremental `--watch` / `--if-stale`) + `dev graph query|trace|dead|check|process|impact|html|view|demo|export|ingest|search|cypher` — sample UI via `dev graph demo` (see [code-graph.md](code-graph.md)). Opt-in PDG/taint and live LSP refs remain Preview (separate rows). **Known limits:** compatibility JSON may be skipped when over `indexing.graph_json_max_bytes` (store stays committed; `dev graph doctor` flags degraded export); semantic embeddings are opt-in and generation-filtered with a soft scan cap; Louvain communities abort after 15s. MCP graph tools wait for sync freshness and mark `stale` when pending. |
+| **Live Dashboard** | Stable: local-only operator UI via `dev dashboard --open` — status panels, blocking-first gaps table, recent runs; loopback + token-guarded apply controls |
 
 ## Watch mode (`dev check --watch`)
 
@@ -67,7 +67,7 @@ commands affected by each save, using a content-hash cache to skip unchanged inp
 
 ## Near-term focus
 
-- Promote more Preview surfaces (map/graph, hooks, corpus) once API shapes settle
+- Promote more Preview surfaces (hooks, corpus) once API shapes settle
 - PR-diff verify in CI scaffold
 - Broader Stop-gate support beyond Claude/Codex where host APIs allow
 - Deeper corpus ↔ acceptance criterion linking

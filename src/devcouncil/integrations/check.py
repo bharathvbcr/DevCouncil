@@ -236,9 +236,19 @@ def _cursor_config_status(project_root: Path) -> tuple[str, bool, list[str]]:
     path = project_root / ".cursor" / "mcp.json"
     data = _load_json_file(path)
     server = ((data.get("mcpServers") or {}).get("devcouncil") or {}) if data else {}
+    command = server.get("command")
+    # Accept bare ``devcouncil`` or an absolute/relative path whose basename is
+    # ``devcouncil`` (project venv). Both are valid; absolute paths are preferred
+    # when Cursor's shell PATH does not include the project venv.
+    from pathlib import Path as _Path
+
+    name_ok = False
+    if isinstance(command, str) and command.strip():
+        name = _Path(command.replace("\\", "/")).name.lower()
+        name_ok = name in {"devcouncil", "devcouncil.exe"}
     ok = (
         server.get("type") == "stdio"
-        and server.get("command") == "devcouncil"
+        and name_ok
         and server.get("args") == ["mcp-server"]
         and (server.get("env") or {}).get("DEVCOUNCIL_PROJECT_ROOT") == str(project_root)
     )

@@ -23,10 +23,13 @@ def write_model_json(
     path: PathLike,
     model: BaseModel,
     *,
-    indent: int = 2,
+    indent: int | None = 2,
     exclude_none: bool = False,
 ) -> None:
-    """Atomically write a Pydantic model as JSON."""
+    """Atomically write a Pydantic model as JSON.
+
+    Pass ``indent=None`` for compact (minified) output.
+    """
     atomic_write_text(
         path,
         model.model_dump_json(indent=indent, exclude_none=exclude_none) + "\n",

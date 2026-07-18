@@ -22,8 +22,10 @@ logger = logging.getLogger(__name__)
 
 # v1 = Python modules; v2 = + JS/TS specs; v3 = + symbols + calls;
 # v4 = + import_details (named imports / alias maps) for warm/cold edge parity;
-# v5 = + references (non-call name/attribute loads) for callback-aware liveness.
-PARSE_CACHE_VERSION = 5
+# v5 = + references (non-call name/attribute loads) for callback-aware liveness;
+# v6 = generic-extractor callee-style qualname hints (owner hints poisoned
+#      same-file call resolution with self-loops).
+PARSE_CACHE_VERSION = 7
 
 # Keys preserved across partial updates (RepoMapper modules/specs vs graph symbols).
 _PRESERVE_KEYS = (
@@ -260,7 +262,21 @@ def extract_cached(
     ):
         return extraction_from_cache_entry(path, entry), entry
     source = raw.decode("utf-8", errors="replace")
-    ext = extract_file(path, source)
+    try:
+        ext = extract_file(path, source)
+    except Exception:
+        # One pathological file (e.g. RecursionError on absurd nesting) must not
+        # fail every subsequent full build. Index it as opaque; sha256 stays ""
+        # so the failure is never treated as a valid warm cache entry.
+        logger.warning("extraction failed for %s; indexing as opaque file", path, exc_info=True)
+        empty = FileExtraction(path=path, language="")
+        return empty, {
+            "sha256": "",
+            "modules": [],
+            "symbols": [],
+            "calls": [],
+            "import_details": [],
+        }
     fresh = extraction_to_cache_entry(ext, digest)
     try:
         from devcouncil.codeintel import get_codeintel_service

@@ -49,6 +49,13 @@ def _append_result(
         if str(item.get("name", "")).strip()
     }
 
+    # Seen-sets instead of list scans: large generated files can carry
+    # thousands of symbols/calls, and per-append linear scans go quadratic.
+    seen_symbols = {(existing.qualname, existing.line) for existing in output.symbols}
+    seen_calls = {
+        (existing.name, existing.line, existing.receiver) for existing in output.calls
+    }
+
     def visit(item: dict[str, Any], prefix: str = "") -> None:
         name = str(item.get("name", "") or "").strip()
         kind = _kind(str(item.get("kind", "") or ""))
@@ -63,10 +70,8 @@ def _append_result(
                 decorators=[str(value) for value in item.get("decorators", [])],
                 exported=name in exported_names or not name.startswith("_"),
             )
-            if not any(
-                existing.qualname == symbol.qualname and existing.line == symbol.line
-                for existing in output.symbols
-            ):
+            if (symbol.qualname, symbol.line) not in seen_symbols:
+                seen_symbols.add((symbol.qualname, symbol.line))
                 output.symbols.append(symbol)
             child_prefix = qualname if kind in {"class", "interface", "struct", "trait", "enum"} else prefix
         else:
@@ -94,43 +99,32 @@ def _append_result(
         ))
     output.all_exports = sorted(set(output.all_exports) | exported_names)
 
-    symbol_spans = sorted(output.symbols, key=lambda symbol: (symbol.line, -(symbol.end_line - symbol.line)))
+    # ``qualname_hint`` is a CALLEE hint (``receiver.name`` / bare name) — the
+    # same convention as every dedicated extractor. resolve_calls resolves it
+    # against the same-file symbol index; the enclosing caller must never go
+    # here or bare in-function calls all bind back to their own caller.
     if "calls" in result:
         for item in result.get("calls", []) or []:
             name = str(item.get("name", "") or "")
             if not name or name in _CALL_KEYWORDS:
                 continue
             line_no = int(item.get("line", 0)) + line_offset
-            owner = next(
-                (
-                    symbol.qualname
-                    for symbol in reversed(symbol_spans)
-                    if symbol.line <= line_no <= symbol.end_line
-                ),
-                "",
-            )
+            receiver = str(item.get("receiver", "") or "")
             call = ExtractedCall(
                 name=name,
                 line=line_no,
-                receiver=str(item.get("receiver", "") or ""),
-                qualname_hint=owner,
+                receiver=receiver,
+                qualname_hint=f"{receiver}.{name}" if receiver else name,
             )
-            if not any(
-                existing.name == call.name
-                and existing.line == call.line
-                and existing.receiver == call.receiver
-                for existing in output.calls
-            ):
+            key = (call.name, call.line, call.receiver)
+            if key not in seen_calls:
+                seen_calls.add(key)
                 output.calls.append(call)
                 output.references.append(name)
         return
 
     # Compatibility for older companion packs that do not return call rows.
     for line_no, line in enumerate(source.splitlines(), start=line_offset + 1):
-        owner = next(
-            (symbol.qualname for symbol in reversed(symbol_spans) if symbol.line <= line_no <= symbol.end_line),
-            "",
-        )
         for match in _CALL.finditer(line):
             name = match.group("name")
             if name in _CALL_KEYWORDS:
@@ -140,7 +134,7 @@ def _append_result(
                 name=name,
                 line=line_no,
                 receiver=receiver,
-                qualname_hint=owner,
+                qualname_hint=f"{receiver}.{name}" if receiver else name,
             ))
             output.references.append(name)
 

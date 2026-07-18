@@ -370,10 +370,17 @@ def _log_document(wiki_dir: Path, timestamp: str, result: WikiResult) -> OKFDocu
     previous_entries: list[str] = []
     log_path = wiki_dir / "log.md"
     if log_path.is_file():
-        existing = OKFDocument.from_markdown(log_path.read_text(encoding="utf-8"), rel_path="log.md")
-        # Entries are "## <timestamp>" sections after the H1.
-        chunks = re.split(r"\n(?=## )", existing.body)
-        previous_entries = [c.strip() for c in chunks if c.strip().startswith("## ")]
+        try:
+            existing = OKFDocument.from_markdown(
+                log_path.read_text(encoding="utf-8", errors="replace"), rel_path="log.md"
+            )
+            # Entries are "## <timestamp>" sections after the H1.
+            chunks = re.split(r"\n(?=## )", existing.body)
+            previous_entries = [c.strip() for c in chunks if c.strip().startswith("## ")]
+        except Exception:
+            # A corrupt change log is a convenience artifact — restart it rather
+            # than failing the whole wiki refresh.
+            logger.warning("wiki log.md unreadable; restarting change log", exc_info=True)
 
     entries = [entry] + previous_entries
     body = "# Wiki change log\n\n" + "\n\n".join(entries[:_LOG_MAX_ENTRIES])
@@ -556,11 +563,16 @@ def _project_name(root: Path) -> str:
 
 def _load_repo_map(root: Path, *, remap: bool) -> RepoMap:
     map_path = root / ".devcouncil" / "repo_map.json"
-    if remap or not map_path.is_file():
-        from devcouncil.cli.commands.map import generate_map_artifacts
+    if not remap and map_path.is_file():
+        try:
+            return RepoMap.model_validate_json(map_path.read_text(encoding="utf-8"))
+        except Exception:
+            # Corrupt/stale-schema map: regenerate instead of crashing — the
+            # mapper is deterministic and cheap relative to a failed wiki run.
+            logger.warning("repo_map.json unreadable; regenerating for wiki", exc_info=True)
+    from devcouncil.indexing.map_artifacts import generate_map_artifacts
 
-        return generate_map_artifacts(root, map_path)
-    return RepoMap.model_validate_json(map_path.read_text(encoding="utf-8"))
+    return generate_map_artifacts(root, map_path)
 
 
 def _build_router(root: Path):

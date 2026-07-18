@@ -157,6 +157,74 @@ def test_tree_sitter_empty_call_rows_do_not_use_regex_fallback(monkeypatch) -> N
     assert result.references == []
 
 
+def test_duplicate_rows_dedup_across_container_and_embedded_regions(monkeypatch) -> None:
+    payload = {
+        "structure": [{
+            "name": "Worker",
+            "kind": "Class",
+            "start_line": 0,
+            "end_line": 5,
+            "decorators": [],
+            "children": [],
+        }],
+        "imports": [],
+        "exports": [],
+        "calls": [
+            {"name": "helper", "receiver": "", "line": 2},
+            {"name": "helper", "receiver": "", "line": 2},
+            {"name": "helper", "receiver": "svc", "line": 2},
+        ],
+    }
+    monkeypatch.setattr(
+        "devcouncil.codeintel.languages.generic_extractor.process_tree_sitter",
+        lambda language, source: payload,
+    )
+
+    result = extract_generic("Worker.java", "class Worker {\n  helper();\n}\n")
+
+    assert [(symbol.qualname, symbol.line) for symbol in result.symbols] == [("Worker", 1)]
+    # Identical (name, line, receiver) rows collapse; a different receiver survives.
+    assert [(call.name, call.receiver) for call in result.calls] == [
+        ("helper", ""),
+        ("helper", "svc"),
+    ]
+
+
+def test_call_rows_use_callee_hints_and_dedup(monkeypatch) -> None:
+    """Native call rows carry callee-style hints (receiver.name / bare name).
+
+    Owner-style hints (the call's enclosing symbol) made resolve_calls bind
+    every bare in-function call back to its own caller as a self-loop, so the
+    replaced ``_owner_lookup`` helper must stay gone from the call path.
+    """
+    monkeypatch.setattr(
+        "devcouncil.codeintel.languages.generic_extractor.process_tree_sitter",
+        lambda _language, _source: {
+            "structure": [
+                {
+                    "name": "run",
+                    "kind": "function",
+                    "start_line": 0,
+                    "end_line": 9,
+                    "children": [],
+                }
+            ],
+            "imports": [],
+            "exports": [],
+            "calls": [
+                {"name": "helper", "receiver": "", "line": 3},
+                {"name": "helper", "receiver": "", "line": 3},
+                {"name": "send", "receiver": "svc", "line": 5},
+            ],
+        },
+    )
+    extracted = extract_generic("worker.c", "int run(void) { return helper(); }\n")
+    assert [(c.name, c.qualname_hint) for c in extracted.calls] == [
+        ("helper", "helper"),
+        ("send", "svc.send"),
+    ]
+
+
 def test_parser_worker_process_is_bounded_and_handles_missing_grammar() -> None:
     pool = ParserWorkerPool(max_workers=1, timeout=10)
     try:

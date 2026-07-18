@@ -147,6 +147,60 @@ def test_store_records_unresolved_dynamic_references_and_rename_aliases(tmp_path
     }
 
 
+def _file_node(path: str) -> GraphNode:
+    return GraphNode(id=path, kind=NodeKind.FILE, path=path, name=Path(path).name, language="python")
+
+
+def test_identical_content_surviving_files_do_not_alias(tmp_path: Path) -> None:
+    """Two identical files present in both generations are not renames."""
+    for rel in ("pkg_a/__init__.py", "pkg_b/__init__.py"):
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("", encoding="utf-8")
+    store = CodeIntelStore(tmp_path)
+    graph = CodeGraph(nodes=[_file_node("pkg_a/__init__.py"), _file_node("pkg_b/__init__.py")])
+    store.save_graph(graph)
+    store.save_graph(graph.model_copy(deep=True))
+
+    assert store.aliases() == []
+
+
+def test_has_indexed_path_and_runtime_observation_gates(tmp_path: Path) -> None:
+    store = CodeIntelStore(tmp_path)
+    assert store.has_indexed_path("src/app.py") is False
+    assert store.has_runtime_observations() is False
+
+    source = tmp_path / "src" / "app.py"
+    source.parent.mkdir()
+    source.write_text("def main():\n    return 1\n", encoding="utf-8")
+    store.save_graph(_graph())
+    assert store.has_indexed_path("src/app.py") is True
+    assert store.has_indexed_path("src\\app.py") is True
+    assert store.has_indexed_path("src/other.py") is False
+
+    assert store.has_runtime_observations() is False
+    session = store.start_runtime_session(
+        provider="pytest", source_fingerprint="fp", build_fingerprint="bp"
+    )
+    store.add_runtime_observations(session, [{"source": "a", "target": "b"}])
+    assert store.has_runtime_observations() is True
+
+
+def test_ambiguous_same_content_rename_is_not_aliased(tmp_path: Path) -> None:
+    """One removed path matching two added identical files is not a provable rename."""
+    old = tmp_path / "old.py"
+    old.write_text("x = 1\n", encoding="utf-8")
+    store = CodeIntelStore(tmp_path)
+    store.save_graph(CodeGraph(nodes=[_file_node("old.py")]))
+
+    old.unlink()
+    for rel in ("first.py", "second.py"):
+        (tmp_path / rel).write_text("x = 1\n", encoding="utf-8")
+    store.save_graph(CodeGraph(nodes=[_file_node("first.py"), _file_node("second.py")]))
+
+    assert store.aliases() == []
+
+
 def test_store_disambiguates_duplicate_legacy_symbol_ids(tmp_path: Path) -> None:
     source = tmp_path / "app.py"
     source.write_text("def run(): pass\ndef run(): pass\n", encoding="utf-8")
@@ -200,13 +254,28 @@ def test_compatibility_export_is_not_reimported_but_external_replacement_is(tmp_
     assert load_code_graph(tmp_path) is not None
     assert service.store.current_generation() == 1
 
+    # External JSON rewrite must not clobber the canonical store.
     replacement = _graph(name="replacement")
     write_model_json(graph_path(tmp_path), replacement)
     loaded = load_code_graph(tmp_path)
 
     assert loaded is not None
-    assert loaded.nodes[-1].name == "replacement"
-    assert service.store.current_generation() == 2
+    assert loaded.nodes[-1].name == "main"
+    assert service.store.current_generation() == 1
+
+
+def test_compatibility_json_imports_only_when_store_missing(tmp_path: Path) -> None:
+    source = tmp_path / "src" / "app.py"
+    source.parent.mkdir()
+    source.write_text("def main(): return 1\n", encoding="utf-8")
+    (tmp_path / ".devcouncil" / "graph").mkdir(parents=True)
+    write_model_json(graph_path(tmp_path), _graph(name="from_json"))
+
+    loaded = load_code_graph(tmp_path)
+    service = get_codeintel_service(tmp_path)
+    assert loaded is not None
+    assert loaded.nodes[-1].name == "from_json"
+    assert service.store.current_generation() == 1
 
 
 def test_incremental_generation_reuses_content_addressed_payloads(tmp_path: Path) -> None:
@@ -309,3 +378,25 @@ def test_failed_compact_generation_keeps_previous_generation(
 
     assert store.current_generation() == first
     assert store.load_graph().nodes[-1].name == "first"  # type: ignore[union-attr]
+
+
+def test_empty_changed_paths_must_not_drop_memberships(tmp_path: Path) -> None:
+    """changed_paths=set() must full-persist, not commit an empty incremental gen."""
+    store = CodeIntelStore(tmp_path)
+    store.save_graph(_graph(name="first"))
+    fuller = _graph(name="second")
+    fuller.nodes.append(
+        GraphNode(
+            id="src/other.py",
+            kind=NodeKind.FILE,
+            path="src/other.py",
+            name="other.py",
+            language="python",
+        )
+    )
+    store.save_graph(fuller, changed_paths=set())
+    loaded = store.load_graph()
+    assert loaded is not None
+    assert len(loaded.nodes) == 3
+    assert {node.id for node in loaded.nodes} >= {"src/app.py", "src/app.py::second", "src/other.py"}
+    assert store.last_write_stats["node_memberships"] == 3

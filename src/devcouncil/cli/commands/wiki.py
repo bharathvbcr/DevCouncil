@@ -23,7 +23,6 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from devcouncil.cli.commands.init import initialize_project
 from devcouncil.indexing.repo_mapper import RepoMap
 
 app = typer.Typer(help="Generate and maintain the agent-facing codebase wiki (OKF bundle).")
@@ -103,7 +102,7 @@ def _load_repo_map(root: Path, *, remap: bool) -> RepoMap:
     """Load .devcouncil/repo_map.json, (re)generating it when missing or on --remap."""
     map_path = root / ".devcouncil" / "repo_map.json"
     if remap or not map_path.is_file():
-        from devcouncil.cli.commands.map import generate_map_artifacts
+        from devcouncil.indexing.map_artifacts import generate_map_artifacts
 
         console.print("[dim]Building repository map...[/dim]")
         return generate_map_artifacts(root, map_path)
@@ -142,6 +141,8 @@ def _update(
 
     set_log_dir(root)
     logger.info("dev wiki update: llm=%s force=%s remap=%s", llm, force, remap)
+    from devcouncil.cli.commands.init import initialize_project
+
     initialize_project(root, quiet=True)
 
     from devcouncil.knowledge.wiki import refresh_wiki

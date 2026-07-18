@@ -109,6 +109,33 @@ def test_god_nodes_and_cycles(call_chain):
     assert "circular_imports" in report
 
 
+def test_pagerank_scores_are_fixed_precision(call_chain):
+    """PageRank values are rounded so tiny solver noise cannot flip JSON bytes."""
+    from devcouncil.indexing.graph.intel import pagerank_scores
+
+    _, graph = call_chain
+    scores = pagerank_scores(graph)
+    assert scores
+    for value in scores.values():
+        assert value == round(value, 4)
+
+
+def test_god_nodes_tie_break_is_stable():
+    """Equal-degree nodes sort by id so ranking does not depend on edge insert order."""
+    nodes = [
+        GraphNode(id="b.py", kind=NodeKind.FILE, path="b.py", name="b.py"),
+        GraphNode(id="a.py", kind=NodeKind.FILE, path="a.py", name="a.py"),
+    ]
+    edges = [
+        GraphEdge(source="a.py", target="b.py", kind="imports"),
+        GraphEdge(source="b.py", target="a.py", kind="imports"),
+    ]
+    graph = CodeGraph(nodes=nodes, edges=edges)
+    first = [row["id"] for row in god_nodes(graph, top_n=5)]
+    second = [row["id"] for row in god_nodes(graph, top_n=5)]
+    assert first == second == ["a.py", "b.py"]
+
+
 def test_circular_import_detected(tmp_path):
     _write(
         tmp_path,
@@ -370,3 +397,153 @@ def test_pdg_cli_explain_json(tmp_path):
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
     assert payload.get("ok") is True
+
+
+def test_pagerank_pure_python_fallback_matches_networkx(call_chain):
+    """When networkx's solver deps are missing, the fallback yields the same ranks."""
+    import networkx as nx
+    import pytest
+
+    from devcouncil.indexing.graph import intel as intel_mod
+    from devcouncil.indexing.graph.intel import pagerank_scores
+
+    _, graph = call_chain
+    expected = pagerank_scores(graph)
+    assert expected and any(v > 0 for v in expected.values())
+
+    def _boom(*args, **kwargs):
+        raise ModuleNotFoundError("No module named 'numpy'")
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(nx, "pagerank", _boom)
+        fallback = pagerank_scores(graph)
+    finally:
+        monkeypatch.undo()
+    assert fallback.keys() == expected.keys()
+    for nid, score in expected.items():
+        assert abs(fallback[nid] - score) <= 2e-4, nid
+    # Sanity on the raw iterator too: probability mass sums to ~1.
+    edges = sorted(
+        {
+            (e.source, e.target)
+            for e in graph.edges
+            if e.kind in intel_mod._STRUCTURAL_KINDS and e.source != e.target
+        }
+    )
+    raw = intel_mod._pagerank_power_iteration(edges)
+    assert abs(sum(raw.values()) - 1.0) < 1e-6
+
+
+def test_god_nodes_exclude_test_mocks():
+    """High fan-in test fixtures must not crowd production hubs out of the ranking."""
+    nodes = [
+        GraphNode(id="pkg/hub.py::run", kind=NodeKind.FUNCTION, path="pkg/hub.py", name="run"),
+        GraphNode(
+            id="tests/mocks.py::mock_loop",
+            kind=NodeKind.FUNCTION,
+            path="tests/mocks.py",
+            name="mock_loop",
+        ),
+    ]
+    edges = []
+    for idx in range(6):
+        edges.append(
+            GraphEdge(
+                source=f"tests/t{idx}.py",
+                target="tests/mocks.py::mock_loop",
+                kind="calls",
+            )
+        )
+    for idx in range(2):
+        edges.append(
+            GraphEdge(source=f"pkg/c{idx}.py", target="pkg/hub.py::run", kind="calls")
+        )
+    graph = CodeGraph(nodes=nodes, edges=edges)
+    gods = god_nodes(graph, top_n=5)
+    ids = [g["id"] for g in gods]
+    assert "pkg/hub.py::run" in ids
+    assert "tests/mocks.py::mock_loop" not in ids
+    assert all(not g["path"].startswith("tests/") for g in gods)
+
+
+def test_ambiguous_edges_excluded_from_god_pagerank_process_impact():
+    """Ambiguous call fan-out must not invent hubs or inflate process/impact walks."""
+    from devcouncil.indexing.graph.intel import blast_radius, pagerank_scores
+
+    nodes = [
+        GraphNode(id="pkg/a.py::caller", kind=NodeKind.FUNCTION, path="pkg/a.py", name="caller"),
+        GraphNode(id="pkg/hub.py::run", kind=NodeKind.FUNCTION, path="pkg/hub.py", name="run"),
+        GraphNode(
+            id="pkg/noise.py::to_dict",
+            kind=NodeKind.FUNCTION,
+            path="pkg/noise.py",
+            name="to_dict",
+        ),
+        GraphNode(
+            id="pkg/other.py::to_dict",
+            kind=NodeKind.FUNCTION,
+            path="pkg/other.py",
+            name="to_dict",
+        ),
+    ]
+    edges = [
+        GraphEdge(
+            source="pkg/a.py::caller",
+            target="pkg/hub.py::run",
+            kind="calls",
+            confidence=Confidence.EXTRACTED,
+        ),
+        # Ambiguous fan-out to every to_dict — historically created fake hubs.
+        GraphEdge(
+            source="pkg/a.py::caller",
+            target="pkg/noise.py::to_dict",
+            kind="calls",
+            confidence=Confidence.AMBIGUOUS,
+            reason="ambiguous (2 candidates)",
+        ),
+        GraphEdge(
+            source="pkg/a.py::caller",
+            target="pkg/other.py::to_dict",
+            kind="calls",
+            confidence=Confidence.AMBIGUOUS,
+            reason="ambiguous (2 candidates)",
+        ),
+        GraphEdge(
+            source="pkg/x.py::x",
+            target="pkg/noise.py::to_dict",
+            kind="calls",
+            confidence=Confidence.AMBIGUOUS,
+        ),
+        GraphEdge(
+            source="pkg/y.py::y",
+            target="pkg/noise.py::to_dict",
+            kind="calls",
+            confidence=Confidence.AMBIGUOUS,
+        ),
+        GraphEdge(
+            source="pkg/z.py::z",
+            target="pkg/noise.py::to_dict",
+            kind="calls",
+            confidence=Confidence.AMBIGUOUS,
+        ),
+    ]
+    graph = CodeGraph(nodes=nodes, edges=edges, entry_roots=["pkg/a.py"])
+
+    gods = god_nodes(graph, top_n=5)
+    god_ids = [g["id"] for g in gods]
+    assert "pkg/hub.py::run" in god_ids
+    assert "pkg/noise.py::to_dict" not in god_ids
+    assert "pkg/other.py::to_dict" not in god_ids
+
+    scores = pagerank_scores(graph)
+    assert scores.get("pkg/hub.py::run", 0) >= scores.get("pkg/noise.py::to_dict", 0)
+
+    procs = extract_processes(graph, entry="pkg/a.py", max_depth=4)
+    steps = {step for proc in procs for step in proc["steps"]}
+    assert "pkg/hub.py::run" in steps
+    assert "pkg/noise.py::to_dict" not in steps
+
+    br = blast_radius(graph, ["pkg/noise.py::to_dict"], max_depth=2)
+    impacted = {n for layer in br["layers"] for n in layer["nodes"]}
+    assert not impacted  # only ambiguous inbound edges exist

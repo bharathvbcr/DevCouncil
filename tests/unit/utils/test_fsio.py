@@ -70,3 +70,31 @@ def test_atomic_write_requires_existing_parent_dir(tmp_path):
         atomic_write_text(missing, "data")
 
     assert not (tmp_path / "no_such_dir").exists()
+
+
+def test_atomic_write_text_cleans_tmp_on_failure(tmp_path, monkeypatch):
+    target = tmp_path / "fail.txt"
+    real_replace = __import__("os").replace
+
+    def boom(src, dst):
+        raise RuntimeError("replace failed")
+
+    monkeypatch.setattr("os.replace", boom)
+    with pytest.raises(RuntimeError, match="replace failed"):
+        atomic_write_text(target, "data")
+    assert not target.exists()
+    assert not [p for p in tmp_path.iterdir() if p.suffix == ".tmp"]
+    monkeypatch.setattr("os.replace", real_replace)
+
+
+def test_atomic_write_bytes_cleans_tmp_on_failure(tmp_path, monkeypatch):
+    target = tmp_path / "fail.bin"
+
+    def boom(src, dst):
+        raise OSError("nope")
+
+    monkeypatch.setattr("os.replace", boom)
+    with pytest.raises(OSError, match="nope"):
+        atomic_write_bytes(target, b"abc")
+    assert not target.exists()
+    assert not [p for p in tmp_path.iterdir() if p.suffix == ".tmp"]

@@ -40,6 +40,10 @@ _JS_IMPORT_RE = re.compile(
     r"""(?:import|export)\s[^'"]*?from\s*['"](?P<spec>[^'"]+)['"]"""
     r"""|(?:require|import)\s*\(\s*['"](?P<spec2>[^'"]+)['"]\s*\)"""
 )
+_JS_WORKER_URL_RE = re.compile(
+    r"""(?:new\s+(?:Worker|SharedWorker)\s*\(\s*)?"""
+    r"""new\s+URL\s*\(\s*['"](?P<spec>[^'"]+)['"]\s*,\s*import\.meta\.url"""
+)
 _JS_BARE_IMPORT_RE = re.compile(r"""^\s*import\s*['"](?P<spec>[^'"]+)['"]""", re.M)
 _JS_EXPORT_LIST_RE = re.compile(
     r"^\s*export\s*\{([^}]+)\}"
@@ -90,6 +94,15 @@ _JS_CALL_SKIP = {
     "if", "for", "while", "switch", "catch", "function", "return", "await", "new",
     "typeof", "instanceof", "void", "delete", "yield", "import", "super",
 }
+# JSX/TSX component tags used as references (keeps components live without call edges).
+# Member form (``<Foo.Bar``) must win over bare PascalCase so ``Nested`` is not
+# captured alone when ``Nested.Thing`` is written.
+_JSX_TAG_RE = re.compile(
+    r"<(?:"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)"
+    r"|([A-Z][A-Za-z0-9_]*)"
+    r")\b"
+)
 _GO_CALL_SKIP = {
     "if", "for", "switch", "return", "go", "defer", "func", "make", "new",
     "len", "cap", "append", "copy", "delete", "panic", "recover", "range",
@@ -104,6 +117,10 @@ def _js_import_specs(source: str) -> List[str]:
     specs: List[str] = []
     for m in _JS_IMPORT_RE.finditer(source):
         spec = m.group("spec") or m.group("spec2")
+        if spec:
+            specs.append(spec)
+    for m in _JS_WORKER_URL_RE.finditer(source):
+        spec = m.group("spec")
         if spec:
             specs.append(spec)
     for m in _JS_BARE_IMPORT_RE.finditer(source):
@@ -208,6 +225,23 @@ def _extract_js_rationales(source: str, symbols: List[ExtractedSymbol]) -> List[
     return out
 
 
+def _jsx_component_refs(source: str) -> List[str]:
+    """Bare component names from JSX/TSX tags (``<Foo />``, ``<Foo.Bar />``)."""
+    names: List[str] = []
+    seen: Set[str] = set()
+    for m in _JSX_TAG_RE.finditer(source):
+        # Member form: groups 1/2; bare PascalCase: group 3.
+        candidates = [m.group(2), m.group(1), m.group(3)]
+        for name in candidates:
+            if not name or name in seen:
+                continue
+            # Prefer component-like identifiers (PascalCase or trailing member).
+            if name[0].isupper() or name is m.group(2):
+                seen.add(name)
+                names.append(name)
+    return names
+
+
 def _extract_js_regex(path: str, source: str) -> FileExtraction:
     lang = "typescript" if path.endswith((".ts", ".tsx")) else "javascript"
     out = FileExtraction(path=path, language=lang, imports=_js_import_specs(source))
@@ -288,6 +322,7 @@ def _extract_js_regex(path: str, source: str) -> FileExtraction:
         if sym.name in exported_names:
             sym.exported = True
     out.all_exports = sorted(exported_names)
+    out.references = _jsx_component_refs(source)
     out.symbols.extend(_extract_js_rationales(source, out.symbols))
     return out
 
@@ -613,6 +648,31 @@ def _extract_js_tree_sitter(path: str, source: str) -> Optional[FileExtraction]:
             by_name[name].exported = True
 
     out.calls = _extract_js_calls(root, raw)
+    # JSX component tags as non-call references (regex covers TSX even when
+    # tree-sitter language was plain typescript).
+    refs = set(_jsx_component_refs(source))
+    for node in _walk(root):
+        if node.type not in {"jsx_opening_element", "jsx_self_closing_element"}:
+            continue
+        name_node = node.child_by_field_name("name") if hasattr(node, "child_by_field_name") else None
+        if name_node is None:
+            for c in node.children:
+                if c.type in {
+                    "identifier",
+                    "jsx_identifier",
+                    "nested_identifier",
+                    "member_expression",
+                }:
+                    name_node = c
+                    break
+        if name_node is None:
+            continue
+        text = _node_text(name_node, raw)
+        if "." in text:
+            text = text.rsplit(".", 1)[-1]
+        if text and text[0].isupper():
+            refs.add(text)
+    out.references = sorted(refs)
     out.symbols.extend(_extract_js_rationales(source, out.symbols))
     return out
 

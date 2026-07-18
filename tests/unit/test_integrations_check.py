@@ -125,6 +125,29 @@ def test_integration_status_summary_marks_configured_project_files(tmp_path):
     assert cursor["fixable"] is False
 
 
+def test_integration_status_accepts_absolute_cursor_mcp_command(tmp_path):
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "integrations:\n  cursor:\n    enabled: true\n    config_path: .cursor/mcp.json\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".cursor").mkdir()
+    abs_cmd = str(tmp_path / ".venv" / "bin" / "devcouncil")
+    (tmp_path / ".cursor" / "mcp.json").write_text(
+        '{"mcpServers":{"devcouncil":{"type":"stdio","command":"'
+        + abs_cmd.replace("\\", "\\\\")
+        + '","args":["mcp-server"],"env":{"DEVCOUNCIL_PROJECT_ROOT":"'
+        + str(tmp_path).replace("\\", "\\\\")
+        + '"}}}}\n',
+        encoding="utf-8",
+    )
+
+    summary = integration_status_summary(tmp_path)
+    cursor = next(row for row in summary["capabilities"] if row["name"] == "cursor")
+    assert cursor["config_status"] == "ok"
+    assert cursor["configured"] is True
+
+
 def test_integration_check_report_json():
     report = IntegrationCheckReport(
         (IntegrationCheckRow(name="Codex CLI", status="missing", details="not installed"),),

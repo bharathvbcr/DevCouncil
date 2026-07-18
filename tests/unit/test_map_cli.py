@@ -77,3 +77,54 @@ def test_cli_map_rejects_missing_project_root(tmp_path, monkeypatch):
     assert not missing.exists()
     combined = (res.stdout or "") + (res.stderr or "")
     assert "does not exist" in combined.lower() or "does not exist" in str(res)
+
+
+def test_cli_map_survives_broken_stdout_pipe(tmp_path, monkeypatch):
+    """A consumer closing stdout early (dev map | head) must not fail the map."""
+    _setup_map_repo(tmp_path, monkeypatch)
+    import typer as typer_mod
+
+    real_echo = typer_mod.echo
+    def _epipe_echo(*args, **kwargs):
+        raise BrokenPipeError(32, "Broken pipe")
+    monkeypatch.setattr("devcouncil.cli.commands.map.typer.echo", _epipe_echo)
+    try:
+        res = runner.invoke(app, ["map", "--no-wiki"])
+    finally:
+        monkeypatch.setattr("devcouncil.cli.commands.map.typer.echo", real_echo)
+    assert res.exit_code == 0, res.output
+    assert (tmp_path / ".devcouncil" / "repo_map.json").is_file()
+
+
+def test_run_entry_exits_quietly_on_broken_pipe(monkeypatch):
+    """The console-script wrapper converts BrokenPipeError into exit 141."""
+    import os
+
+    import pytest
+
+    from devcouncil.cli import main as main_mod
+
+    def _epipe_app():
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(main_mod, "app", _epipe_app)
+    # Neutralize the devnull fd swap — under pytest's capture it would clobber
+    # the captured fd 1; in a real console it is the documented SIGPIPE recipe.
+    monkeypatch.setattr(os, "open", lambda *a, **k: 99)
+    monkeypatch.setattr(os, "dup2", lambda *a, **k: None)
+    with pytest.raises(SystemExit) as exc:
+        main_mod.run_cli()
+    assert exc.value.code == 141
+
+
+def test_cli_map_warns_when_goal_is_a_directory(tmp_path, monkeypatch):
+    """`dev map /other/repo` maps CWD with the path as goal — warn about intent."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _setup_map_repo(repo, monkeypatch)
+    other = tmp_path / "other"
+    other.mkdir()
+    res = runner.invoke(app, ["map", str(other), "--no-wiki"])
+    assert res.exit_code == 0, res.output
+    combined = res.output + str(getattr(res, "stderr", ""))
+    assert "--project-root" in combined

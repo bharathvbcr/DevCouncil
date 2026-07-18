@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 
 
 class WriterLease:
@@ -34,6 +35,39 @@ class WriterLease:
             return False
         self._handle = handle
         return True
+
+    def acquire_with_retry(
+        self,
+        *,
+        timeout: float = 30.0,
+        initial_delay: float = 0.05,
+        max_delay: float = 1.0,
+        sleep: Callable[[float], None] | None = None,
+    ) -> bool:
+        """Acquire the lease, retrying with exponential backoff until ``timeout``.
+
+        Concurrent watchers / MCP writers commonly hold ``writer.lock`` for a short
+        window. Callers that would otherwise fail closed on the first busy probe
+        should use this so pending work drains instead of oscillating into
+        ``read_only`` / lean-map fallbacks.
+        """
+        sleeper = sleep or time.sleep
+        if self.acquire():
+            return True
+        deadline = time.monotonic() + max(0.0, timeout)
+        delay = max(0.0, initial_delay)
+        max_delay = max(delay, max_delay)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            sleeper(min(delay, remaining, max_delay))
+            if self.acquire():
+                return True
+            if delay <= 0:
+                delay = max(initial_delay, 0.05)
+            else:
+                delay = min(max_delay, delay * 2)
 
     def release(self) -> None:
         handle = self._handle

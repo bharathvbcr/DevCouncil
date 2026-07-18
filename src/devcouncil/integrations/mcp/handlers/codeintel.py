@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -10,7 +11,7 @@ from mcp.types import TextContent, Tool
 from devcouncil.codeintel.query import CodeIntelQueryEngine
 from devcouncil.codeintel.service import canonical_project_root, get_codeintel_service
 from devcouncil.codeintel.sync import get_sync_coordinator
-from devcouncil.integrations.mcp.util import error_text, json_text
+from devcouncil.integrations.mcp.util import error_text, json_text, with_codeintel_freshness
 
 Handler = Callable[[Path, dict], Awaitable[list[TextContent]]]
 
@@ -139,8 +140,8 @@ async def _affected(root: Path, arguments: dict) -> list[TextContent]:
 async def _sync(root: Path, arguments: dict) -> list[TextContent]:
     coordinator = get_sync_coordinator(root)
     supplied = [str(value) for value in arguments.get("paths") or []]
-    changed = supplied or coordinator.reconcile()
-    ok = coordinator.sync_now(changed)
+    changed = supplied or await asyncio.to_thread(coordinator.reconcile)
+    ok = await asyncio.to_thread(coordinator.sync_now, changed)
     payload = {"ok": ok, "reconciled": changed, **coordinator.status().as_dict()}
     return json_text(payload) if ok else error_text(
         coordinator.status().last_error or coordinator.status().degraded_reason or "sync failed",
@@ -172,9 +173,9 @@ async def dispatch(name: str, default_root: Path, arguments: dict) -> list[TextC
         return None
     root = resolve_root(default_root, arguments)
     try:
-        if name not in {"devcouncil_code_sync", "devcouncil_code_status"}:
-            get_sync_coordinator(root).wait_until_fresh(timeout=2.0)
-        return await handler(root, arguments)
+        if name in {"devcouncil_code_sync", "devcouncil_code_status"}:
+            return await handler(root, arguments)
+        return await with_codeintel_freshness(root, lambda: handler(root, arguments))
     except FileNotFoundError as exc:
         return error_text(str(exc), code="codeintel_not_initialized", project_root=str(root))
     except (KeyError, TypeError, ValueError) as exc:

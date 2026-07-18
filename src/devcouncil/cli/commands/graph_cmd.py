@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import List, Optional
 
@@ -18,6 +19,7 @@ hooks_app = typer.Typer(name="hooks", help="Optional Git hook integration.", add
 app.add_typer(hooks_app, name="hooks")
 console = Console()
 status = Console(stderr=True)
+logger = logging.getLogger(__name__)
 
 
 def _root(project_root: Path) -> Path:
@@ -26,6 +28,26 @@ def _root(project_root: Path) -> Path:
 
     set_log_dir(root)
     return root
+
+
+def _graph_degraded_fields(root: Path) -> dict[str, object]:
+    """Lean-map handshake for CLI JSON that bypasses the codeintel envelope."""
+    map_path = root / ".devcouncil" / "repo_map.json"
+    if not map_path.is_file():
+        return {"graph_degraded": False}
+    try:
+        from devcouncil.utils.json_persist import read_json
+
+        data = read_json(map_path)
+        if not isinstance(data, dict):
+            return {"graph_degraded": False}
+        degraded = bool(data.get("graph_degraded"))
+        fields: dict[str, object] = {"graph_degraded": degraded}
+        if degraded:
+            fields["graph_degraded_reason"] = str(data.get("graph_degraded_reason") or "")
+        return fields
+    except Exception:
+        return {"graph_degraded": False}
 
 
 def _require_graph(root: Path):
@@ -45,23 +67,49 @@ def graph_init(
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """Build the canonical SQLite graph and deterministic compatibility exports."""
-    from devcouncil.cli.commands.map import generate_map_artifacts
     from devcouncil.codeintel import get_codeintel_service
+    from devcouncil.codeintel.build_control import GraphBuildBusy
+    from devcouncil.indexing.map_artifacts import refresh_map_artifacts
 
     root = _root(project_root)
-    generate_map_artifacts(
-        root,
-        root / ".devcouncil" / "repo_map.json",
-        liveness=not no_liveness,
-        quiet=True,
-    )
+    try:
+        refresh = refresh_map_artifacts(
+            root,
+            root / ".devcouncil" / "repo_map.json",
+            liveness=not no_liveness,
+            quiet=True,
+        )
+    except GraphBuildBusy as exc:
+        if json_output:
+            typer.echo(json.dumps({"ok": False, "code": "graph_writer_busy", "error": str(exc)}))
+        else:
+            status.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    if refresh.degraded:
+        payload = {
+            "ok": False,
+            "degraded": True,
+            "reason": refresh.reason,
+            "mode": refresh.mode,
+        }
+        if json_output:
+            typer.echo(json.dumps(payload, indent=2))
+        else:
+            status.print(f"[red]Graph init degraded: {refresh.reason}[/red]")
+        raise typer.Exit(code=1)
     result = get_codeintel_service(root).status()
+    if refresh.compatibility_export_degraded:
+        result["compatibility_export"] = "degraded"
+        result["degraded_reason"] = refresh.reason
     if json_output:
         typer.echo(json.dumps(result, indent=2))
     else:
+        color = "yellow" if refresh.compatibility_export_degraded else "green"
         status.print(
-            f"[green]Indexed generation {result.get('generation')} — "
-            f"{result.get('node_count')} nodes, {result.get('edge_count')} edges[/green]"
+            f"[{color}]Indexed generation {result.get('generation')} — "
+            f"{result.get('node_count')} nodes, {result.get('edge_count')} edges"
+            f"{f'; export degraded: {refresh.reason}' if refresh.compatibility_export_degraded else ''}"
+            f"[/{color}]"
         )
 
 
@@ -76,6 +124,17 @@ def graph_status(
 
     root = _root(project_root)
     result = get_codeintel_service(root).status()
+    # Cold start: existing compatibility JSON is enough to bootstrap queries/status
+    # without requiring a full ``dev map`` rebuild first.
+    if result.get("state") in {"uninitialized", "empty"}:
+        try:
+            from devcouncil.indexing.graph.build import graph_path, load_code_graph
+
+            if graph_path(root).is_file():
+                load_code_graph(root)
+                result = get_codeintel_service(root).status()
+        except Exception:
+            logger.debug("graph status cold-start bootstrap failed", exc_info=True)
     result["sync"] = get_sync_coordinator(root).status().as_dict()
     if json_output:
         typer.echo(json.dumps(result, indent=2))
@@ -85,6 +144,19 @@ def graph_status(
     console.print(f"nodes/edges: {result.get('node_count', 0)}/{result.get('edge_count', 0)}")
     sync = result["sync"]
     console.print(f"watcher: {sync['state']} ({sync.get('backend') or 'not started'})")
+    if sync.get("state") in {"disabled", "stopped", ""} or not sync.get("backend"):
+        console.print(
+            "[dim]hint: run `dev graph watch` or `dev map --watch` to enable auto-refresh[/dim]"
+        )
+    if sync.get("build_id"):
+        progress = f"{sync.get('build_completed', 0)}/{sync.get('build_total', 0)}"
+        console.print(
+            f"build: {sync.get('build_state') or 'unknown'} / "
+            f"{sync.get('build_phase') or 'unknown'} ({progress}, "
+            f"pid={sync.get('build_pid') or 'n/a'})"
+        )
+    if sync.get("compatibility_export") == "degraded":
+        console.print("compatibility export: degraded")
     if sync.get("pending"):
         console.print("pending: " + ", ".join(sync["pending"]))
     if sync.get("degraded_reason"):
@@ -150,19 +222,62 @@ def graph_doctor(
     from watchdog.observers import Observer
 
     from devcouncil.codeintel import get_codeintel_service
+    from devcouncil.codeintel.build_control import read_build_status
     from devcouncil.codeintel.languages import grammar_status
+    from devcouncil.codeintel.store.sqlite import compatibility_graph_digest
+    from devcouncil.indexing.graph.build import graph_path
+    from devcouncil.utils.json_persist import read_json
 
     root = _root(project_root)
     service = get_codeintel_service(root)
     store = service.status()
     grammars = grammar_status()
     watcher_backend = getattr(Observer, "__name__", type(Observer).__name__)
+    build = read_build_status(root)
+    export_path = graph_path(root)
+    export_health = "missing"
+    export_detail = ""
+    if store["state"] == "committed":
+        recorded_digest, recorded_mtime = service.store.compatibility_export_state()
+        if not export_path.is_file():
+            export_health = "missing"
+            export_detail = "compatibility JSON absent while store is committed"
+        else:
+            try:
+                data = read_json(export_path)
+                from devcouncil.indexing.graph.schema import CodeGraph
+
+                exported = CodeGraph.model_validate(data)
+                digest = compatibility_graph_digest(exported)
+                if recorded_digest and digest != recorded_digest:
+                    export_health = "drift"
+                    export_detail = "JSON digest diverges from store handshake"
+                elif build.compatibility_export == "degraded":
+                    export_health = "degraded"
+                    export_detail = build.degraded_reason or "last build skipped JSON export"
+                else:
+                    export_health = "healthy"
+            except Exception as exc:  # noqa: BLE001
+                export_health = "corrupt"
+                export_detail = f"{type(exc).__name__}: {exc}"
+    elif build.compatibility_export == "degraded":
+        export_health = "degraded"
+        export_detail = build.degraded_reason or "compatibility export degraded"
     result = {
-        "ok": store["state"] == "committed" and grammars["ok"],
+        "ok": store["state"] == "committed" and grammars["ok"] and export_health == "healthy",
         "store": store,
         "watcher_backend": watcher_backend,
         "grammars": grammars,
+        "compatibility_export": {
+            "health": export_health,
+            "detail": export_detail,
+            "build_state": build.state,
+            "build_compatibility_export": build.compatibility_export,
+        },
     }
+    # Uninitialized projects are healthy when grammars are installed.
+    if store["state"] in {"uninitialized", "empty"}:
+        result["ok"] = bool(grammars["ok"])
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         if not result["ok"]:
@@ -171,13 +286,24 @@ def graph_doctor(
     console.print(f"store: {store['state']} (schema {store['schema_version']})")
     console.print(f"watcher backend: {watcher_backend}")
     console.print(
+        f"compatibility export: {export_health}"
+        + (f" — {export_detail}" if export_detail else "")
+    )
+    console.print(
         f"grammars: {grammars['available_count']}/{grammars['required_count']} available locally"
     )
     for row in grammars["languages"]:
         if not row["available"]:
+            # Python parses via stdlib ast regardless of the tree-sitter wheel —
+            # don't let a Python-heavy repo read this line as broken indexing.
+            native_note = (
+                " — extraction unaffected (native stdlib-ast parser)"
+                if row.get("grammar") == "python"
+                else ""
+            )
             console.print(
                 f"  missing: {row['language']} "
-                f"({', '.join(row['missing_grammars'])})"
+                f"({', '.join(row['missing_grammars'])}){native_note}"
             )
     if grammars["action"]:
         console.print(f"grammar action: {grammars['action']}")
@@ -225,30 +351,75 @@ def graph_ingest(
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """Unified analyze entry: codeintel sync → graph export → repo map write."""
-    from devcouncil.cli.commands.map import generate_map_artifacts
+    from devcouncil.indexing.map_artifacts import refresh_map_artifacts
     from devcouncil.codeintel.sync import get_sync_coordinator
+    from devcouncil.codeintel import get_codeintel_service
+    from devcouncil.codeintel.build_control import GraphBuildBusy
     from devcouncil.indexing.graph.embeddings import build_embeddings
 
     root = _root(project_root)
     coordinator = get_sync_coordinator(root)
-    changed = list(paths or coordinator.reconcile())
-    coordinator.sync_now(changed)
+    changed = list(paths or [])
     map_path = root / ".devcouncil" / "repo_map.json"
-    generate_map_artifacts(root, map_path, liveness=not no_liveness, quiet=True)
+    if paths is None:
+        try:
+            refresh = refresh_map_artifacts(
+                root,
+                map_path,
+                liveness=not no_liveness,
+                quiet=True,
+            )
+        except GraphBuildBusy as exc:
+            payload = {
+                "ok": False,
+                "code": "graph_writer_busy",
+                "error": str(exc),
+                "paths": changed,
+            }
+            if json_output:
+                typer.echo(json.dumps(payload, indent=2))
+            else:
+                status.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1) from exc
+    else:
+        synced = coordinator.sync_now(changed)
+        if not synced:
+            payload = {"ok": False, "paths": changed, **coordinator.status().as_dict()}
+            if json_output:
+                typer.echo(json.dumps(payload, indent=2))
+            else:
+                status.print(f"[red]Graph ingest failed: {payload.get('last_error') or payload.get('degraded_reason')}[/red]")
+            raise typer.Exit(code=1)
+        refresh = refresh_map_artifacts(
+            root,
+            map_path,
+            liveness=not no_liveness,
+            quiet=True,
+            graph=get_codeintel_service(root).load(),
+            paths=changed,
+        )
     embedded = build_embeddings(root)
     payload = {
-        "ok": True,
+        "ok": not refresh.degraded,
         "paths": changed,
         "map": str(map_path.relative_to(root)),
         "embeddings_built": embedded,
+        "generation": refresh.generation,
+        "mode": refresh.mode,
+        "degraded": refresh.degraded,
+        "reason": refresh.reason,
     }
     if json_output:
         typer.echo(json.dumps(payload, indent=2))
     else:
+        color = "yellow" if refresh.degraded else "green"
         status.print(
-            f"[green]Ingested {len(changed)} path(s); map at {payload['map']}"
-            f"{f'; {embedded} embeddings' if embedded else ''}[/green]"
+            f"[{color}]Ingested {len(changed)} path(s); map at {payload['map']}"
+            f"{f'; {embedded} embeddings' if embedded else ''}"
+            f"{f'; degraded: {refresh.reason}' if refresh.degraded else ''}[/{color}]"
         )
+    if refresh.degraded:
+        raise typer.Exit(code=1)
 
 
 @app.command("cypher")
@@ -348,10 +519,14 @@ def graph_query(
     from devcouncil.indexing.graph import query_symbol
 
     root = _root(project_root)
-    result = query_symbol(root, name_or_path)
+    result = {**query_symbol(root, name_or_path), **_graph_degraded_fields(root)}
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
+    if result.get("graph_degraded"):
+        status.print(
+            f"[yellow]graph_degraded: {result.get('graph_degraded_reason') or 'lean map'}[/yellow]"
+        )
     if result.get("error"):
         status.print(f"[red]{result['error']}[/red]")
         raise typer.Exit(code=1)
@@ -377,10 +552,14 @@ def graph_trace(
     from devcouncil.indexing.graph import trace_path
 
     root = _root(project_root)
-    result = trace_path(root, start, end)
+    result = {**trace_path(root, start, end), **_graph_degraded_fields(root)}
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
+    if result.get("graph_degraded"):
+        status.print(
+            f"[yellow]graph_degraded: {result.get('graph_degraded_reason') or 'lean map'}[/yellow]"
+        )
     if result.get("error"):
         status.print(f"[red]{result['error']}[/red]")
         raise typer.Exit(code=1)
@@ -427,9 +606,24 @@ def graph_dead(
             if confidence_at_least(e.confidence, min_confidence)
         ]
     hidden = before_min - len(entries)
+    degraded = _graph_degraded_fields(root)
     if json_output:
-        typer.echo(json.dumps([e.model_dump() for e in entries], indent=2))
+        typer.echo(
+            json.dumps(
+                {
+                    "dead_code": [e.model_dump() for e in entries],
+                    "dead_code_hidden": hidden,
+                    **degraded,
+                },
+                indent=2,
+            )
+        )
         return
+    if degraded.get("graph_degraded"):
+        status.print(
+            f"[yellow]graph_degraded: {degraded.get('graph_degraded_reason') or 'lean map'} "
+            "— treat dead tiers as unreliable[/yellow]"
+        )
     if not entries:
         console.print("No dead-code entries.")
         if hidden:
@@ -632,7 +826,12 @@ def graph_view(
         def log_message(self, fmt, *args):  # noqa: A003
             return
 
-    with socketserver.TCPServer(("127.0.0.1", port), Handler) as httpd:
+    try:
+        httpd = socketserver.TCPServer(("127.0.0.1", port), Handler)
+    except OSError as exc:
+        status.print(f"[red]Cannot serve on 127.0.0.1:{port}: {exc} (try --port)[/red]")
+        raise typer.Exit(code=1) from exc
+    with httpd:
         url = f"http://127.0.0.1:{port}/graph.html"
         status.print(f"[green]Serving {url}  (Ctrl-C to stop)[/green]")
         threading.Timer(0.3, lambda: webbrowser.open(url)).start()

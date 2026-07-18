@@ -38,6 +38,24 @@ _IMPORTLIB_RE = re.compile(
     r"""(?:importlib(?:\.import_module)?|__import__)\s*\(\s*['"]([^'"]+)['"]"""
 )
 _DYNAMIC_IMPORT_RE = re.compile(r"""import\s*\(\s*['"]([^'"]+)['"]\s*\)""")
+# Vite/webpack ``new Worker(new URL("./x", import.meta.url))`` (and bare URL).
+_WORKER_URL_RE = re.compile(
+    r"""(?:new\s+(?:Worker|SharedWorker)\s*\(\s*)?"""
+    r"""new\s+URL\s*\(\s*['"]([^'"]+)['"]\s*,\s*import\.meta\.url"""
+)
+# ``python -m pkg.mod`` and argv forms like ``"-m", "pkg.mod"``.
+_PYTHON_DASH_M_RE = re.compile(
+    r"""(?:^|[^\w-])(?:-m|--module)(?:\s+|\s*,\s*)['"]([A-Za-z_][\w.]*)['"]"""
+    r"""|['"](?:-m|--module)['"]\s*,\s*['"]([A-Za-z_][\w.]*)['"]"""
+)
+# ``importlib.resources.files("pkg.sub")`` package-resource loads.
+_PACKAGE_RESOURCES_RE = re.compile(
+    r"""(?:resources\.)?files\s*\(\s*['"]([A-Za-z_][\w.]*)['"]"""
+)
+# Bundled asset basenames referenced as string constants (plugins, images, …).
+_BUNDLED_ASSET_RE = re.compile(
+    r"""['"]([A-Za-z_][\w.-]*\.(?:mjs|cjs|js|css|svg|png|jpe?g|webp|html))['"]"""
+)
 _HATCH_CUSTOM_HOOK_RE = re.compile(
     r"""(?ms)^\[tool\.hatch\.build\.hooks\.custom\]\s*$.*?^path\s*=\s*['"]([^'"]+)['"]"""
 )
@@ -64,7 +82,7 @@ _WIRING_DECORATOR_HINTS = (
 
 # Bumped when dead-symbol / token-scan semantics change so ratchet baselines
 # skip stale symbol diffs instead of firing false stranded_code regressions.
-LIVENESS_SCAN_VERSION = 2
+LIVENESS_SCAN_VERSION = 3
 
 _VENDOR_DIR_NAMES = frozenset({"vendor", "vendored", "node_modules"})
 
@@ -498,6 +516,17 @@ def structural_exemptions(path: str) -> bool:
             }
             if name in route_names or name.startswith("route.") or name.startswith("+"):
                 return True
+        # Cargo build scripts are invoked by rustc, not imported by app code.
+        if name == "build.rs":
+            return True
+        # Bundler / test-runner configs are tooling entrypoints, not product modules.
+        # Exempt from unwired/unreachable — do NOT seed BFS from them.
+        if _TOOLING_CONFIG_RE.search(norm):
+            return True
+        if ".config." in name and suffix in {
+            ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts",
+        }:
+            return True
         return False
     except Exception:
         logger.debug("structural_exemptions failed for %s", path, exc_info=True)
@@ -589,20 +618,45 @@ def _add_module_file(module: str, file_set: Set[str], out: Set[str]) -> None:
             return
 
 
+# Workspace manifests scanned for entry targets (sorted; bounded for determinism
+# and to keep monorepos with generated packages from ballooning map time).
+_PACKAGE_MANIFEST_CAP = 200
+
+
 def _package_json_entry_targets(root: Path, file_set: Set[str]) -> Set[str]:
-    text = _read_text(root, "package.json")
-    if not text:
-        return set()
+    """Entry targets from the root ``package.json`` and workspace manifests.
+
+    Monorepos often have no root ``main``/``bin``/``exports`` at all — the real
+    entries live in ``frontend/package.json`` etc., so every tracked manifest is
+    scanned (capped) with its targets resolved relative to the manifest's dir.
+    """
+    manifests = sorted(
+        p for p in file_set if p.rsplit("/", 1)[-1] == "package.json"
+    )[:_PACKAGE_MANIFEST_CAP]
+    if not manifests and (root / "package.json").is_file():
+        manifests = ["package.json"]
     found: Set[str] = set()
+    for manifest in manifests:
+        _package_json_entry_targets_for(root, manifest, file_set, found)
+    return found
+
+
+def _package_json_entry_targets_for(
+    root: Path, manifest: str, file_set: Set[str], found: Set[str]
+) -> None:
+    text = _read_text(root, manifest)
+    if not text:
+        return
     try:
         data = json.loads(text)
     except Exception:
-        return found
+        return
+    prefix = manifest[: -len("package.json")]  # "" at root, "frontend/" nested
 
     def _add(candidate: object) -> None:
         if not isinstance(candidate, str):
             return
-        rel = _norm(candidate)
+        rel = _norm(f"{prefix}{_norm(candidate)}")
         if rel in file_set:
             found.add(rel)
             return
@@ -637,6 +691,152 @@ def _package_json_entry_targets(root: Path, file_set: Set[str]) -> Set[str]:
                 for nested in v.values():
                     if isinstance(nested, str):
                         _add(nested)
+
+
+# Convention-based mains. JS/TS and Rust paths are specific enough to seed by
+# name; ``main.go`` and Python service mains collide with helpers often enough
+# that a bounded content sniff gates them.
+_JS_MAIN_SEED_RE = re.compile(
+    r"(?:^|/)"
+    r"(?:"
+    r"src/(?:index|main)"
+    r"|App"
+    r"|(?:server|api|backend|worker|functions|lambda)/index"
+    r")"
+    r"\.(?:ts|tsx|js|jsx|mjs)$"
+)
+_RUST_MAIN_SEED_RE = re.compile(r"(?:^|/)src/(?:main\.rs|lib\.rs|bin/[^/]+\.rs)$")
+_TOOLING_CONFIG_RE = re.compile(
+    r"(?:^|/)"
+    r"(?:"
+    r"vite\.config\.[cm]?[jt]s"
+    r"|vitest\.config\.[cm]?[jt]s"
+    r"|webpack\.config\.[cm]?[jt]s"
+    r"|rollup\.config\.[cm]?[jt]s"
+    r"|esbuild\.config\.[cm]?[jt]s"
+    r"|next\.config\.[cm]?[jt]s"
+    r"|astro\.config\.[cm]?[jt]s"
+    r"|nuxt\.config\.[cm]?[jt]s"
+    r"|playwright\.config\.[cm]?[jt]s"
+    r"|tailwind\.config\.[cm]?[jt]s"
+    r"|postcss\.config\.[cm]?[jt]s"
+    r"|eslint\.config\.[cm]?[jt]s"
+    r")"
+    r"$"
+)
+_PY_MAIN_SEED_NAMES = {"main.py", "app.py", "wsgi.py", "asgi.py"}
+# "__main__" covers both quote styles of the run guard.
+_PY_MAIN_SEED_MARKERS = ("__main__", "FastAPI(", "Flask(", "uvicorn.run(")
+_MAIN_SEED_SNIFF_CAP = 512
+_JS_RESOLVE_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+_JS_SUFFIXES = frozenset(_JS_RESOLVE_EXTS)
+
+
+def _normalize_rel_path(target: str) -> str:
+    parts: List[str] = []
+    for comp in target.replace("\\", "/").split("/"):
+        if comp in ("", "."):
+            continue
+        if comp == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(comp)
+    return "/".join(parts)
+
+
+def _probe_js_path(norm: str, file_set: Set[str]) -> Optional[str]:
+    """Resolve extensionless / ``.js``-suffixed specs against ``file_set``."""
+    if not norm:
+        return None
+    candidates = [norm]
+    candidates += [f"{norm}{ext}" for ext in _JS_RESOLVE_EXTS]
+    candidates += [f"{norm}/index{ext}" for ext in _JS_RESOLVE_EXTS]
+    suffix = Path(norm).suffix.lower()
+    if suffix in _JS_SUFFIXES:
+        stem = norm[: -len(suffix)]
+        candidates += [f"{stem}{ext}" for ext in _JS_RESOLVE_EXTS]
+        candidates += [f"{stem}/index{ext}" for ext in _JS_RESOLVE_EXTS]
+    for cand in candidates:
+        if cand in file_set:
+            return cand
+    return None
+
+
+def _expand_roots_via_dynamic_imports(
+    root: Path, file_set: Set[str], seeds: Set[str]
+) -> Set[str]:
+    """One-BFS expansion: dynamic ``import(...)`` / worker URL targets become roots.
+
+    Covers Vite/CRA ``main.tsx → import('./App')``, alias ``import('@/x')``, and
+    ``new Worker(new URL('./worker.ts', import.meta.url))`` without treating every
+    dynamic import in the repo as a seed.
+    """
+    from devcouncil.indexing.repo_mapper import RepoMapper
+
+    mapper = RepoMapper(root)
+    mapper._last_file_set = file_set
+    expanded = set(seeds)
+    queue = list(seeds)
+    seen = set(seeds)
+    while queue:
+        cur = queue.pop()
+        text = _read_text(root, cur)
+        if not text:
+            continue
+        specs: List[str] = [match.group(1) for match in _DYNAMIC_IMPORT_RE.finditer(text)]
+        specs.extend(match.group(1) for match in _WORKER_URL_RE.finditer(text))
+        for spec in specs:
+            if not spec:
+                continue
+            hit: Optional[str] = None
+            if spec.startswith("."):
+                try:
+                    joined = (Path(cur).parent / spec).as_posix()
+                except Exception:
+                    continue
+                hit = _probe_js_path(_normalize_rel_path(joined), file_set)
+            else:
+                try:
+                    hit = mapper._resolve_js_spec(cur, spec, file_set)
+                except Exception:
+                    hit = None
+            if hit and hit not in seen:
+                seen.add(hit)
+                expanded.add(hit)
+                queue.append(hit)
+    return expanded
+
+
+def _conventional_main_seeds(root: Path, file_set: Set[str]) -> Set[str]:
+    """Language-convention entry mains: Go/Rust binaries, Python service mains,
+    JS/TS ``src/index``/``src/main``/``App``/service ``index`` modules, and
+    Rust ``main.rs`` / ``lib.rs``.
+
+    Tooling configs (Vite/PostCSS/…) are structural exemptions only — never BFS
+    seeds (they do not import product modules).
+    """
+    found: Set[str] = set()
+    sniffed = 0
+    for f in sorted(file_set):
+        if _JS_MAIN_SEED_RE.search(f) or _RUST_MAIN_SEED_RE.search(f):
+            found.add(f)
+            continue
+        name = f.rsplit("/", 1)[-1]
+        if name == "main.go":
+            if sniffed >= _MAIN_SEED_SNIFF_CAP:
+                continue
+            sniffed += 1
+            text = _read_text(root, f)
+            if "package main" in text and "func main(" in text:
+                found.add(f)
+        elif name in _PY_MAIN_SEED_NAMES:
+            if sniffed >= _MAIN_SEED_SNIFF_CAP:
+                continue
+            sniffed += 1
+            text = _read_text(root, f)
+            if any(marker in text for marker in _PY_MAIN_SEED_MARKERS):
+                found.add(f)
     return found
 
 
@@ -677,8 +877,12 @@ def entry_roots(
 ) -> list[str]:
     """Config-declared + small convention set used as BFS reachability seeds.
 
-    Seeds are pyproject/package.json targets plus ``__main__.py`` / ``manage.py``.
-    Structural exemptions (routes, migrations, scripts, stories, tests) remain a
+    Seeds are pyproject targets, package.json targets (root + workspace
+    manifests), language-convention mains (``main.go`` binaries, Python service
+    mains, JS/TS ``src/index``/``src/main``/``App``/service indexes, Rust
+    ``src/main.rs``/``lib.rs``), relative dynamic-import expansions from those
+    seeds, plus ``__main__.py`` / ``manage.py``. Structural exemptions (routes,
+    migrations, scripts, stories, tests, tooling configs, ``build.rs``) remain a
     skip-list for unwired/unreachable — they are NOT BFS seeds (that diluted
     reachability and, with caps, could truncate real config entries).
 
@@ -694,12 +898,21 @@ def entry_roots(
         roots |= _pyproject_script_targets(root, file_set)
         roots |= _package_json_entry_targets(root, file_set)
 
+        for f in _conventional_main_seeds(root, file_set):
+            if production_only and is_test_path(f):
+                continue
+            roots.add(f)
+
         for f in file_set:
             if production_only and is_test_path(f):
                 continue
             name = Path(f).name
             if name in {"__main__.py", "manage.py"}:
                 roots.add(f)
+
+        roots = _expand_roots_via_dynamic_imports(root, file_set, roots)
+        if production_only:
+            roots = {r for r in roots if not is_test_path(r)}
 
         return sorted(roots)
     except Exception:
@@ -781,6 +994,21 @@ def module_tokens_for(path: str) -> Set[str]:
     elif "/" in no_ext and len(stem) >= _SHORT_STEM_MAX:
         # Still skip short stems; path/dotted forms above are enough.
         pass
+    # Bundled non-Python assets are often referenced by basename only.
+    name = Path(norm).name
+    if Path(norm).suffix.lower() in {
+        ".mjs",
+        ".cjs",
+        ".js",
+        ".css",
+        ".svg",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+        ".html",
+    }:
+        tokens.add(name)
     return {t for t in tokens if t}
 
 
@@ -825,11 +1053,52 @@ def dynamic_import_keys(path: str, source: str) -> Set[str]:
     if suffix not in _CODE_CONFIG_SUFFIXES:
         return set()
     specs: List[str] = [match.group(1) for match in _IMPORTLIB_RE.finditer(source)]
-    specs.extend(
-        spec
-        for match in _DYNAMIC_IMPORT_RE.finditer(source)
-        if (spec := match.group(1)) and not spec.startswith(".")
-    )
+    for match in _DYNAMIC_IMPORT_RE.finditer(source):
+        spec = match.group(1)
+        if not spec:
+            continue
+        if spec.startswith("."):
+            # Relative dynamic import — resolve against this file so
+            # ``import('./App')`` clears ``App.tsx`` via reference_cleared.
+            try:
+                joined = (Path(norm).parent / spec).as_posix()
+            except Exception:
+                continue
+            resolved = _normalize_rel_path(joined)
+            hit_stem = resolved
+            for ext in _JS_RESOLVE_EXTS:
+                if resolved.endswith(ext):
+                    hit_stem = resolved[: -len(ext)]
+                    break
+            specs.append(resolved)
+            specs.append(hit_stem)
+        else:
+            specs.append(spec)
+    for match in _WORKER_URL_RE.finditer(source):
+        spec = match.group(1)
+        if not spec:
+            continue
+        if spec.startswith("."):
+            try:
+                joined = (Path(norm).parent / spec).as_posix()
+            except Exception:
+                continue
+            resolved = _normalize_rel_path(joined)
+            hit_stem = resolved
+            for ext in _JS_RESOLVE_EXTS:
+                if resolved.endswith(ext):
+                    hit_stem = resolved[: -len(ext)]
+                    break
+            specs.append(resolved)
+            specs.append(hit_stem)
+        else:
+            specs.append(spec)
+    for match in _PYTHON_DASH_M_RE.finditer(source):
+        spec = match.group(1) or match.group(2)
+        if spec:
+            specs.append(spec)
+    specs.extend(_PACKAGE_RESOURCES_RE.findall(source))
+    specs.extend(_BUNDLED_ASSET_RE.findall(source))
     if suffix == ".toml":
         specs.extend(
             (Path(norm).parent / match.group(1)).with_suffix("").as_posix()
@@ -947,8 +1216,35 @@ def reference_cleared(
                     return True
             for m in _DYNAMIC_IMPORT_RE.finditer(text):
                 spec = m.group(1)
-                if spec.startswith("."):
+                if not spec:
                     continue
+                if spec.startswith("."):
+                    try:
+                        joined = (Path(norm).parent / spec).as_posix()
+                    except Exception:
+                        continue
+                    resolved = _normalize_rel_path(joined)
+                    if import_spec_matches(resolved, tokens):
+                        return True
+                    # Extensionless stem match (./App → App.tsx tokens)
+                    stem = resolved
+                    for ext in _JS_RESOLVE_EXTS:
+                        if resolved.endswith(ext):
+                            stem = resolved[: -len(ext)]
+                            break
+                    if import_spec_matches(stem, tokens):
+                        return True
+                    continue
+                if import_spec_matches(spec, tokens):
+                    return True
+            for m in _PYTHON_DASH_M_RE.finditer(text):
+                spec = m.group(1) or m.group(2)
+                if spec and import_spec_matches(spec, tokens):
+                    return True
+            for spec in _PACKAGE_RESOURCES_RE.findall(text):
+                if import_spec_matches(spec, tokens):
+                    return True
+            for spec in _BUNDLED_ASSET_RE.findall(text):
                 if import_spec_matches(spec, tokens):
                     return True
     except Exception:

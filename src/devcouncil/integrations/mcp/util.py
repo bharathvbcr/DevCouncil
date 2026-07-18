@@ -45,6 +45,46 @@ def error_text(message: str, *, code: str = "error", **details: object) -> list[
     return json_text({"ok": False, "error": message, "code": code, **details})
 
 
+def annotate_stale(contents: list[TextContent], coordinator: object) -> list[TextContent]:
+    """Attach top-level stale/sync metadata when a freshness wait timed out."""
+    text = contents[0].text if contents else ""
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return contents
+    if not isinstance(payload, dict):
+        return contents
+    status = coordinator.status()  # type: ignore[attr-defined]
+    payload["stale"] = True
+    payload["fresh"] = False
+    payload["sync"] = {
+        **(payload.get("sync") if isinstance(payload.get("sync"), dict) else {}),
+        "pending": list(getattr(status, "pending", []) or []),
+        "state": getattr(status, "state", "pending"),
+        "fresh": False,
+    }
+    return json_text(payload)
+
+
+async def with_codeintel_freshness(
+    root: Path,
+    produce: object,
+    *,
+    timeout: float = 2.0,
+) -> list[TextContent]:
+    """Await pending sync, run ``produce``, and annotate stale responses."""
+    import asyncio
+
+    from devcouncil.codeintel.sync import get_sync_coordinator
+
+    coordinator = get_sync_coordinator(root)
+    fresh = await asyncio.to_thread(coordinator.wait_until_fresh, timeout=timeout)
+    contents = await produce()  # type: ignore[misc]
+    if not fresh and contents:
+        return annotate_stale(contents, coordinator)
+    return contents
+
+
 def normalize_arguments(arguments: object) -> dict:
     return arguments if isinstance(arguments, dict) else {}
 

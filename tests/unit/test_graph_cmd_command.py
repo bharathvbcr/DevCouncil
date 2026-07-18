@@ -15,11 +15,16 @@ runner = CliRunner()
 
 
 def test_graph_doctor_reports_actionable_embedded_grammar_gaps(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
     monkeypatch.setattr(
         codeintel,
         "get_codeintel_service",
         lambda root: SimpleNamespace(
-            status=lambda: {"state": "committed", "schema_version": 1}
+            status=lambda: {"state": "committed", "schema_version": 1},
+            store=SimpleNamespace(
+                compatibility_export_state=lambda: ("", None),
+            ),
         ),
     )
     monkeypatch.setattr(
@@ -235,8 +240,9 @@ def test_graph_dead_json_and_confidence_filter(tmp_path, monkeypatch):
     )
     assert result.exit_code == 0
     data = json.loads(result.stdout)
-    assert len(data) == 1
-    assert data[0]["id"] == "a.f"
+    assert len(data["dead_code"]) == 1
+    assert data["dead_code"][0]["id"] == "a.f"
+    assert data.get("graph_degraded") is False
 
 
 def test_graph_dead_empty_with_hidden(tmp_path, monkeypatch):

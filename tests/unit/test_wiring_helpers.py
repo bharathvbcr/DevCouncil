@@ -173,7 +173,28 @@ def test_structural_exemptions():
     assert wiring.structural_exemptions("db/migrations/0001_init.py")
     assert wiring.structural_exemptions("scripts/tool.py")
     assert wiring.structural_exemptions("types/foo.d.ts")
+    assert wiring.structural_exemptions("apps/desktop/vite.config.ts")
+    assert wiring.structural_exemptions("apps/desktop/postcss.config.mjs")
+    assert wiring.structural_exemptions("apps/desktop/src-tauri/build.rs")
     assert not wiring.structural_exemptions("pkg/regular.py")
+
+
+def test_tooling_configs_are_not_entry_roots(tmp_path):
+    """Vite/PostCSS configs are exempt, not BFS seeds."""
+    (tmp_path / "apps" / "desktop" / "src").mkdir(parents=True)
+    (tmp_path / "apps" / "desktop" / "src" / "main.tsx").write_text(
+        "export {}\n", encoding="utf-8"
+    )
+    (tmp_path / "apps" / "desktop" / "vite.config.ts").write_text(
+        "export default {}\n", encoding="utf-8"
+    )
+    files = [
+        "apps/desktop/src/main.tsx",
+        "apps/desktop/vite.config.ts",
+    ]
+    roots = wiring.entry_roots(tmp_path, files)
+    assert "apps/desktop/vite.config.ts" not in roots
+    assert wiring.structural_exemptions("apps/desktop/vite.config.ts")
 
 
 # ----------------------------------------------------------------------
@@ -216,6 +237,85 @@ def test_package_json_entry_targets(tmp_path):
     roots = wiring.entry_roots(tmp_path, ["src/index.js", "bin/cli.js", "package.json"])
     assert "src/index.js" in roots
     assert "bin/cli.js" in roots
+
+
+def test_workspace_package_json_entry_targets(tmp_path):
+    frontend = tmp_path / "frontend"
+    (frontend / "src").mkdir(parents=True)
+    (frontend / "package.json").write_text(
+        '{"name": "web", "main": "./src/app.js"}\n', encoding="utf-8"
+    )
+    (frontend / "src" / "app.js").write_text("export {};\n", encoding="utf-8")
+    roots = wiring.entry_roots(
+        tmp_path, ["frontend/package.json", "frontend/src/app.js"]
+    )
+    assert "frontend/src/app.js" in roots
+
+
+def test_entry_roots_go_main_convention(tmp_path):
+    cmd = tmp_path / "cmd" / "server"
+    cmd.mkdir(parents=True)
+    (cmd / "main.go").write_text(
+        "package main\n\nfunc main() {\n}\n", encoding="utf-8"
+    )
+    pkg = tmp_path / "internal"
+    pkg.mkdir()
+    # Named main.go but not a binary: must NOT be seeded.
+    (pkg / "main.go").write_text(
+        "package internal\n\nfunc helper() {\n}\n", encoding="utf-8"
+    )
+    roots = wiring.entry_roots(
+        tmp_path, ["cmd/server/main.go", "internal/main.go"]
+    )
+    assert "cmd/server/main.go" in roots
+    assert "internal/main.go" not in roots
+
+
+def test_entry_roots_python_service_main_convention(tmp_path):
+    sidecar = tmp_path / "backend"
+    sidecar.mkdir()
+    (sidecar / "main.py").write_text(
+        "from fastapi import FastAPI\n\napp = FastAPI()\n", encoding="utf-8"
+    )
+    helper = tmp_path / "lib"
+    helper.mkdir()
+    # A helper module named main.py without entry markers: not seeded.
+    (helper / "main.py").write_text("def util():\n    pass\n", encoding="utf-8")
+    (tmp_path / "run.py").write_text(
+        'if __name__ == "__main__":\n    pass\n', encoding="utf-8"
+    )
+    roots = wiring.entry_roots(
+        tmp_path, ["backend/main.py", "lib/main.py", "run.py"]
+    )
+    assert "backend/main.py" in roots
+    assert "lib/main.py" not in roots
+    # run.py is not a conventional main name even with a guard.
+    assert "run.py" not in roots
+
+
+def test_entry_roots_frontend_and_rust_convention(tmp_path):
+    for rel in (
+        "web/src/index.tsx",
+        "app/src/main.ts",
+        "svc/src/main.rs",
+        "svc/src/lib.rs",
+    ):
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("// entry\n", encoding="utf-8")
+    files = [
+        "web/src/index.tsx",
+        "app/src/main.ts",
+        "svc/src/main.rs",
+        "svc/src/lib.rs",
+        "web/src/util.ts",
+    ]
+    roots = wiring.entry_roots(tmp_path, files)
+    assert "web/src/index.tsx" in roots
+    assert "app/src/main.ts" in roots
+    assert "svc/src/main.rs" in roots
+    assert "svc/src/lib.rs" in roots
+    assert "web/src/util.ts" not in roots
 
 
 # ----------------------------------------------------------------------
@@ -582,15 +682,47 @@ def test_build_dynamic_import_index_repomapper_error(tmp_path, monkeypatch):
     assert wiring.build_dynamic_import_index(tmp_path) == {}
 
 
-def test_build_dynamic_import_index_skips_relative_dynamic_import(tmp_path):
+def test_build_dynamic_import_index_includes_relative_dynamic_import(tmp_path):
+    """Relative ``import('./App')`` must clear App.tsx via the dynamic index."""
     (tmp_path / "m.ts").write_text("const x = import('./local');\n", encoding="utf-8")
-    index = wiring.build_dynamic_import_index(tmp_path, git_files=["m.ts"])
-    assert not any("local" in form for form in index)
+    (tmp_path / "local.ts").write_text("export {};\n", encoding="utf-8")
+    index = wiring.build_dynamic_import_index(
+        tmp_path, git_files=["m.ts", "local.ts"]
+    )
+    assert any("local" in form for form in index)
+    assert wiring.reference_cleared(
+        tmp_path, "local.ts", git_files=["m.ts", "local.ts"], dynamic_index=index
+    ) is True
 
 
-# ----------------------------------------------------------------------
-# reference_cleared: fallback scan + edge branches
-# ----------------------------------------------------------------------
+def test_entry_roots_lib_rs_app_server_and_dynamic_expand(tmp_path):
+    files = [
+        "apps/desktop/src/main.tsx",
+        "apps/desktop/src/App.tsx",
+        "apps/desktop/src/server/index.ts",
+        "apps/desktop/src/server/auth.ts",
+        "apps/desktop/src-tauri/src/main.rs",
+        "apps/desktop/src-tauri/src/lib.rs",
+        "apps/desktop/vite.config.ts",
+        "apps/desktop/src/util.ts",
+    ]
+    for rel in files:
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if rel.endswith("main.tsx"):
+            p.write_text("import('./App');\n", encoding="utf-8")
+        else:
+            p.write_text("// entry\n", encoding="utf-8")
+    roots = wiring.entry_roots(tmp_path, files)
+    assert "apps/desktop/src/main.tsx" in roots
+    assert "apps/desktop/src/App.tsx" in roots  # convention + dynamic expand
+    assert "apps/desktop/src/server/index.ts" in roots
+    assert "apps/desktop/src-tauri/src/lib.rs" in roots
+    assert "apps/desktop/src-tauri/src/main.rs" in roots
+    # Tooling configs are exemptions, not BFS seeds
+    assert "apps/desktop/vite.config.ts" not in roots
+    assert wiring.structural_exemptions("apps/desktop/vite.config.ts") is True
+    assert "apps/desktop/src/util.ts" not in roots
 
 
 def test_reference_cleared_empty_target_returns_false(tmp_path):
@@ -627,12 +759,12 @@ def test_reference_cleared_fallback_default_git_files(tmp_path):
     assert wiring.reference_cleared(tmp_path, "plugins/impl.py") is True
 
 
-def test_reference_cleared_fallback_dynamic_import_relative_skipped(tmp_path):
+def test_reference_cleared_fallback_dynamic_import_relative_clears(tmp_path):
     (tmp_path / "impl.ts").write_text("x = 1\n", encoding="utf-8")
     (tmp_path / "loader.ts").write_text("const m = import('./impl');\n", encoding="utf-8")
     assert wiring.reference_cleared(
         tmp_path, "impl.ts", git_files=["impl.ts", "loader.ts"]
-    ) is False
+    ) is True
 
 
 def test_config_yaml_entry_roots_merged(tmp_path):
@@ -680,3 +812,49 @@ def test_corpus_status_before_build(tmp_path):
     assert status["enabled"] is True
     assert status["verify_gates"] is False
     assert status["node_count"] == 0
+
+
+def test_python_dash_m_clears_reference(tmp_path):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "worker.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "launcher.py").write_text(
+        'subprocess.Popen([sys.executable, "-m", "pkg.worker"])\n',
+        encoding="utf-8",
+    )
+    git_files = ["pkg/worker.py", "launcher.py"]
+    index = wiring.build_dynamic_import_index(tmp_path, git_files=git_files)
+    assert wiring.reference_cleared(
+        tmp_path, "pkg/worker.py", git_files=git_files, dynamic_index=index
+    )
+
+
+def test_package_resources_files_clears_init(tmp_path):
+    pkg = tmp_path / "pkg" / "assets"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "ui.py").write_text(
+        'from importlib import resources\nresources.files("pkg.assets")\n',
+        encoding="utf-8",
+    )
+    git_files = ["pkg/assets/__init__.py", "ui.py"]
+    index = wiring.build_dynamic_import_index(tmp_path, git_files=git_files)
+    assert wiring.reference_cleared(
+        tmp_path, "pkg/assets/__init__.py", git_files=git_files, dynamic_index=index
+    )
+
+
+def test_bundled_asset_basename_clears_mjs(tmp_path):
+    (tmp_path / "integrations").mkdir()
+    (tmp_path / "integrations" / "hook_plugin.mjs").write_text("export {}\n", encoding="utf-8")
+    (tmp_path / "common.py").write_text(
+        'PLUGIN = "hook_plugin.mjs"\n',
+        encoding="utf-8",
+    )
+    git_files = ["integrations/hook_plugin.mjs", "common.py"]
+    index = wiring.build_dynamic_import_index(tmp_path, git_files=git_files)
+    assert wiring.reference_cleared(
+        tmp_path,
+        "integrations/hook_plugin.mjs",
+        git_files=git_files,
+        dynamic_index=index,
+    )

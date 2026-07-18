@@ -228,7 +228,9 @@ STATUS_DOC_UNIT_TEST_DIRS: tuple[tuple[str, str], ...] = (
     ("Manual Executor", "executors"),
     ("Lite Check (`dev check --verify`)", "execution"),
     ("Next-Actions Contract", "reporting"),
+    ("Repo Map & Code Graph", "indexing"),
     ("LSP / AST Indexing", "indexing"),
+    ("Live Dashboard", "dashboard"),
 )
 
 # Flat tests/unit/test_*.py prefixes that back a subsystem when no per-subsystem dir exists.
@@ -240,7 +242,21 @@ STATUS_DOC_FLAT_TEST_PREFIXES: dict[str, tuple[str, ...]] = {
     "executors": ("test_executors", "test_executor_", "test_claude_sdk_executor"),
     "execution": ("test_execution", "test_go_", "test_cli_check", "test_ad_hoc_check"),
     "reporting": ("test_json_report", "test_export_command", "test_pr_comments"),
-    "indexing": ("test_indexing", "test_repo_mapper", "test_repo_map"),
+    "dashboard": ("test_dashboard",),
+    "indexing": (
+        "test_indexing",
+        "test_repo_mapper",
+        "test_repo_map",
+        "test_map_",
+        "test_graph_",
+        "test_graph_html",
+        "test_graph_dead",
+        "test_graph_cmd",
+        "test_graph_intel",
+        "test_graph_query",
+        "test_graph_incremental",
+        "test_graph_schema",
+    ),
 }
 
 
@@ -316,6 +332,156 @@ def check_liveness_reliability(project_root: Path) -> list[tuple[str, str, str]]
     return rows
 
 
+def _repo_languages(project_root: Path) -> set[str]:
+    """Repo languages from repo_map.json, else a bounded filesystem sniff."""
+    try:
+        from devcouncil.utils.json_persist import read_json
+
+        map_path = project_root / ".devcouncil" / "repo_map.json"
+        if map_path.is_file():
+            data = read_json(map_path)
+            langs = (data or {}).get("languages") if isinstance(data, dict) else None
+            if isinstance(langs, list) and langs:
+                return {str(lang) for lang in langs}
+    except Exception:
+        logger.debug("repo language read from map failed", exc_info=True)
+    try:
+        from devcouncil.indexing.lsp import LspInspector
+
+        return set(LspInspector(project_root).detect_languages())
+    except Exception:
+        logger.debug("repo language detection failed", exc_info=True)
+        return set()
+
+
+def check_grammar_coverage(project_root: Path) -> list[tuple[str, str, str]]:
+    """Warn when tree-sitter grammars for the repo's own languages are missing.
+
+    A missing grammar silently degrades extraction for that language (a
+    Python-heavy repo indexed without the Python grammar loses most symbols),
+    so surface it with the install action instead of only in graph doctor.
+    """
+    ok = "[green]OK[/green]"
+    warn = "[yellow]WARN[/yellow]"
+    rows: list[tuple[str, str, str]] = []
+    try:
+        from devcouncil.codeintel.languages import grammar_status
+
+        status = grammar_status()
+        # repo_map languages are lowercase; LANGUAGE_SPECS names are display-cased
+        # ("Python") — compare casefolded or nothing ever matches.
+        repo_langs = {lang.casefold() for lang in _repo_languages(project_root)}
+        if not repo_langs:
+            return rows
+        missing = sorted(
+            row["language"]
+            for row in status.get("languages", [])
+            if str(row.get("language", "")).casefold() in repo_langs
+            and row.get("missing_grammars")
+            # Python extraction is native stdlib-ast (cache._grammar_identity);
+            # a missing python tree-sitter grammar does not degrade indexing.
+            and str(row.get("grammar", "")) != "python"
+        )
+        if missing:
+            action = status.get("action") or (
+                "Install the platform-matched devcouncil-codeintel-grammars wheel."
+            )
+            rows.append((
+                "Grammar coverage",
+                warn,
+                f"Missing tree-sitter grammars for repo language(s): {', '.join(missing)}. "
+                f"{action}",
+            ))
+        else:
+            rows.append((
+                "Grammar coverage",
+                ok,
+                f"Grammars available for all repo languages ({', '.join(sorted(repo_langs))}).",
+            ))
+    except Exception:
+        logger.debug("check_grammar_coverage failed", exc_info=True)
+    return rows
+
+
+def check_lsp_reference_confirmation(project_root: Path) -> list[tuple[str, str, str]]:
+    """Report repo languages with no language server on PATH.
+
+    Without a server, ``--lsp-refs`` dead-symbol confirmation cannot run for
+    that language; WARN when ``indexing.lsp_refs`` is enabled, informational
+    otherwise.
+    """
+    ok = "[green]OK[/green]"
+    warn = "[yellow]WARN[/yellow]"
+    rows: list[tuple[str, str, str]] = []
+    try:
+        from devcouncil.indexing.lsp import LspInspector
+
+        candidates = LspInspector(project_root).server_candidates()
+        if not candidates:
+            return rows
+        available_langs = {c.language for c in candidates if c.available}
+        missing = sorted({c.language for c in candidates} - available_langs)
+        lsp_refs_enabled = False
+        try:
+            from devcouncil.app.config import load_config
+
+            lsp_refs_enabled = bool(load_config(project_root).indexing.lsp_refs)
+        except Exception:
+            logger.debug("lsp_refs config read failed", exc_info=True)
+        if not missing:
+            rows.append((
+                "LSP servers",
+                ok,
+                f"Language server on PATH for: {', '.join(sorted(available_langs))}.",
+            ))
+        elif lsp_refs_enabled:
+            rows.append((
+                "LSP servers",
+                warn,
+                "indexing.lsp_refs is enabled but no language server is on PATH for: "
+                f"{', '.join(missing)} — dead-symbol confirmation is skipped there.",
+            ))
+        else:
+            rows.append((
+                "LSP servers",
+                ok,
+                f"No server on PATH for: {', '.join(missing)} (detection only; install "
+                "one to enable `dev map --lsp-refs` confirmation).",
+            ))
+    except Exception:
+        logger.debug("check_lsp_reference_confirmation failed", exc_info=True)
+    return rows
+
+
+def check_unknown_indexing_keys(project_root: Path) -> list[tuple[str, str, str]]:
+    """Warn on unknown ``indexing.*`` keys in config.yaml (typos/removed options)."""
+    warn = "[yellow]WARN[/yellow]"
+    rows: list[tuple[str, str, str]] = []
+    try:
+        import yaml
+
+        cfg_path = project_root / ".devcouncil" / "config.yaml"
+        if not cfg_path.is_file():
+            return rows
+        payload = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        indexing = payload.get("indexing")
+        if not isinstance(indexing, dict):
+            return rows
+        from devcouncil.app.config import IndexingConfig
+
+        unknown = sorted(str(k) for k in indexing if str(k) not in IndexingConfig.model_fields)
+        if unknown:
+            rows.append((
+                "Config keys",
+                warn,
+                f"Unknown `indexing.*` key(s) ignored: {', '.join(unknown)} — "
+                "typo or an option removed in this version.",
+            ))
+    except Exception:
+        logger.debug("check_unknown_indexing_keys failed", exc_info=True)
+    return rows
+
+
 def check_mapping_stack(project_root: Path) -> list[tuple[str, str, str]]:
     """Doctor rows for repo map + code graph freshness (native mapping stack)."""
     rows: list[tuple[str, str, str]] = []
@@ -331,13 +497,31 @@ def check_mapping_stack(project_root: Path) -> list[tuple[str, str, str]]:
         ))
     rows.extend(check_repo_map_freshness(project_root))
     rows.extend(check_liveness_reliability(project_root))
+    rows.extend(check_grammar_coverage(project_root))
+    rows.extend(check_lsp_reference_confirmation(project_root))
+    rows.extend(check_unknown_indexing_keys(project_root))
     graph_path = project_root / ".devcouncil" / "graph" / "code_graph.json"
     if not graph_path.is_file():
-        rows.append((
-            "Code graph",
-            warn,
-            "Missing ``.devcouncil/graph/code_graph.json``. Run ``dev map`` or ``dev graph ingest``.",
-        ))
+        store_has_graph = False
+        try:
+            from devcouncil.indexing.graph.build import load_code_graph
+
+            store_has_graph = load_code_graph(project_root) is not None
+        except Exception:
+            logger.debug("store probe for missing graph JSON failed", exc_info=True)
+        if store_has_graph:
+            rows.append((
+                "Code graph",
+                warn,
+                "JSON export ``.devcouncil/graph/code_graph.json`` is missing but the "
+                "SQLite store has a graph. Run ``dev map`` to re-export it.",
+            ))
+        else:
+            rows.append((
+                "Code graph",
+                warn,
+                "Missing ``.devcouncil/graph/code_graph.json``. Run ``dev map`` or ``dev graph ingest``.",
+            ))
     else:
         try:
             from devcouncil.indexing.graph.build import load_code_graph
@@ -372,11 +556,21 @@ def check_repo_map_freshness(project_root: Path) -> list[tuple[str, str, str]]:
         if mapper.map_is_stale(data):
             head = str(data.get("generated_head") or "(unknown)")[:12]
             current = mapper._git_head()[:12]
+            if head == current and head != "(unknown)":
+                detail = (
+                    f"Working-tree content changed since the last map "
+                    f"(git HEAD {current}). Run `dev map` or rely on auto-refresh "
+                    f"at checkout/verify."
+                )
+            else:
+                detail = (
+                    f"Behind current code (map HEAD {head}, repo HEAD {current}). "
+                    "Run `dev map` or rely on auto-refresh at checkout/verify."
+                )
             return [(
                 "Repo map",
                 warn,
-                f"Behind current code (map HEAD {head}, repo HEAD {current}). "
-                "Run `dev map` or rely on auto-refresh at checkout/verify.",
+                detail,
             )]
         return [("Repo map", ok, "Fresh — fingerprints match the current repository.")]
     except Exception:
@@ -708,8 +902,9 @@ def _subsystem_maturity_rows() -> list[tuple[str, str, str]]:
         ("CI Scaffolding", "preview", "dev scaffold-ci starter workflow"),
         ("One-command onboarding (dev boot)", "preview", "setup + integrate --apply + go"),
         ("GitHub PR Checks / Comments", "preview", "dev report --github*"),
+        ("Repo Map & Code Graph", "stable", "dev map / dev graph; liveness + query/dead/impact/html"),
         ("LSP / AST Indexing", "preview", "dev lsp inspect (detection-only) / dev ast"),
-        ("Live Dashboard", "preview", "dev dashboard --open"),
+        ("Live Dashboard", "stable", "local-only operator UI; loopback + token-guarded apply"),
         ("Coding CLI Hooks", "preview", "Stop gate on Claude/Codex Stop hooks; assist seeded on integrate"),
         ("Stop gate & claim checks", "preview", "Completion-claim mapper + optional active-task verify"),
         ("Corpus side index", "preview", "dev corpus + optional corpus/doc-ref rigor gates"),

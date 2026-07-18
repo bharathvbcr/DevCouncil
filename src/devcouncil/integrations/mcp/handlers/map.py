@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ from devcouncil.integrations.mcp.util import (
     optional_bool_argument,
     optional_string_argument,
     optional_string_list_argument,
+    with_codeintel_freshness,
 )
 from devcouncil.utils.json_persist import read_json
 
@@ -45,7 +47,18 @@ def _map_stale(root: Path, data: dict[str, Any] | None) -> bool:
     try:
         return RepoMapper(root).map_is_stale(data)
     except Exception:
-        return False
+        # Fail closed: unverifiable map must not be treated as fresh.
+        return True
+
+
+def _graph_degraded_fields(root: Path) -> dict[str, Any]:
+    """Surface lean-map handshake on legacy graph tool responses."""
+    data = _load_repo_map(root) or {}
+    degraded = bool(data.get("graph_degraded"))
+    fields: dict[str, Any] = {"graph_degraded": degraded}
+    if degraded:
+        fields["graph_degraded_reason"] = str(data.get("graph_degraded_reason") or "")
+    return fields
 
 
 def _subsystem_summary(sub: dict[str, Any]) -> dict[str, Any]:
@@ -130,66 +143,69 @@ def _filter_dead_symbols(
 
 
 async def handle_repo_map(root: Path, arguments: dict) -> list[TextContent]:
-    subsystem = optional_string_argument(arguments, "subsystem")
-    path = optional_string_argument(arguments, "path")
-    for arg_name, value in [("subsystem", subsystem), ("path", path)]:
-        if value == "":
+    async def _run() -> list[TextContent]:
+        subsystem = optional_string_argument(arguments, "subsystem")
+        path = optional_string_argument(arguments, "path")
+        for arg_name, value in [("subsystem", subsystem), ("path", path)]:
+            if value == "":
+                return error_text(
+                    f"{arg_name} must be a string",
+                    code="invalid_arguments",
+                    argument=arg_name,
+                )
+
+        data = _load_repo_map(root)
+        if data is None:
             return error_text(
-                f"{arg_name} must be a string",
-                code="invalid_arguments",
-                argument=arg_name,
+                "No repo map found. Run `dev map` to generate .devcouncil/repo_map.json.",
+                code="map_missing",
             )
 
-    data = _load_repo_map(root)
-    if data is None:
-        return error_text(
-            "No repo map found. Run `dev map` to generate .devcouncil/repo_map.json.",
-            code="map_missing",
-        )
+        stale = _map_stale(root, data)
+        resolved_area: str | None = None
+        if path:
+            resolved_area = area_for_path(path, data)
+            if not subsystem and resolved_area:
+                subsystem = resolved_area
 
-    stale = _map_stale(root, data)
-    resolved_area: str | None = None
-    if path:
-        resolved_area = area_for_path(path, data)
-        if not subsystem and resolved_area:
-            subsystem = resolved_area
-
-    if subsystem:
-        sub = _find_subsystem(data, subsystem)
-        if sub is None:
+        if subsystem:
+            sub = _find_subsystem(data, subsystem)
+            if sub is None:
+                return json_text({
+                    "ok": True,
+                    "stale": stale,
+                    "subsystem": None,
+                    "path": path,
+                    "area": resolved_area,
+                    "error": f"Unknown subsystem area: {subsystem}",
+                    "code": "unknown_subsystem",
+                })
             return json_text({
                 "ok": True,
                 "stale": stale,
-                "subsystem": None,
                 "path": path,
-                "area": resolved_area,
-                "error": f"Unknown subsystem area: {subsystem}",
-                "code": "unknown_subsystem",
+                "area": resolved_area or subsystem,
+                "subsystem": _subsystem_detail(sub),
             })
+
+        subsystems = [
+            _subsystem_summary(s)
+            for s in (data.get("subsystems") or [])
+            if isinstance(s, dict) and s.get("area")
+        ]
         return json_text({
             "ok": True,
             "stale": stale,
+            "languages": list(data.get("languages") or []),
+            "frameworks": list(data.get("frameworks") or []),
+            "package_managers": list(data.get("package_managers") or []),
+            "subsystems": subsystems,
             "path": path,
-            "area": resolved_area or subsystem,
-            "subsystem": _subsystem_detail(sub),
+            "area": resolved_area,
+            "symbols": _symbols_for_path(root, path) if path else [],
         })
 
-    subsystems = [
-        _subsystem_summary(s)
-        for s in (data.get("subsystems") or [])
-        if isinstance(s, dict) and s.get("area")
-    ]
-    return json_text({
-        "ok": True,
-        "stale": stale,
-        "languages": list(data.get("languages") or []),
-        "frameworks": list(data.get("frameworks") or []),
-        "package_managers": list(data.get("package_managers") or []),
-        "subsystems": subsystems,
-        "path": path,
-        "area": resolved_area,
-        "symbols": _symbols_for_path(root, path) if path else [],
-    })
+    return await with_codeintel_freshness(root, _run)
 
 
 def _symbols_for_path(root: Path, path: str) -> list[dict[str, Any]]:
@@ -222,164 +238,181 @@ def _symbols_for_path(root: Path, path: str) -> list[dict[str, Any]]:
 
 
 async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
-    paths, list_error = optional_string_list_argument(arguments, "paths")
-    if list_error:
-        return list_error
-    if not paths:
-        return error_text("Missing paths", code="missing_argument", argument="paths")
-    precise, precise_error = optional_bool_argument(arguments, "precise")
-    if precise_error:
-        return precise_error
-    precise = bool(precise)
+    async def _run() -> list[TextContent]:
+        paths, list_error = optional_string_list_argument(arguments, "paths")
+        if list_error:
+            return list_error
+        if not paths:
+            return error_text("Missing paths", code="missing_argument", argument="paths")
+        precise, precise_error = optional_bool_argument(arguments, "precise")
+        if precise_error:
+            return precise_error
+        precise = bool(precise)
 
-    data = _load_repo_map(root)
-    if data is None:
-        return error_text(
-            "No repo map found. Run `dev map` to generate .devcouncil/repo_map.json.",
-            code="map_missing",
-        )
+        data = _load_repo_map(root)
+        if data is None:
+            return error_text(
+                "No repo map found. Run `dev map` to generate .devcouncil/repo_map.json.",
+                code="map_missing",
+            )
 
-    stale = _map_stale(root, data)
-    lsp_pool = None
-    if precise:
-        try:
-            from devcouncil.indexing.lsp_client import LspSessionPool
-
-            lsp_pool = LspSessionPool(root)
-        except Exception:
-            lsp_pool = None
-
-    try:
-        items: list[dict[str, Any]] = []
-        all_neighbor_areas: set[str] = set()
-        for raw in paths:
-            path = raw.replace("\\", "/")
-            dependents, neighbors = impact_targets(path, data)
-            resolution = "import"
-            if precise and lsp_pool is not None:
-                try:
-                    lsp_deps = lsp_pool.dependents_of_file(path)
-                    if lsp_deps is not None:
-                        dependents = lsp_deps
-                        resolution = "lsp"
-                except Exception:
-                    pass
-            area = area_for_path(path, data)
-            all_neighbor_areas.update(neighbors)
-            item: dict[str, Any] = {
-                "path": path,
-                "area": area,
-                "is_entry_root": is_entry_root(path, data),
-                "dependents": dependents,
-                "neighbors": neighbors,
-            }
-            dep_total = dependents_total_of(path, data)
-            if dep_total is not None and dep_total > len(dependents):
-                item["dependents_total"] = dep_total
-            if precise:
-                item["resolution"] = resolution
-            items.append(item)
-
-        crossings = [
-            {"areas": [a, b]}
-            for a, b in cross_boundary_pairs(paths, data)
-        ]
-        payload: dict[str, Any] = {
-            "ok": True,
-            "stale": stale,
-            "paths": items,
-            "neighbor_areas": sorted(all_neighbor_areas),
-            "cross_boundary_pairs": crossings,
-        }
+        stale = _map_stale(root, data)
+        lsp_pool = None
         if precise:
-            payload["precise"] = True
-        return json_text(payload)
-    finally:
-        if lsp_pool is not None:
-            lsp_pool.close()
+            try:
+                from devcouncil.indexing.lsp_client import LspSessionPool
+
+                lsp_pool = LspSessionPool(root)
+            except Exception:
+                lsp_pool = None
+
+        try:
+            items: list[dict[str, Any]] = []
+            all_neighbor_areas: set[str] = set()
+            for raw in paths:
+                path = raw.replace("\\", "/")
+                dependents, neighbors = impact_targets(path, data)
+                resolution = "import"
+                if precise and lsp_pool is not None:
+                    try:
+                        lsp_deps = lsp_pool.dependents_of_file(path)
+                        if lsp_deps is not None:
+                            dependents = lsp_deps
+                            resolution = "lsp"
+                    except Exception:
+                        pass
+                area = area_for_path(path, data)
+                all_neighbor_areas.update(neighbors)
+                item: dict[str, Any] = {
+                    "path": path,
+                    "area": area,
+                    "is_entry_root": is_entry_root(path, data),
+                    "dependents": dependents,
+                    "neighbors": neighbors,
+                }
+                dep_total = dependents_total_of(path, data)
+                if dep_total is not None and dep_total > len(dependents):
+                    item["dependents_total"] = dep_total
+                if precise:
+                    item["resolution"] = resolution
+                items.append(item)
+
+            crossings = [
+                {"areas": [a, b]}
+                for a, b in cross_boundary_pairs(paths, data)
+            ]
+            payload: dict[str, Any] = {
+                "ok": True,
+                "stale": stale,
+                "paths": items,
+                "neighbor_areas": sorted(all_neighbor_areas),
+                "cross_boundary_pairs": crossings,
+            }
+            if precise:
+                payload["precise"] = True
+            return json_text(payload)
+        finally:
+            if lsp_pool is not None:
+                lsp_pool.close()
+
+    return await with_codeintel_freshness(root, _run)
 
 
 async def handle_liveness(root: Path, arguments: dict) -> list[TextContent]:
-    area = optional_string_argument(arguments, "area")
-    path_prefix = optional_string_argument(arguments, "path_prefix")
-    min_confidence = optional_string_argument(arguments, "min_confidence") or "inferred"
-    for arg_name, value in [
-        ("area", area),
-        ("path_prefix", path_prefix),
-        ("min_confidence", min_confidence),
-    ]:
-        if value == "":
+    async def _run() -> list[TextContent]:
+        area = optional_string_argument(arguments, "area")
+        path_prefix = optional_string_argument(arguments, "path_prefix")
+        min_confidence = optional_string_argument(arguments, "min_confidence") or "inferred"
+        for arg_name, value in [
+            ("area", area),
+            ("path_prefix", path_prefix),
+            ("min_confidence", min_confidence),
+        ]:
+            if value == "":
+                return error_text(
+                    f"{arg_name} must be a string",
+                    code="invalid_arguments",
+                    argument=arg_name,
+                )
+        if min_confidence not in {"extracted", "inferred", "ambiguous"}:
             return error_text(
-                f"{arg_name} must be a string",
+                "min_confidence must be extracted|inferred|ambiguous",
                 code="invalid_arguments",
-                argument=arg_name,
+                argument="min_confidence",
             )
-    if min_confidence not in {"extracted", "inferred", "ambiguous"}:
-        return error_text(
-            "min_confidence must be extracted|inferred|ambiguous",
-            code="invalid_arguments",
-            argument="min_confidence",
+
+        data = _load_repo_map(root)
+        if data is None:
+            return error_text(
+                "No repo map found. Run `dev map` to generate .devcouncil/repo_map.json.",
+                code="map_missing",
+            )
+
+        stale = _map_stale(root, data)
+        raw_roots = data.get("entry_roots") or []
+        if not isinstance(raw_roots, list):
+            raw_roots = []
+        global_entry_roots = [str(p) for p in raw_roots]
+
+        unwired = _filter_paths(
+            unwired_candidates_of(data), data, area=area, path_prefix=path_prefix
         )
-
-    data = _load_repo_map(root)
-    if data is None:
-        return error_text(
-            "No repo map found. Run `dev map` to generate .devcouncil/repo_map.json.",
-            code="map_missing",
+        unreachable = _filter_paths(
+            unreachable_of(data), data, area=area, path_prefix=path_prefix
         )
-
-    stale = _map_stale(root, data)
-    entry_roots = data.get("entry_roots") or []
-    if not isinstance(entry_roots, list):
-        entry_roots = []
-    entry_roots = [str(p) for p in entry_roots]
-
-    unwired = _filter_paths(
-        unwired_candidates_of(data), data, area=area, path_prefix=path_prefix
-    )
-    unreachable = _filter_paths(
-        unreachable_of(data), data, area=area, path_prefix=path_prefix
-    )
-    dead_symbols = _filter_dead_symbols(
-        dead_symbol_candidates_of(data), data, area=area, path_prefix=path_prefix
-    )
-    if area or path_prefix:
-        entry_roots = _filter_paths(entry_roots, data, area=area, path_prefix=path_prefix)
-
-    dead_code, hidden = _structured_dead_code(
-        root,
-        area=area,
-        path_prefix=path_prefix,
-        min_confidence=min_confidence,
-    )
-    unreachable_unreliable = (
-        data.get("liveness_unreachable_unreliable") is True
-        or not entry_roots
-    )
-    warn = None
-    if unreachable_unreliable:
-        unreachable = []
-        warn = (
-            "entry_roots empty or liveness_unreachable_unreliable: "
-            "unreachable_files omitted; ignore mass inferred dead"
+        dead_symbols = _filter_dead_symbols(
+            dead_symbol_candidates_of(data), data, area=area, path_prefix=path_prefix
         )
-    payload: dict[str, object] = {
-        "ok": True,
-        "stale": stale,
-        "area": area,
-        "path_prefix": path_prefix,
-        "min_confidence": min_confidence,
-        "entry_roots": entry_roots,
-        "unwired_candidates": unwired,
-        "unreachable_files": unreachable,
-        "dead_symbol_candidates": dead_symbols,
-        "dead_code": dead_code,
-        "dead_code_hidden": hidden,
-        "unreachable_unreliable": unreachable_unreliable,
-    }
-    if warn:
-        payload["warning"] = warn
-    return json_text(payload)
+        entry_roots = global_entry_roots
+        if area or path_prefix:
+            entry_roots = _filter_paths(entry_roots, data, area=area, path_prefix=path_prefix)
+
+        dead_code, hidden = _structured_dead_code(
+            root,
+            area=area,
+            path_prefix=path_prefix,
+            min_confidence=min_confidence,
+        )
+        # Reliability is a GLOBAL property of the map: an area/path_prefix scope that
+        # merely contains no entry root (normal for library subsystems) must not
+        # flip the response to unreliable and drop its unreachable list.
+        unreachable_unreliable = (
+            data.get("liveness_unreachable_unreliable") is True
+            or not global_entry_roots
+        )
+        warn = None
+        if unreachable_unreliable:
+            unreachable = []
+            warn = (
+                "entry_roots empty or liveness_unreachable_unreliable: "
+                "unreachable_files omitted; ignore mass inferred dead"
+            )
+        if data.get("graph_degraded"):
+            warn = (
+                (warn + "; " if warn else "")
+                + "graph_degraded: lean map — treat liveness/dead tiers as unreliable"
+            )
+        payload: dict[str, object] = {
+            "ok": True,
+            "stale": stale,
+            "graph_degraded": bool(data.get("graph_degraded")),
+            "area": area,
+            "path_prefix": path_prefix,
+            "min_confidence": min_confidence,
+            "entry_roots": entry_roots,
+            "unwired_candidates": unwired,
+            "unreachable_files": unreachable,
+            "dead_symbol_candidates": dead_symbols,
+            "dead_code": dead_code,
+            "dead_code_hidden": hidden,
+            "unreachable_unreliable": unreachable_unreliable
+            or bool(data.get("graph_degraded")),
+        }
+        if warn:
+            payload["warning"] = warn
+        return json_text(payload)
+
+    return await with_codeintel_freshness(root, _run)
 
 
 def _structured_dead_code(
@@ -413,159 +446,231 @@ def _structured_dead_code(
 
 async def handle_graph_ingest(root: Path, arguments: dict) -> list[TextContent]:
     paths, _ = optional_string_list_argument(arguments, "paths")
-    from devcouncil.cli.commands.map import generate_map_artifacts
+    from devcouncil.indexing.map_artifacts import refresh_map_artifacts
+    from devcouncil.codeintel import get_codeintel_service
+    from devcouncil.codeintel.build_control import GraphBuildBusy
     from devcouncil.codeintel.sync import get_sync_coordinator
     from devcouncil.indexing.graph.embeddings import build_embeddings
 
     coordinator = get_sync_coordinator(root)
-    changed = list(paths or coordinator.reconcile())
-    coordinator.sync_now(changed)
+    changed = list(paths or [])
     map_path = root / ".devcouncil" / "repo_map.json"
-    generate_map_artifacts(root, map_path, quiet=True)
-    embedded = build_embeddings(root)
-    return json_text({"ok": True, "paths": changed, "embeddings_built": embedded})
+    if paths is None:
+        try:
+            refresh = await asyncio.to_thread(
+                refresh_map_artifacts,
+                root,
+                map_path,
+                quiet=True,
+            )
+        except GraphBuildBusy as exc:
+            return error_text(str(exc), code="graph_writer_busy")
+    else:
+        try:
+            ok = await asyncio.to_thread(coordinator.sync_now, changed)
+            if not ok:
+                state = coordinator.status().as_dict()
+                return error_text(
+                    str(state.get("last_error") or state.get("degraded_reason") or "sync failed"),
+                    code="codeintel_sync_failed",
+                    **state,
+                )
+            refresh = await asyncio.to_thread(
+                refresh_map_artifacts,
+                root,
+                map_path,
+                quiet=True,
+                graph=get_codeintel_service(root).load(),
+                paths=changed,
+            )
+        except GraphBuildBusy as exc:
+            # Same structured error as the full-refresh branch — a held writer
+            # lease must not surface as an unhandled MCP exception.
+            return error_text(str(exc), code="graph_writer_busy")
+    embedded = await asyncio.to_thread(build_embeddings, root)
+    return json_text({
+        "ok": not refresh.degraded,
+        "paths": changed,
+        "embeddings_built": embedded,
+        "generation": refresh.generation,
+        "mode": refresh.mode,
+        "degraded": refresh.degraded,
+        "reason": refresh.reason,
+    })
 
 
 async def handle_graph_cypher(root: Path, arguments: dict) -> list[TextContent]:
-    query = optional_string_argument(arguments, "query")
-    if not query:
-        return error_text("Missing query", code="missing_argument", argument="query")
-    from devcouncil.indexing.graph.cypher import run_cypher
+    async def _run() -> list[TextContent]:
+        query = optional_string_argument(arguments, "query")
+        if not query:
+            return error_text("Missing query", code="missing_argument", argument="query")
+        from devcouncil.indexing.graph.cypher import run_cypher
 
-    return json_text(run_cypher(root, query))
+        return json_text(run_cypher(root, query))
+
+    return await with_codeintel_freshness(root, _run)
 
 
 async def handle_pdg_query(root: Path, arguments: dict) -> list[TextContent]:
-    mode = optional_string_argument(arguments, "mode")
-    target = optional_string_argument(arguments, "target")
-    if not mode:
-        return error_text("Missing mode", code="missing_argument", argument="mode")
-    if not target:
-        return error_text("Missing target", code="missing_argument", argument="target")
-    variable = optional_string_argument(arguments, "variable")
-    from devcouncil.indexing.graph.query import query_pdg_controls, query_pdg_flows
+    async def _run() -> list[TextContent]:
+        mode = optional_string_argument(arguments, "mode")
+        target = optional_string_argument(arguments, "target")
+        if not mode:
+            return error_text("Missing mode", code="missing_argument", argument="mode")
+        if not target:
+            return error_text("Missing target", code="missing_argument", argument="target")
+        variable = optional_string_argument(arguments, "variable")
+        from devcouncil.indexing.graph.query import query_pdg_controls, query_pdg_flows
 
-    if mode == "controls":
-        return json_text(query_pdg_controls(root, target))
-    if mode == "flows":
-        return json_text(query_pdg_flows(root, target, variable=variable or None))
-    return error_text(
-        "mode must be controls or flows",
-        code="invalid_arguments",
-        argument="mode",
-    )
+        if mode == "controls":
+            return json_text(query_pdg_controls(root, target))
+        if mode == "flows":
+            return json_text(query_pdg_flows(root, target, variable=variable or None))
+        return error_text(
+            "mode must be controls or flows",
+            code="invalid_arguments",
+            argument="mode",
+        )
+
+    return await with_codeintel_freshness(root, _run)
 
 
 async def handle_explain(root: Path, arguments: dict) -> list[TextContent]:
-    path = optional_string_argument(arguments, "path")
-    category = optional_string_argument(arguments, "category")
-    from devcouncil.indexing.graph.query import explain_pdg_taint
+    async def _run() -> list[TextContent]:
+        path = optional_string_argument(arguments, "path")
+        category = optional_string_argument(arguments, "category")
+        from devcouncil.indexing.graph.query import explain_pdg_taint
 
-    return json_text(explain_pdg_taint(root, path=path or None, category=category or None))
+        return json_text(explain_pdg_taint(root, path=path or None, category=category or None))
+
+    return await with_codeintel_freshness(root, _run)
 
 
 async def handle_graph_query(root: Path, arguments: dict) -> list[TextContent]:
-    name = optional_string_argument(arguments, "name_or_path")
-    if not name:
-        return error_text(
-            "Missing name_or_path", code="missing_argument", argument="name_or_path"
-        )
-    from devcouncil.indexing.graph import query_symbol
+    async def _run() -> list[TextContent]:
+        name = optional_string_argument(arguments, "name_or_path")
+        if not name:
+            return error_text(
+                "Missing name_or_path", code="missing_argument", argument="name_or_path"
+            )
+        from devcouncil.indexing.graph import query_symbol
 
-    return json_text({"ok": True, **query_symbol(root, name)})
+        return json_text({"ok": True, **query_symbol(root, name), **_graph_degraded_fields(root)})
+
+    return await with_codeintel_freshness(root, _run)
 
 
 async def handle_graph_trace(root: Path, arguments: dict) -> list[TextContent]:
-    start = optional_string_argument(arguments, "from")
-    end = optional_string_argument(arguments, "to")
-    if not start:
-        return error_text("Missing from", code="missing_argument", argument="from")
-    if not end:
-        return error_text("Missing to", code="missing_argument", argument="to")
-    from devcouncil.indexing.graph import trace_path
+    async def _run() -> list[TextContent]:
+        start = optional_string_argument(arguments, "from")
+        end = optional_string_argument(arguments, "to")
+        if not start:
+            return error_text("Missing from", code="missing_argument", argument="from")
+        if not end:
+            return error_text("Missing to", code="missing_argument", argument="to")
+        from devcouncil.indexing.graph import trace_path
 
-    return json_text({"ok": True, **trace_path(root, start, end)})
+        return json_text({"ok": True, **trace_path(root, start, end), **_graph_degraded_fields(root)})
+
+    return await with_codeintel_freshness(root, _run)
 
 
 async def handle_graph_impact(root: Path, arguments: dict) -> list[TextContent]:
     """Symbol-level blast radius from paths or working-tree diff (code graph)."""
-    paths, list_error = optional_string_list_argument(arguments, "paths")
-    if list_error:
-        return list_error
-    use_diff, diff_error = optional_bool_argument(arguments, "diff")
-    if diff_error:
-        return diff_error
-    use_diff = bool(use_diff)
-    if not use_diff and not paths:
-        return error_text(
-            "Provide paths or set diff=true",
-            code="missing_argument",
-            argument="paths",
-        )
 
-    from devcouncil.indexing.graph.build import load_code_graph
-    from devcouncil.indexing.graph.intel import diff_impact
+    async def _run() -> list[TextContent]:
+        paths, list_error = optional_string_list_argument(arguments, "paths")
+        if list_error:
+            return list_error
+        use_diff, diff_error = optional_bool_argument(arguments, "diff")
+        if diff_error:
+            return diff_error
+        use_diff = bool(use_diff)
+        if not use_diff and not paths:
+            return error_text(
+                "Provide paths or set diff=true",
+                code="missing_argument",
+                argument="paths",
+            )
 
-    graph = load_code_graph(root)
-    if graph is None:
-        return error_text(
-            "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
-            code="graph_missing",
+        from devcouncil.indexing.graph.build import load_code_graph
+        from devcouncil.indexing.graph.intel import diff_impact
+
+        graph = load_code_graph(root)
+        if graph is None:
+            return error_text(
+                "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
+                code="graph_missing",
+            )
+        result = diff_impact(
+            root,
+            graph,
+            paths=paths,
+            use_diff=use_diff,
+            max_depth=3,
         )
-    result = diff_impact(
-        root,
-        graph,
-        paths=paths,
-        use_diff=use_diff,
-        max_depth=3,
-    )
-    return json_text({"ok": True, **result})
+        return json_text({"ok": True, **result, **_graph_degraded_fields(root)})
+
+    return await with_codeintel_freshness(root, _run)
 
 
 async def handle_route_map(root: Path, arguments: dict) -> list[TextContent]:
-    from devcouncil.indexing.graph.api_routes import route_map
-    from devcouncil.indexing.graph.build import load_code_graph
+    async def _run() -> list[TextContent]:
+        from devcouncil.indexing.graph.api_routes import route_map
+        from devcouncil.indexing.graph.build import load_code_graph
 
-    graph = load_code_graph(root)
-    if graph is None:
-        return error_text(
-            "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
-            code="graph_missing",
-        )
-    return json_text({"ok": True, **route_map(root, graph)})
+        graph = load_code_graph(root)
+        if graph is None:
+            return error_text(
+                "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
+                code="graph_missing",
+            )
+        return json_text({"ok": True, **route_map(root, graph), **_graph_degraded_fields(root)})
+
+    return await with_codeintel_freshness(root, _run)
 
 
 async def handle_shape_check(root: Path, arguments: dict) -> list[TextContent]:
-    route = optional_string_argument(arguments, "route")
-    if route == "":
-        return error_text("route must be a string", code="invalid_arguments", argument="route")
-    from devcouncil.indexing.graph.api_routes import shape_check
-    from devcouncil.indexing.graph.build import load_code_graph
+    async def _run() -> list[TextContent]:
+        route = optional_string_argument(arguments, "route")
+        if route == "":
+            return error_text("route must be a string", code="invalid_arguments", argument="route")
+        from devcouncil.indexing.graph.api_routes import shape_check
+        from devcouncil.indexing.graph.build import load_code_graph
 
-    graph = load_code_graph(root)
-    if graph is None:
-        return error_text(
-            "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
-            code="graph_missing",
-        )
-    return json_text({"ok": True, **shape_check(root, graph, route_filter=route)})
+        graph = load_code_graph(root)
+        if graph is None:
+            return error_text(
+                "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
+                code="graph_missing",
+            )
+        return json_text({
+            "ok": True,
+            **shape_check(root, graph, route_filter=route),
+            **_graph_degraded_fields(root),
+        })
+
+    return await with_codeintel_freshness(root, _run)
 
 
 async def handle_api_impact(root: Path, arguments: dict) -> list[TextContent]:
-    route_or_path = optional_string_argument(arguments, "route_or_path")
-    if not route_or_path:
-        return error_text(
-            "Missing route_or_path",
-            code="missing_argument",
-            argument="route_or_path",
-        )
-    from devcouncil.indexing.graph.api_routes import api_impact
-    from devcouncil.indexing.graph.build import load_code_graph
+    async def _run() -> list[TextContent]:
+        route_or_path = optional_string_argument(arguments, "route_or_path")
+        if not route_or_path:
+            return error_text(
+                "Missing route_or_path",
+                code="missing_argument",
+                argument="route_or_path",
+            )
+        from devcouncil.indexing.graph.api_routes import api_impact
+        from devcouncil.indexing.graph.build import load_code_graph
 
-    graph = load_code_graph(root)
-    if graph is None:
-        return error_text(
-            "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
-            code="graph_missing",
-        )
-    return json_text({"ok": True, **api_impact(root, route_or_path, graph)})
+        graph = load_code_graph(root)
+        if graph is None:
+            return error_text(
+                "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
+                code="graph_missing",
+            )
+        return json_text({"ok": True, **api_impact(root, route_or_path, graph), **_graph_degraded_fields(root)})
+
+    return await with_codeintel_freshness(root, _run)

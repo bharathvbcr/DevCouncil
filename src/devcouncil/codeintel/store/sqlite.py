@@ -581,7 +581,14 @@ class CodeIntelStore:
                 normalized_changed = {
                     path.replace("\\", "/") for path in (changed_paths or set())
                 }
-                incremental = previous_generation is not None and changed_paths is not None
+                # Empty changed_paths must not enter incremental mode: _copy_unaffected
+                # returns immediately when the exclusion set is empty, which would
+                # commit a generation with zero memberships.
+                incremental = (
+                    previous_generation is not None
+                    and changed_paths is not None
+                    and bool(normalized_changed)
+                )
                 if incremental:
                     assert previous_generation is not None
                     self._copy_unaffected_memberships(
@@ -948,20 +955,44 @@ class CodeIntelStore:
     def _record_rename_aliases(
         self, conn: sqlite3.Connection, previous: int, current: int
     ) -> None:
-        """Preserve identities across same-content file renames as explicit aliases."""
-        renamed = conn.execute(
-            """SELECT old.path AS old_path, new.path AS new_path
-                 FROM generation_files old
-                 JOIN generation_files new
-                   ON old.content_hash<>''
-                  AND old.content_hash=new.content_hash
-                  AND old.path<>new.path
-                WHERE old.generation_id=? AND new.generation_id=?""",
+        """Preserve identities across same-content file renames as explicit aliases.
+
+        A rename is a path that left the index whose content reappeared at
+        exactly one new path. Joining generations on content alone would
+        cross-link every pair of identical files (empty ``__init__.py``,
+        generated boilerplate) into false aliases with quadratic node lookups.
+        """
+        removed = conn.execute(
+            """SELECT path, content_hash FROM generation_files
+                WHERE generation_id=? AND content_hash<>''
+                  AND path NOT IN (
+                      SELECT path FROM generation_files WHERE generation_id=?
+                  )""",
             (previous, current),
         ).fetchall()
-        for pair in renamed:
-            old_nodes = self._nodes_for_path(conn, previous, str(pair["old_path"]))
-            new_nodes = self._nodes_for_path(conn, current, str(pair["new_path"]))
+        added = conn.execute(
+            """SELECT path, content_hash FROM generation_files
+                WHERE generation_id=? AND content_hash<>''
+                  AND path NOT IN (
+                      SELECT path FROM generation_files WHERE generation_id=?
+                  )""",
+            (current, previous),
+        ).fetchall()
+        removed_by_hash: dict[str, list[str]] = {}
+        for row in removed:
+            removed_by_hash.setdefault(str(row["content_hash"]), []).append(str(row["path"]))
+        added_by_hash: dict[str, list[str]] = {}
+        for row in added:
+            added_by_hash.setdefault(str(row["content_hash"]), []).append(str(row["path"]))
+        renamed = [
+            (old_paths[0], new_paths[0])
+            for content_hash, old_paths in sorted(removed_by_hash.items())
+            if len(old_paths) == 1
+            and len(new_paths := added_by_hash.get(content_hash, [])) == 1
+        ]
+        for old_path, new_path in renamed:
+            old_nodes = self._nodes_for_path(conn, previous, old_path)
+            new_nodes = self._nodes_for_path(conn, current, new_path)
             by_shape = {
                 (
                     node.kind.value, node.name if node.kind != NodeKind.FILE else "",
@@ -1222,6 +1253,18 @@ class CodeIntelStore:
             for row in rows
         }
 
+    def has_indexed_path(self, path: str, *, generation: int | None = None) -> bool:
+        """Single-row membership check (cheap enough for per-event watcher calls)."""
+        generation = generation or self.current_generation()
+        if generation is None:
+            return False
+        with self._connect(readonly=True) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM generation_files WHERE generation_id=? AND path=? LIMIT 1",
+                (generation, path.replace("\\", "/")),
+            ).fetchone()
+        return row is not None
+
     def analysis_shards(
         self, *, generation: int | None = None
     ) -> dict[str, dict[str, Any]]:
@@ -1371,6 +1414,7 @@ class CodeIntelStore:
         if not observations:
             return 0
         now = time.time()
+        valid = [row for row in observations if row.get("source") and row.get("target")]
         with self._connect() as conn:
             start = int(conn.execute(
                 "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM runtime_observations WHERE session_id=?",
@@ -1393,17 +1437,25 @@ class CodeIntelStore:
                         float(row.get("last_seen", now)),
                         _json(row.get("evidence") or {}),
                     )
-                    for index, row in enumerate(observations)
-                    if row.get("source") and row.get("target")
+                    for index, row in enumerate(valid)
                 ],
             )
             conn.commit()
-        return len(observations)
+        return len(valid)
 
     def end_runtime_session(self, session_id: str) -> None:
         with self._connect() as conn:
             conn.execute("UPDATE runtime_sessions SET ended_at=? WHERE id=?", (time.time(), session_id))
             conn.commit()
+
+    def has_runtime_observations(self) -> bool:
+        if not self.exists():
+            return False
+        with self._connect(readonly=True) as conn:
+            row = conn.execute(
+                "SELECT EXISTS(SELECT 1 FROM runtime_observations)"
+            ).fetchone()
+        return bool(row[0])
 
     def runtime_observations(
         self,

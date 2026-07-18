@@ -19,27 +19,50 @@ logger = logging.getLogger(__name__)
 
 
 def _fsevents_preflight(root: Path) -> bool:
-    """Probe FSEvents out of process because startup failure may abort Python."""
+    """Probe FSEvents out of process because startup failure may abort Python.
+
+    Retries once: under heavy reconcile/build load the first probe can time out
+    even when FSEvents is healthy, which previously forced a permanent Kqueue
+    fallback for the process lifetime.
+    """
     script = (
         "import sys,time; "
         "from watchdog.events import FileSystemEventHandler; "
         "from watchdog.observers import Observer; "
-        "o=Observer(); o.schedule(FileSystemEventHandler(),sys.argv[1],recursive=False); "
-        "o.start(); time.sleep(0.2); "
-        "ok=all(e.is_alive() for e in o.emitters); "
-        "o.stop(); o.join(1); raise SystemExit(0 if ok else 3)"
+        "o=Observer(); o.schedule(FileSystemEventHandler(),sys.argv[1],recursive=True); "
+        "o.start(); time.sleep(0.35); "
+        "emitters=list(o.emitters); "
+        "ok=bool(emitters) and all(e.is_alive() for e in emitters); "
+        "o.stop(); o.join(2); raise SystemExit(0 if ok else 3)"
     )
-    try:
-        completed = subprocess.run(
-            [sys.executable, "-c", script, str(root)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=3.0,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return completed.returncode == 0
+    last_error = ""
+    for attempt in range(2):
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-c", script, str(root)],
+                capture_output=True,
+                timeout=5.0,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            last_error = "timeout"
+            time.sleep(0.2)
+            continue
+        except OSError as exc:
+            last_error = str(exc)
+            break
+        if completed.returncode == 0:
+            return True
+        stderr = getattr(completed, "stderr", None) or b""
+        if isinstance(stderr, str):
+            stderr_text = stderr.strip()
+        else:
+            stderr_text = stderr.decode("utf-8", errors="replace").strip()
+        last_error = stderr_text or f"exit {completed.returncode}"
+        time.sleep(0.2)
+    if last_error:
+        logger.info("FSEvents preflight failed: %s", last_error)
+    return False
 
 
 @dataclass
@@ -53,6 +76,16 @@ class SyncState:
     last_reconcile_at: float | None = None
     degraded_reason: str = ""
     last_error: str = ""
+    build_id: str = ""
+    build_state: str = "idle"
+    build_pid: int | None = None
+    build_phase: str = ""
+    build_completed: int = 0
+    build_total: int = 0
+    build_last_progress_at: float | None = None
+    generation_before: int | None = None
+    generation_after: int | None = None
+    compatibility_export: str = "unknown"
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -82,6 +115,7 @@ class SyncCoordinator:
         self._stop = threading.Event()
         self._observer: Any = None
         self._worker: threading.Thread | None = None
+        self._sync_lock = threading.Lock()
         self._lease = WriterLease(self.root / ".devcouncil" / "codeintel" / "writer.lock")
 
     def start(self) -> SyncState:
@@ -104,14 +138,49 @@ class SyncCoordinator:
             self._observer = None
         if self._worker is not None:
             self._worker.join(timeout=timeout)
+            if self._worker.is_alive():
+                self._state.state = "stopping"
+                self._state.degraded_reason = "sync worker did not stop before timeout"
+                return
             self._worker = None
-        self._lease.release()
+        if self._sync_lock.locked():
+            self._state.state = "stopping"
+            self._state.degraded_reason = "an in-flight sync is still stopping"
+            return
         self._state.state = "disabled"
 
     def status(self) -> SyncState:
+        from devcouncil.codeintel.build_control import read_build_status
+
+        build = read_build_status(self.root)
         with self._condition:
+            if (
+                self._worker is not None
+                and not self._worker.is_alive()
+                and self._stop.is_set()
+            ):
+                self._worker = None
+                if self._state.state == "stopping":
+                    self._state.state = "disabled"
+            elif (
+                self._worker is None
+                and self._stop.is_set()
+                and not self._sync_lock.locked()
+                and self._state.state == "stopping"
+            ):
+                self._state.state = "disabled"
             self._state.pending = sorted(self._pending)
             self._state.generation = self.service.store.current_generation()
+            self._state.build_id = build.build_id
+            self._state.build_state = build.state
+            self._state.build_pid = build.pid
+            self._state.build_phase = build.phase
+            self._state.build_completed = build.completed
+            self._state.build_total = build.total
+            self._state.build_last_progress_at = build.last_progress_at
+            self._state.generation_before = build.generation_before
+            self._state.generation_after = build.generation_after
+            self._state.compatibility_export = build.compatibility_export
             return SyncState(**asdict(self._state))
 
     def mark_pending(self, path: str | Path) -> None:
@@ -121,7 +190,7 @@ class SyncCoordinator:
             return
         # Deletions cannot pass an existence-based check, so extension + prefix
         # filtering is enough for paths that were present in the committed index.
-        if not self.scope.includes(rel) and rel not in self.service.store.file_metadata():
+        if not self.scope.includes(rel) and not self.service.store.has_indexed_path(rel):
             return
         with self._condition:
             self._pending.add(rel)
@@ -157,35 +226,57 @@ class SyncCoordinator:
         return sorted(changed)
 
     def sync_now(self, paths: list[str] | None = None) -> bool:
-        if paths:
-            for path in paths:
-                self.mark_pending(path)
-        with self._condition:
-            batch = sorted(self._pending)
-        if not batch:
-            return True
-        if not self._lease.acquire():
-            self._state.state = "read_only"
-            self._state.degraded_reason = "another process owns the writer lease"
-            return False
-        try:
-            self._state.state = "syncing"
-            self.sync_callback(batch)
+        from devcouncil.codeintel.build_control import (
+            GraphBuildBusy,
+            _lease_timeouts,
+            graph_build_session,
+        )
+
+        with self._sync_lock:
+            if paths:
+                for path in paths:
+                    self.mark_pending(path)
             with self._condition:
-                self._pending.difference_update(batch)
-                self._pending_since = None if not self._pending else time.monotonic()
-            self._state.state = "healthy" if not self._state.degraded_reason else "degraded"
-            self._state.last_sync_at = time.time()
-            self._state.last_error = ""
-            self._state.generation = self.service.store.current_generation()
-            return True
-        except Exception as exc:
-            logger.exception("code-intelligence sync failed")
-            self._state.state = "degraded"
-            self._state.last_error = f"{type(exc).__name__}: {exc}"
-            return False
-        finally:
-            self._lease.release()
+                batch = sorted(self._pending)
+            if not batch:
+                return True
+            try:
+                # Short bounded wait: another watcher/MCP writer often holds the
+                # lease briefly. Pending stays queued on timeout so the debounce
+                # loop retries instead of clearing work as healthy.
+                sync_timeout = _lease_timeouts(self.root)[1]
+                with graph_build_session(
+                    self.root, lease=self._lease, timeout=sync_timeout
+                ):
+                    self._state.state = "syncing"
+                    self.sync_callback(batch)
+                with self._condition:
+                    self._pending.difference_update(batch)
+                    self._pending_since = None if not self._pending else time.monotonic()
+                if self._stop.is_set():
+                    self._state.state = "stopping"
+                else:
+                    # Drop transient lease-busy reasons so a later successful sync
+                    # does not stay permanently ``degraded`` / ``read_only``.
+                    if "writer lease" in (self._state.degraded_reason or "").lower():
+                        self._state.degraded_reason = ""
+                    self._state.state = (
+                        "healthy" if not self._state.degraded_reason else "degraded"
+                    )
+                self._state.last_sync_at = time.time()
+                self._state.last_error = ""
+                self._state.generation = self.service.store.current_generation()
+                return True
+            except GraphBuildBusy as exc:
+                # Keep pending queued; debounce/reconcile will retry after backoff.
+                self._state.state = "pending" if batch or self._pending else "read_only"
+                self._state.degraded_reason = str(exc)
+                return False
+            except Exception as exc:
+                logger.exception("code-intelligence sync failed")
+                self._state.state = "degraded"
+                self._state.last_error = f"{type(exc).__name__}: {exc}"
+                return False
 
     def wait_until_fresh(self, *, timeout: float = 2.0) -> bool:
         deadline = time.monotonic() + max(0.0, timeout)
@@ -301,9 +392,11 @@ class SyncCoordinator:
             self._state.degraded_reason = f"watcher unavailable: {type(exc).__name__}: {exc}"
 
     def _default_sync(self, paths: list[str]) -> None:
-        from devcouncil.codeintel.sync.incremental import sync_affected_paths
+        # Keep graph watch and ``dev map --watch`` on the same path: incremental
+        # graph sync plus a full repo-map rebuild (subsystems/dependents/guides).
+        from devcouncil.indexing.graph.build import refresh_map_for_paths
 
-        sync_affected_paths(self.service, paths, liveness=True)
+        refresh_map_for_paths(self.service.project_root, paths, liveness=True)
 
 
 _COORDINATORS: dict[Path, SyncCoordinator] = {}
@@ -317,6 +410,14 @@ def get_sync_coordinator(root: Path, **kwargs: object) -> SyncCoordinator:
         if coordinator is None:
             coordinator = SyncCoordinator(service, **kwargs)  # type: ignore[arg-type]
             _COORDINATORS[service.project_root] = coordinator
+        else:
+            for name, requested in kwargs.items():
+                current = getattr(coordinator, name)
+                if current != requested:
+                    raise ValueError(
+                        f"sync coordinator for {service.project_root} already uses "
+                        f"a different {name}"
+                    )
         return coordinator
 
 

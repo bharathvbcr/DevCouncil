@@ -502,6 +502,43 @@ def test_query_engine_explore_paths_impact_tests_dead_and_cache(tmp_path: Path) 
     assert CodeIntelQueryEngine._is_test_path("pkg/widget.spec.ts")
 
 
+def test_query_engine_skips_fingerprint_without_runtime_observations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "app.py").write_text("def target():\n    return 1\n", encoding="utf-8")
+    service = CodeIntelService(tmp_path)
+    service.persist(_query_graph())
+    engine = CodeIntelQueryEngine(service)
+
+    def _boom(root: Path) -> str:
+        raise AssertionError("source_fingerprint must not run without runtime evidence")
+
+    monkeypatch.setattr(
+        "devcouncil.codeintel.debug.fingerprint.source_fingerprint", _boom
+    )
+    assert engine.impact(["target"])["blast_radius"]["total_impacted"] >= 1
+
+    session = service.store.start_runtime_session(
+        provider="pytest", source_fingerprint="fp", build_fingerprint="bp"
+    )
+    inserted = service.store.add_runtime_observations(
+        session,
+        [
+            {"source": "app.py::caller", "target": "app.py::target"},
+            {"source": "", "target": "dropped"},
+        ],
+    )
+    assert inserted == 1
+
+    monkeypatch.setattr(
+        "devcouncil.codeintel.debug.fingerprint.source_fingerprint",
+        lambda root: "fp",
+    )
+    dead = engine.dead(minimum_confidence="extracted")
+    assert dead["runtime_proven_live"] == ["app.py::target"]
+    assert dead["dead_code"] == []
+
+
 def test_mcp_debug_dispatches_every_provider_and_manager_action(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -852,14 +889,24 @@ def test_graph_cli_init_watch_doctor_and_hooks(
     import devcouncil.codeintel as codeintel
     import devcouncil.codeintel.languages as languages
     import devcouncil.codeintel.sync as sync_module
+    import devcouncil.indexing.map_artifacts as map_artifacts
     import time
 
     generated: list[tuple] = []
-    monkeypatch.setattr(
-        map_command,
-        "generate_map_artifacts",
-        lambda *args, **kwargs: generated.append((args, kwargs)),
-    )
+
+    def _record(*args, **kwargs):
+        generated.append((args, kwargs))
+        return types.SimpleNamespace(
+            degraded=False,
+            reason="",
+            mode="full",
+            generation=7,
+            compatibility_export_degraded=False,
+        )
+
+    monkeypatch.setattr(map_artifacts, "generate_map_artifacts", _record)
+    monkeypatch.setattr(map_command, "generate_map_artifacts", _record)
+    monkeypatch.setattr(map_artifacts, "refresh_map_artifacts", _record)
     monkeypatch.setattr(
         codeintel,
         "get_codeintel_service",
@@ -918,6 +965,21 @@ def test_graph_cli_init_watch_doctor_and_hooks(
             "action": "",
         },
     )
+    # Doctor now audits the compatibility-export handshake for committed
+    # stores; an uninitialized store with installed grammars is healthy.
+    monkeypatch.setattr(
+        codeintel,
+        "get_codeintel_service",
+        lambda _root: types.SimpleNamespace(
+            status=lambda: {
+                "state": "uninitialized",
+                "generation": None,
+                "schema_version": 2,
+                "node_count": 0,
+                "edge_count": 0,
+            }
+        ),
+    )
     doctor = runner.invoke(
         app, ["graph", "doctor", "--json", "--project-root", str(tmp_path)]
     )
@@ -963,11 +1025,15 @@ def test_sync_coordinator_failure_paths_and_freshness(
 
     coordinator.sync_callback = lambda _paths: None
     coordinator.mark_pending("app.py")
-    monkeypatch.setattr(coordinator._lease, "acquire", lambda: False)
+    monkeypatch.setattr(coordinator._lease, "acquire_with_retry", lambda **_kwargs: False)
+    monkeypatch.setattr(
+        "devcouncil.codeintel.build_control._lease_timeouts",
+        lambda _root: (0.1, 0.05),
+    )
     assert coordinator.sync_now() is False
-    assert coordinator.status().state == "read_only"
+    assert coordinator.status().state in {"pending", "read_only"}
 
-    monkeypatch.setattr(coordinator._lease, "acquire", lambda: True)
+    monkeypatch.setattr(coordinator._lease, "acquire_with_retry", lambda **_kwargs: True)
     monkeypatch.setattr(coordinator._lease, "release", lambda: None)
     assert coordinator.sync_now() is True
     assert coordinator.wait_until_fresh(timeout=0) is True
@@ -1296,10 +1362,56 @@ def test_generic_extractor_deduplicates_and_falls_back_to_call_regex(
     assert extracted.imports == ["pkg"]
     assert extracted.import_details[0].alias_map == {"alias": "pkg"}
     assert [call.name for call in extracted.calls] == ["run", "run", "run"]
-    assert extracted.calls[0].qualname_hint == "Container"
+    # Callee-hint convention (receiver.name / bare name), matching the dedicated
+    # extractors. Owner-style hints made resolve_calls bind every bare
+    # in-function call back to its enclosing symbol as a self-loop.
+    assert extracted.calls[0].qualname_hint == "run"
     assert all(
-        call.qualname_hint == "Container.run" for call in extracted.calls[1:]
+        call.qualname_hint == "svc.run" for call in extracted.calls[1:]
     )
+
+
+def test_generic_bare_call_resolves_to_sibling_not_enclosing() -> None:
+    """A bare call inside a function must bind to the real same-file callee.
+
+    Regression: owner-style qualname hints made the same-file ladder step
+    resolve every bare in-function call to its own enclosing symbol, emitting
+    caller→caller self-loops and leaving true callees with no inbound edges
+    (false dead-code flags across the generic language matrix, e.g. C).
+    """
+    from devcouncil.indexing.graph.extract_python import (
+        ExtractedCall,
+        ExtractedSymbol,
+        FileExtraction,
+    )
+    from devcouncil.indexing.graph.resolve import (
+        build_file_and_symbol_nodes,
+        resolve_calls,
+    )
+
+    ext = FileExtraction(
+        path="main.c",
+        language="c",
+        symbols=[
+            ExtractedSymbol(
+                kind="function", name="main", qualname="main", line=1, end_line=10
+            ),
+            ExtractedSymbol(
+                kind="function", name="helper", qualname="helper", line=12, end_line=20
+            ),
+        ],
+        calls=[
+            ExtractedCall(name="helper", line=5, receiver="", qualname_hint="helper")
+        ],
+    )
+    extractions = {"main.c": ext}
+    _nodes, symbol_index = build_file_and_symbol_nodes(extractions)
+    edges = resolve_calls(extractions, symbol_index, [])
+    call_edges = {(e.source, e.target) for e in edges if e.kind == "calls"}
+    main_id = symbol_index["main.c::main"]
+    helper_id = symbol_index["main.c::helper"]
+    assert (main_id, helper_id) in call_edges
+    assert (main_id, main_id) not in call_edges
 
 
 @pytest.mark.parametrize(
@@ -1562,8 +1674,21 @@ def test_graph_cli_remaining_output_branches(
     import devcouncil.codeintel.sync as sync_module
     import devcouncil.indexing.graph.build as graph_build
     import devcouncil.indexing.graph.intel as intel
+    import devcouncil.indexing.map_artifacts as map_artifacts
 
+    monkeypatch.setattr(map_artifacts, "generate_map_artifacts", lambda *_a, **_k: None)
     monkeypatch.setattr(map_command, "generate_map_artifacts", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        map_artifacts,
+        "refresh_map_artifacts",
+        lambda *_a, **_k: types.SimpleNamespace(
+            degraded=False,
+            reason="",
+            mode="full",
+            generation=1,
+            compatibility_export_degraded=False,
+        ),
+    )
     monkeypatch.setattr(
         codeintel,
         "get_codeintel_service",
@@ -1790,6 +1915,7 @@ def test_store_export_status_search_and_runtime_filter_branches(
         session_id="runtime",
     )
     assert session == "runtime"
+    # Rows without both endpoints are dropped and must not inflate the count.
     assert (
         store.add_runtime_observations(
             session,
@@ -1798,7 +1924,7 @@ def test_store_export_status_search_and_runtime_filter_branches(
                 {"source": "", "target": "ignored"},
             ],
         )
-        == 2
+        == 1
     )
     store.end_runtime_session(session)
     rows = store.runtime_observations(

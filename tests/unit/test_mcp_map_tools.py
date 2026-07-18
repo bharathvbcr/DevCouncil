@@ -342,7 +342,8 @@ def test_map_stale_no_data_and_exception(tmp_path, monkeypatch):
         "devcouncil.integrations.mcp.handlers.map.RepoMapper.map_is_stale",
         lambda self, data: (_ for _ in ()).throw(RuntimeError("boom")),
     )
-    assert mapmod._map_stale(tmp_path, {"files": []}) is False
+    # Fail closed: unverifiable map must not be reported as fresh.
+    assert mapmod._map_stale(tmp_path, {"files": []}) is True
 
 
 def test_subsystem_detail_handles_bad_role_files():
@@ -649,3 +650,51 @@ async def test_explain_ok(tmp_path, monkeypatch):
         await mapmod.handle_explain(tmp_path, {"path": "src/a.py", "category": "sql-injection"})
     )
     assert out["ok"] is True and out["count"] == 1
+
+@pytest.mark.anyio
+async def test_liveness_scope_without_entry_roots_stays_reliable(tmp_path, monkeypatch):
+    """Filtering to an area that has no entry root must not flip the response
+    to unreachable_unreliable (reliability is a global map property)."""
+    _write_repo_map(tmp_path)
+    monkeypatch.setattr(mapmod, "_map_stale", lambda *_: False)
+    result = await mapmod.handle_liveness(tmp_path, {"area": "src"})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    assert payload["unreachable_unreliable"] is False
+    assert "warning" not in payload
+    assert payload["unreachable_files"] == ["src/orphan.py"]
+    # The scoped entry_roots view is empty — that's fine and expected.
+    assert payload["entry_roots"] == []
+
+
+@pytest.mark.anyio
+async def test_liveness_globally_empty_roots_still_unreliable(tmp_path, monkeypatch):
+    _write_repo_map(tmp_path, entry_roots=[])
+    monkeypatch.setattr(mapmod, "_map_stale", lambda *_: False)
+    result = await mapmod.handle_liveness(tmp_path, {})
+    payload = json.loads(result[0].text)
+    assert payload["unreachable_unreliable"] is True
+    assert payload["unreachable_files"] == []
+    assert "warning" in payload
+
+
+@pytest.mark.anyio
+async def test_graph_ingest_paths_branch_reports_writer_busy(tmp_path, monkeypatch):
+    """A held writer lease during explicit-paths ingest must return the
+    structured graph_writer_busy error, not raise through MCP."""
+    from devcouncil.codeintel.build_control import GraphBuildBusy
+
+    class _Coordinator:
+        def sync_now(self, _paths):
+            raise GraphBuildBusy("another process owns the code-intelligence writer lease")
+
+        def status(self):  # pragma: no cover - not reached
+            raise AssertionError
+
+    monkeypatch.setattr(
+        "devcouncil.codeintel.sync.get_sync_coordinator", lambda _root: _Coordinator()
+    )
+    result = await mapmod.handle_graph_ingest(tmp_path, {"paths": ["a.py"]})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is False
+    assert payload["code"] == "graph_writer_busy"

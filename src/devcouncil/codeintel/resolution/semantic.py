@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import re
+import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from devcouncil.codeintel.resolution.abstract_state import AbstractState
 from devcouncil.codeintel.resolution.frameworks import (
@@ -17,8 +19,14 @@ from devcouncil.codeintel.resolution.frameworks import (
 from devcouncil.indexing.graph.extract_python import FileExtraction
 from devcouncil.indexing.graph.schema import CodeGraph, Confidence, GraphEdge, GraphNode, NodeKind
 
+logger = logging.getLogger(__name__)
+
 _REACT_STATE = re.compile(r"\[\s*(?P<state>[A-Za-z_$][\w$]*)\s*,\s*(?P<setter>[A-Za-z_$][\w$]*)\s*\]\s*=\s*(?:React\.)?useState\s*\(")
 _DYNAMIC = re.compile(r"\b(?P<kind>eval|exec|getattr|setattr|import_module|Class\.forName|Activator\.CreateInstance|NSClassFromString|require|import)\s*\(")
+_WORKER_URL = re.compile(
+    r"""(?:new\s+(?:Worker|SharedWorker)\s*\(\s*)?"""
+    r"""new\s+URL\s*\(\s*['"](?P<spec>[^'"]+)['"]\s*,\s*import\.meta\.url"""
+)
 _CALLBACK = re.compile(r"\b(?:then|catch|finally|map|filter|reduce|forEach|subscribe|useEffect)\s*\(\s*(?P<callback>[A-Za-z_$][\w$]*)")
 _ABSTRACT_ALIAS_CALL = re.compile(
     r"\b(?:new\s+)?(?P<callee>[A-Za-z_$][\w$]*)\s*\("
@@ -81,7 +89,23 @@ def _edge(
 def _symbol_index(nodes: Iterable[GraphNode]) -> dict[str, list[GraphNode]]:
     result: dict[str, list[GraphNode]] = defaultdict(list)
     for node in nodes:
-        if node.name:
+        # Synthesized pathless bridge/channel nodes may already exist when an
+        # incremental refresh re-enriches a persisted graph.  They are graph
+        # endpoints, not source-declared symbols, and admitting them here makes
+        # a second enrichment resolve reflections that a clean build cannot.
+        if (
+            node.name
+            and node.path
+            and node.kind
+            not in {
+                NodeKind.FILE,
+                NodeKind.DYNAMIC,
+                NodeKind.EVENT,
+                NodeKind.PROVIDER,
+                NodeKind.ROUTE,
+                NodeKind.STATE,
+            }
+        ):
             keys = {node.name, node.id.rsplit("::", 1)[-1]}
             for key in keys:
                 result[key].append(node)
@@ -139,10 +163,20 @@ def enrich_semantic_edges(
     root: Path,
     paths: set[str] | None = None,
     extractions: Mapping[str, FileExtraction] | None = None,
+    progress: Callable[[str, int, int], None] | None = None,
+    budget_seconds: float | None = None,
 ) -> CodeGraph:
-    """Add isolated semantic nodes/edges without changing extracted identities."""
+    """Add isolated semantic nodes/edges without changing extracted identities.
+
+    ``budget_seconds`` bounds the per-file enrichment loop by wall clock: when
+    exceeded, remaining files are skipped, partial results are kept, and
+    ``meta["semantic_enrich_partial"]`` records how far it got — a visible
+    partial instead of an unbounded hang on very large repos. The check runs
+    between files, so one pathological file can still overshoot the budget.
+    """
 
     root = root.expanduser().resolve()
+    deadline = time.monotonic() + budget_seconds if budget_seconds else None
     nodes = list(graph.nodes)
     edges = list(graph.edges)
     initial_node_count = len(nodes)
@@ -159,6 +193,10 @@ def enrich_semantic_edges(
     }
     existing_nodes = {node.id for node in nodes}
     existing_edges = {(edge.source, edge.target, edge.kind) for edge in edges}
+    nodes_by_path: dict[str, list[GraphNode]] = defaultdict(list)
+    for node in nodes:
+        if node.path:
+            nodes_by_path[node.path].append(node)
     file_paths = sorted({node.path for node in nodes if node.path})
     if paths is not None:
         file_paths = [path for path in file_paths if path in paths]
@@ -174,13 +212,30 @@ def enrich_semantic_edges(
             existing_edges.add(key)
             edges.append(edge)
 
-    for rel in file_paths:
+    total_files = len(file_paths)
+    for file_index, rel in enumerate(file_paths, start=1):
+        if deadline is not None and time.monotonic() > deadline:
+            graph.meta["semantic_enrich_partial"] = {
+                "files_done": file_index - 1,
+                "files_total": total_files,
+                "budget_seconds": budget_seconds,
+            }
+            logger.warning(
+                "semantic enrichment budget (%ss) exhausted after %d/%d files; "
+                "keeping partial results",
+                budget_seconds,
+                file_index - 1,
+                total_files,
+            )
+            break
+        if progress is not None:
+            progress("semantic", file_index - 1, total_files)
         try:
             text = (root / rel).read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         lines = text.splitlines()
-        file_symbols = [node for node in nodes if node.path == rel]
+        file_symbols = nodes_by_path.get(rel, [])
         callable_aliases, type_aliases = _abstract_import_aliases(
             aliases_by_path.get(rel, {}),
             symbols,
@@ -208,7 +263,7 @@ def enrich_semantic_edges(
             callable_aliases=callable_aliases,
             type_aliases=type_aliases,
         )
-        language = next((node.language for node in nodes if node.path == rel and node.language), "")
+        language = next((node.language for node in file_symbols if node.language), "")
         normalized_rel = rel.replace("\\", "/")
         if any(normalized_rel.startswith(prefix) for prefix in _FILE_ROUTE_PREFIXES) and Path(rel).suffix.lower() in {
             ".astro", ".vue", ".svelte", ".tsx", ".ts", ".jsx", ".js"
@@ -225,7 +280,7 @@ def enrich_semantic_edges(
                 language=language,
                 extras={"verb": "FILE", "route": route_path, "provenance": "framework"},
             ))
-            handler = next((node for node in nodes if node.path == rel and node.kind != NodeKind.FILE), None)
+            handler = next((node for node in file_symbols if node.kind != NodeKind.FILE), None)
             add_edge(_edge(
                 rel,
                 route_id,
@@ -243,7 +298,9 @@ def enrich_semantic_edges(
                 synthesizer="file-route-resolver",
             ))
         for line_no, line in enumerate(lines, start=1):
-            owner = _enclosing(nodes, rel, line_no)
+            if progress is not None and line_no % 1000 == 0:
+                progress("semantic", file_index - 1, total_files)
+            owner = _enclosing(file_symbols, rel, line_no)
             owner_id = owner.id if owner is not None else rel
             match: Any
 
@@ -265,7 +322,7 @@ def enrich_semantic_edges(
                     },
                 ))
                 handler_id = _route_handler_id(
-                    nodes,
+                    file_symbols,
                     symbols,
                     rel,
                     line_no,
@@ -276,7 +333,7 @@ def enrich_semantic_edges(
                     abstract_state,
                 )
                 registration_owner = _registration_owner(
-                    nodes, rel, owner_id, handler_id
+                    file_symbols, rel, owner_id, handler_id
                 )
                 add_edge(_edge(
                     registration_owner,
@@ -320,7 +377,7 @@ def enrich_semantic_edges(
                         },
                     ))
                     handler_id = _route_handler_id(
-                        nodes,
+                        file_symbols,
                         symbols,
                         rel,
                         line_no,
@@ -331,7 +388,7 @@ def enrich_semantic_edges(
                         abstract_state,
                     )
                     registration_owner = _registration_owner(
-                        nodes, rel, owner_id, handler_id
+                        file_symbols, rel, owner_id, handler_id
                     )
                     add_edge(_edge(
                         registration_owner,
@@ -397,9 +454,8 @@ def enrich_semantic_edges(
                     if match.operation == "schedule" and targets[0].kind == NodeKind.CLASS:
                         callback_targets.extend(
                             node
-                            for node in nodes
-                            if node.path == targets[0].path
-                            and node.kind == NodeKind.METHOD
+                            for node in nodes_by_path.get(targets[0].path, [])
+                            if node.kind == NodeKind.METHOD
                             and str(node.extras.get("qualname") or "").startswith(
                                 f"{targets[0].name}."
                             )
@@ -425,7 +481,7 @@ def enrich_semantic_edges(
                 add_edge(_edge(owner_id, state_id, "owns_state", reason="React useState binding", score=0.95, synthesizer="react-state"))
                 for later_no, later in enumerate(lines[line_no:], start=line_no + 1):
                     if re.search(rf"\b{re.escape(setter)}\s*\(", later):
-                        writer = _enclosing(nodes, rel, later_no)
+                        writer = _enclosing(file_symbols, rel, later_no)
                         add_edge(_edge((writer.id if writer else rel), state_id, "writes_state", reason=f"calls state setter {setter}", score=0.9, synthesizer="react-state"))
 
             for match in iter_provider_matches(line):
@@ -538,7 +594,7 @@ def enrich_semantic_edges(
                 ))
                 if kind in {"import", "require", "import_module"}:
                     for value in resolved_values:
-                        target_path = _resolve_dynamic_file(rel, value, file_paths)
+                        target_path = _resolve_dynamic_file(rel, value, file_paths, root=root)
                         if target_path is not None:
                             add_edge(_edge(owner_id, target_path, "imports_dynamic", reason="abstract-state computed import", score=0.8, synthesizer="dynamic-import"))
                 else:
@@ -591,6 +647,30 @@ def enrich_semantic_edges(
                     extras={"channel": "native-method", "provenance": "framework"},
                 ))
                 add_edge(_edge(owner_id, bridge_id, "calls", reason="React Native/Expo bridge call", score=0.8, synthesizer="native-bridge"))
+
+        for match in _WORKER_URL.finditer(text):
+            spec = match.group("spec")
+            target_path = _resolve_dynamic_file(rel, spec, file_paths, root=root)
+            if target_path is None:
+                continue
+            owner = next(
+                (node for node in file_symbols if node.kind == NodeKind.FILE),
+                None,
+            )
+            owner_id = owner.id if owner is not None else rel
+            add_edge(
+                _edge(
+                    owner_id,
+                    target_path,
+                    "imports_dynamic",
+                    reason="Worker/import.meta.url module load",
+                    score=0.9,
+                    synthesizer="worker-url",
+                )
+            )
+
+        if progress is not None:
+            progress("semantic", file_index, total_files)
 
     graph.nodes = nodes
     graph.edges = edges
@@ -691,14 +771,27 @@ def _resolve_dynamic_file(
     source_path: str,
     value: str,
     file_paths: Iterable[str],
+    *,
+    root: Path | None = None,
 ) -> str | None:
     available = set(file_paths)
     raw = value.replace("\\", "/").split("?", 1)[0]
-    base = (
-        (Path(source_path).parent / raw).as_posix()
-        if raw.startswith(".")
-        else raw.lstrip("/")
-    )
+    if raw.startswith("."):
+        base = (Path(source_path).parent / raw).as_posix()
+    else:
+        # Alias / absolute-style specs (``@/components/...``).
+        if root is not None and not raw.startswith("/"):
+            try:
+                from devcouncil.indexing.repo_mapper import RepoMapper
+
+                mapper = RepoMapper(root)
+                mapper._last_file_set = available
+                hit = mapper._resolve_js_spec(source_path, raw, available)
+                if hit:
+                    return hit
+            except Exception:
+                pass
+        base = raw.lstrip("/")
     candidates = [base]
     candidates.extend(f"{base}{suffix}" for suffix in (
         ".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",

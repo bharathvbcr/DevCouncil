@@ -204,7 +204,7 @@ def _generate_initial_map(project_root: Path, quiet: bool) -> None:
     so a mapping failure never blocks initialization.
     """
     try:
-        from devcouncil.cli.commands.map import generate_map_artifacts
+        from devcouncil.indexing.map_artifacts import generate_map_artifacts
 
         generate_map_artifacts(
             project_root,

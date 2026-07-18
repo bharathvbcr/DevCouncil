@@ -43,7 +43,7 @@ def test_parse_cache_v5_has_symbols_and_import_details(tmp_path):
     data = json.loads(
         (tmp_path / ".devcouncil" / "cache" / "repo_map_parse.json").read_text(encoding="utf-8")
     )
-    assert data["version"] == PARSE_CACHE_VERSION == RepoMapper._PARSE_CACHE_VERSION == 5
+    assert data["version"] == PARSE_CACHE_VERSION == RepoMapper._PARSE_CACHE_VERSION == 7
     entry = data["files"]["pkg/a.py"]
     assert entry["sha256"]
     assert isinstance(entry.get("symbols"), list)
@@ -82,7 +82,7 @@ def test_warm_cold_named_import_edge_parity(tmp_path):
     data = json.loads(
         (tmp_path / ".devcouncil" / "cache" / "repo_map_parse.json").read_text(encoding="utf-8")
     )
-    assert data["version"] == 5
+    assert data["version"] == PARSE_CACHE_VERSION
     assert data["files"]["pkg/main.py"].get("import_details")
 
     warm = build_code_graph(tmp_path, liveness=False)
