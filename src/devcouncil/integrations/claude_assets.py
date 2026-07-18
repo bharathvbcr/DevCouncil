@@ -28,6 +28,7 @@ from pathlib import Path
 
 from devcouncil.executors.advisor_tool import ADVISOR_STEERING_NUDGE
 from devcouncil.knowledge.frontmatter import build_frontmatter_markdown
+from devcouncil.integrations.clients.hooks import SESSION_START_MATCHER
 
 # Tools a DevCouncil subagent should be allowed to use: the standard read/edit/run set
 # plus the DevCouncil MCP tools it drives the task loop with. Listing the MCP tools keeps

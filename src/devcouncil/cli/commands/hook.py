@@ -9,6 +9,14 @@ from rich.console import Console
 from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import TaskRepository
 from devcouncil.execution.hook_policy import HookPolicy
+from devcouncil.execution.stop_gate import (
+    build_compact_snapshot,
+    compact_briefing,
+    compact_snapshot_path,
+    compact_snapshot_recent,
+    session_briefing,
+    write_json,
+)
 from devcouncil.telemetry.traces import TraceLogger
 from devcouncil.telemetry.stages import log_step
 from devcouncil.live.signals import write_signal

@@ -42,6 +42,7 @@ from devcouncil.cli.commands import (  # noqa: E402 - imports follow stdio recon
     design,
     doctor,
     go,
+    graph_cmd,
     hook,
     init,
     integrate,
