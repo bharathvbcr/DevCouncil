@@ -12,6 +12,8 @@ It sits *beside* coding agents (Claude Code, Codex, Cursor, Aider, and more) and
 
 Around that map: a multi-role planning council that debates a one-line goal into typed requirements and a scoped task graph; gated execution with scoped writes, command allowlists, and clean rollback; a four-tier verification gate (scope, tests, diff-coverage, rigor) whose acceptance-check compiler turns each criterion into a runnable, majority-voted check; a bounded self-repair loop when evidence is missing; live review cards via `dev watch`; an MCP server so an agent can drive checkout → write → verify → repair itself; plus a local gaps dashboard, run timelines you can revert, and CI that uploads evidence reports.
 
+Also in the box: parallel multi-agent campaigns (director → coordinator → workers → reviewer) with file-overlap serialization, cost budgets, and a progress dashboard; deeper code intelligence (`dev graph cypher`, an opt-in program-dependence graph, AST structural search, a semantic index, LSP detection, all behind a sha256-keyed parse cache); a corpus index for docs, PDFs, and images with their own verify gates; task-level provenance and an audit trail; secret redaction with local-only state; a design-token conformance gate; and GEPA prompt-profile optimization for custom agents, across ~48 CLI commands on a green 1,385-test suite the tool dogfoods on itself.
+
 Built in Python (Typer CLI, asyncio), with provider-agnostic model routing across OpenRouter, Vertex AI, Doubleword, and local Ollama. It runs fully offline at zero cost.
 
 In a controlled adversarial benchmark with hidden ground-truth tests, the gated loop lifted code correctness **+0.14 (0.94 vs. 0.81) with zero false negatives**, an early, deliberately small result I keep honestly caveated rather than oversold.
@@ -31,6 +33,8 @@ So I built **DevCouncil**: a gated orchestrator that wraps any coding agent (Cla
 It starts by mapping the whole repo into a symbol-level graph with `dev map`. Subsystems, entry points, neighbors, imports, call sites. No config. The map stays honest: a missing or stale map is never trusted. Before the agent edits, it gets the blast radius, every file that imports the one it's about to change. You can query callers yourself, flag dead code, open an interactive graph, even generate a wiki the agent can read by subsystem.
 
 Then it debates your goal into scoped tasks, lets the agent touch only what it's allowed to, verifies the diff four ways, and turns every acceptance criterion into a runnable check. Fail the gate and a repair loop kicks in with a specific gap, not a vibe. Live review can critique the session as it runs. MCP lets the agent drive the whole checkout → write → verify loop from inside the editor. Hooks stop unauthorized writes. Offline on Ollama if you want zero API cost.
+
+Need more muscle? `dev campaign` fans a plan out to a parallel team of agents, caps the spend, and keeps every run reversible: timeline it, diff it, revert it from checkpoints.
 
 Early adversarial benchmark (hidden tests the agent never sees): correctness went **0.81 → 0.94, zero false negatives.**
 

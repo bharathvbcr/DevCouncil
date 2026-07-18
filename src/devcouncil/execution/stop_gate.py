@@ -555,7 +555,7 @@ def build_compact_snapshot(root: Path, payload: dict[str, Any]) -> dict[str, Any
     task_id = active_task_id(root)
     phase, blocking_summary = _phase_and_blocking_from_db(root)
     blocking_gaps = 0
-    next_actions = []
+    next_actions: list[str] = []
     if task_id:
         blocking_gaps, next_actions = _task_blocking_summary(root, task_id)
     last = last_event(root)
