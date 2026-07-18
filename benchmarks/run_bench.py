@@ -580,11 +580,12 @@ def arm_devcouncil(ws: Path, goal: str, model: str, executor: str, timeout: int,
                    ac_per_criterion: bool = False, executor_model: str = "") -> dict:
     t0 = time.monotonic()
     bench_env = _bench_env()
-    init_code, init_out = run([DEV, "init"], cwd=ws, timeout=120, env=bench_env)
     key = _resolve_openrouter_key()
+    if key:
+        bench_env["OPENROUTER_API_KEY"] = key
+    init_code, init_out = run([DEV, "init"], cwd=ws, timeout=120, env=bench_env)
     dc_dir = ws / ".devcouncil"
     dc_dir.mkdir(parents=True, exist_ok=True)  # defensive: never fail on a missing dir
-    (dc_dir / "secrets.env").write_text(f"OPENROUTER_API_KEY={key}\n", encoding="utf-8")
     cfg_code, cfg_out = run([DEV, "config", "models", "--provider", "openrouter", "-m", model],
                             cwd=ws, timeout=120, env=bench_env)
     # If config.yaml was not produced, `dev init`/`dev config models` failed. Fail loudly

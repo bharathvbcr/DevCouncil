@@ -973,7 +973,7 @@ def get_api_key(provider: str = "openrouter", project_root: Path = Path(".")) ->
         # swallow the ValueError. The raise below already carries the full actionable
         # message for callers that surface it; a WARNING here polluted agent-facing
         # `--json` output whenever the console handler's stream was captured.
-        logger.debug("API key not found for provider %s (env var %s)", provider, env_var)
+        logger.debug("Provider credentials not configured for %s", provider)
         extra = (
             " You can also authenticate with 'gcloud auth login' for vertexai."
             if _normalized_provider_name(provider) == "vertexai"

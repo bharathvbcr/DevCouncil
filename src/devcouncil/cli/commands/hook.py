@@ -652,11 +652,17 @@ def _emit_additional_context(event_name: str, context: str | None) -> None:
     }, separators=(",", ":")))
 
 
-def _emit_system_message(message: str) -> None:
-    """Emit a user-visible systemMessage (exit 0). PreCompact toast uses this."""
+def _emit_system_message(event_name: str, message: str) -> None:
+    """Emit a Claude-Code hook result with a user-visible systemMessage (exit 0)."""
     if not message:
         return
-    print(dump_json({"systemMessage": message}, separators=(",", ":")))
+    import json
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": event_name,
+            "systemMessage": message,
+        }
+    }, separators=(",", ":")))
 
 
 def _read_stdin_payload(event_json: str | None) -> dict:
@@ -777,7 +783,10 @@ def pre_compact(
         from devcouncil.app.config import load_config
 
         if load_config(root).execution.compact_snapshot_toast:
-            _emit_system_message("DevCouncil: continuity snapshot saved before compaction.")
+            _emit_system_message(
+                "PreCompact",
+                "DevCouncil saved a compact snapshot (phase, task, gaps) before context compaction.",
+            )
     except Exception:
         pass
 
