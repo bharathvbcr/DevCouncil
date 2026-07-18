@@ -460,6 +460,32 @@ def test_load_js_path_aliases_and_alias_resolution(tmp_path):
     assert m._load_js_path_aliases() is rules
 
 
+def test_nested_tsconfig_walk_prunes_vendored_trees_before_cap(tmp_path, monkeypatch):
+    """node_modules tsconfigs must not exhaust the walk cap before real ones.
+
+    Pre-fix, ``sorted(rglob("tsconfig*.json"))[:cap]`` sliced the UNFILTERED
+    list — vendored configs sorting before ``packages/`` silently dropped real
+    monorepo alias rules once node_modules held more than the cap.
+    """
+    monkeypatch.setattr(RepoMapper, "_TSCONFIG_WALK_CAP", 3)
+    for i in range(5):  # > cap, and "node_modules" sorts before "packages"
+        pkg = tmp_path / "node_modules" / f"pkg{i}"
+        pkg.mkdir(parents=True)
+        (pkg / "tsconfig.json").write_text("{}", encoding="utf-8")
+    app = tmp_path / "packages" / "app"
+    (app / "src").mkdir(parents=True)
+    (app / "tsconfig.json").write_text(
+        json.dumps({"compilerOptions": {"paths": {"@/*": ["src/*"]}}}),
+        encoding="utf-8",
+    )
+    m = RepoMapper(tmp_path)
+    # tsconfig.json absent from the file set: the tree walk is load-bearing.
+    m._last_file_set = {"packages/app/src/x.ts"}
+    rules = m._load_js_path_aliases()
+    assert ("@", ["packages/app/src"]) in rules
+    assert m._resolve_js_alias("@/x", {"packages/app/src/x.ts"}) == "packages/app/src/x.ts"
+
+
 def test_js_import_edges_alias_and_barrel_reexports(tmp_path):
     (tmp_path / "tsconfig.json").write_text(
         json.dumps(

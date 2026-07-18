@@ -324,6 +324,43 @@ def test_graph_explain_pdg_query(tmp_path, monkeypatch):
     assert pb.exit_code == 0
 
 
+def test_graph_pdg_build_survives_oversized_compatibility_export(tmp_path, monkeypatch):
+    """Stub-tier export raises after a successful write; `dev graph pdg` must
+    report degraded-export success, not crash (SQLite already committed)."""
+    import json
+
+    from devcouncil.indexing.graph import build as graph_build
+
+    layer = SimpleNamespace(files={"a.py": {}})
+    monkeypatch.setattr(
+        graph_build, "build_pdg_for_paths", lambda root, graph, paths=None: layer
+    )
+    monkeypatch.setattr(
+        graph_build, "merge_pdg_into_graph", lambda graph, layer: {"a.py": {"x": 1}}
+    )
+
+    def _too_large(*_a, **_k):
+        raise CompatibilityGraphTooLarge("exceeded cap; wrote stub JSON")
+
+    monkeypatch.setattr(graph_build, "write_code_graph", _too_large)
+    monkeypatch.setattr(
+        "devcouncil.codeintel.get_codeintel_service",
+        lambda root: SimpleNamespace(store=SimpleNamespace(analysis_shards=lambda: {})),
+    )
+    graph = SimpleNamespace(
+        meta={"pdg": {"stats": {"function_count": 1, "taint_count": 0, "file_count": 1}}}
+    )
+    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: graph)
+    result = runner.invoke(
+        app, ["graph", "pdg", "build", "--json", "--project-root", str(tmp_path)]
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["compatibility_export"] == "degraded"
+    assert "stub" in payload["compatibility_export_reason"]
+
+
 def test_graph_status_json_and_hooks_refuse(tmp_path, monkeypatch):
     from devcouncil.cli.commands.init import initialize_project
 

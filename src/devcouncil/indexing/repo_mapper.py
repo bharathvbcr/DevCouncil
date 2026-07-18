@@ -1228,6 +1228,7 @@ class RepoMapper:
     )
     _JS_BARE_IMPORT_RE = re.compile(r"""^\s*import\s*['"](?P<spec>[^'"]+)['"]""")
     _JS_RESOLVE_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+    _TSCONFIG_WALK_CAP = 200
     _GO_IMPORT_BLOCK_RE = re.compile(r"import\s*\((?P<body>[^)]*)\)", re.DOTALL)
     _GO_IMPORT_SINGLE_RE = re.compile(r"""^\s*import\s+(?:[A-Za-z_.]\w*\s+)?['"](?P<spec>[^'"]+)['"]""")
     _GO_IMPORT_SPEC_RE = re.compile(r"""['"](?P<spec>[^'"]+)['"]""")
@@ -1484,29 +1485,31 @@ class RepoMapper:
                 )[:200]
             # Always also walk the tree: git file lists often omit tsconfig.json,
             # which previously left monorepo ``apps/*/tsconfig.json`` undiscovered.
+            # Prune vendored trees before capping: node_modules commonly holds
+            # hundreds of tsconfig.json, and capping the unfiltered glob silently
+            # dropped real ``packages/*/tsconfig.json`` alias rules.
             try:
-                for path in sorted(self.project_root.rglob("tsconfig*.json"))[:200]:
-                    if any(
-                        part in {"node_modules", "dist", "build", ".git", "target"}
-                        for part in path.parts
-                    ):
-                        continue
-                    try:
-                        rel = path.relative_to(self.project_root).as_posix()
-                    except ValueError:
-                        continue
-                    if rel not in nested_manifests:
-                        nested_manifests.append(rel)
-                for path in sorted(self.project_root.rglob("jsconfig.json"))[:50]:
-                    if any(
-                        part in {"node_modules", "dist", "build", ".git"}
-                        for part in path.parts
-                    ):
-                        continue
-                    try:
-                        rel = path.relative_to(self.project_root).as_posix()
-                    except ValueError:
-                        continue
+                skip_dirs = {"node_modules", "dist", "build", ".git", "target"}
+                walked: List[str] = []
+                for dirpath, dirnames, filenames in os.walk(self.project_root):
+                    dirnames[:] = sorted(d for d in dirnames if d not in skip_dirs)
+                    for fname in filenames:
+                        if fname != "jsconfig.json" and not (
+                            fname.startswith("tsconfig") and fname.endswith(".json")
+                        ):
+                            continue
+                        try:
+                            rel = (
+                                (Path(dirpath) / fname)
+                                .relative_to(self.project_root)
+                                .as_posix()
+                            )
+                        except ValueError:
+                            continue
+                        walked.append(rel)
+                    if len(walked) >= self._TSCONFIG_WALK_CAP:
+                        break
+                for rel in sorted(walked)[: self._TSCONFIG_WALK_CAP]:
                     if rel not in nested_manifests:
                         nested_manifests.append(rel)
             except Exception:

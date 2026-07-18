@@ -1084,6 +1084,7 @@ def graph_pdg_build(
 ) -> None:
     """Build or refresh the PDG layer for Python files."""
     from devcouncil.indexing.graph.build import (
+        CompatibilityGraphTooLarge,
         build_pdg_for_paths,
         merge_pdg_into_graph,
         write_code_graph,
@@ -1102,9 +1103,18 @@ def graph_pdg_build(
         pass
     for path, payload in shards.items():
         merged.setdefault(path, {}).update(payload)
-    write_code_graph(root, graph, analysis_shards=merged)
+    export_warning = ""
+    try:
+        write_code_graph(root, graph, analysis_shards=merged)
+    except CompatibilityGraphTooLarge as exc:
+        # SQLite committed the PDG shards and a stub/pointer JSON is on disk;
+        # only the compatibility export is degraded — not the PDG build.
+        export_warning = str(exc)
     stats = (graph.meta.get("pdg") or {}).get("stats") or {}
     payload = {"ok": True, "stats": stats, "files": sorted(layer.files.keys())}
+    if export_warning:
+        payload["compatibility_export"] = "degraded"
+        payload["compatibility_export_reason"] = export_warning
     if json_output:
         typer.echo(json.dumps(payload, indent=2))
         return
@@ -1112,6 +1122,8 @@ def graph_pdg_build(
         f"PDG: {stats.get('function_count', 0)} functions, "
         f"{stats.get('taint_count', 0)} taint findings across {stats.get('file_count', 0)} files"
     )
+    if export_warning:
+        console.print(f"[yellow]compatibility export degraded: {export_warning}[/yellow]")
 
 
 @app.command("explain")
