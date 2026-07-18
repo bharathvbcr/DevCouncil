@@ -74,7 +74,7 @@ def test_is_runtime_or_generated_file(mapper):
     assert mapper._is_runtime_or_generated_file(".git/config")
     assert mapper._is_runtime_or_generated_file("dist/bundle.js")
     assert mapper._is_runtime_or_generated_file("tmpfile")
-    assert mapper._is_runtime_or_generated_file("devcouncil-0.3.1.tgz")
+    assert mapper._is_runtime_or_generated_file("devcouncil-0.4.0.tgz")
     assert mapper._is_runtime_or_generated_file("dist-copy/package.whl")
     assert mapper._is_runtime_or_generated_file("archives/source.tar.gz")
     assert not mapper._is_runtime_or_generated_file("src/pkg/debugger.py")

@@ -22,6 +22,16 @@ Concretely, it builds a persistent Requirement → Task → Diff → Evidence gr
 
 That's the whole personality of the tool: it would rather tell you "I can't prove this yet" than hand you a green checkmark it didn't earn.
 
+## It reads your codebase before it touches it
+
+A whole class of AI coding failures happens *before* any test runs: the agent edits blind. It renames a function without knowing what else calls it, "fixes" one module, and silently breaks three that imported it. The model never had a map of the code — just the handful of files you happened to paste into the chat.
+
+So DevCouncil builds one. `dev map` parses your repo with tree-sitter into a symbol-level graph — files, subsystems, imports, call sites — and keeps it fresh on its own (an ordinary edit marks it stale; a *missing* map is treated as stale, never trusted). It works out the important files and subsystem boundaries for *any* repo by ranking the import graph, with no configuration.
+
+That map earns its keep twice. It grounds planning in *real* files and symbols instead of hallucinated ones. And right before a task changes a file, DevCouncil hands the agent the **blast radius** — every file that imports the one being edited — so it edits in place and keeps the call sites working instead of starting blind. You can walk the graph yourself, too: `dev graph` traces callers, flags dead code with confidence tiers, and renders the whole codebase as an interactive map.
+
+Prevention up front, proof at the end — the same idea pointed from both directions: give the model the context to get it right, then check that it actually did.
+
 ## Does it actually work? I built a benchmark to find out
 
 It's easy to build something like this and fall in love with the idea. I wanted to know if it moved the needle or if I'd just built an elaborate placebo.

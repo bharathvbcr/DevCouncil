@@ -72,9 +72,9 @@ def test_generated_archive_does_not_change_map_or_freshness(tmp_path):
     repo_map = mapper.map_repo(liveness=False)
 
     assert any(item.path == "src/debug_runtime.py" for item in repo_map.files)
-    archive = tmp_path / "devcouncil-0.3.1.tgz"
+    archive = tmp_path / "devcouncil-0.4.0.tgz"
     archive.write_text("generated archive", encoding="utf-8")
-    assert "devcouncil-0.3.1.tgz" not in mapper.get_git_files()
+    assert "devcouncil-0.4.0.tgz" not in mapper.get_git_files()
     assert not mapper.map_is_stale(repo_map.model_dump())
 
 

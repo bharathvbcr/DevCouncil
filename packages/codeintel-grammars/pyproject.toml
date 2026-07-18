@@ -1,6 +1,6 @@
 [project]
 name = "devcouncil-codeintel-grammars"
-version = "0.3.1"
+version = "0.4.0"
 description = "Platform-specific Tree-sitter grammar assets for DevCouncil code intelligence"
 requires-python = ">=3.12"
 dependencies = ["tree-sitter-language-pack>=1.12.5"]
