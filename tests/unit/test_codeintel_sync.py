@@ -264,7 +264,7 @@ def test_watcher_polling_fallback_is_reported_separately(tmp_path: Path, monkeyp
     monkeypatch.setattr(watchdog.observers, "Observer", FailingObserver)
     try:
         kqueue = importlib.import_module("watchdog.observers.kqueue")
-    except ImportError:
+    except (ImportError, AttributeError):
         pass
     else:
         monkeypatch.setattr(kqueue, "KqueueObserver", FailingObserver)

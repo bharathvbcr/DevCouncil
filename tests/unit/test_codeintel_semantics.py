@@ -529,8 +529,13 @@ def test_semantic_owner_lookup_receives_only_path_local_nodes(tmp_path, monkeypa
     assert {node.path for node in graph.nodes if node.path} == {"a.py", "b.py"}
 
 
-def test_semantic_enrich_budget_keeps_partial_and_records_meta(tmp_path: Path) -> None:
+def test_semantic_enrich_budget_keeps_partial_and_records_meta(tmp_path: Path, monkeypatch) -> None:
     """An exhausted wall-clock budget stops the loop, keeps results, sets meta."""
+    import time
+    t_values = [0.0, 10.0, 20.0, 30.0]
+    t_iter = iter(t_values)
+    monkeypatch.setattr(time, "monotonic", lambda: next(t_iter))
+
     for idx in range(3):
         (tmp_path / f"m{idx}.py").write_text("def f():\n    return 1\n", encoding="utf-8")
     nodes = [

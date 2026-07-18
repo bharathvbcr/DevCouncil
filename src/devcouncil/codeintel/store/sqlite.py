@@ -38,10 +38,12 @@ _CORRUPTION_MARKERS = ("malformed", "not a database", "database disk image")
 
 
 def _corruption_error(exc: sqlite3.DatabaseError) -> bool:
+    text = str(exc).lower()
+    if any(marker in text for marker in _CORRUPTION_MARKERS):
+        return True
     if isinstance(exc, sqlite3.OperationalError):
         return False
-    text = str(exc).lower()
-    return any(marker in text for marker in _CORRUPTION_MARKERS)
+    return False
 
 
 @dataclass(frozen=True)

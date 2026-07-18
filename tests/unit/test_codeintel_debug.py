@@ -72,7 +72,7 @@ def test_adapter_discovery_accepts_explicit_node_debug2_install(tmp_path: Path, 
     discovered = discover_adapters()
 
     assert discovered[0].id == "node-debug2"
-    assert discovered[0].command == ("/usr/bin/node", str(adapter))
+    assert discovered[0].command == (str(Path("/usr/bin/node").resolve()), str(adapter))
     assert discovered[0].version == "1.42.5"
 
 
