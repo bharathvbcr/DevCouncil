@@ -6,7 +6,6 @@ import json
 import subprocess
 from datetime import datetime, timezone
 
-import pytest
 from typer.testing import CliRunner
 
 from devcouncil.cli.main import app

@@ -18,7 +18,7 @@ from devcouncil.live.transcripts import discover_sessions, latest_assistant_turn
 from devcouncil.storage.db import get_db
 from devcouncil.telemetry.traces import read_trace_events
 
-from devcouncil.execution.stop_gate_history import append_event, build_event, last_event, session_tally
+from devcouncil.execution.stop_gate_history import append_event, build_event, last_event
 from devcouncil.execution.stop_gate_state import get_block_count, increment_block_count
 from devcouncil.execution.stop_gate_verify_cache import load_verify_cache, record_verify_cache
 from devcouncil.live.tasks import active_task_id

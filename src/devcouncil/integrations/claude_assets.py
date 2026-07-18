@@ -401,7 +401,6 @@ def build_output_style(root: Path) -> list[GeneratedAsset]:
 PLUGIN_ROOT_REL = Path(".devcouncil") / "claude-plugin"
 _PLUGIN_NAME = "devcouncil"
 _MARKETPLACE_NAME = "devcouncil-local"
-SESSION_START_MATCHER = "startup|resume|clear|compact"
 
 
 def _plugin_dir(root: Path) -> Path:
