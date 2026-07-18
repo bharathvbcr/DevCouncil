@@ -94,6 +94,7 @@ class RepoMapper:
         self.project_root = project_root or Path.cwd()
         self._DEPENDENTS_MAX = type(self)._DEPENDENTS_MAX
         self._LIVENESS_CAP = type(self)._LIVENESS_CAP
+        self._js_alias_cache: Optional[List[Tuple[str, List[str]]]] = None
         try:
             from devcouncil.app.config import load_config
 

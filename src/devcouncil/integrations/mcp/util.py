@@ -6,6 +6,7 @@ import json
 import logging
 import subprocess
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from mcp.types import TextContent
@@ -57,8 +58,10 @@ def annotate_stale(contents: list[TextContent], coordinator: object) -> list[Tex
     status = coordinator.status()  # type: ignore[attr-defined]
     payload["stale"] = True
     payload["fresh"] = False
+    existing_sync = payload.get("sync")
+    sync_base = existing_sync if isinstance(existing_sync, dict) else {}
     payload["sync"] = {
-        **(payload.get("sync") if isinstance(payload.get("sync"), dict) else {}),
+        **sync_base,
         "pending": list(getattr(status, "pending", []) or []),
         "state": getattr(status, "state", "pending"),
         "fresh": False,
@@ -68,7 +71,7 @@ def annotate_stale(contents: list[TextContent], coordinator: object) -> list[Tex
 
 async def with_codeintel_freshness(
     root: Path,
-    produce: object,
+    produce: Callable[[], Awaitable[list[TextContent]]],
     *,
     timeout: float = 2.0,
 ) -> list[TextContent]:
@@ -79,7 +82,7 @@ async def with_codeintel_freshness(
 
     coordinator = get_sync_coordinator(root)
     fresh = await asyncio.to_thread(coordinator.wait_until_fresh, timeout=timeout)
-    contents = await produce()  # type: ignore[misc]
+    contents = await produce()
     if not fresh and contents:
         return annotate_stale(contents, coordinator)
     return contents
