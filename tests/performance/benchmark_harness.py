@@ -9,13 +9,17 @@ from __future__ import annotations
 import json
 import math
 import os
-import resource
 import sqlite3
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+
+try:
+    import resource
+except ImportError:  # Windows has no resource module
+    resource = None  # type: ignore[assignment]
 
 from devcouncil.codeintel.query import CodeIntelQueryEngine
 from devcouncil.codeintel.service import get_codeintel_service
@@ -81,9 +85,33 @@ def materialize_fixture(root: Path, spec: FixtureSpec) -> list[str]:
 
 
 def _peak_rss_bytes() -> int:
-    value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-    # Darwin reports bytes; Linux and the BSDs used in CI report KiB.
-    return value if sys.platform == "darwin" else value * 1024
+    if resource is not None:
+        value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        # Darwin reports bytes; Linux and the BSDs used in CI report KiB.
+        return value if sys.platform == "darwin" else value * 1024
+    import ctypes
+
+    class _ProcessMemoryCounters(ctypes.Structure):
+        _fields_ = [
+            ("cb", ctypes.c_uint32),
+            ("PageFaultCount", ctypes.c_uint32),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    counters = _ProcessMemoryCounters()
+    counters.cb = ctypes.sizeof(counters)
+    handle = ctypes.windll.kernel32.GetCurrentProcess()  # type: ignore[attr-defined]
+    ok = ctypes.windll.psapi.GetProcessMemoryInfo(  # type: ignore[attr-defined]
+        handle, ctypes.byref(counters), counters.cb
+    )
+    return int(counters.PeakWorkingSetSize) if ok else 0
 
 
 def _percentile(values: list[float], percentile: float) -> float:

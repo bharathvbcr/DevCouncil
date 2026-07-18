@@ -46,7 +46,7 @@ def test_dashboard_real_loopback_socket_smoke(tmp_path: Path, monkeypatch: pytes
 
     created: dict[str, dashboard.ThreadingHTTPServer] = {}
 
-    class RecordingServer(dashboard.ThreadingHTTPServer):
+    class RecordingServer(dashboard.DashboardHTTPServer):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             created["server"] = self
