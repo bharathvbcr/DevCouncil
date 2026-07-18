@@ -278,12 +278,18 @@ def graph_doctor(
     # Uninitialized projects are healthy when grammars are installed.
     if store["state"] in {"uninitialized", "empty"}:
         result["ok"] = bool(grammars["ok"])
+    if store["state"] == "corrupt":
+        result["store_action"] = (
+            "index.sqlite is damaged — run `dev map` to quarantine it and rebuild"
+        )
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         if not result["ok"]:
             raise typer.Exit(code=1)
         return
     console.print(f"store: {store['state']} (schema {store['schema_version']})")
+    if result.get("store_action"):
+        console.print(f"store action: {result['store_action']}")
     console.print(f"watcher backend: {watcher_backend}")
     console.print(
         f"compatibility export: {export_health}"

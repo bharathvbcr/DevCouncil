@@ -253,3 +253,77 @@ def test_companion_activation_is_attempted_once_per_process(monkeypatch) -> None
     assert first == second
     assert first["activated"] is True
     assert calls == [True]
+
+
+def _c_grammar_loadable() -> bool:
+    try:
+        import tree_sitter_language_pack as pack
+
+        workers._activate_companion_once()
+        pack.get_language("c")
+        return True
+    except Exception:
+        return False
+
+
+def test_fill_missing_structure_names_follows_declarator_chain() -> None:
+    """C-family definitions arrive with name=None from the language pack; the
+    fill pass must dig the identifier out of the declarator chain."""
+
+    class Node:
+        def __init__(self, type_, start=0, sb=0, eb=0, fields=None, children=()):
+            self.type = type_
+            self.start_point = (start, 0)
+            self.start_byte = sb
+            self.end_byte = eb
+            self._fields = fields or {}
+            self.children = list(children)
+
+        def child_by_field_name(self, field):
+            return self._fields.get(field)
+
+    raw = b"int helper(int x) { return x; }"
+    ident = Node("identifier", start=0, sb=4, eb=10)
+    func_decl = Node("function_declarator", start=0, fields={"declarator": ident})
+    func_def = Node("function_definition", start=0, fields={"declarator": func_decl})
+    root = Node("translation_unit", start=0, children=[func_def])
+    tree = SimpleNamespace(root_node=root)
+
+    rows = [{
+        "name": "",
+        "kind": "Function",
+        "start_line": 0,
+        "end_line": 0,
+        "decorators": [],
+        "children": [],
+    }]
+    workers._fill_missing_structure_names(tree, raw, rows)
+    assert rows[0]["name"] == "helper"
+
+
+def test_c_extraction_end_to_end_with_real_grammar(monkeypatch) -> None:
+    import pytest
+
+    if not _c_grammar_loadable():
+        pytest.skip("C grammar companion not installed")
+    # In-process worker path (skip the spawn pool) through the full generic
+    # extraction, so symbol names, kinds, and callee hints are all covered.
+    monkeypatch.setattr(
+        "devcouncil.codeintel.languages.generic_extractor.process_tree_sitter",
+        workers._native_process,
+    )
+    source = (
+        "int helper(int x) {\n"
+        "    return x * 2;\n"
+        "}\n"
+        "\n"
+        "int main(void) {\n"
+        "    return helper(21);\n"
+        "}\n"
+    )
+    result = extract_generic("native/compute.c", source)
+    symbols = {(s.name, s.kind) for s in result.symbols}
+    assert ("helper", "function") in symbols
+    assert ("main", "function") in symbols
+    calls = [(c.name, c.qualname_hint) for c in result.calls]
+    assert ("helper", "helper") in calls

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -28,6 +29,19 @@ ANALYZER_VERSION = "codeintel-1"
 INDEX_REL = Path(".devcouncil") / "codeintel" / "index.sqlite"
 EXTRACTION_CACHE_MAX_BYTES = 64 * 1024 * 1024
 AMBIGUOUS_EVIDENCE_LIMIT = 8
+
+logger = logging.getLogger(__name__)
+
+# Error texts that mean the database file itself is damaged. Lock/busy
+# conditions (OperationalError) are transient and must never quarantine.
+_CORRUPTION_MARKERS = ("malformed", "not a database", "database disk image")
+
+
+def _corruption_error(exc: sqlite3.DatabaseError) -> bool:
+    if isinstance(exc, sqlite3.OperationalError):
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in _CORRUPTION_MARKERS)
 
 
 @dataclass(frozen=True)
@@ -188,6 +202,40 @@ class CodeIntelStore:
 
     def exists(self) -> bool:
         return self.path.is_file()
+
+    def quarantine_if_corrupt(self, exc: sqlite3.DatabaseError) -> bool:
+        """Move a damaged store aside so the next write rebuilds from scratch.
+
+        Returns True when the error signals file corruption and the store was
+        quarantined (``index.sqlite`` → ``index.sqlite.corrupt``). Lock/busy
+        errors and schema-level errors return False and must be raised by the
+        caller as before.
+        """
+        if not _corruption_error(exc):
+            return False
+        if not self.quarantine():
+            return False
+        logger.warning(
+            "codeintel store is corrupt (%s); quarantined to %s — rebuilding from scratch",
+            exc,
+            self.path.name + ".corrupt",
+        )
+        return True
+
+    def quarantine(self) -> bool:
+        """Move the store file (and WAL/SHM siblings) aside to ``*.corrupt``."""
+        quarantine = self.path.with_name(self.path.name + ".corrupt")
+        try:
+            for suffix in ("", "-wal", "-shm"):
+                source = Path(str(self.path) + suffix)
+                if source.exists():
+                    target = Path(str(quarantine) + suffix)
+                    target.unlink(missing_ok=True)
+                    source.replace(target)
+        except OSError:
+            logger.warning("failed to quarantine corrupt codeintel store", exc_info=True)
+            return False
+        return True
 
     def initialize(self) -> None:
         with self._init_lock:
@@ -1202,12 +1250,19 @@ class CodeIntelStore:
                 generation=None,
                 state="uninitialized",
             )
-        with self._connect(readonly=True) as conn:
-            schema = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            row = conn.execute(
-                """SELECT g.* FROM generations g
-                   JOIN metadata m ON m.key='current_generation' AND CAST(m.value AS INTEGER)=g.id"""
-            ).fetchone()
+        try:
+            with self._connect(readonly=True) as conn:
+                schema = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                row = conn.execute(
+                    """SELECT g.* FROM generations g
+                       JOIN metadata m ON m.key='current_generation' AND CAST(m.value AS INTEGER)=g.id"""
+                ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            if not _corruption_error(exc):
+                raise
+            return StoreStatus(
+                str(self.project_root), str(self.path), STORE_SCHEMA_VERSION, None, "corrupt"
+            )
         if row is None:
             return StoreStatus(str(self.project_root), str(self.path), schema, None, "empty")
         return StoreStatus(

@@ -858,3 +858,19 @@ def test_bundled_asset_basename_clears_mjs(tmp_path):
         git_files=git_files,
         dynamic_index=index,
     )
+
+
+def test_entry_roots_c_main_convention(tmp_path):
+    native = tmp_path / "native"
+    native.mkdir()
+    (native / "compute.c").write_text(
+        "int helper(int x) { return x; }\n\nint main(void) { return helper(1); }\n",
+        encoding="utf-8",
+    )
+    # A C library file without main() must NOT be seeded.
+    (native / "util.c").write_text(
+        "int square(int x) { return x * x; }\n", encoding="utf-8"
+    )
+    roots = wiring.entry_roots(tmp_path, ["native/compute.c", "native/util.c"])
+    assert "native/compute.c" in roots
+    assert "native/util.c" not in roots

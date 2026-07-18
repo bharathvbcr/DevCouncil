@@ -725,6 +725,8 @@ _TOOLING_CONFIG_RE = re.compile(
     r"$"
 )
 _PY_MAIN_SEED_NAMES = {"main.py", "app.py", "wsgi.py", "asgi.py"}
+_C_MAIN_SEED_SUFFIXES = (".c", ".cc", ".cpp", ".cxx")
+_C_MAIN_RE = re.compile(r"\b(?:int|void)\s+main\s*\(")
 # "__main__" covers both quote styles of the run guard.
 _PY_MAIN_SEED_MARKERS = ("__main__", "FastAPI(", "Flask(", "uvicorn.run(")
 _MAIN_SEED_SNIFF_CAP = 512
@@ -809,9 +811,9 @@ def _expand_roots_via_dynamic_imports(
 
 
 def _conventional_main_seeds(root: Path, file_set: Set[str]) -> Set[str]:
-    """Language-convention entry mains: Go/Rust binaries, Python service mains,
-    JS/TS ``src/index``/``src/main``/``App``/service ``index`` modules, and
-    Rust ``main.rs`` / ``lib.rs``.
+    """Language-convention entry mains: Go/Rust/C/C++ binaries, Python service
+    mains, JS/TS ``src/index``/``src/main``/``App``/service ``index`` modules,
+    and Rust ``main.rs`` / ``lib.rs``.
 
     Tooling configs (Vite/PostCSS/…) are structural exemptions only — never BFS
     seeds (they do not import product modules).
@@ -836,6 +838,14 @@ def _conventional_main_seeds(root: Path, file_set: Set[str]) -> Set[str]:
             sniffed += 1
             text = _read_text(root, f)
             if any(marker in text for marker in _PY_MAIN_SEED_MARKERS):
+                found.add(f)
+        elif name.endswith(_C_MAIN_SEED_SUFFIXES):
+            # C/C++ binaries: a file defining main() is a conventional entry,
+            # same as ``package main`` in Go.
+            if sniffed >= _MAIN_SEED_SNIFF_CAP:
+                continue
+            sniffed += 1
+            if _C_MAIN_RE.search(_read_text(root, f)):
                 found.add(f)
     return found
 

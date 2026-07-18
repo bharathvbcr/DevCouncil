@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -45,11 +46,22 @@ class CodeIntelService:
         changed_paths: set[str] | None = None,
         analysis_shards: dict[str, dict[str, Any]] | None = None,
     ) -> int:
-        generation = self.store.save_graph(
-            graph,
-            changed_paths=changed_paths,
-            analysis_shards=analysis_shards,
-        )
+        try:
+            generation = self.store.save_graph(
+                graph,
+                changed_paths=changed_paths,
+                analysis_shards=analysis_shards,
+            )
+        except sqlite3.DatabaseError as exc:
+            if not self.store.quarantine_if_corrupt(exc):
+                raise
+            # The damaged file is gone; an incremental save against the fresh
+            # store would drop every unchanged file, so retry as a full save.
+            generation = self.store.save_graph(
+                graph,
+                changed_paths=None,
+                analysis_shards=analysis_shards,
+            )
         with self._cache_lock:
             self._query_cache.clear()
         return generation

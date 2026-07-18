@@ -52,9 +52,61 @@ def _structure_row(item: Any) -> dict[str, Any]:
     }
 
 
-def _call_rows(parser: Any, source: str) -> list[dict[str, Any]]:
+def _declared_name(node: Any, raw: bytes) -> str:
+    """Resolve a definition's identifier through C-family declarator nesting."""
+    current = node
+    for _ in range(8):
+        candidate = None
+        for field in ("name", "declarator"):
+            try:
+                candidate = current.child_by_field_name(field)
+            except (AttributeError, TypeError):
+                candidate = None
+            if candidate is not None:
+                break
+        if candidate is None:
+            return ""
+        if str(getattr(candidate, "type", "")).endswith("identifier"):
+            return raw[candidate.start_byte:candidate.end_byte].decode("utf-8", errors="replace")
+        current = candidate
+    return ""
+
+
+def _fill_missing_structure_names(tree: Any, raw: bytes, rows: list[dict[str, Any]]) -> None:
+    """The language pack's structure pass yields ``name=None`` for C-family
+    definitions — the identifier hides inside the declarator chain — and
+    downstream extraction drops nameless rows, losing every C/C++/ObjC symbol.
+    Recover names from the parse tree, matched by start line."""
+    pending: dict[int, list[dict[str, Any]]] = {}
+
+    def collect(items: list[dict[str, Any]]) -> None:
+        for row in items:
+            if not row["name"]:
+                pending.setdefault(int(row["start_line"]), []).append(row)
+            collect(row["children"])
+
+    collect(rows)
+    if not pending:
+        return
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
+        stack.extend(reversed(list(getattr(node, "children", ()) or ())))
+        point = getattr(node, "start_point", None)
+        waiting = pending.get(int(point[0])) if point is not None else None
+        if not waiting:
+            continue
+        name = _declared_name(node, raw)
+        if not name:
+            continue
+        row = waiting.pop(0)
+        row["name"] = name
+
+
+def _call_rows(parser: Any, source: str, tree: Any | None = None) -> list[dict[str, Any]]:
     raw = source.encode("utf-8")
-    tree = parser.parse(raw)
+    if tree is None:
+        tree = parser.parse(raw)
     rows: list[dict[str, Any]] = []
     stack = [tree.root_node]
     while stack:
@@ -110,8 +162,12 @@ def _native_process(language: str, source: str) -> dict[str, Any] | None:
         ),
     )
     parser = pack.get_parser(language)
+    raw = source.encode("utf-8")
+    tree = parser.parse(raw)
+    structure = [_structure_row(item) for item in getattr(result, "structure", []) or []]
+    _fill_missing_structure_names(tree, raw, structure)
     return {
-        "structure": [_structure_row(item) for item in getattr(result, "structure", []) or []],
+        "structure": structure,
         "imports": [
             {
                 "source": str(getattr(item, "source", "") or ""),
@@ -124,7 +180,7 @@ def _native_process(language: str, source: str) -> dict[str, Any] | None:
             {"name": str(getattr(item, "name", "") or "")}
             for item in getattr(result, "exports", []) or []
         ],
-        "calls": _call_rows(parser, source),
+        "calls": _call_rows(parser, source, tree),
     }
 
 

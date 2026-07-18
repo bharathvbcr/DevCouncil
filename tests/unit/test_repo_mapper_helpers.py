@@ -1326,6 +1326,7 @@ def test_devprism_shaped_fidelity_baseline(tmp_path):
     file_list = sorted(files)
     file_set = set(file_list)
     rules = mapper._load_js_path_aliases()
+    assert any(pattern == "@" for pattern, _targets in rules)
     hit = mapper._resolve_js_alias("@/components/ui/button", file_set)
     edges = mapper._js_import_edges(file_list, file_set)
     roots = entry_roots(tmp_path, file_list)

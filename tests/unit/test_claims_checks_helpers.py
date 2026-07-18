@@ -92,7 +92,6 @@ def test_execute_checks_and_file_result(tmp_path: Path):
     from types import SimpleNamespace
 
     from devcouncil.verification.claims.checks import (
-        ResolvedCommands,
         execute_checks,
         resolve_commands_from_config,
         _file_result,

@@ -6,17 +6,14 @@ from __future__ import annotations
 
 import json
 import subprocess
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import typer
 from typer.testing import CliRunner
 
 from devcouncil.cli.main import app
 from devcouncil.domain.task import Task
-from devcouncil.execution.stop_gate import StopGateResult
 from devcouncil.indexing.graph.schema import CodeGraph, GraphEdge, GraphNode, NodeKind
 from devcouncil.verification.claims.models import Assertion, CheckResult, Kind, Status
 
@@ -549,7 +546,6 @@ def test_prompt_enhancer_helper_intake_and_brief():
         _knowledge_brief,
         _knowledge_intake,
         _select_knowledge,
-        _select_skills,
     )
 
     skill = SimpleNamespace(name="web", description="Modern web", body="Use React.")

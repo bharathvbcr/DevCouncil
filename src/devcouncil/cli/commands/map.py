@@ -7,7 +7,7 @@ from rich.console import Console
 from devcouncil.indexing.map_artifacts import (
     _important_surfaces as _important_surfaces,
     _wiki_index_rel as _wiki_index_rel,
-    generate_map_artifacts,
+    generate_map_artifacts as generate_map_artifacts,
     write_agent_guides,
 )
 from devcouncil.indexing.repo_mapper import RepoMap, RepoMapper

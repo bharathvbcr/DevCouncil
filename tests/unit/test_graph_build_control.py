@@ -388,7 +388,6 @@ def test_yield_writer_lease_reacquires_with_backoff(tmp_path: Path, monkeypatch)
     from concurrent.futures import ThreadPoolExecutor
 
     from devcouncil.codeintel.build_control import (
-        GraphBuildBusy,
         graph_build_session,
         yield_writer_lease_for_child,
     )

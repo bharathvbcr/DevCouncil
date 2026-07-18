@@ -7,6 +7,7 @@ indexing/verification do not import ``cli.commands.map``.
 from __future__ import annotations
 
 import logging
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -207,6 +208,21 @@ def refresh_map_artifacts(
     reason = ""
     compatibility_export_degraded = False
     with graph_build_session(root):
+        # A damaged index.sqlite fails scattered reads all over the build; move
+        # it aside now (we hold the writer lease) so this run rebuilds cleanly
+        # instead of stamping a lean/degraded map forever.
+        service = get_codeintel_service(root)
+        try:
+            store_corrupt = service.store.exists() and service.status()["state"] == "corrupt"
+        except Exception:
+            store_corrupt = False
+        if store_corrupt and service.store.quarantine():
+            logger.warning(
+                "codeintel store was corrupt; quarantined to %s — running a full rebuild",
+                service.store.path.name + ".corrupt",
+            )
+            paths = None
+            mode = "full"
         if graph is None:
             try:
                 if paths is not None and get_codeintel_service(root).load() is not None:
@@ -321,10 +337,17 @@ def refresh_map_artifacts(
                 status_console.print(
                     f"[green]Wrote code-review-graph context to {graph_output}[/green]"
                 )
+    try:
+        generation = get_codeintel_service(root).store.current_generation()
+    except sqlite3.DatabaseError:
+        # A store that turned unreadable mid-run must not crash the refresh
+        # result — the map artifacts above were already written.
+        logger.warning("could not read store generation after refresh", exc_info=True)
+        generation = None
     return GraphRefreshResult(
         repo_map=repo_map,
         graph=graph,
-        generation=get_codeintel_service(root).store.current_generation(),
+        generation=generation,
         mode=mode,
         degraded=degraded,
         reason=reason,

@@ -6,7 +6,6 @@ import json
 import sys
 import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 from typer.testing import CliRunner
@@ -278,7 +277,6 @@ def test_gaps_payload_and_cli(tmp_path):
 
     empty = tmp_path / "noinit"
     empty.mkdir()
-    monkeypatch_payload = gaps_cmd._gaps_payload
     # uninitialized: get_db returns None after quiet init may still create state —
     # exercise via monkeypatch inside the module.
     import devcouncil.cli.commands.gaps as gmod

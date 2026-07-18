@@ -25,7 +25,10 @@ logger = logging.getLogger(__name__)
 # v5 = + references (non-call name/attribute loads) for callback-aware liveness;
 # v6 = generic-extractor callee-style qualname hints (owner hints poisoned
 #      same-file call resolution with self-loops).
-PARSE_CACHE_VERSION = 7
+# v8 = declarator-chain name recovery for C-family definitions (the language
+#      pack returns name=None, dropping every C/C++/ObjC symbol) + grammar
+#      availability folded into the cache identity.
+PARSE_CACHE_VERSION = 8
 
 # Keys preserved across partial updates (RepoMapper modules/specs vs graph symbols).
 _PRESERVE_KEYS = (
@@ -293,6 +296,9 @@ def extract_cached(
     return ext, fresh
 
 
+_GRAMMAR_PROBE_CACHE: Dict[str, bool] = {}
+
+
 def _grammar_identity(path: str) -> tuple[str, str]:
     from devcouncil.codeintel.languages import detect_language
 
@@ -302,7 +308,22 @@ def _grammar_identity(path: str) -> tuple[str, str]:
         return language, "stdlib-ast"
     try:
         import tree_sitter_language_pack as pack
-
-        return language, str(getattr(pack, "__version__", "unknown"))
     except ImportError:
         return language, "unavailable"
+    version = str(getattr(pack, "__version__", "unknown"))
+    # Per-grammar availability must be part of the identity: installing or
+    # removing the grammar companion changes extraction output without
+    # changing the pack version, and a version-only key would keep serving
+    # pre-grammar (empty/regex) extractions forever.
+    loadable = _GRAMMAR_PROBE_CACHE.get(language)
+    if loadable is None:
+        try:
+            from devcouncil.codeintel.languages.workers import _activate_companion_once
+
+            _activate_companion_once()
+            pack.get_language(language)
+            loadable = True
+        except Exception:
+            loadable = False
+        _GRAMMAR_PROBE_CACHE[language] = loadable
+    return language, f"{version}:{'native' if loadable else 'fallback'}"

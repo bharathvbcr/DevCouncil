@@ -400,3 +400,47 @@ def test_empty_changed_paths_must_not_drop_memberships(tmp_path: Path) -> None:
     assert len(loaded.nodes) == 3
     assert {node.id for node in loaded.nodes} >= {"src/app.py", "src/app.py::second", "src/other.py"}
     assert store.last_write_stats["node_memberships"] == 3
+
+
+def _corrupt_file(path: Path) -> None:
+    # Destroy the sqlite header page: unlike mid-file damage (which WAL-mode
+    # reads can dodge), a broken header fails every subsequent connect.
+    with path.open("r+b") as fh:
+        fh.write(b"\xde\xad\xbe\xef" * 1024)
+
+
+def test_status_reports_corrupt_store_instead_of_raising(tmp_path: Path) -> None:
+    store = CodeIntelStore(tmp_path)
+    store.save_graph(_graph())
+    _corrupt_file(store.path)
+    assert store.status().state == "corrupt"
+
+
+def test_quarantine_if_corrupt_ignores_lock_errors(tmp_path: Path) -> None:
+    store = CodeIntelStore(tmp_path)
+    store.save_graph(_graph())
+    locked = sqlite3.OperationalError("database is locked")
+    assert store.quarantine_if_corrupt(locked) is False
+    assert store.path.is_file()
+    schema_err = sqlite3.DatabaseError("no such table: nodes")
+    assert store.quarantine_if_corrupt(schema_err) is False
+    assert store.path.is_file()
+
+
+def test_persist_quarantines_corrupt_store_and_rebuilds(tmp_path: Path) -> None:
+    from devcouncil.codeintel.service import CodeIntelService
+
+    service = CodeIntelService(tmp_path)
+    service.persist(_graph())
+    _corrupt_file(service.store.path)
+    # WAL/SHM from the first save would replay stale pages; drop them so the
+    # corruption is what sqlite actually sees.
+    for suffix in ("-wal", "-shm"):
+        sibling = Path(str(service.store.path) + suffix)
+        if sibling.exists():
+            sibling.unlink()
+    generation = service.persist(_graph(name="rebuilt"))
+    assert generation >= 1
+    quarantined = service.store.path.with_name(service.store.path.name + ".corrupt")
+    assert quarantined.is_file()
+    assert service.store.status().state == "committed"
