@@ -1,5 +1,8 @@
 execution:
   default_executor: claude
+  # The full unit suite takes ~20 min on CI runners; the 900s default
+  # times out the evidence gate's --test command.
+  command_timeout: 2400
   enforce_file_scope_pre_verify: true
   stop_gate:
     mode: assist
