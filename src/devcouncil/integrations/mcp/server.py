@@ -329,7 +329,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         return await handoff_handlers.handle_handoff_agent(root, db, arguments)
 
     if name == "devcouncil_read_file":
-        return await read_handlers.handle_read_file(root, arguments)
+        return await read_handlers.handle_read_file(root, arguments, db=db)
 
     if name == "devcouncil_get_diff":
         return await git_handlers.handle_get_diff(root, db, arguments)

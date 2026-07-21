@@ -210,23 +210,20 @@ def status(
 
     if payload["pending_signal_items"]:
         table = Table(title="Pending Agent Responses")
-        table.add_column("Client", style="cyan")
+        table.add_column("ID", style="cyan")
+        table.add_column("Client")
         table.add_column("Task")
-        table.add_column("Transcript", overflow="fold")
-        table.add_column("Review Command", overflow="fold")
         for signal in payload["pending_signal_items"]:
             table.add_row(
+                signal.get("id") or "",
                 signal.get("client") or "",
                 signal.get("task_id") or "(unscoped)",
-                signal.get("transcript_path") or "",
-                signal.get("review_command") or "",
             )
         console.print(table)
-        commands = [signal.get("review_command") for signal in payload["pending_signal_items"] if signal.get("review_command")]
-        if commands:
-            console.print("[cyan]Pending review commands:[/cyan]")
-            for command in commands:
-                console.print(command)
+        console.print(
+            "[dim]Sensitive transcript paths and review commands: "
+            "`dev watch signals` / `dev watch review`.[/dim]"
+        )
 
 
 @app.command("resolve")

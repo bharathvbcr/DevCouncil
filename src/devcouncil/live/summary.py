@@ -3,17 +3,35 @@ from __future__ import annotations
 from pathlib import Path
 
 from devcouncil.live.cards import load_cards, unresolved_blocking_cards
-from devcouncil.live.signals import load_signals
+from devcouncil.live.signals import ReviewSignal, load_signals
 from devcouncil.live.tasks import active_task_id
 
 
-def live_review_summary(project_root: Path, task_id: str | None = None) -> dict:
+def _compact_signal_item(signal: ReviewSignal) -> dict:
+    """IDs/counts-safe projection for general status (no PII / absolute paths)."""
+    signal_id = Path(signal.path).name if signal.path else None
+    return {
+        "id": signal_id,
+        "client": signal.client,
+        "task_id": signal.task_id,
+    }
+
+
+def live_review_summary(
+    project_root: Path,
+    task_id: str | None = None,
+    *,
+    include_signal_details: bool = False,
+) -> dict:
     cards = load_cards(project_root)
     signals = load_signals(project_root)
     active_id = active_task_id(project_root)
     scoped_task_id = task_id or active_id
     blockers = unresolved_blocking_cards(project_root, task_id=scoped_task_id, cards=cards)
-    pending_signal_items = [signal.model_dump() for signal in signals]
+    if include_signal_details:
+        pending_signal_items = [signal.model_dump() for signal in signals]
+    else:
+        pending_signal_items = [_compact_signal_item(signal) for signal in signals]
     open_count = 0
     resolved_count = 0
     ignored_count = 0

@@ -17,13 +17,42 @@ from devcouncil.integrations.mcp.util import (
     truncate_text,
     within_root,
 )
+from devcouncil.storage.db import Database
+from devcouncil.storage.repositories import TaskRepository
 
 
-async def handle_read_file(root: Path, arguments: dict) -> list[TextContent]:
+async def handle_read_file(
+    root: Path,
+    arguments: dict,
+    db: Database | None = None,
+) -> list[TextContent]:
     rel_path, arg_error = required_string_argument(arguments, "path")
     if arg_error:
         return arg_error
     assert rel_path is not None
+    task_id = optional_string_argument(arguments, "task_id")
+    if task_id == "":
+        return error_text("task_id must be a string", code="invalid_arguments", argument="task_id")
+    if task_id:
+        if db is None:
+            return error_text(
+                "DevCouncil not initialized in this directory.",
+                code="not_initialized",
+            )
+        with db.get_session() as session:
+            task = TaskRepository(session).get_by_id(task_id)
+        if task is None:
+            return error_text(f"Task {task_id} not found.", code="not_found", task_id=task_id)
+        planned = {pf.path.replace("\\", "/") for pf in task.planned_files}
+        normalized = rel_path.replace("\\", "/")
+        if normalized not in planned:
+            # Fail closed: never broaden task scope to arbitrary repo paths.
+            return error_text(
+                f"Path {normalized} is outside task {task_id} planned-file scope.",
+                code="out_of_scope",
+                path=normalized,
+                task_id=task_id,
+            )
     if is_secret_path(root, rel_path):
         return error_text(
             "Refusing to read a secret/credential path.",

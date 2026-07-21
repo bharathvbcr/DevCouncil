@@ -36,7 +36,7 @@ dev map                 # repo_map.json + code_graph.json + AGENTS.md/CLAUDE.md
 dev graph ingest        # unified analyze entry (alias path: sync + map + optional embeddings)
 dev graph query SYMBOL  # callers / callees
 dev graph dead          # dead-code tiers
-dev graph demo          # sample visualizer UI (no map) + SVG preview
+dev graph demo          # sample self-contained interactive HTML (no map)
 dev graph view          # serve interactive graph.html for this repo
 dev corpus build        # advisory docs/PDF/image index (optional verify gates)
 ```

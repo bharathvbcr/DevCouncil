@@ -1,26 +1,65 @@
 # DevCouncil: The Gated AI Orchestrator
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/bharathvbcr/DevCouncil/main/src/devcouncil/assets/devcouncil_logo_premium.png" alt="DevCouncil Logo" width="300">
+  <img src="https://raw.githubusercontent.com/bharathvbcr/DevCouncil/main/src/devcouncil/assets/devcouncil_social_preview.jpg" alt="DevCouncil gated AI orchestration" width="720">
 </p>
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![uv](https://img.shields.io/badge/managed%20by-uv-purple.svg)](https://github.com/astral-sh/uv)
 
-**"DevCouncil should not merely generate code. It should make AI-generated work prove that it satisfied the original intent."**
+## OpenAI Build Week 2026
 
-DevCouncil is a high-integrity command-line orchestration platform for AI-assisted software development. It turns AI implementation from a black-box generation task into a gated engineering workflow where every change is authorized, verified, and traceable back to a requirement.
+Coding agents -- including Codex and other prompt-taking CLIs -- often claim success without proving that the change satisfied the original requirements. DevCouncil turns that claim into a gated engineering workflow: every change is scoped, verified, and traceable back to a requirement. Model confidence is not the final authority; evidence is.
 
-DevCouncil does not replace coding agents. Its primary native path is Claude Code, followed by Codex CLI; it also works beside OpenCode, Google Antigravity CLI, Warp/Oz, Cursor, Aider, and bring-your-own prompt-taking CLIs. It owns the plan, task scope, verification loop, repair prompts, and evidence trail.
+### What judges should see
+
+1. **Provider-free red-to-green evidence gate** -- install once, then watch a controlled sample fail verification and pass after a real fix, with no API keys.
+2. **Self-contained interactive code graph** -- open the packed `demo.html` artifact and navigate filters, path highlighting, and neighborhoods (no blank canvas).
+3. **Codex / MCP agent-control path** -- status, diffs, and task tools stay correct under real project-sized JSON so an agent can resume from evidence instead of chat memory.
+
+### Judge path (intended package: `devcouncil@0.4.1`)
+
+DevCouncil supports macOS, Linux, and Windows. Requires Node.js 18+, Python 3.12+, and Git. No model provider key is needed for the deterministic demos below.
+
+```bash
+# Prefer the Build Week release once published:
+npm install -g devcouncil@0.4.1
+devcouncil --help
+
+# Core demo: red verdict -> apply fix -> green verdict (no API keys)
+git clone https://github.com/bharathvbcr/DevCouncil.git
+cd DevCouncil
+bash scripts/build-week-demo.sh
+
+# Interactive graph artifact (self-contained HTML)
+mkdir -p /tmp/devcouncil-judge-demo
+dev graph demo --project-root /tmp/devcouncil-judge-demo --json
+# Open /tmp/devcouncil-judge-demo/.devcouncil/graph/demo.html
+```
+
+Until `0.4.1` is on the registry, clone this repository and run the same commands from a checkout that includes the Build Week fixes (`uv sync --group dev` if you need local `dev`).
+
+### Eligible Build Week work
+
+DevCouncil existed before OpenAI Build Week. This submission covers only meaningful extensions on or after **July 13, 2026**. Eligible history begins at commit `6f5bd73` (baseline before eligible work: `3cfd5d1`). Major themes:
+
+- canonical SQLite code-intelligence index, multi-language grammars, incremental watching, graph queries/community detection, and a self-contained interactive code-graph artifact (including a ForceGraph compatibility fix for the packed demo);
+- stronger deterministic verification: stop gates, claim checking, diff-to-evidence coverage, task leases, PDG/corpus checks, bounded repair, machine-readable next actions;
+- deeper CLI, MCP, dashboard, coding-agent, and CI integration, plus the installable npm release path aimed at `0.4.1` for judges.
+
+During Build Week, Codex and GPT-5.6 were used as an engineering partner to map paths, challenge claims, run install/browser checks, implement focused repairs, and verify behavior. The maintainer set requirements, scope, and acceptance evidence. The primary Codex `/feedback` session ID is on the Devpost submission. This does **not** claim that all eligible code was authored exclusively by Codex/GPT-5.6.
+
+See [docs/build-week-demo.md](docs/build-week-demo.md) for the provider-free demo walkthrough.
 
 ## Documentation
 
+- [Build Week demo](docs/build-week-demo.md): provider-free red-to-green judge script.
 - [Quickstart](docs/quickstart.md): shortest install-to-first-task path.
 - [Daily workflow](docs/workflow.md): manual sidecar loop, verification, repair, rollback, and `dev watch`.
 - [Coding CLI integration](docs/coding-cli-integration.md): tiers, Claude Code, Codex, OpenCode, Antigravity, Cursor, Grok Build, Aider, MCP, hooks, stop gate / claim checks, and automated executors (Gemini deprecated).
 - [CLI command reference](docs/cli-reference.md): available `dev` commands.
-- [Repo map & code graph](docs/code-graph.md): `dev map` / `dev graph` — navigation, dead code, blast radius, PDG (opt-in), HTML visualizer.
+- [Repo map & code graph](docs/code-graph.md): `dev map` / `dev graph` -- navigation, dead code, blast radius, PDG (opt-in), HTML visualizer.
 - [Corpus side index](docs/corpus.md): `dev corpus` for docs/PDFs/images and optional verify gates.
 - [Hero loop](docs/hero-loop.md): certified Claude Code + MCP closed loop, leases, rigor, and `dev check --verify` on-ramp.
 - [Architecture](docs/architecture.md): components, artifact graph, state machine, gating policy, and gated execution.

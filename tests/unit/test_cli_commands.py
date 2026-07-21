@@ -2191,8 +2191,11 @@ def test_cli_watch_status_summarizes_cards_signals_and_scope(tmp_path, monkeypat
     assert status_result.exit_code == 0
     payload = json.loads(status_result.output)
     assert payload["pending_signals"] == 1
-    assert payload["pending_signal_items"][0]["transcript_path"] == "session.jsonl"
-    assert payload["pending_signal_items"][0]["review_command"] == "dev watch review --client claude --transcript session.jsonl"
+    item = payload["pending_signal_items"][0]
+    assert item["client"] == "claude"
+    assert "transcript_path" not in item
+    assert "review_command" not in item
+    assert "payload" not in item
     assert payload["cards"]["total"] == 2
     assert payload["cards"]["critical_open"] == 1
     assert len(payload["blocking_cards"]) == 1
@@ -2212,7 +2215,9 @@ def test_cli_watch_status_prints_pending_signal_commands(tmp_path, monkeypatch):
 
     assert status_result.exit_code == 0
     assert "Pending Agent Responses" in status_result.output
-    assert "dev watch review --client claude --transcript session.jsonl --task-id TASK-001" in status_result.output
+    assert "claude" in status_result.output
+    assert "dev watch signals" in status_result.output
+    assert "dev watch review --client claude --transcript session.jsonl --task-id TASK-001" not in status_result.output
 
 
 def test_cli_watch_status_excludes_other_task_blockers(tmp_path, monkeypatch):

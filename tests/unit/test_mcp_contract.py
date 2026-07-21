@@ -48,6 +48,17 @@ async def test_list_tasks_status_filter(tmp_path, monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_list_tasks_is_compact(tmp_path, monkeypatch):
+    _seed(tmp_path, n=1)
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    payload = json.loads((await call_tool("devcouncil_list_tasks", {}))[0].text)
+    task = payload["tasks"][0]
+    assert set(task) <= {"id", "title", "status", "priority", "requirements", "lease"}
+    assert task["id"] == "TASK-000"
+    assert "requirements" in task
+
+
+@pytest.mark.anyio
 async def test_record_command_rejects_invalid_status(tmp_path, monkeypatch):
     _seed(tmp_path, n=1)
     monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))

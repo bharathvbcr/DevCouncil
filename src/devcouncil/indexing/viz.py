@@ -47,7 +47,7 @@ def _vendor_js() -> str:
         "nodeVal:function(){return this},linkColor:function(){return this},"
         "linkDirectionalParticles:function(){return this},"
         "linkDirectionalParticleWidth:function(){return this},"
-        "onNodeClick:function(){return this},onNodeDblClick:function(){return this},"
+        "onNodeClick:function(){return this},"
         "width:function(){return this},height:function(){return this},_missing:true};};"
     )
 
@@ -565,7 +565,16 @@ const g = Graph(elem)
     if (pathHighlight.size && pathHighlight.has(s) && pathHighlight.has(t)) return 3;
     return 1.5;
   }})
-  .onNodeClick(n => {{
+  .onNodeClick((n, event) => {{
+    // ForceGraph exposes click events but no double-click chain method.
+    // The native event detail increments for a double click, so use it to
+    // preserve neighbor expansion without depending on a nonexistent API.
+    if (event && event.detail >= 2) {{
+      const links = activePayload().links;
+      expandIds = neighborExpand(n.id, links, 1);
+      redraw();
+      return;
+    }}
     showDetail(n);
     if (selected.length === 1 && selected[0] === n.id) {{ selected = []; pathHighlight = new Set(); redraw(); return; }}
     if (selected.length >= 2) selected = [];
@@ -576,11 +585,6 @@ const g = Graph(elem)
       pathHighlight = path ? new Set(path) : new Set();
       showDetail(n);
     }}
-    redraw();
-  }})
-  .onNodeDblClick(n => {{
-    const links = activePayload().links;
-    expandIds = neighborExpand(n.id, links, 1);
     redraw();
   }});
 

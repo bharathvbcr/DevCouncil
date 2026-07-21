@@ -14,7 +14,11 @@ def all_tools() -> list[Tool]:
         *debug_tools(),
         Tool(
             name="devcouncil_status",
-            description="Get the current status of the DevCouncil project, including phase, tasks, and gaps.",
+            description=(
+                "Get a compact project status summary (phase, requirement/task/gap counts). "
+                "Default responses stay within a ~32 KB agent context budget; use "
+                "devcouncil_get_task / get_gaps / get_next_actions for detail by ID."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {}
@@ -50,9 +54,10 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_get_gaps",
             description=(
-                "Read the persisted verification gaps for a task WITHOUT re-running "
-                "verification. Cheap and idempotent — use it to resume after a "
-                "reconnect or to inspect outstanding work before deciding to repair."
+                "Read persisted verification gaps for a task WITHOUT re-running "
+                "verification. Returns a compact projection (IDs, severity, type, "
+                "file/line) within a ~32 KB context budget; use get_task for full "
+                "detail. Cheap and idempotent for resume/repair decisions."
             ),
             inputSchema={
                 "type": "object",
@@ -66,9 +71,10 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_get_next_actions",
             description=(
-                "Get the typed, machine-routable next-actions contract for a task from "
-                "its persisted gaps, WITHOUT re-verifying. Returns blocking next_actions "
-                "plus advisory_actions and the tools allowed next."
+                "Get the typed next-actions contract for a task from persisted gaps, "
+                "WITHOUT re-verifying. Compact by default (gap_id/category/action/file; "
+                "~32 KB context budget). Returns blocking next_actions, advisory_actions, "
+                "and allowed_next_tools."
             ),
             inputSchema={
                 "type": "object",
@@ -166,7 +172,11 @@ def all_tools() -> list[Tool]:
         ),
         Tool(
             name="devcouncil_list_tasks",
-            description="List DevCouncil tasks with status and requirement mappings. Supports a status filter and limit/offset paging so large projects don't blow the agent's context.",
+            description=(
+                "List DevCouncil tasks as compact rows (id/title/status/priority/"
+                "requirements/lease) within a ~32 KB context budget. Supports status "
+                "filter and limit/offset paging; use get_task for full detail."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -710,13 +720,21 @@ def all_tools() -> list[Tool]:
                 "Read a repository file (read-only, no lease required) so an MCP-only "
                 "agent can inspect content before constructing a diff or overwriting it. "
                 "Containment-checked against the project root and refuses secret/credential "
-                "paths. Supports offset/limit or line_range windowing. Returns content "
-                "(truncated), sha256, and line_count."
+                "paths. When task_id is set, the path must intersect that task's planned "
+                "files (fail-closed; never broadens scope). Supports offset/limit or "
+                "line_range windowing. Returns content (truncated), sha256, and line_count."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Repository-relative or absolute path inside the project."},
+                    "task_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional task scope. When set, only planned-file paths for "
+                            "that task may be read."
+                        ),
+                    },
                     "offset": {"type": "integer", "minimum": 0, "description": "0-based line offset to start from."},
                     "limit": {"type": "integer", "minimum": 1, "description": "Max number of lines to return."},
                     "line_range": {

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from mcp.types import TextContent
@@ -13,23 +12,9 @@ from devcouncil.integrations.mcp.util import (
     json_text,
     optional_string_argument,
     required_string_argument,
-    run_cli_command,
+    run_cli_json,
     truncate_text,
 )
-
-
-def _cli_json(root: Path, args: list[str]) -> tuple[dict | None, list[TextContent] | None]:
-    result = run_cli_command(args, root)
-    stdout = str(result.get("stdout") or "").strip()
-    if stdout:
-        try:
-            return json.loads(stdout), None
-        except json.JSONDecodeError:
-            pass
-    if not result.get("ok"):
-        stderr = str(result.get("stderr") or "CLI command failed")
-        return None, error_text(stderr, code="cli_failed")
-    return None, error_text("CLI command returned invalid JSON", code="cli_parse_error")
 
 
 async def handle_list_agent_runs(root: Path, arguments: dict) -> list[TextContent]:
@@ -40,7 +25,7 @@ async def handle_list_agent_runs(root: Path, arguments: dict) -> list[TextConten
     cli_args = ["runs", "list", "--json", "--limit", str(limit)]
     if status_filter:
         cli_args.extend(["--status", status_filter])
-    payload, cli_error = _cli_json(root, cli_args)
+    payload, cli_error = run_cli_json(cli_args, root)
     if cli_error:
         return cli_error
     assert payload is not None
@@ -61,7 +46,7 @@ async def handle_get_run(root: Path, arguments: dict) -> list[TextContent]:
     if arg_error:
         return arg_error
     assert run_id is not None
-    payload, cli_error = _cli_json(root, ["runs", "show", run_id, "--json"])
+    payload, cli_error = run_cli_json(["runs", "show", run_id, "--json"], root)
     if cli_error:
         return cli_error
     assert payload is not None

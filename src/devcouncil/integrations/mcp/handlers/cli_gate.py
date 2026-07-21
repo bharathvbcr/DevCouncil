@@ -38,6 +38,6 @@ async def handle_cli(root: Path, arguments: dict) -> list[TextContent]:
     if forbidden:
         return error_text("forbidden flag(s) through MCP: " + ", ".join(forbidden), code="forbidden_flags", flags=forbidden)
     try:
-        return json_text(run_cli_command(args, root))
+        return json_text(run_cli_command(args, root, truncate=True))
     except Exception as exc:
         return error_text(str(exc), code="cli_execution_error")

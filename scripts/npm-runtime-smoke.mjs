@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -58,6 +58,7 @@ try {
   const packMetadata = packed[0];
   assertPackedFile(packMetadata, "src/devcouncil/assets/devcouncil-logo.svg");
   assertPackedFile(packMetadata, "src/devcouncil/assets/devcouncil_logo_premium.png");
+  assertPackedFile(packMetadata, "src/devcouncil/assets/vendor/force-graph.min.js");
   assertPackedFile(packMetadata, "src/devcouncil/llm/model_defaults.yaml");
   assertPackedFile(packMetadata, "src/devcouncil/telemetry/model_pricing.yaml");
   assertPackedFile(packMetadata, "src/devcouncil/integrations/opencode_devcouncil_plugin.mjs");
@@ -179,6 +180,44 @@ try {
     "DevCouncil requires uv to run from the npm package.",
     "missing-uv smoke",
   );
+
+  // Packaged graph demo: ForceGraph must ship, demo.html must render, and the
+  // blank-canvas ForceGraph API mismatch (onNodeDblClick) must stay absent.
+  const graphDemoProject = mkdtempSync(path.join(workspace, "graph-demo-"));
+  const graphDemo = run(
+    process.execPath,
+    [
+      installedBin,
+      "graph",
+      "demo",
+      "--project-root",
+      graphDemoProject,
+      "--json",
+    ],
+    { cwd: workspace, shell: false, env: integrationEnv },
+  );
+  assertOk(graphDemo, "installed dev graph demo --json");
+  let demoPaths;
+  try {
+    demoPaths = JSON.parse(graphDemo.stdout);
+  } catch (err) {
+    throw new Error(
+      `installed dev graph demo --json did not return JSON: ${err}\n${graphDemo.stdout}`,
+    );
+  }
+  const demoHtmlPath = demoPaths.html;
+  if (typeof demoHtmlPath !== "string" || !demoHtmlPath) {
+    throw new Error(`graph demo JSON missing html path: ${graphDemo.stdout}`);
+  }
+  const demoHtml = readFileSync(demoHtmlPath, "utf-8");
+  assertIncludes(demoHtml, "ForceGraph", "graph demo.html ForceGraph");
+  assertIncludes(demoHtml, "vasturiano/force-graph", "graph demo.html vendored ForceGraph");
+  if (demoHtml.includes("onNodeDblClick")) {
+    throw new Error(
+      "graph demo.html still calls onNodeDblClick (incompatible with packed ForceGraph)",
+    );
+  }
+  assertIncludes(demoHtml, "event.detail >= 2", "graph demo.html double-click handler");
 } finally {
   if (packedTarball) {
     rmSync(packedTarball, { force: true });

@@ -261,7 +261,7 @@ dev check --verify --goal "password reset tokens are single-use" --test "pytest 
 Optional live inspection surfaces:
 
 ```bash
-dev graph demo              # sample code-graph UI + SVG (no map required)
+dev graph demo              # sample self-contained interactive HTML (no map required)
 dev map && dev graph view   # repo map + interactive code graph (default :8765)
 dev graph html --open       # write/open graph.html once
 dev dashboard --open        # status dashboard with gaps panel (use --port if graph view is running)

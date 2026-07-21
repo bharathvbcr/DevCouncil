@@ -155,7 +155,7 @@ def test_watch_status_human_with_blockers(tmp_path, monkeypatch):
             "scope_task_id": "TASK-1",
             "pending_signals": 1,
             "pending_signal_items": [
-                {"client": "claude", "task_id": "TASK-1", "transcript_path": "/t.jsonl", "review_command": "dev watch review"}
+                {"id": "claude-abc.json", "client": "claude", "task_id": "TASK-1"}
             ],
             "blocking_cards": [{"id": "CARD-9", "task_id": "TASK-1", "summary": "blocker"}],
             "cards": {"total": 2, "open": 1, "critical_open": 1},
@@ -164,7 +164,8 @@ def test_watch_status_human_with_blockers(tmp_path, monkeypatch):
     result = runner.invoke(app, ["watch", "status", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert "Blocking" in result.output
-    assert "dev watch review" in result.output
+    assert "claude" in result.output
+    assert "dev watch signals" in result.output
 
 
 # --- resolve ----------------------------------------------------------------------

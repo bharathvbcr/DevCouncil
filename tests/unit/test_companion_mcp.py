@@ -334,3 +334,358 @@ async def test_get_diff_scoped_to_task(tmp_path, monkeypatch):
     paths = {f["path"] for f in payload["files"]}
     assert "a.py" in paths
     assert "b.py" not in paths
+
+
+@pytest.mark.anyio
+async def test_get_diff_includes_untracked_text_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    _git_init(tmp_path)
+    (tmp_path / "tracked.py").write_text("ok\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.py"], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, text=True)
+    (tmp_path / "brand_new.py").write_text("print('hello')\n", encoding="utf-8")
+
+    result = await call_tool("devcouncil_get_diff", {})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    paths = {f["path"] for f in payload["files"]}
+    assert "brand_new.py" in paths
+    entry = next(f for f in payload["files"] if f["path"] == "brand_new.py")
+    assert entry["status"] == "A"
+    assert entry["additions"] >= 1
+    assert "brand_new.py" in payload["unified_diff"]
+    assert "+print('hello')" in payload["unified_diff"]
+    assert "diff --git a/brand_new.py b/brand_new.py" in payload["unified_diff"]
+
+
+@pytest.mark.anyio
+async def test_get_diff_includes_empty_untracked_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    _git_init(tmp_path)
+    (tmp_path / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "seed.txt"], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, text=True)
+    (tmp_path / "empty_new.txt").write_text("", encoding="utf-8")
+
+    result = await call_tool("devcouncil_get_diff", {})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    paths = {f["path"] for f in payload["files"]}
+    assert "empty_new.txt" in paths
+    entry = next(f for f in payload["files"] if f["path"] == "empty_new.txt")
+    assert entry["status"] == "A"
+    assert entry["additions"] == 0
+    assert "diff --git a/empty_new.txt b/empty_new.txt" in payload["unified_diff"]
+    assert "new file mode 100644" in payload["unified_diff"]
+
+
+@pytest.mark.anyio
+async def test_get_diff_path_filter_limits_untracked(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    _git_init(tmp_path)
+    (tmp_path / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "seed.txt"], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, text=True)
+    (tmp_path / "keep_me.py").write_text("keep\n", encoding="utf-8")
+    (tmp_path / "skip_me.py").write_text("skip\n", encoding="utf-8")
+
+    result = await call_tool("devcouncil_get_diff", {"paths": ["keep_me.py"]})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    paths = {f["path"] for f in payload["files"]}
+    assert "keep_me.py" in paths
+    assert "skip_me.py" not in paths
+    assert "keep_me.py" in payload["unified_diff"]
+    assert "skip_me.py" not in payload["unified_diff"]
+
+
+@pytest.mark.anyio
+async def test_get_diff_untracked_respects_external_20kb_cap(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    _git_init(tmp_path)
+    (tmp_path / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "seed.txt"], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, text=True)
+    (tmp_path / "big_new.txt").write_text("x" * 30_000 + "\n", encoding="utf-8")
+
+    result = await call_tool("devcouncil_get_diff", {})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    assert "big_new.txt" in {f["path"] for f in payload["files"]}
+    assert payload["truncated"] is True
+    assert len(payload["unified_diff"]) < 30_000
+    assert "truncated to 20000 characters" in payload["unified_diff"]
+
+
+@pytest.mark.anyio
+async def test_get_diff_task_id_without_db_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    _git_init(tmp_path)
+    (tmp_path / "leak.py").write_text("secret\n", encoding="utf-8")
+    subprocess.run(["git", "add", "leak.py"], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, text=True)
+    (tmp_path / "leak.py").write_text("secret\nchanged\n", encoding="utf-8")
+
+    result = await call_tool("devcouncil_get_diff", {"task_id": "TASK-001"})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is False
+    assert payload["code"] == "not_initialized"
+    assert "unified_diff" not in payload or payload.get("unified_diff") in (None, "")
+
+
+@pytest.mark.anyio
+async def test_get_diff_explicit_paths_intersect_task_scope(tmp_path, monkeypatch):
+    db = _init_db(tmp_path)
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    _git_init(tmp_path)
+    (tmp_path / "a.py").write_text("a=1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("b=1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, text=True)
+    (tmp_path / "a.py").write_text("a=1\na2=2\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("b=1\nb2=2\n", encoding="utf-8")
+    with db.get_session() as session:
+        TaskRepository(session).save(Task(
+            id="TASK-001", title="T", description="D",
+            planned_files=[PlannedFile(path="a.py", reason="r", allowed_change="modify")],
+        ))
+
+    # Explicit paths must intersect planned files — never union/broaden to b.py.
+    result = await call_tool(
+        "devcouncil_get_diff",
+        {"task_id": "TASK-001", "paths": ["a.py", "b.py"]},
+    )
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    paths = {f["path"] for f in payload["files"]}
+    assert "a.py" in paths
+    assert "b.py" not in paths
+
+
+@pytest.mark.anyio
+async def test_get_diff_explicit_paths_outside_task_scope_empty(tmp_path, monkeypatch):
+    db = _init_db(tmp_path)
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    _git_init(tmp_path)
+    (tmp_path / "a.py").write_text("a=1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("b=1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, text=True)
+    (tmp_path / "a.py").write_text("a=1\na2=2\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("b=1\nb2=2\n", encoding="utf-8")
+    with db.get_session() as session:
+        TaskRepository(session).save(Task(
+            id="TASK-001", title="T", description="D",
+            planned_files=[PlannedFile(path="a.py", reason="r", allowed_change="modify")],
+        ))
+
+    result = await call_tool(
+        "devcouncil_get_diff",
+        {"task_id": "TASK-001", "paths": ["b.py"]},
+    )
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    assert payload["files"] == []
+    assert payload["unified_diff"] == ""
+
+
+@pytest.mark.anyio
+async def test_get_diff_staged_rename_nul_safe(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    _git_init(tmp_path)
+    (tmp_path / "old_name.py").write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "old_name.py"], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "mv", "old_name.py", "new_name.py"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    result = await call_tool("devcouncil_get_diff", {"staged": True})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    paths = {f["path"] for f in payload["files"]}
+    assert "new_name.py" in paths
+    entry = next(f for f in payload["files"] if f["path"] == "new_name.py")
+    assert str(entry["status"]).startswith("R")
+
+
+@pytest.mark.anyio
+async def test_get_diff_surfaces_nonzero_git_as_ok_false(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    _git_init(tmp_path)
+    (tmp_path / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "seed.txt"], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, text=True)
+
+    from devcouncil.integrations.mcp.handlers import git as git_handlers
+
+    real_run = git_handlers._run_git
+
+    def boom(root, args):
+        if args[:2] == ["git", "diff"] and "--numstat" not in args and "--name-status" not in args:
+            return subprocess.CompletedProcess(
+                args=args, returncode=128, stdout="", stderr="fatal: bad revision",
+            )
+        return real_run(root, args)
+
+    monkeypatch.setattr(git_handlers, "_run_git", boom)
+    result = await call_tool("devcouncil_get_diff", {})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is False
+    assert "bad revision" in payload["error"] or "exited 128" in payload["error"]
+
+
+@pytest.mark.anyio
+async def test_get_diff_includes_binary_untracked_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    _git_init(tmp_path)
+    (tmp_path / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "seed.txt"], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, text=True)
+    (tmp_path / "blob.bin").write_bytes(b"png\x00data\x00more")
+
+    result = await call_tool("devcouncil_get_diff", {})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    paths = {f["path"] for f in payload["files"]}
+    assert "blob.bin" in paths
+    entry = next(f for f in payload["files"] if f["path"] == "blob.bin")
+    assert entry["status"] == "A"
+    assert entry["additions"] == 0
+    assert "Binary files /dev/null and b/blob.bin differ" in payload["unified_diff"]
+
+
+@pytest.mark.anyio
+async def test_get_diff_empty_planned_scope_fail_closed(tmp_path, monkeypatch):
+    db = _init_db(tmp_path)
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    _git_init(tmp_path)
+    (tmp_path / "secret.py").write_text("secret=1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, text=True)
+    (tmp_path / "secret.py").write_text("secret=2\n", encoding="utf-8")
+    with db.get_session() as session:
+        TaskRepository(session).save(Task(
+            id="TASK-001", title="T", description="D",
+            planned_files=[],
+        ))
+
+    result = await call_tool("devcouncil_get_diff", {"task_id": "TASK-001"})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    assert payload["files"] == []
+    assert payload["unified_diff"] == ""
+
+
+@pytest.mark.anyio
+async def test_get_diff_path_filter_empty_intersection(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    _git_init(tmp_path)
+    (tmp_path / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "seed.txt"], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, text=True)
+    (tmp_path / "present.py").write_text("present\n", encoding="utf-8")
+
+    result = await call_tool("devcouncil_get_diff", {"paths": ["absent.py"]})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    assert payload["files"] == []
+    assert payload["unified_diff"] == ""
+
+
+@pytest.mark.anyio
+async def test_get_diff_truncated_keeps_files_authoritative(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    _git_init(tmp_path)
+    (tmp_path / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "seed.txt"], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, text=True)
+    (tmp_path / "big_new.txt").write_text("x" * 30_000 + "\n", encoding="utf-8")
+
+    result = await call_tool("devcouncil_get_diff", {})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    assert payload["truncated"] is True
+    assert "big_new.txt" in {f["path"] for f in payload["files"]}
+    entry = next(f for f in payload["files"] if f["path"] == "big_new.txt")
+    assert entry["status"] == "A"
+    assert entry["additions"] >= 1
+
+
+@pytest.mark.anyio
+async def test_read_file_task_scope_allows_planned_path(tmp_path, monkeypatch):
+    db = _init_db(tmp_path)
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    (tmp_path / "a.py").write_text("ok\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("nope\n", encoding="utf-8")
+    with db.get_session() as session:
+        TaskRepository(session).save(Task(
+            id="TASK-001", title="T", description="D",
+            planned_files=[PlannedFile(path="a.py", reason="r", allowed_change="modify")],
+        ))
+
+    result = await call_tool("devcouncil_read_file", {"path": "a.py", "task_id": "TASK-001"})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    assert payload["content"] == "ok"
+
+
+@pytest.mark.anyio
+async def test_read_file_task_scope_blocks_unplanned_path(tmp_path, monkeypatch):
+    db = _init_db(tmp_path)
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    (tmp_path / "a.py").write_text("ok\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("secret\n", encoding="utf-8")
+    with db.get_session() as session:
+        TaskRepository(session).save(Task(
+            id="TASK-001", title="T", description="D",
+            planned_files=[PlannedFile(path="a.py", reason="r", allowed_change="modify")],
+        ))
+
+    result = await call_tool("devcouncil_read_file", {"path": "b.py", "task_id": "TASK-001"})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is False
+    assert payload["code"] == "out_of_scope"
+    assert "secret" not in result[0].text
+
+
+@pytest.mark.anyio
+async def test_read_file_task_id_without_db_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    (tmp_path / "leak.py").write_text("secret\n", encoding="utf-8")
+
+    result = await call_tool("devcouncil_read_file", {"path": "leak.py", "task_id": "TASK-001"})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is False
+    assert payload["code"] == "not_initialized"
+    assert "secret" not in result[0].text
+
+
+@pytest.mark.anyio
+async def test_get_evidence_does_not_leak_other_task(tmp_path, monkeypatch):
+    db = _init_db(tmp_path)
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    with db.get_session() as session:
+        TaskRepository(session).save(Task(id="TASK-001", title="A", description="D"))
+        TaskRepository(session).save(Task(id="TASK-002", title="B", description="D"))
+        EvidenceRepository(session).save_command_result(
+            "TASK-002",
+            CommandResult(
+                command="pytest",
+                exit_code=1,
+                stdout_path="",
+                stderr_path="",
+                summary="other-task-secret-evidence",
+            ),
+        )
+
+    result = await call_tool("devcouncil_get_evidence", {"task_id": "TASK-001"})
+    payload = json.loads(result[0].text)
+    assert payload.get("ok") is not False
+    assert "other-task-secret-evidence" not in result[0].text
+    evidence = payload.get("evidence") or []
+    assert evidence == []

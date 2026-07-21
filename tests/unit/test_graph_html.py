@@ -129,6 +129,8 @@ def test_html_has_tabs_lenses_and_path_helpers(tmp_path):
     assert "lensDead" in html
     assert "bfsPath" in html
     assert "linkDirectionalParticles" in html
+    assert "onNodeDblClick" not in html
+    assert "event.detail >= 2" in html
     assert "demo-community" in html
     assert "entry_flow" in html
     # Default mode from file_level=False

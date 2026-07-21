@@ -38,7 +38,7 @@ dev graph pdg-query --mode controls --target SYMBOL  # PDG control dependence
 dev graph pdg-query --mode flows --target SYMBOL --variable x  # PDG data flows
 dev graph html              # Write interactive .devcouncil/graph/graph.html (not written by default on dev map)
 dev graph view              # Serve/open the graph HTML via a local HTTP server
-dev graph demo              # Sample visualizer + SVG preview (no map required); see docs/code-graph.md
+dev graph demo              # Sample self-contained interactive HTML (no map required); see docs/code-graph.md
 dev graph export -o out.graphml  # Export GraphML (or --format okf / okf-links)
 dev scaffold-ci             # Write a starter .github/workflows/devcouncil.yml from configured commands
 dev scaffold-ci --force     # Overwrite an existing devcouncil.yml workflow

@@ -10,6 +10,7 @@ from devcouncil.integrations.mcp.util import (
     error_text,
     json_text,
     optional_string_argument,
+    parse_cli_json,
     run_cli_command,
     truncate_text,
 )
@@ -29,18 +30,10 @@ def _apply_body_truncation(payload: dict) -> dict:
 async def handle_wiki_page(root: Path, arguments: dict) -> list[TextContent]:
     page = optional_string_argument(arguments, "page")
     query = optional_string_argument(arguments, "query")
-    result = run_cli_command(
-        _wiki_cli_args(page=page, query=query),
-        root,
+    payload, _cli_error = parse_cli_json(
+        run_cli_command(_wiki_cli_args(page=page, query=query), root, truncate=False),
     )
-    if result.get("ok"):
-        import json
-
-        try:
-            payload = json.loads(str(result.get("stdout") or "{}"))
-        except json.JSONDecodeError:
-            payload = read_wiki_page(root, page=page, query=query)
-    else:
+    if payload is None:
         payload = read_wiki_page(root, page=page, query=query)
     if not payload.get("ok", True):
         return error_text(

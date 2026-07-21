@@ -243,7 +243,24 @@ def parse_cli_json(result: dict[str, object]) -> tuple[dict | None, list[TextCon
     return None, error_text("CLI command returned invalid JSON", code="cli_parse_error")
 
 
-def run_cli_command(args: list[str], root: Path) -> dict[str, object]:
+def _cli_stream_text(value: str | bytes | None, *, truncate: bool) -> tuple[str, bool]:
+    """Optionally truncate a CLI stream for external raw-text boundaries."""
+    if truncate:
+        return truncate_text(value)
+    if value is None:
+        return "", False
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace"), False
+    return value, False
+
+
+def run_cli_command(args: list[str], root: Path, *, truncate: bool = False) -> dict[str, object]:
+    """Run ``devcouncil`` CLI and return a structured subprocess payload.
+
+    By default stdout/stderr are kept intact so structured JSON handlers can
+    parse large payloads. Pass ``truncate=True`` only for external raw-text
+    surfaces such as ``devcouncil_cli`` and report previews.
+    """
     command = [sys.executable, "-m", "devcouncil", *args, "--project-root", str(root)]
     try:
         result = subprocess.run(
@@ -255,8 +272,8 @@ def run_cli_command(args: list[str], root: Path) -> dict[str, object]:
             errors="replace",
             timeout=_CLI_TIMEOUT_SECONDS,
         )
-        stdout, stdout_truncated = truncate_text(result.stdout)
-        stderr, stderr_truncated = truncate_text(result.stderr)
+        stdout, stdout_truncated = _cli_stream_text(result.stdout, truncate=truncate)
+        stderr, stderr_truncated = _cli_stream_text(result.stderr, truncate=truncate)
         return {
             "ok": result.returncode == 0,
             "returncode": result.returncode,
@@ -267,8 +284,8 @@ def run_cli_command(args: list[str], root: Path) -> dict[str, object]:
             "timed_out": False,
         }
     except subprocess.TimeoutExpired as exc:
-        stdout, stdout_truncated = truncate_text(exc.output)
-        stderr, stderr_truncated = truncate_text(exc.stderr)
+        stdout, stdout_truncated = _cli_stream_text(exc.output, truncate=truncate)
+        stderr, stderr_truncated = _cli_stream_text(exc.stderr, truncate=truncate)
         return {
             "ok": False,
             "returncode": None,
@@ -279,6 +296,11 @@ def run_cli_command(args: list[str], root: Path) -> dict[str, object]:
             "timed_out": True,
             "timeout_seconds": _CLI_TIMEOUT_SECONDS,
         }
+
+
+def run_cli_json(args: list[str], root: Path) -> tuple[dict | None, list[TextContent] | None]:
+    """Run CLI without truncating stdout, then parse structured JSON."""
+    return parse_cli_json(run_cli_command(args, root, truncate=False))
 
 
 GIT_APPLY_TIMEOUT_SECONDS = _GIT_APPLY_TIMEOUT_SECONDS

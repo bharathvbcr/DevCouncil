@@ -126,7 +126,13 @@ async def test_mcp_live_review_returns_cards_and_blockers(tmp_path, monkeypatch)
     result = await call_tool("devcouncil_live_review", {"task_id": "TASK-001"})
 
     payload = json.loads(result[0].text)
-    assert payload["pending_signal_items"][0]["review_command"] == "dev watch review --client claude --transcript session.jsonl --task-id TASK-001"
+    item = payload["pending_signal_items"][0]
+    assert item["client"] == "claude"
+    assert item["task_id"] == "TASK-001"
+    assert "review_command" not in item
+    assert "transcript_path" not in item
+    assert "payload" not in item
+    assert "user_email" not in result[0].text
     assert payload["cards"]["critical_open"] == 1
     assert payload["blocking_cards"][0]["task_id"] == "TASK-001"
 
@@ -390,6 +396,120 @@ async def test_mcp_cli_truncates_large_output(tmp_path, monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_mcp_status_parses_oversized_cli_json(tmp_path, monkeypatch):
+    """Structured status must keep full CLI stdout; truncation at 20k caused cli_parse_error."""
+    from devcouncil.integrations.mcp import util as mcp_util
+
+    dev_dir = tmp_path / ".devcouncil"
+    dev_dir.mkdir()
+    Database(dev_dir / "state.sqlite").create_db_and_tables()
+
+    pad = "p" * (mcp_util._CLI_OUTPUT_LIMIT + 5_000)
+    status_payload = {
+        "initialized": True,
+        "phase": "TASK_VERIFIED",
+        "coverage_summary": {
+            "total_requirements": 2,
+            "requirements_without_tasks": 0,
+            "total_tasks": 1,
+            "tasks_without_requirements": 0,
+            "total_gaps": 0,
+            "blocking_gaps": 0,
+        },
+        "padding": pad,
+    }
+    raw = json.dumps(status_payload)
+    assert len(raw) > mcp_util._CLI_OUTPUT_LIMIT
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(["devcouncil"], 0, stdout=raw, stderr="")
+
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(mcp_util.subprocess, "run", fake_run)
+
+    result = await call_tool("devcouncil_status", {})
+    text = result[0].text
+    assert "cli_parse_error" not in text
+    assert "Phase: TASK_VERIFIED" in text
+    assert "Requirements: 2" in text
+    assert "Tasks: 1" in text
+    assert "Gaps: 0" in text
+
+
+@pytest.mark.anyio
+async def test_mcp_list_tasks_parses_oversized_cli_json(tmp_path, monkeypatch):
+    """list_tasks structured path must not truncate before JSON parse."""
+    from devcouncil.integrations.mcp import util as mcp_util
+
+    dev_dir = tmp_path / ".devcouncil"
+    dev_dir.mkdir()
+    Database(dev_dir / "state.sqlite").create_db_and_tables()
+
+    pad = "x" * (mcp_util._CLI_OUTPUT_LIMIT + 2_000)
+    tasks_payload = {
+        "tasks": [
+            {
+                "id": "TASK-001",
+                "title": "Big task",
+                "description": pad,
+                "status": "planned",
+                "priority": "high",
+                "requirement_ids": ["REQ-001"],
+                "planned_files": [{"path": "a.py", "reason": "r", "allowed_change": "modify"}],
+                "lease": None,
+            }
+        ],
+        "total": 1,
+        "offset": 0,
+        "limit": 100,
+        "returned": 1,
+    }
+    raw = json.dumps(tasks_payload)
+    assert len(raw) > mcp_util._CLI_OUTPUT_LIMIT
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(["devcouncil"], 0, stdout=raw, stderr="")
+
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(mcp_util.subprocess, "run", fake_run)
+
+    result = await call_tool("devcouncil_list_tasks", {})
+    payload = json.loads(result[0].text)
+    assert payload.get("ok") is not False
+    assert payload["total"] == 1
+    task = payload["tasks"][0]
+    assert task["id"] == "TASK-001"
+    assert task["title"] == "Big task"
+    assert task["status"] == "planned"
+    assert task["priority"] == "high"
+    assert task["requirements"] == ["REQ-001"]
+    assert task["lease"] is None
+    # Compact listing drops bulky fields.
+    assert "description" not in task
+    assert "planned_files" not in task
+
+
+@pytest.mark.anyio
+async def test_run_cli_command_truncate_false_keeps_full_stdout(tmp_path, monkeypatch):
+    from devcouncil.integrations.mcp import util as mcp_util
+
+    huge = "y" * (mcp_util._CLI_OUTPUT_LIMIT + 100)
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(["devcouncil"], 0, stdout=huge, stderr="")
+
+    monkeypatch.setattr(mcp_util.subprocess, "run", fake_run)
+
+    truncated = mcp_util.run_cli_command(["status", "--json"], tmp_path, truncate=True)
+    full = mcp_util.run_cli_command(["status", "--json"], tmp_path, truncate=False)
+
+    assert truncated["stdout_truncated"] is True
+    assert "[truncated" in truncated["stdout"]
+    assert full["stdout_truncated"] is False
+    assert full["stdout"] == huge
+
+
+@pytest.mark.anyio
 async def test_mcp_cli_timeout_returns_structured_payload(tmp_path, monkeypatch):
     monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
 
@@ -515,3 +635,80 @@ async def test_mcp_lists_live_review_tools():
     assert "devcouncil_live_cards" in names
     assert "devcouncil_live_repair_prompt" in names
     assert "devcouncil_live_repair_all" in names
+
+
+@pytest.mark.anyio
+async def test_mcp_get_task_parses_250kb_valid_json(tmp_path, monkeypatch):
+    """Structured handlers must parse ~250 KB valid CLI JSON without cli_parse_error."""
+    from devcouncil.integrations.mcp import util as mcp_util
+
+    pad = "p" * 250_000
+    task_payload = {
+        "task": {
+            "id": "TASK-001",
+            "title": "Large",
+            "description": pad,
+            "status": "planned",
+            "priority": "high",
+            "planned_files": [],
+            "allowed_commands": [],
+            "expected_tests": [],
+        }
+    }
+    raw = json.dumps(task_payload)
+    assert len(raw) > 250_000
+
+    def fake_run(*_args, **_kwargs):
+        return subprocess.CompletedProcess(["devcouncil"], 0, stdout=raw, stderr="")
+
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(mcp_util.subprocess, "run", fake_run)
+
+    dev_dir = tmp_path / ".devcouncil"
+    dev_dir.mkdir()
+    Database(dev_dir / "state.sqlite").create_db_and_tables()
+
+    result = await call_tool("devcouncil_get_task", {"task_id": "TASK-001"})
+    text = result[0].text
+    assert "cli_parse_error" not in text
+    payload = json.loads(text)
+    assert payload["id"] == "TASK-001"
+    assert len(payload["description"]) == 250_000
+
+
+@pytest.mark.anyio
+async def test_mcp_get_gaps_returns_compact_projection(tmp_path, monkeypatch):
+    from devcouncil.domain.gap import Gap
+    from devcouncil.domain.task import Task
+    from devcouncil.storage.repositories import GapRepository, TaskRepository
+
+    dev_dir = tmp_path / ".devcouncil"
+    dev_dir.mkdir()
+    db = Database(dev_dir / "state.sqlite")
+    db.create_db_and_tables()
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    with db.get_session() as session:
+        TaskRepository(session).save(Task(id="TASK-001", title="T", description="D"))
+        GapRepository(session).save(Gap(
+            id="GAP-1",
+            severity="high",
+            gap_type="missing_test",
+            task_id="TASK-001",
+            description="long description that must not appear in compact MCP gaps",
+            evidence=["huge evidence blob" * 50],
+            recommended_fix="do a thing",
+            blocking=True,
+            file="a.py",
+            line=12,
+        ))
+
+    result = await call_tool("devcouncil_get_gaps", {"task_id": "TASK-001"})
+    payload = json.loads(result[0].text)
+    assert payload["gap_count"] == 1
+    gap = payload["gaps"][0]
+    assert gap["id"] == "GAP-1"
+    assert gap["file"] == "a.py"
+    assert "description" not in gap
+    assert "evidence" not in gap
+    assert "recommended_fix" not in gap
+    assert "long description" not in result[0].text
