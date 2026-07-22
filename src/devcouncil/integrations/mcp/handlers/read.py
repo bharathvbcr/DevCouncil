@@ -7,6 +7,7 @@ from pathlib import Path
 
 from mcp.types import TextContent
 
+from devcouncil.execution.planned_scope import matches_planned_path
 from devcouncil.integrations.mcp.util import (
     error_text,
     int_argument,
@@ -43,9 +44,8 @@ async def handle_read_file(
             task = TaskRepository(session).get_by_id(task_id)
         if task is None:
             return error_text(f"Task {task_id} not found.", code="not_found", task_id=task_id)
-        planned = {pf.path.replace("\\", "/") for pf in task.planned_files}
         normalized = rel_path.replace("\\", "/")
-        if normalized not in planned:
+        if not matches_planned_path(rel_path, task.planned_files):
             # Fail closed: never broaden task scope to arbitrary repo paths.
             return error_text(
                 f"Path {normalized} is outside task {task_id} planned-file scope.",

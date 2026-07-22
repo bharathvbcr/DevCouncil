@@ -464,20 +464,40 @@ def build_integration_check_report(project_root: Path, *, strict: bool = False) 
     raw_config = integrate._load_raw_config(root) if (root / ".devcouncil").exists() else {}
 
     cursor_hooks = root / ".cursor" / "hooks.json"
-    cursor_enabled = bool(raw_config.get("integrations", {}).get("cursor", {}).get("enabled"))
+    cursor_cfg = raw_config.get("integrations", {}).get("cursor", {}) if isinstance(raw_config.get("integrations"), dict) else {}
+    if not isinstance(cursor_cfg, dict):
+        cursor_cfg = {}
+    cursor_enabled = bool(cursor_cfg.get("enabled"))
+    cursor_write_gate = bool(cursor_cfg.get("write_gate", False))
     if cursor_enabled or cursor_hooks.exists():
         hooks_ok = False
+        details = "Run dev integrate hooks --apply --tool cursor."
         if cursor_hooks.exists():
             try:
                 hooks_data = read_json(cursor_hooks) or {}
-                hooks_ok = "preToolUse" in hooks_data.get("hooks", {})
+                hook_events = hooks_data.get("hooks", {}) if isinstance(hooks_data, dict) else {}
+                has_post = "postToolUse" in hook_events
+                has_pre = "preToolUse" in hook_events
+                # Assist (default): PostToolUse only. Contain: PreToolUse present.
+                if cursor_write_gate:
+                    hooks_ok = has_pre and has_post
+                    details = str(cursor_hooks) if hooks_ok else (
+                        "Run dev integrate cursor --apply --write-gate."
+                    )
+                else:
+                    hooks_ok = has_post and not has_pre
+                    if has_post and has_pre:
+                        details = (
+                            "Assist mode expected (no preToolUse). "
+                            "Re-run dev integrate cursor --apply (or pass --write-gate)."
+                        )
+                    elif hooks_ok:
+                        details = f"{cursor_hooks} (assist)"
+                    else:
+                        details = "Run dev integrate cursor --apply."
             except json.JSONDecodeError:
                 hooks_ok = False
-        add(
-            hooks_ok,
-            "Cursor hooks",
-            str(cursor_hooks) if hooks_ok else "Run dev integrate hooks --apply --tool cursor.",
-        )
+        add(hooks_ok, "Cursor hooks", details)
         from devcouncil.integrations.clients.cursor import probe_cursor_auth
 
         auth_ok, auth_details = probe_cursor_auth()
@@ -487,20 +507,39 @@ def build_integration_check_report(project_root: Path, *, strict: bool = False) 
         add_optional(auth_ok, "Cursor auth", auth_details)
 
     grok_hooks = root / ".grok" / "hooks" / "devcouncil.json"
-    grok_enabled = bool(raw_config.get("integrations", {}).get("grok", {}).get("enabled"))
+    grok_cfg = raw_config.get("integrations", {}).get("grok", {}) if isinstance(raw_config.get("integrations"), dict) else {}
+    if not isinstance(grok_cfg, dict):
+        grok_cfg = {}
+    grok_enabled = bool(grok_cfg.get("enabled"))
+    grok_write_gate = bool(grok_cfg.get("write_gate", False))
     if grok_enabled or grok_hooks.exists():
         hooks_ok = False
+        details = "Run dev integrate hooks --apply --tool grok (then /hooks-trust in Grok)."
         if grok_hooks.exists():
             try:
                 hooks_data = read_json(grok_hooks) or {}
-                hooks_ok = "PreToolUse" in hooks_data.get("hooks", {})
+                hook_events = hooks_data.get("hooks", {}) if isinstance(hooks_data, dict) else {}
+                has_post = "PostToolUse" in hook_events
+                has_pre = "PreToolUse" in hook_events
+                if grok_write_gate:
+                    hooks_ok = has_pre and has_post
+                    details = str(grok_hooks) if hooks_ok else (
+                        "Run dev integrate hooks --apply --tool grok --write-gate."
+                    )
+                else:
+                    hooks_ok = has_post and not has_pre
+                    if has_post and has_pre:
+                        details = (
+                            "Assist mode expected (no PreToolUse). "
+                            "Re-run dev integrate hooks --apply --tool grok."
+                        )
+                    elif hooks_ok:
+                        details = f"{grok_hooks} (assist)"
+                    else:
+                        details = "Run dev integrate hooks --apply --tool grok (then /hooks-trust in Grok)."
             except json.JSONDecodeError:
                 hooks_ok = False
-        add(
-            hooks_ok,
-            "Grok hooks",
-            str(grok_hooks) if hooks_ok else "Run dev integrate hooks --apply --tool grok (then /hooks-trust in Grok).",
-        )
+        add(hooks_ok, "Grok hooks", details)
 
     opencode_config = integrate._opencode_config_path(root)
     opencode_enabled = bool(raw_config.get("integrations", {}).get("opencode", {}).get("enabled"))

@@ -4,7 +4,7 @@ A *skill* is a markdown file with YAML frontmatter describing when it applies. T
 ``core-engineering`` skill is always selected; domain skills (android, ios, windows,
 web, ai-training, ...) are selected when the goal text or the repository's files match
 their triggers. Selected skills can be rendered into an agent prompt preamble or
-scaffolded into a target repo's ``.claude/skills/`` directory.
+scaffolded into a target repo's ``.claude/skills/`` and ``.cursor/skills/`` directories.
 """
 
 from __future__ import annotations
@@ -142,7 +142,11 @@ def _skill_from_meta(path: Path, meta: dict, body: str) -> Skill:
 
 # Repo-local skill locations, scanned in addition to the packaged library so users
 # can drop their own skill markdown into a project and have it picked up.
-REPO_SKILL_DIRS = (".claude/skills", ".devcouncil/skills")
+REPO_SKILL_DIRS = (".claude/skills", ".cursor/skills", ".devcouncil/skills")
+
+# Default destinations for ``scaffold_skills`` — Claude Code and Cursor both discover
+# skills under these trees. Callers can pass an explicit list to write fewer roots.
+DEFAULT_SKILL_DESTINATIONS = (".claude/skills", ".cursor/skills")
 
 
 def _try_skill_from_file(path: Path) -> Skill | None:
@@ -388,7 +392,7 @@ def bound_skills(
 
     Skills are kept in order (always-on first), so the core skill is always inline;
     once the skill count or the cumulative body size would be exceeded, the rest are
-    deferred (their full text still lives in the scaffolded .claude/skills/ files).
+    deferred (their full text still lives in scaffolded .claude/skills/ and .cursor/skills/).
     """
     inline: list[Skill] = []
     total = 0
@@ -405,35 +409,38 @@ def bound_skills(
     return inline, deferred
 
 
-def scaffold_skills(project_root: Path, skills: list[Skill]) -> list[Path]:
-    """Write the given skills into ``<project_root>/.claude/skills/<name>/SKILL.md``.
+def scaffold_skills(
+    project_root: Path,
+    skills: list[Skill],
+    destinations: tuple[str, ...] | list[str] | None = None,
+) -> list[Path]:
+    """Write the given skills under each destination as ``<name>/SKILL.md``.
 
-    Only rewrites a file when its content changes, so re-running is a no-op.
+    Defaults to both ``.claude/skills`` and ``.cursor/skills`` so Claude Code and
+    Cursor discover the same intake. Only rewrites a file when its content changes.
+    Per destination: skip when the skill's ``source_path`` already lives under that
+    root (do not re-materialize a repo-local skill onto itself).
     """
+    dest_rels = tuple(destinations) if destinations is not None else DEFAULT_SKILL_DESTINATIONS
     written: list[Path] = []
-    skills_root = project_root / ".claude" / "skills"
-    dev_skills_root = project_root / ".devcouncil" / "skills"
     for skill in skills:
-        # Don't re-materialize a skill that already lives in a repo-local skill dir.
-        # Packaged library files inside a monorepo (e.g. src/.../skills/library/) still
-        # scaffold to .claude/skills/ — only skip when the source IS the destination.
-        if skill.source_path is not None:
-            src = skill.source_path.resolve()
-            skip = False
-            for base in (skills_root, dev_skills_root):
-                try:
-                    src.relative_to(base.resolve())
-                    skip = True
-                    break
-                except ValueError:
-                    continue
-            if skip:
-                continue
-        target = skills_root / skill.name / "SKILL.md"
         content = skill.to_skill_md()
-        if target.exists() and target.read_text(encoding="utf-8") == content:
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-        written.append(target)
+        src = skill.source_path.resolve() if skill.source_path is not None else None
+        for rel in dest_rels:
+            skills_root = project_root / rel
+            # Don't re-materialize a skill that already lives in this destination.
+            # Packaged library files inside a monorepo (e.g. src/.../skills/library/)
+            # still scaffold — only skip when the source IS this destination root.
+            if src is not None:
+                try:
+                    src.relative_to(skills_root.resolve())
+                    continue
+                except (ValueError, OSError):
+                    pass
+            target = skills_root / skill.name / "SKILL.md"
+            if target.exists() and target.read_text(encoding="utf-8") == content:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            written.append(target)
     return written

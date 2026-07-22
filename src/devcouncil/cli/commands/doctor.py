@@ -601,19 +601,34 @@ def check_execution_containment(project_root: Path, config=None) -> list[tuple[s
                 "Off by default. Enable execution.enforce_file_scope_pre_verify for battle-test containment.",
             ))
 
-        write_gate = bool(getattr(cfg.integrations.claude, "write_gate", False))
-        if write_gate:
-            rows.append((
-                "Claude write-gate",
-                ok,
-                "integrations.claude.write_gate is enabled. Run `dev integrate hooks --apply` if hooks are missing.",
-            ))
-        else:
-            rows.append((
-                "Claude write-gate",
-                warn,
-                "Disabled. Run `dev integrate claude --apply --write-gate` for PreToolUse containment.",
-            ))
+        hook_gate_mode = (getattr(cfg.execution.hook_gate, "mode", "contain") or "contain").strip().lower()
+        rows.append((
+            "Hook gate mode",
+            ok if hook_gate_mode == "contain" else warn,
+            f"execution.hook_gate.mode={hook_gate_mode}. "
+            "contain fail-closes Shell/Write without a lease; off allows no-task Shell/Write "
+            "(hard safety retained). Override: DEVCOUNCIL_HOOK_GATE.",
+        ))
+
+        for label, integration, apply_cmd in (
+            ("Claude", cfg.integrations.claude, "dev integrate claude --apply --write-gate"),
+            ("Cursor", cfg.integrations.cursor, "dev integrate cursor --apply --write-gate"),
+            ("Grok", cfg.integrations.grok, "dev integrate hooks --apply --tool grok --write-gate"),
+            ("OpenCode", cfg.integrations.opencode, "dev integrate hooks --apply --tool opencode --write-gate"),
+        ):
+            write_gate = bool(getattr(integration, "write_gate", False))
+            if write_gate:
+                rows.append((
+                    f"{label} write-gate",
+                    ok,
+                    f"integrations.{label.lower()}.write_gate is enabled (contain / PreToolUse).",
+                ))
+            else:
+                rows.append((
+                    f"{label} write-gate",
+                    warn,
+                    f"Assist (PostToolUse refresh only). Run `{apply_cmd}` for PreToolUse containment.",
+                ))
 
         for name, profile in load_agent_profiles(project_root).items():
             mode = (profile.permission_mode or "").strip().lower()

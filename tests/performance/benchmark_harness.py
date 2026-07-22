@@ -241,8 +241,29 @@ def run_benchmark(root: Path, *, profile: str = "fast") -> dict[str, Any]:
         "queries_ms": query_metrics,
         "thresholds": thresholds,
     }
+    result["timing_enforced"] = timing_enforced()
     result["violations"] = ratchet_violations(result)
     return result
+
+
+def timing_enforced() -> bool:
+    """Whether timing ratchets (wall clock + query p95) are enforced here.
+
+    Timing budgets are only meaningful on the CI runners they were tuned on.
+    Windows runners' file I/O and fsync are highly variable (cold build has
+    been observed at 15s and 29s in back-to-back runs), and local developer
+    machines are noisier still (background load, thermals, Spotlight), so
+    enforcing them there produces false failures on unchanged code. The
+    deterministic structural ratchets (payload_rows_written, affected_files,
+    db ratio, RSS) still run everywhere and catch real regressions — e.g. a
+    fall-back-to-full-rebuild shows up as payload_rows_written jumping from 0
+    to ~1500. Timing actuals are always recorded in the result/summary either
+    way. Override with DEVCOUNCIL_BENCH_ENFORCE_TIMING=1 (force on) or =0
+    (force off)."""
+    override = os.environ.get("DEVCOUNCIL_BENCH_ENFORCE_TIMING")
+    if override is not None:
+        return override.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(os.environ.get("CI")) and sys.platform != "win32"
 
 
 def ratchet_violations(result: dict[str, Any]) -> list[str]:
@@ -253,13 +274,7 @@ def ratchet_violations(result: dict[str, Any]) -> list[str]:
         if actual > limit:
             violations.append(f"{metric}: {actual:.4f} > {limit:.4f}")
 
-    # Windows runners' file I/O and fsync are highly variable (cold build has
-    # been observed at 15s and 29s in back-to-back runs), so the wall-clock
-    # timers are too noisy to enforce there. The deterministic structural
-    # ratchets below (payload_rows_written, affected_files, db ratio) still run
-    # on every platform and catch real regressions — e.g. a fall-back-to-full-
-    # rebuild shows up as payload_rows_written jumping from 0 to ~1500.
-    enforce_wall_clock = sys.platform != "win32"
+    enforce_timing = timing_enforced()
 
     if int(result["fixture"]["file_count"]) != int(threshold["file_count"]):
         violations.append(
@@ -274,7 +289,7 @@ def ratchet_violations(result: dict[str, Any]) -> list[str]:
     if int(result["schema_version"]) != 2:
         violations.append(f"schema_version: {result['schema_version']} != 2")
 
-    if enforce_wall_clock:
+    if enforce_timing:
         maximum(
             "cold.wall_seconds",
             float(result["cold"]["wall_seconds"]),
@@ -310,12 +325,13 @@ def ratchet_violations(result: dict[str, Any]) -> list[str]:
         float(result["one_file"]["affected_files"]),
         float(threshold["affected_files_max"]),
     )
-    for query_name, limit in threshold["query_p95_ms_max"].items():
-        maximum(
-            f"queries_ms.{query_name}.p95",
-            float(result["queries_ms"][query_name]["p95"]),
-            float(limit),
-        )
+    if enforce_timing:
+        for query_name, limit in threshold["query_p95_ms_max"].items():
+            maximum(
+                f"queries_ms.{query_name}.p95",
+                float(result["queries_ms"][query_name]["p95"]),
+                float(limit),
+            )
     return violations
 
 
@@ -343,6 +359,11 @@ def render_summary(result: dict[str, Any]) -> str:
             for name, metrics in result["queries_ms"].items()
         ),
     ]
+    if not result.get("timing_enforced", True):
+        lines.append(
+            "- Timing ratchets NOT enforced on this host (non-CI or Windows); "
+            "actuals recorded above. Force with DEVCOUNCIL_BENCH_ENFORCE_TIMING=1."
+        )
     if result["violations"]:
         lines.extend(["", "## Ratchet failures", ""])
         lines.extend(f"- {violation}" for violation in result["violations"])

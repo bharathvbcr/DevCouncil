@@ -49,7 +49,256 @@ def _vendor_js() -> str:
         "linkDirectionalParticleWidth:function(){return this},"
         "onNodeClick:function(){return this},"
         "width:function(){return this},height:function(){return this},_missing:true};};"
+        # Intentionally omit zoomToFit so #vendorWarn still fires on the stub.
     )
+
+
+def _canvas_controls_css() -> str:
+    """CSS for the shared zoom/pan/layout overlay (graph + map HTML)."""
+    return """
+#canvasControls{position:absolute;top:12px;right:12px;z-index:5;display:flex;flex-direction:column;gap:8px;align-items:flex-end;pointer-events:none;font:12px/1.35 ui-sans-serif,system-ui,sans-serif}
+#canvasControls>*{pointer-events:auto}
+#canvasControls .ctrl-row{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end}
+#canvasControls button{width:auto;margin:0;padding:6px 10px;background:#0f1419;color:var(--fg,#e7ecf3);border:1px solid #334155;border-radius:4px;cursor:pointer;font-weight:600}
+#canvasControls button:hover{border-color:var(--accent,#3d8bfd);color:#fff}
+#canvasControls .zoom-pct{min-width:52px;text-align:center;padding:6px 8px;background:#0f1419;border:1px solid #334155;border-radius:4px;color:var(--muted,#8b9bb4)}
+#canvasControls .hint{color:var(--muted,#8b9bb4);font-size:11px;text-align:right;max-width:220px}
+#canvasControls details.layout{background:var(--panel,#1a2332);border:1px solid #334155;border-radius:6px;padding:8px 10px;min-width:200px}
+#canvasControls details.layout summary{cursor:pointer;color:var(--fg,#e7ecf3);font-weight:600;margin-bottom:6px}
+#canvasControls details.layout label{display:flex;align-items:center;gap:6px;margin:4px 0;color:var(--muted,#8b9bb4);font-size:11px}
+#canvasControls details.layout select,#canvasControls details.layout input[type=range]{width:100%;margin:2px 0 6px;padding:4px 6px;background:#0f1419;color:var(--fg,#e7ecf3);border:1px solid #334155;border-radius:4px}
+#canvasLegend{position:absolute;left:12px;bottom:12px;z-index:5;background:rgba(26,35,50,.92);border:1px solid #334155;border-radius:6px;padding:8px 10px;font:11px/1.4 ui-sans-serif,system-ui,sans-serif;color:var(--muted,#8b9bb4);max-width:240px}
+#canvasLegend .leg-row{display:flex;align-items:center;gap:8px;margin:3px 0}
+#canvasLegend .swatch{width:12px;height:12px;border-radius:2px;flex-shrink:0}
+#canvasLegend .swatch.entry{background:var(--entry,#34d399)}
+#canvasLegend .swatch.dead{background:var(--dead,#e35d6a)}
+#canvasLegend .swatch.edge-imports{background:#64748b}
+#canvasLegend .swatch.edge-calls{background:#f59e0b}
+#canvasLegend .swatch.edge-handoff{background:#a78bfa}
+#canvasLegend .swatch.edge-neighbor{background:#3d8bfd}
+"""
+
+
+def _canvas_controls_js() -> str:
+    """Shared ForceGraph 1.51.4 zoom/pan/layout chrome.
+
+    Expects ``g`` (graph instance) and ``elem`` (container) in scope.
+    Optional ``window.__dcCanvasOpts``: ``{getSelectedIds, applyNodeStyle, legendHtml}``.
+    Every ForceGraph call is ``typeof``-guarded; never uses ``onNodeDblClick``.
+    """
+    return r"""
+(function installCanvasControls() {
+  if (!elem || !g) return;
+  const opts = window.__dcCanvasOpts || {};
+  const state = {
+    labelMode: 'hover',
+    sizeMode: 'degree',
+    paused: false,
+    zoomK: 1,
+    initialFitDone: false
+  };
+  window.__dcCanvasState = state;
+
+  function isTypingTarget(el) {
+    if (!el || !el.tagName) return false;
+    const t = el.tagName.toLowerCase();
+    return t === 'input' || t === 'textarea' || t === 'select' || el.isContentEditable;
+  }
+
+  function fitView() {
+    if (g && typeof g.zoomToFit === 'function') {
+      requestAnimationFrame(() => {
+        try { g.zoomToFit(400, 40); } catch (err) { /* vendor stub */ }
+      });
+    }
+  }
+  window.fitView = fitView;
+
+  function centerView() {
+    if (g && typeof g.centerAt === 'function') {
+      try { g.centerAt(0, 0, 400); } catch (err) { /* vendor stub */ }
+    }
+    if (g && typeof g.zoom === 'function') {
+      try { g.zoom(1, 400); } catch (err) { /* vendor stub */ }
+    }
+  }
+
+  function bumpZoom(factor) {
+    if (!(g && typeof g.zoom === 'function')) return;
+    try {
+      const cur = (typeof g.zoom === 'function' && g.zoom()) || state.zoomK || 1;
+      const next = Math.max(0.05, Math.min(8, (typeof cur === 'number' ? cur : state.zoomK) * factor));
+      g.zoom(next, 200);
+    } catch (err) { /* vendor stub */ }
+  }
+
+  function updateZoomPct(k) {
+    state.zoomK = (typeof k === 'number' && k > 0) ? k : state.zoomK;
+    const el = document.getElementById('zoomPct');
+    if (el) el.textContent = Math.round(state.zoomK * 100) + '%';
+  }
+
+  function applyLayoutForces() {
+    const chargeEl = document.getElementById('layoutCharge');
+    const distEl = document.getElementById('layoutDistance');
+    const charge = chargeEl ? Number(chargeEl.value) : -120;
+    const dist = distEl ? Number(distEl.value) : 60;
+    if (g && typeof g.d3Force === 'function') {
+      try {
+        const chargeForce = g.d3Force('charge');
+        if (chargeForce && typeof chargeForce.strength === 'function') chargeForce.strength(charge);
+        const linkForce = g.d3Force('link');
+        if (linkForce && typeof linkForce.distance === 'function') linkForce.distance(dist);
+      } catch (err) { /* vendor stub */ }
+    }
+    if (g && typeof g.d3ReheatSimulation === 'function') {
+      try { g.d3ReheatSimulation(); } catch (err) { /* vendor stub */ }
+    }
+  }
+
+  function applyNodeStyle() {
+    state.labelMode = (document.getElementById('labelMode') || {}).value || 'hover';
+    state.sizeMode = (document.getElementById('sizeMode') || {}).value || 'degree';
+    if (typeof opts.applyNodeStyle === 'function') {
+      opts.applyNodeStyle(state);
+      return;
+    }
+    if (g && typeof g.nodeVal === 'function') {
+      try {
+        if (state.sizeMode === 'constant') g.nodeVal(() => 1);
+        else g.nodeVal(n => n.val || 1);
+      } catch (err) { /* vendor stub */ }
+    }
+    if (g && typeof g.nodeLabel === 'function') {
+      try {
+        g.nodeLabel(n => (n.entry ? '★ ' : '') + (n.path || n.name || n.id));
+      } catch (err) { /* vendor stub */ }
+    }
+    if (g && typeof g.nodeCanvasObject === 'function') {
+      try {
+        if (state.labelMode === 'hover') {
+          g.nodeCanvasObject(null);
+        } else {
+          g.nodeCanvasObject((node, ctx, globalScale) => {
+            const selected = (typeof opts.getSelectedIds === 'function' ? opts.getSelectedIds() : null) || [];
+            const show = state.labelMode === 'always' || (state.labelMode === 'selected' && selected.indexOf(node.id) >= 0);
+            const r = Math.sqrt(Math.max(1, node.val || 1)) * 4;
+            ctx.beginPath();
+            ctx.arc(node.x, node.y, r, 0, 2 * Math.PI, false);
+            ctx.fillStyle = node.color || '#3d8bfd';
+            ctx.fill();
+            if (show) {
+              const label = node.name || node.id;
+              const fontSize = Math.max(10, 12 / globalScale);
+              ctx.font = fontSize + 'px Sans-Serif';
+              ctx.textAlign = 'center';
+              ctx.textBaseline = 'top';
+              ctx.fillStyle = '#e7ecf3';
+              ctx.fillText(label, node.x, node.y + r + 2);
+            }
+          });
+        }
+      } catch (err) { /* vendor stub */ }
+    }
+  }
+  window.__dcApplyNodeStyle = applyNodeStyle;
+
+  // Overlay chrome
+  let root = document.getElementById('canvasControls');
+  if (!root) {
+    root = document.createElement('div');
+    root.id = 'canvasControls';
+    elem.appendChild(root);
+  }
+  root.innerHTML = ''
+    + '<div class="ctrl-row">'
+    + '<button type="button" id="zoomOut" title="Zoom out (−)">−</button>'
+    + '<span class="zoom-pct" id="zoomPct">100%</span>'
+    + '<button type="button" id="zoomIn" title="Zoom in (+)">+</button>'
+    + '<button type="button" id="zoomFit" title="Fit (0)">Fit</button>'
+    + '<button type="button" id="zoomCenter" title="Center">Center</button>'
+    + '</div>'
+    + '<div class="hint">Scroll to zoom · drag background to pan · Esc clears focus</div>'
+    + '<details class="layout"><summary>Layout</summary>'
+    + '<label class="inline"><input type="checkbox" id="layoutPause"/> Pause simulation</label>'
+    + '<label>Charge</label><input type="range" id="layoutCharge" min="-400" max="-20" value="-120"/>'
+    + '<label>Link distance</label><input type="range" id="layoutDistance" min="20" max="200" value="60"/>'
+    + '<label>Labels</label><select id="labelMode"><option value="hover">hover</option><option value="always">always</option><option value="selected">selected</option></select>'
+    + '<label>Node size</label><select id="sizeMode"><option value="degree">degree</option><option value="constant">constant</option></select>'
+    + '</details>';
+
+  let legend = document.getElementById('canvasLegend');
+  if (!legend) {
+    legend = document.createElement('div');
+    legend.id = 'canvasLegend';
+    elem.appendChild(legend);
+  }
+  legend.innerHTML = opts.legendHtml || (
+    '<div class="leg-row"><span class="swatch edge-imports"></span> imports / links</div>'
+    + '<div class="leg-row"><span class="swatch edge-calls"></span> calls</div>'
+    + '<div class="leg-row"><span class="swatch entry"></span> entry</div>'
+    + '<div class="leg-row"><span class="swatch dead"></span> dead / unwired</div>'
+  );
+
+  document.getElementById('zoomIn').addEventListener('click', () => bumpZoom(1.25));
+  document.getElementById('zoomOut').addEventListener('click', () => bumpZoom(0.8));
+  document.getElementById('zoomFit').addEventListener('click', () => fitView());
+  document.getElementById('zoomCenter').addEventListener('click', () => centerView());
+  document.getElementById('layoutPause').addEventListener('change', (ev) => {
+    state.paused = !!ev.target.checked;
+    try {
+      if (state.paused && typeof g.pauseAnimation === 'function') g.pauseAnimation();
+      else if (!state.paused && typeof g.resumeAnimation === 'function') g.resumeAnimation();
+    } catch (err) { /* vendor stub */ }
+  });
+  ['layoutCharge', 'layoutDistance'].forEach(id => {
+    document.getElementById(id).addEventListener('input', applyLayoutForces);
+  });
+  ['labelMode', 'sizeMode'].forEach(id => {
+    document.getElementById(id).addEventListener('change', applyNodeStyle);
+  });
+
+  if (typeof g.onZoom === 'function') {
+    try {
+      g.onZoom(z => {
+        const k = z && typeof z.k === 'number' ? z.k : (typeof z === 'number' ? z : null);
+        if (k != null) updateZoomPct(k);
+      });
+    } catch (err) { /* vendor stub */ }
+  }
+  if (typeof g.onEngineStop === 'function') {
+    try {
+      g.onEngineStop(() => {
+        if (!state.initialFitDone) {
+          state.initialFitDone = true;
+          fitView();
+        }
+      });
+    } catch (err) { /* vendor stub */ }
+  }
+  if (typeof g.enableZoomInteraction === 'function') {
+    try { g.enableZoomInteraction(true); } catch (err) { /* vendor stub */ }
+  }
+  if (typeof g.enablePanInteraction === 'function') {
+    try { g.enablePanInteraction(true); } catch (err) { /* vendor stub */ }
+  }
+  if (typeof g.cooldownTicks === 'function') {
+    try { g.cooldownTicks(80); } catch (err) { /* vendor stub */ }
+  }
+
+  document.addEventListener('keydown', (ev) => {
+    if (isTypingTarget(ev.target)) return;
+    if (ev.key === '+' || ev.key === '=') { ev.preventDefault(); bumpZoom(1.25); }
+    else if (ev.key === '-' || ev.key === '_') { ev.preventDefault(); bumpZoom(0.8); }
+    else if (ev.key === '0') { ev.preventDefault(); fitView(); }
+    else if (ev.key === 'Escape') {
+      if (typeof opts.onEscape === 'function') opts.onEscape();
+    }
+  });
+
+  applyNodeStyle();
+})();
+"""
 
 
 def _conf_val(obj: Any) -> str:
@@ -297,7 +546,7 @@ def render_graph_html(
     raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     raw = raw.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     vendor = _vendor_js()
-    return f"""<!DOCTYPE html>
+    html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
@@ -331,6 +580,7 @@ label.inline input {{ width:auto; margin:0; }}
 .muted {{ color:var(--muted); }}
 .row {{ display:flex; gap:6px; }}
 .row > * {{ flex:1; }}
+/*__CANVAS_CONTROLS_CSS__*/
 </style>
 </head>
 <body>
@@ -592,6 +842,17 @@ const g = Graph(elem)
     redraw();
   }});
 
+window.__dcCanvasOpts = {{
+  getSelectedIds: () => selected.slice(),
+  onEscape: () => {{
+    selected = [];
+    pathHighlight = new Set();
+    expandIds = null;
+    redraw();
+  }}
+}};
+/*__CANVAS_CONTROLS_JS__*/
+
 function updateCounts(fd) {{
  const totalNodes = (activePayload().nodes || []).length;
  const totalEdges = (activePayload().links || []).length;
@@ -614,6 +875,7 @@ function redraw() {{
  g.graphData(fd);
  g.nodeAutoColorBy(n => colorKey(n));
  g.width(elem.clientWidth).height(elem.clientHeight);
+ if (typeof window.__dcApplyNodeStyle === 'function') window.__dcApplyNodeStyle();
  updateCounts(fd);
 }}
 
@@ -766,6 +1028,10 @@ renderIntel();
 </body>
 </html>
 """
+    return (
+        html.replace("/*__CANVAS_CONTROLS_CSS__*/", _canvas_controls_css())
+        .replace("/*__CANVAS_CONTROLS_JS__*/", _canvas_controls_js())
+    )
 
 
 def write_graph_html(

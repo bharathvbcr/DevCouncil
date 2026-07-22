@@ -184,11 +184,30 @@ def semantic_search(
         logger.warning("semantic search failed: %s", exc)
         return {"ok": False, "reason": f"embeddings store error: {exc}", "matches": []}
     matches.sort(key=lambda item: item["score"], reverse=True)
-    return {
+    truncated = scanned > max_scan
+    payload: Dict[str, Any] = {
         "ok": True,
         "matches": matches[: max(1, limit)],
         "scanned": scanned,
-        "truncated": scanned > max_scan,
+        "truncated": truncated,
         "generation": generation,
         "backend": "hash-v1",
     }
+    if truncated:
+        from devcouncil.indexing.graph.communities import (
+            embedding_scan_limit,
+            store_health_from_state,
+        )
+
+        store_state = "committed"
+        try:
+            from devcouncil.codeintel import get_codeintel_service
+
+            store_state = str(get_codeintel_service(project_root).status().get("state") or "")
+        except Exception:
+            pass
+        payload["limit"] = embedding_scan_limit(
+            canonical_store_health=store_health_from_state(store_state),
+            reason=f"embedding_scan_capped_at_{max_scan}",
+        ).as_dict()
+    return payload

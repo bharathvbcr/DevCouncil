@@ -120,9 +120,9 @@ def test_graph_doctor_cypher_explore_affected_corpus(tmp_path, monkeypatch):
             "action": "",
         },
     )
-    ok = runner.invoke(app, ["graph", "doctor", "--json", "--project-root", str(tmp_path)])
+    ok = runner.invoke(app, ["map", "doctor", "--json", "--project-root", str(tmp_path)])
     assert ok.exit_code == 0
-    human = runner.invoke(app, ["graph", "doctor", "--project-root", str(tmp_path)])
+    human = runner.invoke(app, ["map", "doctor", "--project-root", str(tmp_path)])
     assert human.exit_code == 0
 
     monkeypatch.setattr(
@@ -130,12 +130,12 @@ def test_graph_doctor_cypher_explore_affected_corpus(tmp_path, monkeypatch):
         lambda root, query: {"ok": True, "rows": [{"n": "a"}]},
     )
     cy = runner.invoke(
-        app, ["graph", "cypher", "MATCH (n) RETURN n", "--project-root", str(tmp_path)]
+        app, ["map", "cypher", "MATCH (n) RETURN n", "--project-root", str(tmp_path)]
     )
     assert cy.exit_code == 0
     cy_json = runner.invoke(
         app,
-        ["graph", "cypher", "MATCH (n) RETURN n", "--json", "--project-root", str(tmp_path)],
+        ["map", "cypher", "MATCH (n) RETURN n", "--json", "--project-root", str(tmp_path)],
     )
     assert cy_json.exit_code == 0
     monkeypatch.setattr(
@@ -144,7 +144,7 @@ def test_graph_doctor_cypher_explore_affected_corpus(tmp_path, monkeypatch):
     )
     assert (
         runner.invoke(
-            app, ["graph", "cypher", "X", "--project-root", str(tmp_path)]
+            app, ["map", "cypher", "X", "--project-root", str(tmp_path)]
         ).exit_code
         == 1
     )
@@ -171,10 +171,10 @@ def test_graph_doctor_cypher_explore_affected_corpus(tmp_path, monkeypatch):
             return {"tests": ["tests/test_a.py"]}
 
     monkeypatch.setattr("devcouncil.codeintel.query.CodeIntelQueryEngine", _Engine)
-    ex = runner.invoke(app, ["graph", "explore", "f", "--project-root", str(tmp_path)])
+    ex = runner.invoke(app, ["map", "explore", "f", "--project-root", str(tmp_path)])
     assert ex.exit_code == 0
     aff = runner.invoke(
-        app, ["graph", "affected", "a.f", "--project-root", str(tmp_path)]
+        app, ["map", "affected", "a.f", "--project-root", str(tmp_path)]
     )
     assert aff.exit_code == 0
     monkeypatch.setattr(
@@ -188,7 +188,7 @@ def test_graph_doctor_cypher_explore_affected_corpus(tmp_path, monkeypatch):
 
     monkeypatch.setattr("devcouncil.codeintel.query.CodeIntelQueryEngine", _Empty)
     empty = runner.invoke(
-        app, ["graph", "affected", "a.f", "--project-root", str(tmp_path)]
+        app, ["map", "affected", "a.f", "--project-root", str(tmp_path)]
     )
     assert "No affected" in empty.output
 
@@ -256,7 +256,7 @@ def test_graph_explain_pdg_query(tmp_path, monkeypatch):
         },
     )
     assert (
-        runner.invoke(app, ["graph", "explain", "--project-root", str(tmp_path)]).exit_code
+        runner.invoke(app, ["map", "explain", "--project-root", str(tmp_path)]).exit_code
         == 0
     )
     monkeypatch.setattr(
@@ -264,7 +264,7 @@ def test_graph_explain_pdg_query(tmp_path, monkeypatch):
         lambda *a, **k: {"ok": True, "findings": []},
     )
     assert "No taint" in runner.invoke(
-        app, ["graph", "explain", "--project-root", str(tmp_path)]
+        app, ["map", "explain", "--project-root", str(tmp_path)]
     ).output
 
     monkeypatch.setattr(
@@ -277,7 +277,7 @@ def test_graph_explain_pdg_query(tmp_path, monkeypatch):
     pq = runner.invoke(
         app,
         [
-            "graph",
+            "map",
             "pdg-query",
             "--mode",
             "controls",
@@ -291,7 +291,7 @@ def test_graph_explain_pdg_query(tmp_path, monkeypatch):
     bad = runner.invoke(
         app,
         [
-            "graph",
+            "map",
             "pdg-query",
             "--mode",
             "nope",
@@ -319,7 +319,7 @@ def test_graph_explain_pdg_query(tmp_path, monkeypatch):
     graph = SimpleNamespace(meta={"pdg": {"stats": {"function_count": 1, "taint_count": 0, "file_count": 1}}})
     monkeypatch.setattr(graph_build, "load_code_graph", lambda root: graph)
     pb = runner.invoke(
-        app, ["graph", "pdg", "build", "--json", "--project-root", str(tmp_path)]
+        app, ["map", "pdg", "build", "--json", "--project-root", str(tmp_path)]
     )
     assert pb.exit_code == 0
 
@@ -352,7 +352,7 @@ def test_graph_pdg_build_survives_oversized_compatibility_export(tmp_path, monke
     )
     monkeypatch.setattr(graph_build, "load_code_graph", lambda root: graph)
     result = runner.invoke(
-        app, ["graph", "pdg", "build", "--json", "--project-root", str(tmp_path)]
+        app, ["map", "pdg", "build", "--json", "--project-root", str(tmp_path)]
     )
     assert result.exit_code == 0
     payload = json.loads(result.output)
@@ -379,12 +379,12 @@ def test_graph_status_json_and_hooks_refuse(tmp_path, monkeypatch):
             )
         ),
     )
-    js = runner.invoke(app, ["graph", "status", "--json", "--project-root", str(tmp_path)])
+    js = runner.invoke(app, ["map", "status", "--json", "--project-root", str(tmp_path)])
     assert js.exit_code == 0
 
     # no .git
     no_git = runner.invoke(
-        app, ["graph", "hooks", "install", "--project-root", str(tmp_path)]
+        app, ["map", "hooks", "install", "--project-root", str(tmp_path)]
     )
     assert no_git.exit_code == 1
 
@@ -393,7 +393,7 @@ def test_graph_status_json_and_hooks_refuse(tmp_path, monkeypatch):
     existing = git / "post-checkout"
     existing.write_text("#!/bin/sh\necho other\n", encoding="utf-8")
     refuse = runner.invoke(
-        app, ["graph", "hooks", "install", "--project-root", str(tmp_path)]
+        app, ["map", "hooks", "install", "--project-root", str(tmp_path)]
     )
     assert refuse.exit_code == 1
 

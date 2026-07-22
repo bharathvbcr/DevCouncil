@@ -6,38 +6,73 @@ DevCouncil builds a deterministic repository map and a symbol-level knowledge gr
   <img src="graph_preview.png" alt="Code Graph Preview" width="600">
 </p>
 
+
+## CLI umbrella
+
+All map and graph operations live under **`dev map`**. `dev graph …` is a compatibility alias for the same command group.
+
+| Prefer | Alias (same behavior) |
+| :--- | :--- |
+| `dev map` | — (build repo map + code graph) |
+| `dev map query` / `trace` / `dead` / … | `dev graph query` / `trace` / `dead` / … |
+| `dev map ingest` / `init` / `sync` / `watch` / `doctor` | `dev graph ingest` / … |
+| `dev map demo` / `view` / `export` / `search` / `cypher` | `dev graph demo` / … |
+| `dev map graph-html` or `dev map html --symbols` | `dev graph html` |
+| `dev map html` | subsystem map only (no graph alias) |
+| `dev map pdg build` / `explain` / `pdg-query` | `dev graph pdg build` / … |
+
+**HTML split:** `dev map html` writes the subsystem map (`.devcouncil/map.html`). Symbol-level graph HTML is `dev map graph-html`, `dev map html --symbols`, or alias `dev graph html` (`.devcouncil/graph/graph.html`).
+
 ## Artifacts
 
 | Path | Role |
 | :--- | :--- |
 | `.devcouncil/repo_map.json` | File inventory, subsystems, entry roots, unwired/unreachable/dead-symbol candidate lists, reverse-import dependents |
-| `.devcouncil/graph/code_graph.json` | Compact compatibility export of symbol nodes + edges (imports, named imports, calls, inherits, contains) and tiered `dead_code`. **SQLite is canonical**; this JSON is a size-sensitive export (`indexing.compact_graph_json`, default on; 128 MiB default limit). Oversized graphs fall back through slim → compact → stub tiers so a pointer JSON is still written; prefer SQLite-backed `dev graph` commands when the stub tier is used. |
+| `.devcouncil/graph/code_graph.json` | Compact compatibility export of symbol nodes + edges (imports, named imports, calls, inherits, contains) and tiered `dead_code`. **SQLite is canonical**; this JSON is a size-sensitive export (`indexing.compact_graph_json`, default on; 128 MiB default limit). Oversized graphs fall back through slim → compact → stub tiers so a pointer JSON is still written; prefer SQLite-backed `dev map` commands when the stub tier is used. |
 | `.devcouncil/codeintel/index.sqlite` | Canonical WAL-mode graph, source cache, FTS, generations, unresolved references, diagnostics, and fingerprinted runtime observations |
-| `.devcouncil/graph/graph.html` | Self-contained interactive visualizer (`dev graph html`; **not** written by default on `dev map`) |
+| `.devcouncil/graph/graph.html` | Self-contained interactive visualizer (`dev map graph-html` / `dev map html --symbols` / alias `dev graph html`; **not** written by default on bare `dev map`) |
+| `.devcouncil/map.html` | Self-contained subsystem map visualizer (`dev map html`; slim payload — no `files[]` / `dependents{}`) |
+| `.devcouncil/graph/demo.html` | Sample self-contained interactive UI from `dev map demo` (no map required; primary demo artifact) |
+| `.devcouncil/graph/demo.svg` | Optional static companion written by `dev map demo` (not the interactive UI) |
 | `AGENTS.md` / `CLAUDE.md` | Marker-guarded workspace guides kept in sync with the map |
 
 ## Build / refresh
 
 ```bash
 dev map                     # Full rebuild (liveness on by default)
+dev map --goal "…"          # Optional goal text for candidate-file ranking (was positional)
 dev map --if-stale          # No-op when fingerprints still match
 dev map --no-liveness       # Skip entry/unwired/unreachable/dead lists
 dev map --lsp-refs          # Confirm dead symbols via live LSP references
 dev map --wiki / --no-wiki  # Refresh codebase-wiki skeletons after map (on by default)
 dev map --scan-deps         # Opt-in SCA (pip-audit / npm audit / osv-scanner) → dependency_risks
-dev map --watch             # Debounced incremental refresh on edits
-dev graph init              # Build canonical SQLite + compatibility exports
-dev graph ingest            # Unified analyze: codeintel sync → graph export → repo map write
-dev graph ingest src/foo    # Path-scoped ingest (full reconcile when paths omitted)
-dev graph status            # Generation, pending paths, watcher/degraded state
-dev graph sync              # Reconcile and commit now
-dev graph watch             # Native FSEvents/inotify/ReadDirectoryChangesW foreground watcher
-dev graph doctor            # SQLite, watcher, and offline grammar verification
+dev map --watch             # Debounced incremental refresh on edits (same as `dev map watch`)
+dev map html                # Write interactive .devcouncil/map.html (subsystems)
+dev map html --open         # Write and open the subsystem map
+dev map graph-html          # Write symbol-level .devcouncil/graph/graph.html
+dev map html --symbols      # Same as graph-html
+dev map init                # Build canonical SQLite + compatibility exports
+dev map ingest              # Unified analyze: codeintel sync → graph export → repo map write
+dev map ingest src/foo      # Path-scoped ingest (full reconcile when paths omitted)
+dev map status              # Generation, pending paths, watcher/degraded state
+dev map sync                # Reconcile and commit now
+dev map watch               # Native FSEvents/inotify/ReadDirectoryChangesW foreground watcher
+dev map doctor              # SQLite, watcher, and offline grammar verification
 ```
 
-Freshness uses git HEAD, a tracked-file hash, and a content fingerprint so plain edits mark the map stale. Fingerprint / git errors fail closed (treat as stale). A **missing** `.devcouncil/repo_map.json` is also stale — hard rigor blocks checkout/verify until `dev map` or `dev graph ingest` runs. Post-tool-use hooks and `dev map --watch` refresh incrementally; incremental extract still verifies parse-cache sha256 so a concurrent edit to an unlisted path cannot stamp a fresh fingerprint over stale symbols.
+Freshness uses git HEAD, a tracked-file hash, and a content fingerprint so plain edits mark the map stale. Fingerprint / git errors fail closed (treat as stale). A **missing** `.devcouncil/repo_map.json` is also stale — hard rigor blocks checkout/verify until `dev map` or `dev map ingest` runs. Post-tool-use hooks and `dev map --watch` refresh incrementally; incremental extract still verifies parse-cache sha256 so a concurrent edit to an unlisted path cannot stamp a fresh fingerprint over stale symbols.
 
-HTML visualizer: set `indexing.write_graph_html: true` in config if you want `dev map` to also write `graph.html`. Otherwise use `dev graph html` / `dev graph view` explicitly.
+HTML visualizers: set `indexing.write_graph_html: true` in config if you want bare `dev map` to also write `graph.html`. Otherwise use `dev map graph-html` / `dev map view` (or alias `dev graph html`) for the file/symbol graph, and `dev map html` for the subsystem map.
+
+## Sample graph demo (no map)
+
+```bash
+dev map demo --project-root /tmp/devcouncil-docs-smoke --json
+# Open /tmp/devcouncil-docs-smoke/.devcouncil/graph/demo.html
+# Alias: `dev graph demo` (same command group)
+```
+
+`dev map demo` writes a **self-contained interactive HTML** page with a synthetic import graph. Open `demo.html` for filters, path highlighting, and neighborhoods. A static `demo.svg` may also be written; it is not a substitute for the interactive page. Supported platforms for the CLI and npm wrapper: macOS, Linux, and Windows (Node.js 18+, Python 3.12+, Git).
 
 ## PDG / CFG / taint (opt-in)
 
@@ -59,10 +94,10 @@ Program-dependence analysis is **off by default** and does not run during normal
 
 ```bash
 dev map --pdg                                    # map + PDG in one shot
-dev graph pdg build --path src/foo/bar.py        # on-demand for paths
-dev graph explain --category command-injection
-dev graph pdg-query --mode controls --target my_fn
-dev graph pdg-query --mode flows --target my_fn --variable x
+dev map pdg build --path src/foo/bar.py          # on-demand for paths
+dev map explain --category command-injection
+dev map pdg-query --mode controls --target my_fn
+dev map pdg-query --mode flows --target my_fn --variable x
 ```
 
 **Limitations (MVP)**
@@ -77,34 +112,35 @@ dev graph pdg-query --mode flows --target my_fn --variable x
 ## Query the graph
 
 ```bash
-dev graph query build_code_graph   # definition + callers/callees/importers
-dev graph trace path/a.py path/b.py
-dev graph dead                     # full dead-code report (uncapped)
-dev graph dead --min-confidence inferred
-dev graph check                    # god nodes + circular imports
-dev graph process                  # BFS call-flows from entry roots
-dev graph impact src/foo.py        # blast radius
-dev graph impact --diff            # blast radius for working-tree changes
+dev map query build_code_graph     # definition + callers/callees/importers
+dev map trace path/a.py path/b.py
+dev map dead                       # full dead-code report (uncapped)
+dev map dead --min-confidence inferred
+dev map check                      # god nodes + circular imports
+dev map process                    # BFS call-flows from entry roots
+dev map impact src/foo.py          # blast radius
+dev map impact --diff              # blast radius for working-tree changes
 ```
 
-`dev graph check` / `process` / `impact` (and PageRank inside god-node ranking) follow **extracted** and **inferred** import/call edges only. Ambiguous call fan-out stays in the store for explanation UIs but does not invent hubs or inflate blast radius.
+`dev map check` / `process` / `impact` (and PageRank inside god-node ranking) follow **extracted** and **inferred** import/call edges only. Ambiguous call fan-out stays in the store for explanation UIs but does not invent hubs or inflate blast radius.
 
 ```bash
-dev graph html                     # write graph.html
-dev graph view                     # serve/open the HTML
-dev graph export -o out.graphml    # GraphML (or --format okf)
-dev graph search request_handler   # FTS5 symbol/path search
-dev graph search "auth flow" --semantic  # Opt-in local embeddings (indexing.embeddings.enabled)
-dev graph cypher 'MATCH (a)-[r:CALLS]->(b) RETURN a.id, b.id LIMIT 20'
-dev graph explore request_handler  # source + semantic paths + blast radius
-dev graph affected src/foo.py      # tests in the inbound impact closure
+dev map graph-html                 # write symbol graph.html
+dev map html --symbols             # same as graph-html
+dev map view                       # serve/open the HTML
+dev map export -o out.graphml      # GraphML (or --format okf)
+dev map search request_handler     # FTS5 symbol/path search
+dev map search "auth flow" --semantic  # Opt-in local embeddings (indexing.embeddings.enabled)
+dev map cypher 'MATCH (a)-[r:CALLS]->(b) RETURN a.id, b.id LIMIT 20'
+dev map explore request_handler    # source + semantic paths + blast radius
+dev map affected src/foo.py        # tests in the inbound impact closure
 ```
 
 ## Transactional code intelligence
 
 SQLite is canonical; graph v2 JSON remains a deterministic compatibility export. A refresh writes a complete generation in one transaction and advances the current-generation pointer only after every file, node, edge, liveness record, and FTS row is committed. Readers therefore see the complete previous or complete next graph. The store retains two committed generations for rollback/debugging and caches compressed source and extraction facts by content, grammar, analyzer, and configuration hashes.
 
-MCP starts one project watcher for its server lifespan. Queries wait up to two seconds for a pending batch without blocking the async server; if syncing cannot finish, responses retain the last committed generation and identify pending/degraded state. Full builds run in a supervised child that **acquires the per-project writer lease itself**; the parent releases any held lease while supervising so an orphaned worker still serializes against watchers/MCP writers. Lease acquisition uses bounded exponential backoff (`code_intelligence.writer_lease_timeout_seconds`, default 30s for builds / re-acquire; `writer_lease_sync_timeout_seconds`, default 5s for watch `sync_now`) so multi-watcher contention does not stamp lean/degraded maps over a healthy SQLite generation. After the child commits, the parent reloads the graph under the re-acquired lease. The parent terminates a build after 90 seconds without progress or 15 minutes total, preserving the last committed generation. `dev graph status` / `dev graph doctor` expose phase, progress, worker PID, and compatibility-export health (missing/drift/degraded/corrupt). External edits to `code_graph.json` do **not** clobber SQLite — the store wins unless the store is empty. `dev graph watch` and `dev map --watch` both refresh graph **and** rebuild `repo_map.json` subsystems/dependents.
+MCP starts one project watcher for its server lifespan. Queries wait up to two seconds for a pending batch without blocking the async server; if syncing cannot finish, responses retain the last committed generation and identify pending/degraded state. Full builds run in a supervised child that **acquires the per-project writer lease itself**; the parent releases any held lease while supervising so an orphaned worker still serializes against watchers/MCP writers. Lease acquisition uses bounded exponential backoff (`code_intelligence.writer_lease_timeout_seconds`, default 30s for builds / re-acquire; `writer_lease_sync_timeout_seconds`, default 5s for watch `sync_now`) so multi-watcher contention does not stamp lean/degraded maps over a healthy SQLite generation. After the child commits, the parent reloads the graph under the re-acquired lease. The parent terminates a build after 90 seconds without progress or 15 minutes total, preserving the last committed generation. `dev map status` / `dev map doctor` expose phase, progress, worker PID, and compatibility-export health (missing/drift/degraded/corrupt). External edits to `code_graph.json` do **not** clobber SQLite — the store wins unless the store is empty. `dev map watch` and `dev map --watch` both refresh graph **and** rebuild `repo_map.json` subsystems/dependents.
 
 Incremental sync is deliberately conservative. Body-only edits with an unchanged declaration/import resolution surface replace the affected closure in-process. Creates, deletes, renames, or changes to symbols, bases, decorators, exports, imports, re-exports, or aliases trigger a full resolve from warm extraction caches. Persisted analysis shards are pruned to the current non-vendored code-file set before either path. Configure the boundaries with `indexing.build_isolation: hybrid`, `indexing.build_stall_timeout_seconds`, `indexing.build_total_timeout_seconds`, and `indexing.graph_json_max_bytes`.
 
@@ -114,7 +150,7 @@ prefetches the required grammars into a cached build directory, builds the wheel
 verifies every checksum, parses one fixture per grammar plus embedded Svelte/Vue/Astro/Liquid
 regions in an isolated environment, and uploads the artifact. Dispatch release builds may
 add an OIDC Sigstore signature. Runtime analysis never downloads grammars silently: the
-installed companion is activated once before parser workers start. `dev graph doctor`
+installed companion is activated once before parser workers start. `dev map doctor`
 reports `35/35` when the wheel is complete, otherwise it lists missing primary and embedded
 grammars and tells the user to install the matching platform wheel.
 
@@ -153,18 +189,18 @@ may resolve a target, but multiple candidates remain ambiguous. Liveness follows
 registration owner through the registration node to its target; a registration inside a
 dead setup function does not make a route, provider, or observer callback live.
 
-Prefer `dev graph dead --confidence extracted` plus file greps before deleting anything.
+Prefer `dev map dead --confidence extracted` plus file greps before deleting anything.
 Treat `inferred` as **unconfirmed**. If `entry_roots` are empty or
 `liveness_unreachable_unreliable` is set, **ignore** `unreachable_files` and mass inferred dead.
 
 `dev map` stores a **capped** (5000) `dead_symbol_candidates` list for agents:
-**extracted ∩ token-scan** (methods excluded). `dev graph dead` reports the **uncapped**
+**extracted ∩ token-scan** (methods excluded). `dev map dead` reports the **uncapped**
 graph tiers with reasons. Prefer reviewing `ambiguous` before deleting anything. If graph
 assemble fails, the map omits dead-symbol candidates rather than falling back to a token-only flood.
 
 Map liveness lists (`unwired_candidates`, `unreachable_files`, `dead_symbol_candidates`) are
 capped at **5000** each; `dependents[path]` is capped at **256** per file. When a list hits
-its cap, metadata records `*_truncated` plus totals — use `dev graph dead` for uncapped tiers.
+its cap, metadata records `*_truncated` plus totals — use `dev map dead` for uncapped tiers.
 
 ## Liveness lists on the map
 
@@ -186,10 +222,10 @@ Verification can also enforce wiring / stale-map / dead-symbol / liveness-ratche
 
 1. Open `.devcouncil/repo_map.json` before guessing file locations.
 2. Use `subsystems` → `entry_points` / `critical_files` / `role_files` / `neighbors`.
-3. Prefer `dev graph dead --confidence extracted` + greps; treat inferred as unconfirmed.
+3. Prefer `dev map dead --confidence extracted` + greps; treat inferred as unconfirmed.
    If entry roots are empty / unreliable, ignore unreachable and mass inferred dead.
    Check `unwired_candidates` / `dead_symbol_candidates` before adding modules.
-4. Use `dev graph query` / `trace` / `dead` for symbol-level navigation.
+4. Use `dev map query` / `trace` / `dead` for symbol-level navigation.
 5. Run `dev map` after large refactors (or rely on hooks / `--watch`).
 
 ## API route mapping
@@ -198,10 +234,10 @@ Native HTTP surface tools over `ROUTE` nodes and `routes_to` /
 `registers` edges (no external graph service):
 
 ```bash
-dev graph routes --json
-dev graph shape-check --json
-dev graph shape-check --route /api/items --json
-dev graph api-impact /api/items --json
+dev map routes --json
+dev map shape-check --json
+dev map shape-check --route /api/items --json
+dev map api-impact /api/items --json
 ```
 
 - **`routes`** — handlers, registration owners, and client fetch sites

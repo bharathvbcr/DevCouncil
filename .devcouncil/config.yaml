@@ -1,13 +1,41 @@
 execution:
-  default_executor: claude
-  # The full unit suite takes ~20 min on CI runners; the 900s default
-  # times out the evidence gate's --test command.
   command_timeout: 2400
+  default_executor: claude
   enforce_file_scope_pre_verify: true
+  hook_gate:
+    mode: "off"
   stop_gate:
-    mode: assist
     check_claims: true
+    mode: assist
     verify_active_task: true
+integrations:
+  antigravity:
+    enabled: true
+    mcp_config_path: .agents/mcp_config.json
+  claude:
+    enabled: true
+    scope: local
+    settings_path: .claude/settings.local.json
+    write_gate: false
+  cursor:
+    config_path: .cursor/mcp.json
+    enabled: true
+    hooks_path: .cursor/hooks.json
+    rules_path: .cursor/rules/devcouncil.mdc
+    skills_path: .cursor/skills
+    write_gate: false
+  grok:
+    config_path: .grok/config.toml
+    enabled: true
+    hooks_path: .grok/hooks/devcouncil.json
+  opencode:
+    config_path: opencode.json
+    enabled: false
+  warp:
+    command: oz
+    enabled: true
+    mcp_config_path: .devcouncil/integrations/warp-mcp.json
+    run_mode: local
 models:
   provider: openrouter
   roles:
@@ -50,28 +78,3 @@ verification:
     min_added_lines_per_planned_file: 5
     reviewer_required_on_hard: false
     stub_detection: hard
-integrations:
-  claude:
-    enabled: true
-    scope: local
-    write_gate: true
-    settings_path: .claude/settings.local.json
-  cursor:
-    enabled: true
-    config_path: .cursor/mcp.json
-    hooks_path: .cursor/hooks.json
-  grok:
-    enabled: true
-    config_path: .grok/config.toml
-    hooks_path: .grok/hooks/devcouncil.json
-  opencode:
-    enabled: false
-    config_path: opencode.json
-  antigravity:
-    enabled: true
-    mcp_config_path: .agents/mcp_config.json
-  warp:
-    enabled: true
-    command: oz
-    run_mode: local
-    mcp_config_path: .devcouncil/integrations/warp-mcp.json

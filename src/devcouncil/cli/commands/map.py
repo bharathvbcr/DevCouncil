@@ -19,6 +19,12 @@ from devcouncil.utils.json_persist import dump_json
 # Back-compat aliases for tests / external importers.
 _write_agent_guides = write_agent_guides
 
+app = typer.Typer(
+    help=(
+        "Build the repository map, query the code graph, and related HTML visualizers. "
+        "`dev graph` is a compatibility alias for this command group."
+    ),
+)
 console = Console()
 status_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
@@ -40,7 +46,7 @@ def _liveness_summary(repo_map: RepoMap) -> str | None:
         print(
             "warning: unreachable_files low-confidence "
             "(liveness_unreachable_unreliable); prefer unwired_candidates / "
-            "dead_symbol_candidates and `dev graph dead --confidence extracted`",
+            "dead_symbol_candidates and `dev map dead --confidence extracted`",
             file=sys.stderr,
         )
     samples = repo_map.unwired_candidates[:3] + repo_map.dead_symbol_candidates[:2]
@@ -60,8 +66,14 @@ def _liveness_summary(repo_map: RepoMap) -> str | None:
     )
 
 
+@app.callback(invoke_without_command=True)
 def map_repo(
-    goal: str = typer.Argument("", help="Goal text used for candidate-file ranking."),
+    ctx: typer.Context,
+    goal: str = typer.Option(
+        "",
+        "--goal",
+        help="Goal text used for candidate-file ranking (was a positional argument).",
+    ),
     output: Path = typer.Option(
         Path(".devcouncil/repo_map.json"),
         "--output",
@@ -109,19 +121,30 @@ def map_repo(
     ),
 ):
     """Build the deterministic repository map without calling an LLM."""
+    import sys
+
+    if ctx.info_name == "graph":
+        # TTY-only so `dev graph ... --json` stays machine-parseable under CliRunner
+        # (which mixes stderr into `.output` by default).
+        if sys.stderr.isatty():
+            print(
+                "note: `dev graph` is a compatibility alias; prefer `dev map ...`",
+                file=sys.stderr,
+            )
+    if ctx.invoked_subcommand is not None:
+        return
     root = project_root.expanduser().resolve()
     # Reject missing roots before set_log_dir / initialize_project mkdir(parents=True)
     # silently creates an empty project and maps zero files with exit 0.
     if not root.is_dir():
         status_console.print(f"[red]Project root does not exist: {root}[/red]")
         raise typer.Exit(code=1)
-    # `dev map /some/repo` parses the path as the GOAL and maps the CWD repo with
-    # exit 0 — surface the likely intent instead of silently mapping the wrong repo.
+    # `dev map --goal /some/repo` with default project_root still maps CWD — surface intent.
     if goal and project_root == Path("."):
         goal_path = Path(goal).expanduser()
         if goal_path.is_absolute() and goal_path.is_dir() and goal_path.resolve() != root:
             status_console.print(
-                f"[yellow]Goal argument is a directory ({goal}). Did you mean "
+                f"[yellow]Goal option is a directory ({goal}). Did you mean "
                 f"`dev map --project-root {goal}`? Mapping {root} with it as goal text.[/yellow]"
             )
     from devcouncil.telemetry.logging_setup import set_log_dir
@@ -216,7 +239,7 @@ def map_repo(
             else:
                 status_console.print(
                     f"[yellow]Code graph JSON missing and store re-export failed ({graph_out}); "
-                    "run `dev graph doctor`[/yellow]"
+                    "run `dev map doctor`[/yellow]"
                 )
         if graph_out.is_file():
             status_console.print(f"[green]Wrote code graph to {graph_out}[/green]")
@@ -269,6 +292,42 @@ def map_repo(
         log_step("map/complete", project_root=root, trace=True)
         if watch:
             _watch_map(root, liveness=liveness)
+
+
+@app.command("html")
+def map_html(
+    ctx: typer.Context,
+    project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
+    open_browser: bool = typer.Option(False, "--open", help="Open in the default browser."),
+    symbols: bool = typer.Option(
+        False,
+        "--symbols",
+        help=(
+            "Write the symbol-level graph visualizer instead of the subsystem map "
+            "(same as `dev map graph-html`). `dev graph html` always uses that visualizer."
+        ),
+    ),
+) -> None:
+    """Subsystem map HTML (`dev map html`) or symbol graph (`dev graph html` / `--symbols`)."""
+    parent = (ctx.parent.info_name if ctx.parent else "") or ""
+    if parent == "graph" or symbols:
+        from devcouncil.cli.commands.graph_cmd import graph_html
+
+        graph_html(
+            project_root=project_root,
+            open_browser=open_browser,
+            symbols=symbols,
+        )
+        return
+    from devcouncil.indexing.map_viz import write_map_html
+
+    root = project_root.expanduser().resolve()
+    try:
+        out = write_map_html(root, open_browser=open_browser)
+    except FileNotFoundError as exc:
+        status_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    status_console.print(f"[green]Wrote {out}[/green]")
 
 
 def graph_context_cmd(
@@ -325,31 +384,72 @@ def _refresh_wiki_skeletons(root: Path, repo_map: RepoMap) -> None:
 
 def _watch_map(root: Path, *, liveness: bool = True) -> None:
     """Run the shared code-intelligence coordinator for map compatibility."""
-    import time
+    from devcouncil.cli.commands.graph_cmd import run_foreground_watch
 
-    from devcouncil.codeintel.sync import get_sync_coordinator
-    from devcouncil.indexing.graph.build import refresh_map_for_paths
+    run_foreground_watch(root, liveness=liveness, out=status_console)
 
-    coordinator = get_sync_coordinator(
-        root,
-        debounce_seconds=0.8,
-        sync_callback=lambda paths: refresh_map_for_paths(root, paths, liveness=liveness),
-    )
-    state = coordinator.start()
-    status_console.print(
-        f"[cyan]Watching {root} with {state.backend or 'reconciliation'} "
-        f"(state={state.state}, debounce 0.8s). Ctrl-C to stop.[/cyan]"
-    )
-    try:
-        while True:
-            time.sleep(0.8)
-            before = coordinator.status().pending
-            if before and not coordinator.sync_now():
-                failure = coordinator.status().last_error or coordinator.status().degraded_reason
-                status_console.print(f"[yellow]Watch refresh failed (ignored): {failure}[/yellow]")
-            elif before:
-                status_console.print(f"[green]Refreshed map for {len(before)} path(s)[/green]")
-    except KeyboardInterrupt:
-        status_console.print("Stopped watching.")
-    finally:
-        coordinator.stop(timeout=2)
+
+def _mount_graph_commands(target: typer.Typer) -> None:
+    """Attach the graph command tree onto the shared map Typer.
+
+    ``html`` stays the subsystem visualizer on this app; the symbol visualizer is
+    registered as ``graph-html``. When the same app is dual-mounted as ``graph``,
+    ``map_html`` dispatches to the symbol visualizer via ``ctx.parent.info_name``.
+    """
+    from typer.models import CommandInfo, DefaultPlaceholder
+
+    from devcouncil.cli.commands import graph_cmd
+
+    existing_cmds = {c.name for c in target.registered_commands if c.name}
+    existing_groups: set[str] = set()
+    for group in target.registered_groups:
+        name = None if isinstance(group.name, DefaultPlaceholder) else group.name
+        if name:
+            existing_groups.add(name)
+
+    for cmd in graph_cmd.app.registered_commands:
+        name = cmd.name
+        if not name:
+            continue
+        if name == "html":
+            if "graph-html" in existing_cmds:
+                continue
+            target.registered_commands.append(
+                CommandInfo(
+                    name="graph-html",
+                    cls=cmd.cls,
+                    context_settings=cmd.context_settings,
+                    callback=cmd.callback,
+                    help=(
+                        "Write interactive .devcouncil/graph/graph.html "
+                        "(symbol-level visualizer)."
+                    ),
+                    epilog=cmd.epilog,
+                    short_help=cmd.short_help,
+                    options_metavar=cmd.options_metavar,
+                    add_help_option=cmd.add_help_option,
+                    no_args_is_help=cmd.no_args_is_help,
+                    hidden=cmd.hidden,
+                    deprecated=cmd.deprecated,
+                    rich_help_panel=cmd.rich_help_panel,
+                )
+            )
+            existing_cmds.add("graph-html")
+            continue
+        if name in existing_cmds:
+            continue
+        target.registered_commands.append(cmd)
+        existing_cmds.add(name)
+
+    for group in graph_cmd.app.registered_groups:
+        gname = None if isinstance(group.name, DefaultPlaceholder) else group.name
+        ti = group.typer_instance
+        if isinstance(ti, DefaultPlaceholder) or ti is None or not gname:
+            continue
+        if gname in existing_groups:
+            continue
+        target.add_typer(ti, name=gname)
+        existing_groups.add(gname)
+
+
+_mount_graph_commands(app)

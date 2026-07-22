@@ -51,7 +51,7 @@ def test_cli_map_with_goal_and_output(tmp_path, monkeypatch):
     _setup_map_repo(tmp_path, monkeypatch)
     
     custom_output = "custom_map.json"
-    res = runner.invoke(app, ["map", "My task goal", "--output", custom_output])
+    res = runner.invoke(app, ["map", "--goal", "My task goal", "--output", custom_output])
     assert res.exit_code == 0
     assert (tmp_path / custom_output).exists()
 
@@ -118,13 +118,26 @@ def test_run_entry_exits_quietly_on_broken_pipe(monkeypatch):
 
 
 def test_cli_map_warns_when_goal_is_a_directory(tmp_path, monkeypatch):
-    """`dev map /other/repo` maps CWD with the path as goal — warn about intent."""
+    """`dev map --goal /other/repo` maps CWD with the path as goal — warn about intent."""
     repo = tmp_path / "repo"
     repo.mkdir()
     _setup_map_repo(repo, monkeypatch)
     other = tmp_path / "other"
     other.mkdir()
-    res = runner.invoke(app, ["map", str(other), "--no-wiki"])
+    res = runner.invoke(app, ["map", "--goal", str(other), "--no-wiki"])
     assert res.exit_code == 0, res.output
     combined = res.output + str(getattr(res, "stderr", ""))
     assert "--project-root" in combined
+
+
+def test_cli_map_html(tmp_path, monkeypatch):
+    _setup_map_repo(tmp_path, monkeypatch)
+    assert runner.invoke(app, ["map", "--no-wiki"]).exit_code == 0
+    res = runner.invoke(app, ["map", "html"])
+    assert res.exit_code == 0, res.output
+    out = tmp_path / ".devcouncil" / "map.html"
+    assert out.is_file()
+    text = out.read_text(encoding="utf-8")
+    assert "DevCouncil Repo Map" in text
+    assert "canvasControls" in text or "zoomFit" in text
+    assert "onNodeDblClick" not in text

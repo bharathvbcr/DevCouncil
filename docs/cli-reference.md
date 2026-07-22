@@ -1,5 +1,10 @@
 # CLI Command Reference
 
+**Platforms:** macOS, Linux, and Windows. Requires Node.js 18+, Python 3.12+, and Git.
+**Maturity:** Stable / Preview / Experimental labels live in [project-status.md](project-status.md) and are printed by `dev doctor`.
+**Graph demo:** `dev map demo` writes self-contained interactive HTML (`.devcouncil/graph/demo.html`); open that file for the UI. A static `demo.svg` companion may also be written.
+**Executable fixture:** [`examples/build-week-demo/`](../examples/build-week-demo/) — `bash scripts/build-week-demo.sh`.
+
 ```bash
 dev init                    # Initialize DevCouncil in a repo
 dev init --provider vertexai --model YOUR_MODEL_ID # Initialize with one model for every role
@@ -15,31 +20,36 @@ dev e2e "goal" --executor codex --force  # Proceed past advisory planning gaps a
 dev e2e "goal" --executor codex --json --report-file .devcouncil/reports/latest.json # Write machine-readable report
 dev go "goal" --executor codex # Short alias for dev e2e
 dev map                     # Build the deterministic repository map + code graph (no LLM)
+dev map --goal "…"          # Optional goal text for candidate-file ranking (was a positional arg)
 dev map --if-stale          # Skip rebuild when the on-disk map fingerprint is still fresh
 dev map --no-liveness       # Skip entry_roots / unwired / unreachable / dead_symbol lists
 dev map --lsp-refs          # Confirm dead-symbol candidates via live LSP references
 dev map --wiki / --no-wiki  # Refresh codebase-wiki skeletons after map (default on)
 dev map --scan-deps         # Opt-in SCA auditors → dependency_risks (off by default)
 dev map --watch             # Incrementally refresh the map on code edits
-dev graph ingest            # Unified analyze: codeintel sync → graph export → repo map write
-dev graph ingest PATH...    # Path-scoped ingest (full reconcile when paths omitted)
-dev graph query NAME        # 360° symbol view: definition, callers, callees, importers
-dev graph trace A B         # Shortest path between two graph nodes
-dev graph dead              # Dead-code report with confidence tiers (extracted|inferred|ambiguous); uncapped
-dev graph dead --min-confidence inferred  # Filter to inferred+extracted only
-dev graph check             # God nodes (top-connected) and circular-import detection
-dev graph process [ENTRY]   # BFS call-flows from entry roots
-dev graph impact PATH...    # Blast radius for paths (or --diff for working-tree changes)
-dev graph search QUERY      # FTS5 symbol/path search over the committed generation
-dev graph search QUERY --semantic  # Opt-in local embeddings when indexing.embeddings.enabled
-dev graph cypher 'MATCH … RETURN …'  # Supported Cypher subset over native SQLite graph store
-dev graph explain --category command-injection  # PDG taint findings (opt-in PDG layer)
-dev graph pdg-query --mode controls --target SYMBOL  # PDG control dependence
-dev graph pdg-query --mode flows --target SYMBOL --variable x  # PDG data flows
-dev graph html              # Write interactive .devcouncil/graph/graph.html (not written by default on dev map)
-dev graph view              # Serve/open the graph HTML via a local HTTP server
-dev graph demo              # Sample self-contained interactive HTML (no map required); see docs/code-graph.md
-dev graph export -o out.graphml  # Export GraphML (or --format okf / okf-links)
+dev map html                # Write interactive .devcouncil/map.html (subsystem view)
+dev map html --open         # Write and open the subsystem map HTML
+dev map graph-html          # Write symbol-level .devcouncil/graph/graph.html
+dev map html --symbols      # Same as graph-html (alias path: `dev graph html`)
+dev map ingest              # Unified analyze: codeintel sync → graph export → repo map write
+dev map ingest PATH...      # Path-scoped ingest (full reconcile when paths omitted)
+dev map query NAME          # 360° symbol view: definition, callers, callees, importers
+dev map trace A B           # Shortest path between two graph nodes
+dev map dead                # Dead-code report with confidence tiers (extracted|inferred|ambiguous); uncapped
+dev map dead --min-confidence inferred  # Filter to inferred+extracted only
+dev map check               # God nodes (top-connected) and circular-import detection
+dev map process [ENTRY]     # BFS call-flows from entry roots
+dev map impact PATH...      # Blast radius for paths (or --diff for working-tree changes)
+dev map search QUERY        # FTS5 symbol/path search over the committed generation
+dev map search QUERY --semantic  # Opt-in local embeddings when indexing.embeddings.enabled
+dev map cypher 'MATCH … RETURN …'  # Supported Cypher subset over native SQLite graph store
+dev map explain --category command-injection  # PDG taint findings (opt-in PDG layer)
+dev map pdg-query --mode controls --target SYMBOL  # PDG control dependence
+dev map pdg-query --mode flows --target SYMBOL --variable x  # PDG data flows
+dev map view                # Serve/open the graph HTML via a local HTTP server
+dev map demo                # Sample self-contained interactive HTML demo.html (no map); optional static demo.svg; see docs/code-graph.md
+dev map export -o out.graphml  # Export GraphML (or --format okf / okf-links)
+# Migration: `dev graph X` is a compatibility alias for `dev map X` (except `dev map html` = subsystems)
 dev scaffold-ci             # Write a starter .github/workflows/devcouncil.yml from configured commands
 dev scaffold-ci --force     # Overwrite an existing devcouncil.yml workflow
 dev scaffold-ci --evidence  # Also write .github/workflows/devcouncil-evidence.yml (verify → evidence artifacts)
@@ -82,6 +92,7 @@ dev repair                  # Generate repair tasks from gaps
 dev report                  # Generate final evidence report
 dev report --github-pr-comment # Post the report as a GitHub PR comment
 dev report --gitlab-pr-comment # Post the report as a GitLab MR comment
+dev report release-health # Classify blockers as historical debt vs RC regressions
 dev okf export -o ./bundle   # Export the artifact graph as an Open Knowledge Format bundle
 dev okf validate ./bundle    # Validate an OKF bundle (typed docs, resolved links)
 dev okf ingest ./bundle      # Ingest an OKF bundle as planning/coding context

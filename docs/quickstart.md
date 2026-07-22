@@ -2,6 +2,10 @@
 
 This is the shortest path for a new developer who wants to install DevCouncil, initialize a repository, connect a coding CLI, and run the first gated task.
 
+**Platforms:** macOS, Linux, and Windows. Requires Node.js 18+, Python 3.12+, and Git.
+**Maturity:** Public surfaces are labeled Stable / Preview / Experimental in
+[project-status.md](project-status.md) (also printed by `dev doctor`).
+
 Run DevCouncil commands in a normal terminal from the root of the repository you want DevCouncil to manage. Do not run these commands inside the coding CLI chat. Later, you paste the generated `dev prompt TASK-ID` output into Codex, Claude Code, OpenCode, Antigravity, Warp, Cursor, Aider, Copilot, Goose, Amp, Qwen, Crush, or another registered CLI agent. (The legacy Gemini CLI is deprecated — use Antigravity instead.)
 
 ## Where To Run Commands
@@ -125,13 +129,18 @@ If `VERTEXAI_ACCESS_TOKEN` is not configured, DevCouncil can use `gcloud auth pr
 
 Most other entry commands (`dev map`, `dev plan`, `dev run`, `dev status`, `dev verify`, etc.) now auto-initialize the project state if `.devcouncil/` is missing.
 
-To preview the interactive code-graph HTML UI (synthetic import graph, no `dev map` required):
+To preview the interactive code-graph UI (synthetic import graph, no `dev map` required):
 
 ```bash
-dev graph demo
+dev map demo
 ```
 
-This writes `.devcouncil/graph/demo.html` and opens it in your default browser.
+This writes a **self-contained interactive HTML** file at
+`.devcouncil/graph/demo.html` (and may also write a static `demo.svg` companion).
+Open `demo.html` for the interactive UI — filters, path highlighting, and
+neighborhoods. A provider-free red→green evidence-gate fixture lives at
+[`examples/build-week-demo/`](../examples/build-week-demo/); run it with
+`bash scripts/build-week-demo.sh` (see [build-week-demo.md](build-week-demo.md)).
 
 To preview coding CLI integration commands:
 
@@ -261,9 +270,9 @@ dev check --verify --goal "password reset tokens are single-use" --test "pytest 
 Optional live inspection surfaces:
 
 ```bash
-dev graph demo              # sample self-contained interactive HTML (no map required)
-dev map && dev graph view   # repo map + interactive code graph (default :8765)
-dev graph html --open       # write/open graph.html once
+dev map demo              # sample self-contained interactive HTML (no map required)
+dev map && dev map view   # repo map + interactive code graph (default :8765)
+dev map graph-html --open       # write/open graph.html once
 dev dashboard --open        # status dashboard with gaps panel (use --port if graph view is running)
 dev cost show
 dev runs list
@@ -276,6 +285,22 @@ dev skills
 dev scaffold-ci
 dev scaffold-ci --evidence  # also write devcouncil-evidence.yml for PR verify + artifacts
 ```
+
+## Documentation smoke
+
+From a DevCouncil checkout (local `dev` or `./.venv/bin/dev`):
+
+```bash
+dev version
+dev doctor
+mkdir -p /tmp/devcouncil-docs-smoke
+dev map demo --project-root /tmp/devcouncil-docs-smoke --json
+test -f /tmp/devcouncil-docs-smoke/.devcouncil/graph/demo.html
+bash scripts/build-week-demo.sh
+./.venv/bin/ruff check examples/build-week-demo
+```
+
+Full fixture index: [examples/README.md](../examples/README.md).
 
 To publish the final report back to a review thread, set the provider environment variables and run one of:
 

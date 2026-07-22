@@ -17,7 +17,7 @@ class CodeIntelQueryEngine:
     def _graph(self) -> CodeGraph:
         graph = self.service.load()
         if graph is None:
-            raise FileNotFoundError("no code-intelligence index; run `dev graph init`")
+            raise FileNotFoundError("no code-intelligence index; run `dev map init`")
         # Fingerprinting shells out to git (diff + untracked hashing) — only pay
         # that per-query cost when runtime evidence actually exists to match.
         if not self.service.store.has_runtime_observations():

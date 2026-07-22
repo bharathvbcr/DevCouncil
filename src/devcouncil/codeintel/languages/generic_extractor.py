@@ -143,7 +143,7 @@ def _embedded_regions(container: str, source: str) -> list[tuple[str, str, int]]
     regions: list[tuple[str, str, int]] = []
     if container in {"Svelte", "Vue", "Astro", "Liquid"}:
         for match in re.finditer(
-            r"<script\b(?P<attrs>[^>]*)>(?P<body>.*?)</script\s*>",
+            r"<script\b(?P<attrs>[^>]*)>(?P<body>.*?)</script[^>]*>",
             source,
             re.IGNORECASE | re.DOTALL,
         ):
@@ -159,7 +159,7 @@ def _embedded_regions(container: str, source: str) -> list[tuple[str, str, int]]
                 source[:match.start("body")].count("\n"),
             ))
         for match in re.finditer(
-            r"<style\b[^>]*>(?P<body>.*?)</style\s*>",
+            r"<style\b[^>]*>(?P<body>.*?)</style[^>]*>",
             source,
             re.IGNORECASE | re.DOTALL,
         ):
@@ -170,7 +170,7 @@ def _embedded_regions(container: str, source: str) -> list[tuple[str, str, int]]
             ))
     if container in {"Svelte", "Vue", "Astro"}:
         for match in re.finditer(
-            r"<template\b[^>]*>(?P<body>.*?)</template\s*>",
+            r"<template\b[^>]*>(?P<body>.*?)</template[^>]*>",
             source,
             re.IGNORECASE | re.DOTALL,
         ):

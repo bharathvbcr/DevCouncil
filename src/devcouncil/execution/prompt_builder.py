@@ -406,7 +406,10 @@ class PromptBuilder:
             f"{preamble}\n"
         )
         if deferred:
-            section += "\n_Also applicable (read the full text in `.claude/skills/<name>/SKILL.md`):_\n"
+            section += (
+                "\n_Also applicable (read the full text in "
+                "`.claude/skills/<name>/SKILL.md` or `.cursor/skills/<name>/SKILL.md`):_\n"
+            )
             for skill in deferred:
                 blurb = skill.description or skill.title
                 suffix = f" — {blurb}" if blurb else ""
@@ -627,7 +630,7 @@ class PromptBuilder:
                 "subsystems — do not add to this debt; wire what you create._",
                 "_Verify same-task island rule: a new file imported only by other files "
                 "added in this task still needs a pre-existing non-test caller._",
-                "_Prefer `dev graph dead --confidence extracted` + greps; treat inferred "
+                "_Prefer `dev map dead --confidence extracted` + greps; treat inferred "
                 "as unconfirmed. If entry_roots are empty / liveness_unreachable_unreliable, "
                 "ignore unreachable_files and mass inferred dead._",
             ]
@@ -925,8 +928,11 @@ class PromptBuilder:
    public function nothing calls, fails verification. If the caller is outside the
    current planned files, append it with `dev scope update <task_id> --lease-token
    <token> --planned-file <caller>` (modify-op only), then edit.
-6. Run the allowed commands to verify your work.
-7. Provide evidence of passing tests.
+6. When using DevCouncil MCP, call `devcouncil_checkout_task` or
+   `devcouncil_prepare_execution` before coding so you hold a lease and see planned
+   files / applied skills.
+7. Run the allowed commands to verify your work.
+8. Provide evidence of passing tests.
 """
 
         # Hard-task rigor: when the task classifies as hard, verification runs in

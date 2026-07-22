@@ -19,7 +19,7 @@ def test_repo_map_artifact_is_stable_and_valid(tmp_path, monkeypatch):
 
     assert runner.invoke(app, ["init"]).exit_code == 0
 
-    first = runner.invoke(app, ["map", "sample", "--output", ".devcouncil/repo_map.json"])
+    first = runner.invoke(app, ["map", "--goal", "sample", "--output", ".devcouncil/repo_map.json"])
     assert first.exit_code == 0
     map_path = tmp_path / ".devcouncil" / "repo_map.json"
     assert map_path.exists()
@@ -29,7 +29,7 @@ def test_repo_map_artifact_is_stable_and_valid(tmp_path, monkeypatch):
     # `dev init` now generates AGENTS.md and CLAUDE.md, so the agent guides are a stable part of the
     # initialized repository state and are present (and regenerated identically) on both map runs.
 
-    second = runner.invoke(app, ["map", "sample", "--output", ".devcouncil/repo_map.json"])
+    second = runner.invoke(app, ["map", "--goal", "sample", "--output", ".devcouncil/repo_map.json"])
     assert second.exit_code == 0
     second_raw = map_path.read_text(encoding="utf-8")
     second_payload = json.loads(second_raw)

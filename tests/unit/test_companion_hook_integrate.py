@@ -129,10 +129,10 @@ def test_check_passes_when_cursor_hooks_use_dev_cli(tmp_path):
             {
                 "version": 1,
                 "hooks": {
-                    "preToolUse": [
+                    "postToolUse": [
                         {
-                            "command": "/tmp/.venv/bin/dev hook pre-tool-use --client cursor",
-                            "matcher": "Shell|Write",
+                            "command": "/tmp/.venv/bin/dev hook post-tool-use --client cursor",
+                            "matcher": "Shell|Write|Edit|MultiEdit",
                         }
                     ]
                 },
@@ -143,6 +143,8 @@ def test_check_passes_when_cursor_hooks_use_dev_cli(tmp_path):
     report = build_integration_check_report(tmp_path)
     integrity = [r for r in report.checks if r.name == "Cursor hook integrity"]
     assert integrity and integrity[0].status == "ok"
+    cursor_hooks = [r for r in report.checks if r.name == "Cursor hooks"]
+    assert cursor_hooks and cursor_hooks[0].status == "ok"
 
 
 def test_check_skips_integrity_when_no_hook_config(tmp_path):

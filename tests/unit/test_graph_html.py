@@ -172,3 +172,188 @@ def test_sample_demo_graph_and_preview_svg(tmp_path):
     assert paths["svg"].is_file()
     assert "ForceGraph" in paths["html"].read_text(encoding="utf-8")
     assert paths["svg"].read_text(encoding="utf-8").startswith("<svg")
+
+
+def test_graph_html_f07_counts_zoom_and_interaction_hints():
+    """F-07: counts, guarded zoomToFit after layout/reset, in-UI interaction hints."""
+    html = render_graph_html(sample_demo_graph())
+    assert html.count('id="counts"') == 1
+    assert "updateCounts" in html
+    assert "Nodes:" in html and "Edges:" in html and "Filtered:" in html
+    assert "function fitView" in html
+    assert "typeof g.zoomToFit === 'function'" in html or 'typeof g.zoomToFit === "function"' in html
+    assert "requestAnimationFrame" in html
+    assert "g.zoomToFit(" in html
+    # Called after initial layout and reset (not only defined).
+    assert re.search(r"redraw\(\);\s*fitView\(\);", html)
+    assert re.search(r"redraw\(\);\s*fitView\(\);\s*renderDeadList", html) or (
+        "fitView();" in html.split("id=\"reset\"", 1)[-1].split("clearPath", 1)[0]
+        or "fitView();" in html
+    )
+    assert html.count("fitView();") >= 2
+    assert "interactionHint" in html or 'id="hints"' in html
+    assert "Click" in html and "shortest path" in html and "Double-click" in html
+    assert "neighborhood" in html.lower()
+
+
+def test_graph_html_canvas_controls_and_vendor_apis():
+    """Zoom/pan overlay + layout options; every used ForceGraph API exists in vendor 1.51.4."""
+    from pathlib import Path
+
+    from devcouncil.indexing.viz import _canvas_controls_js, _vendor_js
+
+    html = render_graph_html(sample_demo_graph())
+    assert "canvasControls" in html or "zoomFit" in html
+    assert "zoomPct" in html
+    assert "labelMode" in html
+    assert "sizeMode" in html
+    assert "layoutPause" in html
+    assert "layoutCharge" in html
+    assert "layoutDistance" in html
+    assert "canvasLegend" in html
+    assert "onEngineStop" in html
+    assert "onZoom" in html
+    assert "onNodeDblClick" not in html
+    assert "event.detail >= 2" in html
+
+    controls = _canvas_controls_js()
+    vendor = _vendor_js()
+    assert "vasturiano/force-graph" in vendor or "zoomToFit" in vendor
+    # Fallback stub path still omits zoomToFit.
+    stub = (
+        "window.ForceGraph=function(){return{"
+        "graphData:function(){return this},nodeId:function(){return this},"
+        "nodeLabel:function(){return this},nodeAutoColorBy:function(){return this},"
+        "nodeVal:function(){return this},linkColor:function(){return this},"
+        "linkDirectionalParticles:function(){return this},"
+        "linkDirectionalParticleWidth:function(){return this},"
+        "onNodeClick:function(){return this},"
+        "width:function(){return this},height:function(){return this},_missing:true};};"
+    )
+    assert "zoomToFit" not in stub
+
+    # Regression: every new ForceGraph method used in generated JS must appear in vendor.
+    vendor_path = (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "devcouncil"
+        / "assets"
+        / "vendor"
+        / "force-graph.min.js"
+    )
+    vendor_text = vendor_path.read_text(encoding="utf-8") if vendor_path.is_file() else vendor
+    for api in (
+        "zoomToFit",
+        "centerAt",
+        "enableZoomInteraction",
+        "enablePanInteraction",
+        "pauseAnimation",
+        "resumeAnimation",
+        "d3Force",
+        "d3ReheatSimulation",
+        "nodeCanvasObject",
+        "cooldownTicks",
+        "onEngineStop",
+        "onZoom",
+    ):
+        assert api in controls, api
+        assert api in vendor_text, f"ForceGraph API {api!r} missing from vendor 1.51.4"
+    assert "onNodeDblClick" not in controls
+
+
+def _sample_repo_map_payload() -> dict:
+    return {
+        "languages": ["python"],
+        "files": [
+            {"path": "src/devcouncil/cli/main.py", "area": "src/devcouncil/cli", "kind": "code", "summary": "x"},
+        ],
+        "subsystems": [
+            {
+                "area": "src/devcouncil/cli",
+                "summary": "CLI surface",
+                "entry_points": ["src/devcouncil/cli/main.py"],
+                "critical_files": ["src/devcouncil/cli/commands/map.py"],
+                "neighbors": ["src/devcouncil/indexing"],
+                "handoff_paths": [
+                    "cli/commands/map.py -> indexing/repo_mapper.py",
+                    "cli/main.py -> executors/*",
+                ],
+                "role_files": {"entrypoints": ["src/devcouncil/cli/main.py"]},
+            },
+            {
+                "area": "src/devcouncil/indexing",
+                "summary": "Repo mapping",
+                "entry_points": ["src/devcouncil/indexing/repo_mapper.py"],
+                "critical_files": ["src/devcouncil/indexing/repo_mapper.py"],
+                "neighbors": ["src/devcouncil/cli"],
+                "handoff_paths": ["indexing/repo_mapper.py -> cli/commands/map.py"],
+                "role_files": {},
+            },
+            {
+                "area": "src/devcouncil/executors",
+                "summary": "Executors",
+                "entry_points": [],
+                "critical_files": [],
+                "neighbors": [],
+                "handoff_paths": [],
+                "role_files": {},
+            },
+        ],
+        "dependents": {"src/devcouncil/cli/main.py": ["x"]},
+        "entry_roots": ["src/devcouncil/cli/main.py"],
+        "unwired_candidates": ["a.py"] * 400,
+        "unreachable_files": [],
+        "dead_symbol_candidates": [],
+        "liveness_unreachable_unreliable": False,
+    }
+
+
+def test_map_html_payload_and_handoffs():
+    from devcouncil.indexing.map_viz import (
+        _LIVENESS_VIZ_CAP,
+        build_map_viz_payload,
+        match_area,
+        render_map_html,
+        resolve_handoff,
+        write_map_html,
+    )
+
+    areas = ["src/devcouncil/cli", "src/devcouncil/indexing", "src/devcouncil/executors"]
+    assert match_area("cli/commands/map.py", areas) == "src/devcouncil/cli"
+    assert match_area("executors/*", areas) == "src/devcouncil/executors"
+    src, dst, display = resolve_handoff("cli/main.py -> executors/*", areas)
+    assert src == "src/devcouncil/cli" and dst == "src/devcouncil/executors" and "->" in display
+
+    payload = build_map_viz_payload(_sample_repo_map_payload())
+    assert "files" not in payload
+    assert "dependents" not in payload
+    assert len(payload["liveness"]["unwired_candidates"]) == _LIVENESS_VIZ_CAP
+    assert any(l["kind"] == "neighbor" for l in payload["links"])
+    assert any(
+        l["kind"] == "handoff" and l["target"] == "src/devcouncil/executors"
+        for l in payload["links"]
+    )
+
+    raw_map = _sample_repo_map_payload()
+    raw_map["subsystems"][0]["summary"] = "</script><script>alert(1)</script>"
+    html = render_map_html(raw_map)
+    assert "</script><script>" not in html
+    assert "\\u003c" in html
+    assert "DevCouncil Repo Map" in html
+    assert "onNodeDblClick" not in html
+    assert "graph/graph.html" in html
+    assert "zoomPct" in html or "canvasControls" in html
+    data_blob = html.split("const DATA = ", 1)[1].split(";\n", 1)[0]
+    assert '"files"' not in data_blob
+    assert '"dependents"' not in data_blob
+
+
+def test_write_map_html_artifact(tmp_path):
+    from devcouncil.indexing.map_viz import write_map_html
+
+    dc = tmp_path / ".devcouncil"
+    dc.mkdir()
+    (dc / "repo_map.json").write_text(json.dumps(_sample_repo_map_payload()), encoding="utf-8")
+    out = write_map_html(tmp_path)
+    assert out == dc / "map.html"
+    assert "DevCouncil Repo Map" in out.read_text(encoding="utf-8")

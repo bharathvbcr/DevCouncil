@@ -338,7 +338,10 @@ async def test_mcp_lsp_ast_and_prepare_execution_tools(tmp_path, monkeypatch):
 
     assert "python" in json.loads(lsp[0].text)["languages"]
     assert json.loads(ast[0].text)["matches"][0]["name"] == "target_symbol"
-    assert json.loads(execution[0].text)["task_id"] == "TASK-001"
+    execution_payload = json.loads(execution[0].text)
+    assert execution_payload["task_id"] == "TASK-001"
+    assert "applied_skills" in execution_payload
+    assert "core-engineering" in execution_payload["applied_skills"]
 
 
 @pytest.mark.anyio

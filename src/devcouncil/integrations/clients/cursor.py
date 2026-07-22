@@ -92,12 +92,56 @@ def _write_cursor_config(project_root: Path) -> Path:
     return path
 
 
+_CURSOR_RULE_CONTENT = """\
+---
+description: DevCouncil task loop and navigation
+alwaysApply: true
+---
+
+# DevCouncil
+
+Use DevCouncil MCP tools for status, checkout, scope, and verify — do not guess task state.
+
+Navigate via `.devcouncil/repo_map.json` (subsystems, entry_points, critical_files). Prefer `dev map query|trace|dead` for symbol callers.
+
+Checkout a leased task (`devcouncil_checkout_task` / `dev checkout`) before writes when write-gates are active.
+
+Follow engineering skills under `.cursor/skills/` and `.claude/skills/` (`dev skills scaffold` / `dev integrate cursor --apply`).
+"""
+
+
+def _cursor_rules_path(project_root: Path) -> Path:
+    return project_root / ".cursor" / "rules" / "devcouncil.mdc"
+
+
+def _install_cursor_assets(project_root: Path) -> list[Path]:
+    """Scaffold applicable skills and write the always-on DevCouncil Cursor rule.
+
+    Idempotent: skills land under both ``.claude/skills/`` and ``.cursor/skills/``;
+    the rule is ``.cursor/rules/devcouncil.mdc`` with ``alwaysApply: true``.
+    """
+    from devcouncil.skills.registry import scaffold_skills, select_skills
+
+    written: list[Path] = []
+    skills = select_skills("", project_root)
+    written.extend(scaffold_skills(project_root, skills))
+
+    rules_path = _cursor_rules_path(project_root)
+    if not (rules_path.exists() and rules_path.read_text(encoding="utf-8") == _CURSOR_RULE_CONTENT):
+        rules_path.parent.mkdir(parents=True, exist_ok=True)
+        rules_path.write_text(_CURSOR_RULE_CONTENT, encoding="utf-8")
+        written.append(rules_path)
+    return written
+
+
 def _record_cursor_config(project_root: Path) -> None:
     def mutate(config: dict) -> None:
         cursor = config.setdefault("integrations", {}).setdefault("cursor", {})
         cursor.update({
             "enabled": True,
             "config_path": str(_cursor_config_path(project_root).relative_to(project_root)),
+            "skills_path": ".cursor/skills",
+            "rules_path": ".cursor/rules/devcouncil.mdc",
         })
 
     _mutate_raw_config(project_root, mutate)

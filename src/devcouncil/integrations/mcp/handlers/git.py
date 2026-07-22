@@ -8,6 +8,7 @@ from pathlib import Path
 
 from mcp.types import TextContent
 
+from devcouncil.execution.planned_scope import matches_planned_path
 from devcouncil.integrations.mcp.util import (
     CLI_TIMEOUT_SECONDS,
     error_text,
@@ -266,11 +267,10 @@ async def handle_get_diff(root: Path, db: Database | None, arguments: dict) -> l
         if task is None:
             return error_text(f"Task {task_id} not found.", code="not_found", task_id=task_id)
         planned = [pf.path.replace("\\", "/") for pf in task.planned_files]
-        planned_set = set(planned)
         task_scoped = True
         if explicit_paths:
             # Intersect only — explicit paths must never broaden task scope.
-            scope_paths = [p for p in scope_paths if p in planned_set]
+            scope_paths = [p for p in scope_paths if matches_planned_path(p, planned)]
         else:
             scope_paths = planned
 

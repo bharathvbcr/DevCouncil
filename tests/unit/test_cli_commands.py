@@ -83,7 +83,7 @@ def test_cli_map_writes_repo_map(tmp_path, monkeypatch):
     init_result = runner.invoke(app, ["init"])
     assert init_result.exit_code == 0
 
-    map_result = runner.invoke(app, ["map", "sample", "--output", ".devcouncil/repo_map.json"])
+    map_result = runner.invoke(app, ["map", "--goal", "sample", "--output", ".devcouncil/repo_map.json"])
     assert map_result.exit_code == 0
 
     data = json.loads((tmp_path / ".devcouncil" / "repo_map.json").read_text(encoding="utf-8"))
@@ -97,7 +97,7 @@ def test_cli_map_auto_initializes_when_missing(tmp_path, monkeypatch):
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "test_sample.py").write_text("def test_sample(): pass\n", encoding="utf-8")
 
-    result = runner.invoke(app, ["map", "sample", "--output", ".devcouncil/repo_map.json"])
+    result = runner.invoke(app, ["map", "--goal", "sample", "--output", ".devcouncil/repo_map.json"])
     assert result.exit_code == 0
 
     data = json.loads((tmp_path / ".devcouncil" / "repo_map.json").read_text(encoding="utf-8"))
@@ -113,7 +113,7 @@ def test_cli_map_auto_initializes_with_project_root(tmp_path, monkeypatch):
     (project / "sample.py").write_text("print('sample')\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
 
-    result = runner.invoke(app, ["map", "sample", "--project-root", str(project), "--output", ".devcouncil/repo_map.json"])
+    result = runner.invoke(app, ["map", "--goal", "sample", "--project-root", str(project), "--output", ".devcouncil/repo_map.json"])
     assert result.exit_code == 0
 
     data = json.loads((project / ".devcouncil" / "repo_map.json").read_text(encoding="utf-8"))
@@ -127,7 +127,7 @@ def test_cli_map_stdout_is_machine_readable_json(tmp_path, monkeypatch):
     (tmp_path / "sample.py").write_text("print('sample')\n", encoding="utf-8")
     assert runner.invoke(app, ["init"]).exit_code == 0
 
-    result = runner.invoke(app, ["map", "sample"])
+    result = runner.invoke(app, ["map", "--goal", "sample"])
 
     assert result.exit_code == 0
     data = json.loads(result.stdout)
@@ -3812,7 +3812,7 @@ def test_cli_graph_dead_defaults_to_inferred(tmp_path, monkeypatch):
     )
     write_model_json(graph_dir / "code_graph.json", graph)
 
-    result = runner.invoke(app, ["graph", "dead", "--project-root", str(tmp_path)])
+    result = runner.invoke(app, ["map", "dead", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert "a.py::keep" in result.output
     assert "b.py::hide" not in result.output
@@ -3820,7 +3820,7 @@ def test_cli_graph_dead_defaults_to_inferred(tmp_path, monkeypatch):
 
     all_tiers = runner.invoke(
         app,
-        ["graph", "dead", "--project-root", str(tmp_path), "--min-confidence", "ambiguous"],
+        ["map", "dead", "--project-root", str(tmp_path), "--min-confidence", "ambiguous"],
     )
     assert all_tiers.exit_code == 0
     assert "b.py::hide" in all_tiers.output

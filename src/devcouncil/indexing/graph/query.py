@@ -231,7 +231,7 @@ def explain_pdg_taint(
 
     g = _load(root, graph)
     if g is None:
-        return {"ok": False, "error": "no code graph; run `dev map --pdg` or `dev graph pdg build` first"}
+        return {"ok": False, "error": "no code graph; run `dev map --pdg` or `dev map pdg build` first"}
     layer = load_pdg_layer(g)
     findings: List[TaintFinding] = list(layer.taint_findings) if layer else []
     if not findings and isinstance(g.meta.get("pdg"), dict):
@@ -257,7 +257,7 @@ def query_pdg_controls(
         return {"ok": False, "error": "no code graph"}
     functions = _match_pdg_functions(root, g, target)
     if not functions:
-        return {"ok": False, "error": f"no PDG for target {target!r}; run `dev graph pdg build`"}
+        return {"ok": False, "error": f"no PDG for target {target!r}; run `dev map pdg build`"}
     return {
         "ok": True,
         "target": target,
@@ -280,7 +280,7 @@ def query_pdg_flows(
         return {"ok": False, "error": "no code graph"}
     functions = _match_pdg_functions(root, g, target)
     if not functions:
-        return {"ok": False, "error": f"no PDG for target {target!r}; run `dev graph pdg build`"}
+        return {"ok": False, "error": f"no PDG for target {target!r}; run `dev map pdg build`"}
     out: List[dict[str, Any]] = []
     for fn in functions:
         flows = fn.reaching_def

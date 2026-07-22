@@ -188,7 +188,7 @@ CODING_CLI_INTEGRATION_INFO: dict[str, CodingCliIntegrationInfo] = {
         True,
         True,
         True,
-        "dev integrate cursor --apply; agent/cursor-agent for headless",
+        "dev integrate cursor --apply (MCP + hooks + skills + rules); agent/cursor-agent for headless",
         blocking_hooks=True,
     ),
     "grok": CodingCliIntegrationInfo(

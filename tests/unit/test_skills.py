@@ -59,10 +59,33 @@ def test_scaffold_writes_and_is_idempotent(tmp_path):
     paths = {p.relative_to(tmp_path).as_posix() for p in written}
     assert ".claude/skills/core-engineering/SKILL.md" in paths
     assert ".claude/skills/web/SKILL.md" in paths
+    assert ".cursor/skills/core-engineering/SKILL.md" in paths
+    assert ".cursor/skills/web/SKILL.md" in paths
     # Re-running writes nothing new.
     assert scaffold_skills(tmp_path, chosen) == []
     content = (tmp_path / ".claude" / "skills" / "web" / "SKILL.md").read_text(encoding="utf-8")
     assert content.startswith("---\nname: web\n")
+    cursor_content = (tmp_path / ".cursor" / "skills" / "web" / "SKILL.md").read_text(encoding="utf-8")
+    assert cursor_content == content
+
+
+def test_scaffold_dual_destination_mirrors_claude_local_to_cursor(tmp_path):
+    """A skill that already lives under .claude/skills still scaffolds to .cursor/skills."""
+    skill_dir = tmp_path / ".claude" / "skills" / "custom"
+    skill_dir.mkdir(parents=True)
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text(
+        "---\nname: custom\ndescription: local\n---\n# Custom\n",
+        encoding="utf-8",
+    )
+    from devcouncil.skills.registry import discover_repo_skills
+
+    local = next(s for s in discover_repo_skills(tmp_path) if s.name == "custom")
+    written = scaffold_skills(tmp_path, [local])
+    paths = {p.relative_to(tmp_path).as_posix() for p in written}
+    assert ".claude/skills/custom/SKILL.md" not in paths
+    assert ".cursor/skills/custom/SKILL.md" in paths
+    assert scaffold_skills(tmp_path, [local]) == []
 
 
 def test_render_preamble_concatenates_bodies():
@@ -103,12 +126,34 @@ def test_prompt_builder_injects_applicable_skills():
     assert "ios" not in applicable
     # ...and the full android intake body is injected inline (not just the name).
     assert "Establish current state first" in prompt
+    assert "devcouncil_checkout_task" in prompt or "devcouncil_prepare_execution" in prompt
 
     generic = Task(id="T2", title="Fix a typo", description="spelling", planned_files=[], expected_tests=[], allowed_commands=[])
     generic_prompt = PromptBuilder().build_task_prompt(generic, [])
     generic_applicable = next(line for line in generic_prompt.splitlines() if "Applicable skills:" in line)
     assert "core-engineering" in generic_applicable
     assert "android" not in generic_applicable
+
+
+def test_prompt_builder_deferred_skills_list_both_roots(monkeypatch):
+    from devcouncil.domain.task import Task
+    from devcouncil.execution.prompt_builder import PromptBuilder
+    from devcouncil.skills.registry import Skill
+
+    big = Skill(name="big-skill", description="big", body="x" * 20_000)
+    core = Skill(name="core-engineering", description="core", always=True, body="Core body\n")
+
+    monkeypatch.setattr(
+        "devcouncil.skills.registry.select_skills",
+        lambda **_k: [core, big],
+    )
+    prompt = PromptBuilder().build_task_prompt(
+        Task(id="T3", title="t", description="d", planned_files=[], expected_tests=[], allowed_commands=[]),
+        [],
+    )
+    assert ".claude/skills/<name>/SKILL.md" in prompt
+    assert ".cursor/skills/<name>/SKILL.md" in prompt
+    assert "`big-skill`" in prompt
 
 
 def test_backend_skill_selects_for_servers_without_over_matching(tmp_path):
@@ -331,7 +376,12 @@ def test_scaffold_skips_repo_local_skill_sources(tmp_path):
     from devcouncil.skills.registry import discover_repo_skills
 
     local = next(s for s in discover_repo_skills(tmp_path) if s.name == "custom")
-    assert scaffold_skills(tmp_path, [local]) == []
+    # Source is .claude/skills — skip that dest, but still mirror to .cursor/skills.
+    written = scaffold_skills(tmp_path, [local])
+    paths = {p.relative_to(tmp_path).as_posix() for p in written}
+    assert paths == {".cursor/skills/custom/SKILL.md"}
+    # Explicit single-destination still skips when source is that dest.
+    assert scaffold_skills(tmp_path, [local], destinations=(".claude/skills",)) == []
 
 
 def test_cli_skills_scaffold_all(tmp_path):
@@ -340,6 +390,8 @@ def test_cli_skills_scaffold_all(tmp_path):
     scaffolded = {p.name for p in (tmp_path / ".claude" / "skills").iterdir()}
     assert {"core-engineering", "android", "ios", "windows", "web", "ai-training"} <= scaffolded
     assert {"devcouncil", "devcouncil-hero-loop", "devcouncil-verification"} <= scaffolded
+    cursor_scaffolded = {p.name for p in (tmp_path / ".cursor" / "skills").iterdir()}
+    assert cursor_scaffolded == scaffolded
 
 
 def test_devcouncil_skills_select_in_initialized_repo(tmp_path):

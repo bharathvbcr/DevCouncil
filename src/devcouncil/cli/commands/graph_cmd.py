@@ -1,9 +1,10 @@
-"""``dev graph`` — query / trace / dead / check / process / impact / html / view / export."""
+"""Symbol-graph CLI commands (mounted under ``dev map``; ``dev graph`` is an alias)."""
 
 from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -12,14 +13,64 @@ from rich.console import Console
 
 app = typer.Typer(
     name="graph",
-    help="Query and visualize the symbol-level code knowledge graph.",
+    help=(
+        "Query and visualize the symbol-level code knowledge graph "
+        "(prefer `dev map …`; `dev graph` remains a compatibility alias)."
+    ),
     add_completion=False,
 )
-hooks_app = typer.Typer(name="hooks", help="Optional Git hook integration.", add_completion=False)
+hooks_app = typer.Typer(
+    name="hooks",
+    help="Optional Git hook integration (prefer `dev map hooks install`).",
+    add_completion=False,
+)
 app.add_typer(hooks_app, name="hooks")
 console = Console()
 status = Console(stderr=True)
 logger = logging.getLogger(__name__)
+
+# Shared with `dev map --watch` / `dev map watch` / alias `dev graph watch`.
+WATCH_DEBOUNCE_SECONDS = 0.8
+
+
+def run_foreground_watch(
+    root: Path,
+    *,
+    liveness: bool = True,
+    out: Console | None = None,
+) -> None:
+    """Run the shared code-intelligence coordinator until interrupted.
+
+    All watch entry points must use the same coordinator kwargs so a second
+    call does not raise ``ValueError`` on mismatched debounce/callback.
+    """
+    from devcouncil.codeintel.sync import get_sync_coordinator
+    from devcouncil.indexing.graph.build import refresh_map_for_paths
+
+    printer = out or status
+    coordinator = get_sync_coordinator(
+        root,
+        debounce_seconds=WATCH_DEBOUNCE_SECONDS,
+        sync_callback=lambda paths: refresh_map_for_paths(root, paths, liveness=liveness),
+    )
+    state = coordinator.start()
+    printer.print(
+        f"[cyan]Watching {root} with {state.backend or 'reconciliation'} "
+        f"(state={state.state}, debounce {WATCH_DEBOUNCE_SECONDS}s). Ctrl-C to stop.[/cyan]"
+    )
+    try:
+        while True:
+            time.sleep(WATCH_DEBOUNCE_SECONDS)
+            before = coordinator.status().pending
+            if before and not coordinator.sync_now():
+                failure = coordinator.status().last_error or coordinator.status().degraded_reason
+                printer.print(f"[yellow]Watch refresh failed (ignored): {failure}[/yellow]")
+            elif before:
+                printer.print(f"[green]Refreshed map for {len(before)} path(s)[/green]")
+    except KeyboardInterrupt:
+        printer.print("Stopped watching.")
+    finally:
+        coordinator.stop(timeout=2)
 
 
 def _root(project_root: Path) -> Path:
@@ -48,6 +99,24 @@ def _graph_degraded_fields(root: Path) -> dict[str, object]:
         return fields
     except Exception:
         return {"graph_degraded": False}
+
+
+def _canonical_store_health(root: Path) -> str:
+    from devcouncil.codeintel import get_codeintel_service
+    from devcouncil.indexing.graph.communities import store_health_from_state
+
+    state = get_codeintel_service(root).status()
+    return store_health_from_state(str(state.get("state") or ""))
+
+
+def _emit_limit(out: Console, limit_dict: dict) -> None:
+    if not limit_dict.get("degraded"):
+        return
+    out.print(f"[yellow]limit ({limit_dict.get('kind')}): {limit_dict.get('reason')}[/yellow]")
+    if limit_dict.get("recovery_command"):
+        out.print(f"[dim]recovery: {limit_dict['recovery_command']}[/dim]")
+    if limit_dict.get("detail"):
+        out.print(f"[dim]{limit_dict['detail']}[/dim]")
 
 
 def _require_graph(root: Path):
@@ -99,6 +168,12 @@ def graph_init(
         raise typer.Exit(code=1)
     result = get_codeintel_service(root).status()
     if refresh.compatibility_export_degraded:
+        from devcouncil.indexing.graph.communities import compatibility_export_limit
+
+        result["limit"] = compatibility_export_limit(
+            canonical_store_health=_canonical_store_health(root),
+            reason=refresh.reason or "compatibility export degraded",
+        ).as_dict()
         result["compatibility_export"] = "degraded"
         result["degraded_reason"] = refresh.reason
     if json_output:
@@ -111,6 +186,8 @@ def graph_init(
             f"{f'; export degraded: {refresh.reason}' if refresh.compatibility_export_degraded else ''}"
             f"[/{color}]"
         )
+        if refresh.compatibility_export_degraded and result.get("limit"):
+            _emit_limit(status, result["limit"])
 
 
 @app.command("status")
@@ -136,6 +213,17 @@ def graph_status(
         except Exception:
             logger.debug("graph status cold-start bootstrap failed", exc_info=True)
     result["sync"] = get_sync_coordinator(root).status().as_dict()
+    if result["sync"].get("compatibility_export") == "degraded":
+        from devcouncil.indexing.graph.communities import (
+            collect_limit_reports,
+            compatibility_export_limit,
+        )
+
+        result["limit"] = compatibility_export_limit(
+            canonical_store_health=_canonical_store_health(root),
+            reason=str(result["sync"].get("degraded_reason") or "compatibility export degraded"),
+        ).as_dict()
+        result["limits"] = collect_limit_reports(result.get("limit"))
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -146,7 +234,7 @@ def graph_status(
     console.print(f"watcher: {sync['state']} ({sync.get('backend') or 'not started'})")
     if sync.get("state") in {"disabled", "stopped", ""} or not sync.get("backend"):
         console.print(
-            "[dim]hint: run `dev graph watch` or `dev map --watch` to enable auto-refresh[/dim]"
+            "[dim]hint: run `dev map watch` or `dev map --watch` to enable auto-refresh[/dim]"
         )
     if sync.get("build_id"):
         progress = f"{sync.get('build_completed', 0)}/{sync.get('build_total', 0)}"
@@ -157,6 +245,8 @@ def graph_status(
         )
     if sync.get("compatibility_export") == "degraded":
         console.print("compatibility export: degraded")
+        if result.get("limit"):
+            _emit_limit(console, result["limit"])
     if sync.get("pending"):
         console.print("pending: " + ", ".join(sync["pending"]))
     if sync.get("degraded_reason"):
@@ -193,24 +283,7 @@ def graph_watch(
     project_root: Path = typer.Option(Path("."), "--project-root"),
 ) -> None:
     """Run native auto-sync in the foreground until interrupted."""
-    import time
-
-    from devcouncil.codeintel.sync import get_sync_coordinator
-
-    root = _root(project_root)
-    coordinator = get_sync_coordinator(root)
-    state = coordinator.start()
-    status.print(
-        f"[cyan]Watching {root} with {state.backend or 'reconciliation'} "
-        f"(state={state.state}); Ctrl-C to stop.[/cyan]"
-    )
-    try:
-        while True:
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        status.print("Stopped watching.")
-    finally:
-        coordinator.stop()
+    run_foreground_watch(_root(project_root), liveness=True, out=status)
 
 
 @app.command("doctor")
@@ -282,6 +355,39 @@ def graph_doctor(
         result["store_action"] = (
             "index.sqlite is damaged — run `dev map` to quarantine it and rebuild"
         )
+    from devcouncil.indexing.graph.build import load_code_graph
+    from devcouncil.indexing.graph.communities import (
+        collect_limit_reports,
+        compatibility_export_limit,
+        community_detection_limit,
+    )
+
+    _doctor_limits: list[dict] = []
+    _doctor_health = _canonical_store_health(root)
+    if export_health != "healthy":
+        _export_limit = compatibility_export_limit(
+            canonical_store_health=_doctor_health,
+            reason=export_detail or export_health,
+        ).as_dict()
+        result["compatibility_export"]["limit"] = _export_limit
+        _doctor_limits.append(_export_limit)
+    try:
+        _graph = load_code_graph(root)
+        _communities = ((_graph.meta or {}) if _graph is not None else {}).get("communities") or {}
+        if isinstance(_communities, dict) and _communities.get("skipped"):
+            raw_limit = _communities.get("limit")
+            if isinstance(raw_limit, dict) and raw_limit.get("degraded"):
+                _comm_limit = raw_limit
+            else:
+                _comm_limit = community_detection_limit(
+                    canonical_store_health=_doctor_health,
+                    reason=str(_communities.get("reason") or "community_detection_skipped"),
+                ).as_dict()
+            _doctor_limits.append(_comm_limit)
+    except Exception:
+        logger.debug("graph doctor community limit probe failed", exc_info=True)
+    if _doctor_limits:
+        result["limits"] = collect_limit_reports(*_doctor_limits)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         if not result["ok"]:
@@ -295,6 +401,8 @@ def graph_doctor(
         f"compatibility export: {export_health}"
         + (f" — {export_detail}" if export_detail else "")
     )
+    for _limit in result.get("limits") or []:
+        _emit_limit(console, _limit)
     console.print(
         f"grammars: {grammars['available_count']}/{grammars['required_count']} available locally"
     )
@@ -342,6 +450,8 @@ def graph_search(
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
+    if result.get("limit"):
+        _emit_limit(status, result["limit"])
     for match in result.get("matches", []):
         if "line" in match:
             console.print(f"{match['path']}:{match['line']}  {match['id']}  [{match['kind']}]")
@@ -415,6 +525,15 @@ def graph_ingest(
         "degraded": refresh.degraded,
         "reason": refresh.reason,
     }
+    if refresh.compatibility_export_degraded:
+        from devcouncil.indexing.graph.communities import compatibility_export_limit
+
+        payload["compatibility_export"] = "degraded"
+        payload["compatibility_export_reason"] = refresh.reason
+        payload["limit"] = compatibility_export_limit(
+            canonical_store_health=_canonical_store_health(root),
+            reason=refresh.reason or "compatibility export degraded",
+        ).as_dict()
     if json_output:
         typer.echo(json.dumps(payload, indent=2))
     else:
@@ -424,6 +543,8 @@ def graph_ingest(
             f"{f'; {embedded} embeddings' if embedded else ''}"
             f"{f'; degraded: {refresh.reason}' if refresh.degraded else ''}[/{color}]"
         )
+        if refresh.compatibility_export_degraded and payload.get("limit"):
+            _emit_limit(status, payload["limit"])
     if refresh.degraded:
         raise typer.Exit(code=1)
 
@@ -497,22 +618,34 @@ def graph_affected(
 def graph_hooks_install(
     project_root: Path = typer.Option(Path("."), "--project-root"),
 ) -> None:
-    """Install an opt-in post-checkout/post-merge reconciliation hook."""
+    """Install an opt-in post-checkout/post-merge reconciliation hook.
+
+    New installs prefer ``dev map sync``; existing ``dev graph sync`` hooks still
+    work via the ``graph`` alias.
+    """
     root = _root(project_root)
     git_dir = root / ".git"
     if not git_dir.is_dir():
         status.print("[red]Git hook installation requires a normal .git directory.[/red]")
         raise typer.Exit(code=1)
-    hook_body = "#!/bin/sh\nexec dev graph sync --project-root \"$(git rev-parse --show-toplevel)\" >/dev/null 2>&1\n"
+    hook_body = (
+        "#!/bin/sh\n"
+        'exec dev map sync --project-root "$(git rev-parse --show-toplevel)" >/dev/null 2>&1\n'
+    )
     for name in ("post-checkout", "post-merge"):
         path = git_dir / "hooks" / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists() and "dev graph sync" not in path.read_text(encoding="utf-8", errors="replace"):
-            status.print(f"[red]Refusing to overwrite existing hook: {path}[/red]")
-            raise typer.Exit(code=1)
+        if path.exists():
+            existing = path.read_text(encoding="utf-8", errors="replace")
+            if "dev map sync" not in existing and "dev graph sync" not in existing:
+                status.print(f"[red]Refusing to overwrite existing hook: {path}[/red]")
+                raise typer.Exit(code=1)
         path.write_text(hook_body, encoding="utf-8")
         path.chmod(0o755)
-    status.print("[green]Installed post-checkout and post-merge code-intelligence hooks.[/green]")
+    status.print(
+        "[green]Installed post-checkout and post-merge code-intelligence hooks "
+        "(dev map sync).[/green]"
+    )
 
 
 @app.command("query")

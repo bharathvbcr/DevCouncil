@@ -547,3 +547,157 @@ def test_ambiguous_edges_excluded_from_god_pagerank_process_impact():
     br = blast_radius(graph, ["pkg/noise.py::to_dict"], max_depth=2)
     impacted = {n for layer in br["layers"] for n in layer["nodes"]}
     assert not impacted  # only ambiguous inbound edges exist
+
+def test_graph_limit_factories_include_recovery_and_store_health():
+    from devcouncil.indexing.graph.communities import (
+        COMMUNITY_TIMEOUT_SECONDS,
+        community_detection_limit,
+        compatibility_export_limit,
+        embedding_scan_limit,
+        store_health_from_state,
+    )
+    assert COMMUNITY_TIMEOUT_SECONDS == 15.0
+    assert store_health_from_state("committed") == "healthy"
+    assert compatibility_export_limit(canonical_store_health="healthy", reason="test").as_dict()["recovery_command"] == "dev map query <symbol>"
+    assert embedding_scan_limit(canonical_store_health="healthy", reason="x").as_dict()["kind"] == "embedding_scan"
+    assert community_detection_limit(canonical_store_health="healthy", reason="x").as_dict()["recovery_command"] == "dev map"
+
+
+def test_community_timeout_reports_structured_limit(monkeypatch):
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    from devcouncil.indexing.graph.intel import compute_communities
+    from devcouncil.indexing.graph.schema import (
+        CodeGraph,
+        Confidence,
+        GraphEdge,
+        GraphNode,
+        NodeKind,
+    )
+
+    graph = CodeGraph(
+        nodes=[
+            GraphNode(id="a.py", kind=NodeKind.FILE, path="a.py", name="a.py"),
+            GraphNode(id="b.py", kind=NodeKind.FILE, path="b.py", name="b.py"),
+        ],
+        edges=[
+            GraphEdge(
+                source="a.py",
+                target="b.py",
+                kind="imports",
+                confidence=Confidence.EXTRACTED,
+            )
+        ],
+    )
+
+    class _Future:
+        def result(self, timeout=None):
+            raise FuturesTimeout()
+
+    class _Pool:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def submit(self, fn):
+            return _Future()
+
+    import concurrent.futures as cf
+
+    monkeypatch.setattr(cf, "ThreadPoolExecutor", _Pool)
+    summary = compute_communities(graph, seed=0)
+    assert summary["skipped"] is True
+    assert summary["limit"]["degraded"] is True
+    assert summary["limit"]["kind"] == "community_detection"
+    assert summary["limit"]["canonical_store_health"] == "healthy"
+    assert summary["limit"]["recovery_command"] == "dev map"
+
+
+def test_embedding_scan_cap_reports_structured_limit(tmp_path, monkeypatch):
+    from devcouncil.indexing.graph import embeddings as emb
+
+    monkeypatch.setattr(emb, "embeddings_enabled", lambda root: True)
+    monkeypatch.setattr(emb, "ensure_embeddings_schema", lambda root: None)
+    monkeypatch.setattr(emb, "_current_generation", lambda root: 1)
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, *a, **k):
+            return [
+                (f"n{i}", f"p{i}.py", f"l{i}", "hash-v1", "[0.1,0.2]")
+                for i in range(600)
+            ]
+
+    monkeypatch.setattr(emb.sqlite3, "connect", lambda *a, **k: _Conn())
+    result = emb.semantic_search(tmp_path, "query", limit=1)
+    assert result["truncated"] is True
+    assert result["limit"]["kind"] == "embedding_scan"
+    assert "dev map search" in result["limit"]["recovery_command"]
+
+
+def test_graph_doctor_json_includes_export_limit(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from typer.testing import CliRunner
+
+    from devcouncil.cli.main import app
+    import devcouncil.codeintel as codeintel
+    import devcouncil.codeintel.languages as codeintel_languages
+    import devcouncil.codeintel.build_control as build_control
+
+    monkeypatch.setattr(
+        codeintel,
+        "get_codeintel_service",
+        lambda root: SimpleNamespace(
+            status=lambda: {"state": "committed", "schema_version": 1},
+            store=SimpleNamespace(compatibility_export_state=lambda: ("", None)),
+        ),
+    )
+    monkeypatch.setattr(
+        codeintel_languages,
+        "grammar_status",
+        lambda: {
+            "ok": True,
+            "available_count": 1,
+            "required_count": 1,
+            "languages": [],
+            "action": "",
+        },
+    )
+    monkeypatch.setattr(
+        build_control,
+        "read_build_status",
+        lambda root: SimpleNamespace(
+            state="complete",
+            compatibility_export="degraded",
+            degraded_reason="stub export",
+        ),
+    )
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.build.graph_path",
+        lambda root: tmp_path / "missing.json",
+    )
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.build.load_code_graph",
+        lambda root: None,
+    )
+    runner = CliRunner()
+    result = runner.invoke(app, ["map", "doctor", "--json", "--project-root", str(tmp_path)])
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    limit = payload["compatibility_export"]["limit"]
+    assert limit["degraded"] is True
+    assert limit["kind"] == "compatibility_export"
+    assert limit["canonical_store_health"] == "healthy"
+    assert limit["recovery_command"] == "dev map query <symbol>"

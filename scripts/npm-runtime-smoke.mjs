@@ -609,7 +609,21 @@ try {
   // browser with a nonempty canvas, no page exceptions, and working click /
   // double-click / path selection (string-only HTML checks are not enough).
   const graphDemoProject = mkdtempSync(path.join(workspace, "graph-demo-"));
-  const graphDemo = run(
+  // Primary path is `map demo`; keep one `graph demo` alias assert.
+  const mapDemo = run(
+    process.execPath,
+    [
+      installedBin,
+      "map",
+      "demo",
+      "--project-root",
+      graphDemoProject,
+      "--json",
+    ],
+    { cwd: workspace, shell: false, env: integrationEnv },
+  );
+  assertOk(mapDemo, "installed dev map demo --json");
+  const graphDemoAlias = run(
     process.execPath,
     [
       installedBin,
@@ -621,18 +635,18 @@ try {
     ],
     { cwd: workspace, shell: false, env: integrationEnv },
   );
-  assertOk(graphDemo, "installed dev graph demo --json");
+  assertOk(graphDemoAlias, "installed dev graph demo alias --json");
   let demoPaths;
   try {
-    demoPaths = JSON.parse(graphDemo.stdout);
+    demoPaths = JSON.parse(mapDemo.stdout);
   } catch (err) {
     throw new Error(
-      `installed dev graph demo --json did not return JSON: ${err}\n${graphDemo.stdout}`,
+      `installed dev map demo --json did not return JSON: ${err}\n${mapDemo.stdout}`,
     );
   }
   const demoHtmlPath = demoPaths.html;
   if (typeof demoHtmlPath !== "string" || !demoHtmlPath) {
-    throw new Error(`graph demo JSON missing html path: ${graphDemo.stdout}`);
+    throw new Error(`graph demo JSON missing html path: ${mapDemo.stdout}`);
   }
   const demoHtml = readFileSync(demoHtmlPath, "utf-8");
   assertIncludes(demoHtml, "ForceGraph", "graph demo.html ForceGraph");

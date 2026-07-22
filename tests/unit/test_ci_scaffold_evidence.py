@@ -21,7 +21,17 @@ def test_render_evidence_workflow_includes_verify_and_artifacts(tmp_path):
     assert any("verify" in n.lower() for n in names)
     assert any("evidence JSON" in n for n in names)
     assert any("evidence HTML" in n for n in names)
+    assert any("release-health" in n.lower() for n in names)
     assert any("Upload evidence" in n for n in names)
+
+
+def test_render_evidence_workflow_wires_release_health_artifact(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    _init(tmp_path)
+    text = render_evidence_workflow(tmp_path)
+    assert "report release-health" in text
+    assert "--fail-on-regression" in text
+    assert ".devcouncil/release_health.json" in text
 
 
 def test_render_evidence_workflow_wires_github_env(tmp_path):

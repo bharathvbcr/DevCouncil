@@ -57,7 +57,7 @@ def test_cli_wiki_update_and_read(tmp_path, monkeypatch):
     (root / "src" / "app.py").write_text("def run(): pass\n", encoding="utf-8")
     
     # Run dev map to ensure map exists
-    runner.invoke(app, ["map", "test"])
+    runner.invoke(app, ["map", "--goal", "test"])
     
     # Update wiki
     res = runner.invoke(app, ["wiki", "update", "--no-llm"])

@@ -5,6 +5,7 @@ from devcouncil.reporting.markdown_report import MarkdownReportGenerator
 from devcouncil.reporting.json_report import JsonReportGenerator
 from devcouncil.reporting.evidence_export import EvidenceExportGenerator
 from devcouncil.reporting.evidence_html import EvidenceHtmlGenerator
+from devcouncil.reporting.release_health import ReleaseHealthReport, build_release_health_report
 
 class ReportBuilder:
     """Builds reports in various formats from the artifact graph."""
@@ -64,4 +65,18 @@ class ReportBuilder:
 
         return OKFBundleWriter.generate(
             graph, output_dir, repo_map=repo_map, project_name=project_name, timestamp=timestamp
+        )
+
+    @staticmethod
+    def build_release_health(
+        graph: ArtifactGraph,
+        *,
+        baseline: dict | None = None,
+        baseline_path: str | None = None,
+    ) -> ReleaseHealthReport:
+        """Classify current gaps vs a historical baseline (F-14)."""
+        return build_release_health_report(
+            list(graph.gaps.values()),
+            baseline=baseline,
+            baseline_path=baseline_path,
         )

@@ -33,7 +33,7 @@ devcouncil-build-week-demo
 
 # Interactive graph artifact (self-contained HTML)
 mkdir -p /tmp/devcouncil-judge-demo
-dev graph demo --project-root /tmp/devcouncil-judge-demo --json
+dev map demo --project-root /tmp/devcouncil-judge-demo --json
 # Open /tmp/devcouncil-judge-demo/.devcouncil/graph/demo.html
 ```
 
@@ -58,7 +58,7 @@ See [docs/build-week-demo.md](docs/build-week-demo.md) for the provider-free dem
 - [Daily workflow](docs/workflow.md): manual sidecar loop, verification, repair, rollback, and `dev watch`.
 - [Coding CLI integration](docs/coding-cli-integration.md): tiers, Claude Code, Codex, OpenCode, Antigravity, Cursor, Grok Build, Aider, MCP, hooks, stop gate / claim checks, and automated executors (Gemini deprecated).
 - [CLI command reference](docs/cli-reference.md): available `dev` commands.
-- [Repo map & code graph](docs/code-graph.md): `dev map` / `dev graph` -- navigation, dead code, blast radius, PDG (opt-in), HTML visualizer.
+- [Repo map & code graph](docs/code-graph.md): `dev map` (alias `dev graph`) -- navigation, dead code, blast radius, PDG (opt-in), HTML visualizer.
 - [Corpus side index](docs/corpus.md): `dev corpus` for docs/PDFs/images and optional verify gates.
 - [Hero loop](docs/hero-loop.md): certified Claude Code + MCP closed loop, leases, rigor, and `dev check --verify` on-ramp.
 - [Architecture](docs/architecture.md): components, artifact graph, state machine, gating policy, and gated execution.
@@ -190,7 +190,7 @@ DevCouncil is an application layer around coding agents. It does not just emit p
 ### Workflow Features
 
 - **Repository onboarding:** `dev setup` initializes `.devcouncil/`, generates the repo map + `AGENTS.md`/`CLAUDE.md` guides, scaffolds applicable engineering skills, runs environment checks, offers integration setup, and prints the next useful commands. Use `--skip-map` / `--skip-skills` to opt out, or `--scaffold-ci` to also write a starter GitHub Actions workflow. **`dev boot "goal"`** chains setup, `dev integrate --apply`, optional CI scaffold flags, and `dev go` in one command (see [quickstart](docs/quickstart.md)).
-- **Repository mapping:** `dev map` writes `.devcouncil/repo_map.json` and a symbol-level `.devcouncil/graph/code_graph.json`, identifies important files and subsystems, filters generated/temp files, and keeps managed `AGENTS.md` / `CLAUDE.md` workspace guides synchronized. Subsystems, entry points, neighbors, and important surfaces are inferred generically for **any** repository — grouped from the directory tree and ranked by an import-graph in-degree. Freshness uses git HEAD, tracked-file hash, and a content fingerprint so plain edits mark the map stale; a **missing map is stale** (fail-closed on hard rigor). Post-tool-use hooks and `dev map --watch` refresh incrementally. Unified analyze entry: `dev graph ingest`. Query with `dev graph query|trace|dead|search|cypher|html`. Liveness lists are capped at 5000 per list and 256 dependents per file (truncation metadata when hit). The map is also generated automatically on first init. (See [docs/code-graph.md](docs/code-graph.md) for details).
+- **Repository mapping:** `dev map` writes `.devcouncil/repo_map.json` and a symbol-level `.devcouncil/graph/code_graph.json`, identifies important files and subsystems, filters generated/temp files, and keeps managed `AGENTS.md` / `CLAUDE.md` workspace guides synchronized. Subsystems, entry points, neighbors, and important surfaces are inferred generically for **any** repository — grouped from the directory tree and ranked by an import-graph in-degree. Freshness uses git HEAD, tracked-file hash, and a content fingerprint so plain edits mark the map stale; a **missing map is stale** (fail-closed on hard rigor). Post-tool-use hooks and `dev map --watch` refresh incrementally. Unified analyze entry: `dev map ingest`. Query with `dev map query|trace|dead|search|cypher|graph-html`. Liveness lists are capped at 5000 per list and 256 dependents per file (truncation metadata when hit). The map is also generated automatically on first init. (See [docs/code-graph.md](docs/code-graph.md) for details).
   
   <p align="center">
     <img src="docs/graph_preview.png" alt="Repository Code Graph Preview" width="600">
@@ -216,7 +216,7 @@ DevCouncil is an application layer around coding agents. It does not just emit p
 - **CLI:** `dev` and `devcouncil` expose the same Typer command surface for local terminal workflows.
 - **Multi-agent campaigns:** `dev campaign run` executes a planned task graph as a parallel, dependency-aware multi-agent campaign (Director → Coordinator → Worker pool + Reviewer QC) with automatic file-overlap serialization, cost budgeting, ntfy push notifications, and a markdown progress dashboard at `.devcouncil/campaign/dashboard.md`. Roster and mailbox commands (`dev campaign roster` / `dev campaign inbox`) expose the role hierarchy and on-disk message bus.
 - **Agent hub:** `dev agents` lists built-in and custom agents, `dev agents add` registers prompt-taking CLIs, `dev agents doctor` checks wiring, `dev agents run` executes a task through a named agent/profile, and `dev agents optimize` uses GEPA to tune profile preambles from offline eval examples.
-- **Integration hub:** `dev integrate all --apply` configures supported coding CLI and MCP integrations in Claude-first, Codex-second order. `dev integrate check` reports each client's **enforcement posture**: `pre-action`, `advisory+verify`, or `verify-only`, so a client API that cannot natively deny PreToolUse is never presented as blocking.
+- **Integration hub:** `dev integrate all --apply` configures supported coding CLI and MCP integrations in Claude-first, Codex-second order. `dev integrate matrix` reports each client's **capability posture**: `pre-action`, `advisory+verify`, or `verify-only`. `dev integrate check` verifies installed MCP/hook files (including Cursor/Grok assist vs `--write-gate`) rather than re-deriving the matrix.
 - **MCP server:** `dev mcp-server` exposes DevCouncil context and workflow tools over stdio for MCP-capable clients. Native graph tools include `devcouncil_graph_ingest`, `devcouncil_graph_cypher`, `devcouncil_pdg_query`, and `devcouncil_explain` alongside repo-map and symbol-query surfaces. `devcouncil_verify_task` now runs DevCouncil's strong compiled per-criterion checks when a provider key is configured (falling back to a clearly-labeled `coarse` mode otherwise), refuses to pass on an empty diff, and returns `verification_mode`, `diff_empty`, `coverage_measured`/`coverage_skipped_reason`, and an `advisory_actions` array alongside the blocking `next_actions`. Cheap, re-verify-free read tools — `devcouncil_get_gaps` and `devcouncil_get_next_actions` — let a reconnecting agent resume outstanding work from persisted gaps (which now carry `file`/`line`/`suggested_command`/`acceptance_criterion_id`). Task leases expire on a config-driven TTL so a crashed agent's task frees itself, with `devcouncil_renew_lease` and `devcouncil_list_leases` for long runs and fleet supervision; a partial-unique DB index enforces a single active lease per task, so concurrent checkouts can't both win the writer slot. A pure-MCP agent can now make the change itself through lease-gated write tools — `devcouncil_write_file` and `devcouncil_apply_patch` — which policy-check every target path *before* it lands (out-of-scope, protected, or escaping paths are rejected; a patch with any out-of-scope target is rejected whole, never partially applied), write atomically, and record a `FileChangeEvent` for provenance. The corpus is also browsable as MCP **resources** (`devcouncil://report`, `devcouncil://tasks`, `devcouncil://gaps`, `devcouncil://cards`, `devcouncil://task/{id}`) so a host can read project state without a tool call. `devcouncil_get_task_provenance` then exposes that audit trail — gated file changes, verification runs, diff-coverage evidence, and the latest correction manifest — so what happened on disk is inspectable. The diff↔coverage proof is now also retained across graph reloads (it was previously dropped), so reports and `dev status` reflect whether the changed lines were actually exercised.
 - **Live review:** `dev watch` tracks review cards, signals, blocking feedback, and repair guidance while a session is active.
 - **Trace viewer:** `dev trace tail --follow` streams local DevCouncil trace events for execution, verification, and agent handoff.
@@ -274,7 +274,7 @@ DevCouncil stores local workflow state in the target repository:
 - `.devcouncil/config.yaml`: provider, executor, command, integration, and workflow settings.
 - `.devcouncil/secrets.env`: local provider secrets such as API keys or Vertex AI project/location values. Git-ignored; copy `.devcouncil/secrets.env.example` and fill in real values. Environment variables take precedence over this file.
 - `.devcouncil/repo_map.json`: generated repository map and subsystem navigation index.
-- `.devcouncil/graph/code_graph.json`: symbol-level knowledge graph (imports, calls, dead-code tiers); visualize with `dev graph html`.
+- `.devcouncil/graph/code_graph.json`: symbol-level knowledge graph (imports, calls, dead-code tiers); visualize with `dev map graph-html` (or `dev map html --symbols`).
 - `.devcouncil/state.sqlite`: SQLite state for requirements, assumptions, tasks, evidence, gaps, critique findings, and project phase history.
 - `.devcouncil/checkpoints/`: task snapshots used by verification and rollback.
 - `.devcouncil/logs/`: the durable run log (`devcouncil.log`, rotating, DEBUG-level) plus redacted stdout/stderr from verification commands.
@@ -295,7 +295,7 @@ Every command logs each stage and step. The full DEBUG trail always lands in `.d
 
 ### Maturity
 
-The stable daily workflow is planning, manual sidecar execution, verification, the deterministic repair loop in `dev go`/`dev e2e`, rollback, reporting, repo map/code graph (`dev map` / `dev graph`), and the local Live Dashboard (`dev dashboard --open`). The **certified Claude Code MCP closed loop** (checkout → write → verify → repair → release) is **Stable** (see [hero-loop.md](docs/hero-loop.md#certified-path-stable)). Coding CLI executors and hooks (including stop-gate claim checks), `dev boot` onboarding, CI scaffolding, multi-agent campaigns, watch mode, live review, PR comments, LSP/AST tools, corpus side index, opt-in PDG, and GitHub check surfaces are preview features. Optional LLM repair inference remains preview and is not required for the deterministic loop. The native autonomous executor is **Preview** (lease-gated writes + shared verify loop) and still requires DevCouncil verification before work is considered complete.
+The stable daily workflow is planning, manual sidecar execution, verification, the deterministic repair loop in `dev go`/`dev e2e`, rollback, reporting, repo map/code graph (`dev map`; `dev graph` alias), and the local Live Dashboard (`dev dashboard --open`). The **certified Claude Code MCP closed loop** (checkout → write → verify → repair → release) is **Stable** (see [hero-loop.md](docs/hero-loop.md#certified-path-stable)). Coding CLI executors and hooks (including stop-gate claim checks), `dev boot` onboarding, CI scaffolding, multi-agent campaigns, watch mode, live review, PR comments, LSP/AST tools, corpus side index, opt-in PDG, and GitHub check surfaces are preview features. Optional LLM repair inference remains preview and is not required for the deterministic loop. The native autonomous executor is **Preview** (lease-gated writes + shared verify loop) and still requires DevCouncil verification before work is considered complete.
 
 ## Core Flow
 
@@ -373,7 +373,7 @@ devcouncil --help
 
 `--editable` keeps `~/.local/bin/dev` pointed at this checkout so map/graph and other WIP features stay current without reinstalling after every edit. Use `uv tool install --force .` (without `--editable`) for a frozen snapshot of the tree at install time.
 
-See [docs/code-graph.md](docs/code-graph.md) for `dev map` / `dev graph` usage (dead code, blast radius, HTML visualizer).
+See [docs/code-graph.md](docs/code-graph.md) for `dev map` usage (`dev graph` alias) (dead code, blast radius, HTML visualizer).
 
 ## Project Shape
 
@@ -400,7 +400,7 @@ Project ideas and execution patterns come from the open-source ecosystem:
 - [OpenHands](https://github.com/All-Hands-AI/OpenHands): for workspace-aware agent execution patterns.
 - [mini-SWE-agent](https://github.com/SWE-agent/mini-swe-agent): for lightweight execution loop inspiration.
 - [SWE-agent](https://github.com/SWE-agent/SWE-agent): for full-spectrum autonomous SWE-style tasking patterns.
-- [GitNexus](https://github.com/abhigyanpatwari/GitNexus): structural codebase awareness concepts (native `dev map` / `dev graph` — no runtime integration).
+- [GitNexus](https://github.com/abhigyanpatwari/GitNexus): structural codebase awareness concepts (native `dev map` — no runtime integration).
 - [graphify](https://github.com/safishamsi/graphify): knowledge-graph / corpus coordination concepts (native `dev corpus` + optional verify gates — no runtime integration).
 - [Claude-oversight](https://github.com/sabarishraja/Claude-oversight): claim-to-evidence stop-gate semantics (native stop gate + claim mapper).
 - [Claude-hindsight](https://github.com/sabarishraja/Claude-hindsight): session continuity / statusline briefing patterns (native SessionStart briefing).

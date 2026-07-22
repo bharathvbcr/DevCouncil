@@ -243,3 +243,72 @@ def rigor_report(
         typer.echo(dump_json(asdict(report), indent=2))
     else:
         console.print(Markdown(report.to_markdown()))
+
+
+@app.command("release-health")
+def release_health_report(
+    json_format: bool = typer.Option(False, "--json", help="Output machine-readable JSON."),
+    baseline: Optional[Path] = typer.Option(
+        None,
+        "--baseline",
+        help="Baseline snapshot path (default: .devcouncil/release_health_baseline.json).",
+    ),
+    write_baseline: bool = typer.Option(
+        False,
+        "--write-baseline",
+        help="Capture current gaps as the release-health baseline, then report.",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Write the release-health JSON report to this path (CI artifact).",
+    ),
+    fail_on_regression: bool = typer.Option(
+        False,
+        "--fail-on-regression",
+        help="Exit non-zero when RC regressions are present (historical debt alone does not fail).",
+    ),
+    project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """Distinguish historical project gaps from release-candidate regressions."""
+    from devcouncil.reporting.release_health import (
+        load_baseline_snapshot,
+        resolve_baseline_path,
+        write_baseline_snapshot,
+    )
+
+    root = project_root.expanduser().resolve()
+    initialize_project(root, quiet=True)
+    db = get_db(root)
+    if not db:
+        console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
+        raise typer.Exit(code=1)
+
+    baseline_path = resolve_baseline_path(root, baseline)
+    with db.get_session() as session:
+        graph = ArtifactGraphRepository(session).load_graph()
+        gaps = list(graph.gaps.values())
+        if write_baseline:
+            write_baseline_snapshot(baseline_path, gaps, label="cli-write-baseline")
+            console.print(f"[green]Wrote release-health baseline to {baseline_path}[/green]")
+        snapshot = load_baseline_snapshot(baseline_path)
+        report = ReportBuilder.build_release_health(
+            graph,
+            baseline=snapshot,
+            baseline_path=str(baseline_path),
+        )
+
+    if output is not None:
+        out = output.expanduser()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(report.to_json() + "\n", encoding="utf-8")
+        console.print(f"[green]Wrote release-health report to {out}[/green]")
+
+    if json_format:
+        typer.echo(report.to_json())
+    else:
+        console.print(Markdown(report.to_markdown()))
+
+    if fail_on_regression and report.regressions:
+        raise typer.Exit(code=1)

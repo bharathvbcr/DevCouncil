@@ -50,6 +50,8 @@ jobs:
         run: uv run --python 3.12 dev report --evidence-json .devcouncil/evidence.json --fail-on-blocking --project-root .
       - name: Write evidence HTML artifact
         run: uv run --python 3.12 dev report --evidence-html .devcouncil/evidence.html --fail-on-blocking --project-root .
+      - name: Write release-health report
+        run: uv run --python 3.12 dev report release-health --json --output .devcouncil/release_health.json --fail-on-regression --project-root .
       - name: Upload evidence artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -57,6 +59,7 @@ jobs:
           path: |
             .devcouncil/evidence.json
             .devcouncil/evidence.html
+            .devcouncil/release_health.json
           if-no-files-found: error
       - name: Post GitHub Check (blocking gaps only)
         env:

@@ -95,7 +95,7 @@ def agent_guide_text(repo_map_path: Path, repo_root: Path, repo_map: RepoMap) ->
             "",
             "Use `.devcouncil/repo_map.json` as the primary file index for this workspace.",
             f"Repo map: `{repo_map_path.relative_to(repo_root).as_posix() if repo_map_path.is_relative_to(repo_root) else repo_map_path}`",
-            "Code graph: `.devcouncil/graph/code_graph.json` (symbol-level; query with `dev graph`).",
+            "Code graph: `.devcouncil/graph/code_graph.json` (symbol-level; query with `dev map`).",
             *wiki_lines,
             "",
             "Workflow for agents:",
@@ -105,18 +105,27 @@ def agent_guide_text(repo_map_path: Path, repo_root: Path, repo_map: RepoMap) ->
             "4. In `subsystems`, use `entry_points` + `critical_files` for entry points and starting context.",
             "5. Use `role_files` in `subsystems` for subsystem role buckets (entry, runtime, policy, adapters, etc.).",
             "6. Use `neighbors` and `handoff_paths` in `subsystems` to follow cross-subsystem flow.",
-            "7. Prefer `dev graph dead --confidence extracted` + file greps for dead code. "
+            "7. Prefer `dev map dead --confidence extracted` + file greps for dead code. "
             "Treat `inferred` as unconfirmed. Prefer `unwired_candidates` / "
             "`dead_symbol_candidates` over `unreachable_files` (static BFS is often "
             "noisy for routers / dynamic imports / JSX). If `entry_roots` are empty / "
             "`liveness_unreachable_unreliable`, ignore `unreachable_files` and mass inferred dead. "
             "Check `unwired_candidates` / `dead_symbol_candidates` before creating new modules — "
             "wire what you create into a real caller.",
-            "8. Use `dev graph query <name>` / `dev graph trace <a> <b>` / `dev graph dead` "
-            "for symbol callers, paths, and dead-code tiers; `dev graph html` for the visualizer. "
+            "8. Use `dev map query <name>` / `dev map trace <a> <b>` / `dev map dead` "
+            "for symbol callers, paths, and dead-code tiers; `dev map graph-html` "
+            "(or `dev map html --symbols`) for the symbol visualizer. "
             "SQLite (`.devcouncil/codeintel/index.sqlite`) is canonical — prefer "
-            "`dev graph` commands when `code_graph.json` is missing or a size-capped stub.",
-            "9. Run `dev map` (or `dev map --watch` / `dev graph watch`) after large refactors.",
+            "`dev map` commands when `code_graph.json` is missing or a size-capped stub.",
+            "9. Run `dev map` (or `dev map --watch` / `dev map watch`) after large refactors.",
+            "",
+            "DevCouncil loop:",
+            "- Prefer DevCouncil MCP tools (`devcouncil_status`, `devcouncil_checkout_task`, "
+            "`devcouncil_verify_task`, …) for task state; do not guess.",
+            "- Checkout before writes when write-gates are active; use scope/verify tools "
+            "rather than inventing task status.",
+            "- Engineering skills live under `.claude/skills/` and `.cursor/skills/` "
+            "(`dev skills scaffold` / `dev integrate cursor --apply`).",
             "",
             "Important surfaces:",
             *_important_surfaces(repo_map),

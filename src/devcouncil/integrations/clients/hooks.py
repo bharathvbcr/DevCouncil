@@ -241,41 +241,67 @@ def _upsert_cursor_hook(settings: dict, event: str, matcher: str, command: str) 
     entries = hooks.setdefault(event, [])
     for entry in entries:
         if entry.get("command") == command:
+            # Refresh matcher on re-apply (e.g. drop Read|Task).
+            if matcher:
+                entry["matcher"] = matcher
+            elif "matcher" in entry:
+                entry.pop("matcher", None)
             return
     payload: dict = {"command": command}
     if matcher:
         payload["matcher"] = matcher
     entries.append(payload)
 
-def _install_cursor_hooks(project_root: Path) -> list[Path]:
-    path = project_root / ".cursor" / "hooks.json"
+
+def _remove_cursor_hook(settings: dict, event: str, *, command_substr: str) -> None:
+    """Remove Cursor hook entries whose command contains ``command_substr``."""
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return
+    entries = hooks.get(event)
+    if not isinstance(entries, list):
+        return
+    kept = [
+        entry
+        for entry in entries
+        if not (isinstance(entry, dict) and command_substr in str(entry.get("command") or ""))
+    ]
+    if kept:
+        hooks[event] = kept
+    else:
+        hooks.pop(event, None)
+
+
+def _install_cursor_hooks(project_root: Path, *, write_gate: bool = False) -> list[Path]:
+    """Install Cursor hooks. PostToolUse always; PreToolUse only with ``write_gate``."""
+    root = project_root.expanduser().resolve()
+    path = root / ".cursor" / "hooks.json"
     settings = _load_json(path)
     settings.setdefault("version", 1)
-    matcher = "Shell|Write|Edit|MultiEdit|Read|Task"
-    _upsert_cursor_hook(
-        settings,
-        "preToolUse",
-        matcher,
-        _hook_command(project_root, "cursor", "pre-tool-use"),
-    )
-    _upsert_cursor_hook(
-        settings,
-        "postToolUse",
-        matcher,
-        _hook_command(project_root, "cursor", "post-tool-use"),
-    )
+    matcher = "Shell|Write|Edit|MultiEdit"
+    post_cmd = _hook_command(root, "cursor", "post-tool-use")
+    pre_cmd = _hook_command(root, "cursor", "pre-tool-use")
+    # Drop prior DevCouncil entries (absolute/relative path drift) before upsert.
+    _remove_cursor_hook(settings, "postToolUse", command_substr="post-tool-use")
+    _remove_cursor_hook(settings, "preToolUse", command_substr="pre-tool-use")
+    _upsert_cursor_hook(settings, "postToolUse", matcher, post_cmd)
+    if write_gate:
+        _upsert_cursor_hook(settings, "preToolUse", matcher, pre_cmd)
     _save_json(path, settings)
 
     def mutate(config: dict) -> None:
         cursor = config.setdefault("integrations", {}).setdefault("cursor", {})
         cursor.update({
-            "hooks_path": str(path.relative_to(project_root)),
+            "hooks_path": str(path.relative_to(root)),
+            "write_gate": write_gate,
         })
 
-    _mutate_raw_config(project_root, mutate)
+    _mutate_raw_config(root, mutate)
     return [path]
 
-def _install_grok_hooks(project_root: Path) -> list[Path]:
+
+def _install_grok_hooks(project_root: Path, *, write_gate: bool = False) -> list[Path]:
+    """Install Grok hooks. PostToolUse always; PreToolUse only with ``write_gate``."""
     hooks_dir = project_root / ".grok" / "hooks"
     hooks_dir.mkdir(parents=True, exist_ok=True)
     path = hooks_dir / "devcouncil.json"
@@ -283,36 +309,79 @@ def _install_grok_hooks(project_root: Path) -> list[Path]:
     matcher = "Bash|Write|Edit|MultiEdit|run_terminal_cmd|write_file|edit_file|apply_patch"
     _upsert_hook(
         settings,
-        "PreToolUse",
-        matcher,
-        _hook_command(project_root, "grok", "pre-tool-use"),
-        "devcouncil-pre-tool-use",
-    )
-    _upsert_hook(
-        settings,
         "PostToolUse",
         matcher,
         _hook_command(project_root, "grok", "post-tool-use"),
         "devcouncil-post-tool-use",
     )
+    if write_gate:
+        _upsert_hook(
+            settings,
+            "PreToolUse",
+            matcher,
+            _hook_command(project_root, "grok", "pre-tool-use"),
+            "devcouncil-pre-tool-use",
+        )
+    else:
+        _remove_named_hook(settings, "PreToolUse", "devcouncil-pre-tool-use")
     _save_json(path, settings)
 
     def mutate(config: dict) -> None:
         grok = config.setdefault("integrations", {}).setdefault("grok", {})
         grok.update({
             "hooks_path": str(path.relative_to(project_root)),
+            "write_gate": write_gate,
         })
 
     _mutate_raw_config(project_root, mutate)
     return [path]
 
-def _install_opencode_hooks(project_root: Path) -> list[Path]:
-    source = _opencode_plugin_source()
-    if not source.exists():
-        raise FileNotFoundError(f"Missing bundled OpenCode hook plugin: {source}")
+
+def _opencode_plugin_body(*, write_gate: bool) -> str:
+    """Generate OpenCode plugin source. Pre-tool gate only when write_gate."""
+    lines = [
+        'import { spawnSync } from "node:child_process";',
+        "",
+        "const projectRoot = process.env.DEVCOUNCIL_PROJECT_ROOT || process.cwd();",
+        "",
+        "function runHook(event, payload) {",
+        '  const args = ["hook", event, "--client", "opencode", "--project-root", projectRoot];',
+        "  const result = spawnSync(\"devcouncil\", args, {",
+        "    input: JSON.stringify(payload ?? {}),",
+        '    encoding: "utf-8",',
+        "    env: { ...process.env, DEVCOUNCIL_PROJECT_ROOT: projectRoot },",
+        "  });",
+        "  if (result.status === 2) {",
+        '    throw new Error(result.stderr || result.stdout || "DevCouncil blocked the tool call.");',
+        "  }",
+        "}",
+        "",
+        "export const DevCouncilOpenCodeHook = async () => ({",
+    ]
+    if write_gate:
+        lines.extend(
+            [
+                '  "tool.execute.before": async (input, output) => {',
+                "    runHook(\"pre-tool-use\", { tool: input.tool, arguments: output.args });",
+                "  },",
+            ]
+        )
+    lines.extend(
+        [
+            '  "tool.execute.after": async (input, output) => {',
+            "    runHook(\"post-tool-use\", { tool: input.tool, arguments: output.args });",
+            "  },",
+            "});",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _install_opencode_hooks(project_root: Path, *, write_gate: bool = False) -> list[Path]:
     destination = _opencode_plugin_path(project_root)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    destination.write_text(_opencode_plugin_body(write_gate=write_gate), encoding="utf-8")
 
     path = _opencode_config_path(project_root)
     data = _load_json_strict(path, "OpenCode") if path.exists() else {"$schema": "https://opencode.ai/config.json"}
@@ -327,6 +396,12 @@ def _install_opencode_hooks(project_root: Path) -> list[Path]:
     if plugin_ref not in plugins:
         plugins.append(plugin_ref)
     _save_json(path, data)
+
+    def mutate(config: dict) -> None:
+        opencode = config.setdefault("integrations", {}).setdefault("opencode", {})
+        opencode.update({"write_gate": write_gate})
+
+    _mutate_raw_config(project_root, mutate)
     _record_opencode_config(project_root)
     return [destination, path]
 
@@ -451,7 +526,7 @@ def _preview_hook_paths(project_root: Path, tool: str) -> list[tuple[str, Path]]
     return [(client, path) for client in selected for path in paths.get(client, [])]
 
 def _configure_native_hooks(
-    project_root: Path, tool: str = "all", apply: bool = False, *, claude_write_gate: bool = False
+    project_root: Path, tool: str = "all", apply: bool = False, *, write_gate: bool = False, claude_write_gate: bool | None = None
 ) -> None:
     allowed = {"all", *SUPPORTED_HOOK_TOOLS, "gemini", "opencode"}
     if tool not in allowed:
@@ -475,15 +550,18 @@ def _configure_native_hooks(
         selected = ("opencode",)
     else:
         selected = (tool,)
+    # Prefer write_gate; accept legacy claude_write_gate kw from older callers.
+    if claude_write_gate is not None:
+        write_gate = bool(claude_write_gate)
+
     installers = {
         "codex": _install_codex_hooks,
         "gemini": _install_gemini_hooks,
-        # Claude's blocking write-gate is opt-in (assist-mode default); the other clients
-        # install their native pre/post hooks unconditionally as before.
-        "claude": lambda root: _install_claude_hooks(root, write_gate=claude_write_gate),
-        "cursor": _install_cursor_hooks,
-        "grok": _install_grok_hooks,
-        "opencode": _install_opencode_hooks,
+        # Blocking PreToolUse write-gate is opt-in for Claude/Cursor/Grok/OpenCode.
+        "claude": lambda root: _install_claude_hooks(root, write_gate=write_gate),
+        "cursor": lambda root: _install_cursor_hooks(root, write_gate=write_gate),
+        "grok": lambda root: _install_grok_hooks(root, write_gate=write_gate),
+        "opencode": lambda root: _install_opencode_hooks(root, write_gate=write_gate),
     }
     # Batch the per-installer config.yaml record updates (cursor/opencode)
     # into one load/save instead of re-parsing YAML per tool.

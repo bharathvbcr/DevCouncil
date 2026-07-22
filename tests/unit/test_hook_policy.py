@@ -112,7 +112,14 @@ def test_hook_policy_warns_for_direct_push_when_task_allows_it():
     assert policy.evaluate_command("git push origin HEAD:main", task).action == "warn"
 
 
-def test_hook_policy_denies_direct_push_without_active_task():
-    policy = HookPolicy()
+def test_hook_policy_denies_direct_push_without_active_task(tmp_path, monkeypatch):
+    # Isolate from the host repo's execution.hook_gate.mode (may be off).
+    monkeypatch.setenv("DEVCOUNCIL_HOOK_GATE", "contain")
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "project:\n  name: t\nexecution:\n  hook_gate:\n    mode: contain\n",
+        encoding="utf-8",
+    )
+    policy = HookPolicy(project_root=tmp_path)
 
     assert policy.evaluate_command("git push origin main", None).action == "deny"

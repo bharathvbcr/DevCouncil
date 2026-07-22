@@ -172,7 +172,7 @@ def test_map_cli_surfaces_build_status_fields(tmp_path: Path, monkeypatch) -> No
     )
 
     runner = CliRunner()
-    result = runner.invoke(app, ["graph", "status", "--project-root", str(tmp_path)])
+    result = runner.invoke(app, ["map", "status", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert "generation" in result.output.lower() or "healthy" in result.output.lower()
 

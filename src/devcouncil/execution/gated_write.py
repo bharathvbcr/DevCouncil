@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import fnmatch
 import os
 import subprocess
 from pathlib import Path
 
 from devcouncil.execution.hook_policy import HookPolicy
 from devcouncil.execution.lease_validation import require_valid_lease
+from devcouncil.execution.planned_scope import matches_planned_path
 from devcouncil.integrations.mcp.util import (
     GIT_APPLY_TIMEOUT_SECONDS,
     diff_target_paths,
@@ -20,14 +20,8 @@ from devcouncil.storage.repositories import TaskRepository
 
 
 def _explicitly_planned(path: str, task) -> bool:  # noqa: ANN001
-    normalized = path.replace("\\", "/")
-    while normalized.startswith("./"):
-        normalized = normalized[2:]
-    return any(
-        normalized == planned.path.replace("\\", "/")
-        or fnmatch.fnmatch(normalized, planned.path.replace("\\", "/"))
-        for planned in task.planned_files
-    )
+    """True when path is in task planned-file scope (exact or glob)."""
+    return matches_planned_path(path, task.planned_files)
 
 
 def write_file_payload(

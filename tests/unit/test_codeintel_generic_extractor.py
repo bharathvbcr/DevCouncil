@@ -140,6 +140,13 @@ def test_embedded_region_source_offsets() -> None:
     assert ("html", liquid, 0) in _embedded_regions("Liquid", liquid)
 
 
+def test_embedded_script_tolerates_junk_close_tag() -> None:
+    """Browser-tolerant close tags like ``</script foo>`` must still match."""
+    source = "<script>run()</script foo>\n"
+    regions = _embedded_regions("Vue", source)
+    assert ("javascript", "run()", 0) in regions
+
+
 def test_tree_sitter_empty_call_rows_do_not_use_regex_fallback(monkeypatch) -> None:
     monkeypatch.setattr(
         "devcouncil.codeintel.languages.generic_extractor.process_tree_sitter",

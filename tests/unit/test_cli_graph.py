@@ -46,11 +46,11 @@ def _setup_graph_env(tmp_path: Path, monkeypatch) -> Path:
 def test_cli_graph_query(tmp_path, monkeypatch):
     _setup_graph_env(tmp_path, monkeypatch)
     
-    res = runner.invoke(app, ["graph", "query", "src/a.py::func_a"])
+    res = runner.invoke(app, ["map", "query", "src/a.py::func_a"])
     assert res.exit_code == 0
     assert "src/a.py::func_a" in res.output
     
-    res_json = runner.invoke(app, ["graph", "query", "src/a.py::func_a", "--json"])
+    res_json = runner.invoke(app, ["map", "query", "src/a.py::func_a", "--json"])
     assert res_json.exit_code == 0
     data = json.loads(res_json.output)
     assert len(data["definitions"]) > 0
@@ -59,11 +59,11 @@ def test_cli_graph_query(tmp_path, monkeypatch):
 def test_cli_graph_trace(tmp_path, monkeypatch):
     _setup_graph_env(tmp_path, monkeypatch)
     
-    res = runner.invoke(app, ["graph", "trace", "src/a.py::func_a", "src/b.py::func_b"])
+    res = runner.invoke(app, ["map", "trace", "src/a.py::func_a", "src/b.py::func_b"])
     assert res.exit_code == 0
     assert "src/a.py::func_a → src/b.py::func_b" in res.output
     
-    res_json = runner.invoke(app, ["graph", "trace", "src/a.py::func_a", "src/b.py::func_b", "--json"])
+    res_json = runner.invoke(app, ["map", "trace", "src/a.py::func_a", "src/b.py::func_b", "--json"])
     assert res_json.exit_code == 0
     data = json.loads(res_json.output)
     assert data["found"] is True
@@ -72,12 +72,12 @@ def test_cli_graph_trace(tmp_path, monkeypatch):
 def test_cli_graph_dead(tmp_path, monkeypatch):
     _setup_graph_env(tmp_path, monkeypatch)
     
-    res = runner.invoke(app, ["graph", "dead"])
+    res = runner.invoke(app, ["map", "dead"])
     assert res.exit_code == 0
     assert "src/a.py::func_a" in res.output
     assert "uncalled" in res.output
     
-    res_json = runner.invoke(app, ["graph", "dead", "--json"])
+    res_json = runner.invoke(app, ["map", "dead", "--json"])
     assert res_json.exit_code == 0
     data = json.loads(res_json.output)
     assert len(data["dead_code"]) == 1
@@ -87,12 +87,12 @@ def test_cli_graph_dead(tmp_path, monkeypatch):
 def test_cli_graph_check(tmp_path, monkeypatch):
     _setup_graph_env(tmp_path, monkeypatch)
     
-    res = runner.invoke(app, ["graph", "check"])
+    res = runner.invoke(app, ["map", "check"])
     assert res.exit_code == 0
     assert "God nodes" in res.output
     assert "Circular imports" in res.output
     
-    res_json = runner.invoke(app, ["graph", "check", "--json"])
+    res_json = runner.invoke(app, ["map", "check", "--json"])
     assert res_json.exit_code == 0
     data = json.loads(res_json.output)
     assert "god_nodes" in data
@@ -103,28 +103,28 @@ def test_cli_graph_process(tmp_path, monkeypatch):
     _setup_graph_env(tmp_path, monkeypatch)
     
     # Query with entry roots
-    res = runner.invoke(app, ["graph", "process"])
+    res = runner.invoke(app, ["map", "process"])
     assert res.exit_code == 0
     
-    res_json = runner.invoke(app, ["graph", "process", "--json"])
+    res_json = runner.invoke(app, ["map", "process", "--json"])
     assert res_json.exit_code == 0
 
 
 def test_cli_graph_impact(tmp_path, monkeypatch):
     _setup_graph_env(tmp_path, monkeypatch)
     
-    res = runner.invoke(app, ["graph", "impact", "src/a.py"])
+    res = runner.invoke(app, ["map", "impact", "src/a.py"])
     assert res.exit_code == 0
     assert "src/a.py" in res.output
     
-    res_json = runner.invoke(app, ["graph", "impact", "src/a.py", "--json"])
+    res_json = runner.invoke(app, ["map", "impact", "src/a.py", "--json"])
     assert res_json.exit_code == 0
 
 
 def test_cli_graph_html(tmp_path, monkeypatch):
     _setup_graph_env(tmp_path, monkeypatch)
     
-    res = runner.invoke(app, ["graph", "html"])
+    res = runner.invoke(app, ["map", "graph-html"])
     assert res.exit_code == 0, f"res.output: {res.output}"
     assert "Wrote" in res.output
     # Check if the file exists in the graph directory
@@ -134,10 +134,32 @@ def test_cli_graph_html(tmp_path, monkeypatch):
 def test_cli_graph_export(tmp_path, monkeypatch):
     _setup_graph_env(tmp_path, monkeypatch)
     
-    res = runner.invoke(app, ["graph", "export", "--format", "graphml"])
+    res = runner.invoke(app, ["map", "export", "--format", "graphml"])
     assert res.exit_code == 0
     assert "graph" in res.output
     
-    res_okf = runner.invoke(app, ["graph", "export", "--format", "okf", "-o", "okf-out"])
+    res_okf = runner.invoke(app, ["map", "export", "--format", "okf", "-o", "okf-out"])
     assert res_okf.exit_code == 0
     assert "Wrote OKF bundle" in res_okf.output
+
+
+# --- thin `dev graph` alias suite (dual-registered map app) ---------------------
+
+
+def test_graph_alias_query_and_html(tmp_path, monkeypatch):
+    """Compatibility: `dev graph …` remains dual-registered with `dev map …`."""
+    _setup_graph_env(tmp_path, monkeypatch)
+
+    res = runner.invoke(app, ["graph", "query", "src/a.py::func_a"])
+    assert res.exit_code == 0
+    assert "src/a.py::func_a" in res.output
+
+    res_html = runner.invoke(app, ["graph", "html"])
+    assert res_html.exit_code == 0
+    assert (tmp_path / ".devcouncil" / "graph" / "graph.html").exists()
+
+
+def test_graph_alias_demo(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    res = runner.invoke(app, ["graph", "demo", "--json", "--project-root", str(tmp_path)])
+    assert res.exit_code == 0

@@ -103,6 +103,8 @@ def test_dashboard_payload_uninitialized(tmp_path, monkeypatch):
     assert payload["initialized"] is False
     assert payload["phase"] == "UNINITIALIZED"
     assert payload["tasks"] == []
+    assert payload["verdict"]["verdict"] == "uninitialized"
+    assert "cards" in payload
 
 
 def test_is_loopback_client():
@@ -202,6 +204,12 @@ def test_dashboard_html_embeds_token_and_sections():
     assert 'content="token"' in html
     assert "DevCouncil Dashboard" in html
     assert "Recent Agent Runs" in html
+    assert "summary-cards" in html
+    assert "Blocking gaps" in html
+    assert "collapsible" in html
+    assert 'id="coverage"' not in html
+    assert "innerHTML" not in html
+    assert "Apply Detected" in html
 
 
 def test_logo_assets_load():
@@ -283,7 +291,14 @@ def test_dashboard_payload_initialized(tmp_path, monkeypatch):
     fake_db = SimpleNamespace(get_session=lambda: FakeSessionCtx())
     fake_graph = SimpleNamespace(
         tasks={"T1": SimpleNamespace(model_dump=lambda: {"id": "T1", "status": "done"})},
-        coverage_summary=lambda: {"pct": 91},
+        coverage_summary=lambda: {
+            "pct": 91,
+            "blocking_gaps": 0,
+            "ac_without_evidence": 0,
+            "total_tasks": 1,
+        },
+        blocking_gaps=lambda: [],
+        all_gaps=lambda: [],
     )
 
     class FakeStateRepo:
@@ -305,7 +320,9 @@ def test_dashboard_payload_initialized(tmp_path, monkeypatch):
     payload = dash.dashboard_payload(tmp_path)
     assert payload["initialized"] is True
     assert payload["phase"] == "PHASE-X"
-    assert payload["coverage"] == {"pct": 91}
+    assert payload["coverage"]["pct"] == 91
+    assert payload["verdict"]["verdict"] == "passed"
+    assert payload["cards"]["tasks"] == 1
     assert payload["tasks"][0]["id"] == "T1"
 
 

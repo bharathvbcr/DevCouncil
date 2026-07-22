@@ -53,6 +53,29 @@ def test_apply_cursor_writes_project_config(tmp_path, monkeypatch):
     assert server["command"] == "devcouncil"
     assert server["args"] == ["mcp-server"]
     assert server["env"]["DEVCOUNCIL_PROJECT_ROOT"] == str(tmp_path)
+    # One-shot surface also scaffolds skills + always-on rule.
+    assert (tmp_path / ".cursor" / "skills" / "core-engineering" / "SKILL.md").exists()
+    assert (tmp_path / ".claude" / "skills" / "core-engineering" / "SKILL.md").exists()
+    rules = tmp_path / ".cursor" / "rules" / "devcouncil.mdc"
+    assert rules.exists()
+    assert "alwaysApply: true" in rules.read_text(encoding="utf-8")
+    assert any(r["target"] == "cursor-assets" and r["ok"] for r in report.results)
+
+
+def test_apply_cursor_with_hooks_installs_hooks_json(tmp_path, monkeypatch):
+    monkeypatch.setattr("devcouncil.cli.commands.integrate.shutil.which", lambda _cmd: None)
+
+    report = apply_integration_target(tmp_path, "cursor", include_hooks=True)
+
+    assert report.ok is True
+    hooks_path = tmp_path / ".cursor" / "hooks.json"
+    assert hooks_path.exists()
+    hooks_data = json.loads(hooks_path.read_text(encoding="utf-8"))
+    assert "postToolUse" in hooks_data["hooks"]
+    assert "preToolUse" not in hooks_data["hooks"]
+    assert (tmp_path / ".cursor" / "rules" / "devcouncil.mdc").exists()
+    assert any(r["target"] == "cursor-hooks" and r["ok"] for r in report.results)
+    assert any(r["target"] == "cursor-assets" and r["ok"] for r in report.results)
 
 
 def test_apply_all_skips_gemini_mcp_registration(tmp_path, monkeypatch):
@@ -91,6 +114,7 @@ def test_apply_all_skips_gemini_mcp_registration(tmp_path, monkeypatch):
     monkeypatch.setattr("devcouncil.cli.commands.integrate._configure_native_hooks", lambda *_a, **_k: None)
     monkeypatch.setattr("devcouncil.cli.commands.integrate._install_git_map_hooks", lambda *_a, **_k: [])
     monkeypatch.setattr("devcouncil.cli.commands.integrate._install_claude_assets", lambda *_a, **_k: [])
+    monkeypatch.setattr("devcouncil.cli.commands.integrate._install_cursor_assets", lambda *_a, **_k: [])
 
     report = apply_integration_target(tmp_path, "all", include_hooks=False)
 

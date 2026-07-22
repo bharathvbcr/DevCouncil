@@ -110,8 +110,11 @@ def compute_communities(
     if G.number_of_nodes() == 0:
         return {"communities": [], "count": 0}
 
-    # Bound Louvain so pathological graphs cannot stall a full map/graph build.
-    timeout_seconds = 15.0
+    from devcouncil.indexing.graph.communities import (
+        COMMUNITY_TIMEOUT_SECONDS,
+        community_detection_limit,
+    )
+    timeout_seconds = COMMUNITY_TIMEOUT_SECONDS
 
     def _run_louvain() -> list:
         return list(louvain_communities(G, seed=seed, weight=None))
@@ -132,10 +135,23 @@ def compute_communities(
             "count": 0,
             "skipped": True,
             "reason": f"louvain_timeout_{timeout_seconds:.0f}s",
+ "limit": community_detection_limit(
+ canonical_store_health="healthy",
+ reason=f"louvain_timeout_{timeout_seconds:.0f}s",
+ ).as_dict(),
         }
     except Exception:
         logger.warning("community detection failed; skipping", exc_info=True)
-        return {"communities": [], "count": 0, "skipped": True, "reason": "louvain_error"}
+        return {
+ "communities": [],
+ "count": 0,
+ "skipped": True,
+ "reason": "louvain_error",
+ "limit": community_detection_limit(
+ canonical_store_health="healthy",
+ reason="louvain_error",
+ ).as_dict(),
+ }
     # Deterministic order: sort communities by sorted member list.
     ordered = sorted(
         (sorted(c) for c in raw),

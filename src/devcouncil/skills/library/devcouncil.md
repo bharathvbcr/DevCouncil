@@ -23,6 +23,14 @@ Do not guess at task status, file scope, or whether tests actually prove the dif
 3. Check status: `devcouncil_status` (MCP) or `/devcouncil:status` (slash command) or
    `dev status` (CLI).
 
+## Dead code / liveness
+
+Prefer `dev map dead --confidence extracted` plus file greps. Treat `inferred` as
+unconfirmed. If `entry_roots` are empty or `liveness_unreachable_unreliable` is set,
+**ignore** `unreachable_files` and mass inferred dead. Map `dead_symbol_candidates`
+are extracted ∩ token-scan (methods excluded). Prefer `dev map query|trace|dead`
+and `dev map graph-html` for symbol navigation / visualizer.
+
 ## MCP tools vs CLI vs slash commands
 
 | Need | Prefer |

@@ -423,6 +423,30 @@ class StopGateConfig(BaseModel):
     verify_cache_minutes: int = 5
 
 
+class HookGateConfig(BaseModel):
+    """Runtime PreToolUse Shell/Write posture when hooks are installed.
+
+    ``mode``: ``contain`` (default) fail-closes Shell/Write without an active
+    task lease; ``off`` allows no-task Shell/Write while still enforcing hard
+    safety (secrets, out-of-root, git force-push / --no-verify / protected-branch).
+    Override with ``DEVCOUNCIL_HOOK_GATE=off|contain``.
+
+    YAML note: write ``mode: "off"`` (quoted). Bare ``off`` is a YAML boolean.
+    """
+
+    mode: str = "contain"
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _coerce_mode(cls, value: object) -> str:
+        # Bare YAML ``off`` / ``on`` become bools; accept them as mode names.
+        if value is False:
+            return "off"
+        if value is True:
+            return "contain"
+        return str(value or "contain")
+
+
 class ExecutionConfig(BaseModel):
     default_executor: str = "manual"
     max_repair_attempts: int = 3
@@ -433,6 +457,7 @@ class ExecutionConfig(BaseModel):
     # auto-expires after this, so the task frees up without a human running force.
     lease_ttl_seconds: int = 1800
     stop_gate: StopGateConfig = Field(default_factory=StopGateConfig)
+    hook_gate: HookGateConfig = Field(default_factory=HookGateConfig)
     # Deprecated alias: true iff stop_gate.mode != off and verify_active_task.
     # Migrated in load_config; kept for hook compatibility.
     verify_on_post_task: bool = False
@@ -515,6 +540,8 @@ class WarpIntegrationConfig(BaseModel):
 class OpenCodeIntegrationConfig(BaseModel):
     enabled: bool = False
     config_path: str = "opencode.json"
+    # Opt-in PreToolUse write-gate; default assist (refresh/lifecycle only).
+    write_gate: bool = False
 
 
 class AntigravityIntegrationConfig(BaseModel):
@@ -527,11 +554,16 @@ class CursorIntegrationConfig(BaseModel):
     config_path: str = ".cursor/mcp.json"
     hooks_path: str = ".cursor/hooks.json"
     headless_force: bool | None = None
+    # Opt-in PreToolUse write-gate; default assist (PostToolUse refresh only).
+    write_gate: bool = False
 
 
 class GrokIntegrationConfig(BaseModel):
     enabled: bool = False
     config_path: str = ".grok/config.toml"
+    hooks_path: str = ".grok/hooks/devcouncil.json"
+    # Opt-in PreToolUse write-gate; default assist (PostToolUse refresh only).
+    write_gate: bool = False
 
 
 class AiderIntegrationConfig(BaseModel):

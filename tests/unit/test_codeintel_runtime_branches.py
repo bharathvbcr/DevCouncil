@@ -849,7 +849,7 @@ def test_graph_cli_status_sync_search_explore_and_affected(
             }
         ),
     )
-    monkeypatch.setattr(sync_module, "get_sync_coordinator", lambda _root: Coordinator())
+    monkeypatch.setattr(sync_module, "get_sync_coordinator", lambda _root, **_k: Coordinator())
     monkeypatch.setattr(query_module, "CodeIntelQueryEngine", Engine)
 
     for arguments, expected in [
@@ -863,14 +863,14 @@ def test_graph_cli_status_sync_search_explore_and_affected(
         (["affected", "none"], "No affected tests"),
     ]:
         result = runner.invoke(
-            app, ["graph", *arguments, "--project-root", str(tmp_path)]
+            app, ["map", *arguments, "--project-root", str(tmp_path)]
         )
         assert result.exit_code == 0, result.output
         assert expected in result.output
     failed = runner.invoke(
         app,
         [
-            "graph",
+            "map",
             "sync",
             "fail.py",
             "--json",
@@ -923,7 +923,7 @@ def test_graph_cli_init_watch_doctor_and_hooks(
     initialized = runner.invoke(
         app,
         [
-            "graph",
+            "map",
             "init",
             "--no-liveness",
             "--json",
@@ -942,14 +942,14 @@ def test_graph_cli_init_watch_doctor_and_hooks(
                 backend="", state="healthy", backend_kind="native"
             )
 
-        def stop(self):
+        def stop(self, timeout=None):
             self.stopped = True
 
     coordinator = Coordinator()
-    monkeypatch.setattr(sync_module, "get_sync_coordinator", lambda _root: coordinator)
+    monkeypatch.setattr(sync_module, "get_sync_coordinator", lambda _root, **_k: coordinator)
     monkeypatch.setattr(time, "sleep", lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt()))
     watched = runner.invoke(
-        app, ["graph", "watch", "--project-root", str(tmp_path)]
+        app, ["map", "watch", "--project-root", str(tmp_path)]
     )
     assert watched.exit_code == 0
     assert coordinator.stopped
@@ -981,18 +981,18 @@ def test_graph_cli_init_watch_doctor_and_hooks(
         ),
     )
     doctor = runner.invoke(
-        app, ["graph", "doctor", "--json", "--project-root", str(tmp_path)]
+        app, ["map", "doctor", "--json", "--project-root", str(tmp_path)]
     )
     assert doctor.exit_code == 0
     assert json.loads(doctor.output)["ok"] is True
 
     no_git = runner.invoke(
-        app, ["graph", "hooks", "install", "--project-root", str(tmp_path)]
+        app, ["map", "hooks", "install", "--project-root", str(tmp_path)]
     )
     assert no_git.exit_code == 1
     (tmp_path / ".git" / "hooks").mkdir(parents=True)
     installed = runner.invoke(
-        app, ["graph", "hooks", "install", "--project-root", str(tmp_path)]
+        app, ["map", "hooks", "install", "--project-root", str(tmp_path)]
     )
     assert installed.exit_code == 0
     assert (tmp_path / ".git" / "hooks" / "post-checkout").stat().st_mode & 0o111
@@ -1000,7 +1000,7 @@ def test_graph_cli_init_watch_doctor_and_hooks(
         "#!/bin/sh\nother\n", encoding="utf-8"
     )
     conflict = runner.invoke(
-        app, ["graph", "hooks", "install", "--project-root", str(tmp_path)]
+        app, ["map", "hooks", "install", "--project-root", str(tmp_path)]
     )
     assert conflict.exit_code == 1
 
@@ -1628,7 +1628,7 @@ def test_mcp_codeintel_dispatch_all_handlers_and_errors(
     coordinator = Coordinator()
     monkeypatch.setattr(mcp_codeintel, "CodeIntelQueryEngine", Engine)
     monkeypatch.setattr(
-        mcp_codeintel, "get_sync_coordinator", lambda _root: coordinator
+        mcp_codeintel, "get_sync_coordinator", lambda _root, **_k: coordinator
     )
     monkeypatch.setattr(
         mcp_codeintel,
@@ -1718,10 +1718,10 @@ def test_graph_cli_remaining_output_branches(
         lambda _root: types.SimpleNamespace(status=lambda: EmptyState()),
     )
     assert runner.invoke(
-        app, ["graph", "init", "--project-root", str(tmp_path)]
+        app, ["map", "init", "--project-root", str(tmp_path)]
     ).exit_code == 0
     status_result = runner.invoke(
-        app, ["graph", "status", "--project-root", str(tmp_path)]
+        app, ["map", "status", "--project-root", str(tmp_path)]
     )
     assert status_result.exit_code == 0
     assert "not started" in status_result.output
@@ -1744,7 +1744,7 @@ def test_graph_cli_remaining_output_branches(
         },
     )
     failed_doctor = runner.invoke(
-        app, ["graph", "doctor", "--json", "--project-root", str(tmp_path)]
+        app, ["map", "doctor", "--json", "--project-root", str(tmp_path)]
     )
     assert failed_doctor.exit_code == 1
 
@@ -1773,7 +1773,7 @@ def test_graph_cli_remaining_output_branches(
     assert '"definitions"' in runner.invoke(
         app,
         [
-            "graph",
+            "map",
             "explore",
             "target",
             "--json",
@@ -1784,7 +1784,7 @@ def test_graph_cli_remaining_output_branches(
     assert '"tests"' in runner.invoke(
         app,
         [
-            "graph",
+            "map",
             "affected",
             "target",
             "--json",
@@ -1801,7 +1801,7 @@ def test_graph_cli_remaining_output_branches(
         lambda _graph, top_n: {"god_nodes": [], "circular_imports": []},
     )
     assert "(none)" in runner.invoke(
-        app, ["graph", "check", "--project-root", str(tmp_path)]
+        app, ["map", "check", "--project-root", str(tmp_path)]
     ).output
     monkeypatch.setattr(
         intel,
@@ -1810,7 +1810,7 @@ def test_graph_cli_remaining_output_branches(
     )
     assert '"flow"' in runner.invoke(
         app,
-        ["graph", "process", "--json", "--project-root", str(tmp_path)],
+        ["map", "process", "--json", "--project-root", str(tmp_path)],
     ).output
     monkeypatch.setattr(
         intel,
@@ -1836,7 +1836,7 @@ def test_graph_cli_remaining_output_branches(
     impacted = runner.invoke(
         app,
         [
-            "graph",
+            "map",
             "impact",
             "app.py",
             "--max-depth",
@@ -1856,7 +1856,7 @@ def test_graph_cli_remaining_output_branches(
     links = runner.invoke(
         app,
         [
-            "graph",
+            "map",
             "export",
             "--format",
             "okf-links",

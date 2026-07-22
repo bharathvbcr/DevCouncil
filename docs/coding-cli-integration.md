@@ -22,7 +22,7 @@ Setup: `dev integrate <client> --apply` for MCP where supported; executors work 
 | :--- | :--- |
 | Claude | Yes — opt-in blocking PreToolUse write gate + lifecycle/Stop hooks |
 | Codex | Advisory PreToolUse + blocking Stop/SubagentStop; sandbox + verification are the write boundary |
-| Cursor | Yes — `.cursor/hooks.json` |
+| Cursor | Yes — assist by default (PostToolUse); opt-in `--write-gate` PreToolUse |
 | Grok Build | Yes — `.grok/hooks/devcouncil.json` (requires `/hooks-trust`) |
 | OpenCode | Yes — bundled plugin via `dev integrate hooks` |
 | Antigravity / Warp / Aider / Copilot / Goose / Amp / Qwen / Crush | Verification-gated; hooks optional |
@@ -42,7 +42,7 @@ Safety policy is the same across coding CLIs; enforcement differs by runtime. Ho
 | **OpenCode** | Supported | Supported via `opencode run --file` | Supported via project `opencode.json` | Native via `dev integrate hooks` (bundled plugin) |
 | **Google Antigravity CLI** | Supported | Supported via `agy --print` | Supported via project `.agents/mcp_config.json` | Verification-gated sidecar |
 | **Warp / Oz** | Supported | Supported via `oz agent run` | Supported via Warp/Oz MCP JSON | Verification-gated sidecar |
-| **Cursor** | Supported | Supported via `agent`/`cursor-agent --print --trust` (yolo adds `--force`; JSON output) | Supported via project `.cursor/mcp.json` | Native via `dev integrate hooks` (`.cursor/hooks.json`) |
+| **Cursor** | Supported | Supported via `agent`/`cursor-agent --print --trust` (yolo adds `--force`; JSON output) | Supported via project `.cursor/mcp.json` | Assistive PostToolUse by default; opt-in `--write-gate` PreToolUse (`.cursor/hooks.json`) |
 | **Grok Build** | Supported | Supported via `grok -p` with `--directory` | Supported via `grok mcp add` or `.grok/config.toml` | Native via `dev integrate hooks --tool grok` (`.grok/hooks/devcouncil.json`; trust with `/hooks-trust`) |
 | **Aider** | Supported | Supported via `aider --yes --message` | Not a primary path | Verification-gated sidecar |
 | **GitHub Copilot CLI** | Supported | Supported via `copilot --allow-all-tools -p` | Tool-managed MCP config | Verification-gated sidecar |
@@ -381,7 +381,7 @@ advice. Set `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1` to disable (Claude accepts `--a
 
 #### Assist mode vs. the write-gate (important)
 
-By **default** `dev integrate claude --apply` installs *assist mode* — everything above **except** the blocking pre-action write-gate (`PreToolUse`/`PostToolUse`). That write-gate denies any `Bash`/`Write`/`Edit` not authorized by an active task **lease**, so in an interactive human session (where there is no lease) it would fail-closed and block every command. Assist mode keeps DevCouncil's assistance without locking down your own shell.
+By **default** `dev integrate claude --apply` installs *assist mode* — lifecycle hooks plus **refresh-only PostToolUse** (map auto-refresh; never gates writes). The blocking pre-action write-gate is **PreToolUse only**; it denies any `Bash`/`Write`/`Edit` not authorized by an active task **lease**, so in an interactive human session (where there is no lease) it would fail-closed and block every command. Assist mode keeps DevCouncil's assistance without locking down your own shell.
 
 Add the write-gate explicitly when you want pre-action containment (e.g. for autonomous executor runs):
 
@@ -490,6 +490,47 @@ Upstream references: [Antigravity CLI overview](https://antigravity.google/docs/
 
 Use DevCouncil as the planning and verification shell around Cursor.
 
+One-shot project setup:
+
+```bash
+dev integrate cursor --apply
+```
+
+This installs the full Cursor companion surface (mirroring Claude's one-shot):
+
+| Asset | Path |
+| :--- | :--- |
+| MCP server | `.cursor/mcp.json` |
+| Native hooks | `.cursor/hooks.json` — **assist by default** (PostToolUse map refresh only); add `--write-gate` for PreToolUse containment |
+| Engineering skills | `.cursor/skills/<name>/SKILL.md` (also mirrored under `.claude/skills/`) |
+| Always-on rule | `.cursor/rules/devcouncil.mdc` (`alwaysApply: true`) |
+
+`AGENTS.md` / `CLAUDE.md` (from `dev map`) point agents at the DevCouncil MCP loop and these skill roots.
+
+
+#### Assist mode vs. `--write-gate` (Claude parity)
+
+By default `dev integrate cursor --apply` and `dev integrate hooks --apply --tool cursor|grok|opencode`
+install **assist mode**: refresh-only **PostToolUse** (and OpenCode `tool.execute.after`). PostToolUse
+never denies a tool call — it is not a write-gate.
+
+Add the blocking **PreToolUse** write-gate when you want pre-action containment (leased task required
+for Shell/Write):
+
+```bash
+dev integrate cursor --apply --write-gate
+dev integrate hooks --apply --tool grok --write-gate
+dev integrate hooks --apply --tool opencode --write-gate
+```
+
+Re-applying without `--write-gate` strips PreToolUse (assist). Runtime escape hatch for an already
+installed PreToolUse gate: `execution.hook_gate.mode=off` or `DEVCOUNCIL_HOOK_GATE=off` (hard safety
+still enforced; MCP lease write/run paths stay gated).
+
+`dev integrate check` accepts PostToolUse-only Cursor/Grok assist when `integrations.*.write_gate`
+is false. Enforcement posture in `dev integrate matrix` reflects *capability*, not the installed
+assist/contain choice — use `dev doctor` / `dev integrate check` for installed posture.
+
 Headless execution with Cursor Agent CLI:
 
 ```bash
@@ -514,13 +555,7 @@ Paste the prompt into Cursor Chat or Agent mode and instruct Cursor to stay with
 dev verify TASK-001
 ```
 
-MCP setup:
-
-```bash
-dev integrate cursor --apply
-```
-
-The command writes `.cursor/mcp.json` in the project so Cursor editor and `cursor-agent` can discover the same DevCouncil MCP server:
+MCP config shape written by integrate:
 
 ```json
 {

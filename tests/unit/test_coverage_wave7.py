@@ -326,6 +326,9 @@ def test_map_artifact_helpers(tmp_path):
     text = agent_guide_text(tmp_path / ".devcouncil" / "repo_map.json", tmp_path, repo_map)
     assert AGENT_GUIDE_MARKER in text
     assert "Important surfaces" in text
+    assert "DevCouncil loop" in text
+    assert "devcouncil_checkout_task" in text
+    assert ".cursor/skills/" in text
 
     write_agent_guides(tmp_path, tmp_path / ".devcouncil" / "repo_map.json", repo_map)
     assert (tmp_path / "AGENTS.md").is_file()

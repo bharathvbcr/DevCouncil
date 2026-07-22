@@ -174,6 +174,33 @@ def _dashboard_gaps_summary(session) -> dict:
     return {"total": len(all_gaps), "blocking": len(blocking), "items": items}
 
 
+
+def _coverage_cards(coverage: dict[str, Any] | None) -> dict[str, int]:
+    """Compact summary numbers for the dashboard card strip."""
+    cov = coverage or {}
+    return {
+        "requirements": int(cov.get("total_requirements") or 0),
+        "blocking_gaps": int(cov.get("blocking_gaps") or 0),
+        "tasks": int(cov.get("total_tasks") or 0),
+        "ac_without_evidence": int(cov.get("ac_without_evidence") or 0),
+        "open_findings": int(cov.get("open_findings") or 0),
+    }
+
+
+def _dashboard_verdict(
+    *,
+    initialized: bool,
+    graph: "ArtifactGraph | None" = None,
+) -> dict[str, Any]:
+    """Return verdict payload: uninitialized / blocked / incomplete / passed."""
+    if not initialized or graph is None:
+        return {"verdict": "uninitialized", "incomplete_kind": None}
+    from devcouncil.reporting.verdict import classify_verdict
+
+    verdict, kind = classify_verdict(graph)
+    return {"verdict": verdict, "incomplete_kind": kind}
+
+
 def logo_svg() -> str:
     return resources.files("devcouncil.assets").joinpath(LEGACY_LOGO_ASSET).read_text(encoding="utf-8")
 
@@ -185,11 +212,14 @@ def logo_asset_bytes() -> bytes:
 def dashboard_payload(project_root: Path) -> dict:
     db = get_db(project_root)
     if not db:
+        coverage: dict[str, Any] = {}
         return {
             "initialized": False,
             "phase": "UNINITIALIZED",
+            "verdict": _dashboard_verdict(initialized=False),
+            "cards": _coverage_cards(coverage),
             "tasks": [],
-            "coverage": {},
+            "coverage": coverage,
             "events": [],
             "integrations": _integration_summary_cached(project_root),
             "recent_runs": recent_run_artifacts(project_root),
@@ -201,10 +231,13 @@ def dashboard_payload(project_root: Path) -> dict:
         state = StateRepository(session).get_state()
         phase = compute_phase(graph, state.current_phase if state else None)
         tasks = [task.model_dump() for task in graph.tasks.values()]
+        coverage = graph.coverage_summary()
         return {
             "initialized": True,
             "phase": phase,
-            "coverage": graph.coverage_summary(),
+            "verdict": _dashboard_verdict(initialized=True, graph=graph),
+            "cards": _coverage_cards(coverage),
+            "coverage": coverage,
             "tasks": tasks,
             "events": [event.model_dump(by_alias=True) for event in _recent_trace_events_cached(project_root)],
             "integrations": _integration_summary_cached(project_root),
@@ -291,51 +324,98 @@ def dashboard_html(token: str = "") -> str:
     .status-warn {{ background: #fff3cd; color: #664d03; }}
     .status-fail {{ background: #f8d7da; color: #842029; }}
     #integration-result {{ margin-top: 10px; font-size: 12px; }}
+
+    .summary-cards {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; grid-column: 1 / -1; }}
+    .card {{ background: #ffffff; border: 1px solid #d9d9d4; border-radius: 8px; padding: 14px 16px; }}
+    .card-label {{ font-size: 12px; color: #5f6368; margin-bottom: 6px; }}
+    .card-value {{ font-size: 22px; font-weight: 700; text-transform: capitalize; }}
+    .card-sub {{ font-size: 12px; color: #5f6368; margin-top: 4px; }}
+    .verdict-passed {{ color: #155724; }}
+    .verdict-blocked {{ color: #842029; }}
+    .verdict-incomplete {{ color: #664d03; }}
+    .verdict-uninitialized {{ color: #5f6368; }}
+    .empty {{ font-size: 13px; color: #5f6368; margin: 0; }}
+    details.collapsible {{ border: 1px solid #d9d9d4; border-radius: 8px; padding: 12px 16px; background: #ffffff; }}
+    details.collapsible > summary {{ cursor: pointer; font-size: 15px; font-weight: 600; margin: 0; }}
+    details.collapsible[open] > summary {{ margin-bottom: 12px; }}
     @media (max-width: 800px) {{ main {{ grid-template-columns: 1fr; padding: 16px; }} header {{ padding: 16px; }} }}
   </style>
 </head>
 <body>
   <header><div class="brand"><img src="/assets/devcouncil_logo_premium.png" alt="DevCouncil logo"><h1>DevCouncil Dashboard</h1></div><div class="phase-line">Phase: <span id="phase" class="phase">loading</span></div></header>
   <main>
-    <section><h2>Coverage</h2><pre id="coverage">{{}}</pre></section>
-    <section><h2>Tasks</h2><table><thead><tr><th>ID</th><th>Status</th><th>Title</th></tr></thead><tbody id="tasks"></tbody></table></section>
+    <div id="init-banner" class="empty" hidden style="grid-column: 1 / -1;">Project is not initialized. Run <code>dev init</code> to create local state.</div>
+    <div class="summary-cards">
+      <div class="card"><div class="card-label">Verdict</div><div id="verdict" class="card-value">—</div></div>
+      <div class="card"><div class="card-label">Blocking gaps</div><div id="card-blocking" class="card-value">—</div><div id="card-gaps-total" class="card-sub"></div></div>
+      <div class="card"><div class="card-label">Tasks</div><div id="card-tasks" class="card-value">—</div></div>
+      <div class="card"><div class="card-label">AC without evidence</div><div id="card-ac" class="card-value">—</div></div>
+    </div>
     <section style="grid-column: 1 / -1;">
-      <h2>CLI Integrations</h2>
-      <div class="toolbar">
-        <button type="button" data-target="all">Apply Detected</button>
-        <button type="button" data-target="hooks">Install Hooks</button>
-        <button type="button" id="run-check">Run Check</button>
-      </div>
-      <pre id="integration-result"></pre>
-      <table>
-        <thead><tr><th>Client</th><th>PATH</th><th>MCP</th><th>Hooks</th><th>Launcher</th><th>Configured</th><th>Notes</th><th>Action</th></tr></thead>
-        <tbody id="integrations"></tbody>
+      <h2>Blocking gaps</h2>
+      <p id="blocking-gaps-empty" class="empty" hidden>No blocking gaps.</p>
+      <table id="blocking-gaps-table">
+        <thead><tr><th>Task</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody id="blocking-gaps"></tbody>
       </table>
     </section>
     <section style="grid-column: 1 / -1;">
+      <h2>Other gaps</h2>
+      <p id="other-gaps-empty" class="empty" hidden>No advisory gaps.</p>
+      <table id="other-gaps-table">
+        <thead><tr><th>Task</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody id="other-gaps"></tbody>
+      </table>
+    </section>
+    <section>
+      <h2>Tasks</h2>
+      <p id="tasks-empty" class="empty" hidden>No tasks yet.</p>
+      <table id="tasks-table"><thead><tr><th>ID</th><th>Status</th><th>Title</th></tr></thead><tbody id="tasks"></tbody></table>
+    </section>
+    <section>
       <h2>Recent Agent Runs</h2>
-      <table>
+      <p id="runs-empty" class="empty" hidden>No recent agent runs.</p>
+      <table id="runs-table">
         <thead><tr><th>Run</th><th>Task</th><th>Agent</th><th>Status</th><th>Transcript</th></tr></thead>
         <tbody id="runs"></tbody>
       </table>
     </section>
     <section style="grid-column: 1 / -1;">
-      <h2>Verification Gaps</h2>
-      <p id="gaps-summary" style="font-size: 13px; margin: 0 0 12px;"></p>
-      <table>
-        <thead><tr><th>Blocking</th><th>Task</th><th>Type</th><th>Description</th></tr></thead>
-        <tbody id="gaps"></tbody>
-      </table>
-    </section>
-    <section style="grid-column: 1 / -1;">
       <h2>Stop Gate History</h2>
-      <table>
+      <p id="stop-gate-empty" class="empty" hidden>No stop-gate events yet.</p>
+      <table id="stop-gate-table">
         <thead><tr><th>When</th><th>Session</th><th>Decision</th><th>Task</th><th>Claim</th></tr></thead>
         <tbody id="stop-gate"></tbody>
       </table>
     </section>
-    <section style="grid-column: 1 / -1;"><h2>Recent Trace Events</h2><pre id="events"></pre></section>
+    <section style="grid-column: 1 / -1;">
+      <details class="collapsible">
+        <summary>CLI Integrations</summary>
+        <div class="toolbar">
+          <button type="button" data-target="all">Apply Detected</button>
+          <button type="button" data-target="hooks">Install Hooks</button>
+          <button type="button" id="run-check">Run Check</button>
+        </div>
+        <pre id="integration-result"></pre>
+        <p id="integrations-empty" class="empty" hidden>No integration capabilities reported.</p>
+        <table id="integrations-table">
+          <thead><tr><th>Client</th><th>PATH</th><th>MCP</th><th>Hooks</th><th>Launcher</th><th>Configured</th><th>Notes</th><th>Action</th></tr></thead>
+          <tbody id="integrations"></tbody>
+        </table>
+      </details>
+    </section>
+    <section style="grid-column: 1 / -1;">
+      <details class="collapsible">
+        <summary>Recent Trace Events</summary>
+        <p id="events-empty" class="empty" hidden>No recent trace events.</p>
+        <table id="events-table">
+          <thead><tr><th>Type</th><th>Detail</th></tr></thead>
+          <tbody id="events"></tbody>
+        </table>
+      </details>
+    </section>
   </main>
+
   <script>
     function setText(cell, value) {{
       cell.textContent = value == null ? '' : String(value);
@@ -357,6 +437,24 @@ def dashboard_html(token: str = "") -> str:
       return cell;
     }}
 
+
+    function setEmpty(emptyId, tableId, hasRows) {{
+      const empty = document.getElementById(emptyId);
+      const table = document.getElementById(tableId);
+      if (empty) empty.hidden = hasRows;
+      if (table) table.hidden = !hasRows;
+    }}
+
+    function gapRows(items) {{
+      return (items || []).map(gap => {{
+        const row = document.createElement('tr');
+        row.appendChild(setText(document.createElement('td'), gap.task_id || ''));
+        row.appendChild(setText(document.createElement('td'), gap.gap_type || ''));
+        row.appendChild(setText(document.createElement('td'), (gap.description || '').slice(0, 200)));
+        return row;
+      }});
+    }}
+
     const token = document.querySelector('meta[name="devcouncil-dashboard-token"]').content;
 
     async function applyIntegration(target) {{
@@ -371,7 +469,11 @@ def dashboard_html(token: str = "") -> str:
         body: JSON.stringify({{ target }}),
       }});
       const payload = await res.json();
-      resultBox.textContent = JSON.stringify(payload, null, 2);
+      if (payload && payload.ok) {{
+        resultBox.textContent = `Applied ${{payload.target || target}} successfully.`;
+      }} else {{
+        resultBox.textContent = (payload && payload.error) ? String(payload.error) : 'Apply failed.';
+      }}
       await refresh();
     }}
 
@@ -379,22 +481,58 @@ def dashboard_html(token: str = "") -> str:
       const resultBox = document.getElementById('integration-result');
       const res = await fetch('/api/integrations/check');
       const payload = await res.json();
-      resultBox.textContent = JSON.stringify(payload, null, 2);
+      const checks = (payload && payload.checks) || [];
+      const failed = checks.filter(item => item && item.ok === false).length;
+      resultBox.textContent = payload && payload.ok
+        ? `Check passed (${{checks.length}} clients).`
+        : `Check reported ${{failed}} issue(s).`;
     }}
 
     async function refresh() {{
       const res = await fetch('/api/status');
       const data = await res.json();
       document.getElementById('phase').textContent = data.phase;
-      document.getElementById('coverage').textContent = JSON.stringify(data.coverage, null, 2);
+      const initBanner = document.getElementById('init-banner');
+      if (initBanner) initBanner.hidden = Boolean(data.initialized);
+
+      const gs = data.gaps || {{}};
+      const cv = data.coverage || {{}};
+      const cd = data.cards || {{}};
+      let verdict = (data.verdict && data.verdict.verdict) || '';
+      if (!verdict) {{
+        if (!data.initialized) verdict = 'uninitialized';
+        else if (gs.blocking) verdict = 'blocked';
+        else if (cv.ac_without_evidence) verdict = 'incomplete';
+        else verdict = 'passed';
+      }}
+      const ve = document.getElementById('verdict');
+      ve.textContent = verdict;
+      ve.className = 'card-value verdict-' + verdict;
+      const bc = Number(gs.blocking || cd.blocking_gaps || 0);
+      document.getElementById('card-blocking').textContent = String(bc);
+      document.getElementById('card-gaps-total').textContent = 'of ' + Number(gs.total || 0) + ' total';
+      document.getElementById('card-tasks').textContent = String((data.tasks || []).length || cd.tasks || cv.total_tasks || 0);
+      document.getElementById('card-ac').textContent = String(cd.ac_without_evidence ?? cv.ac_without_evidence ?? 0);
+
+      const items = gs.items || [];
+      const blocking = items.filter(g => g.blocking);
+      const other = items.filter(g => !g.blocking);
+      document.getElementById('blocking-gaps').replaceChildren(...gapRows(blocking));
+      document.getElementById('other-gaps').replaceChildren(...gapRows(other));
+      setEmpty('blocking-gaps-empty', 'blocking-gaps-table', blocking.length > 0);
+      setEmpty('other-gaps-empty', 'other-gaps-table', other.length > 0);
+
+      const tasks = data.tasks || [];
       const body = document.getElementById('tasks');
-      body.replaceChildren(...(data.tasks || []).map(t => {{
+      body.replaceChildren(...tasks.map(t => {{
         const row = document.createElement('tr');
         row.appendChild(setText(document.createElement('td'), t.id));
         row.appendChild(setText(document.createElement('td'), t.status));
         row.appendChild(setText(document.createElement('td'), t.title));
         return row;
       }}));
+      setEmpty('tasks-empty', 'tasks-table', tasks.length > 0);
+
       const integrationsBody = document.getElementById('integrations');
       const capabilities = ((data.integrations || {{}}).capabilities || []);
       integrationsBody.replaceChildren(...capabilities.map(item => {{
@@ -416,9 +554,11 @@ def dashboard_html(token: str = "") -> str:
         row.appendChild(action);
         return row;
       }}));
+      setEmpty('integrations-empty', 'integrations-table', capabilities.length > 0);
 
+      const runs = data.recent_runs || [];
       const runsBody = document.getElementById('runs');
-      runsBody.replaceChildren(...(data.recent_runs || []).map(run => {{
+      runsBody.replaceChildren(...runs.map(run => {{
         const row = document.createElement('tr');
         row.appendChild(setText(document.createElement('td'), run.run_id));
         row.appendChild(setText(document.createElement('td'), run.task_id));
@@ -427,39 +567,32 @@ def dashboard_html(token: str = "") -> str:
         row.appendChild(setText(document.createElement('td'), run.transcript || ''));
         return row;
       }}));
+      setEmpty('runs-empty', 'runs-table', runs.length > 0);
 
-      document.getElementById('events').textContent = JSON.stringify(data.events || [], null, 2);
-
-      const gapsSummary = data.gaps || {{}};
-      document.getElementById('gaps-summary').textContent =
-        `${{gapsSummary.blocking || 0}} blocking / ${{gapsSummary.total || 0}} total` +
-        ((gapsSummary.total || 0) > (gapsSummary.items || []).length
-          ? ` (showing first ${{(gapsSummary.items || []).length}})`
-          : '');
-
-      const gapsBody = document.getElementById('gaps');
-      gapsBody.replaceChildren(...(gapsSummary.items || []).map(gap => {{
+      const events = data.events || [];
+      const eventsBody = document.getElementById('events');
+      eventsBody.replaceChildren(...events.map(ev => {{
         const row = document.createElement('tr');
-        row.appendChild(setText(document.createElement('td'), gap.blocking ? 'yes' : 'no'));
-        row.appendChild(setText(document.createElement('td'), gap.task_id || ''));
-        row.appendChild(setText(document.createElement('td'), gap.gap_type || ''));
-        const desc = (gap.description || '').slice(0, 120);
-        row.appendChild(setText(document.createElement('td'), desc));
+        row.appendChild(setText(document.createElement('td'), ev.type || ev.event_type || ''));
+        const detail = ev.message || ev.summary || ev.task_id || ev.path || ev.type || '';
+        row.appendChild(setText(document.createElement('td'), String(detail).slice(0, 200)));
         return row;
       }}));
+      setEmpty('events-empty', 'events-table', events.length > 0);
 
+      const stopEvents = data.stop_gate_events || [];
       const stopGateBody = document.getElementById('stop-gate');
-      stopGateBody.replaceChildren(...(data.stop_gate_events || []).map(ev => {{
+      stopGateBody.replaceChildren(...stopEvents.map(ev => {{
         const row = document.createElement('tr');
         const when = ev.ts ? new Date(ev.ts * 1000).toLocaleString() : '';
         row.appendChild(setText(document.createElement('td'), when));
         row.appendChild(setText(document.createElement('td'), ev.session_id || ''));
         row.appendChild(setText(document.createElement('td'), ev.decision || ''));
         row.appendChild(setText(document.createElement('td'), ev.task_id || ''));
-        const claim = (ev.claim || '').slice(0, 120);
-        row.appendChild(setText(document.createElement('td'), claim));
+        row.appendChild(setText(document.createElement('td'), (ev.claim || '').slice(0, 120)));
         return row;
       }}));
+      setEmpty('stop-gate-empty', 'stop-gate-table', stopEvents.length > 0);
     }}
 
     document.addEventListener('click', event => {{

@@ -41,6 +41,25 @@ def _status_payload(project_root: Path) -> dict:
         for task in graph.tasks.values():
             status_counts[task.status] = status_counts.get(task.status, 0) + 1
 
+        release_health = None
+        try:
+            from devcouncil.reporting.release_health import (
+                compact_release_health_summary,
+                load_baseline_snapshot,
+                resolve_baseline_path,
+            )
+            from devcouncil.reporting.report_builder import ReportBuilder
+
+            baseline_path = resolve_baseline_path(project_root)
+            baseline = load_baseline_snapshot(baseline_path)
+            if baseline is not None:
+                rh = ReportBuilder.build_release_health(
+                    graph, baseline=baseline, baseline_path=str(baseline_path)
+                )
+                release_health = compact_release_health_summary(rh)
+        except Exception:
+            logger.debug("release-health summary skipped", exc_info=True)
+
         return {
             "initialized": True,
             "phase": phase,
@@ -50,6 +69,7 @@ def _status_payload(project_root: Path) -> dict:
             "task_status_counts": status_counts,
             "blocking_gaps": [gap.model_dump() for gap in blocking_gaps],
             "live_review": live_review_summary(project_root),
+            "release_health": release_health,
         }
 
 
@@ -132,6 +152,15 @@ def status(
             for name, stats in sorted(cost_groups.items(), key=lambda kv: kv[1]["cost"], reverse=True):
                 cost_table.add_row(name, f"{stats['cost']:.4f}", str(stats["calls"]))
             console.print(cost_table)
+
+        rh = payload.get("release_health")
+        if rh:
+            console.print(
+                f"\n[bold]Release health:[/bold] verdict={rh.get('verdict')} "
+                f"ready={rh.get('release_ready')} "
+                f"regressions={rh.get('counts', {}).get('regressions', 0)} "
+                f"historical={rh.get('counts', {}).get('historical_blocking', 0)}"
+            )
 
         blocking_gaps = payload["blocking_gaps"]
         if blocking_gaps:

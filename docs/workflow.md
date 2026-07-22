@@ -1,5 +1,10 @@
 # Daily Workflow
 
+**Platforms:** macOS, Linux, and Windows (Node.js 18+, Python 3.12+, Git).
+**Maturity:** see [project-status.md](project-status.md) / `dev doctor`.
+**Runnable fixture:** [`examples/build-week-demo/`](../examples/build-week-demo/) via
+`bash scripts/build-week-demo.sh` (provider-free red→green).
+
 DevCouncil's recommended default is **Manual Sidecar Mode**:
 
 1. DevCouncil plans the work and creates a task graph.
@@ -27,21 +32,22 @@ For machine-readable integration, add `--agent` with the selected automated exec
 dev plan "Add password reset with expiring single-use tokens"
 ```
 
-DevCouncil maps the repository, drafts requirements, runs planner and critic roles, and stores an approved task graph locally. To preview the interactive code-graph UI before mapping, run `dev graph demo` (writes `.devcouncil/graph/demo.html` with a synthetic import graph).
+DevCouncil maps the repository, drafts requirements, runs planner and critic roles, and stores an approved task graph locally. To preview the interactive code-graph UI before mapping, run `dev map demo` (writes self-contained interactive `.devcouncil/graph/demo.html`; a static `demo.svg` may also be written).
 
 Before planning (or after large refactors), refresh navigation artifacts and preview the graph UI:
 
 ```bash
 dev map                 # repo_map.json + code_graph.json + AGENTS.md/CLAUDE.md
-dev graph ingest        # unified analyze entry (alias path: sync + map + optional embeddings)
-dev graph query SYMBOL  # callers / callees
-dev graph dead          # dead-code tiers
-dev graph demo          # sample self-contained interactive HTML (no map)
-dev graph view          # serve interactive graph.html for this repo
+dev map ingest          # unified analyze entry (sync + map + optional embeddings)
+dev map query SYMBOL    # callers / callees
+dev map dead            # dead-code tiers
+dev map demo            # sample self-contained interactive HTML (no map)
+dev map graph-html      # write symbol graph.html (`dev map html` = subsystems)
+dev map view            # serve interactive graph.html for this repo
 dev corpus build        # advisory docs/PDF/image index (optional verify gates)
 ```
 
-A missing or stale map fails closed on hard rigor — run `dev map` or `dev graph ingest`
+A missing or stale map fails closed on hard rigor — run `dev map` or `dev map ingest`
 before `dev verify` on strict tasks. Write policy soft-blocks edits outside planned
 files unless the target is in the same subsystem or a map neighbor (`dev scope update`
 to widen scope).

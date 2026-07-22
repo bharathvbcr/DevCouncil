@@ -1,5 +1,6 @@
 import fnmatch
 import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,13 @@ from devcouncil.execution.policy_engine import (
 from devcouncil.utils.redaction import SECRET_PATTERNS
 
 logger = logging.getLogger(__name__)
+
+# Escape-hatch hint appended to no-task deny reasons under contain mode.
+_HOOK_GATE_HINT = (
+    "Or set execution.hook_gate.mode=off / DEVCOUNCIL_HOOK_GATE=off to allow "
+    "Shell/Write without a lease (hard safety still enforced)."
+)
+
 
 # Splits a shell command into the segments a shell would execute independently, on
 # the chaining/pipe/sequence operators. We deliberately do NOT try to parse quoting
@@ -77,6 +85,29 @@ class HookPolicy:
             # configured command deny with no visible cause.
             logger.warning("Failed to load global allowed commands from config, gate uses empty allowlist: %s", e)
         return []
+
+    def _hook_gate_mode(self) -> str:
+        # Resolve execution.hook_gate.mode with DEVCOUNCIL_HOOK_GATE override.
+        # contain (default) fail-closes Shell/Write without a task. off allows
+        # no-task Shell/Write after hard safety. MCP lease write/run paths always
+        # pass a task into this policy, so they stay gated regardless of mode.
+        env = (os.environ.get("DEVCOUNCIL_HOOK_GATE") or "").strip().lower()
+        if env in {"off", "contain"}:
+            return env
+        try:
+            from devcouncil.app.config import load_config
+
+            mode = (load_config(self.project_root).execution.hook_gate.mode or "contain").strip().lower()
+            return mode if mode in {"off", "contain"} else "contain"
+        except Exception:
+            return "contain"
+
+    @staticmethod
+    def _with_hook_gate_hint(reason: str) -> str:
+        if _HOOK_GATE_HINT.strip() in reason:
+            return reason
+        return f"{reason.rstrip()} {_HOOK_GATE_HINT.strip()}"
+
 
     secret_path_patterns = SECRET_PATH_PATTERNS
     protected_path_patterns = PROTECTED_WRITE_PATTERNS
@@ -143,6 +174,18 @@ class HookPolicy:
         if git_decision.action == "deny":
             return HookDecision(git_decision.action, git_decision.reason, git_decision.target)
 
+        # hook_gate=off: after hard safety, allow Shell without a leased task.
+        # MCP write/run still requires a lease+task upstream, so this only unblocks
+        # interactive PreToolUse companion hooks.
+        if active_task is None and self._hook_gate_mode() == "off":
+            if git_decision.action == "warn":
+                return HookDecision(git_decision.action, git_decision.reason, git_decision.target)
+            return HookDecision(
+                "allow",
+                "hook_gate mode=off allows shell without a task lease.",
+                command,
+            )
+
         # 2) Allowlist enforcement over every executed segment.
         segments = self._split_command_segments(command)
         if not segments:
@@ -152,7 +195,10 @@ class HookPolicy:
         for segment in segments:
             decision = self.policy_engine.evaluate_command(segment, active_task)
             if decision.action == "deny":
-                return HookDecision("deny", decision.reason, decision.target)
+                reason = decision.reason
+                if active_task is None and self._hook_gate_mode() == "contain":
+                    reason = self._with_hook_gate_hint(reason)
+                return HookDecision("deny", reason, decision.target)
             if decision.action == "warn" and warn is None:
                 warn = HookDecision("warn", decision.reason, decision.target)
 
@@ -217,6 +263,26 @@ class HookPolicy:
         # Delegate to the engine, which normalizes via the shared normalize_repo_path and
         # denies out-of-root targets — so the path that is checked is the path enforced.
         decision = self.policy_engine.evaluate_file_change(raw_path, active_task)
+        if decision.action == "deny" and active_task is None:
+            # Hard safety (out-of-root / secrets / restricted client configs) still denies
+            # under hook_gate=off only the no-task authorization deny is relaxed.
+            hard_safety = (
+                "outside the project root" in decision.reason
+                or "Secret and credential" in decision.reason
+                or "Protected repository paths" in decision.reason
+            )
+            if self._hook_gate_mode() == "off" and not hard_safety:
+                return HookDecision(
+                    "allow",
+                    "hook_gate mode=off allows file write without a task lease.",
+                    decision.target,
+                )
+            if self._hook_gate_mode() == "contain":
+                return HookDecision(
+                    "deny",
+                    self._with_hook_gate_hint(decision.reason),
+                    decision.target,
+                )
         return HookDecision(decision.action, decision.reason, decision.target)
 
     def _scan_content_for_secret(self, content: str) -> Optional[str]:

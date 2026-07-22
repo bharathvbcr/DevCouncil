@@ -18,7 +18,7 @@ def _coord(**kwargs):
         "reconcile": lambda: ["a.py"],
         "sync_now": lambda paths: True,
         "start": lambda: SimpleNamespace(backend="poll", state="watching"),
-        "stop": lambda: None,
+        "stop": lambda **_k: None,
         "status": lambda: SimpleNamespace(
             as_dict=lambda: {
                 "state": "idle",
@@ -49,8 +49,8 @@ def test_graph_init_busy_and_status_text(tmp_path, monkeypatch):
         "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
         lambda *a, **k: (_ for _ in ()).throw(GraphBuildBusy("busy")),
     )
-    assert runner.invoke(app, ["graph", "init", "--project-root", str(tmp_path)]).exit_code == 1
-    busy_json = runner.invoke(app, ["graph", "init", "--json", "--project-root", str(tmp_path)])
+    assert runner.invoke(app, ["map", "init", "--project-root", str(tmp_path)]).exit_code == 1
+    busy_json = runner.invoke(app, ["map", "init", "--json", "--project-root", str(tmp_path)])
     assert busy_json.exit_code == 1
     assert "graph_writer_busy" in busy_json.output
 
@@ -75,13 +75,13 @@ def test_graph_init_busy_and_status_text(tmp_path, monkeypatch):
             }
         ),
     )
-    assert runner.invoke(app, ["graph", "init", "--project-root", str(tmp_path)]).exit_code == 0
+    assert runner.invoke(app, ["map", "init", "--project-root", str(tmp_path)]).exit_code == 0
 
     monkeypatch.setattr(
         "devcouncil.codeintel.sync.get_sync_coordinator",
-        lambda _r: _coord(),
+        lambda _r, **_k: _coord(),
     )
-    st = runner.invoke(app, ["graph", "status", "--project-root", str(tmp_path)])
+    st = runner.invoke(app, ["map", "status", "--project-root", str(tmp_path)])
     assert st.exit_code == 0
     assert "generation" in st.output
     assert "degraded" in st.output
@@ -93,18 +93,18 @@ def test_graph_sync_watch_search_ingest(tmp_path, monkeypatch):
     initialize_project(tmp_path, quiet=True, with_map=False, with_skills=False)
     monkeypatch.setattr(
         "devcouncil.codeintel.sync.get_sync_coordinator",
-        lambda _r: _coord(),
+        lambda _r, **_k: _coord(),
     )
-    ok = runner.invoke(app, ["graph", "sync", "--project-root", str(tmp_path)])
+    ok = runner.invoke(app, ["map", "sync", "--project-root", str(tmp_path)])
     assert ok.exit_code == 0
-    js = runner.invoke(app, ["graph", "sync", "--json", "--project-root", str(tmp_path)])
+    js = runner.invoke(app, ["map", "sync", "--json", "--project-root", str(tmp_path)])
     assert js.exit_code == 0
 
     monkeypatch.setattr(
         "devcouncil.codeintel.sync.get_sync_coordinator",
-        lambda _r: _coord(sync_now=lambda paths: False),
+        lambda _r, **_k: _coord(sync_now=lambda paths: False),
     )
-    bad = runner.invoke(app, ["graph", "sync", "--project-root", str(tmp_path)])
+    bad = runner.invoke(app, ["map", "sync", "--project-root", str(tmp_path)])
     assert bad.exit_code == 1
 
     # watch: interrupt immediately
@@ -112,14 +112,14 @@ def test_graph_sync_watch_search_ingest(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "devcouncil.codeintel.sync.get_sync_coordinator",
-        lambda _r: _coord(),
+        lambda _r, **_k: _coord(),
     )
 
     def _sleep(_s):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(time, "sleep", _sleep)
-    watch = runner.invoke(app, ["graph", "watch", "--project-root", str(tmp_path)])
+    watch = runner.invoke(app, ["map", "watch", "--project-root", str(tmp_path)])
     assert watch.exit_code == 0
     assert "Stopped" in watch.output
 
@@ -136,7 +136,7 @@ def test_graph_sync_watch_search_ingest(tmp_path, monkeypatch):
             }
 
     monkeypatch.setattr("devcouncil.codeintel.query.CodeIntelQueryEngine", _Engine)
-    search = runner.invoke(app, ["graph", "search", "foo", "--project-root", str(tmp_path)])
+    search = runner.invoke(app, ["map", "search", "foo", "--project-root", str(tmp_path)])
     assert search.exit_code == 0
 
     monkeypatch.setattr(
@@ -144,12 +144,16 @@ def test_graph_sync_watch_search_ingest(tmp_path, monkeypatch):
         lambda *a, **k: {"ok": False},
     )
     sem = runner.invoke(
-        app, ["graph", "search", "foo", "--semantic", "--json", "--project-root", str(tmp_path)]
+        app, ["map", "search", "foo", "--semantic", "--json", "--project-root", str(tmp_path)]
     )
     assert sem.exit_code == 0
 
     refresh = SimpleNamespace(
-        generation=1, mode="full", degraded=False, reason=None
+        generation=1,
+        mode="full",
+        degraded=False,
+        reason=None,
+        compatibility_export_degraded=False,
     )
     monkeypatch.setattr(
         "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
@@ -161,20 +165,20 @@ def test_graph_sync_watch_search_ingest(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "devcouncil.codeintel.sync.get_sync_coordinator",
-        lambda _r: _coord(),
+        lambda _r, **_k: _coord(),
     )
     monkeypatch.setattr(
         "devcouncil.codeintel.get_codeintel_service",
         lambda _r: SimpleNamespace(load=lambda: SimpleNamespace()),
     )
-    ingest = runner.invoke(app, ["graph", "ingest", "--json", "--project-root", str(tmp_path)])
+    ingest = runner.invoke(app, ["map", "ingest", "--json", "--project-root", str(tmp_path)])
     assert ingest.exit_code == 0
 
     monkeypatch.setattr(
         "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
         lambda *a, **k: (_ for _ in ()).throw(GraphBuildBusy("busy")),
     )
-    busy = runner.invoke(app, ["graph", "ingest", "--json", "--project-root", str(tmp_path)])
+    busy = runner.invoke(app, ["map", "ingest", "--json", "--project-root", str(tmp_path)])
     assert busy.exit_code == 1
 
     monkeypatch.setattr(
@@ -183,10 +187,10 @@ def test_graph_sync_watch_search_ingest(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "devcouncil.codeintel.sync.get_sync_coordinator",
-        lambda _r: _coord(sync_now=lambda paths: False),
+        lambda _r, **_k: _coord(sync_now=lambda paths: False),
     )
     path_fail = runner.invoke(
-        app, ["graph", "ingest", "a.py", "--project-root", str(tmp_path)]
+        app, ["map", "ingest", "a.py", "--project-root", str(tmp_path)]
     )
     assert path_fail.exit_code == 1
 
@@ -216,14 +220,14 @@ def test_graph_routes_shape_api_demo_hooks(tmp_path, monkeypatch):
             ]
         },
     )
-    routes = runner.invoke(app, ["graph", "routes", "--project-root", str(tmp_path)])
+    routes = runner.invoke(app, ["map", "routes", "--project-root", str(tmp_path)])
     assert routes.exit_code == 0
-    empty = runner.invoke(app, ["graph", "routes", "--json", "--project-root", str(tmp_path)])
+    empty = runner.invoke(app, ["map", "routes", "--json", "--project-root", str(tmp_path)])
     assert empty.exit_code == 0
 
     monkeypatch.setattr(api_routes, "route_map", lambda root, g: {"routes": []})
     assert "No routes" in runner.invoke(
-        app, ["graph", "routes", "--project-root", str(tmp_path)]
+        app, ["map", "routes", "--project-root", str(tmp_path)]
     ).output
 
     monkeypatch.setattr(
@@ -239,14 +243,14 @@ def test_graph_routes_shape_api_demo_hooks(tmp_path, monkeypatch):
             ]
         },
     )
-    shape = runner.invoke(app, ["graph", "shape-check", "--project-root", str(tmp_path)])
+    shape = runner.invoke(app, ["map", "shape-check", "--project-root", str(tmp_path)])
     assert shape.exit_code == 0
 
     monkeypatch.setattr(
         api_routes, "shape_check", lambda root, g, route_filter=None: {"mismatches": []}
     )
     assert "No shape" in runner.invoke(
-        app, ["graph", "shape-check", "--project-root", str(tmp_path)]
+        app, ["map", "shape-check", "--project-root", str(tmp_path)]
     ).output
 
     monkeypatch.setattr(
@@ -262,7 +266,7 @@ def test_graph_routes_shape_api_demo_hooks(tmp_path, monkeypatch):
             "shape_mismatches": [{}],
         },
     )
-    impact = runner.invoke(app, ["graph", "api-impact", "/x", "--project-root", str(tmp_path)])
+    impact = runner.invoke(app, ["map", "api-impact", "/x", "--project-root", str(tmp_path)])
     assert impact.exit_code == 0
 
     monkeypatch.setattr(
@@ -272,7 +276,7 @@ def test_graph_routes_shape_api_demo_hooks(tmp_path, monkeypatch):
     )
     assert (
         runner.invoke(
-            app, ["graph", "api-impact", "/missing", "--project-root", str(tmp_path)]
+            app, ["map", "api-impact", "/missing", "--project-root", str(tmp_path)]
         ).exit_code
         == 1
     )
@@ -285,7 +289,7 @@ def test_graph_routes_shape_api_demo_hooks(tmp_path, monkeypatch):
             "svg": tmp_path / "d.svg",
         },
     )
-    demo = runner.invoke(app, ["graph", "demo", "--json", "--project-root", str(tmp_path)])
+    demo = runner.invoke(app, ["map", "demo", "--json", "--project-root", str(tmp_path)])
     assert demo.exit_code == 0
     assert "html" in json.loads(demo.stdout)
 
@@ -293,7 +297,7 @@ def test_graph_routes_shape_api_demo_hooks(tmp_path, monkeypatch):
     git = tmp_path / ".git" / "hooks"
     git.mkdir(parents=True)
     hooks = runner.invoke(
-        app, ["graph", "hooks", "install", "--project-root", str(tmp_path)]
+        app, ["map", "hooks", "install", "--project-root", str(tmp_path)]
     )
     assert hooks.exit_code == 0
 

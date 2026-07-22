@@ -464,7 +464,7 @@ def _stub_graph_export(graph: CodeGraph) -> CodeGraph:
             ),
             "compatibility_export_reason": (
                 "exceeded indexing.graph_json_max_bytes; prefer SQLite-backed "
-                "`dev graph` commands"
+                "`dev map` commands"
             ),
         },
     )
@@ -673,7 +673,7 @@ def load_code_graph(root: Path) -> Optional[CodeGraph]:
             and path.stat().st_mtime_ns != recorded_mtime
         ):
             # Refresh the handshake when the on-disk export matches the store;
-            # otherwise leave SQLite authoritative and let ``dev graph doctor``
+            # otherwise leave SQLite authoritative and let ``dev map doctor``
             # / export self-heal report drift.
             from devcouncil.codeintel.store.sqlite import compatibility_graph_digest
 
@@ -686,7 +686,7 @@ def load_code_graph(root: Path) -> Optional[CodeGraph]:
                     logger.info(
                         "ignoring external compatibility graph that diverges from "
                         "canonical store (sqlite wins); re-export with "
-                        "`dev graph export` / map refresh if JSON must catch up"
+                        "`dev map export` / map refresh if JSON must catch up"
                     )
     except Exception:
         logger.debug("Failed to reconcile compatibility graph export", exc_info=True)
@@ -696,7 +696,7 @@ def load_code_graph(root: Path) -> Optional[CodeGraph]:
             return _annotate_graph_degraded(root, graph)
     except Exception:
         # A corrupt/newer database must not strand users who still have the
-        # versioned JSON export. ``dev graph doctor`` reports the store failure;
+        # versioned JSON export. ``dev map doctor`` reports the store failure;
         # compatibility reads remain available until it is repaired/rebuilt.
         logger.debug("Failed to load canonical code-intelligence store", exc_info=True)
     if not path.is_file():

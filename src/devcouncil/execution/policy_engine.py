@@ -119,8 +119,9 @@ _UV_RUN_DIR_FLAG_RE = re.compile(
 _DEV_BINARIES = frozenset({"dev", "dev.exe", "devcouncil", "devcouncil.exe"})
 _CD_SEGMENT_RE = re.compile(r"^(?:cd|pushd|popd)(?:\s|$)")
 # Trailing shell redirections break fnmatch against ``dev map *``; strip for matching only.
+# Single-clause pattern (no nested ``+``) avoids CodeQL ReDoS; strip in a loop below.
 _REDIRECT_TAIL_RE = re.compile(
-    r"(?:\s+(?:\d*)(?:>>|>|<|&>|&>>)\s*\S+|\s+\d*>&\d+)+\s*$"
+    r"(?: \d*(?:>>|>|<|&>|&>>) ?\S+| \d*>&\d+)$"
 )
 
 
@@ -138,7 +139,11 @@ def normalize_allowlist_command(command: str) -> str:
     normalized = " ".join(command.split())
     if not normalized:
         return normalized
-    normalized = _REDIRECT_TAIL_RE.sub("", normalized).rstrip()
+    while True:
+        updated = _REDIRECT_TAIL_RE.sub("", normalized)
+        if updated == normalized:
+            break
+        normalized = updated
     flagged = _UV_RUN_DIR_FLAG_RE.match(normalized)
     if flagged is not None:
         normalized = f"{flagged.group('head')}{flagged.group('tail')}"
@@ -285,8 +290,8 @@ class TaskPolicyEngine:
                 reason=(
                     "Shell commands require an active task lease. "
                     "Bootstrap with `dev checkout <TASK>`, or use allowlisted "
-                    "orientation commands (`dev status`, `dev map`, `dev doctor`, "
-                    "`dev graph …`)."
+                    "orientation commands (`dev status`, `dev map …`, `dev doctor`; "
+                    "`dev graph …` remains an allowlisted alias)."
                 ),
                 target=normalized,
             )

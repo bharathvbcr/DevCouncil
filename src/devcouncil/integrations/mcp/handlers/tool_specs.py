@@ -344,7 +344,7 @@ def all_tools() -> list[Tool]:
             name="devcouncil_pdg_query",
             description=(
                 "Query opt-in PDG control or data dependence for a symbol qualname or file path. "
-                "Requires `dev map --pdg` or `dev graph pdg build` first."
+                "Requires `dev map --pdg` or `dev map pdg build` first."
             ),
             inputSchema={
                 "type": "object",

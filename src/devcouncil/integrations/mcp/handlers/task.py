@@ -15,6 +15,17 @@ from devcouncil.integrations.mcp.util import (
 from devcouncil.utils.json_persist import dump_json
 
 
+def _applied_skill_names(root: Path, task: dict) -> list[str]:
+    """Skill names selected for this task (names only — bodies stay on disk / in prompts)."""
+    try:
+        from devcouncil.skills.registry import select_skills
+
+        goal = f"{task.get('title') or ''}\n{task.get('description') or ''}"
+        return [skill.name for skill in select_skills(goal=goal, project_root=root)]
+    except Exception:
+        return []
+
+
 async def handle_get_task(root: Path, db: object, arguments: dict) -> list[TextContent]:
     del db  # routed through CLI service layer
     task_id, arg_error = required_string_argument(arguments, "task_id")
@@ -85,4 +96,5 @@ async def handle_prepare_execution(root: Path, db: object, arguments: dict) -> l
         "planned_files": task.get("planned_files") or [],
         "allowed_commands": task.get("allowed_commands") or [],
         "expected_tests": task.get("expected_tests") or [],
+        "applied_skills": _applied_skill_names(root, task),
     })

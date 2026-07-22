@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="360" viewBox="0 0 860 360" role="img" aria-labelledby="title desc">
+<title id="title">DevCouncil Code Graph</title>
+<desc id="desc">Sample entry, execution, verification, and dead-code dependency flow.</desc>
+<rect width="860" height="360" fill="#0f1419"/>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#64748b"/></marker></defs>
+<text x="36" y="48" font-family="ui-sans-serif,system-ui" font-size="24" font-weight="700" fill="#e7ecf3">DevCouncil Code Graph</text>
+<text x="36" y="75" font-family="ui-sans-serif,system-ui" font-size="13" fill="#8b9bb4">Native dependency and liveness preview</text>
+<path d="M156,150 L234,245" stroke="#64748b" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+<path d="M366,245 L444,150" stroke="#64748b" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+<g><rect x="22" y="122" width="136" height="56" rx="10" fill="#3d8bfd"/><text x="90" y="155" text-anchor="middle" font-family="ui-sans-serif,system-ui" font-size="13" fill="#ffffff">main.py</text></g>
+<g><rect x="232" y="217" width="136" height="56" rx="10" fill="#3d8bfd"/><text x="300" y="250" text-anchor="middle" font-family="ui-sans-serif,system-ui" font-size="13" fill="#ffffff">task_runner.py</text></g>
+<g><rect x="442" y="122" width="136" height="56" rx="10" fill="#3d8bfd"/><text x="510" y="155" text-anchor="middle" font-family="ui-sans-serif,system-ui" font-size="13" fill="#ffffff">verifier.py</text></g>
+<g><rect x="652" y="217" width="136" height="56" rx="10" fill="#e35d6a"/><text x="720" y="250" text-anchor="middle" font-family="ui-sans-serif,system-ui" font-size="13" fill="#ffffff">unused_check.py</text></g>
+</svg>

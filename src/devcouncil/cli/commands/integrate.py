@@ -98,6 +98,7 @@ _install_claude_hooks = hooks_client._install_claude_hooks
 _install_codex_hooks = hooks_client._install_codex_hooks
 _install_claude_assets = claude_client._install_claude_assets
 _install_claude_plugin = claude_client._install_claude_plugin
+_install_cursor_assets = cursor_client._install_cursor_assets
 _uninstall_claude = claude_client._uninstall_claude
 _configure_native_hooks = hooks_client._configure_native_hooks
 _opencode_config_path = opencode_client._opencode_config_path
@@ -125,7 +126,11 @@ def overview(ctx: typer.Context):
         table.add_row("Claude assets", f"{PREFERRED_COMMAND} claude-assets --apply", "Slash commands, subagents, output style, statusline, permissions, skills (no MCP/hooks).")
         table.add_row("Claude plugin", f"{PREFERRED_COMMAND} claude-plugin --apply", "Self-contained Claude Code plugin + marketplace bundling everything for /plugin install.")
         table.add_row("Claude uninstall", f"{PREFERRED_COMMAND} claude --uninstall", "Remove DevCouncil hooks, statusline, MCP enablement, and generated assets from .claude/.")
-        table.add_row("Cursor", f"{PREFERRED_COMMAND} cursor --apply", "Writes project .cursor/mcp.json for Cursor editor and agent/cursor-agent.")
+        table.add_row(
+            "Cursor",
+            f"{PREFERRED_COMMAND} cursor --apply",
+            "Writes MCP + assistive hooks + .cursor/skills + .cursor/rules/devcouncil.mdc (add --write-gate for PreToolUse containment).",
+        )
         table.add_row("Grok Build", f"{PREFERRED_COMMAND} grok --apply", "Registers DevCouncil MCP via grok mcp add or .grok/config.toml fallback.")
         table.add_row("OpenCode", f"{PREFERRED_COMMAND} opencode --apply", "Adds DevCouncil as a project-scoped OpenCode MCP server and executor.")
         table.add_row("Google Antigravity CLI", f"{PREFERRED_COMMAND} antigravity --apply", "Writes project .agents/mcp_config.json and enables the agy executor.")
@@ -385,19 +390,38 @@ def claude_github(
 
 @app.command("cursor")
 def cursor(
-    apply: bool = typer.Option(False, "--apply", help="Write project Cursor MCP config instead of printing it."),
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Write Cursor MCP + hooks + skills + rules instead of printing the MCP config.",
+    ),
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+    write_gate: bool = typer.Option(
+        False,
+        "--write-gate/--no-write-gate",
+        "--contain/--no-contain",
+        help="Also install blocking PreToolUse write-gate (off by default; assist mode).",
+    ),
 ):
     """
-    Set up DevCouncil MCP tools for Cursor.
+    Set up DevCouncil for Cursor (MCP, hooks, skills, and always-on rule).
+
+    Defaults to assist mode (PostToolUse map refresh only). Pass --write-gate for
+    pre-action containment (requires a leased task for Shell/Write).
     """
     root = _project_root(project_root)
     if apply:
-        report = apply_integration_target(root, "cursor")
+        report = apply_integration_target(root, "cursor", write_gate=write_gate)
         if not report.ok:
             console.print(report.to_json())
             raise typer.Exit(code=1)
-        console.print("[green]Cursor integration configured.[/green]")
+        mode = "with write-gate (containment)" if write_gate else "assist mode (no write-gate)"
+        console.print(f"[green]Cursor integration configured[/green] ({mode}): MCP + hooks + skills + rules.")
+        if not write_gate:
+            console.print(
+                "[dim]Add pre-action containment with[/dim] "
+                f"[dim]{PREFERRED_COMMAND} cursor --apply --write-gate[/dim]"
+            )
         return
     ok = _configure_cursor(root, apply)
     if not ok and apply:
@@ -590,7 +614,7 @@ def all_tools(
         False,
         "--write-gate/--no-write-gate",
         "--contain/--no-contain",
-        help="Install Claude's blocking write-gate too (off by default; for autonomous executor runs).",
+        help="Install blocking PreToolUse write-gate for Claude/Cursor/Grok/OpenCode (off by default; assist mode).",
     ),
     strict: bool = typer.Option(
         False,
@@ -617,7 +641,7 @@ def all_tools(
             strict=strict,
             gemini_scope=gemini_scope,
             claude_scope=claude_scope,
-            claude_write_gate=write_gate,
+            write_gate=write_gate,
         )
         if not report.ok:
             console.print(report.to_json())
@@ -638,7 +662,7 @@ def all_tools(
     _configure_warp(root, apply)
     _configure_aider(root, apply)
     if hooks:
-        _configure_native_hooks(root, "all", apply)
+        _configure_native_hooks(root, "all", apply, write_gate=write_gate)
 
 
 @app.command("recommend")
@@ -676,8 +700,8 @@ def hooks(
         False,
         "--write-gate/--no-write-gate",
         "--contain/--no-contain",
-        help="Install Claude's blocking PreToolUse write-gate too (off by default; "
-        "fail-closes an interactive session without a task lease).",
+        help="Install blocking PreToolUse write-gate for Claude/Cursor/Grok/OpenCode "
+        "(off by default; assist mode keeps PostToolUse refresh only).",
     ),
     git: bool = typer.Option(
         True,
@@ -694,8 +718,8 @@ def hooks(
     """
     Install DevCouncil hook configuration for Codex, Gemini, Claude, Cursor, and OpenCode.
 
-    Claude installs assistive hooks plus refresh-only PostToolUse by default; add
-    --write-gate for pre-action PreToolUse containment (autonomous executor runs).
+    Claude/Cursor/Grok/OpenCode install assistive hooks plus refresh-only PostToolUse
+    by default; add --write-gate for pre-action PreToolUse containment (autonomous runs).
     Git map-refresh hooks install by default with --apply (use --no-git to skip).
     """
     root = _project_root(project_root)
@@ -714,13 +738,13 @@ def hooks(
         )
         raise typer.Exit(code=1)
     if apply and tool == "all":
-        report = apply_integration_target(root, "hooks", claude_write_gate=write_gate)
+        report = apply_integration_target(root, "hooks", write_gate=write_gate)
         if not report.ok:
             console.print(report.to_json())
             raise typer.Exit(code=1)
         console.print("[green]Native hooks configured.[/green]")
     else:
-        _configure_native_hooks(root, tool, apply, claude_write_gate=write_gate)
+        _configure_native_hooks(root, tool, apply, write_gate=write_gate)
     if git:
         written = _install_git_map_hooks(root, apply=apply)
         for path in written:
