@@ -321,6 +321,8 @@ label {{ color:var(--muted); font-size:12px; display:block; }}
 label.inline {{ display:flex; align-items:center; gap:6px; margin:4px 0; }}
 label.inline input {{ width:auto; margin:0; }}
 #detail {{ margin-top:8px; font-size:12px; color:var(--muted); white-space:pre-wrap; }}
+.interaction-hint {{ margin:8px 0; padding:8px; border:1px solid #334155; border-radius:4px; background:#0f1419; color:var(--fg); font-size:12px; line-height:1.45; }}
+#counts {{ margin:8px 0 4px; font-size:12px; color:var(--accent); font-weight:600; }}
 .flag-dead {{ color:var(--dead); }}
 .badge-entry {{ color:var(--entry); font-weight:600; }}
 .list {{ list-style:none; padding:0; margin:0; font-size:12px; }}
@@ -342,6 +344,8 @@ label.inline input {{ width:auto; margin:0; }}
   </div>
   <div id="panel-graph" class="panel active">
     <h1>DevCouncil Code Graph</h1>
+    <div id="counts" aria-live="polite">Nodes: -- · Edges: -- · Filtered: --</div>
+    <div class="interaction-hint" id="interactionHint"><strong>Click</strong> a node for details. <strong>Select two nodes</strong> to highlight the shortest path. <strong>Double-click</strong> a node to expand its neighborhood.</div>
     <label>Mode</label>
     <select id="mode"><option value="file">File-level</option><option value="symbol">Symbol-level</option></select>
     <label>Search</label>
@@ -360,7 +364,7 @@ label.inline input {{ width:auto; margin:0; }}
     <label>Dead confidence</label>
     <select id="deadConf"><option value="">(any)</option><option>extracted</option><option>inferred</option><option>ambiguous</option></select>
     <div class="row"><button class="primary" id="reset">Reset view</button><button class="primary" id="clearPath">Clear path</button></div>
-    <div id="detail">Click a node for details. Select two nodes to highlight shortest path. Double-click to expand neighborhood.</div>
+    <div id="detail" class="muted">Select a node to inspect callers, callees, and path state.</div>
   </div>
   <div id="panel-dead" class="panel">
     <h1>Dead code</h1>
@@ -588,11 +592,29 @@ const g = Graph(elem)
     redraw();
   }});
 
+function updateCounts(fd) {{
+ const totalNodes = (activePayload().nodes || []).length;
+ const totalEdges = (activePayload().links || []).length;
+ const shownNodes = (fd.nodes || []).length;
+ const shownEdges = (fd.links || []).length;
+ const el = document.getElementById("counts");
+ if (el) el.textContent = "Nodes: " + shownNodes + " / " + totalNodes + " · Edges: " + shownEdges + " / " + totalEdges + " · Filtered: " + Math.max(0, totalNodes - shownNodes) + (expandIds ? " · neighborhood focus" : "");
+}}
+
+function fitView() {{
+  if (g && typeof g.zoomToFit === 'function') {{
+    requestAnimationFrame(() => {{
+      try {{ g.zoomToFit(400, 40); }} catch (err) {{ /* vendor stub */ }}
+    }});
+  }}
+}}
+
 function redraw() {{
-  const fd = filtered();
-  g.graphData(fd);
-  g.nodeAutoColorBy(n => colorKey(n));
-  g.width(elem.clientWidth).height(elem.clientHeight);
+ const fd = filtered();
+ g.graphData(fd);
+ g.nodeAutoColorBy(n => colorKey(n));
+ g.width(elem.clientWidth).height(elem.clientHeight);
+ updateCounts(fd);
 }}
 
 function renderDeadList() {{
@@ -724,6 +746,7 @@ document.getElementById('reset').addEventListener('click', () => {{
   selected = [];
   pathHighlight = new Set();
   redraw();
+  fitView();
 }});
 document.getElementById('clearPath').addEventListener('click', () => {{
   selected = [];
@@ -734,6 +757,7 @@ window.addEventListener('resize', () => g.width(elem.clientWidth).height(elem.cl
 if (!g || typeof g.zoomToFit !== 'function') document.getElementById('vendorWarn').style.display = 'block';
 refillArea();
 redraw();
+fitView();
 renderDeadList();
 renderCommunities();
 renderProcesses();

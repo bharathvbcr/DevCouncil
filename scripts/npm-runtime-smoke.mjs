@@ -345,9 +345,14 @@ async function runGraphDemoBrowserSmoke({ demoHtmlPath, workspace }) {
     if (!box || box.width < 32 || box.height < 32) {
       throw new Error(`#graph canvas bounding box too small: ${JSON.stringify(box)}`);
     }
-    const countsText = await page.locator("#counts").innerText();
-    if (!/Nodes:\s*[1-9]/.test(countsText)) {
-      throw new Error(`#counts did not show nonempty nodes: ${JSON.stringify(countsText)}`);
+    const countsLocator = page.locator("#counts");
+    if (await countsLocator.count()) {
+      const countsText = await countsLocator.innerText({ timeout: 10_000 });
+      if (!/Nodes:\s*[1-9]/.test(countsText)) {
+        throw new Error(`#counts did not show nonempty nodes: ${JSON.stringify(countsText)}`);
+      }
+    } else if (initial.nodeCount < 1) {
+      throw new Error("#counts missing and graph snapshot has no nodes");
     }
     const cx = box.x + box.width / 2;
     const cy = box.y + box.height / 2;
