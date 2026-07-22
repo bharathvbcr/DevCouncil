@@ -5,8 +5,12 @@
 # deliberately buggy change (blocking / red), applies the real repair + regression
 # test, then reruns to a compiled zero-gap (green) pass. No API keys required.
 #
-# Usage:
+# Usage (checkout):
 #   bash scripts/build-week-demo.sh
+#
+# From npm global install (preferred judge path):
+#   npm install -g devcouncil@0.4.2
+#   devcouncil-build-week-demo
 #
 # Optional:
 #   BUILD_WEEK_DEMO_ROOT=/tmp/my-demo bash scripts/build-week-demo.sh

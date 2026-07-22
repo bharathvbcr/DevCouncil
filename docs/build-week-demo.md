@@ -14,25 +14,37 @@ No planning council, no provider API keys — only `dev check --verify`.
 
 Target runtime is under 60 seconds after DevCouncil is installed.
 
-## Run
+## Run (primary: published npm package)
+
+`devcouncil@0.4.2` ships `scripts/build-week-demo.sh` and `examples/build-week-demo/**`.
+No git clone is required for the red→green demo.
+
+```bash
+npm install -g devcouncil@0.4.2
+devcouncil --help
+
+# Preferred: package bin entry
+devcouncil-build-week-demo
+
+# Equivalent paths:
+bash "$(npm root -g)/devcouncil/scripts/build-week-demo.sh"
+BUILD_WEEK_DEMO_ROOT=/tmp/devcouncil-judge-demo bash "$(npm root -g)/devcouncil/scripts/build-week-demo.sh"
+```
 
 From a DevCouncil checkout (local `.venv` or an installed `dev` on `PATH`):
 
 ```bash
 bash scripts/build-week-demo.sh
+# or: npm run demo:build-week
 ```
 
-Optional fixed output directory:
-
-```bash
-BUILD_WEEK_DEMO_ROOT=/tmp/devcouncil-judge-demo bash scripts/build-week-demo.sh
-```
-
-Lint the sample templates:
+Lint the sample templates (checkout only):
 
 ```bash
 ./.venv/bin/ruff check examples/build-week-demo
 ```
+
+See also [examples/README.md](../examples/README.md) for the executable-fixture index and documentation smoke commands.
 
 ## Sample files
 
@@ -41,7 +53,7 @@ Lint the sample templates:
 | `examples/build-week-demo/calc.py` | Correct calculator (green state) |
 | `examples/build-week-demo/broken_calc.py` | Buggy `sub()` used for the red pass |
 | `examples/build-week-demo/test_calc.py` | Regression checks for `add` / `sub` |
-| `scripts/build-week-demo.sh` | End-to-end red→green driver |
+| `scripts/build-week-demo.sh` | End-to-end red→green driver (included in the npm tarball) |
 
 ## Judge checklist
 

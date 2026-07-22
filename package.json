@@ -1,6 +1,6 @@
 {
   "name": "devcouncil",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Gated orchestrator for AI-assisted software development",
   "license": "Apache-2.0",
   "homepage": "https://github.com/bharathvbcr/DevCouncil#readme",
@@ -21,7 +21,8 @@
   ],
   "bin": {
     "devcouncil": "bin/devcouncil.js",
-    "dev": "bin/devcouncil.js"
+    "dev": "bin/devcouncil.js",
+    "devcouncil-build-week-demo": "scripts/build-week-demo.sh"
   },
   "files": [
     "bin/",
@@ -35,6 +36,8 @@
     "packages/codeintel-grammars/pyproject.toml",
     "packages/codeintel-grammars/hatch_build.py",
     "packages/codeintel-grammars/src/devcouncil_codeintel_grammars/__init__.py",
+    "scripts/build-week-demo.sh",
+    "examples/build-week-demo/**",
     "pyproject.toml",
     "uv.lock",
     "README.md",
@@ -47,6 +50,8 @@
     "pack:check": "npm pack --dry-run",
     "smoke:wheel": "uv run python scripts/check-wheel-assets.py",
     "smoke:package": "node scripts/npm-runtime-smoke.mjs",
+    "smoke:registry": "node scripts/npm-registry-smoke.mjs",
+    "demo:build-week": "bash scripts/build-week-demo.sh",
     "test": "uv run pytest",
     "lint": "uv run ruff check .",
     "typecheck": "uv run mypy src",

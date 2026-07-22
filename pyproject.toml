@@ -1,6 +1,6 @@
 [project]
 name = "devcouncil"
-version = "0.4.1"
+version = "0.4.2"
 description = "Gated orchestrator for AI-assisted software development"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -11,7 +11,7 @@ dependencies = [
     "pyyaml>=6.0.1",
     "sqlmodel>=0.0.19",
     "httpx>=0.27.0",
-    "gitpython>=3.1.49",
+    "gitpython>=3.1.53",
     "mcp>=1.27.2",
     "gepa>=0.1.1",
     "watchdog>=4.0.0",
