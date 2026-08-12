@@ -114,6 +114,14 @@ def map_repo(
         "--if-stale",
         help="Fingerprint-check first and exit 0 without rebuilding when the on-disk map is still fresh.",
     ),
+    full: bool = typer.Option(
+        False,
+        "--full",
+        help=(
+            "Force a full isolated rebuild. Without it, a small change set since the "
+            "last committed generation is applied incrementally."
+        ),
+    ),
     pdg: bool = typer.Option(
         False,
         "--pdg/--no-pdg",
@@ -184,7 +192,11 @@ def map_repo(
 
     with log_stage("map", project_root=root, scan_deps=scan_deps):
         log_step("map/1: generating repository map", project_root=root, trace=True)
-        from devcouncil.codeintel.build_control import GraphBuildBusy
+        from devcouncil.codeintel.build_control import (
+            GraphBuildBusy,
+            GraphBuildFailed,
+            GraphBuildTimeout,
+        )
 
         try:
             from devcouncil.indexing.map_artifacts import refresh_map_artifacts
@@ -196,11 +208,34 @@ def map_repo(
                 scan_dependencies=scan_deps,
                 liveness=liveness,
                 lsp_refs=use_lsp,
+                full=full,
             )
             repo_map = refresh.repo_map
         except GraphBuildBusy as exc:
             status_console.print(f"[red]{exc}[/red]")
+            status_console.print(
+                "[dim]Recover with `dev map unlock` (add --force if the holder is "
+                "wedged but still reporting progress).[/dim]"
+            )
             raise typer.Exit(code=1) from exc
+        except (GraphBuildTimeout, GraphBuildFailed) as exc:
+            # These reached the CLI as an uncaught traceback + CRITICAL log. Print
+            # the failure and the three things that actually unblock a big repo.
+            logger.warning("dev map: graph build did not complete", exc_info=True)
+            status_console.print(f"[red]Graph build did not complete: {exc}[/red]")
+            status_console.print(
+                "[dim]Try: `dev map unlock` to free a stuck writer; `dev map "
+                "--no-liveness` to skip the liveness pass; or raise "
+                "indexing.build_stall_timeout_seconds / "
+                "indexing.build_total_timeout_seconds in .devcouncil/config.yaml.[/dim]"
+            )
+            raise typer.Exit(code=1) from exc
+        if refresh.build_incomplete:
+            status_console.print(
+                f"[yellow]Graph build did not finish; refreshed the map from the last "
+                f"committed generation ({refresh.reason}).[/yellow]"
+            )
+            raise typer.Exit(code=1)
         if refresh.degraded:
             status_console.print(
                 f"[red]Map wrote lean/degraded artifacts: {refresh.reason or refresh.mode}[/red]"
@@ -400,6 +435,19 @@ def _mount_graph_commands(target: typer.Typer) -> None:
 
     from devcouncil.cli.commands import graph_cmd
 
+    # A partially-initialised graph_cmd (import cycle, or a stale editable
+    # install being rewritten under a running process) used to raise
+    # ``AttributeError: module 'graph_cmd' has no attribute 'app'`` at import
+    # time and take the whole CLI down — including `dev map unlock`, the command
+    # you need precisely when a build has just been killed. Degrade instead.
+    source_app = getattr(graph_cmd, "app", None)
+    if source_app is None:
+        logger.warning(
+            "graph command group unavailable; `dev map <graph subcommand>` is not "
+            "mounted this run — use `dev graph ...` (e.g. `dev graph unlock`)"
+        )
+        return
+
     existing_cmds = {c.name for c in target.registered_commands if c.name}
     existing_groups: set[str] = set()
     for group in target.registered_groups:
@@ -407,7 +455,7 @@ def _mount_graph_commands(target: typer.Typer) -> None:
         if name:
             existing_groups.add(name)
 
-    for cmd in graph_cmd.app.registered_commands:
+    for cmd in source_app.registered_commands:
         name = cmd.name
         if not name:
             continue
@@ -441,7 +489,7 @@ def _mount_graph_commands(target: typer.Typer) -> None:
         target.registered_commands.append(cmd)
         existing_cmds.add(name)
 
-    for group in graph_cmd.app.registered_groups:
+    for group in source_app.registered_groups:
         gname = None if isinstance(group.name, DefaultPlaceholder) else group.name
         ti = group.typer_instance
         if isinstance(ti, DefaultPlaceholder) or ti is None or not gname:

@@ -13,6 +13,12 @@ from devcouncil.storage.repositories import ArtifactGraphRepository, StateReposi
 from devcouncil.telemetry.cost import group_cost
 from devcouncil.live.summary import live_review_summary
 from devcouncil.telemetry.stages import log_stage, log_step
+from devcouncil.app.config import load_config
+from devcouncil.gating.policy import (
+    effective_artifact_graph,
+    effective_live_review,
+    is_hard_safety_gap,
+)
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -26,11 +32,22 @@ def _status_payload(project_root: Path) -> dict:
     with db.get_session() as session:
         graph_repo = ArtifactGraphRepository(session)
         graph = graph_repo.load_graph()
-        summary = graph.coverage_summary()
+        summary = dict(graph.coverage_summary())
 
-        blocking_gaps = graph.blocking_gaps()
+        stored_blocking_gaps = graph.blocking_gaps()
+        gate_mode = load_config(project_root).gates.mode
+        blocking_gaps = (
+            stored_blocking_gaps
+            if gate_mode == "enforce"
+            else [gap for gap in stored_blocking_gaps if is_hard_safety_gap(gap)]
+        )
+        summary["blocking_gaps"] = len(blocking_gaps)
         state = StateRepository(session).get_state()
-        phase = compute_phase(graph, state.current_phase if state else None)
+        effective_graph = effective_artifact_graph(graph, mode=gate_mode)
+        persisted_phase = state.current_phase if state else None
+        if gate_mode != "enforce" and persisted_phase == "TASK_BLOCKED":
+            persisted_phase = None
+        phase = compute_phase(effective_graph, persisted_phase)
 
         # Single read of the model-call ledger: derive both the grand total and the
         # per-task breakdown from one pass (group_cost -> read_cost_records). This is
@@ -40,6 +57,11 @@ def _status_payload(project_root: Path) -> dict:
         status_counts: dict[str, int] = {}
         for task in graph.tasks.values():
             status_counts[task.status] = status_counts.get(task.status, 0) + 1
+        effective_status_counts: dict[str, int] = {}
+        for task in effective_graph.tasks.values():
+            effective_status_counts[task.status] = (
+                effective_status_counts.get(task.status, 0) + 1
+            )
 
         release_health = None
         try:
@@ -60,6 +82,10 @@ def _status_payload(project_root: Path) -> dict:
         except Exception:
             logger.debug("release-health summary skipped", exc_info=True)
 
+        effective_live = effective_live_review(
+            live_review_summary(project_root),
+            mode=gate_mode,
+        )
         return {
             "initialized": True,
             "phase": phase,
@@ -67,8 +93,12 @@ def _status_payload(project_root: Path) -> dict:
             "total_cost": cost["total_cost"],
             "cost_by_task": cost["by_task"],
             "task_status_counts": status_counts,
+            "effective_task_status_counts": effective_status_counts,
             "blocking_gaps": [gap.model_dump() for gap in blocking_gaps],
-            "live_review": live_review_summary(project_root),
+            "gates_mode": gate_mode,
+            "gates_enabled": gate_mode == "enforce",
+            "stored_blocking_gaps": len(stored_blocking_gaps),
+            "live_review": effective_live,
             "release_health": release_health,
         }
 
@@ -127,6 +157,7 @@ def status(
             f"[bold]Tasks:[/bold] {summary['total_tasks']} ({summary['tasks_without_requirements']} orphaned)\n"
             f"[bold]Acceptance Criteria:[/bold] {summary['total_ac']} ({summary['ac_without_evidence']} unverified)\n"
             f"[bold]Gaps:[/bold] {summary['total_gaps']} ({summary['blocking_gaps']} blocking)\n"
+            f"[bold]Gate mode:[/bold] {payload['gates_mode']}\n"
             f"[bold]Live Review:[/bold] {payload['live_review']['cards']['critical_open']} open critical, "
             f"{len(payload['live_review']['blocking_cards'])} blocking in scope, "
             f"{payload['live_review']['pending_signals']} pending signal(s)\n"
@@ -135,13 +166,19 @@ def status(
             expand=False,
         ))
 
-        if payload["task_status_counts"]:
+        displayed_status_counts = payload["effective_task_status_counts"]
+        if displayed_status_counts:
             table = Table(title="Task Summary")
             table.add_column("Status", style="magenta")
             table.add_column("Count", justify="right")
-            for state, count in sorted(payload["task_status_counts"].items()):
+            for state, count in sorted(displayed_status_counts.items()):
                 table.add_row(state, str(count))
             console.print(table)
+            if payload["task_status_counts"] != displayed_status_counts:
+                console.print(
+                    "[dim]Persisted task statuses are retained for audit history; "
+                    "quality-blocked tasks are effective 'done' outside enforce mode.[/dim]"
+                )
 
         cost_groups = payload.get("cost_by_task") or {}
         if cost_groups:

@@ -65,12 +65,22 @@ _RAN_COMMAND = re.compile(r"\b(?:ran|executed|invoked)\s+[`\"']([^`\"'\n]+)[`\"'
 
 _QUOTED_SPAN = re.compile(r"[`\"']([^`\"'\n]+)[`\"']")
 _BARE_PATH = re.compile(r"(?<![\w./\\-])(?:[A-Za-z]:[/\\])?[\w.-]+(?:[/\\][\w.-]+)+(?![\w/\\])")
-_KNOWN_EXTENSIONS = {
-    "py", "js", "ts", "tsx", "jsx", "json", "md", "txt", "toml", "yaml", "yml",
-    "html", "css", "scss", "sql", "sh", "ps1", "psm1", "bat", "cs", "java",
-    "go", "rs", "c", "cpp", "h", "hpp", "rb", "php", "xml", "csv", "ini",
-    "cfg", "lock", "env",
-}
+
+
+def _known_extensions() -> frozenset[str]:
+    """Stem extensions for path heuristics — registry code + common non-code."""
+    from devcouncil.codeintel.languages import code_extensions
+
+    stems = {ext.lstrip(".").lower() for ext in code_extensions()}
+    stems |= {
+        "json", "md", "txt", "toml", "yaml", "yml",
+        "html", "css", "scss", "sql", "sh", "ps1", "psm1", "bat",
+        "xml", "csv", "ini", "cfg", "lock", "env", "h", "hpp",
+    }
+    return frozenset(stems)
+
+
+_KNOWN_EXTENSIONS = _known_extensions()
 
 
 def _has_known_extension(token: str) -> bool:

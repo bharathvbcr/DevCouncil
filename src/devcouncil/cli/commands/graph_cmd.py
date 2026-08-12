@@ -119,13 +119,52 @@ def _emit_limit(out: Console, limit_dict: dict) -> None:
         out.print(f"[dim]{limit_dict['detail']}[/dim]")
 
 
-def _require_graph(root: Path):
+def _index_freshness_fields(root: Path) -> dict[str, object]:
+    """Freshness probe for read commands; never raises."""
+    try:
+        from devcouncil.codeintel.service import index_freshness
+
+        return index_freshness(root)
+    except Exception as exc:  # noqa: BLE001 - probe must not break reads
+        return {"fresh": None, "reason": f"freshness probe failed: {exc}"}
+
+
+def _warn_if_stale(
+    root: Path, *, note_unknown: bool = False, quiet: bool = False
+) -> dict[str, object]:
+    """Print a loud staleness banner on stderr; return the freshness fields.
+
+    A frozen index must never pass silently as current evidence — results from
+    an index built at another commit misled a deletion decision on 2026-08-11.
+    ``quiet`` suppresses banners for JSON mode, where the structured
+    ``index_freshness`` field (plus the exit code) is the machine signal.
+    """
+    fields = _index_freshness_fields(root)
+    if quiet:
+        return fields
+    if fields.get("fresh") is False:
+        age = fields.get("age_seconds")
+        age_text = f" ({age / 3600.0:.1f}h old)" if isinstance(age, (int, float)) else ""
+        status.print(
+            f"[red]index STALE: {fields.get('reason') or 'index head does not match HEAD'}"
+            f"{age_text} — results reflect the old commit; run `dev map` to refresh[/red]"
+        )
+    elif note_unknown and fields.get("fresh") is None and fields.get("generation") is not None:
+        status.print(
+            f"[yellow]index freshness unknown: {fields.get('reason') or ''}[/yellow]"
+        )
+    return fields
+
+
+def _require_graph(root: Path, *, warn_stale: bool = True):
     from devcouncil.indexing.graph.build import load_code_graph
 
     graph = load_code_graph(root)
     if graph is None:
         status.print("[red]No code graph; run `dev map` first.[/red]")
         raise typer.Exit(code=1)
+    if warn_stale:
+        _warn_if_stale(root)
     return graph
 
 
@@ -149,10 +188,19 @@ def graph_init(
             quiet=True,
         )
     except GraphBuildBusy as exc:
+        from devcouncil.codeintel.build_control import writer_busy_details
+
+        payload = {
+            "ok": False,
+            "code": "graph_writer_busy",
+            "error": str(exc),
+            **writer_busy_details(root),
+        }
         if json_output:
-            typer.echo(json.dumps({"ok": False, "code": "graph_writer_busy", "error": str(exc)}))
+            typer.echo(json.dumps(payload, indent=2))
         else:
             status.print(f"[red]{exc}[/red]")
+            status.print(f"[dim]hint: {payload.get('hint') or 'dev map unlock'}[/dim]")
         raise typer.Exit(code=1) from exc
     if refresh.degraded:
         payload = {
@@ -165,6 +213,22 @@ def graph_init(
             typer.echo(json.dumps(payload, indent=2))
         else:
             status.print(f"[red]Graph init degraded: {refresh.reason}[/red]")
+        raise typer.Exit(code=1)
+    if refresh.build_incomplete:
+        # SQLite is intact but older than HEAD — never report a green index.
+        payload = {
+            "ok": False,
+            "build_incomplete": True,
+            "reason": refresh.reason,
+            "mode": refresh.mode,
+        }
+        if json_output:
+            typer.echo(json.dumps(payload, indent=2))
+        else:
+            status.print(
+                f"[yellow]Graph build did not finish; indexed state came from the "
+                f"last committed generation ({refresh.reason})[/yellow]"
+            )
         raise typer.Exit(code=1)
     result = get_codeintel_service(root).status()
     if refresh.compatibility_export_degraded:
@@ -197,7 +261,9 @@ def graph_status(
 ) -> None:
     """Show canonical generation, watcher health, and pending files."""
     from devcouncil.codeintel import get_codeintel_service
+    from devcouncil.codeintel.build_control import read_build_status, writer_busy_details
     from devcouncil.codeintel.sync import get_sync_coordinator
+    from devcouncil.codeintel.sync.lease import read_holder
 
     root = _root(project_root)
     result = get_codeintel_service(root).status()
@@ -213,6 +279,18 @@ def graph_status(
         except Exception:
             logger.debug("graph status cold-start bootstrap failed", exc_info=True)
     result["sync"] = get_sync_coordinator(root).status().as_dict()
+    holder = read_holder(root / ".devcouncil" / "codeintel" / "writer.lock")
+    build = read_build_status(root)
+    result["writer_holder"] = {
+        "pid": holder.pid,
+        "started_at": holder.started_at,
+    }
+    busy_like = build.state in {"building", "stalled", "timed_out", "stale"} or holder.pid is not None
+    if busy_like:
+        details = writer_busy_details(root)
+        result["hint"] = details["hint"]
+        result["build_pid"] = details["build_pid"]
+        result["build_state"] = details["build_state"]
     if result["sync"].get("compatibility_export") == "degraded":
         from devcouncil.indexing.graph.communities import (
             collect_limit_reports,
@@ -224,11 +302,18 @@ def graph_status(
             reason=str(result["sync"].get("degraded_reason") or "compatibility export degraded"),
         ).as_dict()
         result["limits"] = collect_limit_reports(result.get("limit"))
+    result["index_freshness"] = _index_freshness_fields(root)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
     console.print(f"state: {result['state']}")
     console.print(f"generation: {result.get('generation') or '(none)'}")
+    freshness = result["index_freshness"]
+    if freshness.get("fresh") is False:
+        console.print(f"[red]index: STALE — {freshness.get('reason')}[/red]")
+    elif freshness.get("fresh") is True:
+        head = str(freshness.get("index_head") or "")
+        console.print(f"index: fresh (HEAD {head[:12]})")
     console.print(f"nodes/edges: {result.get('node_count', 0)}/{result.get('edge_count', 0)}")
     sync = result["sync"]
     console.print(f"watcher: {sync['state']} ({sync.get('backend') or 'not started'})")
@@ -236,13 +321,18 @@ def graph_status(
         console.print(
             "[dim]hint: run `dev map watch` or `dev map --watch` to enable auto-refresh[/dim]"
         )
-    if sync.get("build_id"):
+    if sync.get("build_id") or holder.pid is not None:
         progress = f"{sync.get('build_completed', 0)}/{sync.get('build_total', 0)}"
+        pid = sync.get("build_pid") or holder.pid or "n/a"
         console.print(
             f"build: {sync.get('build_state') or 'unknown'} / "
             f"{sync.get('build_phase') or 'unknown'} ({progress}, "
-            f"pid={sync.get('build_pid') or 'n/a'})"
+            f"pid={pid})"
         )
+    if holder.pid is not None:
+        console.print(f"writer holder: pid={holder.pid}")
+    if result.get("hint"):
+        console.print(f"[dim]hint: if stuck, run `{result['hint']}`[/dim]")
     if sync.get("compatibility_export") == "degraded":
         console.print("compatibility export: degraded")
         if result.get("limit"):
@@ -251,6 +341,46 @@ def graph_status(
         console.print("pending: " + ", ".join(sync["pending"]))
     if sync.get("degraded_reason"):
         console.print(f"degraded: {sync['degraded_reason']}")
+
+
+@app.command("unlock")
+def graph_unlock(
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Kill the holder even if build_status still looks like progress.",
+    ),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Free a stuck code-intelligence writer lease (prefer over raw kill).
+
+    Default recovery: free when the recorded holder is dead; if status is
+    stalled/timed_out/stale or the holder is older than the stall timeout,
+    SIGTERM then SIGKILL. Use ``--force`` to kill a still-progressing holder.
+    """
+    from devcouncil.codeintel.build_control import unlock_writer_lease
+
+    root = _root(project_root)
+    result = unlock_writer_lease(root, force=force)
+    if json_output:
+        typer.echo(json.dumps(result, indent=2))
+    else:
+        action = str(result.get("action") or "unknown")
+        reason = str(result.get("reason") or "")
+        color = "green" if result.get("ok") else "yellow"
+        status.print(f"[{color}]unlock {action}: {reason}[/{color}]")
+        if result.get("target_pid") is not None:
+            status.print(f"target pid: {result['target_pid']}")
+        if result.get("build_state"):
+            status.print(
+                f"build: {result.get('build_state')} "
+                f"(pid={result.get('build_pid') or result.get('holder_pid') or 'n/a'})"
+            )
+        if result.get("hint") and not result.get("ok"):
+            status.print(f"[dim]hint: {result['hint']}[/dim]")
+    if not result.get("ok"):
+        raise typer.Exit(code=1)
 
 
 @app.command("sync")
@@ -336,8 +466,19 @@ def graph_doctor(
     elif build.compatibility_export == "degraded":
         export_health = "degraded"
         export_detail = build.degraded_reason or "compatibility export degraded"
+    # The canonical graph and its JSON export are separate axes. A size-capped
+    # export is an export-tier limit, not a broken graph: SQLite is canonical and
+    # fully queryable, so it must not stamp the whole map as failed. Real
+    # inconsistencies (drift / corrupt / missing-while-committed) still fail.
+    graph_ok = store["state"] == "committed"
+    json_export_ok = export_health == "healthy"
+    export_only_size_capped = export_health == "degraded"
     result = {
-        "ok": store["state"] == "committed" and grammars["ok"] and export_health == "healthy",
+        "ok": graph_ok
+        and grammars["ok"]
+        and (json_export_ok or export_only_size_capped),
+        "graph_ok": graph_ok,
+        "json_export_ok": json_export_ok,
         "store": store,
         "watcher_backend": watcher_backend,
         "grammars": grammars,
@@ -397,9 +538,11 @@ def graph_doctor(
     if result.get("store_action"):
         console.print(f"store action: {result['store_action']}")
     console.print(f"watcher backend: {watcher_backend}")
+    console.print(f"graph (canonical SQLite): {'ok' if graph_ok else 'not ok'}")
     console.print(
         f"compatibility export: {export_health}"
         + (f" — {export_detail}" if export_detail else "")
+        + (" (JSON export only; the graph itself is fine)" if export_only_size_capped else "")
     )
     for _limit in result.get("limits") or []:
         _emit_limit(console, _limit)
@@ -486,16 +629,20 @@ def graph_ingest(
                 quiet=True,
             )
         except GraphBuildBusy as exc:
+            from devcouncil.codeintel.build_control import writer_busy_details
+
             payload = {
                 "ok": False,
                 "code": "graph_writer_busy",
                 "error": str(exc),
                 "paths": changed,
+                **writer_busy_details(root),
             }
             if json_output:
                 typer.echo(json.dumps(payload, indent=2))
             else:
                 status.print(f"[red]{exc}[/red]")
+                status.print(f"[dim]hint: {payload.get('hint') or 'dev map unlock'}[/dim]")
             raise typer.Exit(code=1) from exc
     else:
         synced = coordinator.sync_now(changed)
@@ -516,13 +663,18 @@ def graph_ingest(
         )
     embedded = build_embeddings(root)
     payload = {
-        "ok": not refresh.degraded,
+        # A map rebuilt from a prior generation after a build timeout is not a
+        # successful ingest: the graph is intact but older than HEAD. Reporting
+        # ok/green here is exactly the confusion the recovery path exists to
+        # avoid, so it fails alongside `degraded`.
+        "ok": not (refresh.degraded or refresh.build_incomplete),
         "paths": changed,
         "map": str(map_path.relative_to(root)),
         "embeddings_built": embedded,
         "generation": refresh.generation,
         "mode": refresh.mode,
         "degraded": refresh.degraded,
+        "build_incomplete": refresh.build_incomplete,
         "reason": refresh.reason,
     }
     if refresh.compatibility_export_degraded:
@@ -537,15 +689,17 @@ def graph_ingest(
     if json_output:
         typer.echo(json.dumps(payload, indent=2))
     else:
-        color = "yellow" if refresh.degraded else "green"
+        color = "yellow" if (refresh.degraded or refresh.build_incomplete) else "green"
         status.print(
             f"[{color}]Ingested {len(changed)} path(s); map at {payload['map']}"
             f"{f'; {embedded} embeddings' if embedded else ''}"
-            f"{f'; degraded: {refresh.reason}' if refresh.degraded else ''}[/{color}]"
+            f"{f'; degraded: {refresh.reason}' if refresh.degraded else ''}"
+            f"{f'; graph build did not finish — map came from the last committed '
+               f'generation ({refresh.reason})' if refresh.build_incomplete else ''}[/{color}]"
         )
         if refresh.compatibility_export_degraded and payload.get("limit"):
             _emit_limit(status, payload["limit"])
-    if refresh.degraded:
+    if refresh.degraded or refresh.build_incomplete:
         raise typer.Exit(code=1)
 
 
@@ -721,6 +875,12 @@ def graph_dead(
         help="Include this tier and above: extracted > inferred > ambiguous "
         "(default: inferred; pass ambiguous to show all)",
     ),
+    allow_stale: bool = typer.Option(
+        False,
+        "--allow-stale",
+        help="Report even when the index was built from a different commit "
+        "than HEAD (default: exit 3 so stale results cannot pass as evidence).",
+    ),
 ) -> None:
     """Full dead-code report with confidence tiers and reasons."""
     from collections import Counter
@@ -728,7 +888,8 @@ def graph_dead(
     from devcouncil.indexing.graph.liveness import confidence_at_least
 
     root = _root(project_root)
-    graph = _require_graph(root)
+    graph = _require_graph(root, warn_stale=False)
+    freshness = _warn_if_stale(root, note_unknown=True, quiet=json_output)
     entries = list(graph.dead_code)
     if confidence:
         entries = [
@@ -746,17 +907,21 @@ def graph_dead(
         ]
     hidden = before_min - len(entries)
     degraded = _graph_degraded_fields(root)
+    stale = freshness.get("fresh") is False
     if json_output:
         typer.echo(
             json.dumps(
                 {
                     "dead_code": [e.model_dump() for e in entries],
                     "dead_code_hidden": hidden,
+                    "index_freshness": freshness,
                     **degraded,
                 },
                 indent=2,
             )
         )
+        if stale and not allow_stale:
+            raise typer.Exit(code=3)
         return
     if degraded.get("graph_degraded"):
         status.print(
@@ -770,6 +935,13 @@ def graph_dead(
                 f"{hidden} lower-confidence entries hidden "
                 "(--min-confidence ambiguous to show)."
             )
+        if stale and not allow_stale:
+            status.print(
+                "[red]refusing to treat a stale dead-code report as evidence "
+                "(index built from a different commit than HEAD). Run `dev map` "
+                "to refresh, or pass --allow-stale to accept.[/red]"
+            )
+            raise typer.Exit(code=3)
         return
     for e in entries:
         conf = e.confidence.value if hasattr(e.confidence, "value") else e.confidence
@@ -787,6 +959,13 @@ def graph_dead(
             f"{hidden} lower-confidence entries hidden "
             "(--min-confidence ambiguous to show)."
         )
+    if stale and not allow_stale:
+        status.print(
+            "[red]refusing to treat a stale dead-code report as evidence "
+            "(index built from a different commit than HEAD). Run `dev map` "
+            "to refresh, or pass --allow-stale to accept.[/red]"
+        )
+        raise typer.Exit(code=3)
 
 
 @app.command("check")

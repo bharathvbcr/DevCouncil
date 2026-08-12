@@ -9,7 +9,7 @@ from typing import Optional
 from devcouncil.cli.commands.init import initialize_project
 from devcouncil.storage.db import get_db
 from devcouncil.storage.repositories import TaskRepository, RequirementRepository, GapRepository, EvidenceRepository, StateRepository
-from devcouncil.verification.verifier import Verifier
+from devcouncil.verification.verifier import Verifier, verification_task_status
 from devcouncil.llm.provider import create_provider, validate_model_provider
 from devcouncil.llm.router import ModelRouter
 from devcouncil.domain.evidence import CommandResult, DiffEvidence, DiffCoverageEvidence, TestEvidence
@@ -101,18 +101,21 @@ def _run_verify_body(
 
         reqs = req_repo.get_all()
         
-        # Load router for LLM review if possible
+        config = load_config(root)
+        gate_mode = config.gates.mode
+
+        # Load router for LLM review if quality verification is active.
         router = None
-        try:
-            config = load_config(root)
-            validate_model_provider(config.models.provider)
-            api_key = get_api_key(config.models.provider, root)
-            provider = create_provider(config.models.provider, api_key, project_root=root, provider_prefs=config.provider)
-            role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
-            router = ModelRouter(provider, role_config, project_root=root)
-        except Exception as e:
-            # Verification still runs, but silently without the LLM review layer.
-            logger.warning("Failed to build model router, verifying without LLM review: %s", e)
+        if gate_mode != "off":
+            try:
+                validate_model_provider(config.models.provider)
+                api_key = get_api_key(config.models.provider, root)
+                provider = create_provider(config.models.provider, api_key, project_root=root, provider_prefs=config.provider)
+                role_config = {name: role.model_dump() for name, role in config.models.roles.items()}
+                router = ModelRouter(provider, role_config, project_root=root)
+            except Exception as e:
+                # Verification still runs, but silently without the LLM review layer.
+                logger.warning("Failed to build model router, verifying without LLM review: %s", e)
 
         from devcouncil.verification.sandbox import get_sandbox
 
@@ -132,50 +135,65 @@ def _run_verify_body(
                 task_id=task.id,
                 sandbox=sandbox,
             )
-            if sandbox != "local":
+            if sandbox != "local" and gate_mode != "off":
                 commands = task.expected_tests or task.allowed_commands
                 sandbox_result = get_sandbox(sandbox, root).run(task, commands, reqs)
-                if sandbox_result.status == "unsupported":
-                    message = f"Sandbox {sandbox} is unavailable."
-                    if json_format:
-                        typer.echo(dump_json({"ok": False, "error": message, "sandbox": sandbox}, indent=2))
-                    else:
-                        console.print(f"[red]{message}[/red]")
-                    return
-                if sandbox_result.status == "failed":
-                    task.status = "blocked"
+                failed = sandbox_result.status != "passed"
+                gaps = []
+                if failed:
+                    unavailable = sandbox_result.status == "unsupported"
+                    gap = Gap(
+                        id=f"GAP-{task.id}-SANDBOX-{sandbox.upper()}",
+                        severity="high",
+                        gap_type=(
+                            "skipped_verification_command"
+                            if unavailable
+                            else "test_failed"
+                        ),
+                        task_id=task.id,
+                        description=(
+                            f"Sandbox {sandbox} is unavailable."
+                            if unavailable
+                            else f"Task {task.id} failed in the {sandbox} sandbox."
+                        ),
+                        evidence=[str(item) for item in sandbox_result.commands],
+                        recommended_fix=(
+                            f"Install/configure {sandbox}, or select a supported sandbox."
+                            if unavailable
+                            else "Inspect the sandbox command results and fix the failing check."
+                        ),
+                        blocking=gate_mode == "enforce",
+                    )
+                    gaps = [gap]
+                gap_repo.delete_for_task(task.id)
+                for gap in gaps:
+                    gap_repo.save(gap)
+                total_gaps += len(gaps)
+                task.status = "blocked" if any(g.blocking for g in gaps) else "verified"
+                if task.status == "blocked":
                     blocked_tasks += 1
-                    task_repo.save(task)
-                    task_results.append({
-                        "task_id": task.id,
-                        "status": task.status,
-                        "sandbox": sandbox,
-                        "gap_count": 1,
-                        "blocking_gap_count": 1,
-                        "gaps": [],
-                    })
-                    if json_format:
-                        typer.echo(dump_json({
-                            "ok": False,
-                            "task_id": task.id,
-                            "sandbox": sandbox,
-                            "commands": sandbox_result.commands,
-                        }, indent=2))
-                    else:
-                        console.print(f"[red]{task.id} failed in {sandbox} sandbox.[/red]")
-                    continue
-                task.status = "verified"
                 task_repo.save(task)
                 task_results.append({
                     "task_id": task.id,
                     "status": task.status,
                     "sandbox": sandbox,
-                    "gap_count": 0,
-                    "blocking_gap_count": 0,
-                    "gaps": [],
+                    "gap_count": len(gaps),
+                    "blocking_gap_count": len([gap for gap in gaps if gap.blocking]),
+                    "gaps": [gap.model_dump() for gap in gaps],
+                    "commands": sandbox_result.commands,
+                    "gate_mode": gate_mode,
+                    "verification_mode": f"sandbox:{sandbox}",
+                    "verification_skipped": False,
                 })
                 if not json_format:
-                    console.print(f"[green]{task.id} passed in {sandbox} sandbox.[/green]")
+                    color = "red" if task.status == "blocked" else ("yellow" if failed else "green")
+                    verdict = "blocked" if task.status == "blocked" else (
+                        "completed with advisory findings" if failed else "passed"
+                    )
+                    detail = f" {gaps[0].description}" if gaps else ""
+                    console.print(
+                        f"[{color}]{task.id} {verdict} in {sandbox} sandbox.{detail}[/{color}]"
+                    )
                 continue
             TraceLogger(root).log_event(
                 "task_verification_started",
@@ -218,10 +236,10 @@ def _run_verify_body(
 
             per_task_gaps[task.id] = gaps
             if not json_format:
-                _print_task_result(task.id, gaps)
+                _print_task_result(task.id, gaps, outcome)
 
-            if any(gap.blocking for gap in gaps):
-                task.status = "blocked"
+            task.status = verification_task_status(gaps, outcome)
+            if task.status == "blocked":
                 blocked_tasks += 1
                 TraceLogger(root).log_event(
                     "gate_failed",
@@ -230,12 +248,19 @@ def _run_verify_body(
                     summary=f"{task.id} blocked with {len(gaps)} gap(s)",
                 )
             else:
-                task.status = "verified"
                 TraceLogger(root).log_event(
-                    "task_verified",
-                    {"task_id": task.id, "gap_count": len(gaps)},
+                    "task_completed" if task.status == "done" else "task_verified",
+                    {
+                        "task_id": task.id,
+                        "gap_count": len(gaps),
+                        "verification_skipped": task.status == "done",
+                    },
                     task_id=task.id,
-                    summary=f"{task.id} verified",
+                    summary=(
+                        f"{task.id} completed without quality verification"
+                        if task.status == "done"
+                        else f"{task.id} verified"
+                    ),
                 )
             task_repo.save(task)
             blocking_actions, advisory_actions = split_next_actions(gaps)
@@ -248,6 +273,8 @@ def _run_verify_body(
                 "next_actions": [action.model_dump() for action in blocking_actions],
                 "advisory_actions": [action.model_dump() for action in advisory_actions],
                 "verification_mode": outcome.mode if outcome else "unknown",
+                "gate_mode": outcome.gate_mode if outcome else gate_mode,
+                "verification_skipped": outcome.verification_skipped if outcome else False,
                 "compiler_active": outcome.compiler_active if outcome else False,
                 "diff_empty": outcome.diff_empty if outcome else False,
                 "coverage_measured": outcome.coverage_measured if outcome else False,
@@ -301,11 +328,17 @@ def _run_verify_body(
         )
 
         if json_format:
+            skipped_tasks = sum(
+                1 for result in task_results if result.get("verification_skipped")
+            )
             typer.echo(dump_json({
                 "ok": blocked_tasks == 0,
-                "verified_tasks": len(tasks),
+                "processed_tasks": len(tasks),
+                "verified_tasks": len(tasks) - blocked_tasks - skipped_tasks,
+                "completed_without_verification": skipped_tasks,
                 "blocked_tasks": blocked_tasks,
                 "total_gaps": total_gaps,
+                "gate_mode": gate_mode,
                 "tasks": task_results,
             }, indent=2))
         elif len(tasks) > 1:
@@ -325,8 +358,14 @@ def _run_verify_body(
         raise typer.Exit(code=1)
 
 
-def _print_task_result(task_id: str, gaps):
+def _print_task_result(task_id: str, gaps, outcome=None):
     if not gaps:
+        if outcome is not None and outcome.verification_skipped:
+            console.print(
+                f"[green]Task {task_id} completed. Quality verification was skipped "
+                "(gates.mode=off); hard-safety scan passed.[/green]"
+            )
+            return
         console.print(f"[green]Task {task_id} verified successfully! No gaps found.[/green]")
         return
 

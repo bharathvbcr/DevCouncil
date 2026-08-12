@@ -9,6 +9,11 @@ triggers:
 
 # DevCouncil Hero Loop
 
+This is an **opt-in strict task workflow**. It does not override
+`gates.mode=off` or make tasks, leases, or verification mandatory for ordinary
+work. Run it only when the user explicitly requests the hero/task loop or when
+strict enforcement is active.
+
 DevCouncil's certified end-to-end path for Claude Code: the agent checks out a task,
 implements inside declared scope, verifies deterministically, self-repairs from typed
 next actions, and releases — **without a human pasting test output back and forth.**
@@ -27,8 +32,9 @@ checkout_task ─▶ (agent implements) ─▶ verify_task ─▶ passed? ─▶
 ### 1. Pick up work
 
 ```
-devcouncil_next_task          # highest-priority unblocked task (or use a known TASK-ID)
-devcouncil_checkout_task      # acquire lease — required before writes or verify
+devcouncil_next_task          # highest-priority unblocked task (or a known TASK-ID)
+devcouncil_checkout_task      # acquire lease — required before writes or verify when
+                              # write-gates / contain mode are active
 devcouncil_get_task           # scope, planned files, acceptance criteria
 devcouncil_get_prompt           # full executor prompt with rigor + context
 ```
@@ -39,8 +45,9 @@ another task or wait for release.
 ### 2. Implement inside scope
 
 - Read with `devcouncil_read_file`; inspect changes with `devcouncil_get_diff`.
-- **Write only through the gate:** `devcouncil_write_file` / `devcouncil_apply_patch`.
-  Direct editor writes to out-of-scope or protected paths are rejected.
+- Prefer policy-gated writes: `devcouncil_write_file` / `devcouncil_apply_patch`.
+  When write-gates / contain mode are active, direct editor writes to out-of-scope or
+  protected paths are rejected.
 - Run tests with `devcouncil_run_command` or `devcouncil_record_command`.
 - Preflight questionable paths with `devcouncil_policy_check_write`.
 
@@ -53,7 +60,7 @@ stuck on a recurring error, and before declaring the task complete.
 ### 3. Verify
 
 ```
-devcouncil_verify_task        # deterministic verifier — requires active lease
+devcouncil_verify_task        # deterministic verifier — lease required in enforce
 ```
 
 Returns `passed`, `blocking_gaps`, and `next_actions`. A green test suite is not enough;
@@ -72,7 +79,8 @@ Each action is typed (`category`: `fix_code`, `add_test`, `fix_verification`, `s
 `security`, `review`, `plan`) with `file`, `line`, and often `suggested_command`.
 Fix each blocking action, then call `devcouncil_verify_task` again. Repeat until clean.
 
-Do **not** weaken tests, stub around gaps, or skip verification to force a pass.
+Inside this opted-in loop, do **not** weaken tests, stub around gaps, or skip
+verification to force a pass.
 
 ### 5. Release
 
@@ -103,7 +111,8 @@ Same deterministic verifier as the hero loop. Graduate to `dev plan` once you tr
 
 ## Common mistakes
 
-- Editing files before checkout (writes may fail or lack provenance).
-- Calling `devcouncil_verify_task` without a lease (rejected).
+- Skipping checkout during the **hero loop** / contain mode (MCP gated writes and verify need a lease).
+  Interactive assist Shell does not require checkout.
+- Calling `devcouncil_verify_task` without a lease in `enforce` mode (rejected).
 - Declaring done on test pass alone (verifier may report `diff_not_exercised`, stubs, scope gaps).
 - Ignoring `next_actions` categories — branch on `category`, not prose parsing.

@@ -89,13 +89,41 @@ def _local_context_window_budget(project_root: Path, cfg=None) -> int | None:
         return _MIN_PROMPT_CHARS
     return max(_MIN_PROMPT_CHARS, usable_tokens * _CHARS_PER_TOKEN)
 
-_LANG_BY_EXT = {
-    ".py": "python", ".js": "javascript", ".jsx": "jsx", ".ts": "typescript",
-    ".tsx": "tsx", ".go": "go", ".rs": "rust", ".java": "java", ".kt": "kotlin",
-    ".swift": "swift", ".rb": "ruby", ".cs": "csharp", ".cpp": "cpp", ".c": "c",
-    ".sh": "bash", ".yml": "yaml", ".yaml": "yaml", ".json": "json", ".toml": "toml",
-    ".md": "markdown", ".sql": "sql",
+# Fence extras / overrides. Registry grammars + markup overlay fill the rest.
+_LANG_BY_EXT_EXTRAS = {
+    ".jsx": "jsx",
+    ".tsx": "tsx",
+    ".sh": "bash",  # fence prefers bash over generic "shell"
+    ".sql": "sql",
 }
+_LANG_BY_EXT: dict[str, str] | None = None
+
+
+def _lang_by_ext() -> dict[str, str]:
+    """Fence language tags derived from LANGUAGE_SPECS (+ markup/shell extras)."""
+    global _LANG_BY_EXT
+    if _LANG_BY_EXT is not None:
+        return _LANG_BY_EXT
+    from devcouncil.codeintel.languages import (
+        LANGUAGE_SPECS,
+        language_id_for_suffix,
+        markup_extensions,
+    )
+
+    out: dict[str, str] = {}
+    for ext in markup_extensions():
+        lang = language_id_for_suffix(ext, include_markup=True)
+        if lang:
+            out[ext] = lang
+    out.update(_LANG_BY_EXT_EXTRAS)
+    for spec in LANGUAGE_SPECS:
+        for ext in spec.extensions:
+            key = ext.lower()
+            if key in out:
+                continue
+            out[key] = language_id_for_suffix(key) or spec.grammar
+    _LANG_BY_EXT = out
+    return out
 
 
 class PromptBuilder:
@@ -105,7 +133,7 @@ class PromptBuilder:
 
     @staticmethod
     def _lang_for(path: str) -> str:
-        return _LANG_BY_EXT.get(Path(path).suffix.lower(), "")
+        return _lang_by_ext().get(Path(path).suffix.lower(), "")
 
     def _symbol_outline(self, path: str, text: str) -> List[str]:
         """Cheap top-level symbol index (signatures + line numbers) so the agent edits
@@ -173,6 +201,8 @@ class PromptBuilder:
 
     # Bounded per-language regexes over exported/public top-level declarations. Each
     # capture group 2 is the symbol name; group 1 (when present) is the keyword/kind.
+    # Intentionally narrow: needs per-lang patterns or graph outlines — do not emit
+    # empty fakes for Swift/Kotlin/etc. until real analyzers exist.
     _OUTLINE_PATTERNS: dict[str, list[tuple[str, re.Pattern[str]]]] = {}
 
     def _regex_symbol_outline(self, path: str, text: str) -> List[str]:

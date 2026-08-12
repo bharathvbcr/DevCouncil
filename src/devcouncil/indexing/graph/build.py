@@ -25,6 +25,7 @@ from devcouncil.indexing.graph.liveness import (
     file_liveness,
     legacy_dead_strings,
     symbol_reachability_dead,
+    token_dead_from_shards,
     _token_scan_dead,
 )
 from devcouncil.indexing.graph.resolve import (
@@ -218,6 +219,41 @@ def extract_paths(
     return extractions
 
 
+# Files per ``liveness:tokens`` progress tick. Small enough that a large repo
+# reports in well inside the stall window, large enough that the callback is
+# not itself a cost.
+_SHARD_PROGRESS_STRIDE = 100
+
+
+def _build_liveness_shards(
+    root: Path,
+    extractions: Dict[str, FileExtraction],
+    *,
+    progress: Callable[[str, int, int], None] | None = None,
+) -> Dict[str, dict[str, object]]:
+    """Tokenize every extraction into a liveness shard, reporting as it goes.
+
+    This used to be a silent dict comprehension. On a repo with thousands of
+    extractions it reads and tokenizes every file with no observable progress
+    for tens of minutes, which the build supervisor cannot distinguish from a
+    wedged worker — so it killed healthy builds. Progress ticks per chunk fix
+    the observability half; the supervisor's CPU heartbeat covers the rest.
+    """
+    total = len(extractions)
+    if progress is not None:
+        progress("liveness:tokens", 0, total)
+    shards: Dict[str, dict[str, object]] = {}
+    for index, (path, extraction) in enumerate(extractions.items(), start=1):
+        shards[path] = build_liveness_shard(root, extraction)
+        if progress is not None and (
+            index % _SHARD_PROGRESS_STRIDE == 0 or index == total
+        ):
+            progress("liveness:tokens", index, total)
+    if progress is not None and total == 0:
+        progress("liveness:tokens", 0, 0)
+    return shards
+
+
 def assemble_graph(
     root: Path,
     files: List[str],
@@ -285,21 +321,50 @@ def assemble_graph(
     unreachable: List[str] = []
     unreachable_unreliable = False
     dead_code = []
+    pending_shards: Optional[Dict[str, dict[str, object]]] = None
     if liveness:
         if progress is not None:
             progress("liveness", 0, 1)
         from devcouncil.indexing.graph.liveness import project_call_edges_to_files
+        from devcouncil.indexing.wiring import build_dynamic_import_index
 
+        # One dynamic-import index for file + symbol liveness (avoid double scan).
+        dynamic_index = build_dynamic_import_index(root, files)
         liveness_edges = sorted(set(file_edges) | project_call_edges_to_files(edges))
+
+        if progress is not None:
+            progress("liveness:files", 0, 1)
         entry_roots, unwired, unreachable, unreachable_unreliable = file_liveness(
-            root, files, liveness_edges, cap=0
+            root, files, liveness_edges, cap=0, dynamic_index=dynamic_index
         )
+        if progress is not None:
+            progress("liveness:files", 1, 1)
+
         # Empty prod roots → fail-soft empty unreachable (already); keep symbol
         # reachability from treating every file as unreachable.
         reach_unreachable = [] if unreachable_unreliable else unreachable
-        token_dead, _idx, token_keys = _token_scan_dead(
-            root, files, cap=0, lsp_refs=lsp_refs, mapper=mapper
-        )
+
+        # Prefer shard token-dead on the full path (same tokenize as analysis shards)
+        # unless LSP refs need the mapper scan.
+        if not lsp_refs:
+            # Full-file read + tokenize per extraction. On a large repo this is
+            # tens of minutes; emitting progress per chunk is what keeps the
+            # supervisor from reading it as a hang.
+            pending_shards = _build_liveness_shards(root, extractions, progress=progress)
+            if progress is not None:
+                progress("liveness:token_dead", 0, 1)
+            token_dead, _idx, token_keys = token_dead_from_shards(nodes, pending_shards)
+            if progress is not None:
+                progress("liveness:token_dead", 1, 1)
+        else:
+            if progress is not None:
+                progress("liveness:tokens", 0, 1)
+            token_dead, _idx, token_keys = _token_scan_dead(
+                root, files, cap=0, lsp_refs=lsp_refs, mapper=mapper
+            )
+            if progress is not None:
+                progress("liveness:tokens", 1, 1)
+
         dead_code = symbol_reachability_dead(
             root,
             files,
@@ -310,6 +375,8 @@ def assemble_graph(
             token_dead_keys=token_keys,
             file_edges=file_edges,
             unreachable=reach_unreachable,
+            dynamic_index=dynamic_index,
+            progress=progress,
         )
         # Uncapped in code_graph meta; repo_map.json applies _LIVENESS_CAP on write.
         legacy = legacy_dead_strings(dead_code, token_dead, cap=None)
@@ -339,6 +406,9 @@ def assemble_graph(
             **semantic_meta,
         },
     )
+    if pending_shards is not None:
+        _PENDING_ANALYSIS_SHARDS[id(graph)] = pending_shards
+        weakref.finalize(graph, _PENDING_ANALYSIS_SHARDS.pop, id(graph), None)
     try:
         from devcouncil.indexing.graph.intel import enrich_graph_intel
 
@@ -377,11 +447,13 @@ def build_code_graph(
         mapper=mapper,
         progress=progress,
     )
-    _PENDING_ANALYSIS_SHARDS[id(graph)] = {
-        path: build_liveness_shard(root, extraction)
-        for path, extraction in extractions.items()
-    }
-    weakref.finalize(graph, _PENDING_ANALYSIS_SHARDS.pop, id(graph), None)
+    # assemble_graph already stashes shards when it builds them for token-dead;
+    # only rebuild when liveness was skipped or LSP forced the mapper scan.
+    if id(graph) not in _PENDING_ANALYSIS_SHARDS:
+        _PENDING_ANALYSIS_SHARDS[id(graph)] = _build_liveness_shards(
+            root, extractions, progress=progress
+        )
+        weakref.finalize(graph, _PENDING_ANALYSIS_SHARDS.pop, id(graph), None)
     return graph
 
 
@@ -582,6 +654,7 @@ def write_code_graph(
     changed_paths: Set[str] | None = None,
     analysis_shards: dict[str, dict[str, object]] | None = None,
     _lease_held: bool = False,
+    progress: Callable[[str, int, int], None] | None = None,
 ) -> Path:
     if not _lease_held:
         from devcouncil.codeintel.build_control import graph_build_session
@@ -593,6 +666,7 @@ def write_code_graph(
                 changed_paths=changed_paths,
                 analysis_shards=analysis_shards,
                 _lease_held=True,
+                progress=progress,
             )
     # SQLite is the canonical store. Keep the deterministic JSON artifact as a
     # compatibility/export boundary for existing consumers and older clients.
@@ -604,10 +678,15 @@ def write_code_graph(
         graph,
         changed_paths=changed_paths,
         analysis_shards=shards,
+        progress=progress,
     )
     path = graph_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if progress is not None:
+        progress("export:json", 0, 1)
     _write_compatibility_export_tiers(root, path, graph)
+    if progress is not None:
+        progress("export:json", 1, 1)
     return path
 
 

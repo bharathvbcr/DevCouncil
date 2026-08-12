@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import json
@@ -83,7 +84,7 @@ def test_read_build_status_marks_stalled_without_recent_progress(tmp_path: Path)
 
     loaded = read_build_status(tmp_path)
     assert loaded.state == "stalled"
-    assert "no recorded graph progress" in loaded.degraded_reason
+    assert "no graph progress or worker CPU" in loaded.degraded_reason
 
 
 def test_read_build_status_returns_idle_on_missing_or_invalid_file(tmp_path: Path) -> None:
@@ -469,3 +470,166 @@ def test_yield_writer_lease_reacquire_timeout_raises(tmp_path: Path, monkeypatch
         with pytest.raises(GraphBuildBusy, match="re-acquire"):
             f1.result(timeout=5)
         f2.result(timeout=5)
+
+
+def test_yield_writer_lease_preserves_timeout_when_reacquire_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Failed re-acquire must not silently replace GraphBuildTimeout with Busy."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from devcouncil.codeintel.build_control import (
+        GraphBuildTimeout,
+        graph_build_session,
+        yield_writer_lease_for_child,
+    )
+    from devcouncil.codeintel.sync.lease import WriterLease
+
+    (tmp_path / ".devcouncil").mkdir()
+    lock = tmp_path / ".devcouncil" / "codeintel" / "writer.lock"
+    barrier = threading.Barrier(2)
+
+    def parent() -> None:
+        with graph_build_session(tmp_path, timeout=1.0):
+            with yield_writer_lease_for_child(tmp_path):
+                barrier.wait()
+                time.sleep(0.05)
+                raise GraphBuildTimeout("graph build made no progress for 90.0s")
+
+    def rival() -> None:
+        barrier.wait()
+        lease = WriterLease(lock)
+        assert lease.acquire_with_retry(timeout=1.0)
+        time.sleep(1.5)
+        lease.release()
+
+    monkeypatch.setattr(
+        "devcouncil.codeintel.build_control._lease_timeouts",
+        lambda _root: (0.3, 0.1),
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(parent)
+        f2 = pool.submit(rival)
+        with pytest.raises(GraphBuildTimeout, match="no progress"):
+            f1.result(timeout=5)
+        f2.result(timeout=5)
+
+
+def test_cpu_heartbeat_keeps_a_working_worker_out_of_stalled_state(tmp_path: Path) -> None:
+    """Phase counters flat + CPU climbing is a slow phase, not a stall.
+
+    Regression for healthy builds being killed at 90%+ CPU: liveness tokenize
+    and SQLite persist emit no phase progress for minutes.
+    """
+    now = time.time()
+    status = BuildStatus(
+        build_id="working",
+        state="building",
+        mode="full",
+        pid=os.getpid(),
+        phase="liveness:tokens",
+        # Last phase counter is far older than the stall budget...
+        last_progress_at=now - 600.0,
+        # ...but the worker reported CPU a moment ago.
+        last_cpu_progress_at=now - 1.0,
+        worker_cpu_seconds=512.0,
+        stall_timeout_seconds=30.0,
+        total_timeout_seconds=7200.0,
+    )
+    _write_status(tmp_path, status)
+
+    loaded = read_build_status(tmp_path)
+    assert loaded.state == "building"
+    assert loaded.degraded_reason == ""
+
+
+def test_stall_still_fires_when_cpu_is_flat_too(tmp_path: Path) -> None:
+    """A genuinely wedged worker (no phase progress, no CPU) is still killed."""
+    now = time.time()
+    status = BuildStatus(
+        build_id="wedged",
+        state="building",
+        mode="full",
+        pid=os.getpid(),
+        phase="persist:nodes",
+        last_progress_at=now - 600.0,
+        last_cpu_progress_at=now - 600.0,
+        worker_cpu_seconds=12.0,
+        stall_timeout_seconds=30.0,
+        total_timeout_seconds=7200.0,
+    )
+    _write_status(tmp_path, status)
+
+    loaded = read_build_status(tmp_path)
+    assert loaded.state == "stalled"
+    assert "no graph progress or worker CPU" in loaded.degraded_reason
+
+
+def test_changed_paths_go_through_a_file_not_argv(tmp_path: Path) -> None:
+    """A repo-scale change set must not be one --changed-path arg per entry.
+
+    Regression for ``OSError: [Errno 7] Argument list too long``.
+    """
+    from devcouncil.codeintel.build_control import _write_changed_paths_file
+
+    paths = {f"src/pkg/module_{index}.py" for index in range(5_000)}
+    target = _write_changed_paths_file(tmp_path, "buildid", paths)
+    assert target is not None
+    written = [line for line in target.read_text(encoding="utf-8").splitlines() if line]
+    assert set(written) == paths
+
+    assert _write_changed_paths_file(tmp_path, "buildid", set()) is None
+    assert _write_changed_paths_file(tmp_path, "buildid", None) is None
+
+
+def test_worker_parses_changed_paths_from_file_and_argv() -> None:
+    import argparse
+
+    from devcouncil.codeintel import build_worker
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--changed-path", action="append", default=[])
+    parser.add_argument("--changed-paths-file", default="")
+    args = parser.parse_args(["--changed-path", "a.py"])
+    assert build_worker._changed_paths(args) == {"a.py"}
+
+
+def _incomplete_refresh(**over):
+    from devcouncil.indexing.map_artifacts import GraphRefreshResult
+
+    base = dict(
+        repo_map=None,
+        graph=None,
+        generation=7,
+        mode="prior_generation",
+        degraded=False,
+        reason="GraphBuildTimeout: no progress for 90.0s",
+        compatibility_export_degraded=False,
+        build_incomplete=True,
+    )
+    base.update(over)
+    return GraphRefreshResult(**base)
+
+
+def test_mcp_graph_ingest_reports_a_prior_generation_as_not_ok(tmp_path: Path, monkeypatch) -> None:
+    """An agent must not read a graph older than HEAD as a fresh ingest."""
+    import asyncio
+    import json as _json
+
+    from devcouncil.integrations.mcp.handlers import map as map_handler
+
+    monkeypatch.setattr(
+        "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
+        lambda *a, **k: _incomplete_refresh(),
+    )
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.embeddings.build_embeddings", lambda _r: 0
+    )
+    result = asyncio.run(map_handler.handle_graph_ingest(tmp_path, {}))
+    payload = _json.loads(result[0].text)
+
+    assert payload["ok"] is False
+    assert payload["build_incomplete"] is True
+    assert payload["code"] == "graph_build_incomplete"
+    assert "older than HEAD" in payload["detail"]
+    assert payload["generation"] == 7

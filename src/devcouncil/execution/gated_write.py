@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import uuid
 from pathlib import Path
 
 from devcouncil.execution.hook_policy import HookPolicy
@@ -27,7 +28,7 @@ def _explicitly_planned(path: str, task) -> bool:  # noqa: ANN001
 def write_file_payload(
     project_root: Path,
     *,
-    task_id: str,
+    task_id: str | None,
     lease_token: str,
     rel_path: str,
     content: str,
@@ -41,40 +42,56 @@ def write_file_payload(
         return {"ok": False, "error": "DevCouncil state is unavailable in this directory.", "code": "not_initialized"}
 
     with db.get_session() as session:
-        lease_error = require_valid_lease(session, task_id, lease_token)
-        if lease_error:
-            return lease_error
-        lease_record = TaskLeaseRepository(session).active_for_task(task_id)
-        assert lease_record is not None
-        task = TaskRepository(session).get_by_id(task_id)
-        if not task:
+        from devcouncil.app.config import load_config
+
+        enforce = load_config(project_root).gates.mode == "enforce"
+        if enforce:
+            if not task_id:
+                return {
+                    "ok": False,
+                    "error": "A task ID is required when gates.mode=enforce.",
+                    "code": "task_required",
+                }
+            lease_error = require_valid_lease(session, task_id, lease_token)
+            if lease_error:
+                return lease_error
+        lease_record = (
+            TaskLeaseRepository(session).active_for_task(task_id)
+            if task_id
+            else None
+        )
+        task = TaskRepository(session).get_by_id(task_id) if task_id else None
+        if enforce and not task:
             return {"ok": False, "error": f"Task {task_id} not found.", "code": "not_found", "task_id": task_id}
+        lease_id = lease_record.id if lease_record is not None else None
 
         target = within_root(project_root, rel_path)
         if target is None:
             reason = "path escapes the project root"
             FileChangeRepository(session).record(
-                rel_path, "write", False, task_id=task_id, lease_id=lease_record.id, reason=reason,
+                rel_path, "write", False, task_id=task_id, lease_id=lease_id, reason=reason,
             )
             return {
                 "ok": False, "task_id": task_id, "applied_files": [],
                 "rejected_files": [{"path": rel_path, "reason": reason}],
             }
 
-        if not _explicitly_planned(rel_path, task):
+        if enforce and not _explicitly_planned(rel_path, task):
             reason = f"Task {task_id} does not explicitly authorize changes to {rel_path}."
             FileChangeRepository(session).record(
-                rel_path, "write", False, task_id=task_id, lease_id=lease_record.id, reason=reason,
+                rel_path, "write", False, task_id=task_id, lease_id=lease_id, reason=reason,
             )
             return {
                 "ok": False, "task_id": task_id, "applied_files": [],
                 "rejected_files": [{"path": rel_path, "reason": reason}],
             }
 
-        decision = HookPolicy(project_root=project_root).evaluate_file_write(rel_path, task, content=content)
+        decision = HookPolicy(project_root=project_root).evaluate_file_write(
+            rel_path, task, content=content, enforce_task_scope=enforce
+        )
         if not decision.allowed:
             FileChangeRepository(session).record(
-                rel_path, "write", False, task_id=task_id, lease_id=lease_record.id, reason=decision.reason,
+                rel_path, "write", False, task_id=task_id, lease_id=lease_id, reason=decision.reason,
             )
             return {
                 "ok": False, "task_id": task_id, "applied_files": [],
@@ -88,7 +105,7 @@ def write_file_payload(
         except OSError as exc:
             return {"ok": False, "error": f"Write failed: {exc}", "code": "write_failed", "task_id": task_id}
         FileChangeRepository(session).record(
-            rel_path, "write", True, task_id=task_id, lease_id=lease_record.id, reason=decision.reason,
+            rel_path, "write", True, task_id=task_id, lease_id=lease_id, reason=decision.reason,
         )
         return {
             "ok": True, "task_id": task_id, "applied_files": [rel_path], "rejected_files": [],
@@ -98,7 +115,7 @@ def write_file_payload(
 def apply_patch_payload(
     project_root: Path,
     *,
-    task_id: str,
+    task_id: str | None,
     lease_token: str,
     unified_diff: str,
 ) -> dict:
@@ -122,40 +139,66 @@ def apply_patch_payload(
         return {"ok": False, "error": "No target files found in the diff.", "code": "empty_patch", "task_id": task_id}
 
     with db.get_session() as session:
-        lease_error = require_valid_lease(session, task_id, lease_token)
-        if lease_error:
-            return lease_error
-        lease_record = TaskLeaseRepository(session).active_for_task(task_id)
-        assert lease_record is not None
-        task = TaskRepository(session).get_by_id(task_id)
-        if not task:
+        from devcouncil.app.config import load_config
+
+        enforce = load_config(project_root).gates.mode == "enforce"
+        if enforce:
+            if not task_id:
+                return {
+                    "ok": False,
+                    "error": "A task ID is required when gates.mode=enforce.",
+                    "code": "task_required",
+                }
+            lease_error = require_valid_lease(session, task_id, lease_token)
+            if lease_error:
+                return lease_error
+        lease_record = (
+            TaskLeaseRepository(session).active_for_task(task_id)
+            if task_id
+            else None
+        )
+        task = TaskRepository(session).get_by_id(task_id) if task_id else None
+        if enforce and not task:
             return {"ok": False, "error": f"Task {task_id} not found.", "code": "not_found", "task_id": task_id}
+        lease_id = lease_record.id if lease_record is not None else None
 
         policy = HookPolicy(project_root=project_root)
         rejected: list[dict[str, str]] = []
+        from devcouncil.gating.checks.secret_scan_check import SecretScanner
+
+        secret_gaps = SecretScanner().scan_diff(unified_diff, task_id or "UNSCOPED")
+        if secret_gaps:
+            reason = secret_gaps[0].description
+            rejected = [{"path": path, "reason": reason} for path in targets]
         for path in targets:
+            if rejected:
+                break
             if within_root(project_root, path) is None:
                 rejected.append({"path": path, "reason": "path escapes the project root"})
                 continue
-            if not _explicitly_planned(path, task):
+            if enforce and not _explicitly_planned(path, task):
                 rejected.append({
                     "path": path,
                     "reason": f"Task {task_id} does not explicitly authorize changes to {path}.",
                 })
                 continue
-            decision = policy.evaluate_file_write(path, task)
+            decision = policy.evaluate_file_write(
+                path,
+                task,
+                enforce_task_scope=enforce,
+            )
             if not decision.allowed:
                 rejected.append({"path": path, "reason": decision.reason})
         if rejected:
             for item in rejected:
                 FileChangeRepository(session).record(
-                    item["path"], "apply_patch", False, task_id=task_id, lease_id=lease_record.id, reason=item["reason"],
+                    item["path"], "apply_patch", False, task_id=task_id, lease_id=lease_id, reason=item["reason"],
                 )
             return {
                 "ok": False, "task_id": task_id, "applied_files": [], "rejected_files": rejected,
             }
 
-        patch_path = project_root / ".devcouncil" / f"mcp-apply-{lease_record.id}.patch"
+        patch_path = project_root / ".devcouncil" / f"mcp-apply-{uuid.uuid4().hex}.patch"
         patch_path.parent.mkdir(parents=True, exist_ok=True)
         patch_path.write_text(unified_diff, encoding="utf-8")
         try:
@@ -190,7 +233,7 @@ def apply_patch_payload(
                 pass
         for path in targets:
             FileChangeRepository(session).record(
-                path, "apply_patch", True, task_id=task_id, lease_id=lease_record.id, reason="policy allowed",
+                path, "apply_patch", True, task_id=task_id, lease_id=lease_id, reason="policy allowed",
             )
         return {
             "ok": True, "task_id": task_id, "applied_files": targets, "rejected_files": [],

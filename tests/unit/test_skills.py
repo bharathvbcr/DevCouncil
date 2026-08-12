@@ -69,6 +69,29 @@ def test_scaffold_writes_and_is_idempotent(tmp_path):
     assert cursor_content == content
 
 
+def test_skills_for_scaffold_prefers_library_over_stale_repo_copy(tmp_path):
+    """Integrate refresh must not re-scaffold the already-installed stale body."""
+    from devcouncil.skills.registry import LIBRARY_DIR, clear_skill_caches, skills_for_scaffold
+
+    clear_skill_caches()
+    lib = (LIBRARY_DIR / "devcouncil.md").read_text(encoding="utf-8")
+    stale_dir = tmp_path / ".cursor" / "skills" / "devcouncil"
+    stale_dir.mkdir(parents=True)
+    (stale_dir / "SKILL.md").write_text(
+        "---\nname: devcouncil\ndescription: stale\nalways: true\n---\n# Stale\n"
+        "checkout before writes, release when verified.\n",
+        encoding="utf-8",
+    )
+    clear_skill_caches()
+    skills = skills_for_scaffold("", tmp_path)
+    dc = next(s for s in skills if s.name == "devcouncil")
+    assert "Stale" not in (dc.body or "")
+    assert "Interactive Shell" in (dc.body or "") or "Interactive Shell" in lib
+    written = scaffold_skills(tmp_path, skills)
+    refreshed = (tmp_path / ".cursor" / "skills" / "devcouncil" / "SKILL.md").read_text(encoding="utf-8")
+    assert "checkout before writes, release when verified." not in refreshed
+    assert any(p.name == "SKILL.md" and "devcouncil" in str(p) for p in written)
+
 def test_scaffold_dual_destination_mirrors_claude_local_to_cursor(tmp_path):
     """A skill that already lives under .claude/skills still scaffolds to .cursor/skills."""
     skill_dir = tmp_path / ".claude" / "skills" / "custom"
@@ -210,7 +233,7 @@ def get_skill_or_skip(name):
 def test_new_domain_skills_select_precisely(tmp_path):
     def names(goal, files):
         d = tmp_path / f"d{abs(hash((goal, tuple(files)))) % 10000}"
-        d.mkdir()
+        d.mkdir(parents=True, exist_ok=True)
         for f in files:
             (d / f).write_text("x", encoding="utf-8")
         return {s.name for s in select_skills(goal=goal, project_root=d)}

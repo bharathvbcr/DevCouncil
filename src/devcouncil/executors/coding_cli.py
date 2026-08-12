@@ -721,7 +721,11 @@ class CodingCliExecutor(Executor):
     def _scope_enforcement_enabled(self) -> bool:
         try:
             from devcouncil.app.config import load_config
-            return bool(load_config(self.project_root).execution.enforce_file_scope_pre_verify)
+            config = load_config(self.project_root)
+            return bool(
+                config.gates.mode == "enforce"
+                and config.execution.enforce_file_scope_pre_verify
+            )
         except Exception:
             return False
 

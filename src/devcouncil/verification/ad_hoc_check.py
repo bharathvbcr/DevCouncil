@@ -92,6 +92,7 @@ def _persist_ad_hoc_result(
     task: Task,
     gaps: List[Gap],
     evidence: list,
+    outcome=None,
 ) -> None:
     """Write CHECK task gaps/evidence so ``dev report`` can export CI artifacts."""
     from devcouncil.domain.evidence import CommandResult, DiffEvidence, TestEvidence
@@ -123,7 +124,9 @@ def _persist_ad_hoc_result(
                 ev_repo.save_diff_evidence(ev)
             elif isinstance(ev, TestEvidence):
                 ev_repo.save_test_evidence(ev, task.id)
-        task.status = "blocked" if any(g.blocking for g in gaps) else "verified"
+        from devcouncil.verification.verifier import verification_task_status
+
+        task.status = verification_task_status(gaps, outcome)
         TaskRepository(session).save(task)
 
 
@@ -214,6 +217,7 @@ def run_working_tree_check(
             task=task,
             gaps=gaps,
             evidence=evidence,
+            outcome=verifier.last_outcome,
         )
     logger.info("Ad-hoc check result: passed=%s (%d gap(s), %d blocking)", not blocking, len(gaps), len(blocking))
     return AdHocCheckResult(

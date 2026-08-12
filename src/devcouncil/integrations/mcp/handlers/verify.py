@@ -27,10 +27,8 @@ async def handle_verify_task(
     task_id, arg_error = required_string_argument(arguments, "task_id")
     if arg_error:
         return arg_error
-    lease_token, arg_error = required_string_argument(arguments, "lease_token")
-    if arg_error:
-        return arg_error
-    assert task_id is not None and lease_token is not None
+    lease_token = optional_string_argument(arguments, "lease_token") or ""
+    assert task_id is not None
     sandbox = optional_string_argument(arguments, "sandbox") or "local"
     cli_args = [
         "verify-leased", task_id,

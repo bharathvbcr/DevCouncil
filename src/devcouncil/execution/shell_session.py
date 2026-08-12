@@ -109,6 +109,10 @@ class GuardedShellSession:
         self.project_root = project_root.resolve()
         self.task = task
         self.shell = shell
+        try:
+            self.gate_mode = load_config(self.project_root).gates.mode
+        except Exception:
+            self.gate_mode = "enforce"
         if command_timeout is None:
             try:
                 command_timeout = load_config(self.project_root).execution.command_timeout
@@ -135,36 +139,44 @@ class GuardedShellSession:
         if not db:
             raise RuntimeError("DevCouncil not initialized.")
         with db.get_session() as session:
-            lease = TaskLeaseRepository(session).acquire(
-                self.task.id,
-                owner="dev shell",
-                agent=self.shell,
-                force=force,
-            )
-            self.lease_token = lease.lease_token
+            lease = None
+            if self.gate_mode == "enforce":
+                lease = TaskLeaseRepository(session).acquire(
+                    self.task.id,
+                    owner="dev shell",
+                    agent=self.shell,
+                    force=force,
+                )
+                self.lease_token = lease.lease_token
             shell_session = ShellSessionRepository(session).start(
                 self.task.id,
                 self.shell,
                 str(self.project_root),
-                lease_id=lease.id,
+                lease_id=lease.id if lease else None,
             )
             self.session_id = shell_session.id
-            self.task.status = "running"
-            TaskRepository(session).save(self.task)
+            if self.gate_mode == "enforce":
+                self.task.status = "running"
+                TaskRepository(session).save(self.task)
         CheckpointService(self.project_root).create_before(self.task.id)
 
     def finish(self) -> None:
         db = get_db(self.project_root)
-        if not db or not self.lease_token:
+        if not db:
             return
         with db.get_session() as session:
             if self.session_id:
                 ShellSessionRepository(session).finish(self.session_id, "finished")
-            TaskLeaseRepository(session).release(self.task.id, self.lease_token)
+            if self.lease_token:
+                TaskLeaseRepository(session).release(self.task.id, self.lease_token)
 
     def run_one(self, command: str) -> int:
         normalized = " ".join(command.split())
-        decision = self.policy.evaluate_command(normalized, self.task)
+        decision = self.policy.evaluate_command(
+            normalized,
+            self.task,
+            enforce_task_scope=self.gate_mode == "enforce",
+        )
         log_id = uuid.uuid4().hex[:8]
         stdout_path = self.log_dir / f"{self.task.id}-{log_id}.stdout.log"
         stderr_path = self.log_dir / f"{self.task.id}-{log_id}.stderr.log"

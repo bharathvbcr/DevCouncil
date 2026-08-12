@@ -145,8 +145,10 @@ def _verify_after_execution(
         elif isinstance(ev, TestEvidence):
             evidence_repo.save_test_evidence(ev, task.id)
 
-    task.status = "blocked" if any(g.blocking for g in gaps) else "verified"
-    return task.status == "verified"
+    from devcouncil.verification.verifier import verification_task_status
+
+    task.status = verification_task_status(gaps, verifier.last_outcome)
+    return task.status in {"verified", "done"}
 
 
 def _build_verification_router(project_root: Path):
@@ -288,7 +290,7 @@ def _run_task_body(root, task_id, executor, profile, stream, db):
             return
 
         from devcouncil.gating.policy import GatePolicy
-        gate_policy = GatePolicy()
+        gate_policy = GatePolicy(root)
         gate_result = gate_policy.check_task_ready(task, root)
         if not gate_result.passed:
             logger.warning(

@@ -19,7 +19,8 @@ dev e2e "goal" --executor codex --agent # Agent preset: JSON plus .devcouncil/re
 dev e2e "goal" --executor codex --force  # Proceed past advisory planning gaps automatically
 dev e2e "goal" --executor codex --json --report-file .devcouncil/reports/latest.json # Write machine-readable report
 dev go "goal" --executor codex # Short alias for dev e2e
-dev map                     # Build the deterministic repository map + code graph (no LLM)
+dev map                     # Build the map + code graph (no LLM); incremental when the change set is small
+dev map --full              # Force a full isolated rebuild instead of incremental sync
 dev map --goal "…"          # Optional goal text for candidate-file ranking (was a positional arg)
 dev map --if-stale          # Skip rebuild when the on-disk map fingerprint is still fresh
 dev map --no-liveness       # Skip entry_roots / unwired / unreachable / dead_symbol lists
@@ -36,6 +37,9 @@ dev map ingest PATH...      # Path-scoped ingest (full reconcile when paths omit
 dev map query NAME          # 360° symbol view: definition, callers, callees, importers
 dev map trace A B           # Shortest path between two graph nodes
 dev map dead                # Dead-code report with confidence tiers (extracted|inferred|ambiguous); uncapped
+                            # Exits 3 when the index was built from a different commit than HEAD
+                            # (stale evidence is never silently green); refresh with `dev map`
+dev map dead --allow-stale  # Accept a stale-index report explicitly (exit 0)
 dev map dead --min-confidence inferred  # Filter to inferred+extracted only
 dev map check               # God nodes (top-connected) and circular-import detection
 dev map process [ENTRY]     # BFS call-flows from entry roots
@@ -112,6 +116,10 @@ dev integrate opencode --apply # Write project OpenCode MCP config for DevCounci
 dev integrate antigravity --apply # Write project Antigravity MCP config for DevCouncil
 dev integrate warp --apply  # Write Warp/Oz MCP config for DevCouncil
 dev integrate cli-agent NAME --command TOOL --apply # Register any prompt-taking CLI executor
+dev integrate <client> --decouple # Strip PreToolUse/before containment only; keep MCP + PostToolUse
+dev integrate <client> --uninstall # Surgically remove DevCouncil MCP/hooks/assets for that client
+dev integrate decouple --target all|hooks|claude|cursor|opencode|… # Multi-target decouple
+dev integrate uninstall --target all|hooks|claude|cursor|opencode|… # Multi-target uninstall
 dev integrate recommend
 dev integrate status
 dev integrate status --json
@@ -169,6 +177,9 @@ dev config set semantic_layer.router.enabled true # Opt-in complexity routing fo
 dev config set semantic_layer.compressor.enabled true # Toggle long-context compression before LLM calls
 dev config set execution.command_timeout 600 # Set a common dotted config key
 dev config set execution.stop_gate.mode assist # Stop-hook claim+verify gate (off|assist|block); see coding-cli-integration.md
+dev config set gates.mode off      # Skip quality gates/verification; hard safety remains active
+dev config set gates.mode advisory # Run checks and record non-blocking findings
+dev config set gates.mode enforce  # Run checks and block on failures (default)
 dev corpus build            # Build advisory doc/PDF/image corpus graph (config.yaml paths)
 dev corpus query "topic"    # Search corpus concepts
 dev corpus status           # Corpus freshness vs doc fingerprints

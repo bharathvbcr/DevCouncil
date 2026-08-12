@@ -12,8 +12,26 @@ from devcouncil.knowledge.resource_discovery import (
 from devcouncil.live.summary import live_review_summary
 from devcouncil.reporting.report_builder import ReportBuilder
 from devcouncil.storage.db import get_db
-from devcouncil.storage.repositories import ArtifactGraphRepository, GapRepository, TaskRepository
+from devcouncil.storage.repositories import ArtifactGraphRepository, TaskRepository
 from devcouncil.utils.json_persist import dump_json
+
+
+def _effective_views(project_root: Path, graph, live_review=None):  # noqa: ANN001
+    from devcouncil.app.config import load_config
+    from devcouncil.gating.policy import (
+        effective_artifact_graph,
+        effective_live_review,
+    )
+
+    try:
+        mode = load_config(project_root).gates.mode
+    except Exception:
+        mode = "enforce"
+    return (
+        effective_artifact_graph(graph, mode=mode),
+        effective_live_review(live_review, mode=mode),
+        mode,
+    )
 
 
 def read_mcp_resource(project_root: Path, uri: str) -> str:
@@ -27,34 +45,60 @@ def read_mcp_resource(project_root: Path, uri: str) -> str:
             return "DevCouncil is not initialized in this directory."
         with db.get_session() as session:
             graph = ArtifactGraphRepository(session).load_graph()
-        return ReportBuilder.build_markdown(graph, live_review=live_review_summary(project_root))
+        graph, live, _mode = _effective_views(
+            project_root,
+            graph,
+            live_review_summary(project_root),
+        )
+        return ReportBuilder.build_markdown(graph, live_review=live)
 
     if key == "devcouncil://tasks":
         if not db:
             return dump_json({"tasks": []}, indent=2)
         with db.get_session() as session:
-            tasks = [t.model_dump() for t in TaskRepository(session).get_all()]
+            graph = ArtifactGraphRepository(session).load_graph()
+        graph, _live, _mode = _effective_views(project_root, graph)
+        tasks = [task.model_dump() for task in graph.tasks.values()]
         return dump_json({"tasks": tasks}, indent=2)
 
     if key == "devcouncil://gaps":
         if not db:
             return dump_json({"gaps": []}, indent=2)
         with db.get_session() as session:
-            gaps = [g.model_dump() for g in GapRepository(session).get_all()]
+            graph = ArtifactGraphRepository(session).load_graph()
+        graph, _live, _mode = _effective_views(project_root, graph)
+        gaps = [gap.model_dump() for gap in graph.gaps.values()]
         return dump_json({"gaps": gaps}, indent=2)
 
     if key == "devcouncil://cards":
-        return dump_json(live_review_summary(project_root), indent=2)
+        graph = None
+        if db:
+            with db.get_session() as session:
+                graph = ArtifactGraphRepository(session).load_graph()
+        if graph is None:
+            return dump_json(live_review_summary(project_root), indent=2)
+        _graph, live, _mode = _effective_views(
+            project_root,
+            graph,
+            live_review_summary(project_root),
+        )
+        return dump_json(live, indent=2)
 
     if key.startswith("devcouncil://task/"):
         task_id = key.rsplit("/", 1)[-1]
         if not db:
             return dump_json({"ok": False, "error": "not initialized"}, indent=2)
         with db.get_session() as session:
-            task = TaskRepository(session).get_by_id(task_id)
-            if not task:
-                return dump_json({"ok": False, "error": f"Task {task_id} not found."}, indent=2)
-            gaps = [g.model_dump() for g in GapRepository(session).get_for_task(task_id)]
+            graph = ArtifactGraphRepository(session).load_graph()
+        graph, _live, _mode = _effective_views(project_root, graph)
+        task = graph.tasks.get(task_id)
+        if not task:
+            return dump_json({"ok": False, "error": f"Task {task_id} not found."}, indent=2)
+        gaps = [
+            gap.model_dump()
+            for gap in graph.gaps.values()
+            if gap.task_id == task_id
+        ]
         return dump_json({"task": task.model_dump(), "gaps": gaps}, indent=2)
 
     if key == "devcouncil://knowledge":

@@ -94,3 +94,64 @@ def _opencode_plugin_source() -> Path:
 
 def _opencode_plugin_path(project_root: Path) -> Path:
     return project_root / ".devcouncil" / "integrations" / OPENCODE_HOOK_PLUGIN_NAME
+
+
+def _opencode_plugin_ref_canonical() -> str:
+    return f"./.devcouncil/integrations/{OPENCODE_HOOK_PLUGIN_NAME}"
+
+
+def _is_opencode_plugin_ref(value: object) -> bool:
+    """True when a plugin array entry points at the DevCouncil OpenCode hook plugin.
+
+    Accepts the canonical ``./.devcouncil/integrations/…`` form plus common variants
+    (no ``./`` prefix, backslashes, or any path ending in the plugin filename).
+    """
+    if not isinstance(value, str):
+        return False
+    normalized = value.replace("\\", "/").strip()
+    if not normalized:
+        return False
+    canonical = _opencode_plugin_ref_canonical()
+    if normalized == canonical or normalized == canonical[2:]:
+        return True
+    return normalized.endswith(f"/{OPENCODE_HOOK_PLUGIN_NAME}") or normalized == OPENCODE_HOOK_PLUGIN_NAME
+
+
+def _opencode_plugin_registered(data: dict) -> bool:
+    plugins = data.get("plugin")
+    if isinstance(plugins, list):
+        return any(_is_opencode_plugin_ref(item) for item in plugins)
+    if isinstance(plugins, str):
+        return _is_opencode_plugin_ref(plugins)
+    return False
+
+
+def _uninstall_opencode(project_root: Path) -> list[str]:
+    """Remove DevCouncil MCP entry, plugin array ref, and generated plugin file."""
+    from devcouncil.integrations.clients import hooks as _hooks
+
+    removed: list[str] = []
+    root = project_root.expanduser().resolve()
+    path = _opencode_config_path(root)
+    if path.exists():
+        data = _load_json(path)
+        changed = False
+        mcp = data.get("mcp")
+        if isinstance(mcp, dict) and "devcouncil" in mcp:
+            mcp.pop("devcouncil")
+            if not mcp:
+                data.pop("mcp", None)
+            changed = True
+            removed.append(f"mcp.devcouncil in {path.name}")
+        if changed:
+            if data and set(data.keys()) != {"$schema"}:
+                _save_json(path, data)
+            elif data.get("$schema") and len(data) == 1:
+                # Leave schema-only file; callers may still want the project file.
+                _save_json(path, data)
+            elif not data:
+                path.unlink()
+    # Plugin file + plugin[] registration (path variants included).
+    removed.extend(_hooks._uninstall_opencode_hooks(root))
+    removed.extend(_common._clear_client_integration_config(root, "opencode"))
+    return removed

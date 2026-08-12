@@ -88,25 +88,40 @@ class HookPolicy:
 
     def _hook_gate_mode(self) -> str:
         # Resolve execution.hook_gate.mode with DEVCOUNCIL_HOOK_GATE override.
-        # contain (default) fail-closes Shell/Write without a task. off allows
-        # no-task Shell/Write after hard safety. MCP lease write/run paths always
-        # pass a task into this policy, so they stay gated regardless of mode.
-        env = (os.environ.get("DEVCOUNCIL_HOOK_GATE") or "").strip().lower()
-        if env in {"off", "contain"}:
-            return env
+        # off (default): after hard safety, allow Shell/Write without task allowlist
+        # or planned-files — even when a lease/running task exists (leftover interactive
+        # sessions must not re-bind to a tight allowlist). contain: lease+allowlist
+        # enforcement (opt-in with --write-gate). MCP lease write/run paths always
+        # pass a task into this policy and stay gated regardless of mode.
         try:
             from devcouncil.app.config import load_config
 
-            mode = (load_config(self.project_root).execution.hook_gate.mode or "contain").strip().lower()
-            return mode if mode in {"off", "contain"} else "contain"
+            config = load_config(self.project_root)
+            if config.gates.mode != "enforce":
+                return "off"
+            env = (os.environ.get("DEVCOUNCIL_HOOK_GATE") or "").strip().lower()
+            if env in {"off", "contain"}:
+                return env
+            mode = (config.execution.hook_gate.mode or "off").strip().lower()
+            return mode if mode in {"off", "contain"} else "off"
         except Exception:
-            return "contain"
+            # Fail open for interactive agents: prefer allowing Shell over
+            # fail-closing when config is unreadable (hard safety still runs).
+            return "off"
 
     @staticmethod
     def _with_hook_gate_hint(reason: str) -> str:
         if _HOOK_GATE_HINT.strip() in reason:
             return reason
         return f"{reason.rstrip()} {_HOOK_GATE_HINT.strip()}"
+
+    @staticmethod
+    def _is_hard_safety_file_deny(reason: str) -> bool:
+        return (
+            "outside the project root" in reason
+            or "Secret and credential" in reason
+            or "Protected repository paths" in reason
+        )
 
 
     secret_path_patterns = SECRET_PATH_PATTERNS
@@ -139,7 +154,7 @@ class HookPolicy:
         "Shell",
     }
 
-    def evaluate(self, call_data: dict[str, Any], active_task: Optional[Task]) -> HookDecision:
+    def evaluate(self, call_data: dict[str, Any], active_task: Optional[Task], *, enforce_task_scope: bool | None = None) -> HookDecision:
         tool_name = str(call_data.get("name") or call_data.get("tool_name") or call_data.get("tool") or "")
         arguments = call_data.get("arguments") or call_data.get("input") or call_data.get("tool_input") or {}
         if not isinstance(arguments, dict):
@@ -147,16 +162,35 @@ class HookPolicy:
 
         if tool_name in self.shell_tools:
             command = self._extract_command(arguments)
-            return self.evaluate_command(command, active_task)
+            return self.evaluate_command(command, active_task, enforce_task_scope=enforce_task_scope)
 
         if tool_name in self.write_tools:
             target = self._extract_path(arguments)
             content = self._extract_content(arguments)
-            return self.evaluate_file_write(target, active_task, content=content)
+            return self.evaluate_file_write(
+                target, active_task, content=content, enforce_task_scope=enforce_task_scope
+            )
 
         return HookDecision("allow", "Tool is outside DevCouncil hook policy.")
 
-    def evaluate_command(self, command: str, active_task: Optional[Task] = None) -> HookDecision:
+    def _should_enforce_task_scope(self, enforce_task_scope: bool | None) -> bool:
+        """Whether to apply task allowlist / planned-files after hard safety.
+
+        Companion PreToolUse (default ``None``) follows ``hook_gate``: mode=off skips
+        task scope so interactive sessions stay usable even with a leftover lease.
+        MCP/SDK/shell-session callers pass ``True`` so leased write/run stay gated.
+        """
+        if enforce_task_scope is not None:
+            return enforce_task_scope
+        return self._hook_gate_mode() == "contain"
+
+    def evaluate_command(
+        self,
+        command: str,
+        active_task: Optional[Task] = None,
+        *,
+        enforce_task_scope: bool | None = None,
+    ) -> HookDecision:
         """Evaluate a shell command before execution.
 
         Two gates, deny wins:
@@ -174,19 +208,19 @@ class HookPolicy:
         if git_decision.action == "deny":
             return HookDecision(git_decision.action, git_decision.reason, git_decision.target)
 
-        # hook_gate=off: after hard safety, allow Shell without a leased task.
-        # MCP write/run still requires a lease+task upstream, so this only unblocks
-        # interactive PreToolUse companion hooks.
-        if active_task is None and self._hook_gate_mode() == "off":
+        # Companion + hook_gate=off: after hard safety, allow Shell without task allowlist —
+        # whether or not an active lease/running task exists. MCP/SDK/shell-session pass
+        # enforce_task_scope=True so leased runs stay gated.
+        if not self._should_enforce_task_scope(enforce_task_scope):
             if git_decision.action == "warn":
                 return HookDecision(git_decision.action, git_decision.reason, git_decision.target)
             return HookDecision(
                 "allow",
-                "hook_gate mode=off allows shell without a task lease.",
+                "hook_gate mode=off allows shell without task allowlist enforcement.",
                 command,
             )
 
-        # 2) Allowlist enforcement over every executed segment.
+        # 2) Allowlist enforcement over every executed segment (contain / enforce_task_scope).
         segments = self._split_command_segments(command)
         if not segments:
             return HookDecision("deny", "Empty command is not allowed.", command)
@@ -243,6 +277,7 @@ class HookPolicy:
         active_task: Optional[Task],
         *,
         content: Optional[str] = None,
+        enforce_task_scope: bool | None = None,
     ) -> HookDecision:
         if not raw_path:
             return HookDecision("allow", "No file path detected.")
@@ -263,21 +298,19 @@ class HookPolicy:
         # Delegate to the engine, which normalizes via the shared normalize_repo_path and
         # denies out-of-root targets — so the path that is checked is the path enforced.
         decision = self.policy_engine.evaluate_file_change(raw_path, active_task)
-        if decision.action == "deny" and active_task is None:
-            # Hard safety (out-of-root / secrets / restricted client configs) still denies
-            # under hook_gate=off only the no-task authorization deny is relaxed.
-            hard_safety = (
-                "outside the project root" in decision.reason
-                or "Secret and credential" in decision.reason
-                or "Protected repository paths" in decision.reason
-            )
-            if self._hook_gate_mode() == "off" and not hard_safety:
+        if decision.action == "deny":
+            # Hard safety (out-of-root / secrets / restricted client configs) always denies.
+            # Companion + mode=off: planned-files / no-task authorization denies are relaxed
+            # even when a leftover lease/running task exists. MCP/SDK pass enforce_task_scope.
+            if self._is_hard_safety_file_deny(decision.reason):
+                return HookDecision(decision.action, decision.reason, decision.target)
+            if not self._should_enforce_task_scope(enforce_task_scope):
                 return HookDecision(
                     "allow",
-                    "hook_gate mode=off allows file write without a task lease.",
+                    "hook_gate mode=off allows file write without task planned-files enforcement.",
                     decision.target,
                 )
-            if self._hook_gate_mode() == "contain":
+            if active_task is None:
                 return HookDecision(
                     "deny",
                     self._with_hook_gate_hint(decision.reason),

@@ -9,6 +9,7 @@ from mcp.types import TextContent
 from devcouncil.integrations.mcp.util import (
     error_text,
     json_text,
+    optional_string_argument,
     parse_cli_json,
     required_string_argument,
     run_cli_command,
@@ -17,22 +18,22 @@ from devcouncil.integrations.mcp.util import (
 
 async def handle_run_command(root: Path, db: object, arguments: dict) -> list[TextContent]:
     del db  # routed through CLI service layer
-    task_id, arg_error = required_string_argument(arguments, "task_id")
-    if arg_error:
-        return arg_error
-    lease_token, arg_error = required_string_argument(arguments, "lease_token")
-    if arg_error:
-        return arg_error
+    task_id = optional_string_argument(arguments, "task_id")
+    if task_id == "":
+        return error_text("task_id must be a string", code="invalid_arguments", argument="task_id")
+    lease_token = optional_string_argument(arguments, "lease_token") or ""
     command, arg_error = required_string_argument(arguments, "command")
     if arg_error:
         return arg_error
-    assert task_id is not None and lease_token is not None and command is not None
-    cli_args = [
-        "run-cmd", task_id,
+    assert command is not None
+    cli_args = ["run-cmd"]
+    if task_id:
+        cli_args.append(task_id)
+    cli_args.extend([
         "--lease-token", lease_token,
         "--command", command,
         "--json",
-    ]
+    ])
     payload, cli_error = parse_cli_json(run_cli_command(cli_args, root))
     if cli_error:
         return cli_error

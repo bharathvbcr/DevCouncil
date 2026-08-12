@@ -75,11 +75,25 @@ def status_snapshot(root: Path) -> str:
     try:
         with db.get_session() as session:
             graph = ArtifactGraphRepository(session).load_graph()
-            summary = graph.coverage_summary()
             state = StateRepository(session).get_state()
-            phase = compute_phase(graph, state.current_phase if state else None)
+        try:
+            from devcouncil.app.config import load_config
+            cfg = load_config(root)
+            gates = getattr(cfg, "gates", None)
+            gate_mode = gates.mode if gates and hasattr(gates, "mode") else "enforce"
+        except Exception:
+            gate_mode = "enforce"
+
+        from devcouncil.gating.policy import effective_artifact_graph
+
+        graph = effective_artifact_graph(graph, mode=gate_mode)
+        summary = dict(graph.coverage_summary())
+        persisted_phase = state.current_phase if state else None
+        if gate_mode != "enforce" and persisted_phase == "TASK_BLOCKED":
+            persisted_phase = None
+        phase = compute_phase(graph, persisted_phase)
         return (
-            f"Phase: {phase} | "
+            f"Phase: {phase} | gate mode: {gate_mode} | "
             f"tasks: {summary['total_tasks']} | "
             f"gaps: {summary['total_gaps']} ({summary['blocking_gaps']} blocking)"
         )
@@ -89,20 +103,55 @@ def status_snapshot(root: Path) -> str:
 
 def render_prompt_text(name: str, arguments: dict, root: Path) -> str:
     snapshot = status_snapshot(root)
+    try:
+        from devcouncil.app.config import load_config
+
+        gate_mode = load_config(root).gates.mode
+    except Exception:
+        gate_mode = "enforce"
     if name == "devcouncil_implement_next_task":
         client_id = arguments.get("client_id") or "claude-code"
+        completion_step = (
+            "Do not call `devcouncil_verify_task` unless the user explicitly requests it; "
+            "quality verification is disabled. Report completion as unverified."
+            if gate_mode == "off"
+            else (
+                "Verification is optional. If requested, call `devcouncil_verify_task`; "
+                "quality findings are advisory."
+                if gate_mode == "advisory"
+                else "Call `devcouncil_verify_task`; fix blocking gaps and re-verify."
+            )
+        )
+        checkout_step = (
+            "Task checkout is optional in this mode; acquire a lease only when coordination "
+            "with another agent is useful."
+            if gate_mode != "enforce"
+            else (
+                f"Call `devcouncil_checkout_task` with that task_id and "
+                f"client_id='{client_id}' to acquire a lease."
+            )
+        )
+        write_step = (
+            "Make the requested changes with ordinary editing tools or DevCouncil write "
+            "tools; no task scope is required. Hard safety still applies."
+            if gate_mode != "enforce"
+            else (
+                "Make changes ONLY through `devcouncil_write_file` / "
+                "`devcouncil_apply_patch` and run tests with `devcouncil_run_command`."
+            )
+        )
         return (
-            "You are implementing the next DevCouncil task under policy enforcement.\n\n"
+            f"You are implementing the next DevCouncil task with gates.mode={gate_mode}.\n\n"
             f"Project status: {snapshot}\n\n"
             "Do exactly this:\n"
             "1. Call `devcouncil_next_task` to get the highest-priority unblocked task.\n"
-            f"2. Call `devcouncil_checkout_task` with that task_id and client_id='{client_id}' to acquire a lease.\n"
+            f"2. {checkout_step}\n"
             "3. Read the task scope with `devcouncil_get_task` and `devcouncil_get_prompt`; inspect files with `devcouncil_read_file` and `devcouncil_get_diff`.\n"
-            "4. Make changes ONLY through `devcouncil_write_file` / `devcouncil_apply_patch` (the policy gate rejects out-of-scope or protected paths) and run tests with `devcouncil_run_command`.\n"
+            f"4. {write_step}\n"
             f"5. {ADVISOR_STEERING_NUDGE}\n"
-            "6. Call `devcouncil_verify_task`; if it reports blocking gaps, fix them and re-verify.\n"
-            "7. When verified, call `devcouncil_release_task` with the lease token.\n\n"
-            "Never edit files outside the task scope. If a write is rejected, call `devcouncil_update_task_scope` only when the change is legitimately in-scope."
+            f"6. {completion_step}\n"
+            "7. Release any acquired task lease.\n\n"
+            "Hard safety (secrets, out-of-root writes, dangerous Git operations) always applies."
         )
     if name == "devcouncil_repair_task":
         task_id = arguments.get("task_id") or "(the active task)"
@@ -117,10 +166,18 @@ def render_prompt_text(name: str, arguments: dict, root: Path) -> str:
         )
     if name == "devcouncil_verify_task":
         task_id = arguments.get("task_id") or "(the active task)"
+        if gate_mode == "off":
+            return (
+                f"Complete {task_id} with gates.mode=off.\n\n"
+                f"Project status: {snapshot}\n\n"
+                "Call `devcouncil_verify_task`; it will skip quality checks and test "
+                "commands, run only hard-safety scanning, and return status `done` "
+                "when safe. Report the result as completed without verification."
+            )
         return (
             f"Run DevCouncil verification for {task_id} and report the result.\n\n"
             f"Project status: {snapshot}\n\n"
-            "Call `devcouncil_verify_task` (you must hold the task lease via `devcouncil_checkout_task`). "
+            f"Call `devcouncil_verify_task` under gates.mode={gate_mode}. "
             "Summarize the blocking gaps and proposed next actions; do not mark work complete while blocking gaps remain."
         )
     if name == "devcouncil_review_live":

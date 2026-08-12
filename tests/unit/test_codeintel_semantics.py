@@ -5,8 +5,10 @@ from pathlib import Path
 
 from devcouncil.codeintel.languages import (
     LANGUAGE_SPECS,
+    code_extensions,
     detect_language,
     grammar_status,
+    language_id_for_suffix,
     supported_languages,
 )
 from devcouncil.codeintel.query import CodeIntelQueryEngine
@@ -37,6 +39,9 @@ def test_language_manifest_covers_release_matrix_without_download() -> None:
     assert detect_language("main.tf").grammar == "hcl"  # type: ignore[union-attr]
     assert detect_language("Worker.cs").grammar == "csharp"  # type: ignore[union-attr]
     assert detect_language("Worker.vb").grammar == "vb"  # type: ignore[union-attr]
+    assert ".swift" in code_extensions() and ".kt" in code_extensions()
+    assert language_id_for_suffix(".tsx") == "typescript"
+    assert language_id_for_suffix(".swift") == "swift"
     status = grammar_status()
     assert status["downloaded_at_runtime"] is False
     assert status["required_count"] == len(names)

@@ -103,3 +103,31 @@ def _configure_grok(project_root: Path, apply: bool) -> bool:
         "[dim]Trust project hooks with /hooks-trust (or grok --trust) before pre-action gates run.[/dim]"
     )
     return True
+
+
+def _uninstall_grok(project_root: Path) -> list[str]:
+    """Remove DevCouncil Grok MCP registration and hooks file."""
+    from devcouncil.integrations.clients import hooks as _hooks
+
+    removed: list[str] = []
+    root = project_root.expanduser().resolve()
+
+    if shutil.which("grok"):
+        code = _run(["grok", "mcp", "remove", "devcouncil"])
+        if code == 0:
+            removed.append("grok mcp server registration")
+
+    path = _grok_config_path(root)
+    if path.exists():
+        existing = path.read_text(encoding="utf-8")
+        updated = _common._remove_toml_table(existing, "[mcp_servers.devcouncil]")
+        if updated != existing:
+            if updated.strip():
+                path.write_text(updated, encoding="utf-8")
+            else:
+                path.unlink()
+            removed.append(f"[mcp_servers.devcouncil] in {path.relative_to(root)}")
+
+    removed.extend(_hooks._uninstall_grok_hooks(root))
+    removed.extend(_common._clear_client_integration_config(root, "grok"))
+    return removed

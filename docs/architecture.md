@@ -146,7 +146,7 @@ Other execution paths:
 - `manual` — sidecar prompts pasted into any coding tool
 - `mini` — mini-SWE-agent
 - `openhands` — OpenHands task API
-- `native-preview` / `native` — built-in preview loop (Preview maturity; verification remains the completion gate)
+- `native-preview` / `native` — built-in preview loop (Preview maturity; completion follows `gates.mode`)
 
 Coding CLI adapters write the task prompt to `.devcouncil/{TASK}-{client}-task.md` when needed, then launch the CLI in the repository root with `DEVCOUNCIL_PROJECT_ROOT` set. Tier definitions and hook parity: [coding-cli-integration.md](coding-cli-integration.md).
 

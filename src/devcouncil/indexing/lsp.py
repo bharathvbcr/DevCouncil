@@ -35,6 +35,8 @@ class LspInspector:
         "javascript": [["typescript-language-server", "--stdio"]],
         "go": [["gopls"]],
         "rust": [["rust-analyzer"]],
+        "swift": [["sourcekit-lsp"]],
+        "kotlin": [["kotlin-language-server"], ["kotlin-ls"]],
     }
 
     _EXTENSIONS: dict[str, str] = {
@@ -45,6 +47,9 @@ class LspInspector:
         ".jsx": "javascript",
         ".go": "go",
         ".rs": "rust",
+        ".swift": "swift",
+        ".kt": "kotlin",
+        ".kts": "kotlin",
     }
     _IGNORED_DIRS = {".git", ".devcouncil", "__pycache__", ".venv", "node_modules", "dist", "build", "target", "vendor"}
 

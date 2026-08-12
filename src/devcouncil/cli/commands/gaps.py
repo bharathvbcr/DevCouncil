@@ -26,37 +26,50 @@ def _gaps_payload(
         return {"initialized": False, "gaps": [], "blocking_count": 0, "advisory_count": 0}
 
     with db.get_session() as session:
+        from devcouncil.app.config import load_config
+        from devcouncil.gating.policy import apply_gate_enforcement
+
+        gate_mode = load_config(project_root).gates.mode
         if task_id:
             from devcouncil.storage.repositories import GapRepository
 
-            gaps = GapRepository(session).get_for_task(task_id)
+            stored_gaps = GapRepository(session).get_for_task(task_id)
+            gaps = apply_gate_enforcement(stored_gaps, mode=gate_mode)
             if blocking_only:
                 gaps = [g for g in gaps if g.blocking]
             return {
                 "initialized": True,
                 "ok": True,
                 "task_id": task_id,
+                "gates_mode": gate_mode,
                 "gaps": [gap.model_dump() for gap in gaps],
                 "blocking_count": sum(1 for g in gaps if g.blocking),
+                "stored_blocking_count": sum(1 for g in stored_gaps if g.blocking),
             }
 
         graph = ArtifactGraphRepository(session).load_graph()
+        stored_gaps = list(graph.gaps.values())
+        effective_gaps = apply_gate_enforcement(stored_gaps, mode=gate_mode)
         if blocking_only:
-            gaps = graph.blocking_gaps()
+            gaps = [gap for gap in effective_gaps if gap.blocking]
         else:
-            gaps = sorted(graph.gaps.values(), key=lambda g: (not g.blocking, g.id))
+            gaps = sorted(effective_gaps, key=lambda g: (not g.blocking, g.id))
         blocking = [g for g in gaps if g.blocking]
         advisory = [g for g in gaps if not g.blocking]
         return {
             "initialized": True,
+            "gates_mode": gate_mode,
             "gaps": [gap.model_dump() for gap in gaps],
             "blocking_count": len(blocking),
+            "stored_blocking_count": sum(1 for gap in stored_gaps if gap.blocking),
             "advisory_count": len(advisory),
             "total_count": len(gaps),
         }
 
 
 def _next_actions_payload(project_root: Path, task_id: str) -> dict:
+    from devcouncil.app.config import load_config
+    from devcouncil.gating.policy import apply_gate_enforcement
     from devcouncil.integrations.mcp.util import allowed_next_tools
     from devcouncil.storage.repositories import GapRepository, TaskRepository
     from devcouncil.verification.next_actions import split_next_actions
@@ -69,14 +82,21 @@ def _next_actions_payload(project_root: Path, task_id: str) -> dict:
     with db.get_session() as session:
         gaps = GapRepository(session).get_for_task(task_id)
         task = TaskRepository(session).get_by_id(task_id)
-    blocking_actions, advisory_actions = split_next_actions(gaps)
-    has_blocking = any(g.blocking for g in gaps)
+    gate_mode = load_config(project_root).gates.mode
+    effective_gaps = apply_gate_enforcement(gaps, mode=gate_mode)
+    blocking_actions, advisory_actions = split_next_actions(effective_gaps)
+    has_blocking = any(g.blocking for g in effective_gaps)
+    task_status = task.status if task else "planned"
+    if gate_mode != "enforce" and task_status == "blocked" and not has_blocking:
+        task_status = "done"
     return {
         "ok": True,
         "task_id": task_id,
+        "gates_mode": gate_mode,
+        "stored_blocking_count": sum(1 for gap in gaps if gap.blocking),
         "next_actions": [a.model_dump() for a in blocking_actions],
         "advisory_actions": [a.model_dump() for a in advisory_actions],
-        "allowed_next_tools": allowed_next_tools(task.status if task else "planned", has_blocking),
+        "allowed_next_tools": allowed_next_tools(task_status, has_blocking),
     }
 
 

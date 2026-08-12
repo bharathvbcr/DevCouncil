@@ -368,8 +368,8 @@ def test_shell_session_denies_chained_injection(tmp_path):
         planned_files=[], allowed_commands=["git *"],
     )
     session = GuardedShellSession(tmp_path, task, shell="auto")
-    assert session.policy.evaluate_command("git status && rm -rf important", task).action == "deny"
-    assert session.policy.evaluate_command("git status", task).action in {"allow", "warn"}
+    assert session.policy.evaluate_command("git status && rm -rf important", task, enforce_task_scope=True).action == "deny"
+    assert session.policy.evaluate_command("git status", task, enforce_task_scope=True).action in {"allow", "warn"}
 
 
 def test_router_healing_failure_routes_to_fallback(tmp_path, monkeypatch):

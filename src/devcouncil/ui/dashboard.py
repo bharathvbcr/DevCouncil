@@ -152,10 +152,13 @@ def _recent_trace_events_cached(project_root: Path) -> list[TraceEvent]:
     return buffer
 
 
-def _dashboard_gaps_summary(session) -> dict:
+def _dashboard_gaps_summary(session, *, gate_mode: str = "enforce") -> dict:
+    from devcouncil.gating.policy import apply_gate_enforcement
+
     all_gaps = GapRepository(session).get_all()
-    blocking = [gap for gap in all_gaps if gap.blocking]
-    non_blocking = [gap for gap in all_gaps if not gap.blocking]
+    effective_gaps = apply_gate_enforcement(all_gaps, mode=gate_mode)
+    blocking = [gap for gap in effective_gaps if gap.blocking]
+    non_blocking = [gap for gap in effective_gaps if not gap.blocking]
     items: list[dict[str, Any]] = []
     for gap in blocking + non_blocking:
         if len(items) >= _DASHBOARD_GAPS_CAP:
@@ -171,7 +174,12 @@ def _dashboard_gaps_summary(session) -> dict:
                 "description": description,
             }
         )
-    return {"total": len(all_gaps), "blocking": len(blocking), "items": items}
+    return {
+        "total": len(all_gaps),
+        "blocking": len(blocking),
+        "stored_blocking": sum(1 for gap in all_gaps if gap.blocking),
+        "items": items,
+    }
 
 
 
@@ -228,12 +236,24 @@ def dashboard_payload(project_root: Path) -> dict:
         }
     with db.get_session() as session:
         graph = _artifact_graph_cached(project_root, session)
+        from devcouncil.app.config import load_config
+        from devcouncil.gating.policy import effective_artifact_graph
+
+        try:
+            gate_mode = load_config(project_root).gates.mode
+        except Exception:
+            gate_mode = "enforce"
+        graph = effective_artifact_graph(graph, mode=gate_mode)
         state = StateRepository(session).get_state()
-        phase = compute_phase(graph, state.current_phase if state else None)
+        persisted_phase = state.current_phase if state else None
+        if gate_mode != "enforce" and persisted_phase == "TASK_BLOCKED":
+            persisted_phase = None
+        phase = compute_phase(graph, persisted_phase)
         tasks = [task.model_dump() for task in graph.tasks.values()]
         coverage = graph.coverage_summary()
         return {
             "initialized": True,
+            "gates_mode": gate_mode,
             "phase": phase,
             "verdict": _dashboard_verdict(initialized=True, graph=graph),
             "cards": _coverage_cards(coverage),
@@ -243,7 +263,7 @@ def dashboard_payload(project_root: Path) -> dict:
             "integrations": _integration_summary_cached(project_root),
             "recent_runs": recent_run_artifacts(project_root),
             "stop_gate_events": read_stop_gate_events(project_root, limit=30),
-            "gaps": _dashboard_gaps_summary(session),
+            "gaps": _dashboard_gaps_summary(session, gate_mode=gate_mode),
         }
 
 

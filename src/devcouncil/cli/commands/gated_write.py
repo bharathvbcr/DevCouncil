@@ -17,14 +17,17 @@ logger = logging.getLogger(__name__)
 
 
 def write(
-    task_id: str = typer.Argument(..., help="Task ID."),
-    lease_token: str = typer.Option(..., "--lease-token", help="Lease token from checkout."),
+    task_id: str | None = typer.Argument(
+        None,
+        help="Optional task ID; required only when gates.mode=enforce.",
+    ),
+    lease_token: str = typer.Option("", "--lease-token", help="Required in gates.mode=enforce."),
     path: str = typer.Option(..., "--path", help="Repository-relative file path."),
     content: str | None = typer.Option(None, "--content", help="File content (or read from stdin when omitted)."),
     json_format: bool = typer.Option(False, "--json", help="Output machine-readable JSON."),
     project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
 ) -> None:
-    """Write a file for a leased task through DevCouncil's policy gate."""
+    """Write a file under the configured gate posture."""
     root = project_root.expanduser().resolve()
     set_log_dir(root)
     body = content if content is not None else sys.stdin.read()
@@ -46,13 +49,16 @@ def write(
 
 
 def apply_patch(
-    task_id: str = typer.Argument(..., help="Task ID."),
-    lease_token: str = typer.Option(..., "--lease-token", help="Lease token from checkout."),
+    task_id: str | None = typer.Argument(
+        None,
+        help="Optional task ID; required only when gates.mode=enforce.",
+    ),
+    lease_token: str = typer.Option("", "--lease-token", help="Required in gates.mode=enforce."),
     unified_diff: str | None = typer.Option(None, "--unified-diff", help="Unified diff (or read from stdin)."),
     json_format: bool = typer.Option(False, "--json", help="Output machine-readable JSON."),
     project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root containing .devcouncil/."),
 ) -> None:
-    """Apply a unified diff for a leased task through DevCouncil's policy gate."""
+    """Apply a unified diff under the configured gate posture."""
     root = project_root.expanduser().resolve()
     set_log_dir(root)
     diff_body = unified_diff if unified_diff is not None else sys.stdin.read()

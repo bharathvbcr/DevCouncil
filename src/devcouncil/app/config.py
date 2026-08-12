@@ -287,12 +287,45 @@ class VerificationConfig(BaseModel):
 
 
 class GatesConfig(BaseModel):
+    """Quality-gate posture; hard safety policy is never disabled.
+
+    ``off`` skips plan/readiness/verification quality checks. ``advisory`` runs
+    them and records findings without blocking. ``enforce`` runs and blocks.
+    """
+
+    mode: Literal["off", "advisory", "enforce"] = "enforce"
     require_clean_git_before_task: bool = True
     block_orphan_diffs: bool = True
     block_missing_tests_for_high_requirements: bool = True
     block_dependency_changes_without_approval: bool = True
     block_schema_change_without_migration: bool = True
     block_failed_commands: bool = True
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _normalize_yaml_mode(cls, value: object) -> object:
+        # YAML 1.1 parses bare ``off``/``on`` as booleans.
+        if value is False:
+            return "off"
+        if value is True:
+            return "enforce"
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_enabled(cls, value: object) -> object:
+        """Accept the short-lived boolean spelling without ambiguous semantics."""
+        if not isinstance(value, dict) or "mode" in value or "enabled" not in value:
+            return value
+        migrated = dict(value)
+        enabled = migrated.pop("enabled")
+        migrated["mode"] = "enforce" if bool(enabled) else "advisory"
+        return migrated
+
+    @property
+    def enabled(self) -> bool:
+        """Deprecated compatibility view: only strict enforcement is enabled."""
+        return self.mode == "enforce"
 
 
 class PlanningConfig(BaseModel):
@@ -352,10 +385,41 @@ class IndexingConfig(BaseModel):
     build_isolation: Literal["hybrid"] = "hybrid"
     build_stall_timeout_seconds: float = Field(default=90.0, gt=0.0, le=3600.0)
     build_total_timeout_seconds: float = Field(default=900.0, gt=0.0, le=86400.0)
+    # Supervised workers emit a liveness heartbeat carrying consumed CPU time on
+    # this interval, independent of phase counters. The supervisor only declares a
+    # stall when phase progress AND worker CPU are both flat, so a long silent
+    # phase (liveness tokenize, SQLite persist) can no longer be killed as "hung".
+    build_heartbeat_interval_seconds: float = Field(default=5.0, gt=0.0, le=300.0)
+    # Minimum CPU seconds a worker must burn between heartbeats to count as alive.
+    # Guards against a spin-free deadlock still looking busy.
+    build_heartbeat_min_cpu_seconds: float = Field(default=0.05, ge=0.0, le=60.0)
     # Wall-clock bound for semantic edge enrichment during graph assembly; on
     # expiry enrichment keeps partial results (meta.semantic_enrich_partial)
     # instead of hanging on very large repos.
     semantic_enrich_timeout_seconds: float = Field(default=120.0, gt=0.0, le=3600.0)
+    # Persist-phase batching for the SQLite store. Row-at-a-time INSERTs over a
+    # multi-hundred-thousand-node graph dominate build wall clock; batching keeps
+    # the write bounded and lets each batch emit a progress heartbeat.
+    store_write_batch_size: int = Field(default=2_000, ge=1, le=100_000)
+    # Persist compressed file bytes into ``file_contents``. This is what turns a
+    # large repo's index.sqlite into a multi-gigabyte file (and its WAL with it).
+    # Disabled by default: path + content hash + size + mtime are retained either
+    # way, and ``content_for_path`` falls back to reading the working tree.
+    store_file_contents: bool = False
+    # Index untracked-but-not-ignored files (``git ls-files --others``).
+    #
+    # Keep this on. Turning it off does more than hide new files: a file an
+    # agent just wrote and has not staged drops out of the graph entirely, so
+    # the tracked symbols it calls lose those call edges and show up as
+    # dead/unwired candidates. Tracked-only indexing therefore produces false
+    # dead-code signals, not merely a smaller index.
+    #
+    # Set to False only for a repo whose ignore rules genuinely cannot cover its
+    # build output, and accept that trade. ``max_indexed_files`` plus the
+    # generated-tree filter are the real bound on inventory size either way:
+    # untracked paths are dropped first when the inventory exceeds the cap.
+    include_untracked: bool = True
+    max_indexed_files: int = Field(default=50_000, ge=100, le=2_000_000)
     graph_json_max_bytes: int = Field(
         default=128 * 1024 * 1024,
         ge=1024 * 1024,
@@ -376,7 +440,27 @@ class IndexingConfig(BaseModel):
             raise ValueError(
                 "build_total_timeout_seconds must be at least build_stall_timeout_seconds"
             )
+        # A heartbeat that cannot land inside the stall window makes the stall
+        # detector fire before the worker has ever reported liveness.
+        if self.build_heartbeat_interval_seconds * 3 > self.build_stall_timeout_seconds:
+            raise ValueError(
+                "build_stall_timeout_seconds must be at least 3x "
+                "build_heartbeat_interval_seconds so a live worker can report in"
+            )
         return self
+
+    def effective_stall_timeout_seconds(self) -> float:
+        """Stall budget the supervisor actually applies.
+
+        Phase counters go quiet for the whole of semantic enrichment, so the
+        floor is raised past that budget even when a user pins a short
+        ``build_stall_timeout_seconds``. CPU heartbeats are the primary defence;
+        this is belt-and-braces for workers whose heartbeat thread is starved.
+        """
+        return max(
+            float(self.build_stall_timeout_seconds),
+            float(self.semantic_enrich_timeout_seconds) + 30.0,
+        )
 
 
 class CodeIntelligenceDebugConfig(BaseModel):
@@ -426,15 +510,16 @@ class StopGateConfig(BaseModel):
 class HookGateConfig(BaseModel):
     """Runtime PreToolUse Shell/Write posture when hooks are installed.
 
-    ``mode``: ``contain`` (default) fail-closes Shell/Write without an active
-    task lease; ``off`` allows no-task Shell/Write while still enforcing hard
-    safety (secrets, out-of-root, git force-push / --no-verify / protected-branch).
-    Override with ``DEVCOUNCIL_HOOK_GATE=off|contain``.
+    ``mode``: ``off`` (default) allows no-task Shell/Write while still enforcing
+    hard safety (secrets, out-of-root, git force-push / --no-verify /
+    protected-branch). ``contain`` fail-closes Shell/Write without an active task
+    lease (opt-in for autonomous runs with ``--write-gate``). Override with
+    ``DEVCOUNCIL_HOOK_GATE=off|contain``.
 
     YAML note: write ``mode: "off"`` (quoted). Bare ``off`` is a YAML boolean.
     """
 
-    mode: str = "contain"
+    mode: str = "off"
 
     @field_validator("mode", mode="before")
     @classmethod
@@ -444,7 +529,7 @@ class HookGateConfig(BaseModel):
             return "off"
         if value is True:
             return "contain"
-        return str(value or "contain")
+        return str(value or "off")
 
 
 class ExecutionConfig(BaseModel):

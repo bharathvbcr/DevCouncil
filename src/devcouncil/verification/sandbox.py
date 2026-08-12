@@ -91,14 +91,62 @@ class LocalSandbox(VerificationSandbox):
         self.project_root = project_root
 
     def run(self, task: Task, commands: list[str], requirements: list) -> SandboxResult:
-        gaps, _ = asyncio.run(Verifier(self.project_root).verify_task(task, requirements))
+        verifier = Verifier(self.project_root)
+        gaps, _ = asyncio.run(verifier.verify_task(task, requirements))
         status: Literal["passed", "failed", "unsupported"] = (
             "failed" if any(g.blocking for g in gaps) else "passed"
         )
         env = _environment_metadata(self.project_root)
-        command_results = [{"command": cmd, "status": status} for cmd in commands]
+        skipped = bool(verifier.last_outcome and verifier.last_outcome.verification_skipped)
+        if skipped:
+            env["gate_mode"] = "off"
+        command_results = [
+            {"command": cmd, "status": "skipped" if skipped else status}
+            for cmd in commands
+        ]
         _save_run(self.project_root, task, "local", env, command_results, status)
         return SandboxResult(sandbox="local", status=status, environment=env, commands=command_results)
+
+
+class OffSandbox(VerificationSandbox):
+    """No-execution sandbox used when global quality gates are disabled.
+
+    The requested backend is retained in the result for auditability, but no
+    Docker, Nix, setup, or verification command is launched. ``Verifier`` still
+    performs its off-mode hard-safety scan.
+    """
+
+    def __init__(self, project_root: Path, requested: str):
+        self.project_root = project_root
+        self.requested = requested
+
+    def run(self, task: Task, commands: list[str], requirements: list) -> SandboxResult:
+        verifier = Verifier(self.project_root)
+        gaps, _ = asyncio.run(verifier.verify_task(task, requirements))
+        status: Literal["passed", "failed", "unsupported"] = (
+            "failed" if any(g.blocking for g in gaps) else "passed"
+        )
+        env = _environment_metadata(self.project_root)
+        env["gate_mode"] = "off"
+        env["requested_sandbox"] = self.requested
+        command_results = [
+            {"command": command, "status": "skipped", "reason": "gates.mode=off"}
+            for command in commands
+        ]
+        _save_run(
+            self.project_root,
+            task,
+            self.requested,
+            env,
+            command_results,
+            status,
+        )
+        return SandboxResult(
+            sandbox=self.requested,
+            status=status,
+            environment=env,
+            commands=command_results,
+        )
 
 
 class DockerSandbox(VerificationSandbox):
@@ -201,6 +249,8 @@ def _environment_metadata(project_root: Path) -> dict[str, str]:
 
 def get_sandbox(name: str, project_root: Path) -> VerificationSandbox:
     config = load_config(project_root)
+    if config.gates.mode == "off":
+        return OffSandbox(project_root, name)
     if name == "docker":
         return DockerSandbox(project_root, config)
     if name == "nix":

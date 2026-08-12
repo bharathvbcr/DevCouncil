@@ -315,7 +315,6 @@ def test_map_html_payload_and_handoffs():
         match_area,
         render_map_html,
         resolve_handoff,
-        write_map_html,
     )
 
     areas = ["src/devcouncil/cli", "src/devcouncil/indexing", "src/devcouncil/executors"]
@@ -328,10 +327,10 @@ def test_map_html_payload_and_handoffs():
     assert "files" not in payload
     assert "dependents" not in payload
     assert len(payload["liveness"]["unwired_candidates"]) == _LIVENESS_VIZ_CAP
-    assert any(l["kind"] == "neighbor" for l in payload["links"])
+    assert any(link["kind"] == "neighbor" for link in payload["links"])
     assert any(
-        l["kind"] == "handoff" and l["target"] == "src/devcouncil/executors"
-        for l in payload["links"]
+        link["kind"] == "handoff" and link["target"] == "src/devcouncil/executors"
+        for link in payload["links"]
     )
 
     raw_map = _sample_repo_map_payload()

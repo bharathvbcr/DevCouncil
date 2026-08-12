@@ -12,8 +12,14 @@ triggers:
 This repository is managed by **DevCouncil**: a planning, execution, and verification
 layer for coding agents. Evidence — not model confidence — decides when work is done.
 
-Use DevCouncil's MCP tools and `dev` CLI for project state, task scope, and verification.
-Do not guess at task status, file scope, or whether tests actually prove the diff.
+Check `gates.mode` before assuming verification is mandatory: `enforce` blocks,
+`advisory` records non-safety findings without blocking, and `off` skips quality
+verification. Hard-safety policy remains active in every mode.
+
+Tasks, leases, and verification are an opt-in workflow outside `enforce`. In
+`gates.mode=off`, ordinary edits and commands may proceed without creating,
+checking out, or verifying a DevCouncil task. Use task-loop tools only when the
+user explicitly asks for that workflow.
 
 ## Navigate before you edit
 
@@ -75,7 +81,7 @@ Install with `dev integrate claude --apply`. Commands live under `/devcouncil:*`
 `devcouncil_get_gaps`, `devcouncil_get_next_actions`, `devcouncil_get_evidence`,
 `devcouncil_get_task_provenance`
 
-**Verification:** `devcouncil_verify_task` (requires an active lease)
+**Verification:** `devcouncil_verify_task` (a lease is required in `enforce` mode)
 
 **Live review:** `devcouncil_live_review`, `devcouncil_live_cards`,
 `devcouncil_live_repair_prompt`
@@ -90,12 +96,18 @@ When delegated, use the bundled subagents:
 
 ## Rules of engagement
 
-- **Scope:** edit only files declared in the task's planned scope. Out-of-scope or
-  protected paths are rejected by the write gate.
-- **Evidence:** run tests and call `devcouncil_verify_task` before claiming done.
-- **Leases:** one agent owns a task at a time; checkout before writes, release when verified.
-- **Repairs:** when gaps exist, read `devcouncil_get_next_actions` and act on each
-  typed action — do not declare success while blocking gaps remain.
+- **Scope:** edit only files declared in the task's planned scope. When write-gates /
+  contain mode are active, out-of-scope or protected paths are rejected by the write gate.
+- **Evidence:** in `enforce`, run tests and call `devcouncil_verify_task`.
+  In `advisory`, verification is optional and findings cannot block (except hard
+  safety). In `off`, skip quality verification and report completion as unverified.
+- **Interactive Shell:** under assist defaults (no `--write-gate`, `hook_gate.mode=off`),
+  Cursor/Claude Shell does **not** need a lease — do not block on checkout for ad-hoc commands.
+- **Leases:** one agent owns a task at a time; checkout before MCP gated writes / verify when
+  write-gates / contain mode are active (or when running the hero loop), then release.
+- **Repairs:** in `enforce`, read `devcouncil_get_next_actions` and close effective
+  blocking gaps. Outside enforce, stored quality gaps are advisory history, not a
+  reason to block ordinary work.
 
 For the full autonomous loop, follow the **devcouncil-hero-loop** skill. For verifier
 gates and the next-actions contract, follow **devcouncil-verification**.

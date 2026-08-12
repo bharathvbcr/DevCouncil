@@ -163,7 +163,14 @@ class CodingCliIntegrationInfo:
 # Tier 1 = headless executor + verify; tier 2 = MCP companion; hooks = native pre-tool policy.
 CODING_CLI_INTEGRATION_INFO: dict[str, CodingCliIntegrationInfo] = {
     "codex": CodingCliIntegrationInfo(
-        "codex", "Codex CLI", 1, True, True, True, True, "dev integrate codex --apply"
+        "codex",
+        "Codex CLI",
+        1,
+        True,
+        True,
+        True,
+        True,
+        "dev integrate codex --apply (assist default; --write-gate for PreToolUse)",
     ),
     "gemini": CodingCliIntegrationInfo(
         "gemini",
@@ -174,11 +181,17 @@ CODING_CLI_INTEGRATION_INFO: dict[str, CodingCliIntegrationInfo] = {
         True,
         True,
         "Deprecated — migrate to: dev integrate antigravity --apply",
-        blocking_hooks=True,
         deprecated=True,
     ),
     "claude": CodingCliIntegrationInfo(
-        "claude", "Claude Code", 1, True, True, True, True, "dev integrate claude --apply", blocking_hooks=True
+        "claude",
+        "Claude Code",
+        1,
+        True,
+        True,
+        True,
+        True,
+        "dev integrate claude --apply (assist default; --write-gate for PreToolUse)",
     ),
     "cursor": CodingCliIntegrationInfo(
         "cursor",
@@ -188,8 +201,7 @@ CODING_CLI_INTEGRATION_INFO: dict[str, CodingCliIntegrationInfo] = {
         True,
         True,
         True,
-        "dev integrate cursor --apply (MCP + hooks + skills + rules); agent/cursor-agent for headless",
-        blocking_hooks=True,
+        "dev integrate cursor --apply (assist default; --write-gate for PreToolUse)",
     ),
     "grok": CodingCliIntegrationInfo(
         "grok",
@@ -199,11 +211,17 @@ CODING_CLI_INTEGRATION_INFO: dict[str, CodingCliIntegrationInfo] = {
         True,
         True,
         True,
-        "dev integrate grok --apply",
-        blocking_hooks=True,
+        "dev integrate grok --apply (assist default; --write-gate for PreToolUse)",
     ),
     "opencode": CodingCliIntegrationInfo(
-        "opencode", "OpenCode", 1, True, True, True, True, "dev integrate opencode --apply", blocking_hooks=True
+        "opencode",
+        "OpenCode",
+        1,
+        True,
+        True,
+        True,
+        True,
+        "dev integrate opencode --apply (assist default; --write-gate for PreToolUse)",
     ),
     "antigravity": CodingCliIntegrationInfo(
         "antigravity",

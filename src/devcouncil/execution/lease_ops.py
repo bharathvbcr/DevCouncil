@@ -40,6 +40,10 @@ def checkout_task_payload(
         return {"ok": False, "error": "DevCouncil state is unavailable in this directory.", "code": "not_initialized"}
 
     with db.get_session() as session:
+        from devcouncil.app.config import load_config
+        from devcouncil.gating.policy import is_hard_safety_gap
+
+        gate_mode = load_config(project_root).gates.mode
         task_repo = TaskRepository(session)
         task = task_repo.get_by_id(task_id)
         if not task:
@@ -59,7 +63,8 @@ def checkout_task_payload(
         # Refresh stale map BEFORE prompt + liveness baseline so both see fresh
         # fingerprints. Write-once baseline semantics are unchanged (snapshot still
         # skips when a complete baseline already exists).
-        _refresh_stale_map_if_needed(project_root)
+        if gate_mode != "off":
+            _refresh_stale_map_if_needed(project_root)
         prompt = PromptBuilder(project_root).build_task_prompt(task, RequirementRepository(session).get_all())
         semantic = None
         semantic_path = project_root / ".devcouncil" / "semantic" / task_id / "before.json"
@@ -68,14 +73,20 @@ def checkout_task_payload(
         # Snapshot liveness at checkout so verify can ratchet against stranded
         # pre-existing code. Write-once (skip if complete baseline exists).
         # Best-effort; never blocks checkout.
-        try:
-            from devcouncil.verification.checks.liveness_ratchet import (
-                snapshot_liveness_baseline,
-            )
+        if gate_mode != "off":
+            try:
+                from devcouncil.verification.checks.liveness_ratchet import (
+                    snapshot_liveness_baseline,
+                )
 
-            snapshot_liveness_baseline(project_root, task_id, reset=False)
-        except Exception:
-            pass
+                snapshot_liveness_baseline(project_root, task_id, reset=False)
+            except Exception:
+                pass
+        effective_blockers = [
+            gap
+            for gap in GapRepository(session).get_blocking_for_task(task_id)
+            if gate_mode == "enforce" or is_hard_safety_gap(gap)
+        ]
         return {
             "ok": True,
             "lease_token": lease.lease_token,
@@ -87,9 +98,10 @@ def checkout_task_payload(
             "allowed_commands": task.allowed_commands,
             "expected_tests": task.expected_tests,
             "semantic_context": semantic,
+            "gate_mode": gate_mode,
             "allowed_next_tools": allowed_next_tools(
                 "running",
-                bool(GapRepository(session).get_blocking_for_task(task_id)),
+                bool(effective_blockers),
             ),
         }
 

@@ -70,6 +70,25 @@ def test_config_set_bool_value_nested(tmp_path, monkeypatch):
     assert _raw(tmp_path)["verification"]["diff_coverage"]["enforce"] is True
 
 
+def test_config_set_disables_gate_enforcement(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    result = runner.invoke(app, ["config", "set", "gates.mode", "off"])
+    assert result.exit_code == 0
+    assert _raw(tmp_path)["gates"]["mode"] == "off"
+
+
+def test_config_set_rejects_invalid_gate_mode(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    result = runner.invoke(app, ["config", "set", "gates.mode", "maybe"])
+
+    assert result.exit_code == 2
+    assert _raw(tmp_path)["gates"]["mode"] == "enforce"
+
+
 def test_config_set_string_value(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert runner.invoke(app, ["init"]).exit_code == 0

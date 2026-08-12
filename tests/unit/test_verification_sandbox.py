@@ -13,6 +13,7 @@ from devcouncil.verification.sandbox import (
     DockerSandbox,
     LocalSandbox,
     NixSandbox,
+    OffSandbox,
     _command_timeout,
     _run_sandboxed,
     get_sandbox,
@@ -210,6 +211,34 @@ def test_get_sandbox_defaults_to_local(tmp_path):
     (tmp_path / ".devcouncil" / "config.yaml").write_text("project:\n  name: test\n", encoding="utf-8")
     sandbox = get_sandbox("local", tmp_path)
     assert isinstance(sandbox, LocalSandbox)
+
+
+def test_off_mode_skips_requested_external_sandbox(tmp_path, monkeypatch):
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "project:\n  name: test\ngates:\n  mode: off\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "devcouncil.verification.sandbox._run_sandboxed",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("external sandbox must not run in off mode")
+        ),
+    )
+
+    sandbox = get_sandbox("docker", tmp_path)
+    result = sandbox.run(
+        Task(id="T", title="t", description="d"),
+        ["pytest"],
+        [],
+    )
+
+    assert isinstance(sandbox, OffSandbox)
+    assert result.sandbox == "docker"
+    assert result.status == "passed"
+    assert result.commands == [
+        {"command": "pytest", "status": "skipped", "reason": "gates.mode=off"}
+    ]
 
 
 def test_environment_metadata_uv_lookup_failure(tmp_path, monkeypatch):

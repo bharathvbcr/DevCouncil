@@ -97,7 +97,7 @@ def test_warm_cold_named_import_edge_parity(tmp_path):
 
 
 def test_map_repo_single_pass_token_scan(tmp_path, monkeypatch):
-    """map_repo with liveness must run the token scan exactly once via graph build."""
+    """map_repo with liveness must run token-dead exactly once via graph build."""
     _write(tmp_path, {
         "pkg/__init__.py": "",
         "pkg/a.py": "def orphan():\n    return 1\n",
@@ -107,13 +107,13 @@ def test_map_repo_single_pass_token_scan(tmp_path, monkeypatch):
     calls: list[int] = []
     import devcouncil.indexing.graph.build as build_mod
 
-    real = build_mod._token_scan_dead
+    real = build_mod.token_dead_from_shards
 
     def tracking(*args, **kwargs):
         calls.append(1)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(build_mod, "_token_scan_dead", tracking)
+    monkeypatch.setattr(build_mod, "token_dead_from_shards", tracking)
     RepoMapper(tmp_path).map_repo(liveness=True)
     assert len(calls) == 1
 

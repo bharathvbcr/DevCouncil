@@ -902,6 +902,7 @@ def test_graph_cli_init_watch_doctor_and_hooks(
             mode="full",
             generation=7,
             compatibility_export_degraded=False,
+            build_incomplete=False,
         )
 
     monkeypatch.setattr(map_artifacts, "generate_map_artifacts", _record)
@@ -1687,6 +1688,7 @@ def test_graph_cli_remaining_output_branches(
             mode="full",
             generation=1,
             compatibility_export_degraded=False,
+            build_incomplete=False,
         ),
     )
     monkeypatch.setattr(

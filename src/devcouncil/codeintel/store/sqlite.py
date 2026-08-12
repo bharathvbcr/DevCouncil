@@ -13,7 +13,7 @@ import zlib
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence, TypeVar
 
 from devcouncil.indexing.graph.schema import (
     CodeGraph,
@@ -35,6 +35,38 @@ logger = logging.getLogger(__name__)
 # Error texts that mean the database file itself is damaged. Lock/busy
 # conditions (OperationalError) are transient and must never quarantine.
 _CORRUPTION_MARKERS = ("malformed", "not a database", "database disk image")
+
+# Row-at-a-time INSERTs across a few hundred thousand nodes/edges dominate build
+# wall clock and emit no progress. Persist runs in batches of this size so the
+# supervisor sees a heartbeat per batch. Overridable per-project via
+# ``indexing.store_write_batch_size``.
+DEFAULT_WRITE_BATCH = 2_000
+
+# Above this many changed paths, ``path NOT IN (?,?,…)`` needs one bind
+# parameter per path — past SQLITE_MAX_VARIABLE_NUMBER and pathological to plan.
+# Larger sets go through a temporary table instead.
+_CHANGED_PATH_TEMP_TABLE_THRESHOLD = 200
+
+# Single definition shared by migration and the prune-time rebuild so the two
+# can never drift. ``generation_id`` stays UNINDEXED — FTS5 cannot index it —
+# which is exactly why rows must never be deleted through it (see ``_prune``).
+_NODES_FTS_DDL = """CREATE VIRTUAL TABLE nodes_fts USING fts5(
+                    generation_id UNINDEXED,
+                    node_id UNINDEXED,
+                    name,
+                    qualified_name,
+                    path,
+                    tokenize='unicode61'
+                )"""
+
+_T = TypeVar("_T")
+
+
+def _batched(items: Sequence[_T], size: int) -> Iterator[tuple[int, Sequence[_T]]]:
+    """Yield ``(offset, chunk)`` pairs so callers can report progress."""
+    size = max(1, int(size))
+    for start in range(0, len(items), size):
+        yield start, items[start : start + size]
 
 
 def _corruption_error(exc: sqlite3.DatabaseError) -> bool:
@@ -201,6 +233,28 @@ class CodeIntelStore:
         self.path = (path or (self.project_root / INDEX_REL)).expanduser().resolve()
         self._init_lock = threading.Lock()
         self.last_write_stats: dict[str, int] = {}
+        self._active_write_conn: sqlite3.Connection | None = None
+        self._active_write_lock = threading.Lock()
+
+    def interrupt_writes(self) -> bool:
+        """Abort the statement running on the active write connection, if any.
+
+        ``sqlite3.Connection.interrupt()`` is safe to call from another thread;
+        the interrupted statement raises ``OperationalError: interrupted`` and
+        the surrounding transaction rolls back. Returns True when a write
+        connection was open to interrupt. This is the only way a watchdog can
+        stop a wedged multi-hour statement — signals cannot reach a thread
+        blocked inside SQLite C code.
+        """
+        with self._active_write_lock:
+            conn = self._active_write_conn
+            if conn is None:
+                return False
+            try:
+                conn.interrupt()
+            except sqlite3.Error:
+                return False
+            return True
 
     def exists(self) -> bool:
         return self.path.is_file()
@@ -260,8 +314,20 @@ class CodeIntelStore:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL")
                 conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                # The default ~2MB page cache thrashes on gigabyte-scale
+                # indexes: every btree descent during a generation commit
+                # becomes a disk read plus a WAL-frame probe (observed as
+                # hours of pread/walFindFrame during persist:commit). 64MB
+                # keeps the hot interior pages resident for the transaction.
+                conn.execute("PRAGMA cache_size=-65536")
+                with self._active_write_lock:
+                    self._active_write_conn = conn
             yield conn
         finally:
+            if not readonly:
+                with self._active_write_lock:
+                    if self._active_write_conn is conn:
+                        self._active_write_conn = None
             # Close even when pragma setup raises (e.g. a corrupt file): a
             # leaked handle keeps the file open, which blocks the Windows
             # rename in quarantine().
@@ -402,14 +468,9 @@ class CodeIntelStore:
                     evidence TEXT NOT NULL DEFAULT '{}',
                     PRIMARY KEY (session_id, ordinal)
                 );
-                CREATE VIRTUAL TABLE nodes_fts USING fts5(
-                    generation_id UNINDEXED,
-                    node_id UNINDEXED,
-                    name,
-                    qualified_name,
-                    path,
-                    tokenize='unicode61'
-                );
+                """
+                + _NODES_FTS_DDL
+                + """;
                 CREATE INDEX idx_nodes_path ON nodes(generation_id, path);
                 CREATE INDEX idx_nodes_name ON nodes(generation_id, name);
                 CREATE INDEX idx_edges_source ON edges(generation_id, source, kind);
@@ -492,6 +553,26 @@ class CodeIntelStore:
             )
             self._migrate_v1_payloads(conn)
             conn.commit()
+        # Idempotent ensure-step, deliberately outside the versioned ladder so
+        # older readers stay compatible: FK child columns must be indexed.
+        # Payload compaction deletes tens of thousands of parent rows per
+        # build, and SQLite enforces each parent delete by scanning the child
+        # table when the referencing column has no index — a quadratic that
+        # ran persist:commit for hours at repo scale (533s of a 536s save at
+        # 50k nodes; verified by phase profile on 2026-08-11).
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_generation_nodes_payload
+                ON generation_nodes(payload_hash);
+            CREATE INDEX IF NOT EXISTS idx_generation_edges_payload
+                ON generation_edges(payload_hash);
+            CREATE INDEX IF NOT EXISTS idx_generation_dead_payload
+                ON generation_dead(payload_hash);
+            CREATE INDEX IF NOT EXISTS idx_generation_analysis_payload
+                ON generation_analysis(payload_hash);
+            """
+        )
+        conn.commit()
 
     def _migrate_v1_payloads(self, conn: sqlite3.Connection) -> None:
         """Copy retained v1 generations into content-addressed payload tables."""
@@ -586,6 +667,33 @@ class CodeIntelStore:
             row = conn.execute("SELECT value FROM metadata WHERE key='current_generation'").fetchone()
         return int(row[0]) if row is not None else None
 
+    def generation_provenance(self) -> dict[str, Any] | None:
+        """Provenance of the committed generation readers currently see.
+
+        Freshness checks compare ``generated_head`` against the working tree's
+        HEAD so a frozen index can never masquerade as current evidence.
+        """
+        if not self.exists():
+            return None
+        with self._connect(readonly=True) as conn:
+            row = conn.execute("SELECT value FROM metadata WHERE key='current_generation'").fetchone()
+            if row is None:
+                return None
+            generation = int(row[0])
+            record = conn.execute(
+                """SELECT generated_head, created_at, analyzer_version
+                     FROM generations WHERE id=? AND state='committed'""",
+                (generation,),
+            ).fetchone()
+        if record is None:
+            return None
+        return {
+            "generation": generation,
+            "generated_head": str(record["generated_head"] or ""),
+            "created_at": float(record["created_at"]),
+            "analyzer_version": str(record["analyzer_version"] or ""),
+        }
+
     def save_graph(
         self,
         graph: CodeGraph,
@@ -593,8 +701,19 @@ class CodeIntelStore:
         retain_generations: int = 2,
         changed_paths: set[str] | None = None,
         analysis_shards: dict[str, dict[str, Any]] | None = None,
+        progress: Callable[[str, int, int], None] | None = None,
     ) -> int:
         self.initialize()
+        batch = self._write_batch_size()
+
+        def report(phase: str, completed: int, total: int) -> None:
+            if progress is None:
+                return
+            try:
+                progress(phase, completed, total)
+            except Exception:  # noqa: BLE001 - progress must never fail a build
+                logger.debug("persist progress callback failed", exc_info=True)
+
         compatibility_digest = compatibility_graph_digest(graph)
         graph = _canonicalize_duplicate_ids(graph)
         graph_meta = dict(graph.meta)
@@ -651,49 +770,79 @@ class CodeIntelStore:
                     [node for node in graph.nodes if node.path in normalized_changed]
                     if incremental else graph.nodes
                 )
+                report("persist:files", 0, len(file_nodes))
                 file_rows = self._file_rows(generation, file_nodes)
-                for row in file_rows:
-                    _, path, language, content_hash, size, mtime_ns, content = row
-                    if content_hash:
-                        conn.execute(
-                            "INSERT OR IGNORE INTO file_contents(content_hash, content) VALUES(?, ?)",
-                            (content_hash, content),
+                for offset, chunk in _batched(file_rows, batch):
+                    contents = [
+                        (row[3], row[6])
+                        for row in chunk
+                        if row[3] and row[6] is not None
+                    ]
+                    if contents:
+                        conn.executemany(
+                            "INSERT OR IGNORE INTO file_contents(content_hash, content) "
+                            "VALUES(?, ?)",
+                            contents,
                         )
-                    conn.execute(
+                    conn.executemany(
                         """INSERT OR REPLACE INTO generation_files(
                             generation_id, path, language, content_hash, size, mtime_ns
                         ) VALUES(?, ?, ?, ?, ?, ?)""",
-                        (generation, path, language, content_hash, size, mtime_ns),
+                        [row[:6] for row in chunk],
                     )
+                    report("persist:files", offset + len(chunk), len(file_rows))
                 node_payload_writes = 0
                 edge_payload_writes = 0
                 dead_payload_writes = 0
-                for index, node in enumerate(graph.nodes):
-                    if incremental and node.path not in normalized_changed:
-                        continue
-                    payload = self._node_payload(node)
-                    digest, blob = self._payload(payload)
-                    node_payload_writes += conn.execute(
-                        "INSERT OR IGNORE INTO node_payloads VALUES(?, ?)", (digest, blob)
+
+                node_rows = [
+                    (index, node)
+                    for index, node in enumerate(graph.nodes)
+                    if not incremental or node.path in normalized_changed
+                ]
+                report("persist:nodes", 0, len(node_rows))
+                for offset, chunk in _batched(node_rows, batch):
+                    payloads: list[tuple[Any, ...]] = []
+                    memberships: list[tuple[Any, ...]] = []
+                    for index, node in chunk:
+                        digest, blob = self._payload(self._node_payload(node))
+                        payloads.append((digest, blob))
+                        memberships.append((generation, index, digest, node.path, node.id))
+                    node_payload_writes += conn.executemany(
+                        "INSERT OR IGNORE INTO node_payloads VALUES(?, ?)", payloads
                     ).rowcount
-                    conn.execute(
+                    conn.executemany(
                         "INSERT OR REPLACE INTO generation_nodes VALUES(?, ?, ?, ?, ?)",
-                        (generation, index, digest, node.path, node.id),
+                        memberships,
                     )
+                    report("persist:nodes", offset + len(chunk), len(node_rows))
+
+                edge_rows = []
                 for index, edge in enumerate(graph.edges):
                     source_path = self._identity_path(edge.source)
                     target_path = self._identity_path(edge.target)
                     if incremental and not ({source_path, target_path} & normalized_changed):
                         continue
-                    payload = self._edge_payload(edge)
-                    digest, blob = self._payload(payload)
-                    edge_payload_writes += conn.execute(
-                        "INSERT OR IGNORE INTO edge_payloads VALUES(?, ?)", (digest, blob)
+                    edge_rows.append((index, edge, source_path, target_path))
+                report("persist:edges", 0, len(edge_rows))
+                for offset, chunk in _batched(edge_rows, batch):
+                    payloads = []
+                    memberships = []
+                    for index, edge, source_path, target_path in chunk:
+                        digest, blob = self._payload(self._edge_payload(edge))
+                        payloads.append((digest, blob))
+                        memberships.append(
+                            (generation, index, digest, source_path, target_path)
+                        )
+                    edge_payload_writes += conn.executemany(
+                        "INSERT OR IGNORE INTO edge_payloads VALUES(?, ?)", payloads
                     ).rowcount
-                    conn.execute(
+                    conn.executemany(
                         "INSERT OR IGNORE INTO generation_edges VALUES(?, ?, ?, ?, ?)",
-                        (generation, index, digest, source_path, target_path),
+                        memberships,
                     )
+                    report("persist:edges", offset + len(chunk), len(edge_rows))
+
                 unresolved = self._unresolved_rows(generation, graph)
                 conn.executemany(
                     """INSERT INTO unresolved_references(
@@ -701,18 +850,28 @@ class CodeIntelStore:
                     ) VALUES(?, ?, ?, ?, ?, ?, ?)""",
                     unresolved,
                 )
-                for index, entry in enumerate(graph.dead_code):
-                    if incremental and entry.path not in normalized_changed:
-                        continue
-                    payload = self._dead_payload(entry)
-                    digest, blob = self._payload(payload)
-                    dead_payload_writes += conn.execute(
-                        "INSERT OR IGNORE INTO dead_payloads VALUES(?, ?)", (digest, blob)
+                dead_rows = [
+                    (index, entry)
+                    for index, entry in enumerate(graph.dead_code)
+                    if not incremental or entry.path in normalized_changed
+                ]
+                report("persist:dead", 0, len(dead_rows))
+                for offset, chunk in _batched(dead_rows, batch):
+                    payloads = []
+                    memberships = []
+                    for index, entry in chunk:
+                        digest, blob = self._payload(self._dead_payload(entry))
+                        payloads.append((digest, blob))
+                        memberships.append((generation, index, digest, entry.path))
+                    dead_payload_writes += conn.executemany(
+                        "INSERT OR IGNORE INTO dead_payloads VALUES(?, ?)", payloads
                     ).rowcount
-                    conn.execute(
+                    conn.executemany(
                         "INSERT OR IGNORE INTO generation_dead VALUES(?, ?, ?, ?)",
-                        (generation, index, digest, entry.path),
+                        memberships,
                     )
+                    report("persist:dead", offset + len(chunk), len(dead_rows))
+                report("persist:fts", 0, 1)
                 conn.executemany(
                     "INSERT INTO nodes_fts(generation_id, node_id, name, qualified_name, path) VALUES(?, ?, ?, ?, ?)",
                     [
@@ -721,12 +880,16 @@ class CodeIntelStore:
                         if not incremental or node.path in normalized_changed
                     ],
                 )
+                report("persist:fts", 1, 1)
                 if analysis_shards is not None:
+                    report("persist:shards", 0, len(analysis_shards))
                     self._write_analysis_shards(
                         conn, generation, analysis_shards, normalized_changed if incremental else None
                     )
+                    report("persist:shards", len(analysis_shards), len(analysis_shards))
                 if previous_generation is not None:
                     self._record_rename_aliases(conn, previous_generation, generation)
+                report("persist:commit", 0, 1)
                 conn.execute(
                     "UPDATE generations SET state='committed', node_count=?, edge_count=? WHERE id=?",
                     (len(graph.nodes), len(graph.edges), generation),
@@ -757,10 +920,46 @@ class CodeIntelStore:
                     ).fetchone()[0]),
                 }
                 conn.commit()
+                report("persist:commit", 1, 1)
+                # Truncate the WAL now that the generation is durable. Without
+                # this a long build leaves a WAL that keeps growing across runs
+                # (hundreds of MB), and every later read pays walFindFrame on it.
+                self._checkpoint(conn)
                 return generation
             except Exception:
                 conn.rollback()
                 raise
+
+    def _write_batch_size(self) -> int:
+        """Rows per persist batch (``indexing.store_write_batch_size``)."""
+        try:
+            from devcouncil.app.config import load_config
+
+            return max(1, int(load_config(self.project_root).indexing.store_write_batch_size))
+        except Exception:
+            return DEFAULT_WRITE_BATCH
+
+    def _store_file_contents(self) -> bool:
+        """Whether to persist compressed file bytes (``indexing.store_file_contents``)."""
+        try:
+            from devcouncil.app.config import load_config
+
+            return bool(load_config(self.project_root).indexing.store_file_contents)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _checkpoint(conn: sqlite3.Connection) -> None:
+        """Best-effort WAL truncate after a committed generation."""
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            # A concurrent reader can hold the WAL open; PASSIVE still reclaims
+            # what it can and a later write retries.
+            try:
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except sqlite3.Error:
+                logger.debug("wal checkpoint failed", exc_info=True)
 
     def compatibility_export_state(self) -> tuple[str, int | None]:
         """Return the last public graph digest and observed export mtime."""
@@ -799,6 +998,7 @@ class CodeIntelStore:
             if node.path:
                 by_path.setdefault(node.path, node.language)
         rows: list[tuple[Any, ...]] = []
+        store_contents = self._store_file_contents()
         for rel, language in sorted(by_path.items()):
             path = self.project_root / rel
             try:
@@ -808,7 +1008,14 @@ class CodeIntelStore:
                 rows.append((generation, rel, language, "", 0, 0, None))
                 continue
             digest = hashlib.sha256(raw).hexdigest()
-            rows.append((generation, rel, language, digest, len(raw), stat.st_mtime_ns, zlib.compress(raw, 6)))
+            # Content blobs are what make index.sqlite grow to gigabytes on a
+            # large repo. Hash/size/mtime are always kept (they drive change
+            # detection); the bytes themselves are opt-in and otherwise read
+            # back from the working tree by ``content_for_path``.
+            blob = zlib.compress(raw, 6) if store_contents else None
+            rows.append(
+                (generation, rel, language, digest, len(raw), stat.st_mtime_ns, blob)
+            )
         return rows
 
     @staticmethod
@@ -839,57 +1046,79 @@ class CodeIntelStore:
         generation: int,
         changed: set[str],
     ) -> None:
-        placeholders = ",".join("?" for _ in changed)
-        if not placeholders:
+        if not changed:
             return
-        params: tuple[Any, ...] = (generation, previous, *sorted(changed))
-        conn.execute(
-            f"""INSERT INTO generation_files
-                SELECT ?, path, language, content_hash, size, mtime_ns
-                  FROM generation_files
-                 WHERE generation_id=? AND path NOT IN ({placeholders})""",  # noqa: S608
-            params,
-        )
-        conn.execute(
-            f"""INSERT INTO generation_nodes
-                SELECT ?, ordinal, payload_hash, path, node_id
-                  FROM generation_nodes
-                 WHERE generation_id=? AND path NOT IN ({placeholders})""",  # noqa: S608
-            params,
-        )
-        edge_params: tuple[Any, ...] = (
-            generation, previous, *sorted(changed), *sorted(changed)
-        )
-        conn.execute(
-            f"""INSERT INTO generation_edges
-                SELECT ?, ordinal, payload_hash, source_path, target_path
-                  FROM generation_edges
-                 WHERE generation_id=?
-                   AND source_path NOT IN ({placeholders})
-                   AND target_path NOT IN ({placeholders})""",  # noqa: S608
-            edge_params,
-        )
-        conn.execute(
-            f"""INSERT INTO generation_dead
-                SELECT ?, ordinal, payload_hash, path
-                  FROM generation_dead
-                 WHERE generation_id=? AND path NOT IN ({placeholders})""",  # noqa: S608
-            params,
-        )
-        conn.execute(
-            f"""INSERT INTO generation_analysis
-                SELECT ?, path, payload_hash
-                  FROM generation_analysis
-                 WHERE generation_id=? AND path NOT IN ({placeholders})""",  # noqa: S608
-            params,
-        )
-        conn.execute(
-            f"""INSERT INTO nodes_fts(generation_id, node_id, name, qualified_name, path)
-                SELECT ?, node_id, name, qualified_name, path
-                  FROM nodes_fts
-                 WHERE generation_id=? AND path NOT IN ({placeholders})""",  # noqa: S608
-            params,
-        )
+        # Inlining one bind parameter per changed path breaks past
+        # SQLITE_MAX_VARIABLE_NUMBER on a repo-scale change set and forces a
+        # bad plan well before that. Beyond the threshold, stage the exclusion
+        # set in a temp table and let SQLite use its primary-key index.
+        if len(changed) > _CHANGED_PATH_TEMP_TABLE_THRESHOLD:
+            conn.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS changed_paths (path TEXT PRIMARY KEY)"
+            )
+            conn.execute("DELETE FROM changed_paths")
+            conn.executemany(
+                "INSERT OR IGNORE INTO changed_paths(path) VALUES(?)",
+                [(path,) for path in sorted(changed)],
+            )
+            exclusion = "SELECT path FROM changed_paths"
+            params: tuple[Any, ...] = (generation, previous)
+            edge_params: tuple[Any, ...] = params
+        else:
+            exclusion = ",".join("?" for _ in changed)
+            params = (generation, previous, *sorted(changed))
+            edge_params = (generation, previous, *sorted(changed), *sorted(changed))
+        try:
+            conn.execute(
+                f"""INSERT INTO generation_files
+                    SELECT ?, path, language, content_hash, size, mtime_ns
+                      FROM generation_files
+                     WHERE generation_id=? AND path NOT IN ({exclusion})""",  # noqa: S608
+                params,
+            )
+            conn.execute(
+                f"""INSERT INTO generation_nodes
+                    SELECT ?, ordinal, payload_hash, path, node_id
+                      FROM generation_nodes
+                     WHERE generation_id=? AND path NOT IN ({exclusion})""",  # noqa: S608
+                params,
+            )
+            conn.execute(
+                f"""INSERT INTO generation_edges
+                    SELECT ?, ordinal, payload_hash, source_path, target_path
+                      FROM generation_edges
+                     WHERE generation_id=?
+                       AND source_path NOT IN ({exclusion})
+                       AND target_path NOT IN ({exclusion})""",  # noqa: S608
+                edge_params,
+            )
+            conn.execute(
+                f"""INSERT INTO generation_dead
+                    SELECT ?, ordinal, payload_hash, path
+                      FROM generation_dead
+                     WHERE generation_id=? AND path NOT IN ({exclusion})""",  # noqa: S608
+                params,
+            )
+            conn.execute(
+                f"""INSERT INTO generation_analysis
+                    SELECT ?, path, payload_hash
+                      FROM generation_analysis
+                     WHERE generation_id=? AND path NOT IN ({exclusion})""",  # noqa: S608
+                params,
+            )
+            conn.execute(
+                f"""INSERT INTO nodes_fts(generation_id, node_id, name, qualified_name, path)
+                    SELECT ?, node_id, name, qualified_name, path
+                      FROM nodes_fts
+                     WHERE generation_id=? AND path NOT IN ({exclusion})""",  # noqa: S608
+                params,
+            )
+        finally:
+            if len(changed) > _CHANGED_PATH_TEMP_TABLE_THRESHOLD:
+                try:
+                    conn.execute("DELETE FROM changed_paths")
+                except sqlite3.Error:
+                    logger.debug("could not clear changed_paths temp table", exc_info=True)
 
     def _write_analysis_shards(
         self,
@@ -930,7 +1159,10 @@ class CodeIntelStore:
                      WHERE content_hash<>''
                  )"""
         )
-        conn.execute("PRAGMA incremental_vacuum(64)")
+        # Pruning a generation frees tens of thousands of pages; reclaiming 64
+        # per build (256KB) lets a gigabyte-scale freelist accumulate forever.
+        # 8192 pages (~32MB) keeps reclaim bounded but meaningful.
+        conn.execute("PRAGMA incremental_vacuum(8192)")
 
     @staticmethod
     def _node_row(generation: int, node: GraphNode) -> tuple[Any, ...]:
@@ -1089,8 +1321,35 @@ class CodeIntelStore:
             "SELECT id FROM generations WHERE state='committed' ORDER BY id DESC"
         ).fetchall()
         stale = [int(row[0]) for row in rows[keep:] if int(row[0]) != current]
+        if not stale:
+            return
+        # ``DELETE FROM nodes_fts WHERE generation_id=?`` cannot use an index
+        # (FTS5 UNINDEXED column): it full-scans the virtual table and pays
+        # inverted-index churn for every deleted row, with each lookup walking
+        # the transaction's own ever-growing WAL. On a repo-scale generation
+        # that one statement runs for hours at 100% CPU. Rebuilding from the
+        # kept rows is linear and bounded: copy kept rows out, drop the shadow
+        # trees wholesale, re-insert.
+        kept = [int(row[0]) for row in rows if int(row[0]) not in set(stale)]
+        placeholders = ",".join("?" for _ in kept)
+        conn.execute("DROP TABLE IF EXISTS temp.nodes_fts_keep")
+        if kept:
+            conn.execute(
+                f"""CREATE TEMP TABLE nodes_fts_keep AS
+                    SELECT generation_id, node_id, name, qualified_name, path
+                      FROM nodes_fts WHERE generation_id IN ({placeholders})""",  # noqa: S608
+                kept,
+            )
+        conn.execute("DROP TABLE nodes_fts")
+        conn.execute(_NODES_FTS_DDL)
+        if kept:
+            conn.execute(
+                """INSERT INTO nodes_fts(generation_id, node_id, name, qualified_name, path)
+                   SELECT generation_id, node_id, name, qualified_name, path
+                     FROM nodes_fts_keep"""
+            )
+            conn.execute("DROP TABLE nodes_fts_keep")
         for generation in stale:
-            conn.execute("DELETE FROM nodes_fts WHERE generation_id=?", (generation,))
             conn.execute("DELETE FROM generations WHERE id=?", (generation,))
 
     def load_graph(self, generation: int | None = None) -> CodeGraph | None:
@@ -1293,9 +1552,17 @@ class CodeIntelStore:
                    WHERE f.generation_id=? AND f.path=?""",
                 (generation, path.replace("\\", "/")),
             ).fetchone()
-        if row is None or row[0] is None:
+        if row is not None and row[0] is not None:
+            return zlib.decompress(row[0])
+        if row is None:
             return None
-        return zlib.decompress(row[0])
+        # The generation knows the file but content blobs were not stored
+        # (``indexing.store_file_contents`` off, the default). Fall back to the
+        # working tree so callers keep working; None when it is gone.
+        try:
+            return (self.project_root / path.replace("\\", "/")).read_bytes()
+        except OSError:
+            return None
 
     def file_metadata(self, *, generation: int | None = None) -> dict[str, tuple[int, int, str]]:
         """Return ``path -> (size, mtime_ns, sha256)`` for reconciliation."""

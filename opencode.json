@@ -1,0 +1,20 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "devcouncil": {
+      "type": "local",
+      "command": [
+        "devcouncil",
+        "mcp-server"
+      ],
+      "environment": {
+        "DEVCOUNCIL_PROJECT_ROOT": "/Users/bharath/Code/DevCouncil"
+      },
+      "enabled": true,
+      "timeout": 10000
+    }
+  },
+  "plugin": [
+    "./.devcouncil/integrations/opencode_devcouncil_plugin.mjs"
+  ]
+}

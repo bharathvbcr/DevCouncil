@@ -4,6 +4,10 @@ symbol_index module is gone."""
 from __future__ import annotations
 
 import importlib
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 from devcouncil.indexing.lsp import LspInspector
 
@@ -60,13 +64,24 @@ def test_symbol_index_module_is_deleted():
 
 
 def test_indexing_package_imports_cleanly():
-    # No dangling references to the deleted module break the package.
-    import devcouncil.indexing.repo_mapper as repo_mapper
-    import devcouncil.indexing.lsp as lsp
-
-    importlib.reload(lsp)
-    importlib.reload(repo_mapper)
-    assert repo_mapper.RepoMapper is not None
+    # No dangling references to the deleted module break the package. Import in
+    # a fresh interpreter: an in-process importlib.reload would mint new class
+    # objects (RepoMap/RepoFileEntry) while other test modules keep the old
+    # ones, making pydantic validation order-dependent across the suite.
+    src = Path(__file__).resolve().parents[2] / "src"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import devcouncil.indexing.lsp\n"
+            "import devcouncil.indexing.repo_mapper as repo_mapper\n"
+            "assert repo_mapper.RepoMapper is not None\n",
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(src)},
+    )
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_repo_mapper_role_files_have_no_symbol_index_reference():

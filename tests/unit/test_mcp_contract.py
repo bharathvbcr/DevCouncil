@@ -82,3 +82,49 @@ async def test_verify_task_sandbox_enum_is_honest():
     tools = {t.name: t for t in await list_tools()}
     enum = tools["devcouncil_verify_task"].inputSchema["properties"]["sandbox"]["enum"]
     assert enum == ["local"]  # docker/nix were advertised but rejected
+
+
+@pytest.mark.anyio
+async def test_ordinary_write_and_command_tools_do_not_require_task_ids():
+    tools = {t.name: t for t in await list_tools()}
+
+    assert "task_id" not in tools["devcouncil_write_file"].inputSchema["required"]
+    assert "task_id" not in tools["devcouncil_apply_patch"].inputSchema["required"]
+    assert "task_id" not in tools["devcouncil_run_command"].inputSchema["required"]
+    assert "task_id" in tools["devcouncil_verify_task"].inputSchema["required"]
+
+
+@pytest.mark.anyio
+async def test_off_mode_mcp_write_and_command_work_without_task_ids(
+    tmp_path,
+    monkeypatch,
+):
+    _seed(tmp_path, n=1)
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "project:\n  name: test\ngates:\n  mode: off\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+
+    write = json.loads(
+        (
+            await call_tool(
+                "devcouncil_write_file",
+                {"path": "src/taskless.py", "content": "VALUE = 1\n"},
+            )
+        )[0].text
+    )
+    command = json.loads(
+        (
+            await call_tool(
+                "devcouncil_run_command",
+                {"command": "echo taskless"},
+            )
+        )[0].text
+    )
+
+    assert write["ok"] is True
+    assert write["task_id"] is None
+    assert command["ok"] is True
+    assert command["task_id"] is None
+    assert "taskless" in command["stdout"]

@@ -8,7 +8,7 @@ from devcouncil.app.config import load_config
 from devcouncil.domain.task import Task
 from devcouncil.domain.requirement import Requirement
 from devcouncil.domain.gap import Gap
-from devcouncil.domain.evidence import CommandResult
+from devcouncil.domain.evidence import CommandResult, DiffEvidence
 from devcouncil.verification import diff_coverage as dc
 from devcouncil.verification.checks.orphan_diff import classify_change_paths
 from devcouncil.verification.checks.semantic_diff import (
@@ -50,12 +50,14 @@ class VerificationOutcome:
     The pass/fail verdict lives in the gaps; this records the *rigor* of the run so
     an autonomous agent never mistakes ``passed`` for ``proven`` when the gate could
     not actually check. ``mode`` is ``"compiled"`` when DevCouncil's per-criterion
-    acceptance checks were available (a model router was supplied) and ``"coarse"``
-    on the keyless fallback path. ``diff_empty`` flags a run with nothing to verify,
-    and the coverage fields say whether the diff↔coverage gate measured anything.
+    acceptance checks were available (a model router was supplied), ``"coarse"``
+    on the keyless fallback path, and ``"off"`` when quality verification was
+    intentionally skipped. ``diff_empty`` flags a run with nothing to verify.
     """
 
     mode: str = "coarse"
+    gate_mode: str = "enforce"
+    verification_skipped: bool = False
     compiler_active: bool = False
     diff_empty: bool = True
     coverage_measured: bool = False
@@ -71,6 +73,15 @@ class VerificationOutcome:
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+def verification_task_status(gaps: List[Gap], outcome: VerificationOutcome | None) -> str:
+    """Map a verification result to an honest persisted task status."""
+    if any(gap.blocking for gap in gaps):
+        return "blocked"
+    if outcome is not None and bool(getattr(outcome, "verification_skipped", False)):
+        return "done"
+    return "verified"
 
 
 class Verifier:
@@ -251,6 +262,48 @@ class Verifier:
 
     async def verify_task(self, task: Task, requirements: List[Requirement]) -> Tuple[List[Gap], List[Any]]:
         logger.info("verify_task: task=%s requirements=%d", task.id, len(requirements))
+        try:
+            gate_mode = load_config(self.project_root).gates.mode
+        except Exception:
+            # Ad-hoc Verifier use predates project initialization. Preserve the
+            # established strict fallback; relaxing gates must be explicit.
+            gate_mode = "enforce"
+        if gate_mode == "off":
+            diff_content = self.get_diff()
+            if not diff_content.strip():
+                diff_content = self._committed_task_diff(task.id)
+            changed_files = self.get_changed_files()
+            evidence: List[Any] = []
+            if diff_content:
+                added_files, deleted_files = self._classify_change_paths(changed_files)
+                evidence.append(DiffEvidence(
+                    task_id=task.id,
+                    changed_files=changed_files,
+                    added_files=added_files,
+                    deleted_files=deleted_files,
+                    diff_summary=(
+                        f"Diff captured for {len(changed_files)} files; "
+                        "quality verification skipped (gates.mode=off)."
+                    ),
+                ))
+            gaps = self.secret_scanner.scan_diff(diff_content, task.id)
+            self.last_outcome = VerificationOutcome(
+                mode="off",
+                gate_mode="off",
+                verification_skipped=True,
+                compiler_active=False,
+                diff_empty=not bool(diff_content.strip()),
+                coverage_measured=False,
+                coverage_skipped_reason="quality verification disabled by gates.mode=off",
+                difficulty=task.difficulty,
+                rigor_applied=["hard-safety-secret-scan"],
+            )
+            logger.info(
+                "verify_task: skipped quality verification for %s; security_gaps=%d",
+                task.id,
+                len(gaps),
+            )
+            return gaps, evidence
         from devcouncil.indexing.map_refresh import refresh_stale_map_if_needed
 
         refresh_stale_map_if_needed(self.project_root, on_checkout=False, on_verify=True)

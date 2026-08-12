@@ -7,6 +7,7 @@ from devcouncil.skills.registry import (
     render_preamble,
     scaffold_skills,
     select_skills,
+    skills_for_scaffold,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "render_preamble",
     "scaffold_skills",
     "select_skills",
+    "skills_for_scaffold",
 ]

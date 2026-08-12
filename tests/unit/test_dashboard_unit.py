@@ -315,7 +315,11 @@ def test_dashboard_payload_initialized(tmp_path, monkeypatch):
     monkeypatch.setattr(dash, "_recent_trace_events_cached", lambda root: [])
     monkeypatch.setattr(dash, "_integration_summary_cached", lambda root: {"capabilities": []})
     monkeypatch.setattr(dash, "recent_run_artifacts", lambda root: [])
-    monkeypatch.setattr(dash, "_dashboard_gaps_summary", lambda session: {"total": 0, "blocking": 0, "items": []})
+    monkeypatch.setattr(
+        dash,
+        "_dashboard_gaps_summary",
+        lambda session, **kwargs: {"total": 0, "blocking": 0, "items": []},
+    )
 
     payload = dash.dashboard_payload(tmp_path)
     assert payload["initialized"] is True

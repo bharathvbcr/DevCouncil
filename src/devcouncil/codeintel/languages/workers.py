@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import re
 import threading
+import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,35 @@ def _activate_companion_once() -> dict[str, Any]:
                 "error": f"{type(exc).__name__}: {exc}",
             }
         return _ACTIVATION_STATUS
+
+
+def _exit_when_reparented(poll_interval: float = 2.0) -> None:
+    """Exit the pool child when its parent dies.
+
+    A pool child inherits both ends of its call-queue pipe, so parent death
+    never EOFs the read and an orphaned child idles forever (observed: spawn
+    children at ppid 1 for 2h). ``atexit``/SIGTERM cleanup cannot run when the
+    parent dies by signal; watching ppid is the only reliable exit signal.
+    """
+    parent = os.getppid()
+
+    def _watch() -> None:
+        while True:
+            time.sleep(poll_interval)
+            try:
+                if os.getppid() != parent:
+                    os._exit(0)
+            except OSError:
+                os._exit(0)
+
+    threading.Thread(
+        target=_watch, name="devcouncil-pool-parent-watch", daemon=True
+    ).start()
+
+
+def _pool_child_initializer() -> None:
+    _activate_companion_once()
+    _exit_when_reparented()
 
 
 def _structure_row(item: Any) -> dict[str, Any]:
@@ -209,7 +239,7 @@ class ParserWorkerPool:
                 self._pool = ProcessPoolExecutor(
                     max_workers=self.max_workers,
                     mp_context=multiprocessing.get_context("spawn"),
-                    initializer=_activate_companion_once,
+                    initializer=_pool_child_initializer,
                 )
             return self._pool
 

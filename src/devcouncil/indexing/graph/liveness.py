@@ -7,10 +7,10 @@ from __future__ import annotations
 
 import logging
 import re
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, cast
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, cast
 
 from devcouncil.indexing.graph.extract_python import (
     ExtractedCall,
@@ -107,12 +107,30 @@ def _apply_unreachable_ratio_gate(
     return unreachable, False, meta
 
 
+def _allow_unwired_lookup(root: Path) -> Callable[[str], bool]:
+    """Per-pass path→bool cache for ``has_allow_unwired`` (mtime-safe within one pass)."""
+    from devcouncil.indexing.wiring import has_allow_unwired
+
+    cache: Dict[str, bool] = {}
+
+    def _allowed(path: str) -> bool:
+        hit = cache.get(path)
+        if hit is not None:
+            return hit
+        value = has_allow_unwired(root, path)
+        cache[path] = value
+        return value
+
+    return _allowed
+
+
 def file_liveness(
     root: Path,
     files: List[str],
     file_edges: List[Tuple[str, str]],
     *,
     cap: Optional[int] = None,
+    dynamic_index: Optional[dict[str, Set[str]]] = None,
 ) -> Tuple[List[str], List[str], List[str], bool]:
     """Return (entry_roots, unwired, unreachable, unreachable_unreliable).
 
@@ -125,11 +143,12 @@ def file_liveness(
 
     When unreachable density exceeds ``indexing.unreachable_unreliable_ratio``
     (default 0.25), also fail soft — treat the list as low-confidence noise.
+
+    Prefer a prebuilt ``dynamic_index`` from the caller (one scan per assemble pass).
     """
     from devcouncil.indexing.wiring import (
         build_dynamic_import_index,
         entry_roots,
-        has_allow_unwired,
         is_liveness_code_file,
         is_test_path,
         reference_cleared,
@@ -141,7 +160,12 @@ def file_liveness(
     prod_roots = entry_roots(root, files, production_only=True)
     root_set = set(roots)
     prod_root_set = set(prod_roots)
-    dyn_index = build_dynamic_import_index(root, files)
+    dyn_index = (
+        build_dynamic_import_index(root, files)
+        if dynamic_index is None
+        else dynamic_index
+    )
+    allow_unwired = _allow_unwired_lookup(root)
     unreachable_unreliable = not bool(prod_roots)
 
     inbound: Dict[str, Set[str]] = defaultdict(set)
@@ -156,10 +180,9 @@ def file_liveness(
             continue
         if f in root_set or structural_exemptions(f):
             continue
-        if has_allow_unwired(root, f):
+        if allow_unwired(f):
             continue
-        non_test_importers = {i for i in inbound.get(f, ()) if not is_test_path(i)}
-        if non_test_importers:
+        if any(not is_test_path(i) for i in inbound.get(f, ())):
             continue
         if reference_cleared(
             root, f, skip_files=set(), git_files=files, dynamic_index=dyn_index
@@ -190,7 +213,7 @@ def file_liveness(
             if f in reachable:
                 continue
             # Dynamic entrypoints / markers clear unwired; keep unreachable in parity.
-            if has_allow_unwired(root, f):
+            if allow_unwired(f):
                 continue
             if reference_cleared(
                 root, f, skip_files=set(), git_files=files, dynamic_index=dyn_index
@@ -203,6 +226,14 @@ def file_liveness(
     unreachable, unreachable_unreliable, _ratio_meta = _apply_unreachable_ratio_gate(
         root, files, unreachable, unreachable_unreliable
     )
+    if not unreachable_unreliable and unreachable:
+        gap_points = {
+            f: [i for i in inbound.get(f, ()) if i in reachable][0]
+            for f in unreachable
+            if any(i in reachable for i in inbound.get(f, ()))
+        }
+        if gap_points:
+            _ratio_meta["reachability_gap_points"] = gap_points
     return prod_roots, unwired, unreachable, unreachable_unreliable
 
 
@@ -442,17 +473,21 @@ def file_liveness_from_shards(
         and path not in root_set
         and not structural_exemptions(path)
         and not bool(shards.get(path, {}).get("allow_unwired"))
-        and not {item for item in inbound.get(path, ()) if not is_test_path(item)}
+        and not any(not is_test_path(item) for item in inbound.get(path, ()))
         and not reference_cleared(root, path, dynamic_index=effective_dynamic_index)
     ]
     reachable: Set[str] = set()
-    queue = list(production_roots)
-    while queue:
-        path = queue.pop()
-        if path in reachable:
-            continue
-        reachable.add(path)
-        queue.extend(outbound.get(path, ()))
+    if not unreliable:
+        queue = list(production_roots)
+        seen_q: Set[str] = set(queue)
+        while queue:
+            path = queue.pop()
+            reachable.add(path)
+            for nxt in outbound.get(path, ()):
+                if nxt not in seen_q:
+                    seen_q.add(nxt)
+                    queue.append(nxt)
+
     unreachable = [] if unreliable else [
         path for path in sorted(files)
         if is_liveness_code_file(path)
@@ -662,6 +697,7 @@ def symbol_reachability_dead(
     file_edges: Optional[List[Tuple[str, str]]] = None,
     unreachable: Optional[List[str]] = None,
     dynamic_index: Optional[dict[str, Set[str]]] = None,
+    progress: Callable[[str, int, int], None] | None = None,
 ) -> List[DeadCodeEntry]:
     """Symbol-level dead code with fixed-point live propagation and confidence tiers.
 
@@ -669,11 +705,14 @@ def symbol_reachability_dead(
     test-referenced / getattr) or has an inbound call/named-import from a live
     source. Cascade members whose only callers are dead get
     ``reason="only callers are dead"`` at ``inferred`` confidence.
+
+    Propagation uses a worklist BFS (bound ``I <= N+1``) with a ``live_files``
+    membership index: a file path is treated as a live module-level source when
+    it has ≥1 live symbol (replacing an O(|live|) ``startswith`` scan).
     """
     from devcouncil.indexing.wiring import (
         GETATTR_INDEX_PREFIX,
         build_dynamic_import_index,
-        has_allow_unwired,
         is_dunder_symbol,
         is_private_symbol,
         is_test_path,
@@ -696,6 +735,7 @@ def symbol_reachability_dead(
         if dynamic_index is None
         else dynamic_index
     )
+    allow_unwired = _allow_unwired_lookup(root)
     getattr_names = {
         k[len(GETATTR_INDEX_PREFIX) :]
         for k in dyn_index
@@ -746,7 +786,8 @@ def symbol_reachability_dead(
         if node.kind in _seed_kinds and node.name in getattr_names:
             live.add(node.id)
 
-    # Fixed-point: live if inbound from live source, or overrides a live base method.
+    # Fixed-point: worklist BFS — live if inbound from live source, or overrides
+    # a live base method. Bound waves at N+1 (each node joins live at most once).
     unreachable_set = {p.replace("\\", "/") for p in (unreachable or [])}
     entry_root_set = {p.replace("\\", "/") for p in entry_roots}
 
@@ -757,40 +798,82 @@ def symbol_reachability_dead(
             return True
         return norm not in unreachable_set
 
+    live_files: Set[str] = {
+        nid.split("::", 1)[0].replace("\\", "/") for nid in live
+    }
+
     def _source_is_live(src: str) -> bool:
         if src in live:
             return True
         if "::" not in src:
-            if _file_source_is_live(src):
+            norm = src.replace("\\", "/")
+            if _file_source_is_live(norm):
                 return True
-            return any(n.startswith(f"{src}::") for n in live)
+            # File has ≥1 live symbol (not BFS file-reachability).
+            return norm in live_files
         return False
 
-    changed = True
-    while changed:
-        changed = False
-        for node in nodes:
-            alias = str(node.extras.get("identity_alias") or "")
-            if not alias:
-                continue
-            if node.id in live and alias not in live:
-                live.add(alias)
-                changed = True
-            elif alias in live and node.id not in live:
-                live.add(node.id)
-                changed = True
-        for target, srcs in inbound_live_edges.items():
-            if target in live:
-                continue
-            if any(_source_is_live(e.source) for e in srcs):
-                live.add(target)
-                changed = True
-        for child, parents in overrides_of.items():
-            if child in live:
-                continue
-            if any(p in live for p in parents):
-                live.add(child)
-                changed = True
+    # Reverse adjacency for worklist propagation.
+    targets_from: Dict[str, List[str]] = defaultdict(list)
+    for target, elist in inbound_live_edges.items():
+        for e in elist:
+            targets_from[e.source].append(target)
+    children_of: Dict[str, List[str]] = defaultdict(list)
+    for child, parents in overrides_of.items():
+        for parent in parents:
+            children_of[parent].append(child)
+    alias_links: Dict[str, Set[str]] = defaultdict(set)
+    for node in nodes:
+        alias = str(node.extras.get("identity_alias") or "")
+        if not alias:
+            continue
+        alias_links[node.id].add(alias)
+        alias_links[alias].add(node.id)
+
+    work: deque[str] = deque(live)
+    n_nodes = max(len(nodes), 1)
+    max_waves = n_nodes + 1
+
+    def _mark_live(nid: str) -> None:
+        if nid in live:
+            return
+        live.add(nid)
+        path = nid.split("::", 1)[0].replace("\\", "/")
+        was_new_file = path not in live_files
+        live_files.add(path)
+        work.append(nid)
+        # First live symbol in an otherwise-unreachable file activates file→symbol
+        # edges (parity with former startswith scan over live ids).
+        if was_new_file and not _file_source_is_live(path):
+            for target in targets_from.get(path, ()):
+                _mark_live(target)
+
+    # Seed targets of already-live module-level sources (reachable files / entries).
+    for src, targets in list(targets_from.items()):
+        if "::" not in src and _source_is_live(src):
+            for target in targets:
+                _mark_live(target)
+
+    if progress is not None:
+        progress("liveness:symbols", 0, max_waves)
+
+    wave = 0
+    while work and wave < max_waves:
+        wave_size = len(work)
+        wave += 1
+        if progress is not None:
+            progress("liveness:symbols", wave, max_waves)
+        for _ in range(wave_size):
+            nid = work.popleft()
+            for partner in alias_links.get(nid, ()):
+                _mark_live(partner)
+            for target in targets_from.get(nid, ()):
+                _mark_live(target)
+            for child in children_of.get(nid, ()):
+                _mark_live(child)
+
+    if progress is not None:
+        progress("liveness:symbols", max_waves, max_waves)
 
     token_dead_keys = token_dead_keys or set()
     dead: List[DeadCodeEntry] = []
@@ -804,7 +887,7 @@ def symbol_reachability_dead(
             continue
         if is_private_symbol(node.name) or is_dunder_symbol(node.name):
             continue
-        if has_allow_unwired(root, node.path):
+        if allow_unwired(node.path):
             continue
         if node.id in live:
             continue

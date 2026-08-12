@@ -36,8 +36,8 @@ Other coding CLI hooks remain Preview as noted below.
 | **Lite Check (`dev check --verify`)** | Stable: deterministic working-tree evidence gate with no planning and no provider keys |
 | **Repair Loop (deterministic)** | Stable: `dev go`/`dev e2e` drive a bounded, attempt-accounted self-repair loop — correction manifest from blocking gaps + next-actions, capped by `execution.max_repair_attempts`, with no-progress fingerprint detection. Task-scoped failed evidence; repair plan files/tests merged into scope. |
 | **LLM repair inference** | Preview: optional `RepairService` sharpens correction-manifest root cause when a provider key is configured; not required for the deterministic loop |
-| **Native Executor** | Preview: `native` / `native-preview` — lease-gated writes, shared verify/next-actions loop; completion still requires DevCouncil verification |
-| **MCP Server (Claude Code hero loop)** | Stable: certified closed loop with lease-gated writes, typed next-actions, renew/list leases, golden e2e fixtures |
+| **Native Executor** | Preview: `native` / `native-preview` — strict lease/scope writes and shared verify/next-actions loop in `enforce`; advisory/off relax or skip quality gates |
+| **MCP Server (Claude Code hero loop)** | Stable opt-in strict loop: lease-gated writes, typed next-actions, renew/list leases, golden e2e fixtures |
 | **Multi-agent Campaign (`dev campaign`)** | Preview: parallel dependency-wave dispatch, Reviewer QC gate, per-task leases, cost budget + dashboard progress. Tasks that share writable `planned_files` are serialized when `--max-parallel` > 1 (one git working tree). |
 | **Coding CLI Hooks** | Preview: unified stop gate on Claude/Codex Stop+SubagentStop (`execution.stop_gate`; `assist` seeded on integrate when unset). Cursor/Grok pre/post hooks only (no Stop gate). Gemini hooks deprecated (explicit `--tool gemini` only). |
 | **Stop gate & claim checks** | Preview: map completion claims → independent command/filesystem checks; combine with optional active-task verify. See [coding-cli-integration.md](coding-cli-integration.md#stop-gate-assist-vs-block-executionstop_gate). |

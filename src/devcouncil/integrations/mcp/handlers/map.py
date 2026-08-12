@@ -464,7 +464,9 @@ async def handle_graph_ingest(root: Path, arguments: dict) -> list[TextContent]:
                 quiet=True,
             )
         except GraphBuildBusy as exc:
-            return error_text(str(exc), code="graph_writer_busy")
+            from devcouncil.codeintel.build_control import writer_busy_details
+
+            return error_text(str(exc), code="graph_writer_busy", **writer_busy_details(root))
     else:
         try:
             ok = await asyncio.to_thread(coordinator.sync_now, changed)
@@ -486,17 +488,32 @@ async def handle_graph_ingest(root: Path, arguments: dict) -> list[TextContent]:
         except GraphBuildBusy as exc:
             # Same structured error as the full-refresh branch — a held writer
             # lease must not surface as an unhandled MCP exception.
-            return error_text(str(exc), code="graph_writer_busy")
+            from devcouncil.codeintel.build_control import writer_busy_details
+
+            return error_text(str(exc), code="graph_writer_busy", **writer_busy_details(root))
     embedded = await asyncio.to_thread(build_embeddings, root)
-    return json_text({
-        "ok": not refresh.degraded,
+    payload = {
+        # ``build_incomplete`` means the build timed out but a healthy prior
+        # generation was reused. The graph answers queries correctly for the
+        # code it covers, but it predates HEAD — an agent must not read that
+        # as a fresh ingest, so it is not ``ok``.
+        "ok": not (refresh.degraded or refresh.build_incomplete),
         "paths": changed,
         "embeddings_built": embedded,
         "generation": refresh.generation,
         "mode": refresh.mode,
         "degraded": refresh.degraded,
+        "build_incomplete": refresh.build_incomplete,
         "reason": refresh.reason,
-    })
+    }
+    if refresh.build_incomplete:
+        payload["code"] = "graph_build_incomplete"
+        payload["detail"] = (
+            "Graph build did not finish; served from the last committed generation "
+            "(older than HEAD). Re-run `dev map` — see build_status for the phase "
+            "it stopped in."
+        )
+    return json_text(payload)
 
 
 async def handle_graph_cypher(root: Path, arguments: dict) -> list[TextContent]:

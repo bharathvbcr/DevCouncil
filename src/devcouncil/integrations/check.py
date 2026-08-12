@@ -198,8 +198,12 @@ def _codex_config_status(project_root: Path) -> tuple[str, bool, list[str]]:
     return ("ok" if ok else "drifted"), not ok, [logical_path, str(project_root / ".codex" / "hooks.json")]
 
 
-def _codex_hook_schema_status(project_root: Path) -> tuple[bool, str]:
-    """Validate the repository Codex hook schema and canonical feature flag."""
+def _codex_hook_schema_status(project_root: Path, *, write_gate: bool = False) -> tuple[bool, str]:
+    """Validate the repository Codex hook schema and canonical feature flag.
+
+    Assist (``write_gate=False``): PostToolUse + lifecycle, no PreToolUse.
+    Contain (``write_gate=True``): PreToolUse required (exit-2 deny is intentional).
+    """
     hooks_path = project_root / ".codex" / "hooks.json"
     config_path = project_root / ".codex" / "config.toml"
     try:
@@ -208,10 +212,20 @@ def _codex_hook_schema_status(project_root: Path) -> tuple[bool, str]:
     except (OSError, json.JSONDecodeError, tomllib.TOMLDecodeError) as exc:
         return False, f"Invalid Codex hook configuration: {exc}"
     hooks = data.get("hooks") if isinstance(data, dict) else None
-    required = {"PreToolUse", "PostToolUse", "SessionStart", "Stop", "SubagentStop"}
+    required = {"PostToolUse", "SessionStart", "Stop", "SubagentStop"}
+    if write_gate:
+        required.add("PreToolUse")
     if not isinstance(hooks, dict) or not required.issubset(hooks):
         missing = sorted(required - set(hooks or {}))
         return False, f"Missing Codex hook events: {', '.join(missing)}"
+    has_pre = "PreToolUse" in hooks
+    if write_gate and not has_pre:
+        return False, "Contain mode expected PreToolUse. Run dev integrate hooks --apply --tool codex --write-gate."
+    if not write_gate and has_pre:
+        return False, (
+            "Assist mode expected (no PreToolUse). "
+            "Re-run dev integrate hooks --apply --tool codex (or pass --write-gate)."
+        )
     for event, groups in hooks.items():
         if not isinstance(groups, list):
             return False, f"Codex hook event {event} must contain a list"
@@ -229,7 +243,8 @@ def _codex_hook_schema_status(project_root: Path) -> tuple[bool, str]:
         return False, "[features].hooks must be true"
     if "codex_hooks" in features:
         return False, "Deprecated [features].codex_hooks is still present"
-    return True, f"{hooks_path}; hook trust must be reviewed in Codex with /hooks"
+    posture = "contain" if write_gate else "assist"
+    return True, f"{hooks_path} ({posture}); hook trust must be reviewed in Codex with /hooks"
 
 
 def _cursor_config_status(project_root: Path) -> tuple[str, bool, list[str]]:
@@ -321,6 +336,19 @@ def _warp_config_status(project_root: Path) -> tuple[str, bool, list[str]]:
 def integration_capability_rows(project_root: Path) -> list[dict[str, object]]:
     order = resolve_coding_cli_probe_order(project_root)
     rows: list[dict[str, object]] = []
+    # Clients with opt-in PreToolUse: report installed posture, not capability ceiling.
+    write_gate_clients = {"claude", "cursor", "grok", "opencode", "codex", "gemini"}
+    raw_integrations: dict = {}
+    try:
+        from devcouncil.integrations.clients import common as _common
+
+        raw = _common._load_raw_config(project_root)
+        integrations = raw.get("integrations")
+        if isinstance(integrations, dict):
+            raw_integrations = integrations
+    except Exception:
+        raw_integrations = {}
+
     for client in order:
         info = CODING_CLI_INTEGRATION_INFO.get(client)
         if info is None:
@@ -343,6 +371,13 @@ def integration_capability_rows(project_root: Path) -> list[dict[str, object]]:
         elif client == "warp":
             config_status, fixable, paths = _warp_config_status(project_root)
 
+        enforcement = info.enforcement
+        if client in write_gate_clients and info.hooks:
+            cfg = raw_integrations.get(client)
+            write_gate = bool(cfg.get("write_gate", False)) if isinstance(cfg, dict) else False
+            # Assist (default) is advisory+verify; pre-action only when write_gate installed.
+            enforcement = "pre-action" if write_gate else "advisory+verify"
+
         rows.append({
             "name": info.name,
             "label": info.label,
@@ -351,7 +386,7 @@ def integration_capability_rows(project_root: Path) -> list[dict[str, object]]:
             "headless": info.headless,
             "mcp": info.mcp,
             "hooks": info.hooks,
-            "enforcement": info.enforcement,
+            "enforcement": enforcement,
             "launcher_shim": info.launcher_shim,
             "notes": info.notes,
             "configured": config_status == "ok",
@@ -363,11 +398,41 @@ def integration_capability_rows(project_root: Path) -> list[dict[str, object]]:
     return rows
 
 
+# Gate / tool-hook event names DevCouncil installs across clients.
+_DEVCOUNCIL_GATE_EVENTS = frozenset({
+    "PreToolUse",
+    "PostToolUse",
+    "BeforeTool",
+    "preToolUse",
+    "postToolUse",
+})
+
+# Integrity label → integrations.<client> config key (for enabled:true checks).
+_HOOK_INTEGRITY_CLIENT_KEYS: dict[str, str] = {
+    "Claude": "claude",
+    "Codex": "codex",
+    "Gemini": "gemini",
+    "Cursor": "cursor",
+    "Grok": "grok",
+}
+
+
+def _text_references_devcouncil_hooks(text: str) -> bool:
+    """True when raw config text still wires DevCouncil hook commands."""
+    lower = text.lower()
+    if "devcouncil" in lower:
+        return True
+    # Cursor flat hooks: ``…/bin/dev hook pre-tool-use --client cursor …``
+    return "hook pre-tool-use" in lower or "hook post-tool-use" in lower
+
+
 def _hook_config_references_devcouncil(path: Path) -> bool | None:
     """Return whether a client hook config still wires DevCouncil's gate.
 
     ``True``  -> the file exists and still invokes the DevCouncil pre/post-tool gate.
-    ``False`` -> the file exists but no longer references it (tampered/disarmed).
+    ``False`` -> the file exists but no longer references DevCouncil (may be clean
+    uninstall or a disarmed shell — callers must distinguish via
+    :func:`_hook_config_integrity_status`).
     ``None``  -> the file does not exist (client was never integrated here).
 
     Reads the raw text rather than parsing each client's bespoke schema so it works
@@ -383,11 +448,100 @@ def _hook_config_references_devcouncil(path: Path) -> bool | None:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return False
-    lower = text.lower()
-    if "devcouncil" in lower:
+    return _text_references_devcouncil_hooks(text)
+
+
+def _hook_entry_command(entry: dict[str, Any]) -> str:
+    return str(entry.get("command") or "").strip()
+
+
+def _hook_entry_is_devcouncil(entry: dict[str, Any]) -> bool:
+    name = str(entry.get("name") or "")
+    if name.startswith("devcouncil-"):
         return True
-    # Cursor flat hooks: ``…/bin/dev hook pre-tool-use --client cursor …``
-    return "hook pre-tool-use" in lower or "hook post-tool-use" in lower
+    return _text_references_devcouncil_hooks(_hook_entry_command(entry))
+
+
+def _gate_event_is_disarmed(groups: Any) -> bool:
+    """True when a gate event remains as an emptied / disarmed shell.
+
+    Examples: ``PreToolUse: []``, matcher groups with ``hooks: []``, named
+    ``devcouncil-*`` handlers with blank commands, or Cursor flat entries with
+    an empty ``command``.
+    """
+    if not isinstance(groups, list):
+        return False
+    if not groups:
+        return True
+    saw_live = False
+    saw_disarmed = False
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        # Cursor flat: command lives on the event entry itself.
+        if "command" in group and "hooks" not in group:
+            cmd = _hook_entry_command(group)
+            if not cmd:
+                saw_disarmed = True
+            elif _hook_entry_is_devcouncil(group) or _text_references_devcouncil_hooks(cmd):
+                saw_live = True
+            continue
+        handlers = group.get("hooks")
+        if not isinstance(handlers, list):
+            continue
+        if not handlers:
+            saw_disarmed = True
+            continue
+        for hook in handlers:
+            if not isinstance(hook, dict):
+                continue
+            if not _hook_entry_is_devcouncil(hook):
+                continue
+            if _hook_entry_command(hook):
+                saw_live = True
+            else:
+                saw_disarmed = True
+    return saw_disarmed and not saw_live
+
+
+def _hook_config_has_disarmed_gate_events(path: Path) -> bool:
+    """True when DevCouncil gate event keys remain but were emptied/disarmed."""
+    data = _load_json_file(path)
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    if not isinstance(hooks, dict):
+        return False
+    for event, groups in hooks.items():
+        if event not in _DEVCOUNCIL_GATE_EVENTS:
+            continue
+        if _gate_event_is_disarmed(groups):
+            return True
+    return False
+
+
+def _hook_config_integrity_status(path: Path, *, client_enabled: bool) -> str | None:
+    """Classify hook-file integrity for ``dev integrate check``.
+
+    Returns:
+      ``"ok"`` — file still references live DevCouncil hooks.
+      ``"tampered"`` — gate events emptied/disarmed, or ``enabled: true`` with
+      hooks stripped while the settings file remains.
+      ``None`` — skip (missing file, or clean uninstall that preserved user
+      settings / an empty orphaned hooks file).
+    """
+    references = _hook_config_references_devcouncil(path)
+    if references is None:
+        return None
+    if references:
+        # Named hooks with blank commands still contain "devcouncil" in text;
+        # treat emptied DevCouncil handlers as tamper even when the marker remains.
+        if _hook_config_has_disarmed_gate_events(path):
+            return "tampered"
+        return "ok"
+    if _hook_config_has_disarmed_gate_events(path):
+        return "tampered"
+    if client_enabled:
+        return "tampered"
+    return None
 
 
 def _hook_config_tamper_targets(project_root: Path) -> list[tuple[str, Path]]:
@@ -398,6 +552,11 @@ def _hook_config_tamper_targets(project_root: Path) -> list[tuple[str, Path]]:
         ("Cursor", project_root / ".cursor" / "hooks.json"),
         ("Grok", project_root / ".grok" / "hooks" / "devcouncil.json"),
     ]
+
+
+def _client_integration_enabled(integrations_cfg: dict[str, Any], client: str) -> bool:
+    cfg = integrations_cfg.get(client)
+    return bool(cfg.get("enabled")) if isinstance(cfg, dict) else False
 
 
 def build_integration_check_report(project_root: Path, *, strict: bool = False) -> IntegrationCheckReport:
@@ -462,14 +621,51 @@ def build_integration_check_report(project_root: Path, *, strict: bool = False) 
             add_skip(f"{row['label']} config", f"Run dev integrate {name} --apply to repair.")
 
     raw_config = integrate._load_raw_config(root) if (root / ".devcouncil").exists() else {}
+    integrations_cfg = raw_config.get("integrations", {}) if isinstance(raw_config.get("integrations"), dict) else {}
+
+    claude_hooks_path = root / ".claude" / "settings.local.json"
+    claude_cfg = integrations_cfg.get("claude", {}) if isinstance(integrations_cfg.get("claude"), dict) else {}
+    claude_enabled = bool(claude_cfg.get("enabled"))
+    claude_write_gate = bool(claude_cfg.get("write_gate", False))
+    # Skip when disabled and no DevCouncil hooks remain (clean uninstall that
+    # preserved user settings). Event-key presence alone is not enough — foreign
+    # PreToolUse/PostToolUse must not force a re-apply failure.
+    claude_has_dc_hooks = _hook_config_references_devcouncil(claude_hooks_path) is True
+    if claude_enabled or claude_has_dc_hooks:
+        hooks_ok = False
+        details = "Run dev integrate claude --apply."
+        if claude_hooks_path.exists():
+            try:
+                hooks_data = read_json(claude_hooks_path) or {}
+                hook_events = hooks_data.get("hooks", {}) if isinstance(hooks_data, dict) else {}
+                has_post = "PostToolUse" in hook_events
+                has_pre = "PreToolUse" in hook_events
+                if claude_write_gate:
+                    hooks_ok = has_pre and has_post
+                    details = str(claude_hooks_path) if hooks_ok else (
+                        "Run dev integrate claude --apply --write-gate."
+                    )
+                else:
+                    hooks_ok = has_post and not has_pre
+                    if has_post and has_pre:
+                        details = (
+                            "Assist mode expected (no PreToolUse). "
+                            "Re-run dev integrate claude --apply (or pass --write-gate)."
+                        )
+                    elif hooks_ok:
+                        details = f"{claude_hooks_path} (assist)"
+                    else:
+                        details = "Run dev integrate claude --apply."
+            except json.JSONDecodeError:
+                hooks_ok = False
+        add(hooks_ok, "Claude hooks", details)
 
     cursor_hooks = root / ".cursor" / "hooks.json"
-    cursor_cfg = raw_config.get("integrations", {}).get("cursor", {}) if isinstance(raw_config.get("integrations"), dict) else {}
-    if not isinstance(cursor_cfg, dict):
-        cursor_cfg = {}
+    cursor_cfg = integrations_cfg.get("cursor", {}) if isinstance(integrations_cfg.get("cursor"), dict) else {}
     cursor_enabled = bool(cursor_cfg.get("enabled"))
     cursor_write_gate = bool(cursor_cfg.get("write_gate", False))
-    if cursor_enabled or cursor_hooks.exists():
+    cursor_has_dc_hooks = _hook_config_references_devcouncil(cursor_hooks) is True
+    if cursor_enabled or cursor_has_dc_hooks:
         hooks_ok = False
         details = "Run dev integrate hooks --apply --tool cursor."
         if cursor_hooks.exists():
@@ -507,12 +703,11 @@ def build_integration_check_report(project_root: Path, *, strict: bool = False) 
         add_optional(auth_ok, "Cursor auth", auth_details)
 
     grok_hooks = root / ".grok" / "hooks" / "devcouncil.json"
-    grok_cfg = raw_config.get("integrations", {}).get("grok", {}) if isinstance(raw_config.get("integrations"), dict) else {}
-    if not isinstance(grok_cfg, dict):
-        grok_cfg = {}
+    grok_cfg = integrations_cfg.get("grok", {}) if isinstance(integrations_cfg.get("grok"), dict) else {}
     grok_enabled = bool(grok_cfg.get("enabled"))
     grok_write_gate = bool(grok_cfg.get("write_gate", False))
-    if grok_enabled or grok_hooks.exists():
+    grok_has_dc_hooks = _hook_config_references_devcouncil(grok_hooks) is True
+    if grok_enabled or grok_has_dc_hooks:
         hooks_ok = False
         details = "Run dev integrate hooks --apply --tool grok (then /hooks-trust in Grok)."
         if grok_hooks.exists():
@@ -542,32 +737,72 @@ def build_integration_check_report(project_root: Path, *, strict: bool = False) 
         add(hooks_ok, "Grok hooks", details)
 
     opencode_config = integrate._opencode_config_path(root)
-    opencode_enabled = bool(raw_config.get("integrations", {}).get("opencode", {}).get("enabled"))
+    opencode_cfg = integrations_cfg.get("opencode", {}) if isinstance(integrations_cfg.get("opencode"), dict) else {}
+    opencode_enabled = bool(opencode_cfg.get("enabled"))
+    opencode_write_gate = bool(opencode_cfg.get("write_gate", False))
     opencode_plugin = integrate._opencode_plugin_path(root)
+    # Disabled + plugin removed = clean uninstall; do not demand re-apply.
     if opencode_enabled or opencode_plugin.exists():
         plugin_ok = opencode_plugin.exists()
         plugin_registered = False
+        posture_ok = False
+        details = "Run dev integrate hooks --apply --tool opencode."
         if plugin_ok and opencode_config.exists():
             try:
+                from devcouncil.integrations.clients.opencode import _opencode_plugin_registered
+
                 opencode_data = read_json(opencode_config) or {}
                 plugin_registered = (
-                    f"./.devcouncil/integrations/{integrate.OPENCODE_HOOK_PLUGIN_NAME}"
-                    in (opencode_data.get("plugin") or [])
+                    _opencode_plugin_registered(opencode_data)
+                    if isinstance(opencode_data, dict)
+                    else False
                 )
             except json.JSONDecodeError:
                 plugin_registered = False
+        if plugin_ok:
+            try:
+                plugin_body = opencode_plugin.read_text(encoding="utf-8")
+            except OSError:
+                plugin_body = ""
+            has_before = '"tool.execute.before"' in plugin_body
+            has_after = '"tool.execute.after"' in plugin_body
+            if opencode_write_gate:
+                posture_ok = has_before and has_after
+                if not posture_ok:
+                    details = "Run dev integrate hooks --apply --tool opencode --write-gate."
+            else:
+                posture_ok = has_after and not has_before
+                if has_after and has_before:
+                    details = (
+                        "Assist mode expected (no tool.execute.before). "
+                        "Re-run dev integrate hooks --apply --tool opencode."
+                    )
+                elif posture_ok:
+                    details = f"{opencode_plugin} (assist)"
         add(
-            plugin_ok and plugin_registered,
+            plugin_ok and plugin_registered and posture_ok,
             "OpenCode hook plugin",
-            str(opencode_plugin) if plugin_ok and plugin_registered else "Run dev integrate hooks --apply --tool opencode.",
+            details if not (plugin_ok and plugin_registered and posture_ok) else (
+                f"{opencode_plugin} (assist)" if not opencode_write_gate else str(opencode_plugin)
+            ),
         )
 
     bundled_plugin = integrate._opencode_plugin_source()
-    add(
-        bundled_plugin.exists(),
-        "Bundled OpenCode hook plugin",
-        str(bundled_plugin) if bundled_plugin.exists() else "Reinstall DevCouncil; package asset is missing.",
-    )
+    bundled_ok = bundled_plugin.exists()
+    bundled_details = str(bundled_plugin) if bundled_ok else "Reinstall DevCouncil; package asset is missing."
+    if bundled_ok:
+        try:
+            bundled_body = bundled_plugin.read_text(encoding="utf-8")
+        except OSError:
+            bundled_body = ""
+        # Packaged source is the assist template; pre-tool handler must not ship by default.
+        if '"tool.execute.before"' in bundled_body:
+            bundled_ok = False
+            bundled_details = (
+                f"{bundled_plugin} must not register tool.execute.before "
+                "(assist default; generator adds it only with write_gate)."
+            )
+    add(bundled_ok, "Bundled OpenCode hook plugin", bundled_details)
 
     custom_agents = raw_config.get("integrations", {}).get("cli_agents", {}).get("agents", {})
     if custom_agents:
@@ -585,22 +820,33 @@ def build_integration_check_report(project_root: Path, *, strict: bool = False) 
     except Exception as exc:
         add(False, "MCP server", str(exc))
 
-    # Tamper tripwire: any installed client hook config must still reference the
-    # DevCouncil gate. A present-but-unreferenced file means the pre-action gate was
-    # disarmed (by an agent or by hand) and is reported as a failure.
+    # Tamper tripwire: emptied/disarmed DevCouncil gate events, or enabled:true
+    # with hooks stripped mid-file. Clean uninstall that preserves user settings
+    # (file exists, no DevCouncil hooks remain) is not a failure.
     for label, hook_path in _hook_config_tamper_targets(root):
-        references = _hook_config_references_devcouncil(hook_path)
-        if references is None:
+        client_key = _HOOK_INTEGRITY_CLIENT_KEYS.get(label, label.lower())
+        client_enabled = _client_integration_enabled(integrations_cfg, client_key)
+        status = _hook_config_integrity_status(hook_path, client_enabled=client_enabled)
+        if status is None:
             continue
-        add(
-            references,
-            f"{label} hook integrity",
-            str(hook_path) if references else f"{hook_path} no longer references devcouncil (tampered/disarmed).",
-        )
+        if status == "ok":
+            add(True, f"{label} hook integrity", str(hook_path))
+            continue
+        if client_enabled and not _hook_config_has_disarmed_gate_events(hook_path):
+            details = (
+                f"{hook_path} no longer references DevCouncil while "
+                f"integrations.{client_key}.enabled is true (hooks stripped)."
+            )
+        else:
+            details = f"{hook_path} no longer references DevCouncil (tampered/disarmed)."
+        add(False, f"{label} hook integrity", details)
 
     codex_hooks_path = root / ".codex" / "hooks.json"
-    if codex_hooks_path.exists():
-        codex_schema_ok, codex_schema_details = _codex_hook_schema_status(root)
+    # Skip schema check after clean uninstall that left an empty/foreign hooks file.
+    if codex_hooks_path.exists() and _hook_config_references_devcouncil(codex_hooks_path) is True:
+        codex_cfg = integrations_cfg.get("codex", {}) if isinstance(integrations_cfg.get("codex"), dict) else {}
+        codex_write_gate = bool(codex_cfg.get("write_gate", False))
+        codex_schema_ok, codex_schema_details = _codex_hook_schema_status(root, write_gate=codex_write_gate)
         add(codex_schema_ok, "Codex hook schema", codex_schema_details)
         add_skip("Codex hook trust", "Open Codex in this project and run /hooks after any hook change.")
 

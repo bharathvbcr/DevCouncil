@@ -30,17 +30,17 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from devcouncil.indexing.subsystem_map import dependents_of
+from devcouncil.codeintel.languages import code_extensions
 
 # Extensions we treat as "code" for the purpose of deciding whether any code gate is
 # relevant at all. Docs/config-only diffs skip the code gates.
-_CODE_EXTS = frozenset({
-    ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
-    ".go", ".rs", ".java", ".kt", ".rb", ".cs", ".cpp", ".cc", ".c", ".h", ".hpp",
-    ".swift", ".scala", ".php",
-})
+# Derived from LANGUAGE_SPECS so Swift/Kotlin/… stay in sync with the registry.
+_CODE_EXTS = code_extensions() | frozenset({".pyi", ".h", ".hpp", ".hh", ".hxx"})
 
 _PYTHON_EXTS = frozenset({".py", ".pyi"})
 _JS_TS_EXTS = frozenset({".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"})
+# Stack-specific tool narrowing stays python/js only — no fake swift/kotlin
+# command rewriting without wired tools beyond map test_commands.
 
 # Project config paths that affect tool behaviour. A config-only diff still selects the
 # gates for the matching stack so ``dev check --watch`` re-runs lint/typecheck after

@@ -61,6 +61,7 @@ DEFAULT_CONFIG = {
         "typecheck": [],
     },
     "gates": {
+        "mode": "enforce",
         "require_clean_git_before_task": True,
         "block_orphan_diffs": True,
         "block_missing_tests_for_high_requirements": True,

@@ -75,7 +75,7 @@ class ClaudeSdkExecutor(Executor):
         Pure and side-effect free (bar reading repo policy) so it is unit-testable on its
         own: the same call the SDK would make, evaluated against this run's task."""
         call_data = {"tool_name": tool_name, "tool_input": tool_input or {}}
-        return self.policy.evaluate(call_data, self.active_task)
+        return self.policy.evaluate(call_data, self.active_task, enforce_task_scope=True)
 
     # -- SDK loading ----------------------------------------------------------------
 

@@ -47,3 +47,21 @@ def _gemini_command(project_root: Path, scope: str) -> list[str]:
         "devcouncil",
         *_server_args(project_root),
     ]
+
+
+def _uninstall_gemini(project_root: Path) -> list[str]:
+    """Best-effort Gemini MCP remove + strip DevCouncil hooks; clear write_gate."""
+    import shutil
+
+    from devcouncil.integrations.clients import hooks as _hooks
+
+    removed: list[str] = []
+    root = project_root.expanduser().resolve()
+    if shutil.which("gemini"):
+        # Scope-agnostic best-effort; older CLIs may ignore unknown flags.
+        code = _run(["gemini", "mcp", "remove", "devcouncil"])
+        if code == 0:
+            removed.append("gemini mcp server registration")
+    removed.extend(_hooks._uninstall_gemini_hooks(root))
+    removed.extend(_common._clear_client_integration_config(root, "gemini"))
+    return removed

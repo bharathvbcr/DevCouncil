@@ -576,6 +576,15 @@ def _render_final_report(root: Path, json_report: bool) -> str:
     with db.get_session() as session:
         graph = ArtifactGraphRepository(session).load_graph()
     live_review = live_review_summary(root)
+    from devcouncil.app.config import load_config
+    from devcouncil.gating.policy import (
+        effective_artifact_graph,
+        effective_live_review,
+    )
+
+    gate_mode = load_config(root).gates.mode
+    graph = effective_artifact_graph(graph, mode=gate_mode)
+    live_review = effective_live_review(live_review, mode=gate_mode)
     if json_report:
         return ReportBuilder.build_json(graph, live_review=live_review)
     return ReportBuilder.build_markdown(graph, live_review=live_review)

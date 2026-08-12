@@ -408,6 +408,104 @@ def test_map_artifacts_does_not_lean_on_graph_build_busy(tmp_path: Path, monkeyp
     ).get("graph_degraded")
 
 
+def test_map_artifacts_recovers_from_graph_build_timeout_with_prior(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A timeout with a loadable prior generation refreshes the map from it.
+
+    It must not lean-stamp ``graph_degraded`` (that forces perpetual --if-stale
+    rebuilds while SQLite is fine), must not crash the caller with a traceback,
+    and must not re-stamp current-tree fingerprints — the graph is intact but
+    older than HEAD, so staleness detection has to keep saying stale.
+    """
+    from devcouncil.codeintel.build_control import GraphBuildTimeout
+    from devcouncil.indexing import map_artifacts
+
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+    _persist_file(tmp_path, "app.py")
+    assert get_codeintel_service(tmp_path).load() is not None
+
+    def boom(*_a, **_k):
+        raise GraphBuildTimeout("graph build made no progress for 90.0s")
+
+    monkeypatch.setattr(
+        "devcouncil.codeintel.build_control.run_isolated_full_build",
+        boom,
+    )
+    result = map_artifacts.refresh_map_artifacts(
+        tmp_path,
+        tmp_path / ".devcouncil" / "repo_map.json",
+        quiet=True,
+        full=True,
+    )
+    assert result.build_incomplete is True
+    assert result.degraded is False
+    assert result.mode == "prior_generation"
+    assert "GraphBuildTimeout" in result.reason
+
+    map_path = tmp_path / ".devcouncil" / "repo_map.json"
+    written = json.loads(map_path.read_text(encoding="utf-8"))
+    assert not written.get("graph_degraded")
+    # Fingerprints came from the prior graph, not a fresh scan of the tree.
+    prior = get_codeintel_service(tmp_path).load()
+    assert prior is not None
+    assert written.get("content_fingerprint") == prior.content_fingerprint
+
+
+def test_map_artifacts_leans_on_graph_build_timeout_without_prior(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """With no usable prior generation a timeout still writes a lean, degraded map."""
+    from devcouncil.codeintel.build_control import GraphBuildTimeout
+    from devcouncil.indexing import map_artifacts
+
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+
+    def boom(*_a, **_k):
+        raise GraphBuildTimeout("graph build made no progress for 90.0s")
+
+    monkeypatch.setattr(
+        "devcouncil.codeintel.build_control.run_isolated_full_build",
+        boom,
+    )
+    result = map_artifacts.refresh_map_artifacts(
+        tmp_path,
+        tmp_path / ".devcouncil" / "repo_map.json",
+        quiet=True,
+    )
+    assert result.degraded is True
+    assert result.mode == "lean"
+    assert result.build_incomplete is False
+
+
+def test_map_artifacts_reuses_generation_when_nothing_changed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``dev map`` with no drift must not force an isolated full rebuild."""
+    from devcouncil.indexing import map_artifacts
+
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+    _persist_file(tmp_path, "app.py")
+
+    def boom(*_a, **_k):
+        raise AssertionError("full rebuild must not run for an empty change set")
+
+    monkeypatch.setattr(
+        "devcouncil.codeintel.build_control.run_isolated_full_build",
+        boom,
+    )
+    result = map_artifacts.refresh_map_artifacts(
+        tmp_path,
+        tmp_path / ".devcouncil" / "repo_map.json",
+        quiet=True,
+    )
+    assert result.mode == "reused"
+    assert result.degraded is False
+
+
 def test_incremental_sync_re_resolves_reverse_import_closure_without_full_rebuild(
     tmp_path: Path,
 ) -> None:
@@ -1072,3 +1170,88 @@ def test_full_refresh_then_single_edit_parity_with_vendor_present(tmp_path: Path
     assert not any("vendor" in (n.path or "") for n in incremental.nodes)
     coordinator = SyncCoordinator(service, sync_callback=lambda _paths: None)
     assert "assets/vendor/force-graph.min.js" not in coordinator.reconcile()
+
+
+def test_change_set_probe_ignores_non_code_files(tmp_path: Path) -> None:
+    """Docs/config must not register as permanent additions.
+
+    ``generation_files`` only holds files the graph gives nodes to, so comparing
+    the whole inventory reported every .md/.yml as "added" on every run and the
+    change set never converged — `dev map` would sync the same paths forever.
+    """
+    from devcouncil.indexing.map_artifacts import _auto_change_set
+
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("# docs\n", encoding="utf-8")
+    (tmp_path / "config.yml").write_text("key: value\n", encoding="utf-8")
+    _persist_file(tmp_path, "app.py")
+
+    assert _auto_change_set(tmp_path, get_codeintel_service(tmp_path)) == []
+
+    (tmp_path / "app.py").write_text("def main():\n    return 2\n", encoding="utf-8")
+    assert _auto_change_set(tmp_path, get_codeintel_service(tmp_path)) == ["app.py"]
+
+
+def test_change_set_probe_falls_back_to_full_when_large(tmp_path: Path, monkeypatch) -> None:
+    """A big change set is cheaper as one full rebuild than as incremental sync."""
+    from devcouncil.indexing import map_artifacts
+
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+    _persist_file(tmp_path, "app.py")
+    for index in range(50):
+        (tmp_path / f"new_{index}.py").write_text(f"X = {index}\n", encoding="utf-8")
+
+    monkeypatch.setattr(map_artifacts, "_INCREMENTAL_MAX_CHANGED_FILES", 5)
+    assert map_artifacts._auto_change_set(tmp_path, get_codeintel_service(tmp_path)) is None
+
+
+def test_change_set_probe_returns_none_without_a_generation(tmp_path: Path) -> None:
+    from devcouncil.indexing.map_artifacts import _auto_change_set
+
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+
+    assert _auto_change_set(tmp_path, get_codeintel_service(tmp_path)) is None
+
+
+def test_untracked_indexing_preserves_call_edges_into_tracked_symbols(tmp_path: Path) -> None:
+    """Tracked-only indexing produces false dead-code signals, not a smaller index.
+
+    A file an agent just wrote and has not staged still calls tracked symbols.
+    Dropping it from the inventory strips those call edges, so the tracked
+    callee looks unwired. This is why ``include_untracked`` defaults to on.
+    """
+    from devcouncil.indexing.graph.build import build_code_graph
+    from devcouncil.indexing.repo_mapper import RepoMapper
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "base.py").write_text(
+        "def helper():\n    return 1\n", encoding="utf-8"
+    )
+    (tmp_path / "src" / "brand_new.py").write_text(
+        "from src.base import helper\n\n\ndef fresh():\n    return helper() + 1\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", "src/base.py"], cwd=tmp_path, check=True)
+    # src/brand_new.py is deliberately left untracked.
+
+    def _graph_with(include_untracked: bool):
+        mapper = RepoMapper(tmp_path)
+        mapper._inventory_limits = lambda: (include_untracked, 50_000)  # type: ignore[method-assign]
+        return build_code_graph(tmp_path, mapper.get_git_files(), liveness=False, mapper=mapper)
+
+    with_untracked = _graph_with(True)
+    tracked_only = _graph_with(False)
+
+    def _calls_into_helper(graph) -> bool:  # noqa: ANN001
+        return any(edge.target.endswith("::helper") for edge in graph.edges if edge.kind == "calls")
+
+    assert "src/brand_new.py" in {node.path for node in with_untracked.nodes}
+    assert _calls_into_helper(with_untracked)
+
+    # Tracked-only: the new file is gone and so is the evidence that helper is live.
+    assert "src/brand_new.py" not in {node.path for node in tracked_only.nodes}
+    assert not _calls_into_helper(tracked_only)

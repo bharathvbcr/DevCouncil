@@ -116,8 +116,13 @@ class SemanticIndex:
             files = list(iter_project_files(self.project_root))
         source_entries: list[dict] = []
         imports: list[dict] = []
+        from devcouncil.codeintel.languages import code_extensions
+
+        # Hash/import collection follows code_extensions so registry langs are
+        # fingerprinted; import statement extraction below remains language-specific.
+        source_exts = code_extensions()
         for path in files:
-            if not path.is_file() or path.suffix not in {".py", ".ts", ".tsx", ".js", ".go", ".rs"}:
+            if not path.is_file() or path.suffix.lower() not in source_exts:
                 continue
             rel = path.relative_to(self.project_root).as_posix()
             if self._is_ignored_path(rel):
@@ -142,7 +147,7 @@ class SemanticIndex:
                     if isinstance(node, (ast.Import, ast.ImportFrom)):
                         segment = ast.get_source_segment(source, node) or ""
                         imports.append({"path": rel, "statement": segment})
-            else:
+            elif path.suffix.lower() in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".rs"}:
                 for line in source.splitlines():
                     if re.match(r"^\s*(import|from)\s+", line):
                         imports.append({"path": rel, "statement": line.strip()})

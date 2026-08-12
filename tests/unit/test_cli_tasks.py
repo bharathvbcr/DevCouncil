@@ -47,6 +47,31 @@ def test_cli_tasks_list(tmp_path, monkeypatch):
     assert data["tasks"][0]["lease"] is None
 
 
+def test_cli_tasks_off_mode_shows_quality_blocked_task_as_effectively_done(
+    tmp_path,
+    monkeypatch,
+):
+    _setup_tasks_db(tmp_path, monkeypatch)
+    assert runner.invoke(
+        app,
+        ["config", "set", "gates.mode", "off"],
+    ).exit_code == 0
+    db = Database(tmp_path / ".devcouncil" / "state.sqlite")
+    with db.get_session() as session:
+        task = TaskRepository(session).get_by_id("TASK-1")
+        assert task is not None
+        task.status = "blocked"
+        TaskRepository(session).save(task)
+
+    result = runner.invoke(app, ["tasks", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["gates_mode"] == "off"
+    assert payload["tasks"][0]["status"] == "done"
+    assert payload["tasks"][0]["persisted_status"] == "blocked"
+
+
 def test_cli_tasks_list_includes_active_lease(tmp_path, monkeypatch):
     tmp_path, task_id = _setup_tasks_db(tmp_path, monkeypatch)
     from devcouncil.storage.db import Database

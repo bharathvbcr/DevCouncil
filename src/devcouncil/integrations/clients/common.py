@@ -46,6 +46,22 @@ def seed_stop_gate_assist_if_unset(config: dict) -> None:
     stop_gate.setdefault("check_claims", True)
     stop_gate.setdefault("verify_active_task", True)
 
+
+def seed_hook_gate_for_write_gate(config: dict, *, write_gate: bool) -> None:
+    """Align ``execution.hook_gate.mode`` with assist vs containment install.
+
+    Assist (``write_gate=False``) forces ``off`` so interactive Shell/Write is not
+    fail-closed even if PreToolUse was left installed. Containment (``write_gate=True``)
+    forces ``contain`` so PreToolUse actually requires a leased task.
+    """
+    execution = config.setdefault("execution", {})
+    hook_gate = execution.setdefault("hook_gate", {})
+    if not isinstance(hook_gate, dict):
+        hook_gate = {}
+        execution["hook_gate"] = hook_gate
+    # Quote-safe string; yaml.safe_dump will emit a quoted "off" when needed.
+    hook_gate["mode"] = "contain" if write_gate else "off"
+
 # Recorded when hooks are installed so `dev integrate hooks --check` can detect drift
 # between a stale global CLI and the project venv.
 HOOK_DEV_EXECUTABLE_REL = Path(".devcouncil") / "cache" / "hook_dev_executable"
@@ -330,3 +346,129 @@ def _configure(tool: str, command: list[str], apply: bool) -> bool:
     console.print("You can rerun it manually:")
     console.print(_format_command(command), soft_wrap=True)
     return False
+
+
+# Clients that record integrations.<name>.enabled on apply.
+CLIENTS_WITH_ENABLED = frozenset({
+    "claude", "cursor", "grok", "opencode", "antigravity", "warp", "aider",
+})
+# Clients that may record integrations.<name>.write_gate.
+CLIENTS_WITH_WRITE_GATE = frozenset({
+    "claude", "cursor", "grok", "opencode", "codex", "gemini",
+})
+
+
+def _clear_client_integration_config(project_root: Path, client: str) -> list[str]:
+    """Clear enablement / write_gate for a client after uninstall. Idempotent."""
+    changed: list[str] = []
+
+    def mutate(config: dict) -> None:
+        integrations = config.get("integrations")
+        if not isinstance(integrations, dict):
+            return
+        entry = integrations.get(client)
+        if not isinstance(entry, dict):
+            return
+        if client in CLIENTS_WITH_ENABLED or "enabled" in entry:
+            if entry.get("enabled") is not False:
+                entry["enabled"] = False
+                changed.append(f"integrations.{client}.enabled=false")
+        if client in CLIENTS_WITH_WRITE_GATE or "write_gate" in entry:
+            if entry.get("write_gate") is not False:
+                entry["write_gate"] = False
+                changed.append(f"integrations.{client}.write_gate=false")
+
+    _mutate_raw_config(project_root, mutate)
+    return changed
+
+
+def _apply_decouple_config_flags(project_root: Path, client: str | None = None) -> list[str]:
+    """Force assist posture after containment strip: write_gate off, hook_gate off, stop_gate block→assist."""
+    changed: list[str] = []
+
+    def mutate(config: dict) -> None:
+        if client:
+            entry = config.setdefault("integrations", {}).setdefault(client, {})
+            if isinstance(entry, dict) and entry.get("write_gate") is not False:
+                entry["write_gate"] = False
+                changed.append(f"integrations.{client}.write_gate=false")
+        execution = config.setdefault("execution", {})
+        hook_gate = execution.setdefault("hook_gate", {})
+        if not isinstance(hook_gate, dict):
+            hook_gate = {}
+            execution["hook_gate"] = hook_gate
+        if hook_gate.get("mode") != "off":
+            hook_gate["mode"] = "off"
+            changed.append("execution.hook_gate.mode=off")
+        stop_gate = execution.setdefault("stop_gate", {})
+        if not isinstance(stop_gate, dict):
+            stop_gate = {}
+            execution["stop_gate"] = stop_gate
+        mode = str(stop_gate.get("mode") or "").strip().lower()
+        if mode == "block":
+            stop_gate["mode"] = "assist"
+            changed.append("execution.stop_gate.mode=assist")
+
+    _mutate_raw_config(project_root, mutate)
+    return changed
+
+
+def _remove_unmodified_library_skills(
+    project_root: Path,
+    destinations: tuple[str, ...] | list[str] | None = None,
+) -> list[str]:
+    """Delete scaffolded library skill dirs whose SKILL.md still matches packaged content."""
+    from devcouncil.skills.registry import (
+        DEFAULT_SKILL_DESTINATIONS,
+        LIBRARY_DIR,
+        load_skills,
+    )
+
+    dest_rels = tuple(destinations) if destinations is not None else DEFAULT_SKILL_DESTINATIONS
+    # Packaged library only — never use repo-local overrides as the ownership baseline.
+    library = {
+        skill.name: skill
+        for skill in load_skills(LIBRARY_DIR, project_root=None, include_okf=False)
+    }
+    removed: list[str] = []
+    root = project_root.expanduser().resolve()
+    for rel in dest_rels:
+        skills_root = root / rel
+        if not skills_root.is_dir():
+            continue
+        for child in sorted(skills_root.iterdir()):
+            if not child.is_dir() or child.name not in library:
+                continue
+            skill_md = child / "SKILL.md"
+            if not skill_md.is_file():
+                continue
+            try:
+                on_disk = skill_md.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if on_disk != library[child.name].to_skill_md():
+                continue
+            shutil.rmtree(child)
+            try:
+                removed.append(str(child.relative_to(root)))
+            except ValueError:
+                removed.append(str(child))
+    return removed
+
+
+def _remove_toml_table(text: str, header: str) -> str:
+    """Remove a TOML table section (header + body until the next table)."""
+    target = header.strip()
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    skipping = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            skipping = stripped == target
+            if skipping:
+                continue
+        if skipping:
+            continue
+        out.append(line)
+    return "".join(out)

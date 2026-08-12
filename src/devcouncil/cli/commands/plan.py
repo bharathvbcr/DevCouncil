@@ -448,7 +448,7 @@ async def _run_plan_body(
 
     # 8. Check Gates
     log_step("plan/8: checking plan-approval gates", project_root=root, run_id=run_id, trace=True)
-    policy = GatePolicy()
+    policy = GatePolicy(root)
     result = policy.check_plan_approval(
         decision.final_requirements,
         final_tasks,
@@ -556,7 +556,7 @@ def approve(
         final_tasks, _ = apply_plan_difficulty(final_tasks, decision.final_requirements)
         assumptions = spec_output.assumptions if spec_output else []
 
-        policy = GatePolicy()
+        policy = GatePolicy(root)
         log_step("approve/2: checking plan-approval gates", project_root=root)
         result = policy.check_plan_approval(
             decision.final_requirements,

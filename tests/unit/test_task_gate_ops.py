@@ -207,6 +207,33 @@ def test_verify_blocked_status_with_gap(tmp_path, monkeypatch):
     assert payload["verification_mode"] == "unknown"
 
 
+def test_verify_off_mode_needs_no_lease_and_records_done(tmp_path, monkeypatch):
+    _setup(tmp_path, lease=False)
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "project:\n  name: t\ngates:\n  mode: off\n",
+        encoding="utf-8",
+    )
+
+    class _OffOutcome(_FakeOutcome):
+        mode = "off"
+        gate_mode = "off"
+        verification_skipped = True
+
+    _install_fake_verifier(monkeypatch, gaps=[], evidence=[], outcome=_OffOutcome())
+
+    payload = ops.verify_task_payload(
+        tmp_path,
+        task_id="TASK-1",
+        lease_token="",
+        sandbox="docker",
+    )
+
+    assert payload["ok"] is True
+    assert payload["status"] == "done"
+    assert payload["verification_skipped"] is True
+    assert payload["gate_mode"] == "off"
+
+
 # --------------------------------------------------------------------------- #
 # update_task_scope_payload                                                    #
 # --------------------------------------------------------------------------- #
@@ -367,8 +394,21 @@ def test_policy_check_without_task_uses_running_task(tmp_path):
     assert payload["allowed"] is True
 
 
-def test_policy_check_no_running_task_denies(tmp_path):
+def test_policy_check_no_running_task_allows_under_hook_gate_off(tmp_path):
+    # Interactive default (hook_gate=off): preflight allows no-task writes after hard safety.
     _setup(tmp_path, lease=False)  # planned task is status=planned, not running
+    payload = ops.policy_check_write_payload(tmp_path, path="src/a.py")
+    assert payload["task_id"] is None
+    assert payload["allowed"] is True
+
+
+def test_policy_check_no_running_task_denies_under_contain(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVCOUNCIL_HOOK_GATE", "contain")
+    _setup(tmp_path, lease=False)
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "project:\n  name: t\nexecution:\n  hook_gate:\n    mode: contain\n",
+        encoding="utf-8",
+    )
     payload = ops.policy_check_write_payload(tmp_path, path="src/a.py")
     assert payload["task_id"] is None
     assert payload["allowed"] is False
@@ -533,6 +573,42 @@ def test_run_command_task_not_found(tmp_path, monkeypatch):
     monkeypatch.setattr(ops.TaskRepository, "get_by_id", lambda self, tid: None)
     payload = ops.run_command_payload(tmp_path, task_id="TASK-1", lease_token=token, command="echo hi")
     assert payload["code"] == "not_found"
+
+
+def test_run_command_off_mode_needs_no_task(tmp_path):
+    import sys
+
+    _setup(tmp_path, lease=False)
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "project:\n  name: t\ngates:\n  mode: off\n",
+        encoding="utf-8",
+    )
+    command = f'{sys.executable} -c "print(42)"'
+
+    payload = ops.run_command_payload(
+        tmp_path,
+        task_id=None,
+        lease_token="",
+        command=command,
+    )
+
+    assert payload["ok"] is True
+    assert payload["task_id"] is None
+    assert "42" in payload["stdout"]
+
+
+def test_run_command_enforce_mode_requires_task(tmp_path):
+    _setup(tmp_path, lease=False)
+
+    payload = ops.run_command_payload(
+        tmp_path,
+        task_id=None,
+        lease_token="",
+        command="echo hi",
+    )
+
+    assert payload["ok"] is False
+    assert payload["code"] == "task_required"
 
 
 # --------------------------------------------------------------------------- #

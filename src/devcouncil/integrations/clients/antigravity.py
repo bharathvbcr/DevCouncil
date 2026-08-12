@@ -85,3 +85,24 @@ def _configure_antigravity(project_root: Path, apply: bool) -> bool:
     _record_antigravity_config(project_root)
     console.print(f"[green]Antigravity MCP config written:[/green] {written}")
     return True
+
+
+def _uninstall_antigravity(project_root: Path) -> list[str]:
+    """Remove mcpServers.devcouncil from Antigravity MCP config."""
+    removed: list[str] = []
+    root = project_root.expanduser().resolve()
+    path = _antigravity_mcp_path(root)
+    if path.exists():
+        data = _load_json(path)
+        servers = data.get("mcpServers")
+        if isinstance(servers, dict) and "devcouncil" in servers:
+            servers.pop("devcouncil")
+            if not servers:
+                data.pop("mcpServers", None)
+            if data:
+                _save_json(path, data)
+            else:
+                path.unlink()
+            removed.append(f"mcpServers.devcouncil in {path.relative_to(root)}")
+    removed.extend(_common._clear_client_integration_config(root, "antigravity"))
+    return removed

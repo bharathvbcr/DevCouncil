@@ -146,6 +146,23 @@ def test_run_cmd_json_ok(tmp_path, monkeypatch):
     assert res.exit_code == 0
 
 
+def test_run_cmd_accepts_missing_task_id(tmp_path, monkeypatch):
+    captured = {}
+
+    def _payload(*args, **kwargs):
+        captured.update(kwargs)
+        return {"ok": True, "task_id": None, "exit_code": 0}
+
+    monkeypatch.setattr(tg, "run_command_payload", _payload)
+    res = runner.invoke(
+        app,
+        ["run-cmd", "--command", "pytest", "--json", *_root(tmp_path)],
+    )
+
+    assert res.exit_code == 0
+    assert captured["task_id"] is None
+
+
 def test_run_cmd_json_command_not_allowed_does_not_exit_1(tmp_path, monkeypatch):
     monkeypatch.setattr(
         tg, "run_command_payload",

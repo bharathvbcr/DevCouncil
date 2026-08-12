@@ -9,6 +9,7 @@ from mcp.types import TextContent
 from devcouncil.integrations.mcp.util import (
     error_text,
     json_text,
+    optional_string_argument,
     parse_cli_json,
     required_string_argument,
     run_cli_command,
@@ -17,26 +18,26 @@ from devcouncil.integrations.mcp.util import (
 
 async def handle_write_file(root: Path, db: object, arguments: dict) -> list[TextContent]:
     del db  # routed through CLI service layer
-    task_id, arg_error = required_string_argument(arguments, "task_id")
-    if arg_error:
-        return arg_error
-    lease_token, arg_error = required_string_argument(arguments, "lease_token")
-    if arg_error:
-        return arg_error
+    task_id = optional_string_argument(arguments, "task_id")
+    if task_id == "":
+        return error_text("task_id must be a string", code="invalid_arguments", argument="task_id")
+    lease_token = optional_string_argument(arguments, "lease_token") or ""
     rel_path, arg_error = required_string_argument(arguments, "path")
     if arg_error:
         return arg_error
     content = arguments.get("content")
     if not isinstance(content, str):
         return error_text("content must be a string", code="invalid_arguments", argument="content")
-    assert task_id is not None and lease_token is not None and rel_path is not None
-    cli_args = [
-        "write", task_id,
+    assert rel_path is not None
+    cli_args = ["write"]
+    if task_id:
+        cli_args.append(task_id)
+    cli_args.extend([
         "--lease-token", lease_token,
         "--path", rel_path,
         "--content", content,
         "--json",
-    ]
+    ])
     payload, cli_error = parse_cli_json(run_cli_command(cli_args, root))
     if cli_error:
         return cli_error
@@ -46,22 +47,21 @@ async def handle_write_file(root: Path, db: object, arguments: dict) -> list[Tex
 
 async def handle_apply_patch(root: Path, db: object, arguments: dict) -> list[TextContent]:
     del db  # routed through CLI service layer
-    task_id, arg_error = required_string_argument(arguments, "task_id")
-    if arg_error:
-        return arg_error
-    lease_token, arg_error = required_string_argument(arguments, "lease_token")
-    if arg_error:
-        return arg_error
+    task_id = optional_string_argument(arguments, "task_id")
+    if task_id == "":
+        return error_text("task_id must be a string", code="invalid_arguments", argument="task_id")
+    lease_token = optional_string_argument(arguments, "lease_token") or ""
     unified_diff = arguments.get("unified_diff")
     if not isinstance(unified_diff, str) or not unified_diff.strip():
         return error_text("unified_diff must be a non-empty string", code="invalid_arguments", argument="unified_diff")
-    assert task_id is not None and lease_token is not None
-    cli_args = [
-        "apply-patch", task_id,
+    cli_args = ["apply-patch"]
+    if task_id:
+        cli_args.append(task_id)
+    cli_args.extend([
         "--lease-token", lease_token,
         "--unified-diff", unified_diff,
         "--json",
-    ]
+    ])
     payload, cli_error = parse_cli_json(run_cli_command(cli_args, root))
     if cli_error:
         return cli_error

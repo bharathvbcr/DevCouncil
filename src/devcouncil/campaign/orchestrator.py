@@ -58,7 +58,7 @@ class TaskOutcome:
     bloom: str
     executed: bool
     verified: bool
-    status: str  # "verified" | "blocked" | "skipped" | "failed"
+    status: str  # "verified" | "done" | "blocked" | "skipped" | "failed"
     message: str = ""
     blocking_gaps: List[str] = field(default_factory=list)
 
@@ -80,6 +80,10 @@ class CampaignResult:
         return self._ids("verified")
 
     @property
+    def completed_without_verification(self) -> List[str]:
+        return self._ids("done")
+
+    @property
     def blocked(self) -> List[str]:
         return self._ids("blocked") + self._ids("failed")
 
@@ -93,11 +97,12 @@ class CampaignResult:
         if self.halted:
             return False
         actionable = [o for o in self.outcomes if o.status != "skipped"]
-        return bool(actionable) and all(o.status == "verified" for o in actionable)
+        return bool(actionable) and all(o.status in {"verified", "done"} for o in actionable)
 
     def summary_line(self) -> str:
         return (
             f"campaign complete — {len(self.verified)} verified, "
+            f"{len(self.completed_without_verification)} completed unverified, "
             f"{len(self.blocked)} blocked, {len(self.skipped)} skipped"
         )
 
@@ -283,7 +288,7 @@ class Campaign:
                 for fut in as_completed(futures):
                     outcome = fut.result()
                     outcomes[outcome.task_id] = outcome
-                    if outcome.status == "verified":
+                    if outcome.status in {"verified", "done"}:
                         completed_ok.add(outcome.task_id)
                         self._state.completed_tasks += 1
                     else:
@@ -392,21 +397,37 @@ class Campaign:
         assert_allowed(Rank.REVIEWER, Action.QC_REVIEW)
         passed, gaps = self._quality_control(task)
         verified = bool(passed and executed)
+        from devcouncil.app.config import load_config
+
+        try:
+            cfg = load_config(self.root)
+            gates = getattr(cfg, "gates", None)
+            gate_mode = gates.mode if gates and hasattr(gates, "mode") else "enforce"
+        except Exception:
+            gate_mode = "enforce"
+
+        quality_skipped = gate_mode == "off"
 
         self.mailbox.send(
             "coordinator",
-            f"{task.id}: {'verified' if verified else 'blocked'}",
+            f"{task.id}: {'completed' if quality_skipped and verified else ('verified' if verified else 'blocked')}",
             type="qc_result",
             from_agent="reviewer",
         )
         self._set_roster(owner, status="idle", current="-")
 
         if verified:
-            task.status = "verified"
+            task.status = "done" if quality_skipped else "verified"
             with self._state_lock:
                 self._state.achievements.append(f"{task.id} · {task.title} · {owner} · {bloom}")
-            self._emit(f"Reviewer verifies {task.id} — worked by {owner}")
-            status = "verified"
+            self._emit(
+                (
+                    f"Coordinator completes {task.id} without quality verification"
+                    if quality_skipped
+                    else f"Reviewer verifies {task.id} — worked by {owner}"
+                )
+            )
+            status = task.status
         else:
             task.status = "blocked"
             reason = "; ".join(gaps) if gaps else ("execution failed" if not executed else "verification failed")
@@ -422,7 +443,7 @@ class Campaign:
             owner=owner,
             bloom=bloom,
             executed=executed,
-            verified=verified,
+            verified=verified and not quality_skipped,
             status=status,
             message=exec_msg,
             blocking_gaps=list(gaps),
@@ -492,15 +513,21 @@ class Campaign:
         assert_allowed(Rank.COORDINATOR, Action.ROLLUP)
         self._write_dashboard()
         verified = sum(1 for o in outcomes if o.status == "verified")
+        done = sum(1 for o in outcomes if o.status == "done")
         blocked = sum(1 for o in outcomes if o.status in {"blocked", "failed"})
         skipped = sum(1 for o in outcomes if o.status == "skipped")
         summary = (
-            f"Campaign complete — {verified} verified, {blocked} blocked, {skipped} skipped. "
+            f"Campaign complete — {verified} verified, {done} completed unverified, "
+            f"{blocked} blocked, {skipped} skipped. "
             f"Goal: {self.goal}"
         )
         assert_allowed(Rank.COORDINATOR, Action.NOTIFY)
         self.notifier.notify(summary, title="Director campaign", tags=["white_check_mark"])
-        self._emit(f"Coordinator reports to the operator: {verified} verified / {blocked} blocked / {skipped} skipped")
+        self._emit(
+            "Coordinator reports to the operator: "
+            f"{verified} verified / {done} completed unverified / "
+            f"{blocked} blocked / {skipped} skipped"
+        )
         # Director reads the dashboard to answer for the operator (never writes it).
         assert_allowed(Rank.DIRECTOR, Action.READ_DASHBOARD)
 

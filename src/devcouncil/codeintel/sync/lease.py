@@ -2,10 +2,52 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Callable
+
+
+@dataclass(frozen=True)
+class LeaseHolder:
+    """Best-effort identity written into the lock file after flock succeed.
+
+    ``flock`` / ``msvcrt.locking`` remains the source of truth for ownership;
+    metadata is advisory for ``dev map unlock`` and status surfaces.
+    """
+
+    pid: int | None = None
+    started_at: float | None = None
+
+
+def read_holder(path: Path) -> LeaseHolder:
+    """Read advisory holder metadata from ``path`` without taking the lease."""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return LeaseHolder()
+    text = raw.decode("utf-8", errors="replace").strip("\0").strip()
+    if not text:
+        return LeaseHolder()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return LeaseHolder()
+    if not isinstance(data, dict):
+        return LeaseHolder()
+    pid_raw = data.get("pid")
+    started_raw = data.get("started_at")
+    try:
+        pid = int(pid_raw) if pid_raw is not None else None
+    except (TypeError, ValueError):
+        pid = None
+    try:
+        started_at = float(started_raw) if started_raw is not None else None
+    except (TypeError, ValueError):
+        started_at = None
+    return LeaseHolder(pid=pid, started_at=started_at)
 
 
 class WriterLease:
@@ -14,6 +56,9 @@ class WriterLease:
         self._handle: BinaryIO | None = None
 
     def acquire(self) -> bool:
+        # Re-entrant acquire would leak the prior fd while still holding flock (#14).
+        if self._handle is not None:
+            self.release()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         handle = self.path.open("a+b")
         try:
@@ -30,6 +75,7 @@ class WriterLease:
                 import fcntl
 
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._write_holder_metadata(handle)
         except (OSError, BlockingIOError):
             handle.close()
             return False
@@ -94,3 +140,14 @@ class WriterLease:
 
     def __exit__(self, *_args: object) -> None:
         self.release()
+
+    @staticmethod
+    def _write_holder_metadata(handle: BinaryIO) -> None:
+        payload = json.dumps(
+            {"pid": os.getpid(), "started_at": time.time()},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        handle.seek(0)
+        handle.truncate()
+        handle.write(payload)
+        handle.flush()

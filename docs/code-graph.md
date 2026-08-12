@@ -55,10 +55,22 @@ dev map init                # Build canonical SQLite + compatibility exports
 dev map ingest              # Unified analyze: codeintel sync → graph export → repo map write
 dev map ingest src/foo      # Path-scoped ingest (full reconcile when paths omitted)
 dev map status              # Generation, pending paths, watcher/degraded state
+dev map --full              # Force a full isolated rebuild (default is incremental when the change set is small)
+dev map unlock              # Free a stuck writer lease (dead / stalled / timed_out)
+dev map unlock --force      # Kill even if the holder still looks progressive
 dev map sync                # Reconcile and commit now
 dev map watch               # Native FSEvents/inotify/ReadDirectoryChangesW foreground watcher
 dev map doctor              # SQLite, watcher, and offline grammar verification
 ```
+
+### Writer-lease recovery runbook
+
+When `dev map` / `--if-stale` / verify remaps keep failing with `graph_writer_busy`, or `dev map status` shows a stalled build:
+
+1. **Inspect** — `dev map status` (holder pid, phase, `stalled` / `timed_out`, last progress).
+2. **Unlock** — `dev map unlock` (dead holder or stalled/timed-out). Use `dev map unlock --force` only if the holder still looks progressive but you need to reclaim the lease.
+3. **Rebuild** — `dev map` or `dev map ingest` once the lease is free.
+4. **Do not raw-kill** under contain write-gate — `kill` / `pkill` stay denied without a task lease. Prefer `dev map unlock` (lease-lifecycle allowlisted even with `task=None`).
 
 Freshness uses git HEAD, a tracked-file hash, and a content fingerprint so plain edits mark the map stale. Fingerprint / git errors fail closed (treat as stale). A **missing** `.devcouncil/repo_map.json` is also stale — hard rigor blocks checkout/verify until `dev map` or `dev map ingest` runs. Post-tool-use hooks and `dev map --watch` refresh incrementally; incremental extract still verifies parse-cache sha256 so a concurrent edit to an unlisted path cannot stamp a fresh fingerprint over stale symbols.
 
@@ -140,9 +152,34 @@ dev map affected src/foo.py        # tests in the inbound impact closure
 
 SQLite is canonical; graph v2 JSON remains a deterministic compatibility export. A refresh writes a complete generation in one transaction and advances the current-generation pointer only after every file, node, edge, liveness record, and FTS row is committed. Readers therefore see the complete previous or complete next graph. The store retains two committed generations for rollback/debugging and caches compressed source and extraction facts by content, grammar, analyzer, and configuration hashes.
 
-MCP starts one project watcher for its server lifespan. Queries wait up to two seconds for a pending batch without blocking the async server; if syncing cannot finish, responses retain the last committed generation and identify pending/degraded state. Full builds run in a supervised child that **acquires the per-project writer lease itself**; the parent releases any held lease while supervising so an orphaned worker still serializes against watchers/MCP writers. Lease acquisition uses bounded exponential backoff (`code_intelligence.writer_lease_timeout_seconds`, default 30s for builds / re-acquire; `writer_lease_sync_timeout_seconds`, default 5s for watch `sync_now`) so multi-watcher contention does not stamp lean/degraded maps over a healthy SQLite generation. After the child commits, the parent reloads the graph under the re-acquired lease. The parent terminates a build after 90 seconds without progress or 15 minutes total, preserving the last committed generation. `dev map status` / `dev map doctor` expose phase, progress, worker PID, and compatibility-export health (missing/drift/degraded/corrupt). External edits to `code_graph.json` do **not** clobber SQLite — the store wins unless the store is empty. `dev map watch` and `dev map --watch` both refresh graph **and** rebuild `repo_map.json` subsystems/dependents.
+MCP starts one project watcher for its server lifespan. Queries wait up to two seconds for a pending batch without blocking the async server; if syncing cannot finish, responses retain the last committed generation and identify pending/degraded state. Full builds run in a supervised child that **acquires the per-project writer lease itself**; the parent releases any held lease while supervising so an orphaned worker still serializes against watchers/MCP writers. Lease acquisition uses bounded exponential backoff (`code_intelligence.writer_lease_timeout_seconds`, default 30s for builds / re-acquire; `writer_lease_sync_timeout_seconds`, default 5s for watch `sync_now`) so multi-watcher contention does not stamp lean/degraded maps over a healthy SQLite generation. After the child commits, the parent reloads the graph under the re-acquired lease. `dev map status` / `dev map doctor` expose phase, progress, worker PID, consumed worker CPU, and compatibility-export health (missing/drift/degraded/corrupt). `dev map doctor` reports `graph_ok` (canonical SQLite) separately from `json_export_ok` — a size-capped JSON export no longer marks an otherwise healthy graph as failed. External edits to `code_graph.json` do **not** clobber SQLite — the store wins unless the store is empty. `dev map watch` and `dev map --watch` both refresh graph **and** rebuild `repo_map.json` subsystems/dependents.
 
-Incremental sync is deliberately conservative. Body-only edits with an unchanged declaration/import resolution surface replace the affected closure in-process. Creates, deletes, renames, or changes to symbols, bases, decorators, exports, imports, re-exports, or aliases trigger a full resolve from warm extraction caches. Persisted analysis shards are pruned to the current non-vendored code-file set before either path. Configure the boundaries with `indexing.build_isolation: hybrid`, `indexing.build_stall_timeout_seconds`, `indexing.build_total_timeout_seconds`, and `indexing.graph_json_max_bytes`.
+### Stall detection is CPU-aware
+
+Long phases (liveness tokenize, semantic enrichment, SQLite persist) can run for many minutes without advancing a phase counter. The worker therefore emits a **timer-driven heartbeat carrying its consumed CPU time** every `indexing.build_heartbeat_interval_seconds` (default 5s), independent of phase counters, and every long phase also reports incremental progress (`liveness:tokens`, `semantic`, `persist:nodes`, `persist:edges`, `persist:files`, `export:json`).
+
+The supervisor declares a stall only when phase progress **and** worker CPU are both flat past the budget, so a worker at 90%+ CPU is never killed as "hung"; a genuinely wedged (zero-CPU) worker still is. The applied budget is `max(indexing.build_stall_timeout_seconds, indexing.semantic_enrich_timeout_seconds + 30s)`, so a short stall timeout cannot expire inside the semantic budget. `indexing.build_total_timeout_seconds` (default 15 min) remains a hard ceiling. A timed-out worker's writer-lock metadata is cleared automatically, and a dead holder is reclaimed on the next acquire — recovery no longer requires a manual `dev map unlock`.
+
+If a build does time out with a healthy committed generation, the map is refreshed **from that generation** rather than crashing the CLI: `dev map` prints the reason, exits non-zero, and keeps the prior graph's fingerprints so `--if-stale` correctly still reports stale.
+
+### Incremental by default
+
+`dev map` with no path arguments probes the change set against the committed generation using each file's recorded size/mtime (no hashing, no re-reads):
+
+- **No changes** → the generation is reused and only the map artifacts are rewritten.
+- **Small change set** (≤500 files and ≤20% of the tree) → incremental sync.
+- **Larger, corrupt store, or `--full`** → supervised full rebuild.
+
+Incremental sync itself is deliberately conservative. Body-only edits with an unchanged declaration/import resolution surface replace the affected closure in-process. Creates, deletes, renames, or changes to symbols, bases, decorators, exports, imports, re-exports, or aliases trigger a full resolve from warm extraction caches. Persisted analysis shards are pruned to the current non-vendored code-file set before either path. Configure the boundaries with `indexing.build_isolation: hybrid`, `indexing.build_stall_timeout_seconds`, `indexing.build_total_timeout_seconds`, and `indexing.graph_json_max_bytes`.
+
+### Index size and file inventory
+
+- `indexing.store_file_contents` (default **off**) — persist compressed file bytes in `file_contents`. Path, content hash, size, and mtime are always retained; with blobs off, `content_for_path` reads the working tree. Turning this on is what grows `index.sqlite` into the gigabytes on a large repo.
+- `indexing.store_write_batch_size` (default 2000) — rows per batched persist write. Each batch also emits a progress heartbeat. The WAL is truncated after every committed generation so it cannot grow unbounded across runs.
+- `indexing.include_untracked` (default **on**) — index untracked-but-not-ignored files. **Keep this on.** Turning it off does more than hide new files: a file an agent just wrote and has not staged leaves the graph entirely, so the tracked symbols it calls lose those call edges and surface as dead/unwired candidates. Tracked-only indexing produces *false dead-code signals*, not just a smaller index. The generated-tree filter and `max_indexed_files` are the real bound on inventory size.
+- `indexing.max_indexed_files` (default 50000) — hard ceiling on the inventory. Untracked paths are dropped first and the overflow is logged, never silently truncated. Generated trees (`node_modules`, `target`, `coverage`, `vendor`, `Pods`, `.next`, binaries, archives, …) are excluded at any depth regardless.
+
+A repo-scale change set is handed to the build worker through a file, not one `--changed-path` argv entry per path (which overflowed `ARG_MAX`), and the incremental membership copy stages large exclusion sets in a temp table instead of one bind parameter per path.
 
 The 35-language grammar matrix is delivered through platform-specific
 `devcouncil-codeintel-grammars` wheels. Every pull request and push explicitly

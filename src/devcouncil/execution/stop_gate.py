@@ -121,7 +121,7 @@ def _run_task_verify(
             TaskRepository,
         )
         from devcouncil.verification.next_actions import split_next_actions
-        from devcouncil.verification.verifier import Verifier
+        from devcouncil.verification.verifier import Verifier, verification_task_status
 
         db = get_db(project_root)
         if not db:
@@ -131,7 +131,8 @@ def _run_task_verify(
             if not task:
                 return task_id, 0, [], False
             reqs = RequirementRepository(session).get_all()
-            gaps, evidence = asyncio.run(Verifier(project_root).verify_task(task, reqs))
+            verifier = Verifier(project_root)
+            gaps, evidence = asyncio.run(verifier.verify_task(task, reqs))
             gap_repo = GapRepository(session)
             ev_repo = EvidenceRepository(session)
             gap_repo.delete_for_task(task.id)
@@ -148,7 +149,7 @@ def _run_task_verify(
                 elif isinstance(ev, TestEvidence):
                     ev_repo.save_test_evidence(ev, task.id)
             blocking = [g for g in gaps if g.blocking]
-            task.status = "blocked" if blocking else "verified"
+            task.status = verification_task_status(gaps, verifier.last_outcome)
             TaskRepository(session).save(task)
         blocking_actions, _ = split_next_actions(gaps)
         action_strs = [a.action for a in blocking_actions[:10]]
@@ -220,7 +221,12 @@ def evaluate_stop(project_root: Path, payload: dict[str, Any] | None = None) -> 
 
     try:
         cfg, sg = _load_stop_gate_config(root)
+        gate_mode = getattr(getattr(cfg, "gates", None), "mode", "enforce")
+        if gate_mode == "off":
+            return StopGateResult(decision="pass", mode="off")
         mode = _resolve_mode(getattr(sg, "mode", "off"))
+        if gate_mode == "advisory" and mode == "block":
+            mode = "assist"
         if mode == "off":
             return StopGateResult(decision="pass", mode=mode)
 
@@ -462,12 +468,21 @@ def _status_line(root: Path) -> str | None:
 
         with db.get_session() as session:
             graph = ArtifactGraphRepository(session).load_graph()
-            summary = graph.coverage_summary()
+            summary = dict(graph.coverage_summary())
+            stored_blocking = graph.blocking_gaps()
             state = StateRepository(session).get_state()
             phase = compute_phase(graph, state.current_phase if state else None)
+        gate_mode = _load_stop_gate_config(root)[0].gates.mode
+        if gate_mode != "enforce":
+            from devcouncil.gating.policy import is_hard_safety_gap
+
+            summary["blocking_gaps"] = sum(
+                1 for gap in stored_blocking if is_hard_safety_gap(gap)
+            )
         return (
             f"DevCouncil — phase: {phase}; tasks: {summary['total_tasks']}; "
             f"gaps: {summary['total_gaps']} ({summary['blocking_gaps']} blocking). "
+            f"Gate mode: {gate_mode}. "
             "Use the devcouncil_* MCP tools and `dev` CLI to stay inside the verify loop."
         )
     except Exception:
@@ -480,9 +495,12 @@ def _phase_and_blocking_from_db(root: Path) -> tuple[str | None, str | None]:
         if not db:
             return None, None
         from devcouncil.storage.repositories import GapRepository
+        from devcouncil.gating.policy import is_hard_safety_gap
 
         with db.get_session() as session:
             blocking = [g for g in GapRepository(session).get_all() if g.blocking]
+        if _load_stop_gate_config(root)[0].gates.mode != "enforce":
+            blocking = [gap for gap in blocking if is_hard_safety_gap(gap)]
         phase = _project_phase(root)
         return phase, _blocking_gaps_summary(blocking)
     except Exception:
@@ -742,5 +760,3 @@ def _task_blocking_summary(project_root: Path, task_id: str | None) -> tuple[int
     except Exception:
         logger.debug("_task_blocking_summary failed", exc_info=True)
         return 0, []
-
-

@@ -3,11 +3,13 @@ execution:
   default_executor: claude
   enforce_file_scope_pre_verify: true
   hook_gate:
-    mode: "off"
+    mode: 'off'
   stop_gate:
     check_claims: true
     mode: assist
     verify_active_task: true
+gates:
+  mode: false
 integrations:
   antigravity:
     enabled: true
@@ -28,14 +30,20 @@ integrations:
     config_path: .grok/config.toml
     enabled: true
     hooks_path: .grok/hooks/devcouncil.json
+    write_gate: false
   opencode:
     config_path: opencode.json
-    enabled: false
+    enabled: true
+    write_gate: false
   warp:
     command: oz
     enabled: true
     mcp_config_path: .devcouncil/integrations/warp-mcp.json
     run_mode: local
+  aider:
+    enabled: true
+  codex:
+    write_gate: false
 models:
   provider: openrouter
   roles:

@@ -26,6 +26,7 @@ def test_grok_hooks_installer(tmp_path):
     paths = hooks._install_grok_hooks(tmp_path)
     assert len(paths) == 1
     data = paths[0].read_text(encoding="utf-8")
-    assert "PreToolUse" in data
-    assert "hook pre-tool-use --client grok" in data
+    assert "PostToolUse" in data
+    assert "PreToolUse" not in data
+    assert "hook post-tool-use --client grok" in data
     assert "grok" in common.SUPPORTED_HOOK_TOOLS

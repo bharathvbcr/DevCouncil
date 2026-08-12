@@ -30,6 +30,16 @@ RECORD_COMMAND_STATUSES = frozenset({"started", "finished", "failed", "blocked"}
 CLI_TIMEOUT_SECONDS = 120
 
 
+def _gate_mode(project_root: Path) -> str:
+    """Resolve gate posture, preserving the legacy fail-closed default."""
+    try:
+        from devcouncil.app.config import load_config
+
+        return load_config(project_root).gates.mode
+    except Exception:
+        return "enforce"
+
+
 def _db(project_root: Path):
     from devcouncil.cli.commands.init import initialize_project
     from devcouncil.storage.db import get_db
@@ -64,7 +74,8 @@ def verify_task_payload(
     lease_token: str,
     sandbox: str = "local",
 ) -> dict[str, Any]:
-    if sandbox in {"docker", "nix"}:
+    gate_mode = _gate_mode(project_root)
+    if sandbox in {"docker", "nix"} and gate_mode != "off":
         return {
             "ok": False,
             "code": "unsupported_sandbox",
@@ -76,15 +87,16 @@ def verify_task_payload(
         return {"ok": False, "error": "DevCouncil state is unavailable in this directory.", "code": "not_initialized"}
 
     with db.get_session() as session:
-        lease_error = require_valid_lease(session, task_id, lease_token)
-        if lease_error:
-            return lease_error
+        if gate_mode == "enforce":
+            lease_error = require_valid_lease(session, task_id, lease_token)
+            if lease_error:
+                return lease_error
         task_repo = TaskRepository(session)
         task = task_repo.get_by_id(task_id)
         if not task:
             return {"ok": False, "error": f"Task {task_id} not found.", "code": "not_found", "task_id": task_id}
         from devcouncil.execution.stop_gate_verify_cache import record_verify_cache
-        from devcouncil.verification.verifier import Verifier
+        from devcouncil.verification.verifier import Verifier, verification_task_status
 
         GapRepository(session).delete_for_task(task_id)
         EvidenceRepository(session).delete_for_task(task_id)
@@ -104,7 +116,8 @@ def verify_task_payload(
                 EvidenceRepository(session).save_diff_evidence(ev)
             elif isinstance(ev, TestEvidence):
                 EvidenceRepository(session).save_test_evidence(ev, task_id)
-        task.status = "blocked" if any(g.blocking for g in gaps) else "verified"
+        outcome = verifier.last_outcome
+        task.status = verification_task_status(gaps, outcome)
         task_repo.save(task)
         blocking = [g.model_dump() for g in gaps if g.blocking]
         blocking_actions, advisory_actions = split_next_actions(gaps)
@@ -116,7 +129,6 @@ def verify_task_payload(
             next_actions=[a.model_dump() for a in blocking_actions[:20]],
             passed=len(blocking) == 0,
         )
-        outcome = verifier.last_outcome
         return {
             "ok": True,
             "task_id": task_id,
@@ -128,6 +140,10 @@ def verify_task_payload(
             "allowed_next_tools": allowed_next_tools(task.status, len(blocking) > 0),
             "passed": len(blocking) == 0,
             "verification_mode": outcome.mode if outcome else "unknown",
+            "gate_mode": getattr(outcome, "gate_mode", gate_mode),
+            "verification_skipped": bool(
+                getattr(outcome, "verification_skipped", False)
+            ),
             "compiler_active": outcome.compiler_active if outcome else False,
             "diff_empty": outcome.diff_empty if outcome else False,
             "coverage_measured": outcome.coverage_measured if outcome else False,
@@ -431,6 +447,9 @@ def next_task_payload(
         return {"ok": False, "error": "DevCouncil state is unavailable in this directory.", "code": "not_initialized"}
 
     with db.get_session() as session:
+        from devcouncil.gating.policy import is_hard_safety_gap
+
+        gate_mode = _gate_mode(project_root)
         tasks = TaskRepository(session).get_all()
         leased_task_ids = {
             lease.task_id
@@ -439,10 +458,17 @@ def next_task_payload(
         }
         blocking_by_task: dict[str, int] = {}
         for gap in GapRepository(session).get_all():
-            if gap.blocking and gap.task_id:
+            effective_blocker = gap.blocking and (
+                gate_mode == "enforce" or is_hard_safety_gap(gap)
+            )
+            if effective_blocker and gap.task_id:
                 blocking_by_task[gap.task_id] = blocking_by_task.get(gap.task_id, 0) + 1
     done_ids = {t.id for t in tasks if t.status in {"verified", "done"}}
     wanted_statuses = {status_filter} if status_filter else {"planned", "ready"}
+    if not status_filter and gate_mode != "enforce":
+        # Historical quality blockers must not strand tasks after enforcement is
+        # relaxed. Hard-safety blockers remain visible via blocking_count below.
+        wanted_statuses.add("blocked")
     candidates = []
     for task in tasks:
         if task.status not in wanted_statuses:
@@ -473,7 +499,7 @@ def next_task_payload(
 def run_command_payload(
     project_root: Path,
     *,
-    task_id: str,
+    task_id: str | None,
     lease_token: str,
     command: str,
 ) -> dict[str, Any]:
@@ -485,19 +511,36 @@ def run_command_payload(
         return {"ok": False, "error": "DevCouncil state is unavailable in this directory.", "code": "not_initialized"}
 
     with db.get_session() as session:
-        lease_error = require_valid_lease(session, task_id, lease_token)
-        if lease_error:
-            return lease_error
-        task = TaskRepository(session).get_by_id(task_id)
-        if not task:
+        enforce = _gate_mode(project_root) == "enforce"
+        if enforce:
+            if not task_id:
+                return {
+                    "ok": False,
+                    "error": "A task ID is required when gates.mode=enforce.",
+                    "code": "task_required",
+                }
+            lease_error = require_valid_lease(session, task_id, lease_token)
+            if lease_error:
+                return lease_error
+        task = TaskRepository(session).get_by_id(task_id) if task_id else None
+        if enforce and not task:
             return {"ok": False, "error": f"Task {task_id} not found.", "code": "not_found", "task_id": task_id}
-        from devcouncil.execution.policy_engine import TaskPolicyEngine
 
-        policy_decision = TaskPolicyEngine(project_root).evaluate_command(normalized, task)
-        if policy_decision.action == "deny":
-            ShellCommandRepository(session).record(
-                task_id, normalized, "blocked", reason=policy_decision.reason,
+        if enforce:
+            from devcouncil.execution.policy_engine import TaskPolicyEngine
+
+            policy_decision = TaskPolicyEngine(project_root).evaluate_command(normalized, task)
+        else:
+            policy_decision = HookPolicy(project_root=project_root).evaluate_command(
+                normalized,
+                task,
+                enforce_task_scope=False,
             )
+        if policy_decision.action == "deny":
+            if task_id:
+                ShellCommandRepository(session).record(
+                    task_id, normalized, "blocked", reason=policy_decision.reason,
+                )
             return {
                 "ok": False,
                 "error": policy_decision.reason or "Command is not in the task allowlist.",
@@ -527,21 +570,23 @@ def run_command_payload(
             stderr, stderr_truncated = truncate_text(exc.stderr)
             timed_out = True
         except (FileNotFoundError, OSError, ValueError) as exc:
-            ShellCommandRepository(session).record(
-                task_id, normalized, "failed", reason=str(exc),
-            )
+            if task_id:
+                ShellCommandRepository(session).record(
+                    task_id, normalized, "failed", reason=str(exc),
+                )
             return {
                 "ok": False,
                 "error": f"Could not run command: {exc}",
                 "code": "run_failed",
                 "task_id": task_id,
             }
-        ShellCommandRepository(session).record(
-            task_id,
-            normalized,
-            "finished" if exit_code == 0 else "failed",
-            exit_code=exit_code,
-        )
+        if task_id:
+            ShellCommandRepository(session).record(
+                task_id,
+                normalized,
+                "finished" if exit_code == 0 else "failed",
+                exit_code=exit_code,
+            )
         return {
             "ok": exit_code == 0,
             "task_id": task_id,

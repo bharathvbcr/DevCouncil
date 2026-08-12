@@ -1,6 +1,6 @@
 [project]
 name = "devcouncil"
-version = "0.4.3"
+version = "0.4.4"
 description = "Gated orchestrator for AI-assisted software development"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -12,7 +12,11 @@ dependencies = [
     "sqlmodel>=0.0.19",
     "httpx>=0.27.0",
     "gitpython>=3.1.53",
-    "mcp>=1.27.2",
+    # <2: mcp 2.0.0 removed the Server.list_tools/call_tool decorator API this
+    # codebase is written against; an unpinned fresh install crashes the MCP
+    # server at import (AttributeError: 'Server' object has no attribute
+    # 'list_tools'). Raise only together with a server.py migration.
+    "mcp>=1.27.2,<2",
     "gepa>=0.1.1",
     "watchdog>=4.0.0",
     "tree-sitter>=0.23.0",

@@ -139,8 +139,9 @@ def print_integration_matrix(console: Console) -> None:
     console.print(table)
     console.print(
         "\n[dim]Enforcement:[/dim] [green]pre-action[/green] blocks forbidden writes/commands "
-        "before they happen; [cyan]advisory+verify[/cyan] warns in native hooks and "
-        "contains through sandbox/verification; [yellow]verify-only[/yellow] catches them at verify time."
+        "before they happen (installed with --write-gate); [cyan]advisory+verify[/cyan] is the "
+        "assist default (PostToolUse / lifecycle hooks, sandbox+verify contain); "
+        "[yellow]verify-only[/yellow] catches issues at verify time."
     )
     console.print("\nSee [dim]docs/coding-cli-integration.md[/dim] for workflow guidance.")
 

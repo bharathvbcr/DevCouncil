@@ -180,10 +180,15 @@ class CodeIntelQueryEngine:
                 continue
             tier = "high-confidence dead candidate" if confidence == "extracted" else "unconfirmed/unwired"
             rows.append({**entry.model_dump(mode="json"), "tier": tier})
+        # Staleness travels with the evidence: a dead-code list from an index
+        # built at another commit must never read as a current verdict.
+        from devcouncil.codeintel.service import index_freshness
+
         return self._envelope({
             "minimum_confidence": minimum_confidence,
             "dead_code": rows,
             "runtime_proven_live": sorted(runtime_live),
+            "index_freshness": index_freshness(self.service.project_root),
         })
 
     def affected_tests(self, targets: Iterable[str], *, max_depth: int = 3) -> dict[str, Any]:

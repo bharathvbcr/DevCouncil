@@ -14,10 +14,9 @@ function runHook(event, payload) {
   }
 }
 
+// Assist default: post-tool refresh only. Containment installs add the pre-tool
+// handler via _opencode_plugin_body(write_gate=true); do not register it here.
 export const DevCouncilOpenCodeHook = async () => ({
-  "tool.execute.before": async (input, output) => {
-    runHook("pre-tool-use", { tool: input.tool, arguments: output.args });
-  },
   "tool.execute.after": async (input, output) => {
     runHook("post-tool-use", { tool: input.tool, arguments: output.args });
   },

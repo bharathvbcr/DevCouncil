@@ -20,7 +20,10 @@ def test_is_test_path_variants():
     assert wiring.is_test_path("web/foo.test.ts")
     assert wiring.is_test_path("web/foo.spec.tsx")
     assert wiring.is_test_path("svc/foo_test.go")
+    assert wiring.is_test_path("FooTests.swift")
+    assert wiring.is_test_path("FooTest.kt")
     assert not wiring.is_test_path("pkg/module.py")
+    assert not wiring.is_test_path("Contest.kt")
 
 
 def test_is_private_and_dunder():

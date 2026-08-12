@@ -1,6 +1,8 @@
 """Hooks integration adapter."""
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 
 import typer
@@ -29,12 +31,16 @@ _configure = _common._configure
 resolve_dev_executable = _common.resolve_dev_executable
 record_hook_dev_executable = _common.record_hook_dev_executable
 check_hook_dev_executable = _common.check_hook_dev_executable
+_apply_decouple_config_flags = _common._apply_decouple_config_flags
 
 console = _common.console
 OPENCODE_HOOK_PLUGIN_NAME = _common.OPENCODE_HOOK_PLUGIN_NAME
 SUPPORTED_HOOK_TOOLS = _common.SUPPORTED_HOOK_TOOLS
 
 SESSION_START_MATCHER = "startup|resume|clear|compact"
+GIT_MAP_HOOK_MARKER = "# DevCouncil: refresh repo map"
+# Clients that install PreToolUse / BeforeTool / Cursor pre / OpenCode before containment.
+CONTAINMENT_HOOK_CLIENTS = ("claude", "codex", "cursor", "grok", "opencode", "gemini")
 
 _opencode_plugin_path = _opencode._opencode_plugin_path
 _opencode_plugin_source = _opencode._opencode_plugin_source
@@ -171,17 +177,16 @@ def _ensure_codex_hooks_enabled(project_root: Path) -> Path:
         config_path.write_text(rendered, encoding="utf-8")
     return config_path
 
-def _install_codex_hooks(project_root: Path) -> list[Path]:
+def _install_codex_hooks(project_root: Path, *, write_gate: bool = False) -> list[Path]:
+    """Install Codex hooks. PostToolUse/lifecycle always; PreToolUse only with ``write_gate``.
+
+    Assist (default) omits PreToolUse so interactive sessions are not re-bound to a
+    leftover lease allowlist. Under ``write_gate`` (contain), PreToolUse is installed;
+    Codex exit-2 deny on that path is intentional for autonomous runs.
+    """
     path = project_root / ".codex" / "hooks.json"
     settings = _load_json(path)
     matcher = "Bash|shell_command|exec_command|local_shell|Write|Edit|MultiEdit|write_file|edit_file|apply_patch"
-    _upsert_hook(
-        settings,
-        "PreToolUse",
-        matcher,
-        _hook_command(project_root, "codex", "pre-tool-use"),
-        "devcouncil-pre-tool-use",
-    )
     _upsert_hook(
         settings,
         "PostToolUse",
@@ -189,6 +194,16 @@ def _install_codex_hooks(project_root: Path) -> list[Path]:
         _hook_command(project_root, "codex", "post-tool-use"),
         "devcouncil-post-tool-use",
     )
+    if write_gate:
+        _upsert_hook(
+            settings,
+            "PreToolUse",
+            matcher,
+            _hook_command(project_root, "codex", "pre-tool-use"),
+            "devcouncil-pre-tool-use",
+        )
+    else:
+        _remove_named_hook(settings, "PreToolUse", "devcouncil-pre-tool-use")
     _upsert_hook(
         settings,
         "SessionStart",
@@ -213,19 +228,21 @@ def _install_codex_hooks(project_root: Path) -> list[Path]:
         timeout=_stop_hook_timeout_seconds(project_root),
     )
     _save_json(path, settings)
+
+    def mutate(config: dict) -> None:
+        codex = config.setdefault("integrations", {}).setdefault("codex", {})
+        if isinstance(codex, dict):
+            codex["write_gate"] = write_gate
+        _common.seed_hook_gate_for_write_gate(config, write_gate=write_gate)
+
+    _mutate_raw_config(project_root, mutate)
     return [path, _ensure_codex_hooks_enabled(project_root)]
 
-def _install_gemini_hooks(project_root: Path) -> list[Path]:
+def _install_gemini_hooks(project_root: Path, *, write_gate: bool = False) -> list[Path]:
+    """Install Gemini hooks. AfterTool always; BeforeTool only with ``write_gate``."""
     path = project_root / ".gemini" / "settings.json"
     settings = _load_json(path)
     matcher = "run_shell_command|shell_command|write_file|edit_file|replace|apply_patch"
-    _upsert_hook(
-        settings,
-        "BeforeTool",
-        matcher,
-        _hook_command(project_root, "gemini", "pre-tool-use"),
-        "devcouncil-pre-tool-use",
-    )
     _upsert_hook(
         settings,
         "AfterTool",
@@ -233,7 +250,25 @@ def _install_gemini_hooks(project_root: Path) -> list[Path]:
         _hook_command(project_root, "gemini", "post-tool-use"),
         "devcouncil-post-tool-use",
     )
+    if write_gate:
+        _upsert_hook(
+            settings,
+            "BeforeTool",
+            matcher,
+            _hook_command(project_root, "gemini", "pre-tool-use"),
+            "devcouncil-pre-tool-use",
+        )
+    else:
+        _remove_named_hook(settings, "BeforeTool", "devcouncil-pre-tool-use")
     _save_json(path, settings)
+
+    def mutate(config: dict) -> None:
+        gemini = config.setdefault("integrations", {}).setdefault("gemini", {})
+        if isinstance(gemini, dict):
+            gemini["write_gate"] = write_gate
+        _common.seed_hook_gate_for_write_gate(config, write_gate=write_gate)
+
+    _mutate_raw_config(project_root, mutate)
     return [path]
 
 def _upsert_cursor_hook(settings: dict, event: str, matcher: str, command: str) -> None:
@@ -295,6 +330,7 @@ def _install_cursor_hooks(project_root: Path, *, write_gate: bool = False) -> li
             "hooks_path": str(path.relative_to(root)),
             "write_gate": write_gate,
         })
+        _common.seed_hook_gate_for_write_gate(config, write_gate=write_gate)
 
     _mutate_raw_config(root, mutate)
     return [path]
@@ -332,6 +368,7 @@ def _install_grok_hooks(project_root: Path, *, write_gate: bool = False) -> list
             "hooks_path": str(path.relative_to(project_root)),
             "write_gate": write_gate,
         })
+        _common.seed_hook_gate_for_write_gate(config, write_gate=write_gate)
 
     _mutate_raw_config(project_root, mutate)
     return [path]
@@ -400,6 +437,7 @@ def _install_opencode_hooks(project_root: Path, *, write_gate: bool = False) -> 
     def mutate(config: dict) -> None:
         opencode = config.setdefault("integrations", {}).setdefault("opencode", {})
         opencode.update({"write_gate": write_gate})
+        _common.seed_hook_gate_for_write_gate(config, write_gate=write_gate)
 
     _mutate_raw_config(project_root, mutate)
     _record_opencode_config(project_root)
@@ -505,6 +543,14 @@ def _install_claude_hooks(project_root: Path, *, write_gate: bool = False) -> li
         "devcouncil-notification",
     )
     _save_json(path, settings)
+    # Keep runtime gate posture and assist/contain flag in sync with --write-gate.
+    def mutate(config: dict) -> None:
+        claude = config.setdefault("integrations", {}).setdefault("claude", {})
+        if isinstance(claude, dict):
+            claude["write_gate"] = write_gate
+        _common.seed_hook_gate_for_write_gate(config, write_gate=write_gate)
+
+    _mutate_raw_config(project_root, mutate)
     return [path]
 
 def _preview_hook_paths(project_root: Path, tool: str) -> list[tuple[str, Path]]:
@@ -555,9 +601,9 @@ def _configure_native_hooks(
         write_gate = bool(claude_write_gate)
 
     installers = {
-        "codex": _install_codex_hooks,
-        "gemini": _install_gemini_hooks,
-        # Blocking PreToolUse write-gate is opt-in for Claude/Cursor/Grok/OpenCode.
+        # Blocking PreToolUse/BeforeTool write-gate is opt-in for all clients.
+        "codex": lambda root: _install_codex_hooks(root, write_gate=write_gate),
+        "gemini": lambda root: _install_gemini_hooks(root, write_gate=write_gate),
         "claude": lambda root: _install_claude_hooks(root, write_gate=write_gate),
         "cursor": lambda root: _install_cursor_hooks(root, write_gate=write_gate),
         "grok": lambda root: _install_grok_hooks(root, write_gate=write_gate),
@@ -576,3 +622,475 @@ def _configure_native_hooks(
         if any(client in _common.STOP_HOOK_TOOLS for client in selected):
             _mutate_raw_config(project_root, _common.seed_stop_gate_assist_if_unset)
     record_hook_dev_executable(project_root)
+
+
+def _strip_devcouncil_hooks_from_settings(settings: dict) -> bool:
+    """Remove every hook entry whose command invokes ``devcouncil hook`` / ``dev hook``.
+
+    Returns True when settings were mutated. Prunes empty matcher groups and events.
+    """
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    changed = False
+    for event in list(hooks):
+        groups = hooks.get(event)
+        if not isinstance(groups, list):
+            continue
+        # Claude/Codex/Gemini/Grok: list of matcher groups with nested hooks.
+        if groups and isinstance(groups[0], dict) and "hooks" in groups[0]:
+            kept_groups: list[dict] = []
+            for group in groups:
+                if not isinstance(group, dict):
+                    kept_groups.append(group)
+                    continue
+                inner = group.get("hooks", [])
+                if not isinstance(inner, list):
+                    kept_groups.append(group)
+                    continue
+                inner_kept = [
+                    h for h in inner
+                    if not (
+                        isinstance(h, dict)
+                        and (
+                            "devcouncil hook" in str(h.get("command", ""))
+                            or str(h.get("name", "")).startswith("devcouncil-")
+                            or re.search(r"(^|[\s/\\])dev(\.exe)?\s+hook\b", str(h.get("command", "")))
+                        )
+                    )
+                ]
+                if len(inner_kept) != len(inner):
+                    changed = True
+                if inner_kept:
+                    group = {**group, "hooks": inner_kept}
+                    kept_groups.append(group)
+            if kept_groups:
+                if hooks.get(event) != kept_groups:
+                    hooks[event] = kept_groups
+                    changed = True
+            else:
+                hooks.pop(event, None)
+                changed = True
+            continue
+        # Cursor-style: flat list of {command, matcher?} entries.
+        kept_entries = [
+            entry
+            for entry in groups
+            if not (
+                isinstance(entry, dict)
+                and (
+                    "devcouncil hook" in str(entry.get("command", ""))
+                    or "pre-tool-use" in str(entry.get("command", ""))
+                    or "post-tool-use" in str(entry.get("command", ""))
+                    or re.search(r"(^|[\s/\\])dev(\.exe)?\s+hook\b", str(entry.get("command", "")))
+                )
+            )
+        ]
+        if len(kept_entries) != len(groups):
+            changed = True
+            if kept_entries:
+                hooks[event] = kept_entries
+            else:
+                hooks.pop(event, None)
+    if not hooks:
+        settings.pop("hooks", None)
+        changed = True
+    return changed
+
+
+def _strip_opencode_before_handler_text(text: str) -> tuple[str, bool]:
+    """Surgically drop ``tool.execute.before`` from an OpenCode plugin body.
+
+    Returns (new_text, stripped). Falls back to a full assist-mode regen when the
+    before-handler shape cannot be parsed safely.
+    """
+    marker = '"tool.execute.before"'
+    if marker not in text:
+        return text, False
+    known_contain = _opencode_plugin_body(write_gate=True)
+    known_assist = _opencode_plugin_body(write_gate=False)
+    if text == known_contain:
+        return known_assist, True
+    idx = text.find(marker)
+    # Walk back to the start of the property line.
+    line_start = text.rfind("\n", 0, idx) + 1
+    # Find the opening brace of the async handler body after `=>`.
+    arrow = text.find("=>", idx)
+    if arrow < 0:
+        return known_assist, True
+    brace = text.find("{", arrow)
+    if brace < 0:
+        return known_assist, True
+    depth = 0
+    end = brace
+    for i in range(brace, len(text)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    else:
+        return known_assist, True
+    # Consume trailing comma + whitespace/newlines after the handler.
+    while end < len(text) and text[end] in " \t":
+        end += 1
+    if end < len(text) and text[end] == ",":
+        end += 1
+    while end < len(text) and text[end] in " \t\r":
+        end += 1
+    if end < len(text) and text[end] == "\n":
+        end += 1
+    stripped = text[:line_start] + text[end:]
+    if marker in stripped:
+        return known_assist, True
+    return stripped, True
+
+
+def _strip_command_hooks_from_event(
+    settings: dict,
+    event: str,
+    *,
+    command_substr: str,
+) -> None:
+    """Drop nested hook handlers whose command contains ``command_substr``; prune empties."""
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return
+    groups = hooks.get(event)
+    if not isinstance(groups, list):
+        return
+    kept_groups: list[dict] = []
+    for group in groups:
+        if not isinstance(group, dict):
+            kept_groups.append(group)
+            continue
+        inner = group.get("hooks", [])
+        if not isinstance(inner, list):
+            kept_groups.append(group)
+            continue
+        inner_kept = [
+            h
+            for h in inner
+            if not (isinstance(h, dict) and command_substr in str(h.get("command", "")))
+        ]
+        if inner_kept:
+            kept_groups.append({**group, "hooks": inner_kept})
+    if kept_groups:
+        hooks[event] = kept_groups
+    else:
+        hooks.pop(event, None)
+    if not hooks:
+        settings.pop("hooks", None)
+
+
+def _strip_claude_containment(project_root: Path) -> list[str]:
+    """Remove PreToolUse containment only; leave PostToolUse/lifecycle hooks intact."""
+    path = project_root / ".claude" / "settings.local.json"
+    if not path.exists():
+        return []
+    settings = _load_json(path)
+    before = json.dumps(settings, sort_keys=True)
+    _remove_named_hook(settings, "PreToolUse", "devcouncil-pre-tool-use")
+    # Also drop unnamed PreToolUse entries that still invoke the pre-tool-use hook.
+    _strip_command_hooks_from_event(settings, "PreToolUse", command_substr="pre-tool-use")
+    if json.dumps(settings, sort_keys=True) == before:
+        return []
+    if settings:
+        _save_json(path, settings)
+    elif path.exists():
+        path.unlink()
+    return [f"stripped PreToolUse from {path.name}"]
+
+
+def _strip_codex_containment(project_root: Path) -> list[str]:
+    path = project_root / ".codex" / "hooks.json"
+    if not path.exists():
+        return []
+    settings = _load_json(path)
+    before = json.dumps(settings, sort_keys=True)
+    _remove_named_hook(settings, "PreToolUse", "devcouncil-pre-tool-use")
+    _strip_command_hooks_from_event(settings, "PreToolUse", command_substr="pre-tool-use")
+    if json.dumps(settings, sort_keys=True) == before:
+        return []
+    _save_json(path, settings)
+    return [f"stripped PreToolUse from {path.relative_to(project_root)}"]
+
+
+def _strip_gemini_containment(project_root: Path) -> list[str]:
+    path = project_root / ".gemini" / "settings.json"
+    if not path.exists():
+        return []
+    settings = _load_json(path)
+    before = json.dumps(settings, sort_keys=True)
+    _remove_named_hook(settings, "BeforeTool", "devcouncil-pre-tool-use")
+    _strip_command_hooks_from_event(settings, "BeforeTool", command_substr="pre-tool-use")
+    if json.dumps(settings, sort_keys=True) == before:
+        return []
+    _save_json(path, settings)
+    return [f"stripped BeforeTool from {path.relative_to(project_root)}"]
+
+
+def _strip_cursor_containment(project_root: Path) -> list[str]:
+    path = project_root / ".cursor" / "hooks.json"
+    if not path.exists():
+        return []
+    settings = _load_json(path)
+    before = json.dumps(settings, sort_keys=True)
+    _remove_cursor_hook(settings, "preToolUse", command_substr="pre-tool-use")
+    if json.dumps(settings, sort_keys=True) == before:
+        return []
+    hooks = settings.get("hooks")
+    if isinstance(hooks, dict) and not hooks:
+        settings.pop("hooks", None)
+    if settings.get("hooks") or settings.get("version") is not None:
+        _save_json(path, settings)
+    elif path.exists():
+        path.unlink()
+    return [f"stripped preToolUse from {path.relative_to(project_root)}"]
+
+
+def _strip_grok_containment(project_root: Path) -> list[str]:
+    path = project_root / ".grok" / "hooks" / "devcouncil.json"
+    if not path.exists():
+        return []
+    settings = _load_json(path)
+    before = json.dumps(settings, sort_keys=True)
+    _remove_named_hook(settings, "PreToolUse", "devcouncil-pre-tool-use")
+    _strip_command_hooks_from_event(settings, "PreToolUse", command_substr="pre-tool-use")
+    if json.dumps(settings, sort_keys=True) == before:
+        return []
+    _save_json(path, settings)
+    return [f"stripped PreToolUse from {path.relative_to(project_root)}"]
+
+
+def _strip_opencode_containment(project_root: Path) -> list[str]:
+    path = _opencode_plugin_path(project_root)
+    if not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8")
+    new_text, stripped = _strip_opencode_before_handler_text(text)
+    if not stripped or new_text == text:
+        return []
+    path.write_text(new_text, encoding="utf-8")
+    return [f"stripped tool.execute.before from {path.relative_to(project_root)}"]
+
+
+_CONTAINMENT_STRIPPERS = {
+    "claude": _strip_claude_containment,
+    "codex": _strip_codex_containment,
+    "gemini": _strip_gemini_containment,
+    "cursor": _strip_cursor_containment,
+    "grok": _strip_grok_containment,
+    "opencode": _strip_opencode_containment,
+}
+
+
+def _decouple_client_hooks(project_root: Path, client: str) -> list[str]:
+    """Strip containment hooks for one client and force assist config flags."""
+    stripper = _CONTAINMENT_STRIPPERS.get(client)
+    changes: list[str] = []
+    if stripper is not None:
+        changes.extend(stripper(project_root))
+    changes.extend(_apply_decouple_config_flags(project_root, client if client in _common.CLIENTS_WITH_WRITE_GATE else None))
+    return changes
+
+
+def _decouple_all_containment_hooks(project_root: Path) -> list[str]:
+    """Strip PreToolUse/before containment across all hook clients (no reinstall)."""
+    changes: list[str] = []
+    with _batched_raw_config(project_root):
+        for client in CONTAINMENT_HOOK_CLIENTS:
+            changes.extend(_CONTAINMENT_STRIPPERS[client](project_root))
+
+        def mutate(config: dict) -> None:
+            for client in _common.CLIENTS_WITH_WRITE_GATE:
+                entry = config.setdefault("integrations", {}).setdefault(client, {})
+                if isinstance(entry, dict) and entry.get("write_gate") is not False:
+                    entry["write_gate"] = False
+                    changes.append(f"integrations.{client}.write_gate=false")
+            execution = config.setdefault("execution", {})
+            hook_gate = execution.setdefault("hook_gate", {})
+            if not isinstance(hook_gate, dict):
+                hook_gate = {}
+                execution["hook_gate"] = hook_gate
+            if hook_gate.get("mode") != "off":
+                hook_gate["mode"] = "off"
+                changes.append("execution.hook_gate.mode=off")
+            stop_gate = execution.setdefault("stop_gate", {})
+            if not isinstance(stop_gate, dict):
+                stop_gate = {}
+                execution["stop_gate"] = stop_gate
+            mode = str(stop_gate.get("mode") or "").strip().lower()
+            if mode == "block":
+                stop_gate["mode"] = "assist"
+                changes.append("execution.stop_gate.mode=assist")
+
+        _mutate_raw_config(project_root, mutate)
+    seen: set[str] = set()
+    unique: list[str] = []
+    for item in changes:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+    return unique
+
+
+def _uninstall_named_hook_file(path: Path, project_root: Path, *, delete_if_empty: bool = True) -> list[str]:
+    """Strip all DevCouncil hooks from a Claude/Codex-style hooks JSON file."""
+    if not path.exists():
+        return []
+    settings = _load_json(path)
+    before = json.dumps(settings, sort_keys=True)
+    _strip_devcouncil_hooks_from_settings(settings)
+    if json.dumps(settings, sort_keys=True) == before:
+        return []
+    rel = str(path.relative_to(project_root)) if path.is_relative_to(project_root) else str(path)
+    if not settings and delete_if_empty:
+        path.unlink()
+        return [f"deleted empty {rel}"]
+    # Cursor: delete when only version remains and hooks gone.
+    if delete_if_empty and set(settings.keys()) <= {"version"} and "hooks" not in settings:
+        path.unlink()
+        return [f"deleted empty {rel}"]
+    _save_json(path, settings)
+    return [f"stripped DevCouncil hooks from {rel}"]
+
+
+def _uninstall_claude_hooks(project_root: Path) -> list[str]:
+    return _uninstall_named_hook_file(project_root / ".claude" / "settings.local.json", project_root, delete_if_empty=False)
+
+
+def _uninstall_codex_hooks(project_root: Path) -> list[str]:
+    # Do not touch [features] hooks in config.toml — only strip hooks.json entries.
+    return _uninstall_named_hook_file(project_root / ".codex" / "hooks.json", project_root)
+
+
+def _uninstall_gemini_hooks(project_root: Path) -> list[str]:
+    return _uninstall_named_hook_file(project_root / ".gemini" / "settings.json", project_root, delete_if_empty=False)
+
+
+def _uninstall_cursor_hooks(project_root: Path) -> list[str]:
+    return _uninstall_named_hook_file(project_root / ".cursor" / "hooks.json", project_root)
+
+
+def _uninstall_grok_hooks(project_root: Path) -> list[str]:
+    path = project_root / ".grok" / "hooks" / "devcouncil.json"
+    if not path.exists():
+        return []
+    path.unlink()
+    return [str(path.relative_to(project_root))]
+
+
+def _uninstall_opencode_hooks(project_root: Path) -> list[str]:
+    """Remove the generated OpenCode hook plugin file and its plugin[] registration.
+
+    Leaves ``mcp.devcouncil`` alone — that is full client uninstall territory.
+    """
+    removed: list[str] = []
+    root = project_root.expanduser().resolve()
+    plugin = _opencode_plugin_path(root)
+    if plugin.exists():
+        plugin.unlink()
+        removed.append(str(plugin.relative_to(root)))
+    path = _opencode_config_path(root)
+    if path.exists():
+        data = _load_json(path)
+        plugins = data.get("plugin")
+        changed = False
+        if isinstance(plugins, list):
+            kept = [p for p in plugins if not _opencode._is_opencode_plugin_ref(p)]
+            if len(kept) != len(plugins):
+                if kept:
+                    data["plugin"] = kept
+                else:
+                    data.pop("plugin", None)
+                changed = True
+                removed.append(f"plugin entry {_opencode._opencode_plugin_ref_canonical()}")
+        elif isinstance(plugins, str) and _opencode._is_opencode_plugin_ref(plugins):
+            data.pop("plugin", None)
+            changed = True
+            removed.append(f"plugin entry {_opencode._opencode_plugin_ref_canonical()}")
+        if changed:
+            if data:
+                _save_json(path, data)
+            elif path.exists():
+                path.unlink()
+    return removed
+
+
+def _strip_git_map_hook_block(text: str, marker: str = GIT_MAP_HOOK_MARKER) -> str:
+    """Remove DevCouncil map-refresh marker + following command line from a git hook."""
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        if marker in lines[i]:
+            i += 1
+            # Skip blank lines immediately after the marker, then the map command.
+            while i < len(lines) and not lines[i].strip():
+                i += 1
+            if i < len(lines) and ("map --if-stale" in lines[i] or "map --no-wiki" in lines[i]):
+                i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    return "".join(out)
+
+
+def _uninstall_git_map_hooks(project_root: Path) -> list[str]:
+    """Reverse ``_install_git_map_hooks`` — remove DevCouncil map-refresh blocks only."""
+    root = project_root.expanduser().resolve()
+    hooks_dir = root / ".git" / "hooks"
+    if not hooks_dir.is_dir():
+        return []
+    removed: list[str] = []
+    for name in ("post-commit", "post-merge", "post-checkout"):
+        path = hooks_dir / name
+        if not path.exists():
+            continue
+        existing = path.read_text(encoding="utf-8")
+        if GIT_MAP_HOOK_MARKER not in existing:
+            continue
+        updated = _strip_git_map_hook_block(existing)
+        rel = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
+        # Drop file when only a shebang / whitespace remains.
+        residual = updated.strip()
+        if residual in ("", "#!/bin/sh", "#!/usr/bin/env bash", "#!/bin/bash"):
+            path.unlink()
+            removed.append(f"deleted {rel}")
+        else:
+            path.write_text(updated, encoding="utf-8")
+            removed.append(f"stripped DevCouncil map block from {rel}")
+    return removed
+
+
+_NATIVE_HOOK_UNINSTALLERS = {
+    "claude": _uninstall_claude_hooks,
+    "codex": _uninstall_codex_hooks,
+    "gemini": _uninstall_gemini_hooks,
+    "cursor": _uninstall_cursor_hooks,
+    "grok": _uninstall_grok_hooks,
+    "opencode": _uninstall_opencode_hooks,
+}
+
+
+def _uninstall_native_hooks_for_tool(project_root: Path, tool: str) -> list[str]:
+    """Uninstall DevCouncil hooks for one native hook tool (no git map hooks)."""
+    uninstall = _NATIVE_HOOK_UNINSTALLERS.get(tool)
+    if uninstall is None:
+        raise ValueError(f"Unsupported hook tool '{tool}'.")
+    return uninstall(project_root)
+
+
+def _uninstall_all_native_hooks(project_root: Path, *, include_git: bool = True) -> list[str]:
+    """Uninstall hook files/entries for every hook tool (+ optional git map hooks)."""
+    removed: list[str] = []
+    for uninstall in _NATIVE_HOOK_UNINSTALLERS.values():
+        removed.extend(uninstall(project_root))
+    if include_git:
+        removed.extend(_uninstall_git_map_hooks(project_root))
+    return removed
+

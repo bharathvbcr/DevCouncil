@@ -73,3 +73,15 @@ def _configure_warp(project_root: Path, apply: bool) -> bool:
     if not shutil.which("oz"):
         console.print("[yellow]oz CLI not found on PATH. Install Warp/Oz before using `dev run --executor warp`.[/yellow]")
     return True
+
+
+def _uninstall_warp(project_root: Path) -> list[str]:
+    """Delete the DevCouncil-owned Warp MCP JSON and clear config enablement."""
+    removed: list[str] = []
+    root = project_root.expanduser().resolve()
+    path = _warp_mcp_path(root)
+    if path.exists():
+        path.unlink()
+        removed.append(str(path.relative_to(root)))
+    removed.extend(_common._clear_client_integration_config(root, "warp"))
+    return removed

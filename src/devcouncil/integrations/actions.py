@@ -31,6 +31,9 @@ TARGET_ALIASES = {
     "agy": "antigravity",
 }
 
+# Clients with no PreToolUse/BeforeTool containment surface.
+NO_CONTAINMENT_CLIENTS = frozenset({"aider", "warp", "antigravity"})
+
 
 @dataclass(frozen=True)
 class IntegrationActionReport:
@@ -209,6 +212,140 @@ def apply_integration_target(
         apply_aider()
     elif normalized == "hooks":
         apply_hooks()
+
+    check = build_integration_check_report(root, strict=strict).as_dict()
+    ok = all(item["ok"] for item in results) and (not strict or bool(check["ok"]))
+    return IntegrationActionReport(normalized, ok, results, warnings, check)
+
+
+def _action_result(name: str, changes: list[str], *, empty_message: str) -> dict[str, Any]:
+    message = "; ".join(changes) if changes else empty_message
+    return {
+        "target": name,
+        "ok": True,
+        "path": "",
+        "message": message,
+        "changes": list(changes),
+    }
+
+
+def decouple_integration_target(
+    project_root: Path,
+    target: str,
+    *,
+    strict: bool = False,
+) -> IntegrationActionReport:
+    """Strip containment only (PreToolUse/before) and force assist config flags."""
+    from devcouncil.integrations.clients import hooks as hooks_client
+
+    root = project_root.expanduser().resolve()
+    normalized = normalize_apply_target(target)
+    logger.info("Decoupling integration target: %s (root=%s)", normalized, root)
+    warnings: list[str] = []
+    results: list[dict[str, Any]] = []
+
+    if normalized == "all" or normalized == "hooks":
+        changes = hooks_client._decouple_all_containment_hooks(root)
+        results.append(_action_result(
+            normalized,
+            changes,
+            empty_message="No containment hooks to strip.",
+        ))
+    elif normalized in NO_CONTAINMENT_CLIENTS:
+        results.append(_action_result(
+            normalized,
+            [],
+            empty_message=f"{normalized} has no containment hooks to strip.",
+        ))
+    else:
+        changes = hooks_client._decouple_client_hooks(root, normalized)
+        results.append(_action_result(
+            normalized,
+            changes,
+            empty_message="No containment hooks to strip.",
+        ))
+
+    check = build_integration_check_report(root, strict=strict).as_dict()
+    ok = all(item["ok"] for item in results) and (not strict or bool(check["ok"]))
+    return IntegrationActionReport(normalized, ok, results, warnings, check)
+
+
+def uninstall_integration_target(
+    project_root: Path,
+    target: str,
+    *,
+    strict: bool = False,
+) -> IntegrationActionReport:
+    """Surgically remove DevCouncil companion wiring for a target."""
+    from devcouncil.integrations.clients import (
+        aider as aider_client,
+        antigravity as antigravity_client,
+        claude as claude_client,
+        codex as codex_client,
+        cursor as cursor_client,
+        gemini as gemini_client,
+        grok as grok_client,
+        hooks as hooks_client,
+        opencode as opencode_client,
+        warp as warp_client,
+    )
+
+    root = project_root.expanduser().resolve()
+    normalized = normalize_apply_target(target)
+    logger.info("Uninstalling integration target: %s (root=%s)", normalized, root)
+    warnings: list[str] = []
+    results: list[dict[str, Any]] = []
+
+    uninstallers = {
+        "claude": claude_client._uninstall_claude,
+        "cursor": cursor_client._uninstall_cursor,
+        "opencode": opencode_client._uninstall_opencode,
+        "codex": codex_client._uninstall_codex,
+        "grok": grok_client._uninstall_grok,
+        "antigravity": antigravity_client._uninstall_antigravity,
+        "warp": warp_client._uninstall_warp,
+        "aider": aider_client._uninstall_aider,
+        "gemini": gemini_client._uninstall_gemini,
+    }
+
+    if normalized == "hooks":
+        changes = hooks_client._uninstall_all_native_hooks(root, include_git=True)
+        # Hook-file teardown without clearing enablement leaves check red
+        # (enabled:true + no DevCouncil hooks ⇒ integrity/hooks fail).
+        from devcouncil.integrations.clients import common as common_client
+
+        for client in ("claude", "codex", "gemini", "cursor", "grok", "opencode"):
+            changes.extend(common_client._clear_client_integration_config(root, client))
+        results.append(_action_result(
+            "hooks",
+            changes,
+            empty_message="No DevCouncil hooks to remove.",
+        ))
+    elif normalized == "all":
+        for name, uninstall in uninstallers.items():
+            changes = uninstall(root)
+            results.append(_action_result(
+                name,
+                changes,
+                empty_message=f"Nothing to remove for {name}.",
+            ))
+        # Client uninstalls already strip their own hooks; sweep leftovers + git map.
+        git_changes = hooks_client._uninstall_git_map_hooks(root)
+        hook_sweep = hooks_client._uninstall_all_native_hooks(root, include_git=False)
+        combined = git_changes + [c for c in hook_sweep if c not in git_changes]
+        results.append(_action_result(
+            "hooks",
+            combined,
+            empty_message="No leftover hooks or git map markers.",
+        ))
+    else:
+        uninstall = uninstallers[normalized]
+        changes = uninstall(root)
+        results.append(_action_result(
+            normalized,
+            changes,
+            empty_message=f"Nothing to remove for {normalized}.",
+        ))
 
     check = build_integration_check_report(root, strict=strict).as_dict()
     ok = all(item["ok"] for item in results) and (not strict or bool(check["ok"]))

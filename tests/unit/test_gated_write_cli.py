@@ -33,6 +33,31 @@ def test_write_json_ok(tmp_path, monkeypatch):
     assert json.loads(res.stdout)["ok"] is True
 
 
+def test_write_accepts_missing_task_id(tmp_path, monkeypatch):
+    captured = {}
+
+    def _payload(*args, **kwargs):
+        captured.update(kwargs)
+        return {"ok": True, "task_id": None}
+
+    monkeypatch.setattr(gw_cmd, "write_file_payload", _payload)
+    res = runner.invoke(
+        app,
+        [
+            "write",
+            "--path",
+            "src/a.py",
+            "--content",
+            "x=1",
+            "--json",
+            *_root(tmp_path),
+        ],
+    )
+
+    assert res.exit_code == 0
+    assert captured["task_id"] is None
+
+
 def test_write_json_error(tmp_path, monkeypatch):
     monkeypatch.setattr(gw_cmd, "write_file_payload", lambda *a, **k: {"ok": False, "error": "bad"})
     res = runner.invoke(app, [
@@ -91,6 +116,29 @@ def test_apply_patch_json_ok(tmp_path, monkeypatch):
         "apply-patch", "TASK-1", "--lease-token", "t", "--unified-diff", _DIFF, "--json", *_root(tmp_path),
     ])
     assert res.exit_code == 0
+
+
+def test_apply_patch_accepts_missing_task_id(tmp_path, monkeypatch):
+    captured = {}
+
+    def _payload(*args, **kwargs):
+        captured.update(kwargs)
+        return {"ok": True, "task_id": None, "applied_files": ["src/a.py"]}
+
+    monkeypatch.setattr(gw_cmd, "apply_patch_payload", _payload)
+    res = runner.invoke(
+        app,
+        [
+            "apply-patch",
+            "--unified-diff",
+            _DIFF,
+            "--json",
+            *_root(tmp_path),
+        ],
+    )
+
+    assert res.exit_code == 0
+    assert captured["task_id"] is None
 
 
 def test_apply_patch_json_error(tmp_path, monkeypatch):

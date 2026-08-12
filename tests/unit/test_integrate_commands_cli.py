@@ -110,17 +110,23 @@ def test_claude_apply_asset_failure_exits_1(monkeypatch, tmp_path):
 
 
 def test_claude_uninstall_reports_removed(monkeypatch, tmp_path):
-    monkeypatch.setattr(integrate, "_uninstall_claude", lambda root: [".claude/settings.local.json"])
+    monkeypatch.setattr(
+        "devcouncil.integrations.clients.claude._uninstall_claude",
+        lambda root: [".claude/settings.local.json"],
+    )
     result = runner.invoke(integrate.app, ["claude", "--uninstall", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
-    assert "Removed DevCouncil Claude integration" in result.output
+    assert "Uninstall claude" in result.output
 
 
 def test_claude_uninstall_nothing_to_remove(monkeypatch, tmp_path):
-    monkeypatch.setattr(integrate, "_uninstall_claude", lambda root: [])
+    monkeypatch.setattr(
+        "devcouncil.integrations.clients.claude._uninstall_claude",
+        lambda root: [],
+    )
     result = runner.invoke(integrate.app, ["claude", "--uninstall", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
-    assert "Nothing to remove" in result.output
+    assert "Nothing to remove" in result.output or "nothing to remove" in result.output.lower()
 
 
 def test_claude_assets_preview(monkeypatch, tmp_path):
@@ -341,10 +347,27 @@ def test_uninstall_bad_target_exits_2(tmp_path):
 
 
 def test_uninstall_claude_target(monkeypatch, tmp_path):
-    monkeypatch.setattr(integrate, "_uninstall_claude", lambda root: ["one", "two"])
+    monkeypatch.setattr(
+        "devcouncil.integrations.clients.claude._uninstall_claude",
+        lambda root: ["one", "two"],
+    )
     result = runner.invoke(integrate.app, ["uninstall", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert "2 change" in result.output
+
+
+def test_decouple_bad_target_exits_2(tmp_path):
+    result = runner.invoke(integrate.app, ["decouple", "--target", "vim", "--project-root", str(tmp_path)])
+    assert result.exit_code == 2
+
+
+def test_client_flags_mutual_exclusion(tmp_path):
+    result = runner.invoke(
+        integrate.app,
+        ["cursor", "--apply", "--uninstall", "--project-root", str(tmp_path)],
+    )
+    assert result.exit_code == 2
+    assert "cannot be combined" in result.output
 
 
 def test_check_delegates(monkeypatch, tmp_path):

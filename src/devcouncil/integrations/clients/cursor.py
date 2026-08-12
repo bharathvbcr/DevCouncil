@@ -104,7 +104,10 @@ Use DevCouncil MCP tools for status, checkout, scope, and verify — do not gues
 
 Navigate via `.devcouncil/repo_map.json` (subsystems, entry_points, critical_files). Prefer `dev map query|trace|dead` for symbol callers.
 
-Checkout a leased task (`devcouncil_checkout_task` / `dev checkout`) before writes when write-gates are active.
+Interactive Cursor Shell/Write do **not** require a task lease under assist defaults
+(`integrations.cursor.write_gate: false`, `execution.hook_gate.mode: off`). Do not claim
+"Shell is gated" or checkout just to run shell. Only checkout when write-gates / contain
+mode are active (`dev integrate … --write-gate` or `execution.hook_gate.mode: contain`).
 
 Follow engineering skills under `.cursor/skills/` and `.claude/skills/` (`dev skills scaffold` / `dev integrate cursor --apply`).
 """
@@ -120,10 +123,10 @@ def _install_cursor_assets(project_root: Path) -> list[Path]:
     Idempotent: skills land under both ``.claude/skills/`` and ``.cursor/skills/``;
     the rule is ``.cursor/rules/devcouncil.mdc`` with ``alwaysApply: true``.
     """
-    from devcouncil.skills.registry import scaffold_skills, select_skills
+    from devcouncil.skills.registry import scaffold_skills, skills_for_scaffold
 
     written: list[Path] = []
-    skills = select_skills("", project_root)
+    skills = skills_for_scaffold("", project_root)
     written.extend(scaffold_skills(project_root, skills))
 
     rules_path = _cursor_rules_path(project_root)
@@ -206,3 +209,41 @@ def _configure_cursor(project_root: Path, apply: bool) -> bool:
     if not auth_ok:
         console.print(f"[yellow]Auth check: {auth_details}[/yellow]")
     return True
+
+
+def _uninstall_cursor(project_root: Path) -> list[str]:
+    """Surgically remove DevCouncil Cursor MCP, hooks, rule, and unmodified skills."""
+    from devcouncil.integrations.clients import hooks as _hooks
+
+    removed: list[str] = []
+    root = project_root.expanduser().resolve()
+
+    mcp_path = _cursor_config_path(root)
+    if mcp_path.exists():
+        data = _load_json(mcp_path)
+        servers = data.get("mcpServers")
+        if isinstance(servers, dict) and "devcouncil" in servers:
+            servers.pop("devcouncil")
+            if not servers:
+                data.pop("mcpServers", None)
+            if data:
+                _save_json(mcp_path, data)
+            else:
+                mcp_path.unlink()
+            removed.append(f"mcpServers.devcouncil in {mcp_path.relative_to(root)}")
+
+    removed.extend(_hooks._uninstall_cursor_hooks(root))
+
+    rules_path = _cursor_rules_path(root)
+    if rules_path.exists():
+        try:
+            on_disk = rules_path.read_text(encoding="utf-8")
+        except OSError:
+            on_disk = ""
+        if on_disk == _CURSOR_RULE_CONTENT:
+            rules_path.unlink()
+            removed.append(str(rules_path.relative_to(root)))
+
+    removed.extend(_common._remove_unmodified_library_skills(root, destinations=(".cursor/skills",)))
+    removed.extend(_common._clear_client_integration_config(root, "cursor"))
+    return removed

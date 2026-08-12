@@ -67,21 +67,133 @@ def test_graph_build_session_nested_and_busy(tmp_path):
 def test_terminate_worker_paths(monkeypatch):
     done = MagicMock()
     done.poll.return_value = 0
-    _terminate_worker(done)
+    assert _terminate_worker(done) is False
 
     alive = MagicMock()
-    alive.poll.side_effect = [None, None]
+    # Still alive through SIGTERM wait, SIGKILL wait, and process.kill wait.
+    alive.poll.side_effect = [None, None, None, None]
     alive.pid = 4242
     alive.wait.side_effect = subprocess.TimeoutExpired(cmd="x", timeout=1)
     kills = []
+    kill_calls = []
 
     monkeypatch.setattr("devcouncil.codeintel.build_control.os.name", "posix")
     monkeypatch.setattr(
         "devcouncil.codeintel.build_control.os.killpg",
         lambda pid, sig: kills.append((pid, sig)),
     )
-    _terminate_worker(alive)
-    assert kills
+    alive.kill.side_effect = lambda: kill_calls.append("kill")
+    status = SimpleNamespace(degraded_reason="", pid=4242)
+    assert _terminate_worker(alive, status=status) is True
+    assert kills  # SIGTERM + SIGKILL via killpg
+    assert kill_calls == ["kill"]
+    assert status.degraded_reason == "worker_still_alive_after_kill"
+    assert status.pid == 4242
+
+
+def test_terminate_worker_killpg_fail_falls_back_to_process_kill(monkeypatch):
+    """killpg OSError must fall through to process.kill(); still-alive keeps pid."""
+    alive = MagicMock()
+    # start + after SIGTERM + after SIGKILL + after process.kill
+    alive.poll.side_effect = [None, None, None, None]
+    alive.pid = 5151
+    alive.wait.side_effect = subprocess.TimeoutExpired(cmd="x", timeout=1)
+    kill_calls: list[str] = []
+
+    monkeypatch.setattr("devcouncil.codeintel.build_control.os.name", "posix")
+
+    def boom_killpg(_pid, _sig):
+        raise OSError("no such process group")
+
+    monkeypatch.setattr("devcouncil.codeintel.build_control.os.killpg", boom_killpg)
+    alive.kill.side_effect = lambda: kill_calls.append("kill")
+    status = SimpleNamespace(degraded_reason="", pid=5151)
+    assert _terminate_worker(alive, status=status) is True
+    assert kill_calls == ["kill"]
+    assert status.degraded_reason == "worker_still_alive_after_kill"
+    assert status.pid == 5151
+
+
+def test_run_isolated_full_build_success_when_generation_advances_nonzero_exit(
+    tmp_path, monkeypatch
+):
+    """Non-zero worker exit is success if the SQLite generation advanced (post-commit)."""
+    from devcouncil.cli.commands.init import initialize_project
+
+    initialize_project(tmp_path, quiet=True, with_map=False, with_skills=False)
+
+    graph = CodeGraph(nodes=[], edges=[])
+    service = SimpleNamespace(
+        store=SimpleNamespace(current_generation=lambda: 1),
+        load=lambda: graph,
+    )
+    monkeypatch.setattr(
+        "devcouncil.codeintel.build_control.get_codeintel_service",
+        lambda _r: service,
+    )
+    monkeypatch.setattr(
+        "devcouncil.app.config.load_config",
+        lambda _r: SimpleNamespace(
+            indexing=SimpleNamespace(
+                build_stall_timeout_seconds=30.0,
+                build_total_timeout_seconds=60.0,
+            )
+        ),
+    )
+
+    lines = [
+        json.dumps(
+            {
+                "state": "complete",
+                "phase": "complete",
+                "completed": 1,
+                "total": 1,
+                "compatibility_export": "healthy",
+            }
+        )
+        + "\n",
+    ]
+
+    class FakeStdout:
+        def __iter__(self):
+            return iter(lines)
+
+    class FakeProc:
+        def __init__(self):
+            self.pid = 99
+            self.stdout = FakeStdout()
+            self.stderr = MagicMock(__iter__=lambda self: iter([]))
+            self.returncode = 1  # non-zero after successful commit
+            self._polls = 0
+
+        def poll(self):
+            self._polls += 1
+            return 1 if self._polls > 2 else None
+
+        def wait(self, timeout=None):
+            return 1
+
+        def terminate(self):
+            return None
+
+        def kill(self):
+            return None
+
+    monkeypatch.setattr(
+        "devcouncil.codeintel.build_control.subprocess.Popen",
+        lambda *a, **k: FakeProc(),
+    )
+    gens = {"n": 0}
+
+    def gen():
+        gens["n"] += 1
+        return 1 if gens["n"] == 1 else 2
+
+    service.store.current_generation = gen
+    result = run_isolated_full_build(tmp_path, liveness=False)
+    assert result.graph is graph
+    assert result.status.state == "complete"
+    assert result.status.generation_after == 2
 
 
 def test_run_isolated_full_build_success(tmp_path, monkeypatch):
@@ -529,6 +641,7 @@ def test_map_if_stale_and_busy(tmp_path, monkeypatch):
             mode="full",
             generation=1,
             compatibility_export_degraded=False,
+                build_incomplete=False,
         ),
     )
     monkeypatch.setattr(
@@ -603,6 +716,7 @@ def test_map_pdg_and_html_flags(tmp_path, monkeypatch):
             mode="full",
             generation=1,
             compatibility_export_degraded=False,
+                build_incomplete=False,
         ),
     )
     graph_out = tmp_path / ".devcouncil" / "graph" / "code_graph.json"

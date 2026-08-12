@@ -1464,7 +1464,8 @@ def test_cli_integrate_hooks_apply_writes_native_hook_files(tmp_path):
     grok_hooks = json.loads((tmp_path / ".grok" / "hooks" / "devcouncil.json").read_text(encoding="utf-8"))
     claude_settings = json.loads((tmp_path / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
     cursor_hooks = json.loads((tmp_path / ".cursor" / "hooks.json").read_text(encoding="utf-8"))
-    assert "PreToolUse" in codex_hooks["hooks"]
+    assert "PostToolUse" in codex_hooks["hooks"]
+    assert "PreToolUse" not in codex_hooks["hooks"]
     assert "Stop" in codex_hooks["hooks"]
     assert "SubagentStop" in codex_hooks["hooks"]
     assert all(
@@ -1474,7 +1475,8 @@ def test_cli_integrate_hooks_apply_writes_native_hook_files(tmp_path):
         for hook in group["hooks"]
         if hook.get("name", "").startswith("devcouncil-")
     )
-    assert "PreToolUse" in grok_hooks["hooks"]
+    assert "PostToolUse" in grok_hooks["hooks"]
+    assert "PreToolUse" not in grok_hooks["hooks"]
     # Claude installs assist-mode hooks by default (no blocking PreToolUse write-gate).
     # Lifecycle hooks + refresh-only PostToolUse are present.
     assert "Stop" in claude_settings["hooks"]
@@ -1482,10 +1484,14 @@ def test_cli_integrate_hooks_apply_writes_native_hook_files(tmp_path):
     assert "PostToolUse" in claude_settings["hooks"]
     assert "PreToolUse" not in claude_settings["hooks"]
     assert "agent-response" in json.dumps(claude_settings)
-    assert "preToolUse" in cursor_hooks["hooks"]
+    assert "preToolUse" not in cursor_hooks["hooks"]
     assert "postToolUse" in cursor_hooks["hooks"]
-    assert "pre-tool-use" in json.dumps(cursor_hooks)
-    assert (tmp_path / ".devcouncil" / "integrations" / "opencode_devcouncil_plugin.mjs").exists()
+    assert "post-tool-use" in json.dumps(cursor_hooks)
+    plugin_body = (tmp_path / ".devcouncil" / "integrations" / "opencode_devcouncil_plugin.mjs").read_text(
+        encoding="utf-8"
+    )
+    assert '"tool.execute.after"' in plugin_body
+    assert '"tool.execute.before"' not in plugin_body
     opencode_config = json.loads((tmp_path / "opencode.json").read_text(encoding="utf-8"))
     assert "./.devcouncil/integrations/opencode_devcouncil_plugin.mjs" in opencode_config["plugin"]
     config_text = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
@@ -2273,7 +2279,9 @@ def test_cli_hook_pre_tool_use_accepts_stdin_payload(tmp_path, monkeypatch):
     assert "Verification bypass" in result.output
 
 
-def test_cli_hook_pre_tool_use_denies_write_without_running_task(tmp_path, monkeypatch):
+def test_cli_hook_pre_tool_use_allows_write_without_running_task_in_assist_mode(
+    tmp_path, monkeypatch
+):
     monkeypatch.chdir(tmp_path)
 
     result = runner.invoke(
@@ -2282,8 +2290,7 @@ def test_cli_hook_pre_tool_use_denies_write_without_running_task(tmp_path, monke
         input='{"name":"Write","arguments":{"path":"src/app.py"}}',
     )
 
-    assert result.exit_code == 2
-    assert "No running DevCouncil task" in result.output
+    assert result.exit_code == 0
 
 
 def test_cli_hook_pre_tool_use_uses_project_root_env(tmp_path, monkeypatch):

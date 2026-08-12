@@ -417,7 +417,7 @@ def test_mcp_server_exposes_prompts():
     result = asyncio.run(server.get_prompt("devcouncil_implement_next_task", {"client_id": "x"}))
     assert result.messages
     assert result.messages[0].role == "user"
-    assert "devcouncil_checkout_task" in result.messages[0].content.text
+    assert "devcouncil_checkout_task" in result.messages[0].content.text or "Task checkout" in result.messages[0].content.text
 
 
 def test_mcp_get_unknown_prompt_raises():

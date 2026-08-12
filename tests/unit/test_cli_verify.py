@@ -166,7 +166,7 @@ def test_verify_sandbox_unsupported(tmp_path, monkeypatch):
     monkeypatch.setattr(sandbox_mod, "get_sandbox", _fake_sandbox("unsupported"))
 
     res = runner.invoke(app, ["verify", "TASK-1", "--sandbox", "docker"])
-    assert res.exit_code == 0
+    assert res.exit_code == 1
     assert "unavailable" in res.output
 
 
@@ -188,6 +188,42 @@ def test_verify_sandbox_passed(tmp_path, monkeypatch):
     res = runner.invoke(app, ["verify", "TASK-1", "--sandbox", "nix"])
     assert res.exit_code == 0
     assert "passed in nix sandbox" in res.output
+
+
+def test_verify_sandbox_failure_is_advisory_in_advisory_mode(tmp_path, monkeypatch):
+    _setup_verify_db(tmp_path, monkeypatch)
+    assert runner.invoke(app, ["config", "set", "gates.mode", "advisory"]).exit_code == 0
+    import devcouncil.verification.sandbox as sandbox_mod
+    monkeypatch.setattr(sandbox_mod, "get_sandbox", _fake_sandbox("failed"))
+
+    res = runner.invoke(app, ["verify", "TASK-1", "--sandbox", "docker", "--json"])
+
+    assert res.exit_code == 0
+    payload = json.loads(res.output[res.output.index("{"):])
+    assert payload["tasks"][0]["status"] == "verified"
+    assert payload["tasks"][0]["blocking_gap_count"] == 0
+    assert payload["tasks"][0]["gap_count"] == 1
+
+
+def test_verify_off_skips_requested_sandbox_and_records_done(tmp_path, monkeypatch):
+    _setup_verify_db(tmp_path, monkeypatch)
+    assert runner.invoke(app, ["config", "set", "gates.mode", "off"]).exit_code == 0
+    import devcouncil.verification.sandbox as sandbox_mod
+    monkeypatch.setattr(
+        sandbox_mod,
+        "get_sandbox",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("sandbox must not run in off mode")
+        ),
+    )
+
+    res = runner.invoke(app, ["verify", "TASK-1", "--sandbox", "docker", "--json"])
+
+    assert res.exit_code == 0
+    payload = json.loads(res.output[res.output.index("{"):])
+    assert payload["completed_without_verification"] == 1
+    assert payload["tasks"][0]["status"] == "done"
+    assert payload["tasks"][0]["verification_skipped"] is True
 
 
 # --- evidence types + graph context -----------------------------------------------

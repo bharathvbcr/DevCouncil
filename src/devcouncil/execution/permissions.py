@@ -21,10 +21,20 @@ class PermissionManager:
         self.policy = policy
         self.project_root = project_root
         self.dynamic_ignores = self._load_devcouncilignore()
+        self.enforce_task_scope = self._load_enforcement_posture()
         self.policy_engine = TaskPolicyEngine(
             project_root,
             global_allowed_commands=policy.allowed_shell_commands,
         )
+
+    def _load_enforcement_posture(self) -> bool:
+        """Task allowlists are mandatory only under strict gate enforcement."""
+        try:
+            from devcouncil.app.config import load_config
+
+            return load_config(self.project_root).gates.mode == "enforce"
+        except Exception:
+            return True
 
     def _load_devcouncilignore(self) -> List[str]:
         """Load additional restricted paths from .devcouncilignore."""
@@ -50,6 +60,15 @@ class PermissionManager:
         for restricted in self.dynamic_ignores:
             if fnmatch.fnmatch(path, restricted) or path.startswith(restricted.strip("*")):
                 return False
+        if not self.enforce_task_scope:
+            from devcouncil.execution.hook_policy import HookPolicy
+
+            decision = HookPolicy(self.project_root).evaluate_file_write(
+                path,
+                task,
+                enforce_task_scope=False,
+            )
+            return decision.allowed
         decision = self.policy_engine.evaluate_file_change(
             path, task, operation, internal=internal
         )
@@ -65,6 +84,14 @@ class PermissionManager:
 
     def is_command_allowed(self, command: str, task: Task) -> bool:
         """Check if a shell command is authorized by the task or global allowlist."""
+        if not self.enforce_task_scope:
+            from devcouncil.execution.hook_policy import HookPolicy
+
+            return HookPolicy(self.project_root).evaluate_command(
+                command,
+                task,
+                enforce_task_scope=False,
+            ).allowed
         decision = self.policy_engine.evaluate_command(command, task)
         return decision.action == "allow"
 

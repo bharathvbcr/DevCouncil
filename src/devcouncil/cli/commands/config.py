@@ -28,6 +28,7 @@ _CONFIG_SETTABLE_KEYS = {
     "execution.stop_gate.verify_active_task": ("execution", "stop_gate", "verify_active_task", bool),
     "execution.stop_gate.max_blocks": ("execution", "stop_gate", "max_blocks", int),
     "execution.hook_gate.mode": ("execution", "hook_gate", "mode", str),
+    "gates.mode": ("gates", "mode", str),
     "verification.diff_coverage.enforce": ("verification", "diff_coverage", "enforce", bool),
     "semantic_layer.enabled": ("semantic_layer", "enabled", bool),
     "semantic_layer.cache.enabled": ("semantic_layer", "cache", "enabled", bool),
@@ -97,6 +98,7 @@ def show_config(
         console.print(f"  [cyan]verification.diff_coverage.enforce[/cyan]: {cfg.verification.diff_coverage.enforce}")
         console.print(f"  [cyan]verification.rigor.enabled[/cyan]: {cfg.verification.rigor.enabled}")
         console.print(f"  [cyan]verification.rigor.stub_detection[/cyan]: {cfg.verification.rigor.stub_detection}")
+        console.print(f"  [cyan]gates.mode[/cyan]: {cfg.gates.mode}")
         console.print(f"  [cyan]gates.block_orphan_diffs[/cyan]: {cfg.gates.block_orphan_diffs}")
         console.print(f"  [cyan]semantic_layer.enabled[/cyan]: {cfg.semantic_layer.enabled}")
         if cfg.semantic_layer.enabled:
@@ -142,6 +144,9 @@ def set_config(
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=2) from exc
+    if key == "gates.mode" and parsed not in {"off", "advisory", "enforce"}:
+        console.print("[red]gates.mode must be one of: off, advisory, enforce[/red]")
+        raise typer.Exit(code=2)
 
     with log_stage("config", project_root=root, subcommand="set"):
         with open(config_path) as f:

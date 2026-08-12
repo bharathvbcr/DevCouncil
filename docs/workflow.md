@@ -130,7 +130,9 @@ Recommended working rules:
 - Run DevCouncil and the coding CLI from the same repository root.
 - Give the coding CLI one DevCouncil task prompt at a time.
 - Do not ask the coding CLI to broaden scope beyond the generated prompt.
-- Run `dev verify TASK-ID` before committing agent-generated changes.
+- In `gates.mode=enforce`, run `dev verify TASK-ID` before accepting
+  agent-generated changes. In `advisory`, verification is optional and findings
+  are non-blocking; in `off`, report completion as unverified.
 - Use `dev repair` for follow-up fixes instead of free-form retry prompts.
 - Use `dev rollback TASK-ID` if a task needs to be reverted from its checkpoint.
 - Treat `.devcouncil/` as local project state and the audit trail for the gated run.
@@ -138,7 +140,7 @@ Recommended working rules:
 
 ## 7. Live review (`dev watch`)
 
-Optional Sage-style sidecar while verification remains the final authority:
+Optional Sage-style sidecar; under `gates.mode=enforce`, verification remains the final authority:
 
 ```bash
 dev watch sessions --client claude

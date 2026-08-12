@@ -652,43 +652,50 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_write_file",
             description=(
-                "Write a file for a leased task through DevCouncil's policy gate. The write "
-                "is checked against the task's scope BEFORE it lands (out-of-scope or "
-                "protected paths are rejected), applied atomically, and recorded as a "
-                "FileChangeEvent. Returns applied_files and rejected_files."
+                "Write a file through DevCouncil. In gates.mode=enforce a valid lease and "
+                "task scope are required; advisory/off relax coordination and scope gates. "
+                "Hard safety is always checked before the atomic write."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string"},
+                    "task_id": {
+                        "type": "string",
+                        "description": "Optional unless gates.mode=enforce.",
+                    },
                     "lease_token": {"type": "string"},
                     "path": {"type": "string"},
                     "content": {"type": "string"},
                 },
-                "required": ["task_id", "lease_token", "path", "content"],
+                "required": ["path", "content"],
             },
         ),
         Tool(
             name="devcouncil_apply_patch",
             description=(
-                "Apply a unified diff for a leased task through DevCouncil's policy gate. "
-                "EVERY target file is policy-checked first; if any is out of scope the whole "
-                "patch is rejected (never partially applied). Applied atomically via git and "
-                "each file recorded as a FileChangeEvent. Returns applied_files/rejected_files."
+                "Apply a unified diff through DevCouncil. In gates.mode=enforce a valid "
+                "lease and task scope are required; advisory/off relax those gates. Every "
+                "target still passes hard-safety checks before atomic application."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string"},
+                    "task_id": {
+                        "type": "string",
+                        "description": "Optional unless gates.mode=enforce.",
+                    },
                     "lease_token": {"type": "string"},
                     "unified_diff": {"type": "string"},
                 },
-                "required": ["task_id", "lease_token", "unified_diff"],
+                "required": ["unified_diff"],
             },
         ),
         Tool(
             name="devcouncil_verify_task",
-            description="Run verification for a leased task (local sandbox).",
+            description=(
+                "Process task completion under gates.mode: enforce blocks, advisory records "
+                "non-safety findings, and off skips quality verification."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -696,7 +703,7 @@ def all_tools() -> list[Tool]:
                     "lease_token": {"type": "string"},
                     "sandbox": {"type": "string", "enum": ["local"], "default": "local", "description": "Only 'local' is supported in this build."},
                 },
-                "required": ["task_id", "lease_token"],
+                "required": ["task_id"],
             },
         ),
         Tool(
@@ -786,20 +793,21 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_run_command",
             description=(
-                "Run a command for a leased task through DevCouncil's allowlist gate. The "
-                "command must pass the task's allowed_commands policy (same gate as the "
-                "hooks); otherwise it is refused and nothing runs. Executed with a clean "
-                "subprocess env and a timeout, recorded as a ShellCommandEvent. Returns "
-                "exit_code and truncated stdout/stderr."
+                "Run a command through DevCouncil. gates.mode=enforce requires a valid "
+                "lease and task allowlist; advisory/off retain dangerous-Git safety while "
+                "relaxing those gates. Uses a clean environment and bounded timeout."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string"},
+                    "task_id": {
+                        "type": "string",
+                        "description": "Optional unless gates.mode=enforce.",
+                    },
                     "lease_token": {"type": "string"},
                     "command": {"type": "string"},
                 },
-                "required": ["task_id", "lease_token", "command"],
+                "required": ["command"],
             },
         ),
         Tool(

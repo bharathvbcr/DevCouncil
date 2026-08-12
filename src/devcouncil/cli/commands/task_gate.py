@@ -142,13 +142,16 @@ def record_command(
 
 
 def run_cmd(
-    task_id: str = typer.Argument(...),
-    lease_token: str = typer.Option(..., "--lease-token"),
+    task_id: str | None = typer.Argument(
+        None,
+        help="Optional task ID; required only when gates.mode=enforce.",
+    ),
+    lease_token: str = typer.Option("", "--lease-token"),
     command: str = typer.Option(..., "--command"),
     json_format: bool = typer.Option(False, "--json"),
     project_root: Path = typer.Option(Path("."), "--project-root"),
 ) -> None:
-    """Run an allowlisted command for a leased task through the policy gate."""
+    """Run a command under the configured gate posture."""
     root = project_root.expanduser().resolve()
     set_log_dir(root)
     with log_stage("run-cmd", project_root=root, task_id=task_id):
@@ -197,12 +200,12 @@ def attach_committed_range(
 
 def verify_leased(
     task_id: str = typer.Argument(...),
-    lease_token: str = typer.Option(..., "--lease-token"),
+    lease_token: str = typer.Option("", "--lease-token"),
     sandbox: str = typer.Option("local", "--sandbox"),
     json_format: bool = typer.Option(True, "--json/--no-json", help="MCP-compatible JSON output (default on)."),
     project_root: Path = typer.Option(Path("."), "--project-root"),
 ) -> None:
-    """Verify a leased task (MCP-compatible output)."""
+    """Process task completion under the configured gate posture."""
     root = project_root.expanduser().resolve()
     set_log_dir(root)
     with log_stage("verify-leased", project_root=root, task_id=task_id, sandbox=sandbox):

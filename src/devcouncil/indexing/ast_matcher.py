@@ -31,16 +31,7 @@ class AstMatch:
 class AstMatcher:
     """Structural symbol search with tree-sitter when available, regex/AST fallbacks."""
 
-    _EXT_LANGUAGE = {
-        ".py": "python",
-        ".ts": "typescript",
-        ".tsx": "typescript",
-        ".js": "javascript",
-        ".jsx": "javascript",
-        ".go": "go",
-        ".rs": "rust",
-    }
-
+    # Prefer detect_language / code_extensions so new LANGUAGE_SPECS langs are searchable.
     _SYMBOL_PATTERNS: dict[str, re.Pattern[str]] = {
         "typescript": re.compile(
             r"^\s*(?:export\s+)?(?:(?:async\s+)?(?:function|class|interface|type)\s+|const\s+)([A-Za-z_$][\w$]*)"
@@ -65,6 +56,12 @@ class AstMatcher:
         except Exception:
             return False
 
+    @staticmethod
+    def _language_for_suffix(suffix: str) -> str | None:
+        from devcouncil.codeintel.languages import language_id_for_suffix
+
+        return language_id_for_suffix(suffix)
+
     def match(
         self,
         *,
@@ -84,16 +81,21 @@ class AstMatcher:
             except (OSError, UnicodeDecodeError):
                 continue
             rel = path.relative_to(self.project_root).as_posix()
-            file_language = self._EXT_LANGUAGE.get(path.suffix.lower(), path.suffix.lower().lstrip("."))
+            file_language = (
+                self._language_for_suffix(path.suffix.lower())
+                or path.suffix.lower().lstrip(".")
+            )
             matches.extend(self._match_file(rel, file_language, text, query=query, kind=kind))
             if len(matches) >= limit:
                 return matches[:limit]
         return matches[:limit]
 
     def _candidate_files(self, language: str | None, files: list[Path] | None = None) -> list[Path]:
+        from devcouncil.codeintel.languages import code_extensions, language_id_for_suffix
+
         allowed_exts = {
-            ext for ext, ext_language in self._EXT_LANGUAGE.items()
-            if language is None or ext_language == language
+            ext for ext in code_extensions()
+            if language is None or language_id_for_suffix(ext) == language
         }
         # When the caller already walked the tree (e.g. SemanticIndex.create_snapshot
         # shares one traversal across all collectors), filter that list in memory

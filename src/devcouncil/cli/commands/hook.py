@@ -493,8 +493,10 @@ def _maybe_refresh_map(root: Path, payload_text: str) -> None:
         )
         return
 
-    # Only refresh code-ish paths under the project
-    code_exts = {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".rs"}
+    # Only refresh code-ish paths under the project (LANGUAGE_SPECS extensions).
+    from devcouncil.codeintel.languages import code_extensions
+
+    code_exts = code_extensions()
     rels: list[str] = []
     for p in paths:
         candidate = Path(p)
@@ -907,7 +909,7 @@ def _verify_active_task(root: Path) -> str:
             RequirementRepository,
         )
         from devcouncil.verification.next_actions import split_next_actions
-        from devcouncil.verification.verifier import Verifier
+        from devcouncil.verification.verifier import Verifier, verification_task_status
 
         active_id = active_task_id(root)
         db = get_db(root)
@@ -918,7 +920,8 @@ def _verify_active_task(root: Path) -> str:
             if not task:
                 return "Run [bold]dev verify[/bold] to finalize implementation evidence."
             reqs = RequirementRepository(session).get_all()
-            gaps, evidence = asyncio.run(Verifier(root).verify_task(task, reqs))
+            verifier = Verifier(root)
+            gaps, evidence = asyncio.run(verifier.verify_task(task, reqs))
             gap_repo = GapRepository(session)
             ev_repo = EvidenceRepository(session)
             gap_repo.delete_for_task(task.id)
@@ -935,7 +938,7 @@ def _verify_active_task(root: Path) -> str:
                 elif isinstance(ev, TestEvidence):
                     ev_repo.save_test_evidence(ev, task.id)
             blocking = [g for g in gaps if g.blocking]
-            task.status = "blocked" if blocking else "verified"
+            task.status = verification_task_status(gaps, verifier.last_outcome)
             TaskRepository(session).save(task)
         blocking_actions, _ = split_next_actions(gaps)
         TraceLogger(root).log_event(
@@ -949,6 +952,8 @@ def _verify_active_task(root: Path) -> str:
                 f"[yellow]{active_id} is blocked by {len(blocking)} gap(s); "
                 f"{len(blocking_actions)} next action(s). Run [bold]dev repair[/bold].[/yellow]"
             )
+        if task.status == "done":
+            return f"[green]{active_id} completed; quality verification is disabled.[/green]"
         return f"[green]{active_id} verified.[/green]"
     except Exception as exc:  # never let a hook crash the agent
         return f"[dim]post-task verification skipped: {exc}[/dim]"

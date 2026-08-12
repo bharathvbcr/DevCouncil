@@ -62,6 +62,7 @@ def test_graph_init_busy_and_status_text(tmp_path, monkeypatch):
             mode="full",
             generation=3,
             compatibility_export_degraded=False,
+            build_incomplete=False,
         ),
     )
     monkeypatch.setattr(
@@ -154,6 +155,7 @@ def test_graph_sync_watch_search_ingest(tmp_path, monkeypatch):
         degraded=False,
         reason=None,
         compatibility_export_degraded=False,
+        build_incomplete=False,
     )
     monkeypatch.setattr(
         "devcouncil.indexing.map_artifacts.refresh_map_artifacts",

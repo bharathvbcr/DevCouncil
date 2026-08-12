@@ -65,6 +65,33 @@ _BY_EXTENSION = {
     for extension in spec.extensions
 }
 
+# Overlay for markup/config/shell suffixes that are not LANGUAGE_SPECS code
+# languages but still need stable map/fence language ids.
+#
+# HTML intentionally lives here — not in LANGUAGE_SPECS / code_extensions().
+# Labeling .html/.htm in languages[] and files[].language is useful; putting
+# them in code_extensions would promote static-asset trees (public/, dist/,
+# email templates) into code subsystems via _primary_code_files. Markdown is
+# the same class: first-class map labels via include_markup, never subsystem
+# seeds.
+_MARKUP_LANGUAGE_IDS: dict[str, str] = {
+    ".md": "markdown",
+    ".markdown": "markdown",
+    ".html": "html",
+    ".htm": "html",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".toml": "toml",
+    ".json": "json",
+    ".sh": "shell",
+    ".ps1": "powershell",
+}
+
+# Grammar ids that should coalesce to a sibling map/fence id.
+_GRAMMAR_ALIASES: dict[str, str] = {
+    "tsx": "typescript",
+}
+
 
 def supported_languages() -> list[str]:
     return [spec.name for spec in LANGUAGE_SPECS]
@@ -72,6 +99,49 @@ def supported_languages() -> list[str]:
 
 def detect_language(path: str | Path) -> LanguageSpec | None:
     return _BY_EXTENSION.get(Path(path).suffix.lower())
+
+
+def code_extensions() -> frozenset[str]:
+    """All source extensions declared in ``LANGUAGE_SPECS`` (lowercase)."""
+    return frozenset(
+        extension.lower()
+        for spec in LANGUAGE_SPECS
+        for extension in spec.extensions
+    )
+
+
+def markup_extensions() -> frozenset[str]:
+    """Markup/config/shell suffixes from the overlay (not code subsystem seeds)."""
+    return frozenset(_MARKUP_LANGUAGE_IDS)
+
+
+def language_id_for_suffix(
+    suffix: str,
+    *,
+    include_markup: bool = False,
+) -> str | None:
+    """Map a file suffix to a stable lowercase language id.
+
+    Prefers ``LANGUAGE_SPECS`` grammar ids, coalescing ``tsx`` → ``typescript``.
+    When ``include_markup`` is True, also resolves markdown/html/yaml/toml/json/shell.
+    """
+    key = suffix if suffix.startswith(".") else f".{suffix}"
+    key = key.lower()
+    spec = _BY_EXTENSION.get(key)
+    if spec is not None:
+        return _GRAMMAR_ALIASES.get(spec.grammar, spec.grammar)
+    if include_markup:
+        return _MARKUP_LANGUAGE_IDS.get(key)
+    return None
+
+
+def language_id_for_path(
+    path: str | Path,
+    *,
+    include_markup: bool = False,
+) -> str | None:
+    """Convenience wrapper around :func:`language_id_for_suffix`."""
+    return language_id_for_suffix(Path(path).suffix, include_markup=include_markup)
 
 
 def grammar_status() -> dict[str, Any]:

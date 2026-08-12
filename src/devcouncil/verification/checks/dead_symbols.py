@@ -37,6 +37,9 @@ from devcouncil.verification.stub_detector import added_lines_by_file, task_allo
 logger = logging.getLogger(__name__)
 
 _IDENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
+# Intentionally narrow: export/__all__ heuristics are only implemented for py/js.
+# Do not widen to Swift/Kotlin until real analyzers exist (map entry seeds still
+# populate entry_roots for navigation).
 _CODE_SUFFIXES = {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
 
 # (path, start_line, end_line, name)

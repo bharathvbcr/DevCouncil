@@ -583,8 +583,11 @@ async def run_verify_orchestration(
 
     from devcouncil.verification.gap_ids import normalize_verify_gaps
     from devcouncil.verification.verifier import VerificationOutcome
+    from devcouncil.gating.policy import apply_gate_enforcement
 
     gaps = normalize_verify_gaps(gaps)
+    gate_mode = getattr(getattr(_cfg, "gates", None), "mode", "enforce")
+    gaps = apply_gate_enforcement(gaps, mode=gate_mode)
     blocking_count = len([g for g in gaps if g.blocking])
     log_step(
         "verify/complete",
@@ -592,12 +595,14 @@ async def run_verify_orchestration(
         task_id=task.id,
         total_gaps=len(gaps),
         blocking_gaps=blocking_count,
+        gate_mode=gate_mode,
         evidence_items=len(evidence_to_save),
         trace=True,
     )
 
     verifier.last_outcome = VerificationOutcome(
         mode=_verification_mode_label(evidence_to_save, compiler_active=compiler_active),
+        gate_mode=gate_mode,
         compiler_active=compiler_active,
         diff_empty=diff_empty,
         coverage_measured=coverage_measured,

@@ -12,6 +12,7 @@ from devcouncil.codeintel.build_control import (
     graph_build_session,
     record_inline_build_status,
     run_isolated_full_build,
+    update_inline_build_progress,
 )
 from devcouncil.indexing.graph.build import (
     _CODE_SUFFIXES,
@@ -222,9 +223,30 @@ def _sync_affected_paths_locked(
         or node.id in referenced_ids
     ]
 
+    inline_status = None
     if liveness:
         from devcouncil.indexing.wiring import build_dynamic_import_index, entry_roots
 
+        # Inline build_status so unlock can target a stuck watcher (no second supervisor).
+        generation_before = service.store.current_generation()
+        inline_status = record_inline_build_status(
+            root,
+            state="building",
+            mode="incremental",
+            phase="liveness",
+            generation_before=generation_before,
+            generation_after=None,
+            compatibility_export="unknown",
+            completed=0,
+            total=3,
+        )
+        update_inline_build_progress(
+            root,
+            phase="liveness:files",
+            completed=0,
+            total=3,
+            mode="incremental",
+        )
         all_roots = entry_roots(root, files)
         fresh_roots = entry_roots(root, files, production_only=True)
         if any("dynamic_import_keys" not in shard for shard in shards.values()):
@@ -260,8 +282,22 @@ def _sync_affected_paths_locked(
             production_entry_roots=fresh_roots,
             dynamic_index=dynamic_index,
         )
+        update_inline_build_progress(
+            root,
+            phase="liveness:tokens",
+            completed=1,
+            total=3,
+            mode="incremental",
+        )
         token_dead, _token_index, token_keys = _token_scan_dead(
             graph.nodes, shards
+        )
+        update_inline_build_progress(
+            root,
+            phase="liveness:symbols",
+            completed=2,
+            total=3,
+            mode="incremental",
         )
         graph.dead_code = symbol_reachability_dead(
             root,
@@ -352,12 +388,25 @@ def _sync_affected_paths_locked(
 
     generation_before = service.store.current_generation()
     compatibility_reason = ""
+
+    def _persist_progress(phase: str, completed: int, total: int) -> None:
+        # Incremental sync has no supervisor, but `dev map unlock` and status
+        # both read build_status. Without a heartbeat the persist phase looks
+        # stalled for its whole duration and unlock would kill a live writer.
+        try:
+            update_inline_build_progress(
+                root, phase=phase, completed=completed, total=total
+            )
+        except Exception:  # noqa: BLE001 - status is observability, never fatal
+            logger.debug("inline persist heartbeat failed", exc_info=True)
+
     try:
         write_code_graph(
             root,
             graph,
             changed_paths=persistence_paths,
             analysis_shards=shards,
+            progress=_persist_progress,
         )
     except CompatibilityGraphTooLarge as exc:
         compatibility_reason = str(exc)
@@ -368,10 +417,18 @@ def _sync_affected_paths_locked(
         state="degraded" if compatibility_reason else "complete",
         mode="incremental",
         phase="complete",
-        generation_before=generation_before,
+        generation_before=(
+            inline_status.generation_before
+            if inline_status is not None and inline_status.generation_before is not None
+            else generation_before
+        ),
         generation_after=generation_after,
         reason=compatibility_reason,
         compatibility_export="degraded" if compatibility_reason else "healthy",
+        build_id=inline_status.build_id if inline_status is not None else None,
+        started_at=inline_status.started_at if inline_status is not None else None,
+        completed=3,
+        total=3,
     )
     refresh_repo_map_from_graph(
         root,

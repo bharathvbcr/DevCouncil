@@ -100,11 +100,17 @@ def refresh_repo_map_from_graph(
     graph build merely to refresh ``repo_map.json``. This function keeps the
     compatibility artifact aligned using the graph and affected-file set that the
     caller has already computed.
+
+    When affected paths include code or manifests, header fields
+    (``languages`` / frameworks / package_managers / test_commands) and
+    ``subsystems`` are rebuilt via mapper helpers so incremental Swift/Kotlin
+    edits do not leave stale map headers.
     """
     path = root / ".devcouncil" / "repo_map.json"
     if not path.is_file():
         return
     try:
+        from devcouncil.codeintel.languages import code_extensions, markup_extensions
         from devcouncil.indexing.repo_mapper import RepoMap, RepoMapper
 
         repo_mapper = mapper or RepoMapper(root)
@@ -129,6 +135,39 @@ def refresh_repo_map_from_graph(
         repo_map.dead_symbol_candidates = list(
             graph.meta.get("legacy_dead_symbol_candidates") or []
         )[:cap]
+
+        # Rebuild header classification when code/markup/manifest edits land so
+        # languages[] / package_managers[] do not stay stale after incremental sync.
+        # Markup (md/html/…) is included for languages[] only — not code_extensions.
+        _MANIFEST_NAMES = frozenset({
+            "Package.swift", "Cargo.toml", "go.mod", "go.sum",
+            "package.json", "pyproject.toml", "requirements.txt",
+            "build.gradle", "build.gradle.kts",
+            "settings.gradle", "settings.gradle.kts", "gradlew",
+            "AndroidManifest.xml",
+        })
+        header_exts = code_extensions() | markup_extensions()
+        needs_header = any(
+            Path(rel).suffix.lower() in header_exts
+            or Path(rel.replace("\\", "/")).name in _MANIFEST_NAMES
+            for rel in affected
+        )
+        if needs_header:
+            all_files = list(files)
+            repo_map.languages = repo_mapper.detect_languages(all_files)
+            repo_map.frameworks = repo_mapper.detect_frameworks(all_files)
+            repo_map.package_managers = repo_mapper.detect_package_managers(all_files)
+            repo_map.test_commands = repo_mapper.detect_test_commands(all_files)
+            try:
+                repo_mapper._source_root = repo_mapper.detect_source_root(all_files)
+                # Mirror map_repo: generic when the tree is not DevCouncil itself.
+                repo_mapper._use_generic = not any(
+                    f.replace("\\", "/").startswith("src/devcouncil/") for f in all_files
+                )
+                repo_map.subsystems = repo_mapper._build_subsystem_index(all_files)
+            except Exception:
+                logger.debug("incremental subsystem rebuild failed", exc_info=True)
+
         # Do NOT stamp fingerprints or clear graph_degraded here. A later
         # ``mapper.map_repo`` failure in ``refresh_map_artifacts`` would otherwise
         # leave a fingerprint-fresh, non-degraded map while subsystems are stale.

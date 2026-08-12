@@ -37,3 +37,20 @@ def _codex_command(project_root: Path) -> list[str]:
         "--",
         *_server_args(project_root),
     ]
+
+
+def _uninstall_codex(project_root: Path) -> list[str]:
+    """Best-effort Codex MCP remove + strip DevCouncil hooks; leave [features] hooks."""
+    import shutil
+
+    from devcouncil.integrations.clients import hooks as _hooks
+
+    removed: list[str] = []
+    root = project_root.expanduser().resolve()
+    if shutil.which("codex"):
+        code = _run(["codex", "mcp", "remove", "devcouncil"])
+        if code == 0:
+            removed.append("codex mcp server registration")
+    removed.extend(_hooks._uninstall_codex_hooks(root))
+    removed.extend(_common._clear_client_integration_config(root, "codex"))
+    return removed

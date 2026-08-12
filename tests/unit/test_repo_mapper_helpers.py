@@ -1397,3 +1397,71 @@ def test_devprism_shaped_fidelity_baseline(tmp_path):
     assert any(r.endswith("lib.rs") for r in roots)
     assert any(r.endswith("main.rs") for r in roots)
     assert status_state == "committed"
+
+
+def test_generated_trees_are_excluded_from_the_inventory(mapper: RepoMapper) -> None:
+    """node_modules / build output / binaries must never enter the file index.
+
+    Regression for a 136k-file, 175MB repo map: untracked trees are only as
+    bounded as a repo's ignore rules, which the mapper cannot assume.
+    """
+    excluded = [
+        "node_modules/react/index.js",
+        "web/node_modules/left-pad/index.js",
+        "coverage/lcov-report/index.html",
+        "target/debug/build.rs",
+        "vendor/github.com/pkg/errors/errors.go",
+        ".gitnexus/index.db",
+        "Pods/Alamofire/Source/Alamofire.swift",
+        ".next/static/chunks/main.js",
+        "assets/logo.png",
+        "dist/bundle.min.js",
+        "lib/native.so",
+    ]
+    for path in excluded:
+        assert mapper._is_runtime_or_generated_file(path), path
+
+    kept = [
+        "src/app.py",
+        # A source directory that merely happens to be named `build`.
+        "src/devcouncil/indexing/graph/build.py",
+        "packages/core/src/index.ts",
+        "docs/architecture.md",
+    ]
+    for path in kept:
+        assert not mapper._is_runtime_or_generated_file(path), path
+
+
+def test_inventory_cap_drops_untracked_first(mapper: RepoMapper) -> None:
+    tracked = [f"src/mod_{index}.py" for index in range(10)]
+    untracked = [f"scratch/tmp_{index}.py" for index in range(100)]
+
+    capped = mapper._cap_inventory(tracked, untracked, 20)
+
+    assert len(capped) == 20
+    assert set(tracked) <= set(capped)
+    # Overflow came out of the untracked half, not the tracked half.
+    assert len([p for p in capped if p.startswith("scratch/")]) == 10
+
+
+def test_inventory_cap_below_tracked_count_truncates_tracked(mapper: RepoMapper) -> None:
+    tracked = [f"src/mod_{index:03d}.py" for index in range(50)]
+
+    capped = mapper._cap_inventory(tracked, ["scratch/x.py"], 10)
+
+    assert len(capped) == 10
+    assert all(path.startswith("src/") for path in capped)
+
+
+def test_get_git_files_can_exclude_untracked(tmp_path, monkeypatch) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "tracked.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.py"], cwd=tmp_path, check=True)
+    (tmp_path / "untracked.py").write_text("y = 2\n", encoding="utf-8")
+
+    mapper = RepoMapper(tmp_path)
+    monkeypatch.setattr(RepoMapper, "_inventory_limits", lambda self: (True, 50_000))
+    assert set(mapper.get_git_files()) == {"tracked.py", "untracked.py"}
+
+    monkeypatch.setattr(RepoMapper, "_inventory_limits", lambda self: (False, 50_000))
+    assert mapper.get_git_files() == ["tracked.py"]

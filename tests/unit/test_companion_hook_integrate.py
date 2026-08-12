@@ -67,7 +67,7 @@ def test_matrix_shows_enforcement_posture(tmp_path):
     result = runner.invoke(app, ["integrate", "matrix", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert "Enforcement" in result.output
-    assert "pre-action" in result.output
+    assert "advisory+verify" in result.output
     assert "verify-only" in result.output
 
 
@@ -85,7 +85,7 @@ def test_check_flags_tampered_hook_config(tmp_path):
     _init_repo(tmp_path)
     claude_dir = tmp_path / ".claude"
     claude_dir.mkdir()
-    # A hook config that no longer references devcouncil = disarmed gate.
+    # Gate event remains but commands were emptied = disarmed (not clean uninstall).
     (claude_dir / "settings.local.json").write_text(
         json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": []}]}}),
         encoding="utf-8",
@@ -93,6 +93,7 @@ def test_check_flags_tampered_hook_config(tmp_path):
     report = build_integration_check_report(tmp_path)
     integrity = [r for r in report.checks if r.name == "Claude hook integrity"]
     assert integrity and integrity[0].status == "fail"
+    assert "tampered" in integrity[0].details.lower() or "disarmed" in integrity[0].details.lower()
 
 
 def test_check_passes_when_hook_config_references_devcouncil(tmp_path):
@@ -151,3 +152,86 @@ def test_check_skips_integrity_when_no_hook_config(tmp_path):
     _init_repo(tmp_path)
     report = build_integration_check_report(tmp_path)
     assert not any(r.name == "Claude hook integrity" for r in report.checks)
+
+
+def test_check_clean_uninstall_preserves_settings_not_tampered(tmp_path):
+    """Surgical uninstall leaves user settings; absence of DevCouncil hooks is clean."""
+    _init_repo(tmp_path)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "settings.local.json").write_text(
+        json.dumps(
+            {
+                "permissions": {"allow": ["Bash(git *)"]},
+                "hooks": {
+                    "Notification": [
+                        {"matcher": "", "hooks": [{"type": "command", "command": "echo notify"}]}
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    report = build_integration_check_report(tmp_path)
+    assert not any(r.name == "Claude hook integrity" for r in report.checks)
+    assert not any(r.name == "Claude hooks" for r in report.checks)
+
+
+def test_check_empty_orphaned_hooks_file_not_tampered(tmp_path):
+    _init_repo(tmp_path)
+    cursor_dir = tmp_path / ".cursor"
+    cursor_dir.mkdir()
+    (cursor_dir / "hooks.json").write_text(
+        json.dumps({"version": 1, "hooks": {}}),
+        encoding="utf-8",
+    )
+    report = build_integration_check_report(tmp_path)
+    assert not any(r.name == "Cursor hook integrity" for r in report.checks)
+    assert not any(r.name == "Cursor hooks" for r in report.checks)
+
+
+def test_check_skips_hook_rows_when_disabled_and_no_devcouncil_hooks(tmp_path):
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "project:\n  name: test\nintegrations:\n  claude:\n    enabled: false\n"
+        "  cursor:\n    enabled: false\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "settings.local.json").write_text(
+        json.dumps({"permissions": {"allow": ["Bash"]}}),
+        encoding="utf-8",
+    )
+    cursor_dir = tmp_path / ".cursor"
+    cursor_dir.mkdir()
+    (cursor_dir / "hooks.json").write_text(
+        json.dumps({"version": 1, "hooks": {"sessionStart": [{"command": "echo hi"}]}}),
+        encoding="utf-8",
+    )
+    report = build_integration_check_report(tmp_path)
+    assert not any(r.name == "Claude hooks" for r in report.checks)
+    assert not any(r.name == "Cursor hooks" for r in report.checks)
+    assert not any(r.name.endswith("hook integrity") for r in report.checks)
+
+
+def test_check_flags_enabled_but_hooks_stripped(tmp_path):
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "project:\n  name: test\nintegrations:\n  claude:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "settings.local.json").write_text(
+        json.dumps({"permissions": {"allow": ["Bash"]}}),
+        encoding="utf-8",
+    )
+    report = build_integration_check_report(tmp_path)
+    integrity = [r for r in report.checks if r.name == "Claude hook integrity"]
+    assert integrity and integrity[0].status == "fail"
+    assert "enabled" in integrity[0].details.lower()
+    claude_hooks = [r for r in report.checks if r.name == "Claude hooks"]
+    assert claude_hooks and claude_hooks[0].status == "fail"

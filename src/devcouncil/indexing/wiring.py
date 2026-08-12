@@ -16,6 +16,7 @@ import ast
 import json
 import logging
 import re
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Literal, Optional, Set, Tuple
@@ -25,13 +26,24 @@ from pydantic import BaseModel, Field
 from devcouncil.indexing.walk import IGNORED_DIR_NAMES, should_skip_path
 from devcouncil.utils.json_persist import read_model_json, write_model_json
 
+
+@dataclass
+class DiscoveryReport:
+    sources_attempted: List[str] = field(default_factory=list)
+    sources_yielded: Dict[str, int] = field(default_factory=dict)
+    errors: List[Dict[str, str]] = field(default_factory=list)
+
+
 logger = logging.getLogger(__name__)
 
 # Python + JS/TS always. Go is file-level (all package members). Rust is included
 # only when tree-sitter edges are available (see is_liveness_code_file).
+# Intentionally narrow: file-level BFS needs reliable import edges; do not widen
+# to Swift/Kotlin/etc. until those languages emit import edges (see plan
+# "Intentionally narrow" — entry seeds still populate entry_roots for navigation).
 _LIVENESS_EXTS = {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go"}
 _RUST_LIVENESS_EXT = ".rs"
-_TEST_DIR_NAMES = {"tests", "test", "__tests__", "spec"}
+_TEST_DIR_NAMES = {"tests", "test", "__tests__", "spec", "androidtest"}
 _SCRIPT_DIR_NAMES = {"scripts", "bin", "benchmarks"}
 ALLOW_UNWIRED = "devcouncil: allow-unwired"
 _IMPORTLIB_RE = re.compile(
@@ -78,6 +90,8 @@ _WIRING_DECORATOR_HINTS = (
     "app.", "router.", "typer.", "click.", "pytest.", "celery.",
     "flask", "fastapi", "command", "route", "task", "fixture",
     "register", "hookimpl", "hookable",
+    "receiver", "api_view", "action", "subscriber", "listener", "on_event",
+    "dramatiq.", "huey.",
 )
 
 # Bumped when dead-symbol / token-scan semantics change so ratchet baselines
@@ -97,15 +111,20 @@ def _norm(path: str) -> str:
 
 def is_test_path(path: str) -> bool:
     """True when path looks like a test file by common conventions."""
-    norm = _norm(path).lower()
+    norm = _norm(path)
+    norm_l = norm.lower()
     name = norm.rsplit("/", 1)[-1]
-    parts = norm.split("/")
+    name_l = name.lower()
+    parts = norm_l.split("/")
     in_test_dir = any(p in _TEST_DIR_NAMES for p in parts[:-1])
+    # Android / JVM: src/test/, src/androidTest/
+    if "/src/test/" in f"/{norm_l}/" or "/src/androidtest/" in f"/{norm_l}/":
+        in_test_dir = True
     looks_like_test = (
-        name.startswith("test_")
-        or name == "conftest.py"
+        name_l.startswith("test_")
+        or name_l == "conftest.py"
         or any(
-            name.endswith(suffix)
+            name_l.endswith(suffix)
             for suffix in (
                 "_test.py",
                 "_test.go",
@@ -120,6 +139,10 @@ def is_test_path(path: str) -> bool:
                 "_spec.rb",
             )
         )
+        # Swift / Kotlin naming: FooTests.swift, FooTest.kt (case-sensitive suffix).
+        or name.endswith("Tests.swift")
+        or name.endswith("Test.kt")
+        or name.endswith("Tests.kt")
     )
     return looks_like_test or (in_test_dir and not name.startswith("."))
 
@@ -459,7 +482,7 @@ def is_wiring_decorated(decorators: List[str]) -> bool:
     ``preregister``) and hid real dead code behind unrelated decorators.
     """
     for dec in decorators:
-        base = dec.split("(", 1)[0].strip().lower()
+        base = dec.split("(", 1)[0].lstrip("@").strip().lower()
         if not base:
             continue
         segments = [s for s in re.split(r"[.\s]+", base) if s]
@@ -540,6 +563,39 @@ def _read_text(root: Path, rel: str) -> str:
         return ""
 
 
+def _cargo_toml_script_targets(root: Path, file_set: Set[str]) -> Set[str]:
+    """Discover entry points declared in Cargo.toml manifests."""
+    found: Set[str] = set()
+    manifests = [p for p in file_set if p.rsplit("/", 1)[-1] == "Cargo.toml"]
+    if not manifests and (root / "Cargo.toml").is_file():
+        manifests = ["Cargo.toml"]
+    for manifest in manifests:
+        text = _read_text(root, manifest)
+        if not text:
+            continue
+        try:
+            import tomllib
+            data = tomllib.loads(text)
+        except Exception:
+            continue
+        prefix = manifest[: -len("Cargo.toml")]
+        
+        bins = data.get("bin") or []
+        if isinstance(bins, list):
+            for b in bins:
+                if isinstance(b, dict):
+                    bpath = b.get("path")
+                    if isinstance(bpath, str):
+                        cand = _norm(f"{prefix}{bpath}")
+                        if cand in file_set:
+                            found.add(cand)
+        for default_cand in [f"{prefix}src/main.rs", f"{prefix}src/lib.rs"]:
+            cand = _norm(default_cand)
+            if cand in file_set:
+                found.add(cand)
+    return found
+
+
 def _pyproject_script_targets(root: Path, file_set: Set[str]) -> Set[str]:
     """Resolve pyproject [project.scripts]/entry-points/gui-scripts module paths."""
     text = _read_text(root, "pyproject.toml")
@@ -612,8 +668,13 @@ def _add_module_file(module: str, file_set: Set[str], out: Set[str]) -> None:
     # Soft match: any file whose path ends with the module path (sorted for determinism).
     suffix = f"/{parts}.py"
     suffix_init = f"/{parts}/__init__.py"
+    prefix_dir = f"{parts}/"
+    suffix_dir = f"/{parts}/"
     for f in sorted(file_set):
         if f.endswith(suffix) or f.endswith(suffix_init) or f == f"{parts}.py":
+            out.add(f)
+            return
+        if (f.startswith(prefix_dir) or suffix_dir in f) and f.endswith(".py"):
             out.add(f)
             return
 
@@ -631,7 +692,8 @@ def _package_json_entry_targets(root: Path, file_set: Set[str]) -> Set[str]:
     scanned (capped) with its targets resolved relative to the manifest's dir.
     """
     manifests = sorted(
-        p for p in file_set if p.rsplit("/", 1)[-1] == "package.json"
+        (p for p in file_set if p.rsplit("/", 1)[-1] == "package.json"),
+        key=lambda p: (p.count("/"), p),
     )[:_PACKAGE_MANIFEST_CAP]
     if not manifests and (root / "package.json").is_file():
         manifests = ["package.json"]
@@ -706,6 +768,11 @@ _JS_MAIN_SEED_RE = re.compile(
     r"\.(?:ts|tsx|js|jsx|mjs)$"
 )
 _RUST_MAIN_SEED_RE = re.compile(r"(?:^|/)src/(?:main\.rs|lib\.rs|bin/[^/]+\.rs)$")
+_SWIFT_AT_MAIN_RE = re.compile(r"@main\b")
+_SWIFTPM_EXECUTABLE_RE = re.compile(
+    r"""\.executableTarget\s*\(\s*name\s*:\s*["']([^"']+)["']"""
+    r"""|executableTarget\s*\(\s*name\s*:\s*["']([^"']+)["']"""
+)
 _TOOLING_CONFIG_RE = re.compile(
     r"(?:^|/)"
     r"(?:"
@@ -807,13 +874,24 @@ def _expand_roots_via_dynamic_imports(
                 seen.add(hit)
                 expanded.add(hit)
                 queue.append(hit)
+        if cur.endswith(".py"):
+            py_specs = [match.group(1) for match in _IMPORTLIB_RE.finditer(text)]
+            for mod in py_specs:
+                py_hits: Set[str] = set()
+                _add_module_file(mod, file_set, py_hits)
+                for hit in py_hits:
+                    if hit and hit not in seen:
+                        seen.add(hit)
+                        expanded.add(hit)
+                        queue.append(hit)
     return expanded
 
 
 def _conventional_main_seeds(root: Path, file_set: Set[str]) -> Set[str]:
     """Language-convention entry mains: Go/Rust/C/C++ binaries, Python service
     mains, JS/TS ``src/index``/``src/main``/``App``/service ``index`` modules,
-    and Rust ``main.rs`` / ``lib.rs``.
+    Rust ``main.rs`` / ``lib.rs``, Swift ``main.swift`` / ``@main``, and
+    Android ``MainActivity``.
 
     Tooling configs (Vite/PostCSS/…) are structural exemptions only — never BFS
     seeds (they do not import product modules).
@@ -825,7 +903,20 @@ def _conventional_main_seeds(root: Path, file_set: Set[str]) -> Set[str]:
             found.add(f)
             continue
         name = f.rsplit("/", 1)[-1]
-        if name == "main.go":
+        if name == "main.swift":
+            found.add(f)
+            continue
+        if name in {"MainActivity.kt", "MainActivity.java"}:
+            found.add(f)
+            continue
+        if name.endswith(".swift"):
+            if sniffed >= _MAIN_SEED_SNIFF_CAP:
+                continue
+            sniffed += 1
+            if _SWIFT_AT_MAIN_RE.search(_read_text(root, f)):
+                found.add(f)
+            continue
+        if name == "main.go" or (f.endswith(".go") and any(d in f for d in ("cmd/", "bin/"))):
             if sniffed >= _MAIN_SEED_SNIFF_CAP:
                 continue
             sniffed += 1
@@ -847,6 +938,56 @@ def _conventional_main_seeds(root: Path, file_set: Set[str]) -> Set[str]:
             sniffed += 1
             if _C_MAIN_RE.search(_read_text(root, f)):
                 found.add(f)
+    return found
+
+
+def _swiftpm_package_targets(root: Path, file_set: Set[str]) -> Set[str]:
+    """Entry seeds from SwiftPM ``Package.swift`` executable targets.
+
+    Resolves ``.executableTarget(name: "App")`` to conventional
+    ``Sources/<Name>/main.swift`` / ``Sources/<Name>/<Name>.swift`` paths when
+    present (Cargo ``src/main.rs`` analogue).
+    """
+    found: Set[str] = set()
+    manifests = sorted(
+        (p for p in file_set if p.rsplit("/", 1)[-1] == "Package.swift"),
+        key=lambda p: (p.count("/"), p),
+    )[:_PACKAGE_MANIFEST_CAP]
+    if not manifests and (root / "Package.swift").is_file():
+        manifests = ["Package.swift"]
+    for manifest in manifests:
+        text = _read_text(root, manifest)
+        if not text:
+            continue
+        prefix = manifest[: -len("Package.swift")]
+        names: List[str] = []
+        for match in _SWIFTPM_EXECUTABLE_RE.finditer(text):
+            names.append(match.group(1) or match.group(2))
+        for target_name in names:
+            if not target_name:
+                continue
+            for cand in (
+                f"{prefix}Sources/{target_name}/main.swift",
+                f"{prefix}Sources/{target_name}/{target_name}.swift",
+            ):
+                cand_n = _norm(cand)
+                if cand_n in file_set:
+                    found.add(cand_n)
+        # Also seed Package.swift itself as a structural marker when present.
+        if manifest in file_set:
+            found.add(_norm(manifest))
+    return found
+
+
+def _android_manifest_seeds(root: Path, file_set: Set[str]) -> Set[str]:
+    """AndroidManifest.xml as structural entry seed (+ MainActivity when present)."""
+    found: Set[str] = set()
+    for path in file_set:
+        name = path.rsplit("/", 1)[-1]
+        if name == "AndroidManifest.xml":
+            found.add(_norm(path))
+        elif name in {"MainActivity.kt", "MainActivity.java"}:
+            found.add(_norm(path))
     return found
 
 
@@ -879,6 +1020,110 @@ def _config_declared_entry_roots(root: Path, file_set: Set[str]) -> Set[str]:
     return {_norm(str(p)) for p in declared if p and _norm(str(p)) in file_set}
 
 
+def entry_roots_with_report(
+    root: Path,
+    files: Iterable[str],
+    *,
+    production_only: bool = False,
+) -> Tuple[List[str], DiscoveryReport]:
+    """Discover entry roots and return them alongside a DiscoveryReport with diagnostic metadata."""
+    report = DiscoveryReport()
+    try:
+        file_set = {_norm(f) for f in files}
+        roots: Set[str] = set()
+
+        report.sources_attempted.append("config")
+        try:
+            cfg_roots = _config_declared_entry_roots(root, file_set)
+            report.sources_yielded["config"] = len(cfg_roots)
+            roots |= cfg_roots
+        except Exception as exc:
+            report.errors.append({"source": "config", "error": str(exc)})
+
+        report.sources_attempted.append("pyproject")
+        try:
+            pyp_roots = _pyproject_script_targets(root, file_set)
+            report.sources_yielded["pyproject"] = len(pyp_roots)
+            roots |= pyp_roots
+        except Exception as exc:
+            report.errors.append({"source": "pyproject", "error": str(exc)})
+
+        report.sources_attempted.append("cargo")
+        try:
+            cargo_roots = _cargo_toml_script_targets(root, file_set)
+            report.sources_yielded["cargo"] = len(cargo_roots)
+            roots |= cargo_roots
+        except Exception as exc:
+            report.errors.append({"source": "cargo", "error": str(exc)})
+
+        report.sources_attempted.append("swiftpm")
+        try:
+            spm_roots = _swiftpm_package_targets(root, file_set)
+            report.sources_yielded["swiftpm"] = len(spm_roots)
+            roots |= spm_roots
+        except Exception as exc:
+            report.errors.append({"source": "swiftpm", "error": str(exc)})
+
+        report.sources_attempted.append("android")
+        try:
+            android_roots = _android_manifest_seeds(root, file_set)
+            report.sources_yielded["android"] = len(android_roots)
+            roots |= android_roots
+        except Exception as exc:
+            report.errors.append({"source": "android", "error": str(exc)})
+
+        report.sources_attempted.append("package_json")
+        try:
+            pj_roots = _package_json_entry_targets(root, file_set)
+            report.sources_yielded["package_json"] = len(pj_roots)
+            roots |= pj_roots
+        except Exception as exc:
+            report.errors.append({"source": "package_json", "error": str(exc)})
+
+        report.sources_attempted.append("conventional")
+        try:
+            conv_roots = set()
+            for f in _conventional_main_seeds(root, file_set):
+                if production_only and is_test_path(f):
+                    continue
+                conv_roots.add(f)
+            report.sources_yielded["conventional"] = len(conv_roots)
+            roots |= conv_roots
+        except Exception as exc:
+            report.errors.append({"source": "conventional", "error": str(exc)})
+
+        report.sources_attempted.append("scripts")
+        try:
+            script_roots = set()
+            for f in file_set:
+                if production_only and is_test_path(f):
+                    continue
+                name = Path(f).name
+                if name in {"__main__.py", "manage.py"}:
+                    script_roots.add(f)
+            report.sources_yielded["scripts"] = len(script_roots)
+            roots |= script_roots
+        except Exception as exc:
+            report.errors.append({"source": "scripts", "error": str(exc)})
+
+        report.sources_attempted.append("dynamic")
+        try:
+            expanded = _expand_roots_via_dynamic_imports(root, file_set, roots)
+            report.sources_yielded["dynamic"] = max(0, len(expanded) - len(roots))
+            roots = expanded
+        except Exception as exc:
+            report.errors.append({"source": "dynamic", "error": str(exc)})
+
+        if production_only:
+            roots = {r for r in roots if not is_test_path(r)}
+
+        return sorted(roots), report
+    except Exception as exc:
+        logger.debug("entry_roots_with_report failed", exc_info=True)
+        report.errors.append({"source": "entry_roots", "error": str(exc)})
+        return [], report
+
+
 def entry_roots(
     root: Path,
     files: Iterable[str],
@@ -901,33 +1146,8 @@ def entry_roots(
 
     Never raises. Returns a sorted list of repo-relative posix paths.
     """
-    try:
-        file_set = {_norm(f) for f in files}
-        roots: Set[str] = set()
-        roots |= _config_declared_entry_roots(root, file_set)
-        roots |= _pyproject_script_targets(root, file_set)
-        roots |= _package_json_entry_targets(root, file_set)
-
-        for f in _conventional_main_seeds(root, file_set):
-            if production_only and is_test_path(f):
-                continue
-            roots.add(f)
-
-        for f in file_set:
-            if production_only and is_test_path(f):
-                continue
-            name = Path(f).name
-            if name in {"__main__.py", "manage.py"}:
-                roots.add(f)
-
-        roots = _expand_roots_via_dynamic_imports(root, file_set, roots)
-        if production_only:
-            roots = {r for r in roots if not is_test_path(r)}
-
-        return sorted(roots)
-    except Exception:
-        logger.debug("entry_roots failed", exc_info=True)
-        return []
+    roots, _ = entry_roots_with_report(root, files, production_only=production_only)
+    return roots
 
 
 def entry_point_symbols(root: Path, files: Iterable[str]) -> Set[str]:

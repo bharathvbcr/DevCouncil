@@ -138,7 +138,7 @@ def test_hooks_tool_all_does_not_install_gemini(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "devcouncil.integrations.clients.hooks._install_codex_hooks",
-        lambda root: installed.append("codex") or [root / ".codex" / "hooks.json"],
+        lambda root, **kwargs: installed.append("codex") or [root / ".codex" / "hooks.json"],
     )
     monkeypatch.setattr(
         "devcouncil.integrations.clients.hooks._install_claude_hooks",
@@ -146,19 +146,19 @@ def test_hooks_tool_all_does_not_install_gemini(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "devcouncil.integrations.clients.hooks._install_cursor_hooks",
-        lambda root: installed.append("cursor") or [root / ".cursor" / "hooks.json"],
+        lambda root, **kwargs: installed.append("cursor") or [root / ".cursor" / "hooks.json"],
     )
     monkeypatch.setattr(
         "devcouncil.integrations.clients.hooks._install_grok_hooks",
-        lambda root: installed.append("grok") or [root / ".grok" / "hooks" / "devcouncil.json"],
+        lambda root, **kwargs: installed.append("grok") or [root / ".grok" / "hooks" / "devcouncil.json"],
     )
     monkeypatch.setattr(
         "devcouncil.integrations.clients.hooks._install_opencode_hooks",
-        lambda root: installed.append("opencode") or [root / "opencode.json"],
+        lambda root, **kwargs: installed.append("opencode") or [root / "opencode.json"],
     )
     monkeypatch.setattr(
         "devcouncil.integrations.clients.hooks._install_gemini_hooks",
-        lambda root: (_ for _ in ()).throw(AssertionError("gemini must not be installed for tool=all")),
+        lambda root, **kwargs: (_ for _ in ()).throw(AssertionError("gemini must not be installed for tool=all")),
     )
     monkeypatch.setattr(
         "devcouncil.integrations.clients.hooks._batched_raw_config",

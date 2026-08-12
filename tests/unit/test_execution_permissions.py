@@ -114,3 +114,18 @@ def test_path_validation_rejects_sibling_prefix_escape(tmp_path):
 
     with pytest.raises(ExecutionError):
         runner._validate_path_within_root("../DevCouncil2/secret.txt")
+
+
+def test_off_mode_native_permissions_do_not_require_task_scope(tmp_path):
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "project:\n  name: test\ngates:\n  mode: off\n",
+        encoding="utf-8",
+    )
+    manager = PermissionManager(PermissionPolicy(), tmp_path)
+    task = _task_for("src/planned.py")
+
+    assert manager.is_file_change_allowed("src/unplanned.py", task) is True
+    assert manager.is_command_allowed("echo taskless", task) is True
+    assert manager.is_file_change_allowed(".env", task) is False
+    assert manager.is_command_allowed("git push --force origin main", task) is False

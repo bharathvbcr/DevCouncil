@@ -307,7 +307,7 @@ async def test_mcp_verify_persists_gaps_evidence_and_task_status(tmp_path, monke
 
     real_run_cli = mcp_util.run_cli_command
 
-    def fake_run_cli(args, root):
+    def fake_run_cli(args, root, **kwargs):
         if args and args[0] == "verify-leased":
             payload = fake_verify_payload(
                 root,
@@ -324,7 +324,7 @@ async def test_mcp_verify_persists_gaps_evidence_and_task_status(tmp_path, monke
                 "stderr_truncated": False,
                 "timed_out": False,
             }
-        return real_run_cli(args, root)
+        return real_run_cli(args, root, **kwargs)
 
     monkeypatch.setattr(mcp_util, "run_cli_command", fake_run_cli)
     monkeypatch.setattr("devcouncil.integrations.mcp.handlers.verify.run_cli_command", fake_run_cli)

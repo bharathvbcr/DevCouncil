@@ -333,24 +333,63 @@ def check_liveness_reliability(project_root: Path) -> list[tuple[str, str, str]]
 
 
 def _repo_languages(project_root: Path) -> set[str]:
-    """Repo languages from repo_map.json, else a bounded filesystem sniff."""
+    """Repo languages from repo_map.json, merged with a registry disk sniff.
+
+    Map headers can lag after incremental edits; sniff via
+    ``code_extensions`` / ``language_id_for_suffix`` so doctor grammar coverage
+    still sees Swift/Kotlin when those files exist on disk.
+    """
+    langs: set[str] = set()
     try:
         from devcouncil.utils.json_persist import read_json
 
         map_path = project_root / ".devcouncil" / "repo_map.json"
         if map_path.is_file():
             data = read_json(map_path)
-            langs = (data or {}).get("languages") if isinstance(data, dict) else None
-            if isinstance(langs, list) and langs:
-                return {str(lang) for lang in langs}
+            map_langs = (data or {}).get("languages") if isinstance(data, dict) else None
+            if isinstance(map_langs, list) and map_langs:
+                langs = {str(lang) for lang in map_langs}
     except Exception:
         logger.debug("repo language read from map failed", exc_info=True)
+
+    sniffed = _sniff_repo_languages(project_root)
+    if sniffed:
+        langs |= sniffed
+    if langs:
+        return langs
     try:
         from devcouncil.indexing.lsp import LspInspector
 
         return set(LspInspector(project_root).detect_languages())
     except Exception:
         logger.debug("repo language detection failed", exc_info=True)
+        return set()
+
+
+def _sniff_repo_languages(project_root: Path, *, limit: int = 4_000) -> set[str]:
+    """Bounded walk for LANGUAGE_SPECS languages present on disk."""
+    try:
+        from devcouncil.codeintel.languages import code_extensions, language_id_for_suffix
+        from devcouncil.indexing.walk import IGNORED_DIR_NAMES
+
+        exts = code_extensions()
+        found: set[str] = set()
+        scanned = 0
+        for dirpath, dirnames, filenames in os.walk(project_root):
+            dirnames[:] = [d for d in dirnames if d not in IGNORED_DIR_NAMES and not d.startswith(".")]
+            for name in filenames:
+                scanned += 1
+                if scanned > limit:
+                    return found
+                suffix = Path(name).suffix.lower()
+                if suffix not in exts:
+                    continue
+                lang = language_id_for_suffix(suffix)
+                if lang:
+                    found.add(lang)
+        return found
+    except Exception:
+        logger.debug("repo language sniff failed", exc_info=True)
         return set()
 
 
@@ -601,33 +640,45 @@ def check_execution_containment(project_root: Path, config=None) -> list[tuple[s
                 "Off by default. Enable execution.enforce_file_scope_pre_verify for battle-test containment.",
             ))
 
-        hook_gate_mode = (getattr(cfg.execution.hook_gate, "mode", "contain") or "contain").strip().lower()
-        rows.append((
-            "Hook gate mode",
-            ok if hook_gate_mode == "contain" else warn,
-            f"execution.hook_gate.mode={hook_gate_mode}. "
-            "contain fail-closes Shell/Write without a lease; off allows no-task Shell/Write "
-            "(hard safety retained). Override: DEVCOUNCIL_HOOK_GATE.",
-        ))
+        hook_gate = getattr(cfg.execution, "hook_gate", None)
+        hook_gate_mode = str(getattr(hook_gate, "mode", None) or "off").strip().lower()
+        if hook_gate_mode == "off":
+            rows.append((
+                "Hook gate mode",
+                ok,
+                "execution.hook_gate.mode=off (interactive default): no-task Shell/Write allowed "
+                "(hard safety retained). Set contain + --write-gate for lease-gated PreToolUse.",
+            ))
+        else:
+            rows.append((
+                "Hook gate mode",
+                ok,
+                f"execution.hook_gate.mode={hook_gate_mode}: fail-closes Shell/Write without a lease "
+                "when PreToolUse is installed. Override: DEVCOUNCIL_HOOK_GATE.",
+            ))
 
-        for label, integration, apply_cmd in (
-            ("Claude", cfg.integrations.claude, "dev integrate claude --apply --write-gate"),
-            ("Cursor", cfg.integrations.cursor, "dev integrate cursor --apply --write-gate"),
-            ("Grok", cfg.integrations.grok, "dev integrate hooks --apply --tool grok --write-gate"),
-            ("OpenCode", cfg.integrations.opencode, "dev integrate hooks --apply --tool opencode --write-gate"),
+        integrations = getattr(cfg, "integrations", None)
+        for label, attr, apply_cmd in (
+            ("Claude", "claude", "dev integrate claude --apply --write-gate"),
+            ("Cursor", "cursor", "dev integrate cursor --apply --write-gate"),
+            ("Grok", "grok", "dev integrate hooks --apply --tool grok --write-gate"),
+            ("OpenCode", "opencode", "dev integrate hooks --apply --tool opencode --write-gate"),
         ):
+            integration = getattr(integrations, attr, None) if integrations is not None else None
             write_gate = bool(getattr(integration, "write_gate", False))
             if write_gate:
                 rows.append((
                     f"{label} write-gate",
                     ok,
-                    f"integrations.{label.lower()}.write_gate is enabled (contain / PreToolUse).",
+                    f"integrations.{attr}.write_gate is enabled (contain / PreToolUse) — "
+                    "OK for autonomous runs.",
                 ))
             else:
                 rows.append((
                     f"{label} write-gate",
-                    warn,
-                    f"Assist (PostToolUse refresh only). Run `{apply_cmd}` for PreToolUse containment.",
+                    ok,
+                    f"Assist (PostToolUse refresh only) — interactive default. "
+                    f"Use `{apply_cmd}` for PreToolUse containment on autonomous runs.",
                 ))
 
         for name, profile in load_agent_profiles(project_root).items():

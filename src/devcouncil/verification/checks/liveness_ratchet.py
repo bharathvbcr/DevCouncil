@@ -18,6 +18,8 @@ from devcouncil.domain.task import Task
 
 logger = logging.getLogger(__name__)
 
+LIVENESS_SCHEMA_VERSION = 1
+
 
 def _norm(path: str) -> str:
     s = str(path).replace("\\", "/")
@@ -120,6 +122,16 @@ def detect_liveness_regressions(
         return gaps
     assert baseline is not None
     try:
+        base_schema = baseline.get("schema_version")
+        cur_schema = current.get("schema_version") if isinstance(current, Mapping) else None
+        if base_schema and cur_schema and base_schema != cur_schema:
+            logger.warning(
+                "liveness schema version mismatch (baseline=%s, current=%s); skipping ratchet diff",
+                base_schema,
+                cur_schema,
+            )
+            return gaps
+
         added = {_norm(p) for p in (task_added_files or set())}
         task_id = task.id if task is not None else "TASK"
         gap_id = next_gap_id or (lambda tid, kind: f"{tid}-{kind}-1")
@@ -142,7 +154,13 @@ def detect_liveness_regressions(
             if skip_unreachable
             else (cur_unreachable - base_unreachable) - added
         )
-        stranded_files = sorted(newly_unwired | newly_unreachable)
+        removed_from_base = (base_unwired - cur_unwired) | (base_unreachable - cur_unreachable)
+        removed_basenames = {Path(r).name for r in removed_from_base if r}
+
+        raw_stranded = newly_unwired | newly_unreachable
+        stranded_files = sorted(
+            p for p in raw_stranded if Path(p).name not in removed_basenames
+        )
 
         for path in stranded_files:
             reasons = []
@@ -327,6 +345,7 @@ def snapshot_liveness_baseline(
             "generated_head": mapper._git_head(),
             "source": "fresh_scan",
             "scan_version": LIVENESS_SCAN_VERSION,
+            "schema_version": LIVENESS_SCHEMA_VERSION,
             "complete": not unreliable,
         }
         write_json(out_path, payload)

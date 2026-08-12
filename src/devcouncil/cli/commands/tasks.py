@@ -8,7 +8,7 @@ from rich.console import Console
 from rich.table import Table
 from devcouncil.cli.commands.init import initialize_project
 from devcouncil.storage.db import get_db
-from devcouncil.storage.repositories import TaskRepository
+from devcouncil.storage.repositories import GapRepository, TaskRepository
 from devcouncil.storage.native import TaskLeaseRepository
 from devcouncil.telemetry.stages import log_stage, log_step
 from devcouncil.telemetry.traces import TraceLogger
@@ -34,8 +34,15 @@ def _active_leases_by_task(session) -> dict[str, tuple[Any, bool]]:
     }
 
 
-def _task_row_payload(task, leases_by_task: dict[str, tuple[Any, bool]]) -> Any:
+def _task_row_payload(
+    task,
+    leases_by_task: dict[str, tuple[Any, bool]],
+    *,
+    persisted_status: str | None = None,
+) -> Any:
     payload = task.model_dump()
+    if persisted_status is not None and persisted_status != task.status:
+        payload["persisted_status"] = persisted_status
     lease_pair = leases_by_task.get(task.id)
     payload["lease"] = _lease_public_view(lease_pair[0], expired=lease_pair[1]) if lease_pair else None
     return payload
@@ -69,8 +76,29 @@ def tasks(
     with log_stage("tasks", project_root=root):
         log_step("tasks/1: loading task graph", project_root=root, trace=True)
         with db.get_session() as session:
+            from devcouncil.app.config import load_config
+            gate_mode = load_config(root).gates.mode
             task_repo = TaskRepository(session)
-            tasks_list = task_repo.get_all()
+            stored_tasks = task_repo.get_all()
+            stored_statuses = {
+                task.id: task.status
+                for task in stored_tasks
+            }
+            tasks_list = list(stored_tasks)
+            if gate_mode != "enforce":
+                from devcouncil.gating.policy import is_hard_safety_gap
+
+                hard_blocked_tasks = {
+                    gap.task_id
+                    for gap in GapRepository(session).get_all()
+                    if gap.blocking and gap.task_id and is_hard_safety_gap(gap)
+                }
+                tasks_list = [
+                    task.model_copy(update={"status": "done"})
+                    if task.status == "blocked" and task.id not in hard_blocked_tasks
+                    else task
+                    for task in tasks_list
+                ]
             if status:
                 tasks_list = [t for t in tasks_list if t.status == status]
             total = len(tasks_list)
@@ -79,7 +107,15 @@ def tasks(
 
             if json_format:
                 typer.echo(dump_json({
-                    "tasks": [_task_row_payload(task, leases_by_task) for task in window],
+                    "gates_mode": gate_mode,
+                    "tasks": [
+                        _task_row_payload(
+                            task,
+                            leases_by_task,
+                            persisted_status=stored_statuses.get(task.id),
+                        )
+                        for task in window
+                    ],
                     "total": total,
                     "offset": offset,
                     "limit": limit,

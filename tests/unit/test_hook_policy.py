@@ -52,8 +52,15 @@ def test_hook_policy_accepts_codex_style_shell_command_shape():
     assert "Verification bypass" in decision.reason
 
 
-def test_hook_policy_blocks_unplanned_file_write():
-    decision = HookPolicy().evaluate(
+def test_hook_policy_blocks_unplanned_file_write(tmp_path, monkeypatch):
+    # Planned-files enforcement only applies under contain mode.
+    monkeypatch.setenv("DEVCOUNCIL_HOOK_GATE", "contain")
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "project:\n  name: t\nexecution:\n  hook_gate:\n    mode: contain\n",
+        encoding="utf-8",
+    )
+    decision = HookPolicy(project_root=tmp_path).evaluate(
         {"name": "write_file", "arguments": {"path": "src/other.py"}},
         _task(),
     )

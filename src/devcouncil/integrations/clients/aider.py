@@ -50,3 +50,8 @@ def _configure_aider(project_root: Path, apply: bool) -> bool:
     return True
 
 
+def _uninstall_aider(project_root: Path) -> list[str]:
+    """Disable the Aider executor in DevCouncil config."""
+    return _common._clear_client_integration_config(project_root, "aider")
+
+

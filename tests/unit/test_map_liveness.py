@@ -429,3 +429,161 @@ def test_go_same_package_callee_is_wired_via_call_edges(tmp_path):
     assert "cmd/server/handlers.go" not in repo_map.unwired_candidates
     assert "cmd/server/handlers.go" not in repo_map.unreachable_files
     assert not repo_map.liveness_unreachable_unreliable
+
+
+def test_liveness_emits_subphase_and_wave_progress(tmp_path):
+    """Mid-liveness subphases + fixed-point waves refresh the stall clock."""
+    from devcouncil.indexing.graph.build import assemble_graph, extract_all
+
+    _write(tmp_path, {
+        "pyproject.toml": (
+            "[project]\nname = \"x\"\nversion = \"0\"\n"
+            "[project.scripts]\nmycli = \"pkg.cli:main\"\n"
+        ),
+        "pkg/__init__.py": "",
+        "pkg/cli.py": (
+            "from pkg.mid import mid\n"
+            "def main():\n"
+            "    return mid()\n"
+        ),
+        "pkg/mid.py": (
+            "from pkg.leaf import leaf\n"
+            "def mid():\n"
+            "    return leaf()\n"
+        ),
+        "pkg/leaf.py": "def leaf():\n    return 1\n",
+    })
+    _commit(tmp_path)
+    files = RepoMapper(tmp_path).get_git_files()
+    extractions = extract_all(tmp_path, files)
+    events: list[tuple[str, int, int]] = []
+
+    def progress(phase: str, completed: int, total: int) -> None:
+        events.append((phase, completed, total))
+
+    assemble_graph(tmp_path, files, extractions, liveness=True, progress=progress)
+    phases = [phase for phase, _, _ in events]
+    assert "liveness" in phases
+    assert "liveness:files" in phases
+    assert "liveness:tokens" in phases
+    assert "liveness:symbols" in phases
+    # Outer bookends still present for status compatibility.
+    assert ("liveness", 0, 1) in events
+    assert ("liveness", 1, 1) in events
+    symbol_waves = [c for phase, c, _t in events if phase == "liveness:symbols"]
+    assert symbol_waves
+    assert max(symbol_waves) >= 1
+
+
+def test_worklist_live_files_propagates_module_call_from_unreachable(tmp_path):
+    """live_files membership: unreachable file with a live symbol activates file→symbol calls."""
+    from devcouncil.indexing.graph.liveness import symbol_reachability_dead
+    from devcouncil.indexing.graph.schema import (
+        Confidence,
+        GraphEdge,
+        GraphNode,
+        NodeKind,
+    )
+
+    # Seed live via test call into island.a; module-level call island.py → b must
+    # mark b live through live_files (not startswith scan / not file BFS reachability).
+    nodes = [
+        GraphNode(
+            id="pkg/island.py::a",
+            kind=NodeKind.FUNCTION,
+            path="pkg/island.py",
+            name="a",
+            line=1,
+            end_line=2,
+            language="python",
+        ),
+        GraphNode(
+            id="pkg/island.py::b",
+            kind=NodeKind.FUNCTION,
+            path="pkg/island.py",
+            name="b",
+            line=4,
+            end_line=5,
+            language="python",
+        ),
+    ]
+    edges = [
+        GraphEdge(
+            source="tests/test_island.py::test_a",
+            target="pkg/island.py::a",
+            kind="calls",
+            confidence=Confidence.EXTRACTED,
+        ),
+        # Module-level call site (file → symbol), same semantics as import-time exec.
+        GraphEdge(
+            source="pkg/island.py",
+            target="pkg/island.py::b",
+            kind="calls",
+            confidence=Confidence.EXTRACTED,
+        ),
+    ]
+    dead = symbol_reachability_dead(
+        tmp_path,
+        ["pkg/island.py", "tests/test_island.py"],
+        nodes,
+        edges,
+        {},
+        entry_roots=[],
+        token_dead_keys={"pkg/island.py::b"},
+        file_edges=[],
+        unreachable=["pkg/island.py"],
+        dynamic_index={},
+    )
+    dead_ids = {entry.id for entry in dead}
+    assert "pkg/island.py::a" not in dead_ids
+    assert "pkg/island.py::b" not in dead_ids
+
+
+def test_liveness_shard_build_reports_incremental_progress(tmp_path) -> None:
+    """The shard tokenize pass must emit progress, not one silent 0→1 flip.
+
+    Regression for the supervisor killing a healthy build that spent 10-20
+    minutes inside a silent dict comprehension over every extraction.
+    """
+    from devcouncil.indexing.graph.build import _build_liveness_shards, extract_all
+
+    files = []
+    for index in range(250):
+        rel = f"mod_{index}.py"
+        (tmp_path / rel).write_text(f"def fn_{index}():\n    return {index}\n", encoding="utf-8")
+        files.append(rel)
+    extractions = extract_all(tmp_path, files)
+
+    seen: list[tuple[str, int, int]] = []
+    shards = _build_liveness_shards(
+        tmp_path, extractions, progress=lambda p, c, t: seen.append((p, c, t))
+    )
+
+    assert set(shards) == set(extractions)
+    token_ticks = [tick for tick in seen if tick[0] == "liveness:tokens"]
+    # Start, at least two mid-run ticks, and a final tick at the total.
+    assert len(token_ticks) >= 4
+    assert token_ticks[0][1] == 0
+    assert token_ticks[-1][1] == token_ticks[-1][2] == len(extractions)
+    assert [tick[1] for tick in token_ticks] == sorted(tick[1] for tick in token_ticks)
+
+
+def test_semantic_enrich_stops_mid_file_on_budget(tmp_path) -> None:
+    """The budget is checked inside the line loop, not only between files."""
+    from devcouncil.codeintel.resolution.semantic import enrich_semantic_edges
+    from devcouncil.indexing.graph.schema import CodeGraph, GraphNode, NodeKind
+
+    rel = "huge.py"
+    (tmp_path / rel).write_text("x = 1\n" * 200_000, encoding="utf-8")
+    graph = CodeGraph(
+        nodes=[GraphNode(id=rel, kind=NodeKind.FILE, path=rel, name=rel, language="python")]
+    )
+
+    enrich_semantic_edges(
+        graph,
+        root=tmp_path,
+        budget_seconds=0.001,
+    )
+    partial = graph.meta.get("semantic_enrich_partial")
+    assert partial is not None
+    assert partial.get("stopped_mid_file") == rel

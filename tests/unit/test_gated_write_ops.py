@@ -102,6 +102,68 @@ def test_write_policy_denied_out_of_scope(tmp_path):
     assert "src/evil.py" == payload["rejected_files"][0]["path"]
 
 
+def test_write_off_mode_needs_no_lease_or_planned_scope_but_keeps_secret_safety(tmp_path):
+    _setup(tmp_path, lease=False)
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "project:\n  name: t\ngates:\n  mode: off\n",
+        encoding="utf-8",
+    )
+
+    allowed = write_file_payload(
+        tmp_path,
+        task_id="TASK-1",
+        lease_token="",
+        rel_path="src/unplanned.py",
+        content="VALUE = 1\n",
+    )
+    denied = write_file_payload(
+        tmp_path,
+        task_id="TASK-1",
+        lease_token="",
+        rel_path="src/secret.py",
+        content="API_KEY = 'sk-abcdefghijklmnopqrstuvwxyz'\n",
+    )
+
+    assert allowed["ok"] is True
+    assert denied["ok"] is False
+    assert "potential" in denied["rejected_files"][0]["reason"].lower()
+
+
+def test_write_off_mode_needs_no_task(tmp_path):
+    _setup(tmp_path, lease=False)
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "project:\n  name: t\ngates:\n  mode: off\n",
+        encoding="utf-8",
+    )
+
+    payload = write_file_payload(
+        tmp_path,
+        task_id=None,
+        lease_token="",
+        rel_path="src/taskless.py",
+        content="VALUE = 1\n",
+    )
+
+    assert payload["ok"] is True
+    assert payload["task_id"] is None
+    assert (tmp_path / "src" / "taskless.py").read_text() == "VALUE = 1\n"
+
+
+def test_write_enforce_mode_requires_task(tmp_path):
+    _setup(tmp_path, lease=False)
+
+    payload = write_file_payload(
+        tmp_path,
+        task_id=None,
+        lease_token="",
+        rel_path="src/taskless.py",
+        content="VALUE = 1\n",
+    )
+
+    assert payload["ok"] is False
+    assert payload["code"] == "task_required"
+
+
 def test_write_os_error(tmp_path, monkeypatch):
     token = _setup(tmp_path)
 
@@ -227,3 +289,23 @@ def test_apply_success(tmp_path, monkeypatch):
     with db.get_session() as session:
         changes = FileChangeRepository(session).list_for_task("TASK-1")
     assert any(c.path == "src/a.py" and c.operation == "apply_patch" and c.allowed for c in changes)
+
+
+def test_apply_off_mode_needs_no_task(tmp_path, monkeypatch):
+    _setup(tmp_path, lease=False)
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "project:\n  name: t\ngates:\n  mode: off\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gw, "is_git_repo", lambda root: True)
+    monkeypatch.setattr(gw.subprocess, "run", lambda *a, **k: _FakeProc(0))
+
+    payload = apply_patch_payload(
+        tmp_path,
+        task_id=None,
+        lease_token="",
+        unified_diff=_DIFF,
+    )
+
+    assert payload["ok"] is True
+    assert payload["task_id"] is None

@@ -16,7 +16,13 @@ from devcouncil.executors.agent_registry import (
     load_agent_profiles,
     normalize_agent_name,
 )
-from devcouncil.integrations.actions import apply_integration_target
+from devcouncil.integrations.actions import (
+    VALID_INTEGRATION_TARGETS,
+    apply_integration_target,
+    decouple_integration_target,
+    normalize_apply_target,
+    uninstall_integration_target,
+)
 from devcouncil.integrations.integration_cli import (
     print_integration_matrix,
     print_integration_status,
@@ -103,6 +109,41 @@ _uninstall_claude = claude_client._uninstall_claude
 _configure_native_hooks = hooks_client._configure_native_hooks
 _opencode_config_path = opencode_client._opencode_config_path
 _opencode_plugin_path = opencode_client._opencode_plugin_path
+_uninstall_git_map_hooks = hooks_client._uninstall_git_map_hooks
+
+
+def _reject_teardown_flag_conflicts(
+    *,
+    apply: bool = False,
+    write_gate: bool = False,
+    uninstall: bool = False,
+    decouple: bool = False,
+) -> None:
+    """Mutual exclusion among --apply/--write-gate/--uninstall/--decouple."""
+    if uninstall and decouple:
+        console.print("[red]Use only one of --uninstall or --decouple.[/red]")
+        raise typer.Exit(code=2)
+    if (uninstall or decouple) and (apply or write_gate):
+        console.print(
+            "[red]--uninstall/--decouple cannot be combined with --apply or --write-gate.[/red]"
+        )
+        raise typer.Exit(code=2)
+
+
+def _print_action_report(action: str, report) -> None:
+    label = action.capitalize()
+    for item in report.results:
+        changes = item.get("changes") or []
+        if changes:
+            console.print(f"[green]{label} {item['target']}[/green] ({len(changes)} change(s)):")
+            for change in changes:
+                console.print(f"  {change}")
+        else:
+            message = item.get("message") or f"Nothing to {action} for {item['target']}"
+            console.print(f"[dim]{message}[/dim]")
+    if not report.ok:
+        console.print(report.to_json())
+        raise typer.Exit(code=1)
 
 
 @app.callback(invoke_without_command=True)
@@ -125,7 +166,6 @@ def overview(ctx: typer.Context):
         table.add_row("Gemini CLI (deprecated)", f"{PREFERRED_COMMAND} gemini --apply", "Deprecated — use dev integrate antigravity --apply instead.")
         table.add_row("Claude assets", f"{PREFERRED_COMMAND} claude-assets --apply", "Slash commands, subagents, output style, statusline, permissions, skills (no MCP/hooks).")
         table.add_row("Claude plugin", f"{PREFERRED_COMMAND} claude-plugin --apply", "Self-contained Claude Code plugin + marketplace bundling everything for /plugin install.")
-        table.add_row("Claude uninstall", f"{PREFERRED_COMMAND} claude --uninstall", "Remove DevCouncil hooks, statusline, MCP enablement, and generated assets from .claude/.")
         table.add_row(
             "Cursor",
             f"{PREFERRED_COMMAND} cursor --apply",
@@ -139,6 +179,16 @@ def overview(ctx: typer.Context):
         table.add_row("Bring your own CLI", f"{PREFERRED_COMMAND} cli-agent NAME --command TOOL --apply", "Registers any prompt-taking CLI as a DevCouncil executor.")
         table.add_row("All", f"{PREFERRED_COMMAND} all --apply", "Runs MCP setup and installs native hooks.")
         table.add_row("Native hooks", f"{PREFERRED_COMMAND} hooks --apply", "Installs Codex, Claude, Cursor, Grok, and OpenCode hook files.")
+        table.add_row(
+            "Decouple",
+            f"{PREFERRED_COMMAND} <client>|decouple --decouple|--target …",
+            "Strip containment only (PreToolUse/before); keep MCP, PostToolUse, skills. Forces write_gate off + hook_gate off.",
+        )
+        table.add_row(
+            "Uninstall",
+            f"{PREFERRED_COMMAND} <client>|uninstall --uninstall|--target …",
+            "Surgically remove DevCouncil MCP/hooks/assets/config for a client, hooks, or all.",
+        )
         table.add_row("Recommend", f"{PREFERRED_COMMAND} recommend", "Show the best executor for this machine and project.")
         table.add_row("Status", f"{PREFERRED_COMMAND} status", "Compact PATH + config summary (no MCP probe).")
         table.add_row("Matrix", f"{PREFERRED_COMMAND} matrix", "Print built-in coding CLI integration tiers.")
@@ -166,16 +216,31 @@ def integrations_doctor(
 def codex(
     apply: bool = typer.Option(False, "--apply", help="Run the setup command instead of printing it."),
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+    write_gate: bool = typer.Option(
+        False,
+        "--write-gate/--no-write-gate",
+        "--contain/--no-contain",
+        help="Also install blocking PreToolUse write-gate (off by default; assist mode).",
+    ),
+    uninstall: bool = typer.Option(False, "--uninstall", help="Remove DevCouncil Codex MCP registration and hooks."),
+    decouple: bool = typer.Option(False, "--decouple", help="Strip PreToolUse containment only; keep PostToolUse/lifecycle."),
 ):
     """
     Set up DevCouncil MCP tools and native lifecycle hooks for Codex CLI.
     """
     root = _project_root(project_root)
+    _reject_teardown_flag_conflicts(apply=apply, write_gate=write_gate, uninstall=uninstall, decouple=decouple)
+    if uninstall:
+        _print_action_report("uninstall", uninstall_integration_target(root, "codex"))
+        return
+    if decouple:
+        _print_action_report("decouple", decouple_integration_target(root, "codex"))
+        return
     command = _codex_command(root)
     ok = _configure("Codex CLI", command, apply)
     if apply and ok:
         try:
-            written = _install_codex_hooks(root)
+            written = _install_codex_hooks(root, write_gate=write_gate)
             common.record_hook_dev_executable(root)
         except (ValueError, FileNotFoundError, OSError) as exc:
             console.print(f"[red]Codex hook setup failed: {exc}[/red]")
@@ -193,15 +258,24 @@ def gemini(
     apply: bool = typer.Option(False, "--apply", help="Run the setup command instead of printing it."),
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
     scope: str = typer.Option("project", "--scope", help="Gemini MCP config scope: project or user."),
+    uninstall: bool = typer.Option(False, "--uninstall", help="Remove DevCouncil Gemini MCP registration and hooks."),
+    decouple: bool = typer.Option(False, "--decouple", help="Strip BeforeTool containment only; keep AfterTool."),
 ):
     """
     Set up DevCouncil MCP tools for Gemini CLI.
     """
+    root = _project_root(project_root)
+    _reject_teardown_flag_conflicts(apply=apply, uninstall=uninstall, decouple=decouple)
+    if uninstall:
+        _print_action_report("uninstall", uninstall_integration_target(root, "gemini"))
+        return
+    if decouple:
+        _print_action_report("decouple", decouple_integration_target(root, "gemini"))
+        return
     if scope not in {"project", "user"}:
         console.print("[red]--scope must be 'project' or 'user'.[/red]")
         raise typer.Exit(code=2)
 
-    root = _project_root(project_root)
     console.print(f"[yellow]{GEMINI_DEPRECATION_MESSAGE}[/yellow]")
     command = _gemini_command(root, scope)
     ok = _configure("Gemini CLI (deprecated)", command, apply)
@@ -227,6 +301,11 @@ def claude(
         "--uninstall",
         help="Remove DevCouncil's Claude hooks, statusline, MCP enablement, and generated assets.",
     ),
+    decouple: bool = typer.Option(
+        False,
+        "--decouple",
+        help="Strip PreToolUse containment only; keep MCP, PostToolUse, lifecycle hooks, and skills.",
+    ),
 ):
     """
     Set up DevCouncil for Claude Code: MCP server + assistive hooks + slash commands,
@@ -234,14 +313,12 @@ def claude(
     via --write-gate. Use --uninstall to remove everything DevCouncil installed.
     """
     root = _project_root(project_root)
+    _reject_teardown_flag_conflicts(apply=apply, write_gate=write_gate, uninstall=uninstall, decouple=decouple)
     if uninstall:
-        removed = _uninstall_claude(root)
-        if removed:
-            console.print(f"[green]Removed DevCouncil Claude integration[/green] ({len(removed)} change(s)):")
-            for item in removed:
-                console.print(f"  {item}")
-        else:
-            console.print("[dim]Nothing to remove — DevCouncil Claude integration not found.[/dim]")
+        _print_action_report("uninstall", uninstall_integration_target(root, "claude"))
+        return
+    if decouple:
+        _print_action_report("decouple", decouple_integration_target(root, "claude"))
         return
 
     if scope not in {"local", "project", "user"}:
@@ -402,6 +479,8 @@ def cursor(
         "--contain/--no-contain",
         help="Also install blocking PreToolUse write-gate (off by default; assist mode).",
     ),
+    uninstall: bool = typer.Option(False, "--uninstall", help="Remove DevCouncil Cursor MCP, hooks, rule, and unmodified skills."),
+    decouple: bool = typer.Option(False, "--decouple", help="Strip preToolUse containment only; keep MCP and postToolUse."),
 ):
     """
     Set up DevCouncil for Cursor (MCP, hooks, skills, and always-on rule).
@@ -410,6 +489,13 @@ def cursor(
     pre-action containment (requires a leased task for Shell/Write).
     """
     root = _project_root(project_root)
+    _reject_teardown_flag_conflicts(apply=apply, write_gate=write_gate, uninstall=uninstall, decouple=decouple)
+    if uninstall:
+        _print_action_report("uninstall", uninstall_integration_target(root, "cursor"))
+        return
+    if decouple:
+        _print_action_report("decouple", decouple_integration_target(root, "cursor"))
+        return
     if apply:
         report = apply_integration_target(root, "cursor", write_gate=write_gate)
         if not report.ok:
@@ -432,11 +518,26 @@ def cursor(
 def grok(
     apply: bool = typer.Option(False, "--apply", help="Register Grok MCP config instead of printing it."),
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+    write_gate: bool = typer.Option(
+        False,
+        "--write-gate/--no-write-gate",
+        "--contain/--no-contain",
+        help="Also install blocking PreToolUse write-gate when hooks are applied separately.",
+    ),
+    uninstall: bool = typer.Option(False, "--uninstall", help="Remove DevCouncil Grok MCP registration and hooks."),
+    decouple: bool = typer.Option(False, "--decouple", help="Strip PreToolUse containment only; keep PostToolUse."),
 ):
     """
     Set up DevCouncil MCP tools for Grok Build.
     """
     root = _project_root(project_root)
+    _reject_teardown_flag_conflicts(apply=apply, write_gate=write_gate, uninstall=uninstall, decouple=decouple)
+    if uninstall:
+        _print_action_report("uninstall", uninstall_integration_target(root, "grok"))
+        return
+    if decouple:
+        _print_action_report("decouple", decouple_integration_target(root, "grok"))
+        return
     if apply:
         report = apply_integration_target(root, "grok")
         if not report.ok:
@@ -453,11 +554,26 @@ def grok(
 def opencode(
     apply: bool = typer.Option(False, "--apply", help="Write project OpenCode config instead of printing it."),
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+    write_gate: bool = typer.Option(
+        False,
+        "--write-gate/--no-write-gate",
+        "--contain/--no-contain",
+        help="Also install tool.execute.before containment when hooks are applied separately.",
+    ),
+    uninstall: bool = typer.Option(False, "--uninstall", help="Remove DevCouncil OpenCode MCP entry, plugin, and config enablement."),
+    decouple: bool = typer.Option(False, "--decouple", help="Strip tool.execute.before only; keep after-handler and MCP."),
 ):
     """
     Set up DevCouncil MCP tools for OpenCode.
     """
     root = _project_root(project_root)
+    _reject_teardown_flag_conflicts(apply=apply, write_gate=write_gate, uninstall=uninstall, decouple=decouple)
+    if uninstall:
+        _print_action_report("uninstall", uninstall_integration_target(root, "opencode"))
+        return
+    if decouple:
+        _print_action_report("decouple", decouple_integration_target(root, "opencode"))
+        return
     if apply:
         report = apply_integration_target(root, "opencode")
         if not report.ok:
@@ -475,11 +591,20 @@ def opencode(
 def antigravity(
     apply: bool = typer.Option(False, "--apply", help="Write project Antigravity MCP config instead of printing it."),
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+    uninstall: bool = typer.Option(False, "--uninstall", help="Remove DevCouncil Antigravity MCP entry and config enablement."),
+    decouple: bool = typer.Option(False, "--decouple", help="No containment to strip for Antigravity; reports nothing."),
 ):
     """
     Set up DevCouncil MCP tools for Google Antigravity CLI.
     """
     root = _project_root(project_root)
+    _reject_teardown_flag_conflicts(apply=apply, uninstall=uninstall, decouple=decouple)
+    if uninstall:
+        _print_action_report("uninstall", uninstall_integration_target(root, "antigravity"))
+        return
+    if decouple:
+        _print_action_report("decouple", decouple_integration_target(root, "antigravity"))
+        return
     if apply:
         report = apply_integration_target(root, "antigravity")
         if not report.ok:
@@ -497,11 +622,20 @@ def antigravity(
 def warp(
     apply: bool = typer.Option(False, "--apply", help="Write Warp MCP config instead of printing it."),
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+    uninstall: bool = typer.Option(False, "--uninstall", help="Delete DevCouncil-owned Warp MCP JSON and clear config."),
+    decouple: bool = typer.Option(False, "--decouple", help="No containment to strip for Warp; reports nothing."),
 ):
     """
     Set up DevCouncil MCP tools for Warp local agents and the Oz CLI.
     """
     root = _project_root(project_root)
+    _reject_teardown_flag_conflicts(apply=apply, uninstall=uninstall, decouple=decouple)
+    if uninstall:
+        _print_action_report("uninstall", uninstall_integration_target(root, "warp"))
+        return
+    if decouple:
+        _print_action_report("decouple", decouple_integration_target(root, "warp"))
+        return
     if apply:
         report = apply_integration_target(root, "warp")
         if not report.ok:
@@ -517,11 +651,20 @@ def warp(
 def aider(
     apply: bool = typer.Option(False, "--apply", help="Record the built-in Aider executor in DevCouncil config."),
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+    uninstall: bool = typer.Option(False, "--uninstall", help="Disable the Aider executor in DevCouncil config."),
+    decouple: bool = typer.Option(False, "--decouple", help="No containment to strip for Aider; reports nothing."),
 ):
     """
     Enable the built-in Aider headless executor (no MCP integration).
     """
     root = _project_root(project_root)
+    _reject_teardown_flag_conflicts(apply=apply, uninstall=uninstall, decouple=decouple)
+    if uninstall:
+        _print_action_report("uninstall", uninstall_integration_target(root, "aider"))
+        return
+    if decouple:
+        _print_action_report("decouple", decouple_integration_target(root, "aider"))
+        return
     if apply:
         report = apply_integration_target(root, "aider")
         if not report.ok:
@@ -614,17 +757,27 @@ def all_tools(
         False,
         "--write-gate/--no-write-gate",
         "--contain/--no-contain",
-        help="Install blocking PreToolUse write-gate for Claude/Cursor/Grok/OpenCode (off by default; assist mode).",
+        help="Install blocking PreToolUse write-gate for Claude/Cursor/Grok/OpenCode/Codex (off by default; assist mode).",
     ),
     strict: bool = typer.Option(
         False,
         "--strict",
         help="After --apply, run dev integrate check --strict (fails on real integration defects; missing optional coding CLIs stay warnings).",
     ),
+    uninstall: bool = typer.Option(False, "--uninstall", help="Uninstall every companion client + hooks + git map markers."),
+    decouple: bool = typer.Option(False, "--decouple", help="Strip containment across all hook clients."),
 ):
     """
     Set up DevCouncil MCP tools and native hooks for every supported coding CLI found on PATH.
     """
+    root = _project_root(project_root)
+    _reject_teardown_flag_conflicts(apply=apply, write_gate=write_gate, uninstall=uninstall, decouple=decouple)
+    if uninstall:
+        _print_action_report("uninstall", uninstall_integration_target(root, "all", strict=strict))
+        return
+    if decouple:
+        _print_action_report("decouple", decouple_integration_target(root, "all", strict=strict))
+        return
     if gemini_scope not in {"project", "user"}:
         console.print("[red]--gemini-scope must be 'project' or 'user'.[/red]")
         raise typer.Exit(code=2)
@@ -632,7 +785,6 @@ def all_tools(
         console.print("[red]--claude-scope must be 'local', 'project', or 'user'.[/red]")
         raise typer.Exit(code=2)
 
-    root = _project_root(project_root)
     if apply:
         report = apply_integration_target(
             root,
@@ -700,7 +852,7 @@ def hooks(
         False,
         "--write-gate/--no-write-gate",
         "--contain/--no-contain",
-        help="Install blocking PreToolUse write-gate for Claude/Cursor/Grok/OpenCode "
+        help="Install blocking PreToolUse write-gate for Claude/Cursor/Grok/OpenCode/Codex "
         "(off by default; assist mode keeps PostToolUse refresh only).",
     ),
     git: bool = typer.Option(
@@ -714,15 +866,73 @@ def hooks(
         "--check",
         help="Report whether installed hook commands still point at the resolved project `dev` executable.",
     ),
+    uninstall: bool = typer.Option(
+        False,
+        "--uninstall",
+        help="Remove all DevCouncil native hooks and git map-refresh markers.",
+    ),
+    decouple: bool = typer.Option(
+        False,
+        "--decouple",
+        help="Strip PreToolUse/before containment across hook clients; keep PostToolUse/lifecycle.",
+    ),
 ):
     """
     Install DevCouncil hook configuration for Codex, Gemini, Claude, Cursor, and OpenCode.
 
-    Claude/Cursor/Grok/OpenCode install assistive hooks plus refresh-only PostToolUse
-    by default; add --write-gate for pre-action PreToolUse containment (autonomous runs).
-    Git map-refresh hooks install by default with --apply (use --no-git to skip).
+    All clients install assistive hooks plus refresh-only PostToolUse by default; add
+    --write-gate for pre-action PreToolUse containment (autonomous runs). Under contain,
+    Codex PreToolUse exit-2 deny is intentional. Git map-refresh hooks install by default
+    with --apply (use --no-git to skip).
     """
     root = _project_root(project_root)
+    _reject_teardown_flag_conflicts(apply=apply, write_gate=write_gate, uninstall=uninstall, decouple=decouple)
+    tool_norm = (tool or "all").strip().lower()
+    containment_hook_tools = frozenset(hooks_client.CONTAINMENT_HOOK_CLIENTS)
+    if uninstall:
+        if tool_norm in {"", "all"}:
+            _print_action_report("uninstall", uninstall_integration_target(root, "hooks"))
+            return
+        try:
+            changes = hooks_client._uninstall_native_hooks_for_tool(root, tool_norm)
+        except ValueError as exc:
+            allowed = ", ".join(["all", *sorted(hooks_client._NATIVE_HOOK_UNINSTALLERS)])
+            console.print(f"[red]{exc}[/red]")
+            console.print(f"[dim]Allowed --tool values with --uninstall: {allowed}.[/dim]")
+            raise typer.Exit(code=2) from exc
+        # Match uninstall --target hooks: clear enablement so check stays green.
+        changes.extend(common._clear_client_integration_config(root, tool_norm))
+        from devcouncil.integrations.actions import IntegrationActionReport
+
+        report = IntegrationActionReport(
+            tool_norm,
+            True,
+            [{
+                "target": tool_norm,
+                "ok": True,
+                "path": "",
+                "message": "; ".join(changes) if changes else f"No DevCouncil {tool_norm} hooks to remove.",
+                "changes": list(changes),
+            }],
+            [],
+            {},
+        )
+        _print_action_report("uninstall", report)
+        return
+    if decouple:
+        # --tool all → strip every containment client; otherwise one containment client.
+        if tool_norm in {"", "all"}:
+            _print_action_report("decouple", decouple_integration_target(root, "hooks"))
+            return
+        if tool_norm not in containment_hook_tools:
+            allowed = ", ".join(["all", *sorted(containment_hook_tools)])
+            console.print(
+                f"[red]hooks --decouple --tool {tool_norm}: no containment hooks for that tool.[/red]"
+            )
+            console.print(f"[dim]Allowed --tool values with --decouple: {allowed}.[/dim]")
+            raise typer.Exit(code=2)
+        _print_action_report("decouple", decouple_integration_target(root, tool_norm))
+        return
     if check:
         ok, details = common.check_hook_dev_executable(root)
         current = common.resolve_dev_executable(root)
@@ -814,23 +1024,53 @@ def _retarget_git_hook_script(existing: str, quoted_executable: str) -> str:
 @app.command("uninstall")
 def uninstall(
     project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
-    target: str = typer.Option("claude", "--target", help="What to uninstall. Currently: claude."),
+    target: str = typer.Option(
+        "claude",
+        "--target",
+        help="What to uninstall: all, hooks, or a client (claude, cursor, opencode, …).",
+    ),
 ):
     """
-    Remove a DevCouncil integration. Reverses `dev integrate claude` — hooks, statusline,
-    MCP enablement, permission rules, and the generated commands/subagents/output style.
+    Surgically remove DevCouncil companion wiring for a target.
+
+    Reverses integrate apply for that client (MCP keys, hooks, unmodified library skills,
+    config enablement). Does not delete `.devcouncil/` project data (tasks/graph/wiki).
     """
     root = _project_root(project_root)
-    if target != "claude":
-        console.print("[red]--target must be 'claude'.[/red]")
-        raise typer.Exit(code=2)
-    removed = _uninstall_claude(root)
-    if removed:
-        console.print(f"[green]Removed DevCouncil Claude integration[/green] ({len(removed)} change(s)):")
-        for item in removed:
-            console.print(f"  {item}")
-    else:
-        console.print("[dim]Nothing to remove — DevCouncil Claude integration not found.[/dim]")
+    try:
+        normalized = normalize_apply_target(target)
+    except ValueError as exc:
+        allowed = ", ".join(sorted(VALID_INTEGRATION_TARGETS))
+        console.print(f"[red]{exc}[/red]")
+        console.print(f"[dim]Allowed --target values: {allowed}[/dim]")
+        raise typer.Exit(code=2) from exc
+    _print_action_report("uninstall", uninstall_integration_target(root, normalized))
+
+
+@app.command("decouple")
+def decouple(
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+    target: str = typer.Option(
+        "all",
+        "--target",
+        help="What to decouple: all, hooks, or a client with containment hooks.",
+    ),
+):
+    """
+    Strip containment only (PreToolUse / BeforeTool / Cursor pre / OpenCode before).
+
+    Leaves MCP, PostToolUse/lifecycle hooks, skills, and git map hooks alone. Forces
+    write_gate false, hook_gate off, and stop_gate block→assist.
+    """
+    root = _project_root(project_root)
+    try:
+        normalized = normalize_apply_target(target)
+    except ValueError as exc:
+        allowed = ", ".join(sorted(VALID_INTEGRATION_TARGETS))
+        console.print(f"[red]{exc}[/red]")
+        console.print(f"[dim]Allowed --target values: {allowed}[/dim]")
+        raise typer.Exit(code=2) from exc
+    _print_action_report("decouple", decouple_integration_target(root, normalized))
 
 
 @app.command("check")

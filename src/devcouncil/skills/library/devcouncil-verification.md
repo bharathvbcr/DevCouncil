@@ -12,12 +12,21 @@ triggers:
 DevCouncil's verifier is **deterministic** (no extra LLM calls for stub/effort detection).
 It decides pass/fail from evidence: diffs, test output, coverage intersection, and policy checks.
 
+This skill does not make verification mandatory. Check `gates.mode` first:
+
+- `enforce`: verification and effective blocking gaps govern task release.
+- `advisory`: verification is optional; quality findings are recorded as advisory.
+- `off`: quality verification is skipped. Report work as completed unverified.
+
+Hard-safety findings remain blocking in every mode.
+
 ## Verification outputs
 
 `devcouncil_verify_task` (or `dev verify`, `dev check --verify`) returns:
 
 - **`passed`** — no blocking gaps remain
-- **`blocking_gaps`** — must fix before release
+- **`blocking_gaps`** — must fix before release only in `enforce` (hard safety
+  remains blocking in every mode)
 - **`next_actions`** — typed, machine-routable repair instructions
 
 Read persisted state without re-verifying:
@@ -84,7 +93,7 @@ the task mentions scaffolding and the line carries `devcouncil: allow-stub`.
 Repair runs include a **correction manifest** with prior diff, failing output, and
 non-negotiable rules: never weaken tests, never stub around a gap.
 
-## Repair workflow
+## Repair workflow (`enforce`, or when explicitly requested)
 
 1. `devcouncil_get_next_actions` — list blocking items
 2. Fix each gap (smallest change that closes it)
@@ -104,6 +113,9 @@ dev report rigor              # tune rigor thresholds from evidence
 
 ## When to call success
 
-Only when **`passed: true`** from `devcouncil_verify_task` with zero blocking gaps.
-Report the verification result and cite `file:line` for any remaining advisory findings.
-Never claim done based on test output alone without running verify.
+- In `enforce`, only claim verified success when `passed: true` with zero
+  effective blocking gaps.
+- In `advisory`, distinguish test results from optional DevCouncil verification
+  and report advisory findings honestly.
+- In `off`, completion does not require a task or verifier call; say
+  **completed unverified** and include any tests you chose to run.

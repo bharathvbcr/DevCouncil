@@ -50,6 +50,76 @@ class GraphRefreshResult:
     # True when SQLite committed but code_graph.json export was skipped (size cap).
     # Not fail-closed for sync/watch — doctor/export health owns this signal.
     compatibility_export_degraded: bool = False
+    # True when the graph build timed out / failed but a healthy prior generation
+    # was still available, so the map was refreshed from it. The graph is intact
+    # (``degraded`` stays False) but older than HEAD — callers should surface this
+    # and exit non-zero rather than reporting a clean rebuild.
+    build_incomplete: bool = False
+
+
+# A `dev map` with no explicit path list used to force a full extract + semantic
+# + liveness + persist every time, even when three files had changed since the
+# last generation. These bound when the cheap incremental path is preferred.
+_INCREMENTAL_MAX_CHANGED_FILES = 500
+_INCREMENTAL_MAX_CHANGED_FRACTION = 0.2
+
+
+def _auto_change_set(root: Path, service) -> list[str] | None:  # noqa: ANN001
+    """Paths that differ from the committed generation, or ``None`` for a full build.
+
+    Uses the generation's recorded ``(size, mtime_ns)`` per file — no hashing and
+    no re-reads — so the probe itself is cheap on a large repo. Returns ``None``
+    (meaning "run the full build") when there is no committed generation, when
+    the probe cannot be trusted, or when the change set is large enough that a
+    full rebuild is the better plan.
+    """
+    try:
+        stored = service.store.file_metadata()
+    except Exception:
+        logger.debug("change-set probe could not read generation files", exc_info=True)
+        return None
+    if not stored:
+        return None
+    from devcouncil.indexing.graph.build import _code_files
+
+    try:
+        listed = RepoMapper(root).get_git_files()
+    except Exception:
+        logger.debug("change-set probe could not list files", exc_info=True)
+        return None
+    if not listed:
+        return None
+    present = set(listed)
+    # Only code files get graph nodes, so only code files appear in
+    # ``generation_files``. Comparing the full inventory would report every
+    # doc/config file as a permanent addition and the change set would never
+    # converge — the map artifacts are rewritten on every call regardless.
+    current = set(_code_files(listed))
+    changed: set[str] = set(stored) - present  # deletions
+    for rel in current:
+        entry = stored.get(rel)
+        if entry is None:
+            changed.add(rel)  # addition
+            continue
+        try:
+            stat = (root / rel).stat()
+        except OSError:
+            changed.add(rel)
+            continue
+        size, mtime_ns, _digest = entry
+        if stat.st_size != size or stat.st_mtime_ns != mtime_ns:
+            changed.add(rel)
+    limit = min(
+        _INCREMENTAL_MAX_CHANGED_FILES,
+        max(1, int(len(current) * _INCREMENTAL_MAX_CHANGED_FRACTION)),
+    )
+    if len(changed) > limit:
+        logger.debug(
+            "change set of %d files exceeds the incremental limit (%d); full build",
+            len(changed), limit,
+        )
+        return None
+    return sorted(changed)
 
 
 def _important_surfaces(repo_map: RepoMap) -> list[str]:
@@ -122,8 +192,8 @@ def agent_guide_text(repo_map_path: Path, repo_root: Path, repo_map: RepoMap) ->
             "DevCouncil loop:",
             "- Prefer DevCouncil MCP tools (`devcouncil_status`, `devcouncil_checkout_task`, "
             "`devcouncil_verify_task`, …) for task state; do not guess.",
-            "- Checkout before writes when write-gates are active; use scope/verify tools "
-            "rather than inventing task status.",
+            "- Interactive Shell does not need a lease under assist (`hook_gate.mode=off`); "
+            "checkout before writes only when write-gates / contain mode are active.",
             "- Engineering skills live under `.claude/skills/` and `.cursor/skills/` "
             "(`dev skills scaffold` / `dev integrate cursor --apply`).",
             "",
@@ -199,13 +269,21 @@ def refresh_map_artifacts(
     quiet: bool = False,
     graph=None,  # noqa: ANN001
     paths: list[str] | None = None,
+    full: bool = False,
 ) -> GraphRefreshResult:
-    """Refresh graph and map once, falling back to a lean map on graph failure."""
+    """Refresh graph and map once, falling back to a lean map on graph failure.
+
+    With ``paths=None`` and a healthy committed generation, the change set is
+    probed against that generation and the incremental path is preferred when it
+    is small. ``full=True`` forces the isolated full rebuild regardless.
+    """
     import time
 
     from devcouncil.codeintel import get_codeintel_service
     from devcouncil.codeintel.build_control import (
         GraphBuildBusy,
+        GraphBuildFailed,
+        GraphBuildTimeout,
         graph_build_session,
         run_isolated_full_build,
     )
@@ -216,6 +294,7 @@ def refresh_map_artifacts(
     degraded = False
     reason = ""
     compatibility_export_degraded = False
+    build_incomplete = False
     with graph_build_session(root):
         # A damaged index.sqlite fails scattered reads all over the build; move
         # it aside now (we hold the writer lease) so this run rebuilds cleanly
@@ -232,6 +311,30 @@ def refresh_map_artifacts(
             )
             paths = None
             mode = "full"
+            full = True
+        if graph is None and paths is None and not full:
+            # "Update the map" after days of drift should not mean a full
+            # extract + semantic + liveness + persist when a handful of files
+            # moved. Probe the committed generation and go incremental if small.
+            auto_paths = _auto_change_set(root, service)
+            if auto_paths == []:
+                # Nothing moved since the generation was committed: reuse it and
+                # only rewrite the map artifacts. An empty change set through
+                # sync_affected_paths would rewrite every membership row for no
+                # gain (save_graph treats an empty set as a full replace).
+                reused = service.load()
+                if reused is not None:
+                    graph = reused
+                    mode = "reused"
+                    logger.info("map: no changes since the last generation; reusing it")
+            elif auto_paths is not None:
+                paths = auto_paths
+                mode = "incremental"
+                logger.info(
+                    "map: %d changed path(s) since the last generation; "
+                    "using incremental sync",
+                    len(auto_paths),
+                )
         if graph is None:
             try:
                 if paths is not None and get_codeintel_service(root).load() is not None:
@@ -272,6 +375,33 @@ def refresh_map_artifacts(
                 # Lease contention after/during a concurrent writer must not stamp a
                 # lean/degraded map over a healthy SQLite generation (retry storm).
                 raise
+            except (GraphBuildTimeout, GraphBuildFailed) as exc:
+                # A timeout with a healthy committed generation is not a dead end:
+                # SQLite still holds a real graph. Rebuild the map from it instead
+                # of crashing the CLI with a traceback and leaving the on-disk map
+                # untouched for days. Fingerprints come from that prior graph, so
+                # `map_is_stale` still reports stale and --if-stale keeps retrying
+                # — the map is refreshed and usable, not falsely marked fresh.
+                try:
+                    prior = get_codeintel_service(root).load()
+                except Exception:
+                    prior = None
+                if prior is not None:
+                    logger.warning(
+                        "graph build did not finish (%s); refreshing the map from the "
+                        "last committed generation instead",
+                        type(exc).__name__,
+                        exc_info=True,
+                    )
+                    graph = prior
+                    mode = "prior_generation"
+                    build_incomplete = True
+                    reason = f"{type(exc).__name__}: {exc}"
+                else:
+                    logger.warning("graph refresh failed; writing lean repo map", exc_info=True)
+                    degraded = True
+                    reason = f"{type(exc).__name__}: {exc}"
+                    mode = "lean"
             except Exception as exc:  # noqa: BLE001
                 logger.warning("graph refresh failed; writing lean repo map", exc_info=True)
                 degraded = True
@@ -316,6 +446,12 @@ def refresh_map_artifacts(
                 status_console.print(
                     f"[yellow]Graph degraded; wrote {mode} map: {reason}[/yellow]"
                 )
+            elif build_incomplete:
+                status_console.print(
+                    f"[yellow]Graph build did not finish; map refreshed from the last "
+                    f"committed generation ({reason}). The graph is intact but older "
+                    f"than HEAD — re-run `dev map` once the build can complete.[/yellow]"
+                )
             elif compatibility_export_degraded:
                 status_console.print(
                     f"[yellow]Compatibility export degraded (SQLite ok; "
@@ -328,17 +464,26 @@ def refresh_map_artifacts(
         write_agent_guides(root, output, repo_map)
         # Agent guides can add/change tracked files after the fingerprint was taken;
         # re-stamp so the on-disk map is not immediately stale for checkout/verify.
-        mapper = RepoMapper(root)
-        try:
-            files = mapper.get_git_files()
-            repo_map.generated_head = mapper._git_head()
-            repo_map.indexed_hash = mapper._files_fingerprint(files)
-            repo_map.content_fingerprint = mapper._content_fingerprint(files)
-            repo_map.graph_degraded = bool(degraded)
-            repo_map.graph_degraded_reason = reason if degraded else ""
+        # A map rebuilt from a prior generation must NOT be re-stamped against the
+        # current tree — that would advertise a graph older than HEAD as fresh and
+        # silence --if-stale. Keep the prior graph's own fingerprints.
+        if build_incomplete:
+            repo_map.generated_head = graph.generated_head if graph else ""
+            repo_map.indexed_hash = graph.indexed_hash if graph else ""
+            repo_map.content_fingerprint = graph.content_fingerprint if graph else ""
             write_model_json(output, repo_map)
-        except Exception:
-            logger.debug("Failed to re-stamp map fingerprints after agent guides", exc_info=True)
+        else:
+            mapper = RepoMapper(root)
+            try:
+                files = mapper.get_git_files()
+                repo_map.generated_head = mapper._git_head()
+                repo_map.indexed_hash = mapper._files_fingerprint(files)
+                repo_map.content_fingerprint = mapper._content_fingerprint(files)
+                repo_map.graph_degraded = bool(degraded)
+                repo_map.graph_degraded_reason = reason if degraded else ""
+                write_model_json(output, repo_map)
+            except Exception:
+                logger.debug("Failed to re-stamp map fingerprints after agent guides", exc_info=True)
         if graph_context.available:
             graph_output = output.with_name("code_review_graph_context.json")
             write_model_json(graph_output, graph_context)
@@ -361,4 +506,5 @@ def refresh_map_artifacts(
         degraded=degraded,
         reason=reason,
         compatibility_export_degraded=compatibility_export_degraded,
+        build_incomplete=build_incomplete,
     )

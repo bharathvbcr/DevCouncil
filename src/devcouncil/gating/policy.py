@@ -1,7 +1,8 @@
 import logging
+from dataclasses import replace
 from collections import deque
 from pydantic import BaseModel
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 from pathlib import Path
 
 from devcouncil.domain.requirement import Requirement
@@ -15,6 +16,67 @@ from devcouncil.gating.checks.clean_git import CleanGitCheck
 from devcouncil.telemetry.stages import log_step
 
 logger = logging.getLogger(__name__)
+
+
+def is_hard_safety_gap(gap: Gap) -> bool:
+    """Safety findings that remain blocking when quality gates are advisory."""
+    return gap.gap_type == "security_risk"
+
+
+GateMode = Literal["off", "advisory", "enforce"]
+
+
+def apply_gate_enforcement(gaps: List[Gap], *, mode: GateMode) -> List[Gap]:
+    """Apply the configured posture while preserving hard-safety blockers."""
+    if mode == "enforce":
+        return gaps
+    return [
+        gap.model_copy(update={"blocking": False})
+        if gap.blocking and not is_hard_safety_gap(gap)
+        else gap
+        for gap in gaps
+    ]
+
+
+def effective_artifact_graph(graph, *, mode: GateMode):  # noqa: ANN001
+    """Return a reporting view whose blockers match the configured posture.
+
+    Persisted gaps remain untouched so switching back to ``enforce`` restores
+    their original severity. Consumers that make progress/verdict decisions
+    should use this view rather than raw historical blocker flags.
+    """
+    if mode == "enforce":
+        return graph
+    effective = apply_gate_enforcement(list(graph.gaps.values()), mode=mode)
+    hard_blocked_tasks = {
+        gap.task_id
+        for gap in effective
+        if gap.blocking and gap.task_id
+    }
+    tasks = {
+        task_id: (
+            task.model_copy(update={"status": "done"})
+            if task.status == "blocked" and task_id not in hard_blocked_tasks
+            else task
+        )
+        for task_id, task in graph.tasks.items()
+    }
+    return replace(
+        graph,
+        gaps={gap.id: gap for gap in effective},
+        tasks=tasks,
+    )
+
+
+def effective_live_review(live_review: dict | None, *, mode: GateMode) -> dict | None:
+    """Demote live-review cards as progress blockers outside enforce mode."""
+    if live_review is None or mode == "enforce":
+        return live_review
+    effective = dict(live_review)
+    effective["blocking_cards"] = []
+    effective["stored_blocking_cards"] = list(live_review.get("blocking_cards") or [])
+    effective["gates_mode"] = mode
+    return effective
 
 
 class MapPolicyError(Exception):
@@ -133,11 +195,21 @@ def topological_order(tasks: List[Task]) -> List[Task]:
 class GatePolicy:
     """Central engine for executing project and task level quality gates."""
     
-    def __init__(self):
+    def __init__(self, project_root: Path | None = None):
         self.req_coverage = RequirementCoverageCheck()
         self.planned_files = PlannedFilesCheck()
         self.clean_git = CleanGitCheck()
         self.map_policy = FailClosedMapPolicy()
+        self.mode: GateMode = "enforce"
+        if project_root is not None:
+            try:
+                from devcouncil.app.config import load_config
+
+                self.mode = load_config(project_root).gates.mode
+            except Exception:
+                # Missing/invalid configuration keeps the established fail-closed
+                # posture. Disabling enforcement must always be explicit.
+                self.mode = "enforce"
 
     def check_plan_approval(
         self,
@@ -148,6 +220,8 @@ class GatePolicy:
         blocking_questions: Optional[List[Any]] = None,
     ) -> GateResult:
         """Determines if the overall project plan is ready for execution."""
+        if self.mode == "off":
+            return GateResult(passed=True, gaps=[])
         gaps = []
         known_req_ids = {req.id for req in requirements}
         known_ac_ids = {
@@ -322,6 +396,7 @@ class GatePolicy:
                 blocking=True,
             ))
 
+        gaps = apply_gate_enforcement(gaps, mode=self.mode)
         return GateResult(
             passed=_log_gate("plan_approval", gaps),
             gaps=gaps
@@ -329,6 +404,8 @@ class GatePolicy:
 
     def check_task_ready(self, task: Task, project_root: Path) -> GateResult:
         """Determines if a specific task can begin execution."""
+        if self.mode == "off":
+            return GateResult(passed=True, gaps=[])
         gaps = []
         
         # 1. Check Git state
@@ -379,6 +456,7 @@ class GatePolicy:
                 blocking=False,
             ))
 
+        gaps = apply_gate_enforcement(gaps, mode=self.mode)
         return GateResult(
             passed=_log_gate("task_ready", gaps, routine=True, task_id=task.id),
             gaps=gaps

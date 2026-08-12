@@ -79,3 +79,35 @@ def test_cli_status_fail_on_blocking_no_gaps(tmp_path, monkeypatch):
         
     res = runner.invoke(app, ["status", "--fail-on-blocking"])
     assert res.exit_code == 0
+
+
+def test_cli_status_treats_stored_blockers_as_advisory_when_gates_disabled(
+    tmp_path, monkeypatch
+):
+    reset_db_cache()
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert runner.invoke(app, ["config", "set", "gates.mode", "off"]).exit_code == 0
+
+    db = Database(tmp_path / ".devcouncil" / "state.sqlite")
+    gap = Gap(
+        id="GAP-1",
+        severity="high",
+        gap_type="missing_test",
+        description="Stored blocking finding",
+        blocking=True,
+        recommended_fix="Write a test",
+        task_id="TASK-1",
+    )
+    with db.get_session() as session:
+        GapRepository(session).save(gap)
+
+    result = runner.invoke(app, ["status", "--json", "--fail-on-blocking"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["gates_enabled"] is False
+    assert payload["gates_mode"] == "off"
+    assert payload["stored_blocking_gaps"] == 1
+    assert payload["coverage_summary"]["blocking_gaps"] == 0
+    assert payload["blocking_gaps"] == []

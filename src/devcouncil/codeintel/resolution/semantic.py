@@ -39,6 +39,9 @@ _BRIDGE_DECL = re.compile(
 _BRIDGE_CALL = re.compile(
     r"(?:NativeModules\.[A-Za-z_$][\w$]*\.|requireNativeModule\([^)]*\)\.)(?P<name>[A-Za-z_$][\w$]*)\s*\("
 )
+# Lines between deadline/progress checks inside a single file's scan.
+_LINE_CHECK_STRIDE = 1000
+
 _FILE_ROUTE_PREFIXES = (
     "src/pages/",
     "pages/",
@@ -171,8 +174,9 @@ def enrich_semantic_edges(
     ``budget_seconds`` bounds the per-file enrichment loop by wall clock: when
     exceeded, remaining files are skipped, partial results are kept, and
     ``meta["semantic_enrich_partial"]`` records how far it got — a visible
-    partial instead of an unbounded hang on very large repos. The check runs
-    between files, so one pathological file can still overshoot the budget.
+    partial instead of an unbounded hang on very large repos. The deadline is
+    re-checked inside the per-line loop as well, so a single multi-hundred-
+    -thousand-line file cannot overshoot the budget by minutes.
     """
 
     root = root.expanduser().resolve()
@@ -297,9 +301,17 @@ def enrich_semantic_edges(
                 score=0.9,
                 synthesizer="file-route-resolver",
             ))
+        expired = False
         for line_no, line in enumerate(lines, start=1):
-            if progress is not None and line_no % 1000 == 0:
-                progress("semantic", file_index - 1, total_files)
+            if line_no % _LINE_CHECK_STRIDE == 0:
+                # Heartbeat and deadline share a stride: a huge single file must
+                # both report progress and be able to stop at the budget, or it
+                # blows through the budget and looks stalled while doing it.
+                if progress is not None:
+                    progress("semantic", file_index - 1, total_files)
+                if deadline is not None and time.monotonic() > deadline:
+                    expired = True
+                    break
             owner = _enclosing(file_symbols, rel, line_no)
             owner_id = owner.id if owner is not None else rel
             match: Any
@@ -671,6 +683,22 @@ def enrich_semantic_edges(
 
         if progress is not None:
             progress("semantic", file_index, total_files)
+        if expired:
+            graph.meta["semantic_enrich_partial"] = {
+                "files_done": file_index - 1,
+                "files_total": total_files,
+                "budget_seconds": budget_seconds,
+                "stopped_mid_file": rel,
+            }
+            logger.warning(
+                "semantic enrichment budget (%ss) exhausted mid-file (%s) after "
+                "%d/%d files; keeping partial results",
+                budget_seconds,
+                rel,
+                file_index - 1,
+                total_files,
+            )
+            break
 
     graph.nodes = nodes
     graph.edges = edges
@@ -793,10 +821,11 @@ def _resolve_dynamic_file(
                 pass
         base = raw.lstrip("/")
     candidates = [base]
-    candidates.extend(f"{base}{suffix}" for suffix in (
-        ".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
-        ".go", ".rs", ".java", ".cs", ".swift", ".kt", ".rb", ".php",
-    ))
+    from devcouncil.codeintel.languages import code_extensions
+
+    # Resolve candidate suffixes from LANGUAGE_SPECS (+ common index stems).
+    resolve_suffixes = tuple(sorted(code_extensions()))
+    candidates.extend(f"{base}{suffix}" for suffix in resolve_suffixes)
     candidates.extend(f"{base}/index{suffix}" for suffix in (
         ".ts", ".tsx", ".js", ".jsx", ".py",
     ))

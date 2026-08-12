@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Set, Tuple, cast
 
 from pydantic import BaseModel, Field
 
+from devcouncil.codeintel.languages import code_extensions, language_id_for_suffix
 from devcouncil.indexing.graph.cache import PARSE_CACHE_VERSION
 from devcouncil.indexing.graph.schema import CodeGraph
 from devcouncil.indexing.lsp import LspInspector
@@ -19,11 +20,48 @@ from devcouncil.indexing.lsp import LspInspector
 logger = logging.getLogger(__name__)
 
 # File extensions treated as primary source for subsystem inference.
-_CODE_EXTENSIONS = {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".kt", ".rb", ".cs", ".cpp", ".c"}
+# Derived from LANGUAGE_SPECS so Swift/Kotlin/Ruby/… stay in sync with the graph.
+_CODE_EXTENSIONS = code_extensions()
 # Top-level directories grouped as their own area rather than folded into a source root.
-_AUX_AREA_ROOTS = {"tests", "test", "docs", "doc", "scripts", "examples", "example", "benchmarks"}
+# Compared case-insensitively so SPM ``Tests/`` does not collapse ``Sources/`` LCP.
+_AUX_AREA_ROOTS = frozenset({
+    "tests", "test", "docs", "doc", "scripts", "examples", "example", "benchmarks",
+})
 # Filenames that signal an entry point, used to break ties when no import data exists.
 _ENTRY_NAME_HINTS = ("__init__", "__main__", "main", "index", "app", "cli", "server", "mod", "lib")
+
+# Directory names that never hold first-party source, at any depth. Untracked
+# trees under these are what turned a 4.5k-file repo into a 136k-file index:
+# .gitignore coverage is not something the mapper can assume.
+_GENERATED_DIR_NAMES = frozenset({
+    ".git", ".hg", ".svn",
+    ".devcouncil", ".gitnexus",
+    ".pytest_cache", ".ruff_cache", ".mypy_cache", ".tox", ".nox",
+    ".venv", "venv", ".virtualenv", "site-packages",
+    "node_modules", "bower_components", ".pnpm-store", ".yarn",
+    ".next", ".nuxt", ".svelte-kit", ".astro", ".parcel-cache", ".turbo",
+    ".gradle", ".idea", ".vscode-test", ".terraform",
+    "coverage", ".coverage", "htmlcov", ".nyc_output",
+    "__snapshots__", ".cache", ".sass-cache", ".eggs",
+    "vendor", "third_party", "Pods", "DerivedData", "Carthage",
+})
+
+# Binary / archive / artifact suffixes. Indexing these costs a full read and a
+# tokenize pass and yields nothing a symbol graph can use.
+_GENERATED_SUFFIXES = (
+    ".tgz", ".whl", ".tar.gz", ".tar.bz2", ".tar.xz", ".zip", ".jar", ".war",
+    ".so", ".dylib", ".dll", ".a", ".o", ".obj", ".lib", ".exe", ".class",
+    ".wasm", ".bin", ".dat", ".db", ".sqlite", ".sqlite3", ".pack", ".idx",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".tiff",
+    ".pdf", ".mp4", ".mov", ".mp3", ".wav", ".woff", ".woff2", ".ttf", ".eot",
+    ".pyd", ".pyo", ".min.js", ".min.css", ".map",
+    # NOT lock files: uv.lock / Cargo.lock / poetry.lock are how package
+    # managers are detected, and they are small.
+)
+
+
+def _is_aux_area_root(name: str) -> bool:
+    return name.casefold() in _AUX_AREA_ROOTS
 
 
 class RepoFileEntry(BaseModel):
@@ -140,26 +178,6 @@ class RepoMapper:
     _LIVENESS_CAP = 20_000  # serialized entries per liveness debt list
     max_dependents_per_file = 4_096
     max_map_size = 100_000  # hard safety ceiling for each liveness debt list
-
-    _LANGUAGE_BY_EXTENSION = {
-        ".py": "python",
-        ".ts": "typescript",
-        ".tsx": "typescript",
-        ".js": "javascript",
-        ".jsx": "javascript",
-        ".go": "go",
-        ".rs": "rust",
-        ".java": "java",
-        ".c": "c",
-        ".cpp": "cpp",
-        ".md": "markdown",
-        ".yaml": "yaml",
-        ".yml": "yaml",
-        ".toml": "toml",
-        ".json": "json",
-        ".sh": "shell",
-        ".ps1": "powershell",
-    }
 
     _AREA_SUMMARIES = {
         "src/devcouncil/cli": "CLI entrypoints and command registration",
@@ -799,24 +817,33 @@ class RepoMapper:
     }
 
     def _language_for_file(self, path: str) -> str | None:
-        suffix = Path(path).suffix.lower()
-        return self._LANGUAGE_BY_EXTENSION.get(suffix)
+        return language_id_for_suffix(Path(path).suffix, include_markup=True)
 
     def _kind_for_file(self, path: str) -> str:
         normalized = path.replace("\\", "/")
         suffix = Path(normalized).suffix.lower()
         name = Path(normalized).name
-        if normalized.startswith("tests/") or name.startswith("test_"):
+        top = normalized.split("/", 1)[0]
+        if _is_aux_area_root(top) and top.casefold() in {"tests", "test"}:
             return "test"
-        if normalized.startswith("docs/") or suffix == ".md":
+        if name.startswith("test_"):
+            return "test"
+        if _is_aux_area_root(top) and top.casefold() in {"docs", "doc"}:
             return "doc"
+        if suffix in {".md", ".markdown"}:
+            return "doc"
+        # HTML stays kind "file" (not module): labeled in languages[] / files[].language
+        # via markup overlay, but excluded from code_extensions so static assets do not
+        # seed code subsystems.
+        if suffix in {".html", ".htm"}:
+            return "file"
         if suffix in {".yaml", ".yml", ".toml", ".json", ".ini"}:
             return "config"
         if suffix in {".sh", ".ps1", ".bat"}:
             return "script"
         if suffix in {".sqlite", ".db"}:
             return "database"
-        if suffix in {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".c", ".cpp"}:
+        if suffix in _CODE_EXTENSIONS:
             return "module" if name != "__init__.py" else "package"
         return "file"
 
@@ -998,7 +1025,11 @@ class RepoMapper:
         for f in self._code_files(files):
             top = f.replace("\\", "/").split("/")[0]
             name = Path(f).name
-            if top in _AUX_AREA_ROOTS or name.startswith("test_") or name.endswith("_test.go"):
+            if (
+                _is_aux_area_root(top)
+                or name.startswith("test_")
+                or name.endswith("_test.go")
+            ):
                 continue
             primary.append(f)
         return primary
@@ -1025,7 +1056,7 @@ class RepoMapper:
     def _generic_area_for_file(self, path: str, source_root: str) -> str:
         normalized = path.replace("\\", "/")
         parts = normalized.split("/")
-        if parts[0] in _AUX_AREA_ROOTS:
+        if _is_aux_area_root(parts[0]):
             return parts[0]
         if source_root and (normalized == source_root or normalized.startswith(f"{source_root}/")):
             rest = normalized[len(source_root):].lstrip("/").split("/")
@@ -1933,7 +1964,7 @@ class RepoMapper:
             area_files = by_area[area]
             # Skip trivial single-file aux areas (e.g. a lone script) to reduce noise,
             # but keep every real source subsystem.
-            if len(area_files) < 2 and area.split("/")[0] in _AUX_AREA_ROOTS:
+            if len(area_files) < 2 and _is_aux_area_root(area.split("/")[0]):
                 continue
             area_file_set = set(area_files)
             area_roots = [r for r in graph_roots if r in area_file_set]
@@ -2313,11 +2344,14 @@ class RepoMapper:
         lower_name = name.lower()
         if "__pycache__" in parts or normalized.endswith(".pyc"):
             return True
-        if parts.intersection({".git", ".devcouncil", ".pytest_cache", ".ruff_cache", ".mypy_cache", ".venv"}):
+        if parts.intersection(_GENERATED_DIR_NAMES):
             return True
-        if normalized.startswith("dist/") or normalized.startswith("build/"):
+        # ``dist``/``build`` are only generated at the top level; a source
+        # directory literally named ``build`` (e.g. ``src/…/graph/build``) must
+        # not be dropped, so these stay prefix checks rather than segment ones.
+        if normalized.startswith(("dist/", "build/", "out/", "target/")):
             return True
-        if lower_name.endswith((".tgz", ".whl", ".tar.gz")):
+        if lower_name.endswith(_GENERATED_SUFFIXES):
             return True
         if name.startswith(("tmp", "temp", ".tmp")) or name.endswith("~"):
             return True
@@ -2373,24 +2407,52 @@ class RepoMapper:
         except Exception:
             return True
 
+    def _inventory_limits(self) -> tuple[bool, int]:
+        """``(include_untracked, max_indexed_files)`` from indexing config."""
+        try:
+            from devcouncil.app.config import load_config
+
+            indexing = load_config(self.project_root).indexing
+            return bool(indexing.include_untracked), int(indexing.max_indexed_files)
+        except Exception:
+            return True, 50_000
+
     def get_git_files(self) -> List[str]:
+        include_untracked, max_files = self._inventory_limits()
         try:
             from devcouncil.utils.proc import git_output
 
-            # ``-z`` avoids C-quoting of non-ASCII paths (otherwise ``café.py`` becomes
-            # ``"src/caf\303\251.py"`` and fails the ``is_file()`` existence filter).
-            output = git_output(
-                ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-                cwd=self.project_root,
-            )
-            paths = [p.replace("\\", "/") for p in output.split("\0") if p]
-            # Skip index entries whose working-tree file was deleted but not staged.
-            return [
+            def _listed(*flags: str) -> List[str]:
+                # ``-z`` avoids C-quoting of non-ASCII paths (otherwise ``café.py``
+                # becomes ``"src/caf\303\251.py"`` and fails the is_file() filter).
+                output = git_output(
+                    ["ls-files", "-z", *flags], cwd=self.project_root
+                )
+                return [p.replace("\\", "/") for p in output.split("\0") if p]
+
+            def _keep(paths: List[str]) -> List[str]:
+                # Skip index entries whose working-tree file was deleted but not staged.
+                return [
+                    path
+                    for path in paths
+                    if not self._is_runtime_or_generated_file(path)
+                    and (self.project_root / path).is_file()
+                ]
+
+            tracked = _keep(_listed("--cached"))
+            if not include_untracked:
+                return self._cap_inventory(tracked, [], max_files)
+            # Untracked-but-not-ignored files are indexed so a just-written,
+            # not-yet-staged file is navigable. They are also the unbounded
+            # half of the inventory (a repo whose ignore rules miss its build
+            # output), so they are dropped first when the cap is hit.
+            tracked_set = set(tracked)
+            untracked = [
                 path
-                for path in paths
-                if not self._is_runtime_or_generated_file(path)
-                and (self.project_root / path).is_file()
+                for path in _keep(_listed("--others", "--exclude-standard"))
+                if path not in tracked_set
             ]
+            return self._cap_inventory(tracked, untracked, max_files)
         except Exception:
             # Fallback to os.walk if not a git repo or git missing
             from devcouncil.indexing.walk import IGNORED_DIR_NAMES
@@ -2407,27 +2469,73 @@ class RepoMapper:
                     ).replace(os.sep, "/")
                     if not rel_path.startswith(".") and not self._is_runtime_or_generated_file(rel_path):
                         files.append(rel_path)
-            return files
+            return self._cap_inventory(files, [], max_files)
+
+    @staticmethod
+    def _cap_inventory(
+        tracked: List[str],
+        untracked: List[str],
+        max_files: int,
+    ) -> List[str]:
+        """Bound the indexed file set, dropping untracked paths first.
+
+        An unbounded inventory is the root cause of a 175MB repo_map.json and a
+        multi-gigabyte index: every extra file costs a read, a tokenize, and a
+        row in every generation. Overflow is logged rather than silently
+        truncated so an over-broad inventory is visible instead of mysterious.
+        """
+        max_files = max(1, int(max_files))
+        if len(tracked) + len(untracked) <= max_files:
+            return sorted(tracked + untracked)
+        if len(tracked) >= max_files:
+            logger.warning(
+                "indexed file inventory capped at %d of %d tracked files "
+                "(indexing.max_indexed_files); dropped all %d untracked files",
+                max_files, len(tracked), len(untracked),
+            )
+            return sorted(tracked[:max_files])
+        room = max_files - len(tracked)
+        logger.warning(
+            "indexed file inventory capped at %d (indexing.max_indexed_files); "
+            "kept %d tracked + %d of %d untracked files",
+            max_files, len(tracked), room, len(untracked),
+        )
+        return sorted(tracked + untracked[:room])
 
     def detect_languages(self, files: List[str]) -> List[str]:
-        exts = {os.path.splitext(f)[1] for f in files}
-        lang_map = {
-            ".py": "python",
-            ".ts": "typescript",
-            ".tsx": "typescript",
-            ".js": "javascript",
-            ".jsx": "javascript",
-            ".go": "go",
-            ".rs": "rust",
-            ".java": "java",
-            ".c": "c",
-            ".cpp": "cpp",
-        }
-        return sorted(list({lang_map[ext] for ext in exts if ext in lang_map}))
+        """Stable language ids for map ``languages[]``.
+
+        Includes ``LANGUAGE_SPECS`` code langs plus markup overlay ids
+        (markdown, html, yaml, …) so docs/templates appear when present.
+        Markup suffixes are *not* in ``code_extensions()``, so they label the
+        map without promoting HTML-only asset trees into code subsystems.
+        """
+        langs: set[str] = set()
+        for path in files:
+            lang = language_id_for_suffix(Path(path).suffix, include_markup=True)
+            if lang:
+                langs.add(lang)
+        return sorted(langs)
+
+    @staticmethod
+    def _basenames(files: List[str]) -> set[str]:
+        return {Path(f.replace("\\", "/")).name for f in files}
+
+    @staticmethod
+    def _paths_with_basenames(files: List[str], names: set[str]) -> List[str]:
+        return [f for f in files if Path(f.replace("\\", "/")).name in names]
+
+    def _read_rel(self, rel: str) -> str:
+        """Read a repo-relative file (nested manifests); empty on failure."""
+        try:
+            return (self.project_root / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
 
     def detect_frameworks(self, files: List[str]) -> List[str]:
-        frameworks = []
+        frameworks: List[str] = []
         file_set = set(files)
+        basenames = self._basenames(files)
         if "package.json" in file_set:
             content = self._read_config_file("package.json")
             if "next" in content:
@@ -2438,7 +2546,7 @@ class RepoMapper:
                 frameworks.append("vue")
             if "express" in content:
                 frameworks.append("express")
-        
+
         if "requirements.txt" in file_set or "pyproject.toml" in file_set:
             try:
                 parts: List[str] = []
@@ -2456,11 +2564,41 @@ class RepoMapper:
                     frameworks.append("django")
             except Exception as e:
                 logger.debug("Failed to read Python config files: %s", e)
+
+        # SwiftPM / Vapor (basename-any so nested Package.swift counts).
+        if "Package.swift" in basenames:
+            frameworks.append("swiftpm")
+            for rel in self._paths_with_basenames(files, {"Package.swift"})[:8]:
+                text = self._read_rel(rel)
+                if "Vapor" in text or ".package(url:" in text and "vapor" in text.lower():
+                    frameworks.append("vapor")
+                    break
+
+        # Android / Kotlin / Compose (shallow content sniff).
+        if "AndroidManifest.xml" in basenames:
+            frameworks.append("android")
+        gradle_names = {
+            "build.gradle", "build.gradle.kts",
+            "settings.gradle", "settings.gradle.kts",
+        }
+        if basenames & gradle_names or "gradlew" in basenames:
+            for rel in self._paths_with_basenames(files, gradle_names)[:8]:
+                text = self._read_rel(rel).lower()
+                if "com.android" in text or "android." in text:
+                    if "android" not in frameworks:
+                        frameworks.append("android")
+                if "org.jetbrains.kotlin" in text or "kotlin(" in text or "kotlin." in text:
+                    if "kotlin" not in frameworks:
+                        frameworks.append("kotlin")
+                if "compose" in text:
+                    if "compose" not in frameworks:
+                        frameworks.append("compose")
         return frameworks
 
     def detect_package_managers(self, files: List[str]) -> List[str]:
-        managers = []
+        managers: List[str] = []
         file_set = set(files)
+        basenames = self._basenames(files)
         if "package-lock.json" in file_set:
             managers.append("npm")
         elif "package.json" in file_set:
@@ -2473,14 +2611,25 @@ class RepoMapper:
             managers.append("pip")
         if "uv.lock" in file_set:
             managers.append("uv")
-        if "go.sum" in file_set:
+        if "go.mod" in basenames or "go.sum" in basenames:
             managers.append("go mod")
+        if "Cargo.toml" in basenames:
+            managers.append("cargo")
+        if "Package.swift" in basenames:
+            managers.append("swiftpm")
+        gradle_names = {
+            "build.gradle", "build.gradle.kts",
+            "settings.gradle", "settings.gradle.kts", "gradlew",
+        }
+        if basenames & gradle_names:
+            managers.append("gradle")
         return managers
 
     def detect_test_commands(self, files: List[str]) -> List[str]:
         """Detect test, lint, and typecheck commands from project config."""
         commands: List[str] = []
         file_set = set(files)
+        basenames = self._basenames(files)
 
         # Node.js projects: read scripts from package.json
         if "package.json" in file_set:
@@ -2507,14 +2656,29 @@ class RepoMapper:
             commands.append("mypy .")
 
         # Go projects
-        if "go.mod" in file_set:
+        if "go.mod" in basenames:
             commands.append("go test ./...")
             commands.append("go vet ./...")
 
         # Rust projects
-        if "Cargo.toml" in file_set:
+        if "Cargo.toml" in basenames:
             commands.append("cargo test")
             commands.append("cargo clippy")
+
+        # SwiftPM
+        if "Package.swift" in basenames:
+            commands.append("swift test")
+
+        # Gradle / Android
+        gradle_names = {
+            "build.gradle", "build.gradle.kts",
+            "settings.gradle", "settings.gradle.kts", "gradlew",
+        }
+        if basenames & gradle_names:
+            if "gradlew" in basenames:
+                commands.append("./gradlew test")
+            else:
+                commands.append("gradle test")
 
         return commands
 
@@ -2730,6 +2894,14 @@ class RepoMapper:
             "CLAUDE.md",
             "package.json",
             "pyproject.toml",
+            "Package.swift",
+            "Cargo.toml",
+            "go.mod",
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+            "AndroidManifest.xml",
             "src/devcouncil/cli/main.py",
             "src/devcouncil/app/orchestrator.py",
             "src/devcouncil/app/state_machine.py",
@@ -2739,7 +2911,18 @@ class RepoMapper:
             "src/devcouncil/execution/task_runner.py",
             "src/devcouncil/verification/verifier.py",
         ]
+        # Basename-any: nested manifests (app/build.gradle.kts, Packages/…) count too.
+        important_basename_set = {
+            "Package.swift", "Cargo.toml", "go.mod",
+            "build.gradle", "build.gradle.kts",
+            "settings.gradle", "settings.gradle.kts",
+            "AndroidManifest.xml",
+        }
         important_files = [path for path in important_candidates if path in file_set]
+        for path in sorted(files):
+            if Path(path.replace("\\", "/")).name in important_basename_set:
+                if path not in important_files:
+                    important_files.append(path)
         important_files.extend(sorted(path for path in files if path.startswith(".github/workflows/")))
         # On non-DevCouncil repos the curated candidates above mostly miss, so seed
         # important surfaces from the most-depended-on source files.

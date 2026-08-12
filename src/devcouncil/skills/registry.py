@@ -375,6 +375,22 @@ def select_skills(
     return [skill for skill, _ in scored]
 
 
+def skills_for_scaffold(
+    goal: str = "",
+    project_root: Path | None = None,
+    library_dir: Path = LIBRARY_DIR,
+) -> list[Skill]:
+    """Skills to write under ``.claude/skills`` / ``.cursor/skills``.
+
+    Selection still uses repo context (markers/globs), but packaged library content
+    wins over already-scaffolded copies so ``dev integrate … --apply`` can refresh
+    stale ``SKILL.md`` bodies.
+    """
+    selected = select_skills(goal, project_root, library_dir=library_dir)
+    library_by_name = {s.name: s for s in load_skills(library_dir, project_root=None)}
+    return [library_by_name.get(skill.name, skill) for skill in selected]
+
+
 def render_preamble(skills: list[Skill]) -> str:
     """Concatenate skill bodies into a single prompt preamble block."""
     if not skills:

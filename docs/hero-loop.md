@@ -1,5 +1,9 @@
 # The Claude Code Hero Loop
 
+This is an opt-in strict workflow. It describes `gates.mode=enforce` and does
+not make tasks, leases, or verification mandatory for ordinary work when the
+project uses `advisory` or `off`.
+
 DevCouncil's flagship integration is an **autonomous closed loop** with Claude Code over
 MCP: the agent checks out a task, implements it, asks DevCouncil to verify, receives a
 typed list of next actions, repairs, and re-verifies — **without a human pasting prompts

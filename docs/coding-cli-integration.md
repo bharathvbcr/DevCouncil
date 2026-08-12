@@ -2,6 +2,11 @@
 
 DevCouncil works with any tool that can accept a prompt and edit files in the same repository.
 
+Integration tiers describe available capabilities, not mandatory workflow.
+`gates.mode=enforce` activates task, lease, scope, and verification blocking;
+`advisory` records quality findings without blocking; `off` permits ordinary
+taskless work and skips quality verification. Hard safety remains active.
+
 ## Integration tiers
 
 Each supported coding CLI falls into one of three tiers:
@@ -20,30 +25,34 @@ Setup: `dev integrate <client> --apply` for MCP where supported; executors work 
 
 | Client | Native write/shell hooks |
 | :--- | :--- |
-| Claude | Yes — opt-in blocking PreToolUse write gate + lifecycle/Stop hooks |
-| Codex | Advisory PreToolUse + blocking Stop/SubagentStop; sandbox + verification are the write boundary |
+| Claude | Yes — assist by default (PostToolUse + lifecycle); opt-in `--write-gate` PreToolUse |
+| Codex | Assist by default (PostToolUse + Stop/SubagentStop); opt-in `--write-gate` PreToolUse (exit-2 deny intentional under contain); sandbox + verification remain a write boundary |
 | Cursor | Yes — assist by default (PostToolUse); opt-in `--write-gate` PreToolUse |
-| Grok Build | Yes — `.grok/hooks/devcouncil.json` (requires `/hooks-trust`) |
-| OpenCode | Yes — bundled plugin via `dev integrate hooks` |
+| Grok Build | Yes — assist by default; opt-in `--write-gate` PreToolUse (requires `/hooks-trust`) |
+| OpenCode | Yes — assist by default (`tool.execute.after`); opt-in `--write-gate` (`tool.execute.before`) |
 | Antigravity / Warp / Aider / Copilot / Goose / Amp / Qwen / Crush | Verification-gated; hooks optional |
 | Unregistered BYO | Verification-gated only |
 
 ### Executor hardening parity
 
-Safety policy is the same across coding CLIs; enforcement differs by runtime. Hook-aware clients (`dev run --executor codex|claude`, etc.) evaluate policy against the active task: writes are denied with no active run or outside planned files. Claude can block unplanned writes, secret paths, force pushes, `--no-verify` / `--no-gpg-sign`, and protected-branch hard resets before execution. Codex PreToolUse is advisory, so DevCouncil combines hook guidance with Codex sandbox and post-action verification. Claude/Codex **Stop** / **SubagentStop** run the unified stop gate. Clients without hooks get the task contract in prompts and fail non-compliant output at verification.
+Safety policy is the same across coding CLIs; enforcement differs by runtime and
+gate mode. In `enforce`, hook-aware task runs deny writes with no active scope or
+outside planned files and post-run verification can block. `advisory` demotes
+quality failures; `off` bypasses task scope, stop, sandbox, and quality checks
+while retaining hard safety.
 
 ## Compatibility Matrix
 
 | Tool | Manual sidecar prompts | Headless prompt handoff | DevCouncil MCP tools | Write-blocking hooks |
 | :--- | :---: | :---: | :---: | :---: |
 | **Claude Code** | Supported | Tool-dependent | Tools + resources + prompts via `claude mcp` | Assistive hooks + slash commands, subagents, output style, statusline, installable plugin (opt-in `--write-gate` for blocking containment) |
-| **Codex CLI** | Supported | Supported via `codex exec` | Supported via `codex mcp` | Advisory PreToolUse + native Stop gate; sandbox and verify contain writes |
+| **Codex CLI** | Supported | Supported via `codex exec` | Supported via `codex mcp` | Assistive hooks by default; opt-in `--write-gate` PreToolUse (exit-2 deny intentional under contain); sandbox and verify contain writes |
 | **Gemini CLI** | Deprecated | Deprecated (compat only) | Deprecated — use Antigravity | Explicit `--tool gemini` only |
-| **OpenCode** | Supported | Supported via `opencode run --file` | Supported via project `opencode.json` | Native via `dev integrate hooks` (bundled plugin) |
+| **OpenCode** | Supported | Supported via `opencode run --file` | Supported via project `opencode.json` | Assistive plugin by default (`tool.execute.after`); opt-in `--write-gate` (`tool.execute.before`) |
 | **Google Antigravity CLI** | Supported | Supported via `agy --print` | Supported via project `.agents/mcp_config.json` | Verification-gated sidecar |
 | **Warp / Oz** | Supported | Supported via `oz agent run` | Supported via Warp/Oz MCP JSON | Verification-gated sidecar |
 | **Cursor** | Supported | Supported via `agent`/`cursor-agent --print --trust` (yolo adds `--force`; JSON output) | Supported via project `.cursor/mcp.json` | Assistive PostToolUse by default; opt-in `--write-gate` PreToolUse (`.cursor/hooks.json`) |
-| **Grok Build** | Supported | Supported via `grok -p` with `--directory` | Supported via `grok mcp add` or `.grok/config.toml` | Native via `dev integrate hooks --tool grok` (`.grok/hooks/devcouncil.json`; trust with `/hooks-trust`) |
+| **Grok Build** | Supported | Supported via `grok -p` with `--directory` | Supported via `grok mcp add` or `.grok/config.toml` | Assistive PostToolUse by default; opt-in `--write-gate` PreToolUse (`.grok/hooks/devcouncil.json`; trust with `/hooks-trust`) |
 | **Aider** | Supported | Supported via `aider --yes --message` | Not a primary path | Verification-gated sidecar |
 | **GitHub Copilot CLI** | Supported | Supported via `copilot --allow-all-tools -p` | Tool-managed MCP config | Verification-gated sidecar |
 | **Goose** | Supported | Supported via `goose run -i <prompt-file>` | Tool-managed extensions | Verification-gated sidecar |
@@ -96,6 +105,33 @@ dev integrate all --apply --strict  # Apply all integrations, then strict check
 ```
 
 `dev integrations` is an alias for `dev integrate`.
+
+### Decouple vs uninstall
+
+Two teardown modes reverse containment and companion wiring without deleting `.devcouncil/` project data (tasks, graph, wiki, codeintel):
+
+| Action | Effect | Leaves alone |
+|---|---|---|
+| **`--decouple`** | Strip containment only (`PreToolUse` / `BeforeTool` / Cursor `preToolUse` / OpenCode `tool.execute.before`); set `integrations.<client>.write_gate: false` and `execution.hook_gate.mode: off`; if `execution.stop_gate.mode` is `block`, force `assist` | MCP, PostToolUse / lifecycle / assist hooks, skills, rules, plugins, git map hooks |
+| **`--uninstall`** | Surgically remove everything DevCouncil installed for that client (exact MCP keys, DevCouncil hook entries, unmodified library skills, rules/plugin assets, config `enabled` / `write_gate`) | User-owned settings, non-DevCouncil hooks/servers, `.devcouncil/` project data |
+
+```bash
+# Per-client flags
+dev integrate claude --decouple
+dev integrate cursor --uninstall
+
+# Multi-target commands (same actions)
+dev integrate decouple --target all|hooks|claude|cursor|opencode|…
+dev integrate uninstall --target all|hooks|claude|cursor|opencode|…
+```
+
+Clients with no containment hooks (Aider, Warp, Antigravity): `--decouple` reports nothing to strip; `--uninstall` still clears MCP/config enablement.
+
+`dev integrate hooks --uninstall` (or `uninstall --target hooks`) removes native hook files/entries and git map-refresh markers, and clears `integrations.<hook-client>.enabled` / `write_gate` so `dev integrate check` stays green. Pass `--tool <client>` to limit teardown to one hook client (MCP entries stay). Use `dev integrate <client> --uninstall` to remove MCP + assets too.
+
+After either action, `dev integrate check` must pass: clean removal is not reported as “tampered.” Empty or orphaned hook files left behind are skipped. Assist mode with a leftover PreToolUse / `tool.execute.before` and `write_gate: false` still fails check (re-apply assist or pass `--write-gate`).
+
+**OpenCode:** `--decouple` surgically drops `tool.execute.before` from the existing plugin file when the generator shape is recognized (keeps `tool.execute.after` and any hand-edits outside that handler). Re-applying without `--write-gate` (`dev integrate opencode --apply` / hooks assist) fully regenerates the plugin — use that to refresh assist hooks, not `--decouple`, when you want a clean assist rewrite. `--uninstall` removes `mcp.devcouncil`, any plugin array entry pointing at `opencode_devcouncil_plugin.mjs` (canonical `./.devcouncil/integrations/…` or path variants), the generated `.mjs`, and clears config enablement.
 
 ## Dashboard integration controls
 
@@ -314,7 +350,7 @@ dev run TASK-001 --executor claude
 
 Those modes launch the corresponding client with the task prompt and return to DevCouncil for checkpointing and verification.
 
-Claude's opt-in write gate calls `dev hook pre-tool-use` before file-writing tools and blocks unauthorized writes with a non-zero exit. Codex receives the same policy evaluation but its current PreToolUse schema is advisory; do not treat it as a blocking boundary. DevCouncil's lease-gated MCP writes and post-run verification remain blocking boundaries for both clients.
+Claude's opt-in write gate calls `dev hook pre-tool-use` before file-writing tools and blocks unauthorized writes with a non-zero exit. Codex assist omits PreToolUse; with `--write-gate`, PreToolUse is installed and exit-2 deny is intentional under contain mode. DevCouncil's lease-gated MCP writes and post-run verification remain blocking boundaries for both clients.
 
 MCP setup:
 
@@ -389,13 +425,14 @@ Add the write-gate explicitly when you want pre-action containment (e.g. for aut
 dev integrate claude --apply --write-gate     # alias: --contain
 ```
 
-You lose no containment by leaving it off: `dev run --executor claude` performs its own post-hoc scope enforcement (out-of-scope changes are reverted before verify), independent of this hook.
+In `gates.mode=enforce`, leaving the pre-action hook off still retains the
+executor's post-hoc task-scope check. In `advisory` or `off`, that task-scope
+containment is intentionally relaxed.
 
-Remove everything DevCouncil installed (hooks, statusline, MCP enablement, permission rules,
-DevCouncil-written `advisorModel` when it matches the default profile, and the generated
-commands/subagents/output style — your own settings are preserved):
+Strip containment only (keep PostToolUse / lifecycle / MCP / skills) or remove everything DevCouncil installed (hooks, statusline, MCP enablement, permission rules, DevCouncil-written `advisorModel` when it matches the default profile, unmodified library skills, and the generated commands/subagents/output style — your own settings are preserved):
 
 ```bash
+dev integrate claude --decouple       # or: dev integrate decouple --target claude
 dev integrate claude --uninstall      # or: dev integrate uninstall --target claude
 ```
 
@@ -442,7 +479,16 @@ MCP setup:
 dev integrate opencode --apply
 ```
 
-This writes a project-level `opencode.json` entry for the local DevCouncil MCP server with `DEVCOUNCIL_PROJECT_ROOT` set to the repository root.
+This writes a project-level `opencode.json` entry for the local DevCouncil MCP server with `DEVCOUNCIL_PROJECT_ROOT` set to the repository root. With `--write-gate`, the bundled plugin also registers `tool.execute.before` for pre-action containment.
+
+Teardown:
+
+```bash
+dev integrate opencode --decouple     # strip tool.execute.before only; keep after + MCP
+dev integrate opencode --uninstall    # remove mcp.devcouncil, plugin entry, .mjs, config
+```
+
+`--decouple` prefers a surgical edit of the existing `.mjs` (drop the before-handler) so hand-edits outside that section survive. Re-apply assist (`dev integrate opencode --apply` without `--write-gate`) regenerates the full assist plugin when you want a clean rewrite. After either teardown, `dev integrate check` should pass.
 
 Upstream reference: [OpenCode MCP servers](https://thdxr.dev.opencode.ai/docs/mcp-servers/).
 
@@ -523,13 +569,26 @@ dev integrate hooks --apply --tool grok --write-gate
 dev integrate hooks --apply --tool opencode --write-gate
 ```
 
-Re-applying without `--write-gate` strips PreToolUse (assist). Runtime escape hatch for an already
-installed PreToolUse gate: `execution.hook_gate.mode=off` or `DEVCOUNCIL_HOOK_GATE=off` (hard safety
-still enforced; MCP lease write/run paths stay gated).
+Re-applying without `--write-gate` strips PreToolUse (assist) and sets
+`execution.hook_gate.mode=off`. Installing with `--write-gate` sets `mode=contain`.
+Prefer `dev integrate <client> --decouple` when you only want to escape containment
+without rewriting PostToolUse / lifecycle hooks (see [Decouple vs uninstall](#decouple-vs-uninstall)).
+Product default for `execution.hook_gate.mode` is **off** (interactive Shell/Write
+allowed without a lease or allowlist bind, even with a leftover running task; hard safety
+retained). Opt into lease-gated PreToolUse with `--write-gate`, or set
+`execution.hook_gate.mode=contain` / `DEVCOUNCIL_HOOK_GATE=contain`.
+MCP/SDK/shell-session lease write/run paths pass `enforce_task_scope=True` and stay gated
+regardless of mode.
 
-`dev integrate check` accepts PostToolUse-only Cursor/Grok assist when `integrations.*.write_gate`
-is false. Enforcement posture in `dev integrate matrix` reflects *capability*, not the installed
-assist/contain choice — use `dev doctor` / `dev integrate check` for installed posture.
+```bash
+dev integrate cursor --decouple
+dev integrate cursor --uninstall
+```
+
+`dev integrate check` accepts PostToolUse-only assist for Claude/Cursor/Grok/OpenCode/Codex
+when `integrations.*.write_gate` is false (and fails if PreToolUse / `tool.execute.before`
+is present under assist). Capability rows / matrix report installed posture: assist →
+`advisory+verify`, `--write-gate` → `pre-action`.
 
 Headless execution with Cursor Agent CLI:
 
@@ -584,7 +643,7 @@ Headless execution:
 
 ```bash
 dev integrate grok --apply
-dev integrate hooks --apply --tool grok   # pre-action containment; then /hooks-trust in Grok
+dev integrate hooks --apply --tool grok   # assist default; add --write-gate for PreToolUse; then /hooks-trust in Grok
 dev run TASK-001 --executor grok
 dev run TASK-001 --executor grok --profile yolo   # --permission-mode acceptEdits
 ```

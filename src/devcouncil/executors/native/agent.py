@@ -153,7 +153,10 @@ class NativeAgent(Executor):
         ``split_next_actions`` repair contract is byte-for-byte identical across surfaces.
         docker/nix run through ``verification/sandbox.py`` for coding-CLI parity.
         """
-        if self.sandbox in {"docker", "nix"}:
+        from devcouncil.app.config import load_config
+
+        gate_mode = load_config(self.project_root).gates.mode
+        if self.sandbox in {"docker", "nix"} and gate_mode != "off":
             return self._verify_via_sandbox(task, requirements)
         from devcouncil.execution.task_gate_ops import verify_task_payload
 
@@ -178,12 +181,23 @@ class NativeAgent(Executor):
     ) -> Tuple[bool, List[dict], List[dict]]:
         """Run the task's expected commands in a docker/nix sandbox (command_timeout-bounded)."""
         from devcouncil.verification.sandbox import get_sandbox
+        from devcouncil.app.config import load_config
 
         commands = task.expected_tests or task.allowed_commands
         result = get_sandbox(self.sandbox, self.project_root).run(task, commands, requirements)
+        gate_mode = load_config(self.project_root).gates.mode
         if result.status == "unsupported":
             reason = f"Sandbox '{self.sandbox}' is unavailable in this environment."
+            if gate_mode == "advisory":
+                return True, [], [{"action": reason}]
             return False, [{"action": reason}], []
+        if result.status == "failed" and gate_mode == "advisory":
+            return True, [], [{
+                "action": (
+                    f"Sandbox '{self.sandbox}' checks failed, but gates.mode=advisory "
+                    "allows completion."
+                )
+            }]
         return result.status == "passed", [], []
 
     @staticmethod
@@ -212,7 +226,10 @@ class NativeAgent(Executor):
     async def _run_task_async(self, task: Task, requirements: List[Requirement]) -> ExecutionResult:
         logger.info("Native agent starting for %s (max_steps=%d)", task.id, MAX_AGENT_STEPS)
         console.print(f"Starting [bold]Native Executor[/bold] for task {task.id}...")
-        console.print("[yellow]Native executor is preview quality; DevCouncil verification remains the completion gate.[/yellow]")
+        console.print(
+            "[yellow]Native executor is preview quality; verification follows the configured "
+            "gates.mode posture.[/yellow]"
+        )
 
         # Acquire a lease so every write and verify runs through the same lease/scope gate
         # as the MCP surface. Without a lease the gated write path refuses the write.

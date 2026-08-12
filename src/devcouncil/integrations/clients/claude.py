@@ -73,6 +73,7 @@ def _record_claude_config(
             "settings_path": ".claude/settings.local.json",
         })
         _common.seed_stop_gate_assist_if_unset(config)
+        _common.seed_hook_gate_for_write_gate(config, write_gate=write_gate)
 
     _mutate_raw_config(project_root, mutate)
 
@@ -173,9 +174,9 @@ def _selected_skill_assets(project_root: Path):
     Returns (written_paths, skill_assets) where skill_assets carry (path, content) for the
     plugin bundler so the plugin ships the same skill bodies that land in .claude/skills/."""
     from devcouncil.integrations.claude_assets import GeneratedAsset
-    from devcouncil.skills.registry import scaffold_skills, select_skills
+    from devcouncil.skills.registry import scaffold_skills, skills_for_scaffold
 
-    skills = select_skills("", project_root)
+    skills = skills_for_scaffold("", project_root)
     written = scaffold_skills(project_root, skills)
     assets: list[GeneratedAsset] = []
     skills_root = project_root / ".claude" / "skills"
@@ -218,7 +219,13 @@ def _install_claude_plugin(project_root: Path, *, write_gate: bool = False) -> l
     bundle = claude_assets.build_plugin_bundle(
         project_root, version=_devcouncil_version(), skill_assets=skill_assets, write_gate=write_gate
     )
-    return [asset.path for asset in bundle if asset.write_if_changed()]
+    written = [asset.path for asset in bundle if asset.write_if_changed()]
+
+    def mutate(config: dict) -> None:
+        _common.seed_hook_gate_for_write_gate(config, write_gate=write_gate)
+
+    _mutate_raw_config(project_root, mutate)
+    return written
 
 def _uninstall_claude(project_root: Path) -> list[str]:
     """Remove everything DevCouncil installed into a Claude Code project. Idempotent.
@@ -234,29 +241,11 @@ def _uninstall_claude(project_root: Path) -> list[str]:
     settings = _load_json(path)
     before = json.dumps(settings, sort_keys=True)
 
-    # Hooks: drop any entry whose command invokes `devcouncil hook`, then prune empties.
-    hooks = settings.get("hooks")
-    if isinstance(hooks, dict):
-        for event in list(hooks):
-            groups = hooks.get(event)
-            if not isinstance(groups, list):
-                continue
-            kept_groups = []
-            for group in groups:
-                inner = group.get("hooks", []) if isinstance(group, dict) else []
-                inner_kept = [
-                    h for h in inner
-                    if "devcouncil hook" not in str(h.get("command", ""))
-                ]
-                if inner_kept:
-                    group["hooks"] = inner_kept
-                    kept_groups.append(group)
-            if kept_groups:
-                hooks[event] = kept_groups
-            else:
-                hooks.pop(event)
-        if not hooks:
-            settings.pop("hooks")
+    # Hooks: drop DevCouncil-named entries and any command invoking ``devcouncil hook``
+    # or project-venv ``dev hook`` (same matcher as hooks._strip_devcouncil_hooks_from_settings).
+    from devcouncil.integrations.clients import hooks as _hooks
+
+    if _hooks._strip_devcouncil_hooks_from_settings(settings):
         removed.append(f"hooks in {path.name}")
 
     # statusLine: only remove ours.
@@ -336,4 +325,16 @@ def _uninstall_claude(project_root: Path) -> list[str]:
         if code == 0:
             removed.append("claude mcp server registration")
 
+    # Unmodified packaged library skills under both skill trees.
+    removed.extend(_common._remove_unmodified_library_skills(project_root))
+
+    # Self-contained plugin bundle under .devcouncil/claude-plugin/.
+    from devcouncil.integrations.claude_assets import PLUGIN_ROOT_REL
+
+    plugin_root = project_root / PLUGIN_ROOT_REL
+    if plugin_root.exists():
+        shutil.rmtree(plugin_root)
+        removed.append(str(PLUGIN_ROOT_REL))
+
+    removed.extend(_common._clear_client_integration_config(project_root, "claude"))
     return removed

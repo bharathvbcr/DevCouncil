@@ -301,8 +301,38 @@ def test_incremental_generation_reuses_content_addressed_payloads(tmp_path: Path
     with sqlite3.connect(store.path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM node_payloads").fetchone()[0] == 3
         assert conn.execute("SELECT COUNT(*) FROM edge_payloads").fetchone()[0] == 1
-        assert conn.execute("SELECT COUNT(*) FROM file_contents").fetchone()[0] == 2
+        # File blobs are opt-in (indexing.store_file_contents); the generation
+        # still records path/hash/size/mtime for every file.
+        assert conn.execute("SELECT COUNT(*) FROM file_contents").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM generation_files WHERE content_hash != ''"
+        ).fetchone()[0] == 2
         assert conn.execute("SELECT COUNT(*) FROM diagnostics").fetchone()[0] == 0
+
+
+def test_file_contents_are_stored_when_opted_in(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "src" / "app.py"
+    source.parent.mkdir()
+    source.write_text("def main():\n    return 1\n", encoding="utf-8")
+    store = CodeIntelStore(tmp_path)
+    monkeypatch.setattr(CodeIntelStore, "_store_file_contents", lambda self: True)
+    store.save_graph(_graph())
+
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM file_contents").fetchone()[0] == 1
+    assert store.content_for_path("src/app.py") == source.read_bytes()
+
+
+def test_content_for_path_falls_back_to_working_tree(tmp_path: Path) -> None:
+    source = tmp_path / "src" / "app.py"
+    source.parent.mkdir()
+    source.write_text("def main():\n    return 1\n", encoding="utf-8")
+    store = CodeIntelStore(tmp_path)
+    store.save_graph(_graph())
+
+    # Blobs were not persisted, so the read comes from disk instead.
+    assert store.content_for_path("src/app.py") == source.read_bytes()
+    assert store.content_for_path("src/missing.py") is None
 
 
 def test_pruning_reclaims_unreferenced_payload_rows(tmp_path: Path) -> None:
@@ -444,3 +474,54 @@ def test_persist_quarantines_corrupt_store_and_rebuilds(tmp_path: Path) -> None:
     quarantined = service.store.path.with_name(service.store.path.name + ".corrupt")
     assert quarantined.is_file()
     assert service.store.status().state == "committed"
+
+
+def test_save_graph_reports_persist_progress(tmp_path: Path) -> None:
+    """Persist must heartbeat per phase, not go silent for its whole duration.
+
+    Regression for a supervisor killing a worker that was 100% inside
+    sqlite3_step / walFindFrame with no phase counter moving.
+    """
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+    store = CodeIntelStore(tmp_path)
+
+    seen: list[tuple[str, int, int]] = []
+    store.save_graph(_graph(), progress=lambda p, c, t: seen.append((p, c, t)))
+
+    phases = {phase for phase, _c, _t in seen}
+    assert {"persist:files", "persist:nodes", "persist:edges", "persist:commit"} <= phases
+    # The commit phase must both open and close so a watcher sees it finish.
+    assert ("persist:commit", 0, 1) in seen
+    assert ("persist:commit", 1, 1) in seen
+
+
+def test_save_graph_survives_a_failing_progress_callback(tmp_path: Path) -> None:
+    """Progress is observability; a broken callback must never fail a build."""
+    store = CodeIntelStore(tmp_path)
+
+    def boom(*_a: object) -> None:
+        raise RuntimeError("callback exploded")
+
+    assert store.save_graph(_graph(), progress=boom) == 1
+
+
+def test_incremental_copy_handles_a_large_changed_set(tmp_path: Path) -> None:
+    """A repo-scale change set must not inline one bind parameter per path.
+
+    Regression for ``path NOT IN (?,?,…)`` blowing past
+    SQLITE_MAX_VARIABLE_NUMBER on the incremental membership copy.
+    """
+    store = CodeIntelStore(tmp_path)
+    store.save_graph(_graph())
+
+    # Well past both the temp-table threshold and SQLite's default 999/32766
+    # bind-parameter ceiling.
+    changed = {f"src/generated_{index}.py" for index in range(40_000)}
+    changed.add("src/app.py")
+    generation = store.save_graph(_graph(), changed_paths=changed)
+
+    assert generation == 2
+    assert store.current_generation() == 2
+    loaded = store.load_graph()
+    assert loaded is not None

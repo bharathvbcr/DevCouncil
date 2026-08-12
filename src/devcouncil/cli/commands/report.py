@@ -137,6 +137,15 @@ def report(
             graph_repo = ArtifactGraphRepository(session)
             graph = graph_repo.load_graph()
             live_review = live_review_summary(root)
+            from devcouncil.app.config import load_config
+            from devcouncil.gating.policy import (
+                effective_artifact_graph,
+                effective_live_review,
+            )
+
+            gate_mode = load_config(root).gates.mode
+            graph = effective_artifact_graph(graph, mode=gate_mode)
+            live_review = effective_live_review(live_review, mode=gate_mode)
             TraceLogger(root).log_event(
                 "report_generated",
                 {
