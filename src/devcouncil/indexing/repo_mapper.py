@@ -2226,6 +2226,7 @@ class RepoMapper:
         try:
             from devcouncil.indexing.wiring import (
                 decorator_names,
+                is_generated_path,
                 is_liveness_code_file,
                 is_private_symbol,
                 is_test_path,
@@ -2233,6 +2234,7 @@ class RepoMapper:
                 is_wiring_decorated,
                 iter_js_export_symbols,
                 parse_python_all_exports,
+                source_has_generated_header,
                 strip_js_comments,
                 strip_py_comments,
                 strip_string_literals,
@@ -2269,6 +2271,12 @@ class RepoMapper:
                         token_lines[tok][rel].add(lineno)
 
                 if is_test_path(rel):
+                    continue
+
+                # Generated stubs are regenerated, never hand-deleted: index
+                # their tokens (references FROM them still clear symbols) but
+                # never treat their definitions as dead-symbol candidates.
+                if is_generated_path(rel) or source_has_generated_header(source):
                     continue
 
                 if suffix == ".py":

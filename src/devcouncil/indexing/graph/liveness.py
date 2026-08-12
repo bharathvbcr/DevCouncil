@@ -148,6 +148,7 @@ def file_liveness(
     """
     from devcouncil.indexing.wiring import (
         build_dynamic_import_index,
+        content_liveness_exemption,
         entry_roots,
         is_liveness_code_file,
         is_test_path,
@@ -188,6 +189,10 @@ def file_liveness(
             root, f, skip_files=set(), git_files=files, dynamic_index=dyn_index
         ):
             continue
+        # Generated stubs, __main__-guard scripts, go:embed / func init()
+        # carriers, and re-export-only package inits are wired by content.
+        if content_liveness_exemption(root, f) is not None:
+            continue
         unwired.append(f)
         if limit is not None and len(unwired) >= limit:
             break
@@ -218,6 +223,8 @@ def file_liveness(
             if reference_cleared(
                 root, f, skip_files=set(), git_files=files, dynamic_index=dyn_index
             ):
+                continue
+            if content_liveness_exemption(root, f) is not None:
                 continue
             unreachable.append(f)
             if limit is not None and len(unreachable) >= limit:
@@ -284,6 +291,7 @@ def _reference_index(
 def build_liveness_shard(root: Path, extraction: FileExtraction) -> dict[str, object]:
     """Compact persisted reference shard used by one-file liveness updates."""
     from devcouncil.indexing.wiring import (
+        content_liveness_exemption,
         dynamic_import_keys,
         strip_js_comments,
         strip_py_comments,
@@ -310,6 +318,9 @@ def build_liveness_shard(root: Path, extraction: FileExtraction) -> dict[str, ob
         "token_lines": dict(token_lines),
         "dynamic_import_keys": sorted(dynamic_import_keys(extraction.path, source)),
         "allow_unwired": "devcouncil: allow-unwired" in source,
+        "content_exemption": content_liveness_exemption(
+            root, extraction.path, source=source
+        ),
     }
 
 
@@ -353,6 +364,7 @@ def token_dead_from_shards(
 ) -> Tuple[List[str], List[str], Set[str]]:
     """Compute token agreement from persisted per-file token occurrence shards."""
     from devcouncil.indexing.wiring import (
+        is_generated_path,
         is_private_symbol,
         is_test_path,
         is_vendored_path,
@@ -385,6 +397,10 @@ def token_dead_from_shards(
         if suffix not in {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
             continue
         if is_test_path(node.path) or is_vendored_path(node.path):
+            continue
+        if is_generated_path(node.path) or (
+            shards.get(node.path, {}).get("content_exemption") == "generated"
+        ):
             continue
         if "." in str(node.extras.get("qualname") or node.name):
             continue
@@ -445,11 +461,19 @@ def file_liveness_from_shards(
 ) -> Tuple[List[str], List[str], List[str], bool]:
     """Recompute file reachability from persisted adjacency without source scans."""
     from devcouncil.indexing.wiring import (
+        content_liveness_exemption,
         is_liveness_code_file,
         is_test_path,
         reference_cleared,
         structural_exemptions,
     )
+
+    def _content_exempt(path: str) -> bool:
+        """Shard flag when persisted; disk backfill for pre-upgrade shards."""
+        shard = shards.get(path)
+        if shard is not None and "content_exemption" in shard:
+            return shard.get("content_exemption") is not None
+        return content_liveness_exemption(root, path) is not None
 
     file_set = set(files)
     roots = [path for path in entry_roots if path in file_set]
@@ -475,6 +499,7 @@ def file_liveness_from_shards(
         and not bool(shards.get(path, {}).get("allow_unwired"))
         and not any(not is_test_path(item) for item in inbound.get(path, ()))
         and not reference_cleared(root, path, dynamic_index=effective_dynamic_index)
+        and not _content_exempt(path)
     ]
     reachable: Set[str] = set()
     if not unreliable:
@@ -497,6 +522,7 @@ def file_liveness_from_shards(
         and path not in reachable
         and not bool(shards.get(path, {}).get("allow_unwired"))
         and not reference_cleared(root, path, dynamic_index=effective_dynamic_index)
+        and not _content_exempt(path)
     ]
     unreachable, unreliable, _ratio_meta = _apply_unreachable_ratio_gate(
         root, files, unreachable, unreliable
@@ -713,12 +739,26 @@ def symbol_reachability_dead(
     from devcouncil.indexing.wiring import (
         GETATTR_INDEX_PREFIX,
         build_dynamic_import_index,
+        content_liveness_exemption,
+        has_allow_unwired,
         is_dunder_symbol,
         is_private_symbol,
         is_test_path,
         is_wiring_decorated,
         structural_exemptions,
     )
+
+    # Generated files are regenerated, not hand-deleted: their symbols must
+    # never surface as dead candidates at any tier. Memoized per path so the
+    # content sniff costs one read per file, not per symbol.
+    _generated_memo: Dict[str, bool] = {}
+
+    def _in_generated_file(path: str) -> bool:
+        cached = _generated_memo.get(path)
+        if cached is None:
+            cached = content_liveness_exemption(root, path) == "generated"
+            _generated_memo[path] = cached
+        return cached
 
     # Reconstruct file edges from graph imports when not provided
     if file_edges is None:
@@ -888,6 +928,15 @@ def symbol_reachability_dead(
         if is_private_symbol(node.name) or is_dunder_symbol(node.name):
             continue
         if allow_unwired(node.path):
+            continue
+        if _in_generated_file(node.path):
+            continue
+        # Go init()/main() are runtime-invoked — never dead by call-graph absence.
+        if (
+            node.path.endswith(".go")
+            and node.kind == NodeKind.FUNCTION
+            and node.name in {"init", "main"}
+        ):
             continue
         if node.id in live:
             continue

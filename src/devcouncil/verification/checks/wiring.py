@@ -16,6 +16,7 @@ from devcouncil.domain.task import Task
 from devcouncil.indexing.wiring import (
     ALLOW_UNWIRED,
     build_dynamic_import_index,
+    content_liveness_exemption,
     entry_roots,
     has_allow_unwired,
     is_liveness_code_file,
@@ -133,6 +134,11 @@ def detect_unwired_file_gaps(
 
         for path in candidates:
             if path in roots or structural_exemptions(path):
+                continue
+            # Same content-based exemptions as map liveness (generated stubs,
+            # __main__-guard scripts, go:embed / init() carriers, barrel inits)
+            # so the gate and `dev map` never disagree.
+            if content_liveness_exemption(project_root, path) is not None:
                 continue
 
             if has_allow_unwired(project_root, path):
