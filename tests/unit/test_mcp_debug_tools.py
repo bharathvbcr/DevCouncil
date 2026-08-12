@@ -40,4 +40,4 @@ def test_debug_tool_registry_separates_evaluate_and_trace() -> None:
         "devcouncil_debug_stop",
     } <= names
     evaluate = next(tool for tool in debug.tools() if tool.name == "devcouncil_debug_evaluate")
-    assert evaluate.inputSchema["properties"]["allowSideEffects"]["const"] is True
+    assert evaluate.input_schema["properties"]["allowSideEffects"]["const"] is True

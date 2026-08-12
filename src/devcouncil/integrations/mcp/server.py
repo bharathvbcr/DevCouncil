@@ -2,12 +2,29 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from functools import lru_cache
 from pathlib import Path
 
-from mcp.server import Server
+import jsonschema
+from mcp.server import Server, ServerRequestContext
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent
-from pydantic import AnyUrl
+from mcp.types import (
+    CallToolRequestParams,
+    CallToolResult,
+    GetPromptRequestParams,
+    GetPromptResult,
+    ListPromptsResult,
+    ListResourcesResult,
+    ListToolsResult,
+    PaginatedRequestParams,
+    Prompt,
+    ReadResourceRequestParams,
+    ReadResourceResult,
+    Resource,
+    TextContent,
+    TextResourceContents,
+    Tool,
+)
 
 from devcouncil.integrations.check import integration_status_summary
 from devcouncil.integrations.mcp.handlers import ast_lsp as ast_lsp_handlers
@@ -86,8 +103,6 @@ async def _lifespan(_server):  # noqa: ANN001
             coordinator.stop()
 
 
-app = Server("devcouncil", lifespan=_lifespan)
-
 _DB_REQUIRED_TOOLS = {
     "devcouncil_status",
     "devcouncil_report",
@@ -121,6 +136,7 @@ _DB_REQUIRED_TOOLS = {
 def _reset_caches() -> None:
     """Drop all per-root MCP caches. Re-exported for test isolation."""
     router_cache.reset_caches()
+    _tool_input_schemas.cache_clear()
 
 
 def _project_root() -> Path:
@@ -128,32 +144,26 @@ def _project_root() -> Path:
     return Path(configured).expanduser().resolve() if configured else Path(".")
 
 
-@app.list_tools()
-async def list_tools():
+async def list_tools() -> list[Tool]:
     return tool_specs.all_tools()
 
 
-@app.list_resources()
-async def list_resources():
+async def list_resources() -> list[Resource]:
     return await provenance_handlers.list_resources(_project_root())
 
 
-@app.read_resource()
-async def read_resource(uri: AnyUrl) -> str:
+async def read_resource(uri: str) -> str:
     return await provenance_handlers.read_resource(_project_root(), uri)
 
 
-@app.list_prompts()
-async def list_prompts():
+async def list_prompts() -> list[Prompt]:
     return prompt_handlers.list_prompts()
 
 
-@app.get_prompt()
-async def get_prompt(name: str, arguments: dict | None):
+async def get_prompt(name: str, arguments: dict | None) -> GetPromptResult:
     return prompt_handlers.get_prompt(name, arguments, _project_root())
 
 
-@app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     arguments = _normalize_arguments(arguments)
     root = _project_root()
@@ -368,6 +378,105 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     logger.warning("MCP unknown tool requested: %s", name)
     return _error_text(f"Unknown tool: {name}", code="unknown_tool", tool=name)
+
+
+# --- mcp 2.x transport adapters -------------------------------------------------
+# mcp 2.x replaced the ``@app.call_tool()`` decorators with ``on_*`` constructor
+# callables that take ``(ctx, params)`` and return a full protocol result. The
+# functions above stay the canonical implementation -- one owner per operation --
+# and everything below only translates between that contract and the wire types.
+
+
+@lru_cache(maxsize=1)
+def _tool_input_schemas() -> dict[str, dict]:
+    return {tool.name: tool.input_schema for tool in tool_specs.all_tools()}
+
+
+def _input_schema_violation(name: str, arguments: dict) -> str | None:
+    """Return a message when ``arguments`` violate the advertised inputSchema.
+
+    mcp 2.x advertises inputSchema but never enforces it, so the check the v1
+    ``call_tool`` decorator performed is reproduced here rather than dropped.
+    Unknown tools are not rejected here: ``call_tool`` owns that response.
+    """
+    schema = _tool_input_schemas().get(name)
+    if schema is None:
+        return None
+    try:
+        jsonschema.validate(instance=arguments, schema=schema)
+    except jsonschema.ValidationError as exc:
+        return f"Input validation error: {exc.message}"
+    return None
+
+
+def _tool_error(message: str) -> CallToolResult:
+    return CallToolResult(content=[TextContent(type="text", text=message)], is_error=True)
+
+
+async def _on_list_tools(
+    _ctx: ServerRequestContext, _params: PaginatedRequestParams | None
+) -> ListToolsResult:
+    return ListToolsResult(tools=await list_tools())
+
+
+async def _on_list_resources(
+    _ctx: ServerRequestContext, _params: PaginatedRequestParams | None
+) -> ListResourcesResult:
+    return ListResourcesResult(resources=await list_resources())
+
+
+async def _on_read_resource(
+    _ctx: ServerRequestContext, params: ReadResourceRequestParams
+) -> ReadResourceResult:
+    text = await read_resource(params.uri)
+    return ReadResourceResult(
+        contents=[TextResourceContents(uri=params.uri, text=text, mime_type="text/plain")],
+    )
+
+
+async def _on_list_prompts(
+    _ctx: ServerRequestContext, _params: PaginatedRequestParams | None
+) -> ListPromptsResult:
+    return ListPromptsResult(prompts=await list_prompts())
+
+
+async def _on_get_prompt(
+    _ctx: ServerRequestContext, params: GetPromptRequestParams
+) -> GetPromptResult:
+    return await get_prompt(params.name, params.arguments)
+
+
+async def _on_call_tool(
+    _ctx: ServerRequestContext, params: CallToolRequestParams
+) -> CallToolResult:
+    """Validate, dispatch, and wrap a tool call for the mcp 2.x wire contract.
+
+    mcp 2.x lets handler exceptions escape as JSON-RPC transport errors; v1
+    turned them into ``isError`` results, and clients here still expect a
+    result they can read, so the boundary keeps catching them.
+    """
+    arguments = _normalize_arguments(params.arguments)
+    try:
+        violation = _input_schema_violation(params.name, arguments)
+        if violation is not None:
+            return _tool_error(violation)
+        contents = await call_tool(params.name, arguments)
+    except Exception as exc:
+        logger.exception("MCP tool %s raised", params.name)
+        return _tool_error(str(exc))
+    return CallToolResult(content=list(contents), is_error=False)
+
+
+app = Server(
+    "devcouncil",
+    lifespan=_lifespan,
+    on_list_tools=_on_list_tools,
+    on_call_tool=_on_call_tool,
+    on_list_resources=_on_list_resources,
+    on_read_resource=_on_read_resource,
+    on_list_prompts=_on_list_prompts,
+    on_get_prompt=_on_get_prompt,
+)
 
 
 async def run():

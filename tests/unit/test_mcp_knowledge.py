@@ -7,7 +7,6 @@ coding agent (Claude Code, Codex, ...) can pull what project knowledge applies t
 import json
 
 import pytest
-from pydantic import AnyUrl
 
 from devcouncil.integrations.mcp.server import call_tool, list_resources, read_resource
 
@@ -67,7 +66,7 @@ async def test_read_knowledge_index_and_per_source(tmp_path, monkeypatch):
     _seed_knowledge(tmp_path)
     monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
 
-    index = await read_resource(AnyUrl("devcouncil://knowledge"))
+    index = await read_resource("devcouncil://knowledge")
     assert isinstance(index, str)
     assert "Payments domain knowledge" in index
     assert "Acme design system" in index
@@ -78,7 +77,7 @@ async def test_read_knowledge_index_and_per_source(tmp_path, monkeypatch):
         for r in await list_resources()
         if str(r.uri).startswith("devcouncil://knowledge/okf/")
     )
-    body = await read_resource(AnyUrl(okf_uri))
+    body = await read_resource(okf_uri)
     assert "PaymentGateway" in body
 
 

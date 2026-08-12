@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from mcp.types import Resource, TextContent
-from pydantic import AnyUrl
 
 from devcouncil.integrations.mcp.util import (
     json_text,
@@ -54,7 +53,7 @@ async def list_resources(root: Path) -> list[Resource]:
         if isinstance(descriptors, list):
             return [
                 Resource(
-                    uri=AnyUrl(item["uri"]),
+                    uri=item["uri"],
                     name=item["name"],
                     description=item["description"],
                     mimeType=item["mimeType"],
@@ -67,7 +66,7 @@ async def list_resources(root: Path) -> list[Resource]:
 
     return [
         Resource(
-            uri=AnyUrl(item["uri"]),
+            uri=item["uri"],
             name=item["name"],
             description=item["description"],
             mimeType=item["mimeType"],
@@ -76,8 +75,8 @@ async def list_resources(root: Path) -> list[Resource]:
     ]
 
 
-async def read_resource(root: Path, uri: AnyUrl) -> str:
-    key = str(uri).rstrip("/")
+async def read_resource(root: Path, uri: str) -> str:
+    key = uri.rstrip("/")
     result = run_cli_command(["resource", "read", key], root, truncate=False)
     stdout = result.get("stdout")
     if result.get("ok") and stdout is not None:
