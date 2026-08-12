@@ -80,7 +80,7 @@ async def test_record_command_rejects_invalid_status(tmp_path, monkeypatch):
 @pytest.mark.anyio
 async def test_verify_task_sandbox_enum_is_honest():
     tools = {t.name: t for t in await list_tools()}
-    enum = tools["devcouncil_verify_task"].inputSchema["properties"]["sandbox"]["enum"]
+    enum = tools["devcouncil_verify_task"].input_schema["properties"]["sandbox"]["enum"]
     assert enum == ["local"]  # docker/nix were advertised but rejected
 
 
