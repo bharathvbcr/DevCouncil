@@ -494,6 +494,8 @@ def _maybe_refresh_map(root: Path, payload_text: str) -> None:
         return
 
     # Only refresh code-ish paths under the project
+    from devcouncil.indexing.walk import should_skip_path
+
     code_exts = {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".rs"}
     rels: list[str] = []
     for p in paths:
@@ -507,6 +509,11 @@ def _maybe_refresh_map(root: Path, payload_text: str) -> None:
             rel = p.replace("\\", "/")
             if rel.startswith("./"):
                 rel = rel[2:]
+        # Edits from a nested checkout (.claude/worktrees/<name>/…) or an ignored
+        # tree belong to that checkout's own index, not this root's graph —
+        # ingesting them duplicates every edited symbol here.
+        if should_skip_path(rel):
+            continue
         if Path(rel).suffix.lower() in code_exts:
             rels.append(rel)
     if not rels:
@@ -527,7 +534,8 @@ def _maybe_refresh_map(root: Path, payload_text: str) -> None:
         # Debounce burst edits so a multi-file edit lands as one refresh.
         time.sleep(MAP_REFRESH_DEBOUNCE_S)
         pending = set(rels)
-        pending.update(_take_queued_paths(queue_path))
+        # Queue files may predate the nested-checkout filter — re-filter on drain.
+        pending.update(p for p in _take_queued_paths(queue_path) if not should_skip_path(p))
         from devcouncil.indexing.graph.build import refresh_map_for_paths
 
         while pending:
@@ -539,7 +547,7 @@ def _maybe_refresh_map(root: Path, payload_text: str) -> None:
                 project_root=root,
             )
             # Drain anything enqueued while we were refreshing.
-            pending.update(_take_queued_paths(queue_path))
+            pending.update(p for p in _take_queued_paths(queue_path) if not should_skip_path(p))
     except Exception:
         logger.debug("incremental map refresh failed", exc_info=True)
     finally:
@@ -552,7 +560,7 @@ def _maybe_refresh_map(root: Path, payload_text: str) -> None:
         # by re-acquiring if the queue is non-empty.
         if queue_path.is_file() and _try_acquire_refresh_lock(lock):
             try:
-                leftover = _take_queued_paths(queue_path)
+                leftover = [p for p in _take_queued_paths(queue_path) if not should_skip_path(p)]
                 if leftover:
                     from devcouncil.indexing.graph.build import refresh_map_for_paths
 
