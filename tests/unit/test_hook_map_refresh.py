@@ -207,6 +207,61 @@ def test_refresh_holder_drains_queue(tmp_path, monkeypatch):
     assert not queue.is_file() or not _take_queued_paths(queue)
 
 
+def test_nested_worktree_edits_not_ingested_into_main_root(tmp_path, monkeypatch):
+    """Edits made inside a nested Claude worktree checkout (.claude/worktrees/<name>/…)
+    resolve as relative paths under the main root and must never reach the main
+    graph — they would duplicate every edited symbol and trigger spurious rebuilds."""
+    refreshed: list[list[str]] = []
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.build.refresh_map_for_paths",
+        lambda root, paths, **kwargs: refreshed.append(sorted(paths)),
+    )
+    monkeypatch.setattr("devcouncil.cli.commands.hook.MAP_REFRESH_DEBOUNCE_S", 0.0)
+
+    wt_file = tmp_path / ".claude" / "worktrees" / "nervous-volhard-80a90b" / "src" / "pkg" / "a.py"
+    payload = json.dumps({"tool_name": "Edit", "tool_input": {"file_path": str(wt_file)}})
+    _maybe_refresh_map(tmp_path, payload)
+    assert refreshed == []
+
+    # Relative worktree paths are filtered the same way.
+    payload = json.dumps({
+        "tool_name": "Edit",
+        "tool_input": {"file_path": ".claude/worktrees/x/src/pkg/a.py"},
+    })
+    _maybe_refresh_map(tmp_path, payload)
+    assert refreshed == []
+
+    # A real project file still refreshes.
+    payload = json.dumps({
+        "tool_name": "Edit",
+        "tool_input": {"file_path": str(tmp_path / "pkg" / "a.py")},
+    })
+    _maybe_refresh_map(tmp_path, payload)
+    assert {p for batch in refreshed for p in batch} == {"pkg/a.py"}
+
+
+def test_stale_queue_with_worktree_paths_filtered_on_drain(tmp_path, monkeypatch):
+    """Queue files written before the nested-checkout filter may still hold
+    worktree paths; the drain must drop them instead of refreshing them."""
+    refreshed: list[list[str]] = []
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.build.refresh_map_for_paths",
+        lambda root, paths, **kwargs: refreshed.append(sorted(paths)),
+    )
+    monkeypatch.setattr("devcouncil.cli.commands.hook.MAP_REFRESH_DEBOUNCE_S", 0.0)
+
+    queue = tmp_path / ".devcouncil" / "cache" / "map_refresh_queue.json"
+    _enqueue_refresh_paths(queue, [".claude/worktrees/x/src/pkg/b.py", "pkg/b.py"])
+
+    payload = json.dumps({
+        "tool_name": "Edit",
+        "tool_input": {"file_path": str(tmp_path / "pkg" / "a.py")},
+    })
+    _maybe_refresh_map(tmp_path, payload)
+    flat = {p for batch in refreshed for p in batch}
+    assert flat == {"pkg/a.py", "pkg/b.py"}
+
+
 def test_pid_alive_self():
     assert _pid_alive(os.getpid()) is True
     assert _pid_alive(-1) is False

@@ -16,3 +16,15 @@ def test_should_skip_path_git():
 def test_should_skip_path_normal_source():
     assert not should_skip_path("src/devcouncil/foo.py")
     assert not should_skip_path(Path("tests/unit/test_walk.py"))
+
+
+def test_should_skip_path_nested_claude_worktree():
+    assert should_skip_path(".claude/worktrees/nervous-volhard-80a90b/src/devcouncil/a.py")
+    assert should_skip_path(Path(".claude/worktrees/x/README.md"))
+
+
+def test_should_skip_path_keeps_claude_assets_and_plain_worktrees_dirs():
+    # Only the nested-checkout pair is skipped, not .claude assets or a source
+    # directory that happens to be named "worktrees".
+    assert not should_skip_path(".claude/skills/foo/SKILL.md")
+    assert not should_skip_path("src/worktrees/manager.py")
