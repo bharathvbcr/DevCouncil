@@ -88,10 +88,10 @@ async def test_verify_task_sandbox_enum_is_honest():
 async def test_ordinary_write_and_command_tools_do_not_require_task_ids():
     tools = {t.name: t for t in await list_tools()}
 
-    assert "task_id" not in tools["devcouncil_write_file"].inputSchema["required"]
-    assert "task_id" not in tools["devcouncil_apply_patch"].inputSchema["required"]
-    assert "task_id" not in tools["devcouncil_run_command"].inputSchema["required"]
-    assert "task_id" in tools["devcouncil_verify_task"].inputSchema["required"]
+    assert "task_id" not in tools["devcouncil_write_file"].input_schema["required"]
+    assert "task_id" not in tools["devcouncil_apply_patch"].input_schema["required"]
+    assert "task_id" not in tools["devcouncil_run_command"].input_schema["required"]
+    assert "task_id" in tools["devcouncil_verify_task"].input_schema["required"]
 
 
 @pytest.mark.anyio
