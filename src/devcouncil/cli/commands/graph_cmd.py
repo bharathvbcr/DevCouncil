@@ -129,6 +129,226 @@ def _index_freshness_fields(root: Path) -> dict[str, object]:
         return {"fresh": None, "reason": f"freshness probe failed: {exc}"}
 
 
+
+def _devmap_query_payload(root: Path, kind: str, **kwargs):
+    """Try DevMapClient for query surfaces; return payload or None for Python fallback."""
+    from devcouncil.devmap_client import (
+        DevMapClientError,
+        resolution_unavailable_reason,
+        try_connect,
+    )
+
+    client = try_connect(root)
+    if client is None:
+        return None
+    try:
+        if kind == "status":
+            st = client.status()
+            return {
+                "state": "committed" if st.generation_id > 0 else "empty",
+                "generation": st.generation_id or None,
+                "node_count": st.node_count,
+                "edge_count": st.edge_count,
+                "pending_count": st.pending_count,
+                "is_fresh": st.is_fresh,
+                "degraded_reason": st.degraded_reason,
+                "source": "devmap",
+                "index_freshness": {
+                    "fresh": st.is_fresh,
+                    "generation": st.generation_id,
+                    "reason": st.degraded_reason,
+                },
+                "sync": {
+                    "state": "fresh" if st.is_fresh and st.pending_count == 0 else "pending",
+                    "pending": [],
+                    "fresh": st.is_fresh,
+                    "backend": "devmap",
+                    "degraded_reason": st.degraded_reason,
+                },
+            }
+        if kind == "search":
+            query = str(kwargs["query"])
+            limit = int(kwargs.get("limit", 50))
+            resp = client.search(query, limit=2000)
+            reason = resolution_unavailable_reason(resp.resolution)
+            if reason:
+                raise DevMapClientError(reason)
+            if resp.total > 0 and not resp.items and resp.truncated:
+                raise DevMapClientError("truncated empty search")
+            matches = []
+            for item in resp.items[:limit]:
+                path_s = str(item.get("file_path") or "")
+                name = str(item.get("symbol_name") or "")
+                span = item.get("span") or (0, 0)
+                line = int(span[0]) if isinstance(span, (list, tuple)) and span else 0
+                matches.append({
+                    "id": f"{path_s}::{name}" if path_s and name else name or path_s,
+                    "path": path_s,
+                    "name": name,
+                    "kind": str(item.get("kind") or "symbol"),
+                    "line": line,
+                    "score": item.get("score"),
+                })
+            return {
+                "ok": True,
+                "query": query,
+                "matches": matches,
+                "source": "devmap",
+                "truncated": resp.truncated or len(resp.items) > limit,
+                "total": resp.total,
+                **_graph_degraded_fields(root),
+            }
+        if kind == "trace":
+            start = str(kwargs["start"])
+            end = str(kwargs["end"])
+            resp = client.trace(start, depth=3, to_symbol=end)
+            reason = resolution_unavailable_reason(resp.resolution)
+            if reason:
+                return {
+                    "ok": True,
+                    "found": False,
+                    "error": reason,
+                    "path": [],
+                    "source": "devmap",
+                    **_graph_degraded_fields(root),
+                }
+            nodes = []
+            for item in resp.items:
+                node = str(
+                    item.get("node")
+                    or item.get("symbol_name")
+                    or item.get("target_symbol")
+                    or item.get("source_symbol")
+                    or ""
+                )
+                if node:
+                    nodes.append(node)
+            return {
+                "ok": True,
+                "found": bool(nodes),
+                "path": nodes,
+                "source": "devmap",
+                "truncated": resp.truncated,
+                **_graph_degraded_fields(root),
+            }
+        if kind == "query":
+            name_or_path = str(kwargs["name_or_path"])
+            resp = client.search(name_or_path, limit=2000)
+            reason = resolution_unavailable_reason(resp.resolution)
+            if reason:
+                raise DevMapClientError(reason)
+            if resp.total > 0 and not resp.items and resp.truncated:
+                raise DevMapClientError("truncated empty query")
+            defs = []
+            for item in resp.items[:20]:
+                path_s = str(item.get("file_path") or "")
+                name = str(item.get("symbol_name") or "")
+                span = item.get("span") or (0, 0)
+                line = int(span[0]) if isinstance(span, (list, tuple)) and span else 0
+                node_id = f"{path_s}::{name}" if path_s and name else name or path_s
+                callers = []
+                callees = []
+                try:
+                    inbound = client.impact(node_id if name else path_s or name_or_path, depth=1)
+                    if resolution_unavailable_reason(inbound.resolution) is None:
+                        for edge in inbound.items:
+                            src = str(edge.get("source_symbol") or edge.get("source_file") or "")
+                            if src:
+                                callers.append(src)
+                except DevMapClientError:
+                    pass
+                try:
+                    outbound = client.deps(path_s or name_or_path, depth=1)
+                    if resolution_unavailable_reason(outbound.resolution) is None:
+                        for edge in outbound.items:
+                            tgt = str(edge.get("target_symbol") or edge.get("target_file") or "")
+                            if tgt:
+                                callees.append(tgt)
+                except DevMapClientError:
+                    pass
+                defs.append({
+                    "id": node_id,
+                    "kind": str(item.get("kind") or "symbol"),
+                    "path": path_s,
+                    "name": name,
+                    "line": line,
+                    "callers": callers,
+                    "callees": callees,
+                    "importers": [],
+                })
+            return {
+                "ok": True,
+                "definitions": defs,
+                "source": "devmap",
+                **_graph_degraded_fields(root),
+            }
+        if kind == "dead":
+            resp = client.dead_symbols(budget=2000)
+            reason = resolution_unavailable_reason(resp.resolution)
+            if reason:
+                raise DevMapClientError(reason)
+            entries = []
+            for item in resp.items:
+                path_s = str(item.get("file_path") or item.get("path") or "")
+                name = str(item.get("symbol_name") or item.get("name") or "")
+                span = item.get("span") or (0, 0)
+                line = int(span[0]) if isinstance(span, (list, tuple)) and span else int(item.get("line") or 0)
+                conf = item.get("confidence", "inferred")
+                if isinstance(conf, (int, float)):
+                    score = float(conf)
+                    conf = "extracted" if score >= 0.9 else "inferred" if score >= 0.5 else "ambiguous"
+                entries.append({
+                    "id": str(item.get("id") or (f"{path_s}::{name}" if path_s and name else name or path_s)),
+                    "path": path_s,
+                    "name": name,
+                    "line": line,
+                    "confidence": str(conf),
+                    "kind": str(item.get("kind") or "symbol"),
+                    "reason": str(item.get("reason") or item.get("details") or ""),
+                })
+            return {
+                "dead_code": entries,
+                "dead_code_hidden": resp.hidden,
+                "source": "devmap",
+                "truncated": resp.truncated,
+                "total": resp.total,
+                **_graph_degraded_fields(root),
+            }
+        if kind == "impact":
+            paths = list(kwargs.get("paths") or [])
+            depth = int(kwargs.get("max_depth", 3))
+            items = []
+            for path_s in paths:
+                resp = client.impact(path_s, depth=max(1, min(3, depth)))
+                reason = resolution_unavailable_reason(resp.resolution)
+                if reason:
+                    raise DevMapClientError(f"{path_s}: {reason}")
+                nodes = sorted({
+                    str(edge.get("source_symbol") or edge.get("source_file") or "")
+                    for edge in resp.items
+                    if edge.get("source_symbol") or edge.get("source_file")
+                })
+                items.append({
+                    "path": path_s,
+                    "symbols": [],
+                    "blast": {
+                        "layers": [{
+                            "depth": 1,
+                            "nodes": nodes,
+                            "confidence": "extracted",
+                            "count": len(nodes),
+                        }] if nodes else [],
+                        "total_impacted": len(nodes),
+                    },
+                    "resolution": "devmap",
+                })
+            return {"ok": True, "paths": items, "source": "devmap", **_graph_degraded_fields(root)}
+    except DevMapClientError as exc:
+        logger.debug("devmap %s fallback: %s", kind, exc)
+        return None
+    return None
+
+
 def _warn_if_stale(
     root: Path, *, note_unknown: bool = False, quiet: bool = False
 ) -> dict[str, object]:
@@ -266,7 +486,14 @@ def graph_status(
     from devcouncil.codeintel.sync.lease import read_holder
 
     root = _root(project_root)
+    rust_status = _devmap_query_payload(root, "status")
     result = get_codeintel_service(root).status()
+    if rust_status is not None:
+        # Prefer Rust generation/freshness when the binary+DB are available.
+        result = {**result, **{k: v for k, v in rust_status.items() if k != "sync"}}
+        sync = result.get("sync") if isinstance(result.get("sync"), dict) else {}
+        result["sync"] = {**sync, **(rust_status.get("sync") or {})}
+        result["source"] = "devmap+python"
     # Cold start: existing compatibility JSON is enough to bootstrap queries/status
     # without requiring a full ``dev map`` rebuild first.
     if result.get("state") in {"uninitialized", "empty"}:
@@ -583,13 +810,17 @@ def graph_search(
 
         result = semantic_search(root, query, limit=limit)
         if not result.get("ok"):
+            result = _devmap_query_payload(root, "search", query=query, limit=limit)
+            if result is None:
+                from devcouncil.codeintel.query import CodeIntelQueryEngine
+
+                result = CodeIntelQueryEngine(root).search(query, limit=limit)
+    else:
+        result = _devmap_query_payload(root, "search", query=query, limit=limit)
+        if result is None:
             from devcouncil.codeintel.query import CodeIntelQueryEngine
 
             result = CodeIntelQueryEngine(root).search(query, limit=limit)
-    else:
-        from devcouncil.codeintel.query import CodeIntelQueryEngine
-
-        result = CodeIntelQueryEngine(root).search(query, limit=limit)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -809,10 +1040,12 @@ def graph_query(
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """360° view: definition, callers, callees, importers."""
-    from devcouncil.indexing.graph import query_symbol
-
     root = _root(project_root)
-    result = {**query_symbol(root, name_or_path), **_graph_degraded_fields(root)}
+    result = _devmap_query_payload(root, "query", name_or_path=name_or_path)
+    if result is None:
+        from devcouncil.indexing.graph import query_symbol
+
+        result = {**query_symbol(root, name_or_path), **_graph_degraded_fields(root)}
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -842,10 +1075,12 @@ def graph_trace(
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """Shortest path between two graph nodes."""
-    from devcouncil.indexing.graph import trace_path
-
     root = _root(project_root)
-    result = {**trace_path(root, start, end), **_graph_degraded_fields(root)}
+    result = _devmap_query_payload(root, "trace", start=start, end=end)
+    if result is None:
+        from devcouncil.indexing.graph import trace_path
+
+        result = {**trace_path(root, start, end), **_graph_degraded_fields(root)}
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -888,9 +1123,34 @@ def graph_dead(
     from devcouncil.indexing.graph.liveness import confidence_at_least
 
     root = _root(project_root)
-    graph = _require_graph(root, warn_stale=False)
     freshness = _warn_if_stale(root, note_unknown=True, quiet=json_output)
-    entries = list(graph.dead_code)
+    rust_dead = _devmap_query_payload(root, "dead")
+    if rust_dead is not None:
+        class _DeadEntry:
+            def __init__(self, row: dict):
+                self.id = row.get("id")
+                self.path = row.get("path")
+                self.line = row.get("line")
+                self.kind = row.get("kind")
+                self.reason = row.get("reason")
+                self.confidence = row.get("confidence")
+
+            def model_dump(self):
+                return {
+                    "id": self.id,
+                    "path": self.path,
+                    "line": self.line,
+                    "kind": self.kind,
+                    "reason": self.reason,
+                    "confidence": self.confidence,
+                }
+
+        entries = [_DeadEntry(row) for row in rust_dead.get("dead_code") or []]
+        # Skip Python graph load on successful Rust path.
+        graph = None
+    else:
+        graph = _require_graph(root, warn_stale=False)
+        entries = list(graph.dead_code)
     if confidence:
         entries = [
             e
@@ -1042,20 +1302,26 @@ def graph_impact(
     max_depth: int = typer.Option(3, "--max-depth", help="Inbound blast depth (1–3)."),
 ) -> None:
     """Diff / path blast radius via enclosing symbols and inbound callers."""
-    from devcouncil.indexing.graph.intel import diff_impact
-
     root = _root(project_root)
-    graph = _require_graph(root)
     if not diff and not paths:
         status.print("[red]Provide paths or --diff.[/red]")
         raise typer.Exit(code=1)
-    result = diff_impact(
-        root,
-        graph,
-        paths=paths,
-        use_diff=diff,
-        max_depth=max(1, min(3, max_depth)),
-    )
+    result = None
+    if not diff and paths:
+        result = _devmap_query_payload(
+            root, "impact", paths=list(paths), max_depth=max_depth
+        )
+    if result is None:
+        from devcouncil.indexing.graph.intel import diff_impact
+
+        graph = _require_graph(root)
+        result = diff_impact(
+            root,
+            graph,
+            paths=paths,
+            use_diff=diff,
+            max_depth=max(1, min(3, max_depth)),
+        )
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return

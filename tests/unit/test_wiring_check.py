@@ -263,3 +263,15 @@ def test_committed_diff_fallback_parses_added():
         "+    return 1\n"
     )
     assert "pkg/new.py" in added_files_from_diff(diff)
+
+
+def test_committed_diff_fallback_normalizes_windows_path_prefix():
+    diff = (
+        "diff --git a\\pkg\\new.py b\\pkg\\new.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b\\pkg\\new.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+value = 1\n"
+    )
+    assert added_files_from_diff(diff) == {"pkg/new.py"}

@@ -79,6 +79,34 @@ async def with_codeintel_freshness(
     import asyncio
 
     from devcouncil.codeintel.sync import get_sync_coordinator
+    from devcouncil.devmap_client import DevMapClientError, try_connect
+
+    client = try_connect(root)
+    if client is not None:
+        try:
+            fresh = not client.is_map_stale()
+            contents = await produce()
+            if not fresh and contents:
+                class _RustFreshness:
+                    def status(self):
+                        st = client.status()
+                        return type(
+                            "S",
+                            (),
+                            {
+                                "pending": (
+                                    [f"pending:{st.pending_count}"]
+                                    if st.pending_count
+                                    else []
+                                ),
+                                "state": "pending" if st.pending_count else "fresh",
+                            },
+                        )()
+
+                return annotate_stale(contents, _RustFreshness())
+            return contents
+        except DevMapClientError as exc:
+            logger.debug("devmap freshness fallback: %s", exc)
 
     coordinator = get_sync_coordinator(root)
     fresh = await asyncio.to_thread(coordinator.wait_until_fresh, timeout=timeout)

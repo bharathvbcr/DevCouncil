@@ -320,12 +320,37 @@ def detect_dead_symbol_gaps(
                     continue
 
                 try:
-                    from devcouncil.indexing.graph.query import symbol_has_non_test_inbound
+                    from devcouncil.devmap_client import DevMapClient, DevMapClientError
 
-                    if symbol_has_non_test_inbound(project_root, path, name):
+                    client = DevMapClient(project_root)
+                    inbound_resp = client.impact(path, depth=1)
+                    if isinstance(inbound_resp.resolution, dict) and "Unavailable" in inbound_resp.resolution:
+                        raise DevMapClientError(
+                            f"impact unavailable for {path}: {inbound_resp.resolution['Unavailable']}"
+                        )
+                    has_non_test_inbound = any(
+                        _norm(str(item.get("target_file") or "")) == _norm(path)
+                        and (
+                            str(item.get("target_symbol") or "") == name
+                            or str(item.get("target_symbol") or "").endswith(f"::{name}")
+                        )
+                        and not is_test_path(str(item.get("source_file") or ""))
+                        for item in inbound_resp.items
+                    )
+                    if has_non_test_inbound:
                         continue
-                except Exception:
-                    logger.debug("graph inbound check failed for %s", name, exc_info=True)
+                except DevMapClientError as exc:
+                    logger.debug("devmap client inbound check failed for %s: %s", name, exc)
+                    # Hybrid consumers remain usable before the daemon is installed
+                    # and in isolated verification fixtures. The legacy query is a
+                    # compatibility fallback only; Rust remains the primary path.
+                    try:
+                        from devcouncil.indexing.graph.query import symbol_has_non_test_inbound
+
+                        if symbol_has_non_test_inbound(project_root, path, name):
+                            continue
+                    except Exception:
+                        logger.debug("legacy inbound fallback failed for %s", name, exc_info=True)
 
                 if lsp_pool is not None:
                     try:

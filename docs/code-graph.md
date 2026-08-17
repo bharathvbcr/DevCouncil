@@ -191,6 +191,47 @@ installed companion is activated once before parser workers start. `dev map doct
 reports `35/35` when the wheel is complete, otherwise it lists missing primary and embedded
 grammars and tells the user to install the matching platform wheel.
 
+## Rust engine (`devmap`) — in progress
+
+The `dev map` subsystem is being rewritten in Rust as **`devmap`**, a clean-room seven-crate
+workspace under [`rust-port/`](../rust-port/):
+
+| Crate | Responsibility |
+| :--- | :--- |
+| `devmap-extract` | tree-sitter parsing, wiring annotations, framework matchers, explicit unavailable outcomes |
+| `devmap-resolve` | import, call, and receiver-type resolution with typed confidence |
+| `devmap-analyze` | liveness / dead-code tiers and weighted communities |
+| `devmap-store` | rusqlite v6 schema, pending queue, history, differential writes |
+| `devmap-query` | token-budgeted search / deps / manifest |
+| `devmap-serve` | file watcher and durable pending drain |
+| `devmap-cli` | the `devmap` binary |
+
+**The Python engine in `indexing/` and `codeintel/` is still the production path.** Nothing has
+been cut over or deleted. The Rust engine is opt-in and reached over IPC: when a `devmap serve`
+daemon is listening (default socket `/tmp/devmap.sock`), consumers route through the thin client
+in `src/devcouncil/devmap_client.py`, and every one of them falls back to Python when it is not.
+Current hybrid consumers are `dev graph`, the MCP `map` / `codeintel` handlers, and the
+`dead_symbols`, `stale_map`, and `wiring` verify checks.
+
+```bash
+cd rust-port && ./verify.sh
+cargo run -p devmap-cli -- --db /tmp/devmap-test.sqlite --progress always build ./testdata
+cargo run -p devmap-cli -- --db /tmp/devmap-test.sqlite search helper --budget 500
+```
+
+Known limits, kept explicit rather than papered over:
+
+- **Grammar coverage is 5 of 35.** Only Python, JavaScript, TypeScript/TSX, Rust, and Go are
+  linked. Every other registry language returns `ParseOutcome::Failed` — a failed parse is never
+  promoted to fabricated clean output, and failed outcomes are not cache-admitted.
+- **No parity sign-off.** The parity harness still reports diffs against the Python-derived
+  goldens; local passing tests are mechanical evidence only, not a shadow soak or production run.
+- **No cutover, no deletion, no publication.** Phase 6 consumer migration is the active work.
+
+[rust-port/STATUS.md](../rust-port/STATUS.md) is the authoritative ledger of what is verified and
+what is open; [rust-port/PHASE1_CONTRACT.md](../rust-port/PHASE1_CONTRACT.md) freezes the
+35-language specification the Rust registry is written against.
+
 ## Debugger and runtime behavior
 
 ```bash

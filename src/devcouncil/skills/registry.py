@@ -46,6 +46,10 @@ _PRUNE_DIRS = {
     ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__",
     ".devcouncil", ".idea", ".gradle", "build", "dist", ".mypy_cache",
     ".pytest_cache", ".ruff_cache", "DerivedData", "Pods",
+    # Golden corpora describe foreign stacks but are not part of the repository's
+    # implementation. Treating them as stack evidence makes one fixture select
+    # unrelated skills for every task in the host repo.
+    "testdata", "test_data",
 }
 _MAX_WALK_FILES = 20_000
 

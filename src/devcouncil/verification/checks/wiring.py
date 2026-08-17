@@ -50,8 +50,10 @@ def added_files_from_diff(diff_content: str) -> Set[str]:
             pending_new = False
             if target == "/dev/null":
                 continue
-            path = target[2:] if target.startswith(("a/", "b/")) else target
-            added.add(_norm(path))
+            path = _norm(target)
+            if path.startswith(("a/", "b/")):
+                path = path[2:]
+            added.add(path)
     return added
 
 
@@ -128,6 +130,33 @@ def detect_unwired_file_gaps(
             tracked = list(git_files)
         all_files = sorted(set(tracked) | added | {_norm(p) for p in changed_files})
         dependents = mapper.dependents_for(all_files)
+        try:
+            from devcouncil.devmap_client import (
+                DevMapClientError,
+                resolution_unavailable_reason,
+                try_connect,
+            )
+
+            client = try_connect(project_root)
+            if client is not None:
+                for cand in list(candidates):
+                    try:
+                        resp = client.impact(cand, depth=1)
+                        reason = resolution_unavailable_reason(resp.resolution)
+                        if reason:
+                            raise DevMapClientError(reason)
+                        rust_deps = {
+                            str(edge.get("source_file") or "").replace("\\", "/")
+                            for edge in resp.items
+                            if edge.get("source_file")
+                        }
+                        rust_deps = {d for d in rust_deps if d}
+                        if rust_deps:
+                            dependents.setdefault(cand, set()).update(rust_deps)
+                    except DevMapClientError:
+                        continue
+        except Exception:
+            logger.debug("devmap dependents enrichment failed", exc_info=True)
         roots = set(entry_roots(project_root, all_files))
         added_set = set(candidates)
         dyn_index = build_dynamic_import_index(project_root, all_files)

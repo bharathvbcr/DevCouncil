@@ -54,9 +54,20 @@ def detect_stale_map_gaps(
                 return []
             data = loaded
 
-        from devcouncil.indexing.repo_mapper import RepoMapper
+        stale = None
+        try:
+            from devcouncil.devmap_client import try_connect
 
-        if not RepoMapper(project_root).map_is_stale(dict(data)):
+            client = try_connect(project_root)
+            if client is not None:
+                stale = client.is_map_stale()
+        except Exception:
+            stale = None
+        if stale is None:
+            from devcouncil.indexing.repo_mapper import RepoMapper
+
+            stale = RepoMapper(project_root).map_is_stale(dict(data))
+        if not stale:
             return []
 
         stored_head = str(data.get("generated_head") or "") or "(unknown)"

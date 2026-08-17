@@ -1,0 +1,106 @@
+name: devmap (Rust port)
+
+# The Rust port had no CI of any kind: every gate ran only on a developer's
+# macOS machine. That hid two classes of problem at once — platform-specific
+# failures (Windows path separators, named pipes instead of Unix sockets) and
+# the simple case of a change that never got `cargo test` run against it.
+#
+# `verify.sh` is a bash script that shells out to `sqlite3` and `rsync`, so the
+# full gate runs on Unix only. Windows still runs the whole Rust test suite,
+# which is what covers the platform-specific code paths.
+#
+# It must be invoked with bash, matching its `#!/usr/bin/env bash` shebang. This
+# job previously ran it under zsh, where an unquoted parameter expansion is not
+# word-split: `set -- $SIZES` made the five build sizes one word, `S3=$3` died
+# under `set -u`, and gates 6 (growth plateau), 7 (incremental-vs-cold
+# equivalence) and 8 never ran at all. The workflow is new and has never been
+# pushed, so this was never a green build hiding a failure — but it would have
+# been.
+
+on:
+  push:
+    paths:
+      - "rust-port/**"
+      - ".github/workflows/rust-port.yml"
+  pull_request:
+    paths:
+      - "rust-port/**"
+      - ".github/workflows/rust-port.yml"
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: rust-port
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-port
+
+      # Formatting and lints are platform-independent, so one run is enough —
+      # but running them everywhere costs nothing and catches a cfg-gated block
+      # that only compiles on one target.
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # 22 tree-sitter grammars compile C. A build failure here is a real
+      # portability failure, not a test failure, so it is a separate step.
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+  gates:
+    name: verify.sh gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-port
+      - name: Install gate dependencies
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 rsync
+
+      # Determinism, the measured memory ceiling, growth plateau, and the
+      # incremental-vs-cold equivalence check that caught SC16.
+      - name: Full gate suite
+        run: bash ./verify.sh
+
+  parity:
+    name: parity vs frozen Python baseline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-port
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build release binary
+        run: cargo build --release
+      # Reports divergence against the frozen goldens. Deliberate divergences
+      # are recorded in DIVERGENCES.md, so this is informational rather than
+      # blocking until that ledger is machine-readable.
+      - name: Parity harness
+        run: python3 tools/parity/parity_harness.py || true

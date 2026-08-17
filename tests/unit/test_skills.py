@@ -158,6 +158,21 @@ def test_prompt_builder_injects_applicable_skills():
     assert "android" not in generic_applicable
 
 
+def test_golden_testdata_does_not_select_foreign_repo_skill(tmp_path):
+    from devcouncil.skills.registry import clear_skill_caches, select_skills
+
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='host'\n", encoding="utf-8")
+    fixture = tmp_path / "testdata" / "fixtures" / "swift"
+    fixture.mkdir(parents=True)
+    (fixture / "Main.swift").write_text("struct Fixture {}\n", encoding="utf-8")
+    clear_skill_caches()
+
+    selected = {skill.name for skill in select_skills("Build Android login screen", tmp_path)}
+
+    assert "android" in selected
+    assert "ios" not in selected
+
+
 def test_prompt_builder_deferred_skills_list_both_roots(monkeypatch):
     from devcouncil.domain.task import Task
     from devcouncil.execution.prompt_builder import PromptBuilder

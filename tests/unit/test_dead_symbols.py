@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from devcouncil.domain.task import Task
+from devcouncil.devmap_client import BudgetedResponse
 from devcouncil.verification.checks.dead_symbols import detect_dead_symbol_gaps
 
 
@@ -296,3 +297,71 @@ def test_graph_inbound_call_clears_dead_symbol(tmp_path, monkeypatch):
         dead_symbol_blocking=True,
     )
     assert not any(g.gap_type == "dead_symbol" and g.blocking for g in gaps)
+
+
+def test_devmap_inbound_must_match_target_file_and_symbol(tmp_path, monkeypatch):
+    path = "mod.py"
+    body = "def wired_helper():\n    return 1\n"
+    (tmp_path / path).write_text(body, encoding="utf-8")
+    (tmp_path / "caller.py").write_text("x = 1\n", encoding="utf-8")
+
+    def impact(_client, target, depth=1):
+        assert target == path
+        assert depth == 1
+        return BudgetedResponse(
+            shown=1,
+            hidden=0,
+            total=1,
+            truncated=False,
+            tokens_used=25,
+            items=[{
+                "source_file": "caller.py",
+                "target_file": path,
+                "source_symbol": "caller",
+                "target_symbol": "wired_helper",
+            }],
+            resolution="Available",
+        )
+
+    monkeypatch.setattr("devcouncil.devmap_client.DevMapClient.impact", impact)
+    gaps = detect_dead_symbol_gaps(
+        task=_task(),
+        project_root=tmp_path,
+        diff_content=_diff_for(path, body),
+        next_gap_id=_gap_id,
+        dead_symbol_blocking=True,
+    )
+    assert not any(g.gap_type == "dead_symbol" and g.blocking for g in gaps)
+
+
+def test_devmap_same_name_in_other_file_does_not_clear_dead_symbol(tmp_path, monkeypatch):
+    path = "mod.py"
+    body = "def duplicate_name():\n    return 1\n"
+    (tmp_path / path).write_text(body, encoding="utf-8")
+    (tmp_path / "other.py").write_text("x = 1\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "devcouncil.devmap_client.DevMapClient.impact",
+        lambda _client, _target, depth=1: BudgetedResponse(
+            shown=1,
+            hidden=0,
+            total=1,
+            truncated=False,
+            tokens_used=25,
+            items=[{
+                "source_file": "caller.py",
+                "target_file": "other.py",
+                "source_symbol": "caller",
+                "target_symbol": "duplicate_name",
+            }],
+            resolution="Available",
+        ),
+    )
+    gaps = detect_dead_symbol_gaps(
+        task=_task(),
+        project_root=tmp_path,
+        diff_content=_diff_for(path, body),
+        next_gap_id=_gap_id,
+        dead_symbol_blocking=True,
+    )
+    assert any(g.gap_type == "dead_symbol" and "duplicate_name" in g.description for g in gaps)

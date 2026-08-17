@@ -45,6 +45,17 @@ def _map_stale(root: Path, data: dict[str, Any] | None) -> bool:
     if not data:
         return False
     try:
+        from devcouncil.devmap_client import DevMapClientError, try_connect
+
+        client = try_connect(root)
+        if client is not None:
+            try:
+                return client.is_map_stale()
+            except DevMapClientError:
+                pass
+    except Exception:
+        pass
+    try:
         return RepoMapper(root).map_is_stale(data)
     except Exception:
         # Fail closed: unverifiable map must not be treated as fresh.
@@ -210,13 +221,50 @@ async def handle_repo_map(root: Path, arguments: dict) -> list[TextContent]:
 
 def _symbols_for_path(root: Path, path: str) -> list[dict[str, Any]]:
     """Per-path symbol listings from the code graph (empty when unavailable)."""
+    norm = path.replace("\\", "/")
+    try:
+        from devcouncil.devmap_client import (
+            DevMapClientError,
+            resolution_unavailable_reason,
+            try_connect,
+        )
+
+        client = try_connect(root)
+        if client is not None:
+            resp = client.search(norm, limit=2000)
+            reason = resolution_unavailable_reason(resp.resolution)
+            if reason:
+                raise DevMapClientError(reason)
+            if resp.total > 0 and not resp.items and resp.truncated:
+                raise DevMapClientError("truncated empty symbols")
+            out: list[dict[str, Any]] = []
+            for item in resp.items:
+                file_path = str(item.get("file_path") or "").replace("\\", "/")
+                if file_path != norm and not file_path.endswith("/" + norm):
+                    # Keep path-prefix hits from search when exact path misses.
+                    if norm not in file_path:
+                        continue
+                name = str(item.get("symbol_name") or "")
+                span = item.get("span") or (0, 0)
+                line = int(span[0]) if isinstance(span, (list, tuple)) and span else 0
+                kind = str(item.get("kind") or "symbol")
+                if kind == "file":
+                    continue
+                out.append({
+                    "id": f"{file_path}::{name}" if file_path and name else name or file_path,
+                    "kind": kind,
+                    "name": name,
+                    "line": line,
+                })
+            return out[:200]
+    except Exception:
+        pass
     try:
         from devcouncil.indexing.graph.build import load_code_graph
 
         graph = load_code_graph(root)
         if graph is None:
             return []
-        norm = path.replace("\\", "/")
         out = []
         for n in graph.nodes:
             if n.path != norm:
@@ -273,6 +321,30 @@ async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
                 path = raw.replace("\\", "/")
                 dependents, neighbors = impact_targets(path, data)
                 resolution = "import"
+                if not precise:
+                    try:
+                        from devcouncil.devmap_client import (
+                            DevMapClientError,
+                            resolution_unavailable_reason,
+                            try_connect,
+                        )
+
+                        client = try_connect(root)
+                        if client is not None:
+                            resp = client.impact(path, depth=1)
+                            reason = resolution_unavailable_reason(resp.resolution)
+                            if reason:
+                                raise DevMapClientError(reason)
+                            rust_deps = sorted({
+                                str(edge.get("source_file") or "")
+                                for edge in resp.items
+                                if edge.get("source_file")
+                            })
+                            if rust_deps:
+                                dependents = rust_deps
+                                resolution = "devmap"
+                    except Exception:
+                        pass
                 if precise and lsp_pool is not None:
                     try:
                         lsp_deps = lsp_pool.dependents_of_file(path)
@@ -422,6 +494,59 @@ def _structured_dead_code(
     path_prefix: str | None,
     min_confidence: str = "inferred",
 ) -> tuple[list[dict[str, Any]], int]:
+    data = _load_repo_map(root) or {}
+    try:
+        from devcouncil.devmap_client import (
+            DevMapClientError,
+            resolution_unavailable_reason,
+            try_connect,
+        )
+        from devcouncil.indexing.graph.liveness import confidence_at_least
+
+        client = try_connect(root)
+        if client is not None:
+            resp = client.dead_symbols(budget=2000)
+            reason = resolution_unavailable_reason(resp.resolution)
+            if reason:
+                raise DevMapClientError(reason)
+            if resp.total > 0 and not resp.items and resp.truncated:
+                raise DevMapClientError("truncated empty dead")
+            matched: list[dict[str, Any]] = []
+            hidden = 0
+            for item in resp.items:
+                path = str(item.get("file_path") or item.get("path") or "")
+                if not _matches_filters(path, data, area=area, path_prefix=path_prefix):
+                    continue
+                conf = item.get("confidence", "inferred")
+                if isinstance(conf, (int, float)):
+                    score = float(conf)
+                    conf = (
+                        "extracted" if score >= 0.9 else "inferred" if score >= 0.5 else "ambiguous"
+                    )
+                if not confidence_at_least(conf, min_confidence):
+                    hidden += 1
+                    continue
+                name = str(item.get("symbol_name") or item.get("name") or "")
+                span = item.get("span") or (0, 0)
+                line = (
+                    int(span[0])
+                    if isinstance(span, (list, tuple)) and span
+                    else int(item.get("line") or 0)
+                )
+                matched.append({
+                    **item,
+                    "id": str(
+                        item.get("id")
+                        or (f"{path}::{name}" if path and name else name or path)
+                    ),
+                    "path": path,
+                    "name": name,
+                    "line": line,
+                    "confidence": str(conf),
+                })
+            return matched[:200], hidden
+    except Exception:
+        pass
     try:
         from devcouncil.indexing.graph.build import load_code_graph
         from devcouncil.indexing.graph.liveness import confidence_at_least
@@ -429,7 +554,6 @@ def _structured_dead_code(
         graph = load_code_graph(root)
         if graph is None:
             return [], 0
-        data = _load_repo_map(root) or {}
         matched: list[dict[str, Any]] = []
         hidden = 0
         for d in graph.dead_code:

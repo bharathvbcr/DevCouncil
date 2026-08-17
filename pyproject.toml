@@ -139,6 +139,7 @@ exclude_lines = [
 [tool.ruff]
 line-length = 120
 target-version = "py312"
+extend-exclude = ["rust-port/testdata"]
 
 [tool.mypy]
 python_version = "3.12"
