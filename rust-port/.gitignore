@@ -79,3 +79,21 @@ node_modules/
 .mypy_cache/
 .ruff_cache/
 Thumbs.db
+
+# Test fixtures are extractor *inputs*, not build output.
+#
+# rust-port was folded into DevCouncil from a standalone repository, which
+# moved the git worktree root up one level. `extract` walks with
+# `WalkBuilder.git_ignore(true)` and reads ignore rules from that root, so the
+# parent's Python-packaging patterns (`lib/`, `build/`, `var/`, `dist/`,
+# `share/`) began governing which fixture files get indexed:
+# `testdata/vendor/lib/x.py` silently stopped being walked and the testdata
+# determinism digest moved. Language fixtures legitimately use those directory
+# names, so re-include the whole tree here — a nested ignore file takes
+# precedence over the parent's, and the directory must be re-included before
+# any file inside it can be.
+!testdata/
+!testdata/**
+# …but never the generated stores or OS cruft that live inside fixtures.
+testdata/**/.devcouncil/
+testdata/**/.DS_Store
