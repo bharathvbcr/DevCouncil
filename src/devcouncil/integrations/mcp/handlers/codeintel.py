@@ -118,10 +118,22 @@ def resolve_root(default_root: Path, arguments: dict) -> Path:
     return canonical_project_root(Path(explicit) if isinstance(explicit, str) and explicit else default_root)
 
 
-def _client_envelope(root: Path, client: DevMapClient, payload: dict[str, Any]) -> dict[str, Any]:
+def _client_envelope(
+    root: Path, client: DevMapClient, payload: dict[str, Any], *, operation: str = ""
+) -> dict[str, Any]:
+    """Wrap a Rust answer in the payload contract consumers already read.
+
+    `operation` was missing here while the Python engine supplied it, and the
+    gap was invisible for as long as a fallback existed: the handler-contract
+    test passed because Python answered every call in an unbuilt repository.
+    Removing the fallback made the Rust envelope the only answer and the missing
+    key a KeyError — the fallback had been hiding a real contract gap, not
+    covering for a transient one.
+    """
     status = client.status()
     return {
         "ok": True,
+        "operation": operation,
         "project_root": str(root.resolve()),
         "generation": status.generation_id or None,
         "schema_version": status.raw.get("schema_version"),
@@ -148,6 +160,34 @@ def _require_usable(resp: BudgetedResponse, *, label: str) -> None:
         raise DevMapClientError(
             f"devmap {label} returned truncated empty items (total={resp.total})"
         )
+
+
+def _unavailable(
+    root: Path, label: str, reason: str, empty: dict[str, Any]
+) -> dict[str, Any]:
+    """A tri-state *unavailable* answer, never a Python answer in disguise.
+
+    The Rust kernel is primary. When it cannot answer, the honest result is
+    "unavailable, and here is why" — not a silently substituted result from a
+    second engine, and not a confident zero. Substituting was how SC23 hid for a
+    whole pass: every consumer raised, quietly took the Python path, and
+    reported success, so nothing in the output said which engine had answered.
+
+    `resolution` carries the reason in the shape `resolution_unavailable_reason`
+    already parses (X14), so existing consumers detect this without new code.
+    The payload keys are present but empty, so a caller that reads them gets
+    nothing rather than a KeyError — and `ok` is False so nobody mistakes the
+    emptiness for a verified zero.
+    """
+    payload: dict[str, Any] = {
+        "ok": False,
+        "operation": label,
+        "project_root": str(root.resolve()),
+        "engine": "devmap-rust",
+        "resolution": {"Unavailable": {"reason": f"{label}: {reason}"}},
+    }
+    payload.update(empty)
+    return payload
 
 
 def _hit_to_match(item: dict[str, Any]) -> dict[str, Any]:
@@ -180,10 +220,15 @@ def _edge_to_layer_nodes(items: list[dict[str, Any]]) -> list[str]:
     return nodes
 
 
-def _search_via_client(root: Path, query: str, limit: int) -> dict[str, Any] | None:
+def _search_via_client(root: Path, query: str, limit: int) -> dict[str, Any]:
     client = try_connect(root)
     if client is None:
-        return None
+        return _unavailable(
+            root,
+            "search",
+            "no built devmap store (run `dev map`)",
+            {"matches": [], "shown": 0, "total": 0, "truncated": False},
+        )
     try:
         resp = client.search(query, limit=2000)
         _require_usable(resp, label="search")
@@ -198,6 +243,7 @@ def _search_via_client(root: Path, query: str, limit: int) -> dict[str, Any] | N
                 "total": resp.total,
                 "truncated": resp.truncated or len(resp.items) > limit,
             },
+            operation="search",
         )
     except DevMapClientError as exc:
         logger.warning(
@@ -205,13 +251,18 @@ def _search_via_client(root: Path, query: str, limit: int) -> dict[str, Any] | N
             "path: %s. The Rust kernel is primary; a fallback here is a defect.",
             exc,
         )
-        return None
+        return _unavailable(root, "search", str(exc), {"matches": [], "shown": 0, "total": 0, "truncated": False})
 
 
-def _path_via_client(root: Path, start: str, end: str, max_depth: int) -> dict[str, Any] | None:
+def _path_via_client(root: Path, start: str, end: str, max_depth: int) -> dict[str, Any]:
     client = try_connect(root)
     if client is None:
-        return None
+        return _unavailable(
+            root,
+            "path",
+            "no built devmap store (run `dev map`)",
+            {"found": False, "path": [], "length": 0, "truncated": False},
+        )
     try:
         depth = max(1, min(64, max_depth))
         resp = client.trace(start, depth=depth, to_symbol=end)
@@ -250,6 +301,7 @@ def _path_via_client(root: Path, start: str, end: str, max_depth: int) -> dict[s
                 "path": steps,
                 "truncated": resp.truncated,
             },
+            operation="path",
         )
     except DevMapClientError as exc:
         logger.warning(
@@ -257,13 +309,18 @@ def _path_via_client(root: Path, start: str, end: str, max_depth: int) -> dict[s
             "path: %s. The Rust kernel is primary; a fallback here is a defect.",
             exc,
         )
-        return None
+        return _unavailable(root, "path", str(exc), {"found": False, "path": [], "length": 0, "truncated": False})
 
 
-def _impact_via_client(root: Path, targets: list[str], max_depth: int) -> dict[str, Any] | None:
+def _impact_via_client(root: Path, targets: list[str], max_depth: int) -> dict[str, Any]:
     client = try_connect(root)
     if client is None:
-        return None
+        return _unavailable(
+            root,
+            "impact",
+            "no built devmap store (run `dev map`)",
+            {"nodes": [], "layers": [], "count": 0, "total_impacted": 0, "truncated": False},
+        )
     try:
         depth = max(1, min(8, max_depth))
         layers_nodes: list[str] = []
@@ -295,6 +352,7 @@ def _impact_via_client(root: Path, targets: list[str], max_depth: int) -> dict[s
             root,
             client,
             {"targets": targets, "blast_radius": blast},
+            operation="impact",
         )
     except DevMapClientError as exc:
         logger.warning(
@@ -302,13 +360,23 @@ def _impact_via_client(root: Path, targets: list[str], max_depth: int) -> dict[s
             "path: %s. The Rust kernel is primary; a fallback here is a defect.",
             exc,
         )
-        return None
+        return _unavailable(
+            root,
+            "impact",
+            str(exc),
+            {"nodes": [], "layers": [], "count": 0, "total_impacted": 0, "truncated": False},
+        )
 
 
-def _dead_via_client(root: Path, minimum_confidence: str) -> dict[str, Any] | None:
+def _dead_via_client(root: Path, minimum_confidence: str) -> dict[str, Any]:
     client = try_connect(root)
     if client is None:
-        return None
+        return _unavailable(
+            root,
+            "dead",
+            "no built devmap store (run `dev map`)",
+            {"dead_code": [], "runtime_proven_live": [], "total": 0, "truncated": False},
+        )
     try:
         resp = client.dead_symbols(budget=2000)
         _require_usable(resp, label="dead")
@@ -359,6 +427,7 @@ def _dead_via_client(root: Path, minimum_confidence: str) -> dict[str, Any] | No
                 "truncated": resp.truncated,
                 "total": resp.total,
             },
+            operation="dead",
         )
     except DevMapClientError as exc:
         logger.warning(
@@ -366,18 +435,45 @@ def _dead_via_client(root: Path, minimum_confidence: str) -> dict[str, Any] | No
             "path: %s. The Rust kernel is primary; a fallback here is a defect.",
             exc,
         )
-        return None
+        return _unavailable(
+            root,
+            "dead",
+            str(exc),
+            {"dead_code": [], "runtime_proven_live": [], "total": 0, "truncated": False},
+        )
 
 
-def _status_via_client(root: Path) -> dict[str, Any] | None:
+def _status_via_client(root: Path) -> dict[str, Any]:
     client = try_connect(root)
     if client is None:
-        return None
+        return _unavailable(
+            root,
+            "status",
+            "no built devmap store (run `dev map`)",
+            # For *status* specifically, an unbuilt store is not a failure to
+            # report around — it is the answer the caller asked for, and the
+            # Python engine named it `uninitialized`. Keeping that word keeps
+            # the contract while `resolution` still records why the Rust kernel
+            # had nothing further to say.
+            {
+                "state": "uninitialized",
+                "generation": None,
+                "node_count": 0,
+                "edge_count": 0,
+                "pending_count": 0,
+                "is_fresh": False,
+                "degraded_reason": None,
+            },
+        )
     try:
         status = client.status()
         state = "committed" if status.generation_id > 0 else "empty"
         return {
             "ok": True,
+            # Built inline rather than through `_client_envelope`, so the
+            # operation key has to be set here too — its absence is exactly the
+            # gap the fallback used to hide.
+            "operation": "status",
             "project_root": str(root.resolve()),
             "state": state,
             "generation": status.generation_id or None,
@@ -404,7 +500,20 @@ def _status_via_client(root: Path) -> dict[str, Any] | None:
             "path: %s. The Rust kernel is primary; a fallback here is a defect.",
             exc,
         )
-        return None
+        return _unavailable(
+            root,
+            "status",
+            str(exc),
+            {
+                "state": "unavailable",
+                "generation": None,
+                "node_count": 0,
+                "edge_count": 0,
+                "pending_count": 0,
+                "is_fresh": False,
+                "degraded_reason": str(exc),
+            },
+        )
 
 
 async def _explore(root: Path, arguments: dict) -> list[TextContent]:
@@ -417,37 +526,45 @@ async def _explore(root: Path, arguments: dict) -> list[TextContent]:
 async def _search(root: Path, arguments: dict) -> list[TextContent]:
     query = str(arguments["query"])
     limit = int(arguments.get("limit", 50))
-    payload = _search_via_client(root, query, limit)
-    if payload is not None:
-        return json_text(payload)
-    return json_text(CodeIntelQueryEngine(root).search(query, limit=limit))
+    # The Rust kernel answers, or says it cannot. It never hands off to
+    # `CodeIntelQueryEngine`: a second engine answering with no signal
+    # which one answered is the SC23 shape, and an unavailable answer a
+    # caller can see beats a confident one from an engine it did not ask
+    # for.
+    return json_text(_search_via_client(root, query, limit))
 
 
 async def _path(root: Path, arguments: dict) -> list[TextContent]:
     start = str(arguments["from"])
     end = str(arguments["to"])
     max_depth = int(arguments.get("maxDepth", 32))
-    payload = _path_via_client(root, start, end, max_depth)
-    if payload is not None:
-        return json_text(payload)
-    return json_text(CodeIntelQueryEngine(root).path(start, end, max_depth=max_depth))
+    # The Rust kernel answers, or says it cannot. It never hands off to
+    # `CodeIntelQueryEngine`: a second engine answering with no signal
+    # which one answered is the SC23 shape, and an unavailable answer a
+    # caller can see beats a confident one from an engine it did not ask
+    # for.
+    return json_text(_path_via_client(root, start, end, max_depth))
 
 
 async def _impact(root: Path, arguments: dict) -> list[TextContent]:
     targets = [str(value) for value in arguments.get("targets") or []]
     max_depth = int(arguments.get("maxDepth", 3))
-    payload = _impact_via_client(root, targets, max_depth)
-    if payload is not None:
-        return json_text(payload)
-    return json_text(CodeIntelQueryEngine(root).impact(targets, max_depth=max_depth))
+    # The Rust kernel answers, or says it cannot. It never hands off to
+    # `CodeIntelQueryEngine`: a second engine answering with no signal
+    # which one answered is the SC23 shape, and an unavailable answer a
+    # caller can see beats a confident one from an engine it did not ask
+    # for.
+    return json_text(_impact_via_client(root, targets, max_depth))
 
 
 async def _dead(root: Path, arguments: dict) -> list[TextContent]:
     minimum = str(arguments.get("minimumConfidence", "inferred"))
-    payload = _dead_via_client(root, minimum)
-    if payload is not None:
-        return json_text(payload)
-    return json_text(CodeIntelQueryEngine(root).dead(minimum_confidence=minimum))
+    # The Rust kernel answers, or says it cannot. It never hands off to
+    # `CodeIntelQueryEngine`: a second engine answering with no signal
+    # which one answered is the SC23 shape, and an unavailable answer a
+    # caller can see beats a confident one from an engine it did not ask
+    # for.
+    return json_text(_dead_via_client(root, minimum))
 
 
 async def _affected(root: Path, arguments: dict) -> list[TextContent]:
@@ -493,11 +610,12 @@ async def _sync(root: Path, arguments: dict) -> list[TextContent]:
 
 
 async def _status(root: Path, _arguments: dict) -> list[TextContent]:
-    payload = _status_via_client(root)
-    if payload is not None:
-        return json_text(payload)
-    service = get_codeintel_service(root)
-    return json_text({**service.status(), "sync": get_sync_coordinator(root).status().as_dict()})
+    # `_status_via_client` always answers — `committed`, `empty`, or
+    # `uninitialized` with the reason carried in `resolution`. The Python
+    # service is not consulted, because reporting *its* store's state under a
+    # question about the Rust kernel is how a caller ends up confident about an
+    # index that was never built.
+    return json_text(_status_via_client(root))
 
 
 REGISTRY: dict[str, Handler] = {
@@ -515,6 +633,10 @@ REGISTRY: dict[str, Handler] = {
 async def dispatch(name: str, default_root: Path, arguments: dict) -> list[TextContent] | None:
     handler = REGISTRY.get(name)
     if handler is None:
+        # An unknown tool name is not an unavailable *answer* — this server
+        # simply does not implement that tool, and `None` is how the MCP layer
+        # says so. Returning a tri-state envelope here would claim the tool
+        # exists but could not run.
         return None
     root = resolve_root(default_root, arguments)
     try:

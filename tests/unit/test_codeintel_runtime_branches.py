@@ -1655,7 +1655,15 @@ def test_mcp_codeintel_dispatch_all_handlers_and_errors(
     assert asyncio.run(
         invoke("devcouncil_code_sync", {"paths": []})
     )["reconciled"] == ["app.py"]
-    assert asyncio.run(invoke("devcouncil_code_status", {}))["state"] == "committed"
+    # `committed` came from the stubbed Python engine while a fallback existed.
+    # The Rust kernel is primary now and this fixture never builds a devmap
+    # store, so `uninitialized` is the honest answer — the tri-state saying "I
+    # have nothing", rather than a second engine's view of a different store
+    # presented as though the primary had answered.
+    status_payload = asyncio.run(invoke("devcouncil_code_status", {}))
+    assert status_payload["state"] == "uninitialized"
+    assert status_payload["ok"] is False, "an unbuilt store must not read as a verified zero"
+    assert "Unavailable" in status_payload["resolution"], "the reason must be carried, not dropped"
     failed = asyncio.run(
         invoke("devcouncil_code_sync", {"paths": ["fail.py"]})
     )
