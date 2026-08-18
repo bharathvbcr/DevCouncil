@@ -344,7 +344,12 @@ def _devmap_query_payload(root: Path, kind: str, **kwargs):
                 })
             return {"ok": True, "paths": items, "source": "devmap", **_graph_degraded_fields(root)}
     except DevMapClientError as exc:
-        logger.debug("devmap %s fallback: %s", kind, exc)
+        logger.warning(
+                "devmap (Rust) %s failed and this call fell back to the Python path: %s. "
+                "The Rust kernel is primary; a fallback here is a defect, not a mode.",
+                kind,
+                exc,
+            )
         return None
     return None
 

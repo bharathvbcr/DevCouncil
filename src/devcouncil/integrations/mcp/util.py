@@ -106,7 +106,11 @@ async def with_codeintel_freshness(
                 return annotate_stale(contents, _RustFreshness())
             return contents
         except DevMapClientError as exc:
-            logger.debug("devmap freshness fallback: %s", exc)
+            logger.warning(
+            "devmap (Rust) freshness failed and this call fell back to the Python "
+            "path: %s. The Rust kernel is primary; a fallback here is a defect.",
+            exc,
+        )
 
     coordinator = get_sync_coordinator(root)
     fresh = await asyncio.to_thread(coordinator.wait_until_fresh, timeout=timeout)

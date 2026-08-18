@@ -3,6 +3,8 @@ the end-to-end map test: db guard, if-stale, wiki refresh, watch loop, graph-con
 
 from __future__ import annotations
 
+import time
+
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -99,19 +101,31 @@ def test_liveness_summary_reports_counts():
     assert "1 entry roots" in summary
 
 
-# --- map command: db unavailable --------------------------------------------------
+# --- map command: an unusable engine fails the stage -------------------------------
 
 
-def test_map_db_unavailable_exits(tmp_path, monkeypatch):
+def test_map_engine_unavailable_exits(tmp_path, monkeypatch):
+    """`dev map` must end red when the map engine cannot run.
+
+    Replaces `test_map_db_unavailable_exits`, which patched `map_cmd.get_db` —
+    the Python indexer's store handle. The Rust kernel owns its own store, so
+    that seam no longer exists, but the contract it protected does and is the
+    reason there is no Python fallback: a map command that cannot build must
+    not exit 0 having quietly produced nothing.
+    """
+    import devcouncil.devmap_engine as engine
+
     monkeypatch.chdir(tmp_path)
     _git_repo(tmp_path)
     assert runner.invoke(app, ["init"]).exit_code == 0
-    monkeypatch.setattr(map_cmd, "get_db", lambda root: None)
+
+    def _boom(*_args, **_kwargs):
+        raise engine.DevMapEngineError("kernel unavailable")
+
+    monkeypatch.setattr(map_cmd, "build_map", _boom, raising=False)
+    monkeypatch.setattr(engine, "build_map", _boom)
     result = runner.invoke(app, ["map"])
     assert result.exit_code == 1
-
-
-# --- map command: --if-stale skips a fresh map ------------------------------------
 
 
 def test_map_if_stale_skips_when_fresh(tmp_path, monkeypatch):
@@ -223,107 +237,69 @@ def test_refresh_wiki_skeletons_swallows_errors(tmp_path, monkeypatch):
     monkeypatch.setattr(wiki_mod, "wiki_dir_for", boom)
     # Must never raise — wiki refresh is a convenience layer.
     map_cmd._refresh_wiki_skeletons(tmp_path, SimpleNamespace())
+def test_watch_map_rebuilds_when_the_fingerprint_moves(tmp_path, monkeypatch):
+    """Watch must fire on exactly the evidence `--if-stale` reads.
 
-
-# --- _watch_map -------------------------------------------------------------------
-
-
-def test_watch_map_processes_batch_then_stops(tmp_path, monkeypatch):
-    import devcouncil.codeintel.sync as sync_mod
-    import devcouncil.indexing.graph.build as graph_build
-
-    root = tmp_path.resolve()
-    (root / "a.py").write_text("x = 1\n", encoding="utf-8")
-
-    refreshed = {}
-    monkeypatch.setattr(
-        graph_build, "refresh_map_for_paths",
-        lambda root, batch, liveness=True: refreshed.setdefault("batch", batch),
-    )
-
-    class _FakeCoordinator:
-        pending = ["a.py"]
-
-        def __init__(self, callback):
-            self.callback = callback
-
-        def start(self):
-            return SimpleNamespace(backend="FakeObserver", state="healthy")
-
-        def status(self):
-            return SimpleNamespace(pending=list(self.pending), last_error="", degraded_reason="")
-
-        def sync_now(self):
-            self.callback(list(self.pending))
-            self.pending = []
-            return True
-
-        def stop(self, timeout=2):
-            return None
-
-    monkeypatch.setattr(
-        sync_mod,
-        "get_sync_coordinator",
-        lambda root, **kwargs: _FakeCoordinator(kwargs["sync_callback"]),
-    )
-
-    counter = {"n": 0}
-
-    def fake_sleep(_seconds):
-        counter["n"] += 1
-        if counter["n"] >= 2:
-            raise KeyboardInterrupt
-
-    # _watch_map imports `time` locally; patch the stdlib module it resolves to.
-    import time as _time
-    monkeypatch.setattr(_time, "sleep", fake_sleep)
-
-    map_cmd._watch_map(root, liveness=True)
-    assert refreshed["batch"] == ["a.py"]
-
-
-def test_watch_map_refresh_error_is_ignored(tmp_path, monkeypatch):
-    import devcouncil.codeintel.sync as sync_mod
+    Replaces `test_watch_map_processes_batch_then_stops`, which drove the Python
+    coordinator's changed-path batching (`refresh_map_for_paths` plus a fake
+    observer). The Rust kernel rebuilds the whole map, so there is no batch to
+    assert; what survives is the contract that matters — a stale fingerprint
+    causes a rebuild, and a fresh one does not.
+    """
+    import devcouncil.devmap_engine as engine
 
     root = tmp_path.resolve()
-    (root / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (root / ".devcouncil").mkdir(parents=True, exist_ok=True)
+    (root / ".devcouncil" / "repo_map.json").write_text('{"files": []}', encoding="utf-8")
 
-    class _FakeCoordinator:
-        def start(self):
-            return SimpleNamespace(backend="FakeObserver", state="healthy")
+    calls: list[str] = []
+    monkeypatch.setattr(engine, "build_map", lambda r, **_k: calls.append("built"))
+    monkeypatch.setattr(map_cmd.RepoMapper, "map_is_stale", lambda self, data: True)
 
-        def status(self):
-            return SimpleNamespace(
-                pending=["a.py"],
-                last_error="RuntimeError: refresh exploded",
-                degraded_reason="",
-            )
+    real_sleep = time.sleep
 
-        def sync_now(self):
-            return False
-
-        def stop(self, timeout=2):
-            return None
-
-    monkeypatch.setattr(sync_mod, "get_sync_coordinator", lambda root, **kwargs: _FakeCoordinator())
-
-    counter = {"n": 0}
-
-    def fake_sleep(_seconds):
-        counter["n"] += 1
-        if counter["n"] >= 2:
+    def _stop_after_one(_seconds):
+        real_sleep(0)
+        if calls:
             raise KeyboardInterrupt
 
-    import time as _time
-    monkeypatch.setattr(_time, "sleep", fake_sleep)
-
-    messages = []
-    monkeypatch.setattr(map_cmd.status_console, "print", lambda msg: messages.append(str(msg)))
-    map_cmd._watch_map(root, liveness=True)
-    assert any("Watch refresh failed" in m for m in messages)
+    monkeypatch.setattr(time, "sleep", _stop_after_one)
+    map_cmd._watch_map(root)
+    assert calls == ["built"], "a stale fingerprint must trigger exactly one rebuild"
 
 
-# --- map command: --watch flag dispatch -------------------------------------------
+def test_watch_map_reports_a_failed_rebuild_and_keeps_watching(tmp_path, monkeypatch):
+    """A failed rebuild must be visible, and must not end the watch.
+
+    Replaces `test_watch_map_refresh_error_is_ignored`. "Ignored" is the wrong
+    contract to keep: a watcher that swallows failures looks alive while serving
+    an increasingly stale map. It stays alive *and* says so.
+    """
+    import devcouncil.devmap_engine as engine
+
+    root = tmp_path.resolve()
+    (root / ".devcouncil").mkdir(parents=True, exist_ok=True)
+    (root / ".devcouncil" / "repo_map.json").write_text('{"files": []}', encoding="utf-8")
+
+    attempts: list[int] = []
+
+    def _always_fails(_root, **_kwargs):
+        attempts.append(1)
+        raise engine.DevMapEngineError("boom")
+
+    monkeypatch.setattr(engine, "build_map", _always_fails)
+    monkeypatch.setattr(map_cmd.RepoMapper, "map_is_stale", lambda self, data: True)
+
+    real_sleep = time.sleep
+
+    def _stop_after_two(_seconds):
+        real_sleep(0)
+        if len(attempts) >= 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(time, "sleep", _stop_after_two)
+    map_cmd._watch_map(root)
+    assert len(attempts) >= 2, "a failed rebuild must not end the watch"
 
 
 def test_map_watch_flag_invokes_watch_map(tmp_path, monkeypatch):

@@ -200,7 +200,11 @@ def _search_via_client(root: Path, query: str, limit: int) -> dict[str, Any] | N
             },
         )
     except DevMapClientError as exc:
-        logger.debug("devmap search fallback: %s", exc)
+        logger.warning(
+            "devmap (Rust) search failed and this call fell back to the Python "
+            "path: %s. The Rust kernel is primary; a fallback here is a defect.",
+            exc,
+        )
         return None
 
 
@@ -248,7 +252,11 @@ def _path_via_client(root: Path, start: str, end: str, max_depth: int) -> dict[s
             },
         )
     except DevMapClientError as exc:
-        logger.debug("devmap path fallback: %s", exc)
+        logger.warning(
+            "devmap (Rust) path failed and this call fell back to the Python "
+            "path: %s. The Rust kernel is primary; a fallback here is a defect.",
+            exc,
+        )
         return None
 
 
@@ -289,7 +297,11 @@ def _impact_via_client(root: Path, targets: list[str], max_depth: int) -> dict[s
             {"targets": targets, "blast_radius": blast},
         )
     except DevMapClientError as exc:
-        logger.debug("devmap impact fallback: %s", exc)
+        logger.warning(
+            "devmap (Rust) impact failed and this call fell back to the Python "
+            "path: %s. The Rust kernel is primary; a fallback here is a defect.",
+            exc,
+        )
         return None
 
 
@@ -349,7 +361,11 @@ def _dead_via_client(root: Path, minimum_confidence: str) -> dict[str, Any] | No
             },
         )
     except DevMapClientError as exc:
-        logger.debug("devmap dead fallback: %s", exc)
+        logger.warning(
+            "devmap (Rust) dead failed and this call fell back to the Python "
+            "path: %s. The Rust kernel is primary; a fallback here is a defect.",
+            exc,
+        )
         return None
 
 
@@ -383,7 +399,11 @@ def _status_via_client(root: Path) -> dict[str, Any] | None:
             }},
         }
     except DevMapClientError as exc:
-        logger.debug("devmap status fallback: %s", exc)
+        logger.warning(
+            "devmap (Rust) status failed and this call fell back to the Python "
+            "path: %s. The Rust kernel is primary; a fallback here is a defect.",
+            exc,
+        )
         return None
 
 
@@ -455,7 +475,11 @@ async def _sync(root: Path, arguments: dict) -> list[TextContent]:
                 "build": result,
             })
         except DevMapClientError as exc:
-            logger.debug("devmap sync/build fallback: %s", exc)
+            logger.warning(
+            "devmap (Rust) sync/build failed and this call fell back to the Python "
+            "path: %s. The Rust kernel is primary; a fallback here is a defect.",
+            exc,
+        )
     coordinator = get_sync_coordinator(root)
     supplied = [str(value) for value in arguments.get("paths") or []]
     changed = supplied or await asyncio.to_thread(coordinator.reconcile)

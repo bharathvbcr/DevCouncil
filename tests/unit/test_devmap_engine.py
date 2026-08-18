@@ -1,0 +1,137 @@
+"""Regression coverage for the Rust map engine seam.
+
+Two defects found while wiring it, both by measurement rather than review:
+
+1. A **relative** output path was resolved against the process's cwd instead of
+   the project root. `dev map --project-root /other/repo` passes the default
+   `.devcouncil/repo_map.json`, so the engine read and rewrote the map of
+   whichever repository the shell happened to be in. It corrupted this
+   repository's own map during development.
+2. A stale `devmap` on PATH reports the *same version string* as the freshly
+   built one and lacks `--graph-output`, so a version check is not evidence of
+   a capability.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from devcouncil import devmap_engine
+from devcouncil.devmap_engine import DevMapEngineError, build_map, find_engine_binary
+
+
+def _git_repo(tmp_path: Path) -> Path:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "k.py").write_text("def helper(a): return a\ndef main(): return helper(1)\n")
+    subprocess.run(["git", "init", "-q", "."], cwd=root, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+        cwd=root,
+        check=True,
+    )
+    return root
+
+
+def _have_engine() -> bool:
+    try:
+        find_engine_binary()
+    except DevMapEngineError:
+        return False
+    return True
+
+
+requires_engine = pytest.mark.skipif(
+    not _have_engine(), reason="devmap kernel not built (cargo build --release -p devmap-cli)"
+)
+
+
+@requires_engine
+def test_a_relative_output_lands_under_the_project_root_not_the_cwd(tmp_path, monkeypatch):
+    """The cross-repository write that corrupted this repo's map.
+
+    The assertion that matters is the negative one: a *decoy* map sitting at the
+    same relative path under the cwd must be byte-identical afterwards. Checking
+    only that the target was written would have passed while the bug was live.
+    """
+    root = _git_repo(tmp_path)
+    elsewhere = tmp_path / "cwd"
+    (elsewhere / ".devcouncil").mkdir(parents=True)
+    decoy = elsewhere / ".devcouncil" / "repo_map.json"
+    decoy.write_text('{"indexed_hash": "DECOY", "files": []}')
+    before = decoy.read_text()
+
+    monkeypatch.chdir(elsewhere)
+    build_map(root, output=Path(".devcouncil/repo_map.json"))
+
+    assert (root / ".devcouncil" / "repo_map.json").is_file(), "target repo must get the map"
+    assert decoy.read_text() == before, "a map outside the project root must never be touched"
+
+
+@requires_engine
+def test_freshness_is_stamped_and_actually_detects_change(tmp_path):
+    """A fingerprint that always says 'fresh' is worse than none.
+
+    The Rust kernel writes both digests empty, and `map_is_stale` skips its
+    check only when `generated_head` is *also* empty — which it is not. So an
+    unstamped map reads permanently stale and `--if-stale` never short-circuits.
+    Both directions are asserted; the second is the one that matters.
+    """
+    import time
+
+    from devcouncil.indexing.repo_mapper import RepoMapper
+
+    root = _git_repo(tmp_path)
+    written = build_map(root)
+    payload = json.loads(written.read_text())
+
+    assert payload["indexed_hash"], "indexed_hash must be stamped"
+    assert payload["content_fingerprint"], "content_fingerprint must be stamped"
+
+    mapper = RepoMapper(project_root=root)
+    assert mapper.map_is_stale(payload) is False, "a just-built map must read fresh"
+
+    time.sleep(1.1)  # content_fingerprint carries mtime_ns; force a distinct stat
+    (root / "k.py").write_text("def helper(a): return a + 1\ndef main(): return helper(1)\n")
+    assert mapper.map_is_stale(payload) is True, "an edited file must read stale"
+
+
+@requires_engine
+def test_both_artifacts_come_from_one_invocation(tmp_path):
+    """Eleven consumers read code_graph.json; a map without it is a half build."""
+    root = _git_repo(tmp_path)
+    build_map(root)
+    assert (root / ".devcouncil" / "repo_map.json").is_file()
+    assert (root / ".devcouncil" / "graph" / "code_graph.json").is_file()
+
+
+def test_a_binary_without_the_graph_capability_is_refused(tmp_path, monkeypatch):
+    """Version is not evidence of capability.
+
+    `~/.cargo/bin/devmap` reports `devmap 0.1.0` — exactly what the freshly
+    built kernel reports — and cannot write the graph companion. The probe asks
+    what the binary supports rather than what it calls itself.
+    """
+    fake = tmp_path / "devmap"
+    fake.write_text("#!/bin/sh\necho 'Usage: devmap manifest [OPTIONS]'\n")
+    fake.chmod(0o755)
+
+    import shutil as _shutil
+
+    # Point the package-relative search at an empty tree so only PATH answers.
+    monkeypatch.setattr(devmap_engine, "__file__", str(tmp_path / "a" / "b" / "c.py"))
+    monkeypatch.setattr(_shutil, "which", lambda _: str(fake))
+
+    with pytest.raises(DevMapEngineError) as caught:
+        find_engine_binary()
+    assert "too old" in str(caught.value) or "no devmap binary" in str(caught.value)
+
+
+def test_a_missing_project_root_fails_closed(tmp_path):
+    with pytest.raises(DevMapEngineError):
+        build_map(tmp_path / "does-not-exist")

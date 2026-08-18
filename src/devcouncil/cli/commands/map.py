@@ -1,3 +1,4 @@
+import json
 import logging
 from pathlib import Path
 
@@ -157,6 +158,72 @@ def map_repo(
             )
     from devcouncil.telemetry.logging_setup import set_log_dir
     set_log_dir(root)
+
+    # --- The Rust kernel is the map engine. There is no Python fallback. ---
+    #
+    # `devcouncil.indexing` and the Rust kernel answer the same questions
+    # differently, and a fallback gives no signal which one answered. That is
+    # how SC23 stayed hidden for a whole pass: every "hybrid" consumer raised,
+    # silently took the Python path, and reported success. Any failure below
+    # ends the stage red.
+    import json as _json
+    import time as _time
+
+    from devcouncil.devmap_engine import DevMapEngineError, build_map
+
+    def _map_payload() -> dict:
+        try:
+            return _json.loads(output.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def _is_stale() -> bool:
+        # Unreadable or absent map is stale, never "fresh" — a check that could
+        # not run must not report what a passing check reports.
+        payload = _map_payload()
+        if not payload:
+            return True
+        try:
+            # Module-level `RepoMapper` on purpose: tests monkeypatch
+            # `map_cmd.RepoMapper.map_is_stale`, and a function-local import
+            # would rebind past the patch and silently ignore it.
+            return bool(RepoMapper(project_root=root).map_is_stale(payload))
+        except Exception:
+            return True
+
+    def _build_once() -> None:
+        written = build_map(root, output=output)
+        payload = _map_payload()
+        try:
+            typer.echo(dump_json(payload, indent=2))
+        except BrokenPipeError:
+            import os as _os
+            import sys as _sys
+
+            logger.debug("stdout pipe closed while streaming repo map JSON")
+            try:
+                _os.dup2(_os.open(_os.devnull, _os.O_WRONLY), _sys.stdout.fileno())
+            except OSError:
+                pass
+        status_console.print(f"[green]Wrote repository map to {written}[/green]")
+
+    try:
+        if if_stale and not _is_stale():
+            # Keeps the message the `--if-stale` contract already published;
+            # consumers and tests match on "Map is fresh".
+            status_console.print(f"[dim]Map is fresh; skipping rebuild ({output})[/dim]")
+            raise typer.Exit(code=0)
+        _build_once()
+        if watch:
+            # Through the existing `_watch_map` seam, not an inline loop: the
+            # loop bypassed the very hook `test_map_watch_flag_invokes_watch_map`
+            # monkeypatches, so under a test runner it never returned and the
+            # suite hung instead of failing.
+            _watch_map(root, liveness=liveness)
+    except DevMapEngineError as exc:
+        status_console.print(f"[red]devmap (Rust) could not build the map: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    raise typer.Exit(code=0)
     # CLI flag OR config; flag alone is enough without rewriting config.
     use_lsp = lsp_refs
     if not use_lsp:
@@ -418,10 +485,45 @@ def _refresh_wiki_skeletons(root: Path, repo_map: RepoMap) -> None:
 
 
 def _watch_map(root: Path, *, liveness: bool = True) -> None:
-    """Run the shared code-intelligence coordinator for map compatibility."""
-    from devcouncil.cli.commands.graph_cmd import run_foreground_watch
+    """Rebuild through the Rust kernel whenever the repository fingerprint moves.
 
-    run_foreground_watch(root, liveness=liveness, out=status_console)
+    Polls exactly the fingerprint `--if-stale` reads, so a watch rebuild and an
+    `--if-stale` rebuild fire on the same evidence rather than on two rules that
+    can disagree. Ctrl-C is a clean stop, not a failure.
+    """
+    import time
+
+    from devcouncil.devmap_engine import DevMapEngineError, build_map
+
+    del liveness  # the Rust kernel always computes liveness; no partial mode
+    status_console.print("[cyan]Watching for changes (Ctrl-C to stop)…[/cyan]")
+    try:
+        while True:
+            time.sleep(2.0)
+            payload: dict = {}
+            map_path = root / ".devcouncil" / "repo_map.json"
+            try:
+                payload = json.loads(map_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                payload = {}
+            stale = True
+            if payload:
+                try:
+                    stale = bool(RepoMapper(project_root=root).map_is_stale(payload))
+                except Exception:
+                    stale = True
+            if not stale:
+                continue
+            try:
+                build_map(root)
+                status_console.print("[green]Map refreshed.[/green]")
+            except DevMapEngineError as exc:
+                # A failed rebuild must not end the watch — but it must be
+                # visible, not swallowed, or the watcher looks alive while
+                # serving an increasingly stale map.
+                status_console.print(f"[red]devmap rebuild failed: {exc}[/red]")
+    except KeyboardInterrupt:
+        status_console.print("\n[cyan]Stopped watching.[/cyan]")
 
 
 def _mount_graph_commands(target: typer.Typer) -> None:
