@@ -172,6 +172,16 @@ enum Commands {
     },
 }
 
+fn open_for_read(db: &std::path::Path) -> anyhow::Result<Store> {
+    match Store::open_existing(db)? {
+        Some(store) => Ok(store),
+        None => Err(anyhow::anyhow!(
+            "no devmap store at {} — run `devmap build` first",
+            db.display()
+        )),
+    }
+}
+
 fn split_csv(raw: &Option<String>) -> Vec<String> {
     raw.as_ref()
         .map(|s| {
@@ -617,7 +627,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Search { query, budget } => {
-            let store = Store::open(&cli.db)?;
+            let store = open_for_read(&cli.db)?;
             let engine = StoreQueryEngine::new(&store);
             let resp = engine.search(Request {
                 query: query.clone(),
@@ -636,7 +646,7 @@ async fn main() -> anyhow::Result<()> {
             budget,
             min_confidence,
         } => {
-            let store = Store::open(&cli.db)?;
+            let store = open_for_read(&cli.db)?;
             let engine = StoreQueryEngine::new(&store);
             let resp = engine.dependencies(Request {
                 query: file.clone(),
@@ -655,7 +665,7 @@ async fn main() -> anyhow::Result<()> {
             budget,
             depth,
         } => {
-            let store = Store::open(&cli.db)?;
+            let store = open_for_read(&cli.db)?;
             let engine = StoreQueryEngine::new(&store);
             let resp = engine.impact(Request {
                 query: target.clone(),
@@ -675,7 +685,7 @@ async fn main() -> anyhow::Result<()> {
             budget,
             depth,
         } => {
-            let store = Store::open(&cli.db)?;
+            let store = open_for_read(&cli.db)?;
             let engine = StoreQueryEngine::new(&store);
             let resp = if let Some(destination) = to {
                 engine.trace_between(Request {
@@ -699,7 +709,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Dead { budget } => {
-            let store = Store::open(&cli.db)?;
+            let store = open_for_read(&cli.db)?;
             let payload = StoreQueryEngine::new(&store).dead_symbols(*budget)?;
             if cli.json {
                 emit_json(&cli, &serde_json::to_value(&payload)?)?;
@@ -713,7 +723,7 @@ async fn main() -> anyhow::Result<()> {
             graph_output,
             force,
         } => {
-            let store = Store::open(&cli.db)?;
+            let store = open_for_read(&cli.db)?;
             let extractions = store.latest_extractions()?;
             let analysis = store.latest_analysis()?.ok_or_else(|| {
                 anyhow::anyhow!("manifest unavailable: build a persisted generation first")
@@ -776,7 +786,23 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Status => {
-            let store = Store::open(&cli.db)?;
+            // Answers even with no store, but never creates one. The client
+            // treats a missing store as "not built yet"; creating it here made
+            // that a race (see `Store::open_existing`).
+            let Some(store) = Store::open_existing(&cli.db)? else {
+                let payload = serde_json::json!({
+                    "generation_id": serde_json::Value::Null,
+                    "pending_count": 0,
+                    "node_count": 0,
+                    "edge_count": 0,
+                    "is_fresh": false,
+                    "db_path": cli.db.display().to_string(),
+                    "degraded_reason": "no devmap store at this path (run `devmap build`)",
+                    "quarantined_count": 0,
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+                return Ok(());
+            };
             let status = store.status(&cli.db.display().to_string())?;
             let payload = serde_json::json!({
                 "generation_id": status.latest_generation,
@@ -791,7 +817,7 @@ async fn main() -> anyhow::Result<()> {
             emit_json(&cli, &payload)?;
         }
         Commands::History { last } => {
-            let store = Store::open(&cli.db)?;
+            let store = open_for_read(&cli.db)?;
             let rows = store.build_history(*last)?;
 
             if cli.json {
@@ -868,7 +894,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Repair { fts } => {
-            let store = Store::open(&cli.db)?;
+            let store = open_for_read(&cli.db)?;
             if *fts {
                 store.repair_fts()?;
                 if !cli.json {
@@ -879,7 +905,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Snapshots { file, budget } => {
-            let store = Store::open(&cli.db)?;
+            let store = open_for_read(&cli.db)?;
             let extractions = store.latest_extractions()?;
             let resp = semantic_snapshots(
                 &extractions,

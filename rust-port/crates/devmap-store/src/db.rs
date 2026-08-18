@@ -525,6 +525,26 @@ impl Store {
         })
     }
 
+    /// Open a store **without creating one**, for read commands.
+    ///
+    /// `Store::open` uses `Connection::open`, which creates the file — so every
+    /// read was also a write. `devmap status` against a repository with no
+    /// store left an empty database behind, and that file is what let
+    /// `DevMapClient._start_daemon` spawn `devmap serve` on the *next* call,
+    /// which built a generation in the background. An identical command then
+    /// failed on the first invocation and succeeded on the second: "unavailable"
+    /// was a race, not a state.
+    ///
+    /// A read answers from what exists, or reports that nothing is there. It
+    /// does not create the thing it is reading.
+    pub fn open_existing<P: AsRef<Path>>(db_path: P) -> Result<Option<Self>> {
+        let path = db_path.as_ref();
+        if !path.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(Self::open(path)?))
+    }
+
     pub fn open_in_memory() -> Result<Self> {
         let mut conn = Connection::open_in_memory()?;
         Self::configure_connection(&conn)?;
