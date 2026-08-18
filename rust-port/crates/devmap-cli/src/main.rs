@@ -465,7 +465,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // B3/SC2: resolve only the files a change can reach.
+            // B3/SC2: `affected` narrows what this generation *writes*. It no
+            // longer narrows what is *resolved*.
             //
             // Resolution reads two genuinely global maps — the symbol index and
             // the type/method index — and both are keyed by symbol *name*. So a
@@ -473,30 +474,37 @@ async fn main() -> anyhow::Result<()> {
             // name it mentions was defined or removed somewhere else. That is
             // the whole dependency surface, and it makes the affected set
             // computable: the changed files, plus every file mentioning a name
-            // whose definition moved.
+            // whose definition moved. The store partitions edges by source file
+            // and carries the rest forward, so narrowing the write stays sound
+            // and unaffected extractions are copied rather than re-serialized.
             //
-            // The index is still built from every extraction — a subset index
-            // would resolve differently, which is the SC16 failure. Only the
-            // emission loop narrows, and the store carries forward the rest
-            // keyed by source file, so every edge comes from exactly one place.
+            // Narrowing the *resolution* was not sound. `analyze` receives
+            // whatever this produces, and liveness and community detection are
+            // global by nature: they answer "does anything call this symbol"
+            // and "what clusters with what", questions no subset of the edges
+            // can answer. Measured on a 155-file fixture, one edited file
+            // handed the analyser 63 edges instead of 15,017, and the
+            // generation was committed with 433 dead-code candidates instead of
+            // 14 and 138 communities instead of 17 — `CharClass.contains`,
+            // `match_from` and `parse_class`, all plainly called, recorded as
+            // callerless. `devmap dead` then reports them to whoever asks.
+            //
+            // The stored *edges* were correct throughout, which is why
+            // `an_incremental_build_equals_a_cold_build` stayed green: it
+            // compared the graph, and the graph was never the part that broke.
+            // It now compares the generation.
+            //
+            // Resolving the whole tree costs what B3 saved on a changed build.
+            // That is the price of an analysis that means the same thing on
+            // both paths, and the no-change tick B3 was written for still
+            // returns above without reaching here.
             let affected = affected_closure(&store, &extractions)?;
 
             let mut resolver = Resolver::new();
             resolver.index_go_modules(&collect_go_modules(path)?);
             resolver.index_extractions(&extractions);
-            let resolution = match &affected {
-                Some(set) => {
-                    progress.stage(
-                        2,
-                        format_args!("resolving {} of {} files", set.len(), extractions.len()),
-                    );
-                    resolver.resolve_subset(&extractions, Some(set))
-                }
-                None => {
-                    progress.stage(2, format_args!("resolving {} files", extractions.len()));
-                    resolver.resolve_all(&extractions)
-                }
-            };
+            progress.stage(2, format_args!("resolving {} files", extractions.len()));
+            let resolution = resolver.resolve_all(&extractions);
             progress.stage(
                 3,
                 format_args!("analyzing {} resolved edges", resolution.edges.len()),

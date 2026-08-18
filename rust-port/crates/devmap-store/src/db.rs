@@ -1023,6 +1023,35 @@ impl Store {
             edge_ord += 1;
         }
 
+        // The analysis must have been computed over the edge set being stored.
+        //
+        // These two numbers come from different places: `edge_ord` counts the
+        // rows this generation will hold — carried forward plus newly resolved —
+        // while `total_edges` is what the analyser actually saw. Every consumer
+        // of `dead_symbols` and `communities` assumes they are the same set.
+        // They once were not. A build that resolved only the changed files
+        // handed the analyser 63 of 15,017 edges and committed a generation with
+        // 433 dead-code candidates instead of 14; the graph was intact and only
+        // the analysis of it was wrong, so nothing failed and `devmap dead`
+        // reported plainly-called symbols as callerless.
+        //
+        // Checked before commit, so a generation that fails it is never stored.
+        // Stated as an equality rather than a bound because it also tests
+        // B3/SC2's soundness claim on every write: carrying an unaffected file's
+        // edges forward is valid only if a full resolution would have produced
+        // exactly those edges, and if it would not, the counts disagree here
+        // rather than silently in somebody's deletion.
+        //
+        // Skipped when paths were deleted — `--deleted` drops rows from the
+        // write that the analyser may still have counted.
+        if deleted.is_empty() && edge_ord as usize != analysis.total_edges {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "generation would store {edge_ord} edges but its analysis was computed over {}; \
+                 dead-code and community results would describe a different graph than the one stored",
+                analysis.total_edges
+            )));
+        }
+
         for (ordinal, dead) in analysis.dead_symbols.iter().enumerate() {
             let ordinal = u32::try_from(ordinal).map_err(|_| {
                 rusqlite::Error::InvalidParameterName(
