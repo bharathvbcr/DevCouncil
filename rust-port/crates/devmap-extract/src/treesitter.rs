@@ -820,7 +820,7 @@ fn find_string_child(node: Node, source: &str) -> Option<String> {
 /// caller, which collapses `app.py::my_func -> app.py::open` into
 /// `app.py -> app.py::open` and erases caller granularity from impact and
 /// trace. Returns `None` at file scope, where the file itself is the caller.
-fn enclosing_callable_qualified(
+pub(crate) fn enclosing_callable_qualified(
     node: Node,
     source: &str,
     file_symbol_name: &str,
@@ -2504,6 +2504,20 @@ fn extract_node(
             if c_family {
                 extract_c_family_call(node, source, file_symbol_name, calls, references);
                 extract_c_header_export(node, source, file_symbol_name, exports);
+            } else {
+                // Every other language reaching this arm gets declarations only
+                // unless `langcalls` has a module for it (SC34). Five of them —
+                // Ruby, Swift, PHP, Scala, Lua — were measured recovering calls
+                // under the Python implementation this port replaces, so their
+                // absence here was a migration regression, not a shared gap.
+                crate::langcalls::extract_calls(
+                    lang,
+                    node,
+                    source,
+                    file_symbol_name,
+                    calls,
+                    references,
+                );
             }
             // The C family derives its own identity: no C-family declaration
             // carries a `name` field, and an out-of-line definition names its
@@ -3375,7 +3389,10 @@ fn extract_c_family_call(
 /// `_default_runner` keep the edges they always had — and an inline literal has
 /// no symbol to point at. The rule is fail-closed in the direction that
 /// matters: it can only drop a name no symbol could carry.
-fn split_call_target(function_node: Node, source: &str) -> Option<(String, Option<String>)> {
+pub(crate) fn split_call_target(
+    function_node: Node,
+    source: &str,
+) -> Option<(String, Option<String>)> {
     if is_anonymous_callable(function_node.kind()) {
         return None;
     }
@@ -3394,7 +3411,7 @@ fn split_call_target(function_node: Node, source: &str) -> Option<(String, Optio
 /// What it excludes is everything an expression brings with it — whitespace,
 /// brackets, operators, quotes, `.`, `,`, `;` — which is the signature of source
 /// text that reached a fallback instead of a name.
-fn is_callee_identity(name: &str) -> bool {
+pub(crate) fn is_callee_identity(name: &str) -> bool {
     let Some(first) = name.chars().next() else {
         return false;
     };
@@ -3409,7 +3426,7 @@ fn is_callee_identity(name: &str) -> bool {
 /// An immediately-invoked literal is a call with no callee *identity*: there is
 /// no symbol to join to, and recording its source text as a callee name — which
 /// is what a text fallback does — manufactures a row that can never match.
-fn is_anonymous_callable(kind: &str) -> bool {
+pub(crate) fn is_anonymous_callable(kind: &str) -> bool {
     matches!(
         kind,
         "func_literal" | "closure_expression" | "function_expression" | "arrow_function" | "lambda"
@@ -4539,12 +4556,12 @@ fn simple_binding_name(node: Node, source: &str) -> Option<String> {
     None
 }
 
-fn get_child_text(node: Node, field: &str, source: &str) -> Option<String> {
+pub(crate) fn get_child_text(node: Node, field: &str, source: &str) -> Option<String> {
     node.child_by_field_name(field)
         .map(|n| get_node_text(n, source))
 }
 
-fn get_node_text(node: Node, source: &str) -> String {
+pub(crate) fn get_node_text(node: Node, source: &str) -> String {
     let start = node.start_byte();
     let end = node.end_byte();
     if start <= end && end <= source.len() {
@@ -4554,7 +4571,7 @@ fn get_node_text(node: Node, source: &str) -> String {
     }
 }
 
-fn node_span(node: Node) -> Span {
+pub(crate) fn node_span(node: Node) -> Span {
     Span {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
