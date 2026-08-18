@@ -1062,9 +1062,15 @@ impl Store {
         // exactly those edges, and if it would not, the counts disagree here
         // rather than silently in somebody's deletion.
         //
-        // Skipped when paths were deleted — `--deleted` drops rows from the
-        // write that the analyser may still have counted.
-        if deleted.is_empty() && edge_ord as usize != analysis.total_edges {
+        // Deletions are covered too, rather than exempted. The worry was that
+        // `--deleted` drops rows the analyser had counted, but it cannot: a
+        // deleted file is not extracted, so a resolution over the current tree
+        // has no edge touching it, and the carried-forward rows that did are
+        // dropped on both sides of this equality. Checked as well as argued —
+        // 30 randomised deletion builds (6–25 files, up to a third removed)
+        // held it exactly. Exempting the case would have left the watcher, the
+        // most frequent writer of all, unguarded precisely when it deletes.
+        if edge_ord as usize != analysis.total_edges {
             return Err(rusqlite::Error::InvalidParameterName(format!(
                 "generation would store {edge_ord} edges but its analysis was computed over {}; \
                  dead-code and community results would describe a different graph than the one stored",

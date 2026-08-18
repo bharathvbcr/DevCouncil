@@ -54,16 +54,39 @@ def detect_stale_map_gaps(
                 return []
             data = loaded
 
+        # Both signals, and stale wins.
+        #
+        # `client.is_map_stale()` is `not is_fresh or pending_count > 0`, and
+        # `is_fresh` is itself `pending_count == 0` — so it only asks whether the
+        # kernel has queued work. A CLI-driven build leaves that queue empty, so
+        # consulting it *first and alone* answered "fresh" for a map whose
+        # source had demonstrably changed. Measured: kernel `False`, fingerprint
+        # `True`, on the same repository after one edit.
+        #
+        # The fingerprints in `repo_map.json` — the artifact the Rust kernel
+        # writes — are what actually answer "does this map still describe the
+        # code", so they are always consulted, and either signal reporting stale
+        # makes it stale.
         stale = None
         try:
             from devcouncil.devmap_client import try_connect
 
             client = try_connect(project_root)
             if client is not None:
-                stale = client.is_map_stale()
+                stale = client.is_map_stale() or None
         except Exception:
+            # Was `stale = None` with no record, so a kernel that raised on
+            # every call looked identical to one that was simply not built.
+            logger.warning(
+                "devmap (Rust) staleness check failed; falling back to the "
+                "repo_map.json fingerprints",
+                exc_info=True,
+            )
             stale = None
         if stale is None:
+            # Not a second engine: `map_is_stale` compares `repo_map.json` —
+            # the artifact the Rust kernel writes, fingerprints included —
+            # against git. Same question, answered from the kernel's own output.
             from devcouncil.indexing.repo_mapper import RepoMapper
 
             stale = RepoMapper(project_root).map_is_stale(dict(data))

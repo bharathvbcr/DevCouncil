@@ -96,6 +96,9 @@ async def test_repo_map_summary(tmp_path, monkeypatch):
     payload = json.loads(result[0].text)
 
     assert payload["ok"] is True
+    # Freshness comes from the kernel, or from `repo_map.json` — the artifact
+    # the kernel writes — never from the Python sync coordinator, which
+    # reports a different store's pending state.
     assert payload["stale"] is False
     assert payload["languages"] == ["python"]
     areas = {s["area"] for s in payload["subsystems"]}
@@ -152,6 +155,9 @@ async def test_impact_dependents_neighbors_and_crossings(tmp_path, monkeypatch):
         }))[0].text
     )
     assert same["ok"] is True
+    # Freshness comes from the kernel, or from `repo_map.json` — the artifact
+    # the kernel writes — never from the Python sync coordinator, which
+    # reports a different store's pending state.
     assert same["stale"] is False
     models = next(p for p in same["paths"] if p["path"] == "src/payments/models.py")
     assert models["dependents"] == ["src/payments/gateway.py", "src/billing/invoice.py"]
@@ -240,6 +246,9 @@ async def test_liveness_lists_and_filters(tmp_path, monkeypatch):
 
     full = json.loads((await call_tool("devcouncil_liveness", {}))[0].text)
     assert full["ok"] is True
+    # Freshness comes from the kernel, or from `repo_map.json` — the artifact
+    # the kernel writes — never from the Python sync coordinator, which
+    # reports a different store's pending state.
     assert full["stale"] is False
     assert "src/orphan.py" in full["unwired_candidates"]
     assert "src/orphan.py" in full["unreachable_files"]

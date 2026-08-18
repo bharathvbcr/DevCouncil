@@ -61,11 +61,18 @@ fn test_deletion_reconciliation_and_incremental_write() -> anyhow::Result<()> {
     let mut resolver2 = Resolver::new();
     resolver2.index_extractions(std::slice::from_ref(&ext1));
     let res2 = resolver2.resolve_all(std::slice::from_ref(&ext1));
+    // Analysed from the resolution this generation writes, not from gen 1's.
+    // Reusing `ana1` here described two files while storing one, which the
+    // store now refuses: an analysis that does not match the edges beside it is
+    // how a generation came to report 433 dead symbols over a graph with 14.
+    // The reconciliation this test is about is unaffected — every assertion
+    // below is unchanged.
+    let ana2 = analyze(std::slice::from_ref(&ext1), &res2);
 
     let gen2 = store.save_generation_with_opts(
         &affected_ext,
         &res2,
-        &ana1,
+        &ana2,
         GenerationWriteOpts {
             affected_paths: vec!["src/f1.py".to_string()],
             deleted_paths: vec!["src/f2.py".to_string()],

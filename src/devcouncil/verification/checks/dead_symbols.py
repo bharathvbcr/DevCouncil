@@ -319,6 +319,9 @@ def detect_dead_symbol_gaps(
                 if _symbol_is_referenced(name, path, start, end, token_index, lines_index):
                     continue
 
+                # True until an inbound check demonstrably could not run.
+                graph_confirmed = True
+
                 try:
                     from devcouncil.devmap_client import DevMapClient, DevMapClientError
 
@@ -341,16 +344,33 @@ def detect_dead_symbol_gaps(
                         continue
                 except DevMapClientError as exc:
                     logger.debug("devmap client inbound check failed for %s: %s", name, exc)
-                    # Hybrid consumers remain usable before the daemon is installed
-                    # and in isolated verification fixtures. The legacy query is a
-                    # compatibility fallback only; Rust remains the primary path.
+                    # Not a second engine: `symbol_has_non_test_inbound` reads
+                    # `code_graph.json`, the artifact the Rust kernel itself
+                    # writes. Reading the kernel's own output when the live
+                    # store cannot be reached is the same answer by another
+                    # route.
                     try:
                         from devcouncil.indexing.graph.query import symbol_has_non_test_inbound
 
                         if symbol_has_non_test_inbound(project_root, path, name):
                             continue
                     except Exception:
-                        logger.debug("legacy inbound fallback failed for %s", name, exc_info=True)
+                        # Both inbound checks failed. The token scan above still
+                        # ran, so this is not a baseless accusation — but the
+                        # graph evidence that would normally back it is absent,
+                        # and a finding that says "never referenced" while its
+                        # strongest check silently did not run is the SC3c shape:
+                        # a check that could not run reporting what a check that
+                        # ran and passed reports. Recorded, not swallowed.
+                        logger.warning(
+                            "dead-symbol graph confirmation unavailable for %s at %s:%s; "
+                            "the finding rests on the token scan alone",
+                            name,
+                            path,
+                            start,
+                            exc_info=True,
+                        )
+                        graph_confirmed = False
 
                 if lsp_pool is not None:
                     try:
@@ -369,7 +389,15 @@ def detect_dead_symbol_gaps(
                         f"New public symbol `{name}` at {path}:{start} is never referenced "
                         "outside its own definition."
                     ),
-                    evidence=[f"{path}:{start}", f"symbol:{name}"],
+                    evidence=(
+                        [f"{path}:{start}", f"symbol:{name}"]
+                        if graph_confirmed
+                        else [
+                            f"{path}:{start}",
+                            f"symbol:{name}",
+                            "graph-confirmation:unavailable",
+                        ]
+                    ),
                     recommended_fix=(
                         f"Call or register `{name}` from the code that needs it "
                         f"(use `dev scope update {task.id} --lease-token <token> "

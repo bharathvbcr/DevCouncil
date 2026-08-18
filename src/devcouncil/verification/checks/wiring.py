@@ -153,10 +153,21 @@ def detect_unwired_file_gaps(
                         rust_deps = {d for d in rust_deps if d}
                         if rust_deps:
                             dependents.setdefault(cand, set()).update(rust_deps)
-                    except DevMapClientError:
+                    except DevMapClientError as exc:
+                        # Enrichment, not substitution: Rust dependents are
+                        # *added* to the Python-derived set, so a failure here
+                        # narrows evidence rather than replacing it. Narrower
+                        # evidence still moves a wiring verdict, so it is
+                        # recorded instead of dropped.
+                        logger.warning(
+                            "devmap dependents enrichment unavailable for %s: %s; "
+                            "the wiring verdict rests on the Python dependents alone",
+                            cand,
+                            exc,
+                        )
                         continue
         except Exception:
-            logger.debug("devmap dependents enrichment failed", exc_info=True)
+            logger.warning("devmap dependents enrichment failed", exc_info=True)
         roots = set(entry_roots(project_root, all_files))
         added_set = set(candidates)
         dyn_index = build_dynamic_import_index(project_root, all_files)

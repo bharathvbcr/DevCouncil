@@ -69,22 +69,119 @@ def annotate_stale(contents: list[TextContent], coordinator: object) -> list[Tex
     return json_text(payload)
 
 
+def _map_artifact_is_stale(root: Path) -> bool:
+    """Whether `repo_map.json` still describes the code, by fingerprint.
+
+    Reads the artifact the Rust kernel writes (fingerprints stamped by
+    `devmap_engine.stamp_freshness`) and compares it against git. Not a second
+    engine's opinion — the kernel's own output, checked.
+
+    An unreadable or absent map is **not** reported stale here: the caller
+    distinguishes "no map" from "map is behind", and returning True would
+    collapse the two.
+    """
+    try:
+        from devcouncil.indexing.repo_mapper import RepoMapper
+        from devcouncil.utils.json_persist import read_json
+
+        map_path = root / ".devcouncil" / "repo_map.json"
+        if not map_path.is_file():
+            return False
+        data = read_json(map_path) or {}
+        if not isinstance(data, dict) or not data:
+            return False
+        return bool(RepoMapper(project_root=root).map_is_stale(data))
+    except Exception:
+        logger.debug("repo-map fingerprint check failed", exc_info=True)
+        return False
+
+
+class _MapFreshness:
+    """Freshness derived from `repo_map.json` when the kernel cannot be reached.
+
+    Shaped for `annotate_stale`, which wants `.status()` with `pending`/`state`.
+    There is no pending queue to report from an artifact, so it is empty and the
+    reason names why the kernel did not answer.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self._reason = reason
+
+    def status(self):
+        return type("S", (), {"pending": [], "state": "stale", "reason": self._reason})()
+
+
+def annotate_freshness_unknown(
+    contents: list[TextContent], reason: str
+) -> list[TextContent]:
+    """Mark freshness as *unknown* — neither fresh nor verified stale.
+
+    `annotate_stale` asserts `stale: True`, which is a claim. When the Rust
+    kernel cannot answer, we do not know whether the map is stale, and the
+    honest annotation says so rather than picking whichever of the two answers
+    happens to be safer to render.
+
+    The alternative — falling through to `get_sync_coordinator` — substitutes
+    the *Python* store's sync state for a question about the Rust kernel's. Two
+    stores, one answer, and nothing in the payload saying which was measured.
+    That is the SC23 shape, and the X14 rule this codebase already follows says
+    unknown must never be reported as a verified value.
+    """
+    text = contents[0].text if contents else ""
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return contents
+    if not isinstance(payload, dict):
+        return contents
+    existing_sync = payload.get("sync")
+    sync_base = existing_sync if isinstance(existing_sync, dict) else {}
+    payload["stale"] = None
+    payload["fresh"] = None
+    payload["sync"] = {
+        **sync_base,
+        "pending": [],
+        "state": "unknown",
+        "fresh": None,
+        "reason": reason,
+    }
+    return json_text(payload)
+
+
 async def with_codeintel_freshness(
     root: Path,
     produce: Callable[[], Awaitable[list[TextContent]]],
     *,
     timeout: float = 2.0,
 ) -> list[TextContent]:
-    """Await pending sync, run ``produce``, and annotate stale responses."""
-    import asyncio
+    """Run ``produce`` and annotate its freshness from the Rust kernel.
 
-    from devcouncil.codeintel.sync import get_sync_coordinator
+    ``timeout`` is retained for call-site compatibility and is no longer used:
+    it bounded a wait on the Python sync coordinator, which is no longer
+    consulted. No caller passes it.
+    """
+    del timeout
+
     from devcouncil.devmap_client import DevMapClientError, try_connect
 
+    unavailable = ""
     client = try_connect(root)
     if client is not None:
         try:
-            fresh = not client.is_map_stale()
+            # Staleness needs *both* signals, and stale wins.
+            #
+            # `client.is_map_stale()` is `not is_fresh or pending_count > 0`,
+            # and `is_fresh` is itself `pending_count == 0` — so it only asks
+            # whether the kernel has queued work. A CLI-driven build leaves that
+            # queue empty, so it answered "fresh" for a map whose source had
+            # demonstrably changed: a confident wrong value, which is worse than
+            # an unknown one.
+            #
+            # The fingerprints in `repo_map.json` are the evidence that actually
+            # answers "does this map still describe the code" — they are
+            # compared against git HEAD, the tracked file set and content
+            # stat. Either signal reporting stale makes it stale.
+            fresh = not client.is_map_stale() and not _map_artifact_is_stale(root)
             contents = await produce()
             if not fresh and contents:
                 class _RustFreshness:
@@ -106,18 +203,31 @@ async def with_codeintel_freshness(
                 return annotate_stale(contents, _RustFreshness())
             return contents
         except DevMapClientError as exc:
-            logger.warning(
-            "devmap (Rust) freshness failed and this call fell back to the Python "
-            "path: %s. The Rust kernel is primary; a fallback here is a defect.",
-            exc,
-        )
+            logger.warning("devmap (Rust) freshness failed: %s", exc)
+            unavailable = str(exc)
+    else:
+        unavailable = "no built devmap store (run `dev map`)"
 
-    coordinator = get_sync_coordinator(root)
-    fresh = await asyncio.to_thread(coordinator.wait_until_fresh, timeout=timeout)
+    # The sync coordinator is deliberately *not* consulted. It reports the
+    # Python store's pending state — a different store's freshness standing in
+    # for a question about the kernel's, with nothing in the payload saying
+    # which was measured. That is the SC23 shape.
+    #
+    # `RepoMapper.map_is_stale` is a different matter and is used: it compares
+    # `repo_map.json` — the artifact the Rust kernel itself writes, fingerprints
+    # included — against git. That is the same question answered from the
+    # kernel's own output, not a second engine's opinion, and it is exactly what
+    # `verification/checks/stale_map.py` does.
     contents = await produce()
-    if not fresh and contents:
-        return annotate_stale(contents, coordinator)
-    return contents
+    if not contents:
+        return contents
+    map_path = root / ".devcouncil" / "repo_map.json"
+    if map_path.is_file():
+        if _map_artifact_is_stale(root):
+            return annotate_stale(contents, _MapFreshness(unavailable))
+        return contents
+    # No kernel and no map: unknown, never a verified `fresh`.
+    return annotate_freshness_unknown(contents, unavailable)
 
 
 def normalize_arguments(arguments: object) -> dict:
