@@ -1,0 +1,8 @@
+[
+  {
+    "source": "main.lua",
+    "target": "main.lua::Service.run",
+    "kind": "contains",
+    "confidence": "extracted"
+  }
+]

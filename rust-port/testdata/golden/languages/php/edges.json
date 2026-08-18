@@ -1,0 +1,20 @@
+[
+  {
+    "source": "main.php",
+    "target": "main.php::Service",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "main.php",
+    "target": "main.php::Service.run",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "main.php::Service",
+    "target": "main.php::Service.run",
+    "kind": "contains",
+    "confidence": "extracted"
+  }
+]

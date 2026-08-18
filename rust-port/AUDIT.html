@@ -1,0 +1,1311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dev map → Rust: Audit II — 84 new findings, plan &amp; implementation guide</title>
+<style>
+:root {
+  --ground:#F5F7F9; --surface:#FFFFFF; --surface-sunk:#EDF0F4;
+  --border:#DCE1E8; --border-strong:#C3CBD6;
+  --ink:#12161D; --ink-muted:#58616F; --ink-faint:#808A99;
+  --accent:#A85C26; --accent-soft:#F0E2D6;
+  --critical:#A82920; --critical-soft:#F6E0DE;
+  --warn:#7D5200; --warn-soft:#F6EBD5;
+  --info:#2A5680; --info-soft:#DEE8F1;
+  --ok:#2A6349; --ok-soft:#DDEDE4;
+  --code-bg:#F1F4F7;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,"JetBrains Mono",Menlo,Consolas,monospace;
+  --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,sans-serif;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --ground:#0E1116; --surface:#161A21; --surface-sunk:#11151B;
+  --border:#262C36; --border-strong:#38414F;
+  --ink:#E3E8EF; --ink-muted:#98A2B1; --ink-faint:#6E7887;
+  --accent:#D9884A; --accent-soft:#33241A;
+  --critical:#EE7065; --critical-soft:#331C1A;
+  --warn:#DCA347; --warn-soft:#2E2415;
+  --info:#79ACDA; --info-soft:#17242F;
+  --ok:#6FBB92; --ok-soft:#16271E;
+  --code-bg:#10141A;
+}}
+*{box-sizing:border-box}
+body{background:var(--ground);color:var(--ink);font-family:var(--sans);font-size:16px;line-height:1.62;margin:0;padding:0 20px 96px;-webkit-font-smoothing:antialiased}
+.wrap{max-width:980px;margin:0 auto;display:flex;flex-direction:column;gap:54px}
+.prose{max-width:72ch;display:flex;flex-direction:column;gap:14px}
+p{margin:0} a{color:var(--accent)}
+header.masthead{padding:64px 0 0;display:flex;flex-direction:column;gap:22px}
+.eyebrow{font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-faint);margin:0}
+h1{font-family:var(--mono);font-size:clamp(28px,4.4vw,42px);font-weight:600;letter-spacing:-.02em;line-height:1.12;margin:0;text-wrap:balance}
+h1 .arrow{color:var(--accent);font-weight:400}
+.standfirst{font-size:18px;color:var(--ink-muted);max-width:64ch}
+h2{font-family:var(--mono);font-size:22px;font-weight:600;letter-spacing:-.01em;margin:0;padding-top:8px}
+h3{font-size:17px;font-weight:650;margin:24px 0 0}
+section{display:flex;flex-direction:column;gap:18px}
+.chips{display:flex;flex-wrap:wrap;gap:8px}
+.chip{font-family:var(--mono);font-size:12.5px;padding:3px 10px;border-radius:999px;border:1px solid var(--border-strong)}
+.chip.crit{background:var(--critical-soft);color:var(--critical);border-color:transparent}
+.chip.high{background:var(--warn-soft);color:var(--warn);border-color:transparent}
+.chip.med{background:var(--info-soft);color:var(--info);border-color:transparent}
+.chip.low{background:var(--surface-sunk);color:var(--ink-muted)}
+.chip.ok{background:var(--ok-soft);color:var(--ok);border-color:transparent}
+table{border-collapse:collapse;width:100%;font-size:14.5px}
+th{font-family:var(--mono);font-size:11.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-faint);text-align:left;padding:8px 12px;border-bottom:1px solid var(--border-strong)}
+td{padding:8px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+code,.loc{font-family:var(--mono);font-size:.86em;background:var(--code-bg);padding:1.5px 5px;border-radius:4px}
+pre{background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:14px 16px;overflow-x:auto;font-family:var(--mono);font-size:13px;line-height:1.55;margin:0}
+pre code{background:none;padding:0}
+.finding{border:1px solid var(--border);border-radius:10px;background:var(--surface);overflow:hidden}
+.finding summary{display:flex;gap:10px;align-items:baseline;padding:12px 16px;cursor:pointer;list-style:none;flex-wrap:wrap}
+.finding summary::-webkit-details-marker{display:none}
+.finding summary:hover{background:var(--surface-sunk)}
+.fid{font-family:var(--mono);font-weight:650;color:var(--accent);min-width:34px}
+.ftitle{font-weight:600;flex:1;min-width:260px}
+.fbody{padding:4px 16px 16px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:10px;font-size:15px}
+.fmeta{display:flex;gap:14px;flex-wrap:wrap;color:var(--ink-faint);font-family:var(--mono);font-size:12px;padding-top:10px}
+.krow{display:grid;grid-template-columns:84px 1fr;gap:4px 14px}
+.klabel{font-family:var(--mono);font-size:11.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-faint);padding-top:3px}
+.sev{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.06em;padding:2px 8px;border-radius:999px;white-space:nowrap}
+.sev.critical{background:var(--critical-soft);color:var(--critical)}
+.sev.high{background:var(--warn-soft);color:var(--warn)}
+.sev.medium{background:var(--info-soft);color:var(--info)}
+.sev.low{background:var(--surface-sunk);color:var(--ink-muted)}
+.callout{border-left:3px solid var(--accent);background:var(--surface);border-radius:0 8px 8px 0;padding:14px 18px;display:flex;flex-direction:column;gap:8px}
+.callout.warn{border-left-color:var(--critical)}
+.toc{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
+.toc a{display:block;border:1px solid var(--border);border-radius:8px;padding:10px 14px;text-decoration:none;color:var(--ink);background:var(--surface);font-size:14.5px}
+.toc a:hover{border-color:var(--accent)}
+.toc .n{font-family:var(--mono);color:var(--ink-faint);font-size:11.5px;display:block}
+.grouphead{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.groupcount{font-family:var(--mono);font-size:12.5px;color:var(--ink-faint)}
+.cards{display:flex;flex-direction:column;gap:10px}
+footer{color:var(--ink-faint);font-size:13.5px;border-top:1px solid var(--border);padding-top:18px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media (max-width:760px){.two{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="masthead">
+<p class="eyebrow">DevCouncil · rust-port · audit II · 2026-08-11</p>
+<h1>dev map <span class="arrow">→</span> Rust: Audit II</h1>
+<p class="standfirst">A second, deeper audit of the code-intelligence subsystem — <strong>84 new findings</strong> beyond the 31 in <a href="PLAN.html">PLAN</a> — with the amended rewrite plan and implementation guide. Informed by a study of
+<a href="https://github.com/abhigyanpatwari/GitNexus">GitNexus</a> and <a href="https://github.com/colbymchenry/codegraph">CodeGraph</a>.</p>
+<div class="chips">
+<span class="chip crit">1 critical</span>
+<span class="chip high">21 high</span>
+<span class="chip med">40 medium</span>
+<span class="chip low">22 low</span>
+<span class="chip">all fixes land in the Rust port</span>
+<span class="chip ok">every finding → acceptance test</span>
+</div>
+</header>
+
+<nav class="toc">
+<a href="#summary"><span class="n">§1</span>Executive summary</a>
+<a href="#sec-G"><span class="n">§2</span>Findings: graph core</a>
+<a href="#sec-S"><span class="n">§3</span>Findings: store &amp; sync</a>
+<a href="#sec-V"><span class="n">§4</span>Findings: surfaces &amp; viz</a>
+<a href="#sec-X"><span class="n">§5</span>Findings: extraction</a>
+<a href="#adoptions"><span class="n">§6</span>Reference-repo adoptions</a>
+<a href="#plan"><span class="n">§7</span>Amended plan</a>
+<a href="#guide"><span class="n">§8</span>Implementation guide</a>
+<a href="#accept"><span class="n">§9</span>Acceptance additions</a>
+</nav>
+
+<section id="summary">
+<h2>§1 — Executive summary</h2>
+<div class="prose">
+<p><strong>Audit basis:</strong> same tree as PLAN (DevCouncil @ <code>98f23e3</code>-era working copy, 769 source files). Method: four parallel deep-read audits over all 26,837 in-scope LOC — graph core, store/sync, agent-facing surfaces, extraction/integration — each primed with the failure catalogues that GitNexus and CodeGraph fixed in production (traversal identity bugs, impact semantics, cache poisoning, FTS hygiene, provenance). Every finding was verified against exact source lines; the highest-severity claims were independently re-verified.</p>
+<p>The 31 findings in PLAN §3 described a system that is <em>slow, oversized and stale</em>. The 84 findings here describe something sharper: <strong>places where the map is confidently wrong</strong>. Four themes dominate:</p>
+<p><strong>1 · The analysis layer has structural correctness holes.</strong> The PDG's control-flow graph never connects loop headers to their bodies (<a href="#G1">G1</a>) and drops condition lines from every block (<a href="#G2">G2</a>) — reaching-definitions and taint run on a disconnected graph. Resolution silently downgrades or misdirects edges: a stdlib-named method loses all inbound edges (<a href="#G3">G3</a>), an ambiguous fan-out permanently shadows a proven call (<a href="#G5">G5</a>), heuristic picks ship stamped EXTRACTED (<a href="#G6">G6</a>), and a Python class can "inherit" a TypeScript interface (<a href="#G7">G7</a>).</p>
+<p><strong>2 · Extraction has silent blind spots that feed false dead-code.</strong> TS enums/namespaces/declare files extract zero symbols (<a href="#X1">X1</a>), <code>new Foo()</code> is never a reference (<a href="#X2">X2</a>), generic Rust impls vanish (<a href="#G19">G19</a>), and there is <em>no parse-failure signal anywhere</em> (<a href="#X6">X6</a>) — a wedged parser is cached forever as "no symbols" (<a href="#X7">X7</a>).</p>
+<p><strong>3 · The ops layer can destroy work.</strong> On Windows, checking whether a build is alive kills it (<a href="#S1">S1</a>). A crash mid-migration silently empties the store (<a href="#S2">S2</a>). <code>dev map unlock</code> judges "stuck" by wall-clock age and kills healthy builds — and the failure mode of a crashed sync actively steers users into running it against their own MCP server (<a href="#S4">S4</a>/<a href="#S5">S5</a>).</p>
+<p><strong>4 · The surfaces overstate their own authority.</strong> <code>--precise</code> impact replaces real dependents with an authoritative-looking empty list for Go/Rust/Swift/Kotlin (<a href="#X14">X14</a>), watch-mode serves stale blast radius as fresh (<a href="#V4">V4</a>), truncation counts lie (<a href="#V12">V12</a>), capped badges present as totals (<a href="#V13">V13</a>), and the generated graph.html is a 15.5&nbsp;MB page with an XSS hole in its tooltip (<a href="#V1">V1</a>/<a href="#V2">V2</a>).</p>
+<p>Every finding below carries a disposition — the rewrite phase and crate that absorbs it, per PLAN §5's structure. By explicit project direction, <strong>no interim Python patches</strong>: the Python implementation is frozen as the parity baseline, and every fix lands in the Rust port itself, encoded as an acceptance test so it cannot regress.</p>
+</div>
+<div class="callout warn">
+<p><strong>Duplicate consolidation.</strong> Two agent-reported findings merged: G12 (liveness ratio meta discarded) is absorbed into <a href="#V5">V5</a>; X10 (generic Rust impls) is the same defect as <a href="#G19">G19</a>. IDs are preserved; neither is double-counted in the totals.</p>
+</div>
+</section>
+
+<section id="sec-G">
+<div class="grouphead"><h2>G — Graph core — resolution, liveness, PDG, intel</h2><span class="groupcount">25 findings · 4 high · 14 medium · 7 low</span></div>
+<div class="cards">
+<details class="finding" id="G1">
+<summary><span class="fid">G1</span><span class="ftitle">CFG builder wires branch/loop/try bodies by their end block — or not at all</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/pdg/cfg.py:117–158</span></div>
+<div class="klabel">what</div><div>_build_stmts returns only the last block of a sub-body, so `if` tests connect to the then-branch's <em>end</em>, loops get no header→body edge, and try/handler heads are never connected. Reaching-defs and taint run on a largely disconnected CFG.</div>
+<div class="klabel">fix</div><div>Return (entry, exit, pending_exits) from _build_stmts; wire test→then_entry, header→body_entry, try→handler_entry.</div>
+<div class="klabel">lands in</div><div>P3 · devmap-analyze</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="G19">
+<summary><span class="fid">G19</span><span class="ftitle">Rust methods in generic impl blocks are dropped entirely (also found as X10)</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/extract_ts.py:992–1024</span></div>
+<div class="klabel">what</div><div>impl&lt;T&gt; Foo&lt;T&gt; puts the type under generic_type, so type_name stays empty and the whole method walk is skipped — every method on a generic type missing from the graph; ubiquitous in real Rust.</div>
+<div class="klabel">fix</div><div>Descend into generic_type for its type_identifier (both impl and trait side).</div>
+<div class="klabel">lands in</div><div>P2 · devmap-extract</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="G2">
+<summary><span class="fid">G2</span><span class="ftitle">Leader-statement lines excluded from every basic block — condition uses invisible to def-use</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/pdg/cfg.py:117–147 · reaching_def.py:79</span></div>
+<div class="klabel">what</div><div>When a statement group precedes an if/while/for, the leader's line lands in no block's `lines`, so variables read in conditions (and `for` target definitions) generate no gen/use entries. Return/Raise lines equally absent.</div>
+<div class="klabel">fix</div><div>Append the leader statement's line span to the block that terminates in it.</div>
+<div class="klabel">lands in</div><div>P3 · devmap-analyze</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="G3">
+<summary><span class="fid">G3</span><span class="ftitle">stdlib-name guard `continue`s past the ambiguous fan-out, dropping found candidates</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/resolve.py:904–907</span></div>
+<div class="klabel">what</div><div>Methods named after stdlib modules (copy, json, stat, time…) lose all inbound ambiguous edges → dead-code false positives. The guard also fires for JS/Go/Rust though stdlib_module_names is Python-only.</div>
+<div class="klabel">fix</div><div>Scope the check to the unique-global rung only, gated on _lang_family == 'py'.</div>
+<div class="klabel">lands in</div><div>P3 · devmap-resolve</div>
+<div class="klabel">borrow</div><div>GitNexus tier precedence</div>
+</div>
+</div>
+</details>
+<details class="finding" id="G10">
+<summary><span class="fid">G10</span><span class="ftitle">PDG query reloads the whole shard table per candidate path; store errors swallowed</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/query.py:185–214</span></div>
+<div class="klabel">what</div><div>store.analysis_shards() decodes every shard payload of the generation, called inside a loop over substring-matched paths; `except Exception: pass` turns store corruption into 'no PDG for target'.</div>
+<div class="klabel">fix</div><div>Fetch shards once (or add a point lookup); log instead of pass.</div>
+<div class="klabel">lands in</div><div>P5 · devmap-query</div>
+<div class="klabel">borrow</div><div>CodeGraph batch-vs-N+1</div>
+</div>
+</div>
+</details>
+<details class="finding" id="G11">
+<summary><span class="fid">G11</span><span class="ftitle">Cypher shim advertises relationship types that can never match stored kinds</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/cypher.py:9–71</span></div>
+<div class="klabel">what</div><div>EXTENDS never matches (stored kind is `inherits`), REFERENCES matches nothing — both return ok:true with 0 rows; INHERITS/OVERRIDES are rejected as unsupported though the edges exist; node labels are parsed then ignored.</div>
+<div class="klabel">fix</div><div>Alias map EXTENDS→inherits; align _SUPPORTED_REL with schema kinds; honor or reject labels.</div>
+<div class="klabel">lands in</div><div>P5 · retire with N10 or implement real queries</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="G13">
+<summary><span class="fid">G13</span><span class="ftitle">Reaching-defs drops loop-carried dependencies via def_line <= use_line</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/pdg/reaching_def.py:113–114</span></div>
+<div class="klabel">what</div><div>A later-in-body definition legitimately reaches an earlier use on the next iteration; the line-order filter deletes exactly those edges, blinding taint to accumulation patterns.</div>
+<div class="klabel">fix</div><div>Apply line ordering only when def and use share a block.</div>
+<div class="klabel">lands in</div><div>P3 · devmap-analyze</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="G14">
+<summary><span class="fid">G14</span><span class="ftitle">Bare decorators recorded at the decorated node's line — caller misattributed to the decorated function</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/extract_python.py:288–304</span></div>
+<div class="klabel">what</div><div>`@lru_cache def foo()` yields a foo→lru_cache call edge; decorators execute at import time, so dead decorated functions drag their decorators toward dead and invert blast-radius direction.</div>
+<div class="klabel">fix</div><div>Use dec.lineno so attribution lands on module/class scope.</div>
+<div class="klabel">lands in</div><div>P2 · devmap-extract</div>
+<div class="klabel">borrow</div><div>CodeGraph caller semantics</div>
+</div>
+</div>
+</details>
+<details class="finding" id="G15">
+<summary><span class="fid">G15</span><span class="ftitle">_python_return_keys: tautological name check; line=0 handlers absorb every function's keys</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/api_routes.py:287–291</span></div>
+<div class="klabel">what</div><div>`node.name not in {fn.name}` duplicates the != check; regex-fallback handlers (line=0) skip the span guard and aggregate return keys from every function in the file, corrupting shape_check.</div>
+<div class="klabel">fix</div><div>Combine the guards: skip unless the node's line falls in fn's span.</div>
+<div class="klabel">lands in</div><div>P5 · devmap-query</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="G18">
+<summary><span class="fid">G18</span><span class="ftitle">`import * as ns` namespace imports never reach alias_map</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/extract_ts.py:366–383</span></div>
+<div class="klabel">what</div><div>The identifier sits under namespace_import, matched by neither branch — ns.helper() can't resolve through the import-scoped rung and falls to lossier global/ambiguous rungs.</div>
+<div class="klabel">fix</div><div>Handle namespace_import; map ns → module spec.</div>
+<div class="klabel">lands in</div><div>P2 · devmap-extract</div>
+<div class="klabel">borrow</div><div>GitNexus tier precedence</div>
+</div>
+</div>
+</details>
+<details class="finding" id="G20">
+<summary><span class="fid">G20</span><span class="ftitle">Go same-package co-membership emits a complete O(n²) digraph</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/resolve.py:252–259</span></div>
+<div class="klabel">what</div><div>A 200-file Go package produces 39,800 EXTRACTED import edges before any real import — inflating fan-in, community density, blast radius, and export size quadratically.</div>
+<div class="klabel">fix</div><div>Model membership as a star through a synthetic package node.</div>
+<div class="klabel">lands in</div><div>P3 · devmap-resolve</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="G24">
+<summary><span class="fid">G24</span><span class="ftitle">query_symbol ignores edge confidence — ambiguous fan-out floods 50-slot caller lists</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/query.py:50–111</span></div>
+<div class="klabel">what</div><div>intel.py deliberately excludes ambiguous edges from ranked surfaces; query_symbol doesn't, so name collisions flood callers with fan-out noise and symbol_has_non_test_inbound accepts fan-out as proof of wiring.</div>
+<div class="klabel">fix</div><div>Carry per-edge confidence; sort extracted&gt;inferred&gt;ambiguous before the cap; add min_confidence.</div>
+<div class="klabel">lands in</div><div>P5 · devmap-query</div>
+<div class="klabel">borrow</div><div>GitNexus confidence · CodeGraph truncation priority</div>
+</div>
+</div>
+</details>
+<details class="finding" id="G4">
+<summary><span class="fid">G4</span><span class="ftitle">Re-export protection picks an arbitrary file via set iteration; unique-file fallback is dead code</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/liveness.py:571–579</span></div>
+<div class="klabel">what</div><div>`break` on first hit over a Set makes protection hash-order-dependent (PYTHONHASHSEED flips dead_code output); the for/else fallback can only see an empty list. Same bug class was already fixed in resolve.py:614.</div>
+<div class="klabel">fix</div><div>Sort candidates; protect all hits (conservative) or only a unique one.</div>
+<div class="klabel">lands in</div><div>P3 · devmap-resolve</div>
+<div class="klabel">borrow</div><div>determinism</div>
+</div>
+</div>
+</details>
+<details class="finding" id="G5">
+<summary><span class="fid">G5</span><span class="ftitle">Call-edge dedup on (source,target) is first-wins — ambiguous fan-out shadows a later extracted edge</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/resolve.py:949–989</span></div>
+<div class="klabel">what</div><div>If an ambiguous fan-out reaches T before a proven call to T resolves, the EXTRACTED edge is dropped. Liveness, PageRank and blast radius all exclude ambiguous edges, so the proven call vanishes from every ranked surface.</div>
+<div class="klabel">fix</div><div>Dedup as (source,target)→best_confidence and upgrade in place.</div>
+<div class="klabel">lands in</div><div>P3 · devmap-resolve</div>
+<div class="klabel">borrow</div><div>CodeGraph edge identity</div>
+</div>
+</div>
+</details>
+<details class="finding" id="G6">
+<summary><span class="fid">G6</span><span class="ftitle">named_import_edges: arbitrary multi-candidate pick stamped EXTRACTED; fallback drops the module constraint</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/resolve.py:632–655</span></div>
+<div class="klabel">what</div><div>With no module-hint match, `from x import y` binds to <em>any</em> imported file defining y; multi-candidate picks take matches[0] yet are labeled EXTRACTED with no candidates extras.</div>
+<div class="klabel">fix</div><div>Demote multi-candidate picks to AMBIGUOUS with capped candidate extras; downgrade the unscoped fallback to INFERRED.</div>
+<div class="klabel">lands in</div><div>P3 · devmap-resolve</div>
+<div class="klabel">borrow</div><div>GitNexus confidence/provenance</div>
+</div>
+</div>
+</details>
+<details class="finding" id="G7">
+<summary><span class="fid">G7</span><span class="ftitle">Inheritance/overrides: no language-family guard; overrides fan out to every same-named class repo-wide</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/resolve.py:430–511</span></div>
+<div class="klabel">what</div><div>A Python class can 'inherit' a TS interface; any method on a class extending any `Component` gets overrides edges to every Component.render in the repo. Liveness propagates through overrides, suppressing real dead-method findings.</div>
+<div class="klabel">fix</div><div>Filter candidates by _lang_family and import scope; fan out or emit nothing on ambiguity instead of candidates[0].</div>
+<div class="klabel">lands in</div><div>P3 · devmap-resolve</div>
+<div class="klabel">borrow</div><div>GitNexus MRO handling</div>
+</div>
+</div>
+</details>
+<details class="finding" id="G8">
+<summary><span class="fid">G8</span><span class="ftitle">blast_radius raises KeyError for any max_depth > 3</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/intel.py:557–580</span></div>
+<div class="klabel">what</div><div>by_depth and confidence_for_depth are hard-coded to {1,2,3} while max_depth is a public parameter; the sibling SQLite implementation supports depth 8, so the two impact surfaces already disagree.</div>
+<div class="klabel">fix</div><div>Build by_depth from range(1, max_depth+1); .get(d, 'ambiguous') for labels.</div>
+<div class="klabel">lands in</div><div>P5 · devmap-query</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="G9">
+<summary><span class="fid">G9</span><span class="ftitle">api_impact runs the full-repo fetch-site scan twice per query</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/api_routes.py:476–498</span></div>
+<div class="klabel">what</div><div>shape_check internally re-runs route_map; each run reads and regex-scans every file in the graph and re-parses Python handlers. One api_impact call = 2× full-repo I/O.</div>
+<div class="klabel">fix</div><div>Compute route_map once and pass it through; memoize _scan_fetch_sites per (graph, mtime).</div>
+<div class="klabel">lands in</div><div>P5 · devmap-query</div>
+<div class="klabel">borrow</div><div>CodeGraph batch-vs-N+1</div>
+</div>
+</div>
+</details>
+<details class="finding" id="G16">
+<summary><span class="fid">G16</span><span class="ftitle">`name is m.group(2)` — string identity comparison is effectively always False</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/extract_ts.py:234–240</span></div>
+<div class="klabel">what</div><div>m.group(2) returns a fresh object per call; the member-form JSX branch never fires, so lowercase member tags (<Foo.bar/>) drop from references.</div>
+<div class="klabel">fix</div><div>Capture the group once and compare with == (or by index).</div>
+<div class="klabel">lands in</div><div>P2 · devmap-extract</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="G17">
+<summary><span class="fid">G17</span><span class="ftitle">file_doc_path lstrip('./') strips leading dots from dot-directories</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/export_links.py:35–36</span></div>
+<div class="klabel">what</div><div>.storybook/main.js → storybook/main.js; doc paths misrepresent sources and can collide.</div>
+<div class="klabel">fix</div><div>Strip an exact './' prefix, not a character set.</div>
+<div class="klabel">lands in</div><div>P5 · devmap-query</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="G21">
+<summary><span class="fid">G21</span><span class="ftitle">extract_processes BFS marks visited at dequeue — duplicate enqueues</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/intel.py:493–503</span></div>
+<div class="klabel">what</div><div>Two parents can enqueue the same child; queue bloats on dense call graphs. The benign variant of the pattern trace_path gets right.</div>
+<div class="klabel">fix</div><div>Use an enqueued set checked before append.</div>
+<div class="klabel">lands in</div><div>P3 · devmap-analyze</div>
+<div class="klabel">borrow</div><div>CodeGraph #1090 class</div>
+</div>
+</div>
+</details>
+<details class="finding" id="G22">
+<summary><span class="fid">G22</span><span class="ftitle">OKF export neighbor-area computation is a nested full scan</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/export.py:192–197</span></div>
+<div class="klabel">what</div><div>For each import target it scans every area's full file list — O(area_files × imports × total_files).</div>
+<div class="klabel">fix</div><div>Precompute a path→area dict.</div>
+<div class="klabel">lands in</div><div>P5 · devmap-query</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="G23">
+<summary><span class="fid">G23</span><span class="ftitle">Taint: parameter sources filtered out by the source gate; sink filter has a no-op guard</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/pdg/taint.py:84–110</span></div>
+<div class="klabel">what</div><div>Function parameters — the canonical taint source — only survive if literally named like a pattern; `for p in pats if pats` filters on the tuple; substring sink matching flags open_file/reopen as path-traversal sinks.</div>
+<div class="klabel">fix</div><div>Treat parameters as low-confidence sources; exact/dotted-suffix sink matching.</div>
+<div class="klabel">lands in</div><div>P3 · devmap-analyze</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="G25">
+<summary><span class="fid">G25</span><span class="ftitle">build_file_and_symbol_nodes builds a name_index it never returns</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/resolve.py:303–359</span></div>
+<div class="klabel">what</div><div>Populated for every symbol on every build, then discarded; each consumer rebuilds its own variant.</div>
+<div class="klabel">fix</div><div>Delete it, or return and reuse it.</div>
+<div class="klabel">lands in</div><div>P3 · devmap-resolve</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="G26">
+<summary><span class="fid">G26</span><span class="ftitle">trace_path returns a hash-order-dependent shortest path</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/query.py:141–164</span></div>
+<div class="klabel">what</div><div>Neighbors iterate in set order; among equal-length paths the reported one varies across processes.</div>
+<div class="klabel">fix</div><div>Iterate sorted(adj[cur]).</div>
+<div class="klabel">lands in</div><div>P3 · determinism</div>
+
+</div>
+</div>
+</details>
+</div>
+</section>
+<section id="sec-S">
+<div class="grouphead"><h2>S — Store, sync & concurrency</h2><span class="groupcount">20 findings · 1 critical · 6 high · 7 medium · 6 low</span></div>
+<div class="cards">
+<details class="finding" id="S1">
+<summary><span class="fid">S1</span><span class="ftitle">_pid_alive kills the probed process on Windows</span><span class="sev critical">critical</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">codeintel/build_control.py:115–122</span></div>
+<div class="klabel">what</div><div>os.kill(pid, 0) on Windows calls TerminateProcess unconditionally — every liveness probe (dev map status, unlock, coordinator.status) terminates a healthy in-flight worker, then reports it 'alive'.</div>
+<div class="klabel">fix</div><div>On nt, probe via OpenProcess/GetExitCodeProcess (or psutil.pid_exists).</div>
+<div class="klabel">lands in</div><div>P4 · daemon replaces PID probing</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="S2">
+<summary><span class="fid">S2</span><span class="ftitle">Schema migrations non-atomic: crash mid-migration bricks or silently empties the store</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">codeintel/store/sqlite.py:343–575</span></div>
+<div class="klabel">what</div><div>executescript autocommits per statement. Crash in v0 creation → partially-created schema at user_version=0, permanent 'table exists' error with no corruption marker. Crash between the v1→v2 script and payload copy → user_version=2 committed with empty node tables: silent total data loss.</div>
+<div class="klabel">fix</div><div>One explicit transaction per migration step; set user_version as the last statement of the same transaction as the data copy.</div>
+<div class="klabel">lands in</div><div>P4 · devmap-store</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="S3">
+<summary><span class="fid">S3</span><span class="ftitle">FTS5 MATCH gets the raw user query — crashes on common chars, silently degrades to full decompress-scan</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">codeintel/store/sqlite.py:1458–1471</span></div>
+<div class="klabel">what</div><div>`build-control`, quotes, parens or name: prefixes raise OperationalError (or silently change semantics as column filters); the except branch falls back to iterating every membership row with zlib.decompress + json.loads per row — on exactly the queries users type most.</div>
+<div class="klabel">fix</div><div>Quote each term: '"' + term.replace('"', '""') + '"' (optionally + * for prefix).</div>
+<div class="klabel">lands in</div><div>P4 · devmap-store</div>
+<div class="klabel">borrow</div><div>CodeGraph FTS hygiene</div>
+</div>
+</div>
+</details>
+<details class="finding" id="S4">
+<summary><span class="fid">S4</span><span class="ftitle">dev map unlock kills healthy long builds; can kill a recycled PID's whole process group</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">codeintel/build_control.py:284–331, 399–436</span></div>
+<div class="klabel">what</div><div>'Stuck' is judged from lease age vs the 90s progress budget — any build merely running >90s qualifies while state=building with fresh progress. No PID-identity check before killpg; laptop suspend inflates wall-clock age.</div>
+<div class="klabel">fix</div><div>Gate on last_progress_at/last_cpu_progress_at; verify process identity before signaling; avoid killpg for inline holders.</div>
+<div class="klabel">lands in</div><div>P4 · daemon obsoletes unlock heuristics</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="S5">
+<summary><span class="fid">S5</span><span class="ftitle">Crashed incremental sync leaves build_status='building' with a live server PID — the advertised remedy then kills the server</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">codeintel/sync/incremental.py:232–432</span></div>
+<div class="klabel">what</div><div>No try/finally around the sync body: any exception leaves the status file claiming an active build owned by the MCP/watcher process; after 90s it reads 'stalled' with hint 'dev map unlock' — which SIGKILLs the healthy server via S4.</div>
+<div class="klabel">fix</div><div>try/except that writes state='failed' with the reason before re-raising.</div>
+<div class="klabel">lands in</div><div>P4 · daemon owns build status</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="S6">
+<summary><span class="fid">S6</span><span class="ftitle">One reconcile exception permanently kills the sync worker thread</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">codeintel/sync/coordinator.py:303–312</span></div>
+<div class="klabel">what</div><div>The periodic reconcile() is un-wrapped; a transient 'database is locked' unwinds _run, the daemon thread dies silently, and pending paths queue forever with status showing 'pending'.</div>
+<div class="klabel">fix</div><div>Wrap the loop body; record degraded and continue.</div>
+<div class="klabel">lands in</div><div>P4 · devmap-serve</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="S8">
+<summary><span class="fid">S8</span><span class="ftitle">ParserWorkerPool cannot terminate a wedged child — 100%-CPU orphans and a possible atexit hang</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">codeintel/languages/workers.py:227–260</span></div>
+<div class="klabel">what</div><div>shutdown(wait=False, cancel_futures=True) can't cancel a running native parse; the child's only exit path triggers when the parent dies. atexit close(wait=True) on a wedged pool = mutual wait. Every per-file exception also discards and respawns the whole spawn-based pool.</div>
+<div class="klabel">fix</div><div>Track child PIDs and SIGKILL on restart/close; distinguish BrokenProcessPool/Timeout from task errors.</div>
+<div class="klabel">lands in</div><div>P2 · in-process grammars obsolete the pool</div>
+<div class="klabel">borrow</div><div>GitNexus worker quarantine</div>
+</div>
+</div>
+</details>
+<details class="finding" id="S10">
+<summary><span class="fid">S10</span><span class="ftitle">In-process writer contention blocks forever; timeout only bounds the cross-process flock</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">codeintel/build_control.py:478–496 · sync/coordinator.py:235</span></div>
+<div class="klabel">what</div><div>graph_build_session takes the per-root threading.RLock with no timeout before consulting `timeout`; a second thread hangs instead of raising GraphBuildBusy.</div>
+<div class="klabel">fix</div><div>lock.acquire(timeout=wait) → raise GraphBuildBusy on failure.</div>
+<div class="klabel">lands in</div><div>P4 · daemon obsoletes</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="S11">
+<summary><span class="fid">S11</span><span class="ftitle">add_runtime_observations MAX(ordinal) read-then-insert race</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">codeintel/store/sqlite.py:1745–1770</span></div>
+<div class="klabel">what</div><div>SELECT runs in autocommit; the transaction begins at INSERT. Concurrent ingests read the same MAX, collide on the PK, and one whole batch is lost.</div>
+<div class="klabel">fix</div><div>BEGIN IMMEDIATE before the read, or derive ordinal at read time.</div>
+<div class="klabel">lands in</div><div>P4 · devmap-store</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="S12">
+<summary><span class="fid">S12</span><span class="ftitle">Watcher hot path: a git check-ignore subprocess and a fresh SQLite connection per filesystem event</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">codeintel/sync/coordinator.py:186–199 · sync/scope.py:84–98</span></div>
+<div class="klabel">what</div><div>A checkout touching thousands of files serializes thousands of subprocess spawns on the watchdog dispatcher thread.</div>
+<div class="klabel">fix</div><div>Memoize verdicts (invalidate on .gitignore mtime), batch via --stdin, hold an in-memory indexed-path set.</div>
+<div class="klabel">lands in</div><div>P4 · devmap-serve</div>
+<div class="klabel">borrow</div><div>CodeGraph in-process ignore matching</div>
+</div>
+</div>
+</details>
+<details class="finding" id="S13">
+<summary><span class="fid">S13</span><span class="ftitle">put_extraction runs the migration ladder + index-ensure executescript on every call</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">codeintel/store/sqlite.py:296–300, 563–575, 1661</span></div>
+<div class="klabel">what</div><div>During a cold build this fires once per extracted file — thousands of schema-lock acquisitions and commits per build.</div>
+<div class="klabel">fix</div><div>Memoize initialization per store instance.</div>
+<div class="klabel">lands in</div><div>P4 · devmap-store</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="S14">
+<summary><span class="fid">S14</span><span class="ftitle">Python extraction cache key has no interpreter-version salt</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/cache.py:307–308</span></div>
+<div class="klabel">what</div><div>grammar_version is the constant 'stdlib-ast'; after upgrading Python the cache serves extractions parsed by the old interpreter until content changes.</div>
+<div class="klabel">fix</div><div>Salt with sys.version_info major.minor.</div>
+<div class="klabel">lands in</div><div>P2 · producer-identity cache keys</div>
+<div class="klabel">borrow</div><div>GitNexus producer-identity keys</div>
+</div>
+</div>
+</details>
+<details class="finding" id="S7">
+<summary><span class="fid">S7</span><span class="ftitle">Failed sync batch hot-loops forever — no backoff, no poison-file quarantine</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">codeintel/sync/coordinator.py:270–312</span></div>
+<div class="klabel">what</div><div>The comment promises backoff; none exists. A poison file re-runs full extraction+enrichment ~once per second indefinitely.</div>
+<div class="klabel">fix</div><div>Exponential backoff on consecutive failures; quarantine offenders into a surfaced degraded list.</div>
+<div class="klabel">lands in</div><div>P4 · devmap-serve</div>
+<div class="klabel">borrow</div><div>CodeGraph watcher design</div>
+</div>
+</div>
+</details>
+<details class="finding" id="S9">
+<summary><span class="fid">S9</span><span class="ftitle">Read-only SQLite URI built by f-string without percent-encoding</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">codeintel/store/sqlite.py:305</span></div>
+<div class="klabel">what</div><div>Paths containing ? # % break the URI: readers open the wrong file while writers (plain path) work — an asymmetry that looks like a corrupt index only for readers.</div>
+<div class="klabel">fix</div><div>urllib.parse.quote the path before formatting.</div>
+<div class="klabel">lands in</div><div>P4 · devmap-store</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="S15">
+<summary><span class="fid">S15</span><span class="ftitle">Windows lease size-probe is a no-op; guard byte appended every acquire; holder metadata unreadable while locked</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">codeintel/sync/lease.py:28–73</span></div>
+<div class="klabel">what</div><div>tell() after seek(0) is always 0; 'a+b' appends a NUL per acquire; msvcrt mandatory locking makes read_holder fail exactly when someone holds the lease.</div>
+<div class="klabel">fix</div><div>seek(0, SEEK_END) for the probe; keep metadata outside the locked byte range.</div>
+<div class="klabel">lands in</div><div>P4 · devmap-serve</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="S16">
+<summary><span class="fid">S16</span><span class="ftitle">Rename aliases evaporate after one generation</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">codeintel/store/sqlite.py:1240–1298, 1641–1650</span></div>
+<div class="klabel">what</div><div>aliases() reads only the current generation; a rename mapping is queryable exactly until the next unrelated commit.</div>
+<div class="klabel">fix</div><div>Query across retained generations and chain old→new transitively.</div>
+<div class="klabel">lands in</div><div>P4 · devmap-store</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="S17">
+<summary><span class="fid">S17</span><span class="ftitle">Racy-stat window: content hash recorded against a newer mtime — file becomes permanently invisible to reconcile</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">codeintel/store/sqlite.py:1004–1017 · sync/coordinator.py:210–214</span></div>
+<div class="klabel">what</div><div>read_bytes() then stat(): a write between the two stores the new mtime with the old hash; reconcile compares (size, mtime) only, so the stale extraction never heals.</div>
+<div class="klabel">fix</div><div>Stat before and after the read, retry on mismatch; hash-verify racily-clean entries.</div>
+<div class="klabel">lands in</div><div>P4 · devmap-serve</div>
+<div class="klabel">borrow</div><div>CodeGraph freshness layer 3</div>
+</div>
+</div>
+</details>
+<details class="finding" id="S18">
+<summary><span class="fid">S18</span><span class="ftitle">WAL checkpoint failure handling is dead code; busy checkpoints silently ignored</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">codeintel/store/sqlite.py:951–962</span></div>
+<div class="klabel">what</div><div>PRAGMA wal_checkpoint doesn't raise on contention — it returns (busy, log, checkpointed); the PASSIVE fallback is unreachable and a busy TRUNCATE is dropped.</div>
+<div class="klabel">fix</div><div>Read the result row; fall back explicitly when busy=1.</div>
+<div class="klabel">lands in</div><div>P4 · devmap-store</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="S19">
+<summary><span class="fid">S19</span><span class="ftitle">get_sync_coordinator kwargs check false-positives on clamped values and callables</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">codeintel/sync/coordinator.py:107, 414–421</span></div>
+<div class="klabel">what</div><div>The singleton check compares the caller's raw kwarg to the clamped attribute — two identical calls with debounce=0.05 raise ValueError; fresh lambdas fail identity comparison.</div>
+<div class="klabel">fix</div><div>Normalize before comparing; compare callbacks by explicit override flag.</div>
+<div class="klabel">lands in</div><div>P4 · devmap-serve</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="S20">
+<summary><span class="fid">S20</span><span class="ftitle">interrupt_writes tracks only the last-opened write connection</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">codeintel/store/sqlite.py:239–330</span></div>
+<div class="klabel">what</div><div>A short write from another thread steals the single _active_write_conn slot; the watchdog then interrupts the wrong statement and escalates straight to SIGKILL of the process group.</div>
+<div class="klabel">fix</div><div>Track a set of active write connections; interrupt all.</div>
+<div class="klabel">lands in</div><div>P4 · devmap-store</div>
+
+</div>
+</div>
+</details>
+</div>
+</section>
+<section id="sec-V">
+<div class="grouphead"><h2>V — Surfaces — repo map, visualizers, CLI, MCP</h2><span class="groupcount">20 findings · 3 high · 10 medium · 7 low</span></div>
+<div class="cards">
+<details class="finding" id="V1">
+<summary><span class="fid">V1</span><span class="ftitle">XSS: node labels rendered as raw HTML via the force-graph tooltip</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/viz.py:174, 804 · map_viz.py:349</span></div>
+<div class="klabel">what</div><div>The vendored force-graph renders nodeLabel via d3 .html(); a hostile file or symbol name (legal on APFS/ext4) executes on hover in graph.html/map.html. The JSON embed is escaped — this is the one sink that re-opens it.</div>
+<div class="klabel">fix</div><div>escapeHtml inside every nodeLabel accessor; escape the intel panel numerics too.</div>
+<div class="klabel">lands in</div><div>P5 · viz</div>
+<div class="klabel">borrow</div><div>GitNexus canvas labels are never HTML</div>
+</div>
+</div>
+</details>
+<details class="finding" id="V2">
+<summary><span class="fid">V2</span><span class="ftitle">Whole graph inlined into graph.html — 15.5 MB, with large parts embedded twice</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/viz.py:457–535</span></div>
+<div class="klabel">what</div><div>Both file and symbol payloads always embedded, the active one duplicated again as flat back-compat fields, plus a neighbors index re-serializing every call edge twice. Symbol mode hands force-graph 10,895 nodes with no degradation tiers or confirm gate.</div>
+<div class="klabel">fix</div><div>Embed only the active mode (JSON script tags loaded on demand); derive neighbors client-side; add size tiers + a load-confirm gate.</div>
+<div class="klabel">lands in</div><div>P5 · viz</div>
+<div class="klabel">borrow</div><div>GitNexus tiers + fail-safe gate</div>
+</div>
+</div>
+</details>
+<details class="finding" id="V4">
+<summary><span class="fid">V4</span><span class="ftitle">Incremental sync leaves `dependents` (blast radius) stale in repo_map.json</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/map_refresh.py:109–177</span></div>
+<div class="klabel">what</div><div>refresh_repo_map_from_graph updates files/liveness but never dependents, dependents_total, important_files or processes — under watch, devcouncil_impact serves a fresh-looking map whose reverse-import index predates the edits.</div>
+<div class="klabel">fix</div><div>Rebuild dependents from the committed graph's import edges, or stamp dependents_stale for the impact handler to surface.</div>
+<div class="klabel">lands in</div><div>P4+P5 · daemon freshness</div>
+<div class="klabel">borrow</div><div>CodeGraph staleness banner</div>
+</div>
+</div>
+</details>
+<details class="finding" id="V11">
+<summary><span class="fid">V11</span><span class="ftitle">MCP map handlers re-parse the map twice and re-fingerprint the repo on every call</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">integrations/mcp/handlers/map.py:44–51, 344, 432 · subsystem_map.py:36–41</span></div>
+<div class="klabel">what</div><div>handle_liveness parses the multi-MB map twice per call; _map_stale runs git rev-parse + ls-files + a full content fingerprint per tool call; area filtering falls back to a linear scan per candidate (~10^8 comparisons at scale).</div>
+<div class="klabel">fix</div><div>Thread one loaded map through; memoize staleness briefly; build a path→area dict per request.</div>
+<div class="klabel">lands in</div><div>P5 · daemon obsoletes</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="V12">
+<summary><span class="fid">V12</span><span class="ftitle">dead_code_hidden undercounts: the [:200] truncation is silent</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">integrations/mcp/handlers/map.py:433–442</span></div>
+<div class="klabel">what</div><div>hidden counts only confidence-filtered entries; the final slice drops the rest uncounted — a response can claim hidden:0 while omitting hundreds. Liveness lists ship with no cap at all (up to 20,000 entries each).</div>
+<div class="klabel">fix</div><div>hidden += len(matched)-200; cap liveness responses with the map's own {shown,total} shape.</div>
+<div class="klabel">lands in</div><div>P5 · devmap-query</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="V14">
+<summary><span class="fid">V14</span><span class="ftitle">HTML artifacts: non-atomic writes, no freshness stamp, unconditional 15 MB rewrites</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/viz.py:1049 · map_viz.py:429 · cli/commands/map.py:313–319</span></div>
+<div class="klabel">what</div><div>Unlike every JSON artifact, the HTML writers skip atomic_write_text (truncated file on interrupt); neither page shows when/what it was built from; the 15.5 MB page regenerates even on mode='reused' runs.</div>
+<div class="klabel">fix</div><div>Route through atomic_write_text; render generated_head + built-at; skip when the fingerprint matches.</div>
+<div class="klabel">lands in</div><div>P5 · viz</div>
+<div class="klabel">borrow</div><div>CodeGraph staleness banner</div>
+</div>
+</div>
+</details>
+<details class="finding" id="V18">
+<summary><span class="fid">V18</span><span class="ftitle">Source-root detection is all-or-nothing: one stray file collapses subsystem inference</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/repo_mapper.py:1037–1068, 2845</span></div>
+<div class="klabel">what</div><div>Strict longest-common-prefix: a single tools/gen.py makes source_root='' and the whole src tree one subsystem. Any repo vendoring a DevCouncil copy inherits the hand-written DevCouncil summaries wholesale.</div>
+<div class="klabel">fix</div><div>Majority root (≥80% coverage); gate the curated index on project name, not path prefix.</div>
+<div class="klabel">lands in</div><div>P3 · subsystem inference</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="V3">
+<summary><span class="fid">V3</span><span class="ftitle">Symbol-mode edge filtering inconsistent: sizes counted from hidden edges; rendered kinds missing from filters and legend</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/viz.py:373–431, 608</span></div>
+<div class="klabel">what</div><div>contains/dynamic_reference/reflects_to inflate node degree but aren't rendered; dynamic_reference, reflects_to, registers, routes_to render but are absent from the kind dropdown and legend, all colored the same gray.</div>
+<div class="klabel">fix</div><div>Compute degree from rendered kinds only; enumerate dropdown/legend from the payload; distinct colors per kind.</div>
+<div class="klabel">lands in</div><div>P5 · viz</div>
+<div class="klabel">borrow</div><div>GitNexus per-relationship colors</div>
+</div>
+</div>
+</details>
+<details class="finding" id="V5">
+<summary><span class="fid">V5</span><span class="ftitle">Entry-root and unreachable diagnostics computed, then thrown away (absorbs G12)</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/wiring.py:1379 · graph/liveness.py:233–244 · build.py:405</span></div>
+<div class="klabel">what</div><div>DiscoveryReport (per-source entry-root yields), unreachable_unreliable_reason, and reachability_gap_points (the exact reconnect hints) are all discarded; only a bare bool reaches graph.meta. CLAUDE.md tells agents to distrust unreachable_files with no way to see why.</div>
+<div class="klabel">fix</div><div>Persist the report + ratio meta (capped) into graph.meta/liveness_meta; print the per-source yield table when roots are empty.</div>
+<div class="klabel">lands in</div><div>P3+P5 · surface diagnostics</div>
+<div class="klabel">borrow</div><div>GitNexus provenance</div>
+</div>
+</div>
+</details>
+<details class="finding" id="V6">
+<summary><span class="fid">V6</span><span class="ftitle">Entry-root discovery gaps: root-only pyproject, no setup.py/cfg, launcher files one-way, alphabetical 512-file sniff cap</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/wiring.py:831, 1024–1131</span></div>
+<div class="klabel">what</div><div>Monorepo packages' pyproject.tomls unread; console_scripts from setup.cfg absent; Dockerfile CMD targets clear unwired but never seed roots; the shared sniff budget can exhaust on .c files before src/main.py is reached. Sphinx conf.py, noxfile.py, gunicorn.conf.py etc. become unwired false positives.</div>
+<div class="klabel">fix</div><div>Add the missing sources; seed roots from launcher hits; per-language sniff caps; extend structural exemptions.</div>
+<div class="klabel">lands in</div><div>P3 · devmap-analyze</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="V7">
+<summary><span class="fid">V7</span><span class="ftitle">Framework detection by naive substring over whole config files</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/repo_mapper.py:2548–2572</span></div>
+<div class="klabel">what</div><div>'react' in package.json matches preact; 'next' matches lint:next or next-auth; a commented-out flask dep in requirements.txt flags Flask. frameworks[] feeds agent prompts.</div>
+<div class="klabel">fix</div><div>Parse dependency keys; match exact package names.</div>
+<div class="klabel">lands in</div><div>P1 · manifest quality</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="V8">
+<summary><span class="fid">V8</span><span class="ftitle">test_commands fabricates ruff/mypy commands that were never configured</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/repo_mapper.py:2660–2664</span></div>
+<div class="klabel">what</div><div>Every Python repo is told to run ruff and mypy regardless of configuration; pytest is omitted for tests under src/tests/ or test/.</div>
+<div class="klabel">fix</div><div>Gate on [tool.ruff]/[tool.mypy]/dev-deps; use pytest config presence.</div>
+<div class="klabel">lands in</div><div>P1 · manifest quality</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="V9">
+<summary><span class="fid">V9</span><span class="ftitle">Barrel re-export chasing re-reads the same files once per importer</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/repo_mapper.py:1636–1724</span></div>
+<div class="klabel">what</div><div>_follow_js_reexports has a per-call seen set and no cross-call cache: a barrel index.ts imported by N files is read and regex-scanned N× chain-depth times.</div>
+<div class="klabel">fix</div><div>Memoize path→reexport targets per mapper run.</div>
+<div class="klabel">lands in</div><div>P3 · devmap-resolve</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="V10">
+<summary><span class="fid">V10</span><span class="ftitle">JS dead-symbol scan re-splits the whole file once per exported symbol</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/repo_mapper.py:2301–2306</span></div>
+<div class="klabel">what</div><div>source.splitlines() inside the per-symbol loop just to peek at one preceding line.</div>
+<div class="klabel">fix</div><div>Split once before the loop.</div>
+<div class="klabel">lands in</div><div>P3</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="V13">
+<summary><span class="fid">V13</span><span class="ftitle">Map visualizer badges present capped counts as totals</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/map_viz.py:15, 186–196, 325–330</span></div>
+<div class="klabel">what</div><div>Lists are capped at 256 for embedding, then rendered as 'unwired 256' as if that were the total; the real totals exist in liveness_meta but aren't embedded.</div>
+<div class="klabel">fix</div><div>Embed {shown, total}; render 'unwired 256 of 12,041'.</div>
+<div class="klabel">lands in</div><div>P5 · viz</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="V15">
+<summary><span class="fid">V15</span><span class="ftitle">refresh_map_artifacts serializes repo_map.json twice and re-runs inventory for the re-stamp</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/map_artifacts.py:463–484</span></div>
+<div class="klabel">what</div><div>A second RepoMapper, git ls-files, head and full content fingerprint per run — only needed when write_agent_guides actually changed something, which it already detects but doesn't report.</div>
+<div class="klabel">fix</div><div>Return changed-flag from write_agent_guides; re-stamp only then.</div>
+<div class="klabel">lands in</div><div>P5</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="V16">
+<summary><span class="fid">V16</span><span class="ftitle">dev map floods stdout with the full map JSON; no --quiet/--json control</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">cli/commands/map.py:44–51, 233–250</span></div>
+<div class="klabel">what</div><div>Megabytes of JSON on every run, TTY or not; the root command is the only map subcommand without --json; the build_incomplete warning prints twice; a summary getter side-effect-prints to stderr.</div>
+<div class="klabel">fix</div><div>Human summary on TTY, JSON under --json; add --quiet.</div>
+<div class="klabel">lands in</div><div>P5 · devmap-cli</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="V17">
+<summary><span class="fid">V17</span><span class="ftitle">MCP graph-context handler spawns a full CLI subprocess per call and swallows its failures</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">integrations/mcp/handlers/graph.py:24–34</span></div>
+<div class="klabel">what</div><div>A cold python -m devcouncil per tool call, though the in-process adapter is already imported for the fallback; _cli_error is discarded.</div>
+<div class="klabel">fix</div><div>Call CodeReviewGraphAdapter directly; drop the subprocess.</div>
+<div class="klabel">lands in</div><div>P5 · daemon socket</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="V19">
+<summary><span class="fid">V19</span><span class="ftitle">Curated subsystem metadata: substring role matching, duplicated buckets, unvalidated handoff fiction</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/repo_mapper.py:541–629, 996–1003</span></div>
+<div class="klabel">what</div><div>Role buckets match by plain substring (same file in multiple buckets); hand-written handoff strings are never validated against real edges and can silently rot.</div>
+<div class="klabel">fix</div><div>Validate handoffs against live import edges; dedupe buckets before selection.</div>
+<div class="klabel">lands in</div><div>P1 · contract freeze</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="V20">
+<summary><span class="fid">V20</span><span class="ftitle">Dead branch: the .sqlite/.db 'database' kind can never be reached</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/repo_mapper.py:54, 844–845</span></div>
+<div class="klabel">what</div><div>_GENERATED_SUFFIXES filters those files out of the inventory before any file is classified.</div>
+<div class="klabel">fix</div><div>Delete or reconcile.</div>
+<div class="klabel">lands in</div><div>cleanup</div>
+
+</div>
+</div>
+</details>
+</div>
+</section>
+<section id="sec-X">
+<div class="grouphead"><h2>X — Extraction, imports & integration</h2><span class="groupcount">19 findings · 8 high · 9 medium · 2 low</span></div>
+<div class="cards">
+<details class="finding" id="X1">
+<summary><span class="fid">X1</span><span class="ftitle">TS enum, abstract class, namespace and declare declarations extract zero symbols</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/extract_ts.py:408–415, 550–639</span></div>
+<div class="klabel">what</div><div>walk_decl handles six node types and doesn't recurse into unmatched ones: enum_declaration, abstract_class_declaration, internal_module, ambient_declaration (all of .d.ts), and function_signature yield nothing; the regex fallback and export collector miss them too. Importers' named-import edges dangle; enum-only files look empty.</div>
+<div class="klabel">fix</div><div>Add the missing branches (recurse into ambient_declaration); extend the export declaration set.</div>
+<div class="klabel">lands in</div><div>P2 · devmap-extract</div>
+<div class="klabel">borrow</div><div>GitNexus unified capture vocabulary</div>
+</div>
+</div>
+</details>
+<details class="finding" id="X12">
+<summary><span class="fid">X12</span><span class="ftitle">LSP client can deadlock on full pipes: writes hold the lock the reader thread needs</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/lsp_client.py:329–369</span></div>
+<div class="klabel">what</div><div>_notify/_request block in stdin.write while holding self._lock; the reader needs the same lock to drain responses — ABBA deadlock through two full pipes on large didOpen payloads. Timeouts never engage; shutdown also needs the lock.</div>
+<div class="klabel">fix</div><div>Separate write lock from the pending map; or queue writes to a writer thread with timeout.</div>
+<div class="klabel">lands in</div><div>P3 · lsp adjunct</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="X14">
+<summary><span class="fid">X14</span><span class="ftitle">dev impact --precise replaces real dependents with an authoritative empty list for Go/Rust/Swift/Kotlin</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/lsp_client.py:484–535 · mcp/handlers/map.py:276–281</span></div>
+<div class="klabel">what</div><div>_iter_public_symbols understands only .py and JS suffixes; unsupported languages yield [] ('verified zero') rather than None ('unknown'), and the handler overwrites map-derived dependents with an empty list labeled resolution:'lsp' — inverted truth exactly where gopls/rust-analyzer were detected.</div>
+<div class="klabel">fix</div><div>Tri-state: return None for unsupported languages; only override when the LSP actually resolved.</div>
+<div class="klabel">lands in</div><div>P5 · tri-state contract</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="X2">
+<summary><span class="fid">X2</span><span class="ftitle">`new Foo()` is never a call or reference in JS/TS; Go composite literals likewise</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/extract_ts.py:441–442, 778–802</span></div>
+<div class="klabel">what</div><div>Only call_expression is walked; a class used solely via new Store() has zero inbound edges → dead-symbol false positives for plain classes. Go Type{…} usage likewise produces no reference.</div>
+<div class="klabel">fix</div><div>Treat new_expression's constructor as a call; add composite_literal type names to references.</div>
+<div class="klabel">lands in</div><div>P2 · devmap-extract</div>
+<div class="klabel">borrow</div><div>CodeGraph instantiates-as-caller</div>
+</div>
+</div>
+</details>
+<details class="finding" id="X5">
+<summary><span class="fid">X5</span><span class="ftitle">.tsx parsed with the wrong grammar through AstMatcher; ERROR trees extracted silently</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/ts_imports.py:195–217 · codeintel/languages/registry.py:91–93</span></div>
+<div class="klabel">what</div><div>tsx aliases to typescript before grammar dispatch, so JSX parses with the wrong grammar; the tsx fallback is dead code (parse returns ERROR trees, not None); nothing anywhere checks root_node.has_error — a mangled tree is indistinguishable from a sparse file.</div>
+<div class="klabel">fix</div><div>Key grammar on suffix (un-aliased); record has_error and surface it.</div>
+<div class="klabel">lands in</div><div>P2 · devmap-extract</div>
+<div class="klabel">borrow</div><div>GitNexus one grammar table</div>
+</div>
+</div>
+</details>
+<details class="finding" id="X6">
+<summary><span class="fid">X6</span><span class="ftitle">No parse-failure signal exists anywhere in the extraction contract</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/extract_python.py:147–149 · languages/generic_extractor.py:27–29</span></div>
+<div class="klabel">what</div><div>FileExtraction has no parse_ok/diagnostics; SyntaxError, ERROR trees and worker failures all read as 'file defines nothing' — the false-'no symbols' → false-dead pipeline the map warns its own agents about.</div>
+<div class="klabel">fix</div><div>Add parse_ok + parse_error to the contract, persist in cache, exclude parse_ok=False from dead candidates.</div>
+<div class="klabel">lands in</div><div>P1+P2 · contract</div>
+<div class="klabel">borrow</div><div>CodeGraph provenance</div>
+</div>
+</div>
+</details>
+<details class="finding" id="X7">
+<summary><span class="fid">X7</span><span class="ftitle">Transient worker timeout/crash is permanently cached as a valid 'no symbols' extraction</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">codeintel/languages/workers.py:227–233 · graph/cache.py:267–296</span></div>
+<div class="klabel">what</div><div>process() returns None on any exception (incl. 30s timeout, OOM-killed child); the empty extraction is cached under the real sha256. The RecursionError path deliberately guards against exactly this (`sha256: ''`) — the worker path bypasses it. One slow parse = permanent hole in the graph.</div>
+<div class="klabel">fix</div><div>Distinguish failure from empty; on failure skip caching or cache with empty digest, mirroring the RecursionError path.</div>
+<div class="klabel">lands in</div><div>P2 · cache admission (ParseOutcome)</div>
+<div class="klabel">borrow</div><div>GitNexus quarantine-then-retry</div>
+</div>
+</div>
+</details>
+<details class="finding" id="X8">
+<summary><span class="fid">X8</span><span class="ftitle">Registry vs dispatch mismatch: .mts/.cts/.ets/.pyi silently downgraded; eight divergent suffix tables</span><span class="sev high">high</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/extract_ts.py:92, 1190–1205 · registry.py:23–27 · +6 more</span></div>
+<div class="klabel">what</div><div>.pyi misses the Python extractor; .mts/.cts miss the JS extractor AND import resolution (resolve/repo_mapper suffix sets exclude them) while wiring includes them — eight independently-maintained JS/TS suffix tables give different answers to 'what language is this file'.</div>
+<div class="klabel">fix</div><div>Derive every suffix set from LANGUAGE_SPECS; assert each spec routes to a named extractor at startup.</div>
+<div class="klabel">lands in</div><div>P1 · language authority</div>
+<div class="klabel">borrow</div><div>GitNexus satisfies-record pattern</div>
+</div>
+</div>
+</details>
+<details class="finding" id="X11">
+<summary><span class="fid">X11</span><span class="ftitle">LSP initialize timeout with a live server treated as success</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/lsp_client.py:163–191</span></div>
+<div class="klabel">what</div><div>A slow (>20s) init passes the poll() check; the client sends `initialized` before the server answered (protocol violation) and marks itself alive; every later request burns its own 12s timeout.</div>
+<div class="klabel">fix</div><div>init_result is None → fail start, regardless of poll().</div>
+<div class="klabel">lands in</div><div>P3 · lsp adjunct</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="X13">
+<summary><span class="fid">X13</span><span class="ftitle">LSP positions in Python code points; no positionEncodings negotiation (spec default UTF-16)</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/lsp_client.py:64–76, 170–179</span></div>
+<div class="klabel">what</div><div>Non-ASCII before a symbol shifts positions → wrong/empty references → confirm_unreferenced can wrongly confirm 'dead' on files with unicode.</div>
+<div class="klabel">fix</div><div>Negotiate positionEncodings; convert columns via UTF-16 code units when required.</div>
+<div class="klabel">lands in</div><div>P3 · lsp adjunct</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="X15">
+<summary><span class="fid">X15</span><span class="ftitle">Embeddings: the configured model name is a label, not part of the cache/compare key</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/embeddings.py:104–166, 194</span></div>
+<div class="klabel">what</div><div>Vectors are always _hash_vector output but rows store the configured model name, never filtered on search; wiring a real backend would silently cosine-compare across models. With no committed generation, search scans all generations mixed.</div>
+<div class="klabel">fix</div><div>Filter on model in the WHERE clause; refuse cross-generation scans.</div>
+<div class="klabel">lands in</div><div>P5 · devmap-query</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="X16">
+<summary><span class="fid">X16</span><span class="ftitle">Semantic snapshots hard-capped at 500 symbols with no truncation marker — phantom API diffs</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/semantic_index.py:91 · ast_matcher.py:88–91</span></div>
+<div class="klabel">what</div><div>First 500 hits in sorted-path order: adding a symbol in an alphabetically-early file pushes one out of the after-snapshot → spurious exported_symbol_removed; real removals beyond the cap invisible.</div>
+<div class="klabel">fix</div><div>Raise/remove the cap for snapshots, or record symbols_truncated and suppress add/remove classification when set.</div>
+<div class="klabel">lands in</div><div>P5 · budgeted snapshots</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="X19">
+<summary><span class="fid">X19</span><span class="ftitle">MCP handlers run full-repo walks and LSP spawns synchronously on the event loop</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">integrations/mcp/handlers/ast_lsp.py:63–77 · map.py:260–283</span></div>
+<div class="klabel">what</div><div>handle_ast_match rglobs and reads every registry-language file in the async handler; impact --precise spawns language servers (20s) inline — the whole MCP server is unresponsive meanwhile.</div>
+<div class="klabel">fix</div><div>asyncio.to_thread both; pass a cached file list to AstMatcher.</div>
+<div class="klabel">lands in</div><div>P4 · daemon threading</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="X20">
+<summary><span class="fid">X20</span><span class="ftitle">JS/TS decorators produce no call/reference edges (Python's do)</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/extract_ts.py (absent) vs extract_python.py:286–304</span></div>
+<div class="klabel">what</div><div>No decorator handling at all: in NestJS/Angular/MobX codebases, decorator functions and the classes they register show as dead/unwired.</div>
+<div class="klabel">fix</div><div>Walk decorator nodes; emit ExtractedCall like the Python path.</div>
+<div class="klabel">lands in</div><div>P2 · devmap-extract</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="X3">
+<summary><span class="fid">X3</span><span class="ftitle">`export * from './x'` barrels lose all symbol-level export information</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/graph/extract_ts.py:385–436, 501–515</span></div>
+<div class="klabel">what</div><div>Star re-exports contribute a file edge only; symbols reachable solely through barrels read as unexported, skewing the dead-symbol gate. Python handles its analogous case; JS doesn't.</div>
+<div class="klabel">fix</div><div>Record a '*:spec' sentinel and expand against the target's exports at resolve time.</div>
+<div class="klabel">lands in</div><div>P2 · devmap-extract</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="X4">
+<summary><span class="fid">X4</span><span class="ftitle">ts_imports reports every const/let declarator — at any nesting depth — as kind 'function'</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/ts_imports.py:252–265</span></div>
+<div class="klabel">what</div><div>No initializer check and full-body recursion: const MAX_RETRIES = 3 and every local const become 'function' symbols, polluting dev ast results and competing for the 500-symbol snapshot cap.</div>
+<div class="klabel">fix</div><div>Port the initializer check from extract_ts; stop descending into function bodies.</div>
+<div class="klabel">lands in</div><div>P2 · devmap-extract</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="X9">
+<summary><span class="fid">X9</span><span class="ftitle">Rust grouped `use a::{b, c}` flattened into one bogus path a::b::c</span><span class="sev medium">medium</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/ts_imports.py:110–137</span></div>
+<div class="klabel">what</div><div>All identifiers under a use_list concatenate into one segment list: use std::{fs, io} → module 'std::fs', names ['io'] — the fs import is lost and the module path is fictitious. The unit test asserts the corruption.</div>
+<div class="klabel">fix</div><div>Fork the segment walk at use_list nodes; emit one ref per leaf.</div>
+<div class="klabel">lands in</div><div>P2 · devmap-extract</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="X17">
+<summary><span class="fid">X17</span><span class="ftitle">Snapshot import diffing blind to Go block imports and all Rust use statements</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/semantic_index.py:150–153</span></div>
+<div class="klabel">what</div><div>The regex matches only lines starting import/from: Go import ( … ) contributes the useless opener; Rust `use` never matches — import_dependency_change never fires for Go/Rust.</div>
+<div class="klabel">fix</div><div>Reuse the graph extractors' cached import output instead of a second regex pass.</div>
+<div class="klabel">lands in</div><div>P5</div>
+
+</div>
+</div>
+</details>
+<details class="finding" id="X18">
+<summary><span class="fid">X18</span><span class="ftitle">Snapshot `public` heuristic misclassifies Python and matches the word 'export' anywhere</span><span class="sev low">low</span></summary>
+<div class="fbody">
+<div class="krow">
+<div class="klabel">where</div><div><span class="loc">indexing/semantic_index.py:99</span></div>
+<div class="klabel">what</div><div>Lowercase public Python functions never read as public (deleting one never reports exported_symbol_removed); any line containing 'exports' flags private symbols public.</div>
+<div class="klabel">fix</div><div>Per-language rule: Python not name.startswith('_'); JS/TS from the extractor's exported flag.</div>
+<div class="klabel">lands in</div><div>P5</div>
+
+</div>
+</div>
+</details>
+</div>
+</section>
+
+<section id="adoptions">
+<h2>§6 — Reference-repo adoptions</h2>
+<div class="prose"><p>What GitNexus and CodeGraph actually validated in production, mapped to the phase that should import it. These are the non-bug improvements; the bug-shaped lessons are already encoded in the findings above.</p></div>
+<table>
+<thead><tr><th>Technique</th><th>Source</th><th>What it buys dev map</th><th>Phase</th></tr></thead>
+<tbody>
+<tr><td><strong>Precompute at index time</strong></td><td>GitNexus</td><td>Store entry-point→leaf flows, communities and blast radius at build; a symbol query returns the flows it participates in with step indices — not edges the caller must walk. One call is enough.</td><td><span class='loc'>P3+P5</span></td></tr>
+<tr><td><strong>Confidence as a closed vocabulary</strong></td><td>GitNexus</td><td>One tier table (0.95 / 0.9 / 0.5-class) in one module; every edge carries confidence + machine-readable reason; every query takes min_confidence. Today's literals are scattered across semantic.py and _confidence_score.</td><td><span class='loc'>P3</span></td></tr>
+<tr><td><strong>Provenance on every heuristic edge</strong></td><td>CodeGraph</td><td>provenance: extracted | inferred | heuristic plus synthesizedBy channel on synthesized edges (decorator, DI, event, bridge) — machine-checkable honesty about which connections are guesses. The store's provenance column already exists; extend to channels and surface it.</td><td><span class='loc'>P3+P5</span></td></tr>
+<tr><td><strong>Impact semantics that survived production</strong></td><td>CodeGraph</td><td>Exclude upward contains (sibling explosion), count instantiates as a caller, descend into container children at same depth, dedup edges on source|target|kind|line|col, per-add budget caps. dev map already tags instantiates in extras but nothing consumes it.</td><td><span class='loc'>P5</span></td></tr>
+<tr><td><strong>Traversal correctness idioms</strong></td><td>CodeGraph</td><td>enqueued set separate from visited; BFS edge priority contains → calls → rest so truncated results show architecture first; batch node fetches per frontier.</td><td><span class='loc'>P3+P5</span></td></tr>
+<tr><td><strong>Three-layer freshness</strong></td><td>CodeGraph</td><td>Debounced watcher + per-surface staleness banner (⚠️ prefix on any response touching a pending file) + connect-time (size,mtime)+content-hash catch-up. Layers 1–2 partially exist; layer 3 closes S17.</td><td><span class='loc'>P4</span></td></tr>
+<tr><td><strong>FTS5 external-content + triggers</strong></td><td>CodeGraph</td><td>Restructure nodes_fts as an external-content table over a current-generation search table synced by triggers — removes per-generation copy and the UNINDEXED-delete trap; index shrinks to one generation.</td><td><span class='loc'>P4</span></td></tr>
+<tr><td><strong>Single language authority</strong></td><td>GitNexus</td><td>Every suffix set, extractor dispatch and LSP map derived from LANGUAGE_SPECS; a test asserts every spec routes to a named extractor (the satisfies-record pattern as CI). Kills X8's eight divergent tables.</td><td><span class='loc'>P1</span></td></tr>
+<tr><td><strong>Golden corpus per language</strong></td><td>CodeGraph</td><td>One realistic fixture per language (~35 files) with asserted symbol/import/call counts; 11 of 35 languages currently have zero test presence. Catches X1/X9/G19 mechanically and feeds the parity harness.</td><td><span class='loc'>P1</span></td></tr>
+<tr><td><strong>Sibling skeletonization</strong></td><td>CodeGraph</td><td>Collapse ≥3 interchangeable siblings (25 cli/commands/*.py, executor adapters) into an expandable family badge — budgeted progressive disclosure for both the query surface and the visualizer.</td><td><span class='loc'>P5</span></td></tr>
+<tr><td><strong>WebGL + reducers for the symbol graph</strong></td><td>GitNexus</td><td>sigma.js v3 + graphology; filters restyle via nodeReducer/edgeReducer + hidden attributes instead of re-feeding graphData per keystroke; size-tiered physics (>1,500 reduce, >5,000 skip cosmetic passes); confirm gate before loading 10k+ nodes; labels throttled by zoom/density.</td><td><span class='loc'>P5</span></td></tr>
+<tr><td><strong>Blueprint layout for the subsystem map</strong></td><td>CodeGraph</td><td>“Hand-placed so it reads as a deliberate blueprint, not a physics blob” — 24 subsystems need layered hierarchical placement, thin lines, hollow nodes, mono labels; no physics at all.</td><td><span class='loc'>P5</span></td></tr>
+<tr><td><strong>Weighted communities</strong></td><td>GitNexus</td><td>Accumulate call multiplicity as edge weight before clustering; a 50-call pair currently equals a 1-call pair.</td><td><span class='loc'>P3</span></td></tr>
+<tr><td><strong>Deterministic everything</strong></td><td>both</td><td>Sorted iteration wherever order leaks into artifacts (G4, G26); IDs stable under overload addition; snapshot tests become possible.</td><td><span class='loc'>P3</span></td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="plan">
+<h2>§7 — Amended plan</h2>
+<div class="prose">
+<p>The six-phase structure, crate layout, daemon architecture and 32–42-week estimate from <a href="PLAN.html">PLAN §4–5</a> stand. This audit changes the phases' <em>contents and gates</em>, not their shape. Per project direction the Python implementation receives <strong>no fixes</strong> — it is frozen as the parity baseline. That sharpens one consequence PLAN §7 already named: the hazards catalogued here (S1's kill-on-probe, X7's poisoned cache, V1's XSS, V4's stale blast radius) remain live in the interim system until cutover, which strengthens the case for sequencing P4 (store + daemon) as early as its dependencies allow and for running the daemon in shadow mode against real work from mid-P4 onward.</p>
+<p>One nuance on freezing: several findings are <em>parity traps</em>. G4/G26 make the Python baseline nondeterministic, X-audit shows its extractions are silently incomplete, and S17 makes its freshness racy — so "match the Python output" is not a well-defined target everywhere. The parity harness (PLAN §6.7) must therefore compare against <em>pinned snapshots</em> of the frozen baseline taken under a fixed hash seed, with the known-wrong outputs (G1–G7, X1–X3…) recorded as <strong>expected divergences</strong>: places where the Rust port is required to differ, each tied to its acceptance test.</p>
+</div>
+
+<h3>Phase 1 — Freeze the contract · ~3 weeks (was: golden corpus + consumer contracts)</h3>
+<div class="prose"><p><strong>Added:</strong> the golden corpus must now cover the syntax X1/X2/X3/X9/G19 proved missing — enums, namespaces, declare files, new-expressions, star re-exports, grouped Rust use, generic impls, decorators — not just the happy path. Build the <strong>single language authority</strong> (X8): one table generating every suffix set, with a CI assertion that each of the 35 languages routes to a named extractor. Freeze the <em>tri-state</em> consumer contract (X14): unknown ≠ verified-zero, for every surface. Record the six private-internal reaches (X audit §e) as explicit contracts to break loudly in phase 6.</p></div>
+
+<h3>Phase 2 — Extraction · 6–10 weeks</h3>
+<div class="prose"><p><strong>Added:</strong> <code>ParseOutcome</code> provenance in the extraction contract from day one (X6): parse_ok, error, engine, grammar version — cache entries carry it, liveness excludes failed parses from dead candidates, and a failed parse is <em>never</em> admitted to cache under a real content hash (X7). Grammar-correct dispatch (X5), the missing node types (X1, X2, X20, G14, G16, G18, G19, X3, X9), and per-file size caps + gitignore integration (CodeGraph hygiene). Rust's in-process grammars retire the worker pool and its orphan problem (S8) by construction.</p></div>
+
+<h3>Phase 3 — Resolution and analysis · 10–14 weeks</h3>
+<div class="prose"><p><strong>Added:</strong> the confidence ladder becomes a typed protocol — heuristic picks can never ship as EXTRACTED (G6), multi-candidate resolution fans out or abstains rather than picking first-sorted (G6/G7), language-family guards on every global rung (G3/G7), best-confidence edge dedup (G5). Determinism is a phase gate: sorted iteration everywhere order leaks (G4/G26), verified by running the parity harness twice under different hash seeds. The PDG is rebuilt on a correct CFG contract — entry/exit threading (G1), leader-line ownership (G2), block-scoped line ordering (G13), parameters as taint sources (G23). Liveness diagnostics become data, not discards (V5/V6). Go package edges become a star, not a clique (G20).</p></div>
+
+<h3>Phase 4 — Store and daemon · 5–7 weeks</h3>
+<div class="prose"><p><strong>Added to the v3 schema work:</strong> migrations as single transactions with user_version last (S2); FTS external-content tables with trigger sync and quoted query terms (S3 + adoption); percent-encoded URIs (S9); BEGIN IMMEDIATE around read-then-insert (S11); alias chains across generations (S16); stat-read-stat freshness with hash confirmation (S17); checkpoint results read, not assumed (S18). The daemon absorbs the entire S4/S5/S6/S7/S10/S12 cluster by construction — one long-lived process owns the write path, so unlock heuristics, orphaned status files, dead worker threads and per-event subprocess spawns cease to exist as categories. Process liveness via platform APIs, never signal 0 (S1).</p></div>
+
+<h3>Phase 5 — Token-budgeted query surface · ~4 weeks</h3>
+<div class="prose"><p><strong>Added:</strong> confidence-aware, budget-priority responses (G24): extracted before inferred before ambiguous, so truncation drops noise first; honest <code>{shown, total}</code> everywhere including the previously-lying dead_code_hidden (V12) and viz badges (V13). Impact adopts CodeGraph's production semantics (adoption table) with parametric depth (G8). The visualizer splits: a no-physics blueprint layout for the 24-subsystem map, and a WebGL sigma.js explorer for the symbol graph with size tiers, reducers, a confirm gate, per-kind colors and legend derived from the payload (V2/V3), escaped labels (V1), atomic stamped writes (V14). route/shape analysis computes its scan once (G9/G15).</p></div>
+
+<h3>Phase 6 — Cutover and deletion · ~4 weeks</h3>
+<div class="prose"><p>Unchanged, plus: the parity harness must replay this audit — a fixture per finding (86 new + 31 original = <strong>117 regression fixtures</strong>), so the rewrite cannot reintroduce what the audit removed. LSP adjunct features (X11–X13) either meet the same timeout/deadlock standards in the Rust client or are cut at parity review.</p></div>
+</section>
+
+<section id="guide">
+<h2>§8 — Implementation guide (Rust)</h2>
+<div class="prose"><p>Extends PLAN §6. Each sketch below is the load-bearing shape that makes a finding-class structurally impossible, in the crate that owns it.</p></div>
+
+<h3>9.1 · Parse outcome as a value — X6, X7, X5 (devmap-extract)</h3>
+<pre><code>pub enum ParseOutcome {
+    Clean(Extraction),
+    Partial { extraction: Extraction, error_ranges: Vec&lt;ByteRange&gt; }, // tree had ERROR nodes
+    Failed { reason: ParseFailure },                                  // timeout, panic, io
+}
+
+pub struct Extraction {
+    pub engine: Engine,          // tree_sitter(grammar, version) — one enum, no aliases
+    pub symbols: Vec&lt;Symbol&gt;,
+    pub imports: Vec&lt;Import&gt;,
+    pub calls: Vec&lt;CallSite&gt;,
+}</code></pre>
+<div class="prose"><p>Cache admission takes <code>ParseOutcome</code>, and only <code>Clean</code>/<code>Partial</code> are admitted under the content hash — <code>Failed</code> is recorded in a retry table with attempt count and backoff. Liveness receives the outcome enum and excludes <code>Failed</code>/<code>Partial</code>-in-error-range symbols from dead candidates. This one type closes the entire "confidently empty" family.</p></div>
+
+<h3>9.2 · Confidence and provenance as the edge's type — G5, G6, G7, G24 (devmap-resolve)</h3>
+<pre><code>pub enum Resolution {
+    Extracted { target: NodeId },                          // proven by syntax
+    Inferred  { target: NodeId, rule: InferenceRule },     // one candidate after scoping
+    Ambiguous { candidates: SmallVec&lt;NodeId&gt;, capped: bool }, // fan-out, never picks
+    Unresolved { reason: UnresolvedReason },               // ledger, not silence
+}</code></pre>
+<div class="prose"><p>Three invariants, enforced by construction: (1) a multi-candidate resolution <em>cannot</em> produce <code>Extracted</code> — the type has nowhere to put the discard; (2) edge dedup is a map <code>(source, target) → best</code> where <code>Extracted &gt; Inferred &gt; Ambiguous</code>, upgrading in place (G5); (3) every global-scope rung takes a <code>LangFamily</code> parameter — cross-family candidates are unrepresentable (G3, G7). <code>Unresolved</code> rows persist to the store: GitNexus-style provenance for "why is there no edge here".</p></div>
+
+<h3>9.3 · Traversal kernel — G8, G21, G24 + CodeGraph's production checklist (devmap-query)</h3>
+<pre><code>pub struct Traversal {
+    enqueued: FxHashSet&lt;NodeId&gt;,   // separate from visited — parallel edges survive
+    edge_seen: FxHashSet&lt;EdgeKey&gt;, // (source, target, kind, line, col)
+    budget: Budget,                // per-add cap: one hub can't overshoot the limit
+    priority: &amp;'static [EdgeKind], // contains → calls → rest: structure first
+}
+
+pub fn blast_radius(seed: &amp;[NodeId], depth: u8, min_conf: Confidence)
+    -&gt; Layered&lt;Impact&gt;  // by_depth sized from `depth` — no hardcoded {1,2,3}
+</code></pre>
+<div class="prose"><p>Impact semantics fixed as tests, not conventions: upward <code>contains</code> excluded; <code>instantiates</code> counts as a caller; container children fold in at the same depth; results ranked by confidence before the budget truncates. One traversal kernel serves impact, processes, trace and dead-code so the semantics cannot drift apart per surface (today intel/query/engine already disagree three ways).</p></div>
+
+<h3>9.4 · Store discipline — S2, S3, S9, S11, S16–S18 (devmap-store)</h3>
+<pre><code>// Migrations: one transaction per step, version bump is the LAST statement inside it.
+let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+tx.execute_batch(MIGRATION_V3_SQL)?;   // includes: PRAGMA user_version = 3;
+tx.commit()?;                          // crash before this line = clean retry at v2
+
+// FTS: terms are always quoted phrases — user input can't be syntax.
+fn fts_term(raw: &amp;str) -&gt; String { format!("\"{}\"", raw.replace('"', "\"\"")) }</code></pre>
+<div class="prose"><p>Plus: <code>rusqlite</code> opens by path (no URI string assembly — S9); every read-then-write pair lives inside <code>TransactionBehavior::Immediate</code> (S11); alias resolution chains across retained generations (S16); the file scanner stats before and after reading and retries on mismatch (S17); checkpoint results are read and acted on (S18). The daemon is the only writer, so the lease/unlock heuristics that produced S1/S4/S5 are deleted, not ported — <code>devmap status</code> asks the daemon over the socket instead of probing PIDs.</p></div>
+
+<h3>9.5 · Watcher — S6, S7, S12, S17 (devmap-serve)</h3>
+<div class="prose"><p>The event loop is a supervised task: panics are caught per-tick, recorded as <code>degraded</code> with the error, and the loop continues (S6). Failed batches back off exponentially and quarantine poison files into a status-visible list after N attempts (S7). Ignore matching is in-process (the <code>ignore</code> crate — same engine ripgrep uses), with verdicts cached against .gitignore mtimes; no subprocess per event (S12). Freshness follows CodeGraph's three layers: debounced events → per-response staleness banner for pending files → connect-time (size, mtime) sweep with content-hash confirmation for the racy window (S17).</p></div>
+
+<h3>9.6 · Surfaces — V1–V3, V12–V14, X14 (devmap-query + templates)</h3>
+<div class="prose"><p>Responses are typed <code>Budgeted&lt;T&gt; { items, shown, total, truncated }</code> — the count fields are computed by the truncation function itself, so a lying count is unwritable (V12). Dependents queries return <code>Option&lt;Vec&lt;_&gt;&gt;</code>: <code>None</code> = unknown (unsupported language, stale index), never an empty vec masquerading as verified-zero (X14) — and the MCP layer renders <code>None</code> as an explicit <code>"resolution": "unavailable"</code>. Generated HTML: every interpolation goes through one <code>esc()</code> helper (V1); payloads live in <code>&lt;script type="application/json"&gt;</code> blocks per mode (V2); pages embed <code>{generated_head, built_at, fingerprint}</code> and render a staleness banner; writes are tmp+rename (V14). The subsystem map is laid out deterministically by dependency layer — CodeGraph's blueprint, not a physics blob; the symbol explorer is sigma.js WebGL with GitNexus's size tiers and a confirm gate above 5,000 nodes.</p></div>
+
+<h3>9.7 · The language authority — X8 (build-time, all crates)</h3>
+<pre><code>pub struct LanguageSpec {
+    pub name: &amp;'static str,
+    pub extensions: &amp;'static [&amp;'static str],
+    pub grammar: Grammar,          // the actual linked grammar — not a string
+    pub extractor: ExtractorId,    // exhaustive match = compile error if missing
+}
+pub static LANGUAGES: [LanguageSpec; 35] = [ /* … */ ];</code></pre>
+<div class="prose"><p>Suffix→language, language→grammar, language→extractor, LSP capability and viz legend all derive from this table at compile time. Rust's exhaustive <code>match</code> on <code>ExtractorId</code> is the <code>satisfies Record&lt;…&gt;</code> pattern GitNexus uses — a 36th language that forgets its extractor does not build. The eight divergent Python suffix tables have no equivalent to port.</p></div>
+</section>
+
+<section id="accept">
+<h2>§9 — Acceptance additions</h2>
+<div class="prose">
+<p>PLAN §3 turned 31 findings into acceptance tests. This audit adds 84 more, of which the highest-leverage gates are:</p>
+</div>
+<table>
+<thead><tr><th>Gate</th><th>Proves</th><th>Findings</th></tr></thead>
+<tbody>
+<tr><td>CFG threading fixture: loop/branch/try bodies reachable from entry; condition uses visible to def-use</td><td>PDG runs on a connected graph</td><td>G1, G2, G13, G23</td></tr>
+<tr><td>Resolution fixture: stdlib-named methods keep inbound edges; proven call beats earlier fan-out; heuristic picks never EXTRACTED; no cross-language inheritance</td><td>confidence ladder honest</td><td>G3, G5, G6, G7</td></tr>
+<tr><td>Two builds under different hash seeds produce byte-identical artifacts</td><td>determinism</td><td>G4, G26, V5</td></tr>
+<tr><td>Syntax corpus: TS enum/namespace/declare/new/export★/decorators, Rust generic impls + grouped use — all extract</td><td>no silent blind spots</td><td>X1–X3, X9, G14, G16, G18, G19, X20</td></tr>
+<tr><td>Kill a parser mid-file: extraction retries later; cache holds no empty entry under the real hash</td><td>failure ≠ emptiness</td><td>X6, X7</td></tr>
+<tr><td>kill −9 during migration at every statement boundary: store reopens clean at old or new version, never between</td><td>atomic migrations</td><td>S2</td></tr>
+<tr><td>Fuzzed search queries (quotes, hyphens, parens, column syntax): no crash, no full-scan fallback</td><td>FTS hygiene</td><td>S3</td></tr>
+<tr><td>`devmap status`/`unlock` on Windows CI with a live build: build survives; stuck detection keys on progress, not age</td><td>ops can't destroy work</td><td>S1, S4, S5</td></tr>
+<tr><td>Impact for an unsupported-language file reports resolution:unavailable, never an empty dependents list</td><td>unknown ≠ zero</td><td>X14</td></tr>
+<tr><td>Edit-then-query under watch: dependents reflect the edit or carry a stale flag</td><td>freshness honesty</td><td>V4, S17</td></tr>
+<tr><td>Every truncated response: shown + hidden + total reconcile; viz badges show "N of M"</td><td>counts never lie</td><td>V12, V13, T3</td></tr>
+<tr><td>Hostile file names (<code>&lt;img onerror&gt;</code>…) render inert in every generated HTML surface</td><td>output escaping</td><td>V1</td></tr>
+</tbody>
+</table>
+<div class="prose"><p>Full mapping: every finding card above names its phase; the parity harness gains one fixture per ID. With PLAN's originals, the rewrite's specification now stands at <strong>117 verified, regression-tested properties</strong>.</p></div>
+</section>
+
+<footer>
+<p>Audit II · generated 2026-08-11 · basis: DevCouncil working tree (769 source files) · method: four parallel full-read audits (graph core · store/sync · surfaces · extraction), primed with GitNexus and CodeGraph production failure catalogues; all claims verified against exact source lines, high-severity claims independently re-verified. Companion to <a href="PLAN.html">PLAN.html</a> / PLAN.md. Two agent-reported duplicates consolidated (G12→V5, X10→G19).</p>
+</footer>
+
+</div>
+</body>
+</html>

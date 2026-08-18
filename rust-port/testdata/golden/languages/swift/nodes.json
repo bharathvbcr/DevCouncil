@@ -1,0 +1,26 @@
+[
+  {
+    "id": "Main.swift",
+    "kind": "file",
+    "path": "Main.swift",
+    "line": 0,
+    "name": "Main.swift",
+    "exported": false
+  },
+  {
+    "id": "Main.swift::Service",
+    "kind": "class",
+    "path": "Main.swift",
+    "line": 2,
+    "name": "Service",
+    "exported": true
+  },
+  {
+    "id": "Main.swift::Service.run",
+    "kind": "function",
+    "path": "Main.swift",
+    "line": 2,
+    "name": "run",
+    "exported": true
+  }
+]

@@ -1,0 +1,18 @@
+[
+  {
+    "id": "Main.sol",
+    "kind": "file",
+    "path": "Main.sol",
+    "line": 0,
+    "name": "Main.sol",
+    "exported": false
+  },
+  {
+    "id": "Main.sol::run",
+    "kind": "function",
+    "path": "Main.sol",
+    "line": 2,
+    "name": "run",
+    "exported": true
+  }
+]

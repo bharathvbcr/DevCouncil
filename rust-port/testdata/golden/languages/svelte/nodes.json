@@ -1,0 +1,18 @@
+[
+  {
+    "id": "Main.svelte",
+    "kind": "file",
+    "path": "Main.svelte",
+    "line": 0,
+    "name": "Main.svelte",
+    "exported": false
+  },
+  {
+    "id": "Main.svelte::greet",
+    "kind": "function",
+    "path": "Main.svelte",
+    "line": 3,
+    "name": "greet",
+    "exported": true
+  }
+]

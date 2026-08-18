@@ -1,0 +1,74 @@
+[
+  {
+    "source": "index.ts",
+    "target": "index.ts::ServiceConsumer",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "index.ts",
+    "target": "index.ts::ServiceConsumer.execute",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "index.ts",
+    "target": "index.ts::logDecorator",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "index.ts",
+    "target": "index.ts::overloadFn",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "index.ts",
+    "target": "reexport.ts",
+    "kind": "imports",
+    "confidence": "extracted"
+  },
+  {
+    "source": "index.ts",
+    "target": "utils.ts",
+    "kind": "imports",
+    "confidence": "extracted"
+  },
+  {
+    "source": "index.ts::ServiceConsumer",
+    "target": "index.ts::ServiceConsumer.execute",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "index.ts::ServiceConsumer.execute",
+    "target": "utils.ts::Helper.run",
+    "kind": "calls",
+    "confidence": "inferred"
+  },
+  {
+    "source": "reexport.ts",
+    "target": "reexport.ts::REEXPORTED_VALUE",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "utils.ts",
+    "target": "utils.ts::Helper",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "utils.ts",
+    "target": "utils.ts::Helper.run",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "utils.ts::Helper",
+    "target": "utils.ts::Helper.run",
+    "kind": "contains",
+    "confidence": "extracted"
+  }
+]

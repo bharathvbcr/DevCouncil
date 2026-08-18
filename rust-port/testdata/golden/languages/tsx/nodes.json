@@ -1,0 +1,26 @@
+[
+  {
+    "id": "main.tsx",
+    "kind": "file",
+    "path": "main.tsx",
+    "line": 0,
+    "name": "main.tsx",
+    "exported": false
+  },
+  {
+    "id": "main.tsx::View",
+    "kind": "function",
+    "path": "main.tsx",
+    "line": 1,
+    "name": "View",
+    "exported": true
+  },
+  {
+    "id": "main.tsx::work",
+    "kind": "function",
+    "path": "main.tsx",
+    "line": 2,
+    "name": "work",
+    "exported": false
+  }
+]

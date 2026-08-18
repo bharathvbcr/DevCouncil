@@ -1,0 +1,8 @@
+[
+  {
+    "source": "main.metal",
+    "target": "main.metal::kernel",
+    "kind": "contains",
+    "confidence": "extracted"
+  }
+]

@@ -1,0 +1,26 @@
+[
+  {
+    "id": "main.ts",
+    "kind": "file",
+    "path": "main.ts",
+    "line": 0,
+    "name": "main.ts",
+    "exported": false
+  },
+  {
+    "id": "main.ts::Service",
+    "kind": "class",
+    "path": "main.ts",
+    "line": 2,
+    "name": "Service",
+    "exported": true
+  },
+  {
+    "id": "main.ts::Service.run",
+    "kind": "method",
+    "path": "main.ts",
+    "line": 2,
+    "name": "run",
+    "exported": false
+  }
+]

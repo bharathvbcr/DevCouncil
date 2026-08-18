@@ -1,0 +1,668 @@
+<title>dev map → Rust: Clean-Room Rewrite Plan</title>
+<style>
+  :root {
+    --ground: #F5F7F9; --surface: #FFFFFF; --surface-sunk: #EDF0F4;
+    --border: #DCE1E8; --border-strong: #C3CBD6;
+    --ink: #12161D; --ink-muted: #58616F; --ink-faint: #808A99;
+    --accent: #A85C26; --accent-soft: #F0E2D6;
+    --critical: #A82920; --critical-soft: #F6E0DE;
+    --warn: #7D5200; --warn-soft: #F6EBD5;
+    --info: #2A5680; --info-soft: #DEE8F1;
+    --ok: #2A6349; --ok-soft: #DDEDE4;
+    --code-bg: #F1F4F7;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0E1116; --surface: #161A21; --surface-sunk: #11151B;
+      --border: #262C36; --border-strong: #38414F;
+      --ink: #E3E8EF; --ink-muted: #98A2B1; --ink-faint: #6E7887;
+      --accent: #D9884A; --accent-soft: #33241A;
+      --critical: #EE7065; --critical-soft: #331C1A;
+      --warn: #DCA347; --warn-soft: #2E2415;
+      --info: #79ACDA; --info-soft: #17242F;
+      --ok: #6FBB92; --ok-soft: #16271E;
+      --code-bg: #10141A;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #0E1116; --surface: #161A21; --surface-sunk: #11151B;
+    --border: #262C36; --border-strong: #38414F;
+    --ink: #E3E8EF; --ink-muted: #98A2B1; --ink-faint: #6E7887;
+    --accent: #D9884A; --accent-soft: #33241A;
+    --critical: #EE7065; --critical-soft: #331C1A;
+    --warn: #DCA347; --warn-soft: #2E2415;
+    --info: #79ACDA; --info-soft: #17242F;
+    --ok: #6FBB92; --ok-soft: #16271E;
+    --code-bg: #10141A;
+  }
+
+  * { box-sizing: border-box; }
+  body { background: var(--ground); color: var(--ink); font-family: var(--sans); font-size: 16px; line-height: 1.62; margin: 0; padding: 0 20px 96px; -webkit-font-smoothing: antialiased; }
+  .wrap { max-width: 980px; margin: 0 auto; display: flex; flex-direction: column; gap: 54px; }
+  .prose { max-width: 68ch; display: flex; flex-direction: column; gap: 14px; }
+  p { margin: 0; }
+  a { color: var(--accent); }
+
+  header.masthead { padding: 64px 0 0; display: flex; flex-direction: column; gap: 22px; }
+  .eyebrow { font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-faint); margin: 0; }
+  h1 { font-family: var(--mono); font-size: clamp(28px, 4.4vw, 42px); font-weight: 600; letter-spacing: -0.02em; line-height: 1.12; margin: 0; text-wrap: balance; }
+  h1 .arrow { color: var(--accent); font-weight: 400; }
+  .standfirst { font-size: 18px; color: var(--ink-muted); max-width: 64ch; margin: 0; }
+
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: 3px; overflow: hidden; }
+  .metric { background: var(--surface); padding: 16px 18px; display: flex; flex-direction: column; gap: 3px; }
+  .metric .v { font-family: var(--mono); font-size: 23px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; line-height: 1.15; }
+  .metric .k { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-faint); }
+  .metric.is-bad .v { color: var(--critical); }
+  .metric.is-warn .v { color: var(--warn); }
+  .metric.is-ok .v { color: var(--ok); }
+
+  section { display: flex; flex-direction: column; gap: 20px; }
+  .sec-head { display: flex; flex-direction: column; gap: 6px; border-top: 2px solid var(--ink); padding-top: 14px; }
+  h2 { font-family: var(--mono); font-size: 20px; font-weight: 600; letter-spacing: -0.01em; margin: 0; text-wrap: balance; }
+  .sec-num { font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.14em; color: var(--accent); text-transform: uppercase; }
+  h3 { font-family: var(--mono); font-size: 14.5px; font-weight: 600; letter-spacing: 0.01em; margin: 0; color: var(--ink); }
+
+  .scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 3px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  thead th { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-faint); font-weight: 500; background: var(--surface-sunk); white-space: nowrap; }
+  tbody tr:last-child td { border-bottom: none; }
+  td.num, th.num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tfoot td { font-weight: 600; background: var(--surface-sunk); font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  code, .path { font-family: var(--mono); font-size: 0.9em; background: var(--surface-sunk); padding: 1px 5px; border-radius: 2px; border: 1px solid var(--border); white-space: nowrap; }
+  td code, td .path { background: none; border: none; padding: 0; }
+  .id { font-family: var(--mono); font-size: 11.5px; font-weight: 600; color: var(--ink-faint); white-space: nowrap; }
+
+  pre { margin: 0; background: var(--code-bg); border: 1px solid var(--border); border-radius: 3px; padding: 14px 16px; overflow-x: auto; font-family: var(--mono); font-size: 12.5px; line-height: 1.6; color: var(--ink); }
+  pre .c { color: var(--ink-faint); }
+  pre .k { color: var(--accent); }
+  .codecap { font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-faint); }
+  .codeblock { display: flex; flex-direction: column; gap: 7px; }
+
+  .ledger { display: flex; flex-direction: column; gap: 10px; }
+  .finding { background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--border-strong); border-radius: 3px; padding: 14px 18px; display: flex; flex-direction: column; gap: 7px; }
+  .finding.sev-critical { border-left-color: var(--critical); }
+  .finding.sev-high { border-left-color: var(--warn); }
+  .finding.sev-medium { border-left-color: var(--info); }
+  .finding.sev-note { border-left-color: var(--ink-faint); }
+  .f-top { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; }
+  .f-id { font-family: var(--mono); font-size: 11.5px; font-weight: 600; letter-spacing: 0.06em; color: var(--ink-faint); }
+  .f-title { font-family: var(--mono); font-size: 14px; font-weight: 600; letter-spacing: -0.005em; flex: 1 1 240px; }
+  .f-body { font-size: 14.5px; color: var(--ink-muted); }
+  .f-body strong { color: var(--ink); font-weight: 600; }
+  .f-ev { font-family: var(--mono); font-size: 12px; color: var(--ink-faint); display: flex; flex-wrap: wrap; gap: 4px 14px; }
+  .chip { font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; padding: 2.5px 7px; border-radius: 2px; white-space: nowrap; font-weight: 600; }
+  .chip.critical { background: var(--critical-soft); color: var(--critical); }
+  .chip.high { background: var(--warn-soft); color: var(--warn); }
+  .chip.medium { background: var(--info-soft); color: var(--info); }
+  .chip.note { background: var(--surface-sunk); color: var(--ink-faint); }
+  .chip.spec { background: var(--ok-soft); color: var(--ok); }
+
+  .callout { background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 3px; padding: 16px 20px; display: flex; flex-direction: column; gap: 8px; }
+  .callout h3 { color: var(--accent); }
+  .callout p { font-size: 14.5px; color: var(--ink-muted); max-width: 66ch; }
+
+  .phases { display: flex; flex-direction: column; gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: 3px; overflow: hidden; }
+  .phase { background: var(--surface); padding: 18px 20px; display: grid; grid-template-columns: 62px 1fr; gap: 4px 18px; }
+  .phase .p-num { font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em; color: var(--accent); text-transform: uppercase; padding-top: 3px; }
+  .phase .p-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; }
+  .phase h3 { flex: 1 1 auto; }
+  .p-est { font-family: var(--mono); font-size: 11.5px; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+  .phase .p-body { grid-column: 2; display: flex; flex-direction: column; gap: 9px; }
+  .phase p { font-size: 14.5px; color: var(--ink-muted); max-width: 68ch; }
+  .gate { font-family: var(--mono); font-size: 12px; color: var(--ink); background: var(--surface-sunk); border: 1px solid var(--border); border-radius: 2px; padding: 7px 11px; }
+  .gate b { color: var(--accent); font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; font-size: 10.5px; }
+  ul { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 5px; font-size: 14.5px; color: var(--ink-muted); }
+  li strong { color: var(--ink); font-weight: 600; }
+
+  .step { background: var(--surface); border: 1px solid var(--border); border-radius: 3px; padding: 18px 20px; display: flex; flex-direction: column; gap: 12px; }
+  .step-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; border-bottom: 1px solid var(--border); padding-bottom: 10px; }
+  .step-head h3 { flex: 1 1 auto; }
+  .fixes { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); }
+
+  footer { border-top: 1px solid var(--border); padding-top: 18px; font-family: var(--mono); font-size: 12px; color: var(--ink-faint); display: flex; flex-direction: column; gap: 5px; }
+  @media (max-width: 620px) { .phase { grid-template-columns: 1fr; } .phase .p-body { grid-column: 1; } }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <p class="eyebrow">DevCouncil · code-intelligence subsystem</p>
+    <h1>dev map <span class="arrow">→</span> Rust</h1>
+    <p class="standfirst">A clean-room rewrite in Rust — new binary, new store, new agent-facing contract — with 38 spec items, an inventory of what must survive, and a staged plan.</p>
+    <div class="metrics">
+      <div class="metric"><span class="v">38</span><span class="k">Spec items</span></div>
+      <div class="metric"><span class="v">26,837</span><span class="k">LOC replaced</span></div>
+      <div class="metric"><span class="v">35</span><span class="k">Languages</span></div>
+      <div class="metric is-bad"><span class="v">129k</span><span class="k">Tokens · repo map</span></div>
+      <div class="metric is-bad"><span class="v">7.55s</span><span class="k">1-file resync · 10k</span></div>
+      <div class="metric is-bad"><span class="v">1,639ms</span><span class="k">Graph load / query</span></div>
+    </div>
+  </header>
+
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">Section 01</span>
+      <h2>What changed in this revision</h2>
+    </div>
+    <div class="prose">
+      <p>Two directives reshape the plan. <strong>The rewrite is clean-room</strong> — a standalone Rust implementation, not a PyO3 extension wrapping the existing design. Nothing is ported function-by-function and no Python survives in the indexer. <strong>Token efficiency becomes a first-class requirement</strong> rather than an afterthought, which is a substantive change: it is the one dimension where the current system is worst, and it was invisible in the previous plan.</p>
+      <p>The consequence for the findings is clarifying. Under a hybrid port, each defect needed a fix and a migration. Under a clean-room rewrite <strong>the findings are the specification</strong> — the new system is designed so they cannot occur, and each one becomes an acceptance test rather than a patch. The distinction that mattered before, whether Rust "fixes" a defect or "inherits" it, collapses into a single question: is it written into the spec, or will it be rebuilt by accident?</p>
+      <p>One consequence to price in honestly: a clean-room rewrite delivers <em>no</em> value until cutover. The previous plan front-loaded four Python fixes that would have taken resync under 500 ms within weeks. That option is now off the table by choice, and the 35-language matrix — 2.5× GitNexus's coverage, 1.75× CodeGraph's — sits on the critical path from day one.</p>
+      <p>Two additions since: <strong>seven reference-derived enhancements</strong> (§3, R1–R7) drawn from GitNexus and CodeGraph, and <strong>§4, an inventory of capabilities that must survive</strong>. The second is the more important of the pair. A specification says what must become true; nothing until now said what must <em>stay</em> true, and a clean-room rewrite loses undocumented behaviour without any signal that it has.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">Section 02</span>
+      <h2>Token cost — the unmeasured surface</h2>
+    </div>
+    <div class="prose">
+      <p>dev map exists to give agents context. Its own output is therefore a budget item, and nothing in the system accounts for it. Token figures below are byte counts at four characters per token — an estimate, but the magnitudes are not in question.</p>
+    </div>
+
+    <div class="ledger">
+      <div class="finding sev-critical">
+        <div class="f-top"><span class="f-id">T1</span><span class="f-title">The repo map costs 129,000 tokens, and CLAUDE.md tells every agent to read it</span><span class="chip critical">Critical</span><span class="chip spec">Spec item</span></div>
+        <p class="f-body"><span class="path">.devcouncil/repo_map.json</span> is <strong>514,625 bytes ≈ 128,656 tokens</strong> — most of a 200k context window consumed by one file read, before any work begins. The project's own instructions direct agents to open it first. Two keys carry <strong>78%</strong> of the cost: <code>dependents</code> at 63,844 tokens across 406 entries, and <code>files</code> at 35,512 across 853. Both are lookup structures being shipped whole to answer point queries.</p>
+        <p class="f-ev"><span>measured — byte counts per key</span><span>CLAUDE.md step 1</span></p>
+      </div>
+      <div class="finding sev-high">
+        <div class="f-top"><span class="f-id">T2</span><span class="f-title">The compatibility export is twenty context windows</span><span class="chip high">High</span><span class="chip spec">Spec item</span></div>
+        <p class="f-body"><span class="path">code_graph.json</span> is 17.4 MB ≈ <strong>4.36 million tokens</strong>, rewritten on every build (N3). No agent can read it, so it exists purely as a machine interchange format that happens to sit in the context-bearing directory — and its tiering (<code>slim</code>/<code>compact</code>/<code>stub</code>) is a size guard, not a token budget.</p>
+        <p class="f-ev"><span>measured — 17,454,216 bytes</span><span>graph/build.py:650</span></p>
+      </div>
+      <div class="finding sev-medium">
+        <div class="f-top"><span class="f-id">T3</span><span class="f-title">MCP responses are capped by item count, not token budget</span><span class="chip medium">Medium</span><span class="chip spec">Spec item</span></div>
+        <p class="f-body">The map handlers bound output with <code>out[:200]</code>. Two hundred graph nodes carrying paths, kinds, lines and reasons is an unbounded number of tokens — the cap constrains rows, not context. There is no token accounting anywhere in the MCP surface, and no way for a caller to say how much room it has.</p>
+        <p class="f-ev"><span>mcp/handlers/map.py:235,442</span><span>verified — code</span></p>
+      </div>
+      <div class="finding sev-note">
+        <div class="f-top"><span class="f-id">T4</span><span class="f-title">The discipline already exists — in the wrong layer</span><span class="chip note">Note</span><span class="chip spec">Spec item</span></div>
+        <p class="f-body"><span class="path">execution/prompt_builder.py</span> does this correctly: a total char budget, a per-file cap, truncation with an explicit <code>[truncated to N chars]</code> marker, and an <code>[N more files omitted]</code> note so nothing vanishes silently. The pattern to generalise is already written; it simply was never applied to the artifacts or the query surface.</p>
+        <p class="f-ev"><span>prompt_builder.py:281-319</span><span>verified — code</span></p>
+      </div>
+    </div>
+
+    <div class="callout">
+      <h3>Design rule for the rewrite</h3>
+      <p>No agent-facing surface emits an unbounded response. Every query takes a token budget and returns <code>{ shown, total, truncated }</code> so a partial answer can never be mistaken for a complete one. Wholesale artifact reads are replaced by queries — the map becomes something you ask, not something you load.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">Section 03</span>
+      <h2>Findings as specification</h2>
+    </div>
+    <div class="prose">
+      <p>Twenty-seven findings from the first two audit passes, condensed. Each is now a property the new system must hold, with the acceptance test that proves it. Full evidence for each is in the sections that follow the table in prior revisions; the <em>Source</em> column cites where it was verified.</p>
+    </div>
+
+    <h3>Correctness and concurrency</h3>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>ID</th><th>Property the rewrite must hold</th><th>Source</th><th>Acceptance</th></tr></thead>
+        <tbody>
+          <tr><td class="id">B1</td><td>Queued work survives process death</td><td>coordinator.py:270</td><td>kill −9 mid-build, work replays</td></tr>
+          <tr><td class="id">B2</td><td>Back-pressure, never silent discard, on lease contention</td><td>build_control.py:447</td><td>two writers, zero lost edits</td></tr>
+          <tr><td class="id">B3</td><td>Write cost proportional to change size, not repo size</td><td>heavy <code>write_stats</code></td><td>1-file edit writes &lt;100 rows at 10k files</td></tr>
+          <tr><td class="id">B4</td><td>Concurrent readers never blocked by a writer</td><td>sync/lease.py</td><td>query p95 unchanged during build</td></tr>
+          <tr><td class="id">B5</td><td>Staleness self-heals without an unrelated trigger</td><td>service.py:151</td><td>commit-then-idle leaves index fresh</td></tr>
+          <tr><td class="id">N1</td><td>Queries never deserialise the whole graph</td><td>query/engine.py:16</td><td>explore p95 &lt;50 ms at 10k files</td></tr>
+          <tr><td class="id">N2</td><td>Deletions and renames are explicit, not implied</td><td>incremental.py — absent</td><td>deleted file absent from graph next build</td></tr>
+          <tr><td class="id">N4</td><td>A check that could not run never reports as one that passed</td><td>graph/intel.py:118</td><td>clustering timeout surfaces <code>status</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Storage</h3>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>ID</th><th>Property the rewrite must hold</th><th>Source</th><th>Acceptance</th></tr></thead>
+        <tbody>
+          <tr><td class="id">B6</td><td>Generation prune is a bounded delete, not a full reindex</td><td>sqlite.py:1326</td><td>prune cost independent of live row count</td></tr>
+          <tr><td class="id">B7</td><td>Cache admission is O(1), not a table scan</td><td>sqlite.py:1673</td><td>cold build insert cost is linear</td></tr>
+          <tr><td class="id">B8</td><td>Eviction follows liveness, not age</td><td>sqlite.py:1677</td><td>live files never evicted while dead remain</td></tr>
+          <tr><td class="id">B9</td><td>No redundant column in any primary key</td><td>sqlite.py:503</td><td>schema review</td></tr>
+          <tr><td class="id">B10</td><td>Paths interned; no repeated text in hot tables</td><td>sqlite.py:503</td><td>index &lt;60 MB for this repo</td></tr>
+          <tr><td class="id">B11</td><td>Free space is reclaimed on a schedule</td><td>sqlite.py:1165</td><td>freelist ratio &lt;5% after 1,000 builds</td></tr>
+          <tr><td class="id">D2</td><td>One schema, no rollback-compat shadow tables</td><td>sqlite.py:643</td><td>schema review</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Compute and analysis quality</h3>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>ID</th><th>Property the rewrite must hold</th><th>Source</th><th>Acceptance</th></tr></thead>
+        <tbody>
+          <tr><td class="id">B12</td><td>Extraction saturates available cores</td><td>build.py:162</td><td>near-linear scaling to core count</td></tr>
+          <tr><td class="id">B13</td><td>No repeated path parsing in hot loops</td><td>1.09M <code>Path</code> calls</td><td>profile shows no string-path work</td></tr>
+          <tr><td class="id">B14</td><td>One pass over each file's tree, not many regex sweeps</td><td>routes.py:77 · di.py:37</td><td>profile shows one traversal per file</td></tr>
+          <tr><td class="id">B15</td><td>Language resolved once per file, not per edge</td><td>resolve.py:81</td><td>profile review</td></tr>
+          <tr><td class="id">N5</td><td>Leiden clustering — connected communities guaranteed</td><td>intel.py:114</td><td>no disconnected community in output</td></tr>
+          <tr><td class="id">N6</td><td>Receiver types tracked from constructors, not guessed by name</td><td>resolve.py:764</td><td>corpus resolution-precision ratchet</td></tr>
+          <tr><td class="id">N7</td><td>Retrieval fuses lexical and semantic ranking</td><td>sqlite.py:1464</td><td>RRF over BM25 + vectors</td></tr>
+          <tr><td class="id">N9</td><td>Pools sized from real cores and RAM, no fixed ceiling</td><td>workers.py:221</td><td>12-core host uses 12 cores</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Interface and artifacts</h3>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>ID</th><th>Property the rewrite must hold</th><th>Source</th><th>Acceptance</th></tr></thead>
+        <tbody>
+          <tr><td class="id">T1</td><td>No agent-facing artifact exceeds its token budget</td><td>514 KB repo map</td><td>manifest ≤2k tokens</td></tr>
+          <tr><td class="id">T2</td><td>Machine interchange lives outside the context directory</td><td>17.4 MB export</td><td>opt-in, not default</td></tr>
+          <tr><td class="id">T3</td><td>Every response is token-budgeted and reports truncation</td><td>handlers/map.py:235</td><td>all responses carry <code>{shown,total}</code></td></tr>
+          <tr><td class="id">N3</td><td>No dual-write of a second full serialisation</td><td>build.py:650</td><td>one canonical store</td></tr>
+          <tr><td class="id">N8</td><td>Ingestion owned by a long-lived watcher</td><td>graph_cmd.py:425</td><td>freshness holds with hooks disabled</td></tr>
+          <tr><td class="id">N10</td><td>Query surface is honest about its capability</td><td>cypher.py:1-20</td><td>no regex posing as a query language</td></tr>
+          <tr><td class="id">D1</td><td>One extractor per language, tree-sitter throughout</td><td>cache.py:308</td><td>no stdlib-<code>ast</code> path</td></tr>
+          <tr><td class="id">D3</td><td>Lock status reports the true holder</td><td>lease.py:17</td><td>status never names a dead pid</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Reference-derived enhancements</h3>
+    <div class="prose">
+      <p>Adopted from GitNexus and CodeGraph. These are additions rather than defects — nothing in the current system is wrong, but each is a capability it lacks.</p>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>ID</th><th>Enhancement</th><th>Source</th><th>Acceptance</th></tr></thead>
+        <tbody>
+          <tr><td class="id">R1</td><td>One primary query tool; the rest unlisted by default</td><td>CodeGraph</td><td>≤3 listed tools replace today's 18</td></tr>
+          <tr><td class="id">R2</td><td>Results carry verbatim source, grouped by file</td><td>CodeGraph</td><td>symbol query needs no follow-up read</td></tr>
+          <tr><td class="id">R3</td><td>Embedding index bounded by node count</td><td>GitNexus</td><td>peak RSS &lt;1 GB at 10k files</td></tr>
+          <tr><td class="id">R4</td><td>WAL auto-checkpoint tuned for build churn</td><td>GitNexus</td><td>freelist &lt;5% without manual vacuum</td></tr>
+          <tr><td class="id">R5</td><td>Call paths include dynamic-dispatch hops</td><td>CodeGraph</td><td>interface-dispatch path resolves in corpus</td></tr>
+          <tr><td class="id">R6</td><td>Communities carry cohesion scores</td><td>GitNexus</td><td>every community reports cohesion</td></tr>
+          <tr><td class="id">R7</td><td>Targeted repair without a full rebuild</td><td>GitNexus</td><td><code>devmap repair --fts</code> rebuilds index only</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="prose">
+      <p><strong>Declined:</strong> multi-repo global registry and connection pooling (GitNexus). DevCouncil is single-repo by design; adopting these changes the product, not the implementation.</p>
+      <p><strong>Already present, not adopted from elsewhere:</strong> tsconfig path aliases, re-export chains and a portable fallback extractor exist in DevCouncil today — in some cases more thoroughly than in either reference. They belong in the next section, not this one.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">Section 04</span>
+      <h2>Capabilities to preserve</h2>
+    </div>
+    <div class="prose">
+      <p>The counterweight to the specification. A clean-room rewrite loses undocumented behaviour silently — nothing fails, the graph is merely poorer. Golden-corpus parity only catches a regression if the corpus exercises the capability, so each row below carries the corpus requirement that makes it detectable.</p>
+      <p><strong>This inventory is incomplete.</strong> It was compiled from the 49% of the subsystem the audit opened, plus targeted probes into <span class="path">repo_mapper.py</span> and <span class="path">wiring.py</span>. Completing it is a Phase 1 deliverable.</p>
+    </div>
+
+    <h3>Import resolution, per language</h3>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Capability</th><th>Source</th><th>Corpus must contain</th></tr></thead>
+        <tbody>
+          <tr><td>Python module-suffix index + <code>__init__.py</code> ancestry</td><td>repo_mapper.py:1070,1114</td><td>nested and namespace packages</td></tr>
+          <tr><td>JS/TS relative resolution + extension/index probing</td><td>repo_mapper.py:1310,1332</td><td><code>./x</code>, <code>../y</code>, dir-index imports</td></tr>
+          <tr><td>tsconfig/jsconfig aliases across <code>extends</code> + project references</td><td>repo_mapper.py:1340-1344</td><td>multi-level extends, project refs</td></tr>
+          <tr><td>Monorepo package.json workspace → source dir</td><td>repo_mapper.py:1551</td><td>workspace with 2+ packages</td></tr>
+          <tr><td>JS re-export chain following</td><td>repo_mapper.py:1636 · resolve.py:236</td><td><code>export { X } from './y'</code> chains</td></tr>
+          <tr><td>Named-binding imports (<code>import { X as Y }</code>)</td><td>resolve.py:583</td><td>aliased named imports</td></tr>
+          <tr><td>Go module prefix from <code>go.mod</code></td><td>repo_mapper.py:1726</td><td>non-trivial module path</td></tr>
+          <tr><td>Rust crate root + <code>mod.rs</code>/<code>name.rs</code> probing</td><td>repo_mapper.py:1802,1814</td><td>nested modules, both spellings</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Liveness exemptions — the false-positive guard</h3>
+    <div class="prose">
+      <p><span class="path">wiring.py</span> is the layer that stops dead-code detection reporting entry points as dead. Losing any row here does not break a build; it makes <code>dev map dead</code> untrustworthy, which is worse.</p>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Capability</th><th>Source</th><th>Corpus must contain</th></tr></thead>
+        <tbody>
+          <tr><td><code>pyproject.toml</code> script targets</td><td>wiring.py:829</td><td>console_scripts entry point</td></tr>
+          <tr><td><code>package.json</code> entry + script targets</td><td>wiring.py:917,424</td><td>bin/main/scripts entries</td></tr>
+          <tr><td><code>Cargo.toml</code> binary targets</td><td>wiring.py:796</td><td><code>[[bin]]</code> target</td></tr>
+          <tr><td>Launcher files + module-form reference keys</td><td>wiring.py:376,387</td><td>launcher referencing a module</td></tr>
+          <tr><td>Re-export-only <code>__init__.py</code> recognition</td><td>wiring.py:277</td><td>package re-exporting submodules</td></tr>
+          <tr><td>Python <code>__all__</code> and re-export names</td><td>wiring.py:451,470</td><td><code>__all__</code> with indirect exports</td></tr>
+          <tr><td>Generated-file detection (path + header sniff)</td><td>wiring.py:253,258</td><td>file with a codegen header</td></tr>
+          <tr><td>Vendored path detection</td><td>wiring.py:181</td><td>vendored third-party dir</td></tr>
+          <tr><td>Test path detection</td><td>wiring.py:113</td><td>tests in a non-standard location</td></tr>
+          <tr><td>Decorator-based wiring</td><td>wiring.py:706</td><td>registration decorators</td></tr>
+          <tr><td>Structural convention exemptions</td><td>wiring.py:728</td><td>conventionally-wired file</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Framework recognition and subsystem inference</h3>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Capability</th><th>Source</th><th>Corpus must contain</th></tr></thead>
+        <tbody>
+          <tr><td>Routes: django, rails, spring, aspnet, laravel, nest, axum, play, drupal</td><td>frameworks/routes.py</td><td>one app per framework family</td></tr>
+          <tr><td>DI / provider patterns</td><td>frameworks/di.py</td><td>provider registration</td></tr>
+          <tr><td>Event handler patterns</td><td>frameworks/events.py</td><td>event subscriber</td></tr>
+          <tr><td>Source-root detection</td><td>repo_mapper.py:1037</td><td><code>src/</code>-style and flat layouts</td></tr>
+          <tr><td>Area/role classification, role_files buckets</td><td>repo_mapper.py:916,990</td><td>multi-role subsystem</td></tr>
+          <tr><td>Subsystem index (hardcoded + generic paths)</td><td>repo_mapper.py:937,946</td><td>repo matching neither shape</td></tr>
+          <tr><td><code>handoff_paths</code> / <code>neighbors</code> cross-subsystem flow</td><td>repo_map schema</td><td>subsystems that call each other</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout">
+      <h3>Inventory gaps — no capability list exists yet</h3>
+      <p>PDG / taint / CFG (872 LOC), LSP integration (775), debug and DAP runtime observations (1,207), visualization and export (2,591), semantic index and AST matcher (449). Each needs the same treatment before its fate — port, keep in Python, or drop — can be decided. That decision is a Phase 1 gate.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">Section 05</span>
+      <h2>Target architecture</h2>
+    </div>
+    <div class="prose">
+      <p>A single Rust binary that owns indexing, storage, watching and the agent interface. CodeGraph validates the shape: Rust kernel, tree-sitter compiled in, plain SQLite with FTS5. The storage engine does not need to change — SQLite is 3% of the current build — so the rewrite spends its risk budget on the parts that are actually wrong.</p>
+    </div>
+    <div class="codeblock">
+      <span class="codecap">binary surface</span>
+<pre>devmap serve     <span class="c">// long-lived: watcher + index + MCP over stdio/socket</span>
+devmap build     <span class="c">// one-shot index, for CI</span>
+devmap query …   <span class="c">// CLI queries, token-budgeted like the MCP surface</span>
+devmap status    <span class="c">// freshness, generation, lock holder</span></pre>
+    </div>
+    <div class="codeblock">
+      <span class="codecap">workspace</span>
+<pre>crates/
+  devmap-extract/   <span class="c">// tree-sitter, one module per language, rayon</span>
+  devmap-resolve/   <span class="c">// symbols, calls, receiver types, imports</span>
+  devmap-analyze/   <span class="c">// liveness, dead code, Leiden clustering, PDG</span>
+  devmap-store/     <span class="c">// rusqlite, v3 schema, generations</span>
+  devmap-query/     <span class="c">// token-budgeted responses</span>
+  devmap-serve/     <span class="c">// watcher, daemon, MCP</span>
+  devmap-cli/       <span class="c">// binary entry point</span></pre>
+    </div>
+    <div class="prose">
+      <p>The 37 Python consumers do not import a shim — they talk to the daemon. A thin client of roughly 400 LOC replaces 26,837, exposing the same call signatures the verification checks and MCP handlers already use, over a versioned local socket. That client is the <em>only</em> Python that remains, and it contains no analysis logic.</p>
+      <p>Making the daemon the sole ingestion path is what turns three findings into structural impossibilities rather than fixes. B1 (lost pending work) cannot occur when the queue lives in a process that does not exit. N8 is satisfied by construction. And B4 — readers blocked by the writer — dissolves because the daemon holds the write connection and readers use WAL snapshots.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">Section 06</span>
+      <h2>Plan</h2>
+    </div>
+    <div class="prose">
+      <p>Six phases. The first freezes observable behaviour so the rewrite has something to be correct against; the last deletes the Python. Estimates assume one engineer and are <em>inferred</em>, not derived from comparable work in this repository. No phase before cutover ships user-visible value — that is the cost of the clean-room choice.</p>
+    </div>
+
+    <div class="phases">
+      <div class="phase">
+        <span class="p-num">Phase 1</span>
+        <div class="p-body">
+          <div class="p-head"><h3>Freeze the contract</h3><span class="p-est">est. 4–5 weeks</span></div>
+          <p>Capture what the current system produces before replacing it. Build the golden corpus spanning all 35 languages, snapshot canonical graphs from the Python implementation, and write down the 37 consumer contracts — especially the verification checks, whose assumptions about graph shape exist nowhere but their assertions. Add the token budget to the contract now, so the new surface is designed against it rather than retrofitted.</p>
+          <p><strong>Complete the §4 inventory, then build the corpus from it.</strong> Today that inventory covers only the 49% of the subsystem the audit opened; the areas in §4.5 have none at all. Every row in §4 names a corpus requirement, and a capability whose requirement is absent from the corpus is a capability parity cannot protect. This is the phase where an unwritten behaviour becomes a test — or becomes a future regression.</p>
+          <div class="gate"><b>Gate</b> — §4 inventory complete for all 26,837 LOC; corpus satisfies every stated requirement; golden graphs for 35 languages; every consumer contract has a signature and a test; token budgets specified per surface; scoping decision recorded for each §4.5 area (port / keep in Python / drop).</div>
+        </div>
+      </div>
+      <div class="phase">
+        <span class="p-num">Phase 2</span>
+        <div class="p-body">
+          <div class="p-head"><h3>Extraction</h3><span class="p-est">est. 6–10 weeks</span></div>
+          <p>Tree-sitter for all 35 languages including Python, resolving D1 by construction — one extractor, no stdlib-<code>ast</code> path. Parallel by default with <code>rayon</code>, pools sized from real cores (B12, N9). Grammars link into the binary, so the spawn-based crash isolation, the 30s per-file timeout and the quarantine-and-respawn logic have no analogue to port: a panicking grammar unwinds one task.</p>
+          <div class="gate"><b>Gate</b> — extraction parity against golden corpus, all 35 languages; near-linear core scaling; Python-extraction divergences enumerated and individually accepted.</div>
+        </div>
+      </div>
+      <div class="phase">
+        <span class="p-num">Phase 3</span>
+        <div class="p-body">
+          <div class="p-head"><h3>Resolution and analysis</h3><span class="p-est">est. 10–14 weeks</span></div>
+          <p>The largest and hardest phase — 76% of current build time, and global passes with subtle ordering semantics. B13–B15 have no counterpart in a design built on interned <code>FileId</code>s and a single tree traversal. Fold in the quality work while the code is open: Leiden with cohesion scores (N5, R6), constructor-inferred receiver types (N6), dynamic-dispatch hops in call paths (R5), and explicit status on any analysis that times out (N4). R5 builds directly on N6 — once a receiver's type is tracked, an interface-dispatch hop becomes resolvable rather than a dead end — so they are one work item, not two.</p>
+          <div class="gate"><b>Gate</b> — full-graph parity on the corpus; cold build for this repo under 2s; resolution precision ratchet meets or beats the Python baseline; every community reports cohesion; interface-dispatch path resolves in corpus.</div>
+        </div>
+      </div>
+      <div class="phase">
+        <span class="p-num">Phase 4</span>
+        <div class="p-body">
+          <div class="p-head"><h3>Store and daemon</h3><span class="p-est">est. 5–7 weeks</span></div>
+          <p>v3 schema with interned paths (B10), clean primary keys (B9), indexable FTS pruning (B6), O(1) cache admission and liveness-ordered eviction (B7, B8), scheduled vacuum (B11), one schema with no rollback shadow (D2), WAL auto-checkpoint tuned for build churn (R4). Differential membership writes <em>with</em> deletion reconciliation — B3 and N2 are one work item and must never be separated. The daemon owns the watcher and a durable queue, and exposes targeted repair so a corrupt search index does not force a full rebuild (R7).</p>
+          <div class="gate"><b>Gate</b> — 1-file edit writes &lt;100 rows at 10k files; kill −9 mid-build replays; index &lt;60 MB for this repo; freelist &lt;5% without manual vacuum; <code>devmap repair --fts</code> rebuilds the search index alone; freshness holds across a 30-minute multi-session burst.</div>
+        </div>
+      </div>
+      <div class="phase">
+        <span class="p-num">Phase 5</span>
+        <div class="p-body">
+          <div class="p-head"><h3>Token-budgeted query surface</h3><span class="p-est">est. 5–6 weeks</span></div>
+          <p>The graph stays resident in the daemon, so N1's 1,639 ms reload has no analogue. Every response takes a budget and reports truncation. The 129k-token repo map is replaced by a ≤2k-token manifest plus queries; the 17.4 MB export becomes opt-in and moves out of the context directory (T1–T3, N3). Add RRF over BM25 and vectors (N7), bounded by a node cap so the embedding index cannot grow without limit (R3), and either implement real graph queries or retire the Cypher shim honestly (N10).</p>
+          <p>Collapse today's 18 map/graph MCP tools to one primary plus a small unlisted set (R1), and have results carry verbatim source grouped by file (R2). These are the largest remaining token wins and they compound: tool definitions cost context on every request whether or not they are called, and a result without source forces a follow-up read that costs another round-trip.</p>
+          <div class="gate"><b>Gate</b> — explore p95 &lt;50 ms at 10k files; no response exceeds its budget; every truncation reports <code>{shown, total}</code>; manifest ≤2k tokens; ≤3 listed tools; a symbol query answers without a follow-up file read; peak RSS &lt;1 GB at 10k files.</div>
+        </div>
+      </div>
+      <div class="phase">
+        <span class="p-num">Phase 6</span>
+        <div class="p-body">
+          <div class="p-head"><h3>Cutover and deletion</h3><span class="p-est">est. 4 weeks</span></div>
+          <p>Point the 37 consumers at the client, run both systems in parallel against live work until the parity harness is quiet, then delete <span class="path">indexing/</span> and <span class="path">codeintel/</span>. Deleting is the phase — a rewrite that lands beside what it replaces doubles the surface permanently, and the 16,534 LOC of existing tests must pass against the new core before the old one goes.</p>
+          <div class="gate"><b>Gate</b> — all existing tests green against Rust; 26,837 LOC removed; no Python analysis code remains; wheels or binaries published for every supported platform.</div>
+        </div>
+      </div>
+    </div>
+    <div class="prose">
+      <p>Total 34–46 weeks. The 35-language matrix in phase 2 and the global resolution passes in phase 3 are the long poles and carry nearly all the schedule risk. Treat the range as a lower bound: it was derived from the 49% of the subsystem the audit opened.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">Section 07</span>
+      <h2>Implementation guide</h2>
+    </div>
+
+    <div class="step">
+      <div class="step-head"><h3>1 · Token budget as a protocol primitive</h3><span class="fixes">T1–T4, T3 · phase 1, enforced phase 5</span></div>
+      <p class="f-body">Put the budget in the request type so it cannot be forgotten, and make truncation a value rather than an absence. This is the generalisation of what <span class="path">prompt_builder.py</span> already does correctly for file bodies.</p>
+      <div class="codeblock">
+        <span class="codecap">crates/devmap-query/src/budget.rs</span>
+<pre><span class="k">pub struct</span> Request&lt;Q&gt; {
+    <span class="k">pub</span> query: Q,
+    <span class="k">pub</span> token_budget: u32,   <span class="c">// required — no default that hides cost</span>
+    <span class="k">pub</span> min_confidence: Confidence,
+}
+
+<span class="k">pub struct</span> Response&lt;T&gt; {
+    <span class="k">pub</span> items: Vec&lt;T&gt;,
+    <span class="k">pub</span> shown: u32,
+    <span class="k">pub</span> total: u32,          <span class="c">// what a complete answer would have held</span>
+    <span class="k">pub</span> truncated: bool,
+    <span class="k">pub</span> tokens_used: u32,
+}</pre>
+      </div>
+      <p class="f-body">Two rules make this load-bearing. Rank <em>before</em> truncating, so the budget keeps the most relevant rows rather than the first ones. And carry both numbers always — a capped sample presented as complete coverage is how "no dead code found" comes to mean "we stopped looking at 200".</p>
+    </div>
+
+    <div class="step">
+      <div class="step-head"><h3>2 · Replace the repo map with a manifest plus queries</h3><span class="fixes">T1 · 129k → ~2k tokens</span></div>
+      <p class="f-body">78% of the current map is <code>dependents</code> (63,844 tokens) and <code>files</code> (35,512) — lookup tables shipped whole to answer point questions. Neither belongs in a file an agent reads; both are one query each.</p>
+      <div class="codeblock">
+        <span class="codecap">what stays in the manifest — everything under ~2k tokens</span>
+<pre>subsystems (names + entry points only)   ~800 tok
+important_files                          ~140 tok
+entry_roots, languages, test_commands     ~80 tok
+freshness: head, fingerprint, generation   ~30 tok
+<span class="c">-- dependents, files: removed. queried instead.</span></pre>
+      </div>
+      <div class="codeblock">
+        <span class="codecap">what replaces them</span>
+<pre>devmap where &lt;symbol&gt;          <span class="c">// one answer, not 853 file entries</span>
+devmap deps &lt;path&gt; --budget N  <span class="c">// ranked, truncation reported</span>
+devmap impact &lt;symbol&gt;         <span class="c">// precomputed blast radius + confidence</span></pre>
+      </div>
+      <p class="f-body">CLAUDE.md changes with it — "open repo_map.json first" becomes "query the map". That instruction is currently the single largest token expenditure in the system, and it is one line of documentation.</p>
+    </div>
+
+    <div class="step">
+      <div class="step-head"><h3>3 · Collapse the tool surface, return source with results</h3><span class="fixes">R1, R2 · phase 5</span></div>
+      <p class="f-body">Today the MCP surface exposes 18 map/graph tools. Tool definitions are serialised into <em>every</em> request whether or not they are called, so an unused tool is a standing tax on every turn. CodeGraph lists one primary tool and leaves the rest unlisted but callable.</p>
+      <div class="codeblock">
+        <span class="codecap">listed vs callable</span>
+<pre>Listed (≤3):
+  devmap_explore   <span class="c">// symbols + call paths + impact + source, budgeted</span>
+  devmap_search    <span class="c">// ranked lookup, budgeted</span>
+  devmap_status    <span class="c">// freshness, generation</span>
+
+Unlisted but callable: dead, routes, paths, affected-tests,
+                       impact, trace, process, api-impact, …</pre>
+      </div>
+      <p class="f-body">R2 is the other half. A result that gives only a location forces the agent to issue a file read, which costs a round-trip and usually pulls in far more of the file than the answer needed. Returning the relevant spans inline, grouped by file, makes the query self-contained.</p>
+      <div class="codeblock">
+        <span class="codecap">crates/devmap-query/src/types.rs</span>
+<pre><span class="k">pub struct</span> SymbolHit {
+    <span class="k">pub</span> id: SymbolId,
+    <span class="k">pub</span> path: FileId,
+    <span class="k">pub</span> span: (u32, u32),
+    <span class="k">pub</span> source: String,      <span class="c">// R2: the lines themselves, budget-trimmed</span>
+    <span class="k">pub</span> flows: Vec&lt;FlowRef&gt;, <span class="c">// step 4: processes it participates in</span>
+}</pre>
+      </div>
+      <p class="f-body">Both interact with the budget from step 1: source is the first thing trimmed as a response approaches its limit, and the trim is reported rather than silent.</p>
+    </div>
+
+    <div class="step">
+      <div class="step-head"><h3>4 · Precompute so one call is enough</h3><span class="fixes">T3 · GitNexus's central idea</span></div>
+      <p class="f-body">The deepest token saving is not compression but avoided round-trips. An agent that must issue four queries and reassemble edges spends far more context than one that receives a structured answer. GitNexus does clustering, process detection and confidence scoring at index time so tool responses are complete; dev map already computes the raw material in its liveness and PDG layers and then discards the structure.</p>
+      <p class="f-body">Concretely: store the entry-point-to-leaf call flows at build time, and let a symbol query return the flows it participates in with step indices — not a set of edges the caller must walk. Confidence filtering belongs in the same place: speculative low-confidence edges cost context and mislead, so <code>min_confidence</code> is a request parameter with a conservative default.</p>
+    </div>
+
+    <div class="step">
+      <div class="step-head"><h3>5 · Differential writes with deletion reconciliation</h3><span class="fixes">B3 + N2 · one work item</span></div>
+      <p class="f-body">This is the 7.55s. Today each generation re-materialises all 59,880 membership rows; it must write only the delta. The hazard is that deletion is currently handled implicitly <em>by</em> the full rewrite, so the delta path has to carry it explicitly or deleted files persist as live nodes forever.</p>
+      <div class="codeblock">
+        <span class="codecap">algorithm</span>
+<pre>1. carry forward  rows from prev generation whose source file
+                  is not in :affected
+2. delete         rows whose source file is in :affected
+3. insert         freshly resolved rows for :affected
+4. reconcile      any file present in the previous generation but
+                  absent from `git ls-files` is a deletion — add it
+                  to :affected even though nothing on disk changed</pre>
+      </div>
+      <p class="f-body">Step 4 is the one that is easy to miss and the reason these cannot ship separately. Renames are a delete plus an add under this model — correct, though it loses rename identity, which nothing downstream consumes today.</p>
+    </div>
+
+    <div class="step">
+      <div class="step-head"><h3>6 · Schema v3</h3><span class="fixes">B6, B9, B10, D2</span></div>
+      <p class="f-body">Interned paths fix the storage bloat and the hot-loop path parsing at once — B10 and B13 are the same problem at two layers. FTS holds text only, with generation membership in an ordinary indexable table so pruning is a bounded delete rather than a full reindex.</p>
+      <div class="codeblock">
+        <span class="codecap">core tables</span>
+<pre><span class="k">CREATE TABLE</span> paths (
+    id   <span class="k">INTEGER PRIMARY KEY</span>,
+    path <span class="k">TEXT NOT NULL UNIQUE</span>
+);
+
+<span class="k">CREATE TABLE</span> generation_edges (
+    generation_id  <span class="k">INTEGER NOT NULL</span>,
+    ordinal        <span class="k">INTEGER NOT NULL</span>,
+    payload_hash   <span class="k">TEXT NOT NULL</span>,
+    source_file_id <span class="k">INTEGER NOT NULL REFERENCES</span> paths(id),
+    target_file_id <span class="k">INTEGER NOT NULL REFERENCES</span> paths(id),
+    <span class="k">PRIMARY KEY</span> (generation_id, ordinal)   <span class="c">-- B9</span>
+) <span class="k">WITHOUT ROWID</span>;
+
+<span class="c">-- FTS holds text only; membership is indexable</span>
+<span class="k">CREATE VIRTUAL TABLE</span> nodes_fts <span class="k">USING</span> fts5(
+    name, qualified_name, path, tokenize='unicode61'
+);
+<span class="k">CREATE TABLE</span> nodes_fts_map (
+    rowid_ref     <span class="k">INTEGER NOT NULL</span>,
+    generation_id <span class="k">INTEGER NOT NULL</span>,
+    <span class="k">PRIMARY KEY</span> (generation_id, rowid_ref)
+) <span class="k">WITHOUT ROWID</span>;
+
+<span class="k">CREATE TABLE</span> pending_paths (      <span class="c">-- B1: survives process death</span>
+    path       <span class="k">TEXT PRIMARY KEY</span>,
+    queued_at  <span class="k">REAL NOT NULL</span>,
+    attempts   <span class="k">INTEGER NOT NULL DEFAULT</span> 0
+) <span class="k">WITHOUT ROWID</span>;</pre>
+      </div>
+      <p class="f-body">Pending rows are deleted only after the generation commits, so a crash mid-build replays rather than drops. In the core, <code>FileId(u32)</code> replaces every string path in the hot loops, and the per-edge language classification (B15) collapses into a field resolved once at intern time.</p>
+    </div>
+
+    <div class="step">
+      <div class="step-head"><h3>7 · Parallel extraction</h3><span class="fixes">B12, N9 · phase 2</span></div>
+      <div class="codeblock">
+        <span class="codecap">crates/devmap-extract/src/lib.rs</span>
+<pre><span class="k">use</span> rayon::prelude::*;
+
+<span class="k">pub fn</span> extract_all(files: &amp;[FileRef]) -&gt; Vec&lt;(FileId, Extraction)&gt; {
+    files
+        .par_iter()
+        .filter_map(|f| {
+            <span class="k">if let</span> Some(hit) = cache::get(f.content_hash) {
+                <span class="k">return</span> Some((f.id, hit));
+            }
+            <span class="k">let</span> tree = parser_for(f.language).parse(&amp;f.source)?;
+            Some((f.id, extract(&amp;tree, &amp;f.source)))
+        })
+        .collect()
+}</pre>
+      </div>
+      <p class="f-body">Size the pool from real cores rather than the current <code>min(4, cpu_count()//2)</code>. CodeGraph sizes analysis caches from free RAM as well, which matters at 10k files where the Python implementation peaks at 714 MB.</p>
+    </div>
+
+    <div class="step">
+      <div class="step-head"><h3>8 · Parity harness</h3><span class="fixes">phase 1 · gates every later phase</span></div>
+      <p class="f-body">Structural comparison, not textual — ordinals and iteration order will differ legitimately between implementations. Normalise both sides to sorted sets keyed on stable identity, and run per language so a divergence names the grammar responsible.</p>
+      <div class="codeblock">
+        <span class="codecap">canonical form</span>
+<pre>nodes: sorted (id, kind, path, line, name, exported)
+edges: sorted (source, target, kind, confidence)
+dead:  sorted (id, confidence)</pre>
+      </div>
+      <p class="f-body">Confidence belongs in the comparison. A rewrite that finds the same edges at different confidence changes what the verification gates decide — a behaviour change even though the graph "matches". Expect real divergences from D1; the gate is that each is enumerated and accepted deliberately, not that the count is zero.</p>
+    </div>
+
+    <div class="step">
+      <div class="step-head"><h3>9 · Consumer client and distribution</h3><span class="fixes">phase 6</span></div>
+      <p class="f-body">The Python client is a transport, not a port: request/response types, a socket, and auto-spawn of <code>devmap serve</code> if it is not running. Roughly 400 LOC with no analysis logic, replacing 26,837. Keeping it that thin is what makes the deletion in phase 6 possible.</p>
+      <p class="f-body">Distribution ships the binary per platform — macOS arm64 and x86_64, manylinux x86_64 and aarch64, Windows x86_64 — built in CI on tag. Because grammars link into the binary, this replaces the existing <code>devcouncil-codeintel-grammars</code> companion package rather than sitting alongside it; plan that deprecation deliberately.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">Section 08</span>
+      <h2>Risks</h2>
+    </div>
+    <div class="prose">
+      <ul>
+        <li><strong>No value until cutover.</strong> 34–46 weeks before anything improves for a user, and the staleness and query-latency problems persist throughout. This is inherent to the clean-room choice, not a flaw in the plan.</li>
+        <li><strong>The estimate is a lower bound.</strong> It was derived from the 49% of the subsystem the audit opened. The unread half contains the two largest files (<span class="path">repo_mapper.py</span>, <span class="path">wiring.py</span>) and three concerns with no home in the architecture — see §4.5.</li>
+        <li><strong>The §4 inventory is the thing most likely to be skipped, and most costly to skip.</strong> Capability loss from a clean-room rewrite is silent by construction: nothing fails, the graph is merely poorer. The <span class="path">wiring.py</span> exemption rules are the sharpest case — losing one does not break a build, it makes <code>dev map dead</code> report entry points as dead, and a dead-code report nobody trusts is worse than none.</li>
+        <li><strong>The 35-language matrix is the schedule</strong>, not the Rust — 2.5× GitNexus, 1.75× CodeGraph, each needing parity evidence.</li>
+        <li><strong>D1 guarantees divergence.</strong> Moving Python onto tree-sitter will change extractions. The gate is enumerated-and-accepted, not zero-diff, and someone has to make those calls.</li>
+        <li><strong>B3 and N2 must ship together.</strong> Differential writes without deletion reconciliation leave deleted files in the graph permanently — worse than the slowness being fixed.</li>
+        <li><strong>37 contracts, mostly unwritten.</strong> The verification checks encode graph-shape assumptions that exist nowhere but their assertions; phase 1 exists to find them before phase 6 depends on them.</li>
+        <li><strong>Token work is separable.</strong> T1–T3 are generated by Python today and could ship in days — a 129k-token artifact reduced to ~2k without waiting for the rewrite. Holding them until phase 5 is a deliberate choice worth revisiting if the schedule slips.</li>
+      </ul>
+    </div>
+  </section>
+
+  <footer>
+    <span>Audit performed 2026-08-11 against DevCouncil @ 98f23e3 · 769 source files · macOS arm64 · CPython 3.12.13</span>
+    <span>Measurements: cProfile over cold build_code_graph; tests/performance benchmark harness, fast and heavy profiles; SQLite dbstat; direct timing of store.load_graph; byte counts of agent-facing artifacts at 4 chars/token.</span>
+    <span>Reference architectures summarised from github.com/abhigyanpatwari/GitNexus and github.com/colbymchenry/codegraph. Effort estimates are inferred, not derived from comparable work in this repository.</span>
+  </footer>
+
+</div>

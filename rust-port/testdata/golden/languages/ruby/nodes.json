@@ -1,0 +1,26 @@
+[
+  {
+    "id": "main.rb",
+    "kind": "file",
+    "path": "main.rb",
+    "line": 0,
+    "name": "main.rb",
+    "exported": false
+  },
+  {
+    "id": "main.rb::Service",
+    "kind": "class",
+    "path": "main.rb",
+    "line": 2,
+    "name": "Service",
+    "exported": true
+  },
+  {
+    "id": "main.rb::Service.run",
+    "kind": "method",
+    "path": "main.rb",
+    "line": 3,
+    "name": "run",
+    "exported": true
+  }
+]

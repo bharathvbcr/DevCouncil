@@ -1,0 +1,9 @@
+[package]
+name = "devmap-resolve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+devmap-extract = { path = "../devmap-extract" }
+serde.workspace = true

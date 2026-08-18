@@ -1,0 +1,42 @@
+[
+  {
+    "id": "main.rs",
+    "kind": "file",
+    "path": "main.rs",
+    "line": 0,
+    "name": "main.rs",
+    "exported": false
+  },
+  {
+    "id": "main.rs::GenericContainer",
+    "kind": "struct",
+    "path": "main.rs",
+    "line": 8,
+    "name": "GenericContainer",
+    "exported": true
+  },
+  {
+    "id": "main.rs::Processor",
+    "kind": "trait",
+    "path": "main.rs",
+    "line": 4,
+    "name": "Processor",
+    "exported": true
+  },
+  {
+    "id": "main.rs::Processor.process",
+    "kind": "method",
+    "path": "main.rs",
+    "line": 5,
+    "name": "process",
+    "exported": true
+  },
+  {
+    "id": "main.rs::main",
+    "kind": "function",
+    "path": "main.rs",
+    "line": 19,
+    "name": "main",
+    "exported": false
+  }
+]

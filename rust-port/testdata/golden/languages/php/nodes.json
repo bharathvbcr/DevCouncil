@@ -1,0 +1,26 @@
+[
+  {
+    "id": "main.php",
+    "kind": "file",
+    "path": "main.php",
+    "line": 0,
+    "name": "main.php",
+    "exported": false
+  },
+  {
+    "id": "main.php::Service",
+    "kind": "class",
+    "path": "main.php",
+    "line": 3,
+    "name": "Service",
+    "exported": true
+  },
+  {
+    "id": "main.php::Service.run",
+    "kind": "method",
+    "path": "main.php",
+    "line": 3,
+    "name": "run",
+    "exported": true
+  }
+]

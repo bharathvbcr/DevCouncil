@@ -1,0 +1,39 @@
+# devmap (Rust) vs Python Baseline Divergence Ledger (R3)
+
+This document tracks deliberate, documented divergences between Python `devcouncil.indexing` / `codeintel` behavior and `devmap` (Rust).
+
+| Finding ID | Python Behavior | devmap (Rust) Behavior | Justification / Test |
+|------------|-----------------|------------------------|----------------------|
+| **G1** | CFG entry/exit threading missing | Explicit entry/exit control flow nodes | Correct PDG graph contract |
+| **G2** | Leader line attribution inaccurate | Blocks own leader lines explicitly | AST block ownership accuracy |
+| **G3** | Python stdlib names resolve globally | Stdlib name guard restricted to unique-global rung within Python family | Prevents stdlib name pollution across languages |
+| **G4** / **G26** | Nondeterministic hash map iteration | Deterministic output (`BTreeMap`/`BTreeSet` / sorted emission) | R4 requirement: byte-identical artifacts across builds |
+| **G5** | Multi-candidate pick emitted as `Extracted` | Multi-candidate pick MUST NOT emit `Extracted` confidence | R5 requirement: confidence honesty |
+| **G6** | Import-scoped resolution silently widens | Strict import-scoped resolution | Prevents false-positive edge creation |
+| **G7** | Ambiguous inheritance resolution guesses single path | Ambiguity fans out or abstains with `Unresolved` | R5 requirement: confidence honesty |
+| **X1** | Misses TS `enum`/`namespace`/`declare`/`abstract`/overloads | Parses TS syntactic constructs cleanly | Parity requirement for TS AST |
+| **X2** | Drops `new_expression` and Go `composite_literal` calls | Extracts `new` calls & composite literal references | Complete call-graph extraction |
+| **X3** | Ignores `export *` re-exports | Emits re-export chain sentinel for `export *` | Full export graph tracking |
+| **X9** | Drops grouped `use` statements in Rust | Expands grouped Rust `use {a, b::c}` statements | Complete import resolution for Rust |
+| **G19** | Generic impl blocks fail resolution | Handles generic impl resolution (`impl<T> Trait for Struct<T>`) | Rust trait resolution parity |
+| **X30** | Solidity functions emitted flat (`Contract.sol::get`) | Owned by their contract (`Contract.sol::SimpleStorage.get`) | Same ownership rule devmap applies to Java/C# methods; the baseline loses the owner. `treesitter.rs` generic extractor |
+| **X31** | Exported module-level bindings emitted as kind `function` | Emitted as `Variable` (`f.go::Limit`, `c.ts::VALUE`) | Python's kind is a misclassification; devmap records the correct kind. Only *exported* bindings, so private locals add no dead-code noise. `exported_module_level_bindings_are_symbols` |
+| **X32** | HCL/Terraform parsed by the generic extractor, blocks not addressable | Blocks emitted under their Terraform address (`resource.aws_s3_bucket.b`) | Matches the identity `terraform plan` prints and operators already use. `terraform_blocks_are_symbols_with_terraform_addresses` |
+| **X16** | Arbitrary 500-symbol cap on snapshots | Budgeted truncation with shown/total flags | `devmap-query/snapshots.rs` test_x16 |
+| **X18** | Regex-based public symbol rules | Per-language public rules in snapshot builder | `devmap-query/snapshots.rs` test_x18 |
+| **V14** | Artifact writes without atomic rename | tmp+rename with fingerprint skip | `devmap-query/artifacts.rs` test_v14 |
+| **G8** | Fixed traversal depth | Parametric depth in shared kernel + query impact/trace | `test_findings_suite.rs` test_g8 |
+| **B3** | Full rewrite on small edits | Differential generation write with affected_paths | `test_findings_suite.rs` test_b3 |
+| **T1** | Unbounded manifest | ≤2k-token manifest with subsystem cap | `test_findings_suite.rs` test_t1 |
+| **V12** | Dead list hides total count | Budgeted dead with shown+hidden=total | `test_findings_suite.rs` test_v12 |
+| **X14** | Empty list for unknown dependents | Structured zero-count unavailable semantics | `test_findings_suite.rs` test_x14 |
+| **G10** | PDG batch reads unoptimized | Extraction cache enables shard re-read | `test_findings_suite.rs` test_g10 |
+| **N7** | RRF/vector ranking | FTS + lexical rank only (RRF deferred) | `test_findings_suite.rs` test_n7_rrf |
+| **LSP (X11–X13)** | Python LSP adjunct live | **Cut** — no production MCP/CLI usage grep hits; Phase 7 documents cut | STATUS.md Open Questions |
+| **SC11** / **SC6b** | `impl Trait for Type` methods are qualified by the **trait**, and a trait's bare method signatures are not extracted at all | Impl methods are qualified by their **type**; the trait's declared signatures are extracted and own the `Trait.method` identity | A qualified name is the graph's join key. Under the Python naming every implementor of a trait shares one identity — a single `impl` overriding a defaulted method already produced `Trait.method` twice, so two nodes existed that no edge could distinguish. Correctness of the join key outranks bug-for-bug parity. Costs 1 net parity diff on `rust_app` (18 → 19), where the same dead symbol is reported under a different name. `symbol_identities_are_unique_within_a_file`; `test_wiring_exemptions` asserts BOTH the declaration and the implementation stay exempt |
+| **X6** / **X7** | Regex recovery can fabricate symbols from syntactically invalid source | Tree-sitter error trees remain `Partial`; regex recovery is not promoted to authoritative extraction, and error-overlapping symbols are excluded from dead-code conclusions | `test_treesitter_extraction`; `test_x6_partial_error_range_symbol_is_exempt` |
+| **SC6** | Entry-point exemption is file-scoped only: one `func init()` exempts the *whole file* (`indexing/wiring.py` `content_liveness_exemption` → `"side_effect"`), and Rust/Go/pytest entry points other than React lifecycle methods have no rule at all | Entry points are exempted **per symbol** via `WiringAnnotation.target_symbol`. A `func init()` exempts `init` and nothing else, so ordinary unused functions beside it stay confidently dead | `test_hardening.rs` `test_runtime_entry_points_are_exempt_without_exempting_their_file`; `test_phase3_analysis.rs` `symbol_scoped_exemption_reports_its_own_reason_not_the_files` |
+
+## Baseline regeneration decisions
+
+- **2026-08-12 — canonical snapshot schema repair:** regenerate all Phase 1 golden snapshots after fixing the snapshotter to emit PLAN §7.8 identities (`node.id/kind/path/line/name/exported`, `edge.source/target/kind/confidence`, `dead.id/confidence`). The prior files silently wrote empty `qualified_name`/`span` fields that do not exist on the frozen graph schema and therefore were not a usable parity baseline. `tools/snapshot/test_generate_snapshots.py` proves graph-build failures cannot be rewritten as authoritative empty snapshots.

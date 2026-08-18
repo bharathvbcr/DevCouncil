@@ -1,0 +1,14 @@
+[
+  {
+    "source": "Main.kt",
+    "target": "Main.kt::Service",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "Main.kt",
+    "target": "Main.kt::sample",
+    "kind": "contains",
+    "confidence": "extracted"
+  }
+]

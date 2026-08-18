@@ -1,0 +1,18 @@
+[
+  {
+    "id": "main.luau",
+    "kind": "file",
+    "path": "main.luau",
+    "line": 0,
+    "name": "main.luau",
+    "exported": false
+  },
+  {
+    "id": "main.luau::Service.run",
+    "kind": "function",
+    "path": "main.luau",
+    "line": 2,
+    "name": "Service.run",
+    "exported": true
+  }
+]

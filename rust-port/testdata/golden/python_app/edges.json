@@ -1,0 +1,50 @@
+[
+  {
+    "source": "app.py",
+    "target": "app.py::MyClass",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "app.py",
+    "target": "app.py::MyClass.execute",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "app.py",
+    "target": "app.py::dir",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "app.py",
+    "target": "app.py::my_func",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "app.py",
+    "target": "app.py::open",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "app.py::MyClass",
+    "target": "app.py::MyClass.execute",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "app.py::MyClass.execute",
+    "target": "app.py::dir",
+    "kind": "calls",
+    "confidence": "extracted"
+  },
+  {
+    "source": "app.py::my_func",
+    "target": "app.py::open",
+    "kind": "calls",
+    "confidence": "extracted"
+  }
+]

@@ -1,0 +1,14 @@
+[
+  {
+    "source": "Contract.sol",
+    "target": "Contract.sol::get",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "Contract.sol",
+    "target": "Contract.sol::set",
+    "kind": "contains",
+    "confidence": "extracted"
+  }
+]

@@ -1,0 +1,18 @@
+[
+  {
+    "id": "main.c",
+    "kind": "file",
+    "path": "main.c",
+    "line": 0,
+    "name": "main.c",
+    "exported": false
+  },
+  {
+    "id": "main.c::run",
+    "kind": "function",
+    "path": "main.c",
+    "line": 3,
+    "name": "run",
+    "exported": true
+  }
+]

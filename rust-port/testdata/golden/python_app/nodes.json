@@ -1,0 +1,50 @@
+[
+  {
+    "id": "app.py",
+    "kind": "file",
+    "path": "app.py",
+    "line": 0,
+    "name": "app.py",
+    "exported": false
+  },
+  {
+    "id": "app.py::MyClass",
+    "kind": "class",
+    "path": "app.py",
+    "line": 19,
+    "name": "MyClass",
+    "exported": false
+  },
+  {
+    "id": "app.py::MyClass.execute",
+    "kind": "method",
+    "path": "app.py",
+    "line": 20,
+    "name": "execute",
+    "exported": false
+  },
+  {
+    "id": "app.py::dir",
+    "kind": "function",
+    "path": "app.py",
+    "line": 11,
+    "name": "dir",
+    "exported": false
+  },
+  {
+    "id": "app.py::my_func",
+    "kind": "function",
+    "path": "app.py",
+    "line": 15,
+    "name": "my_func",
+    "exported": true
+  },
+  {
+    "id": "app.py::open",
+    "kind": "function",
+    "path": "app.py",
+    "line": 7,
+    "name": "open",
+    "exported": false
+  }
+]

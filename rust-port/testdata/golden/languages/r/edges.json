@@ -1,0 +1,8 @@
+[
+  {
+    "source": "main.R",
+    "target": "main.R::function",
+    "kind": "contains",
+    "confidence": "extracted"
+  }
+]

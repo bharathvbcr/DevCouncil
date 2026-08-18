@@ -1,0 +1,20 @@
+[
+  {
+    "source": "main.ets",
+    "target": "main.ets::Counter",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "main.ets",
+    "target": "main.ets::Counter.increment",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "main.ets::Counter",
+    "target": "main.ets::Counter.increment",
+    "kind": "contains",
+    "confidence": "extracted"
+  }
+]

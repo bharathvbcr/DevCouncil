@@ -1,0 +1,82 @@
+[
+  {
+    "id": "index.ts",
+    "kind": "file",
+    "path": "index.ts",
+    "line": 0,
+    "name": "index.ts",
+    "exported": false
+  },
+  {
+    "id": "index.ts::ServiceConsumer",
+    "kind": "class",
+    "path": "index.ts",
+    "line": 33,
+    "name": "ServiceConsumer",
+    "exported": true
+  },
+  {
+    "id": "index.ts::ServiceConsumer.execute",
+    "kind": "method",
+    "path": "index.ts",
+    "line": 35,
+    "name": "execute",
+    "exported": false
+  },
+  {
+    "id": "index.ts::logDecorator",
+    "kind": "function",
+    "path": "index.ts",
+    "line": 29,
+    "name": "logDecorator",
+    "exported": false
+  },
+  {
+    "id": "index.ts::overloadFn",
+    "kind": "function",
+    "path": "index.ts",
+    "line": 25,
+    "name": "overloadFn",
+    "exported": true
+  },
+  {
+    "id": "reexport.ts",
+    "kind": "file",
+    "path": "reexport.ts",
+    "line": 0,
+    "name": "reexport.ts",
+    "exported": false
+  },
+  {
+    "id": "reexport.ts::REEXPORTED_VALUE",
+    "kind": "function",
+    "path": "reexport.ts",
+    "line": 1,
+    "name": "REEXPORTED_VALUE",
+    "exported": true
+  },
+  {
+    "id": "utils.ts",
+    "kind": "file",
+    "path": "utils.ts",
+    "line": 0,
+    "name": "utils.ts",
+    "exported": false
+  },
+  {
+    "id": "utils.ts::Helper",
+    "kind": "class",
+    "path": "utils.ts",
+    "line": 1,
+    "name": "Helper",
+    "exported": true
+  },
+  {
+    "id": "utils.ts::Helper.run",
+    "kind": "method",
+    "path": "utils.ts",
+    "line": 2,
+    "name": "run",
+    "exported": false
+  }
+]

@@ -1,0 +1,20 @@
+[
+  {
+    "source": "main.rb",
+    "target": "main.rb::Service",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "main.rb",
+    "target": "main.rb::Service.run",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "main.rb::Service",
+    "target": "main.rb::Service.run",
+    "kind": "contains",
+    "confidence": "extracted"
+  }
+]

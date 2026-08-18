@@ -1,0 +1,18 @@
+[package]
+name = "devmap-serve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+devmap-extract = { path = "../devmap-extract" }
+devmap-resolve = { path = "../devmap-resolve" }
+devmap-analyze = { path = "../devmap-analyze" }
+devmap-store = { path = "../devmap-store" }
+devmap-query = { path = "../devmap-query" }
+tokio.workspace = true
+notify.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

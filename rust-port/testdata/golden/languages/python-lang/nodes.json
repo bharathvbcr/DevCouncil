@@ -1,0 +1,26 @@
+[
+  {
+    "id": "service.py",
+    "kind": "file",
+    "path": "service.py",
+    "line": 0,
+    "name": "service.py",
+    "exported": false
+  },
+  {
+    "id": "service.py::Service",
+    "kind": "class",
+    "path": "service.py",
+    "line": 3,
+    "name": "Service",
+    "exported": true
+  },
+  {
+    "id": "service.py::Service.run",
+    "kind": "method",
+    "path": "service.py",
+    "line": 4,
+    "name": "run",
+    "exported": true
+  }
+]

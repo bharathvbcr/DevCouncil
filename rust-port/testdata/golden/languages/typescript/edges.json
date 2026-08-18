@@ -1,0 +1,20 @@
+[
+  {
+    "source": "main.ts",
+    "target": "main.ts::Service",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "main.ts",
+    "target": "main.ts::Service.run",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "main.ts::Service",
+    "target": "main.ts::Service.run",
+    "kind": "contains",
+    "confidence": "extracted"
+  }
+]

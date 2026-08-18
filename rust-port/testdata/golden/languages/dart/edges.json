@@ -1,0 +1,8 @@
+[
+  {
+    "source": "main.dart",
+    "target": "main.dart::Service",
+    "kind": "contains",
+    "confidence": "extracted"
+  }
+]

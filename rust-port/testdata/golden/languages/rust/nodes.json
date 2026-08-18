@@ -1,0 +1,18 @@
+[
+  {
+    "id": "main.rs",
+    "kind": "file",
+    "path": "main.rs",
+    "line": 0,
+    "name": "main.rs",
+    "exported": false
+  },
+  {
+    "id": "main.rs::Service",
+    "kind": "struct",
+    "path": "main.rs",
+    "line": 2,
+    "name": "Service",
+    "exported": true
+  }
+]

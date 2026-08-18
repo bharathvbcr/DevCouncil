@@ -1,0 +1,26 @@
+[
+  {
+    "id": "Contract.sol",
+    "kind": "file",
+    "path": "Contract.sol",
+    "line": 0,
+    "name": "Contract.sol",
+    "exported": false
+  },
+  {
+    "id": "Contract.sol::get",
+    "kind": "function",
+    "path": "Contract.sol",
+    "line": 14,
+    "name": "get",
+    "exported": true
+  },
+  {
+    "id": "Contract.sol::set",
+    "kind": "function",
+    "path": "Contract.sol",
+    "line": 9,
+    "name": "set",
+    "exported": true
+  }
+]

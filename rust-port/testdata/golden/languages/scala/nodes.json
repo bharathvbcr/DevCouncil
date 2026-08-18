@@ -1,0 +1,26 @@
+[
+  {
+    "id": "Main.scala",
+    "kind": "file",
+    "path": "Main.scala",
+    "line": 0,
+    "name": "Main.scala",
+    "exported": false
+  },
+  {
+    "id": "Main.scala::Service",
+    "kind": "class",
+    "path": "Main.scala",
+    "line": 2,
+    "name": "Service",
+    "exported": true
+  },
+  {
+    "id": "Main.scala::Service.run",
+    "kind": "function",
+    "path": "Main.scala",
+    "line": 2,
+    "name": "run",
+    "exported": true
+  }
+]

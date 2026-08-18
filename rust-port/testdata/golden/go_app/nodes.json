@@ -1,0 +1,42 @@
+[
+  {
+    "id": "main.go",
+    "kind": "file",
+    "path": "main.go",
+    "line": 0,
+    "name": "main.go",
+    "exported": false
+  },
+  {
+    "id": "main.go::Config",
+    "kind": "struct",
+    "path": "main.go",
+    "line": 9,
+    "name": "Config",
+    "exported": true
+  },
+  {
+    "id": "main.go::ProcessConfig",
+    "kind": "function",
+    "path": "main.go",
+    "line": 14,
+    "name": "ProcessConfig",
+    "exported": true
+  },
+  {
+    "id": "main.go::dynamic:import:4:0",
+    "kind": "dynamic",
+    "path": "main.go",
+    "line": 4,
+    "name": "import",
+    "exported": false
+  },
+  {
+    "id": "main.go::main",
+    "kind": "function",
+    "path": "main.go",
+    "line": 18,
+    "name": "main",
+    "exported": false
+  }
+]

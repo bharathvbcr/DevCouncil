@@ -1,0 +1,10 @@
+[
+  {
+    "id": "main.rb::Service",
+    "confidence": "ambiguous"
+  },
+  {
+    "id": "main.rb::Service.run",
+    "confidence": "inferred"
+  }
+]

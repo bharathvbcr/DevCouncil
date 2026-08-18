@@ -1,0 +1,18 @@
+[
+  {
+    "id": "main.cu",
+    "kind": "file",
+    "path": "main.cu",
+    "line": 0,
+    "name": "main.cu",
+    "exported": false
+  },
+  {
+    "id": "main.cu::add",
+    "kind": "function",
+    "path": "main.cu",
+    "line": 2,
+    "name": "add",
+    "exported": true
+  }
+]

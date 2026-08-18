@@ -1,0 +1,157 @@
+use std::fs;
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Temp roots must be unique per call, not merely per instant. `SystemTime`
+/// resolution on macOS is 1 us, so two tests entering this function in the same
+/// microsecond used to receive the *same* directory; whichever finished first
+/// deleted the tree out from under its sibling. The pid and the monotonic
+/// counter make the name unique within and across processes.
+fn temp_root() -> std::path::PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock must be after epoch")
+        .as_nanos();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "devmap-progress-{}-{stamp}-{seq}",
+        std::process::id()
+    ));
+    fs::create_dir_all(root.join("src")).expect("create fixture tree");
+    fs::write(root.join("src/main.py"), "def main():\n    return 0\n").expect("write fixture");
+    root
+}
+
+#[test]
+fn build_progress_is_bounded_complete_and_keeps_json_stdout_clean() {
+    let root = temp_root();
+    let db = root.join("index.sqlite");
+    let output = Command::new(env!("CARGO_BIN_EXE_devmap"))
+        .args(["--json", "--progress", "always", "--db"])
+        .arg(&db)
+        .arg("build")
+        .arg(&root)
+        .output()
+        .expect("run build with forced progress");
+
+    assert!(
+        output.status.success(),
+        "build failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout remains one JSON value");
+    assert_eq!(payload["files_indexed"], 1);
+
+    let progress = String::from_utf8(output.stderr).expect("progress is UTF-8");
+    for expected in ["[1/5]", "[2/5]", "[3/5]", "[4/5]", "[5/5]"] {
+        assert!(
+            progress.contains(expected),
+            "missing {expected}: {progress}"
+        );
+    }
+    assert!(
+        progress.contains("complete"),
+        "missing completion: {progress}"
+    );
+
+    fs::remove_dir_all(root).expect("remove fixture tree");
+}
+
+/// Fixture roots must never be shared between concurrently running tests.
+/// Against a purely timestamp-keyed root this fails: `SystemTime` advances in
+/// 1 us steps here, so threads entering together receive one identical path and
+/// the first teardown destroys a live sibling's tree.
+#[test]
+fn fixture_roots_are_unique_under_concurrent_construction() {
+    let roots: Vec<std::path::PathBuf> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..16)
+            .map(|_| scope.spawn(|| (0..16).map(|_| temp_root()).collect::<Vec<_>>()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("fixture thread must not panic"))
+            .collect()
+    });
+
+    let distinct: std::collections::BTreeSet<_> = roots.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        roots.len(),
+        "temp_root() handed the same directory to two callers"
+    );
+    for root in roots {
+        fs::remove_dir_all(root).expect("remove fixture tree");
+    }
+}
+
+#[test]
+fn progress_never_suppresses_all_progress_output() {
+    let root = temp_root();
+    let db = root.join("index.sqlite");
+    let output = Command::new(env!("CARGO_BIN_EXE_devmap"))
+        .args(["--progress", "never", "--db"])
+        .arg(&db)
+        .arg("build")
+        .arg(&root)
+        .output()
+        .expect("run build without progress");
+
+    assert!(output.status.success());
+    assert!(
+        output.stderr.is_empty(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(root).expect("remove fixture tree");
+}
+
+#[test]
+fn history_reports_measured_builds_and_deltas_as_json() {
+    let root = temp_root();
+    let db = root.join("index.sqlite");
+    for body in [
+        "def main():\n    return 0\n",
+        "def main():\n    return 1\n\ndef helper():\n    return 2\n",
+    ] {
+        fs::write(root.join("src/main.py"), body).expect("update fixture");
+        let build = Command::new(env!("CARGO_BIN_EXE_devmap"))
+            .args(["--json", "--progress", "never", "--db"])
+            .arg(&db)
+            .arg("build")
+            .arg(&root)
+            .output()
+            .expect("run history fixture build");
+        assert!(
+            build.status.success(),
+            "build failed: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_devmap"))
+        .args(["--json", "--db"])
+        .arg(&db)
+        .args(["history", "--last", "2"])
+        .output()
+        .expect("query build history");
+    assert!(
+        output.status.success(),
+        "history failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("history stdout is JSON");
+    assert_eq!(payload["shown"], 2);
+    let history = payload["history"].as_array().expect("history is an array");
+    assert_eq!(history.len(), 2);
+    assert!(history[0]["build_ms"].is_number());
+    assert!(history[0]["delta"]["symbols"].is_number());
+    assert!(history[1]["delta"].is_null());
+
+    fs::remove_dir_all(root).expect("remove fixture tree");
+}

@@ -1,0 +1,8 @@
+[
+  {
+    "source": "main.rs",
+    "target": "main.rs::Service",
+    "kind": "contains",
+    "confidence": "extracted"
+  }
+]

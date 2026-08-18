@@ -1,0 +1,18 @@
+[
+  {
+    "id": "main.dart",
+    "kind": "file",
+    "path": "main.dart",
+    "line": 0,
+    "name": "main.dart",
+    "exported": false
+  },
+  {
+    "id": "main.dart::Service",
+    "kind": "class",
+    "path": "main.dart",
+    "line": 2,
+    "name": "Service",
+    "exported": true
+  }
+]

@@ -1,0 +1,18 @@
+[
+  {
+    "id": "main.js",
+    "kind": "file",
+    "path": "main.js",
+    "line": 0,
+    "name": "main.js",
+    "exported": false
+  },
+  {
+    "id": "main.js::run",
+    "kind": "function",
+    "path": "main.js",
+    "line": 2,
+    "name": "run",
+    "exported": true
+  }
+]

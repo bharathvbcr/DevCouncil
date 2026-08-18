@@ -1,0 +1,32 @@
+[
+  {
+    "source": "main.rs",
+    "target": "main.rs::GenericContainer",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "main.rs",
+    "target": "main.rs::Processor",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "main.rs",
+    "target": "main.rs::Processor.process",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "main.rs",
+    "target": "main.rs::main",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "main.rs::Processor",
+    "target": "main.rs::Processor.process",
+    "kind": "contains",
+    "confidence": "extracted"
+  }
+]

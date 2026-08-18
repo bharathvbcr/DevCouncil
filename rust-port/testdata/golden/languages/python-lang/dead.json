@@ -1,0 +1,10 @@
+[
+  {
+    "id": "service.py::Service",
+    "confidence": "extracted"
+  },
+  {
+    "id": "service.py::Service.run",
+    "confidence": "inferred"
+  }
+]

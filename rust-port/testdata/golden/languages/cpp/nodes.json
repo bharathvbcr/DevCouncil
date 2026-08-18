@@ -1,0 +1,26 @@
+[
+  {
+    "id": "main.cpp",
+    "kind": "file",
+    "path": "main.cpp",
+    "line": 0,
+    "name": "main.cpp",
+    "exported": false
+  },
+  {
+    "id": "main.cpp::Service",
+    "kind": "class",
+    "path": "main.cpp",
+    "line": 2,
+    "name": "Service",
+    "exported": true
+  },
+  {
+    "id": "main.cpp::run",
+    "kind": "function",
+    "path": "main.cpp",
+    "line": 2,
+    "name": "run",
+    "exported": true
+  }
+]

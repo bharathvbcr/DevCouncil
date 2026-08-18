@@ -1,0 +1,10 @@
+[
+  {
+    "id": "Main.kt::Service",
+    "confidence": "ambiguous"
+  },
+  {
+    "id": "Main.kt::sample",
+    "confidence": "ambiguous"
+  }
+]

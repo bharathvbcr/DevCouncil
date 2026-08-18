@@ -1,0 +1,10 @@
+[
+  {
+    "id": "main.php::Service",
+    "confidence": "ambiguous"
+  },
+  {
+    "id": "main.php::Service.run",
+    "confidence": "inferred"
+  }
+]

@@ -1,0 +1,20 @@
+[
+  {
+    "source": "service.py",
+    "target": "service.py::Service",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "service.py",
+    "target": "service.py::Service.run",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "service.py::Service",
+    "target": "service.py::Service.run",
+    "kind": "contains",
+    "confidence": "extracted"
+  }
+]

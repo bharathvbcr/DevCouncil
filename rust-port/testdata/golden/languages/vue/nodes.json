@@ -1,0 +1,18 @@
+[
+  {
+    "id": "Main.vue",
+    "kind": "file",
+    "path": "Main.vue",
+    "line": 0,
+    "name": "Main.vue",
+    "exported": false
+  },
+  {
+    "id": "Main.vue::increment",
+    "kind": "function",
+    "path": "Main.vue",
+    "line": 4,
+    "name": "increment",
+    "exported": true
+  }
+]

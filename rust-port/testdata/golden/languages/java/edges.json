@@ -1,0 +1,20 @@
+[
+  {
+    "source": "Main.java",
+    "target": "Main.java::Main",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "Main.java",
+    "target": "Main.java::Main.size",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "Main.java::Main",
+    "target": "Main.java::Main.size",
+    "kind": "contains",
+    "confidence": "extracted"
+  }
+]

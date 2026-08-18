@@ -1,0 +1,20 @@
+[
+  {
+    "source": "main.tsx",
+    "target": "main.tsx::View",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "main.tsx",
+    "target": "main.tsx::work",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "main.tsx::View",
+    "target": "main.tsx::work",
+    "kind": "calls",
+    "confidence": "extracted"
+  }
+]

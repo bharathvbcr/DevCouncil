@@ -1,0 +1,10 @@
+[
+  {
+    "id": "main.rs::Processor.process",
+    "confidence": "inferred"
+  },
+  {
+    "id": "main.rs::main",
+    "confidence": "ambiguous"
+  }
+]

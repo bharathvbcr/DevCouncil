@@ -1,0 +1,20 @@
+[
+  {
+    "source": "main.go",
+    "target": "main.go::Service",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "main.go",
+    "target": "main.go::Service.Run",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "main.go::Service",
+    "target": "main.go::Service.Run",
+    "kind": "contains",
+    "confidence": "extracted"
+  }
+]

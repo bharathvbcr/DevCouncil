@@ -1,0 +1,26 @@
+[
+  {
+    "id": "main.ets",
+    "kind": "file",
+    "path": "main.ets",
+    "line": 0,
+    "name": "main.ets",
+    "exported": false
+  },
+  {
+    "id": "main.ets::Counter",
+    "kind": "class",
+    "path": "main.ets",
+    "line": 1,
+    "name": "Counter",
+    "exported": true
+  },
+  {
+    "id": "main.ets::Counter.increment",
+    "kind": "method",
+    "path": "main.ets",
+    "line": 1,
+    "name": "increment",
+    "exported": true
+  }
+]

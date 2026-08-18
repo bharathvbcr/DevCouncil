@@ -1,0 +1,10 @@
+[
+  {
+    "id": "Contract.sol::get",
+    "confidence": "ambiguous"
+  },
+  {
+    "id": "Contract.sol::set",
+    "confidence": "ambiguous"
+  }
+]

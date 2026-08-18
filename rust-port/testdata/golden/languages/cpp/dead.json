@@ -1,0 +1,10 @@
+[
+  {
+    "id": "main.cpp::Service",
+    "confidence": "ambiguous"
+  },
+  {
+    "id": "main.cpp::run",
+    "confidence": "ambiguous"
+  }
+]

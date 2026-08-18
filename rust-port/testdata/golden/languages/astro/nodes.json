@@ -1,0 +1,18 @@
+[
+  {
+    "id": "Main.astro",
+    "kind": "file",
+    "path": "Main.astro",
+    "line": 0,
+    "name": "Main.astro",
+    "exported": false
+  },
+  {
+    "id": "Main.astro::label",
+    "kind": "function",
+    "path": "Main.astro",
+    "line": 3,
+    "name": "label",
+    "exported": true
+  }
+]

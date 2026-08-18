@@ -1,0 +1,10 @@
+[
+  {
+    "id": "Main.java::Main",
+    "confidence": "ambiguous"
+  },
+  {
+    "id": "Main.java::Main.size",
+    "confidence": "inferred"
+  }
+]

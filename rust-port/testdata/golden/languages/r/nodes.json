@@ -1,0 +1,18 @@
+[
+  {
+    "id": "main.R",
+    "kind": "file",
+    "path": "main.R",
+    "line": 0,
+    "name": "main.R",
+    "exported": false
+  },
+  {
+    "id": "main.R::function",
+    "kind": "function",
+    "path": "main.R",
+    "line": 1,
+    "name": "function",
+    "exported": true
+  }
+]

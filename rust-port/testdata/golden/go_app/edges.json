@@ -1,0 +1,32 @@
+[
+  {
+    "source": "main.go",
+    "target": "main.go::Config",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "main.go",
+    "target": "main.go::ProcessConfig",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "main.go",
+    "target": "main.go::dynamic:import:4:0",
+    "kind": "dynamic_reference",
+    "confidence": "ambiguous"
+  },
+  {
+    "source": "main.go",
+    "target": "main.go::main",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "main.go::main",
+    "target": "main.go::ProcessConfig",
+    "kind": "calls",
+    "confidence": "extracted"
+  }
+]

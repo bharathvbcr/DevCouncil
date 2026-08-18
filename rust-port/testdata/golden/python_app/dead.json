@@ -1,0 +1,14 @@
+[
+  {
+    "id": "app.py::MyClass",
+    "confidence": "extracted"
+  },
+  {
+    "id": "app.py::MyClass.execute",
+    "confidence": "inferred"
+  },
+  {
+    "id": "app.py::dir",
+    "confidence": "ambiguous"
+  }
+]

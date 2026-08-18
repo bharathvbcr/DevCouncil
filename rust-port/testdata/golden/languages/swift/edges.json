@@ -1,0 +1,20 @@
+[
+  {
+    "source": "Main.swift",
+    "target": "Main.swift::Service",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "Main.swift",
+    "target": "Main.swift::Service.run",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "Main.swift::Service.run",
+    "target": "Main.swift::Service.run",
+    "kind": "calls",
+    "confidence": "inferred"
+  }
+]

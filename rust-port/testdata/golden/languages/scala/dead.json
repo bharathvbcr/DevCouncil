@@ -1,0 +1,10 @@
+[
+  {
+    "id": "Main.scala::Service",
+    "confidence": "ambiguous"
+  },
+  {
+    "id": "Main.scala::Service.run",
+    "confidence": "ambiguous"
+  }
+]

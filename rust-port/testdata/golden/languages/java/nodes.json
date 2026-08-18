@@ -1,0 +1,26 @@
+[
+  {
+    "id": "Main.java",
+    "kind": "file",
+    "path": "Main.java",
+    "line": 0,
+    "name": "Main.java",
+    "exported": false
+  },
+  {
+    "id": "Main.java::Main",
+    "kind": "class",
+    "path": "Main.java",
+    "line": 2,
+    "name": "Main",
+    "exported": true
+  },
+  {
+    "id": "Main.java::Main.size",
+    "kind": "method",
+    "path": "Main.java",
+    "line": 2,
+    "name": "size",
+    "exported": true
+  }
+]

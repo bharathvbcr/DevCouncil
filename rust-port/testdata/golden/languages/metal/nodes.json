@@ -1,0 +1,18 @@
+[
+  {
+    "id": "main.metal",
+    "kind": "file",
+    "path": "main.metal",
+    "line": 0,
+    "name": "main.metal",
+    "exported": false
+  },
+  {
+    "id": "main.metal::kernel",
+    "kind": "function",
+    "path": "main.metal",
+    "line": 3,
+    "name": "kernel",
+    "exported": true
+  }
+]

@@ -1,0 +1,26 @@
+[
+  {
+    "id": "Main.kt",
+    "kind": "file",
+    "path": "Main.kt",
+    "line": 0,
+    "name": "Main.kt",
+    "exported": false
+  },
+  {
+    "id": "Main.kt::Service",
+    "kind": "class",
+    "path": "Main.kt",
+    "line": 2,
+    "name": "Service",
+    "exported": true
+  },
+  {
+    "id": "Main.kt::sample",
+    "kind": "class",
+    "path": "Main.kt",
+    "line": 1,
+    "name": "sample",
+    "exported": true
+  }
+]

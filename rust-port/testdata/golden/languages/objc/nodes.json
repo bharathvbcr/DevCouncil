@@ -1,0 +1,26 @@
+[
+  {
+    "id": "main.m",
+    "kind": "file",
+    "path": "main.m",
+    "line": 0,
+    "name": "main.m",
+    "exported": false
+  },
+  {
+    "id": "main.m::run",
+    "kind": "method",
+    "path": "main.m",
+    "line": 3,
+    "name": "run",
+    "exported": true
+  },
+  {
+    "id": "main.m::run",
+    "kind": "method",
+    "path": "main.m",
+    "line": 6,
+    "name": "run",
+    "exported": true
+  }
+]

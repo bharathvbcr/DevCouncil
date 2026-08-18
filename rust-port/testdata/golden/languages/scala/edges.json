@@ -1,0 +1,14 @@
+[
+  {
+    "source": "Main.scala",
+    "target": "Main.scala::Service",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "Main.scala",
+    "target": "Main.scala::Service.run",
+    "kind": "contains",
+    "confidence": "extracted"
+  }
+]

@@ -1,0 +1,14 @@
+[
+  {
+    "source": "main.cpp",
+    "target": "main.cpp::Service",
+    "kind": "contains",
+    "confidence": "extracted"
+  },
+  {
+    "source": "main.cpp",
+    "target": "main.cpp::run",
+    "kind": "contains",
+    "confidence": "extracted"
+  }
+]

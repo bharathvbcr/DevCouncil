@@ -1,0 +1,26 @@
+[
+  {
+    "id": "main.go",
+    "kind": "file",
+    "path": "main.go",
+    "line": 0,
+    "name": "main.go",
+    "exported": false
+  },
+  {
+    "id": "main.go::Service",
+    "kind": "struct",
+    "path": "main.go",
+    "line": 5,
+    "name": "Service",
+    "exported": true
+  },
+  {
+    "id": "main.go::Service.Run",
+    "kind": "method",
+    "path": "main.go",
+    "line": 6,
+    "name": "Run",
+    "exported": true
+  }
+]

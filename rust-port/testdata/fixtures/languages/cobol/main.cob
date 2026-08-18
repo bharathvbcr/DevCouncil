@@ -1,0 +1,6 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. FIXTURE.
+       PROCEDURE DIVISION.
+       RUN-PARA.
+           DISPLAY "RUN".
+           STOP RUN.

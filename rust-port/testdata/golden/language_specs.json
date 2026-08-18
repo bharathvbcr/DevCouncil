@@ -1,0 +1,363 @@
+[
+  {
+    "name": "TypeScript",
+    "grammar": "typescript",
+    "extensions": [
+      ".ts",
+      ".mts",
+      ".cts"
+    ],
+    "embedded": [],
+    "fixture": "typescript"
+  },
+  {
+    "name": "TSX",
+    "grammar": "tsx",
+    "extensions": [
+      ".tsx"
+    ],
+    "embedded": [],
+    "fixture": "tsx"
+  },
+  {
+    "name": "JavaScript",
+    "grammar": "javascript",
+    "extensions": [
+      ".js",
+      ".jsx",
+      ".mjs",
+      ".cjs"
+    ],
+    "embedded": [],
+    "fixture": "javascript"
+  },
+  {
+    "name": "ArkTS",
+    "grammar": "typescript",
+    "extensions": [
+      ".ets"
+    ],
+    "embedded": [],
+    "fixture": "arkts"
+  },
+  {
+    "name": "Python",
+    "grammar": "python",
+    "extensions": [
+      ".py",
+      ".pyi"
+    ],
+    "embedded": [],
+    "fixture": "python-lang"
+  },
+  {
+    "name": "Go",
+    "grammar": "go",
+    "extensions": [
+      ".go"
+    ],
+    "embedded": [],
+    "fixture": "go"
+  },
+  {
+    "name": "Rust",
+    "grammar": "rust",
+    "extensions": [
+      ".rs"
+    ],
+    "embedded": [],
+    "fixture": "rust"
+  },
+  {
+    "name": "Java",
+    "grammar": "java",
+    "extensions": [
+      ".java"
+    ],
+    "embedded": [],
+    "fixture": "java"
+  },
+  {
+    "name": "C#",
+    "grammar": "csharp",
+    "extensions": [
+      ".cs"
+    ],
+    "embedded": [],
+    "fixture": "csharp"
+  },
+  {
+    "name": "VB.NET",
+    "grammar": "vb",
+    "extensions": [
+      ".vb"
+    ],
+    "embedded": [],
+    "fixture": "vbnet"
+  },
+  {
+    "name": "PHP",
+    "grammar": "php",
+    "extensions": [
+      ".php",
+      ".phtml"
+    ],
+    "embedded": [],
+    "fixture": "php"
+  },
+  {
+    "name": "Ruby",
+    "grammar": "ruby",
+    "extensions": [
+      ".rb",
+      ".rake"
+    ],
+    "embedded": [],
+    "fixture": "ruby"
+  },
+  {
+    "name": "C",
+    "grammar": "c",
+    "extensions": [
+      ".c",
+      ".h"
+    ],
+    "embedded": [],
+    "fixture": "c"
+  },
+  {
+    "name": "C++",
+    "grammar": "cpp",
+    "extensions": [
+      ".cc",
+      ".cpp",
+      ".cxx",
+      ".hh",
+      ".hpp",
+      ".hxx"
+    ],
+    "embedded": [],
+    "fixture": "cpp"
+  },
+  {
+    "name": "Objective-C",
+    "grammar": "objc",
+    "extensions": [
+      ".m",
+      ".mm"
+    ],
+    "embedded": [],
+    "fixture": "objc"
+  },
+  {
+    "name": "Metal",
+    "grammar": "cpp",
+    "extensions": [
+      ".metal"
+    ],
+    "embedded": [],
+    "fixture": "metal"
+  },
+  {
+    "name": "CUDA",
+    "grammar": "cuda",
+    "extensions": [
+      ".cu",
+      ".cuh"
+    ],
+    "embedded": [],
+    "fixture": "cuda"
+  },
+  {
+    "name": "Swift",
+    "grammar": "swift",
+    "extensions": [
+      ".swift"
+    ],
+    "embedded": [],
+    "fixture": "swift"
+  },
+  {
+    "name": "Kotlin",
+    "grammar": "kotlin",
+    "extensions": [
+      ".kt",
+      ".kts"
+    ],
+    "embedded": [],
+    "fixture": "kotlin"
+  },
+  {
+    "name": "Scala",
+    "grammar": "scala",
+    "extensions": [
+      ".scala",
+      ".sc"
+    ],
+    "embedded": [],
+    "fixture": "scala"
+  },
+  {
+    "name": "Dart",
+    "grammar": "dart",
+    "extensions": [
+      ".dart"
+    ],
+    "embedded": [],
+    "fixture": "dart"
+  },
+  {
+    "name": "Svelte",
+    "grammar": "svelte",
+    "extensions": [
+      ".svelte"
+    ],
+    "embedded": [
+      "typescript",
+      "javascript",
+      "css",
+      "html"
+    ],
+    "fixture": "svelte"
+  },
+  {
+    "name": "Vue",
+    "grammar": "vue",
+    "extensions": [
+      ".vue"
+    ],
+    "embedded": [
+      "typescript",
+      "javascript",
+      "css",
+      "html"
+    ],
+    "fixture": "vue"
+  },
+  {
+    "name": "Astro",
+    "grammar": "astro",
+    "extensions": [
+      ".astro"
+    ],
+    "embedded": [
+      "typescript",
+      "javascript",
+      "css",
+      "html"
+    ],
+    "fixture": "astro"
+  },
+  {
+    "name": "Liquid",
+    "grammar": "liquid",
+    "extensions": [
+      ".liquid"
+    ],
+    "embedded": [
+      "html",
+      "javascript",
+      "css"
+    ],
+    "fixture": "liquid"
+  },
+  {
+    "name": "Pascal/Delphi",
+    "grammar": "pascal",
+    "extensions": [
+      ".pas",
+      ".pp",
+      ".dpr"
+    ],
+    "embedded": [],
+    "fixture": "pascal"
+  },
+  {
+    "name": "Lua",
+    "grammar": "lua",
+    "extensions": [
+      ".lua"
+    ],
+    "embedded": [],
+    "fixture": "lua"
+  },
+  {
+    "name": "Luau",
+    "grammar": "luau",
+    "extensions": [
+      ".luau"
+    ],
+    "embedded": [],
+    "fixture": "luau"
+  },
+  {
+    "name": "R",
+    "grammar": "r",
+    "extensions": [
+      ".r",
+      ".R"
+    ],
+    "embedded": [],
+    "fixture": "r"
+  },
+  {
+    "name": "CFML",
+    "grammar": "cfml",
+    "extensions": [
+      ".cfm",
+      ".cfc"
+    ],
+    "embedded": [],
+    "fixture": "cfml"
+  },
+  {
+    "name": "COBOL",
+    "grammar": "cobol",
+    "extensions": [
+      ".cob",
+      ".cbl",
+      ".cpy"
+    ],
+    "embedded": [],
+    "fixture": "cobol"
+  },
+  {
+    "name": "Erlang",
+    "grammar": "erlang",
+    "extensions": [
+      ".erl",
+      ".hrl"
+    ],
+    "embedded": [],
+    "fixture": "erlang"
+  },
+  {
+    "name": "Solidity",
+    "grammar": "solidity",
+    "extensions": [
+      ".sol"
+    ],
+    "embedded": [],
+    "fixture": "solidity"
+  },
+  {
+    "name": "Terraform/OpenTofu",
+    "grammar": "hcl",
+    "extensions": [
+      ".tf",
+      ".tfvars",
+      ".hcl"
+    ],
+    "embedded": [],
+    "fixture": "terraform"
+  },
+  {
+    "name": "Nix",
+    "grammar": "nix",
+    "extensions": [
+      ".nix"
+    ],
+    "embedded": [],
+    "fixture": "nix"
+  }
+]

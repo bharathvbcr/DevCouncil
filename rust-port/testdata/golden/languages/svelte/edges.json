@@ -1,0 +1,8 @@
+[
+  {
+    "source": "Main.svelte",
+    "target": "Main.svelte::greet",
+    "kind": "contains",
+    "confidence": "extracted"
+  }
+]
