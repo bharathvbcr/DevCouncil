@@ -474,9 +474,9 @@ pub fn is_builtin(family: LangFamily, name: &str) -> bool {
         LangFamily::Kotlin => KOTLIN_BUILTINS,
         // C/C++/C#/Java have no free-function builtins that reach the resolver
         // this way, and `Generic` spans languages with no curated set at all.
+        LangFamily::Ruby => RUBY_BUILTINS,
+        LangFamily::Php => PHP_BUILTINS,
         LangFamily::CStyle
-        | LangFamily::Ruby
-        | LangFamily::Php
         | LangFamily::Scala
         | LangFamily::Lua
         | LangFamily::R
@@ -565,6 +565,118 @@ pub const KOTLIN_BUILTINS: &[&str] = &[
     "sortedSetOf",
 ];
 
+/// Ruby `Kernel` methods callable with no receiver.
+///
+/// Every one is a private instance method of `Kernel`, mixed into `Object`, so
+/// a bare `puts` in any scope reaches it — no indexed file can declare them.
+/// Measured on this corpus, `puts` alone was 50 rows of the defect tier.
+///
+/// Withheld under the SC30 rule as plausibly repository-declared: `loop`,
+/// `open`, `system`, `exec`, `spawn`, `warn`, `load`, `format`, `exit`, `abort`,
+/// `sleep`, `rand`, `gets`, `lambda`, `proc`, `freeze`. Enumerable methods
+/// (`each`, `map`, `select`) are absent for a structural reason instead: they
+/// are called on a receiver, and the builtin rung only ever sees a bare callee.
+pub const RUBY_BUILTINS: &[&str] = &[
+    "__method__",
+    "at_exit",
+    "autoload",
+    "binding",
+    "block_given?",
+    "caller",
+    "catch",
+    "fail",
+    "p",
+    "pp",
+    "print",
+    "printf",
+    "puts",
+    "raise",
+    "require",
+    "require_relative",
+    "sprintf",
+    "srand",
+    "throw",
+];
+
+/// PHP standard-library functions, core subset.
+///
+/// **Deliberately partial.** PHP's standard library runs to thousands of
+/// functions across optional extensions, and this table carries the core that
+/// is always present. That is safe in exactly one direction: an unlisted
+/// builtin stays `Unresolved`, which over-reports a possible defect, whereas a
+/// wrong entry would exempt a real one. Growing it is cheap; the fail-open
+/// direction is the reason it can ship incomplete.
+///
+/// Withheld as plausibly repository-declared: `compact`, `extract`, `key`,
+/// `current`, `next`, `prev`, `reset`, `end`, `list`, `range`, `min`, `max`,
+/// `abs`, `round`, `sort`, `join`, `implode`, `explode`, `print`, `echo`.
+pub const PHP_BUILTINS: &[&str] = &[
+    "array_column",
+    "array_combine",
+    "array_diff",
+    "array_fill",
+    "array_filter",
+    "array_flip",
+    "array_intersect",
+    "array_key_exists",
+    "array_keys",
+    "array_map",
+    "array_merge",
+    "array_pop",
+    "array_push",
+    "array_reduce",
+    "array_reverse",
+    "array_search",
+    "array_shift",
+    "array_slice",
+    "array_splice",
+    "array_unique",
+    "array_unshift",
+    "array_values",
+    "call_user_func",
+    "call_user_func_array",
+    "count",
+    "func_get_args",
+    "function_exists",
+    "get_class",
+    "gettype",
+    "in_array",
+    "is_array",
+    "is_bool",
+    "is_callable",
+    "is_float",
+    "is_int",
+    "is_null",
+    "is_numeric",
+    "is_object",
+    "is_scalar",
+    "is_string",
+    "iterator_to_array",
+    "json_decode",
+    "json_encode",
+    "preg_match",
+    "preg_match_all",
+    "preg_quote",
+    "preg_replace",
+    "preg_split",
+    "sprintf",
+    "str_contains",
+    "str_ends_with",
+    "str_pad",
+    "str_repeat",
+    "str_replace",
+    "str_split",
+    "str_starts_with",
+    "strlen",
+    "strpos",
+    "strtolower",
+    "strtoupper",
+    "substr",
+    "trim",
+    "var_dump",
+    "var_export",
+];
+
 /// The runtime that supplies `name` as a global, if one does.
 ///
 /// Only ever consulted for a *bare* callee in a JavaScript-family file. A host
@@ -598,6 +710,8 @@ mod tests {
             ("js", JS_BUILTINS),
             ("swift", SWIFT_BUILTINS),
             ("kotlin", KOTLIN_BUILTINS),
+            ("ruby", RUBY_BUILTINS),
+            ("php", PHP_BUILTINS),
         ] {
             let mut sorted = table.to_vec();
             sorted.sort_unstable();

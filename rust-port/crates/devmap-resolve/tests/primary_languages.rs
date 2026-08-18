@@ -120,3 +120,51 @@ fn every_call_extracting_language_owns_its_bucket() {
         );
     }
 }
+
+/// A builtin table's worth is its authority, so each entry must trace to the
+/// language's own specification — not to a popular library.
+///
+/// The check that matters is the negative one. `specify` and `describe` reach a
+/// Ruby file through RSpec, `it` through several DSLs, and admitting them would
+/// say "the language declares this" about something Ruby says nothing about.
+/// That is the one claim `UnresolvedClass::Builtin` must never make: a wrong
+/// entry exempts a real defect permanently, while a missing one only
+/// over-reports.
+#[test]
+fn no_builtin_table_admits_a_library_dsl_name() {
+    for (family, borrowed) in [
+        (LangFamily::Ruby, ["specify", "describe", "it", "expect"]),
+        (LangFamily::Php, ["dd", "collect", "route", "view"]),
+        (LangFamily::Kotlin, ["given", "then", "shouldBe", "verify"]),
+        (LangFamily::Swift, ["XCTAssert", "expect", "describe", "it"]),
+    ] {
+        for name in borrowed {
+            assert!(
+                !is_builtin(family, name),
+                "{name} comes from a library, not from {family:?}'s specification; \
+                 classifying it as Builtin exempts a real defect"
+            );
+        }
+    }
+}
+
+/// Ruby and PHP answer from their own standard libraries.
+#[test]
+fn ruby_and_php_read_their_own_standard_libraries() {
+    assert!(is_builtin(LangFamily::Ruby, "puts"));
+    assert!(is_builtin(LangFamily::Ruby, "block_given?"));
+    assert!(is_builtin(LangFamily::Php, "array_map"));
+    assert!(is_builtin(LangFamily::Php, "is_array"));
+
+    assert!(!is_builtin(LangFamily::Php, "puts"), "no cross-talk");
+    assert!(!is_builtin(LangFamily::Ruby, "array_map"), "no cross-talk");
+
+    // Enumerable/receiver methods must not be here: the builtin rung only sees
+    // a bare callee, so an entry could never match and would only mislead.
+    for receiver_method in ["each", "map", "select", "reject"] {
+        assert!(
+            !is_builtin(LangFamily::Ruby, receiver_method),
+            "{receiver_method} is called on a receiver and can never reach this rung"
+        );
+    }
+}
