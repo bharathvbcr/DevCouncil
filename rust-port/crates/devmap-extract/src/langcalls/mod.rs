@@ -18,6 +18,28 @@
 use crate::model::{ExtractedCall, ExtractedReference};
 use tree_sitter::Node;
 
+pub(crate) mod csharp;
+pub(crate) mod dart;
+pub(crate) mod java;
+pub(crate) mod jvm_dotnet;
+pub(crate) mod kotlin;
+pub mod lua;
+pub(crate) mod php;
+pub mod r;
+pub(crate) mod ruby;
+pub mod scala;
+/// Mirrors the declaration emitter's own scope walk so a call's
+/// `caller_symbol` is the identity the emitter actually produced.
+///
+/// Deliberately not `enclosing_callable_qualified`: that helper answers through
+/// `enclosing_type_name`, which matches only `class_*`/`trait_item`/`impl_item`,
+/// while declarations are named through `generic_symbol_kind`, which also covers
+/// interfaces, enums, structs and namespaces. Three agents measured the same
+/// divergence independently — a Java method in an `interface` emits `F::I.d`
+/// while that helper answers `F::d`, and every such row is an orphaned edge.
+pub(crate) mod scope;
+pub mod swift;
+
 /// Route one node to its language's call extractor.
 ///
 /// Returns without doing anything for a language that has no module yet, which
@@ -32,14 +54,30 @@ pub(crate) fn extract_calls(
     calls: &mut Vec<ExtractedCall>,
     references: &mut Vec<ExtractedReference>,
 ) {
-    let _ = (lang, node, source, file_symbol_name, calls, references);
+    match lang {
+        "csharp" => csharp::extract_csharp_call(node, source, file_symbol_name, calls, references),
+        "dart" => dart::extract_dart_call(node, source, file_symbol_name, calls, references),
+        "java" => java::extract_java_call(node, source, file_symbol_name, calls, references),
+        "kotlin" => kotlin::extract_kotlin_call(node, source, file_symbol_name, calls, references),
+        // Luau is a Lua superset and shares its node kinds; verified identical
+        // by the agent that wrote the module against both grammars.
+        "lua" | "luau" => lua::extract_lua_call(node, source, file_symbol_name, calls, references),
+        "php" => php::extract_php_calls(node, source, file_symbol_name, calls, references),
+        "r" => r::extract_r_call(node, source, file_symbol_name, calls, references),
+        "ruby" => ruby::extract_ruby_calls(node, source, file_symbol_name, calls, references),
+        "scala" => scala::extract_scala_call(node, source, file_symbol_name, calls, references),
+        "swift" => swift::extract_swift_call(node, source, file_symbol_name, calls, references),
+        _ => {}
+    }
 }
 
 /// Languages whose calls this module extracts.
 ///
 /// Read by the coverage report so "this language has no call graph" is a stated
 /// fact rather than an indistinguishable zero. Kept sorted; the test pins it.
-pub const CALL_EXTRACTION_LANGUAGES: &[&str] = &[];
+pub const CALL_EXTRACTION_LANGUAGES: &[&str] = &[
+    "csharp", "dart", "java", "kotlin", "lua", "luau", "php", "r", "ruby", "scala", "swift",
+];
 
 #[cfg(test)]
 mod tests {

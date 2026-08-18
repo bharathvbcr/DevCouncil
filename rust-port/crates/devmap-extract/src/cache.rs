@@ -101,7 +101,16 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `parser.c` table). Object-like `preproc_def` stays out: it is a constant,
 /// never a callee. A v22 payload carries calls to macro targets that do not
 /// exist, which is the SC18/SC30 signal being drowned by its own new coverage.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "23";
+/// v24: eleven languages gain call extraction (SC34) — Ruby, PHP, Swift, Scala,
+/// Lua, Luau, R, Java, C#, Kotlin and Dart. Five of those (Ruby, Swift, PHP,
+/// Scala, Lua) were measured recovering calls under the Python implementation
+/// this port replaces and so were migration regressions; the rest are new
+/// capability neither engine had. Measured on real code: Kotlin 0 -> 91,149
+/// calls over 1,361 first-party files, Java 0 -> 3,622, Ruby 0 -> 97, PHP
+/// 0 -> 65, all at 0 orphaned call edges. A v23 payload carries an empty
+/// `calls`/`references` list for every file in those languages, so a cached
+/// build would resurrect the blackout with no signal that it had.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "24";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
