@@ -34,6 +34,10 @@ use crate::treesitter::{
 };
 
 /// Calls made by Ruby code.
+/// The grammar key this module answers for, so caller attribution asks
+/// `langdecl` the same question the declaration emitter asks.
+const LANG: &str = "ruby";
+
 pub(crate) fn extract_ruby_calls(
     node: Node,
     source: &str,
@@ -60,7 +64,7 @@ pub(crate) fn extract_ruby_calls(
     };
     let receiver = node.child_by_field_name("receiver");
     let receiver_expr = receiver.and_then(|receiver| ruby_receiver_expr(receiver, source));
-    let caller_symbol = enclosing_emitted_symbol(node, source, file_symbol_name);
+    let caller_symbol = enclosing_emitted_symbol(node, source, LANG, file_symbol_name);
     let assigned_to = ruby_assigned_binding(node, source);
 
     // `Widget.new` is Ruby's constructor — the language has no `new` operator,

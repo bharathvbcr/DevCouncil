@@ -36,7 +36,7 @@ pub(crate) fn extract_dart_call(
     references: &mut Vec<ExtractedReference>,
 ) {
     if let Some(site) = call_site(node, source) {
-        record(site, source, file_symbol_name, calls, references);
+        record(site, source, "dart", file_symbol_name, calls, references);
     }
 }
 

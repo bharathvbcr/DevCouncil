@@ -156,6 +156,30 @@ pub fn analyze_liveness(
             ambiguous_symbols.insert((edge.target_file.clone(), edge.target_symbol.clone()));
             if let Some(short_name) = edge.target_symbol.rsplit("::").next() {
                 ambiguous_symbols.insert((edge.target_file.clone(), short_name.to_string()));
+                // …and the member name with its owner stripped.
+                //
+                // `ExtractedSymbol::name` is the bare `toJson`, while an edge
+                // names `File::RemoteTaskEntity.toJson`, so without this the two
+                // never meet and the ambiguity is recorded against nothing.
+                //
+                // This became load-bearing when Kotlin extension functions
+                // gained their receiver: one Android file declares seven
+                // `private fun <T>.toJson()` on seven different types and calls
+                // every one of them as `it.toJson()` inside a `map { }`. The
+                // receiver `it` cannot be typed, so the resolver emits an
+                // *ambiguous* edge naming one candidate — and the other six,
+                // each genuinely called, were reported dead at 0.9 confidence.
+                // Before the receiver fix all seven collapsed into one symbol
+                // and the question could not arise.
+                //
+                // Bounded to the ambiguous set on purpose: this can only move a
+                // finding from 0.9 to 0.4 `only_ambiguous_callers`, never exempt
+                // it, so it cannot hide a symbol nothing calls. Doing the same
+                // for `called_symbols` would silently exempt every same-named
+                // method in the file, which is a different and much worse trade.
+                if let Some(member) = short_name.rsplit('.').next() {
+                    ambiguous_symbols.insert((edge.target_file.clone(), member.to_string()));
+                }
             }
             continue;
         }

@@ -38,6 +38,10 @@ use crate::treesitter::{
 use super::scope::{clamp_receiver, enclosing_emitted_symbol, receiver_from};
 
 /// Calls made by Swift code.
+/// The grammar key this module answers for, so caller attribution asks
+/// `langdecl` the same question the declaration emitter asks.
+const LANG: &str = "swift";
+
 pub fn extract_swift_call(
     node: Node,
     source: &str,
@@ -51,7 +55,7 @@ pub fn extract_swift_call(
     if !is_callee_identity(&call.callee_name) {
         return;
     }
-    let enclosing = enclosing_emitted_symbol(node, source, file_symbol_name);
+    let enclosing = enclosing_emitted_symbol(node, source, LANG, file_symbol_name);
     references.push(ExtractedReference {
         name: call.callee_name.clone(),
         kind: call.kind,
@@ -96,6 +100,14 @@ fn swift_call_identity<'tree>(node: Node<'tree>, source: &str) -> Option<SwiftCa
             if is_anonymous_callable(target.kind()) || target.kind() == "lambda_literal" {
                 return None;
             }
+            // `!applySecret(x)` and `-g()`. tree-sitter-swift binds the prefix
+            // operator *before* the argument list, so the callee of the
+            // `call_expression` is the `prefix_expression` `!applySecret`, which
+            // `split_call_target` refuses — and the call disappears entirely.
+            // Measured on 342 real `.swift` files: two functions called only
+            // through `if !f(…)` were reported dead at 0.9 confidence, from a
+            // call the graph never saw.
+            let target = swift_unwrap_prefix(target).unwrap_or(target);
             if target.kind() == "navigation_expression" {
                 return swift_navigation_call(target, source);
             }
@@ -121,6 +133,25 @@ fn swift_call_identity<'tree>(node: Node<'tree>, source: &str) -> Option<SwiftCa
         }
         _ => None,
     }
+}
+
+/// The operand of an operator prefix, or `None` when the prefix is a leading dot.
+///
+/// `!f()`, `-g()` and `~h()` all name `f`, `g`, `h`. `.text("z")` does not: Swift's
+/// leading-dot inference names a member of a type the site never spells, so the
+/// only honest callee is one this extractor cannot determine. Unwrapping it
+/// anyway would let `.text("z")` bind to any same-named free function in the
+/// file at deterministic confidence — the SC9 class of confidently-wrong edge —
+/// so it is refused, and the case reached that way stays exempt through the
+/// `StructuralExempt` annotation `langdecl::swift` puts on every enum case.
+fn swift_unwrap_prefix<'tree>(target: Node<'tree>) -> Option<Node<'tree>> {
+    if target.kind() != "prefix_expression" {
+        return None;
+    }
+    if target.child(0).is_some_and(|first| first.kind() == ".") {
+        return None;
+    }
+    target.child_by_field_name("target")
 }
 
 /// Whether a `call_expression` is really a subscript: `items[0]`, `dict["k"]`.

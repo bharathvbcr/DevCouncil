@@ -132,6 +132,7 @@ pub(super) struct CallSite<'tree> {
 pub(super) fn record(
     site: CallSite,
     source: &str,
+    lang: &str,
     file_symbol_name: &str,
     calls: &mut Vec<ExtractedCall>,
     references: &mut Vec<ExtractedReference>,
@@ -145,7 +146,7 @@ pub(super) fn record(
         return;
     };
     let receiver_expr = site.receiver.or(inner_receiver);
-    let caller_symbol = enclosing_emitted_symbol(site.call, source, file_symbol_name);
+    let caller_symbol = enclosing_emitted_symbol(site.call, source, lang, file_symbol_name);
     references.push(ExtractedReference {
         name: callee_name.clone(),
         kind: site.kind,

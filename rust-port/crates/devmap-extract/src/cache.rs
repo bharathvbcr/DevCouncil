@@ -110,7 +110,23 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 0 -> 65, all at 0 orphaned call edges. A v23 payload carries an empty
 /// `calls`/`references` list for every file in those languages, so a cached
 /// build would resurrect the blackout with no signal that it had.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "24";
+/// v25: the declaration path becomes per-language (`langdecl`), the way call
+/// extraction already was. Swift and Kotlin visibility is read from the
+/// declaration's own modifier list instead of from a substring scan of its whole
+/// subtree, so `is_exported` stops being a guess and dead-code analysis becomes
+/// answerable for both; Swift `extension Person` stops emitting a second
+/// `Person` node; Swift and Kotlin enums and Kotlin interfaces get their real
+/// `SymbolKind`; a Kotlin `fun Person.extra()` keeps its receiver; Dart emits
+/// function, method and named-constructor symbols for the first time; and an R
+/// function is named after the variable it is bound to rather than after the
+/// `function` keyword. Entry-point and structural exemptions are emitted
+/// alongside, because reading visibility is what first made a symbol capable of
+/// being reported dead. A v24 payload carries the old identities: duplicate
+/// Swift type nodes, bare Kotlin extension names, no Dart callables, three R
+/// functions sharing the name `function`, and an `is_exported` that says nothing
+/// — every one of which is a join key or a dead-code verdict, so reusing it
+/// would silently restore the defects this version fixes.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "25";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

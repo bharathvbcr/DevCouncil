@@ -356,13 +356,16 @@ fn r_attributes_each_call_to_the_function_that_makes_it() {
     assert_eq!(
         owned,
         vec![
-            ("deep".to_string(), "attr.R::function".to_string()),
-            ("inner".to_string(), "attr.R::function".to_string()),
+            ("deep".to_string(), "attr.R::inner".to_string()),
+            ("inner".to_string(), "attr.R::outer".to_string()),
             ("top".to_string(), "<file>".to_string()),
         ],
-        "`attr.R::function` is degenerate but joinable — the R declaration path \
-         names every function after the `function` keyword rather than after the \
-         variable it is bound to, which is reported as a separate defect"
+        "each R function is named after the variable it is bound to. This test \
+         previously expected `attr.R::function` for both callers — degenerate but \
+         joinable — because `tree-sitter-r` points a `function_definition`'s `name` \
+         field at the *keyword*. Two distinct functions therefore shared one \
+         qualified name, which is a broken join key (SC14), and no R call could \
+         resolve to either"
     );
 }
 

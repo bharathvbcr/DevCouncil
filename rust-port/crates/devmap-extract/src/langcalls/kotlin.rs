@@ -55,7 +55,7 @@ pub(crate) fn extract_kotlin_call(
     references: &mut Vec<ExtractedReference>,
 ) {
     if let Some(site) = call_site(node, source) {
-        record(site, source, file_symbol_name, calls, references);
+        record(site, source, "kotlin", file_symbol_name, calls, references);
     }
 }
 
@@ -130,6 +130,19 @@ fn callee_target<'tree>(
         // A trailing lambda applied to a call, or a call of a call. The inner
         // node is visited in its own right and carries the edge.
         "call_expression" => None,
+        // `!h()` and `-g()`. tree-sitter-kotlin-ng binds the prefix operator
+        // *before* the argument list, so the callee of the `call_expression` is
+        // the `unary_expression` `!h` — not the identifier the call actually
+        // names. Refusing it dropped the call entirely: measured on a 1,032-file
+        // Android corpus, `if (!markerPromoted(k))` produced **no call edge and
+        // no unresolved row**, and the function it calls was reported dead at
+        // 0.9 confidence — a proposal to delete working code, from a call the
+        // graph never saw. A postfix `a!!.b()` is a `navigation_expression` and
+        // does not arrive here.
+        "unary_expression" => {
+            let operand = callee.named_child(callee.named_child_count().checked_sub(1)?)?;
+            callee_target(operand, source)
+        }
         // An immediately-invoked literal has no callee identity by
         // construction. `split_call_target` would refuse it too; refusing it
         // here keeps the reason at the shape that causes it.

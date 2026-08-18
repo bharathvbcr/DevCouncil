@@ -93,7 +93,8 @@ pub fn extract_r_call(
         }
         _ => return,
     };
-    let caller_symbol = r_enclosing_symbol(node, source, file_symbol_name);
+    let caller_symbol =
+        super::scope::enclosing_emitted_symbol(node, source, LANG, file_symbol_name);
     references.push(ExtractedReference {
         name: callee_name.clone(),
         kind: ReferenceKind::Call,
@@ -178,34 +179,8 @@ fn is_r_identifier(name: &str) -> bool {
         .all(|ch| ch.is_alphanumeric() || matches!(ch, '.' | '_'))
 }
 
-/// Graph identity of the R function lexically containing `node`.
-///
-/// **Not `enclosing_callable_qualified`.** That helper routes an owner-less
-/// callable through `scoped_qualified_name`, which prefixes the enclosing
-/// scope, so a call inside a function defined inside another function comes
-/// back as `f.r::function.function` while the generic arm emits the flat
-/// `f.r::function`. The edge would then name a source no symbol carries — the
-/// SC9/SC10 orphan shape — and a helper defined inside another function is
-/// ordinary R. The unit test below pins both halves.
-///
-/// The name is read from the same `name` field the generic emitter reads, so
-/// the two cannot drift apart. In `tree-sitter-r` that field is the `function`
-/// **keyword**, which is why the identity is the useless-but-joinable
-/// `f.r::function`; see the module-level note in the report — fixing it means
-/// naming an R function by the variable it is assigned to, which lives in the
-/// declaration path, not here.
-fn r_enclosing_symbol(node: Node, source: &str, file_symbol_name: &str) -> Option<String> {
-    let mut ancestor = node.parent();
-    while let Some(parent) = ancestor {
-        if parent.kind() == "function_definition" {
-            if let Some(name) = get_child_text(parent, "name", source).filter(|n| !n.is_empty()) {
-                return Some(format!("{file_symbol_name}::{name}"));
-            }
-        }
-        ancestor = parent.parent();
-    }
-    None
-}
+/// The grammar key this module answers for.
+const LANG: &str = "r";
 
 #[cfg(test)]
 mod tests {
@@ -264,7 +239,15 @@ mod tests {
         }
     }
 
-    /// The reason `r_enclosing_symbol` exists, as a test rather than a comment.
+    /// The reason this module routes caller attribution through
+    /// `langdecl`, as a test rather than a comment.
+    ///
+    /// The expected strings moved with the fix that named R functions by their
+    /// binding instead of by the `function` keyword: before it, `outer` and
+    /// `inner` both emitted `f.r::function` — one qualified name for two
+    /// symbols. The property under test is unchanged and is the whole point:
+    /// whatever the emitter calls the enclosing declaration, this is the same
+    /// string, and the shared `enclosing_callable_qualified` is not.
     #[test]
     fn the_shared_scope_builder_would_orphan_a_nested_r_call() {
         let mut parser = Parser::new();
@@ -291,7 +274,7 @@ mod tests {
         assert_eq!(
             enclosing_callable_qualified(probe, NESTED, "f.r").as_deref(),
             Some("f.r::function.function"),
-            "the shared builder nests the scope"
+            "the shared builder nests the scope, and still names R functions after the keyword"
         );
         let emitted: Vec<String> = extract_file("f.r", NESTED)
             .symbols
@@ -303,13 +286,19 @@ mod tests {
             "no symbol carries the nested scope string: {emitted:?}"
         );
         assert_eq!(
-            r_enclosing_symbol(probe, NESTED, "f.r").as_deref(),
-            Some("f.r::function"),
+            crate::langcalls::scope::enclosing_emitted_symbol(probe, NESTED, LANG, "f.r")
+                .as_deref(),
+            Some("f.r::inner"),
             "this module must agree with the emitter, not with the shared builder"
         );
         assert!(
-            emitted.iter().any(|name| name == "f.r::function"),
+            emitted.iter().any(|name| name == "f.r::inner"),
             "and the emitter really does carry that name: {emitted:?}"
+        );
+        assert_eq!(
+            emitted,
+            vec!["f.r", "f.r::outer", "f.r::inner"],
+            "and each R function carries its own name, not three copies of `function`"
         );
     }
 

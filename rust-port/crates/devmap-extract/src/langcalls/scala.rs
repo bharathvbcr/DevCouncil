@@ -33,6 +33,10 @@ use crate::treesitter::{
 use super::scope::{clamp_receiver, enclosing_emitted_symbol, receiver_from};
 
 /// Calls made by Scala code.
+/// The grammar key this module answers for, so caller attribution asks
+/// `langdecl` the same question the declaration emitter asks.
+const LANG: &str = "scala";
+
 pub fn extract_scala_call(
     node: Node,
     source: &str,
@@ -46,7 +50,7 @@ pub fn extract_scala_call(
     if !is_callee_identity(&call.callee_name) {
         return;
     }
-    let enclosing = enclosing_emitted_symbol(node, source, file_symbol_name);
+    let enclosing = enclosing_emitted_symbol(node, source, LANG, file_symbol_name);
     references.push(ExtractedReference {
         name: call.callee_name.clone(),
         kind: call.kind,

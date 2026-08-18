@@ -21,7 +21,7 @@ pub(crate) fn extract_java_call(
     references: &mut Vec<ExtractedReference>,
 ) {
     if let Some(site) = call_site(node, source) {
-        record(site, source, file_symbol_name, calls, references);
+        record(site, source, "java", file_symbol_name, calls, references);
     }
 }
 

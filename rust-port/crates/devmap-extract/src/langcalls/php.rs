@@ -37,6 +37,10 @@ use crate::model::{ExtractedCall, ExtractedReference, ReferenceKind};
 use crate::treesitter::{get_node_text, node_span, split_call_target};
 
 /// Calls made by PHP code.
+/// The grammar key this module answers for, so caller attribution asks
+/// `langdecl` the same question the declaration emitter asks.
+const LANG: &str = "php";
+
 pub(crate) fn extract_php_calls(
     node: Node,
     source: &str,
@@ -108,7 +112,7 @@ pub(crate) fn extract_php_calls(
         _ => return,
     };
 
-    let caller_symbol = enclosing_emitted_symbol(node, source, file_symbol_name);
+    let caller_symbol = enclosing_emitted_symbol(node, source, LANG, file_symbol_name);
     references.push(ExtractedReference {
         name: callee_name.clone(),
         kind: reference_kind,

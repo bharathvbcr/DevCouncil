@@ -1340,7 +1340,7 @@ fn hcl_block_address(node: Node, source: &str) -> Option<String> {
 /// other linked grammar. Kinds were read from each grammar's own parse tree
 /// rather than assumed — C in particular does not put a `name` field on
 /// `function_definition`, so the name is recovered through its declarator.
-fn generic_symbol_kind(kind: &str) -> Option<SymbolKind> {
+pub(crate) fn generic_symbol_kind(kind: &str) -> Option<SymbolKind> {
     Some(match kind {
         "class_declaration" | "class_definition" | "class_specifier" | "class"
         | "object_definition" | "singleton_class" => SymbolKind::Class,
@@ -1377,7 +1377,7 @@ fn generic_symbol_kind(kind: &str) -> Option<SymbolKind> {
 }
 
 /// `(kind, name)` for a declaration node, or `None` when it is not one.
-fn generic_declaration(node: Node, source: &str) -> Option<(SymbolKind, String)> {
+pub(crate) fn generic_declaration(node: Node, source: &str) -> Option<(SymbolKind, String)> {
     let kind = generic_symbol_kind(node.kind())?;
     // `function_declarator` exists to name a C-family function whose
     // `function_definition` carries no name field; taking both would emit the
@@ -1461,7 +1461,7 @@ fn metal_shader_entry_reason_of(node: Node, source: &str) -> Option<&'static str
 }
 
 /// Nearest enclosing type-like declaration, so a method is owned by its type.
-fn generic_enclosing_type(node: Node, source: &str) -> Option<String> {
+pub(crate) fn generic_enclosing_type(node: Node, source: &str) -> Option<String> {
     let mut ancestor = node.parent();
     while let Some(parent) = ancestor {
         if let Some(kind) = generic_symbol_kind(parent.kind()) {
@@ -1482,7 +1482,7 @@ fn generic_enclosing_type(node: Node, source: &str) -> Option<String> {
 /// actually uses one; otherwise a declaration is treated as visible, which is
 /// the safe direction — treating a public symbol as private would make it a
 /// dead-code candidate on no evidence.
-fn generic_is_exported(node: Node, source: &str, name: &str) -> bool {
+pub(crate) fn generic_is_exported(node: Node, source: &str, name: &str) -> bool {
     let text = get_node_text(node, source);
     if text.starts_with("pub ") || text.contains("public ") || text.contains("export ") {
         return true;
@@ -2519,26 +2519,15 @@ fn extract_node(
                     references,
                 );
             }
-            // The C family derives its own identity: no C-family declaration
-            // carries a `name` field, and an out-of-line definition names its
-            // owner inside its declarator rather than through an ancestor.
-            let declaration = if c_family {
-                c_family_declaration(node, source)
-            } else {
-                generic_declaration(node, source)
-                    .map(|(kind, name)| (kind, generic_enclosing_type(node, source), name))
-            };
-            if let Some((symbol_kind, owner, name)) = declaration {
-                let qualified = match &owner {
-                    Some(type_name) => format!("{file_symbol_name}::{type_name}.{name}"),
-                    None => format!("{file_symbol_name}::{name}"),
-                };
-                let kind = if owner.is_some() && symbol_kind == SymbolKind::Function {
-                    SymbolKind::Method
-                } else {
-                    symbol_kind
-                };
-                if symbol_kind == SymbolKind::Function && is_metal_path(file_symbol_name) {
+            // Declaration identity, kind and visibility all come from the
+            // language's own module in `langdecl`, which is the single owner of
+            // the answer `langcalls::scope` mirrors for caller attribution.
+            if let Some(declaration) = crate::langdecl::declaration_of(lang, node, source) {
+                let qualified = declaration.qualified(file_symbol_name);
+                let name = declaration.name.clone();
+                if declaration.declared_kind == SymbolKind::Function
+                    && is_metal_path(file_symbol_name)
+                {
                     if let Some(reason) = metal_shader_entry_reason_of(node, source) {
                         wiring.push(WiringAnnotation {
                             kind: WiringKind::RuntimeEntryPoint,
@@ -2547,7 +2536,7 @@ fn extract_node(
                         });
                     }
                 }
-                if c_family && symbol_kind == SymbolKind::Function {
+                if c_family && declaration.declared_kind == SymbolKind::Function {
                     if let Some(reason) =
                         c_family_entry_point_reason(node, source, file_symbol_name, &name)
                     {
@@ -2558,27 +2547,38 @@ fn extract_node(
                         });
                     }
                 }
+                // Reading visibility is what makes an exemption necessary: until
+                // a symbol can report `is_exported = false` nothing could ever
+                // be dead, so nothing needed exempting.
+                if let Some((wiring_kind, reason)) =
+                    crate::langdecl::exemption(lang, node, source, &declaration)
+                {
+                    wiring.push(WiringAnnotation {
+                        kind: wiring_kind,
+                        target_symbol: qualified.clone(),
+                        details: reason.to_string(),
+                    });
+                }
                 symbols.push(ExtractedSymbol {
-                    name: name.clone(),
+                    name,
                     qualified_name: qualified,
-                    kind,
+                    kind: declaration.emitted_kind(),
                     span,
-                    is_exported: if c_family {
-                        c_family_is_exported(node, source, file_symbol_name)
-                    } else {
-                        generic_is_exported(node, source, &name)
-                    },
+                    is_exported: crate::langdecl::is_exported_of(
+                        lang,
+                        node,
+                        source,
+                        &declaration.name,
+                        file_symbol_name,
+                    ),
                     docstring: None,
                     signature: None,
-                    parent_symbol: Some(match &owner {
-                        Some(type_name) => format!("{file_symbol_name}::{type_name}"),
-                        None => file_symbol_name.to_string(),
-                    }),
+                    parent_symbol: Some(declaration.parent_symbol(file_symbol_name)),
                 });
             }
         }
     }
-    maybe_push_name_reference(node, source, file_symbol_name, references);
+    maybe_push_name_reference(node, source, lang, file_symbol_name, references);
 }
 
 /// Grammar keys that parse the C family.
@@ -2586,7 +2586,7 @@ fn extract_node(
 /// Metal has no grammar of its own — its spec routes it to `cpp` — so `"cpp"`
 /// covers both, exactly as `is_metal_path` exists to tell them apart again when
 /// a rule holds for one and not the other.
-fn is_c_family_grammar(lang: &str) -> bool {
+pub(crate) fn is_c_family_grammar(lang: &str) -> bool {
     matches!(lang, "c" | "cpp" | "objc" | "cuda")
 }
 
@@ -2683,7 +2683,7 @@ fn c_declaration_is_explicitly_external(node: Node, source: &str) -> bool {
 /// measurement corpus. Every one of them was exempt, so the C family had no
 /// dead-code analysis at all: 1,094 reports, all of them at confidence 0.3
 /// "Exported or exempt".
-fn c_family_is_exported(node: Node, source: &str, path: &str) -> bool {
+pub(crate) fn c_family_is_exported(node: Node, source: &str, path: &str) -> bool {
     is_c_header_path(path) || c_declaration_is_explicitly_external(node, source)
 }
 
@@ -3113,7 +3113,10 @@ fn is_inside_c_attribute(node: Node) -> bool {
 /// does: functions take their identity from `c_callable_identity`, Objective-C
 /// containers name themselves in an unnamed child, and a bare prototype is not a
 /// declaration this graph records.
-fn c_family_declaration(node: Node, source: &str) -> Option<(SymbolKind, Option<String>, String)> {
+pub(crate) fn c_family_declaration(
+    node: Node,
+    source: &str,
+) -> Option<crate::langdecl::Declaration> {
     match node.kind() {
         "class_implementation"
         | "class_interface"
@@ -3122,11 +3125,15 @@ fn c_family_declaration(node: Node, source: &str) -> Option<(SymbolKind, Option<
             if objc_interface_is_implemented_here(node, source) {
                 return None;
             }
-            Some((SymbolKind::Class, None, objc_container_name(node, source)?))
+            crate::langdecl::Declaration::new(
+                SymbolKind::Class,
+                None,
+                objc_container_name(node, source)?,
+            )
         }
         "function_definition" | "method_definition" => {
             let (owner, name) = c_callable_identity(node, source)?;
-            Some((SymbolKind::Function, owner, name))
+            crate::langdecl::Declaration::new(SymbolKind::Function, owner, name)
         }
         // A function-like macro is a callable in C, and SC31 made that
         // observable: once C-family calls are extracted, `ACTIONS(1)` is
@@ -3146,7 +3153,7 @@ fn c_family_declaration(node: Node, source: &str) -> Option<(SymbolKind, Option<
             if name.is_empty() || node.child_by_field_name("parameters").is_none() {
                 return None;
             }
-            Some((SymbolKind::Function, None, name))
+            crate::langdecl::Declaration::new(SymbolKind::Function, None, name)
         }
         // A prototype declares; it does not define. Emitting it alongside the
         // definition would put two nodes carrying one name into the graph, and
@@ -3175,12 +3182,12 @@ fn c_family_declaration(node: Node, source: &str) -> Option<(SymbolKind, Option<
             node.child_by_field_name("body")?;
             let kind = generic_symbol_kind(node.kind())?;
             let name = generic_declaration_name(node, source).filter(|name| !name.is_empty())?;
-            Some((kind, generic_enclosing_type(node, source), name))
+            crate::langdecl::Declaration::new(kind, generic_enclosing_type(node, source), name)
         }
         _ => {
             let kind = generic_symbol_kind(node.kind())?;
             let name = generic_declaration_name(node, source).filter(|name| !name.is_empty())?;
-            Some((kind, generic_enclosing_type(node, source), name))
+            crate::langdecl::Declaration::new(kind, generic_enclosing_type(node, source), name)
         }
     }
 }
@@ -3909,6 +3916,7 @@ fn go_package_name(root: Node, source: &str) -> Option<String> {
 fn maybe_push_name_reference(
     node: Node,
     source: &str,
+    lang: &str,
     file_symbol_name: &str,
     references: &mut Vec<ExtractedReference>,
 ) {
@@ -3917,7 +3925,20 @@ fn maybe_push_name_reference(
         "identifier"
         | "shorthand_property_identifier"
         | "property_identifier"
-        | "field_identifier" => ReferenceKind::Name,
+        | "field_identifier"
+        // tree-sitter-swift spells every value-position identifier
+        // `simple_identifier`, so without this arm Swift recorded no name
+        // references at all — only type positions, which are
+        // `type_identifier`. A Swift type or function used as a *value* was
+        // therefore invisible: `Const.firebaseTimeoutMs`,
+        // `self[SlideUpDismissKey.self]`, `fields.map(csvField)` and
+        // `AXObserverCreate(pid, selectionObserverCallback, …)` all name a
+        // symbol the graph had no edge for, and each of those symbols was
+        // reported dead at 0.9 confidence on real code once Swift visibility
+        // became readable. The existing gates still apply: a declaration site
+        // (`is_defining_name`), a callee position (`is_call_callee`) and a name
+        // shadowed by a local binding are all still refused.
+        | "simple_identifier" => ReferenceKind::Name,
         _ => return,
     };
     if is_defining_name(node) || is_inside_import_or_export(node) || is_call_callee(node) {
@@ -3930,14 +3951,78 @@ fn maybe_push_name_reference(
     if ref_kind == ReferenceKind::Name && name_is_shadowed_by_local(node, source, &name) {
         return;
     }
-    references.push(extracted_reference(
-        node,
-        source,
-        file_symbol_name,
+    references.push(ExtractedReference {
         name,
-        ref_kind,
-        None,
-    ));
+        kind: ref_kind,
+        span: node_span(node),
+        enclosing_symbol: enclosing_emitted_symbol_for(node, source, lang, file_symbol_name),
+        assigned_to: None,
+    });
+}
+
+/// Grammar keys with a language-specific arm in `extract_node`.
+///
+/// Everything else reaches the generic arm, whose declaration identity comes
+/// from `langdecl` — so a reference made inside one of those languages must be
+/// attributed through `langdecl` too, or it names a symbol the emitter never
+/// produced. Measured: with Kotlin extension functions owned by their receiver,
+/// `enclosing_callable_qualified` still answered `Main.kt::extra` for a
+/// reference inside `fun Person.extra()`, where the emitted symbol is
+/// `Main.kt::Person.extra` — an orphaned edge of exactly the SC9/SC10 shape.
+///
+/// Not trusted: `every_language_attributes_its_references_to_an_emitted_symbol`
+/// in `tests/declarations.rs` runs a declaration-plus-use snippet through every
+/// language named here **and** through the languages served by the generic arm,
+/// and fails if any reference names a symbol the emitter did not produce.
+/// Demonstrated in both directions rather than asserted: adding `"kotlin"` here
+/// makes a reference inside `fun Person.extra()` report `a.kt::extra`, and
+/// removing `"rust"` makes a reference inside an `impl` block report
+/// `a.rs::outer` where the emitter said `a.rs::S.outer`. Both are orphans.
+const SPECIALISED_ARM_LANGUAGES: &[&str] = &[
+    "go",
+    "hcl",
+    "javascript",
+    "python",
+    "rust",
+    "tsx",
+    "typescript",
+];
+
+/// The enclosing symbol a reference belongs to, asked of whichever path emitted
+/// the enclosing declaration.
+fn enclosing_emitted_symbol_for(
+    node: Node,
+    source: &str,
+    lang: &str,
+    file_symbol_name: &str,
+) -> Option<String> {
+    if SPECIALISED_ARM_LANGUAGES.contains(&lang) {
+        return enclosing_callable_qualified(node, source, file_symbol_name);
+    }
+    crate::langcalls::scope::enclosing_emitted_symbol(node, source, lang, file_symbol_name)
+}
+
+/// Whether `node` is the name an R assignment binds.
+///
+/// `<-`, `<<-` and `=` bind their right operand to their left; `->` and `->>`
+/// bind the other way. Every other `binary_operator` — arithmetic, comparison,
+/// a pipe — has operands that are uses, and this must not suppress them.
+fn is_r_binding_target(node: Node) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() != "binary_operator" {
+        return false;
+    }
+    let Some(operator) = parent.child_by_field_name("operator") else {
+        return false;
+    };
+    let operator = operator.kind();
+    match operator {
+        "<-" | "<<-" | "=" => field_contains(parent, "lhs", node),
+        "->" | "->>" => field_contains(parent, "rhs", node),
+        _ => false,
+    }
 }
 
 fn is_user_ident(name: &str) -> bool {
@@ -3950,6 +4035,17 @@ fn is_user_ident(name: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
 }
 
+/// Whether `needle` lies inside the first child of `parent` on `field`.
+///
+/// Deliberately the *first*, not all of them. Several grammars put more than one
+/// child on `name`, and they do not agree on what the extra ones are:
+/// tree-sitter-dart's `constructor_signature` puts the class, a `.` and the
+/// constructor name there, all of them declaration sites, while
+/// tree-sitter-swift's `parameter` puts the parameter name **and its type**
+/// there. Widening this to every `name` child was measured and reverted: it
+/// suppressed 796 real type references across 342 `.swift` files, because every
+/// parameter type stopped counting as a use. The grammars that genuinely need
+/// the wider rule get a named clause in `is_defining_name` instead.
 fn field_contains(parent: Node, field: &str, needle: Node) -> bool {
     parent
         .child_by_field_name(field)
@@ -4018,6 +4114,41 @@ fn is_defining_name(node: Node) -> bool {
     // nor suppresses a reference.
     if is_bodyless_type_specifier_name(node) {
         return false;
+    }
+    // A Kotlin `enum_entry` names its constant in an unlabelled `identifier`
+    // child, so the `name`-field test below cannot see it. Once enum entries
+    // became symbols, the declaration site was being recorded as a *use* of the
+    // symbol it declares — `Main.kt::Mode.FAST` referencing `Main.kt::Mode.FAST`
+    // — which is the self-reference shape
+    // `c_family_declarations_do_not_reference_themselves` already pins for C.
+    if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "enum_entry")
+    {
+        return true;
+    }
+    // R spells every function declaration as an assignment — `helper <-
+    // function(a) …` — so the name being declared sits on `lhs` of a
+    // `binary_operator`, a node kind that also covers `a + 1`. Gated on the
+    // operator actually binding, so an arithmetic operand is never suppressed.
+    // Without it a four-function R file recorded four file-scoped references to
+    // its own declarations, and every uncalled R function looked used.
+    if is_r_binding_target(node) {
+        return true;
+    }
+    // tree-sitter-dart spells a named constructor `Widget.named` as three
+    // children on the `name` field — `Widget`, `.`, `named` — so the generic
+    // first-child test below sees only `Widget` and reported the constructor's
+    // own name as a *use* of the symbol it declares:
+    // `app.dart::Widget.named` referencing `app.dart::Widget.named`, the
+    // self-reference shape `c_family_declarations_do_not_reference_themselves`
+    // pins for C. A parameter's identifiers hang off `formal_parameter_list`
+    // rather than off the signature, so this reaches only the name.
+    if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "constructor_signature")
+    {
+        return true;
     }
     let mut current = node;
     loop {

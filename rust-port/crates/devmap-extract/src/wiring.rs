@@ -224,6 +224,90 @@ pub fn metal_shader_entry_reason(qualifier: &str) -> Option<&'static str> {
     })
 }
 
+/// Swift attributes that hand a declaration to a runtime.
+///
+/// Each names a caller outside the corpus. `@main` is the entry point the
+/// compiler synthesises `main` from; the `@objc` family publishes a selector
+/// that Interface Builder, a target/action pair, KVO or a delegate protocol
+/// invokes by string; `@_cdecl` and `@_silgen_name` publish a C symbol; the
+/// swift-testing and XCTest attributes are collected by a test runner.
+///
+/// Restricted to attributes actually written on the declaration, so an ordinary
+/// helper is never claimed. This exists because Swift visibility is now read:
+/// before it every Swift symbol reported `is_exported` and no exemption could
+/// have mattered.
+pub fn swift_attribute_entry_reason(attribute: &str) -> Option<&'static str> {
+    Some(match attribute {
+        "main" | "UIApplicationMain" | "NSApplicationMain" => {
+            "application entry point synthesised by the compiler"
+        }
+        "objc" | "objcMembers" | "IBAction" | "IBOutlet" | "IBSegueAction" | "IBInspectable"
+        | "IBDesignable" | "NSManaged" => {
+            "published to the Objective-C runtime and invoked by selector"
+        }
+        "_cdecl" | "_silgen_name" | "_expose" | "_alwaysEmitIntoClient" => {
+            "published under a C symbol name and called from outside Swift"
+        }
+        "Test" | "Suite" => "collected by the swift-testing runner",
+        _ => return None,
+    })
+}
+
+/// Swift supertypes whose conformance makes the *type* a runtime entry point.
+///
+/// A `struct … : App` is instantiated by SwiftUI, a `UIApplicationDelegate` by
+/// UIKit, an `XCTestCase` by the test runner. None of them is constructed by any
+/// call in the corpus, so without this the type itself looks unused the moment
+/// its visibility is read.
+///
+/// Deliberately short. It lists only supertypes whose *whole purpose* is to be
+/// instantiated by a framework — conforming to `Equatable` or `Codable` says
+/// nothing about who constructs the type, and listing those would exempt most of
+/// an application on no evidence.
+pub fn swift_runtime_supertype_reason(supertype: &str) -> Option<&'static str> {
+    Some(match supertype {
+        "App" | "Scene" | "WidgetBundle" | "Widget" | "Commands" => {
+            "SwiftUI instantiates the conforming type to run the application"
+        }
+        "UIApplicationDelegate"
+        | "NSApplicationDelegate"
+        | "UISceneDelegate"
+        | "UIWindowSceneDelegate"
+        | "UNUserNotificationCenterDelegate" => {
+            "the application lifecycle instantiates the delegate by class name"
+        }
+        "XCTestCase" => "the test runner instantiates the case by reflection",
+        _ => return None,
+    })
+}
+
+/// Kotlin annotations that hand a declaration to a runtime.
+///
+/// Compose calls a `@Composable` from a composition it owns, JUnit collects
+/// `@Test` by reflection, and every dependency-injection and
+/// serialization-plugin annotation names a caller in generated or framework code
+/// that this corpus does not contain.
+pub fn kotlin_annotation_entry_reason(annotation: &str) -> Option<&'static str> {
+    Some(match annotation {
+        "Composable" | "Preview" => "invoked by the Jetpack Compose runtime",
+        "Test" | "Before" | "After" | "BeforeEach" | "AfterEach" | "BeforeClass" | "AfterClass"
+        | "BeforeAll" | "AfterAll" | "ParameterizedTest" | "RepeatedTest" => {
+            "collected and invoked by the test runner"
+        }
+        "Inject" | "Provides" | "Binds" | "Module" | "Component" | "HiltAndroidApp"
+        | "AndroidEntryPoint" | "HiltViewModel" | "Singleton" | "Factory" | "Assisted"
+        | "AssistedInject" => "constructed by the dependency-injection container",
+        "Serializable" | "Entity" | "Dao" | "Database" | "TypeConverter" | "JsonClass" => {
+            "invoked by generated serialization or persistence code"
+        }
+        "JavascriptInterface" | "Keep" | "JvmStatic" | "JvmName" | "NativeMethod" => {
+            "published to a runtime that resolves it by name"
+        }
+        "SubscribeEvent" | "Subscribe" | "EventHandler" => "invoked by an event bus by reflection",
+        _ => return None,
+    })
+}
+
 /// Python functions a test runner or plugin system collects by name.
 pub fn python_harness_entry_reason(name: &str) -> Option<&'static str> {
     if name.starts_with("test_") {

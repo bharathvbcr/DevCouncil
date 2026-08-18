@@ -2,6 +2,7 @@ pub mod cache;
 pub mod frameworks;
 pub mod gomod;
 pub mod langcalls;
+pub(crate) mod langdecl;
 pub mod languages;
 pub mod model;
 pub mod treesitter;

@@ -619,26 +619,31 @@ fn kotlin_calls_are_attributed_to_the_declaration_the_emitter_actually_named() {
         None,
         "there is no call named `area`"
     );
-    // An extension function *declaration* loses its receiver on the declaration
-    // side: `fun Person.describe()` is emitted as `Main.kt::describe`, not
-    // `Main.kt::Person.describe`. That is a defect owned elsewhere. The call
-    // side mirrors the identity the emitter actually produced, so the edge
-    // joins instead of naming a symbol that does not exist.
+    // An extension function declaration used to lose its receiver:
+    // `fun Person.describe()` was emitted as `Main.kt::describe`. It now takes
+    // the receiver as its owner, the same identity a Go receiver keeps under
+    // SC9 and a Rust `impl` method under SC11, and this test moved with it —
+    // the property it pins is that the two sides agree, whatever the answer is,
+    // so it must fail if only one of them changes.
     let emitted: Vec<&str> = extraction
         .symbols
         .iter()
         .map(|symbol| symbol.qualified_name.as_str())
         .collect();
     assert!(
-        emitted.contains(&"Main.kt::describe"),
-        "the declaration side names it bare: {emitted:?}"
+        emitted.contains(&"Main.kt::Person.describe"),
+        "the declaration side owns it by its receiver: {emitted:?}"
+    );
+    assert!(
+        !emitted.contains(&"Main.kt::describe"),
+        "and no bare copy survives beside it: {emitted:?}"
     );
     assert!(
         extraction
             .calls
             .iter()
-            .any(|call| call.caller_symbol.as_deref() == Some("Main.kt::describe")),
-        "so the call side must name it bare too, or the edge is an orphan"
+            .any(|call| call.caller_symbol.as_deref() == Some("Main.kt::Person.describe")),
+        "so the call side must name it the same way, or the edge is an orphan"
     );
 }
 
@@ -696,19 +701,18 @@ fn dart_records_the_call_shapes_its_grammar_produces() {
 }
 
 #[test]
-fn dart_calls_fall_back_to_the_enclosing_class_because_dart_emits_no_callable_symbols() {
-    // Reported rather than worked around. `generic_declaration_name` reads a
-    // declaration's `name` field, and `tree-sitter-dart` puts the name one
-    // level down on a `signature` child, so **no Dart function or method
-    // becomes a symbol at all** — only the class and the enum do. That is a
-    // declaration-side defect this module cannot fix and must not disguise.
+fn dart_calls_are_attributed_to_the_callable_the_emitter_named() {
+    // This test previously pinned the opposite: `tree-sitter-dart` puts a
+    // declaration's name one level down on a `signature` child, so
+    // `generic_declaration_name` — which reads `name` on the declaration itself
+    // — found nothing and **no Dart function or method became a symbol at
+    // all**. Every Dart call was then attributed to its enclosing class, or to
+    // the file for a top-level function: coarse, joinable, and inert, because no
+    // Dart call could resolve to a Dart target that did not exist.
     //
-    // The consequence is that a Dart call is attributed to the nearest
-    // declaration the emitter *did* name, which for a method body is its class.
-    // Coarser than the method, never orphaned, and strictly better than the
-    // file. A top-level function's calls have nothing above them and are
-    // attributed to the file. Both are pinned here so that fixing the
-    // declaration side has to come back through this test.
+    // `langdecl::dart` reads the signature, so the callables exist and the
+    // attribution follows them. The assertions are inverted rather than
+    // deleted, because the gap they described is exactly what closed.
     let extraction = extract_file("main.dart", DART);
     let emitted: Vec<&str> = extraction
         .symbols
@@ -720,17 +724,21 @@ fn dart_calls_fall_back_to_the_enclosing_class_because_dart_emits_no_callable_sy
         "the class is emitted: {emitted:?}"
     );
     assert!(
-        !emitted.contains(&"main.dart::helper") && !emitted.contains(&"main.dart::Widget.run"),
-        "but neither a top-level function nor a method is — the declaration-side gap: {emitted:?}"
+        emitted.contains(&"main.dart::helper"),
+        "and so is a top-level function: {emitted:?}"
+    );
+    assert!(
+        emitted.contains(&"main.dart::Widget.run"),
+        "and so is a method, owned by its class: {emitted:?}"
     );
     assert_eq!(
         caller_of(&extraction, "helper"),
-        Some("main.dart::Widget"),
-        "a call in a method body is owned by the class, the nearest symbol that exists"
+        Some("main.dart::Widget.run"),
+        "a call in a method body is owned by the method, not by the class"
     );
     assert!(
         !extraction.calls.is_empty(),
-        "the calls themselves are extracted and become live when declarations land"
+        "the calls themselves are extracted and now resolve to Dart targets"
     );
 }
 
