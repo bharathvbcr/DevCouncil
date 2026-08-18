@@ -173,19 +173,44 @@ fn consumer_manifest_json(
         .map(|report| format!("{}::{}", report.file_path, report.symbol_name))
         .collect();
 
+    // A subsystem `area` must be a real directory prefix, not a cluster label.
+    //
+    // `files[].area` is the file's parent directory (`file_area`) while this
+    // used `entry.name`, which clustering generates as `community-1`. The two
+    // never joined: `subsystem_map.area_for_path` matches an area against a
+    // path, so every lookup silently found nothing, and the artifact contract
+    // ("some file lives under this area") was violated for every entry.
+    //
+    // Derived from the subsystem's own representative file so both fields come
+    // from one rule. An area with no file under it is dropped rather than
+    // emitted empty — a subsystem nothing belongs to is not a subsystem, and
+    // emitting it would keep the join broken while looking populated.
+    let file_paths: BTreeSet<&str> = extractions
+        .iter()
+        .map(|ext| ext.file_path.as_str())
+        .collect();
+    let mut seen_areas: BTreeSet<String> = BTreeSet::new();
     let subsystems: Vec<Value> = lean
         .subsystems
         .iter()
-        .map(|entry| {
-            json!({
-                "area": entry.name,
+        .filter_map(|entry| {
+            let area = file_area(&entry.path);
+            if area == "." || !seen_areas.insert(area.clone()) {
+                return None;
+            }
+            let prefix = format!("{area}/");
+            if !file_paths.iter().any(|path| path.starts_with(&prefix)) {
+                return None;
+            }
+            Some(json!({
+                "area": area,
                 "summary": "",
                 "entry_points": entry.entry_points,
                 "critical_files": [entry.path],
                 "neighbors": [],
                 "handoff_paths": [],
                 "role_files": {},
-            })
+            }))
         })
         .collect();
 

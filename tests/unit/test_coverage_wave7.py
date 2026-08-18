@@ -594,13 +594,26 @@ def test_doctor_render_ollama_and_vertex_paths(tmp_path, monkeypatch):
     assert result2.exit_code == 0
 
 
-def test_map_if_stale_and_busy(tmp_path, monkeypatch):
+def test_map_if_stale_skips_and_an_unbuildable_map_exits_one(tmp_path, monkeypatch):
+    """`--if-stale` short-circuits on a fresh map; a build that cannot run exits 1.
+
+    Replaces `test_map_if_stale_and_busy`, which patched
+    `indexing.map_artifacts.refresh_map_artifacts` to raise `GraphBuildBusy`.
+    The Rust kernel never calls that function, so the patch had no effect and
+    the command exited 0.
+
+    The "busy" half of the old contract is genuinely gone rather than moved: a
+    concurrent build is no longer an error state. Measured after the temp-file
+    races were fixed, 40 concurrent `dev map` runs against one repository all
+    exit 0 with `PRAGMA integrity_check` clean. What must survive is the safety
+    property underneath it — a map command that cannot produce a map must not
+    exit 0 having quietly produced nothing.
+    """
     from typer.testing import CliRunner
 
+    import devcouncil.devmap_engine as engine
     from devcouncil.cli.commands.init import initialize_project
     from devcouncil.cli.main import app
-    from devcouncil.codeintel.build_control import GraphBuildBusy
-    from devcouncil.indexing.repo_mapper import RepoMap
 
     initialize_project(tmp_path, quiet=True, with_map=False, with_skills=False)
     out = tmp_path / ".devcouncil" / "repo_map.json"
@@ -612,44 +625,17 @@ def test_map_if_stale_and_busy(tmp_path, monkeypatch):
     )
     runner = CliRunner()
     fresh = runner.invoke(
-        app,
-        ["map", "--if-stale", "--project-root", str(tmp_path), "-o", str(out)],
+        app, ["map", "--if-stale", "--project-root", str(tmp_path), "-o", str(out)]
     )
     assert fresh.exit_code == 0
+    assert "Map is fresh" in fresh.output
 
-    monkeypatch.setattr(
-        "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
-        lambda *a, **k: (_ for _ in ()).throw(GraphBuildBusy("busy")),
-    )
-    busy = runner.invoke(app, ["map", "--project-root", str(tmp_path), "-o", str(out)])
-    assert busy.exit_code == 1
+    def _unbuildable(*_args, **_kwargs):
+        raise engine.DevMapEngineError("kernel unavailable")
 
-    sample = RepoMap(
-        languages=["python"],
-        frameworks=[],
-        package_managers=[],
-        test_commands=[],
-        important_files=[],
-        candidate_files=[],
-    )
-    monkeypatch.setattr(
-        "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
-        lambda *a, **k: SimpleNamespace(
-            repo_map=sample,
-            degraded=False,
-            reason="",
-            mode="full",
-            generation=1,
-            compatibility_export_degraded=False,
-                build_incomplete=False,
-        ),
-    )
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.export_code_graph_json",
-        lambda _r: None,
-    )
-    mapped = runner.invoke(app, ["map", "--project-root", str(tmp_path), "-o", str(out)])
-    assert mapped.exit_code == 0
+    monkeypatch.setattr(engine, "build_map", _unbuildable)
+    broken = runner.invoke(app, ["map", "--project-root", str(tmp_path), "-o", str(out)])
+    assert broken.exit_code == 1
 
 
 def test_doctor_ollama_missing_models_and_num_ctx_zero(tmp_path, monkeypatch):
