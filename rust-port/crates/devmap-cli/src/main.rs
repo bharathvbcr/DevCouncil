@@ -17,7 +17,8 @@ use devmap_query::{
 use devmap_resolve::{Resolver, UnresolvedClass};
 use devmap_serve::{default_ipc_path_for, Daemon};
 use devmap_store::{
-    current_git_head, extract_tree_cached, GenerationWriteOpts, Store, GENERATION_RETENTION,
+    current_git_head, extract_tree_cached_with_report, GenerationWriteOpts, Store,
+    GENERATION_RETENTION,
 };
 
 #[derive(Parser)]
@@ -399,7 +400,35 @@ async fn main() -> anyhow::Result<()> {
             );
             ensure_parent(&cli.db)?;
             let store = Store::open(&cli.db)?;
-            let extractions = extract_tree_cached(&store, path)?;
+            let (extractions, discovery) = extract_tree_cached_with_report(&store, path)?;
+            // Report what discovery refused. A file dropped for being oversized
+            // or unreadable used to vanish with no record: `repo_map.json` would
+            // say five files while two more existed, and nothing distinguished
+            // "not in this repository" from "refused by the indexer". Only
+            // genuine refusals are counted — `NonSource` is the ordinary case of
+            // a README next to the code, not a gap in coverage.
+            let refused: Vec<&(String, devmap_extract::model::DiscoverySkipReason)> = discovery
+                .skipped_paths
+                .iter()
+                .filter(|(_, reason)| {
+                    !matches!(
+                        reason,
+                        devmap_extract::model::DiscoverySkipReason::NonSource
+                    )
+                })
+                .collect();
+            if !refused.is_empty() {
+                eprintln!(
+                    "  discovery refused {} file(s) — these are absent from the graph:",
+                    refused.len()
+                );
+                for (path, reason) in refused.iter().take(20) {
+                    eprintln!("    {path}: {reason:?}");
+                }
+                if refused.len() > 20 {
+                    eprintln!("    … and {} more", refused.len() - 20);
+                }
+            }
 
             // B3/SC2: if the tree that was just scanned is byte-for-byte the one
             // already committed, the graph it would produce is the graph that is

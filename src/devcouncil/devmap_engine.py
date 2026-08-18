@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import List, Optional
@@ -190,7 +191,14 @@ def build_map(
     graph_path.parent.mkdir(parents=True, exist_ok=True)
 
     base = [binary, "--db", str(db_path), "--progress", "never"]
-    _run([*base, "build", str(root)], cwd=root, timeout=timeout)
+    built = _run([*base, "build", str(root)], cwd=root, timeout=timeout)
+    # Discovery refusals reach stderr on a *successful* build, and capturing the
+    # stream would swallow them. A file dropped for being oversized or unreadable
+    # is absent from the graph, so a caller who never sees this line cannot tell
+    # "not in this repository" from "refused by the indexer".
+    for line in (built.stderr or "").splitlines():
+        if "discovery refused" in line or line.startswith("    "):
+            print(line, file=sys.stderr)
     # `--force` is required because the artifacts on disk may have been written
     # by the Python engine, which devmap refuses to clobber unprompted. Passing
     # it here is the cutover being explicit, not a guard being bypassed.

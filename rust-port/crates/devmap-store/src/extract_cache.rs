@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use devmap_extract::cache::{cache_admits, CacheKey};
-use devmap_extract::{collect_sources, detect_language, extract_file, Extraction};
+use devmap_extract::{detect_language, extract_file, Extraction};
 use rayon::prelude::*;
 
 use crate::Store;
@@ -11,12 +11,29 @@ use crate::Store;
 /// Extract all indexable sources under `root`, consulting `store` for cache hits
 /// and admitting clean/partial outcomes after parse (closes X7 via `cache_admits`).
 pub fn extract_tree_cached(store: &Store, root: &Path) -> anyhow::Result<Vec<Extraction>> {
-    let sources = collect_sources(root)?;
-    let extractions: anyhow::Result<Vec<Extraction>> = sources
+    Ok(extract_tree_cached_with_report(store, root)?.0)
+}
+
+/// Extract a tree and return what discovery **refused**, alongside the results.
+///
+/// `extract_tree_cached` calls `collect_sources`, which throws the discovery
+/// report away — so an oversized or unreadable file vanished from the build with
+/// no record anywhere a consumer could reach. Measured on a fixture: a 60,000
+/// function source and a binary file were both dropped, and `repo_map.json`
+/// reported five files with nothing saying two more existed. A capped sample
+/// that reads as complete coverage is the one outcome this codebase treats as
+/// worse than a visible failure (PHASE1_CONTRACT.md), so the report is carried
+/// out rather than discarded.
+pub fn extract_tree_cached_with_report(
+    store: &Store,
+    root: &Path,
+) -> anyhow::Result<(Vec<Extraction>, devmap_extract::model::DiscoveryReport)> {
+    let (sources, report) = devmap_extract::collect_sources_with_report(root)?;
+    let extractions: Vec<Extraction> = sources
         .par_iter()
         .map(|(path, src)| extract_one_cached(store, path, src))
-        .collect();
-    extractions
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((extractions, report))
 }
 
 fn extract_one_cached(store: &Store, path: &str, src: &str) -> anyhow::Result<Extraction> {

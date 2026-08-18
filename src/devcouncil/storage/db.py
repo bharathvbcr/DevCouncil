@@ -3,6 +3,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import SQLModel, create_engine, Session
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import OperationalError
@@ -74,9 +75,24 @@ class Database:
         with Session(self.engine) as session:
             current = session.get(SchemaVersionModel, "singleton")
             if current is None:
-                session.add(SchemaVersionModel(id="singleton", version=SCHEMA_VERSION))
-                session.commit()
-                return
+                # Check-then-act across processes: two `dev` commands starting
+                # against a fresh `.devcouncil/` both read None and both insert,
+                # and the loser died with
+                # `UNIQUE constraint failed: schema_version.id`. Measured at
+                # 24-way concurrent `dev map`, 1 worker in 24.
+                #
+                # Losing the race is a *success* — the row the winner wrote is
+                # the row this process wanted — so the insert is retried as a
+                # read rather than surfaced as a failure.
+                try:
+                    session.add(SchemaVersionModel(id="singleton", version=SCHEMA_VERSION))
+                    session.commit()
+                    return
+                except IntegrityError:
+                    session.rollback()
+                    current = session.get(SchemaVersionModel, "singleton")
+                    if current is None:
+                        raise
             if current.version > SCHEMA_VERSION:
                 raise RuntimeError(
                     f"Unsupported DevCouncil schema version {current.version}; "
