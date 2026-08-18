@@ -10,6 +10,10 @@ execution:
     verify_active_task: true
 gates:
   mode: false
+indexing:
+  primary_languages:
+  - swift
+  - kotlin
 integrations:
   antigravity:
     enabled: true

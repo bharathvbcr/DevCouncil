@@ -470,12 +470,93 @@ pub fn is_builtin(family: LangFamily, name: &str) -> bool {
         LangFamily::Python => PYTHON_BUILTINS,
         LangFamily::Rust => RUST_BUILTINS,
         LangFamily::JsTs => JS_BUILTINS,
+        LangFamily::Swift => SWIFT_BUILTINS,
+        LangFamily::Kotlin => KOTLIN_BUILTINS,
         // C/C++/C#/Java have no free-function builtins that reach the resolver
         // this way, and `Generic` spans languages with no curated set at all.
         LangFamily::CStyle | LangFamily::Generic => return false,
     };
     table.binary_search(&name).is_ok()
 }
+
+/// Swift standard-library **free functions**, from the Swift Standard Library
+/// reference. Swift is a primary language for this repository, so a bare call
+/// to one of these is expected-unresolvable rather than a defect.
+///
+/// Deliberately omits `abs`, `max`, `min`, `swap`, `dump`, `zip`, `stride` and
+/// `sequence`. Each is genuinely in the stdlib, and each is at least as likely
+/// to be a function the repository declares itself — the SC30 rule: a name that
+/// a repository plausibly owns stays in `Unresolved`, because over-reporting a
+/// defect is recoverable and exempting a real one is not. Type initialisers
+/// (`String(...)`, `Int(...)`) are absent for the same reason and because a
+/// constructor call resolves through the type, not through this table.
+pub const SWIFT_BUILTINS: &[&str] = &[
+    "assert",
+    "assertionFailure",
+    "debugPrint",
+    "fatalError",
+    "getVaList",
+    "isKnownUniquelyReferenced",
+    "numericCast",
+    "precondition",
+    "preconditionFailure",
+    "print",
+    "readLine",
+    "repeatElement",
+    "transcode",
+    "unsafeBitCast",
+    "unsafeDowncast",
+    "withExtendedLifetime",
+    "withUnsafeBytes",
+    "withUnsafeMutableBytes",
+    "withUnsafeMutablePointer",
+    "withUnsafePointer",
+    "withVaList",
+];
+
+/// Kotlin top-level functions from the auto-imported `kotlin` package. Kotlin
+/// is a primary language for this repository.
+///
+/// Deliberately omits `error`, `check`, `require`, `repeat`, `maxOf`, `minOf`,
+/// `synchronized` and `lazy` — all real stdlib entries, all plausible names for
+/// a repository to declare, so they stay in `Unresolved` under the SC30 rule.
+/// The scope functions (`let`, `run`, `apply`, `also`, `with`, `use`, `takeIf`)
+/// are absent for a structural reason instead: they are extension functions
+/// invoked as `x.let { }`, and the builtin rung is only ever consulted for a
+/// *bare* callee, so an entry here could never match. `checkNotNull` and
+/// `requireNotNull` are kept where their bare stems are not — the suffixed
+/// forms are not names a repository reaches for.
+pub const KOTLIN_BUILTINS: &[&str] = &[
+    "TODO",
+    "arrayOf",
+    "arrayOfNulls",
+    "buildList",
+    "buildMap",
+    "buildSet",
+    "checkNotNull",
+    "emptyArray",
+    "emptyList",
+    "emptyMap",
+    "emptySet",
+    "hashMapOf",
+    "hashSetOf",
+    "linkedMapOf",
+    "listOf",
+    "listOfNotNull",
+    "mapOf",
+    "mutableListOf",
+    "mutableMapOf",
+    "mutableSetOf",
+    "print",
+    "println",
+    "readLine",
+    "readln",
+    "readlnOrNull",
+    "requireNotNull",
+    "setOf",
+    "sortedMapOf",
+    "sortedSetOf",
+];
 
 /// The runtime that supplies `name` as a global, if one does.
 ///
@@ -508,6 +589,8 @@ mod tests {
             ("python", PYTHON_BUILTINS),
             ("rust", RUST_BUILTINS),
             ("js", JS_BUILTINS),
+            ("swift", SWIFT_BUILTINS),
+            ("kotlin", KOTLIN_BUILTINS),
         ] {
             let mut sorted = table.to_vec();
             sorted.sort_unstable();

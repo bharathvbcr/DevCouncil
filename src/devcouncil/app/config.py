@@ -368,6 +368,18 @@ class IndexingConfig(BaseModel):
     code graph during ``dev map`` (off by default — HTML can be large).
     """
 
+    # Languages this repository treats as primary. Declared rather than inferred:
+    # a file-count scan answers "what is there most of", which is a different
+    # question from "what must the map be correct about". A vendored bundle can
+    # outweigh the application, and a language can be primary before much of it
+    # is written.
+    #
+    # Consumed as the coverage contract for the map engine: a primary language is
+    # expected to have a real call graph, its own resolution bucket, and its own
+    # standard-library table, so `dev map` can report a coverage shortfall for it
+    # instead of returning an indistinguishable zero. Values are devmap grammar
+    # keys (`swift`, `kotlin`, `python`, `go`, `rust`, `typescript`, ...), lowercased.
+    primary_languages: list[str] = Field(default_factory=list)
     lsp_refs: bool = False
     auto_refresh: bool = True
     auto_refresh_max_files: int = 40

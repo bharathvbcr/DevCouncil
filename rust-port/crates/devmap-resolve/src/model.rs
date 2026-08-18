@@ -10,6 +10,18 @@ pub enum LangFamily {
     Go,
     Rust,
     CStyle,
+    /// Swift and Kotlin are primary languages for this repository and each gets
+    /// its own bucket rather than sharing `Generic`.
+    ///
+    /// Candidates are filtered by `*candidate_family == family`
+    /// (`resolver.rs:507`), so `Generic` is not a neutral default — it is one
+    /// shared namespace spanning Swift, Kotlin, Ruby, PHP, Lua, R, COBOL and
+    /// Solidity. A bare `run()` in Swift could resolve to a Ruby `run()` at
+    /// full confidence and the graph would carry a cross-language edge that
+    /// cannot exist. Harmless only while neither language extracted calls;
+    /// separating them before that lands is why this is here now.
+    Swift,
+    Kotlin,
     Generic,
 }
 
@@ -27,6 +39,8 @@ impl LangFamily {
             // otherwise identical C->C cross-file call resolved. Metal needs no
             // entry here — it rides the `cpp` grammar key.
             "c" | "cpp" | "csharp" | "java" | "objc" | "cuda" => LangFamily::CStyle,
+            "swift" => LangFamily::Swift,
+            "kotlin" => LangFamily::Kotlin,
             _ => LangFamily::Generic,
         }
     }
