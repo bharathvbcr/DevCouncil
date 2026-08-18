@@ -22,6 +22,17 @@ pub enum LangFamily {
     /// separating them before that lands is why this is here now.
     Swift,
     Kotlin,
+    Ruby,
+    Php,
+    Scala,
+    Lua,
+    R,
+    Dart,
+    /// Languages that extract **no calls**. Sharing one bucket is harmless here
+    /// only because a language with no call sites contributes no edges to
+    /// mis-resolve — the moment one gains call extraction it must get its own
+    /// variant above, which `every_call_extracting_language_owns_its_bucket`
+    /// enforces rather than leaving to memory.
     Generic,
 }
 
@@ -41,6 +52,14 @@ impl LangFamily {
             "c" | "cpp" | "csharp" | "java" | "objc" | "cuda" => LangFamily::CStyle,
             "swift" => LangFamily::Swift,
             "kotlin" => LangFamily::Kotlin,
+            "ruby" => LangFamily::Ruby,
+            "php" => LangFamily::Php,
+            "scala" => LangFamily::Scala,
+            // Luau shares Lua's bucket deliberately: it is a Lua superset and a
+            // call genuinely can cross between them.
+            "lua" | "luau" => LangFamily::Lua,
+            "r" => LangFamily::R,
+            "dart" => LangFamily::Dart,
             _ => LangFamily::Generic,
         }
     }

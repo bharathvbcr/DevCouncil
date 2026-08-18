@@ -28,15 +28,27 @@ fn swift_and_kotlin_do_not_share_a_resolution_bucket() {
         "a Swift name must not match a Kotlin candidate"
     );
 
-    for shared in ["ruby", "php", "lua", "r", "cobol", "solidity"] {
-        let family = LangFamily::from_lang(shared);
-        assert_eq!(
+    // Languages that now extract calls each own a bucket too, so none of them
+    // can absorb a Swift or Kotlin name.
+    for owned in ["ruby", "php", "lua", "luau", "r", "dart", "scala"] {
+        let family = LangFamily::from_lang(owned);
+        assert_ne!(
             family,
             LangFamily::Generic,
-            "{shared} is expected to still share the generic bucket"
+            "{owned} extracts calls, so it must not sit in the shared bucket"
         );
-        assert_ne!(swift, family, "Swift must not match a {shared} candidate");
-        assert_ne!(kotlin, family, "Kotlin must not match a {shared} candidate");
+        assert_ne!(swift, family, "Swift must not match a {owned} candidate");
+        assert_ne!(kotlin, family, "Kotlin must not match a {owned} candidate");
+    }
+
+    // `Generic` still exists, and is still correct, for languages that
+    // contribute no call sites — they cannot mis-resolve what they never emit.
+    for quiet in ["cobol", "solidity"] {
+        assert_eq!(
+            LangFamily::from_lang(quiet),
+            LangFamily::Generic,
+            "{quiet} extracts no calls, so the shared bucket is harmless for it"
+        );
     }
 }
 
@@ -74,6 +86,37 @@ fn each_primary_language_reads_its_own_standard_library() {
         assert!(
             !is_builtin(LangFamily::Kotlin, withheld),
             "{withheld} is stdlib but plausibly repository-declared; it must stay a possible defect"
+        );
+    }
+}
+
+/// Any language that extracts calls must own its resolution bucket.
+///
+/// This is the guard for the defect a sibling agent reproduced while adding Lua
+/// and R: with both in `LangFamily::Generic`, an R file calling `process(1)`
+/// resolved to a Lua `process` in another file and the graph carried
+///
+/// ```text
+/// caller.r::function -> only_lua.lua::process   Calls   0.9
+/// ```
+///
+/// a cross-language edge that cannot exist, at near-full confidence — the SC9
+/// class of confidently-wrong answer. `Generic` is safe only for languages that
+/// contribute no call sites at all, so the invariant is not "these particular
+/// languages have variants" but "extracting calls implies owning a bucket".
+/// Written as a derived check rather than a hand-maintained list, because the
+/// next language to gain call extraction will be added by someone who has not
+/// read this file.
+#[test]
+fn every_call_extracting_language_owns_its_bucket() {
+    for lang in devmap_extract::langcalls::CALL_EXTRACTION_LANGUAGES {
+        let family = LangFamily::from_lang(lang);
+        assert_ne!(
+            family,
+            LangFamily::Generic,
+            "{lang} extracts calls but shares the generic bucket, so its calls can \
+             resolve to a same-named symbol in an unrelated language at high \
+             confidence; give it a LangFamily variant"
         );
     }
 }

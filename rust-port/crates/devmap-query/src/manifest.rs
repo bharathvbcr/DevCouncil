@@ -8,7 +8,7 @@ use devmap_extract::model::*;
 use devmap_resolve::model::ResolvedEdge;
 use serde_json::{json, Value};
 
-const CONSUMER_MAP_ENGINE: &str = "devmap-rust";
+pub(crate) const CONSUMER_MAP_ENGINE: &str = "devmap-rust";
 const DEAD_CANDIDATE_CAP: usize = 200;
 const DEPENDENTS_CAP: usize = 1_024;
 
@@ -55,6 +55,33 @@ pub fn generate_manifest_with_edges(
     (lean, json)
 }
 
+/// Whether wiring evidence marks this file as an entry point.
+///
+/// One owner for the rule. `lean_manifest` truncates its answer to fit a token
+/// budget and `code_graph.json` carries it uncapped, so having each derive
+/// "what is an entry root" separately is how the two artifacts start
+/// disagreeing about the same repository.
+pub(crate) fn is_entry_root(ext: &Extraction) -> bool {
+    ext.wiring.iter().any(|w| {
+        matches!(
+            w.kind,
+            WiringKind::ScriptEntry | WiringKind::FrameworkDecorator
+        )
+    })
+}
+
+/// Every entry-root file path, sorted and uncapped.
+pub(crate) fn entry_root_paths(extractions: &[Extraction]) -> Vec<String> {
+    let mut roots: Vec<String> = extractions
+        .iter()
+        .filter(|ext| is_entry_root(ext))
+        .map(|ext| ext.file_path.clone())
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 fn lean_manifest(
     extractions: &[Extraction],
     analysis: &AnalysisSummary,
@@ -64,17 +91,9 @@ fn lean_manifest(
     let mut entry_roots = Vec::new();
     let mut important_files = Vec::new();
 
-    for ext in extractions {
-        let is_entry = ext.wiring.iter().any(|w| {
-            matches!(
-                w.kind,
-                WiringKind::ScriptEntry | WiringKind::FrameworkDecorator
-            )
-        });
-        if is_entry {
-            entry_roots.push(ext.file_path.clone());
-        }
+    entry_roots.extend(entry_root_paths(extractions));
 
+    for ext in extractions {
         if ext.file_path == "README.md"
             || ext.file_path == "Cargo.toml"
             || ext.file_path == "package.json"

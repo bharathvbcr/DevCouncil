@@ -1,4 +1,5 @@
 pub mod artifacts;
+pub mod code_graph;
 pub mod engine;
 pub mod escape;
 pub mod manifest;
@@ -9,6 +10,10 @@ pub mod snapshots;
 pub use artifacts::{
     render_subsystem_map_html, render_symbol_explorer_html, should_regenerate, write_atomic,
     ArtifactFingerprint,
+};
+pub use code_graph::{
+    generate_code_graph_json, write_code_graph_atomically, CODE_GRAPH_DEFAULT_OUTPUT,
+    CODE_GRAPH_SCHEMA_VERSION,
 };
 pub use engine::{budget_take, resolved_edge_from_stored, QueryEngine, StoreQueryEngine};
 pub use escape::{html_escape, render_symbol_label};

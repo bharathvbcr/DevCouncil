@@ -9,9 +9,10 @@ use tracing_subscriber::FmtSubscriber;
 use devmap_analyze::analyze;
 use devmap_extract::collect_go_modules;
 use devmap_query::{
-    generate_manifest_with_edges, resolve_manifest_output, resolved_edge_from_stored,
-    semantic_snapshots, write_manifest_atomically, FreshnessInfo, Request, ResolutionAvailability,
-    StoreQueryEngine,
+    generate_code_graph_json, generate_manifest_with_edges, resolve_manifest_output,
+    resolved_edge_from_stored, semantic_snapshots, write_code_graph_atomically,
+    write_manifest_atomically, FreshnessInfo, Request, ResolutionAvailability, StoreQueryEngine,
+    CODE_GRAPH_DEFAULT_OUTPUT,
 };
 use devmap_resolve::{Resolver, UnresolvedClass};
 use devmap_serve::{default_ipc_path_for, Daemon};
@@ -127,12 +128,22 @@ enum Commands {
         #[arg(short, long, default_value_t = 2000)]
         budget: u32,
     },
+    /// Write the consumer artifacts: `repo_map.json` and its symbol-level
+    /// companion `code_graph.json`.
+    ///
+    /// Both come from one invocation because that is how consumers get them
+    /// from `dev map`: eleven modules under `src/devcouncil/` read the graph,
+    /// and a second subcommand would let a repository sit with a fresh map
+    /// beside a stale graph built from a different generation.
     Manifest {
         #[arg(default_value = ".")]
         path: PathBuf,
         #[arg(short, long, default_value = ".devcouncil/repo_map.json")]
         output: PathBuf,
-        /// Replace a Python-schema or otherwise foreign repo map.
+        /// Symbol-level graph companion artifact.
+        #[arg(long, default_value = CODE_GRAPH_DEFAULT_OUTPUT)]
+        graph_output: PathBuf,
+        /// Replace a Python-schema or otherwise foreign repo map / code graph.
         #[arg(long, default_value_t = false)]
         force: bool,
     },
@@ -662,6 +673,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Manifest {
             path,
             output,
+            graph_output,
             force,
         } => {
             let store = Store::open(&cli.db)?;
@@ -681,30 +693,48 @@ async fn main() -> anyhow::Result<()> {
                 .into_iter()
                 .map(resolved_edge_from_stored)
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            let (_manifest, json_str) = generate_manifest_with_edges(
-                &extractions,
-                &analysis,
-                FreshnessInfo {
-                    head_sha: built_head,
-                    generation_id: gen_id,
-                    pending_count: status.pending_count,
-                },
-                &edges,
-            );
+            // One freshness identity for both artifacts: a map and a graph
+            // stamped from different generations is the drift the single
+            // command exists to prevent.
+            let freshness = FreshnessInfo {
+                head_sha: built_head,
+                generation_id: gen_id,
+                pending_count: status.pending_count,
+            };
+            let (_manifest, json_str) =
+                generate_manifest_with_edges(&extractions, &analysis, freshness.clone(), &edges);
             let repo_root = store.latest_repo_root()?.or_else(|| {
                 path.canonicalize()
                     .ok()
                     .map(|root| root.to_string_lossy().into_owned())
             });
+            let graph_json = generate_code_graph_json(
+                &extractions,
+                &analysis,
+                &edges,
+                &freshness,
+                repo_root.as_deref(),
+            )?;
+
             let dest = resolve_manifest_output(repo_root.as_deref(), output);
             ensure_parent(&dest)?;
             write_manifest_atomically(&dest, &json_str, *force)?;
+
+            let graph_dest = resolve_manifest_output(repo_root.as_deref(), graph_output);
+            ensure_parent(&graph_dest)?;
+            write_code_graph_atomically(&graph_dest, &graph_json, *force)?;
+
             if !cli.json {
                 println!("Manifest written to {:?}", dest);
+                println!("Code graph written to {:?}", graph_dest);
             } else {
                 emit_json(
                     &cli,
-                    &serde_json::json!({"output": dest, "generation_id": gen_id}),
+                    &serde_json::json!({
+                        "output": dest,
+                        "graph_output": graph_dest,
+                        "generation_id": gen_id,
+                    }),
                 )?;
             }
         }

@@ -322,7 +322,7 @@ fn shortest_path(
 /// lets `devmap search` return real source spans from anywhere on the machine.
 /// With no recorded root the relative path is used unchanged, which keeps the
 /// pre-v7 behaviour for generations built before the root was captured.
-fn resolve_source_path(repo_root: &Option<String>, path: &str) -> std::path::PathBuf {
+pub(crate) fn resolve_source_path(repo_root: &Option<String>, path: &str) -> std::path::PathBuf {
     match repo_root {
         Some(root) => std::path::Path::new(root).join(path),
         None => std::path::PathBuf::from(path),
@@ -615,7 +615,7 @@ fn unavailable_response<T>(resolution: ResolutionAvailability) -> Response<T> {
     }
 }
 
-fn byte_span_to_line_range(source: &str, span: &Span) -> (u32, u32) {
+pub(crate) fn byte_span_to_line_range(source: &str, span: &Span) -> (u32, u32) {
     let start = span.start_byte.min(source.len());
     let end = span.end_byte.min(source.len()).max(start);
     let start_line = source[..start]

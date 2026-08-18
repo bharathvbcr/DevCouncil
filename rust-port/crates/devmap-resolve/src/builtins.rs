@@ -474,7 +474,14 @@ pub fn is_builtin(family: LangFamily, name: &str) -> bool {
         LangFamily::Kotlin => KOTLIN_BUILTINS,
         // C/C++/C#/Java have no free-function builtins that reach the resolver
         // this way, and `Generic` spans languages with no curated set at all.
-        LangFamily::CStyle | LangFamily::Generic => return false,
+        LangFamily::CStyle
+        | LangFamily::Ruby
+        | LangFamily::Php
+        | LangFamily::Scala
+        | LangFamily::Lua
+        | LangFamily::R
+        | LangFamily::Dart
+        | LangFamily::Generic => return false,
     };
     table.binary_search(&name).is_ok()
 }
