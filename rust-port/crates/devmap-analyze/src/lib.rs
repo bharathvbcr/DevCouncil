@@ -5,7 +5,7 @@ pub mod pdg;
 pub mod traversal;
 
 pub use clustering::detect_communities;
-pub use liveness::analyze_liveness;
+pub use liveness::{analyze_liveness, GO_BUILD_VARIANT_REASON};
 pub use model::*;
 pub use pdg::*;
 pub use traversal::*;

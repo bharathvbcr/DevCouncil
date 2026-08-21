@@ -64,6 +64,8 @@ pub fn extract_lua_call(
         // would add a fact nothing consumes, so it is left unset deliberately
         // rather than filled with something the language cannot support.
         assigned_to: None,
+        // The mirrored call already carries the receiver; repeating it here would be a second copy of one fact.
+        receiver_expr: None,
     });
     calls.push(ExtractedCall {
         caller_symbol,

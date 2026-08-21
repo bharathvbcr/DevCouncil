@@ -142,17 +142,38 @@ impl CacheKey {
     }
 
     fn for_content_hash(language: &str, content_hash: u64) -> Self {
+        let (grammar_version, analyzer_version) = current_payload_identity(language);
         Self {
             content_hash,
             language: language.to_string(),
-            grammar_version: grammar_version_for(language),
-            analyzer_version: format!("{ANALYZER_VERSION}:extract-v{EXTRACTION_SCHEMA_VERSION}"),
+            grammar_version,
+            analyzer_version,
         }
     }
 
     pub fn for_extraction(ext: &Extraction) -> Self {
         Self::for_content_hash(&ext.language, ext.content_hash)
     }
+}
+
+/// The `(grammar_version, analyzer_version)` this build stamps on a payload for
+/// `language`.
+///
+/// One owner, because two of them drifted. The extraction cache keys on this
+/// identity and correctly re-extracts after a bump, but a stored *generation*
+/// carried its rows forward on content hash alone — so `extract-v23` file,
+/// symbol and edge rows survived two schema bumps untouched while the analysis
+/// beside them was computed from fresh `extract-v25` extractions. Measured on
+/// DevCouncil: generation 412 held 1,152 v23 file rows under a v25 binary, and
+/// the next changed build was refused outright by the edge/analysis equality in
+/// `save_generation_with_metadata` — 65,615 stored against 65,798 analysed.
+/// Anything that decides whether a stored payload may be reused must ask this
+/// function rather than assemble the string itself.
+pub fn current_payload_identity(language: &str) -> (String, String) {
+    (
+        grammar_version_for(language),
+        format!("{ANALYZER_VERSION}:extract-v{EXTRACTION_SCHEMA_VERSION}"),
+    )
 }
 
 /// Real compiled grammar semver — never a constant placeholder (closes S14).

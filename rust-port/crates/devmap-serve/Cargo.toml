@@ -16,3 +16,12 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# The upgrade test has to age a stored generation's payload identity, which is
+# what installing a new kernel over an old store does. There is no equivalent on
+# the public Store API and adding a raw-SQL escape hatch to it purely for tests
+# would be worse — the same reasoning devmap-cli records for its own dev use.
+# Already a workspace dependency built for devmap-store, so no new crate enters
+# the tree.
+rusqlite.workspace = true

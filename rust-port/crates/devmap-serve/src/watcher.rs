@@ -96,10 +96,19 @@ impl IgnoreVerdictCache {
     }
 }
 
+/// Upper bound on how long a batch may sit unflushed while events keep
+/// arriving. The debounce flushes only after `DEBOUNCE` of silence, so a
+/// continuously churning tree (a build system, an editor autosave loop) never
+/// went quiet and the buffered paths were never delivered — the daemon fell
+/// behind forever. The cap forces delivery once the oldest pending path has
+/// waited this long, even mid-storm.
+const MAX_DEBOUNCE_HOLD: Duration = Duration::from_secs(10);
+
 struct DebounceBuffer {
     debounce: Duration,
     pending: BTreeSet<String>,
     last_event: Option<Instant>,
+    oldest_pending: Option<Instant>,
 }
 
 impl DebounceBuffer {
@@ -108,6 +117,7 @@ impl DebounceBuffer {
             debounce,
             pending: BTreeSet::new(),
             last_event: None,
+            oldest_pending: None,
         }
     }
 
@@ -116,16 +126,34 @@ impl DebounceBuffer {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.pending.extend(paths.into_iter().map(Into::into));
+        // A fully-filtered batch carries no work, so it must not move either
+        // clock: continuous gitignored churn would otherwise reset the
+        // silence timer forever and starve real edits behind the noise.
+        let admitted: Vec<String> = paths.into_iter().map(Into::into).collect();
+        if admitted.is_empty() {
+            return;
+        }
+        if self.oldest_pending.is_none() {
+            self.oldest_pending = Some(now);
+        }
+        self.pending.extend(admitted);
         self.last_event = Some(now);
     }
 
     fn take_ready(&mut self, now: Instant) -> Option<Vec<String>> {
         let last_event = self.last_event?;
-        if self.pending.is_empty() || now.saturating_duration_since(last_event) < self.debounce {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let quiet_long_enough = now.saturating_duration_since(last_event) >= self.debounce;
+        let held_too_long = self
+            .oldest_pending
+            .is_some_and(|oldest| now.saturating_duration_since(oldest) >= MAX_DEBOUNCE_HOLD);
+        if !quiet_long_enough && !held_too_long {
             return None;
         }
         self.last_event = None;
+        self.oldest_pending = None;
         Some(std::mem::take(&mut self.pending).into_iter().collect())
     }
 }
@@ -213,14 +241,23 @@ pub fn start_file_watcher<P: AsRef<Path>, F: Fn(Vec<String>) + Send + 'static>(
             if stop_rx.try_recv().is_ok() {
                 break;
             }
+            // Deliver matured batches on the event path too: a tree under
+            // continuous churn never lets `recv_timeout` expire, so a flush
+            // evaluated only on silence would never run again.
+            let now = Instant::now();
+            if let Some(paths) = buffer.take_ready(now) {
+                callback(paths);
+            }
             match rx.recv_timeout(Duration::from_millis(250)) {
                 Ok(Ok(event)) => {
-                    if matches!(
+                    let admitted: Vec<String> = if matches!(
                         event.kind,
                         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
                     ) {
-                        buffer.push(
-                            event.paths.into_iter().filter_map(|path| {
+                        event
+                            .paths
+                            .into_iter()
+                            .filter_map(|path| {
                                 if ignore_cache.observe_rule_event(&path) {
                                     return None;
                                 }
@@ -231,10 +268,12 @@ pub fn start_file_watcher<P: AsRef<Path>, F: Fn(Vec<String>) + Send + 'static>(
                                         None
                                     }
                                 }
-                            }),
-                            Instant::now(),
-                        );
-                    }
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    buffer.push(admitted, Instant::now());
                 }
                 Ok(Err(e)) => warn!("Watch error: {:?}", e),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -258,6 +297,110 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
+    /// A batch whose every path was filtered out must not move the debounce
+    /// window.
+    ///
+    /// The watcher filters each raw event through ignore rules before pushing
+    /// it, and a busy tree produces far more filtered-out events than real
+    /// ones — gitignored build output, editor churn, dependency trees. `push`
+    /// stamped `last_event` even for an empty batch, so continuous noise reset
+    /// the silence timer forever and a real edit behind the noise was never
+    /// flushed: the watcher looked alive while indexing nothing until the
+    /// noise happened to pause longer than the debounce.
+    #[test]
+    fn empty_batches_must_not_extend_the_debounce_window() {
+        let start = Instant::now();
+        let mut buffer = DebounceBuffer::new(Duration::from_secs(2));
+        buffer.push(["real.py"], start);
+
+        // Ten seconds of fully-filtered event batches, 200 ms apart. Each one
+        // used to re-stamp `last_event`, pushing eligibility ten seconds out.
+        for step in 1..=50usize {
+            let empty: Vec<String> = Vec::new();
+            buffer.push(empty, start + Duration::from_millis(200 * step as u64));
+        }
+
+        assert_eq!(
+            buffer.take_ready(start + Duration::from_secs(2)).unwrap(),
+            ["real.py".to_string()],
+            "empty batches must not extend the debounce window; \
+             filtered noise must not starve real edits"
+        );
+    }
+
+    /// End to end: sustained gitignored churn must not delay delivery of a
+    /// real source edit past the debounce window, and shutdown must still be
+    /// observed while the churn is running.
+    ///
+    /// This is the regression form of the starvation above: the noise keeps
+    /// flowing for the whole test, so the old flush path (evaluate readiness
+    /// only when the event channel goes quiet) never got a chance to run even
+    /// though the real edit had been quiet for longer than the debounce.
+    #[test]
+    fn sustained_filtered_noise_does_not_starve_a_real_edit_or_shutdown() {
+        let root = std::env::temp_dir().join(format!(
+            "devmap-noise-starve-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".gitignore"), "noise.txt\n").unwrap();
+        std::fs::write(root.join("main.py"), "def first(): pass\n").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let handle = start_file_watcher(&root, move |paths| tx.send(paths).unwrap()).unwrap();
+
+        let noise_root = root.clone();
+        let stop_noise = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_flag = std::sync::Arc::clone(&stop_noise);
+        let noise_thread = std::thread::spawn(move || {
+            let mut round = 0u32;
+            // ~9 s of continuous ignored-file churn, faster than the 250 ms
+            // receive window: the event channel never goes quiet on its own.
+            while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                round += 1;
+                let _ = std::fs::write(
+                    noise_root.join("noise.txt"),
+                    format!("noise {round}\n"),
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        // The real edit lands shortly after the noise starts, then stays
+        // quiet far longer than the debounce.
+        std::thread::sleep(Duration::from_millis(300));
+        let edit_at = Instant::now();
+        std::fs::write(root.join("main.py"), "def second(): pass\n").unwrap();
+
+        let deadline = edit_at + Duration::from_secs(6);
+        let mut delivered = false;
+        while Instant::now() < deadline {
+            if let Ok(paths) = rx.recv_timeout(Duration::from_millis(250)) {
+                if paths.iter().any(|path| path.ends_with("main.py")) {
+                    delivered = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            delivered,
+            "a real edit must flush within the debounce window even while \
+             filtered noise keeps arriving"
+        );
+
+        // Shutdown must be observed promptly even though the noise is still
+        // running: the stop flag is checked every loop iteration.
+        handle.shutdown().expect("clean shutdown under churn");
+
+        stop_noise.store(true, std::sync::atomic::Ordering::Relaxed);
+        noise_thread.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn debounce_buffer_waits_deduplicates_and_sorts() {
         let start = Instant::now();
@@ -272,6 +415,45 @@ mod tests {
             ["a.py", "z.py"]
         );
         assert!(buffer.take_ready(start + Duration::from_secs(10)).is_none());
+    }
+
+    /// A continuously churning tree never goes quiet for `debounce`, so a
+    /// flush that only fires on silence starved forever: build systems and
+    /// autosave loops kept resetting `last_event` and the buffered paths were
+    /// never delivered. The hold cap forces delivery once the oldest pending
+    /// path has waited long enough — and resets cleanly afterwards.
+    #[test]
+    fn a_batch_held_past_the_cap_flushes_even_without_quiet() {
+        let start = Instant::now();
+        let mut buffer = DebounceBuffer::new(Duration::from_secs(2));
+
+        // Events arriving continuously: every one inside the quiet window.
+        buffer.push(["a.py"], start);
+        for step in 1..=6 {
+            buffer.push(
+                [format!("a{step}.py")],
+                start + Duration::from_millis(500 * step),
+            );
+            assert!(
+                buffer
+                    .take_ready(start + Duration::from_millis(500 * step))
+                    .is_none(),
+                "batch must stay debounced while events keep arriving"
+            );
+        }
+
+        // Past MAX_DEBOUNCE_HOLD from the first push, the batch flushes even
+        // though events never stopped.
+        let flushed = buffer.take_ready(start + MAX_DEBOUNCE_HOLD).unwrap();
+        assert!(flushed.contains(&"a.py".to_string()));
+        assert_eq!(flushed.len(), 7);
+        assert!(
+            flushed.iter().any(|path| path == "a6.py"),
+            "paths pushed after the cap elapsed but before the flush must not be dropped"
+        );
+
+        // After a cap flush the state is reset: nothing more until new work.
+        assert!(buffer.take_ready(start + MAX_DEBOUNCE_HOLD).is_none());
     }
 
     #[test]

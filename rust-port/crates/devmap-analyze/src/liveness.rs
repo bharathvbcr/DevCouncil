@@ -124,12 +124,76 @@ fn c_header_exported_names(extractions: &[Extraction]) -> HashSet<&str> {
     names
 }
 
+/// Why a build-variant finding is exempt rather than merely downgraded.
+///
+/// Named once so the analyzer and the tests that pin this behaviour cannot
+/// drift into describing the same exemption two different ways.
+pub const GO_BUILD_VARIANT_REASON: &str =
+    "Go build-constrained variant — the call reaches whichever variant this build selects";
+
+/// Symbol identities that exist in a Go package only as mutually exclusive
+/// build variants, keyed by `(package, identity)`.
+///
+/// Go forbids two package-level declarations of one name. A package that
+/// declares `configureProcessGroup` in both `procgroup_unix.go` and
+/// `procgroup_other.go` therefore cannot compile unless those files are
+/// mutually exclusive — and they are, by `//go:build unix` and `//go:build
+/// !unix`. Exactly one reaches any given build, so a call naming that identity
+/// reaches whichever one compiled. All of them are live.
+///
+/// The resolver cannot see this: it finds N definitions of one name, cannot
+/// pick between them, and emits `AmbiguousGlobal`. Liveness then downgrades
+/// every candidate to `only_ambiguous_callers` — which reads as "this might be
+/// dead" about code that is guaranteed to be running. Measured on a Go-heavy
+/// external corpus, this was **all 16** of its non-exempt findings.
+///
+/// The join is sound rather than merely convenient because of Go's own
+/// visibility rule, which the resolver already enforces in
+/// `go_symbol_visible_from`: an *unexported* name resolves only within its own
+/// directory, and an exported one reports `is_exported` and never reaches this
+/// branch at all. So the ambiguity behind one of these findings is necessarily
+/// within a single package, which is precisely where the uniqueness rule bites.
+///
+/// Requiring **every** declaring file to carry a constraint is the part that
+/// keeps this honest. Two unconstrained files declaring one name is not a build
+/// variant — it is a package that does not compile, or an extraction bug, and
+/// either way it is not evidence that the symbol is alive.
+fn go_build_variant_identities(extractions: &[Extraction]) -> HashSet<(&str, &str, String)> {
+    // (package key, identity) -> (files seen, files carrying a constraint)
+    let mut seen: HashMap<(&str, &str, String), (usize, usize)> = HashMap::new();
+    for ext in extractions {
+        let Some((dir, package)) = go_package_key(ext) else {
+            continue;
+        };
+        // One file declaring a name twice is not two files declaring it, and Go
+        // would reject it anyway; count each file at most once per identity.
+        let mut in_this_file: HashSet<String> = HashSet::new();
+        for sym in &ext.symbols {
+            if sym.kind == SymbolKind::File {
+                continue;
+            }
+            let identity = dead_symbol_identity(sym, &ext.file_path);
+            if !in_this_file.insert(identity.clone()) {
+                continue;
+            }
+            let entry = seen.entry((dir, package, identity)).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += usize::from(ext.go_build_constrained);
+        }
+    }
+    seen.into_iter()
+        .filter(|(_, (files, constrained))| *files >= 2 && files == constrained)
+        .map(|(key, _)| key)
+        .collect()
+}
+
 pub fn analyze_liveness(
     extractions: &[Extraction],
     resolution: &ResolutionResult,
 ) -> Vec<DeadSymbolReport> {
     let go_interface_specs = go_interface_specs_by_package(extractions);
     let c_header_exports = c_header_exported_names(extractions);
+    let go_build_variants = go_build_variant_identities(extractions);
 
     // File-scoped called symbols: (target_file, symbol_name_or_qualified_name)
     let mut called_symbols: HashSet<(String, String)> = HashSet::new();
@@ -306,6 +370,28 @@ pub fn analyze_liveness(
                         && !is_c_header_path(&ext.file_path)
                         && c_header_exports.contains(sym.name.as_str()))
                     .then_some("Declared in a C-family header — public interface")
+                })
+                // A spurious ambiguity, not a real one: the candidates the
+                // resolver could not choose between are one identity compiled
+                // for different platforms, so the call reached whichever one
+                // this build selected.
+                //
+                // Gated on `is_ambiguously_called` deliberately. If *nothing*
+                // calls the identity it is dead in every variant, and the
+                // confident branch must keep saying so — a build constraint
+                // explains an ambiguity, never an absence of callers.
+                .or_else(|| {
+                    (is_ambiguously_called
+                        && go_package_key(ext)
+                            .map(|(dir, package)| {
+                                go_build_variants.contains(&(
+                                    dir,
+                                    package,
+                                    dead_symbol_identity(sym, &ext.file_path),
+                                ))
+                            })
+                            .unwrap_or(false))
+                    .then_some(GO_BUILD_VARIANT_REASON)
                 });
 
             if !is_called

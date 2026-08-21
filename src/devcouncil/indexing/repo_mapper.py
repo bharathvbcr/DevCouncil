@@ -128,8 +128,16 @@ class RepoMap(BaseModel):
     processes: List[Dict[str, object]] = Field(default_factory=list)
 
 class RepoMapper:
-    def __init__(self, project_root: Path | None = None):
-        self.project_root = project_root or Path.cwd()
+    def __init__(self, project_root: Path | str | None = None):
+        # Coerced, not merely annotated. A `str` root silently changed the
+        # answer: `self.project_root / path` raises TypeError for str/str, the
+        # blanket except in `get_git_files` caught it, and the inventory
+        # degraded from `git ls-files` to an `os.walk` that also returns
+        # gitignored files. Measured on this repository — 1347 files from
+        # `RepoMapper(".")` against 1151 from `RepoMapper(Path("."))` — which
+        # made `map_is_stale` answer True and False for the same map depending
+        # on how its caller happened to spell the root.
+        self.project_root = Path(project_root) if project_root is not None else Path.cwd()
         self._DEPENDENTS_MAX = type(self)._DEPENDENTS_MAX
         self._LIVENESS_CAP = type(self)._LIVENESS_CAP
         self._js_alias_cache: Optional[List[Tuple[str, List[str]]]] = None
@@ -2461,8 +2469,29 @@ class RepoMapper:
                 if path not in tracked_set
             ]
             return self._cap_inventory(tracked, untracked, max_files)
-        except Exception:
-            # Fallback to os.walk if not a git repo or git missing
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            # Exactly what `git_output` raises with no default: git missing,
+            # git failing, or this not being a repository. Deliberately *not*
+            # `except Exception` — that also caught TypeError from a `str`
+            # project root and answered with a silently different inventory,
+            # so a broken call looked identical to a directory that simply has
+            # no git. A fallback that cannot be distinguished from the real
+            # path is how a wrong file set reaches a freshness check.
+            # Level split, because the two causes are not equally surprising.
+            # Git answering "not a repository" is the ordinary case this
+            # fallback was written for — an empty directory `dev status` just
+            # initialised — and logging it at WARNING put a line on the console
+            # channel that broke every `--json` caller's parse. Git being
+            # absent or hanging is not ordinary, and stays loud.
+            level = (
+                logging.DEBUG if isinstance(exc, subprocess.CalledProcessError) else logging.WARNING
+            )
+            logger.log(
+                level,
+                "git file inventory unavailable (%s); falling back to a directory walk, "
+                "which also lists gitignored files",
+                exc,
+            )
             from devcouncil.indexing.walk import IGNORED_DIR_NAMES
 
             files = []

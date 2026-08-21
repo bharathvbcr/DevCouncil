@@ -88,6 +88,8 @@ pub(crate) fn extract_ruby_calls(
             span: node_span(node),
             enclosing_symbol: caller_symbol.clone(),
             assigned_to: assigned_to.clone(),
+            // The mirrored call already carries the receiver; repeating it here would be a second copy of one fact.
+            receiver_expr: None,
         },
         None => ExtractedReference {
             name: callee_name.clone(),
@@ -95,6 +97,8 @@ pub(crate) fn extract_ruby_calls(
             span: node_span(method),
             enclosing_symbol: caller_symbol.clone(),
             assigned_to: assigned_to.clone(),
+            // The mirrored call already carries the receiver; repeating it here would be a second copy of one fact.
+            receiver_expr: None,
         },
     });
     calls.push(ExtractedCall {

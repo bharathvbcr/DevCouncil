@@ -10,9 +10,58 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const PROTOCOL_VERSION: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound on how long one query may occupy its connection task.
+///
+/// Queries share the store connection with the drain loop's generation writes,
+/// so a query issued mid-resync otherwise blocks for as long as that write
+/// holds the mutex. Left unbounded, such a request pins the connection until
+/// the write finishes; bounded, it answers with a structured error the caller
+/// can report instead of hanging.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Overall ceiling on reading one request frame, per connection. Per-read
+/// timeouts bound a silent peer; this bounds a peer that keeps the exchange
+/// alive without ever finishing — bytes trickling forever would otherwise
+/// hold a connection task open indefinitely.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
+/// How long the startup liveness probe waits for an existing endpoint to
+/// answer a connect before treating it as active-and-unreachable. Bounded so
+/// a wedged listener cannot stall a new daemon's bind forever.
+const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+/// Ceiling on concurrently served connections. Each accepted connection
+/// spawns a task that may buffer up to MAX_REQUEST_BYTES before any
+/// validation runs; without a cap, a flood of connections converts directly
+/// into unbounded task memory. Excess connections wait at accept, backing up
+/// into the kernel listen backlog instead of daemon heap.
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+/// Consecutive accept failures tolerated before the IPC task gives up: an
+/// unrecoverable condition (persistent fd exhaustion) must surface as a loud
+/// exit, not a silent spin. Each failure backs off exponentially.
+const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 30;
 const MAX_QUERY_BYTES: usize = 4 * 1024;
 const MAX_TOKEN_BUDGET: u32 = 100_000;
 const MAX_TRAVERSAL_DEPTH: usize = 64;
+
+/// Records when the daemon last did anything a consumer asked of it.
+///
+/// Shared between the IPC handlers and [`crate::daemon::Daemon::run_loop`] so
+/// an orphaned daemon whose consumers all died can tell idleness from work and
+/// retire itself (bounded by `DEVMAP_MAX_IDLE_SECS`) instead of running — and
+/// holding its store open — forever.
+#[derive(Default)]
+pub struct Activity(std::sync::Mutex<Option<std::time::Instant>>);
+
+impl Activity {
+    pub fn touch(&self) {
+        let mut slot = self.0.lock().expect("activity mutex poisoned");
+        *slot = Some(std::time::Instant::now());
+    }
+
+    /// How long since the last touch; `None` when nothing was ever recorded.
+    pub fn idle_for(&self) -> Option<Duration> {
+        let slot = self.0.lock().expect("activity mutex poisoned");
+        slot.map(|at| at.elapsed())
+    }
+}
 
 fn default_budget() -> u32 {
     2_000
@@ -245,40 +294,147 @@ pub async fn handle_stream<S>(mut stream: S, store: Arc<Store>) -> anyhow::Resul
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    handle_stream_with_activity(&mut stream, store, &Activity::default()).await
+}
+
+/// Why a request frame could not be read.
+#[derive(Debug)]
+enum FrameReadError {
+    /// The overall request deadline passed before a complete frame arrived,
+    /// cutting off peers that dribble bytes to hold the connection open.
+    DeadlineExceeded,
+    /// The peer closed the connection without sending anything.
+    ClosedBeforeNewline,
+    /// The frame grew past [`MAX_REQUEST_BYTES`] before terminating.
+    TooLarge(usize),
+    /// The transport itself failed or one read exceeded `io_timeout`.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for FrameReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DeadlineExceeded => {
+                write!(formatter, "request deadline exceeded before newline")
+            }
+            Self::ClosedBeforeNewline => {
+                write!(formatter, "connection closed before newline")
+            }
+            Self::TooLarge(limit) => write!(formatter, "request exceeds {limit} bytes"),
+            Self::Io(error) => write!(formatter, "IPC request read failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for FrameReadError {}
+
+impl From<std::io::Error> for FrameReadError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// Read one newline-terminated request frame under two bounds: each read gets
+/// `io_timeout`, and the whole frame must complete by `deadline`.
+///
+/// A clean close after bytes were buffered ends the frame there, so clients
+/// that half-close instead of writing a trailing newline still work; a clean
+/// close with nothing buffered is an incomplete request, not silence.
+async fn read_frame<S>(
+    mut stream: S,
+    io_timeout: Duration,
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, FrameReadError>
+where
+    S: AsyncRead + Unpin,
+{
     let mut payload = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        let read = tokio::time::timeout(IO_TIMEOUT, stream.read(&mut chunk))
+        if std::time::Instant::now() >= deadline {
+            return Err(FrameReadError::DeadlineExceeded);
+        }
+        let read = tokio::time::timeout(io_timeout, stream.read(&mut chunk))
             .await
-            .map_err(|_| anyhow::anyhow!("IPC request read timed out"))??;
+            .map_err(|_| {
+                FrameReadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "IPC request read timed out",
+                ))
+            })??;
         if read == 0 {
-            let envelope = failure("incomplete_request", "connection closed before newline");
-            return write_envelope(&mut stream, &envelope).await;
+            return if payload.is_empty() {
+                Err(FrameReadError::ClosedBeforeNewline)
+            } else {
+                Ok(payload)
+            };
         }
         let newline = chunk[..read].iter().position(|byte| *byte == b'\n');
         let take = newline.unwrap_or(read);
         if payload.len().saturating_add(take) > MAX_REQUEST_BYTES {
-            let envelope = failure(
-                "request_too_large",
-                format!("request exceeds {MAX_REQUEST_BYTES} bytes"),
-            );
-            return write_envelope(&mut stream, &envelope).await;
+            return Err(FrameReadError::TooLarge(MAX_REQUEST_BYTES));
         }
         payload.extend_from_slice(&chunk[..take]);
         if newline.is_some() {
-            break;
+            return Ok(payload);
         }
     }
+}
+
+pub async fn handle_stream_with_activity<S>(
+    mut stream: S,
+    store: Arc<Store>,
+    activity: &Activity,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let payload = match read_frame(
+        &mut stream,
+        IO_TIMEOUT,
+        std::time::Instant::now() + REQUEST_DEADLINE,
+    )
+    .await
+    {
+        Ok(payload) => payload,
+        // Answer a closed-before-newline peer with the same structured
+        // refusal as before; every other read failure means the peer is gone
+        // or hostile, and there is nothing useful to say to it.
+        Err(FrameReadError::ClosedBeforeNewline) => {
+            let envelope = failure("incomplete_request", "connection closed before newline");
+            return write_envelope(&mut stream, &envelope).await;
+        }
+        Err(FrameReadError::TooLarge(limit)) => {
+            let envelope = failure("request_too_large", format!("request exceeds {limit} bytes"));
+            return write_envelope(&mut stream, &envelope).await;
+        }
+        Err(_) => return Ok(()),
+    };
 
     let envelope = match serde_json::from_slice::<IpcRequest>(&payload) {
         Ok(request) => match validate_request(&request) {
             Err(error) => failure("invalid_parameters", error),
             Ok(()) => {
+                activity.touch();
                 let query_store = Arc::clone(&store);
-                match tokio::task::spawn_blocking(move || dispatch(&query_store, request)).await {
-                    Ok(Ok(result)) => success(result),
-                    Ok(Err(error)) => failure("request_failed", error.to_string()),
-                    Err(error) => failure("internal_error", format!("query task failed: {error}")),
+                // Bounded, so a query wedged behind a long generation write
+                // answers with a structured error rather than occupying the
+                // connection for as long as the write holds the store mutex.
+                let dispatched = tokio::time::timeout(
+                    QUERY_TIMEOUT,
+                    tokio::task::spawn_blocking(move || dispatch(&query_store, request)),
+                )
+                .await;
+                match dispatched {
+                    Err(_) => failure(
+                        "query_timeout",
+                        format!("query exceeded {QUERY_TIMEOUT:?}"),
+                    ),
+                    Ok(Err(error)) => {
+                        failure("internal_error", format!("query task failed: {error}"))
+                    }
+                    Ok(Ok(Ok(result))) => success(result),
+                    Ok(Ok(Err(error))) => failure("request_failed", error.to_string()),
                 }
             }
         },
@@ -287,10 +443,107 @@ where
     write_envelope(&mut stream, &envelope).await
 }
 
+/// Delay before the next accept attempt after `consecutive` failures.
+///
+/// Zero errors cost nothing; each additional failure doubles a 10 ms base
+/// delay, capped at one second. The curve keeps a daemon under fd exhaustion
+/// or platform EPROTO storms from spinning hot while still retrying promptly
+/// once the condition clears.
+fn accept_error_backoff(consecutive: u32) -> Duration {
+    if consecutive == 0 {
+        return Duration::ZERO;
+    }
+    let shift = consecutive.saturating_sub(1).min(63);
+    let millis = 10u64.saturating_mul(1u64 << shift);
+    Duration::from_millis(millis).min(Duration::from_secs(1))
+}
+
 #[cfg(unix)]
 pub struct UnixIpcServer {
     listener: tokio::net::UnixListener,
     path: std::path::PathBuf,
+    /// Held exclusively for the server's lifetime. Two daemons racing to serve
+    /// one endpoint previously interleaved the exists→probe→remove→bind
+    /// sequence: the loser unlinked the winner's live socket and bound its own,
+    /// leaving an orphaned listener that answered nothing while still holding
+    /// the store open and running its watcher and drain loops.
+    _lock: std::fs::File,
+}
+
+#[cfg(unix)]
+fn ipc_lock_path(path: &std::path::Path) -> std::path::PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("devmap-ipc");
+    match path.parent() {
+        Some(parent) => parent.join(format!("{file_name}.lock")),
+        None => std::path::PathBuf::from(format!("{file_name}.lock")),
+    }
+}
+
+/// Acquire the exclusive advisory lock guarding `path`'s bind sequence.
+///
+/// `File::try_lock` is an flock, so the kernel releases it if the holder dies
+/// — no stale-lock cleanup is ever needed, unlike an O_EXCL marker file. The
+/// caller must keep the returned file alive for as long as it owns the
+/// endpoint.
+#[cfg(unix)]
+fn lock_ipc_endpoint(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    use std::io::Write;
+
+    let lock_path = ipc_lock_path(path);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    match file.try_lock() {
+        Ok(()) => {
+            let mut file = file;
+            // Best-effort ownership record for diagnostics; failure to write
+            // does not weaken the lock itself.
+            let _ = writeln!(file, "{}", std::process::id());
+            let _ = file.flush();
+            Ok(file)
+        }
+        Err(_busy) => anyhow::bail!(
+            "devmap IPC endpoint {path:?} is owned by another live daemon (lock {:?} held)",
+            lock_path
+        ),
+    }
+}
+
+/// Probe whether the endpoint at `path` is live, bounded by
+/// [`LIVENESS_PROBE_TIMEOUT`].
+///
+/// - `Some(true)` — a peer accepted within the window; the endpoint is active.
+/// - `Some(false)` — connect failed definitively (refused, or the path is not
+///   a socket); whatever sits there is stale and may be replaced.
+/// - `None` — no definitive answer inside the window. The caller must treat
+///   this as *active*: deleting a possibly-live endpoint under a daemon whose
+///   listen backlog is momentarily full would orphan every future client,
+///   while refusing to start is always recoverable by retrying.
+///
+/// The connect runs on a helper thread because a Unix-domain connect to a
+/// listener with a full backlog can block for an unbounded time; the probe
+/// must stay bounded even when the endpoint is hostile.
+#[cfg(unix)]
+fn probe_endpoint_liveness(path: &std::path::Path) -> Option<bool> {
+    use std::sync::mpsc;
+
+    let probe_path = path.to_path_buf();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let connected = std::os::unix::net::UnixStream::connect(&probe_path).is_ok();
+        let _ = sender.send(connected);
+    });
+    receiver
+        .recv_timeout(LIVENESS_PROBE_TIMEOUT)
+        .ok()
 }
 
 #[cfg(unix)]
@@ -309,6 +562,10 @@ impl UnixIpcServer {
             );
         }
 
+        // Serialize concurrent starters before any of them touches the socket
+        // file. Losing means a live daemon already owns this endpoint.
+        let lock = lock_ipc_endpoint(path)?;
+
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
             let is_managed_runtime_dir = parent.parent() == Some(std::env::temp_dir().as_path())
@@ -321,9 +578,15 @@ impl UnixIpcServer {
             }
         }
         if path.exists() {
-            match std::os::unix::net::UnixStream::connect(path) {
-                Ok(_) => anyhow::bail!("devmap IPC endpoint is already active at {path:?}"),
-                Err(_) => std::fs::remove_file(path)?,
+            match probe_endpoint_liveness(path) {
+                Some(true) => {
+                    anyhow::bail!("devmap IPC endpoint is already active at {path:?}")
+                }
+                Some(false) => std::fs::remove_file(path)?,
+                None => anyhow::bail!(
+                    "devmap IPC endpoint {path:?} did not answer its liveness \
+                     probe within {LIVENESS_PROBE_TIMEOUT:?}; leaving it untouched"
+                ),
             }
         }
         let listener = tokio::net::UnixListener::bind(path)?;
@@ -331,18 +594,50 @@ impl UnixIpcServer {
         Ok(Self {
             listener,
             path: path.to_path_buf(),
+            _lock: lock,
         })
     }
 
-    pub async fn run(self, store: Arc<Store>) -> anyhow::Result<()> {
+    pub async fn run(self, store: Arc<Store>, activity: Arc<Activity>) -> anyhow::Result<()> {
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+        let mut consecutive_accept_errors: u32 = 0;
         loop {
-            let (stream, _) = self.listener.accept().await?;
-            let store = Arc::clone(&store);
-            tokio::spawn(async move {
-                if let Err(error) = handle_stream(stream, store).await {
-                    tracing::warn!("IPC connection failed: {error}");
+            match self.listener.accept().await {
+                Ok((stream, _)) => {
+                    consecutive_accept_errors = 0;
+                    // Saturated pool => accept pauses here: backpressure lands
+                    // in the kernel backlog rather than unbounded task memory.
+                    let permit = Arc::clone(&permits)
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("connection semaphore closed"))?;
+                    let store = Arc::clone(&store);
+                    let activity = Arc::clone(&activity);
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        if let Err(error) =
+                            handle_stream_with_activity(stream, store, &activity).await
+                        {
+                            tracing::warn!("IPC connection failed: {error}");
+                        }
+                    });
                 }
-            });
+                Err(error) => {
+                    consecutive_accept_errors = consecutive_accept_errors.saturating_add(1);
+                    if consecutive_accept_errors >= MAX_CONSECUTIVE_ACCEPT_ERRORS {
+                        return Err(anyhow::anyhow!(
+                            "IPC accept failed {consecutive_accept_errors} times \
+                             consecutively; giving up: {error}"
+                        ));
+                    }
+                    let delay = accept_error_backoff(consecutive_accept_errors);
+                    tracing::warn!(
+                        "IPC accept failed ({} consecutive; retry in {delay:?}): {error}",
+                        consecutive_accept_errors
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
         }
     }
 }
@@ -355,19 +650,54 @@ impl Drop for UnixIpcServer {
 }
 
 #[cfg(windows)]
-pub async fn run_named_pipe(store: Arc<Store>, name: &str) -> anyhow::Result<()> {
+pub async fn run_named_pipe(
+    store: Arc<Store>,
+    name: &str,
+    activity: Arc<Activity>,
+) -> anyhow::Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
     let mut server = ServerOptions::new()
         .first_pipe_instance(true)
         .create(name)?;
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let mut consecutive_connect_errors: u32 = 0;
     loop {
-        server.connect().await?;
+        match server.connect().await {
+            Ok(()) => consecutive_connect_errors = 0,
+            Err(error) => {
+                consecutive_connect_errors = consecutive_connect_errors.saturating_add(1);
+                if consecutive_connect_errors >= MAX_CONSECUTIVE_ACCEPT_ERRORS {
+                    return Err(anyhow::anyhow!(
+                        "named-pipe connect failed {consecutive_connect_errors} \
+                         times consecutively; giving up: {error}"
+                    ));
+                }
+                let delay = accept_error_backoff(consecutive_connect_errors);
+                tracing::warn!(
+                    "named-pipe connect failed ({} consecutive; retry in {delay:?}): {error}",
+                    consecutive_connect_errors
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+        }
+        // Same bound as the Unix transport: saturated pool => stop creating
+        // pipe instances until a slot frees, instead of fanning out without
+        // limit.
+        let permit = Arc::clone(&permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("connection semaphore closed"))?;
         let connected = server;
         server = ServerOptions::new().create(name)?;
         let store = Arc::clone(&store);
+        let activity = Arc::clone(&activity);
         tokio::spawn(async move {
-            if let Err(error) = handle_stream(connected, store).await {
+            let _permit = permit;
+            if let Err(error) =
+                handle_stream_with_activity(connected, store, &activity).await
+            {
                 tracing::warn!("named-pipe IPC connection failed: {error}");
             }
         });
@@ -376,6 +706,89 @@ pub async fn run_named_pipe(store: Arc<Store>, name: &str) -> anyhow::Result<()>
 
 #[cfg(test)]
 mod tests {
+    /// A peer dribbling one byte at a time must be cut by an *overall* request
+    /// deadline, not just the per-read timeout.
+    ///
+    /// `handle_stream` bounded each `read` individually: a client that never
+    /// stops sending could hold a connection task and its buffer open forever
+    /// by keeping each byte inside the per-chunk window. The overall deadline
+    /// is what actually bounds a hostile or wedged peer.
+    #[tokio::test]
+    async fn a_dribbling_peer_is_cut_at_the_overall_deadline() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let writer = tokio::spawn(async move {
+            for _ in 0..200 {
+                if client.write_all(b"x").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_millis(300);
+        let result =
+            tokio::time::timeout(Duration::from_secs(3), read_frame(server, IO_TIMEOUT, deadline))
+                .await
+                .expect("read_frame must return instead of hanging past the deadline");
+        let elapsed = started.elapsed();
+
+        let error = result.expect_err("a frame still open at the deadline must be refused");
+        assert!(
+            error.to_string().contains("deadline"),
+            "the refusal must name the overall deadline, got: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the deadline must cut the exchange near 300 ms, took {elapsed:?}"
+        );
+        writer.abort();
+    }
+
+    /// The deadline bounds only unfinished frames: a complete request that
+    /// arrives normally is unaffected, so this cannot pass by refusing
+    /// everything.
+    #[tokio::test]
+    async fn a_complete_frame_within_the_deadline_reads_normally() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        client
+            .write_all(br#"{"version":1,"cmd":"status"}"#)
+            .await
+            .unwrap();
+        drop(client); // half-close: no more bytes are coming
+
+        let payload = read_frame(
+            server,
+            IO_TIMEOUT,
+            std::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("a complete frame must read cleanly");
+        assert_eq!(payload, br#"{"version":1,"cmd":"status"}"#.to_vec());
+    }
+
+    /// Accept-error backoff grows and then caps, and zero errors cost nothing.
+    ///
+    /// The accept loop must survive transient errors (fd exhaustion, EPROTO on
+    /// some platforms) without spinning hot: unbounded retry at full speed is
+    /// its own outage. The delay curve is policy, so it is pinned here.
+    #[test]
+    fn accept_error_backoff_grows_and_caps() {
+        assert_eq!(accept_error_backoff(0), Duration::ZERO);
+        assert_eq!(accept_error_backoff(1), Duration::from_millis(10));
+        assert_eq!(accept_error_backoff(2), Duration::from_millis(20));
+        assert_eq!(accept_error_backoff(3), Duration::from_millis(40));
+        // Monotone growth, hard cap.
+        let mut previous = accept_error_backoff(1);
+        for consecutive in 2..=12u32 {
+            let delay = accept_error_backoff(consecutive);
+            assert!(delay >= previous, "backoff must not shrink");
+            assert!(delay <= Duration::from_secs(1), "backoff must stay capped");
+            previous = delay;
+        }
+        assert_eq!(accept_error_backoff(12), Duration::from_secs(1));
+    }
+
     /// `min_confidence` must be finite and inside [0, 1].
     ///
     /// Both negations and the disjunction were mutable without a failure. A
@@ -515,6 +928,44 @@ mod tests {
             "an oversized trace destination must be rejected even when the \
              source is small"
         );
+    }
+
+    /// A second binder must be refused while the first holds the endpoint,
+    /// and allowed once it lets go.
+    ///
+    /// Without the lock, two racing daemons interleaved
+    /// exists→probe→remove→bind: the loser unlinked the winner's live socket
+    /// and bound its own, stranding an orphaned listener that answered
+    /// nothing while still running its watcher and drain loops against the
+    /// store. The lock is what makes the cleanup sequence exclusive.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_binder_is_refused_while_the_first_holds_the_endpoint() {
+        let path =
+            std::env::temp_dir().join(format!("devmap-lock-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let first = UnixIpcServer::bind(&path).expect("first bind must succeed");
+        assert!(
+            UnixIpcServer::bind(&path).is_err(),
+            "a second bind while the first holds the lock must be refused"
+        );
+        drop(first);
+        // The lock releases on drop (flock semantics), so a fresh daemon can
+        // take over immediately — including after a crash of the previous
+        // holder, which is exactly why an flock is used rather than a marker
+        // file that would need stale-lock cleanup.
+        let second = UnixIpcServer::bind(&path).expect("bind after release must succeed");
+        drop(second);
+        let _ = std::fs::remove_file(ipc_lock_path(&path));
+    }
+
+    /// The query bound is pinned by value: a constant that silently shrank
+    /// would fail slow-but-legitimate queries on large stores, and one that
+    /// grew would stop bounding queries wedged behind long generation writes.
+    #[test]
+    fn query_timeout_is_thirty_seconds() {
+        assert_eq!(QUERY_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(REQUEST_DEADLINE, Duration::from_secs(10));
     }
 
     use super::*;
@@ -732,7 +1183,10 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        let task = tokio::spawn(server.run(Arc::new(Store::open_in_memory().unwrap())));
+        let task = tokio::spawn(server.run(
+            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(Activity::default()),
+        ));
 
         let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
         client
@@ -750,6 +1204,71 @@ mod tests {
         assert!(
             !path.exists(),
             "socket path must be cleaned when server stops"
+        );
+    }
+}
+
+#[cfg(test)]
+mod hardening_limit_tests {
+    use super::*;
+
+    /// The fan-out cap and probe window are contracts, not vibes: both were
+    /// introduced because an unbounded value had a concrete failure mode
+    /// (flood => unbounded task memory; wedged listener => bind hanging
+    /// forever). Pinned by value so silent drift fails here.
+    #[test]
+    fn connection_and_probe_bounds_are_pinned() {
+        assert_eq!(MAX_CONCURRENT_CONNECTIONS, 64);
+        assert_eq!(LIVENESS_PROBE_TIMEOUT, Duration::from_millis(500));
+        assert_eq!(MAX_CONSECUTIVE_ACCEPT_ERRORS, 30);
+    }
+
+    /// A live-but-foreign endpoint (no lock of ours) must be refused by the
+    /// liveness probe rather than clobbered, and a stale non-socket file must
+    /// still be replaced cleanly.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_probe_refuses_live_endpoints_and_replaces_stale_files() {
+        let path = std::env::temp_dir().join(format!(
+            "devmap-probe-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(ipc_lock_path(&path));
+
+        // A live listener we do not own: bind must refuse, naming activity.
+        let foreign = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        match UnixIpcServer::bind(&path) {
+            Ok(_) => panic!("a live foreign endpoint must not be replaced"),
+            Err(error) => assert!(
+                error.to_string().contains("already active"),
+                "refusal must name the live endpoint: {error}"
+            ),
+        }
+        drop(foreign);
+        std::fs::remove_file(&path).unwrap();
+
+        // A stale non-socket file answers the probe negatively and is replaced.
+        std::fs::write(&path, b"junk").unwrap();
+        let server = UnixIpcServer::bind(&path)
+            .expect("a stale file must be replaceable");
+        drop(server);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(ipc_lock_path(&path));
+    }
+
+    /// Accept-failure backoff must stay hot early (retry transient errors
+    /// promptly) and cold late (never spin during sustained failure).
+    #[test]
+    fn accept_backoff_grows_and_caps() {
+        assert_eq!(accept_error_backoff(0), Duration::ZERO);
+        assert_eq!(accept_error_backoff(1), Duration::from_millis(10));
+        assert_eq!(accept_error_backoff(2), Duration::from_millis(20));
+        assert_eq!(accept_error_backoff(20), Duration::from_secs(1));
+        assert_eq!(
+            accept_error_backoff(u32::MAX),
+            Duration::from_secs(1),
+            "the curve must saturate, not overflow"
         );
     }
 }

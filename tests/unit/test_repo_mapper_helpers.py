@@ -1465,3 +1465,134 @@ def test_get_git_files_can_exclude_untracked(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(RepoMapper, "_inventory_limits", lambda self: (False, 50_000))
     assert mapper.get_git_files() == ["tracked.py"]
+
+
+def _tiny_git_repo(tmp_path):
+    """A repo whose gitignored file exists on disk — the walk fallback lists it,
+    `git ls-files` does not, so the two inventories are distinguishable."""
+    import subprocess
+
+    root = tmp_path / "repo"
+    (root / "pkg").mkdir(parents=True)
+    (root / "pkg" / "a.py").write_text("x = 1\n")
+    (root / ".gitignore").write_text("ignored.py\n")
+    (root / "ignored.py").write_text("x = 2\n")
+    subprocess.run(["git", "init", "-q", "."], cwd=root, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+        cwd=root,
+        check=True,
+    )
+    return root
+
+
+def test_a_str_project_root_yields_the_same_inventory_as_a_path(tmp_path):
+    """The root's *spelling* must not change the answer.
+
+    `str / str` raises TypeError, the blanket except caught it, and the
+    inventory silently degraded from `git ls-files` to an `os.walk` that also
+    returns gitignored files. Measured on DevCouncil: 1347 files from
+    `RepoMapper(".")` against 1151 from `RepoMapper(Path("."))`, so
+    `map_is_stale` answered True or False for one map depending on how its
+    caller spelled the root.
+
+    The gitignored file is the discriminator: only the walk fallback lists it.
+    """
+    from pathlib import Path
+
+    from devcouncil.indexing.repo_mapper import RepoMapper
+
+    root = _tiny_git_repo(tmp_path)
+
+    from_str = RepoMapper(str(root)).get_git_files()
+    from_path = RepoMapper(Path(root)).get_git_files()
+
+    assert from_str == from_path
+    assert "ignored.py" not in from_str, "a gitignored file means the walk fallback answered"
+    assert "pkg/a.py" in from_str
+
+
+def test_fingerprints_do_not_depend_on_how_the_root_is_spelled(tmp_path):
+    """`map_is_stale` is the consumer that made this matter."""
+    from pathlib import Path
+
+    from devcouncil.indexing.repo_mapper import RepoMapper
+
+    root = _tiny_git_repo(tmp_path)
+    as_str, as_path = RepoMapper(str(root)), RepoMapper(Path(root))
+
+    files = as_path.get_git_files()
+    stamped = {
+        "generated_head": as_path._git_head(),
+        "indexed_hash": as_path._files_fingerprint(files),
+        "content_fingerprint": as_path._content_fingerprint(files),
+    }
+    assert as_path.map_is_stale(stamped) is False
+    assert as_str.map_is_stale(stamped) is False, "same map, same answer, either spelling"
+
+
+def test_a_programming_error_is_not_reported_as_a_missing_git(tmp_path, monkeypatch):
+    """A fallback that cannot be told apart from the real path hides the bug.
+
+    The walk fallback exists for "no git / not a repository". Catching every
+    exception let an internal TypeError take that path and return a different
+    file set under the same name, with nothing in the result saying which
+    branch answered.
+    """
+    from devcouncil.indexing.repo_mapper import RepoMapper
+
+    import devcouncil.utils.proc as proc
+
+    root = _tiny_git_repo(tmp_path)
+    mapper = RepoMapper(root)
+
+    def _boom(*_args, **_kwargs):
+        raise TypeError("injected: a bug in the git branch, not a missing git")
+
+    # Injected where *only* the git branch reaches it. Patching something both
+    # branches call would make the test pass on the unfixed code for the wrong
+    # reason — the fallback would re-raise the same injection — which is what
+    # the first version of this test did.
+    monkeypatch.setattr(proc, "git_output", _boom)
+
+    with pytest.raises(TypeError):
+        mapper.get_git_files()
+
+
+def test_a_directory_without_git_still_falls_back_to_the_walk(tmp_path):
+    """Narrowing the except must not remove the fallback it was there for."""
+    from devcouncil.indexing.repo_mapper import RepoMapper
+
+    plain = tmp_path / "plain"
+    (plain / "pkg").mkdir(parents=True)
+    (plain / "pkg" / "a.py").write_text("x = 1\n")
+
+    assert RepoMapper(plain).get_git_files() == ["pkg/a.py"]
+
+
+def test_a_directory_without_git_does_not_log_to_the_console_channel(tmp_path, caplog):
+    """The fallback must stay off the console: `--json` callers parse it.
+
+    Logging the ordinary "not a repository" case at WARNING put a line on the
+    console handler, which is configured at WARNING, and three `--json` CLI
+    tests began failing with `JSONDecodeError: Extra data` — the log line landed
+    in the middle of the envelope. Git being *absent* stays loud; git answering
+    "not a repository" is the case this fallback exists for.
+    """
+    import logging
+
+    from devcouncil.indexing.repo_mapper import RepoMapper
+
+    plain = tmp_path / "plain"
+    (plain / "pkg").mkdir(parents=True)
+    (plain / "pkg" / "a.py").write_text("x = 1\n")
+
+    with caplog.at_level(logging.DEBUG, logger="devcouncil.indexing.repo_mapper"):
+        assert RepoMapper(plain).get_git_files() == ["pkg/a.py"]
+
+    fallback = [r for r in caplog.records if "falling back to a directory walk" in r.message]
+    assert fallback, "the degrade must still be recorded somewhere"
+    assert all(r.levelno == logging.DEBUG for r in fallback), (
+        "an ordinary non-git directory must not reach the console channel"
+    )

@@ -135,3 +135,61 @@ def test_a_binary_without_the_graph_capability_is_refused(tmp_path, monkeypatch)
 def test_a_missing_project_root_fails_closed(tmp_path):
     with pytest.raises(DevMapEngineError):
         build_map(tmp_path / "does-not-exist")
+
+
+@requires_engine
+def test_a_commit_that_changes_no_indexed_file_leaves_the_map_fresh(tmp_path):
+    """`generated_head` must describe the tree, not the last persisted generation.
+
+    The Rust `manifest` command stamps `head_sha` from the newest *persisted
+    generation* (`latest_generation_head`), which is honest for the store but
+    answers a different question than `map_is_stale`, which compares the field
+    against the current `git rev-parse HEAD`. Commit without touching an
+    indexed file and the incremental build persists no new generation, so the
+    stamp keeps pointing at the previous commit and the map reads stale
+    *immediately after `dev map` wrote it* — `--if-stale` never short-circuits
+    and the watcher rebuilds forever.
+
+    Measured on this repository before the fix: HEAD `e109d16`, stored
+    `30daf62`, `map_is_stale` True on a map one second old.
+
+    Both artifacts are asserted: the kernel writes them from one freshness
+    identity on purpose, and a map and graph stamped from different commits is
+    the drift that single invocation exists to prevent.
+    """
+    from devcouncil.indexing.repo_mapper import RepoMapper
+
+    root = _git_repo(tmp_path)
+    build_map(root)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "a commit that touches no indexed file",
+        ],
+        cwd=root,
+        check=True,
+    )
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+    written = build_map(root)
+    payload = json.loads(written.read_text())
+
+    assert payload["generated_head"] == head, "the map must be stamped with the current HEAD"
+    assert RepoMapper(project_root=root).map_is_stale(payload) is False, (
+        "a map written moments ago must not read stale"
+    )
+
+    graph = json.loads((root / ".devcouncil" / "graph" / "code_graph.json").read_text())
+    assert graph["generated_head"] == head, "the graph shares the map's freshness identity"
+    assert graph["indexed_hash"] == payload["indexed_hash"]
+    assert graph["content_fingerprint"] == payload["content_fingerprint"]

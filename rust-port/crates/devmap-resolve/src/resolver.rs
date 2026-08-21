@@ -405,9 +405,43 @@ impl Resolver {
                             })
                             .unwrap_or(name.as_str());
                         let spec = Self::import_spec_for_name(&imp.module_specifier, name);
-                        if let Some(target_f) =
-                            self.resolve_import_path(&ext.file_path, &ext.language, &spec)
-                        {
+                        let direct = self.resolve_import_path(&ext.file_path, &ext.language, &spec);
+                        // `from pkg import cmd` binds an attribute of
+                        // `pkg/__init__.py` when that file defines one, and the
+                        // *submodule* `pkg/cmd.py` when it does not. Only the
+                        // first was ever tried, so every submodule import bound
+                        // to the package `__init__` — a file that does not
+                        // declare the name — and every use through it resolved
+                        // to nothing.
+                        //
+                        // That is how `from devcouncil.cli.commands import
+                        // baseline, boot, …` lost its edges. Each name is a
+                        // module; `app.command(...)(baseline.baseline)` is the
+                        // only use of the command behind it; with the binding
+                        // pointing at `commands/__init__.py`, which declares
+                        // none of them, all ten CLI entry points in that one
+                        // file read as confidently dead.
+                        //
+                        // The `__init__` binding still wins when it really does
+                        // declare the name, which is what a re-exporting
+                        // package means and the order Python itself uses.
+                        let declares_name = direct
+                            .as_deref()
+                            .and_then(|file| self.file_symbols.get(file))
+                            .is_some_and(|symbols| symbols.iter().any(|symbol| symbol == name));
+                        let resolved = if declares_name {
+                            direct
+                        } else {
+                            let submodule = (ext.language == "python").then(|| {
+                                self.resolve_import_path(
+                                    &ext.file_path,
+                                    &ext.language,
+                                    &format!("{}.{}", imp.module_specifier, name),
+                                )
+                            });
+                            submodule.flatten().or(direct)
+                        };
+                        if let Some(target_f) = resolved {
                             file_bindings.insert(local.to_string(), (target_f, name.clone()));
                         } else {
                             file_external.insert(local.to_string(), imp.module_specifier.clone());
@@ -661,7 +695,25 @@ impl Resolver {
                         self.scoped_receiver_types
                             .get(&format!("{}:{}:{}", ext.file_path, caller, recv))
                     });
-                    if let Some(class_type) = scoped.or_else(|| self.receiver_types.get(&recv_key))
+                    // A receiver that *is* a type names it directly:
+                    // `PdgBuilder::new()`, `Config.default()`, `Self::helper()`.
+                    // There is no binding to look up because nothing was bound
+                    // — the type is written at the call site — so without this
+                    // an associated function fell past every receiver-aware
+                    // rung to the global tier, where any other type declaring
+                    // `new` made it ambiguous.
+                    //
+                    // It fires only when a type of exactly that name declares
+                    // exactly that method, so it cannot invent a target: the
+                    // `type_methods` lookup below is the same one a bound
+                    // receiver goes through, asked with the name as written.
+                    let literal_type = self
+                        .type_methods
+                        .contains_key(&(family, recv.clone(), call.callee_name.clone()))
+                        .then(|| recv.clone());
+                    if let Some(class_type) = scoped
+                        .or_else(|| self.receiver_types.get(&recv_key))
+                        .or(literal_type.as_ref())
                     {
                         let key = (family, class_type.clone(), call.callee_name.clone());
                         if let Some(hits) = self.type_methods.get(&key) {
@@ -675,26 +727,6 @@ impl Resolver {
                                     receiver_type: class_type.clone(),
                                 }));
                             }
-                        }
-                    }
-                }
-
-                // 2. Same-file symbol resolution
-                if resolved_target.is_none() {
-                    if let Some(file_syms) = self.file_symbols.get(&ext.file_path) {
-                        if file_syms
-                            .iter()
-                            .filter(|symbol| *symbol == &call.callee_name)
-                            .count()
-                            == 1
-                        {
-                            resolved_target =
-                                Some((ext.file_path.clone(), call.callee_name.clone()));
-                            confidence = Confidence::DETERMINISTIC;
-                            resolution = Some(Arc::new(Resolution::SameFile {
-                                target_symbol: call.callee_name.clone(),
-                                target_file: ext.file_path.clone(),
-                            }));
                         }
                     }
                 }
@@ -744,6 +776,47 @@ impl Resolver {
                                     }));
                                 }
                             }
+                        }
+                    }
+                }
+
+                // 2c. Same-file symbol resolution.
+                //
+                // Runs *after* the import rungs and only for a call this file
+                // could actually be the target of. A call with a receiver names
+                // something that receiver owns, so matching the bare callee
+                // against this file's own symbols is a guess — and a wrong one
+                // wherever a module handle shares a name with a local
+                // declaration. `ast_lsp_handlers.reset_caches()` inside a file
+                // that itself declares `reset_caches` resolved to *itself*,
+                // fabricating a self-call edge and leaving the real target with
+                // no caller and a confident dead-code finding. The same shape
+                // put `a.cfg.capabilityFor(model)` on `Adapter.capabilityFor`
+                // and reported `Config.capabilityFor` dead at 0.9.
+                //
+                // A self-reference is the exception, because there the receiver
+                // *is* this scope: `self.helper()` and `this.helper()` name a
+                // sibling declaration, which is exactly what this rung finds.
+                if resolved_target.is_none()
+                    && call
+                        .receiver_expr
+                        .as_deref()
+                        .is_none_or(Self::receiver_is_self)
+                {
+                    if let Some(file_syms) = self.file_symbols.get(&ext.file_path) {
+                        if file_syms
+                            .iter()
+                            .filter(|symbol| *symbol == &call.callee_name)
+                            .count()
+                            == 1
+                        {
+                            resolved_target =
+                                Some((ext.file_path.clone(), call.callee_name.clone()));
+                            confidence = Confidence::DETERMINISTIC;
+                            resolution = Some(Arc::new(Resolution::SameFile {
+                                target_symbol: call.callee_name.clone(),
+                                target_file: ext.file_path.clone(),
+                            }));
                         }
                     }
                 }
@@ -1081,6 +1154,18 @@ impl Resolver {
         }
     }
 
+    /// Whether a receiver expression denotes the enclosing scope itself.
+    ///
+    /// These are the spellings across the indexed languages: `self` (Python,
+    /// Rust, Swift), `this` (JS/TS, Java, C#, PHP's `$this`), `cls` (Python
+    /// classmethods), `me` (VB). A receiver in this set names the object the
+    /// current code is already inside, so a sibling declaration in the same
+    /// file is a real candidate; any other receiver names something else, and
+    /// matching it against this file's symbols by bare name is a guess.
+    fn receiver_is_self(receiver: &str) -> bool {
+        matches!(receiver, "self" | "this" | "cls" | "$this" | "me" | "Self")
+    }
+
     fn lookup_in_package(&self, file: &str, name: &str) -> Option<(String, String)> {
         if self
             .file_symbols
@@ -1262,6 +1347,72 @@ impl Resolver {
             .collect()
     }
 
+    /// A member reference resolved through its receiver.
+    ///
+    /// Two rungs, both of which the call ladder already walks, in the same
+    /// order and with the same evidence:
+    ///
+    /// 1. **Typed receiver.** `cfg` was bound by `cfg = GatesConfig()`, so
+    ///    `cfg.enabled` names `GatesConfig.enabled`. The scoped binding is
+    ///    preferred over the file-wide one for the SC9 reason: a file-wide
+    ///    fallback once declared a local type's method external at full
+    ///    confidence.
+    /// 2. **Imported receiver.** `cmd` was bound by `from pkg import cmd`, so
+    ///    `cmd.baseline` names `pkg/cmd.py::baseline`. This is what makes a
+    ///    decorator registration — `app.command(...)(cmd.baseline)` — a use.
+    ///
+    /// Neither rung guesses. A receiver that is neither typed nor imported
+    /// yields `None` and the reference stays unresolved, which is the honest
+    /// answer: naming the member alone would be the bare-name global lookup
+    /// this function refuses on purpose.
+    fn resolve_member_reference(
+        &self,
+        ext: &Extraction,
+        family: LangFamily,
+        reference: &ExtractedReference,
+        receiver: &str,
+        name: &str,
+    ) -> Option<ResolvedEdge> {
+        let scoped = reference.enclosing_symbol.as_deref().and_then(|scope| {
+            self.scoped_receiver_types
+                .get(&format!("{}:{}:{}", ext.file_path, scope, receiver))
+        });
+        let receiver_key = format!("{}:{}", ext.file_path, receiver);
+        if let Some(class_type) = scoped.or_else(|| self.receiver_types.get(&receiver_key)) {
+            let key = (family, class_type.clone(), name.to_string());
+            if let Some(hits) = self.type_methods.get(&key) {
+                if hits.len() == 1 {
+                    let (target_file, target_symbol) = &hits[0];
+                    return Some(self.reference_edge(
+                        ext,
+                        target_file,
+                        target_symbol,
+                        reference,
+                        Resolution::ReceiverType {
+                            target_symbol: self.qualified_for(target_file, target_symbol),
+                            target_file: target_file.clone(),
+                            receiver_type: class_type.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+
+        let (module_file, _) = self.import_bindings.get(&ext.file_path)?.get(receiver)?;
+        let (resolved_file, resolved_symbol) = self.lookup_in_package(module_file, name)?;
+        Some(self.reference_edge(
+            ext,
+            &resolved_file,
+            &resolved_symbol,
+            reference,
+            Resolution::ImportScoped {
+                target_symbol: self.qualified_for(&resolved_file, &resolved_symbol),
+                target_file: resolved_file.clone(),
+                imported_from: receiver.to_string(),
+            },
+        ))
+    }
+
     fn resolve_name_reference(
         &self,
         ext: &Extraction,
@@ -1325,6 +1476,21 @@ impl Resolver {
                         },
                     ));
                 }
+            }
+        }
+
+        // A *member* reference names something another symbol owns, so the
+        // two rungs that can prove which one apply exactly as they do for a
+        // method call: a receiver whose type is known, and a receiver bound by
+        // an import. `cfg.enabled` and `cmd.baseline` resolve here.
+        //
+        // This runs before the bare-name refusal below and never widens it: a
+        // reference with no receiver is still a bare name and still refused.
+        if let Some(receiver) = reference.receiver_expr.as_deref() {
+            if let Some(edge) =
+                self.resolve_member_reference(ext, family, reference, receiver, name)
+            {
+                return Some(edge);
             }
         }
 

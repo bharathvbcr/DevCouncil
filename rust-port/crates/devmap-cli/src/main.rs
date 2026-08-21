@@ -164,6 +164,12 @@ enum Commands {
         #[arg(short, long, default_value_t = 2000)]
         budget: u32,
     },
+    /// Serve queries over IPC, watching the tree for changes.
+    ///
+    /// The daemon retires itself after 30 minutes with no IPC request, no
+    /// pending work and no watcher event; the next client respawns it against
+    /// the current kernel. Set DEVMAP_MAX_IDLE_SECS (seconds) to change the
+    /// bound, or to 0 to keep serving forever.
     Serve {
         #[arg(default_value = ".")]
         path: PathBuf,
@@ -298,6 +304,13 @@ fn affected_closure(
     let previous_hashes = store.latest_file_hashes()?;
     if previous_hashes.is_empty() {
         return Ok(None); // No prior generation: this is a cold build.
+    }
+    // Nothing stored may be reused when the kernel that stored it is not the
+    // kernel running now. Content hashes are unchanged across an extractor
+    // upgrade — that is exactly the case this catches — so asking them first
+    // would report "nothing changed" over payloads that are entirely stale.
+    if !store.latest_generation_payload_is_current()? {
+        return Ok(None);
     }
     // An added or removed file changes the file set itself; take the full path
     // rather than reason about it.
@@ -448,8 +461,20 @@ async fn main() -> anyhow::Result<()> {
             // 5.5 s rebuild on 1,610 files) to arrive at what is already there.
             // This is the case a watcher hits on every tick where nothing
             // relevant changed.
+            //
+            // "Identical inputs give an identical graph" holds for one kernel,
+            // not across two. An upgraded extractor reads the same bytes and
+            // produces a different graph — that is what an extraction schema
+            // bump *is* — so content hashes alone would report "still current"
+            // over a generation this kernel would never have written. Measured
+            // on DevCouncil: the first `dev map` after two schema bumps printed
+            // "No source changes; generation #412 still current (1,152 files)"
+            // while every row in it came from `extract-v23`.
             let previous = store.latest_file_hashes()?;
-            if !previous.is_empty() && previous.len() == extractions.len() {
+            if !previous.is_empty()
+                && previous.len() == extractions.len()
+                && store.latest_generation_payload_is_current()?
+            {
                 let unchanged = extractions.iter().all(|extraction| {
                     previous
                         .get(&extraction.file_path)
@@ -921,8 +946,16 @@ async fn main() -> anyhow::Result<()> {
         Commands::Serve { path, socket } => {
             ensure_parent(&cli.db)?;
             let store = Store::open(&cli.db)?;
-            let ipc_path = socket.clone().unwrap_or_else(|| default_ipc_path_for(path));
-            let daemon = Daemon::new(store, path.clone()).with_ipc_path(ipc_path);
+            // Canonicalize once, here: the daemon's watcher, reconcile sweep
+            // and path-containment guards each canonicalized independently
+            // before, and a non-canonical root (a symlinked tmpdir, `.`) made
+            // the IPC identity hash — and therefore the socket path — differ
+            // between invocations of the same repository.
+            let root = path.canonicalize()?;
+            let ipc_path = socket
+                .clone()
+                .unwrap_or_else(|| default_ipc_path_for(&root));
+            let daemon = Daemon::new(store, root).with_ipc_path(ipc_path);
             daemon.run_loop().await?;
         }
     }

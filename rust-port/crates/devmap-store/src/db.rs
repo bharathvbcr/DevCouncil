@@ -16,24 +16,82 @@ use crate::schema::{
 
 const MAX_PENDING_ATTEMPTS: u32 = 5;
 
-pub fn current_git_head(root: &Path) -> anyhow::Result<String> {
-    let output = std::process::Command::new("git")
+/// Hard ceiling for the git subprocess. `git` can stall on pathological
+/// repositories, network mounts or hook misconfigurations; unbounded, it hung
+/// every drain batch and CLI status behind it. On expiry the child is killed
+/// and the caller gets an error — `current_git_head`'s callers already treat
+/// an unavailable head as "unavailable", so a stalled git degrades honestly
+/// instead of wedging the daemon.
+const GIT_HEAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn run_git_head_with_deadline(
+    program: &str,
+    root: &Path,
+) -> anyhow::Result<String> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let mut child = std::process::Command::new(program)
         .arg("-C")
         .arg(root)
         .args(["rev-parse", "HEAD"])
-        .output()?;
-    if !output.status.success() {
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| anyhow::anyhow!("cannot spawn {program}: {error}"))?;
+
+    // Drain both pipes on helper threads: reading them only after exit would
+    // deadlock once a pipe buffer filled. Kill on deadline; the readers then
+    // see EOF when the child dies.
+    let mut stdout_pipe = child.stdout.take().unwrap();
+    let mut stderr_pipe = child.stderr.take().unwrap();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout_pipe.read_to_string(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stderr_pipe.read_to_string(&mut buf);
+        buf
+    });
+
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started.elapsed() >= GIT_HEAD_DEADLINE {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!(
+                        "{program} rev-parse HEAD exceeded \
+                         {GIT_HEAD_DEADLINE:?} and was killed"
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => anyhow::bail!("{program} rev-parse HEAD failed: {error}"),
+        }
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if !status.success() {
         anyhow::bail!(
             "git rev-parse HEAD failed for {:?}: {}",
             root,
-            String::from_utf8_lossy(&output.stderr).trim()
+            stderr.trim()
         );
     }
-    let head = String::from_utf8(output.stdout)?.trim().to_string();
+    let head = stdout.trim().to_string();
     if !(7..=64).contains(&head.len()) || !head.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         anyhow::bail!("git returned an invalid HEAD identity for {:?}", root);
     }
     Ok(head)
+}
+
+pub fn current_git_head(root: &Path) -> anyhow::Result<String> {
+    run_git_head_with_deadline("git", root)
 }
 
 /// Fail closed: poisoned mutex is an error, never a panic.
@@ -776,6 +834,88 @@ impl Store {
             opts.deleted_paths.iter().cloned().collect();
         let full_rewrite = affected.is_empty() && deleted.is_empty();
 
+        // Which prior rows may be reused at all.
+        //
+        // "Unaffected" used to be the whole test, and unaffected meant only
+        // "content hash unchanged". That is not enough to make a stored payload
+        // reusable: it must also have been produced by the extractor and
+        // grammar this build is running. The extraction *cache* has always
+        // known that — its key carries both versions — but the generation
+        // carry-forward did not, so after two schema bumps DevCouncil's store
+        // still held 1,152 `extract-v23` rows under a `v25` binary, and the
+        // first changed build was refused by the edge/analysis equality below
+        // (65,615 stored against 65,798 analysed) with no way forward but
+        // deleting the database.
+        //
+        // Same three fields the cache keys on, asked of the same owner, so the
+        // two cannot drift: content hash, grammar version, analyzer version.
+        // A NULL version is a row from before those columns existed — unknown
+        // identity is not a matching identity, so it is not reused.
+        let current_hashes: std::collections::HashMap<&str, i64> = extractions
+            .iter()
+            .map(|ext| (ext.file_path.as_str(), ext.content_hash as i64))
+            .collect();
+        let mut carry: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stale_identity: Vec<String> = Vec::new();
+        if let Some(prev) = prev_gen {
+            if !full_rewrite {
+                let mut stmt = tx.prepare(
+                    "SELECT p.path, f.language, f.content_hash, f.grammar_version, f.analyzer_version
+                     FROM generation_files f
+                     JOIN paths p ON p.id = f.file_id
+                     WHERE f.generation_id = ?1",
+                )?;
+                let rows = stmt.query_map(params![prev], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (path, language, content_hash, grammar, analyzer) = row?;
+                    if deleted.contains(&path) || affected.contains(&path) {
+                        continue;
+                    }
+                    let (current_grammar, current_analyzer) =
+                        devmap_extract::cache::current_payload_identity(&language);
+                    let identity_matches = grammar.as_deref() == Some(current_grammar.as_str())
+                        && analyzer.as_deref() == Some(current_analyzer.as_str());
+                    // A content hash that moved without the path being declared
+                    // affected means the caller's affected set is wrong; the
+                    // stored payload describes different bytes either way.
+                    let content_matches = current_hashes
+                        .get(path.as_str())
+                        .is_none_or(|hash| *hash == content_hash);
+                    if identity_matches && content_matches {
+                        carry.insert(path);
+                    } else {
+                        stale_identity.push(path);
+                    }
+                }
+            }
+        }
+        // A stale path this write cannot replace would simply vanish from the
+        // generation — the file silently absent from the map rather than out of
+        // date. Refused loudly instead, naming the remedy, because the callers
+        // that can rebuild it (the CLI's cold-build closure, the daemon's
+        // full resync) both check the identity first and never reach here.
+        let unreplaceable: Vec<&String> = stale_identity
+            .iter()
+            .filter(|path| !current_hashes.contains_key(path.as_str()))
+            .collect();
+        if !unreplaceable.is_empty() {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "cannot carry forward {} file(s) whose stored payload was produced by a different \
+                 extractor or grammar (for example {}); rebuild this generation from a full \
+                 extraction rather than a differential write",
+                unreplaceable.len(),
+                unreplaceable[0]
+            )));
+        }
+
         if let Some(prev) = prev_gen {
             if !full_rewrite {
                 let mut stmt = tx.prepare(
@@ -809,7 +949,7 @@ impl Store {
                         grammar_version,
                         analyzer_version,
                     ) = row?;
-                    if deleted.contains(&path) || affected.contains(&path) {
+                    if !carry.contains(&path) {
                         continue;
                     }
                     let file_id = Self::ensure_path_id(&tx, &path)?;
@@ -834,7 +974,11 @@ impl Store {
         }
 
         for extraction in extractions {
-            if !full_rewrite && !affected.contains(&extraction.file_path) {
+            // Not "is it affected" but "was it carried". They differ exactly
+            // when a prior payload failed the identity gate: the file is
+            // unaffected, nothing was carried for it, and its fresh rows are
+            // the only ones this generation will have.
+            if !full_rewrite && carry.contains(&extraction.file_path) {
                 continue;
             }
             if deleted.contains(&extraction.file_path) {
@@ -909,7 +1053,7 @@ impl Store {
                 })?;
                 for row in rows {
                     let (path, name, qn, kind, start, end, exported) = row?;
-                    if deleted.contains(&path) || affected.contains(&path) {
+                    if !carry.contains(&path) {
                         continue;
                     }
                     let file_id = Self::ensure_path_id(&tx, &path)?;
@@ -932,9 +1076,9 @@ impl Store {
             }
         }
 
-        // Insert fresh rows for extractions (full rewrite or affected set).
+        // Insert fresh rows for every extraction whose file was not carried.
         for ext in extractions {
-            if !full_rewrite && !affected.contains(&ext.file_path) {
+            if !full_rewrite && carry.contains(&ext.file_path) {
                 continue;
             }
             if deleted.contains(&ext.file_path) {
@@ -970,58 +1114,35 @@ impl Store {
             }
         }
 
-        // Edges: for differential mode, carry forward then add resolution edges for affected.
+        // Edges come from this build's resolution, always — never from the
+        // previous generation.
+        //
+        // Carrying them forward was sound only while a changed build resolved
+        // just the changed files. It no longer does: the build resolves the
+        // whole tree so that the analysis means the same thing on both paths,
+        // which means `resolution.edges` already holds the current, correct
+        // edge for every file, unaffected ones included. Copying the prior
+        // generation's rows over the top of that was not a saving — it read
+        // rows and re-inserted the same number — it was only a way to keep an
+        // older answer.
+        //
+        // And the answer did drift, in two ways the affected-set closure
+        // cannot see. A payload produced by an older extractor stayed until its
+        // file's bytes changed. An edge from an unchanged file into a target
+        // whose *identity* moved without its name changing — a Go package
+        // renamed, an import alias repointed — resolves differently today while
+        // the source file itself never entered the affected set. Both showed up
+        // as the same symptom: the equality below refusing the write.
+        //
+        // Writing every resolved edge makes that equality true by construction
+        // rather than by argument. It stays below as a regression check.
         let mut edge_ord: u32 = 0;
-        if let Some(prev) = prev_gen {
-            if !full_rewrite {
-                let mut stmt = tx.prepare(
-                    "SELECT sp.path, tp.path, e.source_symbol, e.target_symbol, e.edge_kind, e.confidence
-                     FROM generation_edges e
-                     JOIN paths sp ON sp.id = e.source_file_id
-                     JOIN paths tp ON tp.id = e.target_file_id
-                     WHERE e.generation_id = ?1",
-                )?;
-                let rows = stmt.query_map(params![prev], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, f64>(5)?,
-                    ))
-                })?;
-                for row in rows {
-                    let (src, tgt, ss, ts, kind, conf) = row?;
-                    // Partition by *source* file only. An edge belongs to the
-                    // file whose extraction produced it, so source-only keying
-                    // puts every edge in exactly one bucket: carried forward
-                    // when its source was not re-resolved, taken from this
-                    // resolution when it was. Keying on "either endpoint"
-                    // instead leaves a hole — an edge from an unaffected source
-                    // into an affected target is skipped here *and* absent from
-                    // a subset resolution, so it silently disappears.
-                    if deleted.contains(&src) || deleted.contains(&tgt) || affected.contains(&src) {
-                        continue;
-                    }
-                    let src_id = Self::ensure_path_id(&tx, &src)?;
-                    let tgt_id = Self::ensure_path_id(&tx, &tgt)?;
-                    tx.execute(
-                        "INSERT INTO generation_edges (generation_id, ordinal, source_file_id, target_file_id, source_symbol, target_symbol, edge_kind, confidence)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                        params![gen_id, edge_ord, src_id, tgt_id, ss, ts, kind, conf],
-                    )?;
-                    edge_ord += 1;
-                }
-            }
-        }
 
         for edge in &resolution.edges {
+            // Deleted paths are not extracted, so a resolution over the current
+            // tree has no edge touching one. Kept as an explicit guard for
+            // callers that pass a resolution computed before the deletion.
             if deleted.contains(&edge.source_file) || deleted.contains(&edge.target_file) {
-                continue;
-            }
-            // Same partition as the carry-forward above: by source file.
-            if !full_rewrite && !affected.contains(&edge.source_file) {
                 continue;
             }
             let src_f_id = Self::ensure_path_id(&tx, &edge.source_file)?;
@@ -1046,21 +1167,22 @@ impl Store {
         // The analysis must have been computed over the edge set being stored.
         //
         // These two numbers come from different places: `edge_ord` counts the
-        // rows this generation will hold — carried forward plus newly resolved —
-        // while `total_edges` is what the analyser actually saw. Every consumer
-        // of `dead_symbols` and `communities` assumes they are the same set.
-        // They once were not. A build that resolved only the changed files
-        // handed the analyser 63 of 15,017 edges and committed a generation with
-        // 433 dead-code candidates instead of 14; the graph was intact and only
-        // the analysis of it was wrong, so nothing failed and `devmap dead`
-        // reported plainly-called symbols as callerless.
+        // rows this generation will hold, while `total_edges` is what the
+        // analyser actually saw. Every consumer of `dead_symbols` and
+        // `communities` assumes they are the same set. They once were not. A
+        // build that resolved only the changed files handed the analyser 63 of
+        // 15,017 edges and committed a generation with 433 dead-code candidates
+        // instead of 14; the graph was intact and only the analysis of it was
+        // wrong, so nothing failed and `devmap dead` reported plainly-called
+        // symbols as callerless.
         //
-        // Checked before commit, so a generation that fails it is never stored.
-        // Stated as an equality rather than a bound because it also tests
-        // B3/SC2's soundness claim on every write: carrying an unaffected file's
-        // edges forward is valid only if a full resolution would have produced
-        // exactly those edges, and if it would not, the counts disagree here
-        // rather than silently in somebody's deletion.
+        // Now that every resolved edge is stored, agreement is structural: both
+        // sides count the same `resolution.edges`. The check stays because it
+        // costs one comparison and it is the thing that caught the carry-forward
+        // drift — a generation whose stored edges came from an older extractor
+        // than its analysis. It should now be unfailable; if it ever fires
+        // again, a *new* asymmetry has been introduced between what this
+        // function stores and what the caller analysed.
         //
         // Deletions are covered too, rather than exempted. The worry was that
         // `--deleted` drops rows the analyser had counted, but it cannot: a
@@ -1304,6 +1426,48 @@ impl Store {
                 row.get(0)
             })?;
         Ok(count as usize)
+    }
+
+    /// Whether every row in the latest generation was produced by the extractor
+    /// and grammars this build is running.
+    ///
+    /// A build asks this *before* deciding to go differential. The extraction
+    /// cache re-extracts a file whose analyzer or grammar version moved, but a
+    /// generation used to carry its stored rows forward on content hash alone,
+    /// so an upgraded kernel kept committing generations made of old payloads
+    /// until a changed file finally made the stored edges disagree with the
+    /// fresh analysis — at which point every incremental build failed and the
+    /// only way out was deleting the database. Answering false here turns that
+    /// into one full build.
+    ///
+    /// True when there is no generation yet: a cold build carries nothing.
+    pub fn latest_generation_payload_is_current(&self) -> Result<bool> {
+        let conn = lock_conn(&self.conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT language, grammar_version, analyzer_version
+             FROM generation_files
+             WHERE generation_id = (SELECT max(id) FROM generations)",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (language, grammar, analyzer) = row?;
+            let (current_grammar, current_analyzer) =
+                devmap_extract::cache::current_payload_identity(&language);
+            // A NULL version predates these columns: unknown identity is not a
+            // matching one.
+            if grammar.as_deref() != Some(current_grammar.as_str())
+                || analyzer.as_deref() != Some(current_analyzer.as_str())
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// `(path, content_hash)` for every file in the latest generation.
@@ -2157,5 +2321,75 @@ mod connection_tests {
             .expect("busy_timeout pragma");
         assert_eq!(foreign_keys, 1);
         assert!(busy_timeout >= 5_000, "busy timeout was {busy_timeout} ms");
+    }
+}
+
+#[cfg(test)]
+mod git_head_tests {
+    use super::*;
+
+    /// A stalled git must be killed at the deadline, not waited on forever.
+    ///
+    /// `current_git_head` used `.output()`, which waits however long the child
+    /// feels like taking; a hung git (network mount, wedged hook) stalled every
+    /// drain batch behind it. The bounded runner kills at
+    /// [`GIT_HEAD_DEADLINE`]; this test proves the error arrives near the
+    /// deadline rather than after the sleeper's own 30s exit.
+    #[test]
+    fn a_stalled_git_is_killed_at_the_deadline() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("devmap-gitdeadline-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("stalledgit");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let result = run_git_head_with_deadline(
+            &script.to_string_lossy(),
+            std::path::Path::new("/tmp"),
+        );
+        let elapsed = started.elapsed();
+
+        let error = result.expect_err("a stalled git must produce an error");
+        assert!(
+            error.to_string().contains("killed"),
+            "the error must say the child was killed: {error}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(GIT_HEAD_DEADLINE.as_secs() + 2),
+            "kill must land near the deadline, took {elapsed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_git_head_still_validates_normally() {
+        // Positive control: the deadline path must not have broken honest git.
+        // Any directory works — /tmp is outside a repo only if git errors, so
+        // use this crate's own manifest dir which IS in a repository when the
+        // workspace is checked out; fall back to asserting the failure shape
+        // otherwise. Either way it must return quickly and cleanly.
+        let started = std::time::Instant::now();
+        let result = current_git_head(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+        assert!(started.elapsed() < GIT_HEAD_DEADLINE);
+        match result {
+            Ok(head) => assert!(
+                (7..=64).contains(&head.len())
+                    && head.bytes().all(|b| b.is_ascii_hexdigit()),
+                "a real HEAD must pass validation: {head:?}"
+            ),
+            Err(error) => assert!(
+                !error.to_string().contains("killed"),
+                "an honest fast failure must not be a kill: {error}"
+            ),
+        }
     }
 }

@@ -239,6 +239,7 @@ pub fn extract_treesitter(path: &str, lang: &str, source: &str) -> Extraction {
                     go_package: (lang == "go")
                         .then(|| go_package_name(root, source))
                         .flatten(),
+                    go_build_constrained: lang == "go" && go_build_constrained(path, source),
                     go_interface_methods,
                     go_method_params,
                     // After `walk_tree`, so the per-scope cache it warmed is
@@ -745,6 +746,7 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         routes: Vec::new(),
         wiring: extract_wiring_annotations(path, source),
         go_package: None,
+        go_build_constrained: false,
         go_interface_methods: Vec::new(),
         go_method_params: Vec::new(),
         scope_locals: Vec::new(),
@@ -932,6 +934,43 @@ fn callable_binding_name(node: Node, source: &str) -> Option<String> {
     None
 }
 
+/// The object half of a member access, when `node` is the member half.
+///
+/// `cfg` for `cfg.enabled`, `cmd` for `cmd.baseline`, `this.backend` for
+/// `this.backend.hydrate`. `None` for a bare identifier, and `None` for the
+/// object half itself — `cfg` in `cfg.enabled` is a use of `cfg`, not of
+/// anything owned by it.
+///
+/// Recording this is what lets the resolver tell a *member* name, which names
+/// something another symbol owns, from a *local* name, which names a binding in
+/// the current scope. It refuses to resolve the latter globally on purpose, so
+/// that `except Exception as e` cannot bind to an unrelated `def e`; without
+/// the distinction that refusal swallowed every property read and every
+/// callback passed by attribute along with it.
+fn member_access_receiver(node: Node, source: &str) -> Option<String> {
+    let parent = node.parent()?;
+    // The grammars spell the same shape three ways: `attribute` in Python,
+    // `member_expression` in JS/TS, `selector_expression` in Go.
+    let object_field = match parent.kind() {
+        "attribute" => "object",
+        "member_expression" => "object",
+        "selector_expression" => "operand",
+        _ => return None,
+    };
+    // Only the member half has a receiver. The object half is a use in its own
+    // right and must keep resolving as one.
+    let member = parent
+        .child_by_field_name("attribute")
+        .or_else(|| parent.child_by_field_name("property"))
+        .or_else(|| parent.child_by_field_name("field"))?;
+    if member.id() != node.id() {
+        return None;
+    }
+    let object = parent.child_by_field_name(object_field)?;
+    let text = get_node_text(object, source);
+    (!text.is_empty()).then_some(text)
+}
+
 fn extracted_reference(
     node: Node,
     source: &str,
@@ -946,6 +985,9 @@ fn extracted_reference(
         span: node_span(node),
         enclosing_symbol: enclosing_callable_qualified(node, source, file_symbol_name),
         assigned_to,
+        // The object half of a member access, so the resolver can tell
+        // `cfg.enabled` from a bare local named `enabled`.
+        receiver_expr: member_access_receiver(node, source),
     }
 }
 
@@ -1085,31 +1127,53 @@ fn ast_root(node: Node) -> Node {
 ///   check can never be true — a method is exported exactly when its class is.
 /// - `variable_declarator.parent()` is the `lexical_declaration`; the export
 ///   statement wraps that, not the declarator.
-fn js_symbol_is_exported(node: Node) -> bool {
-    let owner = match node.kind() {
-        "method_definition" => {
-            let mut ancestor = node.parent();
-            loop {
-                match ancestor {
-                    Some(parent)
-                        if matches!(
-                            parent.kind(),
-                            "class_declaration" | "abstract_class_declaration" | "class"
-                        ) =>
-                    {
-                        break Some(parent)
-                    }
-                    Some(parent) => ancestor = parent.parent(),
-                    None => break None,
+fn js_symbol_is_exported(node: Node, source: &str) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        match parent.kind() {
+            "export_statement" | "export_declaration" => return true,
+            // The value escapes to the host runtime. `globalThis.ResizeObserver
+            // = class { observe() {} }` publishes `observe` to anything that
+            // constructs a `ResizeObserver` — the browser, a test harness, a
+            // library — and none of those call sites is in the corpus. That is
+            // the same claim `export` makes, made a different way.
+            "assignment_expression" => {
+                if parent
+                    .child_by_field_name("left")
+                    .is_some_and(|left| js_target_is_global(left, source))
+                {
+                    return true;
                 }
+                ancestor = parent.parent();
             }
+            // A value bound inside a callable does not escape by being written.
+            // Proving that a returned object reaches a caller needs escape
+            // analysis, which a syntax-directed extractor does not do, so stop
+            // here and report what is actually evident: not exported.
+            "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "arrow_function"
+            | "method_definition" => return false,
+            _ => ancestor = parent.parent(),
         }
-        "variable_declarator" => node.parent(),
-        _ => Some(node),
-    };
-    owner
-        .and_then(|owner| owner.parent())
-        .is_some_and(|parent| matches!(parent.kind(), "export_statement" | "export_declaration"))
+    }
+    false
+}
+
+/// Whether an assignment target names a property of the global object.
+///
+/// The four spellings are the ones a JavaScript program can actually reach:
+/// `globalThis` is the standard, `window` and `self` are the web ones, `global`
+/// is Node's. A bare identifier is deliberately excluded — `x = class {…}`
+/// assigns to a binding, not to the runtime.
+fn js_target_is_global(left: Node, source: &str) -> bool {
+    if left.kind() != "member_expression" {
+        return false;
+    }
+    left.child_by_field_name("object")
+        .map(|object| get_node_text(object, source))
+        .is_some_and(|root| matches!(root.as_str(), "globalThis" | "window" | "global" | "self"))
 }
 
 /// Declared parameter count of a `parameter_list`.
@@ -1663,7 +1727,7 @@ fn extract_node(
             | "method_definition"
             | "arrow_function" => {
                 if let Some(n) = get_child_text(node, "name", source) {
-                    let is_exported = js_symbol_is_exported(node);
+                    let is_exported = js_symbol_is_exported(node, source);
                     let enclosing_type = (kind == "method_definition")
                         .then(|| enclosing_type_name(node, source))
                         .flatten();
@@ -1711,7 +1775,7 @@ fn extract_node(
                                 source,
                                 file_symbol_name,
                                 n,
-                                js_symbol_is_exported(node),
+                                js_symbol_is_exported(node, source),
                                 span.clone(),
                                 symbols,
                             );
@@ -1719,7 +1783,7 @@ fn extract_node(
                     }
                     if vk == "arrow_function" || vk == "function_expression" {
                         if let Some(n) = get_child_text(node, "name", source) {
-                            let is_exported = js_symbol_is_exported(node);
+                            let is_exported = js_symbol_is_exported(node, source);
                             symbols.push(ExtractedSymbol {
                                 name: n.clone(),
                                 qualified_name: scoped_qualified_name(
@@ -1741,7 +1805,7 @@ fn extract_node(
             }
             "class_declaration" | "abstract_class_declaration" => {
                 if let Some(n) = get_child_text(node, "name", source) {
-                    let is_exported = js_symbol_is_exported(node);
+                    let is_exported = js_symbol_is_exported(node, source);
                     symbols.push(ExtractedSymbol {
                         name: n.clone(),
                         qualified_name: scoped_qualified_name(node, source, file_symbol_name, &n),
@@ -1756,7 +1820,7 @@ fn extract_node(
             }
             "enum_declaration" => {
                 if let Some(n) = get_child_text(node, "name", source) {
-                    let is_exported = js_symbol_is_exported(node);
+                    let is_exported = js_symbol_is_exported(node, source);
                     symbols.push(ExtractedSymbol {
                         name: n.clone(),
                         qualified_name: scoped_qualified_name(node, source, file_symbol_name, &n),
@@ -1771,7 +1835,7 @@ fn extract_node(
             }
             "interface_declaration" | "type_alias_declaration" => {
                 if let Some(n) = get_child_text(node, "name", source) {
-                    let is_exported = js_symbol_is_exported(node);
+                    let is_exported = js_symbol_is_exported(node, source);
                     symbols.push(ExtractedSymbol {
                         name: n.clone(),
                         qualified_name: scoped_qualified_name(node, source, file_symbol_name, &n),
@@ -1786,7 +1850,7 @@ fn extract_node(
             }
             "internal_module" | "module" => {
                 if let Some(n) = get_child_text(node, "name", source) {
-                    let is_exported = js_symbol_is_exported(node);
+                    let is_exported = js_symbol_is_exported(node, source);
                     symbols.push(ExtractedSymbol {
                         name: n.clone(),
                         qualified_name: scoped_qualified_name(node, source, file_symbol_name, &n),
@@ -2024,6 +2088,8 @@ fn extract_node(
                                 span: node_span(node),
                                 enclosing_symbol: scope.clone(),
                                 assigned_to: Some(param.clone()),
+                                // The mirrored call already carries the receiver; repeating it here would be a second copy of one fact.
+                                receiver_expr: None,
                             });
                         }
                         references.push(ExtractedReference {
@@ -2032,6 +2098,8 @@ fn extract_node(
                             span: node_span(node),
                             enclosing_symbol: scope,
                             assigned_to: Some(param),
+                            // The mirrored call already carries the receiver; repeating it here would be a second copy of one fact.
+                            receiver_expr: None,
                         });
                     }
                     let entry_reason = rust_attribute_paths(node, source)
@@ -2290,6 +2358,8 @@ fn extract_node(
                                 span: node_span(node),
                                 enclosing_symbol: scope.clone(),
                                 assigned_to: Some(param.clone()),
+                                // The mirrored call already carries the receiver; repeating it here would be a second copy of one fact.
+                                receiver_expr: None,
                             });
                         }
                         references.push(ExtractedReference {
@@ -2298,6 +2368,8 @@ fn extract_node(
                             span: node_span(node),
                             enclosing_symbol: scope,
                             assigned_to: Some(param),
+                            // The mirrored call already carries the receiver; repeating it here would be a second copy of one fact.
+                            receiver_expr: None,
                         });
                     }
                     if let Some((recv_name, type_name)) = &receiver {
@@ -2331,6 +2403,8 @@ fn extract_node(
                                     },
                                 ),
                                 assigned_to: Some(recv_name.clone()),
+                                // The mirrored call already carries the receiver; repeating it here would be a second copy of one fact.
+                                receiver_expr: None,
                             });
                         }
                     }
@@ -3913,6 +3987,129 @@ fn go_package_name(root: Node, source: &str) -> Option<String> {
     None
 }
 
+/// Every `GOOS` value Go recognises, from `go/build/syslist.go`.
+///
+/// A filename ending `_<GOOS>.go` carries an implicit build constraint even
+/// with no `//go:build` line, so the list is part of the constraint test rather
+/// than decoration. Held as a sorted constant so membership is a fact about the
+/// toolchain rather than a guess about what an OS name looks like — a
+/// name-shaped heuristic would read `_other.go` and `_test.go` as constraints.
+const GO_OS_VALUES: &[&str] = &[
+    "aix",
+    "android",
+    "darwin",
+    "dragonfly",
+    "freebsd",
+    "hurd",
+    "illumos",
+    "ios",
+    "js",
+    "linux",
+    "nacl",
+    "netbsd",
+    "openbsd",
+    "plan9",
+    "solaris",
+    "wasip1",
+    "windows",
+    "zos",
+];
+
+/// Every `GOARCH` value Go recognises, from `go/build/syslist.go`.
+const GO_ARCH_VALUES: &[&str] = &[
+    "386",
+    "amd64",
+    "amd64p32",
+    "arm",
+    "arm64",
+    "arm64be",
+    "armbe",
+    "loong64",
+    "mips",
+    "mips64",
+    "mips64le",
+    "mips64p32",
+    "mips64p32le",
+    "mipsle",
+    "ppc",
+    "ppc64",
+    "ppc64le",
+    "riscv",
+    "riscv64",
+    "s390",
+    "s390x",
+    "sparc",
+    "sparc64",
+    "wasm",
+];
+
+/// Whether a Go file is excluded from some builds — by a `//go:build` or
+/// `// +build` directive, or by an implicit `_GOOS`/`_GOARCH` filename suffix.
+///
+/// Both halves are needed and neither subsumes the other. `procgroup_other.go`
+/// has no recognisable suffix and is constrained only by `//go:build !unix`;
+/// a `foo_windows.go` with no directive is constrained only by its name.
+///
+/// The directive scan stops at the package clause because that is where Go
+/// stops looking: a `//go:build` line below it is an ordinary comment, and
+/// treating it as a constraint would let a comment anywhere in a file suppress
+/// a real finding.
+fn go_build_constrained(path: &str, source: &str) -> bool {
+    go_has_build_directive(source) || go_filename_is_constrained(path)
+}
+
+fn go_has_build_directive(source: &str) -> bool {
+    for line in source.lines() {
+        let trimmed = line.trim();
+        // The header ends at the package clause; nothing below it constrains
+        // the build.
+        if trimmed.starts_with("package ") || trimmed == "package" {
+            return false;
+        }
+        if trimmed.starts_with("//go:build") {
+            return true;
+        }
+        // The legacy form is `// +build`, with the space required.
+        if let Some(rest) = trimmed.strip_prefix("//") {
+            if rest.trim_start().starts_with("+build") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether the `_GOOS` / `_GOARCH` / `_GOOS_GOARCH` filename suffix applies.
+///
+/// `_test` is stripped first: Go reads `foo_linux_test.go` as the linux-only
+/// test file for `foo`, so the constraint sits one component further left.
+fn go_filename_is_constrained(path: &str) -> bool {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let Some(stem) = file.strip_suffix(".go") else {
+        return false;
+    };
+    let stem = stem.strip_suffix("_test").unwrap_or(stem);
+    let mut parts = stem.split('_').rev();
+    let Some(last) = parts.next() else {
+        return false;
+    };
+    // Go only honours the suffix when something precedes it: a file *named*
+    // `linux.go` is not constrained, `net_linux.go` is.
+    let has_prefix = parts.clone().next().is_some();
+    if !has_prefix {
+        return false;
+    }
+    if GO_OS_VALUES.contains(&last) {
+        return true;
+    }
+    if GO_ARCH_VALUES.contains(&last) {
+        // `_GOARCH` alone constrains; `_GOOS_GOARCH` does too, and the OS half
+        // is only meaningful when it really is an OS.
+        return true;
+    }
+    false
+}
+
 fn maybe_push_name_reference(
     node: Node,
     source: &str,
@@ -3957,6 +4154,9 @@ fn maybe_push_name_reference(
         span: node_span(node),
         enclosing_symbol: enclosing_emitted_symbol_for(node, source, lang, file_symbol_name),
         assigned_to: None,
+        // The object half of a member access, so the resolver can tell
+        // `cfg.enabled` from a bare local named `enabled`.
+        receiver_expr: member_access_receiver(node, source),
     });
 }
 
@@ -4602,19 +4802,37 @@ fn is_call_callee(node: Node) -> bool {
         parent.kind(),
         "selector_expression" | "member_expression" | "attribute"
     ) {
-        if let Some(grand) = parent.parent() {
-            // The `function` check is redundant in every linked grammar —
-            // arguments are wrapped in `arguments`/`argument_list`, so a member
-            // expression that is a direct child of a call is always its callee,
-            // measured zero counterexamples over the same corpus. It is kept as
-            // a guard: without it, a grammar that nests arguments differently
-            // would silently classify an argument as the callee.
-            if matches!(grand.kind(), "call" | "call_expression")
-                && grand
-                    .child_by_field_name("function")
-                    .is_some_and(|function| function.id() == parent.id())
-            {
-                return true;
+        // Only the *member* half is the callee. `console.print(…)` names two
+        // things: the method, which the call record already carries, and the
+        // receiver, which is an ordinary use of a different symbol and the only
+        // evidence that symbol is alive.
+        //
+        // Refusing both made every method receiver invisible to the graph. A
+        // module-level singleton used the way singletons are used —
+        // `console = _common.console` at the top of a file and `console.print`
+        // in every function below — had no inbound edge at all and was reported
+        // dead at 0.9 in eleven files of this repository at once.
+        let is_member_half = parent
+            .child_by_field_name("attribute")
+            .or_else(|| parent.child_by_field_name("property"))
+            .or_else(|| parent.child_by_field_name("field"))
+            .is_some_and(|member| member.id() == node.id());
+        if is_member_half {
+            if let Some(grand) = parent.parent() {
+                // The `function` check is redundant in every linked grammar —
+                // arguments are wrapped in `arguments`/`argument_list`, so a
+                // member expression that is a direct child of a call is always
+                // its callee, measured zero counterexamples over the same
+                // corpus. It is kept as a guard: without it, a grammar that
+                // nests arguments differently would silently classify an
+                // argument as the callee.
+                if matches!(grand.kind(), "call" | "call_expression")
+                    && grand
+                        .child_by_field_name("function")
+                        .is_some_and(|function| function.id() == parent.id())
+                {
+                    return true;
+                }
             }
         }
     }
@@ -5830,6 +6048,197 @@ mod tests {
         // A file with no package clause reports none rather than inventing one.
         let bare = extract_treesitter("g.go", "go", "type Loose struct{}\n");
         assert_eq!(bare.go_package, None);
+    }
+
+    fn exported_names(source: &str) -> Vec<(String, bool)> {
+        extract_treesitter("m.js", "javascript", source)
+            .symbols
+            .into_iter()
+            .filter(|symbol| symbol.kind != SymbolKind::File)
+            .map(|symbol| (symbol.name, symbol.is_exported))
+            .collect()
+    }
+
+    fn is_exported(source: &str, name: &str) -> bool {
+        exported_names(source)
+            .into_iter()
+            .find(|(symbol, _)| symbol == name)
+            .unwrap_or_else(|| panic!("{name} must be extracted from: {source}"))
+            .1
+    }
+
+    /// A member of an object or class *expression* is exported when the value
+    /// holding it escapes the module.
+    ///
+    /// The export check used to look only for a `class_declaration` ancestor
+    /// with an `export_statement` parent, so every member of an object literal
+    /// or an anonymous class read as private. Nothing in the corpus calls them
+    /// — the caller is the bundler, the browser, or the test harness — so each
+    /// one became a *confident* dead-code finding on code that is certainly
+    /// running. Measured on a first-party web corpus, this shape was
+    /// `manualChunks` (Rollup's chunking callback) plus the whole
+    /// `ResizeObserver`/`IntersectionObserver` test polyfill.
+    #[test]
+    fn a_member_of_an_escaping_object_or_class_expression_is_exported() {
+        assert!(
+            is_exported("export const handlers = { onClick() {} };\n", "onClick"),
+            "an exported const's object members are public API"
+        );
+        assert!(
+            is_exported(
+                "export default { build: { output: { manualChunks(id) { return id; } } } };\n",
+                "manualChunks"
+            ),
+            "a callback nested in the default export is reached through it"
+        );
+        for global in ["globalThis", "window", "global", "self"] {
+            let source = format!("{global}.ResizeObserver = class {{ observe() {{}} }};\n");
+            assert!(
+                is_exported(&source, "observe"),
+                "assigning to `{global}` publishes the member to the runtime"
+            );
+        }
+    }
+
+    /// A value that does not escape keeps every member detectable.
+    ///
+    /// This is the half that stops the rule from being a blanket amnesty for
+    /// object literals. Losing it would silently disable dead-code detection
+    /// for every method-shaped property in JavaScript and TypeScript.
+    #[test]
+    fn members_of_a_value_that_never_escapes_stay_private() {
+        for (source, name) in [
+            ("const handlers = { onDead() {} };\n", "onDead"),
+            ("class Hidden { neverUsed() {} }\n", "neverUsed"),
+            ("const anon = class { alsoDead() {} };\n", "alsoDead"),
+            ("let obj = { deepDead() {} };\n", "deepDead"),
+            // A bare identifier target is a binding, not the global object.
+            ("ResizeObserver = class { observe() {} };\n", "observe"),
+            // Returned from a function is not *syntactically* an escape;
+            // proving it reaches a caller needs escape analysis this extractor
+            // does not do, so it reports what is evident.
+            ("export function make() { return { get() {} }; }\n", "get"),
+            // A nested declaration does not inherit its enclosing function's
+            // export.
+            (
+                "export function outer() { function inner() {} return inner; }\n",
+                "inner",
+            ),
+        ] {
+            assert!(
+                !is_exported(source, name),
+                "`{name}` does not escape and must stay detectable: {source}"
+            );
+        }
+    }
+
+    /// The ordinary declaration forms are unchanged.
+    ///
+    /// The walk that follows escapes replaced a hand-rolled per-kind match, and
+    /// these are the cases that match had to keep getting right.
+    #[test]
+    fn ordinary_javascript_export_forms_are_unchanged() {
+        assert!(is_exported("export class W { render() {} }\n", "render"));
+        assert!(is_exported("export class W { render() {} }\n", "W"));
+        assert!(!is_exported("class W { render() {} }\n", "render"));
+        assert!(is_exported("export const helper = () => {};\n", "helper"));
+        assert!(!is_exported("const helper = () => {};\n", "helper"));
+        assert!(is_exported("export function fn() {}\n", "fn"));
+        assert!(!is_exported("function fn() {}\n", "fn"));
+    }
+
+    /// A Go build constraint is recorded, from either the directive or the name.
+    ///
+    /// The flag is what lets `analyze_liveness` tell a *spurious* ambiguity
+    /// between platform variants of one identity from a genuine one between two
+    /// unrelated symbols. Reporting no constraint makes every `_unix.go` pair a
+    /// dead-code finding on live code; reporting one everywhere silently
+    /// disables detection for the whole language.
+    #[test]
+    fn a_go_build_constraint_is_recorded_from_the_directive_or_the_filename() {
+        let directive = extract_treesitter(
+            "procgroup_other.go",
+            "go",
+            "//go:build !unix\n\npackage store\nfunc configure() {}\n",
+        );
+        assert!(
+            directive.go_build_constrained,
+            "`//go:build !unix` constrains the build"
+        );
+
+        let legacy = extract_treesitter(
+            "old.go",
+            "go",
+            "// +build linux\n\npackage store\nfunc configure() {}\n",
+        );
+        assert!(
+            legacy.go_build_constrained,
+            "the legacy `// +build` form too"
+        );
+
+        // `unix` is a legal build *tag* but not a GOOS, so this file is
+        // constrained by its directive and never by its name.
+        let by_name = extract_treesitter("sock_linux.go", "go", "package net\nfunc opt() {}\n");
+        assert!(
+            by_name.go_build_constrained,
+            "Go applies the `_GOOS` filename constraint with no directive present"
+        );
+        let arch = extract_treesitter("asm_amd64.go", "go", "package net\nfunc opt() {}\n");
+        assert!(arch.go_build_constrained, "`_GOARCH` constrains too");
+        let goos_arch =
+            extract_treesitter("asm_linux_amd64.go", "go", "package net\nfunc opt() {}\n");
+        assert!(goos_arch.go_build_constrained, "`_GOOS_GOARCH` constrains");
+        let suffixed_test =
+            extract_treesitter("net_linux_test.go", "go", "package net\nfunc opt() {}\n");
+        assert!(
+            suffixed_test.go_build_constrained,
+            "`_test` is stripped first, so the constraint sits one component left"
+        );
+    }
+
+    /// Nothing that merely resembles a constraint is read as one.
+    ///
+    /// Each of these was a way for the flag to be true everywhere, which is the
+    /// direction that silently disables Go dead-code detection rather than the
+    /// one that reports it loudly.
+    #[test]
+    fn a_go_file_without_a_real_constraint_reports_none() {
+        let plain = extract_treesitter("store.go", "go", "package store\nfunc configure() {}\n");
+        assert!(
+            !plain.go_build_constrained,
+            "an ordinary file is unconstrained"
+        );
+
+        // The header ends at the package clause; below it, `//go:build` is an
+        // ordinary comment. Reading it would let a comment anywhere in a file
+        // suppress a real finding.
+        let below = extract_treesitter(
+            "late.go",
+            "go",
+            "package store\n\n//go:build unix\nfunc configure() {}\n",
+        );
+        assert!(
+            !below.go_build_constrained,
+            "a `//go:build` line below the package clause is a comment, not a constraint"
+        );
+
+        for name in [
+            "helpers_other.go", // `other` is not a GOOS
+            "raw_unix.go",      // `unix` is a build tag, not a GOOS
+            "linux.go",         // Go needs something before the suffix
+            "config_test.go",   // `_test` alone is not a platform
+        ] {
+            let extraction = extract_treesitter(name, "go", "package p\nfunc f() {}\n");
+            assert!(
+                !extraction.go_build_constrained,
+                "{name} carries no GOOS/GOARCH suffix and no directive"
+            );
+        }
+
+        // The flag is Go-only: a Python file named like a Go platform variant
+        // must never set it.
+        let python = extract_treesitter("sock_linux.py", "python", "def f():\n    pass\n");
+        assert!(!python.go_build_constrained, "the flag is Go-only");
     }
 
     /// `__all__` is read only where it is actually assigned.

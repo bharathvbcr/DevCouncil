@@ -62,6 +62,8 @@ pub fn extract_swift_call(
         span: node_span(call.name_node),
         enclosing_symbol: enclosing.clone(),
         assigned_to: swift_assignment_binding(node, source),
+        // The mirrored call already carries the receiver; repeating it here would be a second copy of one fact.
+        receiver_expr: None,
     });
     calls.push(ExtractedCall {
         caller_symbol: enclosing,

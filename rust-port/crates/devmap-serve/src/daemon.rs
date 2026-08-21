@@ -68,14 +68,31 @@ pub struct Daemon {
     batch_limit: usize,
     idle_poll: Duration,
     ipc_path: std::path::PathBuf,
+    /// How long the daemon may sit with no IPC request, no pending work and
+    /// no watcher event before retiring itself. `None` (the default) reads
+    /// `DEVMAP_MAX_IDLE_SECS`, falling back to [`DEFAULT_MAX_IDLE_SECS`];
+    /// a zero value disables retirement entirely.
+    max_idle: Option<Option<Duration>>,
 }
 
+/// One batch of watcher/discovery work, before it is persisted.
 #[derive(Default)]
 struct PendingDelta {
     affected: std::collections::BTreeSet<String>,
     deleted: std::collections::BTreeSet<String>,
     fresh: Vec<devmap_extract::Extraction>,
 }
+
+/// Default bounded lifetime for an idle daemon, in seconds.
+///
+/// Daemons are spawned detached (`start_new_session=True` on the Python side),
+/// so every one whose spawning client exited used to outlive its consumer
+/// indefinitely — six were found holding stores open across unrelated
+/// repositories on one development machine, some running superseded binaries.
+/// A generous idle bound retires them; the next client call respawns a fresh
+/// one against the current kernel. Set `DEVMAP_MAX_IDLE_SECS=0` for a
+/// never-exit daemon.
+pub const DEFAULT_MAX_IDLE_SECS: u64 = 1800;
 
 impl Daemon {
     pub fn new(store: Store, root: std::path::PathBuf) -> Self {
@@ -86,6 +103,7 @@ impl Daemon {
             batch_limit: 64,
             idle_poll: Duration::from_secs(2),
             ipc_path,
+            max_idle: None,
         }
     }
 
@@ -102,6 +120,34 @@ impl Daemon {
     pub fn with_idle_poll(mut self, idle_poll: Duration) -> Self {
         self.idle_poll = idle_poll.max(Duration::from_millis(10));
         self
+    }
+
+    /// Override the bounded-idle lifetime. `Some(limit)` with a zero limit
+    /// disables retirement; `None` defers to `DEVMAP_MAX_IDLE_SECS` and
+    /// [`DEFAULT_MAX_IDLE_SECS`].
+    pub fn with_max_idle(mut self, max_idle: Option<Duration>) -> Self {
+        self.max_idle = Some(max_idle);
+        self
+    }
+
+    fn resolved_max_idle(&self) -> Option<Duration> {
+        match self.max_idle {
+            Some(explicit) => explicit,
+            None => match std::env::var("DEVMAP_MAX_IDLE_SECS") {
+                Ok(raw) => match raw.trim().parse::<u64>() {
+                    Ok(0) => None,
+                    Ok(secs) => Some(Duration::from_secs(secs)),
+                    Err(_) => {
+                        warn!(
+                            "DEVMAP_MAX_IDLE_SECS={raw:?} is not a non-negative integer; \
+                             using the default {DEFAULT_MAX_IDLE_SECS}s"
+                        );
+                        Some(Duration::from_secs(DEFAULT_MAX_IDLE_SECS))
+                    }
+                },
+                Err(_) => Some(Duration::from_secs(DEFAULT_MAX_IDLE_SECS)),
+            },
+        }
     }
 
     /// Reconcile the durable generation against disk before serving queries.
@@ -142,9 +188,14 @@ impl Daemon {
                     pending.insert(path);
                 }
                 DiscoverySkipReason::NonUtf8Path => {
-                    anyhow::bail!(
-                        "connect-time sweep cannot represent non-UTF-8 source path {path:?}"
-                    );
+                    // A name that cannot be represented as UTF-8 can never be
+                    // stored in the pending queue, which is keyed by string.
+                    // Skipping it degrades exactly like the CLI build — which
+                    // reports the refusal and continues — instead of killing
+                    // IPC availability for a repository that is otherwise
+                    // perfectly indexable. The refusal is logged loudly so it
+                    // cannot pass for complete coverage.
+                    warn!("connect-time sweep skipped unrepresentable non-UTF-8 source path {path:?}");
                 }
             }
         }
@@ -196,15 +247,37 @@ impl Daemon {
                 format!("{directory_prefix}/")
             };
             let (sources, discovery) = collect_sources_with_report(&canonical)?;
-            if let Some((path, reason)) = discovery
+            // Discovery refusals inside a changed directory degrade to
+            // skipping that one path. Bailing the whole batch made a single
+            // poison file permanently block its directory — the watcher then
+            // retried with backoff forever. Naively dropping the bail would
+            // have been worse: the refusal must not look like a deletion, and
+            // the file still exists, so its stored row is kept untouched (it
+            // stays at the last good extraction until it becomes readable
+            // again).
+            for (path, reason) in discovery
                 .skipped_paths
                 .iter()
-                .find(|(_, reason)| !matches!(reason, DiscoverySkipReason::NonSource))
+                .filter(|(_, reason)| !matches!(reason, DiscoverySkipReason::NonSource))
             {
-                anyhow::bail!(
-                    "changed directory contains an unindexable source {path:?}: {reason:?}"
-                );
+                warn!("refused source {path:?} in changed directory {canonical:?}: {reason:?}");
             }
+            let refused: std::collections::BTreeSet<String> = discovery
+                .skipped_paths
+                .iter()
+                .filter(|(_, reason)| !matches!(reason, DiscoverySkipReason::NonSource))
+                .map(|(path, _)| {
+                    // Discovery reports paths relative to the changed
+                    // directory; stored rows are relative to the daemon
+                    // root. Map through the same prefix the sources below
+                    // use, or the deletion guard misses them.
+                    if prefix.is_empty() {
+                        path.clone()
+                    } else {
+                        format!("{prefix}{path}")
+                    }
+                })
+                .collect();
             let mut live_under_directory = std::collections::BTreeSet::new();
             for (relative_to_directory, source) in sources {
                 let path = if prefix.is_empty() {
@@ -219,6 +292,7 @@ impl Daemon {
             for extraction in previous {
                 if (prefix.is_empty() || extraction.file_path.starts_with(&prefix))
                     && !live_under_directory.contains(&extraction.file_path)
+                    && !refused.contains(&extraction.file_path)
                 {
                     delta.affected.insert(extraction.file_path.clone());
                     delta.deleted.insert(extraction.file_path.clone());
@@ -289,11 +363,32 @@ impl Daemon {
             anyhow::bail!("every pending path failed: {}", failures.join("; "));
         }
 
-        let mut extractions: Vec<_> = previous
-            .into_iter()
-            .filter(|extraction| !affected.contains(&extraction.file_path))
-            .collect();
-        extractions.extend(fresh.iter().cloned());
+        // Everything below reuses `previous` — the payloads stored by whichever
+        // kernel last wrote a generation. After an extractor or grammar upgrade
+        // those describe the same bytes with an older schema, and neither the
+        // resolution built from them nor the rows carried forward from them are
+        // this build's answer. The store refuses to carry them; the daemon's
+        // way out is to re-extract the tree once and write a full generation,
+        // rather than replaying a batch that can never succeed.
+        let payload_is_current = self.store.latest_generation_payload_is_current()?;
+        if !payload_is_current {
+            warn!(
+                "stored payloads predate this kernel; re-extracting {:?} in full before resyncing",
+                self.root
+            );
+        }
+        let (mut extractions, full_rebuild) = if payload_is_current {
+            let mut carried: Vec<_> = previous
+                .into_iter()
+                .filter(|extraction| !affected.contains(&extraction.file_path))
+                .collect();
+            carried.extend(fresh.iter().cloned());
+            (carried, false)
+        } else {
+            let (whole_tree, _report) =
+                devmap_store::extract_tree_cached_with_report(&self.store, &self.root)?;
+            (whole_tree, true)
+        };
         extractions.sort_by(|left, right| left.file_path.cmp(&right.file_path));
         let mut resolver = Resolver::new();
         match collect_go_modules(&self.root) {
@@ -305,12 +400,23 @@ impl Daemon {
         let analysis = analyze(&extractions, &resolution);
         let head_sha = current_git_head(&self.root).unwrap_or_else(|_| "unavailable".to_string());
         self.store.save_generation_with_metadata(
-            &fresh,
+            if full_rebuild { &extractions } else { &fresh },
             &resolution,
             &analysis,
             GenerationWriteOpts {
-                affected_paths: affected.into_iter().collect(),
-                deleted_paths: deleted.into_iter().collect(),
+                // A full rebuild declares nothing affected: an empty affected
+                // set *is* the full-rewrite signal, and every row it needs is
+                // in the extractions above.
+                affected_paths: if full_rebuild {
+                    Vec::new()
+                } else {
+                    affected.into_iter().collect()
+                },
+                deleted_paths: if full_rebuild {
+                    Vec::new()
+                } else {
+                    deleted.into_iter().collect()
+                },
                 repo_root: Some(root.to_string_lossy().into_owned()),
                 build_started: Some(resync_started),
             },
@@ -335,19 +441,40 @@ impl Daemon {
     }
 
     /// Long-lived loop: file watcher enqueues durable pending paths; idle poll drains them.
-    /// Does not return until cancelled / fatal error.
+    /// Does not return until cancelled / fatal error / idle retirement.
+    ///
+    /// The IPC listener binds *before* the connect-time reconcile. Reconcile
+    /// hashes the whole source tree, which on any real repository takes
+    /// seconds; binding first means `status` answers immediately from the last
+    /// committed generation (honestly reporting the pending work), instead of
+    /// clients seeing a dead endpoint for the entire sweep — the Python client
+    /// gave up and killed the daemon it had just spawned after three seconds,
+    /// then fell back to re-doing the work through the CLI, on every call.
     pub async fn run_loop(&self) -> anyhow::Result<()> {
         info!(
             "DevMap daemon started for {:?} (batch_limit={})",
             self.root, self.batch_limit
         );
+        if let Some(limit) = self.resolved_max_idle() {
+            info!(
+                "daemon retires after {limit:?} with no requests, pending work or \
+                 watcher events (DEVMAP_MAX_IDLE_SECS=0 disables)"
+            );
+        } else {
+            info!("bounded-idle retirement disabled (DEVMAP_MAX_IDLE_SECS=0)");
+        }
+
+        let activity = Arc::new(crate::protocol::Activity::default());
+        let max_idle = self.resolved_max_idle();
 
         let store = Arc::clone(&self.store);
         let root = self.root.clone();
+        let watcher_activity = Arc::clone(&activity);
         let _watcher = start_file_watcher(root, move |paths| {
             if paths.is_empty() {
                 return;
             }
+            watcher_activity.touch();
             if let Err(err) = store.enqueue_pending_paths(&paths) {
                 warn!("failed to enqueue pending paths: {err}");
             } else {
@@ -355,31 +482,43 @@ impl Daemon {
             }
         })?;
 
-        let reconciled = self.reconcile_connect_time()?;
-        if reconciled > 0 {
-            info!("connect-time sweep enqueued {reconciled} changed path(s)");
-        }
-
         #[cfg(unix)]
         let mut ipc_task = AbortTaskOnDrop({
             let server = crate::protocol::UnixIpcServer::bind(&self.ipc_path)?;
             let store = Arc::clone(&self.store);
-            tokio::spawn(server.run(store))
+            tokio::spawn(server.run(store, Arc::clone(&activity)))
         });
 
         #[cfg(windows)]
         let mut ipc_task = AbortTaskOnDrop({
             let store = Arc::clone(&self.store);
             let name = self.ipc_path.to_string_lossy().into_owned();
-            tokio::spawn(async move { crate::protocol::run_named_pipe(store, &name).await })
+            tokio::spawn(async move {
+                crate::protocol::run_named_pipe(store, &name, Arc::clone(&activity)).await
+            })
         });
 
-        let store = Arc::clone(&self.store);
+        // Reconcile after the endpoint is live: a failure here is logged and
+        // survived rather than fatal. Queries keep answering from the last
+        // committed generation, and the drain loop still replays whatever was
+        // enqueued before the failure; a daemon that refused to serve until
+        // its startup sweep succeeded turned one unreadable path into a full
+        // map outage.
+        match self.reconcile_connect_time() {
+            Ok(reconciled) => {
+                if reconciled > 0 {
+                    info!("connect-time sweep enqueued {reconciled} changed path(s)");
+                }
+            }
+            Err(err) => warn!("connect-time sweep failed; serving stale generation: {err}"),
+        }
+
+        let maintenance_store = Arc::clone(&self.store);
         let _maintenance_task = AbortTaskOnDrop(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
             loop {
                 interval.tick().await;
-                match store.checkpoint_wal() {
+                match maintenance_store.checkpoint_wal() {
                     Ok(result) if result.busy != 0 => warn!(
                         "WAL checkpoint remained busy after {:?} fallback: {}/{} frames checkpointed",
                         result.mode, result.checkpointed_frames, result.log_frames
@@ -387,7 +526,7 @@ impl Daemon {
                     Ok(_) => {}
                     Err(err) => warn!("WAL checkpoint failed: {err}"),
                 }
-                if let Err(err) = store.vacuum_if_needed() {
+                if let Err(err) = maintenance_store.vacuum_if_needed() {
                     warn!("vacuum_if_needed failed: {err}");
                 }
             }
@@ -396,6 +535,10 @@ impl Daemon {
         let mut ticker = tokio::time::interval(self.idle_poll);
         let mut consecutive_failures = 0u32;
         let mut next_attempt = tokio::time::Instant::now();
+        // An untouched activity record means no consumer ever spoke to this
+        // daemon — idle time runs from loop start, not from zero. That is the
+        // orphan case: spawned, used once, client died, nothing left to ask.
+        let started_at = std::time::Instant::now();
         loop {
             tokio::select! {
                 result = &mut ipc_task.0 => {
@@ -403,6 +546,23 @@ impl Daemon {
                         .map_err(|error| anyhow::anyhow!("IPC task join failed: {error}"))?;
                 }
                 _ = ticker.tick() => {
+                    if let Some(limit) = max_idle {
+                        let idle_for = activity
+                            .idle_for()
+                            .unwrap_or_else(|| started_at.elapsed());
+                        if idle_for >= limit {
+                            // Pending work keeps the daemon alive through its
+                            // idle bound: retiring mid-queue would stall the
+                            // resync until some future client respawned us.
+                            if self.store.get_pending_paths()?.is_empty() {
+                                info!(
+                                    "no IPC request, pending work or watcher event \
+                                     for {idle_for:?}; retiring daemon"
+                                );
+                                return Ok(());
+                            }
+                        }
+                    }
                     if tokio::time::Instant::now() < next_attempt {
                         continue;
                     }
@@ -667,6 +827,233 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// An upgraded kernel must not leave the watcher replaying a batch that
+    /// can never commit.
+    ///
+    /// Everything the incremental resync builds on comes from the last
+    /// generation: the extractions it resolves, and the rows the store carries
+    /// forward. After an extractor or grammar bump those describe the same
+    /// bytes in an older schema, so the store refuses to reuse them — and the
+    /// daemon, whose only failure handling is to keep the pending paths for a
+    /// later attempt, would retry the same impossible batch for as long as it
+    /// ran. It re-extracts the tree instead, once.
+    ///
+    /// Fails against a daemon without that branch: `drain_pending_batch`
+    /// returns the store's refusal rather than a committed generation.
+    #[test]
+    fn an_upgraded_kernel_makes_the_daemon_rebuild_rather_than_replay() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("devmap-daemon-upgrade-{stamp}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for index in 0..6 {
+            fs::write(
+                dir.join(format!("mod_{index}.py")),
+                format!("def leaf_{index}():\n    return {index}\n\n\ndef caller_{index}():\n    return leaf_{index}()\n"),
+            )
+            .unwrap();
+        }
+
+        let db_path = dir.join("index.sqlite");
+        let store = Store::open(&db_path).unwrap();
+        let daemon = Daemon::new(store, dir.clone());
+
+        // A first generation, written by "the previous kernel".
+        daemon
+            .store
+            .enqueue_pending_paths(
+                &(0..6)
+                    .map(|index| {
+                        dir.join(format!("mod_{index}.py"))
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        daemon.drain_pending_batch().unwrap();
+        assert!(
+            daemon.store.latest_generation_payload_is_current().unwrap(),
+            "fixture precondition: the first generation is written by this kernel"
+        );
+
+        // The upgrade: stored rows now carry an identity this kernel does not
+        // produce, exactly as two schema bumps left DevCouncil's own store.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE generation_files SET analyzer_version = '0.0.9:extract-v1'
+                 WHERE generation_id = (SELECT max(id) FROM generations)",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(
+            !daemon.store.latest_generation_payload_is_current().unwrap(),
+            "fixture precondition: the store now looks like it predates this kernel"
+        );
+
+        fs::write(
+            dir.join("mod_3.py"),
+            "def leaf_3():\n    return 33\n\n\ndef caller_3():\n    return leaf_3() + 3\n",
+        )
+        .unwrap();
+        daemon
+            .store
+            .enqueue_pending_paths(&[dir.join("mod_3.py").to_string_lossy().into_owned()])
+            .unwrap();
+
+        let drained = daemon
+            .drain_pending_batch()
+            .expect("an upgraded store must resync, not fail forever");
+        assert_eq!(drained, 1);
+        assert!(
+            daemon.store.latest_generation_payload_is_current().unwrap(),
+            "the resync must leave a generation this kernel could have written"
+        );
+        assert_eq!(
+            daemon.store.get_pending_paths().unwrap().len(),
+            0,
+            "a committed resync acknowledges its batch instead of replaying it"
+        );
+        // The rebuild is whole-tree, not just the one pending file.
+        assert_eq!(
+            daemon.store.latest_extractions().unwrap().len(),
+            6,
+            "a full re-extraction must keep every file in the generation"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A refused file inside a changed directory must neither block the
+    /// directory's resync nor delete its own previously-stored extraction.
+    ///
+    /// The directory branch bailed the whole batch when discovery refused any
+    /// file (oversized, unreadable): one poison file meant the directory could
+    /// never be resynced, and the watcher retried it with backoff forever.
+    /// Worse, had the bail been dropped naively, the refusal would have made
+    /// the poison path look *deleted* — the file still exists on disk, so
+    /// removing its stored row would be a falsehood about the tree.
+    #[test]
+    fn a_refused_file_in_a_changed_directory_neither_blocks_nor_deletes_siblings() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("devmap-dir-poison-{stamp}"));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("good.py"), "def good_v1():\n    return 1\n").unwrap();
+        fs::write(root.join("poison.py"), "def poison_v1():\n    return 2\n").unwrap();
+
+        let initial = extract_tree(&root).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&initial);
+        let resolution = resolver.resolve_all(&initial);
+        let analysis = analyze(&initial, &resolution);
+        let store = Store::open_in_memory().unwrap();
+        store
+            .save_generation(&initial, &resolution, &analysis)
+            .unwrap();
+
+        // The edit: one legitimate change, and the sibling grows past the
+        // source-size limit so discovery refuses it.
+        fs::write(root.join("good.py"), "def good_v2():\n    return 11\n").unwrap();
+        fs::write(
+            root.join("poison.py"),
+            vec![b'x'; (MAX_SOURCE_BYTES + 1) as usize],
+        )
+        .unwrap();
+
+        store.enqueue_pending_paths(&[root.to_string_lossy().into_owned()]).unwrap();
+        let daemon = Daemon::new(store, root.clone());
+
+        daemon
+            .drain_pending_batch()
+            .expect("a refused sibling must not block resyncing the directory");
+
+        let persisted = daemon.store.latest_extractions().unwrap();
+        assert!(
+            persisted.iter().any(|extraction| {
+                extraction.file_path == "good.py"
+                    && extraction.symbols.iter().any(|symbol| symbol.name == "good_v2")
+            }),
+            "the healthy sibling must be re-extracted"
+        );
+        assert!(
+            persisted.iter().any(|extraction| {
+                extraction.file_path == "poison.py"
+                    && extraction.symbols.iter().any(|symbol| symbol.name == "poison_v1")
+            }),
+            "a refused-but-existing file must keep its stored row instead of \
+             being recorded as deleted"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// One unrepresentable filename must not stop the daemon from starting at
+    /// all. The CLI build reports the refusal and continues; connect-time
+    /// reconciliation used to bail instead, so a single non-UTF-8 source name
+    /// killed IPC availability for the whole repository.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_source_path_is_skipped_not_fatal_at_reconcile() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("devmap-nonutf8-{stamp}"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("ok.py"), "def ok(): pass\n").unwrap();
+
+        let initial = extract_tree(&root).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&initial);
+        let resolution = resolver.resolve_all(&initial);
+        let analysis = analyze(&initial, &resolution);
+        let store = Store::open_in_memory().unwrap();
+        store
+            .save_generation(&initial, &resolution, &analysis)
+            .unwrap();
+
+        // A source whose name is not valid UTF-8 appears after the last build.
+        // Some volume configurations (APFS with name normalization among them)
+        // refuse such names outright rather than storing them; there the
+        // fixture cannot exist and the daemon-tolerance property has no local
+        // subject, so say so instead of panicking on fixture setup.
+        if let Err(error) = fs::write(root.join(OsStr::from_bytes(b"bad\xff.py")), "def odd(): pass\n") {
+            if error.raw_os_error().is_some() {
+                eprintln!(
+                    "skipping non-UTF-8 reconcile test: this platform/volume refuses \
+                     non-UTF-8 filenames ({error})"
+                );
+                let _ = fs::remove_dir_all(&root);
+                return;
+            }
+            panic!("unexpected fixture failure: {error}");
+        }
+
+        let daemon = Daemon::new(store, root.clone());
+        let reconciled = daemon
+            .reconcile_connect_time()
+            .expect("an unrepresentable filename must degrade to a skip, not kill the sweep");
+        assert_eq!(
+            reconciled, 0,
+            "only representable paths may enter the pending queue"
+        );
+        assert!(daemon.store.get_pending_paths().unwrap().is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn watcher_enqueue_survives_via_store() {
         let stamp = SystemTime::now()
@@ -862,6 +1249,192 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains("did not stabilize"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Short unix socket base for fixtures: macOS `temp_dir()` alone exceeds
+    /// the 100-byte portable sockaddr_un limit once a file name is appended,
+    /// which would make every assertion here trip the path-length guard
+    /// instead of the behavior under test.
+    #[cfg(unix)]
+    fn short_unix_fixture_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from("/tmp").join(format!(
+            "devmap-fx-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn status_answers_while_the_connect_time_sweep_is_still_running() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Regression for the bind-after-reconcile ordering. The sweep hashed
+        // the whole tree before the IPC listener bound, so a client's three-
+        // second readiness deadline expired on any real repository: the
+        // daemon was killed mid-startup, then every call repeated the spawn,
+        // wait and kill before falling back to the CLI. Bound first, so
+        // `status` answers from the last committed generation while the
+        // sweep is still grinding.
+        let root = short_unix_fixture_dir("bindfirst");
+        // Enough files that hashing the tree takes comfortably longer than
+        // the probe budget below; the precondition asserts this so the test
+        // cannot pass vacuously on a fast machine.
+        const FILE_COUNT: usize = 6_000;
+        for index in 0..FILE_COUNT {
+            fs::write(
+                root.join(format!("mod_{index}.py")),
+                format!("def leaf_{index}():\n    return {index}\n"),
+            )
+            .unwrap();
+        }
+
+        let sweep_started = std::time::Instant::now();
+        let (sources, _report) = devmap_extract::collect_sources_with_report(&root).unwrap();
+        let _hashes: Vec<u64> = sources
+            .iter()
+            .map(|(_, source)| devmap_extract::content_hash(source))
+            .collect();
+        let sweep_elapsed = sweep_started.elapsed();
+        assert!(
+            sweep_elapsed >= Duration::from_millis(120),
+            "fixture precondition failed: a {FILE_COUNT}-file sweep took only \
+             {sweep_elapsed:?}; the ordering assertion below would be vacuous"
+        );
+
+        let store = Store::open_in_memory().unwrap();
+        let socket = root.join("b.sock");
+        let probe_budget = sweep_elapsed / 4;
+        let daemon = Daemon::new(store, root.clone())
+            .with_ipc_path(socket.clone())
+            .with_idle_poll(Duration::from_millis(10))
+            .with_max_idle(Some(Duration::from_secs(30)));
+        let task = tokio::spawn(async move { daemon.run_loop().await });
+
+        let bind_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !socket.exists() && tokio::time::Instant::now() < bind_deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(socket.exists(), "daemon IPC socket did not start");
+
+        // The whole round trip must land inside a fraction of one sweep —
+        // under the old ordering it could not start until a full sweep
+        // finished.
+        let answer = tokio::time::timeout(probe_budget, async {
+            loop {
+                match tokio::net::UnixStream::connect(&socket).await {
+                    Err(_) => tokio::time::sleep(Duration::from_millis(2)).await,
+                    Ok(mut stream) => {
+                        stream
+                            .write_all(b"{\"version\":1,\"cmd\":\"status\"}\n")
+                            .await
+                            .unwrap();
+                        let mut response = String::new();
+                        stream.read_to_string(&mut response).await.unwrap();
+                        break serde_json::from_str::<serde_json::Value>(response.trim())
+                            .unwrap();
+                    }
+                }
+            }
+        })
+        .await;
+        let payload = answer.expect("status must answer within a fraction of one sweep");
+        assert_eq!(payload["ok"], true);
+        // The store here has never committed a generation, and the wire form
+        // for that is JSON null — the same shape the Python client maps to 0
+        // (`try_connect` treats it as unusable, which is correct: nothing has
+        // been indexed). Pinning null keeps the envelope contract honest; a
+        // fabricated 0 would claim a generation exists.
+        assert!(payload["result"]["generation_id"].is_null());
+
+        task.abort();
+        let _ = task.await;
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_idle_daemon_with_no_pending_work_retires_itself() {
+        // Orphaned daemons used to live forever: spawned detached, they kept
+        // their store open and their watcher running with no consumer at all.
+        // A bounded idle lifetime retires them; pending work keeps them alive.
+        let root = short_unix_fixture_dir("idle");
+        fs::write(root.join("main.py"), "def main(): pass\n").unwrap();
+
+        let socket = root.join("idle.sock");
+        let daemon = Daemon::new(Store::open_in_memory().unwrap(), root.clone())
+            .with_ipc_path(socket.clone())
+            .with_idle_poll(Duration::from_millis(20))
+            .with_max_idle(Some(Duration::from_millis(100)));
+        let task = tokio::spawn(async move { daemon.run_loop().await });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !socket.exists() && tokio::time::Instant::now() < deadline {
+            if task.is_finished() {
+                let joined = task.await;
+                let inner = joined.expect("join");
+                panic!(
+                    "run_loop exited before binding IPC: {inner:?}",
+                    inner = inner.map_err(|error| error.to_string())
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(socket.exists(), "daemon IPC socket did not start");
+
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("daemon did not retire within its idle bound")
+            .expect("retirement task panicked");
+        result.expect("idle retirement must be a clean exit");
+        for _ in 0..100 {
+            if !socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!socket.exists(), "retired daemon leaked its IPC endpoint");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_work_defers_idle_retirement() {
+        let root = short_unix_fixture_dir("busyhold");
+        fs::write(root.join("main.py"), "def main(): pass\n").unwrap();
+
+        let socket = root.join("busy.sock");
+        // max_idle (50ms) is far below the drain cost of the batch below; the
+        // daemon must keep working until the queue empties rather than retire
+        // mid-resync.
+        let store = Store::open_in_memory().unwrap();
+        let paths: Vec<String> = (0..3).map(|i| format!("{}/m{i}.py", root.display())).collect();
+        for path in &paths {
+            fs::write(path, format!("def f{}(): pass\n", path.len())).unwrap();
+        }
+        store.enqueue_pending_paths(&paths).unwrap();
+        let daemon = Daemon::new(store, root.clone())
+            .with_ipc_path(socket.clone())
+            .with_idle_poll(Duration::from_millis(20))
+            .with_max_idle(Some(Duration::from_millis(50)))
+            .with_batch_limit(1);
+        let handle = tokio::spawn(async move { daemon.run_loop().await });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        // Retiring cleanly after the queue drains is exactly what must happen:
+        // max_idle is far below one drain, so only deferred-by-work retirement
+        // lets this succeed.
+        let retired = matches!(
+            tokio::time::timeout_at(deadline, handle).await,
+            Ok(Ok(Ok(())))
+        );
+        assert!(
+            retired,
+            "daemon neither drained its queue nor retired cleanly in time"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

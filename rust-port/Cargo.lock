@@ -310,6 +310,7 @@ dependencies = [
  "devmap-resolve",
  "devmap-store",
  "notify",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",

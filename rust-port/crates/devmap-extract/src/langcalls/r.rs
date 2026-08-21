@@ -104,6 +104,8 @@ pub fn extract_r_call(
         // nothing a receiver lookup could use. Left unset deliberately rather
         // than filled with a fact nothing consumes.
         assigned_to: None,
+        // The mirrored call already carries the receiver; repeating it here would be a second copy of one fact.
+        receiver_expr: None,
     });
     calls.push(ExtractedCall {
         caller_symbol,

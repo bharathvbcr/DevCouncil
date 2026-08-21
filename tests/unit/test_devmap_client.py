@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import errno
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
 
+from devcouncil import devmap_client as client_module
 from devcouncil.devmap_client import DEFAULT_DB_PATH, DevMapClient, DevMapClientError
 
 
@@ -274,6 +278,7 @@ def test_start_daemon_reaps_child_when_readiness_times_out(
     times = iter([0.0, 4.0])
     client = DevMapClient(tmp_path)
     monkeypatch.setattr(client, "_find_devmap_binary", lambda: "devmap")
+    monkeypatch.setattr(client, "_supports_serve", lambda _binary: True)
     monkeypatch.setattr(
         "devcouncil.devmap_client.subprocess.Popen", lambda *_args, **_kwargs: process
     )
@@ -360,3 +365,368 @@ def test_resolution_unavailable_reason_tri_state() -> None:
     assert resolution_unavailable_reason("Available") is None
     assert resolution_unavailable_reason(None) is None
     assert resolution_unavailable_reason({"Unavailable": {"reason": "missing"}}) == "missing"
+
+
+# ---------------------------------------------------------------------------
+# Stress-derived hardening: every test below pins behavior that a live stress
+# run showed to be missing (unbounded dribble hang, wedged-daemon poisoning,
+# silent adoption of an outdated binary, repeated CLI timeouts).
+# ---------------------------------------------------------------------------
+
+
+class _DribbleServer:
+    """Real unix-socket server sending one byte every `delay` seconds, forever."""
+
+    def __init__(self, path, delay):
+        import socket as socket_module
+        import threading
+
+        self.delay = delay
+        self._stop = threading.Event()
+        self.server = socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_STREAM)
+        self.server.bind(path)
+        self.server.listen(1)
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self):
+        try:
+            conn, _ = self.server.accept()
+        except OSError:
+            return
+        with conn:
+            conn.settimeout(5)
+            try:
+                conn.recv(65536)
+            except OSError:
+                return
+            while not self._stop.is_set():
+                try:
+                    conn.sendall(b"x")
+                except OSError:
+                    return
+                self._stop.wait(self.delay)
+
+    def close(self):
+        self._stop.set()
+        self.server.close()
+
+
+def test_slowloris_dribble_is_bounded_by_the_total_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One byte per timeout-window must not keep the client spinning forever.
+
+    Pre-fix, the only bounds were the 2s per-recv timeout and MAX_RESPONSE_BYTES;
+    a server that never violates either held the client for weeks. The total
+    deadline must cut the exchange and the failure must route to the CLI
+    fallback instead of raising.
+    """
+    endpoint = f"/tmp/dm-dribble-{os.getpid()}.sock"
+    try:
+        os.unlink(endpoint)
+    except FileNotFoundError:
+        pass
+    dribbler = _DribbleServer(endpoint, delay=0.05)
+    try:
+        client = DevMapClient(
+            tmp_path,
+            socket_path=endpoint,
+            response_deadline_seconds=1.0,
+        )
+        monkeypatch.setattr(client, "_start_daemon", lambda: False)
+        monkeypatch.setattr(
+            client,
+            "_run_cli_command",
+            lambda *_a, **_k: {
+                "generation_id": 1,
+                "pending_count": 0,
+                "node_count": 1,
+                "edge_count": 1,
+                "is_fresh": True,
+                "via_cli": True,
+            },
+        )
+        started = time.monotonic()
+        result = client.status()
+        elapsed = time.monotonic() - started
+
+        assert result.raw.get("via_cli") is True, "bounded failure must fall back to CLI"
+        assert elapsed < 10.0, f"dribble was not bounded promptly: {elapsed:.2f}s"
+    finally:
+        dribbler.close()
+        try:
+            os.unlink(endpoint)
+        except FileNotFoundError:
+            pass
+
+
+def _valid_status_payload(**extra):
+    payload = {
+        "generation_id": 1,
+        "pending_count": 0,
+        "node_count": 1,
+        "edge_count": 1,
+        "is_fresh": True,
+    }
+    payload.update(extra)
+    return payload
+
+
+def test_transport_timeout_marks_daemon_unhealthy_and_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wedged daemon costs one bounded stall, then the CLI takes over."""
+    endpoint = tmp_path / "wedged.sock"
+    endpoint.touch()
+
+    class _WedgedSocket:
+        def settimeout(self, _t):
+            pass
+
+        def connect(self, _path):
+            pass
+
+        def sendall(self, _payload):
+            pass
+
+        def recv(self, _size):
+            import socket as socket_module
+
+            raise socket_module.timeout("wedged")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "devcouncil.devmap_client.socket.socket", lambda *_a, **_k: _WedgedSocket()
+    )
+    cli_calls = []
+
+    def fake_cli(*_args, **_kwargs):
+        cli_calls.append(1)
+        return _valid_status_payload(via="cli")
+
+    client = DevMapClient(tmp_path, socket_path=str(endpoint))
+    client._start_daemon = lambda: False  # respawn is out of scope here
+    monkeypatch.setattr(client, "_run_cli_command", fake_cli)
+
+    first = client.status()
+    second = client.status()
+
+    assert first.raw.get("via") == "cli" and second.raw.get("via") == "cli"
+    assert len(cli_calls) == 2
+
+
+def test_cooldown_skips_the_socket_entirely_after_a_transport_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    endpoint = tmp_path / "cooldown.sock"
+    endpoint.touch()
+    attempts = []
+
+    def counting_socket(*_a, **_k):
+        attempts.append(1)
+
+        class _Raising:
+            def __getattr__(self, name):
+                raise AssertionError("socket must not be used during cooldown")
+
+        class _Boom:
+            def settimeout(self, _t):
+                pass
+
+            def connect(self, _p):
+                import socket as socket_module
+
+                raise OSError(errno.EIO, "simulated wedge")
+
+            def close(self):
+                pass
+
+        return _Boom()
+
+    client = DevMapClient(tmp_path, socket_path=str(endpoint))
+    monkeypatch.setattr("devcouncil.devmap_client.socket.socket", counting_socket)
+    monkeypatch.setattr(
+        client, "_run_cli_command", lambda *_a, **_k: _valid_status_payload()
+    )
+    client.status()
+    assert len(attempts) == 1
+    client.status()
+    assert len(attempts) == 1, "cooldown must skip the socket after a failure"
+
+
+def _write_binary(path: Path, body: str, exit_code: int = 0) -> None:
+    path.write_text(f"#!/bin/sh\ncat <<'MSG'\n{body}\nMSG\nexit {exit_code}\n")
+    path.chmod(0o755)
+
+
+def test_start_daemon_refuses_a_binary_that_cannot_serve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An outdated binary without `serve --socket` must never be spawned.
+
+    Both builds report version 0.1.0, so capability — not the version string —
+    is the only honest evidence. Pre-fix, an outdated PATH binary was spawned,
+    burned the readiness window, then served CLI traffic from a stale kernel.
+    """
+    db = tmp_path / DEFAULT_DB_PATH
+    db.parent.mkdir(parents=True, exist_ok=True)
+    db.write_bytes(b"sqlite")
+
+    old_binary = tmp_path / "devmap-old"
+    _write_binary(old_binary, "usage: devmap manifest [OPTIONS]")  # no --socket
+
+    # Probe against the real script first (unpatched), so the verdict below
+    # comes from actual subprocess behavior rather than a stub.
+    client = DevMapClient(tmp_path, socket_path=str(tmp_path / "unused.sock"))
+    assert client._supports_serve(str(old_binary)) is False
+
+    spawned = []
+
+    class _NoSpawn:
+        def __getattr__(self, name):
+            raise AssertionError("an incapable binary must never be spawned")
+
+    monkeypatch.setattr(
+        client_module.subprocess, "Popen", lambda *a, **k: spawned.append(a) or _NoSpawn()
+    )
+    monkeypatch.setattr(client, "_find_devmap_binary", lambda: str(old_binary))
+
+    assert client._start_daemon() is False
+    assert spawned == [], "an incapable binary must never be spawned"
+
+
+def test_start_daemon_spawns_only_when_the_probe_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    good_binary = tmp_path / "devmap-good"
+    _write_binary(good_binary, "--socket <SOCKET>   IPC listen path")
+    client = DevMapClient(tmp_path, socket_path=str(tmp_path / "unused.sock"))
+    assert client._supports_serve(str(good_binary)) is True
+
+
+def test_cli_timeout_fail_fasts_within_cooldown_but_build_is_exempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hung CLI costs its timeout once; later short calls fail immediately.
+
+    Pre-fix stress: an outdated hanging binary cost 3s + 120s on EVERY status.
+    The cooldown bounds that to once; `build` opts out because one slow build
+    must not poison the next command's 600s budget.
+    """
+    calls = []
+    real_run = client_module.subprocess.run
+
+    def flaky_run(*args, **kwargs):
+        calls.append(kwargs.get("timeout"))
+        if len(calls) == 1:
+            raise client_module.subprocess.TimeoutExpired(cmd="devmap", timeout=120.0)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(client_module.subprocess, "run", flaky_run)
+    client = DevMapClient(tmp_path)
+
+    started = time.monotonic()
+    with pytest.raises(DevMapClientError, match="timed out"):
+        client.status()
+    first_elapsed = time.monotonic() - started
+
+    # Real subprocess would stall 120s; fail-fast must return ~immediately.
+    monkeypatch.setattr(
+        client_module.subprocess,
+        "run",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
+    started = time.monotonic()
+    with pytest.raises(DevMapClientError, match="failing fast"):
+        client.status()
+    fast_elapsed = time.monotonic() - started
+
+    assert first_elapsed < 30
+    assert fast_elapsed < 1.0, "fail-fast must not re-invoke the CLI"
+
+
+def test_named_pipe_read_is_bounded_by_a_watchdog_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows named-pipe reads had no bound at all pre-fix; watchdog closes."""
+    import errno as errno_module
+    import threading
+
+    close_event = threading.Event()
+    closed = []
+
+    class _WedgedPipe:
+        """Mimics a real blocking pipe: closing the fd wakes the reader."""
+
+        def write(self, _data):
+            return 8
+
+        def read(self, _size):
+            if close_event.wait(timeout=30):
+                raise OSError(errno_module.EBADF, "watchdog closed the pipe")
+            return b""
+
+        def close(self):
+            if not closed:
+                closed.append(1)
+                close_event.set()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            self.close()
+
+    opened = []
+    monkeypatch.setattr(
+        client_module,
+        "open",
+        lambda *_a, **_k: opened.append(1) or _WedgedPipe(),
+        raising=False,
+    )
+    client = DevMapClient(
+        tmp_path, socket_path=str(tmp_path / "pipe"), response_deadline_seconds=0.5
+    )
+
+    started = time.monotonic()
+    outcome = client._send_named_pipe_request({"cmd": "status"})
+    elapsed = time.monotonic() - started
+
+    assert outcome is None, "watchdog-unblocked read must fall back, not raise"
+    assert elapsed < 5.0, f"named-pipe exchange was not bounded: {elapsed:.2f}s"
+
+
+def test_a_wedged_binary_fails_fast_after_one_bounded_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stress evidence: a hanging outdated binary cost 123s per status call.
+
+    The probe bounds detection to 10s and a probe timeout must poison the CLI
+    cooldown, so the first call is bounded by the probe and every call after it
+    fails immediately instead of paying the full CLI timeout again.
+    """
+    hung_binary = tmp_path / "devmap-hung"
+    hung_binary.write_text("#!/bin/sh\nsleep 60\n")
+    hung_binary.chmod(0o755)
+
+    client = DevMapClient(tmp_path)
+    monkeypatch.setattr(client, "_find_devmap_binary", lambda: str(hung_binary))
+
+    started = time.monotonic()
+    assert client._supports_serve(str(hung_binary)) is False
+    assert client._cli_unhealthy_until > time.monotonic(), (
+        "a probe timeout must engage the CLI fail-fast cooldown"
+    )
+
+    monkeypatch.setattr(
+        client_module.subprocess,
+        "run",
+        lambda *_a, **_k: pytest.fail("CLI must not run during cooldown"),
+    )
+    fast_started = time.monotonic()
+    with pytest.raises(DevMapClientError, match="failing fast"):
+        client._run_cli_command(["status"])
+    assert time.monotonic() - fast_started < 1.0

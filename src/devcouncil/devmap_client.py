@@ -13,6 +13,7 @@ import os
 import pathlib
 import socket
 import subprocess
+import threading
 import time
 from typing import Any, Dict, List, Optional, Union, cast
 
@@ -42,6 +43,36 @@ MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_QUERY_BYTES = 4 * 1024
 MAX_TOKEN_BUDGET = 100_000
 MAX_TRAVERSAL_DEPTH = 64
+# Whole-exchange ceiling for one socket request: connect, send, and receive
+# must all finish inside this budget. The per-call socket timeout (2s) bounds a
+# single recv; without an overall deadline a peer that trickles one byte at a
+# time keeps every recv under its timeout while the exchange runs for hours
+# (measured: a 1-byte/0.5s drip holds the client until MAX_RESPONSE_BYTES
+# accumulates — months). When the deadline trips, the daemon is treated as
+# unavailable and the request degrades to the CLI path.
+RESPONSE_DEADLINE_SECONDS = 5.0
+# After a transport-level failure (timeout, reset, frame breakage), skip this
+# daemon endpoint for a bounded cool-down instead of paying the full deadline
+# on every subsequent call. The endpoint is retried after the window so a
+# recovered daemon is picked up without restarting the process.
+SOCKET_COOLDOWN_SECONDS = 30.0
+# Per-read socket timeout. Bounds one recv(2) call; the response deadline below
+# bounds the exchange as a whole. Without the deadline, a server that dribbles
+# one byte per timeout-1 forever keeps this loop alive for weeks — measured in
+# stress (slowloris), where only MAX_RESPONSE_BYTES capped the loop.
+SOCKET_TIMEOUT_SECONDS = 2.0
+# Total wall clock allowed for one daemon exchange (connect + write + framed
+# read). Every transport path must respect it.
+RESPONSE_DEADLINE_SECONDS = 30.0
+# After a transport-level failure (timeout, reset, deadline) the daemon side is
+# skipped entirely for this long: subsequent calls fail over straight to the CLI
+# instead of paying the socket stall again on every request.
+TRANSPORT_COOLDOWN_SECONDS = 60.0
+# After a CLI invocation times out, later CLI calls fail fast for this long so a
+# hung binary costs its timeout once, not once per call.
+CLI_COOLDOWN_SECONDS = 60.0
+DAEMON_READINESS_SECONDS = 3.0
+SERVE_PROBE_TIMEOUT_SECONDS = 10.0
 
 @dataclass
 class DevMapStatus:
@@ -132,13 +163,26 @@ class DevMapClient:
         root_dir: Optional[Union[str, pathlib.Path]] = None,
         socket_path: Optional[str] = None,
         db_path: Optional[str] = None,
+        response_deadline_seconds: float = RESPONSE_DEADLINE_SECONDS,
     ):
         self.root_dir = pathlib.Path(root_dir or os.getcwd()).resolve()
         self.socket_path = socket_path or self._default_socket_path()
         self.db_path = db_path or DEFAULT_DB_PATH
+        if not 0 < response_deadline_seconds <= 3600:
+            raise DevMapClientError(
+                f"response deadline must be within (0, 3600] seconds, got {response_deadline_seconds!r}"
+            )
+        self._response_deadline_seconds = float(response_deadline_seconds)
         self._binary_path: Optional[str] = None
+        self._serve_capable: Optional[bool] = None
         self._spawn_attempted = False
         self._daemon_process: Optional[subprocess.Popen[bytes]] = None
+        # Transport health, set by observed failures — never by assumption. A
+        # cooldown that starts on a guess would route around a healthy daemon
+        # for a minute for no reason; a check that did not run must not report
+        # the same verdict as one that ran and failed.
+        self._transport_unhealthy_until = 0.0
+        self._cli_unhealthy_until = 0.0
 
     def _default_socket_path(self) -> str:
         if os.name == "nt":
@@ -168,6 +212,43 @@ class DevMapClient:
 
         self._binary_path = "devmap"
         return self._binary_path
+
+    def _supports_serve(self, binary: str) -> bool:
+        """Probe whether *binary* can actually host the IPC daemon.
+
+        Version strings cannot answer this — every build of devmap reports
+        `0.1.0`, so an outdated install is indistinguishable from a fresh one by
+        name. The only honest evidence is asking the binary what it supports.
+        A binary without `serve --socket` must never be spawned: the readiness
+        poll would burn its full window on a process that can never listen, and
+        the fallback CLI would then run the same stale kernel against a schema
+        it may predate. Result is cached per instance; the probe runs at most
+        once per client, only when a spawn is actually about to happen.
+        """
+        if self._serve_capable is not None:
+            return self._serve_capable
+        try:
+            probe = subprocess.run(
+                [binary, "serve", "--help"],
+                capture_output=True,
+                text=True,
+                timeout=SERVE_PROBE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            # A binary too wedged to answer --help inside 10s will hang real
+            # commands the same way. Marking the CLI cooldown here turns the
+            # measured 123s-per-call outdated-binary stall into one bounded
+            # probe plus immediate fail-fast.
+            self._cli_unhealthy_until = time.monotonic() + CLI_COOLDOWN_SECONDS
+            self._serve_capable = False
+            return False
+        except (OSError, subprocess.SubprocessError):
+            self._serve_capable = False
+            return False
+        self._serve_capable = probe.returncode == 0 and "--socket" in (
+            probe.stdout or ""
+        )
+        return self._serve_capable
 
     @staticmethod
     def _strict_nonnegative_int(value: Any, field_name: str) -> int:
@@ -220,10 +301,11 @@ class DevMapClient:
         client: Optional[socket.socket] = None
         try:
             client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            client.settimeout(2.0)
+            client.settimeout(SOCKET_TIMEOUT_SECONDS)
             client.connect(self.socket_path)
             data_bytes = json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n"
             client.sendall(data_bytes)
+            deadline = time.monotonic() + self._response_deadline_seconds
             response_bytes = b""
             while b"\n" not in response_bytes:
                 chunk = client.recv(4096)
@@ -234,6 +316,11 @@ class DevMapClient:
                     raise DevMapClientError(
                         f"devmap daemon response exceeds {MAX_RESPONSE_BYTES} bytes"
                     )
+                # The per-recv timeout bounds one read; a server that dribbles
+                # bytes slower than that timeout resets it forever. The total
+                # deadline is what makes the exchange bounded, not the recv.
+                if time.monotonic() > deadline:
+                    raise TimeoutError("response deadline exceeded")
             if not response_bytes:
                 raise DevMapClientError("devmap daemon closed without a response")
             line, separator, trailing = response_bytes.partition(b"\n")
@@ -245,10 +332,43 @@ class DevMapClient:
         except OSError as err:
             if err.errno in {errno.ENOENT, errno.ECONNREFUSED}:
                 return None
-            raise DevMapClientError(f"devmap daemon transport failed: {err}") from err
+            self._transport_unhealthy_until = (
+                time.monotonic() + TRANSPORT_COOLDOWN_SECONDS
+            )
+            return None
         finally:
             if client is not None:
                 client.close()
+
+    def _read_named_pipe_response(self, pipe: Any) -> bytes:
+        """Read one newline-framed response from *pipe*, bounded by the deadline.
+
+        A synchronous named-pipe read has no timeout of its own and can block
+        forever on a wedged server. A daemon watchdog thread closes the handle
+        at the deadline, which unblocks the read with an error; the belt-and-
+        braces monotonic check covers servers that answer just often enough to
+        keep the loop alive without ever finishing a frame.
+        """
+        deadline = time.monotonic() + self._response_deadline_seconds
+        watchdog = threading.Timer(self._response_deadline_seconds, pipe.close)
+        watchdog.daemon = True
+        watchdog.start()
+        response = bytearray()
+        try:
+            while b"\n" not in response:
+                chunk = pipe.read(4096)
+                if not chunk:
+                    break
+                response.extend(chunk)
+                if len(response) > MAX_RESPONSE_BYTES:
+                    raise DevMapClientError(
+                        f"devmap daemon response exceeds {MAX_RESPONSE_BYTES} bytes"
+                    )
+                if time.monotonic() > deadline:
+                    raise TimeoutError("response deadline exceeded")
+        finally:
+            watchdog.cancel()
+        return bytes(response)
 
     def _send_named_pipe_request(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         request = dict(payload)
@@ -257,20 +377,16 @@ class DevMapClient:
         try:
             with open(self.socket_path, "r+b", buffering=0) as pipe:
                 pipe.write(data)
-                response = bytearray()
-                while b"\n" not in response:
-                    chunk = pipe.read(4096)
-                    if not chunk:
-                        break
-                    response.extend(chunk)
-                    if len(response) > MAX_RESPONSE_BYTES:
-                        raise DevMapClientError(
-                            f"devmap daemon response exceeds {MAX_RESPONSE_BYTES} bytes"
-                        )
+                response = self._read_named_pipe_response(pipe)
         except FileNotFoundError:
             return None
-        except OSError as err:
-            raise DevMapClientError(f"devmap named-pipe transport failed: {err}") from err
+        except (OSError, ValueError) as err:
+            # ValueError covers reads unwound by the watchdog's close(); OSError
+            # covers every other transport failure including the deadline.
+            self._transport_unhealthy_until = (
+                time.monotonic() + TRANSPORT_COOLDOWN_SECONDS
+            )
+            return None
         if not response:
             raise DevMapClientError("devmap daemon closed without a response")
         line, separator, trailing = bytes(response).partition(b"\n")
@@ -311,6 +427,14 @@ class DevMapClient:
         db = self.root_dir / self.db_path
         if not db.is_file() or db.stat().st_size == 0:
             return False
+        # An outdated binary must never host the IPC endpoint: it cannot serve,
+        # so spawning it only burns the readiness window before falling through
+        # anyway — and worse, a *stale* serve-capable binary would keep owning
+        # the socket with old behavior. Capability, not the version string,
+        # decides; every build reports the same version number. Checked after
+        # the cheap db guard, so repositories with no store never pay for it.
+        if not self._supports_serve(binary):
+            return False
         command = [
             binary,
             "--db",
@@ -331,13 +455,18 @@ class DevMapClient:
             )
         except OSError:
             return False
-        deadline = time.monotonic() + 3.0
+        deadline = time.monotonic() + DAEMON_READINESS_SECONDS
         while time.monotonic() < deadline:
             if self._daemon_process.poll() is not None:
                 self._reap_daemon_process()
                 return False
             response = self._send_socket_request({"cmd": "status"})
             if response is not None:
+                # The answer may have come from a pre-existing daemon rather
+                # than our child. If our own child already lost the bind race
+                # and exited, reap it here instead of leaking it.
+                if self._daemon_process.poll() is not None:
+                    self._reap_daemon_process()
                 return True
             time.sleep(0.05)
         self._reap_daemon_process()
@@ -360,7 +489,20 @@ class DevMapClient:
         finally:
             self._daemon_process = None
 
-    def _run_cli_command(self, cmd_args: List[str], timeout: float = 120.0) -> Dict[str, Any]:
+    def _run_cli_command(
+        self,
+        cmd_args: List[str],
+        timeout: float = 120.0,
+        *,
+        fail_fast_on_timeout: bool = True,
+    ) -> Dict[str, Any]:
+        # A CLI that already timed out recently is presumed hung: fail fast
+        # rather than paying the full timeout again on every call. Long-running
+        # commands (build) opt out — one slow build must not poison the next.
+        if time.monotonic() < self._cli_unhealthy_until:
+            raise DevMapClientError(
+                "devmap CLI timed out recently; failing fast for a cooldown before retrying"
+            )
         binary = self._find_devmap_binary()
         full_cmd = [
             binary,
@@ -381,17 +523,22 @@ class DevMapClient:
                     f"devmap CLI failed (code {res.returncode}): {res.stderr or res.stdout}"
                 )
             return self._decode_json_object(res.stdout, "CLI response")
-        except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as err:
+        except subprocess.TimeoutExpired as err:
+            if fail_fast_on_timeout:
+                self._cli_unhealthy_until = time.monotonic() + CLI_COOLDOWN_SECONDS
+            raise DevMapClientError(f"devmap CLI invocation failed: {err}") from err
+        except (OSError, json.JSONDecodeError) as err:
             raise DevMapClientError(f"devmap CLI invocation failed: {err}") from err
 
     def _request(self, payload: Dict[str, Any], cli_args: List[str], timeout: float = 120.0) -> Dict[str, Any]:
-        response = self._send_socket_request(payload)
-        if response is not None:
-            return response
-        if self._start_daemon():
+        if time.monotonic() >= self._transport_unhealthy_until:
             response = self._send_socket_request(payload)
             if response is not None:
                 return response
+            if self._start_daemon():
+                response = self._send_socket_request(payload)
+                if response is not None:
+                    return response
         return self._run_cli_command(cli_args, timeout=timeout)
 
     def _budgeted(self, resp: Dict[str, Any], budget: int) -> BudgetedResponse:
@@ -474,7 +621,7 @@ class DevMapClient:
             args.extend(["--affected", ",".join(affected)])
         if deleted:
             args.extend(["--deleted", ",".join(deleted)])
-        return self._run_cli_command(args, timeout=600.0)
+        return self._run_cli_command(args, timeout=600.0, fail_fast_on_timeout=False)
 
     def search(self, query: str, limit: int = 2000) -> BudgetedResponse:
         self._validate_query(query)

@@ -446,6 +446,23 @@ pub struct ExtractedReference {
     /// grammar proves an assignment such as `worker = Worker()`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assigned_to: Option<String>,
+    /// The object half of a member access, when this reference *is* one:
+    /// `cfg` for `cfg.enabled`, `cmd` for `cmd.baseline`.
+    ///
+    /// Without it the extractor flattens `obj.attr` into a bare `attr`, and the
+    /// resolver — which refuses to resolve a bare name globally, so that
+    /// `except Exception as e` cannot bind to some unrelated `def e` — has no
+    /// way to tell a member name from a local variable and drops both. Every
+    /// property read, every callback passed by attribute, and every decorator
+    /// registration therefore left no edge, and the symbol behind it was
+    /// reported dead.
+    ///
+    /// This is the same field `ExtractedCall` carries for the same reason. A
+    /// non-call member use is a method call minus the invocation, so it
+    /// resolves on the same rungs: a typed receiver, or a receiver bound by an
+    /// import.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_expr: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -591,6 +608,18 @@ pub struct Extraction {
     /// so G20 stars and package-level import edges survive reload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub go_package: Option<String>,
+    /// Whether a Go file carries a build constraint — a `//go:build` or
+    /// `// +build` directive, or an implicit `_GOOS`/`_GOARCH` filename suffix.
+    /// Always false for non-Go files.
+    ///
+    /// Go forbids two package-level declarations of one name, so a package that
+    /// declares the same name in two files can only compile if those files are
+    /// mutually exclusive — which is to say, build-constrained. Recording the
+    /// constraint is what lets `analyze_liveness` tell a *spurious* ambiguity
+    /// between platform variants of one identity from a genuine one between two
+    /// unrelated symbols.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub go_build_constrained: bool,
     /// Interface method specs declared in this file. Empty for non-Go files.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub go_interface_methods: Vec<GoInterfaceMethod>,
@@ -1010,6 +1039,7 @@ mod go_interface_exemption_tests {
             },
             enclosing_symbol: None,
             assigned_to: None,
+            receiver_expr: None,
         };
 
         let mut extraction = base_extraction();

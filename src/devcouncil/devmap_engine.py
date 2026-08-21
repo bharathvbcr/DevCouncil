@@ -106,20 +106,38 @@ def _run(argv: List[str], *, cwd: Path, timeout: float) -> subprocess.CompletedP
     return completed
 
 
-def stamp_freshness(root: Path, map_path: Path) -> None:
-    """Fill `indexed_hash` / `content_fingerprint` in a Rust-written map.
+def stamp_freshness(root: Path, *artifacts: Path) -> None:
+    """Stamp `generated_head` / `indexed_hash` / `content_fingerprint` into
+    every Rust-written artifact.
 
-    The Rust kernel writes both as `""` — they are SHA-1 digests over the git
-    file set, and no hashing crate is linked in that workspace. Left empty they
-    are not merely absent: `RepoMapper.map_is_stale` skips its check only when
-    `generated_head` is *also* empty, and the Rust map does carry a real HEAD.
+    The kernel cannot write two of the three: they are SHA-1 digests over the
+    git file set, and no hashing crate is linked in that workspace. Left empty
+    they are not merely absent — `RepoMapper.map_is_stale` skips its check only
+    when `generated_head` is *also* empty, and the Rust map does carry a head.
     So `"" != <real digest>` on every call and the map reads permanently stale,
     which makes `--if-stale` never short-circuit and the watcher rebuild
     forever.
 
-    Computed here with the *same* functions and the *same* file list the
-    staleness check uses, because a fingerprint written by one rule and read by
-    another is worse than none at all — it would read as fresh when it is not.
+    `generated_head` is stamped here too, and for the same reason. The kernel
+    writes it from the newest *persisted generation* — honest for the store,
+    but a different question from the one `map_is_stale` asks, which is whether
+    this artifact describes the tree at the current `git rev-parse HEAD`. An
+    incremental build that finds no changed file persists no new generation, so
+    after a commit that touches nothing indexed the stamp keeps pointing at the
+    previous commit and the map reads stale the moment `dev map` finishes.
+    Measured on this repository: HEAD `e109d16`, stored `30daf62`, stale on a
+    map one second old.
+
+    All three come from `RepoMapper`, the same object `map_is_stale` uses, read
+    once from one snapshot of the tree — a field written by one rule and read
+    by another is worse than none at all, because it can read fresh when it is
+    not. An unavailable HEAD is stamped as the empty string rather than raised
+    on, matching the Python writer: a repository with no commits still gets a
+    usable map, and staleness then rests on the two fingerprints.
+
+    Every artifact gets the *same* values. The kernel writes the map and the
+    graph from one freshness identity on purpose; stamping only one of them
+    would reintroduce exactly the drift that single invocation prevents.
     """
     # Imported from the Python indexer deliberately: one owner for the digest,
     # so writer and checker cannot drift. Relocating these two pure helpers is
@@ -127,30 +145,43 @@ def stamp_freshness(root: Path, map_path: Path) -> None:
     from devcouncil.indexing.graph.build import _files_fingerprint, content_fingerprint
     from devcouncil.indexing.repo_mapper import RepoMapper
 
+    mapper = RepoMapper(project_root=root)
     try:
-        payload = json.loads(map_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise DevMapEngineError(f"cannot read the map devmap just wrote: {exc}") from exc
-
-    try:
-        files = RepoMapper(project_root=root).get_git_files()
+        files = mapper.get_git_files()
     except Exception as exc:  # noqa: BLE001 - any failure here must fail the stage
         raise DevMapEngineError(f"cannot enumerate git files to fingerprint: {exc}") from exc
 
-    payload["indexed_hash"] = _files_fingerprint(files)
-    payload["content_fingerprint"] = content_fingerprint(root, files)
-    # A *unique* temp file, not `<name>.tmp`. Two `dev map` runs against one
-    # repository share a fixed temp name, so one renames it away and the other's
-    # rename raises FileNotFoundError — measured, 1 of 8 concurrent workers died
-    # this way. The Rust store survived the same race intact (SC28); this was
-    # the Python stamp being the only unguarded writer left.
-    handle, tmp_name = tempfile.mkstemp(
-        dir=str(map_path.parent), prefix=map_path.name + ".", suffix=".tmp"
-    )
+    freshness = {
+        "generated_head": mapper._git_head(),
+        "indexed_hash": _files_fingerprint(files),
+        "content_fingerprint": content_fingerprint(root, files),
+    }
+
+    for artifact in artifacts:
+        try:
+            payload = json.loads(artifact.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise DevMapEngineError(
+                f"cannot read the artifact devmap just wrote ({artifact.name}): {exc}"
+            ) from exc
+        payload.update(freshness)
+        _write_json_atomically(artifact, payload)
+
+
+def _write_json_atomically(path: Path, payload: object) -> None:
+    """Replace `path` with `payload`, never leaving a partial file behind.
+
+    A *unique* temp name, not `<name>.tmp`. Two `dev map` runs against one
+    repository share a fixed temp name, so one renames it away and the other's
+    rename raises FileNotFoundError — measured, 1 of 8 concurrent workers died
+    this way. The Rust store survived the same race intact (SC28); this was the
+    Python stamp being the only unguarded writer left.
+    """
+    handle, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
             json.dump(payload, stream, indent=2)
-        os.replace(tmp_name, map_path)
+        os.replace(tmp_name, path)
     except BaseException:
         # Never leave a partial temp behind for the next run to trip over.
         try:
@@ -220,5 +251,5 @@ def build_map(
         if not produced.is_file():
             raise DevMapEngineError(f"devmap reported success but did not write {produced}")
 
-    stamp_freshness(root, map_path)
+    stamp_freshness(root, map_path, graph_path)
     return map_path

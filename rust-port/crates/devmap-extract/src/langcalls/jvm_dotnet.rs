@@ -153,6 +153,8 @@ pub(super) fn record(
         span: node_span(site.name),
         enclosing_symbol: caller_symbol.clone(),
         assigned_to: assigned_binding(site.call, source),
+        // The mirrored call already carries the receiver; repeating it here would be a second copy of one fact.
+        receiver_expr: None,
     });
     calls.push(ExtractedCall {
         caller_symbol,
