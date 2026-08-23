@@ -1,0 +1,27 @@
+{
+  "model": "google/gemini-2.5-pro",
+  "executor": "claude",
+  "records": [
+    {
+      "task": "median",
+      "arms": {
+        "B": {
+          "exit": 0,
+          "seconds": 698.4,
+          "verdict": "passed",
+          "cost_usd": 0.4676,
+          "output_tail": "s.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'tests/test_stats.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'tests/test_stats.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'tests/test_stats.py', LF will be replaced by CRLF the next time Git touches it\n",
+          "score": 4,
+          "total": 4,
+          "fraction": 1.0,
+          "detail": {
+            "odd_value": true,
+            "even_is_average_float": true,
+            "does_not_mutate_input": true,
+            "empty_raises_valueerror": true
+          }
+        }
+      }
+    }
+  ]
+}

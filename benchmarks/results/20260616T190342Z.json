@@ -1,0 +1,60 @@
+{
+  "model": "google/gemini-2.5-flash",
+  "executor": "claude",
+  "records": [
+    {
+      "task": "median",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 11.6,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Added the `median(values)` function to stats.py:\n\n```python\ndef median(values):\n    ordered = sorted(values)\n    n = len(ordered)\n    mid = n // 2\n    if n % 2 == 0:\n        return (ordered[mid - 1] + ordered[mid]) / 2\n    return ordered[mid]\n```\n\nIt sorts the values, then returns the middle element for odd-length lists or the average of the two middle elements for even-length lists.\n",
+          "score": 0,
+          "total": 4,
+          "fraction": 0.0,
+          "detail": {}
+        },
+        "B": {
+          "exit": 1,
+          "seconds": 60.5,
+          "verdict": "error",
+          "cost_usd": 0.0118,
+          "output_tail": "dels --model <model>)\nInitial parse failed for planner_a, attempting healing: Unterminated string starting at: line 3 column 16 (char 64)\nHealing failed for planner_a: 1 validation error for PlanOutput\ntasks\n  Field required [type=missing, input_value={'id': 'median-function-i...added a closing quote.\"}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing\n",
+          "score": 0,
+          "total": 4,
+          "fraction": 0.0,
+          "detail": {}
+        }
+      }
+    },
+    {
+      "task": "chunk",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 15.2,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "`lists.py`:\n\n```python\ndef chunk(items, size):\n    \"\"\"Split a list into sublists of length size.\"\"\"\n    if size <= 0:\n        raise ValueError(\"size must be a positive integer\")\n    return [items[i:i + size] for i in range(0, len(items), size)]\n```\n\nIt slices `items` in steps of `size`, so the final sublist holds any remainder. A non-positive `size` raises `ValueError` (avoids an infinite range).\n",
+          "score": 0,
+          "total": 5,
+          "fraction": 0.0,
+          "detail": {}
+        },
+        "B": {
+          "exit": 0,
+          "seconds": 383.2,
+          "verdict": "passed",
+          "cost_usd": 0.0372,
+          "output_tail": "copy of 'test_lists.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'test_lists.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'test_lists.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'test_lists.py', LF will be replaced by CRLF the next time Git touches it\n",
+          "score": 0,
+          "total": 5,
+          "fraction": 0.0,
+          "detail": {}
+        }
+      }
+    }
+  ]
+}

@@ -165,7 +165,9 @@ t.jsonl
 !.devcouncil/knowledge/okf/wiki/
 
 # Generated benchmark outputs (benchmark source under benchmarks/ stays tracked)
-benchmarks/results/
+# benchmarks/results/ is deliberately tracked: the correctness figures the
+# README and CV cite (0.81 -> 0.94, 0 false negatives) are only checkable
+# against the run that produced them.
 
 # DevCouncil local state
 !.devcouncil/

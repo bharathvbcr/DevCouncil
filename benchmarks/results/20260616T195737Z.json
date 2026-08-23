@@ -1,0 +1,345 @@
+{
+  "model": "google/gemini-2.5-pro",
+  "executor": "claude",
+  "records": [
+    {
+      "task": "median",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 10.2,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Added a `median(values)` function to stats.py. It sorts the values, then returns the middle element for odd-length lists or the average of the two middle elements for even-length lists.\n",
+          "score": 3,
+          "total": 4,
+          "fraction": 0.75,
+          "detail": {
+            "odd_value": true,
+            "even_is_average_float": true,
+            "does_not_mutate_input": true,
+            "empty_raises_valueerror": false
+          }
+        },
+        "B": {
+          "exit": 0,
+          "seconds": 376.0,
+          "verdict": "passed",
+          "cost_usd": 0.2863,
+          "output_tail": "ng: Expecting value: line 1 column 1 (char 0)\nHealing failed for critic_a: 1 validation error for CritiqueOutput\nfindings\n  Field required [type=missing, input_value={}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing\nRole 'critic_a' (model 'google/gemini-2.5-pro') could not produce valid CritiqueOutput; using a safe fallback so planning can continue.\n",
+          "score": 4,
+          "total": 4,
+          "fraction": 1.0,
+          "detail": {
+            "odd_value": true,
+            "even_is_average_float": true,
+            "does_not_mutate_input": true,
+            "empty_raises_valueerror": true
+          }
+        },
+        "C": {
+          "exit": 0,
+          "seconds": 14.5,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Done. Added `median(values)` to stats.py:\n\n- **Empty input** \u2192 raises `ValueError`.\n- **Unsorted input** \u2192 handled via `sorted()`, which also returns a new list, so the **input is not mutated**.\n- **Odd length** \u2192 returns the middle value.\n- **Even length** \u2192 returns the average of the two middle values as a float (`/ 2` yields a float).\n",
+          "score": 4,
+          "total": 4,
+          "fraction": 1.0,
+          "detail": {
+            "odd_value": true,
+            "even_is_average_float": true,
+            "does_not_mutate_input": true,
+            "empty_raises_valueerror": true
+          }
+        }
+      }
+    },
+    {
+      "task": "chunk",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 12.7,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "ems)`` is not a multiple\n    of ``size``.\n    \"\"\"\n    if size <= 0:\n        raise ValueError(\"size must be a positive integer\")\n    return [items[i:i + size] for i in range(0, len(items), size)]\n```\n\nIt slices the list into consecutive sublists of `size`, with the last one shorter if the length isn't an exact multiple. I added a guard for non-positive `size` to avoid an infinite/empty-step error.\n",
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "even_split": true,
+            "last_partial_chunk": true,
+            "size_zero_raises": true,
+            "size_larger_than_list": true,
+            "does_not_mutate_input": true
+          }
+        },
+        "B": {
+          "exit": 1,
+          "seconds": 373.5,
+          "verdict": "blocked",
+          "cost_usd": 0.3327,
+          "output_tail": "            \n\nUnfinished task(s): task-1-implement-chunk (blocked), task-4-llm-review \n(blocked)\nwarning: in the working copy of 'lists.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'lists.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'lists.py', LF will be replaced by CRLF the next time Git touches it\n",
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "even_split": true,
+            "last_partial_chunk": true,
+            "size_zero_raises": true,
+            "size_larger_than_list": true,
+            "does_not_mutate_input": true
+          }
+        },
+        "C": {
+          "exit": 0,
+          "seconds": 15.9,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": " size] for i in range(0, len(items), size)]` naturally handles all the requirements:\n- **Final chunk shorter** \u2014 slicing tolerates the end index exceeding `len(items)`.\n- **No mutation** \u2014 slicing creates new lists, leaving `items` untouched.\n- **`size >= len(items)`** \u2014 `range` yields just `0`, so a single chunk with all items is returned.\n- **`size <= 0`** \u2014 raises `ValueError` before any work.\n",
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "even_split": true,
+            "last_partial_chunk": true,
+            "size_zero_raises": true,
+            "size_larger_than_list": true,
+            "does_not_mutate_input": true
+          }
+        }
+      }
+    },
+    {
+      "task": "roman",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 14.9,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Added `roman_to_int(s)` to roman.py. It walks the string right-to-left and applies the subtractive rule \u2014 if a numeral's value is less than the one to its right (e.g. the I in IV), it's subtracted; otherwise added.\n\nFor example: `roman_to_int(\"MCMXCIV\")` \u2192 1994, `roman_to_int(\"IX\")` \u2192 9, `roman_to_int(\"LVIII\")` \u2192 58.\n",
+          "score": 3,
+          "total": 6,
+          "fraction": 0.5,
+          "detail": {
+            "simple": true,
+            "subtractive_iv": true,
+            "complex_1994": true,
+            "lowercase_accepted": false,
+            "empty_raises": false,
+            "invalid_char_raises": false
+          }
+        },
+        "B": {
+          "exit": 1,
+          "seconds": 452.6,
+          "verdict": "blocked",
+          "cost_usd": 0.306,
+          "output_tail": ".5-pro') could not produce valid RebuttalOutput; using a safe fallback so planning can continue.\nwarning: in the working copy of 'roman.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'roman.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'roman.py', LF will be replaced by CRLF the next time Git touches it\n",
+          "score": 5,
+          "total": 6,
+          "fraction": 0.833,
+          "detail": {
+            "simple": true,
+            "subtractive_iv": true,
+            "complex_1994": true,
+            "lowercase_accepted": false,
+            "empty_raises": true,
+            "invalid_char_raises": true
+          }
+        },
+        "C": {
+          "exit": 0,
+          "seconds": 44.2,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "1994.\n- **ValueError**: raised for an empty string, and for any character not in `IVXLCDM` (a `KeyError` during the lookup is re-raised as `ValueError`).\n\nI tried to run a quick verification but the Python commands needed approval in this environment. The logic checks out by hand \u2014 e.g. `MCMXCIV` = 1000 + (900) + (90) + (4) = 1994. If you'd like, approve a Python run and I'll execute a test pass.\n",
+          "score": 6,
+          "total": 6,
+          "fraction": 1.0,
+          "detail": {
+            "simple": true,
+            "subtractive_iv": true,
+            "complex_1994": true,
+            "lowercase_accepted": true,
+            "empty_raises": true,
+            "invalid_char_raises": true
+          }
+        }
+      }
+    },
+    {
+      "task": "balanced",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 11.7,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Added `is_balanced(s)` to brackets.py. It uses a stack to match `()`, `[]`, and `{}`, ignoring other characters, and returns `True` only when every opener is properly closed in order.\n",
+          "score": 6,
+          "total": 6,
+          "fraction": 1.0,
+          "detail": {
+            "simple_pairs": true,
+            "nested": true,
+            "wrong_type_not_balanced": true,
+            "interleaved_not_balanced": true,
+            "empty_is_balanced": true,
+            "ignores_other_chars": true
+          }
+        },
+        "B": {
+          "exit": 0,
+          "seconds": 307.4,
+          "verdict": "passed",
+          "cost_usd": 0.3491,
+          "output_tail": "       \n \u2022 Blocking cards in scope: None.                                              \nwarning: in the working copy of 'brackets.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'brackets.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'brackets.py', LF will be replaced by CRLF the next time Git touches it\n",
+          "score": 6,
+          "total": 6,
+          "fraction": 1.0,
+          "detail": {
+            "simple_pairs": true,
+            "nested": true,
+            "wrong_type_not_balanced": true,
+            "interleaved_not_balanced": true,
+            "empty_is_balanced": true,
+            "ignores_other_chars": true
+          }
+        },
+        "C": {
+          "exit": 0,
+          "seconds": 29.0,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "; a mismatched type like `(]` or an extra closer with an empty stack returns `False`.\n- **Non-bracket characters** fall through both branches and are ignored.\n- At the end, `not stack` ensures no openers were left unclosed \u2014 so `''` \u2192 `True`, `'('` \u2192 `False`.\n\nIf you'd like, approve a run and I'll execute the test cases (`''`, `'()[]{}'`, `'([{}])'`, `'(]'`, `'([)]'`, `'a(b)c'`, etc.) to confirm.\n",
+          "score": 6,
+          "total": 6,
+          "fraction": 1.0,
+          "detail": {
+            "simple_pairs": true,
+            "nested": true,
+            "wrong_type_not_balanced": true,
+            "interleaved_not_balanced": true,
+            "empty_is_balanced": true,
+            "ignores_other_chars": true
+          }
+        }
+      }
+    },
+    {
+      "task": "parse_kv",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 13.7,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Added `parse_kv(text)` to `config.py`. It splits each line on the first `=`, strips whitespace from keys and values, and skips blank lines or lines without `=`. Values may contain `=`, and on duplicate keys the last one wins.\n",
+          "score": 4,
+          "total": 5,
+          "fraction": 0.8,
+          "detail": {
+            "basic": true,
+            "skips_blank_and_comments": false,
+            "strips_whitespace": true,
+            "splits_on_first_equals": true,
+            "duplicate_last_wins": true
+          }
+        },
+        "B": {
+          "exit": 1,
+          "seconds": 388.1,
+          "verdict": "blocked",
+          "cost_usd": 0.3777,
+          "output_tail": "                        \n\nUnfinished task(s): task-1-implement-parser-and-exception (blocked)\nwarning: in the working copy of 'config.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'config.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'config.py', LF will be replaced by CRLF the next time Git touches it\n",
+          "score": 4,
+          "total": 5,
+          "fraction": 0.8,
+          "detail": {
+            "basic": true,
+            "skips_blank_and_comments": true,
+            "strips_whitespace": true,
+            "splits_on_first_equals": true,
+            "duplicate_last_wins": false
+          }
+        },
+        "C": {
+          "exit": 0,
+          "seconds": 43.3,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "**: `key.strip()` and `value.strip()` strip surrounding whitespace.\n- **First `=` only**: `split(\"=\", 1)` keeps `=` characters inside values intact.\n- **Duplicate keys**: assignment into the dict means the last occurrence wins.\n\nLines without any `=` are skipped. I couldn't run a verification script (Python execution wasn't permitted in this environment), but the logic covers the specified cases.\n",
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "basic": true,
+            "skips_blank_and_comments": true,
+            "strips_whitespace": true,
+            "splits_on_first_equals": true,
+            "duplicate_last_wins": true
+          }
+        }
+      }
+    },
+    {
+      "task": "merge_intervals",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 15.7,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Added `merge_intervals(intervals)` to intervals.py:108.\n\nThe function sorts intervals by start, then sweeps through them combining any that overlap or touch (`start <= previous_end`). For example, `[[1,3],[2,6],[8,10],[15,18]]` \u2192 `[[1,6],[8,10],[15,18]]`. Returns a new list and doesn't mutate the input.\n",
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "overlapping": true,
+            "adjacent_merge": true,
+            "unsorted_input": true,
+            "empty": true,
+            "does_not_mutate_input": true
+          }
+        },
+        "B": {
+          "exit": 1,
+          "seconds": 484.3,
+          "verdict": "blocked",
+          "cost_usd": 0.2628,
+          "output_tail": "ld not produce valid CritiqueOutput; using a safe fallback so planning can continue.\nwarning: in the working copy of 'intervals.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'intervals.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'intervals.py', LF will be replaced by CRLF the next time Git touches it\n",
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "overlapping": true,
+            "adjacent_merge": true,
+            "unsorted_input": true,
+            "empty": true,
+            "does_not_mutate_input": true
+          }
+        },
+        "C": {
+          "exit": 0,
+          "seconds": 28.0,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "re merging.\n- **Overlapping + adjacent merge** \u2014 uses `start <= last[1]`, so `[1,2]` and `[2,3]` merge into `[1,3]`.\n- **Empty input** \u2014 returns `[]`.\n- **No mutation** \u2014 `sorted()` builds a new list, and each output interval is a fresh `list(...)` copy, so neither the input list nor its inner pairs are touched.\n- `max(last[1], end)` handles fully-nested intervals like `[1,4]` containing `[2,3]`.\n",
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "overlapping": true,
+            "adjacent_merge": true,
+            "unsorted_input": true,
+            "empty": true,
+            "does_not_mutate_input": true
+          }
+        }
+      }
+    }
+  ]
+}

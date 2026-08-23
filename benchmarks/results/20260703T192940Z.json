@@ -1,0 +1,289 @@
+{
+  "model": "qwen/qwen3-max",
+  "executor": "claude",
+  "dc_timeout": 2400,
+  "ollama_env": {
+    "OLLAMA_THINK": "false",
+    "OLLAMA_TIMEOUT": "900",
+    "OLLAMA_NUM_PREDICT": null
+  },
+  "monitor": {
+    "provider": "openrouter",
+    "model": "qwen/qwen3-max",
+    "roles": [
+      "implementation_reviewer",
+      "live_reviewer"
+    ]
+  },
+  "acceptance_checks": {
+    "samples": 1,
+    "repair_attempts": 1,
+    "per_criterion": false
+  },
+  "records": [
+    {
+      "task": "median",
+      "arms": {
+        "B": {
+          "exit": 1,
+          "seconds": 713.3,
+          "verdict": "blocked",
+          "cost_usd": 0.1176,
+          "output_tail": "ant claims to re-apply a 'dehyphen'    \n   addition but provides no actual code change, diff, or evidence of            \n   implementation. The response is vague, lacks actionable output, and fails to \n   demonstrate completion of any task.                                          \n2026-07-03 11:53:01 WARNING [devcouncil.cli.commands.go] dev go finished with 1 unfinished task(s): TASK-1 (blocked)\n",
+          "attempts": 1,
+          "score": 4,
+          "total": 4,
+          "fraction": 1.0,
+          "detail": {
+            "odd_value": true,
+            "even_is_average_float": true,
+            "does_not_mutate_input": true,
+            "empty_raises_valueerror": true
+          }
+        }
+      }
+    },
+    {
+      "task": "chunk",
+      "arms": {
+        "B": {
+          "exit": 0,
+          "seconds": 467.6,
+          "verdict": "incomplete",
+          "cost_usd": 0.1095,
+          "output_tail": "You've hit your session limit \u00b7 resets 2pm (America/Los_Angeles)\n2026-07-03 12:00:48 ERROR   [devcouncil.cli.commands.run] claude failed to start or execute for TASK-01: claude exited with code 1: You've hit your session limit \u00b7 resets 2pm (America/Los_Angeles)\n2026-07-03 12:00:48 WARNING [devcouncil.cli.commands.go] TASK-01: repair made no progress (identical gaps) after attempt 2; stopping loop\n",
+          "attempts": 1,
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "even_split": true,
+            "last_partial_chunk": true,
+            "size_zero_raises": true,
+            "size_larger_than_list": true,
+            "does_not_mutate_input": true
+          }
+        }
+      }
+    },
+    {
+      "task": "roman",
+      "arms": {
+        "B": {
+          "exit": 1,
+          "seconds": 195.8,
+          "verdict": "blocked",
+          "cost_usd": 0.1088,
+          "output_tail": "xceeded: limit_rpm/qwen/qwen3-max/5e31ba3c-d5bf-4ced-a52d-96e2e6635f95. High demand for qwen/qwen3-max on OpenRouter - limited to 20 requests per minute. Please retry shortly.\",\"code\":429,\"metadata\":{\"headers\":{\"X-RateLimit-Limit\":\"20\",\"X-RateLimit-Remaining\":\"0\",\"X-'). Retrying...\n2026-07-03 12:04:05 WARNING [devcouncil.cli.commands.go] dev go finished with 1 unfinished task(s): TASK-1 (blocked)\n",
+          "attempts": 1,
+          "score": 0,
+          "total": 6,
+          "fraction": 0.0,
+          "detail": {
+            "simple": false,
+            "subtractive_iv": false,
+            "complex_1994": false,
+            "lowercase_accepted": false,
+            "empty_raises": false,
+            "invalid_char_raises": false
+          }
+        }
+      }
+    },
+    {
+      "task": "balanced",
+      "arms": {
+        "B": {
+          "exit": 1,
+          "seconds": 198.8,
+          "verdict": "blocked",
+          "cost_usd": 0.1068,
+          "output_tail": " exited 1 for TASK-1: You've hit your session limit \u00b7 resets 2pm (America/Los_Angeles)\n2026-07-03 12:06:14 ERROR   [devcouncil.cli.commands.run] claude failed to start or execute for TASK-1: claude exited with code 1: You've hit your session limit \u00b7 resets 2pm (America/Los_Angeles)\n2026-07-03 12:07:24 WARNING [devcouncil.cli.commands.go] dev go finished with 1 unfinished task(s): TASK-1 (blocked)\n",
+          "attempts": 1,
+          "score": 0,
+          "total": 6,
+          "fraction": 0.0,
+          "detail": {
+            "simple_pairs": false,
+            "nested": false,
+            "wrong_type_not_balanced": false,
+            "interleaved_not_balanced": false,
+            "empty_is_balanced": false,
+            "ignores_other_chars": false
+          }
+        }
+      }
+    },
+    {
+      "task": "parse_kv",
+      "arms": {
+        "B": {
+          "exit": 1,
+          "seconds": 178.1,
+          "verdict": "blocked",
+          "cost_usd": 0.0961,
+          "output_tail": " exited 1 for TASK-1: You've hit your session limit \u00b7 resets 2pm (America/Los_Angeles)\n2026-07-03 12:09:29 ERROR   [devcouncil.cli.commands.run] claude failed to start or execute for TASK-1: claude exited with code 1: You've hit your session limit \u00b7 resets 2pm (America/Los_Angeles)\n2026-07-03 12:10:23 WARNING [devcouncil.cli.commands.go] dev go finished with 1 unfinished task(s): TASK-1 (blocked)\n",
+          "attempts": 1,
+          "score": 0,
+          "total": 5,
+          "fraction": 0.0,
+          "detail": {
+            "basic": false,
+            "skips_blank_and_comments": false,
+            "strips_whitespace": false,
+            "splits_on_first_equals": false,
+            "duplicate_last_wins": false
+          }
+        }
+      }
+    },
+    {
+      "task": "merge_intervals",
+      "arms": {
+        "B": {
+          "exit": 1,
+          "seconds": 221.4,
+          "verdict": "blocked",
+          "cost_usd": 0.1223,
+          "output_tail": "wen/qwen3-max/5e31ba3c-d5bf-4ced-a52d-96e2e6635f95. High demand for qwen/qwen3-max on OpenRouter - limited to 20 requests per minute. Please retry shortly.\",\"code\":429,\"metadata\":{\"headers\":{\"X-RateLimit-Limit\":\"20\",\"X-RateLimit-Remaining\":\"0\",\"X-'). Retrying...\n2026-07-03 12:14:04 WARNING [devcouncil.cli.commands.go] dev go finished with 2 unfinished task(s): TASK-01 (blocked), TASK-02 (blocked)\n",
+          "attempts": 1,
+          "score": 0,
+          "total": 5,
+          "fraction": 0.0,
+          "detail": {
+            "overlapping": false,
+            "adjacent_merge": false,
+            "unsorted_input": false,
+            "empty": false,
+            "does_not_mutate_input": false
+          }
+        }
+      }
+    },
+    {
+      "task": "eval_rpn",
+      "arms": {
+        "B": {
+          "exit": 1,
+          "seconds": 183.6,
+          "verdict": "blocked",
+          "cost_usd": 0.0922,
+          "output_tail": " exited 1 for TASK-1: You've hit your session limit \u00b7 resets 2pm (America/Los_Angeles)\n2026-07-03 12:16:07 ERROR   [devcouncil.cli.commands.run] claude failed to start or execute for TASK-1: claude exited with code 1: You've hit your session limit \u00b7 resets 2pm (America/Los_Angeles)\n2026-07-03 12:17:08 WARNING [devcouncil.cli.commands.go] dev go finished with 1 unfinished task(s): TASK-1 (blocked)\n",
+          "attempts": 1,
+          "score": 0,
+          "total": 7,
+          "fraction": 0.0,
+          "detail": {
+            "basic_add": false,
+            "leetcode_example": false,
+            "trunc_toward_zero_pos": false,
+            "trunc_toward_zero_neg": false,
+            "too_few_operands_raises": false,
+            "leftover_operands_raises": false,
+            "div_by_zero_raises": false
+          }
+        }
+      }
+    },
+    {
+      "task": "base_convert",
+      "arms": {
+        "B": {
+          "exit": 1,
+          "seconds": 260.7,
+          "verdict": "blocked",
+          "cost_usd": 0.1378,
+          "output_tail": "ited 1 for TASK-01: You've hit your session limit \u00b7 resets 2pm (America/Los_Angeles)\n2026-07-03 12:19:45 ERROR   [devcouncil.cli.commands.run] claude failed to start or execute for TASK-01: claude exited with code 1: You've hit your session limit \u00b7 resets 2pm (America/Los_Angeles)\n2026-07-03 12:21:29 WARNING [devcouncil.cli.commands.go] dev go finished with 1 unfinished task(s): TASK-01 (blocked)\n",
+          "attempts": 1,
+          "score": 0,
+          "total": 8,
+          "fraction": 0.0,
+          "detail": {
+            "hex_to_bin": false,
+            "bin_to_hex_lowercase": false,
+            "zero": false,
+            "base36_digit": false,
+            "case_insensitive_input": false,
+            "leading_zeros": false,
+            "invalid_digit_raises": false,
+            "base_out_of_range_raises": false
+          }
+        }
+      }
+    },
+    {
+      "task": "parse_csv_line",
+      "arms": {
+        "B": {
+          "exit": 1,
+          "seconds": 148.8,
+          "verdict": "incomplete",
+          "cost_usd": 0.0688,
+          "output_tail": "ERROR   [devcouncil.cli.commands.run] claude failed to start or execute for TASK-1: claude exited with code 1: You've hit your session limit \u00b7 resets 2pm (America/Los_Angeles)\n2026-07-03 12:23:58 ERROR   [devcouncil.stage] \u2716 verify failed (0.14s): ValueError('No closing quotation')\n2026-07-03 12:23:58 WARNING [devcouncil.cli.commands.go] dev go finished with 1 unfinished task(s): TASK-1 (planned)\n",
+          "attempts": 1,
+          "score": 0,
+          "total": 6,
+          "fraction": 0.0,
+          "detail": {
+            "plain": false,
+            "quoted_comma": false,
+            "escaped_quotes": false,
+            "empty_fields": false,
+            "trailing_comma": false,
+            "empty_line_one_field": false
+          }
+        }
+      }
+    },
+    {
+      "task": "flatten",
+      "arms": {
+        "B": {
+          "exit": 1,
+          "seconds": 133.5,
+          "verdict": "incomplete",
+          "cost_usd": 0.0626,
+          "output_tail": "ROR   [devcouncil.cli.commands.run] claude failed to start or execute for TASK-01: claude exited with code 1: You've hit your session limit \u00b7 resets 2pm (America/Los_Angeles)\n2026-07-03 12:26:11 ERROR   [devcouncil.stage] \u2716 verify failed (0.17s): ValueError('No closing quotation')\n2026-07-03 12:26:11 WARNING [devcouncil.cli.commands.go] dev go finished with 1 unfinished task(s): TASK-01 (planned)\n",
+          "attempts": 1,
+          "score": 0,
+          "total": 6,
+          "fraction": 0.0,
+          "detail": {
+            "deep_nesting": false,
+            "empty": false,
+            "strings_are_atomic": false,
+            "mixed": false,
+            "empty_nested_vanish": false,
+            "does_not_mutate_input": false
+          }
+        }
+      }
+    },
+    {
+      "task": "parse_duration",
+      "arms": {
+        "B": {
+          "exit": 1,
+          "seconds": 207.3,
+          "verdict": "blocked",
+          "cost_usd": 0.1099,
+          "output_tail": "ited 1 for TASK-01: You've hit your session limit \u00b7 resets 2pm (America/Los_Angeles)\n2026-07-03 12:28:22 ERROR   [devcouncil.cli.commands.run] claude failed to start or execute for TASK-01: claude exited with code 1: You've hit your session limit \u00b7 resets 2pm (America/Los_Angeles)\n2026-07-03 12:29:39 WARNING [devcouncil.cli.commands.go] dev go finished with 1 unfinished task(s): TASK-01 (blocked)\n",
+          "attempts": 1,
+          "score": 0,
+          "total": 8,
+          "fraction": 0.0,
+          "detail": {
+            "seconds": false,
+            "combined": false,
+            "days": false,
+            "case_insensitive": false,
+            "whitespace_ignored": false,
+            "empty_raises": false,
+            "number_without_unit_raises": false,
+            "unknown_unit_raises": false
+          }
+        }
+      }
+    }
+  ]
+}

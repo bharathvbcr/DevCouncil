@@ -1,0 +1,51 @@
+{
+  "model": "google/gemini-2.5-flash",
+  "executor": "claude",
+  "monitor": {
+    "provider": "ollama",
+    "model": "hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0",
+    "roles": [
+      "implementation_reviewer",
+      "live_reviewer"
+    ]
+  },
+  "records": [
+    {
+      "task": "median",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 13.9,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Added the `median` function to stats.py. It sorts the values, then returns the middle element for odd-length lists or the average of the two middle elements for even-length lists.\n",
+          "score": 3,
+          "total": 4,
+          "fraction": 0.75,
+          "detail": {
+            "odd_value": true,
+            "even_is_average_float": true,
+            "does_not_mutate_input": true,
+            "empty_raises_valueerror": false
+          }
+        },
+        "B": {
+          "exit": 0,
+          "seconds": 511.7,
+          "verdict": "incomplete",
+          "cost_usd": 0.0474,
+          "output_tail": "           \n \u2022 Blocking cards in scope: None.                                               \nInitial parse failed for implementation_reviewer, attempting healing: 1 validation error for CompiledChecks\nchecks\n  Field required [type=missing, input_value={'$defs': {'CompiledCheck...ecks', 'type': 'object'}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing\n",
+          "score": 4,
+          "total": 4,
+          "fraction": 1.0,
+          "detail": {
+            "odd_value": true,
+            "even_is_average_float": true,
+            "does_not_mutate_input": true,
+            "empty_raises_valueerror": true
+          }
+        }
+      }
+    }
+  ]
+}

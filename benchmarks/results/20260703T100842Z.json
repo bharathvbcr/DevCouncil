@@ -1,0 +1,470 @@
+{
+  "model": "google/gemini-2.5-flash",
+  "executor": "claude",
+  "monitor": {
+    "provider": "ollama",
+    "model": "hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0",
+    "roles": [
+      "implementation_reviewer",
+      "live_reviewer"
+    ]
+  },
+  "acceptance_checks": {
+    "samples": 3,
+    "repair_attempts": 2,
+    "per_criterion": true
+  },
+  "records": [
+    {
+      "task": "median",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 20.7,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Added the `median` function to `stats.py`:\n\n```python\ndef median(values):\n    ordered = sorted(values)\n    n = len(ordered)\n    mid = n // 2\n    if n % 2 == 0:\n        return (ordered[mid - 1] + ordered[mid]) / 2\n    return ordered[mid]\n```\n\nIt sorts the values, then returns the middle element for odd-length lists or the average of the two middle elements for even-length lists.\n",
+          "score": 3,
+          "total": 4,
+          "fraction": 0.75,
+          "detail": {
+            "odd_value": true,
+            "even_is_average_float": true,
+            "does_not_mutate_input": true,
+            "empty_raises_valueerror": false
+          }
+        },
+        "B": {
+          "exit": 124,
+          "seconds": 1201.7,
+          "verdict": "error",
+          "cost_usd": 0.0307,
+          "output_tail": "2026-07-02 22:31:59 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n2026-07-02 22:31:59 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n2026-07-02 22:31:59 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n2026-07-02 22:31:59 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n",
+          "score": 4,
+          "total": 4,
+          "fraction": 1.0,
+          "detail": {
+            "odd_value": true,
+            "even_is_average_float": true,
+            "does_not_mutate_input": true,
+            "empty_raises_valueerror": true
+          }
+        }
+      }
+    },
+    {
+      "task": "chunk",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 13.4,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "      raise ValueError(\"size must be a positive integer\")\n    return [items[i:i + size] for i in range(0, len(items), size)]\n```\n\nIt slices `items` into consecutive sublists of length `size`, with the last one shorter if the list doesn't divide evenly (e.g. `chunk([1,2,3,4,5], 2)` \u2192 `[[1,2],[3,4],[5]]`). It guards against a non-positive `size`, which would otherwise cause an infinite/empty range.\n",
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "even_split": true,
+            "last_partial_chunk": true,
+            "size_zero_raises": true,
+            "size_larger_than_list": true,
+            "does_not_mutate_input": true
+          }
+        },
+        "B": {
+          "exit": 124,
+          "seconds": 1201.3,
+          "verdict": "error",
+          "cost_usd": 0.0374,
+          "output_tail": "2026-07-02 23:13:15 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n2026-07-02 23:13:15 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n2026-07-02 23:13:15 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n2026-07-02 23:13:15 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n",
+          "score": 1,
+          "total": 5,
+          "fraction": 0.2,
+          "detail": {
+            "even_split": false,
+            "last_partial_chunk": false,
+            "size_zero_raises": false,
+            "size_larger_than_list": false,
+            "does_not_mutate_input": true
+          }
+        }
+      }
+    },
+    {
+      "task": "roman",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 16.3,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Added `roman_to_int(s)` to `roman.py`. It scans the string right-to-left, subtracting any numeral smaller than the one to its right (handling cases like `IV`, `IX`, `XL`) and adding otherwise.\n",
+          "score": 3,
+          "total": 6,
+          "fraction": 0.5,
+          "detail": {
+            "simple": true,
+            "subtractive_iv": true,
+            "complex_1994": true,
+            "lowercase_accepted": false,
+            "empty_raises": false,
+            "invalid_char_raises": false
+          }
+        },
+        "B": {
+          "exit": 124,
+          "seconds": 1201.3,
+          "verdict": "error",
+          "cost_usd": 0.0503,
+          "output_tail": "2026-07-02 23:54:19 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n2026-07-02 23:54:19 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n2026-07-02 23:54:19 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n2026-07-02 23:54:19 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n",
+          "score": 6,
+          "total": 6,
+          "fraction": 1.0,
+          "detail": {
+            "simple": true,
+            "subtractive_iv": true,
+            "complex_1994": true,
+            "lowercase_accepted": true,
+            "empty_raises": true,
+            "invalid_char_raises": true
+          }
+        }
+      }
+    },
+    {
+      "task": "balanced",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 16.0,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Added `is_balanced(s)` to `brackets.py`. It uses a stack to match `()`, `[]`, and `{}`, ignoring any non-bracket characters, and returns `True` only when every opener has a correctly-ordered matching closer.\n",
+          "score": 6,
+          "total": 6,
+          "fraction": 1.0,
+          "detail": {
+            "simple_pairs": true,
+            "nested": true,
+            "wrong_type_not_balanced": true,
+            "interleaved_not_balanced": true,
+            "empty_is_balanced": true,
+            "ignores_other_chars": true
+          }
+        },
+        "B": {
+          "exit": 1,
+          "seconds": 13.5,
+          "verdict": "error",
+          "cost_usd": 0.0036,
+          "output_tail": "ield required [type=missing, input_value={'requirements': [{'id': ...', 'required': True}]}]}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing\nblocking_questions\n  Field required [type=missing, input_value={'requirements': [{'id': ...', 'required': True}]}]}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing\n",
+          "score": 0,
+          "total": 6,
+          "fraction": 0.0,
+          "detail": {
+            "simple_pairs": false,
+            "nested": false,
+            "wrong_type_not_balanced": false,
+            "interleaved_not_balanced": false,
+            "empty_is_balanced": false,
+            "ignores_other_chars": false
+          }
+        }
+      }
+    },
+    {
+      "task": "parse_kv",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 14.6,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Added `parse_kv(text)` to `config.py`. It parses `key=value` lines into a dict, with these behaviors:\n\n- Skips blank lines and `#` comments\n- Strips whitespace around keys and values\n- Splits on the first `=` only, so values may contain `=`\n- Last value wins for duplicate keys\n",
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "basic": true,
+            "skips_blank_and_comments": true,
+            "strips_whitespace": true,
+            "splits_on_first_equals": true,
+            "duplicate_last_wins": true
+          }
+        },
+        "B": {
+          "exit": 124,
+          "seconds": 1201.3,
+          "verdict": "error",
+          "cost_usd": 0.0466,
+          "output_tail": "2026-07-03 00:35:32 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n2026-07-03 00:35:32 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n2026-07-03 00:35:32 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n2026-07-03 00:35:32 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n",
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "basic": true,
+            "skips_blank_and_comments": true,
+            "strips_whitespace": true,
+            "splits_on_first_equals": true,
+            "duplicate_last_wins": true
+          }
+        }
+      }
+    },
+    {
+      "task": "merge_intervals",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 17.9,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "o `intervals.py`. It sorts intervals by start, then merges any that overlap or touch:\n\n- Accepts any iterable of `(start, end)` pairs\n- Returns a new sorted list of `[start, end]` pairs\n- Merges touching intervals too (e.g. `[1,2]` and `[2,3]` \u2192 `[1,3]`), taking `max` of ends to handle nested intervals correctly\n\nExample: `merge_intervals([(1,3),(2,6),(8,10),(15,18)])` \u2192 `[[1,6],[8,10],[15,18]]`.\n",
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "overlapping": true,
+            "adjacent_merge": true,
+            "unsorted_input": true,
+            "empty": true,
+            "does_not_mutate_input": true
+          }
+        },
+        "B": {
+          "exit": 1,
+          "seconds": 22.6,
+          "verdict": "error",
+          "cost_usd": 0.0065,
+          "output_tail": "ield required [type=missing, input_value={'requirements': [{'id': ...st: list) -> list:`.'}]}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing\nblocking_questions\n  Field required [type=missing, input_value={'requirements': [{'id': ...st: list) -> list:`.'}]}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing\n",
+          "score": 0,
+          "total": 5,
+          "fraction": 0.0,
+          "detail": {
+            "overlapping": false,
+            "adjacent_merge": false,
+            "unsorted_input": false,
+            "empty": false,
+            "does_not_mutate_input": false
+          }
+        }
+      }
+    },
+    {
+      "task": "eval_rpn",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 18.2,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "contains a `.`).\n- On an operator (`+`, `-`, `*`, `/`), pops the two most recent operands, applies the op in correct order (`a op b`), and pushes the result.\n- Raises `ValueError` on malformed input (too few operands, or a leftover stack that isn't a single value).\n\nQuick check:\n\n```python\neval_rpn([\"2\", \"3\", \"+\", \"4\", \"*\"])   # 20\neval_rpn([\"5\", \"1\", \"2\", \"+\", \"4\", \"*\", \"+\", \"3\", \"-\"])  # 14\n```\n",
+          "score": 5,
+          "total": 7,
+          "fraction": 0.714,
+          "detail": {
+            "basic_add": true,
+            "leetcode_example": true,
+            "trunc_toward_zero_pos": false,
+            "trunc_toward_zero_neg": false,
+            "too_few_operands_raises": true,
+            "leftover_operands_raises": true,
+            "div_by_zero_raises": true
+          }
+        },
+        "B": {
+          "exit": 124,
+          "seconds": 1201.2,
+          "verdict": "error",
+          "cost_usd": 0.0439,
+          "output_tail": "2026-07-03 01:04:07 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n2026-07-03 01:04:07 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n2026-07-03 01:04:07 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n2026-07-03 01:04:07 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n",
+          "score": 5,
+          "total": 7,
+          "fraction": 0.714,
+          "detail": {
+            "basic_add": true,
+            "leetcode_example": true,
+            "trunc_toward_zero_pos": false,
+            "trunc_toward_zero_neg": false,
+            "too_few_operands_raises": true,
+            "leftover_operands_raises": true,
+            "div_by_zero_raises": true
+          }
+        }
+      }
+    },
+    {
+      "task": "base_convert",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 34.5,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "r` on empty input, out-of-range bases, or digits invalid for the source base (e.g. `'9'` in base 2).\n\nQuick examples of expected behavior: `base_convert('ff', 16, 2)` \u2192 `'11111111'`, `base_convert('1010', 2, 10)` \u2192 `'10'`, `base_convert('-ff', 16, 10)` \u2192 `'-255'`, `base_convert('z', 36, 10)` \u2192 `'35'`.\n\nIf you'd like, I can add a small test file \u2014 or you can approve the test command to see it run.\n",
+          "score": 8,
+          "total": 8,
+          "fraction": 1.0,
+          "detail": {
+            "hex_to_bin": true,
+            "bin_to_hex_lowercase": true,
+            "zero": true,
+            "base36_digit": true,
+            "case_insensitive_input": true,
+            "leading_zeros": true,
+            "invalid_digit_raises": true,
+            "base_out_of_range_raises": true
+          }
+        },
+        "B": {
+          "exit": 124,
+          "seconds": 1201.3,
+          "verdict": "error",
+          "cost_usd": 0.0517,
+          "output_tail": "2026-07-03 01:39:01 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n2026-07-03 01:39:01 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n2026-07-03 01:39:01 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n2026-07-03 01:39:01 WARNING [devcouncil.llm.router] LLM request failed (attempt 1/3): . Retrying...\n",
+          "score": 7,
+          "total": 8,
+          "fraction": 0.875,
+          "detail": {
+            "hex_to_bin": true,
+            "bin_to_hex_lowercase": false,
+            "zero": true,
+            "base36_digit": true,
+            "case_insensitive_input": true,
+            "leading_zeros": true,
+            "invalid_digit_raises": true,
+            "base_out_of_range_raises": true
+          }
+        }
+      }
+    },
+    {
+      "task": "parse_csv_line",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 22.2,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "led `\"\"` inside a quoted field becomes a single literal `\"`.\n- **Unquoted fields** \u2014 split on the delimiter as normal.\n\nThe `delimiter` and `quotechar` are parameterized (defaulting to `,` and `\"`) so it works for other separators too.\n\nQuick behavior examples:\n- `a,b,c` \u2192 `['a', 'b', 'c']`\n- `\"a,b\",c` \u2192 `['a,b', 'c']`\n- `\"she said \"\"hi\"\"\",x` \u2192 `['she said \"hi\"', 'x']`\n- `a,,c` \u2192 `['a', '', 'c']`\n",
+          "score": 6,
+          "total": 6,
+          "fraction": 1.0,
+          "detail": {
+            "plain": true,
+            "quoted_comma": true,
+            "escaped_quotes": true,
+            "empty_fields": true,
+            "trailing_comma": true,
+            "empty_line_one_field": true
+          }
+        },
+        "B": {
+          "exit": 1,
+          "seconds": 27.8,
+          "verdict": "error",
+          "cost_usd": 0.0106,
+          "output_tail": "   For further information visit https://errors.pydantic.dev/2.13/v/string_type\nrationale\n  Field required [type=missing, input_value={'id': None}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing\ntasks\n  Field required [type=missing, input_value={'id': None}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing\n",
+          "score": 0,
+          "total": 6,
+          "fraction": 0.0,
+          "detail": {
+            "plain": false,
+            "quoted_comma": false,
+            "escaped_quotes": false,
+            "empty_fields": false,
+            "trailing_comma": false,
+            "empty_line_one_field": false
+          }
+        }
+      }
+    },
+    {
+      "task": "flatten",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 15.7,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "ened contents of any nested list:\n\n```python\ndef flatten(nested):\n    \"\"\"Flatten an arbitrarily nested list into a single flat list.\"\"\"\n    result = []\n    for item in nested:\n        if isinstance(item, list):\n            result.extend(flatten(item))\n        else:\n            result.append(item)\n    return result\n```\n\nFor example, `flatten([1, [2, [3, 4], 5], [6]])` returns `[1, 2, 3, 4, 5, 6]`.\n",
+          "score": 6,
+          "total": 6,
+          "fraction": 1.0,
+          "detail": {
+            "deep_nesting": true,
+            "empty": true,
+            "strings_are_atomic": true,
+            "mixed": true,
+            "empty_nested_vanish": true,
+            "does_not_mutate_input": true
+          }
+        },
+        "B": {
+          "exit": 1,
+          "seconds": 37.8,
+          "verdict": "error",
+          "cost_usd": 0.0165,
+          "output_tail": "rce\n  Field required [type=missing, input_value={'id': 'REQ-1', 'title': ...s should be preserved.'}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing\nfinal_tasks\n  Field required [type=missing, input_value={'accepted_finding_ids': ...should be preserved.'}]}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing\n",
+          "score": 0,
+          "total": 6,
+          "fraction": 0.0,
+          "detail": {
+            "deep_nesting": false,
+            "empty": false,
+            "strings_are_atomic": false,
+            "mixed": false,
+            "empty_nested_vanish": false,
+            "does_not_mutate_input": false
+          }
+        }
+      }
+    },
+    {
+      "task": "parse_duration",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 38.6,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "W'`)\n- Raises `ValueError` on empty or malformed input (e.g. `'abc'`, or stray characters), and `TypeError` on non-strings\n\nIt uses a regex to tokenize `<number><unit>` pairs and verifies the whole string is consumed, so partially-invalid input like `'1h!!'` is rejected rather than silently accepted. Want me to add a test file, or should I try running the verification (it needs command approval)?\n",
+          "score": 7,
+          "total": 8,
+          "fraction": 0.875,
+          "detail": {
+            "seconds": true,
+            "combined": true,
+            "days": true,
+            "case_insensitive": true,
+            "whitespace_ignored": false,
+            "empty_raises": true,
+            "number_without_unit_raises": true,
+            "unknown_unit_raises": true
+          }
+        },
+        "B": {
+          "exit": 124,
+          "seconds": 1201.4,
+          "verdict": "error",
+          "cost_usd": 0.0474,
+          "output_tail": "durations.\n2026-07-03 02:54:56 WARNING [devcouncil.cli.commands.run] claude finished but install-pytest blocked by verification gaps\n2026-07-03 02:59:17 WARNING [devcouncil.cli.commands.run] claude finished but install-pytest blocked by verification gaps\n2026-07-03 02:59:17 WARNING [devcouncil.cli.commands.go] install-pytest: repair made no progress (identical gaps) after attempt 1; stopping loop\n",
+          "score": 7,
+          "total": 8,
+          "fraction": 0.875,
+          "detail": {
+            "seconds": true,
+            "combined": true,
+            "days": false,
+            "case_insensitive": true,
+            "whitespace_ignored": true,
+            "empty_raises": true,
+            "number_without_unit_raises": true,
+            "unknown_unit_raises": true
+          }
+        }
+      }
+    }
+  ]
+}

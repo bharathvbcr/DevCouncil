@@ -1,0 +1,501 @@
+{
+  "model": "hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0",
+  "samples": 3,
+  "per_criterion": true,
+  "tasks": {
+    "median": {
+      "compile_seconds": 38.9,
+      "arms": {
+        "reference": {
+          "AC-001": {
+            "verdict": "split",
+            "runs": [
+              {
+                "command": "python -c \"import stats; assert stats.median([3, 1, 2]) == 2\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              },
+              {
+                "command": "python -c \"import stats; assert stats.median([5, 1, 3, 9, 7]) == 3\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nAssertionError\n"
+              }
+            ]
+          },
+          "AC-002": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import stats; result = stats.median([1, 2, 3, 4]); assert isinstance(result, float), f'Expected float but got {type(result).__name__}'; assert result == 2.5, f'Expected 2.5 but got {result}'\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              },
+              {
+                "command": "python -c \"import stats; assert isinstance(stats.median([1, 4, 2, 3]), float); assert stats.median([1, 4, 2, 3]) == 2.5\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              },
+              {
+                "command": "python -c \"import stats; result = stats.median([1, 5, 3, 4]); assert abs(result - 3.5) < 1e-9, f'expected 3.5 but got {result}'; assert isinstance(result, float), 'median of even-length list must return a float'",
+                "exit": 2,
+                "unrunnable": false,
+                "stderr": "/bin/sh: -c: line 0: unexpected EOF while looking for matching `\"'\n/bin/sh: -c: line 1: syntax error: unexpected end of file\n"
+              }
+            ]
+          },
+          "AC-003": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"\nimport stats\noriginal = [5, 2, 8, 1, 9]\ncopy = list(original)\nresult = stats.median(original)\nassert original == copy, 'Input was mutated'\nprint('OK')\n\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              },
+              {
+                "command": "python -c \"import stats\noriginal = [5, 2, 8, 1, 9]\ncopy = list(original)\nresult = stats.median(original)\nassert result == 5.0, f'wrong median: {result}'\nassert original == copy, f'mutated input: {original} vs {copy}'\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              },
+              {
+                "command": "python -c \"\nimport stats\n# Use an unsorted list with distinct elements to test that median does not mutate input\noriginal = [5, 1, 4, 2, 3]\ncopy = list(original)\nresult = stats.median(original)\nassert original == copy, 'Input list was mutated'\nprint('OK')\n\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          },
+          "AC-004": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import stats\ntry: stats.median([])\nexcept ValueError: pass\nelse: raise SystemExit(1)\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          }
+        },
+        "buggy": {
+          "AC-001": {
+            "verdict": "split",
+            "runs": [
+              {
+                "command": "python -c \"import stats; assert stats.median([3, 1, 2]) == 2\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              },
+              {
+                "command": "python -c \"import stats; assert stats.median([5, 1, 3, 9, 7]) == 3\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nAssertionError\n"
+              }
+            ]
+          },
+          "AC-002": {
+            "verdict": "failed",
+            "runs": [
+              {
+                "command": "python -c \"import stats; result = stats.median([1, 2, 3, 4]); assert isinstance(result, float), f'Expected float but got {type(result).__name__}'; assert result == 2.5, f'Expected 2.5 but got {result}'\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nAssertionError: Expected float but got int\n"
+              },
+              {
+                "command": "python -c \"import stats; assert isinstance(stats.median([1, 4, 2, 3]), float); assert stats.median([1, 4, 2, 3]) == 2.5\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nAssertionError\n"
+              },
+              {
+                "command": "python -c \"import stats; result = stats.median([1, 5, 3, 4]); assert abs(result - 3.5) < 1e-9, f'expected 3.5 but got {result}'; assert isinstance(result, float), 'median of even-length list must return a float'",
+                "exit": 2,
+                "unrunnable": false,
+                "stderr": "/bin/sh: -c: line 0: unexpected EOF while looking for matching `\"'\n/bin/sh: -c: line 1: syntax error: unexpected end of file\n"
+              }
+            ]
+          },
+          "AC-003": {
+            "verdict": "failed",
+            "runs": [
+              {
+                "command": "python -c \"\nimport stats\noriginal = [5, 2, 8, 1, 9]\ncopy = list(original)\nresult = stats.median(original)\nassert original == copy, 'Input was mutated'\nprint('OK')\n\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 6, in <module>\nAssertionError: Input was mutated\n"
+              },
+              {
+                "command": "python -c \"import stats\noriginal = [5, 2, 8, 1, 9]\ncopy = list(original)\nresult = stats.median(original)\nassert result == 5.0, f'wrong median: {result}'\nassert original == copy, f'mutated input: {original} vs {copy}'\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 6, in <module>\nAssertionError: mutated input: [1, 2, 5, 8, 9] vs [5, 2, 8, 1, 9]\n"
+              },
+              {
+                "command": "python -c \"\nimport stats\n# Use an unsorted list with distinct elements to test that median does not mutate input\noriginal = [5, 1, 4, 2, 3]\ncopy = list(original)\nresult = stats.median(original)\nassert original == copy, 'Input list was mutated'\nprint('OK')\n\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 7, in <module>\nAssertionError: Input list was mutated\n"
+              }
+            ]
+          },
+          "AC-004": {
+            "verdict": "failed",
+            "runs": [
+              {
+                "command": "python -c \"import stats\ntry: stats.median([])\nexcept ValueError: pass\nelse: raise SystemExit(1)\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 2, in <module>\n  File \"/private/var/folders/wl/qc_0nnp91cd5kfy179krkjxr0000gn/T/dc_probe_median_h55ri277/stats.py\", line 8, in median\n    return (values[mid - 1] + values[mid]) // 2\n            ~~~~~~^^^^^^^^^\nIndexError: list index out of range\n"
+              }
+            ]
+          }
+        }
+      },
+      "compiled": {
+        "AC-001": [
+          "python -c \"import stats; assert stats.median([3, 1, 2]) == 2\"",
+          "python -c \"import stats; assert stats.median([5, 1, 3, 9, 7]) == 3\""
+        ],
+        "AC-002": [
+          "python -c \"import stats; result = stats.median([1, 2, 3, 4]); assert isinstance(result, float), f'Expected float but got {type(result).__name__}'; assert result == 2.5, f'Expected 2.5 but got {result}'\"",
+          "python -c \"import stats; assert isinstance(stats.median([1, 4, 2, 3]), float); assert stats.median([1, 4, 2, 3]) == 2.5\"",
+          "python -c \"import stats; result = stats.median([1, 5, 3, 4]); assert abs(result - 3.5) < 1e-9, f'expected 3.5 but got {result}'; assert isinstance(result, float), 'median of even-length list must return a float'"
+        ],
+        "AC-003": [
+          "python -c \"\nimport stats\noriginal = [5, 2, 8, 1, 9]\ncopy = list(original)\nresult = stats.median(original)\nassert original == copy, 'Input was mutated'\nprint('OK')\n\"",
+          "python -c \"import stats\noriginal = [5, 2, 8, 1, 9]\ncopy = list(original)\nresult = stats.median(original)\nassert result == 5.0, f'wrong median: {result}'\nassert original == copy, f'mutated input: {original} vs {copy}'\"",
+          "python -c \"\nimport stats\n# Use an unsorted list with distinct elements to test that median does not mutate input\noriginal = [5, 1, 4, 2, 3]\ncopy = list(original)\nresult = stats.median(original)\nassert original == copy, 'Input list was mutated'\nprint('OK')\n\""
+        ],
+        "AC-004": [
+          "python -c \"import stats\ntry: stats.median([])\nexcept ValueError: pass\nelse: raise SystemExit(1)\""
+        ]
+      },
+      "coverage": "4/4"
+    },
+    "chunk": {
+      "compile_seconds": 42.8,
+      "arms": {
+        "reference": {
+          "AC-001": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import lists\nassert lists.chunk([1,2,3,4,5], 2) == [[1,2],[3,4],[5]]\nassert lists.chunk([], 3) == []\nassert lists.chunk([1], 2) == [[1]]\nassert lists.chunk([1,2,3,4], 3) == [[1,2,3],[4]]\ntry:\n    lists.chunk([1], 0)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\ntry:\n    lists.chunk([1], -1)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              },
+              {
+                "command": "python -c \"import lists\nassert lists.chunk([1,2,3,4,5], 2) == [[1,2],[3,4],[5]]\nassert lists.chunk([], 3) == []\nassert lists.chunk([7], 5) == [[7]]\nassert lists.chunk(list(range(10)), 3) == [list(range(0,3)), list(range(3,6)), list(range(6,9)), [9]]\ntry:\n    lists.chunk([1], 0)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\ntry:\n    lists.chunk([1], -2)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              },
+              {
+                "command": "python -c \"import lists\nassert lists.chunk([1,2,3,4,5], 2) == [[1,2],[3,4],[5]]\ntry:\n    lists.chunk([1,2,3,4,5], 0)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\ntry:\n    lists.chunk([1,2,3,4,5], -1)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\nassert lists.chunk([], 3) == []\nassert lists.chunk([1,2,3,4,5], 7) == [[1,2,3,4,5]]\nassert lists.chunk(list(range(10)), 3) == [list(range(i,i+3)) for i in range(0,10,3)]\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 17, in <module>\nAssertionError\n"
+              }
+            ]
+          },
+          "AC-002": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import lists\ntry: lists.chunk([1, 2], 0)\nexcept ValueError: pass\nelse: raise SystemExit(1)\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              },
+              {
+                "command": "python -c \"import lists\ntry: lists.chunk([1, 2], -5)\nexcept ValueError: pass\nelse: raise SystemExit(1)\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          },
+          "AC-003": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import lists\nresult = lists.chunk([1, 2, 3, 4, 5], 10)\nassert result == [[1, 2, 3, 4, 5]], f'Expected single chunk with all items but got {result}'\nassert len(result) == 1, f'Expected exactly one chunk but got {len(result)} chunks'",
+                "exit": 2,
+                "unrunnable": false,
+                "stderr": "/bin/sh: -c: line 0: unexpected EOF while looking for matching `\"'\n/bin/sh: -c: line 4: syntax error: unexpected end of file\n"
+              },
+              {
+                "command": "python -c \"import lists\nresult = lists.chunk([1, 2, 3, 4, 5], 10)\nassert len(result) == 1, f'Expected 1 chunk but got {len(result)}'\nassert result[0] == [1, 2, 3, 4, 5], f'Expected all items in single chunk but got {result}'\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              },
+              {
+                "command": "python -c \"\nimport lists\nresult = lists.chunk([1, 2, 3, 4, 5], 10)\nassert result == [[1, 2, 3, 4, 5]], f'Expected single chunk with all items but got {result}'\nassert len(result) == 1, f'Expected exactly one chunk but got {len(result)} chunks'\n\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          }
+        },
+        "buggy": {
+          "AC-001": {
+            "verdict": "failed",
+            "runs": [
+              {
+                "command": "python -c \"import lists\nassert lists.chunk([1,2,3,4,5], 2) == [[1,2],[3,4],[5]]\nassert lists.chunk([], 3) == []\nassert lists.chunk([1], 2) == [[1]]\nassert lists.chunk([1,2,3,4], 3) == [[1,2,3],[4]]\ntry:\n    lists.chunk([1], 0)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\ntry:\n    lists.chunk([1], -1)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\"",
+                "exit": 124,
+                "unrunnable": false,
+                "stderr": "TIMEOUT"
+              },
+              {
+                "command": "python -c \"import lists\nassert lists.chunk([1,2,3,4,5], 2) == [[1,2],[3,4],[5]]\nassert lists.chunk([], 3) == []\nassert lists.chunk([7], 5) == [[7]]\nassert lists.chunk(list(range(10)), 3) == [list(range(0,3)), list(range(3,6)), list(range(6,9)), [9]]\ntry:\n    lists.chunk([1], 0)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\ntry:\n    lists.chunk([1], -2)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\"",
+                "exit": 124,
+                "unrunnable": false,
+                "stderr": "TIMEOUT"
+              },
+              {
+                "command": "python -c \"import lists\nassert lists.chunk([1,2,3,4,5], 2) == [[1,2],[3,4],[5]]\ntry:\n    lists.chunk([1,2,3,4,5], 0)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\ntry:\n    lists.chunk([1,2,3,4,5], -1)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\nassert lists.chunk([], 3) == []\nassert lists.chunk([1,2,3,4,5], 7) == [[1,2,3,4,5]]\nassert lists.chunk(list(range(10)), 3) == [list(range(i,i+3)) for i in range(0,10,3)]\"",
+                "exit": 124,
+                "unrunnable": false,
+                "stderr": "TIMEOUT"
+              }
+            ]
+          },
+          "AC-002": {
+            "verdict": "failed",
+            "runs": [
+              {
+                "command": "python -c \"import lists\ntry: lists.chunk([1, 2], 0)\nexcept ValueError: pass\nelse: raise SystemExit(1)\"",
+                "exit": 124,
+                "unrunnable": false,
+                "stderr": "TIMEOUT"
+              },
+              {
+                "command": "python -c \"import lists\ntry: lists.chunk([1, 2], -5)\nexcept ValueError: pass\nelse: raise SystemExit(1)\"",
+                "exit": 124,
+                "unrunnable": false,
+                "stderr": "TIMEOUT"
+              }
+            ]
+          },
+          "AC-003": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import lists\nresult = lists.chunk([1, 2, 3, 4, 5], 10)\nassert result == [[1, 2, 3, 4, 5]], f'Expected single chunk with all items but got {result}'\nassert len(result) == 1, f'Expected exactly one chunk but got {len(result)} chunks'",
+                "exit": 2,
+                "unrunnable": false,
+                "stderr": "/bin/sh: -c: line 0: unexpected EOF while looking for matching `\"'\n/bin/sh: -c: line 4: syntax error: unexpected end of file\n"
+              },
+              {
+                "command": "python -c \"import lists\nresult = lists.chunk([1, 2, 3, 4, 5], 10)\nassert len(result) == 1, f'Expected 1 chunk but got {len(result)}'\nassert result[0] == [1, 2, 3, 4, 5], f'Expected all items in single chunk but got {result}'\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              },
+              {
+                "command": "python -c \"\nimport lists\nresult = lists.chunk([1, 2, 3, 4, 5], 10)\nassert result == [[1, 2, 3, 4, 5]], f'Expected single chunk with all items but got {result}'\nassert len(result) == 1, f'Expected exactly one chunk but got {len(result)} chunks'\n\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          }
+        }
+      },
+      "compiled": {
+        "AC-001": [
+          "python -c \"import lists\nassert lists.chunk([1,2,3,4,5], 2) == [[1,2],[3,4],[5]]\nassert lists.chunk([], 3) == []\nassert lists.chunk([1], 2) == [[1]]\nassert lists.chunk([1,2,3,4], 3) == [[1,2,3],[4]]\ntry:\n    lists.chunk([1], 0)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\ntry:\n    lists.chunk([1], -1)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\"",
+          "python -c \"import lists\nassert lists.chunk([1,2,3,4,5], 2) == [[1,2],[3,4],[5]]\nassert lists.chunk([], 3) == []\nassert lists.chunk([7], 5) == [[7]]\nassert lists.chunk(list(range(10)), 3) == [list(range(0,3)), list(range(3,6)), list(range(6,9)), [9]]\ntry:\n    lists.chunk([1], 0)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\ntry:\n    lists.chunk([1], -2)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\"",
+          "python -c \"import lists\nassert lists.chunk([1,2,3,4,5], 2) == [[1,2],[3,4],[5]]\ntry:\n    lists.chunk([1,2,3,4,5], 0)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\ntry:\n    lists.chunk([1,2,3,4,5], -1)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\nassert lists.chunk([], 3) == []\nassert lists.chunk([1,2,3,4,5], 7) == [[1,2,3,4,5]]\nassert lists.chunk(list(range(10)), 3) == [list(range(i,i+3)) for i in range(0,10,3)]\""
+        ],
+        "AC-002": [
+          "python -c \"import lists\ntry: lists.chunk([1, 2], 0)\nexcept ValueError: pass\nelse: raise SystemExit(1)\"",
+          "python -c \"import lists\ntry: lists.chunk([1, 2], -5)\nexcept ValueError: pass\nelse: raise SystemExit(1)\""
+        ],
+        "AC-003": [
+          "python -c \"import lists\nresult = lists.chunk([1, 2, 3, 4, 5], 10)\nassert result == [[1, 2, 3, 4, 5]], f'Expected single chunk with all items but got {result}'\nassert len(result) == 1, f'Expected exactly one chunk but got {len(result)} chunks'",
+          "python -c \"import lists\nresult = lists.chunk([1, 2, 3, 4, 5], 10)\nassert len(result) == 1, f'Expected 1 chunk but got {len(result)}'\nassert result[0] == [1, 2, 3, 4, 5], f'Expected all items in single chunk but got {result}'\"",
+          "python -c \"\nimport lists\nresult = lists.chunk([1, 2, 3, 4, 5], 10)\nassert result == [[1, 2, 3, 4, 5]], f'Expected single chunk with all items but got {result}'\nassert len(result) == 1, f'Expected exactly one chunk but got {len(result)} chunks'\n\""
+        ]
+      },
+      "coverage": "3/3"
+    },
+    "parse_kv": {
+      "compile_seconds": 36.9,
+      "arms": {
+        "reference": {
+          "AC-001": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import config\nresult = config.parse_kv('  key1 = value1 \\n# comment with = sign\\nkey2=value=with=equals\\n  key3 = value3  ')\nassert result == {'key1': 'value1', 'key2': 'value=with=equals', 'key3': 'value3'}, f'Got: {result}'\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              },
+              {
+                "command": "python -c \"\nimport config\nresult = config.parse_kv('  key1 = value1 \\n# comment with = sign\\nkey2=value=extra\\n  key3 = spaced \\n')\nassert result == {'key1': 'value1', 'key2': 'value=extra', 'key3': 'spaced'}, f'Unexpected: {result}'\n\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              },
+              {
+                "command": "python -c \"import config\nresult = config.parse_kv('  key1 = value1 \n key2=value2  \n# comment\nkey3= val with = signs ')\nassert result == {'key1': 'value1', 'key2': 'value2', 'key3': 'val with = signs'}, f'Got: {result}'\nassert '#' not in str(result)\"",
+                "exit": 1,
+                "unrunnable": true,
+                "stderr": "  File \"<string>\", line 2\n    result = config.parse_kv('  key1 = value1 \n                             ^\nSyntaxError: unterminated string literal (detected at line 2)\n"
+              }
+            ]
+          },
+          "AC-002": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import config\nresult = config.parse_kv('# c=3\\n\\na=1\\nb=2#value\\n')\nassert result == {'c': '3', 'a': '1', 'b': '2#value'}, f'Got: {result}'\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 3, in <module>\nAssertionError: Got: {'a': '1', 'b': '2#value'}\n"
+              },
+              {
+                "command": "python -c \"import config\nresult = config.parse_kv('# c=3\\n\\nk=1\\n# d=4\\nv=2=3')\nassert result == {'k': '1', 'v': '2=3'}, f'Got {result}'\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              },
+              {
+                "command": "python -c \"\nimport config\nresult = config.parse_kv('# c=3\\na=b=1\\n\\nk=v=x=y=z')\nassert result == {'a': 'b=1', 'k': 'v=x=y=z'}, f'Got {result}'\n\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          },
+          "AC-003": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import config\nresult = config.parse_kv('url=http://x?a=b')\nassert result == {'url': 'http://x?a=b'}, f'Got: {result}'\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              },
+              {
+                "command": "python -c \"import config\nresult = config.parse_kv('url=http://x?a=b')\nassert result == {'url': 'http://x?a=b'}, f'Expected url to contain the full value with embedded equals, got {result}'\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              },
+              {
+                "command": "python -c \"import config\nresult = config.parse_kv('url=http://x?a=b')\nassert result == {'url': 'http://x?a=b'}, f'Expected url=http://x?a=b but got {result}'\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          }
+        },
+        "buggy": {
+          "AC-001": {
+            "verdict": "failed",
+            "runs": [
+              {
+                "command": "python -c \"import config\nresult = config.parse_kv('  key1 = value1 \\n# comment with = sign\\nkey2=value=with=equals\\n  key3 = value3  ')\nassert result == {'key1': 'value1', 'key2': 'value=with=equals', 'key3': 'value3'}, f'Got: {result}'\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 3, in <module>\nAssertionError: Got: {'key1': 'value1', '# comment with': 'sign', 'key2': 'value', 'key3': 'value3'}\n"
+              },
+              {
+                "command": "python -c \"\nimport config\nresult = config.parse_kv('  key1 = value1 \\n# comment with = sign\\nkey2=value=extra\\n  key3 = spaced \\n')\nassert result == {'key1': 'value1', 'key2': 'value=extra', 'key3': 'spaced'}, f'Unexpected: {result}'\n\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 4, in <module>\nAssertionError: Unexpected: {'key1': 'value1', '# comment with': 'sign', 'key2': 'value', 'key3': 'spaced'}\n"
+              },
+              {
+                "command": "python -c \"import config\nresult = config.parse_kv('  key1 = value1 \n key2=value2  \n# comment\nkey3= val with = signs ')\nassert result == {'key1': 'value1', 'key2': 'value2', 'key3': 'val with = signs'}, f'Got: {result}'\nassert '#' not in str(result)\"",
+                "exit": 1,
+                "unrunnable": true,
+                "stderr": "  File \"<string>\", line 2\n    result = config.parse_kv('  key1 = value1 \n                             ^\nSyntaxError: unterminated string literal (detected at line 2)\n"
+              }
+            ]
+          },
+          "AC-002": {
+            "verdict": "failed",
+            "runs": [
+              {
+                "command": "python -c \"import config\nresult = config.parse_kv('# c=3\\n\\na=1\\nb=2#value\\n')\nassert result == {'c': '3', 'a': '1', 'b': '2#value'}, f'Got: {result}'\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 3, in <module>\nAssertionError: Got: {'# c': '3', 'a': '1', 'b': '2#value'}\n"
+              },
+              {
+                "command": "python -c \"import config\nresult = config.parse_kv('# c=3\\n\\nk=1\\n# d=4\\nv=2=3')\nassert result == {'k': '1', 'v': '2=3'}, f'Got {result}'\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 3, in <module>\nAssertionError: Got {'# c': '3', 'k': '1', '# d': '4', 'v': '2'}\n"
+              },
+              {
+                "command": "python -c \"\nimport config\nresult = config.parse_kv('# c=3\\na=b=1\\n\\nk=v=x=y=z')\nassert result == {'a': 'b=1', 'k': 'v=x=y=z'}, f'Got {result}'\n\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 4, in <module>\nAssertionError: Got {'# c': '3', 'a': 'b', 'k': 'v'}\n"
+              }
+            ]
+          },
+          "AC-003": {
+            "verdict": "failed",
+            "runs": [
+              {
+                "command": "python -c \"import config\nresult = config.parse_kv('url=http://x?a=b')\nassert result == {'url': 'http://x?a=b'}, f'Got: {result}'\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 3, in <module>\nAssertionError: Got: {'url': 'http://x?a'}\n"
+              },
+              {
+                "command": "python -c \"import config\nresult = config.parse_kv('url=http://x?a=b')\nassert result == {'url': 'http://x?a=b'}, f'Expected url to contain the full value with embedded equals, got {result}'\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 3, in <module>\nAssertionError: Expected url to contain the full value with embedded equals, got {'url': 'http://x?a'}\n"
+              },
+              {
+                "command": "python -c \"import config\nresult = config.parse_kv('url=http://x?a=b')\nassert result == {'url': 'http://x?a=b'}, f'Expected url=http://x?a=b but got {result}'\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 3, in <module>\nAssertionError: Expected url=http://x?a=b but got {'url': 'http://x?a'}\n"
+              }
+            ]
+          }
+        }
+      },
+      "compiled": {
+        "AC-001": [
+          "python -c \"import config\nresult = config.parse_kv('  key1 = value1 \\n# comment with = sign\\nkey2=value=with=equals\\n  key3 = value3  ')\nassert result == {'key1': 'value1', 'key2': 'value=with=equals', 'key3': 'value3'}, f'Got: {result}'\"",
+          "python -c \"\nimport config\nresult = config.parse_kv('  key1 = value1 \\n# comment with = sign\\nkey2=value=extra\\n  key3 = spaced \\n')\nassert result == {'key1': 'value1', 'key2': 'value=extra', 'key3': 'spaced'}, f'Unexpected: {result}'\n\"",
+          "python -c \"import config\nresult = config.parse_kv('  key1 = value1 \n key2=value2  \n# comment\nkey3= val with = signs ')\nassert result == {'key1': 'value1', 'key2': 'value2', 'key3': 'val with = signs'}, f'Got: {result}'\nassert '#' not in str(result)\""
+        ],
+        "AC-002": [
+          "python -c \"import config\nresult = config.parse_kv('# c=3\\n\\na=1\\nb=2#value\\n')\nassert result == {'c': '3', 'a': '1', 'b': '2#value'}, f'Got: {result}'\"",
+          "python -c \"import config\nresult = config.parse_kv('# c=3\\n\\nk=1\\n# d=4\\nv=2=3')\nassert result == {'k': '1', 'v': '2=3'}, f'Got {result}'\"",
+          "python -c \"\nimport config\nresult = config.parse_kv('# c=3\\na=b=1\\n\\nk=v=x=y=z')\nassert result == {'a': 'b=1', 'k': 'v=x=y=z'}, f'Got {result}'\n\""
+        ],
+        "AC-003": [
+          "python -c \"import config\nresult = config.parse_kv('url=http://x?a=b')\nassert result == {'url': 'http://x?a=b'}, f'Got: {result}'\"",
+          "python -c \"import config\nresult = config.parse_kv('url=http://x?a=b')\nassert result == {'url': 'http://x?a=b'}, f'Expected url to contain the full value with embedded equals, got {result}'\"",
+          "python -c \"import config\nresult = config.parse_kv('url=http://x?a=b')\nassert result == {'url': 'http://x?a=b'}, f'Expected url=http://x?a=b but got {result}'\""
+        ]
+      },
+      "coverage": "3/3"
+    }
+  }
+}

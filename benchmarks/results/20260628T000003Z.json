@@ -1,0 +1,129 @@
+{
+  "model": "google/gemini-2.5-flash",
+  "executor": "claude",
+  "monitor": {
+    "provider": "ollama",
+    "model": "hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0",
+    "roles": [
+      "implementation_reviewer",
+      "live_reviewer"
+    ]
+  },
+  "records": [
+    {
+      "task": "median",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 13.8,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Added a `median(values)` function to `stats.py`. It sorts the values and returns the middle element for odd-length lists, or the average of the two middle elements for even-length lists.\n",
+          "score": 3,
+          "total": 4,
+          "fraction": 0.75,
+          "detail": {
+            "odd_value": true,
+            "even_is_average_float": true,
+            "does_not_mutate_input": true,
+            "empty_raises_valueerror": false
+          }
+        },
+        "B": {
+          "exit": 1,
+          "seconds": 382.7,
+          "verdict": "blocked",
+          "cost_usd": 0.0397,
+          "output_tail": "eview                                                                     \n\n \u2022 Pending signals: 0                                                           \n \u2022 Open cards: 0                                                                \n \u2022 Open critical cards: 0                                                       \n \u2022 Blocking cards in scope: None.                                               \n",
+          "score": 4,
+          "total": 4,
+          "fraction": 1.0,
+          "detail": {
+            "odd_value": true,
+            "even_is_average_float": true,
+            "does_not_mutate_input": true,
+            "empty_raises_valueerror": true
+          }
+        }
+      }
+    },
+    {
+      "task": "chunk",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 18.1,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "e <= 0:\n        raise ValueError(\"size must be a positive integer\")\n    return [items[i:i + size] for i in range(0, len(items), size)]\n```\n\nIt slices the list in `size`-length steps. A non-positive `size` would otherwise cause an infinite/empty result, so it raises `ValueError`. The last chunk is shorter when the length isn't an exact multiple \u2014 e.g. `chunk([1,2,3,4,5], 2)` \u2192 `[[1,2],[3,4],[5]]`.\n",
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "even_split": true,
+            "last_partial_chunk": true,
+            "size_zero_raises": true,
+            "size_larger_than_list": true,
+            "does_not_mutate_input": true
+          }
+        },
+        "B": {
+          "exit": 0,
+          "seconds": 270.3,
+          "verdict": "incomplete",
+          "cost_usd": 0.041,
+          "output_tail": "eview                                                                     \n\n \u2022 Pending signals: 0                                                           \n \u2022 Open cards: 0                                                                \n \u2022 Open critical cards: 0                                                       \n \u2022 Blocking cards in scope: None.                                               \n",
+          "score": 1,
+          "total": 5,
+          "fraction": 0.2,
+          "detail": {
+            "even_split": false,
+            "last_partial_chunk": false,
+            "size_zero_raises": false,
+            "size_larger_than_list": false,
+            "does_not_mutate_input": true
+          }
+        }
+      }
+    },
+    {
+      "task": "parse_kv",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 20.3,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": " for line in text.splitlines():\n        line = line.strip()\n        if not line or \"=\" not in line:\n            continue\n        key, value = line.split(\"=\", 1)\n        result[key.strip()] = value.strip()\n    return result\n```\n\nIt splits on the first `=` (so values may contain `=`), strips whitespace from keys/values, and skips blank lines or lines without `=`. Duplicate keys keep the last value.\n",
+          "score": 4,
+          "total": 5,
+          "fraction": 0.8,
+          "detail": {
+            "basic": true,
+            "skips_blank_and_comments": false,
+            "strips_whitespace": true,
+            "splits_on_first_equals": true,
+            "duplicate_last_wins": true
+          }
+        },
+        "B": {
+          "exit": 1,
+          "seconds": 522.7,
+          "verdict": "blocked",
+          "cost_usd": 0.0508,
+          "output_tail": "eview                                                                     \n\n \u2022 Pending signals: 0                                                           \n \u2022 Open cards: 0                                                                \n \u2022 Open critical cards: 0                                                       \n \u2022 Blocking cards in scope: None.                                               \n",
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "basic": true,
+            "skips_blank_and_comments": true,
+            "strips_whitespace": true,
+            "splits_on_first_equals": true,
+            "duplicate_last_wins": true
+          }
+        }
+      }
+    }
+  ]
+}

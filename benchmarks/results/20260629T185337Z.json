@@ -1,0 +1,39 @@
+{
+  "model": "google/gemini-2.5-flash",
+  "executor": "claude",
+  "monitor": {
+    "provider": "openrouter",
+    "model": "anthropic/claude-sonnet-4.6",
+    "roles": [
+      "implementation_reviewer"
+    ]
+  },
+  "acceptance_checks": {
+    "samples": 1,
+    "repair_attempts": 1,
+    "per_criterion": false
+  },
+  "records": [
+    {
+      "task": "median",
+      "arms": {
+        "B": {
+          "exit": 0,
+          "seconds": 231.9,
+          "verdict": "incomplete",
+          "cost_usd": 0.4245,
+          "output_tail": " conversion (e.g., `Decimal`, `Fraction`) or strictly raise a `TypeError` for anything not `int` or `float`?; requirement_not_planned: Blocking question remains unanswered: Are there any existing utility functions within `stats.py` or the broader codebase that should be leveraged for sorting or averaging, or should the `median` function be entirely self-contained using standard library functions?\n",
+          "score": 4,
+          "total": 4,
+          "fraction": 1.0,
+          "detail": {
+            "odd_value": true,
+            "even_is_average_float": true,
+            "does_not_mutate_input": true,
+            "empty_raises_valueerror": true
+          }
+        }
+      }
+    }
+  ]
+}

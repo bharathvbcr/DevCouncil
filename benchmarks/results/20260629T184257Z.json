@@ -1,0 +1,39 @@
+{
+  "model": "google/gemini-2.5-flash",
+  "executor": "claude",
+  "monitor": {
+    "provider": "openrouter",
+    "model": "anthropic/claude-sonnet-4.6",
+    "roles": [
+      "implementation_reviewer"
+    ]
+  },
+  "acceptance_checks": {
+    "samples": 1,
+    "repair_attempts": 1,
+    "per_criterion": false
+  },
+  "records": [
+    {
+      "task": "median",
+      "arms": {
+        "B": {
+          "exit": 1,
+          "seconds": 611.2,
+          "verdict": "blocked",
+          "cost_usd": 0.5043,
+          "output_tail": "Task run-linter-checks has no planned files. Agents won't know where to write code.\n2026-06-29 13:42:56 WARNING [devcouncil.cli.commands.run] Task run-linter-checks failed readiness gate: Task run-linter-checks has no planned files. Agents won't know where to write code.\n2026-06-29 13:42:56 WARNING [devcouncil.cli.commands.go] dev go finished with 1 unfinished task(s): run-linter-checks (blocked)\n",
+          "score": 4,
+          "total": 4,
+          "fraction": 1.0,
+          "detail": {
+            "odd_value": true,
+            "even_is_average_float": true,
+            "does_not_mutate_input": true,
+            "empty_raises_valueerror": true
+          }
+        }
+      }
+    }
+  ]
+}

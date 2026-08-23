@@ -1,0 +1,242 @@
+{
+  "model": "google/gemini-2.5-flash",
+  "executor": "claude",
+  "records": [
+    {
+      "task": "median",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 11.2,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Added `median(values)` to `stats.py`. It sorts the list, then returns the middle element for odd-length lists or the average of the two middle elements for even-length lists.\n",
+          "score": 3,
+          "total": 4,
+          "fraction": 0.75,
+          "detail": {
+            "odd_value": true,
+            "even_is_average_float": true,
+            "does_not_mutate_input": true,
+            "empty_raises_valueerror": false
+          }
+        },
+        "B": {
+          "exit": 0,
+          "seconds": 88.6,
+          "verdict": "passed",
+          "cost_usd": 0.0323,
+          "output_tail": "ive Review                                                                    \n\n \u2022 Pending signals: 0                                                          \n \u2022 Open cards: 0                                                               \n \u2022 Open critical cards: 0                                                      \n \u2022 Blocking cards in scope: None.                                              \n",
+          "score": 4,
+          "total": 4,
+          "fraction": 1.0,
+          "detail": {
+            "odd_value": true,
+            "even_is_average_float": true,
+            "does_not_mutate_input": true,
+            "empty_raises_valueerror": true
+          }
+        }
+      }
+    },
+    {
+      "task": "chunk",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 14.2,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Added `chunk(items, size)` to `lists.py`. It uses a list comprehension with range stepping by `size` to slice the input list into sublists of the given length (the last sublist will be shorter if the list doesn't divide evenly).\n",
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "even_split": true,
+            "last_partial_chunk": true,
+            "size_zero_raises": true,
+            "size_larger_than_list": true,
+            "does_not_mutate_input": true
+          }
+        },
+        "B": {
+          "exit": 1,
+          "seconds": 546.5,
+          "verdict": "blocked",
+          "cost_usd": 0.0532,
+          "output_tail": "e working copy of 'lists.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'test_lists.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'lists.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'test_lists.py', LF will be replaced by CRLF the next time Git touches it\n",
+          "score": 1,
+          "total": 5,
+          "fraction": 0.2,
+          "detail": {
+            "even_split": false,
+            "last_partial_chunk": false,
+            "size_zero_raises": false,
+            "size_larger_than_list": false,
+            "does_not_mutate_input": true
+          }
+        }
+      }
+    },
+    {
+      "task": "roman",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 15.2,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "`roman_to_int` is added to `roman.py`. It iterates the string in reverse, subtracting a numeral's value when it's less than the one that follows it (e.g., `IV` \u2192 subtract 1, add 5 = 4), and adding otherwise.\n",
+          "score": 3,
+          "total": 6,
+          "fraction": 0.5,
+          "detail": {
+            "simple": true,
+            "subtractive_iv": true,
+            "complex_1994": true,
+            "lowercase_accepted": false,
+            "empty_raises": false,
+            "invalid_char_raises": false
+          }
+        },
+        "B": {
+          "exit": 1,
+          "seconds": 535.3,
+          "verdict": "blocked",
+          "cost_usd": 0.0445,
+          "output_tail": "                \n \u2022 Blocking cards in scope: None.                                              \nwarning: in the working copy of 'roman.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'roman.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'roman.py', LF will be replaced by CRLF the next time Git touches it\n",
+          "score": 6,
+          "total": 6,
+          "fraction": 1.0,
+          "detail": {
+            "simple": true,
+            "subtractive_iv": true,
+            "complex_1994": true,
+            "lowercase_accepted": true,
+            "empty_raises": true,
+            "invalid_char_raises": true
+          }
+        }
+      }
+    },
+    {
+      "task": "balanced",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 11.9,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Added `is_balanced(s)` to `brackets.py`. It uses a stack to track opening brackets and verifies each closing bracket matches the most recent opener, returning `False` on any mismatch or unmatched opener, and `True` only when the stack is empty at the end.\n",
+          "score": 6,
+          "total": 6,
+          "fraction": 1.0,
+          "detail": {
+            "simple_pairs": true,
+            "nested": true,
+            "wrong_type_not_balanced": true,
+            "interleaved_not_balanced": true,
+            "empty_is_balanced": true,
+            "ignores_other_chars": true
+          }
+        },
+        "B": {
+          "exit": 0,
+          "seconds": 104.5,
+          "verdict": "incomplete",
+          "cost_usd": 0.0394,
+          "output_tail": "       \n \u2022 Blocking cards in scope: None.                                              \nwarning: in the working copy of 'brackets.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'brackets.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'brackets.py', LF will be replaced by CRLF the next time Git touches it\n",
+          "score": 6,
+          "total": 6,
+          "fraction": 1.0,
+          "detail": {
+            "simple_pairs": true,
+            "nested": true,
+            "wrong_type_not_balanced": true,
+            "interleaved_not_balanced": true,
+            "empty_is_balanced": true,
+            "ignores_other_chars": true
+          }
+        }
+      }
+    },
+    {
+      "task": "parse_kv",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 34.3,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Added `parse_kv(text)` to `config.py`. It splits on newlines, strips whitespace, and uses `partition('=')` to split each line so that values containing `=` are preserved correctly.\n",
+          "score": 4,
+          "total": 5,
+          "fraction": 0.8,
+          "detail": {
+            "basic": true,
+            "skips_blank_and_comments": false,
+            "strips_whitespace": true,
+            "splits_on_first_equals": true,
+            "duplicate_last_wins": true
+          }
+        },
+        "B": {
+          "exit": 1,
+          "seconds": 618.1,
+          "verdict": "blocked",
+          "cost_usd": 0.0681,
+          "output_tail": " copy of 'config.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'test_config.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'test_config.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'test_config.py', LF will be replaced by CRLF the next time Git touches it\n",
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "basic": true,
+            "skips_blank_and_comments": true,
+            "strips_whitespace": true,
+            "splits_on_first_equals": true,
+            "duplicate_last_wins": true
+          }
+        }
+      }
+    },
+    {
+      "task": "merge_intervals",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 14.2,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "`merge_intervals` is added to `intervals.py`. It sorts by start, then iterates through to merge any interval whose start falls within the current merged interval's end.\n",
+          "score": 2,
+          "total": 5,
+          "fraction": 0.4,
+          "detail": {
+            "overlapping": false,
+            "adjacent_merge": false,
+            "unsorted_input": false,
+            "empty": true,
+            "does_not_mutate_input": true
+          }
+        },
+        "B": {
+          "exit": 0,
+          "seconds": 467.9,
+          "verdict": "passed",
+          "cost_usd": 0.058,
+          "output_tail": "    \n \u2022 Blocking cards in scope: None.                                              \nwarning: in the working copy of 'intervals.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'intervals.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'intervals.py', LF will be replaced by CRLF the next time Git touches it\n",
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "overlapping": true,
+            "adjacent_merge": true,
+            "unsorted_input": true,
+            "empty": true,
+            "does_not_mutate_input": true
+          }
+        }
+      }
+    }
+  ]
+}

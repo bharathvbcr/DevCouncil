@@ -1,0 +1,129 @@
+{
+  "model": "google/gemini-2.5-flash",
+  "executor": "claude",
+  "monitor": {
+    "provider": "ollama",
+    "model": "hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0",
+    "roles": [
+      "implementation_reviewer",
+      "live_reviewer"
+    ]
+  },
+  "records": [
+    {
+      "task": "median",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 11.2,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Added `median(values)` to `stats.py`. It sorts the values, returns the middle element for odd-length lists, and averages the two middle elements for even-length lists.\n",
+          "score": 3,
+          "total": 4,
+          "fraction": 0.75,
+          "detail": {
+            "odd_value": true,
+            "even_is_average_float": true,
+            "does_not_mutate_input": true,
+            "empty_raises_valueerror": false
+          }
+        },
+        "B": {
+          "exit": 0,
+          "seconds": 200.3,
+          "verdict": "incomplete",
+          "cost_usd": 0.0354,
+          "output_tail": "eview                                                                     \n\n \u2022 Pending signals: 0                                                           \n \u2022 Open cards: 0                                                                \n \u2022 Open critical cards: 0                                                       \n \u2022 Blocking cards in scope: None.                                               \n",
+          "score": 4,
+          "total": 4,
+          "fraction": 1.0,
+          "detail": {
+            "odd_value": true,
+            "even_is_average_float": true,
+            "does_not_mutate_input": true,
+            "empty_raises_valueerror": true
+          }
+        }
+      }
+    },
+    {
+      "task": "chunk",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 14.6,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "evenly\n    divisible by ``size``.\n    \"\"\"\n    if size <= 0:\n        raise ValueError(\"size must be a positive integer\")\n    return [items[i:i + size] for i in range(0, len(items), size)]\n```\n\nIt slices the list into consecutive sublists of length `size` (the last one shorter if it doesn't divide evenly), and guards against a non-positive `size`. E.g. `chunk([1,2,3,4,5], 2)` \u2192 `[[1,2],[3,4],[5]]`.\n",
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "even_split": true,
+            "last_partial_chunk": true,
+            "size_zero_raises": true,
+            "size_larger_than_list": true,
+            "does_not_mutate_input": true
+          }
+        },
+        "B": {
+          "exit": 1,
+          "seconds": 349.6,
+          "verdict": "blocked",
+          "cost_usd": 0.0379,
+          "output_tail": "eview                                                                     \n\n \u2022 Pending signals: 0                                                           \n \u2022 Open cards: 0                                                                \n \u2022 Open critical cards: 0                                                       \n \u2022 Blocking cards in scope: None.                                               \n",
+          "score": 1,
+          "total": 5,
+          "fraction": 0.2,
+          "detail": {
+            "even_split": false,
+            "last_partial_chunk": false,
+            "size_zero_raises": false,
+            "size_larger_than_list": false,
+            "does_not_mutate_input": true
+          }
+        }
+      }
+    },
+    {
+      "task": "parse_kv",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 12.8,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Added `parse_kv(text)` to `config.py`. It splits the input into lines and for each non-blank line containing `=`, splits on the first `=`, strips whitespace from key and value, and collects them into a dict (last value wins on duplicate keys; lines without `=` are skipped).\n",
+          "score": 4,
+          "total": 5,
+          "fraction": 0.8,
+          "detail": {
+            "basic": true,
+            "skips_blank_and_comments": false,
+            "strips_whitespace": true,
+            "splits_on_first_equals": true,
+            "duplicate_last_wins": true
+          }
+        },
+        "B": {
+          "exit": 0,
+          "seconds": 333.4,
+          "verdict": "incomplete",
+          "cost_usd": 0.0522,
+          "output_tail": "eview                                                                     \n\n \u2022 Pending signals: 0                                                           \n \u2022 Open cards: 0                                                                \n \u2022 Open critical cards: 0                                                       \n \u2022 Blocking cards in scope: None.                                               \n",
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "basic": true,
+            "skips_blank_and_comments": true,
+            "strips_whitespace": true,
+            "splits_on_first_equals": true,
+            "duplicate_last_wins": true
+          }
+        }
+      }
+    }
+  ]
+}

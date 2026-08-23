@@ -1,0 +1,27 @@
+{
+  "model": "google/gemini-2.5-pro",
+  "executor": "claude",
+  "records": [
+    {
+      "task": "median",
+      "arms": {
+        "B": {
+          "exit": 1,
+          "seconds": 475.6,
+          "verdict": "blocked",
+          "cost_usd": 0.4005,
+          "output_tail": "c.dev/2.13/v/missing\nStructured output failed for role 'critic_b'; retrying fresh (attempt 2/2).\nwarning: in the working copy of 'stats.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'stats.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'stats.py', LF will be replaced by CRLF the next time Git touches it\n",
+          "score": 4,
+          "total": 4,
+          "fraction": 1.0,
+          "detail": {
+            "odd_value": true,
+            "even_is_average_float": true,
+            "does_not_mutate_input": true,
+            "empty_raises_valueerror": true
+          }
+        }
+      }
+    }
+  ]
+}

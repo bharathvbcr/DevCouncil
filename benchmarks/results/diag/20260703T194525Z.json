@@ -1,0 +1,70 @@
+{
+  "model": "qwen/qwen3-max",
+  "executor": "claude",
+  "dc_timeout": 2400,
+  "ollama_env": {
+    "OLLAMA_THINK": "false",
+    "OLLAMA_TIMEOUT": "900",
+    "OLLAMA_NUM_PREDICT": null
+  },
+  "monitor": {
+    "provider": "openrouter",
+    "model": "qwen/qwen3-max",
+    "roles": [
+      "implementation_reviewer",
+      "live_reviewer"
+    ]
+  },
+  "acceptance_checks": {
+    "samples": 1,
+    "repair_attempts": 1,
+    "per_criterion": false
+  },
+  "records": [
+    {
+      "task": "median",
+      "arms": {
+        "B": {
+          "exit": 1,
+          "seconds": 144.7,
+          "verdict": "blocked",
+          "cost_usd": 0.0746,
+          "output_tail": " exited 1 for TASK-1: You've hit your session limit \u00b7 resets 2pm (America/Los_Angeles)\n2026-07-03 12:41:51 ERROR   [devcouncil.cli.commands.run] claude failed to start or execute for TASK-1: claude exited with code 1: You've hit your session limit \u00b7 resets 2pm (America/Los_Angeles)\n2026-07-03 12:42:27 WARNING [devcouncil.cli.commands.go] dev go finished with 1 unfinished task(s): TASK-1 (blocked)\n",
+          "attempts": 1,
+          "score": 0,
+          "total": 4,
+          "fraction": 0.0,
+          "detail": {
+            "odd_value": false,
+            "even_is_average_float": false,
+            "does_not_mutate_input": false,
+            "empty_raises_valueerror": false
+          }
+        }
+      }
+    },
+    {
+      "task": "chunk",
+      "arms": {
+        "B": {
+          "exit": 1,
+          "seconds": 177.4,
+          "verdict": "blocked",
+          "cost_usd": 0.1014,
+          "output_tail": " exited 1 for TASK-1: You've hit your session limit \u00b7 resets 2pm (America/Los_Angeles)\n2026-07-03 12:44:15 ERROR   [devcouncil.cli.commands.run] claude failed to start or execute for TASK-1: claude exited with code 1: You've hit your session limit \u00b7 resets 2pm (America/Los_Angeles)\n2026-07-03 12:45:24 WARNING [devcouncil.cli.commands.go] dev go finished with 1 unfinished task(s): TASK-1 (blocked)\n",
+          "attempts": 1,
+          "score": 1,
+          "total": 5,
+          "fraction": 0.2,
+          "detail": {
+            "even_split": false,
+            "last_partial_chunk": false,
+            "size_zero_raises": false,
+            "size_larger_than_list": false,
+            "does_not_mutate_input": true
+          }
+        }
+      }
+    }
+  ]
+}

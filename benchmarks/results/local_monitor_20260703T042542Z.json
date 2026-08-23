@@ -1,0 +1,293 @@
+{
+  "model": "hf.co/deepreinforce-ai/Ornith-1.0-35B-GGUF:Q8_0",
+  "samples": 1,
+  "per_criterion": false,
+  "tasks": {
+    "median": {
+      "compile_seconds": 27.6,
+      "arms": {
+        "reference": {
+          "AC-001": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import stats; assert stats.median([7, 3, 9, 1, 5]) == 5\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          },
+          "AC-002": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import stats; result = stats.median([2, 8]); assert result == 5.0 and isinstance(result, float)\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          },
+          "AC-003": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import stats; lst = [7, 3, 9]; original = lst[:]; stats.median(lst); assert lst == original\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          },
+          "AC-004": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import stats\ntry: stats.median([])\nexcept ValueError: pass\nelse: raise SystemExit(1)\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          }
+        },
+        "buggy": {
+          "AC-001": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import stats; assert stats.median([7, 3, 9, 1, 5]) == 5\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          },
+          "AC-002": {
+            "verdict": "failed",
+            "runs": [
+              {
+                "command": "python -c \"import stats; result = stats.median([2, 8]); assert result == 5.0 and isinstance(result, float)\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nAssertionError\n"
+              }
+            ]
+          },
+          "AC-003": {
+            "verdict": "failed",
+            "runs": [
+              {
+                "command": "python -c \"import stats; lst = [7, 3, 9]; original = lst[:]; stats.median(lst); assert lst == original\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nAssertionError\n"
+              }
+            ]
+          },
+          "AC-004": {
+            "verdict": "failed",
+            "runs": [
+              {
+                "command": "python -c \"import stats\ntry: stats.median([])\nexcept ValueError: pass\nelse: raise SystemExit(1)\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 2, in <module>\n  File \"/private/var/folders/wl/qc_0nnp91cd5kfy179krkjxr0000gn/T/dc_probe_median_t_d6oi5p/stats.py\", line 8, in median\n    return (values[mid - 1] + values[mid]) // 2\n            ~~~~~~^^^^^^^^^\nIndexError: list index out of range\n"
+              }
+            ]
+          }
+        }
+      },
+      "compiled": {
+        "AC-001": [
+          "python -c \"import stats; assert stats.median([7, 3, 9, 1, 5]) == 5\""
+        ],
+        "AC-002": [
+          "python -c \"import stats; result = stats.median([2, 8]); assert result == 5.0 and isinstance(result, float)\""
+        ],
+        "AC-003": [
+          "python -c \"import stats; lst = [7, 3, 9]; original = lst[:]; stats.median(lst); assert lst == original\""
+        ],
+        "AC-004": [
+          "python -c \"import stats\ntry: stats.median([])\nexcept ValueError: pass\nelse: raise SystemExit(1)\""
+        ]
+      },
+      "coverage": "4/4"
+    },
+    "chunk": {
+      "compile_seconds": 23.0,
+      "arms": {
+        "reference": {
+          "AC-001": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import lists\nassert lists.chunk([1, 2, 3, 4, 5], 2) == [[1, 2], [3, 4], [5]]\nassert lists.chunk([], 3) == []\nassert lists.chunk([7], 2) == [[7]]\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          },
+          "AC-002": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import lists\ntry:\n    lists.chunk([1, 2, 3], 0)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          },
+          "AC-003": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import lists\nassert lists.chunk([1, 2, 3], 5) == [[1, 2, 3]]\nassert lists.chunk([4, 5], 2) == [[4, 5]]\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          }
+        },
+        "buggy": {
+          "AC-001": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import lists\nassert lists.chunk([1, 2, 3, 4, 5], 2) == [[1, 2], [3, 4], [5]]\nassert lists.chunk([], 3) == []\nassert lists.chunk([7], 2) == [[7]]\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          },
+          "AC-002": {
+            "verdict": "failed",
+            "runs": [
+              {
+                "command": "python -c \"import lists\ntry:\n    lists.chunk([1, 2, 3], 0)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\"",
+                "exit": 124,
+                "unrunnable": false,
+                "stderr": "TIMEOUT"
+              }
+            ]
+          },
+          "AC-003": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import lists\nassert lists.chunk([1, 2, 3], 5) == [[1, 2, 3]]\nassert lists.chunk([4, 5], 2) == [[4, 5]]\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          }
+        }
+      },
+      "compiled": {
+        "AC-001": [
+          "python -c \"import lists\nassert lists.chunk([1, 2, 3, 4, 5], 2) == [[1, 2], [3, 4], [5]]\nassert lists.chunk([], 3) == []\nassert lists.chunk([7], 2) == [[7]]\""
+        ],
+        "AC-002": [
+          "python -c \"import lists\ntry:\n    lists.chunk([1, 2, 3], 0)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\""
+        ],
+        "AC-003": [
+          "python -c \"import lists\nassert lists.chunk([1, 2, 3], 5) == [[1, 2, 3]]\nassert lists.chunk([4, 5], 2) == [[4, 5]]\""
+        ]
+      },
+      "coverage": "3/3"
+    },
+    "parse_kv": {
+      "compile_seconds": 26.6,
+      "arms": {
+        "reference": {
+          "AC-001": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import config\nresult = config.parse_kv('  key1 = value1  \\n  key2 = value2  ')\nassert result == {'key1': 'value1', 'key2': 'value2'}\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          },
+          "AC-002": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import config\nresult = config.parse_kv('# c=3\\n\\nkey=value')\nassert result == {'key': 'value'}\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          },
+          "AC-003": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import config\nresult = config.parse_kv('url=http://x?a=b')\nassert result == {'url': 'http://x?a=b'}\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          }
+        },
+        "buggy": {
+          "AC-001": {
+            "verdict": "proven",
+            "runs": [
+              {
+                "command": "python -c \"import config\nresult = config.parse_kv('  key1 = value1  \\n  key2 = value2  ')\nassert result == {'key1': 'value1', 'key2': 'value2'}\"",
+                "exit": 0,
+                "unrunnable": false,
+                "stderr": ""
+              }
+            ]
+          },
+          "AC-002": {
+            "verdict": "failed",
+            "runs": [
+              {
+                "command": "python -c \"import config\nresult = config.parse_kv('# c=3\\n\\nkey=value')\nassert result == {'key': 'value'}\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 3, in <module>\nAssertionError\n"
+              }
+            ]
+          },
+          "AC-003": {
+            "verdict": "failed",
+            "runs": [
+              {
+                "command": "python -c \"import config\nresult = config.parse_kv('url=http://x?a=b')\nassert result == {'url': 'http://x?a=b'}\"",
+                "exit": 1,
+                "unrunnable": false,
+                "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 3, in <module>\nAssertionError\n"
+              }
+            ]
+          }
+        }
+      },
+      "compiled": {
+        "AC-001": [
+          "python -c \"import config\nresult = config.parse_kv('  key1 = value1  \\n  key2 = value2  ')\nassert result == {'key1': 'value1', 'key2': 'value2'}\""
+        ],
+        "AC-002": [
+          "python -c \"import config\nresult = config.parse_kv('# c=3\\n\\nkey=value')\nassert result == {'key': 'value'}\""
+        ],
+        "AC-003": [
+          "python -c \"import config\nresult = config.parse_kv('url=http://x?a=b')\nassert result == {'url': 'http://x?a=b'}\""
+        ]
+      },
+      "coverage": "3/3"
+    }
+  }
+}

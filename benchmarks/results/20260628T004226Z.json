@@ -1,0 +1,122 @@
+{
+  "model": "anthropic/claude-sonnet-4.6",
+  "executor": "claude",
+  "monitor": null,
+  "records": [
+    {
+      "task": "median",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 17.8,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Added `median(values)` to `stats.py`. It sorts the values and returns the middle element for odd-length lists, or the average of the two middle elements for even-length lists.\n",
+          "score": 3,
+          "total": 4,
+          "fraction": 0.75,
+          "detail": {
+            "odd_value": true,
+            "even_is_average_float": true,
+            "does_not_mutate_input": true,
+            "empty_raises_valueerror": false
+          }
+        },
+        "B": {
+          "exit": 0,
+          "seconds": 414.3,
+          "verdict": "incomplete",
+          "cost_usd": 0.6817,
+          "output_tail": "eview                                                                     \n\n \u2022 Pending signals: 0                                                           \n \u2022 Open cards: 1                                                                \n \u2022 Open critical cards: 0                                                       \n \u2022 Blocking cards in scope: None.                                               \n",
+          "score": 3,
+          "total": 4,
+          "fraction": 0.75,
+          "detail": {
+            "odd_value": true,
+            "even_is_average_float": true,
+            "does_not_mutate_input": true,
+            "empty_raises_valueerror": false
+          }
+        }
+      }
+    },
+    {
+      "task": "chunk",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 23.8,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "ze`` must be a positive integer.\n    \"\"\"\n    if size <= 0:\n        raise ValueError(\"size must be a positive integer\")\n    return [items[i:i + size] for i in range(0, len(items), size)]\n```\n\nIt slices the list into consecutive chunks of `size`, with the last chunk shorter if the length isn't an even multiple. A non-positive `size` raises `ValueError` to avoid an empty-range infinite/empty result.\n",
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "even_split": true,
+            "last_partial_chunk": true,
+            "size_zero_raises": true,
+            "size_larger_than_list": true,
+            "does_not_mutate_input": true
+          }
+        },
+        "B": {
+          "exit": 1,
+          "seconds": 572.2,
+          "verdict": "blocked",
+          "cost_usd": 0.7459,
+          "output_tail": "eview                                                                     \n\n \u2022 Pending signals: 0                                                           \n \u2022 Open cards: 3                                                                \n \u2022 Open critical cards: 0                                                       \n \u2022 Blocking cards in scope: None.                                               \n",
+          "score": 5,
+          "total": 5,
+          "fraction": 1.0,
+          "detail": {
+            "even_split": true,
+            "last_partial_chunk": true,
+            "size_zero_raises": true,
+            "size_larger_than_list": true,
+            "does_not_mutate_input": true
+          }
+        }
+      }
+    },
+    {
+      "task": "parse_kv",
+      "arms": {
+        "A": {
+          "exit": 0,
+          "seconds": 23.7,
+          "verdict": null,
+          "cost_usd": 0.0,
+          "output_tail": "Added `parse_kv(text)` to `config.py`. It splits the input into lines, skips blanks and lines without `=`, splits each remaining line on the first `=` (so values may contain `=`), strips whitespace from keys and values, and returns the result as a dict (last value wins on duplicate keys).\n",
+          "score": 4,
+          "total": 5,
+          "fraction": 0.8,
+          "detail": {
+            "basic": true,
+            "skips_blank_and_comments": false,
+            "strips_whitespace": true,
+            "splits_on_first_equals": true,
+            "duplicate_last_wins": true
+          }
+        },
+        "B": {
+          "exit": 0,
+          "seconds": 535.1,
+          "verdict": "incomplete",
+          "cost_usd": 0.807,
+          "output_tail": "eview                                                                     \n\n \u2022 Pending signals: 0                                                           \n \u2022 Open cards: 2                                                                \n \u2022 Open critical cards: 0                                                       \n \u2022 Blocking cards in scope: None.                                               \n",
+          "score": 4,
+          "total": 5,
+          "fraction": 0.8,
+          "detail": {
+            "basic": true,
+            "skips_blank_and_comments": false,
+            "strips_whitespace": true,
+            "splits_on_first_equals": true,
+            "duplicate_last_wins": true
+          }
+        }
+      }
+    }
+  ]
+}
