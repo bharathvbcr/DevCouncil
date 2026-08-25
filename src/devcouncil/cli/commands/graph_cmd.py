@@ -130,6 +130,73 @@ def _index_freshness_fields(root: Path) -> dict[str, object]:
 
 
 
+#: Edge kinds that represent one symbol invoking another. The devmap store also
+#: emits structural edges (`Contains` for file→symbol, `MemberOf` for
+#: symbol→type); including those in a caller/callee list makes a symbol look like
+#: it calls itself and inflates blast radius with edges nobody can act on.
+_CALL_EDGE_KINDS = frozenset({"Calls"})
+
+
+def _call_edges(client, method: str, target: str, symbol_key: str, file_key: str):
+    """Return ``(edges, unavailable_reason)`` for one direction of the call graph.
+
+    Fail-closed, deliberately. The previous form was::
+
+        try:
+            resp = client.impact(...)
+            if resolution_unavailable_reason(resp.resolution) is None:
+                ...collect...
+        except DevMapClientError:
+            pass
+
+    which produced an empty list on *three* different outcomes: a genuine absence
+    of callers, a transport error, and a store that reported its resolution
+    unavailable. A consumer asking "what calls this before I delete it" could not
+    tell those apart, and two of them are the answer "I don't know."
+
+    That is the exact conflation :func:`devcouncil.devmap_client.try_connect`
+    exists to prevent — *"a check that could not run must never report what a
+    check that ran and passed reports."* This applies the same rule one layer up:
+    on failure the caller gets ``(None, reason)``, and ``None`` is not ``[]``.
+    """
+    from devcouncil.devmap_client import (
+        DevMapClientError,
+        resolution_unavailable_reason,
+    )
+
+    try:
+        resp = getattr(client, method)(target, depth=1)
+    except DevMapClientError as exc:
+        return None, f"{method} failed: {exc}"
+
+    reason = resolution_unavailable_reason(resp.resolution)
+    if reason:
+        return None, f"{method} resolution unavailable: {reason}"
+
+    edges = []
+    for edge in resp.items:
+        if str(edge.get("edge_kind") or "") not in _CALL_EDGE_KINDS:
+            continue
+        node = str(edge.get(symbol_key) or edge.get(file_key) or "")
+        if node:
+            edges.append(node)
+    return edges, None
+
+
+def _render_edge_field(definition: dict, field: str) -> str:
+    """Render one edge list, keeping "empty" and "unknown" visibly different.
+
+    The old renderer printed ``(none)`` for both, so a transport failure looked
+    exactly like a symbol nothing calls — which is the reading that gets a live
+    function deleted.
+    """
+    value = definition.get(field)
+    if value is None:
+        reason = definition.get(f"{field}_unavailable") or "not measured"
+        return f"[yellow](unknown — {reason})[/yellow]"
+    return ", ".join(value) or "(none)"
+
+
 def _devmap_query_payload(root: Path, kind: str, **kwargs):
     """Try DevMapClient for query surfaces; return payload or None for Python fallback."""
     from devcouncil.devmap_client import (
@@ -246,26 +313,19 @@ def _devmap_query_payload(root: Path, kind: str, **kwargs):
                 span = item.get("span") or (0, 0)
                 line = int(span[0]) if isinstance(span, (list, tuple)) and span else 0
                 node_id = f"{path_s}::{name}" if path_s and name else name or path_s
-                callers = []
-                callees = []
-                try:
-                    inbound = client.impact(node_id if name else path_s or name_or_path, depth=1)
-                    if resolution_unavailable_reason(inbound.resolution) is None:
-                        for edge in inbound.items:
-                            src = str(edge.get("source_symbol") or edge.get("source_file") or "")
-                            if src:
-                                callers.append(src)
-                except DevMapClientError:
-                    pass
-                try:
-                    outbound = client.deps(path_s or name_or_path, depth=1)
-                    if resolution_unavailable_reason(outbound.resolution) is None:
-                        for edge in outbound.items:
-                            tgt = str(edge.get("target_symbol") or edge.get("target_file") or "")
-                            if tgt:
-                                callees.append(tgt)
-                except DevMapClientError:
-                    pass
+                target = node_id if name else path_s or name_or_path
+                callers, callers_unavailable = _call_edges(
+                    client, "impact", target, "source_symbol", "source_file"
+                )
+                # Symbol-scoped, like the inbound side. This used to pass
+                # `path_s` — the FILE — so a function's "callees" were the whole
+                # file's outbound edges. `IsRestatement` reported 35 callees
+                # where the symbol-scoped answer is 0, and the list included
+                # `Contains`/`MemberOf` structural edges, which is why symbols
+                # appeared to call themselves.
+                callees, callees_unavailable = _call_edges(
+                    client, "deps", target, "target_symbol", "target_file"
+                )
                 defs.append({
                     "id": node_id,
                     "kind": str(item.get("kind") or "symbol"),
@@ -273,8 +333,17 @@ def _devmap_query_payload(root: Path, kind: str, **kwargs):
                     "name": name,
                     "line": line,
                     "callers": callers,
+                    "callers_unavailable": callers_unavailable,
                     "callees": callees,
-                    "importers": [],
+                    "callees_unavailable": callees_unavailable,
+                    # Not computed. The devmap store surfaces Calls/Contains/
+                    # MemberOf edges here, not Imports, so there is nothing to
+                    # derive an importer list from. This was previously a
+                    # hardcoded `[]`, which reads as "nothing imports this"
+                    # rather than "never measured" — the same conflation
+                    # `try_connect` refuses to make about an empty store.
+                    "importers": None,
+                    "importers_unavailable": "not computed: devmap exposes no Imports edges",
                 })
             return {
                 "ok": True,
@@ -1067,9 +1136,8 @@ def graph_query(
         return
     for d in defs:
         console.print(f"[bold]{d['id']}[/bold]  ({d.get('kind')})  {d.get('path')}:{d.get('line')}")
-        console.print(f"  callers: {', '.join(d.get('callers') or []) or '(none)'}")
-        console.print(f"  callees: {', '.join(d.get('callees') or []) or '(none)'}")
-        console.print(f"  importers: {', '.join(d.get('importers') or []) or '(none)'}")
+        for field in ("callers", "callees", "importers"):
+            console.print(f"  {field}: {_render_edge_field(d, field)}")
 
 
 @app.command("trace")

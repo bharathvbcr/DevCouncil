@@ -1596,3 +1596,107 @@ def test_a_directory_without_git_does_not_log_to_the_console_channel(tmp_path, c
     assert all(r.levelno == logging.DEBUG for r in fallback), (
         "an ordinary non-git directory must not reach the console channel"
     )
+
+
+# ── role_files: generic inference outside DevCouncil's own tree ──────────────
+#
+# `_SUBSYSTEM_ROLE_FILES` is keyed on DevCouncil's own source paths, so before
+# this fix `_build_role_files` returned {} for every other repository — while
+# the generated AGENTS.md told agents in every mapped project to use it, and
+# test_resolver / wiki / map_viz all read it and silently got nothing.
+# Measured on a 4,082-file polyglot repo: {} on all 10 subsystems.
+
+def test_role_files_are_inferred_for_a_repo_with_no_curated_spec(mapper):
+    roles = mapper._build_role_files(
+        "backend",
+        [
+            "backend/cmd/server/main.go",
+            "backend/internal/api/router.go",
+            "backend/internal/api/router_test.go",
+            "backend/internal/models/user.go",
+            "backend/internal/services/mailer.go",
+            "backend/migrations/0001_init.sql",
+            "backend/config/settings.yaml",
+            "backend/docs/design.md",
+        ],
+    )
+
+    assert roles, "an unmapped area must still get role buckets"
+    assert roles["entry"] == ["backend/cmd/server/main.go"]
+    assert roles["api"] == ["backend/internal/api/router.go"]
+    assert roles["tests"] == ["backend/internal/api/router_test.go"]
+    assert roles["models"] == ["backend/internal/models/user.go"]
+    assert roles["services"] == ["backend/internal/services/mailer.go"]
+    assert roles["migrations"] == ["backend/migrations/0001_init.sql"]
+    assert roles["config"] == ["backend/config/settings.yaml"]
+    assert roles["docs"] == ["backend/docs/design.md"]
+
+
+def test_role_buckets_partition_rather_than_overlap(mapper):
+    # A test file under routers/ is a test, not an api file. Without
+    # first-match-wins the same path lands in several buckets and the buckets
+    # stop describing the subsystem.
+    roles = mapper._build_role_files(
+        "svc",
+        ["svc/routers/user_test.py", "svc/routers/user.py"],
+    )
+    assert roles["tests"] == ["svc/routers/user_test.py"]
+    assert roles["api"] == ["svc/routers/user.py"]
+
+    seen = [p for paths in roles.values() for p in paths]
+    assert len(seen) == len(set(seen)), "a path must appear under exactly one role"
+
+
+def test_role_files_caps_each_bucket(mapper):
+    roles = mapper._build_role_files(
+        "svc", [f"svc/services/client_{i}.py" for i in range(20)]
+    )
+    assert len(roles["services"]) == mapper._ROLE_FILES_PER_ROLE_MAX
+
+
+def test_unmatched_files_land_in_other(mapper):
+    roles = mapper._build_role_files("svc", ["svc/widget.py", "svc/routers/a.py"])
+    assert roles["api"] == ["svc/routers/a.py"]
+    assert roles["other"] == ["svc/widget.py"]
+
+
+def test_curated_spec_still_wins_for_devcouncils_own_tree(mapper):
+    # Chesterton's fence: the hand-curated table is more precise than inference
+    # for this repo, so it must keep taking priority.
+    roles = mapper._build_role_files(
+        "src/devcouncil/domain",
+        ["src/devcouncil/domain/task.py", "src/devcouncil/domain/requirement.py"],
+    )
+    assert roles["tasks"] == ["src/devcouncil/domain/task.py"]
+    assert roles["requirements"] == ["src/devcouncil/domain/requirement.py"]
+
+
+def test_empty_area_yields_no_roles(mapper):
+    assert mapper._build_role_files("anything", []) == {}
+
+
+def test_role_file_counts_carry_the_real_totals_behind_the_cap(mapper):
+    # The rule this pins: never present a capped sample as complete coverage.
+    # role_files shows 4; role_file_counts says how many there really are.
+    files = [f"svc/services/client_{i}.py" for i in range(20)] + ["svc/widget.py"]
+    roles, counts = mapper._build_role_files_with_counts("svc", files)
+
+    assert len(roles["services"]) == mapper._ROLE_FILES_PER_ROLE_MAX
+    assert counts["services"] == 20
+    # A file that matched a role but lost the cap is classified, not "other".
+    assert roles["other"] == ["svc/widget.py"]
+    assert counts["other"] == 1
+
+
+def test_curated_role_counts_also_report_beyond_the_cap(mapper):
+    files = [f"src/devcouncil/domain/task.py"] * 1
+    roles, counts = mapper._build_role_files_with_counts("src/devcouncil/domain", files)
+    assert counts["tasks"] == 1
+    assert roles["tasks"] == ["src/devcouncil/domain/task.py"]
+
+
+def test_subsystem_carries_role_file_counts_field():
+    from devcouncil.indexing.repo_mapper import RepoSubsystem
+
+    sub = RepoSubsystem(area="a", summary="", entry_points=[], critical_files=[])
+    assert sub.role_file_counts == {}

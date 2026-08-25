@@ -465,3 +465,136 @@ def test_graph_view_missing_graph(tmp_path, monkeypatch):
     monkeypatch.setattr(viz, "write_graph_html", boom)
     result = runner.invoke(app, ["map", "view", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
+
+
+# ── devmap query: edge scoping and fail-closed edge lists ────────────────────
+#
+# These pin three defects found 2026-08-24 against a real 36k-node store:
+#   1. `callees` was queried with the FILE path, so a function's callees were
+#      its whole file's outbound edges (35 reported vs 0 symbol-scoped).
+#   2. edges were not filtered by kind, so `Contains`/`MemberOf` structural
+#      edges appeared as calls — which is why symbols looked self-calling.
+#   3. a failed or unavailable edge query silently became `[]`, indistinguishable
+#      from "nothing calls this".
+
+class _FakeResp:
+    def __init__(self, items, resolution="Available", total=None, truncated=False):
+        self.items = items
+        self.resolution = resolution
+        self.total = len(items) if total is None else total
+        self.truncated = truncated
+        self.tokens_used = 0
+
+
+class _FakeClient:
+    """Records the targets it is asked about so scoping can be asserted."""
+
+    def __init__(self, *, deps_items=None, impact_items=None, deps_exc=None,
+                 impact_resolution="Available"):
+        self.deps_items = deps_items or []
+        self.impact_items = impact_items or []
+        self.deps_exc = deps_exc
+        self.impact_resolution = impact_resolution
+        self.deps_targets = []
+        self.impact_targets = []
+
+    def search(self, query, limit=2000):
+        return _FakeResp([{
+            "file_path": "pkg/mod.py",
+            "symbol_name": "widget",
+            "kind": "function",
+            "span": (12, 20),
+        }])
+
+    def impact(self, target, depth=1):
+        self.impact_targets.append(target)
+        return _FakeResp(self.impact_items, resolution=self.impact_resolution)
+
+    def deps(self, target, depth=1):
+        self.deps_targets.append(target)
+        if self.deps_exc is not None:
+            raise self.deps_exc
+        return _FakeResp(self.deps_items)
+
+
+def _query(monkeypatch, tmp_path, client):
+    from devcouncil.cli.commands import graph_cmd
+    import devcouncil.devmap_client as devmap_client
+
+    monkeypatch.setattr(devmap_client, "try_connect", lambda root: client)
+    return graph_cmd._devmap_query_payload(tmp_path, "query", name_or_path="widget")
+
+
+def test_query_scopes_callees_to_the_symbol_not_the_file(monkeypatch, tmp_path):
+    client = _FakeClient(deps_items=[
+        {"edge_kind": "Calls", "target_symbol": "pkg/mod.py::helper"},
+    ])
+    result = _query(monkeypatch, tmp_path, client)
+
+    # Both directions must ask about the same node.
+    assert client.deps_targets == ["pkg/mod.py::widget"]
+    assert client.impact_targets == ["pkg/mod.py::widget"]
+    assert result["definitions"][0]["callees"] == ["pkg/mod.py::helper"]
+
+
+def test_query_drops_structural_edges_from_call_lists(monkeypatch, tmp_path):
+    client = _FakeClient(
+        deps_items=[
+            {"edge_kind": "Contains", "target_symbol": "pkg/mod.py::widget"},
+            {"edge_kind": "MemberOf", "target_symbol": "pkg/mod.py::Widget"},
+            {"edge_kind": "Calls", "target_symbol": "pkg/mod.py::helper"},
+        ],
+        impact_items=[
+            {"edge_kind": "Contains", "source_symbol": "pkg/mod.py"},
+            {"edge_kind": "Calls", "source_symbol": "pkg/other.py::caller"},
+        ],
+    )
+    definition = _query(monkeypatch, tmp_path, client)["definitions"][0]
+
+    # A `Contains` edge from the file to this very symbol is what made symbols
+    # appear to call themselves.
+    assert definition["callees"] == ["pkg/mod.py::helper"]
+    assert definition["callers"] == ["pkg/other.py::caller"]
+
+
+def test_query_reports_a_failed_edge_query_as_unknown_not_empty(monkeypatch, tmp_path):
+    from devcouncil.devmap_client import DevMapClientError
+
+    client = _FakeClient(
+        impact_items=[{"edge_kind": "Calls", "source_symbol": "pkg/other.py::caller"}],
+        deps_exc=DevMapClientError("socket closed"),
+    )
+    definition = _query(monkeypatch, tmp_path, client)["definitions"][0]
+
+    # None, not [] — "I could not check" must not read as "nothing".
+    assert definition["callees"] is None
+    assert "socket closed" in definition["callees_unavailable"]
+    # The direction that DID succeed still reports normally.
+    assert definition["callers"] == ["pkg/other.py::caller"]
+    assert definition["callers_unavailable"] is None
+
+
+def test_query_reports_unavailable_resolution_as_unknown(monkeypatch, tmp_path):
+    client = _FakeClient(impact_resolution={"Unavailable": {"reason": "index rebuilding"}})
+    definition = _query(monkeypatch, tmp_path, client)["definitions"][0]
+
+    assert definition["callers"] is None
+    assert "index rebuilding" in definition["callers_unavailable"]
+
+
+def test_query_does_not_present_uncomputed_importers_as_empty(monkeypatch, tmp_path):
+    definition = _query(monkeypatch, tmp_path, _FakeClient())["definitions"][0]
+
+    # Was a hardcoded [], which reads as "nothing imports this".
+    assert definition["importers"] is None
+    assert definition["importers_unavailable"]
+
+
+def test_query_distinguishes_empty_from_unknown_when_rendering(monkeypatch, tmp_path):
+    from devcouncil.cli.commands.graph_cmd import _render_edge_field
+
+    assert _render_edge_field({"callers": []}, "callers") == "(none)"
+    rendered = _render_edge_field(
+        {"callers": None, "callers_unavailable": "impact failed: boom"}, "callers"
+    )
+    assert "unknown" in rendered and "boom" in rendered

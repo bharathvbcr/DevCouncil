@@ -113,7 +113,12 @@ def map_repo(
     if_stale: bool = typer.Option(
         False,
         "--if-stale",
-        help="Fingerprint-check first and exit 0 without rebuilding when the on-disk map is still fresh.",
+        help=(
+            "Refresh only. Fingerprint-check first and exit 0 without rebuilding when "
+            "the on-disk map is still fresh — and also when there is no map at all, "
+            "since a cold build is a full index rather than a refresh. Safe to wire "
+            "into an editor or git hook; plain `dev map` is not."
+        ),
     ),
     full: bool = typer.Option(
         False,
@@ -172,6 +177,29 @@ def map_repo(
         "dev map: goal=%r scan_deps=%s liveness=%s lsp_refs=%s if_stale=%s",
         goal, scan_deps, liveness, use_lsp, if_stale,
     )
+
+    enclosing = _enclosing_project_root(root)
+    if enclosing is not None:
+        # A `.devcouncil/config.yaml` makes its directory a project root, and
+        # the root is just `--project-root` (default: cwd). So an agent that
+        # cd's into a subdirectory to run its build or tests, in a repo that has
+        # a nested config, silently indexes that subtree as a separate project.
+        #
+        # Observed: three nested configs committed by accident into a polyglot
+        # repo's `backend/*/` directories produced a 713MB duplicate index of
+        # one subtree, rebuilt on its own schedule, alongside the real 1.7GB
+        # root index. Nothing reported it, because from inside the subdirectory
+        # nothing is wrong.
+        status_console.print(
+            f"[yellow]Nested project root.[/yellow] {root} sits inside "
+            f"{enclosing}, which is also a DevCouncil project.\n"
+            "Indexing here builds a SECOND, separate index of this subtree — it "
+            "does not contribute to the parent's map.\n"
+            f"If that is not what you want, run from {enclosing} "
+            f"(or pass --project-root {enclosing}) and delete "
+            f"{root / '.devcouncil' / 'config.yaml'}."
+        )
+
     from devcouncil.cli.commands.init import initialize_project
 
     initialize_project(root, quiet=True, with_map=False)
@@ -179,7 +207,33 @@ def map_repo(
         raise typer.Exit(code=1)
 
     output = output if output.is_absolute() else root / output
-    if if_stale and output.is_file():
+    if if_stale:
+        if not output.is_file():
+            # `--if-stale` means "refresh only if there is something cheap to
+            # refresh". With no map on disk there is nothing to compare against,
+            # and the only way to proceed is the most expensive operation this
+            # tool has: a full cold build, which on a large polyglot repo is
+            # several hundred megabytes of SQLite and many minutes of CPU.
+            #
+            # This used to fall straight through to that build with no message.
+            # `.devcouncil/` is gitignored, so every fresh git worktree starts
+            # with no map — and an editor hook wired to `dev map --if-stale`
+            # therefore kicked off a full build on the first file edit. Hooks
+            # get killed on timeout, but the grandchild build is not in the
+            # hook's process group and survives as an orphan at PPID 1, holding
+            # a core until it finishes. Observed on one machine: 89 abandoned
+            # build and shell processes, load average 184, 0.0% idle.
+            #
+            # Refusing here is the honest reading of the flag. A caller who
+            # wants an unconditional build runs `dev map` without it.
+            status_console.print(
+                f"[yellow]No map at {output} — nothing to refresh.[/yellow]\n"
+                "[yellow]--if-stale will not start a cold build: that is a full "
+                "index, not a refresh.[/yellow]\n"
+                "Run [bold]dev map[/bold] (without --if-stale) to build one, in the "
+                "foreground where you can see it."
+            )
+            raise typer.Exit(code=0)
         try:
             from devcouncil.utils.json_persist import read_json
 
@@ -375,6 +429,24 @@ def map_repo(
         log_step("map/complete", project_root=root, trace=True)
         if watch:
             _watch_map(root, liveness=liveness)
+
+
+def _enclosing_project_root(root: Path) -> Path | None:
+    """Return the nearest ancestor that is also a DevCouncil project, if any.
+
+    A project root is any directory holding ``.devcouncil/config.yaml``. Nesting
+    one inside another is almost always accidental — a stray `dev init` in a
+    subdirectory, or a config committed by a snapshot commit — and it is
+    invisible from inside the child.
+    """
+    try:
+        resolved = root.resolve()
+    except OSError:
+        return None
+    for parent in resolved.parents:
+        if (parent / ".devcouncil" / "config.yaml").is_file():
+            return parent
+    return None
 
 
 @app.command("html")

@@ -141,6 +141,47 @@ def test_map_if_stale_skips_when_fresh(tmp_path, monkeypatch):
     assert "Map is fresh" in result.output
 
 
+def test_map_if_stale_refuses_a_cold_build(tmp_path, monkeypatch):
+    """`--if-stale` must never trigger a full index.
+
+    `.devcouncil/` is gitignored, so every fresh git worktree starts with no
+    map. This branch used to fall straight through to a full cold build with no
+    message, which is how an editor hook wired to `dev map --if-stale` came to
+    kick off a multi-minute index on the first file edit — and, when the hook
+    was killed on timeout, leave the build orphaned at PPID 1 holding a core.
+    """
+    monkeypatch.chdir(tmp_path)
+    _git_repo(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    # The condition under test is "no map on disk", which is the state of every
+    # fresh git worktree. `dev init` may leave one behind, so remove it rather
+    # than assuming.
+    map_path = tmp_path / ".devcouncil" / "repo_map.json"
+    map_path.unlink(missing_ok=True)
+    assert not map_path.exists()
+
+    built = []
+    monkeypatch.setattr(
+        map_cmd, "build_map",
+        lambda *a, **k: built.append(1), raising=False,
+    )
+
+    result = runner.invoke(app, ["map", "--if-stale"])
+
+    assert result.exit_code == 0
+    assert built == [], "--if-stale must not start a build when there is no map"
+
+    # Rich hard-wraps console output, so match on whitespace-normalized text —
+    # otherwise this assertion depends on terminal width, not behaviour.
+    said = " ".join(result.output.split())
+    assert "nothing to refresh" in said
+    assert "will not start a cold build" in said
+    # The message has to name the way out, or the refusal just relocates the
+    # confusion.
+    assert "Run dev map" in said
+
+
 # --- graph_context_cmd ------------------------------------------------------------
 
 
@@ -361,3 +402,32 @@ def test_map_writes_graph_html_when_configured(tmp_path, monkeypatch):
 
     result = runner.invoke(app, ["map"])
     assert result.exit_code == 0
+
+
+def test_map_warns_when_the_project_root_is_nested_inside_another(tmp_path, monkeypatch):
+    """A nested `.devcouncil/config.yaml` silently indexes a subtree twice.
+
+    Root resolution is just `--project-root` (default: cwd), so an agent that
+    cd's into `backend/service/` to run its build — in a repo that has a nested
+    config there — indexes that subtree as its own project. Observed: three
+    configs committed by accident into a polyglot repo produced a 713MB
+    duplicate index of one subtree, on its own rebuild schedule, next to the
+    real root index. From inside the subdirectory nothing looks wrong.
+    """
+    parent = tmp_path / "repo"
+    child = parent / "backend" / "service"
+    (parent / ".devcouncil").mkdir(parents=True)
+    (parent / ".devcouncil" / "config.yaml").write_text("project: {}\n")
+    child.mkdir(parents=True)
+
+    assert map_cmd._enclosing_project_root(child) == parent.resolve()
+    # The real root is not nested in anything.
+    assert map_cmd._enclosing_project_root(parent) is None
+
+
+def test_enclosing_project_root_ignores_a_directory_without_a_config(tmp_path):
+    parent = tmp_path / "repo"
+    child = parent / "sub"
+    child.mkdir(parents=True)
+    (parent / ".devcouncil").mkdir()          # dir exists, no config.yaml
+    assert map_cmd._enclosing_project_root(child) is None

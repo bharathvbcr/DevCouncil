@@ -80,6 +80,10 @@ class RepoSubsystem(BaseModel):
     neighbors: List[str] = Field(default_factory=list)
     handoff_paths: List[str] = Field(default_factory=list)
     role_files: Dict[str, List[str]] = Field(default_factory=dict)
+    #: Real per-role totals. ``role_files`` is capped at a handful of examples
+    #: per role, so without these a reader cannot tell "this subsystem has two
+    #: tests" from "this subsystem has 900 tests and you are seeing four".
+    role_file_counts: Dict[str, int] = Field(default_factory=dict)
 
 
 class RepoMap(BaseModel):
@@ -981,7 +985,7 @@ class RepoMapper:
             critical_files = ranked_files[: self._SUBSYSTEM_CRITICAL_MAX]
             neighbors = [n for n in self._SUBSYSTEM_NEIGHBORS.get(area, []) if n in by_area]
             handoff_paths = self._SUBSYSTEM_HANDOFFS.get(area, [])
-            role_files = self._build_role_files(area, area_files)
+            role_files, role_file_counts = self._build_role_files_with_counts(area, area_files)
             subsystems.append(
                 RepoSubsystem(
                     area=area,
@@ -991,33 +995,139 @@ class RepoMapper:
                     neighbors=neighbors,
                     handoff_paths=handoff_paths,
                     role_files=role_files,
+                    role_file_counts=role_file_counts,
                 )
             )
         return subsystems
 
-    def _build_role_files(self, area: str, area_files: List[str]) -> Dict[str, List[str]]:
-        role_specs = self._SUBSYSTEM_ROLE_FILES.get(area)
-        if not role_specs:
-            return {}
+    #: Generic role inference, applied to any repository that has no curated
+    #: entry in ``_SUBSYSTEM_ROLE_FILES``.
+    #:
+    #: Ordered most-specific first: a path is claimed by the first role it
+    #: matches, so ``routers/user_test.py`` lands in ``tests`` rather than
+    #: ``api``. Each entry is ``(role, suffixes, path_or_name_tokens)``.
+    _GENERIC_ROLE_RULES: List[Tuple[str, Tuple[str, ...], Tuple[str, ...]]] = [
+        ("tests", (".py", ".go", ".ts", ".tsx", ".js", ".jsx", ".rs"),
+         ("test_", "_test.", ".test.", ".spec.", "/tests/", "/__tests__/", "/testdata/")),
+        ("migrations", (), ("/migrations/", "/migrate", "migration_")),
+        ("entry", (), ("/main.", "/index.", "/__main__.", "/app.", "/server.", "/cmd/")),
+        ("api", (), ("/router", "/routes", "/handler", "/controller", "/api/", "/endpoints")),
+        ("models", (), ("/model", "/schema", "/types.", "/entities", ".proto")),
+        ("services", (), ("/service", "/client", "/provider", "/adapter", "/repository")),
+        ("config", (".yaml", ".yml", ".toml", ".ini", ".env"), ("/config", ".config.", "settings")),
+        ("docs", (".md", ".rst", ".adoc"), ("/docs/",)),
+    ]
 
+    #: Cap per role, so a subsystem with thousands of files still yields a
+    #: readable bucket rather than an unusable dump.
+    #:
+    #: These buckets are therefore a **capped sample for orientation**, never an
+    #: inventory: `role_files["tests"]` naming four files does not mean the
+    #: subsystem has four tests. Consumers that need completeness must go to
+    #: `files`. The companion `role_file_counts` carries the real totals so a
+    #: reader can tell a small subsystem from a truncated one.
+    _ROLE_FILES_PER_ROLE_MAX = 4
+
+    def _build_role_files(self, area: str, area_files: List[str]) -> Dict[str, List[str]]:
+        """Bucket a subsystem's files by the role they play.
+
+        Curated specs win where they exist; everything else is inferred from
+        conventional path and filename signals.
+
+        Why the fallback exists: ``_SUBSYSTEM_ROLE_FILES`` is keyed on
+        DevCouncil's *own* source paths (``src/devcouncil/council`` and
+        friends), so for every other repository ``role_specs`` was ``None`` and
+        this returned ``{}`` immediately. Measured on a 4,082-file polyglot
+        repo: ``role_files`` was ``{}`` on all 10 subsystems.
+
+        That silence was not confined to the map. The generated ``AGENTS.md``
+        tells agents in *every* mapped project to "use ``role_files`` in
+        ``subsystems`` for subsystem role buckets", and three consumers read it
+        and quietly got nothing: :mod:`devcouncil.verification.test_resolver`
+        (``role_files["tests"]`` — its subsystem-test resolution path was dead
+        outside this repo), :mod:`devcouncil.knowledge.wiki`, and
+        :mod:`devcouncil.indexing.map_viz`. A documented navigation feature that
+        works in exactly one repository is worse than an absent one, because
+        the empty result reads as "this subsystem has no roles".
+        """
+        by_role, _counts = self._build_role_files_with_counts(area, area_files)
+        return by_role
+
+    def _build_role_files_with_counts(
+        self, area: str, area_files: List[str]
+    ) -> Tuple[Dict[str, List[str]], Dict[str, int]]:
+        """As :meth:`_build_role_files`, but also returning the real totals.
+
+        The sampled lists and the counts are produced in one pass so they can
+        never disagree about what was matched.
+        """
+        curated = self._SUBSYSTEM_ROLE_FILES.get(area)
+        by_role, used, counts = (
+            self._apply_curated_roles(curated, area_files)
+            if curated
+            else self._infer_generic_roles(area_files)
+        )
+
+        if not by_role:
+            return {}, {}
+
+        remaining = [path for path in area_files if path not in used]
+        if remaining:
+            by_role.setdefault("other", remaining[: self._ROLE_FILES_PER_ROLE_MAX])
+            counts["other"] = len(remaining)
+
+        return by_role, counts
+
+    def _apply_curated_roles(
+        self, role_specs: List[Tuple[str, List[str]]], area_files: List[str]
+    ) -> Tuple[Dict[str, List[str]], set, Dict[str, int]]:
         by_role: Dict[str, List[str]] = {}
-        used = set()
+        used: set = set()
+        counts: Dict[str, int] = {}
         for role, tokens in role_specs:
             matches = [path for path in area_files if any(token in path for token in tokens)]
             if not matches:
                 continue
-            selected = matches[:4]
-            by_role[role] = selected
-            used.update(selected)
+            by_role[role] = matches[: self._ROLE_FILES_PER_ROLE_MAX]
+            counts[role] = len(matches)
+            # Every match, not just the sampled ones: `used` decides what falls
+            # into "other", and a file that matched a role is not unclassified
+            # merely because it lost the cap.
+            used.update(matches)
+        return by_role, used, counts
 
-        if not by_role:
-            return {}
+    def _infer_generic_roles(self, area_files: List[str]) -> Tuple[Dict[str, List[str]], set]:
+        """Assign each file to the first matching role rule.
 
-        leftovers = [path for path in area_files if path not in used][:4]
-        if leftovers:
-            by_role.setdefault("other", leftovers)
+        First-match-wins is deliberate: the rules are ordered most-specific
+        first, so a test file is a test before it is an ``api`` file, and a
+        migration is a migration before it is an ``entry``. Without that, a
+        single path would appear under several roles and the buckets would stop
+        partitioning the subsystem.
+        """
+        by_role: Dict[str, List[str]] = {}
+        counts: Dict[str, int] = {}
+        used: set = set()
 
-        return by_role
+        for path in area_files:
+            lowered = ("/" + path.replace("\\", "/").lstrip("/")).lower()
+            suffix = Path(path).suffix.lower()
+
+            for role, suffixes, tokens in self._GENERIC_ROLE_RULES:
+                if suffixes and suffix not in suffixes:
+                    continue
+                if not any(token in lowered for token in tokens):
+                    continue
+                bucket = by_role.setdefault(role, [])
+                if len(bucket) < self._ROLE_FILES_PER_ROLE_MAX:
+                    bucket.append(path)
+                # Counted and marked used even past the cap, so `other` holds
+                # only genuinely unclassified files and the count is the truth.
+                counts[role] = counts.get(role, 0) + 1
+                used.add(path)
+                break
+
+        return by_role, used, counts
 
     # ------------------------------------------------------------------
     # Generic (non-DevCouncil) subsystem inference

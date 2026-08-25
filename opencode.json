@@ -8,7 +8,7 @@
         "mcp-server"
       ],
       "environment": {
-        "DEVCOUNCIL_PROJECT_ROOT": "/Users/bharath/Code/DevCouncil"
+        "DEVCOUNCIL_PROJECT_ROOT": "/Users/bharath/Code/devtools/DevCouncil"
       },
       "enabled": true,
       "timeout": 10000
