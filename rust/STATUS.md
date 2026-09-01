@@ -16,6 +16,10 @@ significant case it is measurably less capable, and cutting over would weaken a 
 > `dc-store/tests/interop.rs`, because this copy resolves DevCouncil as its own
 > ancestor while MANVI's searches upward for a sibling checkout.
 > [§6](#6-the-two-copies) records the decision this still needs.
+>
+> The whole-programme view — what is done, what is left, and in what order —
+> lives in MANVI's `docs/DEVCOUNCIL_PORT_ROADMAP.md`. This ledger covers only
+> the analysis plane that landed here.
 
 This ledger follows `rust-port/STATUS.md`'s convention: claims are labelled
 **verified** (a command was run and its output read), **inferred**, or
@@ -205,6 +209,10 @@ The three options, none of them yet chosen:
    known end date and option 1 is enough to survive until then.
 
 Until one is chosen, treat MANVI as upstream and mirror by hand.
+
+Recorded as **D1** in MANVI's `docs/DEVCOUNCIL_PORT_ROADMAP.md`, which
+recommends option 3 with option 1 as insurance: "temporary" has no enforcement,
+and a digest check is cheap for however long temporary turns out to be.
 
 ## 7. Change log since the port
 
