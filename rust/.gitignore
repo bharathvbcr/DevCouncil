@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target/
+
+# Stores a test or a local run left behind. dc-store's suites write to the
+# system temp directory, not here, but `dcstore --db` will happily point at a
+# path inside the workspace and a committed lease database would hand every
+# checkout someone else's active leases.
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# testdata is extractor *input*, not build output.
+#
+# Same hazard rust-port documents at the bottom of its own ignore file: this
+# workspace sits inside a Python repository whose root patterns (`__pycache__`,
+# `build/`, `dist/`, `.venv/`) govern anything not re-included here. The fnmatch
+# parity fixture is the cross-language gate between this crate and the Go
+# matcher, so it must be tracked no matter what the parent ignores.
+!testdata/
+!testdata/**
