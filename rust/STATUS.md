@@ -9,17 +9,26 @@ DevCouncil runs exactly as it did before this port. Read [§4](#4-what-this-does
 before assuming the Rust side is an upgrade to the Python it resembles — in one
 significant case it is measurably less capable, and cutting over would weaken a gate.
 
-> **Upstream is MANVI.** These crates and their Go clients now exist in both
-> repositories, and MANVI is where they are edited. A change made here and not
-> there forks them silently: the two copies have no build-time relationship, so
-> nothing fails when they drift. One file is deliberately different —
-> `dc-store/tests/interop.rs`, because this copy resolves DevCouncil as its own
-> ancestor while MANVI's searches upward for a sibling checkout.
-> [§6](#6-the-two-copies) records the decision this still needs.
+> **These are DevCouncil components, and DevCouncil is upstream.**
 >
-> The whole-programme view — what is done, what is left, and in what order —
-> lives in MANVI's `docs/DEVCOUNCIL_PORT_ROADMAP.md`. This ledger covers only
-> the analysis plane that landed here.
+> They were authored in MANVI and ported here, but that is history, not
+> ownership. DevCouncil is the component layer: `devmap`, `dcstore`, `dcverify`
+> and `dcgrep` are components with a JSON-on-stdio contract, useful to anything
+> that speaks it. MANVI is the harness that unifies them — it resolves each one
+> as a binary from `PATH` and **links none of them**. Going forward these crates
+> are edited here, and MANVI's `crates/` copy is a development convenience that
+> mirrors this one.
+>
+> The two copies still have no build-time relationship, so nothing fails when
+> they drift — [§6](#6-the-two-copies) is the standing decision that needs
+> making. One file is deliberately different: `dc-store/tests/interop.rs`,
+> because this copy resolves DevCouncil as its own ancestor while MANVI's
+> searches upward for a sibling checkout.
+>
+> The relationship, the component inventory, and the checklist a newly ported
+> component must satisfy live in MANVI's
+> [`docs/COMPONENTS_AND_HARNESS.md`](../../Manvi/docs/COMPONENTS_AND_HARNESS.md).
+> This ledger covers only the analysis-plane components that landed here.
 
 This ledger follows `rust-port/STATUS.md`'s convention: claims are labelled
 **verified** (a command was run and its output read), **inferred**, or
@@ -60,9 +69,12 @@ build of which takes minutes. The analysis plane is 6.4k lines and three
 dependencies, and its whole value is that a test run is seconds. Folding it in
 would make every `dc-verify` test compile tree-sitter.
 
-They are also different planes. `rust-port/` answers *what does this code mean*;
-`dc-*` answers *may this change proceed*. MANVI keeps the same split — it builds
-the `dc-*` crates and resolves `devmap` as an external binary from `PATH`.
+They are also different components. `rust-port/` answers *what does this code
+mean*; `dc-*` answers *may this change proceed*. Both are DevCouncil components
+and MANVI consumes them identically — `devmap`, `dcstore`, `dcverify` and
+`dcgrep` are each resolved as a binary from `PATH`, linked by nothing. The
+harness draws no distinction between them, and neither should this workspace
+split, which is about build cost rather than about status.
 
 ---
 
@@ -189,30 +201,34 @@ differential run over real diffs says otherwise.
 
 ## 6. The two copies
 
-Since 2026-09-01 the `dc-*` crates and the Go clients exist here **and** in
-MANVI, with no mechanism keeping them equal. The first change after the port
-already had to be applied twice by hand (§7), which is the whole problem in
-miniature: it worked because one person did both halves in one sitting, and
-nothing would have failed if they had not.
+Since 2026-09-01 the `dc-*` crate sources exist here **and** in MANVI, with no
+mechanism keeping them equal. The first change after the port already had to be
+applied twice by hand (§7), which is the whole problem in miniature: it worked
+because one person did both halves in one sitting, and nothing would have failed
+if they had not.
 
-The three options, none of them yet chosen:
+Note what is *not* duplicated. MANVI never links these crates — it resolves
+`dcstore`, `dcverify` and `dcgrep` as binaries from `PATH`, exactly as it already
+resolves `devmap`. So the duplication is of **sources**, not of the runtime
+dependency, and the deployed arrangement is already the right one: one set of
+component binaries, one harness consuming them.
 
-1. **MANVI depends on nothing; DevCouncil vendors.** Keep editing in MANVI and
-   re-vendor here on a cadence, with a checked-in digest so a stale copy is a
-   test failure rather than a surprise. Cheapest, and the drift is at least
-   detectable.
-2. **One workspace, consumed by path or git dependency.** Cargo and Go both
-   support it. Removes the duplication outright; couples the two repositories'
-   release cycles.
-3. **This copy is temporary.** Under the "converge on MANVI" route, DevCouncil's
-   Python is retired and this copy goes with it. Then the duplication has a
-   known end date and option 1 is enough to survive until then.
+That narrows the options to how MANVI's source copy should end:
 
-Until one is chosen, treat MANVI as upstream and mirror by hand.
+1. **Delete it; require installed components.** The honest expression of
+   "DevCouncil owns the components". `toolBinary`'s cargo-build fallback stops
+   being reachable, and MANVI's test suite needs DevCouncil's binaries on `PATH`
+   — which is what its live-contract tests already assume for `devmap`.
+2. **Keep it as a development convenience, with a digest check.** MANVI can be
+   built and tested without a DevCouncil checkout; a checked-in digest of the
+   component sources makes a stale copy a test failure rather than a surprise.
+3. **Consume by path or git dependency.** Removes the source duplication without
+   removing the convenience, at the cost of coupling the two repositories'
+   release cycles — and it buys nothing at runtime, since nothing links.
 
-Recorded as **D1** in MANVI's `docs/DEVCOUNCIL_PORT_ROADMAP.md`, which
-recommends option 3 with option 1 as insurance: "temporary" has no enforcement,
-and a digest check is cheap for however long temporary turns out to be.
+Option 2 is the cheapest thing that makes drift *detectable*, and option 1 is
+where this should land once installing DevCouncil's components is routine. Until
+one is chosen: **edit here, mirror to MANVI.**
 
 ## 7. Change log since the port
 
