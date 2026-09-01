@@ -9,6 +9,14 @@ DevCouncil runs exactly as it did before this port. Read [§4](#4-what-this-does
 before assuming the Rust side is an upgrade to the Python it resembles — in one
 significant case it is measurably less capable, and cutting over would weaken a gate.
 
+> **Upstream is MANVI.** These crates and their Go clients now exist in both
+> repositories, and MANVI is where they are edited. A change made here and not
+> there forks them silently: the two copies have no build-time relationship, so
+> nothing fails when they drift. One file is deliberately different —
+> `dc-store/tests/interop.rs`, because this copy resolves DevCouncil as its own
+> ancestor while MANVI's searches upward for a sibling checkout.
+> [§6](#6-the-two-copies) records the decision this still needs.
+
 This ledger follows `rust-port/STATUS.md`'s convention: claims are labelled
 **verified** (a command was run and its output read), **inferred**, or
 **unverified**. Passing tests are local mechanical evidence, not evidence of a
@@ -60,7 +68,8 @@ All commands run 2026-09-01 on darwin/arm64, `cargo 1.98.0`, `go1.26.4`,
 DevCouncil `.venv` Python 3.12.13.
 
 **Rust — verified.** `cargo test --workspace` in `rust/`: **130 passed, 0 failed,
-0 ignored.**
+0 ignored** at the time of the port. Now **134**; the four added are in
+[§7](#7-change-log-since-the-port).
 
 **Cross-language interop with DevCouncil's own Python — verified, and newly
 executed.** `rust/dc-store/tests/interop.rs` drives both sides against one
@@ -171,3 +180,64 @@ differential run over real diffs says otherwise.
 - **No differential run** of Rust vs Python gates over real DevCouncil diffs.
   Section 4's verdicts are from reading both implementations, not from measurement.
 - **Linux is unverified.** Everything here was run on darwin/arm64 only.
+
+---
+
+## 6. The two copies
+
+Since 2026-09-01 the `dc-*` crates and the Go clients exist here **and** in
+MANVI, with no mechanism keeping them equal. The first change after the port
+already had to be applied twice by hand (§7), which is the whole problem in
+miniature: it worked because one person did both halves in one sitting, and
+nothing would have failed if they had not.
+
+The three options, none of them yet chosen:
+
+1. **MANVI depends on nothing; DevCouncil vendors.** Keep editing in MANVI and
+   re-vendor here on a cadence, with a checked-in digest so a stale copy is a
+   test failure rather than a surprise. Cheapest, and the drift is at least
+   detectable.
+2. **One workspace, consumed by path or git dependency.** Cargo and Go both
+   support it. Removes the duplication outright; couples the two repositories'
+   release cycles.
+3. **This copy is temporary.** Under the "converge on MANVI" route, DevCouncil's
+   Python is retired and this copy goes with it. Then the duplication has a
+   known end date and option 1 is enough to survive until then.
+
+Until one is chosen, treat MANVI as upstream and mirror by hand.
+
+## 7. Change log since the port
+
+**2026-09-01 — the requirements a task exists to satisfy now cross the boundary.**
+
+`schema.rs` created `requirement_ids_json` and `acceptance_criterion_ids_json`
+because they are in the DevCouncil schema it was transcribed from. `Store::task`
+selected neither, `dcstore` emitted neither, and `dc.Task` had no field for
+either — so every task reaching the Go plane reported no requirements and no
+acceptance criteria. Not an empty list: absent. A requirement-coverage gate
+reading this store would find nothing to check and report a task accountable to
+no requirement exactly as it reports one accountable to all of them.
+
+Added: the two columns to the task read (verbatim, never merged — there is
+deliberately no `agent_appended_*` counterpart, because a task that could append
+to its own requirements could discharge one by claiming it); the two keys to the
+boundary reply; the fields to Go's wire and domain types; and `dc.Requirement` /
+`dc.AcceptanceCriterion`, DevCouncil's model field for field.
+
+Both Go types decode by hand because DevCouncil declares `required: bool = True`
+and `source: ... = "planner"`, pydantic omits defaults when it serialises, and Go
+zeroes an absent bool to `false`. With plain struct tags every criterion whose
+producer omitted the key would have arrived **optional** — still listed, still
+looking checked, no longer something the work must satisfy.
+
+Verified: `cargo test --workspace` 134 passed / 0 failed (was 130), clippy clean;
+`go test ./...` all 7 packages pass. The cross-language tests drive DevCouncil's
+own pydantic models, including under `model_dump_json(exclude_defaults=True)` —
+the hostile case where every defaulted key leaves the wire — and read the
+`verification_method` / `priority` / `source` sets out of the Python `Literal`s
+so a member DevCouncil adds and Go has not learned fails here rather than in
+production. Red-demonstrated by dropping `llm_review` from the Go set and
+watching the parity test fail.
+
+**Still not wired.** This closes a gap the council port depends on; it does not
+by itself make anything call the Rust plane.
