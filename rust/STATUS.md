@@ -21,9 +21,22 @@ significant case it is measurably less capable, and cutting over would weaken a 
 >
 > The two copies still have no build-time relationship, so nothing fails when
 > they drift — [§6](#6-the-two-copies) is the standing decision that needs
-> making. One file is deliberately different: `dc-store/tests/interop.rs`,
-> because this copy resolves DevCouncil as its own ancestor while MANVI's
-> searches upward for a sibling checkout.
+> making. **Exactly two files are deliberately different**, and a mirroring
+> script has to know both:
+>
+> - `dc-store/tests/interop.rs` — this copy resolves DevCouncil as its own
+>   ancestor; MANVI's searches upward for a sibling checkout.
+> - `dc-glob/src/lib.rs` — one `include_str!` path, because the parity fixture
+>   is at `rust/testdata/` here and at the repository root in MANVI.
+>
+> Four paths exist only here and have no MANVI counterpart: `.gitignore`,
+> `README.md`, `STATUS.md`, and `testdata/` (MANVI keeps the parity fixture at
+> its repository root). Every other file is byte-identical:
+>
+> ```bash
+> diff -rq --exclude=target <manvi>/crates rust \
+>   | grep -v 'Only in rust'   # must name exactly the two files above
+> ```
 >
 > The relationship, the component inventory, and the checklist a newly ported
 > component must satisfy live in MANVI's
