@@ -1,0 +1,186 @@
+name: analysis components (rust/ + go clients)
+
+# The dc-* components and their Go clients landed with no CI of any kind: every
+# gate had only ever run on one developer's macOS machine. That hides two things
+# at once — a platform-specific failure nobody can see, and the ordinary case of
+# a change that never had `cargo test` run against it.
+#
+# `rust-port.yml` covers devmap and matches only `rust-port/**`, so none of this
+# tree was reached by it.
+#
+# Three jobs, because they fail for three different reasons and a single job
+# would make them indistinguishable in the summary:
+#
+#   rust    — the components themselves, on three platforms.
+#   interop — the components against DevCouncil's own Python, which is the only
+#             evidence that both sides agree about one state.sqlite.
+#   go      — the clients, driving real component binaries rather than fakes.
+
+on:
+  push:
+    paths:
+      - "rust/**"
+      - "backend/go_orchestrator/**"
+      - "rust-port/**"
+      - ".github/workflows/analysis-plane.yml"
+  pull_request:
+    paths:
+      - "rust/**"
+      - "backend/go_orchestrator/**"
+      - "rust-port/**"
+      - ".github/workflows/analysis-plane.yml"
+  workflow_dispatch:
+
+jobs:
+  rust:
+    name: components (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # dc-store compiles SQLite from source (rusqlite "bundled"), so a failure
+      # here is a C toolchain or portability problem rather than a test problem.
+      # Windows is in the matrix because dc-grep carries cfg(not(unix)) fallbacks
+      # for O_NOFOLLOW and path separators that nothing else exercises; three of
+      # the four crates were confirmed to compile for the MSVC target locally,
+      # and dc-store's C build could not be cross-checked from macOS — this job
+      # is where that answer comes from.
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+  interop:
+    name: interop with DevCouncil's Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # dc-store's interop suite drives DevCouncil's own TaskLeaseRepository
+      # against the same state.sqlite the Rust store wrote. It needs the package
+      # importable from a .venv in the checkout root, which is where the test
+      # looks for the interpreter.
+      - name: Install DevCouncil
+        run: uv sync --all-groups --python 3.12
+
+      # The point of this job. Without DC_STORE_REQUIRE_INTEROP the suite
+      # *skips* when it cannot find an interpreter, and cargo prints ok — three
+      # checks that never ran, reported exactly like three that passed. With it
+      # set, an unreachable Python side is a failure that says the agreement is
+      # UNPROVEN. A check that could not run must never report what a check that
+      # ran and passed reports.
+      - name: Interop, required
+        working-directory: rust
+        env:
+          DC_STORE_REQUIRE_INTEROP: "1"
+        run: cargo test -p dc-store --test interop
+
+  go:
+    name: clients (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go_orchestrator/go.mod
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          # devmap is built below from its own workspace; cache both so the
+          # tree-sitter grammars are not recompiled on every run.
+          cache-all-crates: true
+
+      # internal/testsupport builds dcstore, dcverify and dcgrep out of rust/
+      # and the tests exec them, so this job needs a Rust toolchain even though
+      # nothing here is Rust. A C compiler comes with both runner images.
+      #
+      # sqlite3 is not optional: the requirements suite plants a task row with
+      # it, and testsupport.Unavailable *fails* by default rather than skipping,
+      # which is the intended behaviour and would take the job red without this.
+      - name: Install sqlite3
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y sqlite3
+          else
+            sqlite3 --version
+          fi
+
+      # dc/devmap's TestTheLive* tests drive the real devmap binary and skip
+      # when it is absent. A skip is visible but the job still goes green, and
+      # devmap lives in this repository — so a devmap change could break its own
+      # Go client here with nothing to notice. Building it makes those three
+      # tests actually run, which is why rust-port/** is in this workflow's
+      # trigger paths.
+      - name: Build devmap
+        working-directory: rust-port
+        run: cargo build -p devmap-cli --bin devmap
+
+      - name: Put devmap on PATH
+        run: echo "$GITHUB_WORKSPACE/rust-port/target/debug" >> "$GITHUB_PATH"
+
+      - name: Formatting
+        working-directory: backend/go_orchestrator
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt would rewrite:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: Vet
+        working-directory: backend/go_orchestrator
+        run: go vet ./...
+
+      - name: Test
+        working-directory: backend/go_orchestrator
+        run: go test ./... -count=1
+
+      # The live-contract tests are the only check that the field names this
+      # module decodes are the ones devmap emits. If they skipped, the step
+      # above was green without ever having spoken to the producer, so the skip
+      # is turned into a failure here rather than left in the log.
+      - name: Live devmap contract must have run
+        working-directory: backend/go_orchestrator
+        run: |
+          out="$(go test ./dc/devmap/ -count=1 -run TestTheLive -v 2>&1)"
+          echo "$out"
+          if echo "$out" | grep -q -- '--- SKIP'; then
+            echo "::error::the live devmap contract tests skipped; the producer was never driven"
+            exit 1
+          fi
+          echo "$out" | grep -q -- '--- PASS: TestTheLiveContractHolds' || {
+            echo "::error::TestTheLiveContractHolds did not run"; exit 1; }

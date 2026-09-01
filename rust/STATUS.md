@@ -181,21 +181,53 @@ differential run over real diffs says otherwise.
 
 ---
 
-## 5. Not done
+## 5. State of the handoff
 
-- **Nothing is wired.** No Python consumer imports these binaries. There is no
-  `analysis_plane` client module yet — the pattern to follow is
-  `src/devcouncil/devmap_client.py`, including its `try_connect` discipline
-  (a store that cannot answer must not report a confident zero).
-- **No CI.** Neither workspace is in `.github/`. `DC_STORE_REQUIRE_INTEROP=1`
-  exists precisely so CI can demand the interop evidence, and nothing sets it.
-- **The execution plane is not ported.** MANVI's `gate`, `policy`, `grants`,
-  `agent`, `llm`, `session`, `tools` and `ui` (~123k lines of Go) are what would
-  actually replace `src/devcouncil/execution/` and `gating/`. Only the IPC clients
-  came across.
-- **No differential run** of Rust vs Python gates over real DevCouncil diffs.
-  Section 4's verdicts are from reading both implementations, not from measurement.
-- **Linux is unverified.** Everything here was run on darwin/arm64 only.
+**Closed since the port.**
+
+- **CI exists.** [`.github/workflows/analysis-plane.yml`](../.github/workflows/analysis-plane.yml)
+  covers `rust/**`, `backend/go_orchestrator/**` and `rust-port/**` in three jobs
+  that fail for three different reasons: the components on Linux/macOS/Windows;
+  the interop suite with `DC_STORE_REQUIRE_INTEROP=1` so the Python agreement is
+  demanded rather than hoped for; and the Go clients driving real binaries, with
+  a step that **fails if the live devmap contract tests skipped**. `rust-port/**`
+  is in the trigger paths on purpose: devmap and its Go client live in one
+  repository, so a devmap change must run the client's contract tests.
+- **A build and install path.** [`scripts/install-components.sh`](../scripts/install-components.sh)
+  builds all four release, health-checks each **before** installing any, and
+  installs by atomic rename. Its `dcstore` check refuses a binary that does not
+  report `exclusion_index: verified` — demonstrated against the stale build that
+  was installed on the author's machine, which omits the key entirely.
+- **A component README.** [`README.md`](README.md) states the contract all four
+  binaries follow, the command surfaces as the binaries themselves report them,
+  and where to look next.
+- **Formatting is enforced and clean.** `cargo fmt --all -- --check` passed only
+  after fixing `dc-store/tests/requirements.rs`; without that, the new CI would
+  have been red on its first run.
+
+**Still open, and deliberately so.**
+
+- **Nothing is wired to Python.** No Python consumer imports these binaries, and
+  under the component model none needs to: DevCouncil owns the components, a
+  harness consumes them. If a Python consumer is ever wanted, the pattern is
+  `src/devcouncil/devmap_client.py` and its `try_connect` discipline — a store
+  that cannot answer must not report a confident zero. Note `CONSUMERS.md`'s
+  record of what that pattern cost last time: seven "hybrid" consumers whose
+  Rust path never executed once, hidden by the Python fallback.
+- **The execution plane is not a component.** MANVI's `gate`, `policy`, `grants`,
+  `agent`, `llm`, `session`, `tools` and `ui` are the *harness*, not components,
+  and are not candidates for porting into this repository.
+- **No differential run** of these gates against DevCouncil's Python equivalents
+  over real diffs. §4's verdicts are from reading both implementations, not from
+  measurement — which is why §4 says do not cut over stub detection.
+- **Windows is unproven for `dc-store`.** `dc-glob`, `dc-verify` and `dc-grep`
+  were confirmed to `cargo check` for `x86_64-pc-windows-msvc` locally;
+  `dc-store` compiles SQLite from source and could not be cross-checked from
+  macOS. It is in the CI matrix because `rust-port` already builds bundled
+  `rusqlite` on Windows, so the answer should be yes — but that is an inference,
+  and the first Windows CI run is what settles it.
+- **Linux is unproven locally.** Everything here was run on darwin/arm64. The
+  new CI is what covers it, and it has not run yet.
 
 ---
 
