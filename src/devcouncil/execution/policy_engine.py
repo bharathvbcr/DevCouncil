@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from devcouncil.domain.task import PlannedFile, Task
 
@@ -21,11 +21,66 @@ _PROTECTED_BRANCH_PUSH_RE = re.compile(
 )
 
 
+# Rule identifiers, and the severity of each.
+#
+# Manvi owns this vocabulary (manvi/policy/decision.go); DevCouncil emits it so
+# that one decision means the same thing in all three products. The shared
+# definition is contracts/verdict.schema.json, and
+# tests/unit/test_verdict_contract.py fails if this map and that file disagree.
+#
+# A rule absent from this map is treated as "hard" — a new rule is
+# un-overridable until someone decides otherwise, which is the fail-closed
+# direction and matches Manvi's own default.
+SEVERITY_BY_RULE: dict[str, str] = {
+    "": "none",
+    "path.malformed": "hard",
+    "path.outside_root": "hard",
+    "path.secret": "hard",
+    "path.restricted": "hard",
+    "path.protected_write": "warn",
+    "task.absent": "soft",
+    "task.forbidden_change": "soft",
+    "scope.unplanned": "soft",
+    "scope.read_only": "soft",
+    "scope.operation": "soft",
+    "command.empty": "hard",
+    "command.no_lease": "soft",
+    "command.not_allowed": "soft",
+    "command.bypass_flag": "hard",
+    "command.force_push": "hard",
+    "command.protected_reset": "hard",
+    "command.protected_branch_push": "warn",
+    "command.substitution": "hard",
+    "command.heredoc": "hard",
+    "command.reparse": "hard",
+    "command.too_long": "hard",
+}
+
+
 class PolicyDecision(BaseModel):
+    """One policy decision, in the shape contracts/verdict.schema.json defines.
+
+    ``severity`` is derived from ``rule`` rather than passed in: it is a
+    property of the rule, not of the call site, and twenty-nine call sites
+    each choosing one is twenty-nine chances to mark a hard rule soft.
+    """
+
     action: Literal["allow", "warn", "deny"]
     reason: str
     target: str
     task_id: str | None = None
+    #: The rung that fired. Empty on a clean allow.
+    rule: str = ""
+    #: Derived from ``rule``; never set directly by a call site.
+    severity: str = "none"
+
+    @model_validator(mode="after")
+    def _derive_severity(self) -> "PolicyDecision":
+        # Unknown rule -> hard. Failing closed here matters: an unrecognised
+        # rule that defaulted to "soft" would be demotable and grantable, and
+        # the whole point of a new hard rule is that it is neither.
+        object.__setattr__(self, "severity", SEVERITY_BY_RULE.get(self.rule, "hard"))
+        return self
 
 
 def normalize_repo_path(project_root: Path, raw_path: str) -> tuple[str, bool]:
@@ -253,6 +308,7 @@ class TaskPolicyEngine:
                 action="deny",
                 reason="Empty command is not allowed.",
                 target=command,
+                rule="command.empty",
                 task_id=task.id if task else None,
             )
 
@@ -294,6 +350,7 @@ class TaskPolicyEngine:
                     "`dev graph …` remains an allowlisted alias)."
                 ),
                 target=normalized,
+                rule="command.no_lease",
             )
 
         # Match allowlist entries against both raw and normalized forms so a task
@@ -324,6 +381,7 @@ class TaskPolicyEngine:
             action="deny",
             reason="Command is not in task or global allowlists.",
             target=normalized,
+            rule="command.not_allowed",
             task_id=task.id,
         )
 
@@ -343,6 +401,7 @@ class TaskPolicyEngine:
                 action="deny",
                 reason="Path is outside the project root.",
                 target=normalized,
+                rule="path.outside_root",
                 task_id=task_id,
             )
 
@@ -351,6 +410,7 @@ class TaskPolicyEngine:
                 action="deny",
                 reason="Secret and credential paths are never writable.",
                 target=normalized,
+                rule="path.secret",
                 task_id=task_id,
             )
 
@@ -359,6 +419,7 @@ class TaskPolicyEngine:
                 action="deny",
                 reason="Protected repository paths cannot be modified.",
                 target=normalized,
+                rule="path.restricted",
                 task_id=task_id,
             )
 
@@ -367,6 +428,7 @@ class TaskPolicyEngine:
                 action="deny",
                 reason="No running DevCouncil task authorizes this file write.",
                 target=normalized,
+                rule="task.absent",
             )
 
         if self._matches_forbidden(normalized, task):
@@ -374,6 +436,7 @@ class TaskPolicyEngine:
                 action="deny",
                 reason="Path is listed in forbidden_changes.",
                 target=normalized,
+                rule="task.forbidden_change",
                 task_id=task.id,
             )
 
@@ -386,6 +449,7 @@ class TaskPolicyEngine:
                 action="deny",
                 reason=f"Task {task.id} does not authorize changes to {normalized}.",
                 target=normalized,
+                rule="scope.unplanned",
                 task_id=task.id,
             )
 
@@ -394,6 +458,7 @@ class TaskPolicyEngine:
                 action="deny",
                 reason="Planned file is read-only.",
                 target=normalized,
+                rule="scope.read_only",
                 task_id=task.id,
             )
         if operation == "write":
@@ -402,6 +467,7 @@ class TaskPolicyEngine:
                     action="deny",
                     reason=f"Operation {operation} not allowed for planned file.",
                     target=normalized,
+                    rule="scope.operation",
                     task_id=task.id,
                 )
         elif planned.allowed_change != operation:
@@ -409,6 +475,7 @@ class TaskPolicyEngine:
                 action="deny",
                 reason=f"Operation {operation} not allowed for planned file.",
                 target=normalized,
+                rule="scope.operation",
                 task_id=task.id,
             )
 
@@ -417,6 +484,7 @@ class TaskPolicyEngine:
                 action="warn",
                 reason=f"{normalized} is a protected high-impact file; verification gates must approve it.",
                 target=normalized,
+                rule="path.protected_write",
                 task_id=task.id,
             )
 
@@ -439,6 +507,7 @@ class TaskPolicyEngine:
                 action="deny",
                 reason="Verification bypass flags are not allowed.",
                 target=normalized,
+                rule="command.bypass_flag",
             )
 
         if _HARD_RESET_PROTECTED_RE.search(lowered):
@@ -446,6 +515,7 @@ class TaskPolicyEngine:
                 action="deny",
                 reason="Protected branch hard resets are not allowed.",
                 target=normalized,
+                rule="command.protected_reset",
             )
 
         if _FORCE_PUSH_FLAG_RE.search(lowered) or _FORCE_PUSH_PLUS_REFSPEC_RE.search(lowered):
@@ -456,6 +526,7 @@ class TaskPolicyEngine:
                 action="deny",
                 reason="Force pushes are not allowed.",
                 target=normalized,
+                rule="command.force_push",
             )
 
         if _PROTECTED_BRANCH_PUSH_RE.search(lowered):
@@ -463,6 +534,7 @@ class TaskPolicyEngine:
                 action="warn",
                 reason="Direct pushes to protected branches should go through verification gates.",
                 target=normalized,
+                rule="command.protected_branch_push",
             )
 
         return PolicyDecision(action="allow", reason="Command is allowed.", target=normalized)
@@ -528,6 +600,7 @@ class TaskPolicyEngine:
                     f"declared neighbor). Expand scope with `dev scope update`."
                 ),
                 target=path,
+                rule="scope.unplanned",
                 task_id=task.id,
             )
         except Exception:
