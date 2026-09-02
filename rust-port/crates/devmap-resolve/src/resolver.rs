@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use devmap_extract::model::*;
 
 use crate::model::*;
@@ -580,48 +582,54 @@ impl Resolver {
         extractions: &[Extraction],
         only: Option<&BTreeSet<String>>,
     ) -> ResolutionResult {
-        let mut edges = Vec::new();
-        let mut unresolved: Vec<UnresolvedReference> = Vec::new();
-        let mut package_groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        // Per-file resolution runs in parallel.
+        //
+        // Sound because the loop body below reads only `self` — the symbol and
+        // type indexes, both immutable and fully built before this point — and
+        // writes only its own file's output. No iteration observes another's
+        // edges, and `self` is never mutated. That was checked, not assumed.
+        //
+        // Determinism survives because emission order was never load-bearing:
+        // `edges` is totally ordered by the sort below (R4), which exists
+        // precisely so the result cannot depend on iteration order.
+        // `par_iter().map().collect()` into a `Vec` preserves input order
+        // anyway, so the merge below is the same sequence the serial loop
+        // produced, and `package_groups` is merged into a `BTreeMap` whose
+        // ordering is by key.
+        //
+        // Worth doing because this phase does not shrink on an incremental
+        // build: resolution deliberately covers the whole tree on every changed
+        // build so that liveness and community detection mean the same thing on
+        // both paths (see the comment in `devmap-cli`'s build command), which
+        // makes it the phase whose cost grows straight-line with repository
+        // size while extraction is cached away.
+        type FileResolution = (
+            Vec<ResolvedEdge>,
+            Vec<UnresolvedReference>,
+            BTreeMap<String, BTreeSet<String>>,
+        );
+        let per_file: Vec<FileResolution> = extractions
+            .par_iter()
+            // "No subset requested, or this file is in it" — the positive form
+            // of the `continue` guard this replaced.
+            .filter(|ext| only.is_none_or(|set| set.contains(&ext.file_path)))
+            .map(|ext| {
+                let mut edges: Vec<ResolvedEdge> = Vec::new();
+                let mut unresolved: Vec<UnresolvedReference> = Vec::new();
+                let mut package_groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+                let family = LangFamily::from_lang(&ext.language);
 
-        for ext in extractions {
-            if only.is_some_and(|set| !set.contains(&ext.file_path)) {
-                continue;
-            }
-            let family = LangFamily::from_lang(&ext.language);
-
-            // Lexical containment. The file owns every symbol declared in it —
-            // including nested methods — and a type additionally owns its own
-            // methods, which is exactly the frozen baseline's `contains` shape.
-            for sym in &ext.symbols {
-                if sym.kind == SymbolKind::File {
-                    continue;
-                }
-                edges.push(ResolvedEdge {
-                    source_file: ext.file_path.clone(),
-                    target_file: ext.file_path.clone(),
-                    source_symbol: ext.file_path.clone(),
-                    target_symbol: sym.qualified_name.clone(),
-                    edge_kind: EdgeKind::Contains,
-                    confidence: Confidence::DETERMINISTIC,
-                    resolution: Some(Arc::new(Resolution::SameFile {
-                        target_symbol: sym.qualified_name.clone(),
-                        target_file: ext.file_path.clone(),
-                    })),
-                    details: None,
-                });
-                // A method is contained twice: once by the file, once by the
-                // type that declares it. Only emit the second when the parent
-                // is a real type rather than the file itself.
-                if let Some(parent) = sym
-                    .parent_symbol
-                    .as_deref()
-                    .filter(|parent| *parent != ext.file_path)
-                {
+                // Lexical containment. The file owns every symbol declared in it —
+                // including nested methods — and a type additionally owns its own
+                // methods, which is exactly the frozen baseline's `contains` shape.
+                for sym in &ext.symbols {
+                    if sym.kind == SymbolKind::File {
+                        continue;
+                    }
                     edges.push(ResolvedEdge {
                         source_file: ext.file_path.clone(),
                         target_file: ext.file_path.clone(),
-                        source_symbol: parent.to_string(),
+                        source_symbol: ext.file_path.clone(),
                         target_symbol: sym.qualified_name.clone(),
                         edge_kind: EdgeKind::Contains,
                         confidence: Confidence::DETERMINISTIC,
@@ -631,140 +639,134 @@ impl Resolver {
                         })),
                         details: None,
                     });
-                }
-            }
-
-            // G20: Group Go package members for star topology
-            if family == LangFamily::Go {
-                if let Some(pkg_name) = go_package_name_of(ext) {
-                    if pkg_name != "main" {
-                        let dir = Self::parent_dir(&ext.file_path);
-                        let key = format!("package:{dir}/{pkg_name}");
-                        package_groups
-                            .entry(key)
-                            .or_default()
-                            .insert(ext.file_path.clone());
-                    }
-                }
-            }
-
-            // Resolve imports
-            for imp in &ext.imports {
-                let targets = self.resolve_import_targets(
-                    &ext.file_path,
-                    &ext.language,
-                    &imp.module_specifier,
-                );
-                let edge_targets = if ext.language == "go" {
-                    self.go_import_edge_targets(&targets)
-                } else {
-                    targets
-                };
-                for target_f in edge_targets {
-                    edges.push(ResolvedEdge {
-                        source_file: ext.file_path.clone(),
-                        target_file: target_f.clone(),
-                        source_symbol: ext.file_path.clone(),
-                        target_symbol: target_f.clone(),
-                        edge_kind: EdgeKind::Imports,
-                        confidence: Confidence::DETERMINISTIC,
-                        resolution: Some(Arc::new(Resolution::ImportScoped {
-                            target_symbol: target_f.clone(),
-                            target_file: target_f,
-                            imported_from: imp.module_specifier.clone(),
-                        })),
-                        details: Some(imp.raw_import.clone()),
-                    });
-                }
-            }
-
-            // Resolve calls using Resolution Ladder (SameFile -> ImportScoped -> UniqueGlobal -> AmbiguousGlobal)
-            for call in &ext.calls {
-                let mut resolved_target = None;
-                let mut resolution = None;
-                let mut confidence = Confidence::HIGH;
-
-                // 1. Receiver-based resolution (SameFile / Constructor tracking N6)
-                if let Some(recv) = &call.receiver_expr {
-                    // Prefer the binding scoped to the calling symbol; fall back
-                    // to the file-wide map only when it is unambiguous. Poisoned
-                    // keys are absent from both maps, so a collision falls
-                    // through the ladder instead of resolving to a guess (SC9).
-                    let recv_key = format!("{}:{}", ext.file_path, recv);
-                    let scoped = call.caller_symbol.as_deref().and_then(|caller| {
-                        self.scoped_receiver_types
-                            .get(&format!("{}:{}:{}", ext.file_path, caller, recv))
-                    });
-                    // A receiver that *is* a type names it directly:
-                    // `PdgBuilder::new()`, `Config.default()`, `Self::helper()`.
-                    // There is no binding to look up because nothing was bound
-                    // — the type is written at the call site — so without this
-                    // an associated function fell past every receiver-aware
-                    // rung to the global tier, where any other type declaring
-                    // `new` made it ambiguous.
-                    //
-                    // It fires only when a type of exactly that name declares
-                    // exactly that method, so it cannot invent a target: the
-                    // `type_methods` lookup below is the same one a bound
-                    // receiver goes through, asked with the name as written.
-                    let literal_type = self
-                        .type_methods
-                        .contains_key(&(family, recv.clone(), call.callee_name.clone()))
-                        .then(|| recv.clone());
-                    if let Some(class_type) = scoped
-                        .or_else(|| self.receiver_types.get(&recv_key))
-                        .or(literal_type.as_ref())
+                    // A method is contained twice: once by the file, once by the
+                    // type that declares it. Only emit the second when the parent
+                    // is a real type rather than the file itself.
+                    if let Some(parent) = sym
+                        .parent_symbol
+                        .as_deref()
+                        .filter(|parent| *parent != ext.file_path)
                     {
-                        let key = (family, class_type.clone(), call.callee_name.clone());
-                        if let Some(hits) = self.type_methods.get(&key) {
-                            if hits.len() == 1 {
-                                let (target_f, target_symbol) = &hits[0];
-                                resolved_target = Some((target_f.clone(), target_symbol.clone()));
-                                confidence = Confidence::DETERMINISTIC;
-                                resolution = Some(Arc::new(Resolution::ReceiverType {
-                                    target_symbol: target_symbol.clone(),
-                                    target_file: target_f.clone(),
-                                    receiver_type: class_type.clone(),
-                                }));
-                            }
+                        edges.push(ResolvedEdge {
+                            source_file: ext.file_path.clone(),
+                            target_file: ext.file_path.clone(),
+                            source_symbol: parent.to_string(),
+                            target_symbol: sym.qualified_name.clone(),
+                            edge_kind: EdgeKind::Contains,
+                            confidence: Confidence::DETERMINISTIC,
+                            resolution: Some(Arc::new(Resolution::SameFile {
+                                target_symbol: sym.qualified_name.clone(),
+                                target_file: ext.file_path.clone(),
+                            })),
+                            details: None,
+                        });
+                    }
+                }
+
+                // G20: Group Go package members for star topology
+                if family == LangFamily::Go {
+                    if let Some(pkg_name) = go_package_name_of(ext) {
+                        if pkg_name != "main" {
+                            let dir = Self::parent_dir(&ext.file_path);
+                            let key = format!("package:{dir}/{pkg_name}");
+                            package_groups
+                                .entry(key)
+                                .or_default()
+                                .insert(ext.file_path.clone());
                         }
                     }
                 }
 
-                // 2a. Import-scoped named binding (G6 — no silent global widen)
-                if resolved_target.is_none() {
-                    if let Some(bindings) = self.import_bindings.get(&ext.file_path) {
-                        if let Some((target_f, target_sym)) = bindings.get(&call.callee_name) {
-                            if let Some((resolved_file, resolved_sym)) =
-                                self.lookup_in_package(target_f, target_sym)
-                            {
-                                resolved_target =
-                                    Some((resolved_file.clone(), resolved_sym.clone()));
-                                confidence = Confidence::DETERMINISTIC;
-                                resolution = Some(Arc::new(Resolution::ImportScoped {
-                                    target_symbol: resolved_sym,
-                                    target_file: resolved_file,
-                                    imported_from: call.callee_name.clone(),
-                                }));
-                            }
-                        }
-                    }
-                }
-
-                // 2b. Import-scoped module.method (G6 — no silent global widen)
-                if resolved_target.is_none() {
-                    let (recv, method) = if let Some(r) = &call.receiver_expr {
-                        (r.clone(), call.callee_name.clone())
-                    } else if let Some((r, m)) = call.callee_name.rsplit_once('.') {
-                        (r.to_string(), m.to_string())
+                // Resolve imports
+                for imp in &ext.imports {
+                    let targets = self.resolve_import_targets(
+                        &ext.file_path,
+                        &ext.language,
+                        &imp.module_specifier,
+                    );
+                    let edge_targets = if ext.language == "go" {
+                        self.go_import_edge_targets(&targets)
                     } else {
-                        (String::new(), String::new())
+                        targets
                     };
-                    if !recv.is_empty() && !method.is_empty() {
+                    for target_f in edge_targets {
+                        edges.push(ResolvedEdge {
+                            source_file: ext.file_path.clone(),
+                            target_file: target_f.clone(),
+                            source_symbol: ext.file_path.clone(),
+                            target_symbol: target_f.clone(),
+                            edge_kind: EdgeKind::Imports,
+                            confidence: Confidence::DETERMINISTIC,
+                            resolution: Some(Arc::new(Resolution::ImportScoped {
+                                target_symbol: target_f.clone(),
+                                target_file: target_f,
+                                imported_from: imp.module_specifier.clone(),
+                            })),
+                            details: Some(imp.raw_import.clone()),
+                        });
+                    }
+                }
+
+                // Resolve calls using Resolution Ladder (SameFile -> ImportScoped -> UniqueGlobal -> AmbiguousGlobal)
+                for call in &ext.calls {
+                    let mut resolved_target = None;
+                    let mut resolution = None;
+                    let mut confidence = Confidence::HIGH;
+
+                    // 1. Receiver-based resolution (SameFile / Constructor tracking N6)
+                    if let Some(recv) = &call.receiver_expr {
+                        // Prefer the binding scoped to the calling symbol; fall back
+                        // to the file-wide map only when it is unambiguous. Poisoned
+                        // keys are absent from both maps, so a collision falls
+                        // through the ladder instead of resolving to a guess (SC9).
+                        let recv_key = format!("{}:{}", ext.file_path, recv);
+                        let scoped = call.caller_symbol.as_deref().and_then(|caller| {
+                            self.scoped_receiver_types
+                                .get(&format!("{}:{}:{}", ext.file_path, caller, recv))
+                        });
+                        // A receiver that *is* a type names it directly:
+                        // `PdgBuilder::new()`, `Config.default()`, `Self::helper()`.
+                        // There is no binding to look up because nothing was bound
+                        // — the type is written at the call site — so without this
+                        // an associated function fell past every receiver-aware
+                        // rung to the global tier, where any other type declaring
+                        // `new` made it ambiguous.
+                        //
+                        // It fires only when a type of exactly that name declares
+                        // exactly that method, so it cannot invent a target: the
+                        // `type_methods` lookup below is the same one a bound
+                        // receiver goes through, asked with the name as written.
+                        let literal_type = self
+                            .type_methods
+                            .contains_key(&(family, recv.clone(), call.callee_name.clone()))
+                            .then(|| recv.clone());
+                        if let Some(class_type) = scoped
+                            .or_else(|| self.receiver_types.get(&recv_key))
+                            .or(literal_type.as_ref())
+                        {
+                            let key = (family, class_type.clone(), call.callee_name.clone());
+                            if let Some(hits) = self.type_methods.get(&key) {
+                                if hits.len() == 1 {
+                                    let (target_f, target_symbol) = &hits[0];
+                                    resolved_target =
+                                        Some((target_f.clone(), target_symbol.clone()));
+                                    confidence = Confidence::DETERMINISTIC;
+                                    resolution = Some(Arc::new(Resolution::ReceiverType {
+                                        target_symbol: target_symbol.clone(),
+                                        target_file: target_f.clone(),
+                                        receiver_type: class_type.clone(),
+                                    }));
+                                }
+                            }
+                        }
+                    }
+
+                    // 2a. Import-scoped named binding (G6 — no silent global widen)
+                    if resolved_target.is_none() {
                         if let Some(bindings) = self.import_bindings.get(&ext.file_path) {
-                            if let Some((target_f, _)) = bindings.get(&recv) {
+                            if let Some((target_f, target_sym)) = bindings.get(&call.callee_name) {
                                 if let Some((resolved_file, resolved_sym)) =
-                                    self.lookup_in_package(target_f, &method)
+                                    self.lookup_in_package(target_f, target_sym)
                                 {
                                     resolved_target =
                                         Some((resolved_file.clone(), resolved_sym.clone()));
@@ -772,244 +774,291 @@ impl Resolver {
                                     resolution = Some(Arc::new(Resolution::ImportScoped {
                                         target_symbol: resolved_sym,
                                         target_file: resolved_file,
-                                        imported_from: recv.clone(),
+                                        imported_from: call.callee_name.clone(),
                                     }));
                                 }
                             }
                         }
                     }
-                }
 
-                // 2c. Same-file symbol resolution.
-                //
-                // Runs *after* the import rungs and only for a call this file
-                // could actually be the target of. A call with a receiver names
-                // something that receiver owns, so matching the bare callee
-                // against this file's own symbols is a guess — and a wrong one
-                // wherever a module handle shares a name with a local
-                // declaration. `ast_lsp_handlers.reset_caches()` inside a file
-                // that itself declares `reset_caches` resolved to *itself*,
-                // fabricating a self-call edge and leaving the real target with
-                // no caller and a confident dead-code finding. The same shape
-                // put `a.cfg.capabilityFor(model)` on `Adapter.capabilityFor`
-                // and reported `Config.capabilityFor` dead at 0.9.
-                //
-                // A self-reference is the exception, because there the receiver
-                // *is* this scope: `self.helper()` and `this.helper()` name a
-                // sibling declaration, which is exactly what this rung finds.
-                if resolved_target.is_none()
-                    && call
-                        .receiver_expr
-                        .as_deref()
-                        .is_none_or(Self::receiver_is_self)
-                {
-                    if let Some(file_syms) = self.file_symbols.get(&ext.file_path) {
-                        if file_syms
-                            .iter()
-                            .filter(|symbol| *symbol == &call.callee_name)
-                            .count()
-                            == 1
-                        {
-                            resolved_target =
-                                Some((ext.file_path.clone(), call.callee_name.clone()));
-                            confidence = Confidence::DETERMINISTIC;
-                            resolution = Some(Arc::new(Resolution::SameFile {
-                                target_symbol: call.callee_name.clone(),
-                                target_file: ext.file_path.clone(),
-                            }));
+                    // 2b. Import-scoped module.method (G6 — no silent global widen)
+                    if resolved_target.is_none() {
+                        let (recv, method) = if let Some(r) = &call.receiver_expr {
+                            (r.clone(), call.callee_name.clone())
+                        } else if let Some((r, m)) = call.callee_name.rsplit_once('.') {
+                            (r.to_string(), m.to_string())
+                        } else {
+                            (String::new(), String::new())
+                        };
+                        if !recv.is_empty() && !method.is_empty() {
+                            if let Some(bindings) = self.import_bindings.get(&ext.file_path) {
+                                if let Some((target_f, _)) = bindings.get(&recv) {
+                                    if let Some((resolved_file, resolved_sym)) =
+                                        self.lookup_in_package(target_f, &method)
+                                    {
+                                        resolved_target =
+                                            Some((resolved_file.clone(), resolved_sym.clone()));
+                                        confidence = Confidence::DETERMINISTIC;
+                                        resolution = Some(Arc::new(Resolution::ImportScoped {
+                                            target_symbol: resolved_sym,
+                                            target_file: resolved_file,
+                                            imported_from: recv.clone(),
+                                        }));
+                                    }
+                                }
+                            }
                         }
                     }
-                }
 
-                // 3. Global lookup (UniqueGlobal vs AmbiguousGlobal - G5, G3)
-                if resolved_target.is_none() {
-                    if let Some(hits) = self.symbol_index.get(&call.callee_name) {
-                        let family_hits: Vec<_> = hits
-                            .iter()
-                            .filter(|(path, _, candidate_family)| {
-                                *candidate_family == family
-                                    && (*candidate_family != LangFamily::Go
-                                        || Self::go_symbol_visible_from(
-                                            &ext.file_path,
-                                            path,
-                                            &call.callee_name,
-                                        ))
-                            })
-                            .collect();
-                        if family_hits.len() == 1 {
-                            let (target_f, _, _) = family_hits[0];
-                            // G3: Python stdlib-name guard inside UniqueGlobal rung only
-                            let is_python_stdlib_guard = family == LangFamily::Python
-                                && matches!(
-                                    call.callee_name.as_str(),
-                                    "open" | "dir" | "print" | "type" | "id" | "len"
-                                )
-                                && target_f != &ext.file_path;
-
-                            if !is_python_stdlib_guard {
+                    // 2c. Same-file symbol resolution.
+                    //
+                    // Runs *after* the import rungs and only for a call this file
+                    // could actually be the target of. A call with a receiver names
+                    // something that receiver owns, so matching the bare callee
+                    // against this file's own symbols is a guess — and a wrong one
+                    // wherever a module handle shares a name with a local
+                    // declaration. `ast_lsp_handlers.reset_caches()` inside a file
+                    // that itself declares `reset_caches` resolved to *itself*,
+                    // fabricating a self-call edge and leaving the real target with
+                    // no caller and a confident dead-code finding. The same shape
+                    // put `a.cfg.capabilityFor(model)` on `Adapter.capabilityFor`
+                    // and reported `Config.capabilityFor` dead at 0.9.
+                    //
+                    // A self-reference is the exception, because there the receiver
+                    // *is* this scope: `self.helper()` and `this.helper()` name a
+                    // sibling declaration, which is exactly what this rung finds.
+                    if resolved_target.is_none()
+                        && call
+                            .receiver_expr
+                            .as_deref()
+                            .is_none_or(Self::receiver_is_self)
+                    {
+                        if let Some(file_syms) = self.file_symbols.get(&ext.file_path) {
+                            if file_syms
+                                .iter()
+                                .filter(|symbol| *symbol == &call.callee_name)
+                                .count()
+                                == 1
+                            {
                                 resolved_target =
-                                    Some((target_f.clone(), call.callee_name.clone()));
-                                confidence = Confidence::HIGH;
-                                resolution = Some(Arc::new(Resolution::UniqueGlobal {
+                                    Some((ext.file_path.clone(), call.callee_name.clone()));
+                                confidence = Confidence::DETERMINISTIC;
+                                resolution = Some(Arc::new(Resolution::SameFile {
                                     target_symbol: call.callee_name.clone(),
-                                    target_file: target_f.clone(),
+                                    target_file: ext.file_path.clone(),
+                                }));
+                            }
+                        }
+                    }
+
+                    // 3. Global lookup (UniqueGlobal vs AmbiguousGlobal - G5, G3)
+                    if resolved_target.is_none() {
+                        if let Some(hits) = self.symbol_index.get(&call.callee_name) {
+                            let family_hits: Vec<_> = hits
+                                .iter()
+                                .filter(|(path, _, candidate_family)| {
+                                    *candidate_family == family
+                                        && (*candidate_family != LangFamily::Go
+                                            || Self::go_symbol_visible_from(
+                                                &ext.file_path,
+                                                path,
+                                                &call.callee_name,
+                                            ))
+                                })
+                                .collect();
+                            if family_hits.len() == 1 {
+                                let (target_f, _, _) = family_hits[0];
+                                // G3: Python stdlib-name guard inside UniqueGlobal rung only
+                                let is_python_stdlib_guard = family == LangFamily::Python
+                                    && matches!(
+                                        call.callee_name.as_str(),
+                                        "open" | "dir" | "print" | "type" | "id" | "len"
+                                    )
+                                    && target_f != &ext.file_path;
+
+                                if !is_python_stdlib_guard {
+                                    resolved_target =
+                                        Some((target_f.clone(), call.callee_name.clone()));
+                                    confidence = Confidence::HIGH;
+                                    resolution = Some(Arc::new(Resolution::UniqueGlobal {
+                                        target_symbol: call.callee_name.clone(),
+                                        target_file: target_f.clone(),
+                                        family,
+                                    }));
+                                }
+                            } else if family_hits.len() > 1 {
+                                // G5: Multi-candidate pick MUST NOT emit Extracted / HIGH confidence
+                                let candidates: Vec<(String, String)> = family_hits
+                                    .iter()
+                                    .map(|(f, _, _)| ((*f).clone(), call.callee_name.clone()))
+                                    .collect();
+                                resolved_target =
+                                    Some((candidates[0].0.clone(), call.callee_name.clone()));
+                                confidence = Confidence::SPECULATIVE;
+                                resolution = Some(Arc::new(Resolution::AmbiguousGlobal {
+                                    candidates,
                                     family,
                                 }));
                             }
-                        } else if family_hits.len() > 1 {
-                            // G5: Multi-candidate pick MUST NOT emit Extracted / HIGH confidence
-                            let candidates: Vec<(String, String)> = family_hits
+                        }
+                    }
+
+                    let caller_sym = call
+                        .caller_symbol
+                        .clone()
+                        .unwrap_or_else(|| ext.file_path.clone());
+                    if let Some(Resolution::AmbiguousGlobal { candidates, .. }) =
+                        resolution.as_deref()
+                    {
+                        for (target_f, target_sym) in candidates {
+                            edges.push(ResolvedEdge {
+                                source_file: ext.file_path.clone(),
+                                target_file: target_f.clone(),
+                                source_symbol: caller_sym.clone(),
+                                target_symbol: self.qualified_for(target_f, target_sym),
+                                edge_kind: EdgeKind::Calls,
+                                confidence,
+                                resolution: resolution.clone(),
+                                details: None,
+                            });
+                        }
+                    } else if let Some((target_f, target_sym)) = resolved_target {
+                        let target_symbol = self.qualified_for(&target_f, &target_sym);
+                        edges.push(ResolvedEdge {
+                            source_file: ext.file_path.clone(),
+                            target_file: target_f,
+                            source_symbol: caller_sym,
+                            target_symbol,
+                            edge_kind: EdgeKind::Calls,
+                            confidence,
+                            resolution,
+                            details: None,
+                        });
+                    } else {
+                        // D17 / R5: a call the ladder could not resolve is recorded,
+                        // never dropped. Silence here is indistinguishable from
+                        // "there was no call", which is the failure R5 forbids.
+                        let class = self.classify_unresolved(
+                            &ext.file_path,
+                            family,
+                            &call.callee_name,
+                            call.receiver_expr.as_deref(),
+                            &caller_sym,
+                        );
+                        unresolved.push(UnresolvedReference {
+                            source_file: ext.file_path.clone(),
+                            source_symbol: caller_sym,
+                            callee_name: call.callee_name.clone(),
+                            resolution: Resolution::Unresolved {
+                                reason: format!(
+                                    "no resolution ladder rung matched {:?} in {} family {:?}",
+                                    call.callee_name, ext.file_path, family
+                                ),
+                            },
+                            class,
+                            receiver: call.receiver_expr.clone(),
+                        });
+                    }
+                }
+
+                for reference in &ext.references {
+                    if matches!(
+                        reference.kind,
+                        ReferenceKind::Call | ReferenceKind::Constructor | ReferenceKind::JsxTag
+                    ) {
+                        continue;
+                    }
+                    if let Some(edge) = self.resolve_name_reference(ext, family, reference) {
+                        edges.push(edge);
+                    }
+                }
+
+                // Resolve routes
+                for route in &ext.routes {
+                    if let Some(hits) = self.symbol_index.get(&route.handler_name) {
+                        let same_file: Vec<_> = hits
+                            .iter()
+                            .filter(|(path, _, _)| path == &ext.file_path)
+                            .collect();
+                        let route_target = if same_file.len() == 1 {
+                            let (target_f, _, _) = same_file[0];
+                            Some((
+                                target_f.clone(),
+                                Confidence::DETERMINISTIC,
+                                Resolution::SameFile {
+                                    target_symbol: route.handler_name.clone(),
+                                    target_file: target_f.clone(),
+                                },
+                            ))
+                        } else if let Some((target_f, target_symbol)) = self
+                            .import_bindings
+                            .get(&ext.file_path)
+                            .and_then(|bindings| bindings.get(&route.handler_name))
+                        {
+                            Some((
+                                target_f.clone(),
+                                Confidence::DETERMINISTIC,
+                                Resolution::ImportScoped {
+                                    target_symbol: target_symbol.clone(),
+                                    target_file: target_f.clone(),
+                                    imported_from: route.handler_name.clone(),
+                                },
+                            ))
+                        } else {
+                            let family_hits: Vec<_> = hits
                                 .iter()
-                                .map(|(f, _, _)| ((*f).clone(), call.callee_name.clone()))
+                                .filter(|(path, _, candidate_family)| {
+                                    *candidate_family == family
+                                        && (*candidate_family != LangFamily::Go
+                                            || Self::go_symbol_visible_from(
+                                                &ext.file_path,
+                                                path,
+                                                &route.handler_name,
+                                            ))
+                                })
                                 .collect();
-                            resolved_target =
-                                Some((candidates[0].0.clone(), call.callee_name.clone()));
-                            confidence = Confidence::SPECULATIVE;
-                            resolution =
-                                Some(Arc::new(Resolution::AmbiguousGlobal { candidates, family }));
+                            (family_hits.len() == 1).then(|| {
+                                let (target_f, _, _) = family_hits[0];
+                                (
+                                    target_f.clone(),
+                                    Confidence::HIGH,
+                                    Resolution::UniqueGlobal {
+                                        target_symbol: route.handler_name.clone(),
+                                        target_file: target_f.clone(),
+                                        family,
+                                    },
+                                )
+                            })
+                        };
+                        if let Some((target_f, confidence, resolution)) = route_target {
+                            edges.push(ResolvedEdge {
+                                source_file: ext.file_path.clone(),
+                                target_file: target_f.clone(),
+                                source_symbol: format!(
+                                    "{} {}",
+                                    route.http_method, route.path_pattern
+                                ),
+                                target_symbol: route.handler_name.clone(),
+                                edge_kind: EdgeKind::HandlesRoute,
+                                confidence,
+                                resolution: Some(Arc::new(resolution)),
+                                details: Some(route.framework.clone()),
+                            });
                         }
                     }
                 }
+                (edges, unresolved, package_groups)
+            })
+            .collect();
 
-                let caller_sym = call
-                    .caller_symbol
-                    .clone()
-                    .unwrap_or_else(|| ext.file_path.clone());
-                if let Some(Resolution::AmbiguousGlobal { candidates, .. }) = resolution.as_deref()
-                {
-                    for (target_f, target_sym) in candidates {
-                        edges.push(ResolvedEdge {
-                            source_file: ext.file_path.clone(),
-                            target_file: target_f.clone(),
-                            source_symbol: caller_sym.clone(),
-                            target_symbol: self.qualified_for(target_f, target_sym),
-                            edge_kind: EdgeKind::Calls,
-                            confidence,
-                            resolution: resolution.clone(),
-                            details: None,
-                        });
-                    }
-                } else if let Some((target_f, target_sym)) = resolved_target {
-                    let target_symbol = self.qualified_for(&target_f, &target_sym);
-                    edges.push(ResolvedEdge {
-                        source_file: ext.file_path.clone(),
-                        target_file: target_f,
-                        source_symbol: caller_sym,
-                        target_symbol,
-                        edge_kind: EdgeKind::Calls,
-                        confidence,
-                        resolution,
-                        details: None,
-                    });
-                } else {
-                    // D17 / R5: a call the ladder could not resolve is recorded,
-                    // never dropped. Silence here is indistinguishable from
-                    // "there was no call", which is the failure R5 forbids.
-                    let class = self.classify_unresolved(
-                        &ext.file_path,
-                        family,
-                        &call.callee_name,
-                        call.receiver_expr.as_deref(),
-                        &caller_sym,
-                    );
-                    unresolved.push(UnresolvedReference {
-                        source_file: ext.file_path.clone(),
-                        source_symbol: caller_sym,
-                        callee_name: call.callee_name.clone(),
-                        resolution: Resolution::Unresolved {
-                            reason: format!(
-                                "no resolution ladder rung matched {:?} in {} family {:?}",
-                                call.callee_name, ext.file_path, family
-                            ),
-                        },
-                        class,
-                        receiver: call.receiver_expr.clone(),
-                    });
-                }
-            }
-
-            for reference in &ext.references {
-                if matches!(
-                    reference.kind,
-                    ReferenceKind::Call | ReferenceKind::Constructor | ReferenceKind::JsxTag
-                ) {
-                    continue;
-                }
-                if let Some(edge) = self.resolve_name_reference(ext, family, reference) {
-                    edges.push(edge);
-                }
-            }
-
-            // Resolve routes
-            for route in &ext.routes {
-                if let Some(hits) = self.symbol_index.get(&route.handler_name) {
-                    let same_file: Vec<_> = hits
-                        .iter()
-                        .filter(|(path, _, _)| path == &ext.file_path)
-                        .collect();
-                    let route_target = if same_file.len() == 1 {
-                        let (target_f, _, _) = same_file[0];
-                        Some((
-                            target_f.clone(),
-                            Confidence::DETERMINISTIC,
-                            Resolution::SameFile {
-                                target_symbol: route.handler_name.clone(),
-                                target_file: target_f.clone(),
-                            },
-                        ))
-                    } else if let Some((target_f, target_symbol)) = self
-                        .import_bindings
-                        .get(&ext.file_path)
-                        .and_then(|bindings| bindings.get(&route.handler_name))
-                    {
-                        Some((
-                            target_f.clone(),
-                            Confidence::DETERMINISTIC,
-                            Resolution::ImportScoped {
-                                target_symbol: target_symbol.clone(),
-                                target_file: target_f.clone(),
-                                imported_from: route.handler_name.clone(),
-                            },
-                        ))
-                    } else {
-                        let family_hits: Vec<_> = hits
-                            .iter()
-                            .filter(|(path, _, candidate_family)| {
-                                *candidate_family == family
-                                    && (*candidate_family != LangFamily::Go
-                                        || Self::go_symbol_visible_from(
-                                            &ext.file_path,
-                                            path,
-                                            &route.handler_name,
-                                        ))
-                            })
-                            .collect();
-                        (family_hits.len() == 1).then(|| {
-                            let (target_f, _, _) = family_hits[0];
-                            (
-                                target_f.clone(),
-                                Confidence::HIGH,
-                                Resolution::UniqueGlobal {
-                                    target_symbol: route.handler_name.clone(),
-                                    target_file: target_f.clone(),
-                                    family,
-                                },
-                            )
-                        })
-                    };
-                    if let Some((target_f, confidence, resolution)) = route_target {
-                        edges.push(ResolvedEdge {
-                            source_file: ext.file_path.clone(),
-                            target_file: target_f.clone(),
-                            source_symbol: format!("{} {}", route.http_method, route.path_pattern),
-                            target_symbol: route.handler_name.clone(),
-                            edge_kind: EdgeKind::HandlesRoute,
-                            confidence,
-                            resolution: Some(Arc::new(resolution)),
-                            details: Some(route.framework.clone()),
-                        });
-                    }
-                }
+        let mut edges: Vec<ResolvedEdge> = Vec::new();
+        let mut unresolved: Vec<UnresolvedReference> = Vec::new();
+        let mut package_groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (file_edges, file_unresolved, file_packages) in per_file {
+            edges.extend(file_edges);
+            unresolved.extend(file_unresolved);
+            for (package, files) in file_packages {
+                package_groups.entry(package).or_default().extend(files);
             }
         }
 

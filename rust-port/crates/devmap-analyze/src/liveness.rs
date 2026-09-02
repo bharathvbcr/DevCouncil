@@ -262,8 +262,19 @@ pub fn analyze_liveness(
     let mut reports = Vec::new();
 
     for ext in extractions {
-        // X6: Parse-failed files must NEVER be reported as confirmed dead code candidates
-        let is_parse_failed = matches!(ext.parse_outcome, ParseOutcome::Failed { .. });
+        // X6: Parse-failed files must NEVER be reported as confirmed dead code
+        // candidates — and neither must pattern-recovered ones.
+        //
+        // A `Fallback` file had its declarations recovered by line pattern
+        // because no grammar exists for its language, and that tier extracts no
+        // calls at all. So *every* symbol in such a file is uncalled by
+        // construction, and reporting them would hand `devmap dead` one false
+        // candidate per declaration in every `.proto`, `.ps1` and `.vb` in the
+        // tree. "Nothing calls it" is only evidence when calls were looked for.
+        let is_parse_failed = matches!(
+            ext.parse_outcome,
+            ParseOutcome::Failed { .. } | ParseOutcome::Fallback { .. }
+        );
 
         // A wiring annotation is file-scoped only when it targets the file
         // itself. Symbol-scoped annotations must never be read as file-scoped:
@@ -324,7 +335,13 @@ pub fn analyze_liveness(
             })
             .unwrap_or_default();
 
-        let file_reason = if is_parse_failed {
+        let file_reason = if matches!(ext.parse_outcome, ParseOutcome::Fallback { .. }) {
+            Some(
+                "Declarations recovered by pattern, no call extraction — \
+                 excluded from dead code candidates"
+                    .to_string(),
+            )
+        } else if is_parse_failed {
             Some("Parse failed — excluded from dead code candidates".to_string())
         } else {
             file_wiring.first().map(|w| w.details.clone())
@@ -347,7 +364,11 @@ pub fn analyze_liveness(
                 ParseOutcome::Partial { error_ranges } => error_ranges.iter().any(|range| {
                     sym.span.start_byte < range.end_byte && range.start_byte < sym.span.end_byte
                 }),
-                ParseOutcome::Clean | ParseOutcome::Failed { .. } => false,
+                // No grammar ran, so there are no error ranges to overlap.
+                // The file is exempt wholesale via `is_parse_failed` above.
+                ParseOutcome::Clean
+                | ParseOutcome::Failed { .. }
+                | ParseOutcome::Fallback { .. } => false,
             };
 
             let is_exported = sym.is_exported;
@@ -479,6 +500,8 @@ mod tests {
             docstring: None,
             signature: None,
             parent_symbol: None,
+            body_signature: None,
+            declaration_hash: None,
         }
     }
 

@@ -10,6 +10,25 @@ members = [
     "crates/devmap-cli",
 ]
 
+# The release profile was left at cargo's defaults, which are tuned for build
+# time: `codegen-units = 16` splits each crate into units optimized in isolation,
+# and cross-crate inlining is off. That is the wrong trade for this binary. It is
+# built rarely and run on every agent turn, and its hot loops — tree-sitter
+# walks in `devmap-extract`, the symbol-index lookups in `devmap-resolve` — cross
+# crate boundaries constantly, which is exactly what a unified codegen unit and
+# LTO can see through.
+#
+# `lto = "thin"` rather than `"fat"`: measured on this workspace, thin recovers
+# effectively all of fat's runtime win for a fraction of the link time.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# Abort rather than unwind. The CLI has no `catch_unwind` recovery anywhere — a
+# panic already ends the process — so unwinding tables are landing-pad code and
+# inlining barriers for a path that never runs. Tests keep the default unwind
+# profile, so `#[should_panic]` coverage is unaffected.
+panic = "abort"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

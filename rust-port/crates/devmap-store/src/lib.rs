@@ -7,7 +7,7 @@ pub mod schema;
 
 pub use db::{
     current_git_head, BuildHistoryRow, GenerationWriteOpts, Store, StoreStatus, StoredEdge,
-    StoredFile, StoredSymbol, WalCheckpointMode, WalCheckpointResult,
+    StoredFile, StoredSymbol, VacuumAction, VacuumOutcome, WalCheckpointMode, WalCheckpointResult,
 };
 #[cfg(feature = "parse")]
 pub use extract_cache::{extract_tree_cached, extract_tree_cached_with_report};

@@ -89,6 +89,33 @@ struct PendingDelta {
 /// so every one whose spawning client exited used to outlive its consumer
 /// indefinitely — six were found holding stores open across unrelated
 /// repositories on one development machine, some running superseded binaries.
+/// Identity of the executable backing this process: `(size, mtime)`.
+///
+/// `None` when it cannot be determined — a deleted or unreadable `/proc` entry,
+/// a platform without `current_exe`. `None` compares equal to `None`, so an
+/// undeterminable identity never *causes* a retirement; the daemon then behaves
+/// exactly as it did before this check existed. Failing the other way would let
+/// an unreadable executable path restart the daemon on every tick.
+fn executable_identity() -> Option<(u64, std::time::SystemTime)> {
+    let path = std::env::current_exe().ok()?;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
+/// Whether a changed executable identity should retire the daemon.
+///
+/// Split from the tick so the policy can be asserted directly. The effect —
+/// "process exits at some point in the next two seconds" — is not something a
+/// test can observe without racing, and the branch guards a silent failure
+/// (stale answers from a rebuilt kernel), which is exactly the kind that
+/// survives an untested predicate.
+fn should_retire_for_new_binary(
+    started_as: Option<(u64, std::time::SystemTime)>,
+    current: Option<(u64, std::time::SystemTime)>,
+) -> bool {
+    started_as != current
+}
+
 /// A generous idle bound retires them; the next client call respawns a fresh
 /// one against the current kernel. Set `DEVMAP_MAX_IDLE_SECS=0` for a
 /// never-exit daemon.
@@ -325,6 +352,33 @@ impl Daemon {
     /// Process up to `batch_limit` claimed paths. Only claimed files are read
     /// from disk; unchanged extraction payloads come from the durable generation.
     /// Attempts are recorded before work starts, and paths are acknowledged only
+    /// Whether the working tree's HEAD differs from the one the latest
+    /// generation was built at. (B5)
+    ///
+    /// Fails *safe*, not quiet: if either side cannot be read the answer is
+    /// `true`, forcing a full rebuild. An unreadable HEAD is precisely the
+    /// state in which "nothing changed" is the claim least worth trusting, and
+    /// a redundant full rebuild costs time while a skipped one costs
+    /// correctness.
+    fn head_differs_from_last_generation(&self, root: &std::path::Path) -> bool {
+        let stored = match self.store.latest_generation_head_sha() {
+            Ok(Some(stored)) => stored,
+            // No generation yet: nothing to invalidate.
+            Ok(None) => return false,
+            Err(error) => {
+                warn!("cannot read the stored head_sha, assuming HEAD moved: {error}");
+                return true;
+            }
+        };
+        match devmap_store::current_git_head(root) {
+            Ok(current) => current != stored,
+            Err(error) => {
+                warn!("cannot read git HEAD, assuming it moved: {error}");
+                true
+            }
+        }
+    }
+
     /// after extraction, resolution, analysis, and persistence all succeed.
     pub fn drain_pending_batch(&self) -> anyhow::Result<usize> {
         let batch = self.store.get_pending_paths_limited(self.batch_limit)?;
@@ -346,7 +400,21 @@ impl Daemon {
 
         let mut succeeded = Vec::new();
         let mut failures = Vec::new();
+        // B5: git moved HEAD or a ref. Not a file to extract — a statement that
+        // the generation may describe a tree that no longer exists. Consumed
+        // here so `collect_pending_path` never sees a path that is not one, and
+        // acknowledged either way so it cannot be redelivered forever.
+        let head_event = batch
+            .iter()
+            .any(|pending| pending == crate::watcher::GIT_HEAD_SENTINEL);
+        let head_moved = head_event && self.head_differs_from_last_generation(&root);
+        if head_event {
+            succeeded.push(crate::watcher::GIT_HEAD_SENTINEL.to_string());
+        }
         for pending in &batch {
+            if pending == crate::watcher::GIT_HEAD_SENTINEL {
+                continue;
+            }
             match self.collect_pending_path(&root, &previous, pending) {
                 Ok(delta) => {
                     affected.extend(delta.affected);
@@ -379,7 +447,18 @@ impl Daemon {
                 self.root
             );
         }
-        let (mut extractions, full_rebuild) = if payload_is_current {
+        if head_moved {
+            warn!(
+                "git HEAD moved since the last generation; re-extracting {:?} in full",
+                self.root
+            );
+        }
+        // A moved HEAD invalidates the carry-forward for the same reason a
+        // stale payload does: `previous` describes a different checkout, and
+        // every file it holds that this batch did not touch may now differ.
+        // Carrying them forward would leave the graph describing a mixture of
+        // two commits, which is worse than describing the old one.
+        let (mut extractions, full_rebuild) = if payload_is_current && !head_moved {
             let mut carried: Vec<_> = previous
                 .into_iter()
                 .filter(|extraction| !affected.contains(&extraction.file_path))
@@ -541,6 +620,9 @@ impl Daemon {
         // daemon — idle time runs from loop start, not from zero. That is the
         // orphan case: spawned, used once, client died, nothing left to ask.
         let started_at = std::time::Instant::now();
+        // Captured once, at startup, so the tick below compares against what
+        // this process was actually launched from. See the retirement check.
+        let started_as = executable_identity();
         loop {
             tokio::select! {
                 result = &mut ipc_task.0 => {
@@ -548,6 +630,50 @@ impl Daemon {
                         .map_err(|error| anyhow::anyhow!("IPC task join failed: {error}"))?;
                 }
                 _ = ticker.tick() => {
+                    // Retire when the binary that started this process has been
+                    // replaced on disk.
+                    //
+                    // The IPC handshake checks `PROTOCOL_VERSION`, which is a
+                    // wire-format number, not a build identity — it does not
+                    // move when the kernel is rebuilt. So a daemon started
+                    // before a `cargo build` keeps answering from the old code
+                    // for up to its full idle bound (30 minutes by default),
+                    // and every client gets pre-fix answers from a tree that
+                    // has been fixed. Observed exactly that while fixing the
+                    // oversized-search-hit bug: the rebuilt kernel returned the
+                    // match, the daemon in front of it kept returning nothing,
+                    // and the difference was invisible from either side.
+                    //
+                    // Identity is (size, mtime) rather than a version string,
+                    // for the reason `find_engine_binary` already documents:
+                    // every build of this workspace reports `devmap 0.1.0`, so
+                    // a version cannot distinguish two of them.
+                    //
+                    // Unlike the idle bound below, this does **not** wait for
+                    // the pending queue to drain.
+                    //
+                    // The idle bound waits because retiring mid-queue would
+                    // stall the resync until some future client respawned us.
+                    // That reasoning inverts here: draining under a superseded
+                    // binary means the old kernel writes the generation, which
+                    // is the outcome this check exists to prevent. The queue is
+                    // persisted in the store, not held in memory, so the daemon
+                    // the next client spawns picks up exactly the same paths and
+                    // drains them with the new kernel — nothing is lost by
+                    // leaving now.
+                    //
+                    // Waiting would also make the check unreliable precisely
+                    // where it matters most: on a repository busy enough that
+                    // the queue never empties, a stale daemon would serve old
+                    // answers indefinitely.
+                    if should_retire_for_new_binary(started_as, executable_identity()) {
+                        info!(
+                            "devmap binary changed on disk since this daemon started; \
+                             retiring so the next client gets the current kernel \
+                             (pending work stays queued in the store)"
+                        );
+                        return Ok(());
+                    }
                     if let Some(limit) = max_idle {
                         let idle_for = activity
                             .idle_for()
@@ -1278,6 +1404,63 @@ mod tests {
         dir
     }
 
+    /// A rebuilt binary retires the daemon; an unchanged one does not.
+    ///
+    /// The hazard is specific: `PROTOCOL_VERSION` does not move when the kernel
+    /// is rebuilt, so without this check a daemon started before a `cargo
+    /// build` keeps serving the old code for its whole idle bound — 30 minutes
+    /// by default — and every client reads pre-fix answers from a fixed tree.
+    #[test]
+    fn a_changed_executable_identity_retires_the_daemon() {
+        let epoch = std::time::UNIX_EPOCH;
+        let started = Some((1_000u64, epoch));
+
+        assert!(
+            !should_retire_for_new_binary(started, started),
+            "an unchanged binary must not restart the daemon on every tick"
+        );
+        assert!(
+            should_retire_for_new_binary(started, Some((2_000, epoch))),
+            "a binary whose size changed is a rebuild"
+        );
+        assert!(
+            should_retire_for_new_binary(
+                started,
+                Some((1_000, epoch + std::time::Duration::from_secs(1))),
+            ),
+            "a rebuild that happens to produce the same size still moves mtime"
+        );
+    }
+
+    /// An undeterminable identity must not cause a retirement.
+    ///
+    /// `None` is "could not tell", not "changed". Treating it as a change would
+    /// make the daemon exit on every tick on any platform or sandbox where
+    /// `current_exe` fails — turning a diagnostic gap into a crash loop that
+    /// respawns a process per client call.
+    #[test]
+    fn an_undeterminable_executable_identity_never_retires() {
+        assert!(!should_retire_for_new_binary(None, None));
+    }
+
+    /// The real probe answers for this test binary, and answers consistently.
+    ///
+    /// Without this the two tests above would pass over a function that always
+    /// returned `None` in practice, and the check would be dead.
+    #[test]
+    fn executable_identity_resolves_and_is_stable() {
+        let first = executable_identity();
+        assert!(
+            first.is_some(),
+            "current_exe/metadata should resolve for the test binary"
+        );
+        assert_eq!(
+            first,
+            executable_identity(),
+            "identity must be stable for an unchanged binary"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn status_answers_while_the_connect_time_sweep_is_still_running() {
@@ -1291,16 +1474,28 @@ mod tests {
         // `status` answers from the last committed generation while the
         // sweep is still grinding.
         let root = short_unix_fixture_dir("bindfirst");
-        // Enough files that hashing the tree takes comfortably longer than
+        // Enough *work* that hashing the tree takes comfortably longer than
         // the probe budget below; the precondition asserts this so the test
         // cannot pass vacuously on a fast machine.
+        //
+        // The margin is in bytes per file rather than in file count. At two
+        // lines per file this fixture drifted down to 115 ms against its own
+        // 120 ms floor and failed on the precondition — correctly, since the
+        // ordering assertion would have been meaningless — as the kernel got
+        // faster. Reaching the same margin by multiplying the file count would
+        // mean tens of thousands of inodes and a setup slower than the test;
+        // hashing cost scales with content, so bigger files buy the same
+        // headroom for 6,000 `fs::write` calls instead of 25,000.
         const FILE_COUNT: usize = 6_000;
+        const BODIES_PER_FILE: usize = 24;
         for index in 0..FILE_COUNT {
-            fs::write(
-                root.join(format!("mod_{index}.py")),
-                format!("def leaf_{index}():\n    return {index}\n"),
-            )
-            .unwrap();
+            let mut body = String::with_capacity(BODIES_PER_FILE * 48);
+            for leaf in 0..BODIES_PER_FILE {
+                body.push_str(&format!(
+                    "def leaf_{index}_{leaf}():\n    return {index} + {leaf}\n"
+                ));
+            }
+            fs::write(root.join(format!("mod_{index}.py")), body).unwrap();
         }
 
         let sweep_started = std::time::Instant::now();

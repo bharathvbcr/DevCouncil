@@ -178,7 +178,7 @@ fn test_n4_n5_communities_connected_and_status() {
         unresolved: Vec::new(),
     };
 
-    let comms = detect_communities(&[file_a], &resolution);
+    let comms = detect_communities(&[file_a], &resolution).communities;
     assert!(!comms.is_empty());
     for comm in comms {
         assert!(!comm.members.is_empty());
@@ -273,7 +273,7 @@ fn test_n5_louvain_splits_clusters_joined_by_a_bridge() {
         ("a1.py", "b1.py", 1), // the bridge
     ]);
 
-    let comms = detect_communities(&files, &resolution);
+    let comms = detect_communities(&files, &resolution).communities;
 
     assert!(
         comms.len() >= 2,
@@ -310,8 +310,8 @@ fn test_n5_edge_weight_is_call_multiplicity() {
     };
     let files = nodes(&["a1.py", "a2.py", "a3.py", "b1.py", "b2.py", "b3.py"]);
 
-    let light = detect_communities(&files, &two_triangles(1));
-    let heavy = detect_communities(&files, &two_triangles(60));
+    let light = detect_communities(&files, &two_triangles(1)).communities;
+    let heavy = detect_communities(&files, &two_triangles(60)).communities;
 
     assert_ne!(
         community_of(&light, "a1.py").community_id,
@@ -335,7 +335,7 @@ fn test_n5_every_community_is_internally_connected() {
         ("q.py", "r.py", 1),
     ]);
 
-    let comms = detect_communities(&files, &resolution);
+    let comms = detect_communities(&files, &resolution).communities;
 
     let adjacency: Vec<(String, String)> = resolution
         .edges
@@ -381,7 +381,7 @@ fn test_n5_cohesion_is_measured_not_assumed() {
     // A file with no edges cannot be measured; it must score 0.0 rather than a
     // flattering 1.0 — an unexamined value must never read as a perfect one.
     let files = nodes(&["alone.py"]);
-    let comms = detect_communities(&files, &edges(&[]));
+    let comms = detect_communities(&files, &edges(&[])).communities;
 
     assert_eq!(comms.len(), 1);
     assert_eq!(
@@ -391,7 +391,7 @@ fn test_n5_cohesion_is_measured_not_assumed() {
 
     // A fully-internal cluster keeps all of its weight and scores 1.0.
     let files = nodes(&["m.py", "n.py"]);
-    let comms = detect_communities(&files, &edges(&[("m.py", "n.py", 4)]));
+    let comms = detect_communities(&files, &edges(&[("m.py", "n.py", 4)])).communities;
     let scored = community_of(&comms, "m.py");
     assert_eq!(
         scored.cohesion_score, 1.0,
@@ -410,9 +410,11 @@ fn test_n5_partition_is_deterministic() {
         ("a3.py", "b1.py", 1),
     ]);
 
-    let expected = serde_json::to_string(&detect_communities(&files, &resolution)).unwrap();
+    let expected =
+        serde_json::to_string(&detect_communities(&files, &resolution).communities).unwrap();
     for _ in 0..16 {
-        let actual = serde_json::to_string(&detect_communities(&files, &resolution)).unwrap();
+        let actual =
+            serde_json::to_string(&detect_communities(&files, &resolution).communities).unwrap();
         assert_eq!(actual, expected, "partition changed between identical runs");
     }
 }

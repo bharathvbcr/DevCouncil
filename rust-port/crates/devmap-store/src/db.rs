@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use devmap_analyze::clones::CloneCandidate;
 use devmap_analyze::model::*;
 use devmap_extract::model::*;
 #[cfg(feature = "parse")]
@@ -10,9 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::schema::{
     BUILD_HISTORY_RETENTION, BUILD_HISTORY_TABLE, CREATE_SCHEMA_V3, CURRENT_SCHEMA_VERSION,
-    MIGRATION_V10_TO_V11, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5, MIGRATION_V5_TO_V6,
-    MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10,
-    UNRESOLVED_TABLE,
+    MIGRATION_V10_TO_V11, MIGRATION_V11_TO_V12, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5,
+    MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9,
+    MIGRATION_V9_TO_V10, UNRESOLVED_TABLE,
 };
 
 const MAX_PENDING_ATTEMPTS: u32 = 5;
@@ -198,10 +199,95 @@ pub struct BuildHistoryRow {
     pub db_bytes: u64,
 }
 
+/// What [`Store::vacuum_if_needed`] did, and what it saw when it decided.
+///
+/// Returned rather than discarded because "declined to reclaim" and "reclaimed
+/// nothing" leave an identical database behind, and telling them apart is the
+/// difference between a healthy store and one growing forever. That is not
+/// hypothetical: a stale freelist read made this function decline eight builds
+/// in a row while a third of the file was free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VacuumOutcome {
+    pub freelist_before: i64,
+    pub page_count_before: i64,
+    pub action: VacuumAction,
+}
+
+impl VacuumOutcome {
+    /// Free pages as a percentage of the file when the decision was made.
+    pub fn freelist_ratio(&self) -> f64 {
+        if self.page_count_before <= 0 {
+            return 0.0;
+        }
+        self.freelist_before as f64 / self.page_count_before as f64
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VacuumAction {
+    /// Below the threshold; nothing worth reclaiming.
+    Declined,
+    /// Bounded reclaim of up to `pages` free pages.
+    Incremental { pages: i64 },
+    /// Whole-file rewrite that also converts a legacy store to incremental
+    /// mode, so this is the last time that store pays for one.
+    FullConverting,
+}
+
+impl std::fmt::Display for VacuumAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Declined => write!(f, "declined"),
+            Self::Incremental { pages } => write!(f, "incremental({pages} pages)"),
+            Self::FullConverting => write!(f, "full+convert"),
+        }
+    }
+}
+
 impl Store {
+    /// Page cache for a write connection, in KiB (negative = KiB, per SQLite).
+    ///
+    /// 64 MiB against SQLite's 2 MiB default. A generation write is a bulk
+    /// insert that revisits index pages across the whole file — at 2 MiB the
+    /// working set does not fit and the same pages are read, evicted and read
+    /// again for the length of the transaction.
+    const CACHE_SIZE_KIB: i32 = -65_536;
+
     fn configure_connection(conn: &Connection) -> Result<()> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+
+        // `synchronous = NORMAL`, not the `FULL` default.
+        //
+        // This is a durability trade and worth stating plainly. Under WAL,
+        // NORMAL stops fsync-ing on every commit and syncs at checkpoints
+        // instead. The documented consequence is that a power loss or OS crash
+        // (**not** a process crash — WAL still recovers from that) can lose the
+        // most recent transactions. It cannot corrupt the database; that is the
+        // difference between NORMAL and OFF, and why OFF is not used here.
+        //
+        // Losing the most recent transaction here costs a rebuild, not data.
+        // Every row in this store is derived from files in the working tree: a
+        // generation that vanishes is recomputed by the next `devmap build`,
+        // which is exactly what happens today whenever the extraction schema
+        // changes. Paying an fsync per commit to durably persist a cache of
+        // something already durable on disk buys nothing.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "cache_size", Self::CACHE_SIZE_KIB)?;
+        // Pruning and vacuuming sort large intermediate result sets. On disk
+        // those spill to temp files in the filesystem's temp directory, which
+        // on this platform is neither the database's filesystem nor necessarily
+        // fast.
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+
+        // Incremental auto-vacuum, so reclaim costs what the waste costs rather
+        // than what the database costs. See [`Self::vacuum_if_needed`].
+        //
+        // This only takes effect on a database with no tables yet, which is why
+        // it sits in `configure_connection` — called before `migrate` creates
+        // the schema. On an existing mode-NONE store the statement is accepted
+        // and ignored; that store is converted on its next full vacuum instead.
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         Ok(())
     }
 
@@ -274,6 +360,9 @@ impl Store {
                     "span_start",
                     "span_end",
                     "is_exported",
+                    "body_exact",
+                    "body_structural",
+                    "body_nodes",
                 ],
             ),
             (
@@ -557,9 +646,20 @@ impl Store {
                 tx.execute_batch(MIGRATION_V10_TO_V11)?;
             }
             tx.execute("PRAGMA user_version = 11", [])?;
-            Self::validate_schema(&tx)?;
+            // No mid-chain validation: a v11 database legitimately lacks the
+            // v12 body-signature columns until the next step adds them.
             tx.commit()?;
             version = 11;
+        }
+        if version == 11 {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !Self::has_column(&tx, "generation_nodes", "body_exact")? {
+                tx.execute_batch(MIGRATION_V11_TO_V12)?;
+            }
+            tx.execute("PRAGMA user_version = 12", [])?;
+            Self::validate_schema(&tx)?;
+            tx.commit()?;
+            version = 12;
         }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(rusqlite::Error::InvalidParameterName(format!(
@@ -634,26 +734,48 @@ impl Store {
     }
 
     #[cfg(feature = "parse")]
+    /// `ensure_path_id`, memoised for the life of one generation write.
+    ///
+    /// Path ids are stable within a transaction — `paths` is insert-only here —
+    /// so the second lookup of a path can only return what the first did. The
+    /// repetition is severe rather than incidental: every edge names a source
+    /// and a target file, and a 73,000-edge generation over 1,280 files asks
+    /// for ~146,000 ids drawn from 1,280 distinct values. The cache turns that
+    /// into 1,280 queries.
+    ///
+    /// Deliberately scoped to a single call rather than held on `Store`: a
+    /// cache outliving its transaction would hand out ids from a write that
+    /// rolled back.
+    fn ensure_path_id_cached(
+        tx: &rusqlite::Transaction<'_>,
+        cache: &mut std::collections::HashMap<String, u32>,
+        path: &str,
+    ) -> Result<u32> {
+        if let Some(id) = cache.get(path) {
+            return Ok(*id);
+        }
+        let id = Self::ensure_path_id(tx, path)?;
+        cache.insert(path.to_string(), id);
+        Ok(id)
+    }
+
     fn ensure_path_id(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<u32> {
-        if let Some(id) = tx
-            .query_row(
-                "SELECT id FROM paths WHERE path = ?1",
-                params![path],
-                |row| row.get(0),
-            )
+        // `prepare_cached`, not `query_row`/`execute`: those compile the SQL
+        // afresh on every call, and this is the most-called statement in the
+        // writer — twice per edge, so ~146,000 compilations of two 40-character
+        // queries in a single DevCouncil generation.
+        let mut select = tx.prepare_cached("SELECT id FROM paths WHERE path = ?1")?;
+        if let Some(id) = select
+            .query_row(params![path], |row| row.get(0))
             .optional()?
         {
             return Ok(id);
         }
-        tx.execute(
-            "INSERT OR IGNORE INTO paths (path) VALUES (?1)",
-            params![path],
-        )?;
-        tx.query_row(
-            "SELECT id FROM paths WHERE path = ?1",
-            params![path],
-            |row| row.get(0),
-        )
+        drop(select);
+        tx.prepare_cached("INSERT OR IGNORE INTO paths (path) VALUES (?1)")?
+            .execute(params![path])?;
+        tx.prepare_cached("SELECT id FROM paths WHERE path = ?1")?
+            .query_row(params![path], |row| row.get(0))
     }
 
     pub fn enqueue_pending_paths(&self, paths: &[String]) -> Result<()> {
@@ -805,6 +927,10 @@ impl Store {
         }
         let mut conn = lock_conn(&self.conn)?;
         let tx = conn.transaction()?;
+        // One path-id memo for the whole generation write. See
+        // `ensure_path_id_cached`: the edge loop alone asks for two ids per
+        // edge drawn from a file set two orders of magnitude smaller.
+        let mut path_ids: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -956,7 +1082,7 @@ impl Store {
                     if !carry.contains(&path) {
                         continue;
                     }
-                    let file_id = Self::ensure_path_id(&tx, &path)?;
+                    let file_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &path)?;
                     tx.execute(
                         "INSERT INTO generation_files
                          (generation_id, file_id, language, content_hash, parse_outcome_json, engine_json, extraction_json, grammar_version, analyzer_version)
@@ -1011,7 +1137,7 @@ impl Store {
                     extraction.file_path
                 ))
             })?;
-            let file_id = Self::ensure_path_id(&tx, &extraction.file_path)?;
+            let file_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &extraction.file_path)?;
             tx.execute(
                 "INSERT INTO generation_files
                  (generation_id, file_id, language, content_hash, parse_outcome_json, engine_json, extraction_json, grammar_version, analyzer_version)
@@ -1038,8 +1164,14 @@ impl Store {
         // Carry forward unchanged files from previous generation (differential).
         if let Some(prev) = prev_gen {
             if !full_rewrite {
+                // The signature columns are carried with the row. Dropping
+                // them here would make every unchanged file look unsigned after
+                // one incremental build, and a clone report reads unsigned as
+                // "not examined" — so the whole tree would quietly go dark
+                // except the handful of files that happened to be edited.
                 let mut stmt = tx.prepare(
-                    "SELECT p.path, n.name, n.qualified_name, n.kind, n.span_start, n.span_end, n.is_exported
+                    "SELECT p.path, n.name, n.qualified_name, n.kind, n.span_start, n.span_end, n.is_exported,
+                            n.body_exact, n.body_structural, n.body_nodes
                      FROM generation_nodes n
                      JOIN paths p ON p.id = n.file_id
                      WHERE n.generation_id = ?1",
@@ -1053,28 +1185,35 @@ impl Store {
                         row.get::<_, i64>(4)?,
                         row.get::<_, i64>(5)?,
                         row.get::<_, i64>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
                     ))
                 })?;
                 for row in rows {
-                    let (path, name, qn, kind, start, end, exported) = row?;
+                    let (path, name, qn, kind, start, end, exported, b_exact, b_struct, b_nodes) =
+                        row?;
                     if !carry.contains(&path) {
                         continue;
                     }
-                    let file_id = Self::ensure_path_id(&tx, &path)?;
-                    tx.execute(
-                        "INSERT INTO generation_nodes (generation_id, ordinal, file_id, name, qualified_name, kind, span_start, span_end, is_exported)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                        params![gen_id, node_ord, file_id, name, qn, kind, start, end, exported],
-                    )?;
+                    let file_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &path)?;
+                    tx.prepare_cached(
+                        "INSERT INTO generation_nodes (generation_id, ordinal, file_id, name, qualified_name, kind, span_start, span_end, is_exported, body_exact, body_structural, body_nodes)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    )?
+                    .execute(params![
+                        gen_id, node_ord, file_id, name, qn, kind, start, end, exported, b_exact,
+                        b_struct, b_nodes
+                    ])?;
                     let fts_rowid = Self::fts_rowid(gen_id, node_ord);
-                    tx.execute(
+                    tx.prepare_cached(
                         "INSERT INTO nodes_fts (rowid, name, qualified_name, path) VALUES (?1, ?2, ?3, ?4)",
-                        params![fts_rowid, name, qn, path],
-                    )?;
-                    tx.execute(
+                    )?
+                    .execute(params![fts_rowid, name, qn, path])?;
+                    tx.prepare_cached(
                         "INSERT INTO nodes_fts_map (rowid_ref, generation_id) VALUES (?1, ?2)",
-                        params![fts_rowid, gen_id],
-                    )?;
+                    )?
+                    .execute(params![fts_rowid, gen_id])?;
                     node_ord += 1;
                 }
             }
@@ -1088,32 +1227,38 @@ impl Store {
             if deleted.contains(&ext.file_path) {
                 continue;
             }
-            let file_id = Self::ensure_path_id(&tx, &ext.file_path)?;
+            let file_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &ext.file_path)?;
             for sym in &ext.symbols {
                 tx.execute(
-                    "INSERT INTO generation_nodes (generation_id, ordinal, file_id, name, qualified_name, kind, span_start, span_end, is_exported)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    "INSERT INTO generation_nodes (generation_id, ordinal, file_id, name, qualified_name, kind, span_start, span_end, is_exported, body_exact, body_structural, body_nodes)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         gen_id,
                         node_ord,
                         file_id,
                         sym.name,
                         sym.qualified_name,
-                        format!("{:?}", sym.kind),
+                        sym.kind.as_str(),
                         sym.span.start_byte,
                         sym.span.end_byte,
-                        sym.is_exported as i32
+                        sym.is_exported as i32,
+                        // SQLite integers are signed. The cast is bit-preserving
+                        // and reversed on read, so the stored value round-trips
+                        // even though half the hash space reads back negative.
+                        sym.body_signature.map(|s| s.exact as i64),
+                        sym.body_signature.map(|s| s.structural as i64),
+                        sym.body_signature.map(|s| i64::from(s.nodes))
                     ],
                 )?;
                 let fts_rowid = Self::fts_rowid(gen_id, node_ord);
-                tx.execute(
+                tx.prepare_cached(
                     "INSERT INTO nodes_fts (rowid, name, qualified_name, path) VALUES (?1, ?2, ?3, ?4)",
-                    params![fts_rowid, sym.name, sym.qualified_name, ext.file_path],
-                )?;
-                tx.execute(
+                )?
+                .execute(params![fts_rowid, sym.name, sym.qualified_name, ext.file_path])?;
+                tx.prepare_cached(
                     "INSERT INTO nodes_fts_map (rowid_ref, generation_id) VALUES (?1, ?2)",
-                    params![fts_rowid, gen_id],
-                )?;
+                )?
+                .execute(params![fts_rowid, gen_id])?;
                 node_ord += 1;
             }
         }
@@ -1149,11 +1294,17 @@ impl Store {
             if deleted.contains(&edge.source_file) || deleted.contains(&edge.target_file) {
                 continue;
             }
-            let src_f_id = Self::ensure_path_id(&tx, &edge.source_file)?;
-            let tgt_f_id = Self::ensure_path_id(&tx, &edge.target_file)?;
-            tx.execute(
+            let src_f_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &edge.source_file)?;
+            let tgt_f_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &edge.target_file)?;
+            // `prepare_cached` so this 8-parameter INSERT is compiled once per
+            // transaction rather than once per edge. It is the single
+            // highest-frequency statement in the writer: one execution for
+            // every resolved edge, 73,000 of them in a DevCouncil generation.
+            tx.prepare_cached(
                 "INSERT INTO generation_edges (generation_id, ordinal, source_file_id, target_file_id, source_symbol, target_symbol, edge_kind, confidence)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?
+            .execute(
                 params![
                     gen_id,
                     edge_ord,
@@ -1449,6 +1600,29 @@ impl Store {
     /// A build-path question: it compares against grammar identities only
     /// the parsing frontend can supply.
     #[cfg(feature = "parse")]
+    /// The git HEAD the latest generation was built from, if any.
+    ///
+    /// Exists for B5: a commit, branch switch, rebase or stash changes what the
+    /// index should contain while touching no watched file. Comparing this
+    /// against the working tree's current HEAD is what lets the daemon notice
+    /// that its generation describes a tree that no longer exists.
+    ///
+    /// `None` means no generation has been written. A stored `"unavailable"`
+    /// (what the CLI stamps outside a git repository) is returned verbatim
+    /// rather than mapped to `None`, because "built outside git" and "never
+    /// built" are different facts and only one of them warrants a rebuild.
+    pub fn latest_generation_head_sha(&self) -> Result<Option<String>> {
+        let conn = lock_conn(&self.conn)?;
+        let sha = conn
+            .query_row(
+                "SELECT head_sha FROM generations WHERE id = (SELECT max(id) FROM generations)",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(sha)
+    }
+
     pub fn latest_generation_payload_is_current(&self) -> Result<bool> {
         let conn = lock_conn(&self.conn)?;
         let mut stmt = conn.prepare(
@@ -1666,6 +1840,42 @@ impl Store {
 
     /// Search only the latest persisted generation. This never reads or parses
     /// the source tree, so callers cannot accidentally turn a query into a build.
+    /// Every symbol row in the latest generation.
+    ///
+    /// Semantic ranking scores the whole corpus, not a keyword-matched page:
+    /// the point of it is to find symbols whose *names do not contain the query
+    /// terms*, which is exactly what `search_symbols` cannot return. A
+    /// primary-key range scan over one generation is the cheapest way to get
+    /// them, and there is nothing to precompute or keep in step.
+    pub fn all_symbols(&self) -> Result<Vec<StoredSymbol>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = conn.prepare(
+            "SELECT n.name, n.qualified_name, n.kind, p.path,
+                    n.span_start, n.span_end, n.is_exported
+             FROM generation_nodes n
+             JOIN paths p ON p.id = n.file_id
+             WHERE n.generation_id = ?1
+             ORDER BY n.ordinal",
+        )?;
+        let rows = stmt.query_map(params![gen], |row| {
+            let start: i64 = row.get(4)?;
+            let end: i64 = row.get(5)?;
+            Ok(StoredSymbol {
+                name: row.get(0)?,
+                qualified_name: row.get(1)?,
+                kind: row.get(2)?,
+                path: row.get(3)?,
+                span_start: start.max(0) as usize,
+                span_end: end.max(0) as usize,
+                is_exported: row.get::<_, i64>(6)? != 0,
+            })
+        })?;
+        rows.collect()
+    }
+
     pub fn search_symbols(&self, query: &str, limit: usize) -> Result<Vec<StoredSymbol>> {
         if query.trim().is_empty() || limit == 0 {
             return Ok(Vec::new());
@@ -1830,6 +2040,107 @@ impl Store {
         Ok(extractions)
     }
 
+    /// One file's stored extraction, or `None` when the latest generation does
+    /// not contain it.
+    ///
+    /// `latest_extractions` deserialises every file in the generation — 1,300
+    /// JSON payloads on this repository — which is the wrong shape for a
+    /// question about one path. `None` distinguishes "this file is not
+    /// indexed" from "this file is indexed and empty", and a preview has to
+    /// tell those apart: against an unindexed file every symbol in the buffer
+    /// is an addition, which is true but worth saying out loud rather than
+    /// presenting as a diff against known content.
+    pub fn latest_extraction_for_path(&self, path: &str) -> Result<Option<Extraction>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
+            return Ok(None);
+        };
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT f.extraction_json
+                 FROM generation_files f
+                 JOIN paths p ON p.id = f.file_id
+                 WHERE f.generation_id = ?1 AND p.path = ?2",
+                params![gen, path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        let extraction = serde_json::from_str(&json).map_err(|error| {
+            rusqlite::Error::InvalidParameterName(format!(
+                "stored extraction for {path} is invalid: {error}"
+            ))
+        })?;
+        Ok(Some(extraction))
+    }
+
+    /// Call edges whose *target* is one of `names`, excluding those originating
+    /// in `exclude_file`.
+    ///
+    /// `names` are **qualified** names (`path::Symbol`), which is what
+    /// `generation_edges.target_symbol` holds. Bare names match nothing here,
+    /// and match nothing quietly: the query returns zero rows and the caller
+    /// reports that nothing depends on the symbol.
+    ///
+    /// The exclusion is what makes the answer mean "who outside this file
+    /// depends on these symbols". A file's own internal calls are not callers
+    /// that a rewrite of that file would break — they are being rewritten too —
+    /// and counting them inflates every preview of a self-contained module.
+    ///
+    /// An empty `names` returns no rows without touching the database, rather
+    /// than building `IN ()`, which SQLite rejects.
+    pub fn callers_of(
+        &self,
+        names: &[String],
+        exclude_file: &str,
+        min_confidence: f32,
+    ) -> Result<Vec<StoredEdge>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = lock_conn(&self.conn)?;
+        let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
+            return Ok(Vec::new());
+        };
+        let placeholders = std::iter::repeat_n("?", names.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT sp.path, tp.path, e.source_symbol, e.target_symbol,
+                    e.edge_kind, e.confidence
+             FROM generation_edges e
+             JOIN paths sp ON sp.id = e.source_file_id
+             JOIN paths tp ON tp.id = e.target_file_id
+             WHERE e.generation_id = ?1
+               AND e.edge_kind = 'Calls'
+               AND sp.path <> ?2
+               AND CAST(ROUND(e.confidence * 1000) AS INTEGER) >= CAST(ROUND(?3 * 1000) AS INTEGER)
+               AND e.target_symbol IN ({placeholders})
+             ORDER BY e.confidence DESC, e.target_symbol, sp.path, e.source_symbol"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(names.len() + 3);
+        bound.push(&gen);
+        bound.push(&exclude_file);
+        bound.push(&min_confidence);
+        for name in names {
+            bound.push(name);
+        }
+        let rows = stmt.query_map(bound.as_slice(), |row| {
+            Ok(StoredEdge {
+                source_file: row.get(0)?,
+                target_file: row.get(1)?,
+                source_symbol: row.get(2)?,
+                target_symbol: row.get(3)?,
+                edge_kind: row.get(4)?,
+                confidence: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     pub fn latest_edges_for_file(
         &self,
         path: &str,
@@ -1915,6 +2226,76 @@ impl Store {
         rows.collect()
     }
 
+    /// Rebuild clone candidates from the latest generation's symbol rows.
+    ///
+    /// Returns the candidates and the number of symbols with no signature. The
+    /// second half is not decoration: `group_clones` needs it to report a
+    /// denominator, and a caller that assumed zero would turn "most of this
+    /// tree was never examined" into "this tree is clean".
+    ///
+    /// Reads every symbol row of one generation. `generation_nodes` is
+    /// `WITHOUT ROWID` keyed on `(generation_id, ordinal)`, so this is a
+    /// primary-key range scan rather than a table scan of every generation.
+    pub fn latest_clone_candidates(&self) -> Result<(Vec<CloneCandidate>, usize)> {
+        let conn = lock_conn(&self.conn)?;
+        let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
+            return Ok((Vec::new(), 0));
+        };
+        let mut stmt = conn.prepare(
+            "SELECT p.path, n.name, n.qualified_name, n.kind, n.span_start, n.span_end,
+                    n.body_exact, n.body_structural, n.body_nodes
+             FROM generation_nodes n
+             JOIN paths p ON p.id = n.file_id
+             WHERE n.generation_id = ?1
+             ORDER BY n.ordinal",
+        )?;
+        let rows = stmt.query_map(params![gen], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+            ))
+        })?;
+
+        let mut candidates = Vec::new();
+        let mut unsigned = 0usize;
+        for row in rows {
+            let (path, name, qn, kind, start, end, exact, structural, nodes) = row?;
+            // All three or none. A row missing any part carries no usable
+            // signature, and half a signature must not be grouped on.
+            let (Some(exact), Some(structural), Some(nodes)) = (exact, structural, nodes) else {
+                unsigned += 1;
+                continue;
+            };
+            // A kind this binary does not know cannot be grouped: the Type-2
+            // rule is stated in terms of kinds, and applying it to an
+            // uninterpretable one would be a guess.
+            let Some(kind) = SymbolKind::from_persisted(&kind) else {
+                unsigned += 1;
+                continue;
+            };
+            candidates.push(CloneCandidate {
+                file_path: path,
+                symbol_name: name,
+                qualified_name: qn,
+                span_start: start.max(0) as usize,
+                span_end: end.max(0) as usize,
+                kind,
+                // Reverses the bit-preserving cast made on write.
+                exact: exact as u64,
+                structural: structural as u64,
+                nodes: nodes.clamp(0, i64::from(u32::MAX)) as u32,
+            });
+        }
+        Ok((candidates, unsigned))
+    }
+
     /// Count dead-symbol rows whose persisted confidence is at least `min`
     /// in milliconfidence space, so `0.9` matches HIGH rows SQLite REAL
     /// cannot round-trip from `f32`.
@@ -1976,14 +2357,108 @@ impl Store {
         page_count > 0 && (freelist_count as f64 / page_count as f64) > Self::VACUUM_FREELIST_RATIO
     }
 
-    pub fn vacuum_if_needed(&self) -> Result<()> {
+    /// Free pages one `vacuum_if_needed` will reclaim at most.
+    ///
+    /// Incremental vacuum costs time proportional to the pages it moves, so
+    /// this bounds a single build's reclaim rather than the database's size.
+    /// 65,536 pages is 256 MiB at the default 4 KiB page size — far above the
+    /// per-build churn measured here (a prune frees on the order of 5% of the
+    /// file), so the steady state reclaims everything in one pass and the cap
+    /// only bites when a long-neglected store has accumulated a backlog. That
+    /// backlog then drains over consecutive builds instead of stalling one.
+    const INCREMENTAL_VACUUM_MAX_PAGES: i64 = 65_536;
+
+    /// Reclaim free pages, cheaply where the database allows it.
+    ///
+    /// **Why not a plain `VACUUM`.** `VACUUM` rebuilds the entire database into
+    /// a new file: its cost is proportional to the *database*, not to the waste
+    /// being reclaimed, and it takes an exclusive lock for the duration. Because
+    /// every build prunes a generation, the freelist crosses
+    /// [`Self::VACUUM_FREELIST_RATIO`] on essentially every build — so the
+    /// whole-file rewrite ran nearly every time. Measured on DevCouncil's own
+    /// store: 937 ms of a 3.40 s incremental build, 28% of the wall time, to
+    /// reclaim a few percent of the file.
+    ///
+    /// `PRAGMA incremental_vacuum(N)` moves only free pages to the end and
+    /// truncates, costing what the waste costs. It requires the database to
+    /// have been created with `auto_vacuum = INCREMENTAL`; a database in mode
+    /// NONE cannot be switched without a full rewrite, so those keep the old
+    /// path. That is the honest fallback — an incremental vacuum on a mode-NONE
+    /// database is a silent no-op, and a reclaim that quietly reclaims nothing
+    /// is exactly the failure `vacuum_returns_freed_pages_to_the_filesystem`
+    /// exists to catch.
+    ///
+    /// **The trade this makes, stated plainly.** A full `VACUUM` compacted the
+    /// file to its live size every build; this does not. Measured over 15
+    /// consecutive incremental builds of DevCouncil, the store settles at
+    /// 295 MB against ~197 MB of live data and *stays there* — the free pages
+    /// left by each prune are reused by the next generation's write instead of
+    /// being returned to the filesystem and immediately re-allocated. So the
+    /// cost is a bounded ~50% space overhead, not unbounded growth, and the
+    /// bound is what makes it acceptable: the file did not move off 295 MB
+    /// across those 15 builds, and the WAL stayed truncated. Reclaim time went
+    /// from 937 ms to 2 ms over the same window.
+    pub fn vacuum_if_needed(&self) -> Result<VacuumOutcome> {
+        // Checkpoint before reading the page accounting.
+        //
+        // In WAL mode `PRAGMA freelist_count` reports the *main database file*.
+        // Pages freed by the two prunes that run immediately before this live
+        // in the WAL until a checkpoint folds them back, so the freelist read
+        // here was reporting the state before this build's pruning — and it
+        // read *below* the threshold while a third of the file was in fact
+        // free. Measured on this repository: eight consecutive builds each
+        // declined to reclaim in 0 ms while the freelist sat at 33.2% and the
+        // store stayed pinned at 295 MB; a manual `incremental_vacuum` on the
+        // same file immediately took it to 0.4% and 50,684 pages.
+        //
+        // A reclaim policy reading stale accounting does not merely reclaim
+        // late — it reports "nothing to reclaim" with perfect confidence, which
+        // is the failure mode that hides indefinitely. A checkpoint failure is
+        // not fatal here: the decision is then made on the same stale numbers
+        // as before, so this can only improve the accuracy of the answer, and
+        // refusing to reclaim because bookkeeping was unavailable would be
+        // worse than reclaiming on a conservative estimate.
+        let _ = self.checkpoint_wal();
+
         let conn = lock_conn(&self.conn)?;
         let freelist_count: i64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
         let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
-        if Self::should_vacuum(freelist_count, page_count) {
-            conn.execute("VACUUM", [])?;
+        if !Self::should_vacuum(freelist_count, page_count) {
+            return Ok(VacuumOutcome {
+                freelist_before: freelist_count,
+                page_count_before: page_count,
+                action: VacuumAction::Declined,
+            });
         }
-        Ok(())
+        // 0 = NONE, 1 = FULL, 2 = INCREMENTAL. Only 2 supports the pragma.
+        let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
+        if auto_vacuum == 2 {
+            let pages = freelist_count.min(Self::INCREMENTAL_VACUUM_MAX_PAGES);
+            // `execute_batch`, not `execute`: this pragma yields rows, and
+            // `execute` rejects any statement that returns some
+            // (`ExecuteReturnedResults`) rather than running it.
+            conn.execute_batch(&format!("PRAGMA incremental_vacuum({pages});"))?;
+            return Ok(VacuumOutcome {
+                freelist_before: freelist_count,
+                page_count_before: page_count,
+                action: VacuumAction::Incremental { pages },
+            });
+        }
+
+        // A store already in mode NONE is converted here rather than at open.
+        // Switching `auto_vacuum` on a populated database only takes effect on
+        // the next full rewrite — and this branch is that rewrite. The
+        // conversion is therefore free: this build was going to pay for a
+        // `VACUUM` either way, and every build after it takes the bounded path
+        // above. Doing it in `open` instead would put a whole-file rewrite in
+        // front of read commands like `devmap status`, which must stay cheap.
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        conn.execute("VACUUM", [])?;
+        Ok(VacuumOutcome {
+            freelist_before: freelist_count,
+            page_count_before: page_count,
+            action: VacuumAction::FullConverting,
+        })
     }
 
     /// Attempt to truncate the WAL and explicitly fall back to a non-blocking
@@ -2067,14 +2542,14 @@ impl Store {
             drop(stmt);
             for (ord, name, qn, path) in collected {
                 let fts_rowid = Self::fts_rowid(g, ord);
-                tx.execute(
+                tx.prepare_cached(
                     "INSERT INTO nodes_fts (rowid, name, qualified_name, path) VALUES (?1, ?2, ?3, ?4)",
-                    params![fts_rowid, name, qn, path],
-                )?;
-                tx.execute(
+                )?
+                .execute(params![fts_rowid, name, qn, path])?;
+                tx.prepare_cached(
                     "INSERT INTO nodes_fts_map (rowid_ref, generation_id) VALUES (?1, ?2)",
-                    params![fts_rowid, g],
-                )?;
+                )?
+                .execute(params![fts_rowid, g])?;
             }
         }
         tx.commit()?;
@@ -2332,6 +2807,47 @@ mod connection_tests {
             .expect("busy_timeout pragma");
         assert_eq!(foreign_keys, 1);
         assert!(busy_timeout >= 5_000, "busy timeout was {busy_timeout} ms");
+    }
+
+    /// The write-path pragmas are a contract, not an incidental default.
+    ///
+    /// Each of these was measured: leaving `synchronous` at `FULL` and
+    /// `cache_size` at SQLite's 2 MiB default made `save_generation` the single
+    /// most expensive phase of a build. A later edit that drops one of them
+    /// would restore that cost silently — nothing fails, builds just get slower
+    /// — so the settings are asserted rather than trusted.
+    ///
+    /// `synchronous` is asserted as exactly 1 (NORMAL). Not `<= 1`: 0 is OFF,
+    /// which trades corruption-on-crash for speed, and this store must never
+    /// drift into it.
+    #[test]
+    fn write_connections_use_the_tuned_durability_and_cache_pragmas() {
+        let store = Store::open_in_memory().expect("store");
+        let conn = lock_conn(&store.conn).expect("connection");
+
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .expect("synchronous pragma");
+        assert_eq!(
+            synchronous, 1,
+            "expected synchronous=NORMAL (1), found {synchronous} \
+             (0=OFF risks corruption, 2=FULL fsyncs every commit)"
+        );
+
+        let cache_size: i64 = conn
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .expect("cache_size pragma");
+        assert_eq!(
+            cache_size,
+            Store::CACHE_SIZE_KIB as i64,
+            "cache_size should be the tuned {} KiB",
+            -Store::CACHE_SIZE_KIB
+        );
+
+        let temp_store: i64 = conn
+            .query_row("PRAGMA temp_store", [], |row| row.get(0))
+            .expect("temp_store pragma");
+        assert_eq!(temp_store, 2, "expected temp_store=MEMORY (2)");
     }
 }
 

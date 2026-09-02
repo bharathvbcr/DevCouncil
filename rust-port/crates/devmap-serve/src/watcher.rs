@@ -189,6 +189,50 @@ impl Drop for WatcherHandle {
     }
 }
 
+/// The sentinel path enqueued when git's HEAD or refs move.
+///
+/// A real path would be re-extracted; this is not a file to extract, it is a
+/// statement that the *whole* generation may describe a tree that no longer
+/// exists. The daemon recognises it, drops it from the extraction set, and
+/// forces a full rebuild.
+pub const GIT_HEAD_SENTINEL: &str = "\u{0}devmap:git-head-changed";
+
+/// Whether this path is git telling us the checkout moved. (B5)
+///
+/// `.git/` is a dotted directory and `is_ignored_path` prunes it, which is
+/// correct for indexing and wrong for *noticing*: a commit, branch switch,
+/// rebase or stash changes what the index should contain while touching no
+/// watched file, so the daemon never woke at all. Without this the clean-room
+/// design reproduces exactly the staleness the rewrite exists to fix.
+///
+/// Deliberately narrow. `.git/` churns constantly — object writes, index
+/// updates, lock files — and admitting it wholesale would wake the daemon on
+/// every `git status`. Only the files that define *which commit is checked
+/// out* qualify:
+///
+/// - `HEAD` — the symbolic ref, rewritten by checkout and rebase
+/// - `refs/**` — loose refs, rewritten by commit and reset
+/// - `packed-refs` — the packed form of the same, rewritten by gc and clone
+///
+/// `.git/index` is excluded on purpose: it changes on `git add` with no change
+/// to the working tree, and the working tree is what the graph describes.
+fn is_git_ref_event(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    let Some(rest) = relative.strip_prefix(".git/") else {
+        return false;
+    };
+    // `HEAD.lock` and `refs/heads/main.lock` are git's write-in-progress
+    // files. Ignoring them avoids waking twice per ref update; the real file
+    // follows immediately.
+    if rest.ends_with(".lock") {
+        return false;
+    }
+    rest == "HEAD" || rest == "packed-refs" || rest.starts_with("refs/")
+}
+
 fn admitted_watch_path(
     root: &Path,
     path: &Path,
@@ -260,6 +304,12 @@ pub fn start_file_watcher<P: AsRef<Path>, F: Fn(Vec<String>) + Send + 'static>(
                             .filter_map(|path| {
                                 if ignore_cache.observe_rule_event(&path) {
                                     return None;
+                                }
+                                // Checked before the ignore rules, because
+                                // `.git/` is pruned by them and this is the one
+                                // thing inside it the daemon has to see.
+                                if is_git_ref_event(&root, &path) {
+                                    return Some(GIT_HEAD_SENTINEL.to_string());
                                 }
                                 match admitted_watch_path(&root, &path, &mut ignore_cache) {
                                     Ok(path) => path,
@@ -638,5 +688,92 @@ mod tests {
             "gitignored source escaped watcher filter: {observed:?}"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod git_head_tests {
+    use super::*;
+
+    fn root() -> std::path::PathBuf {
+        std::path::PathBuf::from("/repo")
+    }
+
+    /// A moved checkout is visible to the watcher. (B5)
+    ///
+    /// `.git/` is pruned by `is_ignored_path`, which is right for indexing and
+    /// wrong for noticing: a commit, branch switch, rebase or stash changes
+    /// what the index should contain while touching no watched file, so before
+    /// this the daemon never woke at all.
+    #[test]
+    fn git_ref_movement_is_observed() {
+        for path in [
+            ".git/HEAD",
+            ".git/packed-refs",
+            ".git/refs/heads/main",
+            ".git/refs/remotes/origin/main",
+            ".git/refs/tags/v1.0.0",
+        ] {
+            assert!(
+                is_git_ref_event(&root(), &root().join(path)),
+                "{path} defines which commit is checked out and must be observed"
+            );
+        }
+    }
+
+    /// The observation is narrow on purpose.
+    ///
+    /// `.git/` churns constantly — object writes, index updates, lock files.
+    /// Admitting it wholesale would wake the daemon on every `git status`, and
+    /// a watcher that fires continuously is one an operator turns off.
+    #[test]
+    fn ordinary_git_churn_is_not_observed() {
+        for (path, why) in [
+            (
+                ".git/index",
+                "changes on `git add` with no working-tree change",
+            ),
+            (".git/objects/ab/cdef", "object writes are not ref movement"),
+            (".git/COMMIT_EDITMSG", "an editor buffer, not a ref"),
+            (".git/logs/HEAD", "the reflog trails the ref it records"),
+            (".git/config", "configuration is not a checkout"),
+        ] {
+            assert!(
+                !is_git_ref_event(&root(), &root().join(path)),
+                "{path} must not wake the daemon: {why}"
+            );
+        }
+    }
+
+    /// Git's write-in-progress files must not double-wake.
+    ///
+    /// Every ref update writes `X.lock` then renames it onto `X`. Admitting
+    /// both means two resyncs per commit, the first against a half-written ref.
+    #[test]
+    fn lock_files_are_not_observed() {
+        for path in [".git/HEAD.lock", ".git/refs/heads/main.lock"] {
+            assert!(
+                !is_git_ref_event(&root(), &root().join(path)),
+                "{path} is git's write-in-progress file; the real file follows"
+            );
+        }
+    }
+
+    /// A path outside the watched root is never a ref event, whatever it looks
+    /// like. A nested checkout's `.git` is not this repository's.
+    #[test]
+    fn a_foreign_git_directory_is_not_observed() {
+        assert!(!is_git_ref_event(
+            &root(),
+            std::path::Path::new("/elsewhere/.git/HEAD")
+        ));
+    }
+
+    /// Ordinary source files are unaffected by the carve-out.
+    #[test]
+    fn source_paths_are_not_mistaken_for_ref_events() {
+        for path in ["src/main.rs", "docs/.gitignore", "vendor/git/HEAD.rs"] {
+            assert!(!is_git_ref_event(&root(), &root().join(path)), "{path}");
+        }
     }
 }

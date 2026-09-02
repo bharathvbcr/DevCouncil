@@ -131,6 +131,8 @@ pub fn extract_treesitter(path: &str, lang: &str, source: &str) -> Extraction {
                     docstring: None,
                     signature: None,
                     parent_symbol: None,
+                    body_signature: None,
+                    declaration_hash: None,
                 });
 
                 // File-level wiring first, so a file-scoped exemption always
@@ -218,6 +220,14 @@ pub fn extract_treesitter(path: &str, lang: &str, source: &str) -> Extraction {
                     Ok(routes) => (routes, Vec::new()),
                     Err(reason) => (Vec::new(), vec![reason]),
                 };
+
+                // Body signatures are stamped here, after every language arm
+                // has finished pushing symbols, rather than inside `walk_tree`.
+                // The walk emits symbols from more than thirty grammar-specific
+                // branches; hashing in each is thirty chances to add a grammar
+                // later and silently omit its signatures.
+                crate::clonesig::stamp_signatures(&mut symbols, root, source);
+                crate::clonesig::stamp_declaration_hashes(&mut symbols, root, source);
 
                 return Extraction {
                     file_path: path.to_string(),
@@ -726,23 +736,119 @@ fn python_module_aliases(root: Node, source: &str) -> std::collections::BTreeSet
     aliases
 }
 
+/// Extraction for a language with no linked grammar.
+///
+/// Emits the `File` node, then tries tier-2 pattern recovery for declarations.
+///
+/// A file that reached here used to contribute *no nodes whatsoever*: the
+/// `File` node was pushed only on the tree-sitter path above, so there was no
+/// symbol, no span, and nothing for an edge to point at. On two real trees that
+/// silently swallowed every `.proto`, `.ps1`, `.vb`, `.vue` and `.metal` file
+/// in them. Both halves are closed now — the file is always addressable, and
+/// its declarations are recovered when the language has any to recover.
+///
+/// The two *declaration* outcomes stay labelled differently on purpose. When
+/// the scanner finds declarations the file reports `RegexFallback` /
+/// `ParseOutcome::Fallback`, so no consumer can mistake a pattern-matched
+/// symbol for a parsed one. When it finds none the outcome stays `Failed`,
+/// because no declaration was recovered and the `File` node is not a
+/// declaration — reporting success on the strength of it would be the lie the
+/// labelling exists to prevent.
+///
 fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
+    let scan = if crate::fallback::applies_to(lang) {
+        crate::fallback::scan_declarations(path, source)
+    } else {
+        // Prose and data formats declare nothing; see
+        // `fallback::NON_DECLARATIVE_LANGUAGES` for what scanning them produced.
+        crate::fallback::FallbackScan {
+            symbols: Vec::new(),
+            truncated: 0,
+        }
+    };
+    let recovered_count = scan.symbols.len();
+    let recovered = recovered_count > 0;
+
+    // The `File` node, which this path used to omit entirely.
+    //
+    // It is pushed on the tree-sitter path above as the first symbol of every
+    // parsed file, but that push sits *inside* the `if let Some(ts_lang)` block,
+    // so a file with no linked grammar was recorded in `generation_files` and
+    // contributed nothing to the graph: not addressable by a file-level query,
+    // and unusable as the target of any edge. That is placement, not design —
+    // nothing downstream wants a nodeless file.
+    //
+    // Emitted for *every* grammarless file, including the prose and data
+    // formats that get no declaration scan. Being unable to recover a file's
+    // declarations is not a reason to deny that the file exists; a Markdown
+    // document that something links to still has to be a valid edge target.
+    //
+    // Safe against the dead-code surface by construction: `File` nodes are
+    // exempt in `liveness.rs` (both the Go duplicate-identity count and the
+    // dead-symbol sweep) and are skipped as `Contains` sources in the resolver,
+    // so this widens what the graph can address without adding a single
+    // dead-symbol candidate.
+    let mut symbols = Vec::with_capacity(scan.symbols.len() + 1);
+    symbols.push(ExtractedSymbol {
+        name: path.rsplit('/').next().unwrap_or(path).to_string(),
+        qualified_name: path.to_string(),
+        kind: SymbolKind::File,
+        span: Span {
+            start_byte: 0,
+            end_byte: source.len(),
+        },
+        is_exported: true,
+        docstring: None,
+        signature: None,
+        parent_symbol: None,
+        // A file has no body to fingerprint; clone detection is over symbol
+        // bodies, and `None` means "not computed", never "no duplicates".
+        body_signature: None,
+        declaration_hash: None,
+    });
+    symbols.extend(scan.symbols);
+    let mut diagnostics: Vec<String> = Vec::new();
+    if scan.truncated > 0 {
+        // Reported, not silently dropped: the symbol list is a prefix, and a
+        // consumer that reads it as complete would conclude the rest of the
+        // file declares nothing.
+        diagnostics.push(format!(
+            "fallback declaration scan stopped at {} symbols; {} more were dropped",
+            crate::fallback::MAX_FALLBACK_SYMBOLS,
+            scan.truncated
+        ));
+    }
     Extraction {
         file_path: path.to_string(),
         language: lang.to_string(),
         content_hash: content_hash(source),
-        engine: ExtractionEngine::Unavailable {
-            requested_language: lang.to_string(),
+        engine: if recovered {
+            ExtractionEngine::RegexFallback {
+                requested_language: lang.to_string(),
+            }
+        } else {
+            ExtractionEngine::Unavailable {
+                requested_language: lang.to_string(),
+            }
         },
-        parse_outcome: ParseOutcome::Failed {
-            reason: format!("no linked tree-sitter grammar for {lang}"),
+        parse_outcome: if recovered {
+            ParseOutcome::Fallback {
+                reason: format!(
+                    "no linked tree-sitter grammar for {lang}; {} declaration(s) recovered by pattern",
+                    recovered_count
+                ),
+            }
+        } else {
+            ParseOutcome::Failed {
+                reason: format!("no linked tree-sitter grammar for {lang}"),
+            }
         },
-        symbols: Vec::new(),
+        symbols,
         imports: Vec::new(),
         calls: Vec::new(),
         exports: Vec::new(),
         references: Vec::new(),
-        diagnostics: Vec::new(),
+        diagnostics,
         routes: Vec::new(),
         wiring: extract_wiring_annotations(path, source),
         go_package: None,
@@ -1370,6 +1476,8 @@ fn push_module_binding(
         docstring: None,
         signature: None,
         parent_symbol: Some(file_symbol_name.to_string()),
+        body_signature: None,
+        declaration_hash: None,
     });
 }
 
@@ -1596,6 +1704,8 @@ fn extract_node(
                                 docstring: None,
                                 signature: None,
                                 parent_symbol: Some(file_symbol_name.to_string()),
+                                body_signature: None,
+                                declaration_hash: None,
                             });
                         }
                     }
@@ -1633,6 +1743,8 @@ fn extract_node(
                         docstring: None,
                         signature: None,
                         parent_symbol: Some(parent_symbol),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -1647,6 +1759,8 @@ fn extract_node(
                         docstring: None,
                         signature: None,
                         parent_symbol: Some(file_symbol_name.to_string()),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -1762,6 +1876,8 @@ fn extract_node(
                         docstring: None,
                         signature: None,
                         parent_symbol: Some(parent_symbol),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -1798,6 +1914,8 @@ fn extract_node(
                                 docstring: None,
                                 signature: None,
                                 parent_symbol: Some(file_symbol_name.to_string()),
+                                body_signature: None,
+                                declaration_hash: None,
                             });
                         }
                     }
@@ -1815,6 +1933,8 @@ fn extract_node(
                         docstring: None,
                         signature: None,
                         parent_symbol: Some(file_symbol_name.to_string()),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -1830,6 +1950,8 @@ fn extract_node(
                         docstring: None,
                         signature: None,
                         parent_symbol: Some(file_symbol_name.to_string()),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -1845,6 +1967,8 @@ fn extract_node(
                         docstring: None,
                         signature: None,
                         parent_symbol: Some(file_symbol_name.to_string()),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -1860,6 +1984,8 @@ fn extract_node(
                         docstring: None,
                         signature: None,
                         parent_symbol: Some(file_symbol_name.to_string()),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -2144,6 +2270,8 @@ fn extract_node(
                             Some(type_name) => format!("{}::{}", file_symbol_name, type_name),
                             None => file_symbol_name.to_string(),
                         }),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -2213,6 +2341,8 @@ fn extract_node(
                             Some(type_name) => format!("{}::{}", file_symbol_name, type_name),
                             None => file_symbol_name.to_string(),
                         }),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -2232,6 +2362,8 @@ fn extract_node(
                         docstring: None,
                         signature: None,
                         parent_symbol: Some(file_symbol_name.to_string()),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -2427,6 +2559,8 @@ fn extract_node(
                             }
                         }),
                         parent_symbol: Some(parent_symbol),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -2446,6 +2580,8 @@ fn extract_node(
                         docstring: None,
                         signature: None,
                         parent_symbol: Some(file_symbol_name.to_string()),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -2563,6 +2699,8 @@ fn extract_node(
                         docstring: None,
                         signature: None,
                         parent_symbol: Some(file_symbol_name.to_string()),
+                        body_signature: None,
+                        declaration_hash: None,
                     });
                 }
             }
@@ -2648,6 +2786,8 @@ fn extract_node(
                     docstring: None,
                     signature: None,
                     parent_symbol: Some(declaration.parent_symbol(file_symbol_name)),
+                    body_signature: None,
+                    declaration_hash: None,
                 });
             }
         }
@@ -4930,6 +5070,100 @@ pub(crate) fn node_span(node: Node) -> Span {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every discovered file is addressable, whether or not it parsed. (K1)
+    ///
+    /// The `File` node used to be pushed only inside the tree-sitter branch, so
+    /// a language with no linked grammar produced an `Extraction` with an empty
+    /// `symbols` vector: the file was recorded in `generation_files` and was
+    /// absent from the graph entirely — not returnable by a file-level query
+    /// and not usable as the target of any edge.
+    ///
+    /// All three cases below reached that same nodeless state, and they are
+    /// kept apart because they fail for different reasons: a grammarless
+    /// language whose declarations *are* recoverable, one whose declarations
+    /// are not, and a prose format that is deliberately never scanned. Only
+    /// the first would be fixed by improving the fallback scanner, which is
+    /// why "tier-2 recovers declarations" does not subsume this test.
+    #[test]
+    fn a_grammarless_file_still_gets_a_file_node() {
+        for (path, source, why) in [
+            (
+                "api/user.proto",
+                "message User {\n  string id = 1;\n}\n",
+                "grammarless source with recoverable declarations",
+            ),
+            (
+                "scripts/manifest.psd1",
+                "@{ ModuleVersion = '1.0' }\n",
+                "grammarless source with nothing to recover",
+            ),
+            (
+                "docs/design.md",
+                "# Design\n\nProse, never declaration-scanned.\n",
+                "prose format excluded from tier-2 by NON_DECLARATIVE_LANGUAGES",
+            ),
+        ] {
+            let extraction = crate::extract_file(path, source);
+            let files: Vec<&ExtractedSymbol> = extraction
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.kind == SymbolKind::File)
+                .collect();
+            assert_eq!(
+                files.len(),
+                1,
+                "{path} ({why}) must contribute exactly one File node, got {:?}",
+                extraction.symbols
+            );
+            let file = files[0];
+            assert_eq!(
+                file.qualified_name, path,
+                "the File node is addressed by full path, like every parsed file"
+            );
+            assert_eq!(
+                file.span.end_byte,
+                source.len(),
+                "the File node spans the whole file"
+            );
+        }
+    }
+
+    /// The `File` node is not a declaration, so it must not be read as one.
+    ///
+    /// Emitting it unconditionally would be an easy way to make a nodeless file
+    /// *look* recovered. It must not move `parse_outcome`: a file whose
+    /// declarations could not be recovered still reports `Failed`, and only a
+    /// real declaration recovery reports `Fallback`.
+    #[test]
+    fn the_file_node_alone_is_never_reported_as_a_recovery() {
+        let bare = crate::extract_file("scripts/manifest.psd1", "@{ ModuleVersion = '1.0' }\n");
+        assert!(
+            matches!(bare.parse_outcome, ParseOutcome::Failed { .. }),
+            "a File node is not a recovered declaration, got {:?}",
+            bare.parse_outcome
+        );
+        assert!(
+            matches!(bare.engine, ExtractionEngine::Unavailable { .. }),
+            "engine must stay Unavailable, got {:?}",
+            bare.engine
+        );
+
+        let recovered =
+            crate::extract_file("api/user.proto", "message User {\n  string id = 1;\n}\n");
+        assert!(
+            matches!(recovered.parse_outcome, ParseOutcome::Fallback { .. }),
+            "a real declaration recovery still reports Fallback, got {:?}",
+            recovered.parse_outcome
+        );
+        assert!(
+            recovered
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "User" && symbol.kind != SymbolKind::File),
+            "the recovered declaration must survive alongside the File node"
+        );
+    }
 
     /// A real syntax error must never be reported as a clean parse.
     ///

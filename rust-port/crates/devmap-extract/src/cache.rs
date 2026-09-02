@@ -126,7 +126,21 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// functions sharing the name `function`, and an `is_exported` that says nothing
 /// — every one of which is a join key or a dead-code verdict, so reusing it
 /// would silently restore the defects this version fixes.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "25";
+/// v26 adds tier-2 declaration recovery: a file whose language has no linked
+/// grammar now contributes pattern-matched symbols instead of nothing, and is
+/// marked `ExtractionEngine::RegexFallback` / `ParseOutcome::Fallback` so a
+/// consumer can tell a matched symbol from a parsed one. A v25 payload for such
+/// a file carries an empty symbol list under a real content hash, so reusing it
+/// would leave every `.proto`, `.ps1` and `.vb` in the tree permanently
+/// invisible while looking freshly indexed.
+/// v27 adds `body_signature`: a Type-1 and Type-2 hash of each symbol body,
+/// computed from the parse tree. A v26 payload has the field absent, which
+/// `serde(default)` reads back as `None` — and `None` means "no signature was
+/// computed", which is exactly what a clone report would then conclude about
+/// every cached file. Without the bump the first incremental build after this
+/// change would report clones found only among the handful of files that
+/// happened to be edited, and report it as a whole-repository answer.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "27";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

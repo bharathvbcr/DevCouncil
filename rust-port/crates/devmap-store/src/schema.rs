@@ -21,6 +21,9 @@ CREATE TABLE IF NOT EXISTS generation_nodes (
     span_start     INTEGER NOT NULL,
     span_end       INTEGER NOT NULL,
     is_exported    INTEGER NOT NULL,
+    body_exact     INTEGER,
+    body_structural INTEGER,
+    body_nodes     INTEGER,
     PRIMARY KEY (generation_id, ordinal)
 ) WITHOUT ROWID;
 
@@ -303,7 +306,32 @@ pub const MIGRATION_V10_TO_V11: &str = r#"
 ALTER TABLE generation_unresolved ADD COLUMN receiver TEXT;
 "#;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 11;
+/// SC26: body signatures for clone detection.
+///
+/// Three nullable columns rather than a `generation_clones` table, because a
+/// clone group is not a fact about the tree — it is a join over facts about
+/// symbols. Storing the groups would mean storing a derived, truncated view
+/// that has to be kept in step with the rows it came from; storing the hashes
+/// lets any generation be grouped on demand, in full, by the one grouping
+/// implementation in `devmap-analyze`.
+///
+/// No covering index. `generation_nodes` is `WITHOUT ROWID` on
+/// `(generation_id, ordinal)`, so reading one generation's symbols is already a
+/// primary-key range scan; an index on the hashes would add store size — the
+/// thing this schema works to bound — to save nothing on a scan that has to
+/// touch every row of the generation anyway.
+///
+/// Nullable, and null means "no signature was computed for this symbol": a body
+/// under the size floor, a kind with no comparable body, or a file no grammar
+/// parsed. Rows written before this column existed backfill to null, which says
+/// the same true thing about them.
+pub const MIGRATION_V11_TO_V12: &str = r#"
+ALTER TABLE generation_nodes ADD COLUMN body_exact INTEGER;
+ALTER TABLE generation_nodes ADD COLUMN body_structural INTEGER;
+ALTER TABLE generation_nodes ADD COLUMN body_nodes INTEGER;
+"#;
+
+pub const CURRENT_SCHEMA_VERSION: i32 = 12;
 
 #[cfg(test)]
 mod retention_constant_tests {

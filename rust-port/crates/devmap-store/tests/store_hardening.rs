@@ -6,7 +6,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use devmap_analyze::{analyze, DeadSymbolReport};
 use devmap_extract::cache::CacheKey;
 use devmap_extract::extract_all;
-use devmap_extract::{extract_file, extract_tree, FileRef};
+use devmap_extract::{extract_file, extract_tree, FileRef, SymbolKind};
 use devmap_resolve::Resolver;
 use devmap_store::{GenerationWriteOpts, Store, WalCheckpointMode, CURRENT_SCHEMA_VERSION};
 
@@ -783,15 +783,29 @@ fn durable_extraction_json_is_smaller_than_the_live_blob() {
 #[test]
 fn build_history_separates_confident_ambiguous_and_unmeasured_values() {
     let clean = extract_file("src/live.py", "def live():\n    return 1\n");
-    // A language declared in the registry but with no linked grammar, so the
-    // engine reports it unavailable rather than parsing it. This was `.java`
-    // until Java was linked, at which point the fixture silently stopped
-    // testing anything — hence the explicit precondition below.
-    let unavailable = extract_file("src/legacy.vb", "Class Legacy\nEnd Class\n");
+    // A language declared in the registry but with no linked grammar, whose
+    // content also yields nothing to tier-2 pattern recovery — so the engine
+    // reports it unavailable rather than parsing *or* pattern-matching it.
+    //
+    // This was `.java` until Java was linked, at which point the fixture
+    // silently stopped testing anything; it then held `Class Legacy` until the
+    // regex fallback landed and started recovering that declaration, which is
+    // the same failure a second time. Both are why the precondition below is
+    // explicit: the fixture has to keep meaning "nothing was extracted", and
+    // that now takes content no tier can read.
+    let unavailable = extract_file("src/legacy.vb", "' just a comment\n\n");
     assert!(
         format!("{:?}", unavailable.engine).contains("Unavailable"),
-        "fixture precondition: `.vb` must have no linked grammar, got {:?}",
+        "fixture precondition: `.vb` must have no linked grammar and no \
+         pattern-recoverable declarations, got {:?}",
         unavailable.engine
+    );
+    assert!(
+        unavailable
+            .symbols
+            .iter()
+            .all(|s| s.kind == SymbolKind::File),
+        "fixture precondition: the unavailable file must declare nothing"
     );
     let extractions = vec![clean, unavailable];
     let mut resolver = Resolver::new();
@@ -969,6 +983,201 @@ fn vacuum_returns_freed_pages_to_the_filesystem() {
     assert!(
         freelist_after < freelist,
         "vacuum did not consume the freelist: {freelist} -> {freelist_after}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A freshly created store must be in incremental auto-vacuum mode, and its
+/// reclaim must not be a whole-file rewrite.
+///
+/// The existing reclaim test asserts only that space comes back, which a full
+/// `VACUUM` also satisfies — so it cannot tell the cheap path from the
+/// expensive one. That distinction is the entire point of the change: a full
+/// `VACUUM` costs O(database) and ran on nearly every build (measured: 937 ms,
+/// 28% of an incremental build on this repository), while
+/// `PRAGMA incremental_vacuum` costs O(pages reclaimed).
+///
+/// Mode is asserted at creation because that is the only moment it can be set
+/// on a database that has no tables yet. If `configure_connection` stopped
+/// issuing the pragma, or started issuing it after `migrate`, every new store
+/// would silently fall back to whole-file rewrites — no failure, just the old
+/// cost back.
+#[test]
+fn new_stores_use_incremental_auto_vacuum_and_reclaim_without_a_full_rewrite() {
+    let dir = tmp_dir("vacuum-incremental");
+    let db_path = dir.join("index.sqlite");
+    let store = Store::open(&db_path).unwrap();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let auto_vacuum: i64 = conn
+        .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+        .unwrap();
+    drop(conn);
+    assert_eq!(
+        auto_vacuum, 2,
+        "a new store should be auto_vacuum=INCREMENTAL (2), found {auto_vacuum} \
+         (0=NONE forces a whole-file VACUUM to reclaim anything)"
+    );
+
+    // Same churn shape as the reclaim test: enough generations that pruning
+    // leaves a freelist above the threshold.
+    let mut extractions = Vec::new();
+    for i in 0..60 {
+        extractions.push(extract_file(
+            &format!("src/f{i}.py"),
+            &format!("def fn{i}():\n    return {i}\n"),
+        ));
+    }
+    for round in 0..6 {
+        let mut churn = extractions.clone();
+        churn.push(extract_file(
+            "src/churn.py",
+            &format!("def churn():\n    return {round}\n"),
+        ));
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&churn);
+        let resolution = resolver.resolve_all(&churn);
+        let analysis = analyze(&churn, &resolution);
+        store
+            .save_generation(&churn, &resolution, &analysis)
+            .unwrap();
+    }
+    store.prune_generations_except_latest(1).unwrap();
+    store.prune_extraction_cache().unwrap();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let freelist_before: i64 = conn
+        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+        .unwrap();
+    let pages_before: i64 = conn
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap();
+    drop(conn);
+    assert!(
+        freelist_before > 0,
+        "pruning should have left free pages to reclaim, found none"
+    );
+
+    store.vacuum_if_needed().unwrap();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let pages_after: i64 = conn
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap();
+    let freelist_after: i64 = conn
+        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+        .unwrap();
+    let auto_vacuum_after: i64 = conn
+        .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+        .unwrap();
+    drop(conn);
+
+    // The reclaim contract is identical to the full-vacuum path's: space must
+    // actually return to the filesystem. Only the cost differs.
+    assert!(
+        pages_after < pages_before,
+        "incremental vacuum did not shrink the database: \
+         {pages_before} -> {pages_after} pages"
+    );
+    assert!(
+        freelist_after < freelist_before,
+        "incremental vacuum did not consume the freelist: \
+         {freelist_before} -> {freelist_after}"
+    );
+    assert_eq!(
+        auto_vacuum_after, 2,
+        "reclaim must not drop the store out of incremental mode"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A pre-existing mode-NONE store is converted by its next reclaim, not left
+/// paying for whole-file rewrites forever.
+///
+/// Stores created before this change are `auto_vacuum=NONE`, and that mode
+/// cannot be switched on a populated database except by a full rewrite. The
+/// conversion therefore rides on the `VACUUM` such a store was already going to
+/// run, so it costs nothing extra — but only if it actually happens. Without
+/// this test the fallback branch would keep working correctly and every
+/// long-lived store would keep the old cost, which is invisible from behaviour
+/// alone.
+#[test]
+fn a_legacy_none_mode_store_is_converted_to_incremental_by_its_next_reclaim() {
+    let dir = tmp_dir("vacuum-convert");
+    let db_path = dir.join("index.sqlite");
+
+    // Build a store and force it back to the legacy mode, which is what every
+    // database created before this change looks like on disk.
+    {
+        let store = Store::open(&db_path).unwrap();
+        let mut extractions = Vec::new();
+        for i in 0..60 {
+            extractions.push(extract_file(
+                &format!("src/f{i}.py"),
+                &format!("def fn{i}():\n    return {i}\n"),
+            ));
+        }
+        for round in 0..6 {
+            let mut churn = extractions.clone();
+            churn.push(extract_file(
+                "src/churn.py",
+                &format!("def churn():\n    return {round}\n"),
+            ));
+            let mut resolver = Resolver::new();
+            resolver.index_extractions(&churn);
+            let resolution = resolver.resolve_all(&churn);
+            let analysis = analyze(&churn, &resolution);
+            store
+                .save_generation(&churn, &resolution, &analysis)
+                .unwrap();
+        }
+    }
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "auto_vacuum", "NONE").unwrap();
+        conn.execute("VACUUM", []).unwrap();
+        let mode: i64 = conn
+            .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, 0, "test setup failed to produce a legacy store");
+    }
+
+    let store = Store::open(&db_path).unwrap();
+    store.prune_generations_except_latest(1).unwrap();
+    store.prune_extraction_cache().unwrap();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let freelist_before: i64 = conn
+        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+        .unwrap();
+    drop(conn);
+    assert!(
+        freelist_before > 0,
+        "pruning should have left free pages to reclaim, found none"
+    );
+
+    store.vacuum_if_needed().unwrap();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let mode_after: i64 = conn
+        .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+        .unwrap();
+    let freelist_after: i64 = conn
+        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+        .unwrap();
+    drop(conn);
+
+    assert_eq!(
+        mode_after, 2,
+        "a legacy store's reclaim should convert it to incremental mode, \
+         leaving it at {mode_after}"
+    );
+    assert!(
+        freelist_after < freelist_before,
+        "the converting vacuum must still reclaim: \
+         {freelist_before} -> {freelist_after}"
     );
 
     let _ = fs::remove_dir_all(&dir);
@@ -1227,5 +1436,91 @@ fn unresolved_calls_are_persisted_and_pruned_with_their_generation() {
         store_rows <= per_generation * retained,
         "ledger rows must be pruned with their generation: {store_rows} rows for \
          {per_generation} unresolved calls across {retained} retained generations"
+    );
+}
+
+/// Body signatures must survive the differential write path.
+///
+/// An incremental build re-extracts only the changed files and carries every
+/// other file's symbol rows forward from the previous generation. If the carry
+/// dropped the three signature columns, the very next build after an edit would
+/// report the whole repository as unsigned — and an unsigned symbol reads as
+/// "not examined", so `devmap clones` would answer "nothing found" over a tree
+/// it had simply stopped looking at. The failure is silent, which is why it is
+/// pinned here rather than left to the end-to-end suite.
+#[test]
+fn body_signatures_survive_an_incremental_carry_forward() {
+    let body = "\n    total = 0\n    for row in rows:\n        if row.active:\n            total += row.amount * rate\n        else:\n            total -= row.penalty\n    return total\n";
+    let shared = format!("def compute(rows, rate):{body}");
+    let a = extract_file("a.py", &shared);
+    let b = extract_file("b.py", &shared);
+    let c = extract_file("c.py", "def solo(x):\n    return x + 1\n");
+
+    let signed_in_extraction = |e: &devmap_extract::model::Extraction| {
+        e.symbols
+            .iter()
+            .filter(|s| s.body_signature.is_some())
+            .count()
+    };
+    assert_eq!(
+        signed_in_extraction(&a),
+        1,
+        "fixture must produce a signed symbol or this test proves nothing"
+    );
+
+    let all = [a.clone(), b.clone(), c.clone()];
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&all);
+    let resolution = resolver.resolve_all(&all);
+    let analysis = analyze(&all, &resolution);
+
+    let store = Store::open_in_memory().unwrap();
+    store.save_generation(&all, &resolution, &analysis).unwrap();
+
+    let (cold, _) = store.latest_clone_candidates().unwrap();
+    let cold_signed = cold.len();
+    assert!(
+        cold_signed >= 2,
+        "cold build signed {cold_signed} symbols; expected the two shared bodies"
+    );
+
+    // Edit only c.py. a.py and b.py — which hold the duplicate — are carried.
+    let c2 = extract_file("c.py", "def solo(x):\n    return x + 2\n");
+    let after = [a, b, c2];
+    let mut resolver2 = Resolver::new();
+    resolver2.index_extractions(&after);
+    let resolution2 = resolver2.resolve_all(&after);
+    let analysis2 = analyze(&after, &resolution2);
+    store
+        .save_generation_with_opts(
+            &after,
+            &resolution2,
+            &analysis2,
+            GenerationWriteOpts {
+                affected_paths: vec!["c.py".into()],
+                deleted_paths: vec![],
+                build_started: None,
+                repo_root: None,
+            },
+        )
+        .unwrap();
+
+    let (warm, _) = store.latest_clone_candidates().unwrap();
+    assert_eq!(
+        warm.len(),
+        cold_signed,
+        "an incremental build lost signatures: {} signed after carry-forward, {} before",
+        warm.len(),
+        cold_signed
+    );
+
+    // And the duplicate is still findable, which is the fact the columns exist for.
+    let summary = devmap_analyze::group_clones(&warm, 0);
+    assert!(
+        summary.groups.iter().any(|g| g.members.len() == 2
+            && g.members.iter().any(|m| m.file_path == "a.py")
+            && g.members.iter().any(|m| m.file_path == "b.py")),
+        "the a.py/b.py duplicate did not survive the incremental build: {:?}",
+        summary.groups
     );
 }

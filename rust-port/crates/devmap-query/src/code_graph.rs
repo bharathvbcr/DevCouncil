@@ -31,7 +31,7 @@ use crate::manifest::{entry_root_paths, is_entry_root, CONSUMER_MAP_ENGINE};
 use crate::model::FreshnessInfo;
 use devmap_analyze::model::{AnalysisStatus, AnalysisSummary};
 use devmap_extract::model::{
-    confidence_millis, EdgeKind, ExtractedSymbol, Extraction, SymbolKind, WiringKind,
+    confidence_millis, EdgeKind, ExtractedSymbol, Extraction, ParseOutcome, SymbolKind, WiringKind,
 };
 use devmap_resolve::model::ResolvedEdge;
 use serde_json::{json, Map, Value};
@@ -258,6 +258,14 @@ struct GraphProvenance {
     dead_code_exempt_omitted: usize,
     dead_code_without_node: usize,
     dead_code_duplicates_dropped: usize,
+    /// Files whose symbols were recovered by line pattern because no grammar is
+    /// linked for their language.
+    ///
+    /// Surfaced because those symbols are a weaker claim than parsed ones —
+    /// names and spans only, no calls, no nesting — and a consumer that treats
+    /// the graph uniformly would over-trust them. It is also the number that
+    /// says how much of the tree the engine can only see coarsely.
+    regex_fallback_files: usize,
 }
 
 /// Render `code_graph.json` from a committed generation.
@@ -293,6 +301,9 @@ pub fn generate_code_graph_json(
         let source = std::fs::read_to_string(resolve_source_path(&root, &ext.file_path)).ok();
         if source.is_none() {
             provenance.files_without_readable_source += 1;
+        }
+        if matches!(ext.parse_outcome, ParseOutcome::Fallback { .. }) {
+            provenance.regex_fallback_files += 1;
         }
         let area = file_area(&ext.file_path);
         let community = communities
@@ -463,6 +474,59 @@ pub fn generate_code_graph_json(
         AnalysisStatus::Timeout { reason } => format!("timeout: {reason}"),
     };
 
+    // The `unavailable` map is built rather than written as a literal because
+    // two of its entries are now conditional. A digest the caller supplied is a
+    // computed answer; leaving its "not fingerprinted" note in place would have
+    // the artifact assert both at once, which is worse than either alone — a
+    // consumer reading the marker would skip a check the value could have
+    // satisfied. The unconditional entries stay unconditional: nothing about a
+    // caller-supplied digest makes reachability or edge reasons computable.
+    let mut unavailable = serde_json::Map::new();
+    unavailable.insert(
+        "unreachable_files".to_string(),
+        json!(
+            "file-level reachability BFS is not implemented in the Rust \
+             kernel; the empty list is not a computed result"
+        ),
+    );
+    unavailable.insert(
+        "edge_reason".to_string(),
+        json!(
+            "generation_edges persists no reason string, so every edge \
+             reports the empty reason Python's compact tier also uses"
+        ),
+    );
+    unavailable.insert(
+        "edge_extras".to_string(),
+        json!("no per-edge extras are persisted"),
+    );
+    unavailable.insert(
+        "node_extras_bases_implements_decorators".to_string(),
+        json!(
+            "the extractor records no base/interface/decorator lists on a \
+             symbol; the keys are omitted rather than emitted empty"
+        ),
+    );
+    if freshness.stamped.indexed_hash.is_none() {
+        unavailable.insert(
+            "indexed_hash".to_string(),
+            json!(
+                "the Rust kernel computes no SHA-1 file-list digest; \
+                 consumers treat the empty string as 'not fingerprinted' and \
+                 skip the check rather than concluding freshness"
+            ),
+        );
+    }
+    if freshness.stamped.content_fingerprint.is_none() {
+        unavailable.insert(
+            "content_fingerprint".to_string(),
+            json!(
+                "the Rust kernel computes no SHA-1 size+mtime digest; see \
+                 indexed_hash"
+            ),
+        );
+    }
+
     let payload = json!({
         "schema_version": CODE_GRAPH_SCHEMA_VERSION,
         "nodes": nodes,
@@ -473,9 +537,17 @@ pub fn generate_code_graph_json(
         // Never computed. See `meta.devmap_rust.unavailable.unreachable_files`
         // and the unconditional `liveness_unreachable_unreliable` below.
         "unreachable_files": Vec::<String>::new(),
-        "generated_head": freshness.head_sha,
-        "indexed_hash": "",
-        "content_fingerprint": "",
+        "generated_head": freshness.generated_head(),
+        // Empty unless the caller computed one. See `StampedFreshness`; the
+        // paired `meta.devmap_rust.unavailable` entries below are removed for
+        // exactly the fields that carry a real value, so "not fingerprinted"
+        // and "fingerprinted" are never both claimed at once.
+        "indexed_hash": freshness.stamped.indexed_hash.clone().unwrap_or_default(),
+        "content_fingerprint": freshness
+            .stamped
+            .content_fingerprint
+            .clone()
+            .unwrap_or_default(),
         "meta": {
             // Ownership marker. Python never writes this key, so its absence is
             // what identifies a foreign graph to the clobber guard.
@@ -498,31 +570,25 @@ pub fn generate_code_graph_json(
                 "duplicate_edges_dropped": provenance.duplicate_edges_dropped,
                 "edge_endpoints_without_node": provenance.edge_endpoints_without_node,
                 "files_without_readable_source": provenance.files_without_readable_source,
-                "unavailable": {
-                    "unreachable_files":
-                        "file-level reachability BFS is not implemented in the Rust \
-                         kernel; the empty list is not a computed result",
-                    "edge_reason":
-                        "generation_edges persists no reason string, so every edge \
-                         reports the empty reason Python's compact tier also uses",
-                    "edge_extras":
-                        "no per-edge extras are persisted",
-                    "node_extras_bases_implements_decorators":
-                        "the extractor records no base/interface/decorator lists on a \
-                         symbol; the keys are omitted rather than emitted empty",
-                    "indexed_hash":
-                        "the Rust kernel computes no SHA-1 file-list digest; \
-                         consumers treat the empty string as 'not fingerprinted' and \
-                         skip the check rather than concluding freshness",
-                    "content_fingerprint":
-                        "the Rust kernel computes no SHA-1 size+mtime digest; see \
-                         indexed_hash",
-                },
+                "regex_fallback_files": provenance.regex_fallback_files,
+                "unavailable": unavailable,
             },
         },
     });
 
-    Ok(serde_json::to_string_pretty(&payload)?)
+    // Compact, not pretty — unlike `repo_map.json`, which stays indented.
+    //
+    // The two artifacts have different readers. `repo_map.json` is small
+    // (0.4 MB here) and `CLAUDE.md` tells agents to open it, so its indentation
+    // buys something. This graph is 27 MB on DevCouncil and 105 MB on a
+    // 4,300-file repository; nobody reads that by hand, and every one of its
+    // twelve consumers under `src/devcouncil/` reaches it through `json.load`,
+    // which cannot tell the two apart.
+    //
+    // Indentation was therefore 23.3% of the file (27.30 MB → 20.94 MB
+    // measured) spent on whitespace no reader sees, paid again on every write,
+    // every read, and every byte of disk churn the watcher causes.
+    Ok(serde_json::to_string(&payload)?)
 }
 
 /// Refuse to clobber a Python (or otherwise foreign) `code_graph.json` unless
@@ -555,6 +621,9 @@ fn is_foreign_code_graph(path: &Path) -> anyhow::Result<bool> {
 #[cfg(all(test, feature = "parse"))]
 mod tests {
     use super::*;
+    // Only the tests construct caller-supplied freshness; the emitters read it
+    // off `FreshnessInfo`.
+    use crate::model::StampedFreshness;
     use devmap_analyze::model::{AnalysisStatus, CommunityReport, DeadSymbolReport};
     use devmap_extract::extract_file;
     use devmap_extract::model::Confidence;
@@ -564,6 +633,7 @@ mod tests {
             head_sha: "abc123".to_string(),
             generation_id: 1,
             pending_count: 0,
+            stamped: Default::default(),
         }
     }
 
@@ -576,6 +646,7 @@ mod tests {
             communities,
             status: AnalysisStatus::Ok,
             unresolved_calls: 0,
+            clone_coverage: Default::default(),
         }
     }
 
@@ -677,6 +748,93 @@ mod tests {
             "top-level keys must match schema.py's CodeGraph exactly"
         );
         assert_eq!(value["schema_version"], json!(CODE_GRAPH_SCHEMA_VERSION));
+    }
+
+    /// A caller-supplied digest is stamped, and stops being advertised as
+    /// unavailable.
+    ///
+    /// The two halves are one contract. Stamping the value while leaving
+    /// `meta.devmap_rust.unavailable.indexed_hash` in place would have the
+    /// artifact assert both "here is the digest" and "this kernel computes no
+    /// digest" — and a consumer that reads the marker skips the very check the
+    /// value would have satisfied, so the map reads permanently unverifiable
+    /// while carrying a perfectly good fingerprint.
+    ///
+    /// `generated_head` is asserted to *override* the kernel's `head_sha`
+    /// rather than merely fill a blank. They answer different questions: the
+    /// kernel's is the head of the last persisted generation, the caller's is
+    /// the head the artifact describes, and an incremental build that persists
+    /// no generation makes them differ.
+    #[test]
+    fn caller_supplied_freshness_is_stamped_and_drops_its_unavailable_marker() {
+        let extractions = [extract_file("k.py", "def a(): pass\n")];
+        let analysis = empty_analysis();
+
+        let mut stamped_freshness = freshness();
+        stamped_freshness.stamped = StampedFreshness {
+            generated_head: Some("cafe1234".to_string()),
+            indexed_hash: Some("files-digest".to_string()),
+            content_fingerprint: Some("content-digest".to_string()),
+        };
+        let json = generate_code_graph_json(&extractions, &analysis, &[], &stamped_freshness, None)
+            .unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value["indexed_hash"], json!("files-digest"));
+        assert_eq!(value["content_fingerprint"], json!("content-digest"));
+        assert_eq!(
+            value["generated_head"],
+            json!("cafe1234"),
+            "a caller-supplied head must win over the kernel's generation head"
+        );
+
+        let unavailable = &value["meta"]["devmap_rust"]["unavailable"];
+        assert!(
+            unavailable.get("indexed_hash").is_none(),
+            "a stamped indexed_hash must not also be declared unavailable"
+        );
+        assert!(
+            unavailable.get("content_fingerprint").is_none(),
+            "a stamped content_fingerprint must not also be declared unavailable"
+        );
+        // Nothing about a supplied digest makes reachability computable.
+        assert!(
+            unavailable.get("unreachable_files").is_some(),
+            "unconditional unavailability markers must survive stamping"
+        );
+        assert_eq!(
+            value["meta"]["liveness_unreachable_unreliable"],
+            json!(true)
+        );
+    }
+
+    /// Without caller-supplied digests the artifact is exactly what it was:
+    /// empty values, markers present.
+    ///
+    /// The stamping path must not become the only correct path. `dev map` is
+    /// not the sole caller — the daemon and any direct `devmap manifest` run
+    /// pass nothing — and for those the honest answer is still "not
+    /// fingerprinted", never a plausible-looking empty string with no warning
+    /// attached.
+    #[test]
+    fn unstamped_freshness_still_reports_the_digests_as_unavailable() {
+        let value = graph(
+            &[extract_file("k.py", "def a(): pass\n")],
+            &empty_analysis(),
+            &[],
+        );
+        assert_eq!(value["indexed_hash"], json!(""));
+        assert_eq!(value["content_fingerprint"], json!(""));
+
+        let unavailable = &value["meta"]["devmap_rust"]["unavailable"];
+        assert!(
+            unavailable.get("indexed_hash").is_some(),
+            "an uncomputed indexed_hash must stay declared unavailable"
+        );
+        assert!(
+            unavailable.get("content_fingerprint").is_some(),
+            "an uncomputed content_fingerprint must stay declared unavailable"
+        );
     }
 
     /// Node and dead-code entries carry every field their pydantic model
@@ -946,6 +1104,7 @@ mod tests {
             head_sha: "abc123".to_string(),
             generation_id: 0,
             pending_count: 0,
+            stamped: Default::default(),
         };
         let error = generate_code_graph_json(
             &[extract_file("k.py", "def a(): pass\n")],

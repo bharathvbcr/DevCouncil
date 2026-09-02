@@ -460,6 +460,19 @@ pub fn detect_language(path: &Path) -> &'static str {
     } else {
         match ext {
             "sh" | "bash" | "zsh" => "shell",
+            // Named here rather than left as "generic" so `is_indexable_source`
+            // admits them at all. Both are source with real declarations and no
+            // linked grammar, so discovery was dropping them before extraction
+            // ever ran: 19 `.proto` and 17 `.ps1` files on one corpus that the
+            // graph could not see. Tier-2 recovery (`crate::fallback`) reads
+            // protobuf `message`/`service`/`rpc` and PowerShell `function`.
+            "proto" => "protobuf",
+            "ps1" | "psm1" | "psd1" => "powershell",
+            // A notebook is source, and `crate::notebook` knows how to read it
+            // (G5). Named here for the same reason as the two above: discovery
+            // admits only what `detect_language` names, so an unnamed extension
+            // never reaches an extractor that could handle it.
+            "ipynb" => "notebook",
             "html" | "htm" => "html",
             "css" | "scss" | "less" => "css",
             "sql" => "sql",
@@ -725,5 +738,29 @@ mod tests {
         assert!(!is_ignored_path("src/main.rs"));
         assert!(is_indexable_source("src/main.rs"));
         assert!(is_indexable_source("Cargo.toml"));
+    }
+
+    /// Discovery, not extraction, was dropping these.
+    ///
+    /// `is_indexable_source` admits a path only when `detect_language` names
+    /// it, so an unnamed extension is invisible before any extractor runs —
+    /// tier-2 recovery cannot rescue a file the walk never yields. Both of
+    /// these are source with real declarations and no linked grammar, and a
+    /// scan of one working tree found 19 `.proto` and 17 `.ps1` files that the
+    /// graph could not see at all.
+    #[test]
+    fn grammarless_source_languages_are_still_discovered() {
+        for (path, language) in [
+            ("api/v1/user.proto", "protobuf"),
+            ("scripts/deploy.ps1", "powershell"),
+            ("scripts/mod.psm1", "powershell"),
+            ("scripts/mod.psd1", "powershell"),
+        ] {
+            assert_eq!(detect_language(Path::new(path)), language, "{path}");
+            assert!(
+                is_indexable_source(path),
+                "{path} must reach extraction to be recoverable by tier 2"
+            );
+        }
     }
 }

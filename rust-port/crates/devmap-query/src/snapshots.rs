@@ -116,6 +116,8 @@ mod tests {
             docstring: None,
             signature: None,
             parent_symbol: None,
+            body_signature: None,
+            declaration_hash: None,
         }
     }
 

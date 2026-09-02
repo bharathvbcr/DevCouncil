@@ -101,6 +101,7 @@ fn test_t1_manifest_within_budget() {
             head_sha: "test-head".into(),
             generation_id: 1,
             pending_count: 0,
+            stamped: Default::default(),
         },
     );
     assert!(json.len() < 8000, "manifest JSON should stay compact");

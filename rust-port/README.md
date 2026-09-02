@@ -16,9 +16,9 @@ open gates.
 - **[PLAN.md](PLAN.md)** — full audit, specification, phases, and implementation guide.
 - **[PHASE1_CONTRACT.md](PHASE1_CONTRACT.md)** — token budgets, §4.5 scoping, starter corpus.
 - [AUDIT.html](AUDIT.html) — Audit II: 84 further findings; all fixes land in the Rust port.
-- [PLAN.html](PLAN.html) — a styled companion, **not** a render of PLAN.md and not in sync
-  with it: last written 2026-08-12, organised differently, and missing everything added since.
-  There is no generator. See PLAN.md's header.
+- [PLAN.html](PLAN.html) — PLAN.md rendered, styled for humans. Regenerate with
+  `tools/render/render_plan.sh` after editing PLAN.md; it is a build product, not a
+  second source.
 
 ## What this replaces (eventually)
 

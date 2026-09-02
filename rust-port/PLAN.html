@@ -128,541 +128,1489 @@
 </style>
 
 <div class="wrap">
-
-  <header class="masthead">
-    <p class="eyebrow">DevCouncil · code-intelligence subsystem</p>
-    <h1>dev map <span class="arrow">→</span> Rust</h1>
-    <p class="standfirst">A clean-room rewrite in Rust — new binary, new store, new agent-facing contract — with 38 spec items, an inventory of what must survive, and a staged plan.</p>
-    <div class="metrics">
-      <div class="metric"><span class="v">38</span><span class="k">Spec items</span></div>
-      <div class="metric"><span class="v">26,837</span><span class="k">LOC replaced</span></div>
-      <div class="metric"><span class="v">35</span><span class="k">Languages</span></div>
-      <div class="metric is-bad"><span class="v">129k</span><span class="k">Tokens · repo map</span></div>
-      <div class="metric is-bad"><span class="v">7.55s</span><span class="k">1-file resync · 10k</span></div>
-      <div class="metric is-bad"><span class="v">1,639ms</span><span class="k">Graph load / query</span></div>
-    </div>
-  </header>
-
-  <section>
-    <div class="sec-head">
-      <span class="sec-num">Section 01</span>
-      <h2>What changed in this revision</h2>
-    </div>
-    <div class="prose">
-      <p>Two directives reshape the plan. <strong>The rewrite is clean-room</strong> — a standalone Rust implementation, not a PyO3 extension wrapping the existing design. Nothing is ported function-by-function and no Python survives in the indexer. <strong>Token efficiency becomes a first-class requirement</strong> rather than an afterthought, which is a substantive change: it is the one dimension where the current system is worst, and it was invisible in the previous plan.</p>
-      <p>The consequence for the findings is clarifying. Under a hybrid port, each defect needed a fix and a migration. Under a clean-room rewrite <strong>the findings are the specification</strong> — the new system is designed so they cannot occur, and each one becomes an acceptance test rather than a patch. The distinction that mattered before, whether Rust "fixes" a defect or "inherits" it, collapses into a single question: is it written into the spec, or will it be rebuilt by accident?</p>
-      <p>One consequence to price in honestly: a clean-room rewrite delivers <em>no</em> value until cutover. The previous plan front-loaded four Python fixes that would have taken resync under 500 ms within weeks. That option is now off the table by choice, and the 35-language matrix — 2.5× GitNexus's coverage, 1.75× CodeGraph's — sits on the critical path from day one.</p>
-      <p>Two additions since: <strong>seven reference-derived enhancements</strong> (§3, R1–R7) drawn from GitNexus and CodeGraph, and <strong>§4, an inventory of capabilities that must survive</strong>. The second is the more important of the pair. A specification says what must become true; nothing until now said what must <em>stay</em> true, and a clean-room rewrite loses undocumented behaviour without any signal that it has.</p>
-    </div>
-  </section>
-
-  <section>
-    <div class="sec-head">
-      <span class="sec-num">Section 02</span>
-      <h2>Token cost — the unmeasured surface</h2>
-    </div>
-    <div class="prose">
-      <p>dev map exists to give agents context. Its own output is therefore a budget item, and nothing in the system accounts for it. Token figures below are byte counts at four characters per token — an estimate, but the magnitudes are not in question.</p>
-    </div>
-
-    <div class="ledger">
-      <div class="finding sev-critical">
-        <div class="f-top"><span class="f-id">T1</span><span class="f-title">The repo map costs 129,000 tokens, and CLAUDE.md tells every agent to read it</span><span class="chip critical">Critical</span><span class="chip spec">Spec item</span></div>
-        <p class="f-body"><span class="path">.devcouncil/repo_map.json</span> is <strong>514,625 bytes ≈ 128,656 tokens</strong> — most of a 200k context window consumed by one file read, before any work begins. The project's own instructions direct agents to open it first. Two keys carry <strong>78%</strong> of the cost: <code>dependents</code> at 63,844 tokens across 406 entries, and <code>files</code> at 35,512 across 853. Both are lookup structures being shipped whole to answer point queries.</p>
-        <p class="f-ev"><span>measured — byte counts per key</span><span>CLAUDE.md step 1</span></p>
-      </div>
-      <div class="finding sev-high">
-        <div class="f-top"><span class="f-id">T2</span><span class="f-title">The compatibility export is twenty context windows</span><span class="chip high">High</span><span class="chip spec">Spec item</span></div>
-        <p class="f-body"><span class="path">code_graph.json</span> is 17.4 MB ≈ <strong>4.36 million tokens</strong>, rewritten on every build (N3). No agent can read it, so it exists purely as a machine interchange format that happens to sit in the context-bearing directory — and its tiering (<code>slim</code>/<code>compact</code>/<code>stub</code>) is a size guard, not a token budget.</p>
-        <p class="f-ev"><span>measured — 17,454,216 bytes</span><span>graph/build.py:650</span></p>
-      </div>
-      <div class="finding sev-medium">
-        <div class="f-top"><span class="f-id">T3</span><span class="f-title">MCP responses are capped by item count, not token budget</span><span class="chip medium">Medium</span><span class="chip spec">Spec item</span></div>
-        <p class="f-body">The map handlers bound output with <code>out[:200]</code>. Two hundred graph nodes carrying paths, kinds, lines and reasons is an unbounded number of tokens — the cap constrains rows, not context. There is no token accounting anywhere in the MCP surface, and no way for a caller to say how much room it has.</p>
-        <p class="f-ev"><span>mcp/handlers/map.py:235,442</span><span>verified — code</span></p>
-      </div>
-      <div class="finding sev-note">
-        <div class="f-top"><span class="f-id">T4</span><span class="f-title">The discipline already exists — in the wrong layer</span><span class="chip note">Note</span><span class="chip spec">Spec item</span></div>
-        <p class="f-body"><span class="path">execution/prompt_builder.py</span> does this correctly: a total char budget, a per-file cap, truncation with an explicit <code>[truncated to N chars]</code> marker, and an <code>[N more files omitted]</code> note so nothing vanishes silently. The pattern to generalise is already written; it simply was never applied to the artifacts or the query surface.</p>
-        <p class="f-ev"><span>prompt_builder.py:281-319</span><span>verified — code</span></p>
-      </div>
-    </div>
-
-    <div class="callout">
-      <h3>Design rule for the rewrite</h3>
-      <p>No agent-facing surface emits an unbounded response. Every query takes a token budget and returns <code>{ shown, total, truncated }</code> so a partial answer can never be mistaken for a complete one. Wholesale artifact reads are replaced by queries — the map becomes something you ask, not something you load.</p>
-    </div>
-  </section>
-
-  <section>
-    <div class="sec-head">
-      <span class="sec-num">Section 03</span>
-      <h2>Findings as specification</h2>
-    </div>
-    <div class="prose">
-      <p>Twenty-seven findings from the first two audit passes, condensed. Each is now a property the new system must hold, with the acceptance test that proves it. Full evidence for each is in the sections that follow the table in prior revisions; the <em>Source</em> column cites where it was verified.</p>
-    </div>
-
-    <h3>Correctness and concurrency</h3>
-    <div class="scroll">
-      <table>
-        <thead><tr><th>ID</th><th>Property the rewrite must hold</th><th>Source</th><th>Acceptance</th></tr></thead>
-        <tbody>
-          <tr><td class="id">B1</td><td>Queued work survives process death</td><td>coordinator.py:270</td><td>kill −9 mid-build, work replays</td></tr>
-          <tr><td class="id">B2</td><td>Back-pressure, never silent discard, on lease contention</td><td>build_control.py:447</td><td>two writers, zero lost edits</td></tr>
-          <tr><td class="id">B3</td><td>Write cost proportional to change size, not repo size</td><td>heavy <code>write_stats</code></td><td>1-file edit writes &lt;100 rows at 10k files</td></tr>
-          <tr><td class="id">B4</td><td>Concurrent readers never blocked by a writer</td><td>sync/lease.py</td><td>query p95 unchanged during build</td></tr>
-          <tr><td class="id">B5</td><td>Staleness self-heals without an unrelated trigger</td><td>service.py:151</td><td>commit-then-idle leaves index fresh</td></tr>
-          <tr><td class="id">N1</td><td>Queries never deserialise the whole graph</td><td>query/engine.py:16</td><td>explore p95 &lt;50 ms at 10k files</td></tr>
-          <tr><td class="id">N2</td><td>Deletions and renames are explicit, not implied</td><td>incremental.py — absent</td><td>deleted file absent from graph next build</td></tr>
-          <tr><td class="id">N4</td><td>A check that could not run never reports as one that passed</td><td>graph/intel.py:118</td><td>clustering timeout surfaces <code>status</code></td></tr>
-        </tbody>
-      </table>
-    </div>
-
-    <h3>Storage</h3>
-    <div class="scroll">
-      <table>
-        <thead><tr><th>ID</th><th>Property the rewrite must hold</th><th>Source</th><th>Acceptance</th></tr></thead>
-        <tbody>
-          <tr><td class="id">B6</td><td>Generation prune is a bounded delete, not a full reindex</td><td>sqlite.py:1326</td><td>prune cost independent of live row count</td></tr>
-          <tr><td class="id">B7</td><td>Cache admission is O(1), not a table scan</td><td>sqlite.py:1673</td><td>cold build insert cost is linear</td></tr>
-          <tr><td class="id">B8</td><td>Eviction follows liveness, not age</td><td>sqlite.py:1677</td><td>live files never evicted while dead remain</td></tr>
-          <tr><td class="id">B9</td><td>No redundant column in any primary key</td><td>sqlite.py:503</td><td>schema review</td></tr>
-          <tr><td class="id">B10</td><td>Paths interned; no repeated text in hot tables</td><td>sqlite.py:503</td><td>index &lt;60 MB for this repo</td></tr>
-          <tr><td class="id">B11</td><td>Free space is reclaimed on a schedule</td><td>sqlite.py:1165</td><td>freelist ratio &lt;5% after 1,000 builds</td></tr>
-          <tr><td class="id">D2</td><td>One schema, no rollback-compat shadow tables</td><td>sqlite.py:643</td><td>schema review</td></tr>
-        </tbody>
-      </table>
-    </div>
-
-    <h3>Compute and analysis quality</h3>
-    <div class="scroll">
-      <table>
-        <thead><tr><th>ID</th><th>Property the rewrite must hold</th><th>Source</th><th>Acceptance</th></tr></thead>
-        <tbody>
-          <tr><td class="id">B12</td><td>Extraction saturates available cores</td><td>build.py:162</td><td>near-linear scaling to core count</td></tr>
-          <tr><td class="id">B13</td><td>No repeated path parsing in hot loops</td><td>1.09M <code>Path</code> calls</td><td>profile shows no string-path work</td></tr>
-          <tr><td class="id">B14</td><td>One pass over each file's tree, not many regex sweeps</td><td>routes.py:77 · di.py:37</td><td>profile shows one traversal per file</td></tr>
-          <tr><td class="id">B15</td><td>Language resolved once per file, not per edge</td><td>resolve.py:81</td><td>profile review</td></tr>
-          <tr><td class="id">N5</td><td>Leiden clustering — connected communities guaranteed</td><td>intel.py:114</td><td>no disconnected community in output</td></tr>
-          <tr><td class="id">N6</td><td>Receiver types tracked from constructors, not guessed by name</td><td>resolve.py:764</td><td>corpus resolution-precision ratchet</td></tr>
-          <tr><td class="id">N7</td><td>Retrieval fuses lexical and semantic ranking</td><td>sqlite.py:1464</td><td>RRF over BM25 + vectors</td></tr>
-          <tr><td class="id">N9</td><td>Pools sized from real cores and RAM, no fixed ceiling</td><td>workers.py:221</td><td>12-core host uses 12 cores</td></tr>
-        </tbody>
-      </table>
-    </div>
-
-    <h3>Interface and artifacts</h3>
-    <div class="scroll">
-      <table>
-        <thead><tr><th>ID</th><th>Property the rewrite must hold</th><th>Source</th><th>Acceptance</th></tr></thead>
-        <tbody>
-          <tr><td class="id">T1</td><td>No agent-facing artifact exceeds its token budget</td><td>514 KB repo map</td><td>manifest ≤2k tokens</td></tr>
-          <tr><td class="id">T2</td><td>Machine interchange lives outside the context directory</td><td>17.4 MB export</td><td>opt-in, not default</td></tr>
-          <tr><td class="id">T3</td><td>Every response is token-budgeted and reports truncation</td><td>handlers/map.py:235</td><td>all responses carry <code>{shown,total}</code></td></tr>
-          <tr><td class="id">N3</td><td>No dual-write of a second full serialisation</td><td>build.py:650</td><td>one canonical store</td></tr>
-          <tr><td class="id">N8</td><td>Ingestion owned by a long-lived watcher</td><td>graph_cmd.py:425</td><td>freshness holds with hooks disabled</td></tr>
-          <tr><td class="id">N10</td><td>Query surface is honest about its capability</td><td>cypher.py:1-20</td><td>no regex posing as a query language</td></tr>
-          <tr><td class="id">D1</td><td>One extractor per language, tree-sitter throughout</td><td>cache.py:308</td><td>no stdlib-<code>ast</code> path</td></tr>
-          <tr><td class="id">D3</td><td>Lock status reports the true holder</td><td>lease.py:17</td><td>status never names a dead pid</td></tr>
-        </tbody>
-      </table>
-    </div>
-
-    <h3>Reference-derived enhancements</h3>
-    <div class="prose">
-      <p>Adopted from GitNexus and CodeGraph. These are additions rather than defects — nothing in the current system is wrong, but each is a capability it lacks.</p>
-    </div>
-    <div class="scroll">
-      <table>
-        <thead><tr><th>ID</th><th>Enhancement</th><th>Source</th><th>Acceptance</th></tr></thead>
-        <tbody>
-          <tr><td class="id">R1</td><td>One primary query tool; the rest unlisted by default</td><td>CodeGraph</td><td>≤3 listed tools replace today's 18</td></tr>
-          <tr><td class="id">R2</td><td>Results carry verbatim source, grouped by file</td><td>CodeGraph</td><td>symbol query needs no follow-up read</td></tr>
-          <tr><td class="id">R3</td><td>Embedding index bounded by node count</td><td>GitNexus</td><td>peak RSS &lt;1 GB at 10k files</td></tr>
-          <tr><td class="id">R4</td><td>WAL auto-checkpoint tuned for build churn</td><td>GitNexus</td><td>freelist &lt;5% without manual vacuum</td></tr>
-          <tr><td class="id">R5</td><td>Call paths include dynamic-dispatch hops</td><td>CodeGraph</td><td>interface-dispatch path resolves in corpus</td></tr>
-          <tr><td class="id">R6</td><td>Communities carry cohesion scores</td><td>GitNexus</td><td>every community reports cohesion</td></tr>
-          <tr><td class="id">R7</td><td>Targeted repair without a full rebuild</td><td>GitNexus</td><td><code>devmap repair --fts</code> rebuilds index only</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <div class="prose">
-      <p><strong>Declined:</strong> multi-repo global registry and connection pooling (GitNexus). DevCouncil is single-repo by design; adopting these changes the product, not the implementation.</p>
-      <p><strong>Already present, not adopted from elsewhere:</strong> tsconfig path aliases, re-export chains and a portable fallback extractor exist in DevCouncil today — in some cases more thoroughly than in either reference. They belong in the next section, not this one.</p>
-    </div>
-  </section>
-
-  <section>
-    <div class="sec-head">
-      <span class="sec-num">Section 04</span>
-      <h2>Capabilities to preserve</h2>
-    </div>
-    <div class="prose">
-      <p>The counterweight to the specification. A clean-room rewrite loses undocumented behaviour silently — nothing fails, the graph is merely poorer. Golden-corpus parity only catches a regression if the corpus exercises the capability, so each row below carries the corpus requirement that makes it detectable.</p>
-      <p><strong>This inventory is incomplete.</strong> It was compiled from the 49% of the subsystem the audit opened, plus targeted probes into <span class="path">repo_mapper.py</span> and <span class="path">wiring.py</span>. Completing it is a Phase 1 deliverable.</p>
-    </div>
-
-    <h3>Import resolution, per language</h3>
-    <div class="scroll">
-      <table>
-        <thead><tr><th>Capability</th><th>Source</th><th>Corpus must contain</th></tr></thead>
-        <tbody>
-          <tr><td>Python module-suffix index + <code>__init__.py</code> ancestry</td><td>repo_mapper.py:1070,1114</td><td>nested and namespace packages</td></tr>
-          <tr><td>JS/TS relative resolution + extension/index probing</td><td>repo_mapper.py:1310,1332</td><td><code>./x</code>, <code>../y</code>, dir-index imports</td></tr>
-          <tr><td>tsconfig/jsconfig aliases across <code>extends</code> + project references</td><td>repo_mapper.py:1340-1344</td><td>multi-level extends, project refs</td></tr>
-          <tr><td>Monorepo package.json workspace → source dir</td><td>repo_mapper.py:1551</td><td>workspace with 2+ packages</td></tr>
-          <tr><td>JS re-export chain following</td><td>repo_mapper.py:1636 · resolve.py:236</td><td><code>export { X } from './y'</code> chains</td></tr>
-          <tr><td>Named-binding imports (<code>import { X as Y }</code>)</td><td>resolve.py:583</td><td>aliased named imports</td></tr>
-          <tr><td>Go module prefix from <code>go.mod</code></td><td>repo_mapper.py:1726</td><td>non-trivial module path</td></tr>
-          <tr><td>Rust crate root + <code>mod.rs</code>/<code>name.rs</code> probing</td><td>repo_mapper.py:1802,1814</td><td>nested modules, both spellings</td></tr>
-        </tbody>
-      </table>
-    </div>
-
-    <h3>Liveness exemptions — the false-positive guard</h3>
-    <div class="prose">
-      <p><span class="path">wiring.py</span> is the layer that stops dead-code detection reporting entry points as dead. Losing any row here does not break a build; it makes <code>dev map dead</code> untrustworthy, which is worse.</p>
-    </div>
-    <div class="scroll">
-      <table>
-        <thead><tr><th>Capability</th><th>Source</th><th>Corpus must contain</th></tr></thead>
-        <tbody>
-          <tr><td><code>pyproject.toml</code> script targets</td><td>wiring.py:829</td><td>console_scripts entry point</td></tr>
-          <tr><td><code>package.json</code> entry + script targets</td><td>wiring.py:917,424</td><td>bin/main/scripts entries</td></tr>
-          <tr><td><code>Cargo.toml</code> binary targets</td><td>wiring.py:796</td><td><code>[[bin]]</code> target</td></tr>
-          <tr><td>Launcher files + module-form reference keys</td><td>wiring.py:376,387</td><td>launcher referencing a module</td></tr>
-          <tr><td>Re-export-only <code>__init__.py</code> recognition</td><td>wiring.py:277</td><td>package re-exporting submodules</td></tr>
-          <tr><td>Python <code>__all__</code> and re-export names</td><td>wiring.py:451,470</td><td><code>__all__</code> with indirect exports</td></tr>
-          <tr><td>Generated-file detection (path + header sniff)</td><td>wiring.py:253,258</td><td>file with a codegen header</td></tr>
-          <tr><td>Vendored path detection</td><td>wiring.py:181</td><td>vendored third-party dir</td></tr>
-          <tr><td>Test path detection</td><td>wiring.py:113</td><td>tests in a non-standard location</td></tr>
-          <tr><td>Decorator-based wiring</td><td>wiring.py:706</td><td>registration decorators</td></tr>
-          <tr><td>Structural convention exemptions</td><td>wiring.py:728</td><td>conventionally-wired file</td></tr>
-        </tbody>
-      </table>
-    </div>
-
-    <h3>Framework recognition and subsystem inference</h3>
-    <div class="scroll">
-      <table>
-        <thead><tr><th>Capability</th><th>Source</th><th>Corpus must contain</th></tr></thead>
-        <tbody>
-          <tr><td>Routes: django, rails, spring, aspnet, laravel, nest, axum, play, drupal</td><td>frameworks/routes.py</td><td>one app per framework family</td></tr>
-          <tr><td>DI / provider patterns</td><td>frameworks/di.py</td><td>provider registration</td></tr>
-          <tr><td>Event handler patterns</td><td>frameworks/events.py</td><td>event subscriber</td></tr>
-          <tr><td>Source-root detection</td><td>repo_mapper.py:1037</td><td><code>src/</code>-style and flat layouts</td></tr>
-          <tr><td>Area/role classification, role_files buckets</td><td>repo_mapper.py:916,990</td><td>multi-role subsystem</td></tr>
-          <tr><td>Subsystem index (hardcoded + generic paths)</td><td>repo_mapper.py:937,946</td><td>repo matching neither shape</td></tr>
-          <tr><td><code>handoff_paths</code> / <code>neighbors</code> cross-subsystem flow</td><td>repo_map schema</td><td>subsystems that call each other</td></tr>
-        </tbody>
-      </table>
-    </div>
-
-    <div class="callout">
-      <h3>Inventory gaps — no capability list exists yet</h3>
-      <p>PDG / taint / CFG (872 LOC), LSP integration (775), debug and DAP runtime observations (1,207), visualization and export (2,591), semantic index and AST matcher (449). Each needs the same treatment before its fate — port, keep in Python, or drop — can be decided. That decision is a Phase 1 gate.</p>
-    </div>
-  </section>
-
-  <section>
-    <div class="sec-head">
-      <span class="sec-num">Section 05</span>
-      <h2>Target architecture</h2>
-    </div>
-    <div class="prose">
-      <p>A single Rust binary that owns indexing, storage, watching and the agent interface. CodeGraph validates the shape: Rust kernel, tree-sitter compiled in, plain SQLite with FTS5. The storage engine does not need to change — SQLite is 3% of the current build — so the rewrite spends its risk budget on the parts that are actually wrong.</p>
-    </div>
-    <div class="codeblock">
-      <span class="codecap">binary surface</span>
-<pre>devmap serve     <span class="c">// long-lived: watcher + index + MCP over stdio/socket</span>
-devmap build     <span class="c">// one-shot index, for CI</span>
-devmap query …   <span class="c">// CLI queries, token-budgeted like the MCP surface</span>
-devmap status    <span class="c">// freshness, generation, lock holder</span></pre>
-    </div>
-    <div class="codeblock">
-      <span class="codecap">workspace</span>
-<pre>crates/
-  devmap-extract/   <span class="c">// tree-sitter, one module per language, rayon</span>
-  devmap-resolve/   <span class="c">// symbols, calls, receiver types, imports</span>
-  devmap-analyze/   <span class="c">// liveness, dead code, Leiden clustering, PDG</span>
-  devmap-store/     <span class="c">// rusqlite, v3 schema, generations</span>
-  devmap-query/     <span class="c">// token-budgeted responses</span>
-  devmap-serve/     <span class="c">// watcher, daemon, MCP</span>
-  devmap-cli/       <span class="c">// binary entry point</span></pre>
-    </div>
-    <div class="prose">
-      <p>The 37 Python consumers do not import a shim — they talk to the daemon. A thin client of roughly 400 LOC replaces 26,837, exposing the same call signatures the verification checks and MCP handlers already use, over a versioned local socket. That client is the <em>only</em> Python that remains, and it contains no analysis logic.</p>
-      <p>Making the daemon the sole ingestion path is what turns three findings into structural impossibilities rather than fixes. B1 (lost pending work) cannot occur when the queue lives in a process that does not exit. N8 is satisfied by construction. And B4 — readers blocked by the writer — dissolves because the daemon holds the write connection and readers use WAL snapshots.</p>
-    </div>
-  </section>
-
-  <section>
-    <div class="sec-head">
-      <span class="sec-num">Section 06</span>
-      <h2>Plan</h2>
-    </div>
-    <div class="prose">
-      <p>Six phases. The first freezes observable behaviour so the rewrite has something to be correct against; the last deletes the Python. Estimates assume one engineer and are <em>inferred</em>, not derived from comparable work in this repository. No phase before cutover ships user-visible value — that is the cost of the clean-room choice.</p>
-    </div>
-
-    <div class="phases">
-      <div class="phase">
-        <span class="p-num">Phase 1</span>
-        <div class="p-body">
-          <div class="p-head"><h3>Freeze the contract</h3><span class="p-est">est. 4–5 weeks</span></div>
-          <p>Capture what the current system produces before replacing it. Build the golden corpus spanning all 35 languages, snapshot canonical graphs from the Python implementation, and write down the 37 consumer contracts — especially the verification checks, whose assumptions about graph shape exist nowhere but their assertions. Add the token budget to the contract now, so the new surface is designed against it rather than retrofitted.</p>
-          <p><strong>Complete the §4 inventory, then build the corpus from it.</strong> Today that inventory covers only the 49% of the subsystem the audit opened; the areas in §4.5 have none at all. Every row in §4 names a corpus requirement, and a capability whose requirement is absent from the corpus is a capability parity cannot protect. This is the phase where an unwritten behaviour becomes a test — or becomes a future regression.</p>
-          <div class="gate"><b>Gate</b> — §4 inventory complete for all 26,837 LOC; corpus satisfies every stated requirement; golden graphs for 35 languages; every consumer contract has a signature and a test; token budgets specified per surface; scoping decision recorded for each §4.5 area (port / keep in Python / drop).</div>
-        </div>
-      </div>
-      <div class="phase">
-        <span class="p-num">Phase 2</span>
-        <div class="p-body">
-          <div class="p-head"><h3>Extraction</h3><span class="p-est">est. 6–10 weeks</span></div>
-          <p>Tree-sitter for all 35 languages including Python, resolving D1 by construction — one extractor, no stdlib-<code>ast</code> path. Parallel by default with <code>rayon</code>, pools sized from real cores (B12, N9). Grammars link into the binary, so the spawn-based crash isolation, the 30s per-file timeout and the quarantine-and-respawn logic have no analogue to port: a panicking grammar unwinds one task.</p>
-          <div class="gate"><b>Gate</b> — extraction parity against golden corpus, all 35 languages; near-linear core scaling; Python-extraction divergences enumerated and individually accepted.</div>
-        </div>
-      </div>
-      <div class="phase">
-        <span class="p-num">Phase 3</span>
-        <div class="p-body">
-          <div class="p-head"><h3>Resolution and analysis</h3><span class="p-est">est. 10–14 weeks</span></div>
-          <p>The largest and hardest phase — 76% of current build time, and global passes with subtle ordering semantics. B13–B15 have no counterpart in a design built on interned <code>FileId</code>s and a single tree traversal. Fold in the quality work while the code is open: Leiden with cohesion scores (N5, R6), constructor-inferred receiver types (N6), dynamic-dispatch hops in call paths (R5), and explicit status on any analysis that times out (N4). R5 builds directly on N6 — once a receiver's type is tracked, an interface-dispatch hop becomes resolvable rather than a dead end — so they are one work item, not two.</p>
-          <div class="gate"><b>Gate</b> — full-graph parity on the corpus; cold build for this repo under 2s; resolution precision ratchet meets or beats the Python baseline; every community reports cohesion; interface-dispatch path resolves in corpus.</div>
-        </div>
-      </div>
-      <div class="phase">
-        <span class="p-num">Phase 4</span>
-        <div class="p-body">
-          <div class="p-head"><h3>Store and daemon</h3><span class="p-est">est. 5–7 weeks</span></div>
-          <p>v3 schema with interned paths (B10), clean primary keys (B9), indexable FTS pruning (B6), O(1) cache admission and liveness-ordered eviction (B7, B8), scheduled vacuum (B11), one schema with no rollback shadow (D2), WAL auto-checkpoint tuned for build churn (R4). Differential membership writes <em>with</em> deletion reconciliation — B3 and N2 are one work item and must never be separated. The daemon owns the watcher and a durable queue, and exposes targeted repair so a corrupt search index does not force a full rebuild (R7).</p>
-          <div class="gate"><b>Gate</b> — 1-file edit writes &lt;100 rows at 10k files; kill −9 mid-build replays; index &lt;60 MB for this repo; freelist &lt;5% without manual vacuum; <code>devmap repair --fts</code> rebuilds the search index alone; freshness holds across a 30-minute multi-session burst.</div>
-        </div>
-      </div>
-      <div class="phase">
-        <span class="p-num">Phase 5</span>
-        <div class="p-body">
-          <div class="p-head"><h3>Token-budgeted query surface</h3><span class="p-est">est. 5–6 weeks</span></div>
-          <p>The graph stays resident in the daemon, so N1's 1,639 ms reload has no analogue. Every response takes a budget and reports truncation. The 129k-token repo map is replaced by a ≤2k-token manifest plus queries; the 17.4 MB export becomes opt-in and moves out of the context directory (T1–T3, N3). Add RRF over BM25 and vectors (N7), bounded by a node cap so the embedding index cannot grow without limit (R3), and either implement real graph queries or retire the Cypher shim honestly (N10).</p>
-          <p>Collapse today's 18 map/graph MCP tools to one primary plus a small unlisted set (R1), and have results carry verbatim source grouped by file (R2). These are the largest remaining token wins and they compound: tool definitions cost context on every request whether or not they are called, and a result without source forces a follow-up read that costs another round-trip.</p>
-          <div class="gate"><b>Gate</b> — explore p95 &lt;50 ms at 10k files; no response exceeds its budget; every truncation reports <code>{shown, total}</code>; manifest ≤2k tokens; ≤3 listed tools; a symbol query answers without a follow-up file read; peak RSS &lt;1 GB at 10k files.</div>
-        </div>
-      </div>
-      <div class="phase">
-        <span class="p-num">Phase 6</span>
-        <div class="p-body">
-          <div class="p-head"><h3>Cutover and deletion</h3><span class="p-est">est. 4 weeks</span></div>
-          <p>Point the 37 consumers at the client, run both systems in parallel against live work until the parity harness is quiet, then delete <span class="path">indexing/</span> and <span class="path">codeintel/</span>. Deleting is the phase — a rewrite that lands beside what it replaces doubles the surface permanently, and the 16,534 LOC of existing tests must pass against the new core before the old one goes.</p>
-          <div class="gate"><b>Gate</b> — all existing tests green against Rust; 26,837 LOC removed; no Python analysis code remains; wheels or binaries published for every supported platform.</div>
-        </div>
-      </div>
-    </div>
-    <div class="prose">
-      <p>Total 34–46 weeks. The 35-language matrix in phase 2 and the global resolution passes in phase 3 are the long poles and carry nearly all the schedule risk. Treat the range as a lower bound: it was derived from the 49% of the subsystem the audit opened.</p>
-    </div>
-  </section>
-
-  <section>
-    <div class="sec-head">
-      <span class="sec-num">Section 07</span>
-      <h2>Implementation guide</h2>
-    </div>
-
-    <div class="step">
-      <div class="step-head"><h3>1 · Token budget as a protocol primitive</h3><span class="fixes">T1–T4, T3 · phase 1, enforced phase 5</span></div>
-      <p class="f-body">Put the budget in the request type so it cannot be forgotten, and make truncation a value rather than an absence. This is the generalisation of what <span class="path">prompt_builder.py</span> already does correctly for file bodies.</p>
-      <div class="codeblock">
-        <span class="codecap">crates/devmap-query/src/budget.rs</span>
-<pre><span class="k">pub struct</span> Request&lt;Q&gt; {
-    <span class="k">pub</span> query: Q,
-    <span class="k">pub</span> token_budget: u32,   <span class="c">// required — no default that hides cost</span>
-    <span class="k">pub</span> min_confidence: Confidence,
+<h1 id="dev-map--rust-clean-room-rewrite-plan">dev map → Rust: Clean-Room Rewrite Plan</h1>
+<p><strong>Status:</strong> Phase 6 hybrid. <code>dev map</code> <strong>already executes the Rust kernel</strong> — <code>rust-port/target/release/devmap</code>, with <code>src/devcouncil/devmap_engine.py</code> as the seam. Python <code>indexing/</code> + <code>codeintel/</code> are still present and still own the surfaces not yet migrated, but they are no longer what a <code>dev map</code> build runs. See <a href="STATUS.md">STATUS.md</a> for what is actually migrated and <a href="PHASE1_CONTRACT.md">PHASE1_CONTRACT.md</a> for token budgets and §4.5 scoping. <strong>Audit basis:</strong> DevCouncil @ <code>98f23e3</code>, 769 source files, macOS arm64, CPython 3.12.13, 2026-08-11. <strong>Kernel measurements (§2.1, §3 <code>K</code> findings, §3 <code>G</code> gaps):</strong> 2026-09-02, DevCouncil @ 994 code files and scholarlm @ 3,674, same host. Everything outside those three sections profiles the pre-port Python incumbent. <strong>PLAN.html:</strong> a styled companion, <strong>not</strong> a render of this file and not kept in sync with it. It was last written 2026-08-12 and is organised differently — 8 sections against this file's 11, with headings (<code>What changed in this revision</code>, <code>Token cost — the unmeasured surface</code>) that have no counterpart here, and without §2.1, §3.1, §9, §10, the <code>K</code> findings or the <code>G</code> gaps. It previously described itself as "same content, styled", which was already inaccurate before the 2026-09-02 pass and is now badly so. There is no generator; treat it as a snapshot of an earlier revision, or regenerate it.</p>
+<p>A standalone Rust implementation of the code-intelligence subsystem — new binary, new store, new agent-facing contract. Not a PyO3 extension and not a function-by-function port. The 32 audit findings and 7 reference-derived enhancements below are the <strong>acceptance specification</strong>: the new system is designed so the defects cannot occur, and each item becomes a test rather than a patch.</p>
+<p>§4 is the counterweight — an inventory of behaviour that already works and must survive. A clean-room rewrite loses undocumented capability silently, and that inventory is what makes the loss detectable.</p>
+<hr />
+<h2 id="1-scope-being-replaced">1. Scope being replaced</h2>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th style="text-align: right;">LOC</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>src/devcouncil/indexing/</code></td>
+<td style="text-align: right;">17,929</td>
+<td>Repo map, graph build, resolution, liveness, viz</td>
+</tr>
+<tr>
+<td><code>src/devcouncil/codeintel/</code></td>
+<td style="text-align: right;">8,405</td>
+<td>SQLite store, generations, incremental sync, languages</td>
+</tr>
+<tr>
+<td><code>src/devcouncil/cli/commands/map.py</code></td>
+<td style="text-align: right;">503</td>
+<td>CLI entry point</td>
+</tr>
+<tr>
+<td><strong>Production total</strong></td>
+<td style="text-align: right;"><strong>26,837</strong></td>
+<td>29% of the 93,676-LOC <code>src</code> tree</td>
+</tr>
+<tr>
+<td>Associated tests</td>
+<td style="text-align: right;">16,534</td>
+<td>Behaviour that must survive</td>
+</tr>
+</tbody>
+</table>
+<p><strong>37 files outside those directories import them</strong> — 11 CLI commands, 5 MCP handlers, 11 verification checks, plus <code>execution/policy_engine.py</code>, <code>knowledge/wiki.py</code>, and the OKF bundle writer. Each is a contract the rewrite must honour.</p>
+<h2 id="2-measurements">2. Measurements</h2>
+<p>All figures measured, not estimated.</p>
+<p><strong>Read §2.1 before acting on anything in this section.</strong> Everything from here to §2.1 profiles the <strong>Python incumbent</strong> at the 2026-08-11 audit basis — 769 files, 15.4 s. It is the case <em>for</em> the port, not a description of what <code>dev map</code> does today. <code>dev map</code> has run the Rust kernel since the Phase 6 hybrid pass, so a reader who takes "cold build 15.4 s" as current is out by an order of magnitude and will optimise a tier that no longer runs.</p>
+<h3 id="cold-build--769-files-154s">Cold build — 769 files, 15.4s</h3>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th style="text-align: right;">Cumulative</th>
+<th style="text-align: right;">Share</th>
+<th>Nature</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>enrich_semantic_edges</code></td>
+<td style="text-align: right;">5.81s</td>
+<td style="text-align: right;">38%</td>
+<td>Python resolution</td>
+</tr>
+<tr>
+<td><code>resolve_calls</code></td>
+<td style="text-align: right;">4.07s</td>
+<td style="text-align: right;">26%</td>
+<td>Python symbol resolution</td>
+</tr>
+<tr>
+<td><code>_build_liveness_shards</code></td>
+<td style="text-align: right;">1.88s</td>
+<td style="text-align: right;">12%</td>
+<td>Python reachability</td>
+</tr>
+<tr>
+<td><code>extract_all</code> (parsing)</td>
+<td style="text-align: right;">0.66s</td>
+<td style="text-align: right;">4%</td>
+<td>stdlib <code>ast</code> + tree-sitter</td>
+</tr>
+<tr>
+<td><code>sqlite3.execute</code></td>
+<td style="text-align: right;">0.42s</td>
+<td style="text-align: right;">3%</td>
+<td>Native SQLite</td>
+</tr>
+</tbody>
+</table>
+<p>Already-native components are ~7% of the build; tree-sitter is not in the top 22 hot functions. Accidental overhead in the Python tier: <strong>1,085,746</strong> <code>Path</code> constructions (1,412/file), <strong>5,827,369</strong> <code>re.finditer</code> calls, <strong>176,348</strong> route-matcher and <strong>176,298</strong> DI-matcher invocations (~229 redundant sweeps per file each), <strong>247,115</strong> uncached <code>_lang_family</code> calls.</p>
+<h3 id="benchmark-harness">Benchmark harness</h3>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th style="text-align: right;">fast · 256</th>
+<th style="text-align: right;">heavy · 10,000</th>
+<th style="text-align: right;">Current ratchet</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cold build</td>
+<td style="text-align: right;">1.22s</td>
+<td style="text-align: right;">59.9s</td>
+<td style="text-align: right;">300s</td>
+</tr>
+<tr>
+<td>Single-file resync</td>
+<td style="text-align: right;">0.18s</td>
+<td style="text-align: right;"><strong>7.55s</strong></td>
+<td style="text-align: right;">60s</td>
+</tr>
+<tr>
+<td>Peak RSS</td>
+<td style="text-align: right;">103 MB</td>
+<td style="text-align: right;">714 MB</td>
+<td style="text-align: right;">2 GB</td>
+</tr>
+<tr>
+<td>Query p95 — search (FTS)</td>
+<td style="text-align: right;">0.57 ms</td>
+<td style="text-align: right;">0.78 ms</td>
+<td style="text-align: right;">50 ms</td>
+</tr>
+<tr>
+<td>Query p95 — explore</td>
+<td style="text-align: right;">36.8 ms</td>
+<td style="text-align: right;"><strong>754 ms</strong></td>
+<td style="text-align: right;">5,000 ms</td>
+</tr>
+<tr>
+<td>Query p95 — dead</td>
+<td style="text-align: right;">44.2 ms</td>
+<td style="text-align: right;"><strong>751 ms</strong></td>
+<td style="text-align: right;">5,000 ms</td>
+</tr>
+</tbody>
+</table>
+<p>Ratchets sit far above actuals and cannot catch regression.</p>
+<h3 id="storage--live-index-769-source-files">Storage — live index, 769 source files</h3>
+<table>
+<thead>
+<tr>
+<th>Object</th>
+<th style="text-align: right;">Size</th>
+<th style="text-align: right;">Share</th>
+<th style="text-align: right;">Rows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>extraction_cache</code> (~18 KB/row, 64 MB cap)</td>
+<td style="text-align: right;">56.2 MB</td>
+<td style="text-align: right;">34.5%</td>
+<td style="text-align: right;">2,972</td>
+</tr>
+<tr>
+<td><code>generation_edges</code> + 4 indexes (~490 B/row)</td>
+<td style="text-align: right;">52.7 MB</td>
+<td style="text-align: right;">32.3%</td>
+<td style="text-align: right;">107,136</td>
+</tr>
+<tr>
+<td><code>edge_payloads</code> + autoindex</td>
+<td style="text-align: right;">21.8 MB</td>
+<td style="text-align: right;">13.4%</td>
+<td style="text-align: right;">53,568</td>
+</tr>
+<tr>
+<td><code>generation_nodes</code> + 3 indexes</td>
+<td style="text-align: right;">10.8 MB</td>
+<td style="text-align: right;">6.6%</td>
+<td style="text-align: right;">23,332</td>
+</tr>
+<tr>
+<td><code>nodes_fts</code> (all shadow tables)</td>
+<td style="text-align: right;">6.7 MB</td>
+<td style="text-align: right;">4.1%</td>
+<td style="text-align: right;">23,332</td>
+</tr>
+<tr>
+<td>Freelist (never reclaimed)</td>
+<td style="text-align: right;">42.2 MB</td>
+<td style="text-align: right;">20%</td>
+<td style="text-align: right;">10,312 pg</td>
+</tr>
+<tr>
+<td><strong>File on disk</strong></td>
+<td style="text-align: right;"><strong>208 MB</strong></td>
+<td style="text-align: right;"></td>
+<td style="text-align: right;">270 KB per source file</td>
+</tr>
+</tbody>
+</table>
+<h3 id="token-cost-of-agent-facing-surfaces">Token cost of agent-facing surfaces</h3>
+<p>Byte counts at 4 chars/token — an estimate, but the magnitudes are not in question.</p>
+<table>
+<thead>
+<tr>
+<th>Artifact</th>
+<th style="text-align: right;">Size</th>
+<th style="text-align: right;">Tokens</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>.devcouncil/repo_map.json</code></td>
+<td style="text-align: right;">514,625 B</td>
+<td style="text-align: right;"><strong>~128,656</strong></td>
+</tr>
+<tr>
+<td>├─ <code>dependents</code> (406 entries)</td>
+<td style="text-align: right;">255,376 B</td>
+<td style="text-align: right;">~63,844 (50%)</td>
+</tr>
+<tr>
+<td>├─ <code>files</code> (853 entries)</td>
+<td style="text-align: right;">142,049 B</td>
+<td style="text-align: right;">~35,512 (28%)</td>
+</tr>
+<tr>
+<td>├─ <code>subsystems</code> (24 entries)</td>
+<td style="text-align: right;">26,480 B</td>
+<td style="text-align: right;">~6,620</td>
+</tr>
+<tr>
+<td>└─ everything else</td>
+<td style="text-align: right;">~6,200 B</td>
+<td style="text-align: right;">~1,550</td>
+</tr>
+<tr>
+<td><code>.devcouncil/graph/code_graph.json</code></td>
+<td style="text-align: right;">17,454,216 B</td>
+<td style="text-align: right;"><strong>~4,363,554</strong></td>
+</tr>
+</tbody>
+</table>
+<p>CLAUDE.md step 1 directs every agent to open <code>repo_map.json</code>. That single instruction is the largest token expenditure in the system, and <strong>78% of it is two lookup tables</strong> shipped whole to answer point queries.</p>
+<h3 id="21-rust-kernel--measured-2026-09-02">2.1 Rust kernel — measured 2026-09-02</h3>
+<p>The figures above are the incumbent. These are the shipped kernel, measured with <code>benchmarks/map_bench.py</code> against a scratch store (the real <code>.devcouncil/</code> is never touched), reporting the <strong>minimum</strong> of N runs rather than the mean: the minimum is the run least contaminated by other load, and a mean on a laptop mostly measures what else was scheduled.</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th style="text-align: right;">DevCouncil · 994 files · 41.8 MB</th>
+<th style="text-align: right;">scholarlm · 3,674 files · 37.9 MB</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>cold</code> — full index into an empty store</td>
+<td style="text-align: right;">2.13 s</td>
+<td style="text-align: right;">10.22 s</td>
+</tr>
+<tr>
+<td><code>warm</code> — no-op rebuild, nothing changed</td>
+<td style="text-align: right;">0.196 s</td>
+<td style="text-align: right;">0.900 s</td>
+</tr>
+<tr>
+<td><code>touch</code> — one file edited, incremental</td>
+<td style="text-align: right;">1.31 s</td>
+<td style="text-align: right;">7.63 s</td>
+</tr>
+<tr>
+<td><code>manifest</code> — write <code>repo_map</code> + <code>code_graph</code></td>
+<td style="text-align: right;">0.367 s</td>
+<td style="text-align: right;">1.26 s</td>
+</tr>
+<tr>
+<td><code>e2e</code> — <code>dev map</code> end to end via the Python seam</td>
+<td style="text-align: right;">1.04 s</td>
+<td style="text-align: right;">not measured</td>
+</tr>
+<tr>
+<td><code>repo_map.json</code></td>
+<td style="text-align: right;">418,688 B</td>
+<td style="text-align: right;">1,236,709 B</td>
+</tr>
+<tr>
+<td><code>code_graph.json</code></td>
+<td style="text-align: right;">20,592,594 B</td>
+<td style="text-align: right;">84,276,217 B</td>
+</tr>
+</tbody>
+</table>
+<p>Against the pre-pass baseline on DevCouncil: <strong>e2e −57.5%</strong>, cold −36.8%, touch −35.7%, manifest −29.5%, warm −14.7%. The e2e figure is much larger than the cold figure because roughly 70% of <code>dev map</code>'s wall time was Python wrapper overhead around the kernel, not kernel work — the seam, not the engine, was the dominant cost.</p>
+<p><strong>Where a cold build actually goes</strong> (scholarlm, <code>--json</code> breakdown, post-K8):</p>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th style="text-align: right;">Quiet host · 13.44 s</th>
+<th style="text-align: right;">Loaded host · 20.11 s</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>scan + extract</td>
+<td style="text-align: right;">7.25 s · 54%</td>
+<td style="text-align: right;">8.30 s · 41%</td>
+</tr>
+<tr>
+<td>resolve</td>
+<td style="text-align: right;">3.29 s · 24%</td>
+<td style="text-align: right;">5.76 s · 29%</td>
+</tr>
+<tr>
+<td>persist (total)</td>
+<td style="text-align: right;">2.65 s · 20%</td>
+<td style="text-align: right;">5.62 s · 28%</td>
+</tr>
+<tr>
+<td>├─ <code>persist:write</code></td>
+<td style="text-align: right;">2.50 s</td>
+<td style="text-align: right;">5.37 s</td>
+</tr>
+<tr>
+<td>├─ <code>persist:prune_extractions</code></td>
+<td style="text-align: right;">0.13 s</td>
+<td style="text-align: right;">0.23 s</td>
+</tr>
+<tr>
+<td>├─ <code>persist:vacuum</code></td>
+<td style="text-align: right;">0.02 s</td>
+<td style="text-align: right;">0.03 s</td>
+</tr>
+<tr>
+<td>└─ <code>persist:prune_generations</code></td>
+<td style="text-align: right;">0.04 ms</td>
+<td style="text-align: right;">0.2 ms</td>
+</tr>
+<tr>
+<td>analyze</td>
+<td style="text-align: right;">0.24 s</td>
+<td style="text-align: right;">0.42 s</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Extraction dominates, then resolution, then the store write</strong> — the one ordering that holds across both. The right-hand column was taken while a concurrent build occupied the machine; it is included rather than discarded because it shows which conclusions are load-sensitive (the exact shares are; the ordering is not). Sub-phase seconds are <em>included</em> in their parent, not additional to it: on the loaded run they sum to 5.624 s against a parent of 5.624 s.</p>
+<p>This contradicts what a profiler would have reported before K8 was fixed. The instrumentation attributed each phase's cost to the <em>next</em> phase's label, so the same 13.44 s run "showed" resolution at 54% and <strong>extraction at 42 nanoseconds</strong>. The four <code>persist:*</code> sub-phases were always measured correctly; only the four top-level stages were shifted.</p>
+<p><strong>Two caveats on this subsection.</strong> <code>touch</code> is an incremental build and still costs 60% of a cold one at 3,674 files, because resolution is deliberately global on every changed build — narrowing it was tried and broke liveness and community detection, so the cost is a known consequence of a correctness decision, not an unexamined one. That is B3/SC2, and it is unresolved. Second, the <code>.devcouncil/codeintel/index.sqlite</code> in this repository is at <code>user_version=2</code> while the current binary writes <code>user_version=11</code>; the live store is nine schema versions stale, so it is not a valid sample of current behaviour and no figure above is drawn from it.</p>
+<hr />
+<h2 id="3-findings-as-specification">3. Findings as specification</h2>
+<p>32 findings plus 7 reference-derived enhancements — 39 items. Each is a property the rewrite must hold, with the acceptance test that proves it.</p>
+<h3 id="correctness-and-concurrency">Correctness and concurrency</h3>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Property</th>
+<th>Source</th>
+<th>Acceptance</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>B1</td>
+<td>Queued work survives process death</td>
+<td><code>sync/coordinator.py:270</code></td>
+<td>kill −9 mid-build, work replays</td>
+</tr>
+<tr>
+<td>B2</td>
+<td>Back-pressure, never silent discard, on lease contention</td>
+<td><code>build_control.py:447</code></td>
+<td>two writers, zero lost edits</td>
+</tr>
+<tr>
+<td>B3</td>
+<td>Write cost ∝ change size, not repo size</td>
+<td>heavy <code>write_stats</code></td>
+<td>1-file edit writes &lt;100 rows at 10k</td>
+</tr>
+<tr>
+<td>B4</td>
+<td>Readers never blocked by a writer</td>
+<td><code>sync/lease.py</code></td>
+<td>query p95 unchanged during build</td>
+</tr>
+<tr>
+<td>B5</td>
+<td>Staleness self-heals without an unrelated trigger</td>
+<td><code>service.py:151</code></td>
+<td>commit-then-idle leaves index fresh</td>
+</tr>
+<tr>
+<td>N1</td>
+<td>Queries never deserialise the whole graph</td>
+<td><code>query/engine.py:16</code></td>
+<td>explore p95 &lt;50 ms at 10k</td>
+</tr>
+<tr>
+<td>N2</td>
+<td>Deletions and renames explicit, not implied</td>
+<td><code>incremental.py</code> — absent</td>
+<td>deleted file absent next build</td>
+</tr>
+<tr>
+<td>N4</td>
+<td>A check that could not run never reports as one that passed</td>
+<td><code>graph/intel.py:118</code></td>
+<td>timeout surfaces <code>status</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="storage">Storage</h3>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Property</th>
+<th>Source</th>
+<th>Acceptance</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>B6</td>
+<td>Generation prune is a bounded delete, not a full reindex</td>
+<td><code>sqlite.py:1326</code></td>
+<td>prune cost ⊥ live row count</td>
+</tr>
+<tr>
+<td>B7</td>
+<td>Cache admission is O(1), not a table scan</td>
+<td><code>sqlite.py:1673</code></td>
+<td>cold-build insert cost linear</td>
+</tr>
+<tr>
+<td>B8</td>
+<td>Eviction follows liveness, not age</td>
+<td><code>sqlite.py:1677</code></td>
+<td>live files never evicted first</td>
+</tr>
+<tr>
+<td>B9</td>
+<td>No redundant column in any primary key</td>
+<td><code>sqlite.py:503</code></td>
+<td>schema review</td>
+</tr>
+<tr>
+<td>B10</td>
+<td>Paths interned; no repeated text in hot tables</td>
+<td><code>sqlite.py:503</code></td>
+<td>index &lt;60 MB for this repo</td>
+</tr>
+<tr>
+<td>B11</td>
+<td>Free space reclaimed on a schedule</td>
+<td><code>sqlite.py:1165</code></td>
+<td>freelist &lt;5% after 1,000 builds</td>
+</tr>
+<tr>
+<td>D2</td>
+<td>One schema, no rollback-compat shadow tables</td>
+<td><code>sqlite.py:643</code></td>
+<td>schema review</td>
+</tr>
+</tbody>
+</table>
+<h3 id="compute-and-analysis-quality">Compute and analysis quality</h3>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Property</th>
+<th>Source</th>
+<th>Acceptance</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>B12</td>
+<td>Extraction saturates available cores</td>
+<td><code>build.py:162</code></td>
+<td>near-linear core scaling</td>
+</tr>
+<tr>
+<td>B13</td>
+<td>No repeated path parsing in hot loops</td>
+<td>1.09M <code>Path</code> calls</td>
+<td>profile shows no string-path work</td>
+</tr>
+<tr>
+<td>B14</td>
+<td>One tree pass per file, not many regex sweeps</td>
+<td><code>routes.py:77</code>, <code>di.py:37</code></td>
+<td>profile shows one traversal</td>
+</tr>
+<tr>
+<td>B15</td>
+<td>Language resolved once per file, not per edge</td>
+<td><code>resolve.py:81</code></td>
+<td>profile review</td>
+</tr>
+<tr>
+<td>N5</td>
+<td>Leiden clustering — connected communities guaranteed</td>
+<td><code>intel.py:114</code></td>
+<td>no disconnected community</td>
+</tr>
+<tr>
+<td>N6</td>
+<td>Receiver types tracked from constructors, not guessed by name</td>
+<td><code>resolve.py:764</code></td>
+<td>resolution-precision ratchet</td>
+</tr>
+<tr>
+<td>N7</td>
+<td>Retrieval fuses lexical and semantic ranking</td>
+<td><code>sqlite.py:1464</code></td>
+<td>RRF over BM25 + vectors</td>
+</tr>
+<tr>
+<td>N9</td>
+<td>Pools sized from real cores and RAM, no fixed ceiling</td>
+<td><code>workers.py:221</code></td>
+<td>12-core host uses 12 cores</td>
+</tr>
+</tbody>
+</table>
+<h3 id="interface-and-artifacts">Interface and artifacts</h3>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Property</th>
+<th>Source</th>
+<th>Acceptance</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T1</td>
+<td>No agent-facing artifact exceeds its token budget</td>
+<td>514 KB repo map</td>
+<td>manifest ≤2k tokens</td>
+</tr>
+<tr>
+<td>T2</td>
+<td>Machine interchange lives outside the context directory</td>
+<td>17.4 MB export</td>
+<td>opt-in, not default</td>
+</tr>
+<tr>
+<td>T3</td>
+<td>Every response token-budgeted, reports truncation</td>
+<td><code>handlers/map.py:235</code></td>
+<td>all carry <code>{shown,total}</code></td>
+</tr>
+<tr>
+<td>T4</td>
+<td>Budget discipline generalised from <code>prompt_builder</code></td>
+<td><code>prompt_builder.py:281</code></td>
+<td>applied to all surfaces</td>
+</tr>
+<tr>
+<td>N3</td>
+<td>No dual-write of a second full serialisation</td>
+<td><code>build.py:650</code></td>
+<td>one canonical store</td>
+</tr>
+<tr>
+<td>N8</td>
+<td>Ingestion owned by a long-lived watcher</td>
+<td><code>graph_cmd.py:425</code></td>
+<td>freshness holds, hooks off</td>
+</tr>
+<tr>
+<td>N10</td>
+<td>Query surface honest about its capability</td>
+<td><code>cypher.py:1-20</code></td>
+<td>no regex posing as a query language</td>
+</tr>
+<tr>
+<td>D1</td>
+<td>One extractor per language, tree-sitter throughout</td>
+<td><code>cache.py:308</code></td>
+<td>no stdlib-<code>ast</code> path</td>
+</tr>
+<tr>
+<td>D3</td>
+<td>Lock status reports the true holder</td>
+<td><code>lease.py:17</code></td>
+<td>status never names a dead pid</td>
+</tr>
+</tbody>
+</table>
+<h3 id="reference-derived-enhancements">Reference-derived enhancements</h3>
+<p>Adopted from GitNexus and CodeGraph. These are additions rather than defects — nothing in the current system is wrong, but each is a capability it lacks.</p>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Enhancement</th>
+<th>Source</th>
+<th>Acceptance</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>R1</td>
+<td>One primary query tool; the rest unlisted by default</td>
+<td>CodeGraph</td>
+<td>≤3 listed tools replace today's 18</td>
+</tr>
+<tr>
+<td>R2</td>
+<td>Results carry verbatim source, grouped by file</td>
+<td>CodeGraph</td>
+<td>symbol query needs no follow-up read</td>
+</tr>
+<tr>
+<td>R3</td>
+<td>Embedding index bounded by node count</td>
+<td>GitNexus</td>
+<td>peak RSS &lt;1 GB at 10k files</td>
+</tr>
+<tr>
+<td>R4</td>
+<td>WAL auto-checkpoint tuned for build churn</td>
+<td>GitNexus</td>
+<td>freelist &lt;5% without manual vacuum</td>
+</tr>
+<tr>
+<td>R5</td>
+<td>Call paths include dynamic-dispatch hops</td>
+<td>CodeGraph</td>
+<td>interface-dispatch path resolves in corpus</td>
+</tr>
+<tr>
+<td>R6</td>
+<td>Communities carry cohesion scores</td>
+<td>GitNexus</td>
+<td>every community reports cohesion</td>
+</tr>
+<tr>
+<td>R7</td>
+<td>Targeted repair without a full rebuild</td>
+<td>GitNexus</td>
+<td><code>devmap repair --fts</code> rebuilds index only</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Declined:</strong> multi-repo global registry and connection pooling (GitNexus). DevCouncil is single-repo by design; adopting these changes the product, not the implementation.</p>
+<p><strong>Already present, not adopted from elsewhere</strong> — see §4. tsconfig path aliases, re-export chains and a portable fallback extractor exist in DevCouncil today, in some cases more thoroughly than in either reference.</p>
+<h3 id="gortex-derived-gaps--reviewed-2026-09-02">Gortex-derived gaps — reviewed 2026-09-02</h3>
+<p>A third reference (<a href="https://github.com/zzet/gortex">zzet/gortex</a>) was reviewed against this kernel. Unlike the GitNexus/CodeGraph items above, most of these are <strong>capabilities the kernel lacks</strong>, not defects. Recorded so the list is explicit rather than implied by absence.</p>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Capability</th>
+<th>State</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>G1</td>
+<td>Breadth beyond linked grammars</td>
+<td><strong>partly closed</strong> — tier-2 recovery (K2/K3) serves grammarless languages; K1 leaves the nodeless case open</td>
+</tr>
+<tr>
+<td>G2</td>
+<td>Lexical + semantic retrieval that actually ranks</td>
+<td><strong>closed</strong> — TF-IDF replaced the random-projection hash ranker (K7)</td>
+</tr>
+<tr>
+<td>G3</td>
+<td>Clone / duplicate detection</td>
+<td><strong>in progress</strong> — <code>devmap-extract/src/clonesig.rs</code>, owned by a separate session as of this writing</td>
+</tr>
+<tr>
+<td>G4</td>
+<td>Speculative edit preview — answer "what breaks if I change this" without writing</td>
+<td>open</td>
+</tr>
+<tr>
+<td>G5</td>
+<td>Notebook (<code>.ipynb</code>) extraction</td>
+<td>open</td>
+</tr>
+<tr>
+<td>G6</td>
+<td>Compact binary wire format for the graph export</td>
+<td>open — <code>code_graph.json</code> is 84 MB on scholarlm (§2.1)</td>
+</tr>
+<tr>
+<td>G7</td>
+<td>Savings accounting — report tokens saved vs. reading the files</td>
+<td>open</td>
+</tr>
+<tr>
+<td>G8</td>
+<td>Cross-repository graph</td>
+<td><strong>declined, restated</strong> — the multi-repo registry was already declined above as a product change. Gortex does not change that judgement; noted so a future reader does not re-open it as an oversight</td>
+</tr>
+</tbody>
+</table>
+<p>G6 is the one with a measured cost attached: at 84,276,217 B the scholarlm graph export is ~21M tokens, which is not an artifact any agent can open. That is the same class of problem as T1/T2 — it is bounded today only by being opt-in, not by being small.</p>
+<h3 id="kernel-findings--2026-09-02">Kernel findings — 2026-09-02</h3>
+<p>The 39 items above were derived from the <strong>Python incumbent</strong>. These eight were found in the <strong>Rust kernel itself</strong>, by measuring it rather than by reading it, during the performance-and-gap pass. They are numbered <code>K</code> to keep that provenance visible: a <code>B</code> finding is a defect the rewrite must not reproduce, a <code>K</code> finding is one the rewrite introduced or inherited and now owns.</p>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Property</th>
+<th>Evidence</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>K1</td>
+<td>Every discovered file has at least one addressable node</td>
+<td><code>File</code> node was pushed only on the tree-sitter path; a grammarless file yielded <strong>zero</strong> nodes, so it could not be an edge target</td>
+<td>closed</td>
+</tr>
+<tr>
+<td>K2</td>
+<td>A source language with no grammar is still discovered</td>
+<td><code>is_indexable_source</code> admits only what <code>detect_language</code> names, so 19 <code>.proto</code> and 17 <code>.ps1</code> were dropped before extraction ran</td>
+<td>closed</td>
+</tr>
+<tr>
+<td>K3</td>
+<td>Pattern recovery never runs on prose or data formats</td>
+<td>tier 2 attributed <code>ReasoningBank</code>/<code>TrajectoryOutcome</code> to the <code>.md</code> files that <em>described</em> them: 40 markdown files, 457 invented symbols</td>
+<td>closed</td>
+</tr>
+<tr>
+<td>K4</td>
+<td>A symbol larger than the token budget still returns a hit</td>
+<td>search returned <strong>zero</strong> results for large-symbol matches rather than a truncated one</td>
+<td>closed</td>
+</tr>
+<tr>
+<td>K5</td>
+<td>The reclaim decision reads committed state</td>
+<td><code>freelist_count</code> was read before the WAL checkpoint, reporting 0 free pages while 33% of the store was free</td>
+<td>closed</td>
+</tr>
+<tr>
+<td>K6</td>
+<td>A daemon never serves a superseded binary</td>
+<td>a rebuilt kernel left the running daemon answering from the old code</td>
+<td>closed</td>
+</tr>
+<tr>
+<td>K7</td>
+<td>An exact term match ranks first</td>
+<td>hash-projection embeddings put the correct symbol at rank 28 or absent on all 5 probes; TF-IDF puts it at rank 1</td>
+<td>closed</td>
+</tr>
+<tr>
+<td>K8</td>
+<td>A phase profiler attributes cost to the phase that incurred it</td>
+<td><code>stage()</code> recorded time-since-previous-announcement against the <em>next</em> label: extraction's 7.25 s printed as "resolving", extraction as 42 ns</td>
+<td>closed</td>
+</tr>
+</tbody>
+</table>
+<p><strong>K1 was the one that mattered most, and it is now closed.</strong> K2 and K3 make tier-2 recovery correct <em>when it fires</em>, but a grammarless file the scanner finds nothing in — 8 of the 17 <code>.ps1</code> on scholarlm, and every <code>.md</code>, <code>.json</code>, <code>.yaml</code> in any tree — was still recorded in <code>generation_files</code> and absent from the graph. Recovering declarations was only half the gap; the other half was that the file itself was not addressable.</p>
+<p><code>unavailable_extraction</code> now emits the <code>File</code> node unconditionally, for prose and data formats too: being unable to recover a file's declarations is not a reason to deny that the file exists, and a Markdown document something links to still has to be a valid edge target. The change is safe against the dead-code surface <strong>by construction rather than by tuning</strong> — <code>File</code> nodes are already exempt in <code>liveness.rs</code> (both the Go duplicate-identity count and the dead-symbol sweep) and are skipped as <code>Contains</code> sources in the resolver, so this widens what the graph can address without adding one dead-symbol candidate.</p>
+<p>Verified at both scales: on a 4-file probe every file carries exactly one <code>File</code> node and the Markdown file still contributes <strong>zero</strong> declaration symbols; on scholarlm, <strong>4,089 files, 0 with zero nodes, 0 missing a <code>File</code> node</strong>, where 380 <code>Failed</code> files previously contributed nothing at all. A second test pins the thing that would make this a false win — the <code>File</code> node must not move <code>parse_outcome</code>, so a file with no recoverable declarations still reports <code>Failed</code> and only a real recovery reports <code>Fallback</code>.</p>
+<p><strong>K3 is a regression this pass introduced and then closed</strong>, and it is worth recording as such rather than as a clean win: tier-2 recovery was added, and it immediately did the exact thing the module's own documentation warns against — "a missed declaration costs a search hit, while an invented one puts a symbol in the graph that does not exist, and the graph is what other tools reason about." The guard now excludes markdown, html, css, json, yaml, toml, config and text, as a <strong>denylist</strong> rather than an allowlist: the tier exists to serve languages nobody enumerated, so its default must be to scan.</p>
+<p><strong>K8 is closed and verified by execution.</strong> Stages now close against their own label and sub-phases nest under their parent. Three properties were checked on a live build rather than asserted: the stages sum to the reported total (20.108 s of 20.110 s, a 2 ms tail), the four <code>persist:*</code> sub-phases sum exactly to their parent stage (5.624 s of 5.624 s, so nesting does not double-count), and extraction is labelled as extraction rather than reporting 42 ns. A stage still running when the breakdown is requested is emitted with <code>"open": true</code> and its elapsed-so-far, so the stages can never silently fail to account for the total — Class A (§3.1) applied to the profiler itself.</p>
+<h3 id="31-failure-classes--what-recurs-and-what-would-close-it">3.1 Failure classes — what recurs, and what would close it</h3>
+<p>The 47 findings above are listed by <em>subsystem</em>. Grouped by <strong>failure shape</strong> instead, they collapse into five classes, and four of the five are still open as classes even though every individual instance is closed. This is the distinction between fixing a case and hardening: a class stays open until something structurally prevents the next instance, and every class below produced a <em>new</em> instance in the Rust kernel after the Python instance was fixed.</p>
+<p>Each class states the gate that would close it, and <strong>all five are now implemented</strong>: Class B in <code>devmap-cli/tests/coverage_invariants.rs</code> (its assertions must walk the filesystem, so it stands alone), Classes A, C and D in <code>devmap-cli/tests/failure_class_gates.rs</code>, and Class E as unit tests beside <code>ProgressReporter</code> in <code>devmap-cli/src/main.rs</code>, which is where the type lives.</p>
+<p>The gates are stated over <strong>types and outcomes</strong>, not over specific inputs. "Search finds <code>foo</code>" pins a case; "an operation that declined to run is distinguishable from one that ran and found nothing" pins the shape, and the shape is what kept recurring. Each was checked against a mutation or a revert rather than merely observed to pass — a gate nobody has seen go red is a gate nobody has tested.</p>
+<hr />
+<p><strong>Class A — a check that could not run reports as one that ran and passed.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Instance</th>
+<th>What reported success</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>N4</code></td>
+<td>a <code>graph/intel.py:118</code> timeout returned the same shape as a completed analysis</td>
+</tr>
+<tr>
+<td><code>K4</code></td>
+<td>search returned <strong>zero</strong> hits for a matching query; both budget gates stayed green</td>
+</tr>
+<tr>
+<td><code>K5</code></td>
+<td><code>vacuum_if_needed</code> read <code>freelist_count</code> pre-checkpoint, saw 0 free pages on a store that was 33% garbage, and reported a 0 ms vacuum as success</td>
+</tr>
+</tbody>
+</table>
+<p>The instances look unrelated — an analysis timeout, a query budget, a storage reclaim — which is exactly why fixing them one at a time did not close the class. In all three, the failure path and the success path are <strong>indistinguishable in the return value</strong>, so no caller and no gate can tell them apart. <code>K4</code> is the sharpest: both budget properties were satisfied (nothing exceeded budget, every truncation was reported) by returning nothing at all.</p>
+<p><em>Gate that closes it:</em> every operation that can decline to run returns an outcome that distinguishes <strong>ran-and-found-nothing</strong> from <strong>could-not-run</strong>, and no gate asserts a threshold on a number that has a not-computed state without first asserting it was computed.</p>
+<p><strong>Implemented</strong> — <code>failure_class_gates.rs::class_a_declined_is_not_success</code>, three assertions: a declined vacuum is distinguishable from a completed one <em>and</em> carries the counters it was decided from; work dropped against a cap is counted rather than yielding a prefix presented as a set; a file discovery refused is recorded with a reason instead of vanishing between the walker and the extractor. The first also asserts the enum can express "ran" at all, because a single-variant outcome would satisfy the distinction while meaning nothing.</p>
+<p>Still auditable mechanically for new code: any function returning a bare collection, count or <code>bool</code> where a timeout, budget exhaustion, cap or skip is reachable is a candidate.</p>
+<hr />
+<p><strong>Class B — the pipeline's own view is used to measure the pipeline's coverage.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Instance</th>
+<th>What was invisible</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>K2</code></td>
+<td>19 <code>.proto</code> + 17 <code>.ps1</code> dropped at <em>discovery</em>, so they never reached the extractor to be counted as missing</td>
+</tr>
+<tr>
+<td><code>K1</code></td>
+<td>grammarless files got <strong>no node at all</strong> — recorded in <code>generation_files</code>, absent from the graph (closed; gated at 0 nodeless files)</td>
+</tr>
+<tr>
+<td><code>B10</code>/<code>SC5</code></td>
+<td>size assumptions calibrated against what the store held, not what the tree contained</td>
+</tr>
+</tbody>
+</table>
+<p>A coverage number computed from the index can only describe files the index already admits. <code>K2</code> is the proof: "35 languages parse correctly" was true <em>and</em> two whole languages were missing from every graph. No parity gate stated over extractor input could ever have seen it.</p>
+<p><em>Gate that closes it:</em> every coverage and completeness claim is stated over <strong>on-disk truth</strong>, never over the indexer's own inventory, and the two counts are reported together so a divergence is visible rather than inferable. This is how the 19/19 and 17/17 figures in §2.1 were confirmed, and it is the only reason <code>K2</code> was found at all.</p>
+<p><strong>Implemented</strong> — <code>devmap-cli/tests/coverage_invariants.rs</code>, the only one of the five gates that exists as code today. Three assertions over a fixture tree walked from the <em>filesystem</em> rather than through the walker: discovery admits every file it claims to handle (K2), every extracted file contributes at least one node (K1), and — because Class B and Class C pull in opposite directions — addressability is <strong>not</strong> bought by declaration-scanning prose (K3). That third assertion matters: the cheapest way to make "every file has a node" true everywhere is to scan everything, which is exactly how 457 symbols were read out of fenced code blocks. All three fail against the pre-fix tree.</p>
+<hr />
+<p><strong>Class C — invented data presented in the same shape as derived data.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Instance</th>
+<th>What was fabricated</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>K3</code></td>
+<td>457 graph symbols read out of fenced code blocks in markdown design documents</td>
+</tr>
+<tr>
+<td><code>K7</code></td>
+<td>random-projection hash vectors ranked noise as semantic similarity</td>
+</tr>
+<tr>
+<td><code>N10</code></td>
+<td>a regex shim presented as a query language</td>
+</tr>
+<tr>
+<td><code>D10</code>-adjacent</td>
+<td>an empty <code>indexed_hash</code> reading like a computed digest</td>
+</tr>
+</tbody>
+</table>
+<p>The graph is what other tools reason about, so a fabricated symbol is not a cosmetic defect — it is an assertion that code exists which does not. <code>K3</code> is the cautionary instance because the module that produced it <em>documents this exact risk in its own header</em> and did it anyway: recovery was pointed at prose, and precision-over-recall was stated but not enforced.</p>
+<p><em>Gate that closes it:</em> every derived artifact carries machine-readable provenance for <strong>how</strong> it was derived, and consumers can filter on it.</p>
+<p><strong>Implemented</strong> — <code>failure_class_gates.rs::class_c_provenance_is_machine_readable</code>. Both directions are asserted deliberately: a parsed file must report <code>TreeSitter</code>/<code>Clean</code> and a pattern-matched one <code>RegexFallback</code>/<code>Fallback</code>. Pinning only the fallback side would let "label everything <code>RegexFallback</code>" pass while destroying the distinction. A second assertion pins the subtler half — a pattern-matched symbol must not claim <code>is_exported</code>, because exportedness is a language rule the line scanner never evaluated, and asserting it would put a public-API claim into the graph on the strength of a regex.</p>
+<hr />
+<p><strong>Class D — a stale component serves as if fresh.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Instance</th>
+<th>What was stale</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>K6</code></td>
+<td>a rebuilt binary left the daemon answering from superseded code</td>
+</tr>
+<tr>
+<td><code>B5</code></td>
+<td>a commit/rebase/stash changed what the index should hold while touching no watched file</td>
+</tr>
+<tr>
+<td>§2.1</td>
+<td>the working store is at <code>user_version=2</code> against a binary writing <code>user_version=11</code></td>
+</tr>
+<tr>
+<td><code>D3</code></td>
+<td><code>writer.lock</code> naming a dead pid</td>
+</tr>
+</tbody>
+</table>
+<p><em>Gate that closes it:</em> every long-lived component validates the identity of what it depends on — binary, schema, HEAD — at each service boundary rather than at startup only, and refuses rather than degrades on mismatch.</p>
+<p><strong>Implemented for the schema boundary</strong> — <code>failure_class_gates.rs::class_d_identity_is_validated</code> asserts a store stamped newer than <code>CURRENT_SCHEMA_VERSION</code> is <em>refused</em>, not opened and misread. Fail-closed is the only safe direction: a forward-compatible read of an unknown schema silently misreads rows, and a graph that is confidently wrong is worse than one that is unavailable. The binary boundary is covered by K6's own regression. <strong>The HEAD boundary (B5) is not gated</strong>, and the working store's nine-version drift is the standing evidence that schema drift goes unnoticed in practice even though it is now refused at open.</p>
+<hr />
+<p><strong>Class E — a measurement is attributed to the wrong thing.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Instance</th>
+<th>What it misled about</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>K8</code></td>
+<td>phase costs recorded against the <em>next</em> stage's label: extraction's 7.25 s printed as "resolving"</td>
+</tr>
+<tr>
+<td>§2</td>
+<td>incumbent Python figures readable as current kernel figures</td>
+</tr>
+<tr>
+<td><code>main.rs</code></td>
+<td>a comment calling persistence "the largest phase of a build", inferred from <code>K8</code>'s output</td>
+</tr>
+</tbody>
+</table>
+<p>This class is the most corrosive because its output is <em>plausible</em>. <code>K8</code> produced a profile that named a real phase, with a real duration, summing to the real total — and pointed at the wrong one. Everything downstream that consumed it inherited the error, including a code comment that is still wrong today.</p>
+<p><em>Gate that closes it:</em> every reported measurement carries the corpus, date and tier it was taken from, and a derived figure states its derivation. §2.1 and the appendix now do this; §2 has a pointer rather than a restatement, which is weaker but does not require re-measuring the incumbent.</p>
+<p><strong>Implemented for the profiler</strong> — unit tests beside <code>ProgressReporter</code> in <code>devmap-cli/src/main.rs</code>. Three properties a consumer needs before trusting a breakdown, none of which held before K8: the stage that slept is the stage that reports the time; sub-phases nest inside their parent and are included in its total rather than listed beside it, so no consumer can double-count; and the stages account for the whole build, which is precisely the check a 42-nanosecond extraction would have failed. A fourth test pins Class A <em>applied to the profiler</em> — an unfinished stage is emitted with <code>"open": true</code> rather than omitted, because omitting it would let the breakdown silently fail to account for the total.</p>
+<p>Verified by mutation: forcing a stage to record no time of its own turns the attribution test red while the other four stay green.</p>
+<hr />
+<p><strong>Why this section exists.</strong> Four of these five classes produced a fresh instance in the Rust port <em>after</em> the Python instance had been found, fixed and written into this plan as a property. Class A produced three instances across three unrelated subsystems. A plan that lists 47 properties but does not name the shapes they share will keep catching instances one at a time, which is what happened here — the six defects closed in the 2026-09-02 pass were all found by measurement, and none of them by the acceptance tests written to prevent their class. The gates above are the correction: 14 assertions across five classes, stated over shapes rather than cases.</p>
+<p><strong>What they do not cover.</strong> A gate proves the shape is held <em>at the points it inspects</em>. Class A's mechanical audit — every function returning a bare collection or count where a decline is reachable — has not been run across the workspace; Class D does not cover the HEAD boundary (B5); Class E covers the build profiler and not every reported measurement. These are gates against recurrence at the known surfaces, not proof of universal absence.</p>
+<h3 id="notes-on-two-findings-that-are-not-bugs">Notes on two findings that are not bugs</h3>
+<ul>
+<li><strong>D2</strong> — the six 0-row legacy tables are deliberate: <code>sqlite.py:643</code> keeps them "present for rollback-compatible schema inspection" after the v1→v2 migration. The rewrite implements v2 semantics only; this is a decision, not a defect.</li>
+<li><strong>D3</strong> — <code>writer.lock</code> naming a dead pid is cosmetic. <code>flock</code> is the authority and the OS releases it on process death.</li>
+</ul>
+<hr />
+<h2 id="4-capabilities-to-preserve">4. Capabilities to preserve</h2>
+<p>A clean-room rewrite loses undocumented behaviour silently. Golden-corpus parity only catches a regression if the corpus exercises the capability — so each row below carries the corpus requirement that makes it detectable. <strong>This inventory is incomplete</strong>: it was compiled from the 49% of the subsystem the audit opened plus targeted probes into <code>repo_mapper.py</code> and <code>wiring.py</code>. Completing it is a Phase 1 deliverable.</p>
+<h3 id="41-import-resolution-per-language">4.1 Import resolution, per language</h3>
+<table>
+<thead>
+<tr>
+<th>Capability</th>
+<th>Source</th>
+<th>Corpus must contain</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Python module-suffix index + <code>__init__.py</code> ancestry</td>
+<td><code>repo_mapper.py:1070,1114</code></td>
+<td>nested packages, namespace pkgs</td>
+</tr>
+<tr>
+<td>JS/TS relative resolution + extension/index probing</td>
+<td><code>repo_mapper.py:1310,1332</code></td>
+<td><code>./x</code>, <code>../y</code>, dir-index imports</td>
+</tr>
+<tr>
+<td>tsconfig/jsconfig path aliases <strong>across <code>extends</code> + project references</strong></td>
+<td><code>repo_mapper.py:1340-1344</code></td>
+<td>multi-level <code>extends</code>, project refs</td>
+</tr>
+<tr>
+<td>Monorepo package.json workspace → source dir mapping</td>
+<td><code>repo_mapper.py:1551</code></td>
+<td>workspace with 2+ packages</td>
+</tr>
+<tr>
+<td>JS re-export chain following</td>
+<td><code>repo_mapper.py:1636</code>, <code>resolve.py:236</code></td>
+<td><code>export { X } from './y'</code> chains</td>
+</tr>
+<tr>
+<td>Named-binding imports (<code>import { X as Y }</code>)</td>
+<td><code>resolve.py:583</code></td>
+<td>aliased named imports</td>
+</tr>
+<tr>
+<td>Go module prefix from <code>go.mod</code></td>
+<td><code>repo_mapper.py:1726</code></td>
+<td>go.mod with non-trivial module path</td>
+</tr>
+<tr>
+<td>Rust crate root + <code>mod.rs</code>/<code>name.rs</code> probing</td>
+<td><code>repo_mapper.py:1802,1814</code></td>
+<td>nested modules both spellings</td>
+</tr>
+</tbody>
+</table>
+<h3 id="42-liveness-exemptions--the-false-positive-guard">4.2 Liveness exemptions — the false-positive guard</h3>
+<p><code>wiring.py</code> is the layer that stops dead-code detection reporting entry points as dead. Losing any row here does not break a build; it makes <code>dev map dead</code> untrustworthy, which is worse.</p>
+<table>
+<thead>
+<tr>
+<th>Capability</th>
+<th>Source</th>
+<th>Corpus must contain</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>pyproject.toml</code> script targets</td>
+<td><code>wiring.py:829</code></td>
+<td>console_scripts entry point</td>
+</tr>
+<tr>
+<td><code>package.json</code> entry + script targets</td>
+<td><code>wiring.py:917,424</code></td>
+<td>bin/main/scripts entries</td>
+</tr>
+<tr>
+<td><code>Cargo.toml</code> binary targets</td>
+<td><code>wiring.py:796</code></td>
+<td><code>[[bin]]</code> target</td>
+</tr>
+<tr>
+<td>Launcher files + module-form reference keys</td>
+<td><code>wiring.py:376,387</code></td>
+<td>a launcher referencing a module</td>
+</tr>
+<tr>
+<td>Re-export-only <code>__init__.py</code> recognition</td>
+<td><code>wiring.py:277</code></td>
+<td>package re-exporting submodules</td>
+</tr>
+<tr>
+<td>Python <code>__all__</code> and re-export names</td>
+<td><code>wiring.py:451,470</code></td>
+<td><code>__all__</code> with indirect exports</td>
+</tr>
+<tr>
+<td>Generated-file detection (path + header sniff)</td>
+<td><code>wiring.py:253,258</code></td>
+<td>a file with a codegen header</td>
+</tr>
+<tr>
+<td>Vendored path detection</td>
+<td><code>wiring.py:181</code></td>
+<td>a vendored third-party dir</td>
+</tr>
+<tr>
+<td>Test path detection</td>
+<td><code>wiring.py:113</code></td>
+<td>tests in a non-standard location</td>
+</tr>
+<tr>
+<td>Decorator-based wiring (<code>is_wiring_decorated</code>)</td>
+<td><code>wiring.py:706</code></td>
+<td>registration decorators</td>
+</tr>
+<tr>
+<td>Structural convention exemptions</td>
+<td><code>wiring.py:728</code></td>
+<td>conventionally-wired file</td>
+</tr>
+</tbody>
+</table>
+<h3 id="43-framework-recognition">4.3 Framework recognition</h3>
+<table>
+<thead>
+<tr>
+<th>Capability</th>
+<th>Source</th>
+<th>Corpus must contain</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Route extraction: django, rails, spring, aspnet, laravel, nest, axum, play, drupal</td>
+<td><code>frameworks/routes.py</code></td>
+<td>one app per framework family</td>
+</tr>
+<tr>
+<td>DI/provider patterns</td>
+<td><code>frameworks/di.py</code></td>
+<td>provider registration</td>
+</tr>
+<tr>
+<td>Event handler patterns</td>
+<td><code>frameworks/events.py</code></td>
+<td>event subscriber</td>
+</tr>
+</tbody>
+</table>
+<h3 id="44-subsystem-inference-and-artifacts">4.4 Subsystem inference and artifacts</h3>
+<table>
+<thead>
+<tr>
+<th>Capability</th>
+<th>Source</th>
+<th>Corpus must contain</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Source-root detection</td>
+<td><code>repo_mapper.py:1037</code></td>
+<td><code>src/</code>-style and flat layouts</td>
+</tr>
+<tr>
+<td>Area/role classification, role_files buckets</td>
+<td><code>repo_mapper.py:916,990</code></td>
+<td>multi-role subsystem</td>
+</tr>
+<tr>
+<td>Subsystem index (hardcoded + generic paths)</td>
+<td><code>repo_mapper.py:937,946</code></td>
+<td>repo matching neither shape</td>
+</tr>
+<tr>
+<td><code>handoff_paths</code> / <code>neighbors</code> cross-subsystem flow</td>
+<td>repo_map schema</td>
+<td>subsystems that call each other</td>
+</tr>
+</tbody>
+</table>
+<h3 id="45-unaudited--inventory-incomplete">4.5 Unaudited — inventory incomplete</h3>
+<p>No capability inventory yet exists for: PDG/taint/CFG (872 LOC), LSP integration (775), debug/DAP runtime observations (1,207), visualization and export (2,591), semantic index and AST matcher (449). Each needs the same treatment before its fate — port, keep in Python, or drop — can be decided.</p>
+<h2 id="5-target-architecture">5. Target architecture</h2>
+<p>A single Rust binary owning indexing, storage, watching and the agent interface. CodeGraph validates the shape (Rust kernel + tree-sitter compiled in + plain SQLite/FTS5); the storage engine does not need replacing, since SQLite is 3% of the current build.</p>
+<pre><code>devmap serve     // long-lived: watcher + index + MCP over stdio/socket
+devmap build     // one-shot index, for CI
+devmap query …   // CLI queries, token-budgeted like the MCP surface
+devmap status    // freshness, generation, lock holder</code></pre>
+<pre><code>rust-port/crates/
+  devmap-extract/   // tree-sitter, one module per language, rayon
+  devmap-resolve/   // symbols, calls, receiver types, imports
+  devmap-analyze/   // liveness, dead code, Leiden clustering, PDG
+  devmap-store/     // rusqlite, v3 schema, generations
+  devmap-query/     // token-budgeted responses
+  devmap-serve/     // watcher, daemon, MCP
+  devmap-cli/       // binary entry point</code></pre>
+<p>The 37 Python consumers do not import a shim — they talk to the daemon over a versioned local socket. A thin client of ~400 LOC replaces 26,837 and contains no analysis logic.</p>
+<p>Making the daemon the sole ingestion path turns three findings into structural impossibilities rather than fixes: <strong>B1</strong> cannot occur when the queue lives in a process that does not exit, <strong>N8</strong> is satisfied by construction, and <strong>B4</strong> dissolves because the daemon holds the write connection while readers use WAL snapshots.</p>
+<h3 id="why-rust-over-go">Why Rust over Go</h3>
+<p>Tree-sitter's canonical binding is Rust; <code>rusqlite</code> is mature; <code>rayon</code> makes parallel extraction trivial. Go's main advantage — simple cross-compilation — is forfeited the moment tree-sitter pulls in cgo, and cgo taxes every node visit.</p>
+<h3 id="reference-architectures">Reference architectures</h3>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>dev map (today)</th>
+<th>GitNexus</th>
+<th>CodeGraph</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Core language</td>
+<td>Python</td>
+<td>TypeScript / WASM</td>
+<td><strong>Rust kernel</strong></td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>SQLite + FTS5</td>
+<td>LadybugDB (ex-Kuzu)</td>
+<td><strong>SQLite + FTS5</strong></td>
+</tr>
+<tr>
+<td>Languages</td>
+<td><strong>35</strong></td>
+<td>14</td>
+<td>20</td>
+</tr>
+<tr>
+<td>Parallelism</td>
+<td>serial; pool capped at 4</td>
+<td>cores−1, max 16</td>
+<td>sized from cores + RAM</td>
+</tr>
+<tr>
+<td>Ingestion trigger</td>
+<td>per-tool-use hook</td>
+<td>git-diff on re-run</td>
+<td><strong>OS file events, 2s debounce</strong></td>
+</tr>
+<tr>
+<td>Incremental cost</td>
+<td>scales with <em>repo</em> size</td>
+<td>changed files only</td>
+<td><strong>scales with change size</strong></td>
+</tr>
+<tr>
+<td>Search ranking</td>
+<td>BM25 only</td>
+<td><strong>BM25 + vector + RRF</strong></td>
+<td>FTS5</td>
+</tr>
+<tr>
+<td>Clustering</td>
+<td>Louvain, skipped at 15s</td>
+<td><strong>Leiden + cohesion</strong></td>
+<td>—</td>
+</tr>
+<tr>
+<td>Query surface</td>
+<td>many tools + regex Cypher</td>
+<td>17 tools + real Cypher</td>
+<td><strong>one primary tool</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Deliberately <strong>not</strong> imported: the embedded graph database. It buys real Cypher (N10) at the cost of replacing a layer that is not the bottleneck.</p>
+<hr />
+<h2 id="6-phases">6. Phases</h2>
+<p>Six phases, 34–46 weeks, one engineer. Estimates are <strong>inferred</strong>, not derived from comparable work in this repository. No phase before cutover ships user-visible value — that is the cost of the clean-room choice.</p>
+<h3 id="phase-1--freeze-the-contract--45-weeks">Phase 1 — Freeze the contract · 4–5 weeks</h3>
+<p>Capture what the current system produces before replacing it: golden corpus across all 35 languages, canonical graph snapshots from the Python implementation, and the 37 consumer contracts written down — especially the verification checks, whose graph-shape assumptions exist nowhere but their assertions. Specify token budgets now so the new surface is designed against them rather than retrofitted.</p>
+<p><strong>Complete the §4 capabilities inventory</strong>, then build the corpus <em>from</em> it. The inventory is currently drawn from the 49% of the subsystem the audit opened; the unaudited areas in §4.5 have no inventory at all. Every row in §4 names a corpus requirement, and a capability whose requirement is absent from the corpus is a capability parity cannot protect. This is the phase where an unwritten behaviour becomes a test or becomes a future regression.</p>
+<p><strong>Gate:</strong> §4 inventory complete for all 26,837 LOC; corpus satisfies every stated requirement; golden graphs for 35 languages; every consumer contract has a signature and a test; token budgets specified per surface; scoping decision recorded for each §4.5 area (port / keep in Python / drop).</p>
+<h3 id="phase-2--extraction--610-weeks">Phase 2 — Extraction · 6–10 weeks</h3>
+<p>Tree-sitter for all 35 languages including Python, resolving <strong>D1</strong> by construction. Parallel by default with <code>rayon</code>, pools sized from real cores (<strong>B12</strong>, <strong>N9</strong>). Grammars link into the binary, so the spawn-based crash isolation, 30s per-file timeout and quarantine/respawn logic have no analogue to port — a panicking grammar unwinds one task.</p>
+<p><strong>Gate:</strong> extraction parity against golden corpus, all 35 languages; near-linear core scaling; Python-extraction divergences enumerated and individually accepted.</p>
+<p><strong>Added 2026-09-02 — this phase owns K1, K2 and K3, and extraction is the largest phase of a cold build</strong> (7.25 s of 13.44 s, 54%, §2.1). Two gate clauses are missing and should be added before the phase can close:</p>
+<ul>
+<li><em>Every discovered file is addressable.</em> K1, <strong>closed</strong>: the <code>File</code> node was emitted only on the tree-sitter path, so a grammarless file was recorded in <code>generation_files</code> and had no node at all. "35 languages parse" does not imply "every indexed file exists in the graph", and only the second is what a consumer depends on. Now gated at 0 nodeless files on a 4,089-file corpus; keep the gate, because the failure was invisible to every parity measure that existed.</li>
+<li><em>Discovery and extraction are gated together.</em> K2 was a discovery defect that looked like an extraction gap: <code>is_indexable_source</code> admits only extensions <code>detect_language</code> names, so files never reached the extractor to be counted as missing. A parity gate that measures only what arrives at the extractor cannot see this class at all — it must be stated over files <strong>on disk</strong>, which is how the 19/19 <code>.proto</code> and 17/17 <code>.ps1</code> figures were confirmed.</li>
+</ul>
+<p>Tier-2 pattern recovery (<code>devmap-extract/src/fallback.rs</code>) is <em>not</em> a substitute for a grammar and its output is labelled <code>ParseOutcome::Fallback</code> / <code>ExtractionEngine::RegexFallback</code> throughout so no consumer can mistake a pattern-matched symbol for a parsed one. K3 is the standing warning about what happens when that tier is pointed at prose.</p>
+<h3 id="phase-3--resolution-and-analysis--1014-weeks">Phase 3 — Resolution and analysis · 10–14 weeks</h3>
+<p>Largest and hardest — 76% of current build time, global passes with subtle ordering semantics. <strong>B13</strong>–<strong>B15</strong> have no counterpart in a design built on interned <code>FileId</code>s and a single tree traversal. Fold in quality work while the code is open: Leiden with cohesion scores (<strong>N5</strong>, <strong>R6</strong>), constructor-inferred receiver types (<strong>N6</strong>), dynamic-dispatch hops in call paths (<strong>R5</strong>), explicit status on timed-out analysis (<strong>N4</strong>). <strong>R5</strong> builds directly on <strong>N6</strong> — once a receiver's type is tracked, an interface-dispatch hop is resolvable rather than a dead end — so they are one work item, not two.</p>
+<p><strong>Gate:</strong> full-graph parity; cold build for this repo under 2s; resolution precision ≥ Python baseline; every community reports cohesion; interface-dispatch path resolves in corpus.</p>
+<h3 id="phase-4--store-and-daemon--57-weeks">Phase 4 — Store and daemon · 5–7 weeks</h3>
+<p>v3 schema: interned paths (<strong>B10</strong>), clean primary keys (<strong>B9</strong>), indexable FTS pruning (<strong>B6</strong>), O(1) cache admission and liveness-ordered eviction (<strong>B7</strong>, <strong>B8</strong>), scheduled vacuum (<strong>B11</strong>), one schema with no rollback shadow (<strong>D2</strong>), WAL auto-checkpoint tuned for build churn (<strong>R4</strong>). Differential membership writes <em>with</em> deletion reconciliation — <strong>B3 and N2 are one work item and must never be separated</strong>. Daemon owns the watcher and a durable queue, and exposes targeted repair so a corrupt FTS index does not force a full rebuild (<strong>R7</strong>).</p>
+<p>The durable queue is what converts lease contention from data loss into back-pressure (<strong>B2</strong>) — with work persisted, a writer that cannot acquire the lease has deferred, not dropped, so the timeout stops being a correctness parameter. Status surfaces report the lease holder from the lock itself rather than stale advisory metadata (<strong>D3</strong>).</p>
+<p><strong>The watcher must observe git HEAD, not only the working tree</strong> (<strong>B5</strong>). A commit, branch switch, rebase or stash changes what the index should contain while touching no watched file — <code>.git/HEAD</code> and <code>.git/refs</code> need their own watch, or the clean-room design reproduces exactly the staleness that motivated the rewrite.</p>
+<p><strong>Gate:</strong> 1-file edit writes &lt;100 rows at 10k files; kill −9 mid-build replays; index &lt;60 MB for this repo; freelist &lt;5% without manual vacuum; <code>devmap repair --fts</code> rebuilds the search index alone; freshness holds across a 30-minute multi-session burst; <strong><code>git commit</code> then idle leaves the index fresh</strong>; a lease timeout under load loses zero edits; status never names a dead pid.</p>
+<p><strong>Added 2026-09-02 — K5 and K6, and one gate that cannot be measured as written.</strong></p>
+<ul>
+<li><p>K5 makes the freelist gate above <strong>unmeasurable in its current form</strong>. <code>vacuum_if_needed</code> read <code>freelist_count</code> <em>before</em> checkpointing the WAL, so it saw 0 free pages while 33% of the store was reclaimable, and reported a 0 ms vacuum as success. A gate reading the same pre-checkpoint counter would have passed on a store that was a third garbage. The checkpoint now runs first; the gate should state that it is measured post-checkpoint, because the number means nothing otherwise. This is the <code>N4</code> property — a check that could not run must not report as one that passed — applied to the store's own accounting.</p></li>
+<li><p>K6: a rebuilt binary left the running daemon serving the old code, so every query answered from a superseded kernel with nothing to indicate it. The daemon now compares its executable identity at each tick and retires itself. Add to the gate: <strong>a rebuild retires the running daemon</strong>.</p></li>
+<li><p><code>persist:write</code> is 19% of a cold build on scholarlm and, on DevCouncil, <em>larger on an incremental build than on a cold one</em> (2,448 ms vs 1,490 ms) — backwards on its face, and the direct consequence of B3 being unresolved. The four <code>persist:*</code> sub-phases exist precisely so this is attributable; see §2.1. These four were unaffected by K8 and are the one part of the old breakdown that can be trusted as recorded.</p>
+<p><strong>Stale claim to correct when the extract crate is free:</strong> the comment above <code>progress.timed("persist:write", …)</code> in <code>devmap-cli/src/main.rs</code> states that persistence is "the largest phase of a build". That was inferred from the pre-K8 attribution and is false — extraction is, at 54%. The two millisecond figures in the same comment are sound; only the superlative is not.</p></li>
+<li><p>The store in this repository is at <code>user_version=2</code> against a binary writing <code>user_version=11</code>. Whatever the intended migration path is, nine versions of drift on the primary development store means it is not exercised, and no gate currently notices.</p></li>
+</ul>
+<h3 id="phase-5--token-budgeted-query-surface--56-weeks">Phase 5 — Token-budgeted query surface · 5–6 weeks</h3>
+<p>Graph stays resident in the daemon, so <strong>N1</strong>'s 1,639 ms reload has no analogue. Every response takes a budget and reports truncation. The 129k-token repo map becomes a ≤2k-token manifest plus queries; the 17.4 MB export becomes opt-in and moves out of the context directory (<strong>T1</strong>–<strong>T3</strong>, <strong>N3</strong>). Add RRF over BM25 and vectors (<strong>N7</strong>), bounded by a node cap so the embedding index cannot grow unbounded (<strong>R3</strong>); either implement real graph queries or retire the Cypher shim honestly (<strong>N10</strong>).</p>
+<p>Collapse today's 18 map/graph MCP tools to one primary plus a small unlisted set (<strong>R1</strong>), and have results carry verbatim source grouped by file (<strong>R2</strong>). These two are the largest remaining token wins and they compound: tool definitions cost context on every request whether or not they are called, and a result without source forces a follow-up read that costs another round-trip.</p>
+<p><strong>Gate:</strong> explore p95 &lt;50 ms at 10k files; no response exceeds its budget; every truncation reports <code>{shown, total}</code>; manifest ≤2k tokens; ≤3 listed tools; a symbol query answers without a follow-up file read; peak RSS &lt;1 GB at 10k files.</p>
+<p><strong>Added 2026-09-02 — K4: "no response exceeds its budget" was satisfied by returning nothing.</strong> The budget is a hard contract (<code>test_search_never_exceeds_hard_token_budget</code> pins it, correctly), and a symbol whose source span alone exceeded the whole budget was therefore dropped — search returned <strong>zero</strong> hits for a query that matched. Both halves of the gate were green: no budget was exceeded, and every truncation that occurred was reported. Neither noticed that the answer was empty.</p>
+<p>The fix caps the span rather than the result (<code>cap_source_span</code>, char-boundary safe) and reports the omission as <code>source_span_omitted_bytes</code>. The gate needs a third clause: <strong>a query that matches returns at least one hit, whatever the size of the match.</strong> This is the <code>N4</code> shape again — an empty result and a no-match result must not be indistinguishable.</p>
+<p>Also relevant to <code>T2</code> and <code>G6</code>: the opt-in export is 84,276,217 B on a 3,674-file corpus (§2.1), roughly 21M tokens. Opt-in bounds <em>who pays</em>, not <em>how much</em>.</p>
+<h3 id="phase-6--cutover-and-deletion--4-weeks">Phase 6 — Cutover and deletion · ~4 weeks</h3>
+<p>Point the 37 consumers at the client, run both systems in parallel against live work until the parity harness is quiet, then delete <code>indexing/</code> and <code>codeintel/</code>. Deleting <em>is</em> the phase — a rewrite that lands beside what it replaces doubles the surface permanently.</p>
+<p><strong>Gate:</strong> all 16,534 LOC of existing tests green against Rust; 26,837 LOC removed; no Python analysis code remains; binaries published for every supported platform.</p>
+<hr />
+<h2 id="7-implementation-guide">7. Implementation guide</h2>
+<h3 id="71-token-budget-as-a-protocol-primitive--t1t4">7.1 Token budget as a protocol primitive — T1–T4</h3>
+<p>Put the budget in the request type so it cannot be forgotten; make truncation a value rather than an absence. This generalises what <code>prompt_builder.py:281-319</code> already does correctly for file bodies.</p>
+<pre class="rust"><code>pub struct Request&lt;Q&gt; {
+    pub query: Q,
+    pub token_budget: u32,   // required — no default that hides cost
+    pub min_confidence: Confidence,
 }
 
-<span class="k">pub struct</span> Response&lt;T&gt; {
-    <span class="k">pub</span> items: Vec&lt;T&gt;,
-    <span class="k">pub</span> shown: u32,
-    <span class="k">pub</span> total: u32,          <span class="c">// what a complete answer would have held</span>
-    <span class="k">pub</span> truncated: bool,
-    <span class="k">pub</span> tokens_used: u32,
-}</pre>
-      </div>
-      <p class="f-body">Two rules make this load-bearing. Rank <em>before</em> truncating, so the budget keeps the most relevant rows rather than the first ones. And carry both numbers always — a capped sample presented as complete coverage is how "no dead code found" comes to mean "we stopped looking at 200".</p>
-    </div>
+pub struct Response&lt;T&gt; {
+    pub items: Vec&lt;T&gt;,
+    pub shown: u32,
+    pub total: u32,          // what a complete answer would have held
+    pub truncated: bool,
+    pub tokens_used: u32,
+}</code></pre>
+<p>Two rules make this load-bearing. <strong>Rank before truncating</strong>, so the budget keeps the most relevant rows rather than the first ones. And <strong>carry both numbers always</strong> — a capped sample presented as complete coverage is how "no dead code found" comes to mean "we stopped at 200".</p>
+<h3 id="72-replace-the-repo-map-with-a-manifest-plus-queries--t1">7.2 Replace the repo map with a manifest plus queries — T1</h3>
+<p>78% of the map is <code>dependents</code> (63,844 tokens) and <code>files</code> (35,512) — lookup tables shipped whole to answer point questions. Neither belongs in a file an agent reads.</p>
+<pre><code>Manifest (~2k tokens total):
+  subsystems (names + entry points only)   ~800 tok
+  important_files                          ~140 tok
+  entry_roots, languages, test_commands     ~80 tok
+  freshness: head, fingerprint, generation   ~30 tok
+  -- dependents, files: removed. queried instead.
 
-    <div class="step">
-      <div class="step-head"><h3>2 · Replace the repo map with a manifest plus queries</h3><span class="fixes">T1 · 129k → ~2k tokens</span></div>
-      <p class="f-body">78% of the current map is <code>dependents</code> (63,844 tokens) and <code>files</code> (35,512) — lookup tables shipped whole to answer point questions. Neither belongs in a file an agent reads; both are one query each.</p>
-      <div class="codeblock">
-        <span class="codecap">what stays in the manifest — everything under ~2k tokens</span>
-<pre>subsystems (names + entry points only)   ~800 tok
-important_files                          ~140 tok
-entry_roots, languages, test_commands     ~80 tok
-freshness: head, fingerprint, generation   ~30 tok
-<span class="c">-- dependents, files: removed. queried instead.</span></pre>
-      </div>
-      <div class="codeblock">
-        <span class="codecap">what replaces them</span>
-<pre>devmap where &lt;symbol&gt;          <span class="c">// one answer, not 853 file entries</span>
-devmap deps &lt;path&gt; --budget N  <span class="c">// ranked, truncation reported</span>
-devmap impact &lt;symbol&gt;         <span class="c">// precomputed blast radius + confidence</span></pre>
-      </div>
-      <p class="f-body">CLAUDE.md changes with it — "open repo_map.json first" becomes "query the map". That instruction is currently the single largest token expenditure in the system, and it is one line of documentation.</p>
-    </div>
+Replaced by:
+  devmap where &lt;symbol&gt;            // one answer, not 853 file entries
+  devmap deps &lt;path&gt; --budget N    // ranked, truncation reported
+  devmap impact &lt;symbol&gt;           // precomputed blast radius + confidence</code></pre>
+<p>CLAUDE.md changes with it: "open repo_map.json first" becomes "query the map". ~65× reduction for one line of documentation.</p>
+<h3 id="73-collapse-the-tool-surface-return-source-with-results--r1-r2">7.3 Collapse the tool surface, return source with results — R1, R2</h3>
+<p>Today the MCP surface exposes 18 map/graph tools. Tool definitions are serialised into <em>every</em> request whether or not they are called, so an unused tool is a standing tax on every turn. CodeGraph lists one primary tool and leaves the rest unlisted but callable.</p>
+<pre><code>Listed (≤3):
+  devmap_explore   // symbols + call paths + impact + verbatim source, budgeted
+  devmap_search    // ranked lookup, budgeted
+  devmap_status    // freshness, generation
 
-    <div class="step">
-      <div class="step-head"><h3>3 · Collapse the tool surface, return source with results</h3><span class="fixes">R1, R2 · phase 5</span></div>
-      <p class="f-body">Today the MCP surface exposes 18 map/graph tools. Tool definitions are serialised into <em>every</em> request whether or not they are called, so an unused tool is a standing tax on every turn. CodeGraph lists one primary tool and leaves the rest unlisted but callable.</p>
-      <div class="codeblock">
-        <span class="codecap">listed vs callable</span>
-<pre>Listed (≤3):
-  devmap_explore   <span class="c">// symbols + call paths + impact + source, budgeted</span>
-  devmap_search    <span class="c">// ranked lookup, budgeted</span>
-  devmap_status    <span class="c">// freshness, generation</span>
-
-Unlisted but callable: dead, routes, paths, affected-tests,
-                       impact, trace, process, api-impact, …</pre>
-      </div>
-      <p class="f-body">R2 is the other half. A result that gives only a location forces the agent to issue a file read, which costs a round-trip and usually pulls in far more of the file than the answer needed. Returning the relevant spans inline, grouped by file, makes the query self-contained.</p>
-      <div class="codeblock">
-        <span class="codecap">crates/devmap-query/src/types.rs</span>
-<pre><span class="k">pub struct</span> SymbolHit {
-    <span class="k">pub</span> id: SymbolId,
-    <span class="k">pub</span> path: FileId,
-    <span class="k">pub</span> span: (u32, u32),
-    <span class="k">pub</span> source: String,      <span class="c">// R2: the lines themselves, budget-trimmed</span>
-    <span class="k">pub</span> flows: Vec&lt;FlowRef&gt;, <span class="c">// step 4: processes it participates in</span>
-}</pre>
-      </div>
-      <p class="f-body">Both interact with the budget from step 1: source is the first thing trimmed as a response approaches its limit, and the trim is reported rather than silent.</p>
-    </div>
-
-    <div class="step">
-      <div class="step-head"><h3>4 · Precompute so one call is enough</h3><span class="fixes">T3 · GitNexus's central idea</span></div>
-      <p class="f-body">The deepest token saving is not compression but avoided round-trips. An agent that must issue four queries and reassemble edges spends far more context than one that receives a structured answer. GitNexus does clustering, process detection and confidence scoring at index time so tool responses are complete; dev map already computes the raw material in its liveness and PDG layers and then discards the structure.</p>
-      <p class="f-body">Concretely: store the entry-point-to-leaf call flows at build time, and let a symbol query return the flows it participates in with step indices — not a set of edges the caller must walk. Confidence filtering belongs in the same place: speculative low-confidence edges cost context and mislead, so <code>min_confidence</code> is a request parameter with a conservative default.</p>
-    </div>
-
-    <div class="step">
-      <div class="step-head"><h3>5 · Differential writes with deletion reconciliation</h3><span class="fixes">B3 + N2 · one work item</span></div>
-      <p class="f-body">This is the 7.55s. Today each generation re-materialises all 59,880 membership rows; it must write only the delta. The hazard is that deletion is currently handled implicitly <em>by</em> the full rewrite, so the delta path has to carry it explicitly or deleted files persist as live nodes forever.</p>
-      <div class="codeblock">
-        <span class="codecap">algorithm</span>
-<pre>1. carry forward  rows from prev generation whose source file
-                  is not in :affected
+Unlisted but callable: dead, routes, cypher/paths, affected-tests,
+                       impact, trace, process, api-impact, …</code></pre>
+<p>R2 is the other half. A result that gives a location forces the agent to issue a file read, which costs a round-trip and usually pulls in far more of the file than the answer needed. Returning the relevant spans inline, grouped by file, makes the query self-contained:</p>
+<pre class="rust"><code>pub struct SymbolHit {
+    pub id: SymbolId,
+    pub path: FileId,
+    pub span: (u32, u32),
+    pub source: String,      // R2: the lines themselves, budget-trimmed
+    pub flows: Vec&lt;FlowRef&gt;, // §7.4: which processes it participates in
+}</code></pre>
+<p>Both interact with the budget from §7.1: source is the first thing trimmed when a response approaches its limit, and the trim is reported rather than silent.</p>
+<h3 id="74-precompute-so-one-call-is-enough--gitnexuss-central-idea">7.4 Precompute so one call is enough — GitNexus's central idea</h3>
+<p>The deepest token saving is avoided round-trips, not compression. An agent that issues four queries and reassembles edges spends far more context than one receiving a structured answer. Store entry-point-to-leaf call flows at build time and let a symbol query return the flows it participates in with step indices — not edges the caller must walk. <code>min_confidence</code> is a request parameter with a conservative default, since speculative edges cost context and mislead.</p>
+<h3 id="75-differential-writes-with-deletion-reconciliation--b3--n2">7.5 Differential writes with deletion reconciliation — B3 + N2</h3>
+<p>This is the 7.55s. Each generation currently re-materialises all 59,880 membership rows.</p>
+<pre><code>1. carry forward  rows from prev generation whose source file is not in :affected
 2. delete         rows whose source file is in :affected
 3. insert         freshly resolved rows for :affected
-4. reconcile      any file present in the previous generation but
-                  absent from `git ls-files` is a deletion — add it
-                  to :affected even though nothing on disk changed</pre>
-      </div>
-      <p class="f-body">Step 4 is the one that is easy to miss and the reason these cannot ship separately. Renames are a delete plus an add under this model — correct, though it loses rename identity, which nothing downstream consumes today.</p>
-    </div>
-
-    <div class="step">
-      <div class="step-head"><h3>6 · Schema v3</h3><span class="fixes">B6, B9, B10, D2</span></div>
-      <p class="f-body">Interned paths fix the storage bloat and the hot-loop path parsing at once — B10 and B13 are the same problem at two layers. FTS holds text only, with generation membership in an ordinary indexable table so pruning is a bounded delete rather than a full reindex.</p>
-      <div class="codeblock">
-        <span class="codecap">core tables</span>
-<pre><span class="k">CREATE TABLE</span> paths (
-    id   <span class="k">INTEGER PRIMARY KEY</span>,
-    path <span class="k">TEXT NOT NULL UNIQUE</span>
+4. reconcile      any file present in the previous generation but absent from
+                  `git ls-files` is a deletion — add it to :affected even though
+                  nothing on disk changed</code></pre>
+<p><strong>Step 4 is why B3 and N2 cannot ship separately.</strong> Deletion is currently handled implicitly <em>by</em> the full rewrite; make writes differential without it and deleted files persist as live nodes forever. Renames are a delete plus an add — correct, though it loses rename identity, which nothing downstream consumes today.</p>
+<h3 id="76-schema-v3--b6-b9-b10-d2">7.6 Schema v3 — B6, B9, B10, D2</h3>
+<pre class="sql"><code>CREATE TABLE paths (
+    id   INTEGER PRIMARY KEY,
+    path TEXT NOT NULL UNIQUE
 );
 
-<span class="k">CREATE TABLE</span> generation_edges (
-    generation_id  <span class="k">INTEGER NOT NULL</span>,
-    ordinal        <span class="k">INTEGER NOT NULL</span>,
-    payload_hash   <span class="k">TEXT NOT NULL</span>,
-    source_file_id <span class="k">INTEGER NOT NULL REFERENCES</span> paths(id),
-    target_file_id <span class="k">INTEGER NOT NULL REFERENCES</span> paths(id),
-    <span class="k">PRIMARY KEY</span> (generation_id, ordinal)   <span class="c">-- B9</span>
-) <span class="k">WITHOUT ROWID</span>;
+CREATE TABLE generation_edges (
+    generation_id  INTEGER NOT NULL,
+    ordinal        INTEGER NOT NULL,
+    payload_hash   TEXT NOT NULL,
+    source_file_id INTEGER NOT NULL REFERENCES paths(id),
+    target_file_id INTEGER NOT NULL REFERENCES paths(id),
+    PRIMARY KEY (generation_id, ordinal)   -- B9: payload_hash was redundant
+) WITHOUT ROWID;
 
-<span class="c">-- FTS holds text only; membership is indexable</span>
-<span class="k">CREATE VIRTUAL TABLE</span> nodes_fts <span class="k">USING</span> fts5(
-    name, qualified_name, path, tokenize='unicode61'
+-- FTS holds text only; membership is indexable, so prune is a bounded delete
+CREATE VIRTUAL TABLE nodes_fts USING fts5(
+    name, qualified_name, path, tokenize=&#39;unicode61&#39;
 );
-<span class="k">CREATE TABLE</span> nodes_fts_map (
-    rowid_ref     <span class="k">INTEGER NOT NULL</span>,
-    generation_id <span class="k">INTEGER NOT NULL</span>,
-    <span class="k">PRIMARY KEY</span> (generation_id, rowid_ref)
-) <span class="k">WITHOUT ROWID</span>;
+CREATE TABLE nodes_fts_map (
+    rowid_ref     INTEGER NOT NULL,
+    generation_id INTEGER NOT NULL,
+    PRIMARY KEY (generation_id, rowid_ref)
+) WITHOUT ROWID;
 
-<span class="k">CREATE TABLE</span> pending_paths (      <span class="c">-- B1: survives process death</span>
-    path       <span class="k">TEXT PRIMARY KEY</span>,
-    queued_at  <span class="k">REAL NOT NULL</span>,
-    attempts   <span class="k">INTEGER NOT NULL DEFAULT</span> 0
-) <span class="k">WITHOUT ROWID</span>;</pre>
-      </div>
-      <p class="f-body">Pending rows are deleted only after the generation commits, so a crash mid-build replays rather than drops. In the core, <code>FileId(u32)</code> replaces every string path in the hot loops, and the per-edge language classification (B15) collapses into a field resolved once at intern time.</p>
-    </div>
+CREATE TABLE pending_paths (      -- B1: survives process death
+    path       TEXT PRIMARY KEY,
+    queued_at  REAL NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;</code></pre>
+<p>Pending rows are deleted only after the generation commits, so a crash mid-build replays rather than drops. In the core, <code>FileId(u32)</code> replaces every string path in hot loops; the per-edge language classification (<strong>B15</strong>) collapses into a field resolved once at intern time.</p>
+<h3 id="77-parallel-extraction--b12-n9">7.7 Parallel extraction — B12, N9</h3>
+<pre class="rust"><code>use rayon::prelude::*;
 
-    <div class="step">
-      <div class="step-head"><h3>7 · Parallel extraction</h3><span class="fixes">B12, N9 · phase 2</span></div>
-      <div class="codeblock">
-        <span class="codecap">crates/devmap-extract/src/lib.rs</span>
-<pre><span class="k">use</span> rayon::prelude::*;
-
-<span class="k">pub fn</span> extract_all(files: &amp;[FileRef]) -&gt; Vec&lt;(FileId, Extraction)&gt; {
+pub fn extract_all(files: &amp;[FileRef]) -&gt; Vec&lt;(FileId, Extraction)&gt; {
     files
         .par_iter()
         .filter_map(|f| {
-            <span class="k">if let</span> Some(hit) = cache::get(f.content_hash) {
-                <span class="k">return</span> Some((f.id, hit));
+            if let Some(hit) = cache::get(f.content_hash) {
+                return Some((f.id, hit));
             }
-            <span class="k">let</span> tree = parser_for(f.language).parse(&amp;f.source)?;
+            let tree = parser_for(f.language).parse(&amp;f.source)?;
             Some((f.id, extract(&amp;tree, &amp;f.source)))
         })
         .collect()
-}</pre>
-      </div>
-      <p class="f-body">Size the pool from real cores rather than the current <code>min(4, cpu_count()//2)</code>. CodeGraph sizes analysis caches from free RAM as well, which matters at 10k files where the Python implementation peaks at 714 MB.</p>
-    </div>
-
-    <div class="step">
-      <div class="step-head"><h3>8 · Parity harness</h3><span class="fixes">phase 1 · gates every later phase</span></div>
-      <p class="f-body">Structural comparison, not textual — ordinals and iteration order will differ legitimately between implementations. Normalise both sides to sorted sets keyed on stable identity, and run per language so a divergence names the grammar responsible.</p>
-      <div class="codeblock">
-        <span class="codecap">canonical form</span>
-<pre>nodes: sorted (id, kind, path, line, name, exported)
+}</code></pre>
+<p>Size the pool from real cores rather than the current <code>min(4, cpu_count()//2)</code>. CodeGraph sizes analysis caches from free RAM too, which matters at 10k files where Python peaks at 714 MB.</p>
+<h3 id="78-parity-harness--gates-every-phase-after-1">7.8 Parity harness — gates every phase after 1</h3>
+<p>Structural comparison, not textual — ordinals and iteration order differ legitimately between implementations. Normalise both sides to sorted sets keyed on stable identity, and run per language so a divergence names the grammar responsible.</p>
+<pre><code>nodes: sorted (id, kind, path, line, name, exported)
 edges: sorted (source, target, kind, confidence)
-dead:  sorted (id, confidence)</pre>
-      </div>
-      <p class="f-body">Confidence belongs in the comparison. A rewrite that finds the same edges at different confidence changes what the verification gates decide — a behaviour change even though the graph "matches". Expect real divergences from D1; the gate is that each is enumerated and accepted deliberately, not that the count is zero.</p>
-    </div>
+dead:  sorted (id, confidence)</code></pre>
+<p>Confidence belongs in the comparison: a rewrite finding the same edges at different confidence changes what the verification gates decide. Expect real divergences from <strong>D1</strong> — the gate is that each is enumerated and accepted deliberately, not that the count is zero.</p>
+<h3 id="79-consumer-client-and-distribution">7.9 Consumer client and distribution</h3>
+<p>The Python client is a transport, not a port: request/response types, a socket, and auto-spawn of <code>devmap serve</code> if not running. ~400 LOC with no analysis logic. Keeping it that thin is what makes the phase-6 deletion possible.</p>
+<p>Distribution ships the binary per platform — macOS arm64/x86_64, manylinux x86_64/aarch64, Windows x86_64 — built in CI on tag. Because grammars link into the binary, this <strong>replaces</strong> the existing <code>devcouncil-codeintel-grammars</code> companion package rather than sitting alongside it; plan that deprecation deliberately.</p>
+<hr />
+<h2 id="8-risks">8. Risks</h2>
+<ul>
+<li><strong>No value until cutover.</strong> 34–46 weeks before anything improves for a user; staleness and query latency persist throughout. Inherent to the clean-room choice, not a flaw in the plan.</li>
+<li><strong>The estimate is a lower bound.</strong> It was derived from the 49% of the subsystem the audit opened. The unread half contains the two largest files (<code>repo_mapper.py</code>, <code>wiring.py</code>) and three concerns with no home in the architecture — see §4.5.</li>
+<li><strong>The §4 inventory is the thing most likely to be skipped, and most costly to skip.</strong> Capability loss from a clean-room rewrite is silent by construction: nothing fails, the graph is merely poorer. The <code>wiring.py</code> exemption rules are the sharpest case — losing one does not break a build, it makes <code>dev map dead</code> report entry points as dead, and a dead-code report nobody trusts is worse than none.</li>
+<li><strong>The 35-language matrix is the schedule</strong>, not the Rust — 2.5× GitNexus, 1.75× CodeGraph, each needing parity evidence.</li>
+<li><strong>D1 guarantees divergence.</strong> Moving Python onto tree-sitter will change extractions. The gate is enumerated-and-accepted, not zero-diff, and someone must make those calls.</li>
+<li><strong>B3 and N2 must ship together.</strong> Differential writes without deletion reconciliation leave deleted files in the graph permanently — worse than the slowness being fixed.</li>
+<li><strong>37 contracts, mostly unwritten.</strong> Phase 1 exists to find them before phase 6 depends on them.</li>
+<li><strong>Token work is separable.</strong> T1–T3 are generated by Python today and could ship in days — 129k tokens reduced to ~2k without waiting for the rewrite. Holding them until phase 5 is a deliberate choice worth revisiting if the schedule slips.</li>
+</ul>
+<hr />
+<h2 id="9-distribution-surfaces--mcp-and-plugin-packaging">9. Distribution surfaces — MCP and plugin packaging</h2>
+<p>Added 2026-09-02. §1–§8 plan the <em>engine</em>; this section plans the two surfaces the engine is consumed through. Both moved under the port, and neither appears in the phase ledger.</p>
+<p><strong>A naming correction first, because it changes what has to be done.</strong> There is no "MCP 2.0" protocol version — the specification is date-versioned, and the current revision is <strong>2026-07-28</strong>. What this repository pins is the <em>Python SDK</em> major version: <code>pyproject.toml:18</code> reads <code>mcp&gt;=2.0.0,&lt;3</code>. Those are different things with different risk: the SDK constraint admits any 2.x, and 2.x is the line that carries the 2026-07-28 protocol, so <strong>this repository has already accepted the largest breaking revision in MCP's history through a version range, without a compatibility statement anywhere in the tree.</strong> Likewise "Plugin 1.0" resolves to two distinct standards — Claude Code's own plugin format and the separate <strong>Agent Plugins 1.0</strong> coalition spec, which Claude Code did <em>not</em> adopt. §9.2 treats them separately.</p>
+<h3 id="91-mcp-2026-07-28--accepted-exposure">9.1 MCP 2026-07-28 — accepted exposure</h3>
+<p>The revision is described by its authors as the largest since launch. Three changes are breaking, and DevCouncil's server (<code>src/devcouncil/integrations/mcp/server.py</code>) is exposed to all three by virtue of the open <code>&lt;3</code> bound.</p>
+<table>
+<thead>
+<tr>
+<th>Change</th>
+<th>Nature</th>
+<th>DevCouncil exposure</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Stateless core</strong> — <code>initialize</code>/<code>initialized</code> handshake and <code>Mcp-Session-Id</code> removed; each request self-describes protocol version, client identity and capabilities in <code>_meta</code></td>
+<td>breaking</td>
+<td>Server is <code>stdio_server</code> only, so no session header today; the risk is the <em>inverse</em> — a stateless core plus <code>Store</code>-backed handles means per-request store opens unless a handle is minted explicitly</td>
+</tr>
+<tr>
+<td><strong>Multi Round-Trip Requests</strong> replace server-initiated <code>elicitation/create</code>, <code>sampling/createMessage</code>, <code>roots/list</code>; server returns <code>resultType: "input_required"</code>, client retries with <code>inputResponses</code></td>
+<td>breaking</td>
+<td><strong>Not used</strong> — verified by search over the whole MCP surface. No migration required</td>
+</tr>
+<tr>
+<td><strong>Header-based routing</strong> — <code>Mcp-Method</code> and <code>Mcp-Name</code> headers required on streamable requests</td>
+<td>breaking</td>
+<td>Not applicable while stdio-only; becomes mandatory the moment a remote transport is offered</td>
+</tr>
+<tr>
+<td><strong>Cacheable list results</strong> — <code>ttlMs</code> and <code>cacheScope</code> on <code>tools/list</code>, <code>prompts/list</code>, <code>resources/list</code>, <code>resources/read</code></td>
+<td>additive</td>
+<td><strong>The largest token win available and it is free.</strong> <code>tools/list</code> is re-fetched per session and this repository ships 18 map/graph tools; see R1/T1</td>
+</tr>
+<tr>
+<td><strong>Authorization hardening</strong> — RFC 9207 issuer validation, <code>application_type</code> at registration, credentials bound to issuer; Dynamic Client Registration deprecated for Client ID Metadata Documents</td>
+<td>breaking for remote</td>
+<td>Not applicable to stdio; a hard prerequisite for any hosted deployment</td>
+</tr>
+<tr>
+<td><strong>Extensions framework</strong></td>
+<td>additive</td>
+<td>Formalises Tasks / MCP Apps; no action</td>
+</tr>
+<tr>
+<td>Roots, Sampling, Logging; DCR; legacy HTTP+SSE transport</td>
+<td>deprecated, 12-month minimum offramp</td>
+<td><strong>None in use</strong> — verified by search: no elicitation, sampling, roots or MCP <code>logging/setLevel</code> call site exists (the <code>logger.info</code> calls are Python stdlib logging, a different facility). Deprecation exposure is zero</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Actions, in cost order.</strong></p>
+<ol type="1">
+<li><strong>Pin the protocol, not just the SDK.</strong> Record the protocol revision the server is written against and assert it at startup. An open <code>&lt;3</code> range means a patch upgrade can change the wire contract with no signal — the Class D shape (§3.1) applied to a dependency instead of a daemon.</li>
+<li><strong>Adopt <code>ttlMs</code> / <code>cacheScope</code> on <code>tools/list</code>.</strong> Additive, no migration, and it attacks the same cost T1 and R1 attack: tool definitions are paid for on every request whether or not they are called.</li>
+<li><strong>Write the compatibility statement.</strong> Which revision the server targets, and the verified fact that it uses none of the deprecated features — so a future reader does not re-derive it under deadline. Absent today.</li>
+<li><strong>Do not offer a remote transport until 1–3 land</strong>, because header routing and the authorization changes are prerequisites, not enhancements.</li>
+</ol>
+<h3 id="92-plugin-packaging">9.2 Plugin packaging</h3>
+<p>Two standards, and the difference matters. <strong>Claude Code's format</strong> is a <code>.claude-plugin/plugin.json</code> manifest — optional, with auto-discovery of <code>skills/</code>, <code>commands/</code>, <code>agents/</code>, <code>hooks/hooks.json</code>, <code>.mcp.json</code>, <code>.lsp.json</code> — plus <code>${CLAUDE_PLUGIN_ROOT}</code> / <code>${CLAUDE_PLUGIN_DATA}</code> interpolation, a <code>userConfig</code> schema with a <code>sensitive</code> flag, declared <code>dependencies</code>, and four installation scopes (<code>user</code>, <code>project</code>, <code>local</code>, <code>managed</code>). <strong>Agent Plugins 1.0</strong> is a separate coalition specification; Claude Code did not adopt it, though plugins authored to it can install.</p>
+<p>DevCouncil ships neither. It has the components a plugin packages — an MCP server, skills under <code>.claude/skills/</code>, hooks — distributed by repository checkout instead.</p>
+<p>This bears directly on <strong>SC21</strong> in <a href="STATUS.md">STATUS.md</a>, recorded as "the binary being unreachable outside this repository" and marked closed. It is closed for the <em>binary</em>; the packaging problem it is an instance of is not. A plugin manifest is the mechanism that makes the engine installable, and three of its features map onto open items here:</p>
+<ul>
+<li><code>${CLAUDE_PLUGIN_DATA}</code> is a per-installation writable directory — the correct home for a store that currently lives at a repository-relative <code>.devcouncil/</code> path.</li>
+<li><code>userConfig</code> with <code>sensitive: true</code> is the declared way to take a token without it reaching a config file, which is what the repository's own no-secrets rule requires.</li>
+<li>Declared <code>dependencies</code> and lockfile-driven install (<code>bun.lock</code> / <code>package-lock.json</code>, no lifecycle scripts) is a supply-chain posture the current checkout distribution has no answer to at all.</li>
+</ul>
+<p><strong>Recommendation:</strong> target Claude Code's format, and treat Agent Plugins 1.0 as a portability question to revisit rather than a second target to maintain. Deciding otherwise means maintaining two manifests for one artifact.</p>
+<h3 id="93-the-assert-as-guard-fragility">9.3 The assert-as-guard fragility</h3>
+<p>Not a defect — stated precisely because it would be easy to overstate. <code>call_tool</code> gates database-backed tools with a membership test against <code>_DB_REQUIRED_TOOLS</code>, then narrows the type at each branch with <code>assert db is not None</code>. <strong>The list is currently complete: 26 entries against 24 assert-guarded branches, zero gaps</strong> (the two extras use <code>db</code> outside an assert branch). So there is no live bug.</p>
+<p>The fragility is that nothing <em>enforces</em> that completeness. A tool added to a branch but not to the list is caught only by the assert — and <code>assert</code> is removed under <code>python -O</code>, so the same mistake is a clean rejection in development and an <code>AttributeError</code> from inside a handler in an optimised deployment. There are 91 asserts under <code>src/devcouncil/</code>, 24 in this file alone. This is Class A (§3.1) in its purest form: <strong>a check that cannot run must not be the thing correctness rests on.</strong> The fix is to derive the list from the branches, or to fail closed on an unlisted tool, rather than to add a 25th assert.</p>
+<hr />
+<h2 id="10-worst-case-scenarios">10. Worst-case scenarios</h2>
+<blockquote>
+<p>Execution order and the consolidated open-work register live in <a href="AGENT_PLAN.md#consolidated-open-work-register-2026-09-02">AGENT_PLAN.md</a>. This section owns the scenarios; that register owns what is left to do about them.</p>
+</blockquote>
+<p>Added 2026-09-02. §8 lists risks — things that may go wrong and cost schedule. This section lists the scenarios that would make the port <em>worse than not doing it</em>, with the property that would prevent each. They are chosen because the 2026-09-02 pass demonstrated the mechanism for five of the seven, at smaller scale.</p>
+<p><strong>W1 — The graph asserts code that does not exist, and an agent acts on it.</strong> Demonstrated: tier-2 recovery attributed 457 symbols to Markdown design documents (K3), Go and TypeScript types that were <em>described</em> rather than defined. An agent asked to modify <code>ReasoningBank</code> would have been sent to a design document. Worst case is this at cutover scale with no prose guard and no provenance labelling, in a graph nobody yet distrusts. <em>Prevented by:</em> Class C — provenance on every derived artifact, enforced rather than conventional.</p>
+<p><strong>W2 — Cutover silently drops a language, and nobody notices for months.</strong> Demonstrated: 19 <code>.proto</code> and 17 <code>.ps1</code> files were invisible to the graph while extraction parity was green (K2), because discovery dropped them before the extractor could count them missing. Worst case is the same failure spanning a language someone depends on, past the point where the Python incumbent is still available for comparison. <em>Prevented by:</em> Class B, now implemented — coverage stated over the filesystem, never over the index's own inventory.</p>
+<p><strong>W3 — A green gate certifies an unexamined system.</strong> Demonstrated twice. Search returned zero hits for a matching query with both budget gates green (K4); the freelist gate read a pre-checkpoint counter that reported 0 free pages on a store that was 33% garbage (K5). Worst case: the two-week shadow soak passes because its checks degrade to no-ops under exactly the load it exists to test, and cutover proceeds on it. <em>Prevented by:</em> Class A — an operation that declines to run must not return what success returns. <strong>No gate for this exists yet; it is the highest-value unbuilt item in this plan.</strong></p>
+<p><strong>W4 — Deletion reconciliation is deferred and the graph accumulates ghosts.</strong> Not demonstrated; already stated in §8 as "B3 and N2 must ship together". The worst case is sharper than slowness: a deleted file that stays in the graph makes <code>dead</code> and <code>trace</code> wrong in the direction that <em>invents</em> work, and the failure grows monotonically with time since cutover. <em>Prevented by:</em> shipping B3 and N2 as one work item, which §8 already requires and the phase ledger does not yet enforce.</p>
+<p><strong>W5 — A dependency range changes the wire contract without a signal.</strong> Not demonstrated here, but the exposure is live: <code>mcp&gt;=2.0.0,&lt;3</code> has already accepted the 2026-07-28 breaking revision (§9.1). Worst case is a transitive upgrade during cutover week, diagnosed as a port regression because the port is what changed most visibly. <em>Prevented by:</em> §9.1 action 1 — pin and assert the protocol revision, not just the SDK range.</p>
+<p><strong>W6 — Two writers, one tree, and the evidence is not reproducible.</strong> Demonstrated during this very session: a concurrent session held the workspace, the suite failed in <code>store_hardening</code> and passed in isolation seconds later, and one run failed to <em>build</em> when shared <code>target/</code> artifacts vanished mid-run. Worst case at cutover is a parity failure that cannot be reproduced, attributed to the port, and burns days. <em>Prevented by:</em> parity and soak runs taking an exclusive checkout, and every recorded run carrying the tree state it was taken against. Neither is required today.</p>
+<p><strong>W7 — The measurement that justifies cutover is attributed to the wrong thing.</strong> Demonstrated: the phase profiler reported extraction's 7.25 s beside the word "resolving" and extraction itself as 42 ns (K8), and a code comment inferred from that output asserted the wrong phase was the build's largest — plausible, internally consistent, and wrong. <em>Prevented by:</em> Class E — every measurement carries corpus, date and tier; every derived figure states its derivation.</p>
+<p><strong>The pattern across all seven</strong> is that none is a crash. Each produces a system that runs, answers, and reports success while being wrong — which is why §3.1's classes, not §3's instance list, are what the remaining hardening budget should buy.</p>
+<hr />
+<h2 id="appendix--how-the-measurements-were-taken">Appendix — how the measurements were taken</h2>
+<pre class="bash"><code># Cold-build profile
+python -c &quot;import cProfile; from devcouncil.indexing.graph.build import build_code_graph; ...&quot;
 
-    <div class="step">
-      <div class="step-head"><h3>9 · Consumer client and distribution</h3><span class="fixes">phase 6</span></div>
-      <p class="f-body">The Python client is a transport, not a port: request/response types, a socket, and auto-spawn of <code>devmap serve</code> if it is not running. Roughly 400 LOC with no analysis logic, replacing 26,837. Keeping it that thin is what makes the deletion in phase 6 possible.</p>
-      <p class="f-body">Distribution ships the binary per platform — macOS arm64 and x86_64, manylinux x86_64 and aarch64, Windows x86_64 — built in CI on tag. Because grammars link into the binary, this replaces the existing <code>devcouncil-codeintel-grammars</code> companion package rather than sitting alongside it; plan that deprecation deliberately.</p>
-    </div>
-  </section>
+# Benchmark harness (existing, in-repo)
+python -m pytest tests/performance/test_codeintel_benchmark.py
+# heavy profile via tests/performance/benchmark_harness.run_benchmark(profile=&quot;heavy&quot;)
 
-  <section>
-    <div class="sec-head">
-      <span class="sec-num">Section 08</span>
-      <h2>Risks</h2>
-    </div>
-    <div class="prose">
-      <ul>
-        <li><strong>No value until cutover.</strong> 34–46 weeks before anything improves for a user, and the staleness and query-latency problems persist throughout. This is inherent to the clean-room choice, not a flaw in the plan.</li>
-        <li><strong>The estimate is a lower bound.</strong> It was derived from the 49% of the subsystem the audit opened. The unread half contains the two largest files (<span class="path">repo_mapper.py</span>, <span class="path">wiring.py</span>) and three concerns with no home in the architecture — see §4.5.</li>
-        <li><strong>The §4 inventory is the thing most likely to be skipped, and most costly to skip.</strong> Capability loss from a clean-room rewrite is silent by construction: nothing fails, the graph is merely poorer. The <span class="path">wiring.py</span> exemption rules are the sharpest case — losing one does not break a build, it makes <code>dev map dead</code> report entry points as dead, and a dead-code report nobody trusts is worse than none.</li>
-        <li><strong>The 35-language matrix is the schedule</strong>, not the Rust — 2.5× GitNexus, 1.75× CodeGraph, each needing parity evidence.</li>
-        <li><strong>D1 guarantees divergence.</strong> Moving Python onto tree-sitter will change extractions. The gate is enumerated-and-accepted, not zero-diff, and someone has to make those calls.</li>
-        <li><strong>B3 and N2 must ship together.</strong> Differential writes without deletion reconciliation leave deleted files in the graph permanently — worse than the slowness being fixed.</li>
-        <li><strong>37 contracts, mostly unwritten.</strong> The verification checks encode graph-shape assumptions that exist nowhere but their assertions; phase 1 exists to find them before phase 6 depends on them.</li>
-        <li><strong>Token work is separable.</strong> T1–T3 are generated by Python today and could ship in days — a 129k-token artifact reduced to ~2k without waiting for the rewrite. Holding them until phase 5 is a deliberate choice worth revisiting if the schedule slips.</li>
-      </ul>
-    </div>
-  </section>
+# Storage breakdown
+sqlite3 .devcouncil/codeintel/index.sqlite \
+  &quot;SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY 2 DESC&quot;
 
-  <footer>
-    <span>Audit performed 2026-08-11 against DevCouncil @ 98f23e3 · 769 source files · macOS arm64 · CPython 3.12.13</span>
-    <span>Measurements: cProfile over cold build_code_graph; tests/performance benchmark harness, fast and heavy profiles; SQLite dbstat; direct timing of store.load_graph; byte counts of agent-facing artifacts at 4 chars/token.</span>
-    <span>Reference architectures summarised from github.com/abhigyanpatwari/GitNexus and github.com/colbymchenry/codegraph. Effort estimates are inferred, not derived from comparable work in this repository.</span>
-  </footer>
+# Query cost
+python -c &quot;from devcouncil.codeintel.service import get_codeintel_service; ...&quot;  # times .load()
+
+# Token cost
+wc -c .devcouncil/repo_map.json .devcouncil/graph/code_graph.json   # ÷ 4 for tokens</code></pre>
+<h3 id="kernel-measurements-21--2026-09-02">Kernel measurements (§2.1) — 2026-09-02</h3>
+<p>Everything above profiles the Python incumbent. The kernel figures come from a staged harness instead, because the stages have different fixes and a single wall-clock number hides which one moved:</p>
+<pre class="bash"><code># Staged benchmark: cold / warm / touch / manifest / e2e, min-of-N, scratch store.
+python benchmarks/map_bench.py --repo /path/to/any/tree --repeat 5
+python benchmarks/map_bench.py --repo . --baseline benchmarks/results/map/&lt;earlier&gt;.json
+
+# Per-phase breakdown of one build, straight from the kernel.
+devmap --db /tmp/scratch.sqlite --progress never --json build /path/to/tree | jq .timings</code></pre>
+<p>Two properties of the harness are load-bearing rather than incidental:</p>
+<ul>
+<li><strong>Minimum of N, not mean.</strong> The minimum is the run least contaminated by other load; a mean on a laptop substantially measures what else was scheduled.</li>
+<li><strong>A scratch store, always.</strong> Every stage writes to a temporary database. The real <code>.devcouncil/</code> is never touched, so a benchmark cannot corrupt the working index and a stale working index cannot flatter a benchmark — which it did once during this pass, when a leftover store made a cold build appear <em>faster</em> than a warm one.</li>
+</ul>
+<p>Results land in <code>benchmarks/results/map/&lt;timestamp&gt;.{json,md}</code>; <code>--baseline</code> diffs against an earlier run. Corpus sizes are recorded in each JSON, so a figure can be checked against the tree it came from rather than trusted.</p>
 
 </div>

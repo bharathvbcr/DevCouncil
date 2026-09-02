@@ -28,6 +28,106 @@ pub enum SymbolKind {
     Community,
 }
 
+impl SymbolKind {
+    /// The canonical name of this kind, as persisted.
+    ///
+    /// The store has always written `format!("{:?}", kind)`, which makes the
+    /// `Debug` derive an on-disk format: renaming a variant would silently
+    /// change what every future generation records, and there is no inverse to
+    /// read it back with. This pair states the mapping on purpose. The strings
+    /// are exactly what `Debug` produced, so no existing database or query
+    /// changes meaning — `debug_and_canonical_names_agree` holds them to that.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SymbolKind::File => "File",
+            SymbolKind::Module => "Module",
+            SymbolKind::Class => "Class",
+            SymbolKind::Struct => "Struct",
+            SymbolKind::Enum => "Enum",
+            SymbolKind::Interface => "Interface",
+            SymbolKind::Trait => "Trait",
+            SymbolKind::Function => "Function",
+            SymbolKind::Method => "Method",
+            SymbolKind::Field => "Field",
+            SymbolKind::Variable => "Variable",
+            SymbolKind::Route => "Route",
+            SymbolKind::Endpoint => "Endpoint",
+            SymbolKind::EventSubscriber => "EventSubscriber",
+            SymbolKind::Dependency => "Dependency",
+            SymbolKind::Subsystem => "Subsystem",
+            SymbolKind::Community => "Community",
+        }
+    }
+
+    /// Every variant, so a round-trip test cannot silently miss a new one.
+    pub const ALL: &'static [SymbolKind] = &[
+        SymbolKind::File,
+        SymbolKind::Module,
+        SymbolKind::Class,
+        SymbolKind::Struct,
+        SymbolKind::Enum,
+        SymbolKind::Interface,
+        SymbolKind::Trait,
+        SymbolKind::Function,
+        SymbolKind::Method,
+        SymbolKind::Field,
+        SymbolKind::Variable,
+        SymbolKind::Route,
+        SymbolKind::Endpoint,
+        SymbolKind::EventSubscriber,
+        SymbolKind::Dependency,
+        SymbolKind::Subsystem,
+        SymbolKind::Community,
+    ];
+
+    /// Read a persisted kind back, or `None` for a name this build does not
+    /// know. `None` rather than a `File` fallback: a row written by a newer
+    /// binary carries a kind this one cannot interpret, and quietly relabelling
+    /// it would put a fabricated kind into a report.
+    pub fn from_persisted(name: &str) -> Option<SymbolKind> {
+        SymbolKind::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.as_str() == name)
+    }
+}
+
+#[cfg(test)]
+mod symbol_kind_name_tests {
+    use super::SymbolKind;
+
+    /// The store wrote `Debug` output for years. If `as_str` ever disagrees
+    /// with it, this build starts writing names the previous one cannot read.
+    #[test]
+    fn debug_and_canonical_names_agree() {
+        for kind in SymbolKind::ALL {
+            assert_eq!(
+                format!("{kind:?}"),
+                kind.as_str(),
+                "canonical name diverged from the persisted Debug form"
+            );
+        }
+    }
+
+    #[test]
+    fn every_kind_round_trips() {
+        for kind in SymbolKind::ALL {
+            assert_eq!(
+                SymbolKind::from_persisted(kind.as_str()),
+                Some(*kind),
+                "{kind:?} does not read back"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_kind_is_not_guessed_at() {
+        assert_eq!(SymbolKind::from_persisted("Coroutine"), None);
+        assert_eq!(SymbolKind::from_persisted("function"), None);
+        assert_eq!(SymbolKind::from_persisted(""), None);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EdgeKind {
     Imports,
@@ -265,8 +365,25 @@ pub struct DiscoveryReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParseOutcome {
     Clean,
-    Partial { error_ranges: Vec<TextRange> },
-    Failed { reason: String },
+    Partial {
+        error_ranges: Vec<TextRange>,
+    },
+    Failed {
+        reason: String,
+    },
+    /// No grammar was available and declarations were recovered by pattern
+    /// instead (see [`crate::fallback`]).
+    ///
+    /// Distinct from `Failed` because the two answer different questions and
+    /// consumers act on them differently: `Failed` means the file contributed
+    /// nothing and is retried on every build, while this means the file
+    /// contributed named symbols that were matched rather than parsed. Folding
+    /// it into `Partial` would be worse still — that variant means tree-sitter
+    /// parsed the file and flagged error ranges, a much stronger claim than
+    /// anything this tier can make.
+    Fallback {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,8 +393,24 @@ pub enum ExtractionEngine {
         grammar_version: u32,
     },
     ConfigScanner,
+    /// Declarations recovered by line pattern because no grammar is linked for
+    /// `requested_language`. Symbols carry names and spans but no calls,
+    /// imports or nesting.
+    RegexFallback {
+        requested_language: String,
+    },
     Unavailable {
         requested_language: String,
+    },
+    /// Code reconstructed from a Jupyter notebook's code cells and parsed with
+    /// the kernel's grammar, then relocated back into the raw `.ipynb`.
+    ///
+    /// Distinct from `TreeSitter` because the parse ran over a buffer that does
+    /// not exist on disk: symbols are real declarations, but the notebook is
+    /// not a file the grammar could read directly, and a consumer comparing
+    /// engines should be able to see that.
+    Notebook {
+        kernel_language: String,
     },
 }
 
@@ -300,6 +433,47 @@ pub struct ExtractedSymbol {
     pub signature: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_symbol: Option<String>,
+    /// Body identity for clone detection, or `None` when none was computed.
+    ///
+    /// `None` is load-bearing and means exactly one thing: no signature exists
+    /// for this symbol. That covers a body under the size floor, a symbol kind
+    /// with no comparable body, and a file recovered by the regex fallback
+    /// rather than a grammar. It never means "no duplicates" — a reader that
+    /// treats absence as a negative finding is reading a fact that was never
+    /// recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_signature: Option<BodySignature>,
+    /// Hash of the declaration with its body excluded — the part of a symbol a
+    /// caller depends on. `None` when the grammar gives the declaration no
+    /// `body` field to exclude, so there is nothing to separate.
+    ///
+    /// Unlike [`Self::body_signature`] this is computed for *every* symbol, not
+    /// only those above the size floor: a one-line accessor whose parameter
+    /// list changes breaks its callers exactly as thoroughly as a large one.
+    ///
+    /// **In-memory only — never serialised.** The one consumer, `preview`,
+    /// extracts both the buffer and the current file on disk in the same
+    /// process, so it always has two freshly computed values. Persisting it
+    /// would add a column, a schema version and a cache-invalidation bump to
+    /// carry a number nothing reads back.
+    #[serde(default, skip_serializing)]
+    pub declaration_hash: Option<u64>,
+}
+
+/// Two hashes of one symbol body, from [`crate::clonesig`].
+///
+/// Kept in the model rather than beside the walk that computes it so the query
+/// half of the workspace can read signatures back without the `parse` feature
+/// and its thirty-odd grammars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BodySignature {
+    /// Node kinds *and* leaf text: the same code (Type-1 clone).
+    pub exact: u64,
+    /// Node kinds only: the same shape under renaming (Type-2 clone).
+    pub structural: u64,
+    /// Non-comment nodes hashed. The weight behind a match — a 500-node
+    /// collision is evidence, a 24-node one is a coincidence waiting to happen.
+    pub nodes: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -888,6 +1062,8 @@ mod go_interface_exemption_tests {
             docstring: None,
             signature: None,
             parent_symbol: None,
+            body_signature: None,
+            declaration_hash: None,
         }
     }
 

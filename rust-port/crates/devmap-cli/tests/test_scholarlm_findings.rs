@@ -599,6 +599,7 @@ fn manifest_emits_consumer_keys_agents_are_told_to_read() {
             head_sha: "abc".into(),
             generation_id: 1,
             pending_count: 0,
+            stamped: Default::default(),
         },
         &result.edges,
     );

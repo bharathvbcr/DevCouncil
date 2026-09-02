@@ -19,6 +19,10 @@ fn outcome(extraction: &Extraction) -> String {
         ParseOutcome::Clean => "Clean".to_string(),
         ParseOutcome::Partial { error_ranges } => format!("Partial({})", error_ranges.len()),
         ParseOutcome::Failed { .. } => "Failed".to_string(),
+        // Tier-2 pattern recovery. Metal is routed onto the C++ grammar, so it
+        // should never reach this arm; naming it here rather than matching `_`
+        // keeps that a checked expectation instead of an assumption.
+        ParseOutcome::Fallback { .. } => "Fallback".to_string(),
     }
 }
 

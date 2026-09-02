@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Already a workspace dependency built for devmap-extract and devmap-store, so
+# no new crate enters the tree; resolution is the last serial CPU phase.
+rayon.workspace = true
 devmap-extract = { path = "../devmap-extract", default-features = false }
 serde.workspace = true
 

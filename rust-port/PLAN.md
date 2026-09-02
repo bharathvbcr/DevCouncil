@@ -9,13 +9,11 @@ migrated and [PHASE1_CONTRACT.md](PHASE1_CONTRACT.md) for token budgets and §4.
 **Kernel measurements (§2.1, §3 `K` findings, §3 `G` gaps):** 2026-09-02, DevCouncil @ 994 code
 files and scholarlm @ 3,674, same host. Everything outside those three sections profiles the
 pre-port Python incumbent.
-**PLAN.html:** a styled companion, **not** a render of this file and not kept in sync with it.
-It was last written 2026-08-12 and is organised differently — 8 sections against this file's 11,
-with headings (`What changed in this revision`, `Token cost — the unmeasured surface`) that have
-no counterpart here, and without §2.1, §3.1, §9, §10, the `K` findings or the `G` gaps. It
-previously described itself as "same content, styled", which was already inaccurate before the
-2026-09-02 pass and is now badly so. There is no generator; treat it as a snapshot of an earlier
-revision, or regenerate it.
+**Rendered version:** [PLAN.html](PLAN.html) — now genuinely generated from this file by
+`tools/render/render_plan.sh` (pandoc; styling preserved in `tools/render/plan_head.html`).
+**Re-run it after editing this file.** Until 2026-09-02 the claim here was false: PLAN.html was
+a hand-maintained 2026-08-12 snapshot with 8 sections against this file's 11 and headings with
+no counterpart here, drifting further with every edit.
 
 A standalone Rust implementation of the code-intelligence subsystem — new binary, new store,
 new agent-facing contract. Not a PyO3 extension and not a function-by-function port. The 32

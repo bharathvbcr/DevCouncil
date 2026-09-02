@@ -149,12 +149,17 @@ fn consumer_manifest_json(
         if !ext.language.is_empty() && ext.language != "unknown" {
             languages.insert(ext.language.clone());
         }
+        // No `summary` key. It was emitted as a constant `""` on every one of
+        // these entries — 1,306 of them on this repository — and nothing reads
+        // it: not the Python consumers, not the agent guides, not the visualizer
+        // (which reads `summary` off *subsystems*, a different structure that
+        // keeps its own). A field that always holds the same empty value is
+        // bytes in a file agents are told to open, and nothing else.
         files.push(json!({
             "path": ext.file_path,
             "area": file_area(&ext.file_path),
             "kind": "code",
             "language": ext.language,
-            "summary": "",
         }));
     }
     files.sort_by(|left, right| {
@@ -226,9 +231,16 @@ fn consumer_manifest_json(
         "subsystems": subsystems,
         "dependents": dependents,
         "dependents_total": dependents_total,
-        "generated_head": freshness.head_sha,
-        "indexed_hash": "",
-        "content_fingerprint": "",
+        // Caller-supplied when available, empty otherwise — the same rule the
+        // code graph applies, from the same `FreshnessInfo`, so the two
+        // artifacts cannot disagree about how fresh they are.
+        "generated_head": freshness.generated_head(),
+        "indexed_hash": freshness.stamped.indexed_hash.clone().unwrap_or_default(),
+        "content_fingerprint": freshness
+            .stamped
+            .content_fingerprint
+            .clone()
+            .unwrap_or_default(),
         "graph_degraded": false,
         "graph_degraded_reason": "",
         "lsp": {},
@@ -247,7 +259,93 @@ fn consumer_manifest_json(
         "map_engine": CONSUMER_MAP_ENGINE,
         "freshness": freshness,
     });
-    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+    // Compact, not pretty. This artifact is not read by a person: it is the
+    // file the agent guides instruct an agent to open before searching, and on
+    // this repository indentation and newlines were 22% of it — 23,000 tokens
+    // of whitespace in a 105,000-token file.
+    //
+    // It is not, however, evicting content: the *lean* manifest that feeds this
+    // one is separately budgeted at 8,000 bytes and measures 5,524 pretty, so
+    // nothing was being dropped to make room for the formatting. This is a size
+    // win, not a recovery — `code_graph.json` was compacted for the same reason
+    // earlier in this pass.
+    serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+}
+
+#[cfg(all(test, feature = "parse"))]
+mod wire_format_tests {
+    use super::*;
+    use devmap_extract::extract_file;
+
+    fn manifest_json() -> String {
+        let extractions = vec![
+            extract_file("src/a.py", "def one():\n    return 1\n"),
+            extract_file("src/b.py", "def two():\n    return 2\n"),
+        ];
+        let analysis = AnalysisSummary {
+            total_files: 2,
+            total_symbols: 2,
+            total_edges: 0,
+            dead_symbols: Vec::new(),
+            communities: Vec::new(),
+            status: AnalysisStatus::Ok,
+            unresolved_calls: 0,
+            clone_coverage: Default::default(),
+        };
+        let freshness = FreshnessInfo::new("head".into(), 1, 0);
+        let (_, json) = generate_manifest_with_edges(&extractions, &analysis, freshness, &[]);
+        json
+    }
+
+    /// The artifact agents are told to open must not spend a quarter of itself
+    /// on indentation. Measured on this repository, pretty-printing was 22% of
+    /// `repo_map.json`; with the constant `summary` field it came to 26.2%,
+    /// 27,578 tokens.
+    #[test]
+    fn the_consumer_manifest_is_not_pretty_printed() {
+        let json = manifest_json();
+        assert!(
+            !json.contains("\n  \""),
+            "the consumer manifest is indented; this is a file for a machine to \
+             read and the whitespace is a fifth of it"
+        );
+        // Still valid JSON, and still the schema consumers index into.
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        for key in [
+            "files",
+            "dependents",
+            "subsystems",
+            "entry_roots",
+            "map_engine",
+        ] {
+            assert!(parsed.get(key).is_some(), "consumer key {key} disappeared");
+        }
+    }
+
+    /// `summary` was emitted as a constant empty string on every file entry.
+    /// Nothing read it. Subsystems keep theirs, because the visualizer indexes
+    /// it directly and would raise on its absence.
+    #[test]
+    fn file_entries_carry_no_constant_summary_but_subsystems_keep_theirs() {
+        let parsed: serde_json::Value = serde_json::from_str(&manifest_json()).unwrap();
+        let files = parsed["files"].as_array().expect("files is an array");
+        assert!(!files.is_empty(), "fixture produced no files");
+        for file in files {
+            assert!(
+                file.get("summary").is_none(),
+                "a constant empty summary is back on file entries: {file}"
+            );
+            for key in ["path", "area", "kind", "language"] {
+                assert!(file.get(key).is_some(), "file entry lost {key}: {file}");
+            }
+        }
+        for subsystem in parsed["subsystems"].as_array().unwrap_or(&Vec::new()) {
+            assert!(
+                subsystem.get("summary").is_some(),
+                "subsystem summary was removed; map_viz.py indexes it directly"
+            );
+        }
+    }
 }
 
 fn file_area(path: &str) -> String {
@@ -349,6 +447,7 @@ mod tests {
             head_sha: "abc123".to_string(),
             generation_id: 1,
             pending_count: 0,
+            stamped: Default::default(),
         }
     }
 
@@ -361,6 +460,7 @@ mod tests {
             communities: Vec::new(),
             status: AnalysisStatus::Ok,
             unresolved_calls: 0,
+            clone_coverage: Default::default(),
         }
     }
 

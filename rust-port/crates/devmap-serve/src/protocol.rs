@@ -86,6 +86,11 @@ pub enum IpcCommand {
         query: String,
         #[serde(default = "default_budget")]
         budget: u32,
+        /// Rank by name similarity instead of FTS5 prefix matching.
+        /// `serde(default)` is false, so a client that predates this field
+        /// gets exactly the search it always got.
+        #[serde(default)]
+        semantic: bool,
     },
     Deps {
         target: String,
@@ -114,6 +119,34 @@ pub enum IpcCommand {
         #[serde(default = "default_budget")]
         budget: u32,
     },
+    Preview {
+        /// Repository-relative path the buffer would be written to.
+        file: String,
+        /// The candidate content itself. Bounded by `MAX_REQUEST_BYTES`
+        /// (1 MiB) on the whole frame, which is also the extractor's own
+        /// `MAX_SOURCE_BYTES` ceiling — a buffer too large to preview is
+        /// refused at the frame, before anything tries to parse it.
+        content: String,
+        #[serde(default = "default_budget")]
+        budget: u32,
+        #[serde(default = "default_preview_confidence")]
+        min_confidence: f32,
+    },
+    Clones {
+        #[serde(default = "default_budget")]
+        budget: u32,
+        /// `exact`, `structural`, or absent for both. Rejected rather than
+        /// silently ignored when it is anything else, so a typo cannot come
+        /// back as a full report the caller reads as filtered.
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        min_nodes: u32,
+    },
+}
+
+fn default_preview_confidence() -> f32 {
+    devmap_query::PREVIEW_CALLER_MIN_CONFIDENCE
 }
 
 #[derive(Debug, Serialize)]
@@ -156,7 +189,7 @@ fn failure(code: &'static str, message: impl Into<String>) -> Envelope {
 fn validate_request(request: &IpcRequest) -> Result<(), String> {
     let (text, budget, depth, min_confidence) = match &request.command {
         IpcCommand::Status => return Ok(()),
-        IpcCommand::Search { query, budget } => (query.as_str(), *budget, 1, None),
+        IpcCommand::Search { query, budget, .. } => (query.as_str(), *budget, 1, None),
         IpcCommand::Deps {
             target,
             budget,
@@ -182,6 +215,26 @@ fn validate_request(request: &IpcRequest) -> Result<(), String> {
             (from.as_str(), *budget, *depth, None)
         }
         IpcCommand::Dead { budget } => ("", *budget, 1, None),
+        IpcCommand::Preview {
+            file,
+            budget,
+            min_confidence,
+            ..
+        } => (file.as_str(), *budget, 1, Some(*min_confidence)),
+        IpcCommand::Clones { budget, kind, .. } => {
+            // Asks the parser rather than re-listing the names: a third kind
+            // added later must not be accepted here and then silently ignored
+            // by the filter, which is how a caller ends up reading an
+            // unfiltered report as a filtered one.
+            if let Some(kind) = kind {
+                if devmap_query::parse_clone_kind(kind).is_none() {
+                    return Err(format!(
+                        "clone kind must be 'exact' or 'structural', got '{kind}'"
+                    ));
+                }
+            }
+            ("", *budget, 1, None)
+        }
     };
     if text.len() > MAX_QUERY_BYTES {
         return Err(format!("query exceeds {MAX_QUERY_BYTES} bytes"));
@@ -220,13 +273,22 @@ fn dispatch(store: &Store, request: IpcRequest) -> anyhow::Result<Value> {
                 "quarantined_count": status.quarantined_count,
             }))
         }
-        IpcCommand::Search { query, budget } => {
-            Ok(serde_json::to_value(engine.search(Request {
-                query,
-                token_budget: budget,
-                min_confidence: 0.0,
-                max_depth: 1,
-            })?)?)
+        IpcCommand::Search {
+            query,
+            budget,
+            semantic,
+        } => {
+            let response = if semantic {
+                engine.search_semantic(&query, budget)?
+            } else {
+                engine.search(Request {
+                    query,
+                    token_budget: budget,
+                    min_confidence: 0.0,
+                    max_depth: 1,
+                })?
+            };
+            Ok(serde_json::to_value(response)?)
         }
         IpcCommand::Deps {
             target,
@@ -272,6 +334,29 @@ fn dispatch(store: &Store, request: IpcRequest) -> anyhow::Result<Value> {
             Ok(serde_json::to_value(response)?)
         }
         IpcCommand::Dead { budget } => Ok(serde_json::to_value(engine.dead_symbols(budget)?)?),
+        IpcCommand::Preview {
+            file,
+            content,
+            budget,
+            min_confidence,
+        } => Ok(serde_json::to_value(engine.preview(
+            &file,
+            &content,
+            budget,
+            min_confidence,
+        )?)?),
+        IpcCommand::Clones {
+            budget,
+            kind,
+            min_nodes,
+        } => {
+            // `validate` has already rejected any kind string that is neither
+            // of the two, so `None` here means "no filter requested".
+            let wanted = kind.as_deref().and_then(devmap_query::parse_clone_kind);
+            Ok(serde_json::to_value(
+                engine.clones(budget, wanted, min_nodes)?,
+            )?)
+        }
     }
 }
 
@@ -533,8 +618,6 @@ fn lock_ipc_endpoint(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
 /// must stay bounded even when the endpoint is hostile.
 #[cfg(unix)]
 fn probe_endpoint_liveness(path: &std::path::Path) -> Option<bool> {
-    use std::sync::mpsc;
-
     let probe_path = path.to_path_buf();
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -887,7 +970,11 @@ mod tests {
     fn request_bounds_are_exclusive_and_each_limit_is_enforced() {
         let search = |query: String, budget: u32| IpcRequest {
             version: 1,
-            command: IpcCommand::Search { query, budget },
+            command: IpcCommand::Search {
+                query,
+                budget,
+                semantic: false,
+            },
         };
 
         // Query length: at the limit is fine, one byte over is not.
@@ -1139,6 +1226,63 @@ mod tests {
         let value: Value = serde_json::from_str(response.trim()).unwrap();
         assert_eq!(value["ok"], false);
         assert_eq!(value["error"]["code"], "invalid_parameters");
+    }
+
+    /// A client that predates `semantic` must get exactly the search it always
+    /// got, not a different ranking because a field defaulted oddly.
+    #[test]
+    fn a_search_request_without_the_semantic_field_is_the_keyword_search() {
+        let legacy: IpcRequest =
+            serde_json::from_str(r#"{"version":1,"cmd":"search","query":"x","budget":100}"#)
+                .unwrap();
+        assert!(validate_request(&legacy).is_ok());
+        match legacy.command {
+            IpcCommand::Search { semantic, .. } => {
+                assert!(!semantic, "an absent `semantic` field defaulted to true");
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+
+        let explicit: IpcRequest = serde_json::from_str(
+            r#"{"version":1,"cmd":"search","query":"x","budget":100,"semantic":true}"#,
+        )
+        .unwrap();
+        match explicit.command {
+            IpcCommand::Search { semantic, .. } => assert!(semantic),
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    /// A typo in `kind` must be refused, not answered.
+    ///
+    /// Silently ignoring an unrecognised kind returns the full report to a
+    /// caller who asked for half of it, and nothing in the response says the
+    /// filter did not apply.
+    #[test]
+    fn clones_protocol_refuses_an_unknown_kind_rather_than_ignoring_it() {
+        let good: IpcRequest = serde_json::from_str(
+            r#"{"version":1,"cmd":"clones","budget":2000,"kind":"structural"}"#,
+        )
+        .unwrap();
+        assert!(validate_request(&good).is_ok());
+
+        let bare: IpcRequest = serde_json::from_str(r#"{"version":1,"cmd":"clones"}"#).unwrap();
+        assert!(validate_request(&bare).is_ok(), "kind is optional");
+
+        let typo: IpcRequest =
+            serde_json::from_str(r#"{"version":1,"cmd":"clones","budget":2000,"kind":"exakt"}"#)
+                .unwrap();
+        let err = validate_request(&typo).unwrap_err();
+        assert!(
+            err.contains("exakt"),
+            "error must name the rejected value: {err}"
+        );
+
+        let over_budget: IpcRequest =
+            serde_json::from_str(r#"{"version":1,"cmd":"clones","budget":4294967295}"#).unwrap();
+        assert!(validate_request(&over_budget)
+            .unwrap_err()
+            .contains("token budget"));
     }
 
     #[test]

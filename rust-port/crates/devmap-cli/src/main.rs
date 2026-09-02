@@ -11,8 +11,8 @@ use devmap_extract::collect_go_modules;
 use devmap_query::{
     generate_code_graph_json, generate_manifest_with_edges, resolve_manifest_output,
     resolved_edge_from_stored, semantic_snapshots, write_code_graph_atomically,
-    write_manifest_atomically, FreshnessInfo, Request, ResolutionAvailability, StoreQueryEngine,
-    CODE_GRAPH_DEFAULT_OUTPUT,
+    write_manifest_atomically, FreshnessInfo, Request, ResolutionAvailability, StampedFreshness,
+    StoreQueryEngine, CODE_GRAPH_DEFAULT_OUTPUT,
 };
 use devmap_resolve::{Resolver, UnresolvedClass};
 use devmap_serve::{default_ipc_path_for, Daemon};
@@ -20,6 +20,19 @@ use devmap_store::{
     current_git_head, extract_tree_cached_with_report, GenerationWriteOpts, Store,
     GENERATION_RETENTION,
 };
+
+/// `Some(value)` for a non-blank flag, `None` otherwise.
+///
+/// A flag passed as the empty string is a caller whose own computation failed,
+/// not a caller reporting an empty digest. Treating the two the same would
+/// stamp `""` into the artifact as if it were an answer.
+fn non_empty(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
 
 #[derive(Parser)]
 #[command(
@@ -50,9 +63,48 @@ enum ProgressMode {
     Never,
 }
 
+/// One completed stage and the sub-phases that ran inside it.
+struct StageTiming {
+    label: String,
+    seconds: f64,
+    /// Sub-phases closed while this stage was open. Their durations are
+    /// *included* in `seconds`; they break the stage down, they do not add to
+    /// it. Summing both levels would double-count the build.
+    sub: Vec<(String, f64)>,
+}
+
+/// The stage in flight: its label, when it began, and the sub-phases closed
+/// inside it so far.
+///
+/// Named rather than written inline because the tuple appears in a field, a
+/// borrow and two closures, and a reader meeting `(String, Instant, Vec<(String,
+/// f64)>)` in any of them has to reconstruct which position means what.
+type OpenStage = (String, Instant, Vec<(String, f64)>);
+
 struct ProgressReporter {
     enabled: bool,
     started_at: Instant,
+    /// The stage currently running: its label, when it began, and the
+    /// sub-phases closed inside it so far.
+    ///
+    /// A stage's cost is recorded when the stage *ends*, against its own label.
+    /// Attributing it at the next stage boundary — which is what this reporter
+    /// used to do — shifts every measurement one position: on a 13.44 s
+    /// scholarlm build, extraction's 7.25 s was printed beside the word
+    /// "resolving" and extraction itself was reported as 42 ns. A profiler that
+    /// names the wrong phase is worse than none, because the reader acts on it.
+    ///
+    /// A cumulative-only readout ("complete in 2.90s") is the other failure:
+    /// it cannot tell an operator whether a slow build is parsing, resolving,
+    /// or writing, and those have nothing in common as fixes.
+    ///
+    /// `RefCell` because `stage` takes `&self`: the reporter is shared by the
+    /// whole pipeline and must not need a mutable borrow to print.
+    open: std::cell::RefCell<Option<OpenStage>>,
+    /// Stages that have closed, in the order they ran, for `--json` builds.
+    /// Kept so a benchmark or a daemon can consume the breakdown without
+    /// scraping stderr, which is formatted for humans and not a contract.
+    timings: std::cell::RefCell<Vec<StageTiming>>,
 }
 
 impl ProgressReporter {
@@ -67,24 +119,162 @@ impl ProgressReporter {
         Self {
             enabled,
             started_at: Instant::now(),
+            open: std::cell::RefCell::new(None),
+            timings: std::cell::RefCell::new(Vec::new()),
         }
     }
 
-    fn stage(&self, current: usize, message: impl std::fmt::Display) {
+    /// Close the running stage, recording its cost against its own label.
+    fn close_open_stage(&self) {
+        let Some((label, started, sub)) = self.open.borrow_mut().take() else {
+            return;
+        };
+        let seconds = started.elapsed().as_secs_f64();
         if self.enabled {
-            eprintln!("[{current}/{}] {message}", Self::TOTAL_STAGES);
+            eprintln!("      {label} took {:.0}ms", seconds * 1000.0);
+        }
+        self.timings.borrow_mut().push(StageTiming {
+            label,
+            seconds,
+            sub,
+        });
+    }
+
+    /// Record and announce a stage boundary.
+    ///
+    /// Timings are recorded whether or not printing is enabled: `--progress
+    /// never` is about keeping stderr clean, not about declining to measure,
+    /// and the `--json` breakdown must not depend on the human output being on.
+    fn stage(&self, current: usize, message: impl std::fmt::Display) {
+        self.close_open_stage();
+        let rendered = message.to_string();
+        if self.enabled {
+            eprintln!("[{current}/{}] {rendered}", Self::TOTAL_STAGES);
+        }
+        *self.open.borrow_mut() = Some((rendered, Instant::now(), Vec::new()));
+    }
+
+    /// Time one sub-phase, recording it under `label` without printing a stage
+    /// header. Used to break a stage that is too coarse to act on into the
+    /// parts that have different fixes.
+    ///
+    /// The result is returned untouched, including the error case: a phase that
+    /// fails is still a phase that took time, and swallowing the error to keep
+    /// the timing tidy would trade a correct build for a pretty number.
+    fn timed<T, E>(
+        &self,
+        label: &str,
+        work: impl FnOnce() -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        let started = Instant::now();
+        let outcome = work();
+        let elapsed = started.elapsed().as_secs_f64();
+        if self.enabled {
+            eprintln!("      {label} (+{:.0}ms)", elapsed * 1000.0);
+        }
+        match self.open.borrow_mut().as_mut() {
+            Some((_, _, sub)) => sub.push((label.to_string(), elapsed)),
+            // A sub-phase outside any stage would otherwise be dropped
+            // silently. Record it as a stage of its own rather than lose it.
+            None => self.timings.borrow_mut().push(StageTiming {
+                label: label.to_string(),
+                seconds: elapsed,
+                sub: Vec::new(),
+            }),
+        }
+        outcome
+    }
+
+    /// An untimed detail line under the current stage. Does not disturb the
+    /// stage clock, so a note between two phases cannot be mistaken for one.
+    fn note(&self, message: impl std::fmt::Display) {
+        if self.enabled {
+            eprintln!("      {message}");
         }
     }
 
+    /// Close the last stage and print the total.
+    ///
+    /// Deliberately not a `stage` call: completion is an instant, not a span,
+    /// and opening a fifth stage here would leave it running forever and put a
+    /// zero-length entry in the breakdown.
     fn complete(&self, generation_id: u32) {
-        self.stage(
-            Self::TOTAL_STAGES,
-            format_args!(
-                "complete: generation #{generation_id} in {:.2}s",
+        self.close_open_stage();
+        if self.enabled {
+            eprintln!(
+                "[{}/{}] complete: generation #{generation_id} in {:.2}s",
+                Self::TOTAL_STAGES,
+                Self::TOTAL_STAGES,
                 self.started_at.elapsed().as_secs_f64()
-            ),
-        );
+            );
+        }
     }
+
+    /// The recorded breakdown as `{stage_label: seconds}` plus the total, for
+    /// embedding in a `--json` build result.
+    /// The recorded breakdown, for embedding in a `--json` build result.
+    ///
+    /// Sub-phase seconds are nested inside their stage and are already counted
+    /// in the stage's own `seconds`; a consumer sums one level, never both.
+    /// A stage still running when this is called is reported with its elapsed
+    /// time so far and `"open": true`, because omitting it would make the
+    /// stages silently fail to account for the total.
+    fn timings_json(&self) -> serde_json::Value {
+        let render = |label: &str, secs: f64, sub: &[(String, f64)], open: bool| {
+            let mut entry = serde_json::json!({"stage": label, "seconds": secs});
+            if !sub.is_empty() {
+                entry["sub"] = sub
+                    .iter()
+                    .map(|(l, s)| serde_json::json!({"stage": l, "seconds": s}))
+                    .collect();
+            }
+            if open {
+                entry["open"] = serde_json::Value::Bool(true);
+            }
+            entry
+        };
+        let mut stages: Vec<serde_json::Value> = self
+            .timings
+            .borrow()
+            .iter()
+            .map(|t| render(&t.label, t.seconds, &t.sub, false))
+            .collect();
+        if let Some((label, started, sub)) = self.open.borrow().as_ref() {
+            stages.push(render(label, started.elapsed().as_secs_f64(), sub, true));
+        }
+        serde_json::json!({
+            "stages": stages,
+            "total_seconds": self.started_at.elapsed().as_secs_f64(),
+        })
+    }
+}
+
+#[derive(Subcommand)]
+enum WorkspaceAction {
+    /// Register a repository in this workspace.
+    Add {
+        /// Repository root. Stored canonicalised, so the registry survives a
+        /// caller with a different working directory.
+        path: PathBuf,
+        /// Label for results. Defaults to the directory name.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Remove a repository by name.
+    Remove { name: String },
+    /// List registered repositories and whether each has a readable store.
+    List,
+    /// Search every registered repository at once.
+    Search {
+        query: String,
+        #[arg(short, long, default_value_t = 2000)]
+        budget: u32,
+        #[arg(long)]
+        semantic: bool,
+    },
+    /// Imports in one repository that another repository declares the module
+    /// for. Candidates with evidence, not resolved edges.
+    Links,
 }
 
 #[derive(Subcommand)]
@@ -102,6 +292,11 @@ enum Commands {
         query: String,
         #[arg(short, long, default_value_t = 2000)]
         budget: u32,
+        /// Rank by TF-IDF similarity of symbol names instead of FTS5 prefix
+        /// matching. Finds symbols whose names are *about* the query rather
+        /// than ones that contain it.
+        #[arg(long)]
+        semantic: bool,
     },
     Deps {
         file: String,
@@ -129,6 +324,66 @@ enum Commands {
         #[arg(short, long, default_value_t = 2000)]
         budget: u32,
     },
+    /// Ask what an unsaved edit would do to the graph, without writing it.
+    ///
+    /// Reads the candidate content from `--content` (a file, or `-` for stdin)
+    /// and diffs it against the indexed version of `--file`, reporting symbols
+    /// added, removed and re-declared, plus the calls from other files that a
+    /// removal or re-declaration would break.
+    Preview {
+        /// Path the buffer would be written to. Resolved against the index as
+        /// given, so it must match the indexed path.
+        #[arg(long)]
+        file: String,
+        /// Where the candidate content comes from: a path, or `-` for stdin.
+        #[arg(long, default_value = "-")]
+        content: String,
+        #[arg(short, long, default_value_t = 2000)]
+        budget: u32,
+        /// Confidence a call edge needs to be listed as affected. The default
+        /// excludes the resolver's name-only tier, whose edges are counted
+        /// separately rather than shown.
+        #[arg(long, default_value_t = devmap_query::PREVIEW_CALLER_MIN_CONFIDENCE)]
+        min_confidence: f32,
+    },
+    /// Manage the workspace registry and query across every repository in it.
+    ///
+    /// `devmap serve` indexes one root, which is the right unit for a build and
+    /// the wrong one for a question: "who calls this" does not stop at a
+    /// repository boundary when the caller is a sibling service.
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceAction,
+    },
+    /// Report what the map cost against what reading files would have.
+    ///
+    /// Every figure is bytes divided by 4, which is an estimate and is labelled
+    /// one. With `--query`, also reports one search's actual token spend beside
+    /// the size of the files that search pointed into.
+    Savings {
+        /// Optional search to account for, in addition to the corpus figures.
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(short, long, default_value_t = 2000)]
+        budget: u32,
+    },
+    /// Report duplicated symbol bodies in the latest generation.
+    ///
+    /// `exact` groups are the same code modulo formatting and comments;
+    /// `structural` groups are the same shape under renaming, and are limited
+    /// to callables.
+    Clones {
+        #[arg(short, long, default_value_t = 2000)]
+        budget: u32,
+        /// Report only one kind. Both are reported by default.
+        #[arg(long, value_parser = ["exact", "structural"])]
+        kind: Option<String>,
+        /// Drop groups whose smallest body is under this many parse nodes.
+        /// Raises the floor for this query only; it cannot lower it below the
+        /// one signatures were computed with.
+        #[arg(long, default_value_t = 0)]
+        min_nodes: u32,
+    },
     /// Write the consumer artifacts: `repo_map.json` and its symbol-level
     /// companion `code_graph.json`.
     ///
@@ -147,6 +402,28 @@ enum Commands {
         /// Replace a Python-schema or otherwise foreign repo map / code graph.
         #[arg(long, default_value_t = false)]
         force: bool,
+        /// Caller-computed `generated_head` to stamp into both artifacts.
+        ///
+        /// The three stamp flags exist because the kernel cannot compute these
+        /// values and the caller can. `devcouncil.devmap_engine.stamp_freshness`
+        /// used to add them by reading each finished artifact back, parsing it,
+        /// setting three scalars and re-serializing the whole thing — 1.68 s of
+        /// a 2.72 s `dev map` on this repository, almost all of it Python
+        /// re-encoding a 26 MB graph the kernel had just encoded.
+        ///
+        /// Passing them in means they are written once, by the writer, at
+        /// generation time. Omitted, the artifacts carry the empty values and
+        /// their `meta.devmap_rust.unavailable` markers exactly as before: a
+        /// value is stamped only when a caller supplies a real one, and never
+        /// invented here.
+        #[arg(long)]
+        generated_head: Option<String>,
+        /// Caller-computed `indexed_hash` (SHA-1 over the git file list).
+        #[arg(long)]
+        indexed_hash: Option<String>,
+        /// Caller-computed `content_fingerprint` (SHA-1 over size+mtime).
+        #[arg(long)]
+        content_fingerprint: Option<String>,
     },
     Status,
     /// Longitudinal view: how the map has moved across recent builds.
@@ -281,6 +558,165 @@ fn emit_dead(resp: &devmap_query::Response<devmap_analyze::DeadSymbolReport>) {
         );
     }
     emit_truncation(resp.shown, resp.hidden, resp.total, resp.truncated);
+}
+
+fn emit_savings(report: &devmap_query::SavingsReport) {
+    let tokens = |bytes: u64| bytes / u64::from(devmap_query::BYTES_PER_TOKEN);
+    println!("basis: {}", report.basis);
+    println!(
+        "corpus:   {} files, {} bytes  (~{} tokens to read in full)",
+        report.indexed_files,
+        report.corpus_bytes,
+        tokens(report.corpus_bytes)
+    );
+    if report.corpus_files_unreadable > 0 {
+        // Named, not folded into the total as zero: an unread file makes the
+        // corpus look smaller, which makes the map look better.
+        println!(
+            "          {} indexed file(s) could not be read and are excluded from that total",
+            report.corpus_files_unreadable
+        );
+    }
+    match report.repo_map_bytes {
+        Some(bytes) => println!("repo_map: {} bytes  (~{} tokens)", bytes, tokens(bytes)),
+        None => println!("repo_map: not written yet"),
+    }
+    let Some(query) = &report.query else {
+        println!("(pass --query to account for one search)");
+        return;
+    };
+    println!(
+        "query {:?}: {} hit(s) across {} file(s)",
+        query.query, query.hits, query.files_named
+    );
+    println!("  map answer cost:        {} tokens", query.answer_tokens);
+    println!(
+        "  reading those files:    ~{} tokens ({} bytes)",
+        tokens(query.files_bytes),
+        query.files_bytes
+    );
+    if query.files_unreadable > 0 {
+        println!(
+            "  {} named file(s) could not be read and are excluded",
+            query.files_unreadable
+        );
+    }
+    let alternative = tokens(query.files_bytes);
+    if alternative > u64::from(query.answer_tokens) {
+        println!(
+            "  floor on the saving:    ~{} tokens, and only for a reader who already \
+             knew which files to open",
+            alternative - u64::from(query.answer_tokens)
+        );
+    } else {
+        // Said plainly rather than suppressed. On a tiny corpus, or a query
+        // whose hits live in small files, the map is not cheaper — and a
+        // savings report that can only ever report a saving is advertising.
+        println!("  no saving on this query: the files are smaller than the answer");
+    }
+}
+
+fn emit_preview(report: &devmap_query::PreviewReport) {
+    println!("{}  parse={}", report.file_path, report.parse_status);
+    if report.compared_against == "nothing" {
+        println!("note: no file at this path; every symbol reads as added");
+    }
+    if !report.file_is_indexed {
+        println!("note: this file is not in the index; no caller graph is available for it");
+    }
+    if let Some(reason) = &report.degraded_reason {
+        println!("note: {reason}");
+    }
+    if !report.delta_available {
+        // The reason above already says why. Printing an empty symbol list
+        // underneath it would read as "no changes".
+        return;
+    }
+    for symbol in &report.symbols {
+        let change = match symbol.change {
+            devmap_query::PreviewChange::Added => "added",
+            devmap_query::PreviewChange::Removed => "removed",
+            devmap_query::PreviewChange::SignatureChanged => "signature",
+            devmap_query::PreviewChange::BodyChanged => "body",
+            devmap_query::PreviewChange::Changed => "changed",
+        };
+        println!("{change:<11} {} ({})", symbol.qualified_name, symbol.kind);
+    }
+    if report.symbols.is_empty() {
+        println!("no symbol-level change");
+    }
+    if report.bodies_not_compared > 0 {
+        println!(
+            "{} symbol(s) declared identically but not body-compared \
+             (below the signature size floor, or no grammar)",
+            report.bodies_not_compared
+        );
+    }
+    for caller in &report.broken_callers.items {
+        // `caller_symbol` and `target_symbol` are already `path::Name`, so the
+        // file is not printed again beside them.
+        println!(
+            "  affects  {}  ->  {}  ({:.2})",
+            caller.caller_symbol, caller.target_symbol, caller.confidence
+        );
+    }
+    if report.broken_callers.total == 0 {
+        println!("no calls from other files are affected");
+    }
+    if report.ambiguous_callers > 0 {
+        println!(
+            "{} further call edge(s) fell below the confidence floor and are not \
+             listed (usually a bare method name matching many definitions); \
+             pass --min-confidence 0 to see them",
+            report.ambiguous_callers
+        );
+    }
+    emit_truncation(
+        report.broken_callers.shown,
+        report.broken_callers.hidden,
+        report.broken_callers.total,
+        report.broken_callers.truncated,
+    );
+}
+
+fn emit_clones(report: &devmap_query::CloneReport) {
+    if let ResolutionAvailability::Unavailable { reason } = &report.groups.resolution {
+        emit_unavailable(reason);
+        return;
+    }
+    for group in &report.groups.items {
+        let kind = match group.kind {
+            devmap_analyze::CloneKind::Exact => "exact",
+            devmap_analyze::CloneKind::Structural => "structural",
+        };
+        println!(
+            "{kind}  {} members  {} nodes  #{:016x}",
+            group.members.len(),
+            group.min_nodes,
+            group.signature
+        );
+        for member in &group.members {
+            println!(
+                "    {}:{}  {}",
+                member.file_path, member.span_start, member.symbol_name
+            );
+        }
+        if group.members_omitted > 0 {
+            println!("    ... {} more members not listed", group.members_omitted);
+        }
+    }
+    // Always printed, including when nothing was found: "no duplicates" and
+    // "nothing was examined" are different answers and must not print the same.
+    println!(
+        "coverage: {} symbols signed, {} unsigned",
+        report.signed_symbols, report.unsigned_symbols
+    );
+    emit_truncation(
+        report.groups.shown,
+        report.groups.hidden,
+        report.groups.total,
+        report.groups.truncated,
+    );
 }
 
 /// Files whose edges a change can reach, or `None` for a full resolve.
@@ -571,13 +1007,30 @@ async fn main() -> anyhow::Result<()> {
                     analysis.total_symbols, analysis.total_edges
                 ),
             );
-            let gen_id = store.save_generation_with_metadata(
-                &extractions,
-                &resolution,
-                &analysis,
-                opts,
-                &head_sha,
-            )?;
+            // Persistence is timed in four parts rather than one. It is the
+            // third-largest phase of a cold build after extraction and
+            // resolution (28% on a 4,089-file corpus), but it is larger on an
+            // *incremental* build than on a cold one — 2,448 ms against
+            // 1,490 ms on this repository — which is backwards on its face and
+            // is the visible edge of B3. A single "persisting" span could not
+            // say which of the write, the two prunes, or the VACUUM was
+            // responsible, and they have nothing in common as fixes.
+            //
+            // These four sub-phases were the only trustworthy part of the old
+            // breakdown: they are measured by `timed`, which brackets its own
+            // work, while the top-level stages were shifted by one until K8.
+            // An earlier version of this comment called persistence "the
+            // largest phase of a build" — that was read off the shifted
+            // attribution and was never true.
+            let gen_id = progress.timed("persist:write", || {
+                store.save_generation_with_metadata(
+                    &extractions,
+                    &resolution,
+                    &analysis,
+                    opts,
+                    &head_sha,
+                )
+            })?;
 
             // Every generation carries a full carry-forward copy of the
             // repository. Without this the store grows by O(repository size)
@@ -585,12 +1038,27 @@ async fn main() -> anyhow::Result<()> {
             // generations, so both must bound retention. Reclaim afterwards:
             // deleting rows returns pages to the freelist, not to the
             // filesystem, so a pruned database otherwise never shrinks.
-            store.prune_generations_except_latest(GENERATION_RETENTION)?;
+            progress.timed("persist:prune_generations", || {
+                store.prune_generations_except_latest(GENERATION_RETENTION)
+            })?;
             // After the generations go, drop cached extractions none of the
             // survivors reference (SC7). Order matters: this reads
             // generation_files, so it must see the pruned set.
-            store.prune_extraction_cache()?;
-            store.vacuum_if_needed()?;
+            progress.timed("persist:prune_extractions", || {
+                store.prune_extraction_cache()
+            })?;
+            let vacuum = progress.timed("persist:vacuum", || store.vacuum_if_needed())?;
+            // Report what the reclaim decided, not just how long it took. A
+            // decline and a reclaim-that-reclaimed-nothing both take ~0 ms and
+            // leave the same file behind, so the duration alone cannot tell a
+            // healthy store from one growing without bound.
+            progress.note(format_args!(
+                "reclaim: {} at {:.1}% free ({} of {} pages)",
+                vacuum.action,
+                vacuum.freelist_ratio() * 100.0,
+                vacuum.freelist_before,
+                vacuum.page_count_before,
+            ));
 
             progress.complete(gen_id);
 
@@ -634,6 +1102,10 @@ async fn main() -> anyhow::Result<()> {
                         "unresolved_external": external_calls,
                         "unresolved_uninferred_receiver": uninferred_receiver_calls,
                         "unresolved_unattributed": unattributed_calls,
+                        // The per-stage breakdown, so a caller profiling a slow
+                        // build reads it from the result rather than scraping
+                        // the human progress lines off stderr.
+                        "timings": progress.timings_json(),
                     }),
                 )?;
             } else {
@@ -651,15 +1123,23 @@ async fn main() -> anyhow::Result<()> {
                 println!("    unattributed:       {unattributed_calls}");
             }
         }
-        Commands::Search { query, budget } => {
+        Commands::Search {
+            query,
+            budget,
+            semantic,
+        } => {
             let store = open_for_read(&cli.db)?;
             let engine = StoreQueryEngine::new(&store);
-            let resp = engine.search(Request {
-                query: query.clone(),
-                token_budget: *budget,
-                min_confidence: 0.0,
-                max_depth: 1,
-            })?;
+            let resp = if *semantic {
+                engine.search_semantic(query, *budget)?
+            } else {
+                engine.search(Request {
+                    query: query.clone(),
+                    token_budget: *budget,
+                    min_confidence: 0.0,
+                    max_depth: 1,
+                })?
+            };
             if cli.json {
                 emit_json(&cli, &serde_json::to_value(&resp)?)?;
             } else {
@@ -742,11 +1222,239 @@ async fn main() -> anyhow::Result<()> {
                 emit_dead(&payload);
             }
         }
+        Commands::Workspace { action } => {
+            // Rooted at the store's repository, so `devmap --db X workspace` and
+            // `dev map workspace` agree on where the registry lives.
+            let root = cli
+                .db
+                .parent()
+                .and_then(|dir| dir.parent())
+                .and_then(|dir| dir.parent())
+                .map(|dir| dir.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."));
+            let mut workspace = devmap_query::workspace::Workspace::load(&root)?;
+            match action {
+                WorkspaceAction::Add { path, name } => {
+                    let canonical = path.canonicalize().map_err(|error| {
+                        anyhow::anyhow!("cannot resolve {}: {error}", path.display())
+                    })?;
+                    let label = name
+                        .clone()
+                        .unwrap_or_else(|| devmap_query::workspace::name_for(&canonical));
+                    workspace.add(label.clone(), canonical.clone());
+                    let written = workspace.save(&root)?;
+                    if cli.json {
+                        emit_json(
+                            &cli,
+                            &serde_json::json!({
+                                "added": label,
+                                "root": canonical,
+                                "registry": written,
+                            }),
+                        )?;
+                    } else {
+                        println!(
+                            "added {label} -> {} ({})",
+                            canonical.display(),
+                            written.display()
+                        );
+                    }
+                }
+                WorkspaceAction::Remove { name } => {
+                    // Distinguished from success: a caller retrying a removal
+                    // should learn the name was never registered.
+                    let removed = workspace.remove(name);
+                    if removed {
+                        workspace.save(&root)?;
+                    }
+                    if cli.json {
+                        emit_json(&cli, &serde_json::json!({"removed": removed, "name": name}))?;
+                    } else if removed {
+                        println!("removed {name}");
+                    } else {
+                        println!("{name} is not registered");
+                    }
+                }
+                WorkspaceAction::List => {
+                    if cli.json {
+                        let repos: Vec<serde_json::Value> = workspace
+                            .repos
+                            .iter()
+                            .map(|repo| {
+                                let db = repo.db_path();
+                                let status = devmap_store::Store::open_existing(&db)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|store| store.status(&db.display().to_string()).ok());
+                                serde_json::json!({
+                                    "name": repo.name,
+                                    "root": repo.root,
+                                    "db": db,
+                                    // Null rather than zero when there is no
+                                    // generation: "never indexed" and "indexed
+                                    // and empty" are different states, and one
+                                    // of the repositories here is the second.
+                                    "generation": status.as_ref().and_then(|s| s.latest_generation),
+                                    "symbols": status.as_ref().map(|s| s.node_count),
+                                    "edges": status.as_ref().map(|s| s.edge_count),
+                                })
+                            })
+                            .collect();
+                        emit_json(
+                            &cli,
+                            &serde_json::json!({"repos": repos, "registry_root": root}),
+                        )?;
+                        return Ok(());
+                    }
+                    if workspace.repos.is_empty() {
+                        println!("no repositories registered ({})", root.display());
+                    }
+                    for repo in &workspace.repos {
+                        // The store *file* existing says nothing about whether
+                        // it holds anything. One of these repositories has two
+                        // generations whose latest contains zero symbols, and
+                        // reporting that as "indexed" because the file is on
+                        // disk is the same error as a check that could not run
+                        // reporting as one that passed.
+                        let db = repo.db_path();
+                        let state = match devmap_store::Store::open_existing(&db) {
+                            Ok(None) => "no store".to_string(),
+                            Err(error) => format!("unreadable: {error}"),
+                            Ok(Some(store)) => match store.status(&db.display().to_string()) {
+                                Err(error) => format!("unreadable: {error}"),
+                                Ok(status) => match status.latest_generation {
+                                    None => "no generation".to_string(),
+                                    Some(gen) => format!(
+                                        "gen {gen}, {} symbols, {} edges",
+                                        status.node_count, status.edge_count
+                                    ),
+                                },
+                            },
+                        };
+                        println!("{:<16} {:<34} {}", repo.name, state, repo.root.display());
+                    }
+                }
+                WorkspaceAction::Search {
+                    query,
+                    budget,
+                    semantic,
+                } => {
+                    let result =
+                        devmap_query::workspace_search(&workspace, query, *budget, *semantic)?;
+                    if cli.json {
+                        emit_json(&cli, &serde_json::to_value(&result)?)?;
+                    } else {
+                        for entry in &result.items {
+                            println!(
+                                "[{}] {}:{}  {}",
+                                entry.repo,
+                                entry.hit.file_path,
+                                entry.hit.span.0,
+                                entry.hit.symbol_name
+                            );
+                        }
+                        println!(
+                            "{} repo(s) queried, {} shown of {}",
+                            result.repos_queried, result.shown, result.total
+                        );
+                        // Never silent. A workspace answer assembled from a
+                        // subset is not a workspace answer.
+                        for missing in &result.unavailable {
+                            println!("  unavailable: {} — {}", missing.repo, missing.reason);
+                        }
+                    }
+                }
+                WorkspaceAction::Links => {
+                    let links = devmap_query::link_candidates(&workspace)?;
+                    if cli.json {
+                        // An object, not a bare array: the count and the set of
+                        // repositories considered are part of the answer, and a
+                        // reader seeing `[]` should be able to tell "no links"
+                        // from "no repositories were examined".
+                        emit_json(
+                            &cli,
+                            &serde_json::json!({
+                                "links": links,
+                                "count": links.len(),
+                                "repos_considered": workspace
+                                    .repos
+                                    .iter()
+                                    .map(|repo| repo.name.as_str())
+                                    .collect::<Vec<_>>(),
+                            }),
+                        )?;
+                    } else {
+                        for link in &links {
+                            println!(
+                                "{} {} -> {}  ({}; {})",
+                                link.from_repo,
+                                link.module_specifier,
+                                link.to_repo,
+                                link.from_file,
+                                link.evidence
+                            );
+                        }
+                        println!("{} candidate link(s)", links.len());
+                    }
+                }
+            }
+        }
+        Commands::Savings { query, budget } => {
+            let store = open_for_read(&cli.db)?;
+            let report = StoreQueryEngine::new(&store).savings(query.as_deref(), *budget)?;
+            if cli.json {
+                emit_json(&cli, &serde_json::to_value(&report)?)?;
+            } else {
+                emit_savings(&report);
+            }
+        }
+        Commands::Preview {
+            file,
+            content,
+            budget,
+            min_confidence,
+        } => {
+            let source = if content == "-" {
+                let mut buffer = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)?;
+                buffer
+            } else {
+                std::fs::read_to_string(content)
+                    .map_err(|e| anyhow::anyhow!("cannot read {content}: {e}"))?
+            };
+            let store = open_for_read(&cli.db)?;
+            let report =
+                StoreQueryEngine::new(&store).preview(file, &source, *budget, *min_confidence)?;
+            if cli.json {
+                emit_json(&cli, &serde_json::to_value(&report)?)?;
+            } else {
+                emit_preview(&report);
+            }
+        }
+        Commands::Clones {
+            budget,
+            kind,
+            min_nodes,
+        } => {
+            let store = open_for_read(&cli.db)?;
+            // `value_parser` has already rejected anything but the two names,
+            // so a `None` here can only be "no filter requested".
+            let wanted = kind.as_deref().and_then(devmap_query::parse_clone_kind);
+            let report = StoreQueryEngine::new(&store).clones(*budget, wanted, *min_nodes)?;
+            if cli.json {
+                emit_json(&cli, &serde_json::to_value(&report)?)?;
+            } else {
+                emit_clones(&report);
+            }
+        }
         Commands::Manifest {
             path,
             output,
             graph_output,
             force,
+            generated_head,
+            indexed_hash,
+            content_fingerprint,
         } => {
             let store = open_for_read(&cli.db)?;
             let extractions = store.latest_extractions()?;
@@ -772,6 +1480,15 @@ async fn main() -> anyhow::Result<()> {
                 head_sha: built_head,
                 generation_id: gen_id,
                 pending_count: status.pending_count,
+                // Blank flags are treated as absent. An empty `--indexed-hash`
+                // is a caller whose digest computation failed, and stamping ""
+                // as though it were a result is the exact confusion the
+                // "unavailable" markers exist to prevent.
+                stamped: StampedFreshness {
+                    generated_head: non_empty(generated_head),
+                    indexed_hash: non_empty(indexed_hash),
+                    content_fingerprint: non_empty(content_fingerprint),
+                },
             };
             let (_manifest, json_str) =
                 generate_manifest_with_edges(&extractions, &analysis, freshness.clone(), &edges);
@@ -966,6 +1683,86 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Class E (PLAN.md §3.1): a measurement is attributed to what incurred it.
+    ///
+    /// K8 recorded time-since-previous-announcement against the *next* stage's
+    /// label, so a 13.44 s build reported extraction's 7.25 s beside the word
+    /// "resolving" and extraction itself as 42 nanoseconds. The output was
+    /// plausible — real phase names, real durations, summing to the real total
+    /// — and pointed at the wrong one, which is what makes this class corrosive
+    /// rather than merely wrong.
+    ///
+    /// The three properties below are what a consumer needs in order to trust
+    /// the breakdown, and none of them held before the fix.
+    #[test]
+    fn stage_timings_are_attributed_to_the_stage_that_incurred_them() {
+        let reporter = ProgressReporter::new(ProgressMode::Never, true);
+
+        reporter.stage(1, "alpha");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        reporter.stage(2, "beta");
+        let _: std::result::Result<(), ()> = reporter.timed("beta:inner", || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            Ok(())
+        });
+        reporter.complete(1);
+
+        let json = reporter.timings_json();
+        let stages = json["stages"].as_array().expect("stages array");
+        assert_eq!(stages.len(), 2, "two stages ran: {stages:?}");
+
+        // 1. The stage that slept is the stage that reports the time. Under the
+        //    off-by-one, `alpha`'s 20 ms was reported against `beta`.
+        assert_eq!(stages[0]["stage"], "alpha");
+        let alpha = stages[0]["seconds"].as_f64().expect("alpha seconds");
+        assert!(
+            alpha >= 0.015,
+            "alpha slept 20ms and must report it, got {alpha}s"
+        );
+
+        // 2. Sub-phases nest inside their parent and are included in its total,
+        //    never listed beside it — summing both levels would double-count.
+        let beta = stages[1]["seconds"].as_f64().expect("beta seconds");
+        let sub = stages[1]["sub"].as_array().expect("beta sub-phases");
+        assert_eq!(sub.len(), 1, "one sub-phase ran inside beta: {sub:?}");
+        assert_eq!(sub[0]["stage"], "beta:inner");
+        let inner = sub[0]["seconds"].as_f64().expect("inner seconds");
+        assert!(
+            inner <= beta + 1e-6,
+            "a sub-phase cannot exceed the stage containing it: {inner}s in {beta}s"
+        );
+
+        // 3. The stages account for the whole build. A phase that went
+        //    unattributed would leave a gap here, which is exactly how a
+        //    42-nanosecond extraction went unnoticed.
+        let total = json["total_seconds"].as_f64().expect("total");
+        assert!(
+            alpha + beta <= total + 1e-6 && alpha + beta >= total * 0.5,
+            "stages ({alpha}s + {beta}s) must account for the total ({total}s)"
+        );
+    }
+
+    /// A stage still running is reported as open, never omitted.
+    ///
+    /// Class A applied to the profiler itself: if an unfinished stage were
+    /// simply left out, the breakdown would silently fail to account for the
+    /// total and a reader would attribute the missing time to nothing at all.
+    #[test]
+    fn an_unfinished_stage_is_reported_rather_than_dropped() {
+        let reporter = ProgressReporter::new(ProgressMode::Never, true);
+        reporter.stage(1, "still running");
+
+        let json = reporter.timings_json();
+        let stages = json["stages"].as_array().expect("stages array");
+        assert_eq!(stages.len(), 1, "the open stage must appear: {stages:?}");
+        assert_eq!(stages[0]["stage"], "still running");
+        assert_eq!(
+            stages[0]["open"],
+            serde_json::Value::Bool(true),
+            "an unfinished stage must be marked open so its time is not read as final"
+        );
+    }
 
     /// A capped result always says so; a complete one stays quiet.
     ///

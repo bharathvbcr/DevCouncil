@@ -853,9 +853,12 @@ fn test_community_reports_are_deterministic() {
         unresolved: Vec::new(),
     };
 
-    let expected = serde_json::to_string(&detect_communities(&extractions, &resolution)).unwrap();
+    let expected =
+        serde_json::to_string(&detect_communities(&extractions, &resolution).communities).unwrap();
     for _ in 0..16 {
-        let actual = serde_json::to_string(&detect_communities(&extractions, &resolution)).unwrap();
+        let actual =
+            serde_json::to_string(&detect_communities(&extractions, &resolution).communities)
+                .unwrap();
         assert_eq!(
             actual, expected,
             "community output changed between identical runs"

@@ -33,6 +33,19 @@ pub struct AnalysisSummary {
     /// absence honestly means "not recorded", not "zero".
     #[serde(default)]
     pub unresolved_calls: usize,
+    /// How much of this generation carries a body signature.
+    ///
+    /// Not the duplicate groups themselves — those are derived on demand from
+    /// the signature columns on the symbol table, so persisting them here would
+    /// be a truncated second copy of a derivable fact. What is *not* derivable
+    /// is how many symbols were never signed, which is the denominator every
+    /// clone report has to be read against.
+    ///
+    /// `serde(default)` yields zeroes for generations written before clone
+    /// detection existed, and zero signed symbols is exactly the truth about
+    /// them: nothing was examined.
+    #[serde(default)]
+    pub clone_coverage: crate::clones::CloneCoverage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

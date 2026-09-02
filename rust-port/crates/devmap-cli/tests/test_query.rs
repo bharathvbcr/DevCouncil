@@ -8,6 +8,7 @@ fn freshness() -> FreshnessInfo {
         head_sha: "test-head".into(),
         generation_id: 1,
         pending_count: 0,
+        stamped: Default::default(),
     }
 }
 
@@ -61,6 +62,7 @@ fn test_manifest_budget_t1() {
         communities: vec![],
         status: AnalysisStatus::Ok,
         unresolved_calls: 0,
+        clone_coverage: Default::default(),
     };
 
     let (_manifest, json_str) = generate_manifest(&extractions, &analysis, freshness());
@@ -83,6 +85,7 @@ fn manifest_reports_supplied_head_and_pending_count() {
         communities: vec![],
         status: AnalysisStatus::Ok,
         unresolved_calls: 0,
+        clone_coverage: Default::default(),
     };
     let (manifest, _) = generate_manifest(
         &[],
@@ -91,6 +94,7 @@ fn manifest_reports_supplied_head_and_pending_count() {
             head_sha: "0123456789abcdef".into(),
             generation_id: 42,
             pending_count: 7,
+            stamped: Default::default(),
         },
     );
     assert_eq!(manifest.freshness.head_sha, "0123456789abcdef");
@@ -114,6 +118,7 @@ fn test_manifest_budget_resists_hostile_paths() {
         }],
         status: AnalysisStatus::Ok,
         unresolved_calls: 0,
+        clone_coverage: Default::default(),
     };
 
     let (manifest, json) = generate_manifest(&[], &analysis, freshness());
@@ -185,6 +190,7 @@ fn test_manifest_order_is_deterministic_for_tied_communities() {
         ],
         status: AnalysisStatus::Ok,
         unresolved_calls: 0,
+        clone_coverage: Default::default(),
     };
 
     let (_manifest, json) = generate_manifest(&extractions, &analysis, freshness());
@@ -283,4 +289,300 @@ fn test_g8_impact_depth_expands_the_full_inbound_chain() {
         .items
         .iter()
         .any(|edge| edge.source_symbol == "a" && edge.target_symbol == "b"));
+}
+
+/// End-to-end for `devmap clones`: extraction stamps the signatures, the store
+/// persists them, and the query engine groups them back into findings.
+#[test]
+fn clones_round_trip_through_the_store() {
+    use devmap_store::Store;
+
+    let body = "\n    total = 0\n    for row in rows:\n        if row.active:\n            total += row.amount * rate\n        else:\n            total -= row.penalty\n    return total\n";
+    let shared = format!("def compute(rows, rate):{body}");
+    let extractions = vec![
+        extract_file("pkg/a.py", &shared),
+        extract_file("other/b.py", &shared),
+        extract_file("pkg/c.py", "def solo(x):\n    return x + 1\n"),
+    ];
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions);
+    let analysis = devmap_analyze::analyze(&extractions, &resolution);
+
+    let store = Store::open_in_memory().unwrap();
+    store
+        .save_generation(&extractions, &resolution, &analysis)
+        .unwrap();
+
+    let report = StoreQueryEngine::new(&store).clones(2000, None, 0).unwrap();
+    assert_eq!(report.signed_symbols, 2, "expected the two shared bodies");
+    assert!(
+        report.unsigned_symbols > 0,
+        "the trivial function and the file nodes should be unsigned"
+    );
+    assert_eq!(report.groups.items.len(), 1, "{:?}", report.groups.items);
+
+    let group = &report.groups.items[0];
+    assert_eq!(group.kind, devmap_analyze::CloneKind::Exact);
+    assert_eq!(group.members.len(), 2);
+    assert_eq!(group.members[0].file_path, "other/b.py");
+    assert_eq!(group.members[1].file_path, "pkg/a.py");
+    assert!(group.min_nodes >= 32);
+    assert!(!report.groups.truncated);
+
+    // The build recorded the same denominator the query reports, so a caller
+    // reading the generation sees no different a picture than one running the
+    // query against it.
+    assert_eq!(
+        analysis.clone_coverage.signed_symbols,
+        report.signed_symbols
+    );
+    assert_eq!(
+        analysis.clone_coverage.unsigned_symbols,
+        report.unsigned_symbols
+    );
+
+    // A budget too small for the single group withholds it and says so, rather
+    // than reporting an empty tree.
+    let squeezed = StoreQueryEngine::new(&store).clones(10, None, 0).unwrap();
+    assert!(squeezed.groups.items.is_empty());
+    assert!(squeezed.groups.truncated, "truncation was not reported");
+    assert_eq!(
+        squeezed.groups.total, 1,
+        "the withheld group was not counted"
+    );
+    assert_eq!(
+        squeezed.signed_symbols, 2,
+        "coverage must survive truncation; it is what makes an empty list readable"
+    );
+}
+
+/// With nothing built, the report says so instead of reporting a clean tree.
+#[test]
+fn clones_on_an_empty_store_are_unavailable_not_clean() {
+    use devmap_store::Store;
+    let store = Store::open_in_memory().unwrap();
+    let report = StoreQueryEngine::new(&store).clones(2000, None, 0).unwrap();
+    assert!(matches!(
+        report.groups.resolution,
+        ResolutionAvailability::Unavailable { .. }
+    ));
+    assert_eq!(report.signed_symbols, 0);
+}
+
+/// Filters must run before the budget, not after it.
+///
+/// Filtering an already-budgeted page cannot reach what the budget cut, and
+/// re-budgeting the survivors leaves `hidden` at zero — so a filtered subset
+/// comes back labelled complete. Observed on this repository before the fix:
+/// `--kind exact --min-nodes 100` under a 900-token budget reported "2 groups,
+/// not truncated" where the true answer was 29.
+///
+/// The fixture makes every *structural* group heavier than every *exact* one,
+/// so a small budget's unfiltered page is entirely structural. Asking for
+/// `exact` must then still reach the exact groups.
+#[test]
+fn clone_filters_apply_before_the_token_budget() {
+    use devmap_store::Store;
+
+    let long_body = |name: &str, var: &str| {
+        format!(
+            "def {name}(rows, rate):\n    {var} = 0\n    for row in rows:\n        if row.active:\n            {var} += row.amount * rate\n        elif row.pending:\n            {var} += row.amount\n        else:\n            {var} -= row.penalty\n    for extra in rows:\n        {var} += extra.bonus * rate\n    return {var}\n"
+        )
+    };
+    let short_body = |name: &str| {
+        format!(
+            "def {name}(rows, rate):\n    total = 0\n    for row in rows:\n        total += row.amount * rate\n    return total\n"
+        )
+    };
+
+    let mut sources: Vec<(String, String)> = Vec::new();
+    // Heavy pairs that differ only by a variable name: structural, not exact.
+    for i in 0..6 {
+        sources.push((
+            format!("s{i}a.py"),
+            long_body(&format!("wide_{i}"), "total"),
+        ));
+        sources.push((format!("s{i}b.py"), long_body(&format!("wide_{i}"), "sum_")));
+    }
+    // Lighter pairs that are byte-identical: exact.
+    for i in 0..6 {
+        let body = short_body(&format!("thin_{i}"));
+        sources.push((format!("e{i}a.py"), body.clone()));
+        sources.push((format!("e{i}b.py"), body));
+    }
+
+    let extractions: Vec<_> = sources
+        .iter()
+        .map(|(path, source)| extract_file(path, source))
+        .collect();
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions);
+    let analysis = devmap_analyze::analyze(&extractions, &resolution);
+    let store = Store::open_in_memory().unwrap();
+    store
+        .save_generation(&extractions, &resolution, &analysis)
+        .unwrap();
+
+    let engine = StoreQueryEngine::new(&store);
+    let all = engine.clones(1_000_000, None, 0).unwrap();
+    let exact_total = all
+        .groups
+        .items
+        .iter()
+        .filter(|g| g.kind == devmap_analyze::CloneKind::Exact)
+        .count() as u32;
+    assert!(exact_total > 0, "fixture must produce exact groups");
+
+    // The heaviest group sorts first. Renaming makes the long bodies a single
+    // structural group rather than one per name, which is the point of Type-2 —
+    // so the counts are read off the data instead of assumed.
+    let heaviest = all.groups.items.first().expect("groups exist");
+    assert_eq!(
+        heaviest.kind,
+        devmap_analyze::CloneKind::Structural,
+        "fixture must put a structural group at the top of the weight order"
+    );
+    let budget = devmap_query::clone_group_tokens(heaviest);
+
+    // A budget that holds exactly the heaviest group: the unfiltered page has
+    // no exact group in it at all.
+    let page = engine.clones(budget, None, 0).unwrap();
+    assert!(page.groups.truncated, "budget must actually bite");
+    assert!(
+        page.groups
+            .items
+            .iter()
+            .all(|g| g.kind == devmap_analyze::CloneKind::Structural),
+        "fixture is wrong: the unfiltered page already contains an exact group"
+    );
+
+    // Filtering before the budget reaches them; filtering after cannot.
+    let narrow = engine
+        .clones(budget, Some(devmap_analyze::CloneKind::Exact), 0)
+        .unwrap();
+    assert!(
+        !narrow.groups.items.is_empty(),
+        "every exact group was unreachable: the filter ran after the budget"
+    );
+    assert!(
+        narrow
+            .groups
+            .items
+            .iter()
+            .all(|g| g.kind == devmap_analyze::CloneKind::Exact),
+        "the kind filter let a structural group through"
+    );
+    assert_eq!(
+        narrow.groups.total, exact_total,
+        "total must count every group matching the filter, not just the page"
+    );
+    assert_eq!(narrow.groups.shown + narrow.groups.hidden, exact_total);
+}
+
+/// A corpus figure that silently skips what it could not open understates the
+/// alternative, which flatters the map. The count must survive.
+#[test]
+fn savings_counts_files_it_could_not_read_rather_than_calling_them_empty() {
+    use devmap_store::{GenerationWriteOpts, Store};
+
+    let dir = std::env::temp_dir().join(format!("devmap-savings-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let present = "def kept():\n    return 1\n";
+    std::fs::write(dir.join("present.py"), present).unwrap();
+    // Indexed but never written to disk: the state a deleted or moved file
+    // leaves behind between builds.
+    let extractions = vec![
+        extract_file("present.py", present),
+        extract_file("vanished.py", "def gone():\n    return 2\n"),
+    ];
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions);
+    let analysis = devmap_analyze::analyze(&extractions, &resolution);
+    let store = Store::open_in_memory().unwrap();
+    store
+        .save_generation_with_opts(
+            &extractions,
+            &resolution,
+            &analysis,
+            GenerationWriteOpts {
+                affected_paths: Vec::new(),
+                deleted_paths: Vec::new(),
+                build_started: None,
+                repo_root: Some(dir.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+
+    let report = StoreQueryEngine::new(&store).savings(None, 2000).unwrap();
+    assert_eq!(report.indexed_files, 2);
+    assert_eq!(
+        report.corpus_files_unreadable, 1,
+        "the missing file was folded into the corpus as zero bytes"
+    );
+    assert_eq!(
+        report.corpus_bytes,
+        present.len() as u64,
+        "corpus_bytes must be the sum of what was actually read"
+    );
+    assert!(
+        report.basis.contains("not a tokenizer count"),
+        "the estimate must say it is one: {}",
+        report.basis
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The report has no stake in the answer. If the files are cheaper than the
+/// query, that is what it says.
+#[test]
+fn savings_reports_the_query_side_without_assuming_a_saving() {
+    use devmap_store::{GenerationWriteOpts, Store};
+
+    let dir = std::env::temp_dir().join(format!("devmap-savings-q-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let tiny = "def findme():\n    return 1\n";
+    std::fs::write(dir.join("tiny.py"), tiny).unwrap();
+
+    let extractions = vec![extract_file("tiny.py", tiny)];
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions);
+    let analysis = devmap_analyze::analyze(&extractions, &resolution);
+    let store = Store::open_in_memory().unwrap();
+    store
+        .save_generation_with_opts(
+            &extractions,
+            &resolution,
+            &analysis,
+            GenerationWriteOpts {
+                affected_paths: Vec::new(),
+                deleted_paths: Vec::new(),
+                build_started: None,
+                repo_root: Some(dir.to_string_lossy().into_owned()),
+            },
+        )
+        .unwrap();
+
+    let report = StoreQueryEngine::new(&store)
+        .savings(Some("findme"), 2000)
+        .unwrap();
+    let query = report.query.expect("a named query is accounted for");
+    assert_eq!(query.query, "findme");
+    assert!(query.hits > 0, "fixture symbol was not found");
+    assert_eq!(query.files_named, 1);
+    assert_eq!(
+        query.files_bytes,
+        tiny.len() as u64,
+        "the named file's size is measured from disk"
+    );
+    assert_eq!(query.files_unreadable, 0);
+    // No assertion that a saving exists: on a two-line file it does not, and a
+    // test that required one would be pinning the metric to flatter itself.
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1,9 +1,11 @@
+use devmap_analyze::clones::group_clones;
 use devmap_analyze::traversal::{traverse_graph, TraversalOptions};
 use devmap_extract::model::*;
 use devmap_resolve::model::*;
 use devmap_store::{Store, StoredEdge};
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::{Path, PathBuf};
 
 use crate::model::*;
 
@@ -39,29 +41,6 @@ impl<'a> StoreQueryEngine<'a> {
         let query = req.query.to_lowercase();
         let mut hits = Vec::with_capacity(rows.len());
         for row in rows {
-            let source_result = std::fs::read_to_string(resolve_source_path(&repo_root, &row.path));
-            let source_unavailable_reason = source_result.as_ref().err().map(|error| {
-                format!(
-                    "source unavailable at query time for {:?}: {error}",
-                    row.path
-                )
-            });
-            let source = source_result.ok();
-            let source_span = source
-                .as_deref()
-                .and_then(|text| text.get(row.span_start..row.span_end))
-                .unwrap_or("")
-                .to_string();
-            let span = source
-                .as_deref()
-                .map(|text| {
-                    Span {
-                        start_byte: row.span_start,
-                        end_byte: row.span_end,
-                    }
-                    .line_range(text)
-                })
-                .unwrap_or((0, 0));
             let name = row.name.to_lowercase();
             let qualified = row.qualified_name.to_lowercase();
             let score = if name == query || qualified == query {
@@ -71,15 +50,12 @@ impl<'a> StoreQueryEngine<'a> {
             } else {
                 0.8
             };
-            hits.push(SymbolHit {
-                symbol_name: row.name,
-                file_path: row.path,
-                kind: row.kind,
-                span,
-                source_span,
-                source_unavailable_reason,
+            hits.push(hit_from_stored(
+                row,
+                repo_root.as_deref(),
+                req.token_budget,
                 score,
-            });
+            ));
         }
         hits.sort_by(|a, b| {
             b.score
@@ -88,11 +64,7 @@ impl<'a> StoreQueryEngine<'a> {
                 .then_with(|| a.symbol_name.cmp(&b.symbol_name))
                 .then_with(|| a.span.cmp(&b.span))
         });
-        let mut response = budget_take(hits, req.token_budget, |hit| {
-            u32::try_from(hit.source_span.len() / 4)
-                .unwrap_or(u32::MAX)
-                .saturating_add(20)
-        });
+        let mut response = budget_take(hits, req.token_budget, search_hit_tokens);
         response.total = total;
         response.hidden = total.saturating_sub(response.shown);
         response.truncated = response.hidden > 0;
@@ -245,6 +217,739 @@ impl<'a> StoreQueryEngine<'a> {
             .collect();
         Ok(budget_take(dead, token_budget, |_| 30))
     }
+
+    /// Duplicate bodies in the latest generation.
+    ///
+    /// Grouping runs here rather than at build time. The signatures are stored
+    /// per symbol, so the groups are derivable on demand and never go stale
+    /// against the rows they came from — and a build does not pay for a report
+    /// most builds have no reader for.
+    /// `kind` and `min_nodes` narrow the report; `None` and `0` mean no filter.
+    ///
+    /// The filters are applied *before* the budget, and that ordering is the
+    /// whole contract. Filtering afterwards would narrow a list the budget had
+    /// already cut, so `--min-nodes` could never reach past the first page —
+    /// and, because re-budgeting the survivors leaves `hidden` at zero, the
+    /// subset would be returned as a complete answer. Measured on this
+    /// repository: `--kind exact --min-nodes 100` under a 900-token budget
+    /// reported "2 groups, not truncated" where the true answer was 29.
+    pub fn clones(
+        &self,
+        token_budget: u32,
+        kind: Option<devmap_analyze::CloneKind>,
+        min_nodes: u32,
+    ) -> anyhow::Result<CloneReport> {
+        if self.store.latest_generation_id()?.is_none() {
+            return Ok(CloneReport {
+                groups: unavailable_response(ResolutionAvailability::Unavailable {
+                    reason: "no persisted generation is available".to_string(),
+                }),
+                signed_symbols: 0,
+                unsigned_symbols: 0,
+            });
+        }
+        let (candidates, unsigned) = self.store.latest_clone_candidates()?;
+        let summary = group_clones(&candidates, unsigned);
+        let matching: Vec<_> = summary
+            .groups
+            .into_iter()
+            .filter(|group| kind.is_none_or(|wanted| group.kind == wanted))
+            .filter(|group| group.min_nodes >= min_nodes)
+            .collect();
+        Ok(CloneReport {
+            groups: budget_take(matching, token_budget, clone_group_tokens),
+            signed_symbols: summary.signed_symbols,
+            unsigned_symbols: summary.unsigned_symbols,
+        })
+    }
+
+    /// Rank symbols by TF-IDF similarity of their names to `query`.
+    ///
+    /// Complements `search`, which is FTS5 prefix matching: that finds symbols
+    /// whose names *contain* the query, this finds symbols whose names are
+    /// *about* it. `LLMCache` for "llm cache", `compute_freshness` for
+    /// "freshness computation".
+    ///
+    /// Scores nothing when no symbol shares a term with the query, rather than
+    /// returning the whole corpus ordered by a zero. "Nothing matched" is an
+    /// answer.
+    pub fn search_semantic(
+        &self,
+        query: &str,
+        token_budget: u32,
+    ) -> anyhow::Result<Response<SymbolHit>> {
+        if self.store.latest_generation_id()?.is_none() {
+            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+                reason: "no persisted generation is available".to_string(),
+            }));
+        }
+        let symbols = self.store.all_symbols()?;
+        if symbols.is_empty() || query.trim().is_empty() {
+            return Ok(budget_take(Vec::new(), token_budget, |_| 0));
+        }
+        // Both names, so a query can match either the bare symbol or the path
+        // and type it sits under.
+        let texts: Vec<String> = symbols
+            .iter()
+            .map(|s| format!("{} {}", s.name, s.qualified_name))
+            .collect();
+        let index = crate::semantic::SemanticIndex::build(&texts);
+
+        let repo_root = self.store.latest_repo_root()?;
+        let hits: Vec<SymbolHit> = index
+            .score(query)
+            .into_iter()
+            .map(|(position, score)| {
+                hit_from_stored(
+                    symbols[position].clone(),
+                    repo_root.as_deref(),
+                    token_budget,
+                    score,
+                )
+            })
+            .collect();
+        Ok(budget_take(hits, token_budget, search_hit_tokens))
+    }
+
+    /// What the map cost against what reading files would have.
+    ///
+    /// Sizes come from the files on disk, resolved against the generation's
+    /// `repo_root`. Files that cannot be read are counted separately rather
+    /// than treated as zero bytes: a corpus figure that silently omits what it
+    /// could not open understates the alternative and flatters the map.
+    pub fn savings(&self, query: Option<&str>, token_budget: u32) -> anyhow::Result<SavingsReport> {
+        let repo_root = self.store.latest_repo_root()?;
+        let resolve = |path: &str| -> PathBuf {
+            match &repo_root {
+                Some(root) if !Path::new(path).is_absolute() => Path::new(root).join(path),
+                _ => PathBuf::from(path),
+            }
+        };
+        let size_of =
+            |path: &str| -> Option<u64> { std::fs::metadata(resolve(path)).ok().map(|m| m.len()) };
+
+        let indexed_paths = match self.store.latest_generation_id()? {
+            Some(gen) => self.store.list_generation_paths(gen)?,
+            None => Vec::new(),
+        };
+        let mut corpus_bytes = 0u64;
+        let mut corpus_files_unreadable = 0usize;
+        for path in &indexed_paths {
+            match size_of(path) {
+                Some(bytes) => corpus_bytes = corpus_bytes.saturating_add(bytes),
+                None => corpus_files_unreadable += 1,
+            }
+        }
+
+        let repo_map_bytes = repo_root
+            .as_ref()
+            .map(|root| Path::new(root).join(".devcouncil/repo_map.json"))
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|m| m.len());
+
+        let query_savings = match query {
+            None => None,
+            Some(text) => {
+                let response = self.search(Request {
+                    query: text.to_string(),
+                    token_budget,
+                    min_confidence: 0.0,
+                    max_depth: 1,
+                })?;
+                let mut named: BTreeSet<&str> = BTreeSet::new();
+                for hit in &response.items {
+                    named.insert(hit.file_path.as_str());
+                }
+                let mut files_bytes = 0u64;
+                let mut files_unreadable = 0usize;
+                for path in &named {
+                    match size_of(path) {
+                        Some(bytes) => files_bytes = files_bytes.saturating_add(bytes),
+                        None => files_unreadable += 1,
+                    }
+                }
+                Some(QuerySavings {
+                    query: text.to_string(),
+                    hits: response.items.len(),
+                    answer_tokens: response.tokens_used,
+                    files_named: named.len(),
+                    files_bytes,
+                    files_unreadable,
+                })
+            }
+        };
+
+        Ok(SavingsReport {
+            basis: format!("estimated as bytes / {BYTES_PER_TOKEN}; not a tokenizer count"),
+            indexed_files: indexed_paths.len(),
+            corpus_bytes,
+            corpus_files_unreadable,
+            repo_map_bytes,
+            query: query_savings,
+        })
+    }
+
+    /// What `new_source` would do to the graph if it were written to `path`.
+    ///
+    /// Nothing is written and no generation is created. The buffer is extracted
+    /// in memory and diffed against the stored extraction for the same path.
+    ///
+    /// A buffer that fails to parse produces no symbols, and diffing that
+    /// against a real file reports every symbol as removed and every caller as
+    /// breaking. That output is indistinguishable from a genuine mass deletion
+    /// and is the single most likely thing to be produced by a half-typed edit,
+    /// which is exactly when an agent would be asking. So a failed parse
+    /// returns `delta_available: false` and no symbols at all.
+    ///
+    /// Requires the `parse` feature. Every other query on this engine answers
+    /// from a persisted map; this one has to parse a buffer that was never
+    /// indexed, so it is the one surface that genuinely needs the grammars.
+    #[cfg(feature = "parse")]
+    pub fn preview(
+        &self,
+        path: &str,
+        new_source: &str,
+        token_budget: u32,
+        min_confidence: f32,
+    ) -> anyhow::Result<PreviewReport> {
+        let candidate = devmap_extract::extract_file(path, new_source);
+        let parse_status = parse_status_name(&candidate.parse_outcome).to_string();
+
+        let empty_callers = || Response {
+            items: Vec::new(),
+            shown: 0,
+            hidden: 0,
+            total: 0,
+            truncated: false,
+            tokens_used: 0,
+            resolution: ResolutionAvailability::Available,
+        };
+
+        if let ParseOutcome::Failed { reason } = &candidate.parse_outcome {
+            return Ok(PreviewReport {
+                file_path: path.to_string(),
+                parse_status,
+                delta_available: false,
+                file_is_indexed: self.store.latest_extraction_for_path(path)?.is_some(),
+                compared_against: "nothing".to_string(),
+                degraded_reason: Some(format!(
+                    "the buffer did not parse ({reason}); no delta is reported,                      because an unparsed file yields no symbols and would read                      as a deletion of every symbol in it"
+                )),
+                symbols: Vec::new(),
+                bodies_not_compared: 0,
+                ambiguous_callers: 0,
+                broken_callers: empty_callers(),
+            });
+        }
+
+        // The "before" side is extracted from the file on disk, not read back
+        // from the store. Two reasons: the stored extraction has been through
+        // `for_durable_store`, and more importantly the user is editing the
+        // file that is on disk — diffing against a generation built from an
+        // older commit would report their own already-saved work as part of the
+        // candidate change. The store is still consulted, but only for the
+        // caller graph, where being a generation behind is a known and stated
+        // property rather than a wrong diff.
+        let file_is_indexed = self.store.latest_extraction_for_path(path)?.is_some();
+        // Resolved against the generation's own root, not the process's working
+        // directory. Indexed paths are repository-relative, and the two callers
+        // of this have different working directories: the CLI runs wherever the
+        // user is, the daemon wherever it was spawned. Reading `path` directly
+        // works for one of them and silently finds nothing for the other —
+        // which reads as "no such file", i.e. every symbol added.
+        let resolved = match self.store.latest_repo_root()? {
+            Some(root) if !Path::new(path).is_absolute() => Path::new(&root).join(path),
+            _ => PathBuf::from(path),
+        };
+        let on_disk = std::fs::read_to_string(&resolved).ok();
+        let compared_against = if on_disk.is_some() { "disk" } else { "nothing" };
+        let previous = on_disk
+            .as_deref()
+            .map(|source| devmap_extract::extract_file(path, source).symbols)
+            .unwrap_or_default();
+
+        let mut old_by_name: BTreeMap<&str, &ExtractedSymbol> = BTreeMap::new();
+        for symbol in &previous {
+            old_by_name.insert(symbol.qualified_name.as_str(), symbol);
+        }
+        let mut new_by_name: BTreeMap<&str, &ExtractedSymbol> = BTreeMap::new();
+        for symbol in &candidate.symbols {
+            new_by_name.insert(symbol.qualified_name.as_str(), symbol);
+        }
+
+        let mut symbols: Vec<PreviewSymbol> = Vec::new();
+        let mut bodies_not_compared = 0usize;
+        for (qualified, now) in &new_by_name {
+            match old_by_name.get(qualified) {
+                None => symbols.push(PreviewSymbol {
+                    symbol_name: now.name.clone(),
+                    qualified_name: now.qualified_name.clone(),
+                    kind: now.kind.as_str().to_string(),
+                    change: PreviewChange::Added,
+                    was: None,
+                    now: now.signature.clone(),
+                }),
+                Some(was) => {
+                    // Declaration first: that is what a caller binds to, and a
+                    // changed declaration outranks whatever the body did.
+                    //
+                    // `ExtractedSymbol::signature` is not used for this. It is
+                    // populated by only one grammar in this workspace — 80 of
+                    // ~2,300 sampled symbols, all Go — so comparing it makes
+                    // every Python, Rust and TypeScript signature change look
+                    // like a body change. The declaration hash is computed from
+                    // the tree and works wherever the grammar names a body.
+                    let declaration_moved = match (was.declaration_hash, now.declaration_hash) {
+                        (Some(a), Some(b)) => Some(a != b),
+                        _ => None,
+                    };
+                    let change = match declaration_moved {
+                        Some(true) => PreviewChange::SignatureChanged,
+                        Some(false) | None => match (was.body_signature, now.body_signature) {
+                            (Some(a), Some(b)) if a.exact != b.exact => {
+                                if declaration_moved.is_none() {
+                                    // The body moved and nothing could tell
+                                    // whether the declaration did. Reported as
+                                    // the caller-affecting case, because
+                                    // under-reporting a break is the costlier
+                                    // error of the two.
+                                    PreviewChange::Changed
+                                } else {
+                                    PreviewChange::BodyChanged
+                                }
+                            }
+                            (Some(_), Some(_)) => continue,
+                            // Bodies not comparable. With an unchanged
+                            // declaration there is nothing to report; without
+                            // one, nothing was compared at all.
+                            _ => {
+                                bodies_not_compared += 1;
+                                continue;
+                            }
+                        },
+                    };
+                    symbols.push(PreviewSymbol {
+                        symbol_name: now.name.clone(),
+                        qualified_name: now.qualified_name.clone(),
+                        kind: now.kind.as_str().to_string(),
+                        change,
+                        was: was.signature.clone(),
+                        now: now.signature.clone(),
+                    });
+                }
+            }
+        }
+        for (qualified, was) in &old_by_name {
+            if new_by_name.contains_key(qualified) {
+                continue;
+            }
+            symbols.push(PreviewSymbol {
+                symbol_name: was.name.clone(),
+                qualified_name: was.qualified_name.clone(),
+                kind: was.kind.as_str().to_string(),
+                change: PreviewChange::Removed,
+                was: was.signature.clone(),
+                now: None,
+            });
+        }
+        symbols.sort_by(|a, b| {
+            (a.change as u8, &a.qualified_name).cmp(&(b.change as u8, &b.qualified_name))
+        });
+
+        // Only removals and re-declarations can break a caller. A body change
+        // moves behaviour without touching the call site, and listing its
+        // callers would bury the cases that actually stop compiling.
+        let at_risk: Vec<String> = symbols
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.change,
+                    PreviewChange::Removed
+                        | PreviewChange::SignatureChanged
+                        | PreviewChange::Changed
+                )
+            })
+            // Qualified, not bare. Every `target_symbol` in `generation_edges`
+            // is `path::Name` — matching on the bare name finds nothing at all,
+            // and "no calls are affected" is a perfectly plausible-looking way
+            // for this feature to do nothing.
+            .map(|s| s.qualified_name.clone())
+            .collect();
+        let callers: Vec<PreviewCaller> = self
+            .store
+            .callers_of(&at_risk, path, min_confidence)?
+            .into_iter()
+            .map(|edge| PreviewCaller {
+                target_symbol: edge.target_symbol,
+                caller_file: edge.source_file,
+                caller_symbol: edge.source_symbol,
+                confidence: edge.confidence,
+            })
+            .collect();
+        // What the floor excluded. Reported rather than dropped: a symbol with
+        // no confident callers and 900 ambiguous ones is not the same situation
+        // as one nothing references, and the difference decides whether a
+        // reader should go and look.
+        let ambiguous_callers = self
+            .store
+            .callers_of(&at_risk, path, 0.0)?
+            .len()
+            .saturating_sub(callers.len());
+
+        let degraded_reason = match &candidate.parse_outcome {
+            ParseOutcome::Partial { .. } => Some(
+                "the buffer parsed with errors; a symbol inside an error region \
+                 is invisible to extraction and will appear here as removed"
+                    .to_string(),
+            ),
+            ParseOutcome::Fallback { .. } => Some(
+                "the buffer's language has no linked grammar, so declarations \
+                 were recovered by pattern and carry no bodies; body changes \
+                 cannot be detected"
+                    .to_string(),
+            ),
+            _ => None,
+        };
+
+        Ok(PreviewReport {
+            file_path: path.to_string(),
+            parse_status,
+            delta_available: true,
+            file_is_indexed,
+            compared_against: compared_against.to_string(),
+            degraded_reason,
+            symbols,
+            bodies_not_compared,
+            ambiguous_callers,
+            broken_callers: budget_take(callers, token_budget, |_| PREVIEW_CALLER_TOKENS),
+        })
+    }
+}
+
+/// Search every repository in a workspace, labelling each hit with its origin.
+///
+/// Repositories are queried in registry order and the budget is spent across
+/// the union, so a large first repository can exhaust it before a later one is
+/// reached. That is reported — `truncated` and `hidden` cover the whole
+/// workspace, not one repository — rather than papered over by giving each
+/// repository an equal slice, which would silently drop the best matches in a
+/// large repository to make room for weak ones in a small one.
+pub fn workspace_search(
+    workspace: &crate::workspace::Workspace,
+    query: &str,
+    token_budget: u32,
+    semantic: bool,
+) -> anyhow::Result<crate::workspace::FederatedSearch> {
+    use crate::workspace::{FederatedHit, FederatedSearch, RepoUnavailable};
+
+    let mut all: Vec<FederatedHit> = Vec::new();
+    let mut unavailable: Vec<RepoUnavailable> = Vec::new();
+    let mut queried = 0usize;
+
+    for repo in &workspace.repos {
+        let db = repo.db_path();
+        let store = match devmap_store::Store::open_existing(&db) {
+            Ok(Some(store)) => store,
+            Ok(None) => {
+                unavailable.push(RepoUnavailable {
+                    repo: repo.name.clone(),
+                    reason: format!("no store at {}", db.display()),
+                });
+                continue;
+            }
+            Err(error) => {
+                unavailable.push(RepoUnavailable {
+                    repo: repo.name.clone(),
+                    reason: format!("store at {} could not be opened: {error}", db.display()),
+                });
+                continue;
+            }
+        };
+        let engine = StoreQueryEngine::new(&store);
+        // Each repository is asked for the *whole* budget's worth of hits; the
+        // union is trimmed once at the end. Asking each for a slice would rank
+        // within repositories instead of across them.
+        let response = if semantic {
+            engine.search_semantic(query, token_budget)?
+        } else {
+            engine.search(Request {
+                query: query.to_string(),
+                token_budget,
+                min_confidence: 0.0,
+                max_depth: 1,
+            })?
+        };
+        if let ResolutionAvailability::Unavailable { reason } = &response.resolution {
+            unavailable.push(RepoUnavailable {
+                repo: repo.name.clone(),
+                reason: reason.clone(),
+            });
+            continue;
+        }
+        queried += 1;
+        for hit in response.items {
+            all.push(FederatedHit {
+                repo: repo.name.clone(),
+                hit,
+            });
+        }
+    }
+
+    // One ranking across the workspace. Ties break on repository then path so
+    // the order is total and identical on every run.
+    all.sort_by(|a, b| {
+        b.hit
+            .score
+            .total_cmp(&a.hit.score)
+            .then_with(|| a.repo.cmp(&b.repo))
+            .then_with(|| a.hit.file_path.cmp(&b.hit.file_path))
+            .then_with(|| a.hit.symbol_name.cmp(&b.hit.symbol_name))
+    });
+
+    let total = all.len() as u32;
+    let budgeted = budget_take(all, token_budget, |entry| search_hit_tokens(&entry.hit));
+    Ok(FederatedSearch {
+        items: budgeted.items,
+        repos_queried: queried,
+        unavailable,
+        total,
+        shown: budgeted.shown,
+        hidden: total.saturating_sub(budgeted.shown),
+        truncated: total > budgeted.shown,
+    })
+}
+
+/// Modules each repository *provides*, as `(specifier prefix, evidence)`.
+///
+/// Two sources, both declarations rather than inferences:
+///
+/// - Go: every `module` line in every `go.mod`. `import "manvi/dc/store"`
+///   resolving to the repository whose `go.mod` says `module manvi` is not a
+///   guess, it is how the toolchain resolves it.
+/// - Python and JavaScript: top-level package directories — a directory
+///   directly under the root containing `__init__.py`, or a `package.json`
+///   `name`. Weaker than Go's, and labelled as the directory it came from.
+///
+/// Deliberately not included: matching on symbol names. Two repositories both
+/// declaring `Client` is not a link, and asserting one would produce edges at a
+/// rate that buries the real ones.
+fn provided_modules(root: &std::path::Path) -> Vec<(String, String)> {
+    let mut provided: Vec<(String, String)> = Vec::new();
+
+    if let Ok(modules) = devmap_extract::collect_go_modules(root) {
+        for module in modules {
+            if module.prefix.is_empty() {
+                continue;
+            }
+            let where_from = if module.dir.is_empty() {
+                "go.mod".to_string()
+            } else {
+                format!("{}/go.mod", module.dir)
+            };
+            provided.push((
+                module.prefix.clone(),
+                format!("{where_from} declares `module {}`", module.prefix),
+            ));
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || name == "node_modules" || name == "target" {
+                continue;
+            }
+            if entry.path().join("__init__.py").is_file() {
+                provided.push((
+                    name.clone(),
+                    format!("{name}/__init__.py declares a Python package"),
+                ));
+            }
+        }
+    }
+    // A `src/` layout puts the package one level down, which is where this
+    // repository's own `devcouncil` package lives.
+    if let Ok(entries) = std::fs::read_dir(root.join("src")) {
+        for entry in entries.flatten() {
+            if entry.path().join("__init__.py").is_file() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                provided.push((
+                    name.clone(),
+                    format!("src/{name}/__init__.py declares a Python package"),
+                ));
+            }
+        }
+    }
+
+    provided.sort();
+    provided.dedup();
+    provided
+}
+
+/// Whether `specifier` is satisfied by a module named `prefix`.
+///
+/// Exact, or a path segment beneath it. `manvi/dc/store` is provided by
+/// `manvi`; `manvibench` is not, and matching on a bare `starts_with` would
+/// claim it is.
+fn specifier_matches(specifier: &str, prefix: &str) -> bool {
+    if specifier == prefix {
+        return true;
+    }
+    specifier
+        .strip_prefix(prefix)
+        .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('.'))
+}
+
+/// Imports in one repository that another repository declares the module for.
+///
+/// Reported as *candidates*. A matching module path is strong evidence — for Go
+/// it is how the compiler resolves the import — but this does not verify that
+/// the imported symbol exists in the target, and it cannot tell a local
+/// checkout from a published copy at a different version. Calling these
+/// resolved edges would put an unverified claim in the graph beside verified
+/// ones.
+pub fn link_candidates(
+    workspace: &crate::workspace::Workspace,
+) -> anyhow::Result<Vec<crate::workspace::LinkCandidate>> {
+    use crate::workspace::LinkCandidate;
+
+    // What each repository provides.
+    let mut providers: Vec<(&str, Vec<(String, String)>)> = Vec::new();
+    for repo in &workspace.repos {
+        providers.push((repo.name.as_str(), provided_modules(&repo.root)));
+    }
+
+    let mut candidates: Vec<LinkCandidate> = Vec::new();
+    for repo in &workspace.repos {
+        let Ok(Some(store)) = devmap_store::Store::open_existing(repo.db_path()) else {
+            continue;
+        };
+        let extractions = store.latest_extractions()?;
+        for extraction in &extractions {
+            for import in &extraction.imports {
+                let specifier = import.module_specifier.trim();
+                if specifier.is_empty() || specifier.starts_with('.') {
+                    continue;
+                }
+                for (provider_name, provided) in &providers {
+                    // A repository importing its own module is not a
+                    // cross-repository link.
+                    if *provider_name == repo.name {
+                        continue;
+                    }
+                    for (prefix, evidence) in provided {
+                        if specifier_matches(specifier, prefix) {
+                            candidates.push(LinkCandidate {
+                                from_repo: repo.name.clone(),
+                                from_file: extraction.file_path.clone(),
+                                module_specifier: specifier.to_string(),
+                                to_repo: (*provider_name).to_string(),
+                                evidence: evidence.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    candidates.sort_by(|a, b| {
+        (&a.from_repo, &a.from_file, &a.module_specifier, &a.to_repo).cmp(&(
+            &b.from_repo,
+            &b.from_file,
+            &b.module_specifier,
+            &b.to_repo,
+        ))
+    });
+    candidates.dedup_by(|a, b| {
+        a.from_repo == b.from_repo
+            && a.from_file == b.from_file
+            && a.module_specifier == b.module_specifier
+            && a.to_repo == b.to_repo
+    });
+    Ok(candidates)
+}
+
+#[cfg(test)]
+mod specifier_tests {
+    use super::specifier_matches;
+
+    /// A module prefix matches its own path and anything beneath it — and
+    /// nothing that merely starts with the same letters. `manvibench` sharing a
+    /// prefix with `manvi` is not an import of it, and a bare `starts_with`
+    /// would claim it is.
+    #[test]
+    fn a_prefix_matches_only_on_a_segment_boundary() {
+        assert!(specifier_matches("example.com/libb", "example.com/libb"));
+        assert!(specifier_matches(
+            "example.com/libb/store",
+            "example.com/libb"
+        ));
+        assert!(specifier_matches("devcouncil.app.config", "devcouncil"));
+
+        assert!(!specifier_matches(
+            "example.com/libbeta",
+            "example.com/libb"
+        ));
+        assert!(!specifier_matches("manvibench", "manvi"));
+        assert!(!specifier_matches("libb", "example.com/libb"));
+    }
+}
+
+/// Token cost of one caller line: two paths and a symbol name.
+const PREVIEW_CALLER_TOKENS: u32 = 25;
+
+/// Confidence a call edge needs before `preview` will call it a caller.
+///
+/// The resolver publishes three tiers on this workspace's 50,533 call edges:
+/// 1.0 (19,134 edges), 0.9 (4,800) and 0.2 (26,599). The 0.2 tier is
+/// name-only attribution, and on a common method name it is not close to
+/// right: every `dict.get(...)` in the tree resolves to
+/// `LLMCache.get`, giving that one method 921 edges — all of them at 0.2, none
+/// of them real. Listing those under "this change breaks" would send a reader
+/// to `benchmarks/map_bench.py` to fix a call it does not contain.
+///
+/// 0.5 sits in the empty band between 0.2 and 0.9, so it separates the tiers
+/// rather than cutting through one. Edges below it are counted, not discarded —
+/// see `PreviewReport::ambiguous_callers`.
+pub const PREVIEW_CALLER_MIN_CONFIDENCE: f32 = 0.5;
+
+/// Describe a parse outcome in one word, for a report a human reads.
+fn parse_status_name(outcome: &ParseOutcome) -> &'static str {
+    match outcome {
+        ParseOutcome::Clean => "clean",
+        ParseOutcome::Partial { .. } => "partial",
+        ParseOutcome::Fallback { .. } => "fallback",
+        ParseOutcome::Failed { .. } => "failed",
+    }
+}
+
+/// Parse a clone kind from a caller-supplied string.
+///
+/// `None` for an unrecognised name rather than a default, so a caller can
+/// reject a typo instead of answering it with an unfiltered report.
+pub fn parse_clone_kind(name: &str) -> Option<devmap_analyze::CloneKind> {
+    match name {
+        "exact" => Some(devmap_analyze::CloneKind::Exact),
+        "structural" => Some(devmap_analyze::CloneKind::Structural),
+        _ => None,
+    }
+}
+
+/// Token cost of one clone group: a header line plus one line per member.
+///
+/// Public because a caller that filters groups has to re-take the budget over
+/// what survives, and it must charge the same rate this engine did — two copies
+/// of the arithmetic is how a response comes to report a token count it did not
+/// spend.
+pub fn clone_group_tokens(group: &devmap_analyze::CloneGroup) -> u32 {
+    /// A group's header line.
+    const HEADER_TOKENS: u32 = 12;
+    /// One member line: a path, a symbol name, and a span.
+    const MEMBER_TOKENS: u32 = 25;
+    HEADER_TOKENS + group.members.len() as u32 * MEMBER_TOKENS
 }
 
 fn edge_node_matches(file: &str, symbol: &str, query: &str) -> bool {
@@ -421,6 +1126,10 @@ impl<'a> QueryEngine<'a> {
                     .unwrap_or("")
                     .to_string();
                 let line_span = byte_span_to_line_range(code_str, &sym.span);
+                // Capped for the same reason as the store-backed search above:
+                // this engine shares the cost function, so it shares the bug.
+                let (source_span, source_span_omitted_bytes) =
+                    cap_source_span(source_span, req.token_budget);
 
                 hits.push(SymbolHit {
                     symbol_name: sym.name.clone(),
@@ -429,6 +1138,7 @@ impl<'a> QueryEngine<'a> {
                     span: line_span,
                     source_span,
                     source_unavailable_reason,
+                    source_span_omitted_bytes,
                     score,
                 });
             }
@@ -627,6 +1337,118 @@ pub(crate) fn byte_span_to_line_range(source: &str, span: &Span) -> (u32, u32) {
     (start_line, end_line)
 }
 
+/// Per-hit token overhead in [`StoreQueryEngine::search`]'s cost function.
+/// Kept next to [`cap_source_span`] because the cap must invert the same
+/// arithmetic the packer uses, and a drift between the two reintroduces the
+/// oversized-hit bug in a form no test names.
+const SEARCH_HIT_OVERHEAD_TOKENS: u32 = 20;
+
+/// Bytes of source per token, matching the `len / 4` estimate in the search
+/// cost function.
+pub const BYTES_PER_TOKEN: u32 = 4;
+
+/// Token cost of one search hit: its source span plus a fixed per-row overhead.
+///
+/// Shared by keyword and semantic search so the two spend the budget at the
+/// same rate; two copies of this arithmetic would let the same result cost
+/// different amounts depending on which command asked for it.
+fn search_hit_tokens(hit: &SymbolHit) -> u32 {
+    u32::try_from(hit.source_span.len() / BYTES_PER_TOKEN as usize)
+        .unwrap_or(u32::MAX)
+        .saturating_add(SEARCH_HIT_OVERHEAD_TOKENS)
+}
+
+/// Build a hit from a stored symbol row, reading its source span from disk.
+///
+/// One owner for the read, the line-range conversion, the span cap and the
+/// unavailability reason. When the file cannot be read the reason is recorded
+/// on the hit rather than dropped, so an empty `source_span` is never mistaken
+/// for a symbol with no body.
+fn hit_from_stored(
+    row: devmap_store::StoredSymbol,
+    repo_root: Option<&str>,
+    token_budget: u32,
+    score: f32,
+) -> SymbolHit {
+    let owned_root = repo_root.map(str::to_string);
+    let source_result = std::fs::read_to_string(resolve_source_path(&owned_root, &row.path));
+    let source_unavailable_reason = source_result.as_ref().err().map(|error| {
+        format!(
+            "source unavailable at query time for {:?}: {error}",
+            row.path
+        )
+    });
+    let source = source_result.ok();
+    let source_span = source
+        .as_deref()
+        .and_then(|text| text.get(row.span_start..row.span_end))
+        .unwrap_or("")
+        .to_string();
+    let span = source
+        .as_deref()
+        .map(|text| {
+            Span {
+                start_byte: row.span_start,
+                end_byte: row.span_end,
+            }
+            .line_range(text)
+        })
+        .unwrap_or((0, 0));
+    let (source_span, source_span_omitted_bytes) = cap_source_span(source_span, token_budget);
+    SymbolHit {
+        symbol_name: row.name,
+        file_path: row.path,
+        kind: row.kind,
+        span,
+        source_span,
+        source_unavailable_reason,
+        source_span_omitted_bytes,
+        score,
+    }
+}
+
+/// Cap a hit's source span so one hit can never exceed the whole token budget.
+///
+/// A search hit costs `source_span.len() / 4 + 20` tokens, and `source_span` is
+/// the symbol's entire body. One 8 KB function therefore outweighed the 2,000
+/// token default on its own, and the caller enforces the budget as a hard
+/// contract — `DevMapClient._budgeted` raises on an over-budget response — so
+/// an uncapped hit is not merely large, it is unreturnable. `devmap search
+/// "resolve calls"` on this repository matched exactly one symbol,
+/// `resolve_calls`, and answered with nothing.
+///
+/// Returns the (possibly capped) span and the number of bytes dropped, which
+/// the caller records in `source_span_omitted_bytes`. A capped span is never
+/// passed off as the verbatim body R2 promises.
+/// Largest share of a request's budget one hit's source span may take.
+///
+/// Capping at the *whole* budget — which this did — is enough to keep a single
+/// oversized item from being withheld, but it lets that item crowd out every
+/// other result. A `File` symbol's span is its entire file, so a search whose
+/// best matches are files returned two hits against a 4,000-token budget and
+/// reported 512 more withheld. A quarter guarantees at least three results
+/// survive alongside any one of them.
+const MAX_HIT_BUDGET_SHARE: u32 = 4;
+
+fn cap_source_span(source_span: String, token_budget: u32) -> (String, Option<u32>) {
+    let max_bytes = (token_budget / MAX_HIT_BUDGET_SHARE)
+        .saturating_sub(SEARCH_HIT_OVERHEAD_TOKENS)
+        .saturating_mul(BYTES_PER_TOKEN) as usize;
+    if source_span.len() <= max_bytes {
+        return (source_span, None);
+    }
+    // Truncate on a char boundary: `String` slicing panics mid-codepoint, and
+    // source files contain non-ASCII in strings, comments and identifiers.
+    let mut end = max_bytes;
+    while end > 0 && !source_span.is_char_boundary(end) {
+        end -= 1;
+    }
+    let omitted = u32::try_from(source_span.len() - end).unwrap_or(u32::MAX);
+    let mut capped = source_span;
+    capped.truncate(end);
+    (capped, Some(omitted))
+}
+
 pub fn budget_take<T, F>(items: Vec<T>, token_budget: u32, cost_of: F) -> Response<T>
 where
     F: Fn(&T) -> u32,
@@ -636,6 +1458,14 @@ where
     let mut current_tokens = 0u32;
     let mut truncated = false;
 
+    // The budget is hard: an item that does not fit is withheld, never emitted
+    // over budget. `test_search_never_exceeds_hard_token_budget` pins this, and
+    // `DevMapClient._budgeted` raises on any response that breaks it, so a
+    // packer that "made progress" by exceeding the budget would turn a thin
+    // result into a client-side error.
+    //
+    // Which is why an oversized *item* is bounded where it is built rather than
+    // waved through here — see `cap_source_span`.
     for item in items {
         let cost = cost_of(&item);
         if cost > token_budget.saturating_sub(current_tokens) {
@@ -692,6 +1522,60 @@ mod tests {
     use super::*;
     use devmap_extract::extract_file;
     use devmap_resolve::Resolver;
+
+    /// A symbol too large for the budget is returned capped, and says so.
+    ///
+    /// The whole point: a hit costs `len / 4 + 20` tokens against a 2,000-token
+    /// default, so one 8 KB function was unreturnable — the packer dropped it
+    /// and `DevMapClient._budgeted` would reject it even if the packer had not.
+    /// The cap must leave the hit inside the budget *and* record what it
+    /// dropped, because `source_span` is contractually the verbatim body.
+    #[test]
+    fn an_oversized_source_span_is_capped_within_budget_and_reports_the_omission() {
+        let budget = 2_000u32;
+        let huge = "x".repeat(40_000);
+        let (capped, omitted) = cap_source_span(huge.clone(), budget);
+
+        let cost = (capped.len() as u32) / BYTES_PER_TOKEN + SEARCH_HIT_OVERHEAD_TOKENS;
+        assert!(
+            cost <= budget,
+            "capped hit still costs {cost} tokens against a {budget} budget"
+        );
+        let omitted = omitted.expect("a capped span must report what it dropped");
+        assert_eq!(
+            capped.len() as u32 + omitted,
+            huge.len() as u32,
+            "kept + omitted must account for every byte of the original"
+        );
+    }
+
+    /// A span that already fits is returned untouched and unmarked.
+    ///
+    /// `source_span_omitted_bytes` must mean "this was capped" and nothing
+    /// else; a `Some(0)` on every hit would make the signal useless.
+    #[test]
+    fn a_span_within_budget_is_left_verbatim() {
+        let small = "def f():\n    return 1\n".to_string();
+        let (kept, omitted) = cap_source_span(small.clone(), 2_000);
+        assert_eq!(kept, small);
+        assert_eq!(omitted, None);
+    }
+
+    /// Capping never splits a UTF-8 codepoint.
+    ///
+    /// `String::truncate` panics on a non-boundary index, so a source file with
+    /// non-ASCII in a comment or string literal would crash the query rather
+    /// than answer it.
+    #[test]
+    fn capping_a_span_full_of_multibyte_characters_does_not_panic() {
+        // 4-byte codepoints, so most byte offsets are not char boundaries.
+        let emoji_source = "🦀".repeat(4_000);
+        let (capped, omitted) = cap_source_span(emoji_source.clone(), 200);
+        assert!(capped.len() < emoji_source.len());
+        assert!(omitted.is_some());
+        // Round-trips as valid UTF-8 precisely because it stopped on a boundary.
+        assert!(capped.chars().all(|c| c == '🦀'));
+    }
 
     #[test]
     fn search_reports_shown_and_total_when_truncated() {

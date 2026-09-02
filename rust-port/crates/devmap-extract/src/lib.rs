@@ -4,6 +4,8 @@
 // actually uses.
 #[cfg(feature = "parse")]
 pub mod cache;
+pub mod clonesig;
+pub mod fallback;
 pub mod frameworks;
 pub mod gomod;
 #[cfg(feature = "parse")]
@@ -12,6 +14,10 @@ pub mod langcalls;
 pub(crate) mod langdecl;
 pub mod languages;
 pub mod model;
+// Needs the grammars: a notebook's cells are reconstructed and then handed to
+// the real extractor, so this module is only meaningful with `parse` on.
+#[cfg(feature = "parse")]
+pub mod notebook;
 #[cfg(feature = "parse")]
 pub mod treesitter;
 pub mod wiring;
@@ -170,6 +176,15 @@ fn matches_ignore(
 
 #[cfg(feature = "parse")]
 pub fn extract_file(path: &str, source: &str) -> Extraction {
+    // Notebooks divert here rather than inside `extract_treesitter`, because
+    // what they need is not a different grammar but a different *source*: the
+    // code has to be reconstructed out of the JSON before any grammar sees it,
+    // and the resulting spans relocated back into the raw file. Handing the
+    // reconstructed buffer straight to the extractor would produce symbols
+    // whose spans index a string that exists only in memory.
+    if notebook::is_notebook(path) {
+        return notebook::extract_notebook(path, source, extract_treesitter);
+    }
     let lang = detect_language(Path::new(path));
     extract_treesitter(path, lang, source)
 }
