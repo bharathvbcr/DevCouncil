@@ -77,7 +77,7 @@ against their contracts:
 | Row | File | Change |
 |---|---|---|
 | 15 | `integrations/mcp/util.py` | `TextContent` moved to `TYPE_CHECKING` with a local import in `json_text()`; response shape unchanged |
-| — | `indexing/graph/embeddings.py` | **Deleted in `079bc50`.** The `K7` ranker fix landed here first as a stored TF-IDF index (IDF table, build step, generation stamp, model tag, `stale_rows_skipped`); the kernel now does the same ranking statelessly per query in `devmap-query/src/semantic.rs`, so none of that machinery survives. `EmbeddingsConfig` in `app/config.py` still declares `enabled` / `model_name: "hash-v1"` for the deleted module — dead configuration, not a live setting |
+| — | `indexing/graph/embeddings.py` | **Deleted in `079bc50`.** The `K7` ranker fix landed here first as a stored TF-IDF index (IDF table, build step, generation stamp, model tag, `stale_rows_skipped`); the kernel now does the same ranking statelessly per query in `devmap-query/src/semantic.rs`, so none of that machinery survives. `EmbeddingsConfig` went with it in `6a4e656`, along with the init-template entry and three build call sites; `grep -r 'EmbeddingsConfig\|hash-v1' src/` is empty. (`SemanticCacheConfig` in `app/config.py` is a different, live subsystem — the FAISS cache for the LLM layer — and is not related to graph embeddings) |
 
 That row read differently when it was written, and the rewrite is the point: it described the
 embedding change as *"a behaviour change to a stored artifact, not just an algorithm swap"*,
