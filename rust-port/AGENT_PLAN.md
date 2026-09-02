@@ -522,7 +522,7 @@ doc that contradicts the code is worse than a missing one — a reader trusts it
 |---|---|---|
 | `DOC-1` | `PLAN.html` was a 2026-08-12 snapshot with different structure (8 sections vs PLAN.md's 11) and no generator, while its own `.md` called it "same content, styled" | **closed 2026-09-02** — `tools/render/render_plan.sh` regenerates it from PLAN.md with pandoc, styling preserved in `tools/render/plan_head.html`. Structural parity verified: 11 `<h2>` in both, 25 tables rendered. **Re-run after editing PLAN.md** |
 | `DOC-2` | `AUDIT.html` had no `AUDIT.md` in the tree: 84 audit findings existed only as rendered HTML, ungreppable and undiffable | **closed 2026-09-02** — `AUDIT.md` recovered with `pandoc --from=html --to=gfm` (23 headings, 9 sections, 30 tables). It is labelled a **reading copy, not a build source**: AUDIT.html stays hand-authored and authoritative, and is deliberately *not* regenerated, because its masthead and severity chips (1 critical / 21 high / 40 medium / 22 low) cannot be expressed in markdown and a round-trip would silently delete them |
-| `DOC-3` | **`CLAUDE.md` / `AGENTS.md` are never regenerated, at either root, and they advertise that they are.** Not a staleness chore and not a structural question — both earlier diagnoses here were wrong | **open — root cause identified, fix gated on decision 3** (see below) |
+| `DOC-3` | **`CLAUDE.md` / `AGENTS.md` are never regenerated, at either root, while carrying a marker that says they are kept in sync.** Three diagnoses were tried here; the first two were wrong | **open, gated on decision 3.** All four guides are **gitignored** (`rust-port/.gitignore:35`), so they are per-checkout artifacts that no commit can carry: a fresh clone gets whatever `dev map` writes, which is nothing. The generator is therefore the only fix that reaches anyone. The `rust-port` pair on *this* checkout was hand-corrected on 2026-09-02 (its surfaces list read `crates: model, model, model`) with an in-file comment pointing here — that helps agents on this machine and **nowhere else**, and is mitigation, not a fix |
 | `DOC-4` | `CONSUMERS.md` did not mention the `devmap_engine.py` seam changes or the Python embedding replacement (K7) | **closed 2026-09-02** — and the audit found more than the row described: the 37-row matrix does not track the seam at all, and it still records `cli/commands/map.py` as frozen under R1 when that file has been modified |
 
 **`DOC-3` in full, because the finding is larger than the row.** Verified 2026-09-02 by running
@@ -552,6 +552,12 @@ Not isolated: whether `write_agent_guides` is unreached (an early return before
 `map_artifacts.py:464`) or reached and skipping. The equality skip is implausible given the
 subsystem shapes above differ. One adjacent smell — `cli/commands/map.py:21` binds
 `_write_agent_guides = write_agent_guides` and **never calls it**, a dead alias.
+
+One further fact makes this sharper than a stale-file problem: **all four guides are
+gitignored** (`rust-port/.gitignore:35` and the root equivalent). They are never committed, so
+a fresh clone has no workspace guide until `dev map` writes one — and `dev map` does not write
+one. The stale copies on any given machine are the only ones that exist, and they cannot be
+repaired by a commit. Hand-editing them, as was done here on 2026-09-02, fixes one checkout.
 
 Fix is gated on required-decision 3: `map_artifacts.py` is a Python indexing owner under the
 R1 freeze, the same freeze `cli/commands/map.py` is already recorded as violating.
