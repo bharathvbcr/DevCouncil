@@ -57,7 +57,7 @@ const INFERRED_FLOOR_MILLIS: i64 = 400;
 /// `every_symbol_kind_maps_into_the_frozen_node_kind_set` can prove the mapping
 /// stays inside it. A value outside this set does not degrade the artifact — it
 /// makes `CodeGraph.model_validate` raise and every consumer lose the graph.
-#[cfg(test)]
+#[cfg(all(test, feature = "parse"))]
 const PYTHON_NODE_KINDS: &[&str] = &[
     "file",
     "module",
@@ -552,7 +552,7 @@ fn is_foreign_code_graph(path: &Path) -> anyhow::Result<bool> {
         != Some(CONSUMER_MAP_ENGINE))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "parse"))]
 mod tests {
     use super::*;
     use devmap_analyze::model::{AnalysisStatus, CommunityReport, DeadSymbolReport};

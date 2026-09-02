@@ -10,39 +10,89 @@ serde_json.workspace = true
 rayon.workspace = true
 regex.workspace = true
 anyhow.workspace = true
-tree-sitter.workspace = true
-tree-sitter-language.workspace = true
-tree-sitter-python.workspace = true
-tree-sitter-javascript.workspace = true
-tree-sitter-typescript.workspace = true
-tree-sitter-rust.workspace = true
-tree-sitter-go.workspace = true
-tree-sitter-hcl.workspace = true
-tree-sitter-java.workspace = true
-tree-sitter-c-sharp.workspace = true
-tree-sitter-php.workspace = true
-tree-sitter-ruby.workspace = true
-tree-sitter-c.workspace = true
-tree-sitter-cpp.workspace = true
-tree-sitter-objc.workspace = true
-tree-sitter-cuda.workspace = true
-tree-sitter-swift.workspace = true
-tree-sitter-scala.workspace = true
-tree-sitter-dart.workspace = true
-tree-sitter-pascal.workspace = true
-tree-sitter-lua.workspace = true
-tree-sitter-luau.workspace = true
-tree-sitter-r.workspace = true
-tree-sitter-cfml.workspace = true
-tree-sitter-erlang.workspace = true
-tree-sitter-solidity.workspace = true
-tree-sitter-bash.workspace = true
-tree-sitter-sequel.workspace = true
-tree-sitter-nix.workspace = true
-tree-sitter-kotlin-ng.workspace = true
-tree-sitter-svelte-ng.workspace = true
-tree-sitter-astro-next.workspace = true
+tree-sitter = { workspace = true, optional = true }
+tree-sitter-language = { workspace = true, optional = true }
+tree-sitter-python = { workspace = true, optional = true }
+tree-sitter-javascript = { workspace = true, optional = true }
+tree-sitter-typescript = { workspace = true, optional = true }
+tree-sitter-rust = { workspace = true, optional = true }
+tree-sitter-go = { workspace = true, optional = true }
+tree-sitter-hcl = { workspace = true, optional = true }
+tree-sitter-java = { workspace = true, optional = true }
+tree-sitter-c-sharp = { workspace = true, optional = true }
+tree-sitter-php = { workspace = true, optional = true }
+tree-sitter-ruby = { workspace = true, optional = true }
+tree-sitter-c = { workspace = true, optional = true }
+tree-sitter-cpp = { workspace = true, optional = true }
+tree-sitter-objc = { workspace = true, optional = true }
+tree-sitter-cuda = { workspace = true, optional = true }
+tree-sitter-swift = { workspace = true, optional = true }
+tree-sitter-scala = { workspace = true, optional = true }
+tree-sitter-dart = { workspace = true, optional = true }
+tree-sitter-pascal = { workspace = true, optional = true }
+tree-sitter-lua = { workspace = true, optional = true }
+tree-sitter-luau = { workspace = true, optional = true }
+tree-sitter-r = { workspace = true, optional = true }
+tree-sitter-cfml = { workspace = true, optional = true }
+tree-sitter-erlang = { workspace = true, optional = true }
+tree-sitter-solidity = { workspace = true, optional = true }
+tree-sitter-bash = { workspace = true, optional = true }
+tree-sitter-sequel = { workspace = true, optional = true }
+tree-sitter-nix = { workspace = true, optional = true }
+tree-sitter-kotlin-ng = { workspace = true, optional = true }
+tree-sitter-svelte-ng = { workspace = true, optional = true }
+tree-sitter-astro-next = { workspace = true, optional = true }
 ignore.workspace = true
 
 [build-dependencies]
 cc = "1"
+
+[features]
+default = ["parse"]
+
+# The parsing frontend: tree-sitter and its 32 grammars.
+#
+# Optional because the *query* half of this workspace does not need it. Reading
+# a persisted map back — search, dependencies, impact, trace, dead symbols —
+# touches only the model types and the SQLite store; the grammars are needed to
+# BUILD a map, not to answer questions about one.
+#
+# That distinction matters to embedders. GitPulse links devmap-query to answer
+# impact queries in-process and never indexes anything itself, and with this
+# feature on it inherited 49 crates and 32 C-compiled grammars to do it.
+#
+# On by default, so every existing consumer builds exactly as before.
+parse = [
+    "dep:tree-sitter",
+    "dep:tree-sitter-language",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-javascript",
+    "dep:tree-sitter-typescript",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-go",
+    "dep:tree-sitter-hcl",
+    "dep:tree-sitter-java",
+    "dep:tree-sitter-c-sharp",
+    "dep:tree-sitter-php",
+    "dep:tree-sitter-ruby",
+    "dep:tree-sitter-c",
+    "dep:tree-sitter-cpp",
+    "dep:tree-sitter-objc",
+    "dep:tree-sitter-cuda",
+    "dep:tree-sitter-swift",
+    "dep:tree-sitter-scala",
+    "dep:tree-sitter-dart",
+    "dep:tree-sitter-pascal",
+    "dep:tree-sitter-lua",
+    "dep:tree-sitter-luau",
+    "dep:tree-sitter-r",
+    "dep:tree-sitter-cfml",
+    "dep:tree-sitter-erlang",
+    "dep:tree-sitter-solidity",
+    "dep:tree-sitter-bash",
+    "dep:tree-sitter-sequel",
+    "dep:tree-sitter-nix",
+    "dep:tree-sitter-kotlin-ng",
+    "dep:tree-sitter-svelte-ng",
+    "dep:tree-sitter-astro-next",
+]

@@ -98,7 +98,7 @@ pub fn semantic_snapshots(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "parse"))]
 mod tests {
     use super::*;
     use devmap_extract::extract_file;

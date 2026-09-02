@@ -1,21 +1,31 @@
+// The parsing frontend. Everything below the `parse` gate needs tree-sitter
+// and its grammars; everything above it — the model types, language detection,
+// go.mod parsing, the ignore rules — does not, and is what a *query* consumer
+// actually uses.
+#[cfg(feature = "parse")]
 pub mod cache;
 pub mod frameworks;
 pub mod gomod;
+#[cfg(feature = "parse")]
 pub mod langcalls;
+#[cfg(feature = "parse")]
 pub(crate) mod langdecl;
 pub mod languages;
 pub mod model;
+#[cfg(feature = "parse")]
 pub mod treesitter;
 pub mod wiring;
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "parse")]
 use rayon::prelude::*;
 
 pub use gomod::{collect_go_modules, git_worktree_root, parse_go_mod, GoModule};
 pub use languages::{detect_language, is_ignored_path, is_indexable_source};
 pub use model::*;
+#[cfg(feature = "parse")]
 pub use treesitter::extract_treesitter;
 
 pub struct FileRef<'a> {
@@ -158,11 +168,13 @@ fn matches_ignore(
     ignored
 }
 
+#[cfg(feature = "parse")]
 pub fn extract_file(path: &str, source: &str) -> Extraction {
     let lang = detect_language(Path::new(path));
     extract_treesitter(path, lang, source)
 }
 
+#[cfg(feature = "parse")]
 pub fn extract_all(files: &[FileRef]) -> Vec<Extraction> {
     files
         .par_iter()
@@ -267,6 +279,7 @@ pub fn collect_sources_with_report(
 }
 
 /// Extract every indexable file under `root` (owned paths — no leaks).
+#[cfg(feature = "parse")]
 pub fn extract_tree(root: &Path) -> anyhow::Result<Vec<Extraction>> {
     let sources = collect_sources(root)?;
     let refs: Vec<FileRef> = sources
@@ -279,7 +292,7 @@ pub fn extract_tree(root: &Path) -> anyhow::Result<Vec<Extraction>> {
     Ok(extract_all(&refs))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "parse"))]
 mod tests {
     use super::*;
     use std::fs;

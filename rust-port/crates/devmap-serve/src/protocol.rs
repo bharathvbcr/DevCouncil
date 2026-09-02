@@ -405,7 +405,10 @@ where
             return write_envelope(&mut stream, &envelope).await;
         }
         Err(FrameReadError::TooLarge(limit)) => {
-            let envelope = failure("request_too_large", format!("request exceeds {limit} bytes"));
+            let envelope = failure(
+                "request_too_large",
+                format!("request exceeds {limit} bytes"),
+            );
             return write_envelope(&mut stream, &envelope).await;
         }
         Err(_) => return Ok(()),
@@ -426,10 +429,7 @@ where
                 )
                 .await;
                 match dispatched {
-                    Err(_) => failure(
-                        "query_timeout",
-                        format!("query exceeded {QUERY_TIMEOUT:?}"),
-                    ),
+                    Err(_) => failure("query_timeout", format!("query exceeded {QUERY_TIMEOUT:?}")),
                     Ok(Err(error)) => {
                         failure("internal_error", format!("query task failed: {error}"))
                     }
@@ -541,9 +541,7 @@ fn probe_endpoint_liveness(path: &std::path::Path) -> Option<bool> {
         let connected = std::os::unix::net::UnixStream::connect(&probe_path).is_ok();
         let _ = sender.send(connected);
     });
-    receiver
-        .recv_timeout(LIVENESS_PROBE_TIMEOUT)
-        .ok()
+    receiver.recv_timeout(LIVENESS_PROBE_TIMEOUT).ok()
 }
 
 #[cfg(unix)]
@@ -695,9 +693,7 @@ pub async fn run_named_pipe(
         let activity = Arc::clone(&activity);
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) =
-                handle_stream_with_activity(connected, store, &activity).await
-            {
+            if let Err(error) = handle_stream_with_activity(connected, store, &activity).await {
                 tracing::warn!("named-pipe IPC connection failed: {error}");
             }
         });
@@ -727,10 +723,12 @@ mod tests {
 
         let started = std::time::Instant::now();
         let deadline = started + Duration::from_millis(300);
-        let result =
-            tokio::time::timeout(Duration::from_secs(3), read_frame(server, IO_TIMEOUT, deadline))
-                .await
-                .expect("read_frame must return instead of hanging past the deadline");
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            read_frame(server, IO_TIMEOUT, deadline),
+        )
+        .await
+        .expect("read_frame must return instead of hanging past the deadline");
         let elapsed = started.elapsed();
 
         let error = result.expect_err("a frame still open at the deadline must be refused");
@@ -941,8 +939,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_second_binder_is_refused_while_the_first_holds_the_endpoint() {
-        let path =
-            std::env::temp_dir().join(format!("devmap-lock-{}.sock", std::process::id()));
+        let path = std::env::temp_dir().join(format!("devmap-lock-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let first = UnixIpcServer::bind(&path).expect("first bind must succeed");
         assert!(
@@ -1229,10 +1226,7 @@ mod hardening_limit_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn the_probe_refuses_live_endpoints_and_replaces_stale_files() {
-        let path = std::env::temp_dir().join(format!(
-            "devmap-probe-{}.sock",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("devmap-probe-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(ipc_lock_path(&path));
 
@@ -1250,8 +1244,7 @@ mod hardening_limit_tests {
 
         // A stale non-socket file answers the probe negatively and is replaced.
         std::fs::write(&path, b"junk").unwrap();
-        let server = UnixIpcServer::bind(&path)
-            .expect("a stale file must be replaceable");
+        let server = UnixIpcServer::bind(&path).expect("a stale file must be replaceable");
         drop(server);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(ipc_lock_path(&path));

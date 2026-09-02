@@ -24,10 +24,7 @@ const MAX_PENDING_ATTEMPTS: u32 = 5;
 /// instead of wedging the daemon.
 const GIT_HEAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
-fn run_git_head_with_deadline(
-    program: &str,
-    root: &Path,
-) -> anyhow::Result<String> {
+fn run_git_head_with_deadline(program: &str, root: &Path) -> anyhow::Result<String> {
     use std::io::Read;
     use std::process::Stdio;
 
@@ -746,6 +743,9 @@ impl Store {
         ((gen_id as i64) << 32) | (node_ord as i64)
     }
 
+    /// Writes a generation. Part of the build path, so it needs the parsing
+    /// frontend's grammar-identity stamps and is gated with it.
+    #[cfg(feature = "parse")]
     pub fn save_generation(
         &self,
         extractions: &[Extraction],
@@ -766,6 +766,7 @@ impl Store {
     /// 1. Carry forward prior-generation rows whose source file is not in affected∪deleted
     /// 2. Insert freshly resolved rows for affected (from `extractions`)
     /// 3. Deleted paths contribute zero rows (explicit absence — N2)
+    #[cfg(feature = "parse")]
     pub fn save_generation_with_opts(
         &self,
         extractions: &[Extraction],
@@ -776,6 +777,7 @@ impl Store {
         self.save_generation_with_metadata(extractions, resolution, analysis, opts, "unknown")
     }
 
+    #[cfg(feature = "parse")]
     pub fn save_generation_with_metadata(
         &self,
         extractions: &[Extraction],
@@ -1441,6 +1443,10 @@ impl Store {
     /// into one full build.
     ///
     /// True when there is no generation yet: a cold build carries nothing.
+    /// Whether the stored payload was produced by the current grammars.
+    /// A build-path question: it compares against grammar identities only
+    /// the parsing frontend can supply.
+    #[cfg(feature = "parse")]
     pub fn latest_generation_payload_is_current(&self) -> Result<bool> {
         let conn = lock_conn(&self.conn)?;
         let mut stmt = conn.prepare(
@@ -2184,6 +2190,7 @@ impl Store {
         Ok(removed)
     }
 
+    #[cfg(feature = "parse")]
     pub fn try_get_cached_extraction(
         &self,
         key: &devmap_extract::cache::CacheKey,
@@ -2234,6 +2241,7 @@ impl Store {
         Ok(payload.and_then(|json| serde_json::from_str(&json).ok()))
     }
 
+    #[cfg(feature = "parse")]
     pub fn admit_cached_extraction(
         &self,
         key: &devmap_extract::cache::CacheKey,
@@ -2271,6 +2279,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(feature = "parse")]
     pub fn record_extraction_retry(
         &self,
         key: &devmap_extract::cache::CacheKey,
@@ -2351,10 +2360,8 @@ mod git_head_tests {
         }
 
         let started = std::time::Instant::now();
-        let result = run_git_head_with_deadline(
-            &script.to_string_lossy(),
-            std::path::Path::new("/tmp"),
-        );
+        let result =
+            run_git_head_with_deadline(&script.to_string_lossy(), std::path::Path::new("/tmp"));
         let elapsed = started.elapsed();
 
         let error = result.expect_err("a stalled git must produce an error");
@@ -2382,8 +2389,7 @@ mod git_head_tests {
         assert!(started.elapsed() < GIT_HEAD_DEADLINE);
         match result {
             Ok(head) => assert!(
-                (7..=64).contains(&head.len())
-                    && head.bytes().all(|b| b.is_ascii_hexdigit()),
+                (7..=64).contains(&head.len()) && head.bytes().all(|b| b.is_ascii_hexdigit()),
                 "a real HEAD must pass validation: {head:?}"
             ),
             Err(error) => assert!(

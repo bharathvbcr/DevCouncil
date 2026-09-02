@@ -195,7 +195,9 @@ impl Daemon {
                     // IPC availability for a repository that is otherwise
                     // perfectly indexable. The refusal is logged loudly so it
                     // cannot pass for complete coverage.
-                    warn!("connect-time sweep skipped unrepresentable non-UTF-8 source path {path:?}");
+                    warn!(
+                        "connect-time sweep skipped unrepresentable non-UTF-8 source path {path:?}"
+                    );
                 }
             }
         }
@@ -969,7 +971,9 @@ mod tests {
         )
         .unwrap();
 
-        store.enqueue_pending_paths(&[root.to_string_lossy().into_owned()]).unwrap();
+        store
+            .enqueue_pending_paths(&[root.to_string_lossy().into_owned()])
+            .unwrap();
         let daemon = Daemon::new(store, root.clone());
 
         daemon
@@ -980,14 +984,20 @@ mod tests {
         assert!(
             persisted.iter().any(|extraction| {
                 extraction.file_path == "good.py"
-                    && extraction.symbols.iter().any(|symbol| symbol.name == "good_v2")
+                    && extraction
+                        .symbols
+                        .iter()
+                        .any(|symbol| symbol.name == "good_v2")
             }),
             "the healthy sibling must be re-extracted"
         );
         assert!(
             persisted.iter().any(|extraction| {
                 extraction.file_path == "poison.py"
-                    && extraction.symbols.iter().any(|symbol| symbol.name == "poison_v1")
+                    && extraction
+                        .symbols
+                        .iter()
+                        .any(|symbol| symbol.name == "poison_v1")
             }),
             "a refused-but-existing file must keep its stored row instead of \
              being recorded as deleted"
@@ -1029,7 +1039,10 @@ mod tests {
         // refuse such names outright rather than storing them; there the
         // fixture cannot exist and the daemon-tolerance property has no local
         // subject, so say so instead of panicking on fixture setup.
-        if let Err(error) = fs::write(root.join(OsStr::from_bytes(b"bad\xff.py")), "def odd(): pass\n") {
+        if let Err(error) = fs::write(
+            root.join(OsStr::from_bytes(b"bad\xff.py")),
+            "def odd(): pass\n",
+        ) {
             if error.raw_os_error().is_some() {
                 eprintln!(
                     "skipping non-UTF-8 reconcile test: this platform/volume refuses \
@@ -1258,10 +1271,8 @@ mod tests {
     /// instead of the behavior under test.
     #[cfg(unix)]
     fn short_unix_fixture_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::path::PathBuf::from("/tmp").join(format!(
-            "devmap-fx-{}-{tag}",
-            std::process::id()
-        ));
+        let dir = std::path::PathBuf::from("/tmp")
+            .join(format!("devmap-fx-{}-{tag}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -1334,8 +1345,7 @@ mod tests {
                             .unwrap();
                         let mut response = String::new();
                         stream.read_to_string(&mut response).await.unwrap();
-                        break serde_json::from_str::<serde_json::Value>(response.trim())
-                            .unwrap();
+                        break serde_json::from_str::<serde_json::Value>(response.trim()).unwrap();
                     }
                 }
             }
@@ -1411,7 +1421,9 @@ mod tests {
         // daemon must keep working until the queue empties rather than retire
         // mid-resync.
         let store = Store::open_in_memory().unwrap();
-        let paths: Vec<String> = (0..3).map(|i| format!("{}/m{i}.py", root.display())).collect();
+        let paths: Vec<String> = (0..3)
+            .map(|i| format!("{}/m{i}.py", root.display()))
+            .collect();
         for path in &paths {
             fs::write(path, format!("def f{}(): pass\n", path.len())).unwrap();
         }

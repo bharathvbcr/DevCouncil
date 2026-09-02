@@ -362,10 +362,7 @@ mod tests {
             // receive window: the event channel never goes quiet on its own.
             while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
                 round += 1;
-                let _ = std::fs::write(
-                    noise_root.join("noise.txt"),
-                    format!("noise {round}\n"),
-                );
+                let _ = std::fs::write(noise_root.join("noise.txt"), format!("noise {round}\n"));
                 std::thread::sleep(Duration::from_millis(100));
             }
         });

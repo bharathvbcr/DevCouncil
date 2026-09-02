@@ -5,10 +5,16 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-devmap-extract = { path = "../devmap-extract" }
-devmap-resolve = { path = "../devmap-resolve" }
-devmap-analyze = { path = "../devmap-analyze" }
-devmap-store = { path = "../devmap-store" }
+devmap-extract = { path = "../devmap-extract", default-features = false }
+devmap-resolve = { path = "../devmap-resolve", default-features = false }
+devmap-analyze = { path = "../devmap-analyze", default-features = false }
+devmap-store = { path = "../devmap-store", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+
+[features]
+default = ["parse"]
+# Forwards the parsing frontend. Off, this crate builds without tree-sitter
+# and answers questions about a persisted map rather than building one.
+parse = ["devmap-extract/parse", "devmap-resolve/parse", "devmap-analyze/parse", "devmap-store/parse"]

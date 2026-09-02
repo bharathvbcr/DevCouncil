@@ -445,7 +445,7 @@ pub fn analyze_liveness(
     reports
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "parse"))]
 mod tests {
     use super::*;
 

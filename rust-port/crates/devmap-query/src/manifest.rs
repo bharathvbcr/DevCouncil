@@ -321,7 +321,7 @@ fn is_foreign_repo_map(path: &Path) -> anyhow::Result<bool> {
     Ok(value.get("map_engine").and_then(Value::as_str) != Some(CONSUMER_MAP_ENGINE))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "parse"))]
 mod tests {
     use super::*;
     use devmap_extract::extract_file;
