@@ -770,6 +770,13 @@ Closed, each with a regression that fails against the pre-fix code:
 - **K6** — a rebuilt binary left the running daemon answering from superseded code.
 - **K7** — the embedding ranker was measurably broken: random-projection hash vectors put the
   correct symbol at rank 28 or absent on all 5 probes. Replaced with TF-IDF; rank 1 on all 5.
+  **Superseded 2026-09-02 by `079bc50`, and this entry described a fix that no longer exists.**
+  The Python fix landed in `indexing/graph/embeddings.py` as a *stored* index — an IDF table, a
+  build step, a generation stamp, a model tag and a `stale_rows_skipped` counter for when they
+  disagreed. That module has been deleted and the ranking ported into the kernel as
+  `devmap-query/src/semantic.rs`, computed at query time over `generation_nodes` with nothing
+  stored. The defect and the measurement stand; the *mechanism* described above does not, and
+  the stored-index machinery it depended on is gone rather than fixed.
 
 Also closed, after this section was first written:
 
@@ -821,7 +828,7 @@ it is another reason to re-run when the tree is quiet. Second,
 idempotent and harmless but was not asked for.
 
 Not run and not claimed: soak, multi-platform CI, production validation, mutation coverage.
-The Python-side changes (TF-IDF embeddings, freshness stamping) were verified against the
+The Python-side changes (freshness stamping; the TF-IDF embeddings since deleted, see K7) were verified against the
 Python suite, and K2/K3 end-to-end against both corpora, before the concurrent edits began.
 
 ## Required decisions / external gates

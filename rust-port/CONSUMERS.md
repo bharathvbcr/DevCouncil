@@ -77,12 +77,14 @@ against their contracts:
 | Row | File | Change |
 |---|---|---|
 | 15 | `integrations/mcp/util.py` | `TextContent` moved to `TYPE_CHECKING` with a local import in `json_text()`; response shape unchanged |
-| — | `indexing/graph/embeddings.py` | Ranker replaced (hash projection → TF-IDF, `K7`). `model_name` in `app/config.py` moved `hash-v1` → `tfidf-v1`, so rows written by the old model are now model-filtered out of `semantic_search` and reported via `stale_rows_skipped` rather than silently ranked |
+| — | `indexing/graph/embeddings.py` | **Deleted in `079bc50`.** The `K7` ranker fix landed here first as a stored TF-IDF index (IDF table, build step, generation stamp, model tag, `stale_rows_skipped`); the kernel now does the same ranking statelessly per query in `devmap-query/src/semantic.rs`, so none of that machinery survives. `EmbeddingsConfig` in `app/config.py` still declares `enabled` / `model_name: "hash-v1"` for the deleted module — dead configuration, not a live setting |
 
-The embedding change is a behaviour change to a stored artifact, not just an algorithm swap:
-existing embedding rows carry the old model tag and are skipped until rebuilt. A consumer that
-read `semantic_search` results as complete coverage of the index would now be reading a subset,
-which is why the skip is counted and surfaced rather than left implicit.
+That row read differently when it was written, and the rewrite is the point: it described the
+embedding change as *"a behaviour change to a stored artifact, not just an algorithm swap"*,
+with old-model rows skipped until rebuilt. Within hours the stored artifact was removed
+entirely. Nothing is stored now, so there is no stale row to skip and no coverage subset to
+warn about — the warning outlived the thing it warned about, which is the failure this ledger
+exists to prevent.
 
 ## The 37 Consumers Matrix
 

@@ -63,7 +63,8 @@ Covers:
 - Deleting `src/devcouncil/indexing/` or `src/devcouncil/codeintel/`
 - Full 35-language parity harness
 - Embedding / RRF ranking (N7/R3) — deferred to Phase 5. **Note 2026-09-02:** the *Python*
-  consumer's embedding ranker was replaced (hash projection → TF-IDF, K7) because it was
+  consumer's embedding ranker was replaced (hash projection → TF-IDF, K7) — and has since been
+  deleted outright, the ranking moving into `devmap-query/src/semantic.rs`. It was
   measurably broken — the correct symbol ranked 28th or was absent on all five probes. That
   is a repair to the live Python surface, not the Rust N7/R3 work, which remains deferred.
 - Real Cypher engine (N10) — deferred; no regex Cypher shim in Rust

@@ -256,7 +256,7 @@ kernel lacks**, not defects. Recorded so the list is explicit rather than implie
 | ID | Capability | State |
 |---|---|---|
 | G1 | Breadth beyond linked grammars | **partly closed** — tier-2 recovery (K2/K3) serves grammarless languages; K1 leaves the nodeless case open |
-| G2 | Lexical + semantic retrieval that actually ranks | **closed** — TF-IDF replaced the random-projection hash ranker (K7) |
+| G2 | Lexical + semantic retrieval that actually ranks | **closed** — TF-IDF replaced the random-projection hash ranker (K7), and now lives in the kernel as `devmap-query/src/semantic.rs`, computed per query rather than stored |
 | G3 | Clone / duplicate detection | **in progress** — `devmap-extract/src/clonesig.rs`, owned by a separate session as of this writing |
 | G4 | Speculative edit preview — answer "what breaks if I change this" without writing | open |
 | G5 | Notebook (`.ipynb`) extraction | open |
@@ -284,7 +284,7 @@ introduced or inherited and now owns.
 | K4 | A symbol larger than the token budget still returns a hit | search returned **zero** results for large-symbol matches rather than a truncated one | closed |
 | K5 | The reclaim decision reads committed state | `freelist_count` was read before the WAL checkpoint, reporting 0 free pages while 33% of the store was free | closed |
 | K6 | A daemon never serves a superseded binary | a rebuilt kernel left the running daemon answering from the old code | closed |
-| K7 | An exact term match ranks first | hash-projection embeddings put the correct symbol at rank 28 or absent on all 5 probes; TF-IDF puts it at rank 1 | closed |
+| K7 | An exact term match ranks first | hash-projection embeddings put the correct symbol at rank 28 or absent on all 5 probes; TF-IDF puts it at rank 1 | closed — but **re-sited**: the Python module carrying the fix was deleted in `079bc50` and the ranking now lives in `devmap-query/src/semantic.rs`, stateless at query time |
 | K8 | A phase profiler attributes cost to the phase that incurred it | `stage()` recorded time-since-previous-announcement against the *next* label: extraction's 7.25 s printed as "resolving", extraction as 42 ns | closed |
 
 **K1 was the one that mattered most, and it is now closed.** K2 and K3 make tier-2 recovery

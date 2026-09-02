@@ -129,7 +129,7 @@
 
 <div class="wrap">
 <h1 id="dev-map--rust-clean-room-rewrite-plan">dev map → Rust: Clean-Room Rewrite Plan</h1>
-<p><strong>Status:</strong> Phase 6 hybrid. <code>dev map</code> <strong>already executes the Rust kernel</strong> — <code>rust-port/target/release/devmap</code>, with <code>src/devcouncil/devmap_engine.py</code> as the seam. Python <code>indexing/</code> + <code>codeintel/</code> are still present and still own the surfaces not yet migrated, but they are no longer what a <code>dev map</code> build runs. See <a href="STATUS.md">STATUS.md</a> for what is actually migrated and <a href="PHASE1_CONTRACT.md">PHASE1_CONTRACT.md</a> for token budgets and §4.5 scoping. <strong>Audit basis:</strong> DevCouncil @ <code>98f23e3</code>, 769 source files, macOS arm64, CPython 3.12.13, 2026-08-11. <strong>Kernel measurements (§2.1, §3 <code>K</code> findings, §3 <code>G</code> gaps):</strong> 2026-09-02, DevCouncil @ 994 code files and scholarlm @ 3,674, same host. Everything outside those three sections profiles the pre-port Python incumbent. <strong>PLAN.html:</strong> a styled companion, <strong>not</strong> a render of this file and not kept in sync with it. It was last written 2026-08-12 and is organised differently — 8 sections against this file's 11, with headings (<code>What changed in this revision</code>, <code>Token cost — the unmeasured surface</code>) that have no counterpart here, and without §2.1, §3.1, §9, §10, the <code>K</code> findings or the <code>G</code> gaps. It previously described itself as "same content, styled", which was already inaccurate before the 2026-09-02 pass and is now badly so. There is no generator; treat it as a snapshot of an earlier revision, or regenerate it.</p>
+<p><strong>Status:</strong> Phase 6 hybrid. <code>dev map</code> <strong>already executes the Rust kernel</strong> — <code>rust-port/target/release/devmap</code>, with <code>src/devcouncil/devmap_engine.py</code> as the seam. Python <code>indexing/</code> + <code>codeintel/</code> are still present and still own the surfaces not yet migrated, but they are no longer what a <code>dev map</code> build runs. See <a href="STATUS.md">STATUS.md</a> for what is actually migrated and <a href="PHASE1_CONTRACT.md">PHASE1_CONTRACT.md</a> for token budgets and §4.5 scoping. <strong>Audit basis:</strong> DevCouncil @ <code>98f23e3</code>, 769 source files, macOS arm64, CPython 3.12.13, 2026-08-11. <strong>Kernel measurements (§2.1, §3 <code>K</code> findings, §3 <code>G</code> gaps):</strong> 2026-09-02, DevCouncil @ 994 code files and scholarlm @ 3,674, same host. Everything outside those three sections profiles the pre-port Python incumbent. <strong>Rendered version:</strong> <a href="PLAN.html">PLAN.html</a> — now genuinely generated from this file by <code>tools/render/render_plan.sh</code> (pandoc; styling preserved in <code>tools/render/plan_head.html</code>). <strong>Re-run it after editing this file.</strong> Until 2026-09-02 the claim here was false: PLAN.html was a hand-maintained 2026-08-12 snapshot with 8 sections against this file's 11 and headings with no counterpart here, drifting further with every edit.</p>
 <p>A standalone Rust implementation of the code-intelligence subsystem — new binary, new store, new agent-facing contract. Not a PyO3 extension and not a function-by-function port. The 32 audit findings and 7 reference-derived enhancements below are the <strong>acceptance specification</strong>: the new system is designed so the defects cannot occur, and each item becomes a test rather than a patch.</p>
 <p>§4 is the counterweight — an inventory of behaviour that already works and must survive. A clean-room rewrite loses undocumented capability silently, and that inventory is what makes the loss detectable.</p>
 <hr />
@@ -795,7 +795,7 @@
 <tr>
 <td>G2</td>
 <td>Lexical + semantic retrieval that actually ranks</td>
-<td><strong>closed</strong> — TF-IDF replaced the random-projection hash ranker (K7)</td>
+<td><strong>closed</strong> — TF-IDF replaced the random-projection hash ranker (K7), and now lives in the kernel as <code>devmap-query/src/semantic.rs</code>, computed per query rather than stored</td>
 </tr>
 <tr>
 <td>G3</td>
@@ -882,7 +882,7 @@
 <td>K7</td>
 <td>An exact term match ranks first</td>
 <td>hash-projection embeddings put the correct symbol at rank 28 or absent on all 5 probes; TF-IDF puts it at rank 1</td>
-<td>closed</td>
+<td>closed — but <strong>re-sited</strong>: the Python module carrying the fix was deleted in <code>079bc50</code> and the ranking now lives in <code>devmap-query/src/semantic.rs</code>, stateless at query time</td>
 </tr>
 <tr>
 <td>K8</td>
