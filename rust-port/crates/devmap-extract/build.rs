@@ -6,6 +6,32 @@ use std::path::{Path, PathBuf};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
+
+    // The grammar versions are stamped only when the grammars are compiled in.
+    //
+    // They are read back by `cache.rs`, which is `#[cfg(feature = "parse")]`
+    // and is their only consumer. Emitting them unconditionally meant this
+    // build script read the *workspace's* `Cargo.lock` and failed unless all
+    // thirty tree-sitter packages were resolved in it — with `parse` off, when
+    // none of them is a dependency at all.
+    //
+    // That made the feature only half a feature. `--no-default-features` built
+    // fine inside this workspace, whose lockfile happens to carry the grammars
+    // for the other members, and could not build anywhere else: a consumer that
+    // vendored or copied this crate to answer queries about a persisted map hit
+    // "tree-sitter-python is absent from …/Cargo.lock" for a package it had
+    // deliberately excluded. The point of the feature is that such a consumer
+    // needs none of this.
+    if env::var_os("CARGO_FEATURE_PARSE").is_some() {
+        stamp_grammar_versions(&manifest_dir)?;
+    }
+
+    build_vendored_grammars(&manifest_dir)?;
+    Ok(())
+}
+
+/// Records the resolved version of every grammar, for the extraction cache key.
+fn stamp_grammar_versions(manifest_dir: &Path) -> Result<(), Box<dyn Error>> {
     let lock_path = manifest_dir.join("../..").join("Cargo.lock");
     println!("cargo:rerun-if-changed={}", lock_path.display());
 
@@ -54,7 +80,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
         println!("cargo:rustc-env={env_name}={version}");
     }
-    build_vendored_grammars(&manifest_dir)?;
     Ok(())
 }
 
