@@ -7,7 +7,8 @@ This document tracks all 37 external consumer files in `src/devcouncil/` that in
 The table below described seven consumers as Rust-primary with a Python
 fallback. That was true of the *code* and false of the *behaviour*: until SC23,
 `DevMapClient.DEFAULT_DB_PATH` pointed at `.devcouncil/codeintel/index.sqlite`,
-which is the Python schema (`user_version = 2`). The Rust store is `v10` and
+which is the Python schema (`user_version = 2`). The Rust store is `v12` (was `v10` when this
+was written; `CURRENT_SCHEMA_VERSION` in `devmap-store/src/schema.rs` is authoritative) and
 fails closed on it, so every hybrid call raised `DevMapClientError` and took the
 fallback — on every invocation, in this repository, since the pass landed.
 
@@ -51,6 +52,37 @@ rg -l 'from devcouncil\.(indexing|codeintel)' src/devcouncil --glob '*.py' \
 ```
 
 Hybrid consumers (DevMapClient/`try_connect` present): **7** files under `src/devcouncil/` excluding the client itself.
+
+## Correction (2026-09-02): three surfaces this ledger does not track, and one freeze it records as intact
+
+**The matrix has exactly 37 rows and the seam is not one of them.** `src/devcouncil/devmap_engine.py`
+is what every `dev map` build now executes — it invokes `target/release/devmap` and is the
+boundary between the Python CLI and the Rust kernel. Neither it nor `devmap_client.py` nor
+`indexing/graph/embeddings.py` appears here. The ledger's stated scope is files that interface
+with code intelligence; on that reading the most load-bearing interface in the system is
+untracked. Whether the seam belongs in this matrix or in a section of its own is a real
+question — it consumes the *Rust* kernel rather than the Python modules the matrix was built
+around — but "absent" is not the right answer either way.
+
+**`cli/commands/map.py` is recorded above as `Frozen (R1) — not modified in Phase 6 thin-client
+track`. It was modified on 2026-09-02**, gaining a `_refresh_embeddings()` call in `_build_once`
+so the embedding index is rebuilt with the map. The change is tested and works; that is not the
+point. R1 froze this file, this ledger records the freeze, and STATUS.md required-decision 3
+says changes to frozen Python consumers need approval before they land. The edit is in the
+working tree awaiting that decision, and this row should not be read as still accurate.
+
+Two further rows changed on the same date and are less consequential, but were not re-verified
+against their contracts:
+
+| Row | File | Change |
+|---|---|---|
+| 15 | `integrations/mcp/util.py` | `TextContent` moved to `TYPE_CHECKING` with a local import in `json_text()`; response shape unchanged |
+| — | `indexing/graph/embeddings.py` | Ranker replaced (hash projection → TF-IDF, `K7`). `model_name` in `app/config.py` moved `hash-v1` → `tfidf-v1`, so rows written by the old model are now model-filtered out of `semantic_search` and reported via `stale_rows_skipped` rather than silently ranked |
+
+The embedding change is a behaviour change to a stored artifact, not just an algorithm swap:
+existing embedding rows carry the old model tag and are skipped until rebuilt. A consumer that
+read `semantic_search` results as complete coverage of the index would now be reading a subset,
+which is why the skip is counted and surfaced rather than left implicit.
 
 ## The 37 Consumers Matrix
 
