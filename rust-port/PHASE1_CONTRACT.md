@@ -16,6 +16,28 @@
 
 Rank before truncate. Never present a capped sample as complete coverage.
 
+### Amendment 2026-09-02 — the four fields above are not sufficient (K4)
+
+`{shown, total, truncated, tokens_used}` can all be present and correct while the response
+is **empty**. A symbol whose source span alone exceeded the whole budget was dropped rather
+than trimmed, so `devmap search` returned zero hits for a query that matched. No budget was
+exceeded and every truncation that did occur was reported — both halves of the contract were
+green, and neither could distinguish *"nothing matched"* from *"something matched and did
+not fit"*.
+
+Amended contract for `devmap search`:
+
+| Requirement | Meaning |
+|---|---|
+| A match always returns a hit | Whatever the size of the match. Oversized source is capped, not the result dropped |
+| `source_span_omitted_bytes` | Present on any hit whose source was capped; absent means the source is complete |
+| Empty ⇒ genuinely no match | An empty result set is a claim that nothing matched, and must never mean "it did not fit" |
+
+This is `N4` — *a check that could not run must never report as one that ran and passed* —
+applied to the budget contract itself. The `Never present a capped sample as complete
+coverage` line above states the principle; K4 is the instance where the stated fields were
+not enough to enforce it.
+
 ## §4.5 scoping decisions (port / keep in Python / drop)
 
 | Area | LOC (plan) | Decision | Rationale |
@@ -40,5 +62,8 @@ Covers:
 
 - Deleting `src/devcouncil/indexing/` or `src/devcouncil/codeintel/`
 - Full 35-language parity harness
-- Embedding / RRF ranking (N7/R3) — deferred to Phase 5
+- Embedding / RRF ranking (N7/R3) — deferred to Phase 5. **Note 2026-09-02:** the *Python*
+  consumer's embedding ranker was replaced (hash projection → TF-IDF, K7) because it was
+  measurably broken — the correct symbol ranked 28th or was absent on all five probes. That
+  is a repair to the live Python surface, not the Rust N7/R3 work, which remains deferred.
 - Real Cypher engine (N10) — deferred; no regex Cypher shim in Rust

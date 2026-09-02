@@ -2,10 +2,12 @@
 
 Clean-room Rust rewrite of the `dev map` code-intelligence subsystem.
 
-**Status: active port; not ready for production cutover.** Workspace crates under `crates/`
-implement extract → resolve → analyze → store → query → serve → CLI. The Python implementation in
-`src/devcouncil/indexing/` and `src/devcouncil/codeintel/` remains the live production
-system until Phase 6 cutover. See [STATUS.md](STATUS.md) for verified and open gates.
+**Status: Phase 6 hybrid; not ready for full cutover.** Workspace crates under `crates/`
+implement extract → resolve → analyze → store → query → serve → CLI. **`dev map` already runs
+this kernel** (`target/release/devmap`, via `src/devcouncil/devmap_engine.py` as the seam);
+`src/devcouncil/indexing/` and `codeintel/` still own the surfaces not yet migrated, but they
+are no longer what a `dev map` build executes. See [STATUS.md](STATUS.md) for verified and
+open gates.
 
 ## Read this first
 
@@ -14,7 +16,9 @@ system until Phase 6 cutover. See [STATUS.md](STATUS.md) for verified and open g
 - **[PLAN.md](PLAN.md)** — full audit, specification, phases, and implementation guide.
 - **[PHASE1_CONTRACT.md](PHASE1_CONTRACT.md)** — token budgets, §4.5 scoping, starter corpus.
 - [AUDIT.html](AUDIT.html) — Audit II: 84 further findings; all fixes land in the Rust port.
-- [PLAN.html](PLAN.html) — same plan content, styled for humans.
+- [PLAN.html](PLAN.html) — a styled companion, **not** a render of PLAN.md and not in sync
+  with it: last written 2026-08-12, organised differently, and missing everything added since.
+  There is no generator. See PLAN.md's header.
 
 ## What this replaces (eventually)
 
@@ -26,10 +30,11 @@ plus 16,534 LOC of tests, with **37 files outside those directories importing th
 ```
 rust-port/
   crates/
-    devmap-extract/   tree-sitter + explicit unavailable outcomes + wiring + frameworks
+    devmap-extract/   tree-sitter, tier-2 regex fallback for grammarless languages,
+                      notebooks, wiring + frameworks
     devmap-resolve/   imports, calls, receiver types
     devmap-analyze/   liveness + communities (cohesion)
-    devmap-store/     rusqlite v6 schema, pending queue, history, differential writes
+    devmap-store/     rusqlite v12 schema, pending queue, history, differential writes
     devmap-query/     token-budgeted search/deps + manifest
     devmap-serve/     watcher + durable pending drain
     devmap-cli/       `devmap` binary
@@ -62,8 +67,13 @@ runs two semantic-digest builds and an optimized DevCouncil self-map with time/s
 
 ## For agents
 
-- **PLAN.md §3** — acceptance specification (31 findings + 7 enhancements). Each property
-  becomes a test, not a patch.
+- **PLAN.md §3** — acceptance specification: 32 findings + 7 reference-derived enhancements
+  (39 items), plus the `K1`–`K8` kernel findings and `G1`–`G8` gortex gaps added 2026-09-02.
+  Each property becomes a test, not a patch.
+- **PLAN.md §3.1** — the same findings grouped by *failure shape* rather than subsystem. Worth
+  reading before adding a gate: four of the five classes produced a fresh instance in the Rust
+  port after the Python instance had already been found, fixed, and written up as an
+  acceptance property.
 - **PLAN.md §4** — capabilities that must survive; inventory completion is a Phase 1 gate.
 - Do **not** delete Python analysis code in this track.
 - Trap: differential writes without deletion reconciliation leave deleted files live forever
