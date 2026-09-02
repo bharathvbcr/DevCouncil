@@ -1,0 +1,79 @@
+{
+  "binary": {
+    "mtime": "2026-09-02T18:11:08.563829+00:00",
+    "path": "/Users/bharath/Code/devtools/DevCouncil/rust-port/target/release/devmap",
+    "size_bytes": 70527728,
+    "version": "devmap 0.1.0"
+  },
+  "comparison": {
+    "cold": {
+      "baseline_s": 3.3708753749961033,
+      "current_s": 2.375844000001962,
+      "pct": -29.518485980671766
+    },
+    "e2e": {
+      "baseline_s": 2.4414607920043636,
+      "current_s": 1.0778278340003453,
+      "pct": -55.853158177671084
+    },
+    "manifest": {
+      "baseline_s": 0.5200074169988511,
+      "current_s": 0.40367233299912186,
+      "pct": -22.37181243897263
+    },
+    "touch": {
+      "baseline_s": 2.0398165410006186,
+      "current_s": 1.3045741669993731,
+      "pct": -36.04453435996637
+    },
+    "warm": {
+      "baseline_s": 0.23027558300236706,
+      "current_s": 0.21465283300494775,
+      "pct": -6.784371053903146
+    }
+  },
+  "corpus": {
+    "code_bytes": 41824997,
+    "code_files": 994,
+    "tracked_files": 1308
+  },
+  "generated_at": "2026-09-02T18:15:06+00:00",
+  "label": "final verified: all optimizations, fmt+clippy clean",
+  "python": "3.12.13",
+  "repeat": 5,
+  "repo": "/Users/bharath/Code/devtools/DevCouncil",
+  "stages": {
+    "cold": {
+      "max_s": 2.928374167000584,
+      "median_s": 2.6010360830041463,
+      "min_s": 2.375844000001962,
+      "samples": 5
+    },
+    "e2e": {
+      "max_s": 1.1769690830042236,
+      "median_s": 1.1322872919990914,
+      "min_s": 1.0778278340003453,
+      "samples": 5
+    },
+    "manifest": {
+      "graph_bytes": 20592502.0,
+      "map_bytes": 418320.0,
+      "max_s": 0.4351479160031886,
+      "median_s": 0.42816941600176506,
+      "min_s": 0.40367233299912186,
+      "samples": 5
+    },
+    "touch": {
+      "max_s": 1.720997583004646,
+      "median_s": 1.6458209580014227,
+      "min_s": 1.3045741669993731,
+      "samples": 5
+    },
+    "warm": {
+      "max_s": 0.2231634589988971,
+      "median_s": 0.21892599999409867,
+      "min_s": 0.21465283300494775,
+      "samples": 5
+    }
+  }
+}

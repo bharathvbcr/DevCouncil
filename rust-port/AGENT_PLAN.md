@@ -291,6 +291,244 @@ PHASE1_CONTRACT land here, each against its audit spec, then the last Python goe
 
 ---
 
+## Consolidated open-work register (2026-09-02)
+
+**Why this section exists.** Open work was spread across eleven documents in two workspaces,
+and the same item appeared in three of them with different status. This is the single place a
+worker reads to know what is left. It is an **index, not a copy**: each row names the document
+that owns the detail, and that document stays authoritative. Adding a twelfth checklist would
+have been the duplication this repository's rules forbid, so this extends the file that
+already owns execution rather than standing beside it.
+
+### Document map — who owns what
+
+Read the owner before working an item; do not restate an owner's content here.
+
+| Document | Owns | Do not use it for |
+|---|---|---|
+| `rust-port/PLAN.md` | Design, the 47 findings + `K1`–`K8` + `G1`–`G8`, §3.1 failure classes, §9 MCP/plugin surfaces, §10 worst-case scenarios | Execution order or progress |
+| `rust-port/STATUS.md` | Phase progress, verification evidence, the 11 required decisions | Design rationale |
+| `rust-port/AGENT_PLAN.md` (this file) | Execution: order, ground rules, proof obligations, **this register** | Design, findings, evidence |
+| `rust-port/INTEGRITY.md` | The independent audit's `D1`–`D17`, `T1`–`T9` | Current status — see STATUS.md |
+| `rust-port/DIVERGENCES.md` | Every deliberate difference from the Python baseline (R3) | Bugs |
+| `rust-port/CONSUMERS.md` | The 37 downstream contracts | Anything else |
+| `rust-port/PHASE1_CONTRACT.md` | Token budgets, §4.5 scoping | Progress |
+| `rust/STATUS.md` | The **separate** analysis-plane port (`dc-glob`/`grep`/`store`/`verify`) | The devmap kernel |
+| `IMPROVEMENTS.md` (root) | Dated narrative of landed work | A to-do list |
+
+**Two Rust workspaces exist and they are not duplicates.** `rust-port/` is the devmap
+code-intelligence kernel; `rust/` is the analysis plane ported from MANVI on 2026-09-01. They
+share no crates. `rust/STATUS.md` §1 records why the second workspace was not folded into the
+first — read it before proposing a merge.
+
+### Standing warnings — read before touching anything
+
+1. **R1 is being violated in the working tree, right now.** R1 (§1) freezes
+   `src/devcouncil/indexing/`, `src/devcouncil/codeintel/` and
+   `src/devcouncil/cli/commands/map.py`. Two modified files fall inside that freeze:
+   `src/devcouncil/indexing/graph/embeddings.py` (hash-projection ranker replaced with TF-IDF)
+   and `src/devcouncil/cli/commands/map.py` (embedding refresh wired into `_build_once`).
+   STATUS.md **required decision 3** says exactly this needs approval first. The changes are
+   improvements and are tested; that is not the point. **Do not build on them, and do not
+   revert them unilaterally — surface them for the decision 3 call.**
+
+2. **`dc-verify` stub detection is a capability regression.** `rust/STATUS.md` §4: Python's
+   `stub_detector.py` does an AST parse with per-language idioms; `rigor::detect_stubs` does
+   substring matching over added diff lines. Cutting this over **weakens a gate**. The honest
+   first cutover is `dc-store`, where interop is proven and semantics are identical.
+
+3. **A second session may hold this tree.** During the 2026-09-02 pass a concurrent session
+   refactored `devmap-extract`, `devmap-analyze`, `devmap-store` and `devmap-query` while work
+   was in flight. Two full-suite runs failed for reasons that were not the code — a test file
+   rewritten mid-run, and shared `target/` artifacts vanishing under a build. Both passed on
+   retry. **Check `git status` and file mtimes before assuming a failure is yours**, and
+   re-run a suite before treating it as a gate (W6 in PLAN.md §10).
+
+4. **The working store is nine schema versions stale.** `.devcouncil/codeintel/index.sqlite`
+   is at `user_version=2`; the binary writes `12`. It is refused at open, not misread, but no
+   gate notices the drift. Do not draw measurements from it.
+
+### Open work
+
+Status is one of: **open** (not started), **partial** (started, gated), **decision** (blocked
+on a human). Nothing here is "done" — closed items live in STATUS.md's dated sections.
+
+#### A. Correctness and capability — devmap kernel
+
+| ID | Item | Owner doc | Status |
+|---|---|---|---|
+| SC34 | Call-graph blackout across ~26 non-C languages | STATUS.md | open |
+| SC14 | Nested-symbol identity collisions inside anonymous callbacks and nested types | STATUS.md | partial |
+| SC29 | Unexplained SC26 per-file memory increase | STATUS.md | open |
+| SC2/B3 | Write amplification + genuinely incremental resolve | PLAN.md §7.5 | **decision** (#2) |
+| SC4 | Collapse speculative ambiguous calls into one edge with a candidate set | STATUS.md | **decision** (#7) |
+| — | VB.NET: the one frozen `LANGUAGE_SPECS` entry with no linked grammar | STATUS.md | **decision** (#1) |
+| G4 | Speculative edit preview — "what breaks if I change this" without writing | PLAN.md §3 | **in progress — do not start** |
+| G6 | Compact wire format — `code_graph.json` is 84 MB / ~21M tokens on a 3,674-file corpus | PLAN.md §3 · spec below | open |
+| G7 | Savings accounting — tokens saved versus reading the files | PLAN.md §3 · spec below | open |
+
+**G4 is being built by another session as of 2026-09-02 15:23.** `devmap-query/src/engine.rs`
+carries a `preview()` entry point and a `PreviewChange` enum; `devmap-cli/src/main.rs` carries
+a `Preview` subcommand and `emit_preview`. It compiles and the suite is green, but it ships no
+tests yet, so it does not meet R2. **Do not start G4.** Either take it over from that session
+deliberately, or leave it. What it still needs, whoever finishes it: tests that fail against
+the pre-fix code, and a decision on the unsigned-body case the current code already flags —
+when one side has no `body_signature`, nothing compared the bodies, and "unchanged" would be a
+claim rather than a finding. That is the Class A distinction (§3.1) and the existing code
+appears to get it right; it is untested either way.
+
+**G7 — savings accounting: what to build.** The claim is "answering from the graph cost N
+tokens; reading the files would have cost M". Both numbers must be *measured*, never modelled.
+
+- `Response<T>` already carries `tokens_used`; extend that struct rather than adding a
+  parallel accounting type. It is the canonical owner of per-response cost.
+- The denominator is the sum of the byte lengths of the distinct files a hit set touched,
+  converted at the same `BYTES_PER_TOKEN` the budgeter already uses (`engine.rs`). Reusing
+  the budgeter's constant is what makes the two numbers comparable; a second constant would
+  make the ratio meaningless.
+- **Class A applies.** A file whose size could not be read is not a zero-cost file. The
+  denominator must distinguish "measured across all N files" from "measured across the N−k we
+  could stat", and never present a partial denominator as a total — that would overstate
+  savings, which is the flattering direction and therefore the one to guard.
+- **Class C applies.** Savings are derived, so they carry provenance: how many files were
+  measured, how many were not, and the conversion used.
+
+**G6 — compact wire format: what to build.** 84,276,217 bytes on a 3,674-file corpus, roughly
+21M tokens. Read PLAN.md §3 `G6` and T2 before starting.
+
+- `devmap-query/src/code_graph.rs` owns the export. Extend it with a second *encoding* of the
+  same model; do not create a second exporter with its own traversal, or the two will drift
+  and one will silently lose a field.
+- The existing JSON export stays the interchange format (T2 makes it opt-in and out of the
+  context directory). The compact form is an addition, not a replacement — say which is
+  canonical in `DIVERGENCES.md`.
+- Path interning is the obvious first win: `B10` already interns paths in the store, and the
+  export re-expands them to full strings on every node and every edge endpoint.
+- **Determinism (R4) is the gate that will catch mistakes here.** Build twice, diff the bytes.
+  A compact encoder that iterates a hash map produces a different file each run and no test
+  will notice until a consumer diffs two exports.
+- Ship a round-trip test: compact-encode, decode, and assert the decoded model equals the one
+  the JSON path produces. An encoder without a decoder cannot be checked and must not land.
+
+#### B. Hardening — the failure classes
+
+All five gates are implemented (`coverage_invariants.rs`, `failure_class_gates.rs`, and unit
+tests beside `ProgressReporter`). What is left is coverage, not mechanism.
+
+| ID | Item | Owner doc | Status |
+|---|---|---|---|
+| A-audit | Class A's mechanical audit has been run once (5 candidates, 2 real, both fixed). It is not wired into CI, so it does not run on new code | PLAN.md §3.1 | open |
+| E-scope | Class E gates the build profiler; "every measurement carries its provenance" is a standard applied per measurement, not a single task | PLAN.md §3.1 | standing |
+| W1–W7 | Seven worst-case scenarios; five have a demonstrated mechanism | PLAN.md §10 | standing |
+
+#### C. Surfaces — MCP and packaging
+
+| ID | Item | Owner doc | Status |
+|---|---|---|---|
+| MCP-1 | Pin and assert the MCP **protocol** revision. `pyproject.toml:18` is `mcp>=2.0.0,<3`, and the 2.x line carries the breaking 2026-07-28 revision. No compatibility statement exists | PLAN.md §9.1 | **decision** (#10) |
+| MCP-2 | Adopt `ttlMs` / `cacheScope` on `tools/list`. Additive, no migration, attacks the same cost as T1/R1 across 18 tools | PLAN.md §9.1 | open — cheapest item here |
+| MCP-3 | Compatibility statement recording that none of the deprecated features are used (verified) | PLAN.md §9.1 | open |
+| PKG-1 | Plugin packaging target: Claude Code's format vs Agent Plugins 1.0. Targeting both means two manifests for one artifact | PLAN.md §9.2 | **decision** (#10) |
+| PY-1 | `assert`-as-guard fragility: `_DB_REQUIRED_TOOLS` is currently complete (26 vs 24, zero gaps) but nothing enforces it, and `assert` is stripped under `python -O` | PLAN.md §9.3 | open |
+
+#### D. Process and evidence
+
+| ID | Item | Owner doc | Status |
+|---|---|---|---|
+| GATE-1 | Peak-memory gate and external-corpus gate in `verify.sh`. `benchmarks/map_bench.py` supplies the external-corpus half; **nothing measures RSS** | STATUS.md #8 | **decision** (#8) |
+| GATE-2 | Workspace-wide mutation coverage beyond the retention surface | STATUS.md | **decision** (#5, cargo-mutants) |
+| SOAK-1 | Two-week shadow soak, multi-platform CI, production validation | STATUS.md #4 | **decision** (#4) |
+| CUT-1 | Consumer cutover, deletion of `indexing/` + `codeintel/`, platform publication | AGENT_PLAN Phase 6–7 | open |
+| PROP-1 | Full 117-property suite (PLAN §3 + AUDIT) | AGENT_PLAN R2 | partial |
+
+#### E. Analysis plane (`rust/`) — separate workspace
+
+| ID | Item | Owner doc | Status |
+|---|---|---|---|
+| AP-1 | `dc-store` cutover — interop proven, semantics identical; the honest first move | rust/STATUS.md §4 | open |
+| AP-2 | `dc-verify` rigor gates as a **second opinion** only, never a replacement, until a differential run says otherwise | rust/STATUS.md §4 | open |
+| AP-3 | Differential corpus run for secret scanning — both implementations exist, neither is measured | rust/STATUS.md §4 | open |
+
+### Handoff — state as of 2026-09-02 15:24
+
+Written for a contributor picking this up cold. Everything below was verified by running it,
+not inferred from the code.
+
+**Verified state**
+
+| Check | Result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | **740 passed, 0 failed**, exit 0 |
+| `cargo fmt --all -- --check` | **one file dirty** — see below, deliberately not fixed |
+| Workspace builds | yes, debug and release |
+| Uncommitted files | **59**, nothing committed |
+
+**Three things to know before your first commit**
+
+1. **Nothing is committed, and the 59 changed files have two authors.** A second session was
+   editing this tree concurrently and is *still active* — it wrote
+   `devmap-query/src/engine.rs` (+364 lines) and `devmap-cli/src/main.rs` at 15:22 and 15:23,
+   building **G4 speculative edit preview** on top of its own clone-signature work
+   (`PreviewChange`, `body_signature`). That work is mid-flight: it compiles and the suite is
+   green, but it adds no tests yet. **Do not `git add -A`.** Separate the two authors' changes
+   before committing, or coordinate with whoever holds the other session.
+
+2. **`cargo fmt --all` will reformat someone else's in-flight file.** The single fmt failure
+   is in `devmap-query/src/engine.rs:373`, inside the G4 work above. It was left alone on
+   purpose. Run `cargo fmt -p <your-crate>` instead until the tree is quiet.
+
+3. **R1 is violated in the working tree** (see standing warning 1). Awaiting required
+   decision 3. Do not build on it; do not revert it.
+
+**What landed in the 2026-09-02 pass** — detail in STATUS.md, design in PLAN.md
+
+- **`K1`–`K8` all closed**, each with a regression that fails against the pre-fix code. The
+  two worth knowing: `K1`, grammarless files had *no graph node at all* and so could not be an
+  edge target; `K8`, the phase profiler attributed every measurement to the wrong phase, which
+  had already propagated into a code comment asserting the wrong phase was a build's largest.
+- **All five failure-class gates implemented** — `devmap-cli/tests/coverage_invariants.rs`
+  (Class B), `devmap-cli/tests/failure_class_gates.rs` (A, C, D), and unit tests beside
+  `ProgressReporter` (Class E).
+- **Class A's mechanical audit was run** across the kernel: 5 candidates, 3 false positives,
+  2 real. Following them surfaced the larger finding — `AnalysisSummary::status` was the
+  literal `AnalysisStatus::Ok` on every path, making `Partial`/`Timeout` unconstructible
+  anywhere and their render arms unreachable. The field exists to satisfy N4, whose acceptance
+  is "timeout surfaces `status`". Now computed from clustering convergence.
+- **B5** — the watcher could not see the checkout move at all, because `.git/` is pruned. It
+  now admits `HEAD`, `refs/**` and `packed-refs` and nothing else, and the daemon forces a
+  full rebuild when HEAD differs from the generation's `head_sha`.
+- **G5** — notebook extraction, with symbols relocated from the reconstructed buffer back into
+  the raw `.ipynb` so spans index the file on disk.
+- **Performance:** end-to-end `dev map` −57.5%, cold −36.8%, incremental −35.7%. Most of it
+  was Python seam overhead, not kernel work.
+
+**Start here**
+
+1. Read the standing warnings above, then `git status` and file mtimes.
+2. Pick an item from the register that is **open**, not **decision** — the seven `decision`
+   rows are blocked on a human, not on work.
+3. `MCP-2` (`ttlMs`/`cacheScope` on `tools/list`) is the cheapest real win: additive, no
+   migration, and it attacks the cost of 18 tool definitions paid on every request.
+4. Reproduce the baseline before changing anything:
+   `cargo test --workspace --no-fail-fast` should give 740/0.
+
+### How to work an item
+
+Unchanged from §0 and §1; restated only where this register adds an obligation.
+
+1. Read the **owner document** first. This register is an index; it is not sufficient input.
+2. Check the standing warnings above, then `git status` and file mtimes (warning 3).
+3. **Extend, do not add beside.** Before writing a new module, function or document, find the
+   existing owner of that behaviour and extend it. A second implementation next to the first
+   doubles the surface even when both are correct — the same rule that made this register a
+   section of AGENT_PLAN.md rather than a twelfth file.
+4. Every fix ships with a test that **fails against the pre-fix code** (R2). Watch it go red;
+   a gate nobody has seen fail is a gate nobody has tested.
+5. Record proof in `STATUS.md`; record deliberate differences in `DIVERGENCES.md` (R3).
+6. On conflict between documents, stop and record it (R10) rather than choosing silently.
+
+---
+
 ## Continuous obligations
 
 - `STATUS.md` current every session (§0). `DIVERGENCES.md` for every deliberate difference

@@ -1,5 +1,10 @@
 # Analysis Plane (Rust) — Port Status Ledger
 
+> **This is not the devmap kernel.** `rust-port/` is a separate workspace with separate
+> crates and its own ledger. Open work for both ports is indexed in
+> [`rust-port/AGENT_PLAN.md` → Consolidated open-work register](../rust-port/AGENT_PLAN.md#consolidated-open-work-register-2026-09-02)
+> (section E covers this workspace). This file stays authoritative for the detail.
+
 **What this is:** the four `dc-*` crates and their Go clients, ported from the MANVI
 harness (`~/Code/devtools/Manvi`) into DevCouncil on 2026-09-01.
 

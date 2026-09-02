@@ -1,0 +1,52 @@
+{
+  "binary": {
+    "mtime": "2026-09-01T18:36:50.222692+00:00",
+    "path": "/Users/bharath/Code/devtools/DevCouncil/rust-port/target/release/devmap",
+    "size_bytes": 73202176,
+    "version": "devmap 0.1.0"
+  },
+  "corpus": {
+    "code_bytes": 41758295,
+    "code_files": 994,
+    "tracked_files": 1308
+  },
+  "generated_at": "2026-09-02T16:45:52+00:00",
+  "label": "baseline: pre-optimization",
+  "python": "3.12.13",
+  "repeat": 3,
+  "repo": "/Users/bharath/Code/devtools/DevCouncil",
+  "stages": {
+    "cold": {
+      "max_s": 3.935131583995826,
+      "median_s": 3.881027791001543,
+      "min_s": 3.3708753749961033,
+      "samples": 3
+    },
+    "e2e": {
+      "max_s": 4.351735084004758,
+      "median_s": 3.304802667000331,
+      "min_s": 2.4414607920043636,
+      "samples": 3
+    },
+    "manifest": {
+      "graph_bytes": 26214353.0,
+      "map_bytes": 415133.0,
+      "max_s": 0.575673999999708,
+      "median_s": 0.5564957079986925,
+      "min_s": 0.5200074169988511,
+      "samples": 3
+    },
+    "touch": {
+      "max_s": 3.598538208003447,
+      "median_s": 3.221875082999759,
+      "min_s": 2.0398165410006186,
+      "samples": 3
+    },
+    "warm": {
+      "max_s": 0.24572574999911012,
+      "median_s": 0.2432285419999971,
+      "min_s": 0.23027558300236706,
+      "samples": 3
+    }
+  }
+}

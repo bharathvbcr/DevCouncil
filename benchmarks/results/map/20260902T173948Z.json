@@ -1,0 +1,46 @@
+{
+  "binary": {
+    "mtime": "2026-09-02T17:25:24.869562+00:00",
+    "path": "/Users/bharath/Code/devtools/DevCouncil/rust-port/target/release/devmap",
+    "size_bytes": 70510448,
+    "version": "devmap 0.1.0"
+  },
+  "corpus": {
+    "code_bytes": 37892163,
+    "code_files": 3674,
+    "tracked_files": 4321
+  },
+  "generated_at": "2026-09-02T17:39:48+00:00",
+  "label": "scaling check: scholarlm (4321 tracked files)",
+  "python": "3.12.13",
+  "repeat": 3,
+  "repo": "/Users/bharath/Code/scholarlm",
+  "stages": {
+    "cold": {
+      "max_s": 10.560883750003995,
+      "median_s": 10.20089695900242,
+      "min_s": 9.964543249996495,
+      "samples": 3
+    },
+    "manifest": {
+      "graph_bytes": 104534533.0,
+      "map_bytes": 1236709.0,
+      "max_s": 1.4567103750014212,
+      "median_s": 1.4204759170024772,
+      "min_s": 1.3947485419994337,
+      "samples": 3
+    },
+    "touch": {
+      "max_s": 9.559418249998998,
+      "median_s": 8.830151832997217,
+      "min_s": 7.783662791996903,
+      "samples": 3
+    },
+    "warm": {
+      "max_s": 0.8748687500046799,
+      "median_s": 0.8668772080054623,
+      "min_s": 0.8579513339936966,
+      "samples": 3
+    }
+  }
+}

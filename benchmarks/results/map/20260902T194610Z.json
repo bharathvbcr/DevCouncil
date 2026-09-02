@@ -1,0 +1,79 @@
+{
+  "binary": {
+    "mtime": "2026-09-02T19:43:48.230258+00:00",
+    "path": "/Users/bharath/Code/devtools/DevCouncil/rust-port/target/release/devmap",
+    "size_bytes": 70611008,
+    "version": "devmap 0.1.0"
+  },
+  "comparison": {
+    "cold": {
+      "baseline_s": 2.1308863749945886,
+      "current_s": 5.198082207993139,
+      "pct": 143.9399054304967
+    },
+    "e2e": {
+      "baseline_s": 1.0374003750039265,
+      "current_s": 1.7318720409966772,
+      "pct": 66.94345623213431
+    },
+    "manifest": {
+      "baseline_s": 0.3667518329966697,
+      "current_s": 0.42571399999724235,
+      "pct": 16.076856799542725
+    },
+    "touch": {
+      "baseline_s": 1.3117407500030822,
+      "current_s": 1.7186887500065495,
+      "pct": 31.023508265830053
+    },
+    "warm": {
+      "baseline_s": 0.19640345799416536,
+      "current_s": 0.24366987500252435,
+      "pct": 24.0659800448947
+    }
+  },
+  "corpus": {
+    "code_bytes": 41887493,
+    "code_files": 994,
+    "tracked_files": 1308
+  },
+  "generated_at": "2026-09-02T19:46:10+00:00",
+  "label": "",
+  "python": "3.12.13",
+  "repeat": 3,
+  "repo": "/Users/bharath/Code/devtools/DevCouncil",
+  "stages": {
+    "cold": {
+      "max_s": 5.863093084000866,
+      "median_s": 5.6517494169966085,
+      "min_s": 5.198082207993139,
+      "samples": 3
+    },
+    "e2e": {
+      "max_s": 3.9645160000000033,
+      "median_s": 1.8659810000026482,
+      "min_s": 1.7318720409966772,
+      "samples": 3
+    },
+    "manifest": {
+      "graph_bytes": 20841241.0,
+      "map_bytes": 419861.0,
+      "max_s": 0.4778932920016814,
+      "median_s": 0.44287216600059764,
+      "min_s": 0.42571399999724235,
+      "samples": 3
+    },
+    "touch": {
+      "max_s": 2.475947459002782,
+      "median_s": 2.1578064169952995,
+      "min_s": 1.7186887500065495,
+      "samples": 3
+    },
+    "warm": {
+      "max_s": 1.569680916996731,
+      "median_s": 0.2534002909960691,
+      "min_s": 0.24366987500252435,
+      "samples": 3
+    }
+  }
+}

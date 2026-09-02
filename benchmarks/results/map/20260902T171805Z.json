@@ -1,0 +1,79 @@
+{
+  "binary": {
+    "mtime": "2026-09-02T17:16:33.499108+00:00",
+    "path": "/Users/bharath/Code/devtools/DevCouncil/rust-port/target/release/devmap",
+    "size_bytes": 70483680,
+    "version": "devmap 0.1.0"
+  },
+  "comparison": {
+    "cold": {
+      "baseline_s": 3.3708753749961033,
+      "current_s": 2.4303370410052594,
+      "pct": -27.9019017127541
+    },
+    "e2e": {
+      "baseline_s": 2.4414607920043636,
+      "current_s": 1.0508716250042198,
+      "pct": -56.95725983207427
+    },
+    "manifest": {
+      "baseline_s": 0.5200074169988511,
+      "current_s": 0.38184691700007534,
+      "pct": -26.568947957732885
+    },
+    "touch": {
+      "baseline_s": 2.0398165410006186,
+      "current_s": 1.6150276670014136,
+      "pct": -20.82485681731101
+    },
+    "warm": {
+      "baseline_s": 0.23027558300236706,
+      "current_s": 0.20026550000329735,
+      "pct": -13.032247104879213
+    }
+  },
+  "corpus": {
+    "code_bytes": 41804083,
+    "code_files": 994,
+    "tracked_files": 1308
+  },
+  "generated_at": "2026-09-02T17:18:05+00:00",
+  "label": "optimized: store pragmas + incremental vacuum + kernel stamping + lazy mcp + LTO",
+  "python": "3.12.13",
+  "repeat": 3,
+  "repo": "/Users/bharath/Code/devtools/DevCouncil",
+  "stages": {
+    "cold": {
+      "max_s": 2.4707627080060774,
+      "median_s": 2.4593731249988195,
+      "min_s": 2.4303370410052594,
+      "samples": 3
+    },
+    "e2e": {
+      "max_s": 1.0939157500033616,
+      "median_s": 1.0519681669975398,
+      "min_s": 1.0508716250042198,
+      "samples": 3
+    },
+    "manifest": {
+      "graph_bytes": 26424114.0,
+      "map_bytes": 415897.0,
+      "max_s": 0.38618220900389133,
+      "median_s": 0.3858657089949702,
+      "min_s": 0.38184691700007534,
+      "samples": 3
+    },
+    "touch": {
+      "max_s": 1.8821854170018923,
+      "median_s": 1.857367416996567,
+      "min_s": 1.6150276670014136,
+      "samples": 3
+    },
+    "warm": {
+      "max_s": 0.2091270840028301,
+      "median_s": 0.2009342090022983,
+      "min_s": 0.20026550000329735,
+      "samples": 3
+    }
+  }
+}

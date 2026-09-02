@@ -1,0 +1,79 @@
+{
+  "binary": {
+    "mtime": "2026-09-02T18:11:08.563829+00:00",
+    "path": "/Users/bharath/Code/devtools/DevCouncil/rust-port/target/release/devmap",
+    "size_bytes": 70527728,
+    "version": "devmap 0.1.0"
+  },
+  "comparison": {
+    "cold": {
+      "baseline_s": 3.3708753749961033,
+      "current_s": 2.1308863749945886,
+      "pct": -36.785370625069405
+    },
+    "e2e": {
+      "baseline_s": 2.4414607920043636,
+      "current_s": 1.0374003750039265,
+      "pct": -57.509029905319395
+    },
+    "manifest": {
+      "baseline_s": 0.5200074169988511,
+      "current_s": 0.3667518329966697,
+      "pct": -29.471807322802096
+    },
+    "touch": {
+      "baseline_s": 2.0398165410006186,
+      "current_s": 1.3117407500030822,
+      "pct": -35.693199675711206
+    },
+    "warm": {
+      "baseline_s": 0.23027558300236706,
+      "current_s": 0.19640345799416536,
+      "pct": -14.709386278202805
+    }
+  },
+  "corpus": {
+    "code_bytes": 41824997,
+    "code_files": 994,
+    "tracked_files": 1308
+  },
+  "generated_at": "2026-09-02T18:16:00+00:00",
+  "label": "final (settled): all optimizations",
+  "python": "3.12.13",
+  "repeat": 5,
+  "repo": "/Users/bharath/Code/devtools/DevCouncil",
+  "stages": {
+    "cold": {
+      "max_s": 2.5836563330012723,
+      "median_s": 2.193562541004212,
+      "min_s": 2.1308863749945886,
+      "samples": 5
+    },
+    "e2e": {
+      "max_s": 1.0567712920019403,
+      "median_s": 1.0523245420044987,
+      "min_s": 1.0374003750039265,
+      "samples": 5
+    },
+    "manifest": {
+      "graph_bytes": 20592594.0,
+      "map_bytes": 418688.0,
+      "max_s": 0.39884712499770103,
+      "median_s": 0.37794383299478795,
+      "min_s": 0.3667518329966697,
+      "samples": 5
+    },
+    "touch": {
+      "max_s": 1.533920207999472,
+      "median_s": 1.5156491250018007,
+      "min_s": 1.3117407500030822,
+      "samples": 5
+    },
+    "warm": {
+      "max_s": 0.20770425000227988,
+      "median_s": 0.19834541599993827,
+      "min_s": 0.19640345799416536,
+      "samples": 5
+    }
+  }
+}

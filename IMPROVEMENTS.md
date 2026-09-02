@@ -303,3 +303,210 @@ Note: Ollama context truncation was checked and is already handled (adaptive num
 - **`warn_once()` in `telemetry/logging_setup.py`:** the new unsafe-config warnings fire from per-task (`resolve_verify_context`) and per-review (`reviewer._samples`) paths — a 20-task run would have printed 20 identical lines, recreating the log-spam problem this session started by fixing. Process-level dedupe by message.
 - **`dev doctor` row (`check_local_monitor_sampling`):** surfaces the same unsafe overrides at setup time (Risky rows), and when the monitor/reviewer IS local with safe settings, prints one OK row showing the resolved ensembling (samples/repairs/per_criterion/votes). Cloud configs add no rows. Never raises.
 - Verified standalone: warn_once dedupe, and doctor row logic across local-unsafe (3 Risky), local-auto (1 OK), and cloud (0 rows) cases.
+
+---
+
+## `dev map` engine: performance pass and gortex gap review (2026-09-02)
+
+Goal: benchmark the mapping engine against [zzet/gortex](https://github.com/zzet/gortex),
+find and harden the bottlenecks, and close reachable gaps. Every number below is
+measured on this repository (1,308 tracked / 994 code files) unless stated, with
+a scaling check on a 4,321-file repository. Harness: `benchmarks/map_bench.py`;
+raw results in `benchmarks/results/map/`.
+
+### Results
+
+| stage | before | after | change |
+|---|---|---|---|
+| `cold` build | 3.37s | 2.13s | −36.8% (295 → 466 files/s) |
+| `warm` (no change) | 230ms | 196ms | −14.7% |
+| `touch` (one file changed) | 2.04s | 1.31s | −35.7% |
+| `manifest` | 520ms | 367ms | −29.5% |
+| **`dev map` end-to-end** | **2.44s** | **1.04s** | **−57.5%** |
+| `code_graph.json` | 26.21 MB | 20.59 MB | −21.5% |
+
+Minimum of 5 repeats, baseline `20260902T164552Z` vs `20260902T181600Z`. Run-to-
+run spread on an otherwise-busy machine is a few percent on every stage except
+`e2e`, which is stable to ±2%; a run taken while a background daemon was
+re-indexing measured `cold` at 2.38s rather than 2.13s, so compare like with
+like. Scaling check on a 4,321-file repository: 359 files/s cold, and
+`code_graph.json` 104.5 MB → 84.3 MB.
+
+Verified: 668 Rust tests, 4,114 Python tests, 0 failures; `cargo fmt --check`
+and `cargo clippy` clean on every changed crate. Artifacts are byte-identical
+under `RAYON_NUM_THREADS` of 1, 2 and 8.
+
+### Defects found (each was silent)
+
+1. **Search returned nothing for any query whose top match was a large symbol.**
+   A hit costs `source_span.len() / 4 + 20` tokens — the symbol's whole body —
+   against a 2,000-token budget, so one 8 KB function was unreturnable. The
+   response said `{total: 1, shown: 0, truncated: true}`, which reads as "too
+   many results" rather than "the one result did not fit", and `DevMapClient`
+   logged it as a kernel failure and fell back to the Python path on every such
+   query. `devmap search "resolve calls"` returned zero of its one match.
+   Fixed by capping the span to the budget and reporting the omission in a new
+   `source_span_omitted_bytes`, so a capped span is never passed off as the
+   verbatim body R2 promises. The hard-budget contract is unchanged.
+2. **The store reclaim decided on stale accounting.** `vacuum_if_needed` read
+   `PRAGMA freelist_count` before the WAL was checkpointed, so it saw the state
+   *before* the two prunes that run immediately above it — declining to reclaim,
+   in 0 ms, while a third of the file was free. Eight consecutive builds
+   declined while the store sat pinned at 295 MB.
+3. **A rebuilt kernel kept being served by the old daemon.** The IPC handshake
+   checks `PROTOCOL_VERSION`, a wire-format number that does not move on a
+   rebuild, so a daemon started before `cargo build` served pre-fix answers for
+   its full 30-minute idle bound. Found the hard way while fixing (1): the
+   rebuilt binary returned the match and the daemon in front of it did not.
+   The daemon now retires when its own executable's (size, mtime) changes —
+   identity, not a version string, for the reason `find_engine_binary` already
+   documents: every build here reports `devmap 0.1.0`.
+
+   Unlike the idle bound, this deliberately does *not* wait for the pending
+   queue to drain. The first attempt copied that guard and the retirement then
+   never fired on this repository, which always carries pending paths — and
+   draining under a superseded binary is the very outcome the check exists to
+   prevent. The queue is persisted in the store, so the next client's daemon
+   picks up the same paths and drains them with the new kernel. Verified
+   end-to-end: retires ~5s after the binary changes, with pending work present.
+
+### Bottlenecks removed
+
+Ranked by measured share of wall time when found:
+
+- **Python re-serialized the whole graph to stamp three fields** — 1.68s of a
+  2.72s `dev map`. `devmap manifest` now takes `--generated-head`,
+  `--indexed-hash` and `--content-fingerprint` and writes them itself; the
+  read-modify-write survives only as the fallback for a kernel too old for the
+  flags, because an unstamped map reads permanently stale to `map_is_stale`.
+- **A full `VACUUM` ran on nearly every build** — 937ms, 28% of an incremental
+  build, to reclaim a few percent of the file. Now `PRAGMA incremental_vacuum`
+  (2ms). Legacy `auto_vacuum=NONE` stores convert on the vacuum they were
+  already going to pay for.
+- **The writer recompiled its SQL per row** — ~73,000 edge inserts and ~146,000
+  path-id lookups. `prepare_cached` plus a per-transaction path-id memo:
+  `persist:write` 1180ms → 613ms.
+- **`mcp` was imported by every `dev` command** — 208ms of a 490ms CLI import,
+  via `cli.commands.lease` → `execution.lease_ops` → `integrations.mcp.util`,
+  for a symbol only one function needs at runtime.
+- **SQLite defaults** — `synchronous=FULL` fsyncing every commit of a *derived*
+  index, and a 2 MiB page cache for a bulk generation write.
+- **Resolution was the last serial CPU phase** — and it does not shrink on an
+  incremental build, since it deliberately covers the whole tree so liveness and
+  community detection mean the same thing on both paths. Now parallel.
+- **No `[profile.release]`** — default `codegen-units = 16`, no LTO, for a
+  binary built rarely and run on every agent turn.
+- **`code_graph.json` was pretty-printed** — 23% whitespace in a machine-only
+  artifact. `repo_map.json`, which agents do open, stays indented.
+
+Observability: `devmap build` now reports per-stage timings, with the persist
+phase split into write / prune / prune / reclaim, and the reclaim decision
+printed with the freelist ratio it saw — because "declined" and "reclaimed
+nothing" leave an identical file behind.
+
+### Gaps vs gortex — status
+
+Closed in this session:
+
+1. **Language breadth.** ~~Absent~~ **Closed.** Tier-2 declaration recovery
+   (`devmap-extract/src/fallback.rs`): a file whose language has no linked
+   grammar now contributes pattern-matched declarations instead of nothing,
+   stamped `ExtractionEngine::RegexFallback` / `ParseOutcome::Fallback` so a
+   consumer can tell a matched symbol from a parsed one. `.proto` and `.ps1`
+   were being indexed as `generic` and contributing zero symbols; on the
+   scholarlm corpus the fallback recovers 19 protobuf and 9 PowerShell files.
+   Prose and data formats are excluded by `NON_DECLARATIVE_LANGUAGES` — an
+   early version invented `ReasoningBank` and `HyDEService` out of fenced code
+   blocks in Markdown design docs. Fallback files are exempted from the
+   dead-code sweep, because they emit no calls and every symbol in them would
+   otherwise read as callerless.
+
+5. **Clone detection.** ~~Absent~~ **Closed.** `devmap clones` / `dev map
+   clones`, reporting duplicated symbol bodies in two tiers: `exact` (the same
+   code modulo formatting and comments) and `structural` (the same shape under
+   renaming, callables only). On this repository: 388 groups — 112 exact, 276
+   structural — over 11,495 signed symbols. Findings are real, e.g. `_repo_map`
+   duplicated across two test files, `modifier_nodes` shared by
+   `langdecl/kotlin.rs` and `langdecl/swift.rs`, `collect_args` shared by
+   `dc-grep` and `dc-verify`, and four near-identical integration functions in
+   `cli/commands/integrate.py` (`grok`/`opencode`, `antigravity`/`aider`).
+
+   Design notes worth keeping:
+   - **Signatures come from the parse tree, not the text.** A text-based
+     comment stripper collapses `a = "//foo"` and `a = "//bar"` to the same
+     prefix and reports two unrelated functions as identical. Comments are
+     grammar-declared nodes and whitespace is not in the tree at all, so the
+     tree-based hash is comment- and format-immune by construction.
+   - **Stamped at extraction, not analysis.** Extraction caches strip
+     `source_code`, so an analysis-time fingerprint would see bodies only for
+     files edited in that build.
+   - **Stored per symbol, grouped on demand.** Three nullable columns on
+     `generation_nodes` (schema v12), not a persisted group table: a group is a
+     join over facts, and persisting it would store a truncated derived view
+     that goes stale. Cost is +1.31% store size (169.17 → 171.39 MB).
+   - **The size floor is measured.** `MIN_SIGNATURE_NODES = 32` sits in the gap
+     between accessors (Python getter 15, TypeScript 20, Go 23, Rust 24, Python
+     one-line delegate 25) and real bodies (Python guard-and-call 36, Go error
+     wrap 43, Rust three-line 52, Go three-line 60). A floor of 24 would admit
+     the Go and Rust getters.
+   - **Coverage travels with the report.** `signed_symbols` / `unsigned_symbols`
+     are printed even when nothing is found, because an empty list says the same
+     thing for a clean tree and for a tree nothing was examined in.
+   - **Build cost is below the noise floor.** Measured by interleaved A/B — two
+     release binaries differing only in whether stamping runs, alternating over
+     7 rounds so both arms see the same machine load. Minimums: 2.238 s with
+     stamping, 2.387 s without. The stamping arm came out *faster*, which is not
+     a speedup but the honest reading that the difference is smaller than
+     run-to-run variance on a loaded machine (±6%). A straight
+     `map_bench.py --baseline` comparison on the same machine read "+143.9%
+     cold" for the same code, which was load, not regression: three consecutive
+     runs of one unchanged binary gave 4.35 s, 2.96 s and 5.20 s. Verify the two
+     binaries actually differ before trusting any A/B — here, 11,514 signed
+     symbols against 0.
+
+Still open, in rough order of value. None are started.
+
+2. **Cross-repo / multi-repo graph.** `devmap serve` is single-root; there is no
+   workspace registry, no cross-repo edge resolution, no shared canonical ids
+   for contracts spanning services.
+3. **Vector search in the kernel.** FTS5 exists (`nodes_fts`). Embeddings are
+   TF-IDF over the Python path (`indexing/graph/embeddings.py`) and are now
+   refreshed by `dev map`. **Correction to the earlier note in this document:**
+   it claimed `--semantic` "quietly does less than it says" because embeddings
+   read a store `dev map` no longer builds. That was wrong — embeddings are
+   opt-in and off by default, so the flag was not silently degrading; it was
+   not enabled. What remains genuinely open is that vector search lives outside
+   the kernel rather than beside FTS5 in SQLite.
+4. **Speculative execution.** No `preview_edit` / `simulate_chain` equivalent:
+   no shadow graph for unsaved buffers, so an agent cannot ask what a change
+   would do before writing it.
+6. **Notebooks.** No `.ipynb` / Databricks support. Deliberately not built:
+   neither working corpus contains a single `.ipynb`, and doing it honestly
+   requires mapping symbol spans back through the JSON cell array — spans that
+   are wrong are worse than absent, since `devmap search` slices source by them.
+7. **Compact wire format.** Gortex publishes GCX1 (−27% tokens vs JSON). The
+   artifacts here are JSON; compacting the graph recovered 21.5% of that.
+8. **Token-savings accounting.** No equivalent of `gortex savings`.
+
+### Defect found and fixed while building clone detection
+
+`--kind` / `--min-nodes` were filtering the report *after* the token budget had
+already cut it, then re-taking the budget over the survivors. Because
+re-budgeting a short list leaves `hidden` at zero, the result came back labelled
+complete: `--kind exact --min-nodes 100 --budget 900` reported "2 groups, not
+truncated" where the true answer was 29. Filtering now happens before the
+budget, inside `StoreQueryEngine::clones`, and the helper that made the wrong
+order possible was deleted rather than documented.
+`clone_filters_apply_before_the_token_budget` pins it, and fails against the
+pre-fix ordering.
+
+### Known flake, not fixed
+
+`protocol::tests::a_second_binder_is_refused_while_the_first_holds_the_endpoint`
+fails intermittently under heavy CPU load — it releases an advisory `flock` and
+rebinds immediately, assuming the release has taken effect. It failed twice
+while a full pytest run saturated the machine and passed 52/52 across five
+consecutive clean runs. Pre-existing and not a product bug: `flock` is released
+by the OS on process exit, so the leftover PID-named `.lock` files in TMPDIR are
+harmless. Left alone deliberately — retiming a locking test could mask a real
+regression, and the honest report is worth more than a green run.

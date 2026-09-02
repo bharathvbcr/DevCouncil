@@ -200,3 +200,153 @@ uv run pytest tests/performance -q
 uv run python scripts/codeintel-benchmark.py --profile heavy \
   --output artifacts/codeintel-heavy.json
 ```
+
+---
+
+# `dev map` performance benchmark
+
+A second, separate harness: `map_bench.py` measures the **mapping engine**, not
+the council loop. Where `run_bench.py` asks whether the gated loop produces
+better code, this asks how long `dev map` takes and where the time goes.
+
+It exists because the map is on the hot path of every agent turn — rebuilt by
+hooks, by the watcher, and by hand — so a second of avoidable overhead is paid
+hundreds of times a day.
+
+## Running it
+
+```bash
+python benchmarks/map_bench.py                                  # this repo
+python benchmarks/map_bench.py --repo ~/src/other --repeat 5    # any tree
+python benchmarks/map_bench.py --baseline benchmarks/results/map/<ts>.json
+```
+
+Results land in `benchmarks/results/map/<timestamp>.{json,md}`. Pass a prior
+run's JSON as `--baseline` to get a change column.
+
+## What each stage measures
+
+| stage | what it times |
+|---|---|
+| `cold` | full index of every discovered file into an empty store |
+| `warm` | incremental build that finds no changed file (the watcher's common tick) |
+| `touch` | incremental build after one file's content changes (the agent's common case) |
+| `manifest` | writing `repo_map.json` + `code_graph.json` from the store |
+| `e2e` | the real `dev map` command, Python wrapper included |
+
+Two design choices worth knowing:
+
+- **Minimum, not mean.** Wall-clock latency has a hard floor and an unbounded
+  tail — background load can only make a run slower — so the mean measures the
+  machine's mood while the minimum measures the code. Median and max are
+  recorded alongside so a pathological tail stays visible.
+- **A scratch store, always.** Every stage writes to a temporary database, never
+  the target repository's `.devcouncil/`. A benchmark that mutates the tree it
+  measures is not repeatable, and this one runs against real working repos.
+
+For a finer breakdown than the five stages, run the kernel directly — each phase
+reports its own cost, and the persist phase is split into its four parts:
+
+```bash
+rust-port/target/release/devmap --progress always build .
+```
+
+## Results: 2026-09-02 optimization pass
+
+Baseline `20260902T164552Z`, final `20260902T181600Z`, on DevCouncil itself
+(1,308 tracked / 994 code files, 41.8 MB), 5 repeats, Apple Silicon.
+
+| stage | before | after | change |
+|---|---|---|---|
+| `cold` | 3.37s | 2.13s | **−36.8%** (295 → 466 files/s) |
+| `warm` | 230ms | 196ms | −14.7% |
+| `touch` | 2.04s | 1.31s | **−35.7%** |
+| `manifest` | 520ms | 367ms | −29.5% |
+| `e2e` (`dev map`) | 2.44s | 1.04s | **−57.5%** |
+| `code_graph.json` | 26.21 MB | 20.59 MB | −21.5% |
+
+Compare like with like: a run taken while a background daemon was re-indexing
+measured `cold` at 2.38s rather than 2.13s. `e2e` is the stable stage (±2%);
+the kernel stages carry a few percent of spread on a busy machine. On a
+4,321-file repository the same build runs at 359 files/s and the graph drops
+from 104.5 MB to 84.3 MB.
+
+What changed, each found by measurement rather than review:
+
+1. **The Python wrapper was most of `dev map`.** `stamp_freshness` read each
+   finished artifact back, parsed it, set three scalars and re-serialized the
+   whole thing — 1.68s of a 2.72s command, nearly all of it re-encoding a 26 MB
+   graph the kernel had just encoded. `devmap manifest` now takes the three
+   digests as flags and writes them itself.
+2. **`mcp` was imported on every `dev` command.** `cli.commands.lease` →
+   `execution.lease_ops` → `integrations.mcp.util` imported `mcp.types` at
+   module scope for a symbol only one function needs at runtime. 208ms of a
+   490ms CLI import, paid by commands that never speak MCP.
+3. **A full `VACUUM` ran on nearly every build.** Pruning a generation pushes
+   the freelist over the 5% threshold every time, so the store paid an
+   O(database) whole-file rewrite — 937ms, 28% of an incremental build — to
+   reclaim a few percent. Now `PRAGMA incremental_vacuum`, which costs what the
+   waste costs (2ms). The reclaim decision also had to be moved after a WAL
+   checkpoint: it was reading the pre-prune freelist and declining to reclaim
+   while a third of the file was free.
+4. **The store ran on SQLite's defaults.** `synchronous=FULL` fsynced every
+   commit of a *derived* index, and a 2 MiB page cache could not hold the
+   working set of a bulk generation write.
+5. **The writer recompiled its SQL per row.** ~73,000 edge inserts and ~146,000
+   path-id lookups, each compiling its statement afresh. Now `prepare_cached`
+   plus a per-transaction path-id memo: `persist:write` 1180ms → 613ms.
+6. **Resolution was the last serial CPU phase.** Extraction was parallel;
+   resolution walked files one at a time, and it does *not* shrink on an
+   incremental build (it deliberately covers the whole tree so liveness and
+   community detection mean the same thing on both paths). Now parallel, with
+   `parallel_determinism.rs` proving 1-thread and 8-thread results are identical
+   field-by-field — verified end-to-end too: the artifacts are byte-identical
+   under `RAYON_NUM_THREADS` of 1, 2 and 8.
+7. **The release profile did not exist.** Default `codegen-units = 16` and no
+   LTO, for a binary built rarely and run constantly.
+8. **`code_graph.json` was pretty-printed.** 23% of a 27 MB machine-only
+   artifact was indentation no reader sees; `repo_map.json`, which agents do
+   open, stays indented.
+
+### The trade in (3), stated plainly
+
+Incremental vacuum does not compact the file the way a full `VACUUM` did. Over
+15 consecutive builds the DevCouncil store settles at 295 MB against ~197 MB of
+live data and stays there — free pages are reused by the next generation rather
+than returned and immediately re-allocated. Checked on a 4,321-file repository
+too: 1,155 MB, unmoved across 8 builds. The cost is a bounded ~50% space
+overhead; the bound is what makes it acceptable, and it is asserted by
+`new_stores_use_incremental_auto_vacuum_and_reclaim_without_a_full_rewrite`.
+
+## Measuring a small change on a busy machine
+
+`map_bench.py --baseline` compares against a JSON written at some earlier time,
+and that comparison is only as good as the machine's state in between. On a
+loaded developer machine it is not good at all: three consecutive `cold` runs of
+one unchanged binary measured 4.35 s, 2.96 s and 5.20 s here, and the same
+unchanged code read "+143.9% vs baseline" purely because a background indexer
+for an unrelated repository was saturating the CPU. Waiting for the load to
+settle is not a reliable option either — an interactive machine has other work.
+
+For a change expected to cost single-digit percent, measure a **ratio** rather
+than an absolute, by interleaving:
+
+1. Build two release binaries that differ only in the change under test. Keep
+   both aside (`cp target/release/devmap …`), because the next `cargo build`
+   overwrites one of them.
+2. **Verify they actually behave differently** before timing anything. A build
+   that silently reused a stale artifact, or a source edit that did not take,
+   produces two identical binaries and a beautiful null result. Assert on an
+   observable: here, the with-signatures binary wrote 11,514 signed symbols and
+   the without wrote 0.
+3. Alternate A, B, A, B … for several rounds against the same repository, each
+   round rebuilding a scratch store from cold. Both arms then absorb the same
+   load excursions.
+4. Report minimums *and* medians, and say so when the difference is smaller than
+   the spread.
+
+The last point is the one that matters. In the clone-signature measurement the
+arm doing *more* work came out 6.2% faster on minimums — not a speedup, but the
+correct conclusion that the cost is below this machine's noise floor. Reporting
+"-6.2%" as a win, or picking the run that showed "+143.9%" as a regression,
+would both have been fabrications drawn from the same data.

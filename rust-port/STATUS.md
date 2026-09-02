@@ -1,12 +1,16 @@
 # devmap (Rust) Status Ledger
 
-**Active work:** Phase 6 consumer hybrid migration (2026-08-12)
+**Active work:** Phase 6 consumer hybrid migration (2026-08-12); kernel performance and gap pass (2026-09-02)
 **Verified scope:** local Rust kernel, persisted queries, differential daemon batching, IPC, and one hybrid Python consumer
 **Closed 2026-08-15 (external-corpus remediation):** generation retention (SC1), peak memory (SC3), build time (SC3b), missing memory/growth gates (SC3c/SC5), dead-code entry-point false positives (SC6), Go cross-file interface exemptions (SC6a), extraction-cache growth (SC7), doubled payload storage (SC8), receiver-name collision producing confidently wrong edges and an unjoinable Go call graph (SC9), orphaned JS/TS call scopes (SC10), Rust trait identity collisions and missing trait signatures (SC11/SC6b), unresolvable Rust method calls (SC12), calls hidden in Rust macro bodies (SC13), most nested-symbol identity collisions (SC14)
 
 **Closed 2026-08-17 (personal-corpus remediation):** phantom call edges from JSX intrinsic host elements and Go composite-literal type expressions (SC17); external/builtin classification of calls that can never resolve (SC18); CI running the gate script under the wrong shell (SC20); the binary being unreachable outside this repository (SC21); shell and SQL parsing (SC22); the hybrid consumers' Rust path never having executed (SC23); an unbuilt store reporting itself as available (SC24); receiver-type inference for library types (SC25); five call shapes recording whole expressions as callees, recovering 89,356 real edges (SC26); a size gate measuring a state production never reaches (SC27); two concurrency defects that made a cold start unreliable for any second process (SC28); Metal coverage measured and found at C++ parity, closing an item that had been recorded as unclosable (SC19); an absolute memory gate that covered no large corpus, replaced with a scale-invariant one — and the Σ N² memory model this ledger had asserted since SC3, refuted by measurement (SC29); the unresolved defect tier resolved into four evidence-backed classes (SC30); the C family given a call graph and made answerable to dead-code analysis (SC31); the whole-expression-callee mechanism SC26 had only patched shape-by-shape (SC32)
 
-**Not complete:** one unlinked grammar (VB.NET), the call-graph blackout across ~26 non-C languages (SC34), the unexplained SC26 per-file memory increase (SC29), full audit-property suite, the B3 write-amplification redesign and genuinely incremental resolve (SC2), nested-symbol identity collisions inside anonymous callbacks and nested types (SC14), workspace-wide mutation coverage beyond the retention surface, freshness soak, consumer cutover, deletion, and platform publication
+**Not complete** — the consolidated, de-duplicated list of open work with owners and blocking decisions now lives in [AGENT_PLAN.md → Consolidated open-work register](AGENT_PLAN.md#consolidated-open-work-register-2026-09-02); this line is the narrative summary it indexes: one unlinked grammar (VB.NET), the call-graph blackout across ~26 non-C languages (SC34), the unexplained SC26 per-file memory increase (SC29), full audit-property suite, the B3 write-amplification redesign and genuinely incremental resolve (SC2), nested-symbol identity collisions inside anonymous callbacks and nested types (SC14), workspace-wide mutation coverage beyond the retention surface, freshness soak, consumer cutover, deletion, and platform publication
+
+**Closed 2026-09-02 (kernel performance and gap pass, K1–K8 in [PLAN.md](PLAN.md) §3):** discovery silently dropping grammarless source languages — 19 `.proto` and 17 `.ps1` invisible to the graph (K2); tier-2 pattern recovery inventing 457 symbols out of fenced code blocks in markdown design documents (K3, a regression this pass introduced); search returning **zero** hits when a matched symbol exceeded the token budget, with both budget gates green throughout (K4); the reclaim policy reading a pre-checkpoint freelist and reporting a 0 ms vacuum as success on a store that was 33% garbage (K5); a rebuilt binary leaving the daemon serving superseded code (K6); an embedding ranker that put the correct symbol at rank 28 or absent on all 5 probes (K7). End-to-end `dev map` is **−57.5%**, cold −36.8%, incremental −35.7% — most of it Python seam overhead rather than kernel work.
+
+**All eight kernel findings K1–K8 are closed**, each with a regression that fails against the pre-fix code; workspace suite **717 passed / 0 failed**. **Open as *classes* rather than instances:** the five failure shapes in [PLAN.md](PLAN.md) §3.1, four of which produced a fresh instance in the Rust port after the Python instance had already been fixed and written up as an acceptance property. **All five now have closing gates in code** (required decisions 9 and 11); what remains is the workspace-wide Class A audit, the HEAD boundary for Class D, and measurements beyond the build profiler for Class E. Also open: the unbuilt gortex capabilities G4–G7. See [Performance and gap pass (2026-09-02)](#performance-and-gap-pass-2026-09-02).
 
 **Ledger corrections (2026-08-17), each measured rather than asserted:**
 
@@ -719,18 +723,167 @@ Not run and not claimed: `devmap serve` under sustained load on this corpus (SC2
 per-edit cost ~111 s, so the daemon result is derived from the build measurement rather than
 measured directly), multi-repository soak, and any non-darwin host.
 
+## Performance and gap pass (2026-09-02)
+
+A pass over the shipped kernel for bottlenecks and for gaps against a third reference
+([zzet/gortex](https://github.com/zzet/gortex)). Eight kernel findings, numbered `K1`–`K8` in
+[PLAN.md](PLAN.md) §3; measurement method in §2.1 and the appendix. Every figure below is from
+`benchmarks/map_bench.py` against a **scratch** store — the working `.devcouncil/` was not
+touched — reporting the minimum of N runs.
+
+### Results
+
+| Stage | DevCouncil · 994 files | scholarlm · 3,674 files | vs. baseline (DevCouncil) |
+|---|---:|---:|---:|
+| `cold` | 2.13 s | 10.22 s | −36.8% |
+| `warm` | 0.196 s | 0.900 s | −14.7% |
+| `touch` | 1.31 s | 7.63 s | −35.7% |
+| `manifest` | 0.367 s | 1.26 s | −29.5% |
+| `e2e` (`dev map`, full) | 1.04 s | — | **−57.5%** |
+
+`e2e` improved far more than `cold` because roughly 70% of `dev map`'s wall time was Python
+wrapper overhead around the kernel rather than kernel work. **The seam was the bottleneck, not
+the engine** — which is not what this ledger would have predicted, and is the single most
+useful thing the pass found.
+
+Cold-build phase split (scholarlm, 13.44 s): extract **7.25 s / 54%**, resolve 3.29 s / 24%,
+`persist:write` 2.50 s / 19%, analyze 0.24 s / 1.8%.
+
+### Defects found
+
+Closed, each with a regression that fails against the pre-fix code:
+
+- **K2** — `.proto` and `.ps1` were dropped at *discovery*, not extraction: `is_indexable_source`
+  admits only extensions `detect_language` names. 19 `.proto` and 17 `.ps1`/`.psm1`/`.psd1` were
+  invisible to the graph on scholarlm. Now 19/19 and 17/17 discovered (9 `.ps1` recover
+  declarations, 8 genuinely declare none). Verified against on-disk `git ls-files` counts, not
+  against the indexer's own view — the indexer's view is what was wrong.
+- **K3** — tier-2 pattern recovery was attributing Go and TypeScript types written inside
+  *fenced code blocks in design documents* to the `.md` files describing them: 40 markdown
+  files, 457 symbols that exist nowhere. Now 28 fallback files, all real source
+  (19 protobuf + 9 powershell), 390 symbols. This was a regression introduced by this pass.
+- **K4** — search returned **zero** hits when a matching symbol's source span exceeded the
+  whole token budget. Both budget gates stayed green throughout; neither could distinguish an
+  empty result from a no-match result.
+- **K5** — `vacuum_if_needed` read `freelist_count` before checkpointing the WAL, so it saw 0
+  free pages while 33% of the store was reclaimable and reported a 0 ms vacuum as success.
+- **K6** — a rebuilt binary left the running daemon answering from superseded code.
+- **K7** — the embedding ranker was measurably broken: random-projection hash vectors put the
+  correct symbol at rank 28 or absent on all 5 probes. Replaced with TF-IDF; rank 1 on all 5.
+
+Also closed, after this section was first written:
+
+- **K1 — grammarless files had no graph node at all.** Not "no symbols": *no node*. The `File`
+  node was pushed only on the tree-sitter path, so a file with no linked grammar was recorded
+  in `generation_files` and absent from the graph — not an edge target, not returnable by a
+  file-level query. K2 and K3 make tier-2 recovery correct when it fires; they did not close
+  this. Two doc comments in `fallback.rs` and `treesitter.rs` asserted the opposite ("a `File`
+  node and nothing else"); both were corrected, then corrected again once the fix landed.
+  `unavailable_extraction` now emits the node unconditionally, prose and data formats
+  included. Safe against dead-code analysis by construction — `File` nodes are already exempt
+  in `liveness.rs` and skipped as `Contains` sources — so no dead-symbol candidate was added.
+  **Verified: 4,089 files on scholarlm, 0 with zero nodes, 0 missing a `File` node**, against
+  380 `Failed` files that previously contributed nothing.
+- *(closed 2026-09-02, after this section was first written)* **K8 — the phase profiler
+  misattributed every measurement by one position**, recording time-since-previous-announcement
+  against the *next* stage's label. On the 13.44 s scholarlm build it printed extraction's
+  7.25 s beside the word "resolving" and extraction itself as **42 ns**. Now verified by
+  execution, not assertion: stages sum to the reported total (20.108 s of 20.110 s), the four
+  `persist:*` sub-phases sum exactly to their parent (5.624 s of 5.624 s, so nesting does not
+  double-count), and a stage still open when the breakdown is requested is emitted with
+  `"open": true` so the accounting can never come up silently short.
+
+### Gaps vs. gortex
+
+Recorded as `G1`–`G8` in [PLAN.md](PLAN.md) §3. Closed: G2 (retrieval ranking, via K7).
+Partly closed: G1 (language breadth — tier-2 recovery, less K1). In progress under a separate
+session: G3 (clone detection, `devmap-extract/src/clonesig.rs`). Open: G4 speculative edit
+preview, G5 notebooks, G6 compact wire format, G7 savings accounting. Restated as declined:
+G8 cross-repository graph — already declined in PLAN.md as a product change; noted so it is
+not re-opened as an oversight.
+
+### Not claimed
+
+**The workspace suite was re-run and is green: 717 passed, 0 failed** (`cargo test --workspace
+--no-fail-fast`, exit 0), superseding the stale 683 figure. That run includes a concurrent
+session's in-progress clone-detection work alongside K1, K8 and all five class gates.
+`cargo fmt --all` is clean.
+
+Two caveats on that number, both real. First, it was taken while another session was editing
+the same tree, and an earlier attempt failed in `devmap-store::store_hardening` — a test that
+passed in isolation seconds later, because the file was being rewritten mid-run. **The suite
+is currently non-deterministic for reasons that have nothing to do with the code**, and a run
+should be repeated once the tree is quiet before it is treated as a gate. A second run failed
+to *build* — `regex-automata` and `libsqlite3-sys` artifacts vanished mid-run because both
+sessions share one `target/` — and succeeded on retry; that is contention, not breakage, but
+it is another reason to re-run when the tree is quiet. Second,
+`cargo fmt --all` reformatted files belonging to the other session's in-flight work; that is
+idempotent and harmless but was not asked for.
+
+Not run and not claimed: soak, multi-platform CI, production validation, mutation coverage.
+The Python-side changes (TF-IDF embeddings, freshness stamping) were verified against the
+Python suite, and K2/K3 end-to-end against both corpora, before the concurrent edits began.
+
 ## Required decisions / external gates
 
 1. Approve a concrete set of new/upgraded Tree-sitter grammar dependencies before the remaining 29 language families can be linked and tested.
 2. Decide whether B3 warrants the required validity-range/current-state schema redesign now; the existing full-generation carry-forward representation cannot meet <100 row writes at 10k.
    External-corpus evidence (SC2) raises the cost of deferring: at 4,731 files a one-file edit
    costs 110.88 s and 461,480 row writes, so the daemon cannot ship at this scale either way.
+   **Updated 2026-09-02.** The 110.88 s figure no longer holds — a one-file edit on a
+   3,674-file corpus now costs **7.63 s** (`touch`, min-of-3, scratch store). That is a large
+   improvement and it does not change the decision, because the *shape* is unchanged: `touch`
+   is still 60% of a full cold build, and `persist:write` is still larger on an incremental
+   build than on a cold one (2,448 ms vs 1,490 ms on this repository). Both follow from
+   resolution being deliberately global on every changed build — narrowing it was tried during
+   this pass and broke liveness and community detection, so the cost is a consequence of a
+   correctness decision, not an unexamined one. **The decision is now better posed than it was:
+   B3 is not blocked on making the daemon viable at scale (7.63 s is viable), it is a question
+   of whether incremental cost should scale with the change or with the repository.** Deciding
+   it also decides whether the global-resolution constraint has to be revisited first.
 3. Approve Phase 6 edits to the remaining frozen Python consumers when shadow parity data is ready; current repository rules prohibit changing the Python indexing owners during the port.
 4. The two-week shadow soak, multi-platform CI/publication, and live production validation require elapsed/external work and cannot be represented by local unit tests.
 5. Approve installing `cargo-mutants` if the optional mutation gate is required locally; it is not installed and repository policy forbids adding tools/dependencies without approval.
 6. ~~Decide the generation retention policy (SC1).~~ **Resolved 2026-08-15 — no decision was needed.** The audit found `Store::prune_generations_except_latest` (`crates/devmap-store/src/db.rs:1543`) already implemented and correct, with zero production call sites: the only callers were two unit tests. SC1 was a wiring defect, not a missing capability, and needed no schema change. Retention is now `GENERATION_RETENTION = 2`, wired into both commit paths. **Correction:** the alias-chaining dependency (S16) cited here earlier does not exist in the Rust port — `devmap-resolve` depends only on `devmap-extract` and `serde`, contains zero references to generations or the store, and there is no `aliases` table in the schema. S16 describes an unimplemented feature, not a live constraint. The dependency is real in the *Python* incumbent (`src/devcouncil/codeintel/store/sqlite.py:1284`), which needs exactly one prior generation.
 7. Decide whether to collapse speculative ambiguous calls into one edge carrying a candidate set (SC4). This is a representation change to the resolver and store, not a precision change, and it is the single largest lever on both the SC3 memory ceiling and SC2 build time.
 8. Approve adding a peak-memory gate and an external-corpus build gate to `verify.sh`. Neither exists today; the current gates measure only wall time and database size against DevCouncil, which is why SC1, SC3 and SC5 were not caught. Recalibrating the 80 KiB/file size assumption (SC5) depends on the outcome of decisions 6 and 7.
+   **Updated 2026-09-02 — the external-corpus half now has an implementation to approve, and
+   the peak-memory half still has nothing.** `benchmarks/map_bench.py` takes `--repo` and runs
+   any tree against a scratch store, with `--baseline` for run-to-run diffing and corpus sizes
+   recorded in each result; it has been exercised on DevCouncil and scholarlm. Wiring it into
+   `verify.sh` is a decision, not new work. It measures **wall time and artifact sizes only —
+   it does not measure RSS**, so it closes none of decision 8's memory half.
+
+   Two findings from this pass argue the gate list is still missing a category rather than
+   just a threshold. **K4**: a query that matched returned zero results while both budget
+   gates stayed green, because neither could tell an empty result from a no-match result.
+   **K5**: the freelist gate as written reads a pre-checkpoint counter that reported 0 free
+   pages on a store that was 33% garbage — a gate on that number would have passed a store it
+   was specifically meant to catch. Both are the `N4` property applied to the gates themselves:
+   *a check that could not run must not report as one that ran and passed.* Approving new
+   gates without fixing what the existing ones measure buys less than it appears to.
+
+9. **~~Approve the five class-level gates in [PLAN.md](PLAN.md) §3.1~~ — all five are implemented as of 2026-09-02 and need no approval.** Superseded by decision 11, which carries what is left. The Class B gate is `devmap-cli/tests/coverage_invariants.rs` (three assertions, all failing against the pre-fix tree); it is the shape that caught K1 and K2, and it is stated over the filesystem rather than the index because that is the only vantage from which a file the pipeline never saw is visible. Added 2026-09-02. Grouped by failure *shape* rather than by subsystem, the 47 findings collapse into five classes — and four of the five produced a **fresh instance in the Rust port after the Python instance had been found, fixed, and written into the plan as an acceptance property**. Class A ("a check that could not run reports as one that ran and passed") produced three instances across three unrelated subsystems: an analysis timeout (N4), a query budget (K4), and a storage reclaim (K5).
+
+   The evidence that per-instance acceptance tests are not sufficient is direct: **all six defects closed in the 2026-09-02 pass were found by measurement, and none by the acceptance tests written to prevent their class.** The gates are stated in §3.1 and are auditable rather than aspirational — Class A's, for example, is mechanical: any function returning a bare collection, count or `bool` where a timeout, budget exhaustion, cap or skip is reachable is a candidate for review.
+
+   This is a decision rather than work-in-progress because the Class A and Class B gates would each fail against parts of the current tree, and deciding to add them is deciding to fix what they catch. Class B's in particular — *every coverage claim stated over `git ls-files`, never over the indexer's own inventory* — is what surfaced K2, and is the only reason two entire languages missing from every graph were noticed at all.
+
+10. **Decide the MCP protocol pin and the plugin packaging target.** Added 2026-09-02; see [PLAN.md](PLAN.md) §9. Two findings make this a decision rather than a task.
+
+    First, **this repository has already accepted the largest breaking revision in MCP's history through a version range.** `pyproject.toml:18` pins `mcp>=2.0.0,<3`; the 2.x SDK line carries the **2026-07-28** protocol revision, which removes the `initialize`/`initialized` handshake and `Mcp-Session-Id` in favour of a stateless core, replaces server-initiated elicitation/sampling/roots with Multi Round-Trip Requests, and requires `Mcp-Method`/`Mcp-Name` headers on streamable transports. There is no compatibility statement anywhere in the tree. ("MCP 2.0" is an SDK major version, not a protocol version — the specification is date-versioned.)
+
+    The good news is measured, not assumed: the server is **stdio-only and uses none of the deprecated or replaced features** — verified by search, no elicitation, sampling, roots, or MCP `logging/setLevel` call site exists. So today's exposure is latent rather than active. It becomes active on any remote transport, where header routing and the RFC 9207 authorization changes are prerequisites rather than enhancements.
+
+    The cheapest item is additive and should not wait for the decision: **`ttlMs` / `cacheScope` on `tools/list`**. This repository ships 18 map/graph tools whose definitions are paid for on every request whether called or not — the same cost T1 and R1 target, with no migration.
+
+    Second, **plugin packaging has no owner.** DevCouncil ships the components a plugin packages — MCP server, skills, hooks — distributed by repository checkout. SC21 is recorded as closed for the *binary*; the packaging class it belongs to is open. Claude Code's format offers three things that map onto open items: `${CLAUDE_PLUGIN_DATA}` as a per-installation writable home for a store now living at a repository-relative path, `userConfig` with `sensitive: true` as the declared way to take a token without it reaching a config file, and lockfile-driven dependency install with no lifecycle scripts. **Agent Plugins 1.0 is a separate coalition spec that Claude Code did not adopt**; targeting both means maintaining two manifests for one artifact, which is the decision to make.
+
+11. **~~Fund the four unbuilt class gates~~ — built 2026-09-02. Decide whether to run Class A's workspace-wide audit.** Added 2026-09-02; see [PLAN.md](PLAN.md) §10. Seven worst-case scenarios are now written down, and **five of the seven have a demonstrated mechanism** from the 2026-09-02 pass — invented symbols in the graph (W1/K3), a language silently absent while parity was green (W2/K2), gates staying green over an unexamined system (W3/K4+K5), evidence that could not be reproduced under a concurrent writer (W6, demonstrated during the session itself), and a measurement attributed to the wrong phase (W7/K8). None of the seven is a crash: each produces a system that runs, answers, and reports success while being wrong.
+
+    **All five class gates are now implemented** — 14 assertions in `devmap-cli/tests/coverage_invariants.rs` (Class B), `devmap-cli/tests/failure_class_gates.rs` (A, C, D) and unit tests beside `ProgressReporter` in `devmap-cli/src/main.rs` (E). Each was checked against a mutation or a revert rather than merely observed to pass: reverting K1/K2 turns all three Class B assertions red, and forcing a stage to record no time of its own turns Class E's attribution test red while the others stay green. W3 — the scenario where the shadow soak passes because its checks degrade to no-ops under exactly the load they exist to test — now has a gate.
+
+    **What remains a decision.** A gate proves the shape holds *at the points it inspects*, not universally. Three coverage holes are known and named: Class A's mechanical audit (every function returning a bare collection or count where a decline is reachable) has **not** been run across the workspace; Class D does not cover the HEAD boundary (B5); Class E covers the build profiler and not every reported measurement. The Class A audit is the one worth funding — it is the shape that produced three instances in three unrelated subsystems, and the gate currently pins three known surfaces rather than the class.
 
 ## Independent integrity audit (2026-08-12, separate auditor session)
 

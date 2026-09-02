@@ -1,0 +1,79 @@
+{
+  "binary": {
+    "mtime": "2026-09-02T17:46:13.092874+00:00",
+    "path": "/Users/bharath/Code/devtools/DevCouncil/rust-port/target/release/devmap",
+    "size_bytes": 70510672,
+    "version": "devmap 0.1.0"
+  },
+  "comparison": {
+    "cold": {
+      "baseline_s": 3.3708753749961033,
+      "current_s": 2.064535292003711,
+      "pct": -38.753734198610125
+    },
+    "e2e": {
+      "baseline_s": 2.4414607920043636,
+      "current_s": 1.029271792001964,
+      "pct": -57.84196922708049
+    },
+    "manifest": {
+      "baseline_s": 0.5200074169988511,
+      "current_s": 0.35492325000086566,
+      "pct": -31.74650237697478
+    },
+    "touch": {
+      "baseline_s": 2.0398165410006186,
+      "current_s": 1.2154375000027358,
+      "pct": -40.4143718039216
+    },
+    "warm": {
+      "baseline_s": 0.23027558300236706,
+      "current_s": 0.18904408300295472,
+      "pct": -17.905285250754748
+    }
+  },
+  "corpus": {
+    "code_bytes": 41810107,
+    "code_files": 994,
+    "tracked_files": 1308
+  },
+  "generated_at": "2026-09-02T17:47:06+00:00",
+  "label": "final: all optimizations",
+  "python": "3.12.13",
+  "repeat": 5,
+  "repo": "/Users/bharath/Code/devtools/DevCouncil",
+  "stages": {
+    "cold": {
+      "max_s": 2.2025437919946853,
+      "median_s": 2.167707916996733,
+      "min_s": 2.064535292003711,
+      "samples": 5
+    },
+    "e2e": {
+      "max_s": 1.045894708004198,
+      "median_s": 1.0441187500036904,
+      "min_s": 1.029271792001964,
+      "samples": 5
+    },
+    "manifest": {
+      "graph_bytes": 20582748.0,
+      "map_bytes": 417584.0,
+      "max_s": 0.3747126250018482,
+      "median_s": 0.3625423750054324,
+      "min_s": 0.35492325000086566,
+      "samples": 5
+    },
+    "touch": {
+      "max_s": 1.523732708999887,
+      "median_s": 1.4934090829992783,
+      "min_s": 1.2154375000027358,
+      "samples": 5
+    },
+    "warm": {
+      "max_s": 0.20397679199959384,
+      "median_s": 0.19256120899808593,
+      "min_s": 0.18904408300295472,
+      "samples": 5
+    }
+  }
+}
