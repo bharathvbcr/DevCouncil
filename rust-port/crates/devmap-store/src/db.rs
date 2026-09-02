@@ -3,6 +3,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use devmap_analyze::model::*;
 use devmap_extract::model::*;
+#[cfg(feature = "parse")]
 use devmap_resolve::model::*;
 use rusqlite::{params, Connection, OptionalExtension, Result, TransactionBehavior};
 use std::collections::{BTreeMap, BTreeSet};
@@ -632,6 +633,7 @@ impl Store {
         )
     }
 
+    #[cfg(feature = "parse")]
     fn ensure_path_id(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<u32> {
         if let Some(id) = tx
             .query_row(
