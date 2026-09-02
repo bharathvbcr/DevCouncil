@@ -125,8 +125,12 @@ was scheduled.
 | `touch` — one file edited, incremental | 1.31 s | 7.63 s |
 | `manifest` — write `repo_map` + `code_graph` | 0.367 s | 1.26 s |
 | `e2e` — `dev map` end to end via the Python seam | 1.04 s | not measured |
-| `repo_map.json` | 418,688 B | 1,236,709 B |
-| `code_graph.json` | 20,592,594 B | 84,276,217 B |
+| `repo_map.json` | 310,925 B | 1,236,709 B |
+| `code_graph.json` | 21,067,574 B | 84,276,217 B |
+
+The DevCouncil `repo_map.json` figure is post-`G6`: it was 418,688 B when §2.1 was first
+written and 310,925 B after the compaction, a 25.7% reduction achieved without changing the
+schema any consumer reads. The scholarlm column predates that work and has not been re-measured.
 
 Against the pre-pass baseline on DevCouncil: **e2e −57.5%**, cold −36.8%, touch −35.7%,
 manifest −29.5%, warm −14.7%. The e2e figure is much larger than the cold figure because
@@ -258,10 +262,10 @@ kernel lacks**, not defects. Recorded so the list is explicit rather than implie
 | G1 | Breadth beyond linked grammars | **partly closed** — tier-2 recovery (K2/K3) serves grammarless languages; K1 leaves the nodeless case open |
 | G2 | Lexical + semantic retrieval that actually ranks | **closed** — TF-IDF replaced the random-projection hash ranker (K7), and now lives in the kernel as `devmap-query/src/semantic.rs`, computed per query rather than stored |
 | G3 | Clone / duplicate detection | **in progress** — `devmap-extract/src/clonesig.rs`, owned by a separate session as of this writing |
-| G4 | Speculative edit preview — answer "what breaks if I change this" without writing | open |
+| G4 | Speculative edit preview — answer "what breaks if I change this" without writing | **closed** — `devmap preview` / `dev map preview`; `preview_writes_nothing` asserts no generation is committed |
 | G5 | Notebook (`.ipynb`) extraction | open |
-| G6 | Compact binary wire format for the graph export | open — `code_graph.json` is 84 MB on scholarlm (§2.1) |
-| G7 | Savings accounting — report tokens saved vs. reading the files | open |
+| G6 | Compact binary wire format for the graph export | **closed by measurement, not by adopting a binary format** — `repo_map.json` −25.7% (418,688 → 310,925 B) by dropping pretty-printing and a constant empty `summary` on 1,306 file entries. A columnar/interned form reaching 72% was measured and **declined**: it changes the `files`/`dependents` shape CLAUDE.md documents to agents as the navigation contract |
+| G7 | Savings accounting — report tokens saved vs. reading the files | **closed** — `devmap savings`, every figure bytes÷4 and labelled as such, counterfactual named, unreadable indexed files counted separately rather than folded in as zero |
 | G8 | Cross-repository graph | **declined, restated** — the multi-repo registry was already declined above as a product change. Gortex does not change that judgement; noted so a future reader does not re-open it as an oversight |
 
 G6 is the one with a measured cost attached: at 84,276,217 B the scholarlm graph export is

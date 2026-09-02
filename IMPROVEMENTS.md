@@ -620,7 +620,7 @@ could only be had by breaking the interface the agent guides document.
    flatter the map. And when the files are cheaper than the query, it says so —
    a savings report that can only ever report a saving is advertising.
 
-### Defect found and fixed while building clone detection### Defect found and fixed while building clone detection
+### Defect found and fixed while building clone detection
 
 `--kind` / `--min-nodes` were filtering the report *after* the token budget had
 already cut it, then re-taking the budget over the survivors. Because

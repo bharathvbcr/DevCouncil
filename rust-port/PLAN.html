@@ -405,16 +405,17 @@
 </tr>
 <tr>
 <td><code>repo_map.json</code></td>
-<td style="text-align: right;">418,688 B</td>
+<td style="text-align: right;">310,925 B</td>
 <td style="text-align: right;">1,236,709 B</td>
 </tr>
 <tr>
 <td><code>code_graph.json</code></td>
-<td style="text-align: right;">20,592,594 B</td>
+<td style="text-align: right;">21,067,574 B</td>
 <td style="text-align: right;">84,276,217 B</td>
 </tr>
 </tbody>
 </table>
+<p>The DevCouncil <code>repo_map.json</code> figure is post-<code>G6</code>: it was 418,688 B when §2.1 was first written and 310,925 B after the compaction, a 25.7% reduction achieved without changing the schema any consumer reads. The scholarlm column predates that work and has not been re-measured.</p>
 <p>Against the pre-pass baseline on DevCouncil: <strong>e2e −57.5%</strong>, cold −36.8%, touch −35.7%, manifest −29.5%, warm −14.7%. The e2e figure is much larger than the cold figure because roughly 70% of <code>dev map</code>'s wall time was Python wrapper overhead around the kernel, not kernel work — the seam, not the engine, was the dominant cost.</p>
 <p><strong>Where a cold build actually goes</strong> (scholarlm, <code>--json</code> breakdown, post-K8):</p>
 <table>
@@ -805,7 +806,7 @@
 <tr>
 <td>G4</td>
 <td>Speculative edit preview — answer "what breaks if I change this" without writing</td>
-<td>open</td>
+<td><strong>closed</strong> — <code>devmap preview</code> / <code>dev map preview</code>; <code>preview_writes_nothing</code> asserts no generation is committed</td>
 </tr>
 <tr>
 <td>G5</td>
@@ -815,12 +816,12 @@
 <tr>
 <td>G6</td>
 <td>Compact binary wire format for the graph export</td>
-<td>open — <code>code_graph.json</code> is 84 MB on scholarlm (§2.1)</td>
+<td><strong>closed by measurement, not by adopting a binary format</strong> — <code>repo_map.json</code> −25.7% (418,688 → 310,925 B) by dropping pretty-printing and a constant empty <code>summary</code> on 1,306 file entries. A columnar/interned form reaching 72% was measured and <strong>declined</strong>: it changes the <code>files</code>/<code>dependents</code> shape CLAUDE.md documents to agents as the navigation contract</td>
 </tr>
 <tr>
 <td>G7</td>
 <td>Savings accounting — report tokens saved vs. reading the files</td>
-<td>open</td>
+<td><strong>closed</strong> — <code>devmap savings</code>, every figure bytes÷4 and labelled as such, counterfactual named, unreadable indexed files counted separately rather than folded in as zero</td>
 </tr>
 <tr>
 <td>G8</td>

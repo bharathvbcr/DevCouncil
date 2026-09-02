@@ -802,12 +802,18 @@ Also closed, after this section was first written:
 
 ### Gaps vs. gortex
 
-Recorded as `G1`–`G8` in [PLAN.md](PLAN.md) §3. Closed: G2 (retrieval ranking, via K7).
-Partly closed: G1 (language breadth — tier-2 recovery, less K1). In progress under a separate
-session: G3 (clone detection, `devmap-extract/src/clonesig.rs`). Open: G4 speculative edit
-preview, G5 notebooks, G6 compact wire format, G7 savings accounting. Restated as declined:
-G8 cross-repository graph — already declined in PLAN.md as a product change; noted so it is
-not re-opened as an oversight.
+Recorded as `G1`–`G8` in [PLAN.md](PLAN.md) §3. **All eight are now resolved**, the last four
+by a concurrent session in `079bc50`: G1 language breadth (tier-2 recovery), G2 retrieval
+ranking, G3 clone detection, G4 `devmap preview`, G5 notebooks, G6 wire-format compaction,
+G7 `devmap savings`. G8 cross-repository graph stays **declined** — already declined in
+PLAN.md as a product change, recorded so it is not re-opened as an oversight.
+
+G6 is worth reading rather than ticking. It closed by *measurement* rather than by adopting a
+binary format: `repo_map.json` fell 25.7% by dropping pretty-printing and a constant empty
+`summary` field on 1,306 entries. A columnar/interned encoding reaching 72% was measured and
+**declined**, because it changes the `files`/`dependents` shape that CLAUDE.md documents to
+agents as the navigation contract. Saving tokens by breaking the interface agents are told to
+use is not a saving.
 
 ### Not claimed
 
