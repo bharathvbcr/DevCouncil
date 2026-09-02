@@ -406,7 +406,13 @@ nothing" leave an identical file behind.
 
 ### Gaps vs gortex — status
 
-Closed in this session:
+All eight are closed. They are listed in the order they were reviewed, not the
+order they were built, so the numbering matches the original gap review above.
+
+Two of the eight were closed by *deleting* rather than adding — the Python
+embedding index (#3) and the constant `summary` field (#7) — and one, #7, was
+deliberately closed short of what was measurable, because the remaining 46%
+could only be had by breaking the interface the agent guides document.
 
 1. **Language breadth.** ~~Absent~~ **Closed.** Tier-2 declaration recovery
    (`devmap-extract/src/fallback.rs`): a file whose language has no linked
@@ -464,31 +470,157 @@ Closed in this session:
      binaries actually differ before trusting any A/B — here, 11,514 signed
      symbols against 0.
 
-Still open, in rough order of value. None are started.
+4. **Speculative execution.** ~~Absent~~ **Closed.** `devmap preview` /
+   `dev map preview`: extract a candidate buffer in memory, diff it against the
+   file on disk, and report symbols added, removed and re-declared plus the
+   calls from other files that a removal or re-declaration would affect. Nothing
+   is written and no generation is committed (`preview_writes_nothing` asserts
+   both).
 
-2. **Cross-repo / multi-repo graph.** `devmap serve` is single-root; there is no
-   workspace registry, no cross-repo edge resolution, no shared canonical ids
-   for contracts spanning services.
-3. **Vector search in the kernel.** FTS5 exists (`nodes_fts`). Embeddings are
-   TF-IDF over the Python path (`indexing/graph/embeddings.py`) and are now
-   refreshed by `dev map`. **Correction to the earlier note in this document:**
-   it claimed `--semantic` "quietly does less than it says" because embeddings
-   read a store `dev map` no longer builds. That was wrong — embeddings are
-   opt-in and off by default, so the flag was not silently degrading; it was
-   not enabled. What remains genuinely open is that vector search lives outside
-   the kernel rather than beside FTS5 in SQLite.
-4. **Speculative execution.** No `preview_edit` / `simulate_chain` equivalent:
-   no shadow graph for unsaved buffers, so an agent cannot ask what a change
-   would do before writing it.
-6. **Notebooks.** No `.ipynb` / Databricks support. Deliberately not built:
-   neither working corpus contains a single `.ipynb`, and doing it honestly
-   requires mapping symbol spans back through the JSON cell array — spans that
-   are wrong are worse than absent, since `devmap search` slices source by them.
-7. **Compact wire format.** Gortex publishes GCX1 (−27% tokens vs JSON). The
-   artifacts here are JSON; compacting the graph recovered 21.5% of that.
-8. **Token-savings accounting.** No equivalent of `gortex savings`.
+   Three findings that shaped it, each one a wrong answer first:
 
-### Defect found and fixed while building clone detection
+   - **A buffer that does not parse yields no symbols**, so a naive diff reports
+     every symbol in the file as removed and every caller as breaking — the most
+     alarming output the tool can produce, from a half-typed edit, which is
+     exactly when an agent would be asking. A failed parse now returns
+     `delta_available: false` and no symbols; a partial parse reports the delta
+     with an explicit warning that a symbol inside an error region will look
+     removed.
+   - **`generation_edges.target_symbol` holds qualified names** (`path::Name`).
+     Matching callers on the bare `symbol_name` returned zero rows and printed
+     "no calls from other files are affected" — a plausible-looking answer that
+     meant the feature's more valuable half had never run.
+   - **`ExtractedSymbol.signature` is populated by one grammar.** 80 of ~2,300
+     sampled symbols, all Go; null for Python, Rust and TypeScript. Comparing it
+     made every signature change in those languages look like a body change. The
+     declaration/body split now comes from a `declaration_hash` computed off the
+     parse tree with the `body` field child excluded — in memory only, never
+     persisted, because the one consumer extracts both sides in the same
+     process.
+
+   Two accuracy decisions worth keeping:
+
+   - **Callers are filtered by resolver confidence.** The 50,533 call edges sit
+     in three tiers — 1.0 (19,134), 0.9 (4,800) and 0.2 (26,599) — and the 0.2
+     tier is name-only attribution. Every `dict.get(...)` in the tree resolves to
+     `LLMCache.get`, giving that one method 921 edges, none of them real.
+     `PREVIEW_CALLER_MIN_CONFIDENCE = 0.5` sits in the empty band between the
+     tiers. Excluded edges are *counted* in `ambiguous_callers`, not dropped, so
+     "no callers affected" cannot quietly mean "none we would vouch for".
+   - **The diff is against disk, not the index.** The user is editing the file
+     that is on disk; diffing against a generation built from an older commit
+     would report their own already-saved work as part of the candidate change.
+     The index is still consulted, but only for the caller graph, where being a
+     generation behind is a stated property rather than a wrong diff. Paths
+     resolve against the generation's `repo_root`, since the CLI and the daemon
+     have different working directories.
+
+2. **Cross-repo / multi-repo graph.** ~~Absent~~ **Closed.** `devmap workspace`
+   — a registry (`.devcouncil/workspace.json`), federated search across every
+   registered repository, and cross-repository link candidates.
+
+   What it deliberately does *not* do is join repositories on symbol names. Two
+   repositories both declaring `New`, `Client` or `get` is the normal case, not
+   a dependency, and asserting edges from it would manufacture them at the scale
+   the resolver already records at 0.2 confidence *within* one repository. The
+   only cross-repository relation asserted is "repository A imports a module
+   repository B declares", evidenced by B's `go.mod` module path or a top-level
+   Python package, with the evidence string carried on every candidate. Verified
+   on a two-repo fixture: `svca example.com/libb/store -> libb (go.mod declares
+   module example.com/libb)`, and `shared_symbol_names_alone_do_not_make_a_link`
+   pins the negative.
+
+   Prefix matching is on segment boundaries, not `starts_with`: `manvibench` is
+   not an import of `manvi`. Repositories that cannot be queried are named in
+   the response — a federated answer assembled from three of five repositories
+   is not a federated answer, and the reader has no other way to know.
+
+3. **Vector search in the kernel.** ~~Outside the kernel~~ **Closed.**
+   `devmap search --semantic` / `dev map search --semantic`, TF-IDF over symbol
+   names in `devmap-query/src/semantic.rs`.
+
+   Nothing is stored. The vocabulary, document frequencies and vectors are all
+   derivable from `generation_nodes`, so precomputing them would put a second
+   copy of a derived fact in the database — one to rebuild in step with the
+   symbols, and stale whenever it was not. That is precisely the machinery the
+   Python implementation carried: a `symbol_embedding_idf` table, a build step,
+   a generation stamp, and a `stale_rows_skipped` counter for when they
+   disagreed. Computing instead costs one pass over ~14,500 names; the whole
+   query, including opening the store, measures 40–50 ms.
+
+   The 398-line Python implementation, its build wiring in three places, its
+   config flag and its tests are **removed**, not left beside the new one.
+   `--semantic` no longer silently falls back to prefix matching when no index
+   exists — it reports that it cannot answer, because returning keyword results
+   under a flag promising similarity ranking is a different answer, not a
+   degraded one.
+
+   One real bug found by its own test: the tokenizer split `LLMCache` into the
+   single term `llmcache`, so a query for "llm cache" could not match it. An
+   acronym run needs a boundary *before its last capital* when a lowercase
+   follows. With that fixed, `LLMCache` ranks first (0.979) for "llm cache";
+   before, a `cache.py` file node did.
+
+   A second defect surfaced while measuring it: `cap_source_span` capped a hit
+   at the *whole* budget, so a single `File` symbol — whose span is its entire
+   file — crowded out every other result. A 4,000-token search returned 2 hits
+   and reported 512 withheld. Capped at a quarter of the budget, the same query
+   returns 7. That fix applies to keyword search too.
+
+6. **Notebooks.** ~~Absent~~ **Closed.** `.ipynb` files are indexed:
+   `devmap-extract/src/notebook.rs` reconstructs code cells, parses them as one
+   buffer so a symbol defined in cell 3 resolves against a call in cell 7, and
+   relocates every resulting span back into the raw file.
+
+   The extractor was written in a concurrent session and left unregistered — it
+   did not compile into the crate. Wiring it in surfaced four instances of one
+   defect: the synthetic filename used for the parse (`nb.ipynb.py`) leaking
+   into `qualified_name`, `caller_symbol`, `parent_symbol`, and the call spans.
+   The `parent_symbol` one was the quiet one — the resolver emits a second
+   `Contains` edge only when a symbol's parent differs from its file, so every
+   notebook symbol gained a containment edge from a file that does not exist.
+   A fifth: relocation rebuilt qualified names from `symbol.name`, flattening
+   `Holder.method` to `method` while the call attributed to it kept the dotted
+   form, so every method declared in a notebook was recorded under a name
+   nothing referred to. `no_synthetic_filename_survives_into_the_extraction`
+   asserts on the substring rather than the known fields, so the next field
+   added gets the guarantee without anyone remembering to extend the test.
+
+   Verified end to end: spans index the raw `.ipynb` bytes (`raw[309:330]` is
+   exactly `def load_frame(path):`), prose in Markdown cells contributes no
+   symbols, and a cross-cell call resolves.
+
+7. **Compact wire format.** ~~JSON~~ **Closed**, and by measurement rather than
+   by adopting a binary format. `repo_map.json` — the artifact the agent guides
+   instruct an agent to open before searching — went from 411.4 KB to 303.7 KB,
+   a 26.2% reduction, or about 27,600 tokens, matching gortex's GCX1 claim of
+   −27% without changing the schema a single consumer reads.
+
+   Two causes: the file was still pretty-printed (22%), and every one of its
+   1,306 file entries carried `"summary": ""`, a constant nothing read. The
+   *subsystem* summaries are kept, because `map_viz.py` indexes them directly
+   and would raise on their absence.
+
+   The deeper compaction was measured and **not** taken: columnar file rows plus
+   an interned path table reach 72% (105,329 tokens to 29,333). It changes the
+   shape of `files` and `dependents`, which CLAUDE.md documents to agents as the
+   navigation contract. Saving tokens by breaking the interface agents are told
+   to use is not a saving.
+
+8. **Token-savings accounting.** ~~Absent~~ **Closed.** `devmap savings`, with
+   the counterfactual named rather than implied.
+
+   Every figure is bytes ÷ 4 and says so — a tokenizer count depends on the
+   model reading it, and a precise-looking number derived from a divisor is
+   fabricated precision. The comparison is deliberately conservative: the
+   alternative is charged only for reading the files the map *already named*,
+   not for the grep that would have been needed to find them, so the reported
+   figure is a floor. Indexed files that cannot be read are counted separately
+   rather than folded in as zero bytes, which would shrink the corpus and
+   flatter the map. And when the files are cheaper than the query, it says so —
+   a savings report that can only ever report a saving is advertising.
+
+### Defect found and fixed while building clone detection### Defect found and fixed while building clone detection
 
 `--kind` / `--min-nodes` were filtering the report *after* the token budget had
 already cut it, then re-taking the budget over the survivors. Because
