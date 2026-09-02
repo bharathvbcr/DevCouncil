@@ -622,9 +622,6 @@ def test_mcp_graph_ingest_reports_a_prior_generation_as_not_ok(tmp_path: Path, m
         "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
         lambda *a, **k: _incomplete_refresh(),
     )
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.embeddings.build_embeddings", lambda _r: 0
-    )
     result = asyncio.run(map_handler.handle_graph_ingest(tmp_path, {}))
     payload = _json.loads(result[0].text)
 

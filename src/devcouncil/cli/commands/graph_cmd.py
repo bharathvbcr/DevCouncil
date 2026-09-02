@@ -236,7 +236,7 @@ def _devmap_query_payload(root: Path, kind: str, **kwargs):
         if kind == "search":
             query = str(kwargs["query"])
             limit = int(kwargs.get("limit", 50))
-            resp = client.search(query, limit=2000)
+            resp = client.search(query, limit=2000, semantic=bool(kwargs.get("semantic")))
             reason = resolution_unavailable_reason(resp.resolution)
             if reason:
                 raise DevMapClientError(reason)
@@ -874,27 +874,39 @@ def graph_search(
     query: str = typer.Argument(...),
     project_root: Path = typer.Option(Path("."), "--project-root"),
     limit: int = typer.Option(50, "--limit"),
-    semantic: bool = typer.Option(False, "--semantic", help="Use opt-in local embeddings when enabled."),
+    semantic: bool = typer.Option(
+        False,
+        "--semantic",
+        help="Rank by name similarity in the kernel instead of prefix matching.",
+    ),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Full-text (or semantic) symbol and path search over the committed generation."""
+    """Full-text (or semantic) symbol and path search over the committed generation.
+
+    ``--semantic`` no longer depends on a separately built embedding index. The
+    kernel derives the ranking from the symbol names in the generation it
+    already holds, so the flag either works or reports that no map exists —
+    it can no longer quietly fall back to prefix matching while claiming to be
+    semantic.
+    """
     root = _root(project_root)
-    if semantic:
-        from devcouncil.indexing.graph.embeddings import semantic_search
+    result = _devmap_query_payload(root, "search", query=query, limit=limit, semantic=semantic)
+    if result is None:
+        if semantic:
+            # No silent downgrade. Prefix matching is a different answer, and
+            # returning it under a `--semantic` flag is the failure this used
+            # to have: the old path fell through to keyword search whenever the
+            # embedding index was missing, which it was by default.
+            typer.secho(
+                "semantic search is unavailable: it needs the devmap index "
+                "(run `dev map` to build one)",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
+            raise typer.Exit(3)
+        from devcouncil.codeintel.query import CodeIntelQueryEngine
 
-        result = semantic_search(root, query, limit=limit)
-        if not result.get("ok"):
-            result = _devmap_query_payload(root, "search", query=query, limit=limit)
-            if result is None:
-                from devcouncil.codeintel.query import CodeIntelQueryEngine
-
-                result = CodeIntelQueryEngine(root).search(query, limit=limit)
-    else:
-        result = _devmap_query_payload(root, "search", query=query, limit=limit)
-        if result is None:
-            from devcouncil.codeintel.query import CodeIntelQueryEngine
-
-            result = CodeIntelQueryEngine(root).search(query, limit=limit)
+        result = CodeIntelQueryEngine(root).search(query, limit=limit)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -919,7 +931,6 @@ def graph_ingest(
     from devcouncil.codeintel.sync import get_sync_coordinator
     from devcouncil.codeintel import get_codeintel_service
     from devcouncil.codeintel.build_control import GraphBuildBusy
-    from devcouncil.indexing.graph.embeddings import build_embeddings
 
     root = _root(project_root)
     coordinator = get_sync_coordinator(root)
@@ -966,7 +977,6 @@ def graph_ingest(
             graph=get_codeintel_service(root).load(),
             paths=changed,
         )
-    embedded = build_embeddings(root)
     payload = {
         # A map rebuilt from a prior generation after a build timeout is not a
         # successful ingest: the graph is intact but older than HEAD. Reporting
@@ -975,7 +985,6 @@ def graph_ingest(
         "ok": not (refresh.degraded or refresh.build_incomplete),
         "paths": changed,
         "map": str(map_path.relative_to(root)),
-        "embeddings_built": embedded,
         "generation": refresh.generation,
         "mode": refresh.mode,
         "degraded": refresh.degraded,
@@ -997,7 +1006,6 @@ def graph_ingest(
         color = "yellow" if (refresh.degraded or refresh.build_incomplete) else "green"
         status.print(
             f"[{color}]Ingested {len(changed)} path(s); map at {payload['map']}"
-            f"{f'; {embedded} embeddings' if embedded else ''}"
             f"{f'; degraded: {refresh.reason}' if refresh.degraded else ''}"
             f"{f'; graph build did not finish — map came from the last committed '
                f'generation ({refresh.reason})' if refresh.build_incomplete else ''}[/{color}]"
@@ -1299,6 +1307,261 @@ def graph_dead(
             "to refresh, or pass --allow-stale to accept.[/red]"
         )
         raise typer.Exit(code=3)
+
+
+@app.command("preview")
+def graph_preview(
+    file: str = typer.Argument(..., help="Repository-relative path the buffer would be written to."),
+    content: Optional[Path] = typer.Option(
+        None, "--content", help="File holding the candidate content; omit to read stdin."
+    ),
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    json_output: bool = typer.Option(False, "--json"),
+    budget: int = typer.Option(2000, "--budget"),
+    min_confidence: float = typer.Option(
+        0.5,
+        "--min-confidence",
+        help="Confidence a call edge needs to be listed. The default excludes "
+        "the resolver's name-only tier, which is counted separately.",
+    ),
+) -> None:
+    """Ask what an unsaved edit would do to the graph, without writing it."""
+    import sys
+
+    from devcouncil.devmap_client import DevMapClientError, try_connect
+
+    root = _root(project_root)
+    _warn_if_stale(root, note_unknown=True, quiet=json_output)
+
+    if content is not None:
+        source = content.read_text(encoding="utf-8", errors="replace")
+    else:
+        source = sys.stdin.read()
+
+    client = try_connect(root)
+    if client is None:
+        # No Python fallback: the delta comes from parsing the buffer with the
+        # tree-sitter grammars the Rust kernel owns. Reporting nothing found
+        # would read as "this edit changes nothing".
+        message = (
+            "preview is unavailable: it needs the devmap index "
+            "(run `dev map` to build one)"
+        )
+        if json_output:
+            typer.echo(json.dumps({"error": message}, indent=2))
+        else:
+            typer.secho(message, fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(3)
+
+    try:
+        report = client.preview(
+            file=file, content=source, budget=budget, min_confidence=min_confidence
+        )
+    except DevMapClientError as exc:
+        typer.secho(f"preview failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+
+    if json_output:
+        typer.echo(json.dumps(report, indent=2))
+        return
+
+    typer.echo(f"{report.get('file_path')}  parse={report.get('parse_status')}")
+    if report.get("compared_against") == "nothing":
+        typer.echo("note: no file at this path; every symbol reads as added")
+    if not report.get("file_is_indexed"):
+        typer.echo("note: this file is not in the index; no caller graph is available for it")
+    if report.get("degraded_reason"):
+        typer.echo(f"note: {report['degraded_reason']}")
+    if not report.get("delta_available"):
+        raise typer.Exit(3)
+
+    labels = {
+        "Added": "added",
+        "Removed": "removed",
+        "SignatureChanged": "signature",
+        "BodyChanged": "body",
+        "Changed": "changed",
+    }
+    for symbol in report.get("symbols") or []:
+        change = labels.get(str(symbol.get("change")), str(symbol.get("change")))
+        typer.echo(f"{change:<11} {symbol.get('qualified_name')} ({symbol.get('kind')})")
+    if not (report.get("symbols") or []):
+        typer.echo("no symbol-level change")
+    if report.get("bodies_not_compared"):
+        typer.echo(
+            f"{report['bodies_not_compared']} symbol(s) declared identically but not "
+            "body-compared (below the signature size floor, or no grammar)"
+        )
+
+    callers = (report.get("broken_callers") or {}).get("items") or []
+    for caller in callers:
+        typer.echo(
+            f"  affects  {caller.get('caller_symbol')}  ->  "
+            f"{caller.get('target_symbol')}  ({caller.get('confidence'):.2f})"
+        )
+    if not callers:
+        typer.echo("no calls from other files are affected")
+    if report.get("ambiguous_callers"):
+        typer.echo(
+            f"{report['ambiguous_callers']} further call edge(s) fell below the "
+            "confidence floor and are not listed; pass --min-confidence 0 to see them"
+        )
+
+
+@app.command("savings")
+def graph_savings(
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    query: Optional[str] = typer.Option(None, "--query", help="Also account for one search."),
+    budget: int = typer.Option(2000, "--budget"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Report what the map cost against what reading files would have.
+
+    Every figure is an estimate of bytes / 4, and the comparison charges the
+    alternative only for reading the files the map already named — so the
+    reported saving is a floor, not a best case.
+    """
+    from devcouncil.devmap_client import DevMapClientError, try_connect
+
+    root = _root(project_root)
+    client = try_connect(root)
+    if client is None:
+        message = "savings is unavailable: it needs the devmap index (run `dev map` to build one)"
+        if json_output:
+            typer.echo(json.dumps({"error": message}, indent=2))
+        else:
+            typer.secho(message, fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(3)
+    try:
+        report = client.savings(query=query, budget=budget)
+    except DevMapClientError as exc:
+        typer.secho(f"savings failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(report, indent=2))
+
+
+@app.command(
+    "workspace",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def graph_workspace(
+    ctx: typer.Context,
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+) -> None:
+    """Manage the multi-repo registry: add, remove, list, search, links.
+
+    Arguments are passed to `devmap workspace` unchanged, so this stays one
+    command rather than a second copy of its subcommand tree that can drift.
+    """
+    from devcouncil.devmap_client import DevMapClientError, try_connect
+
+    root = _root(project_root)
+    client = try_connect(root)
+    if client is None:
+        message = (
+            "workspace is unavailable: it needs the devmap binary "
+            "(run `dev map` to build an index first)"
+        )
+        typer.secho(message, fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(3)
+    if not ctx.args:
+        typer.secho("usage: dev map workspace <add|remove|list|search|links> ...", err=True)
+        raise typer.Exit(2)
+    try:
+        result = client.workspace(list(ctx.args))
+    except DevMapClientError as exc:
+        typer.secho(f"workspace failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(result, indent=2))
+
+
+@app.command("clones")
+def graph_clones(
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    json_output: bool = typer.Option(False, "--json"),
+    kind: Optional[str] = typer.Option(
+        None, "--kind", help="Report only 'exact' or only 'structural' groups."
+    ),
+    min_nodes: int = typer.Option(
+        0, "--min-nodes", help="Drop groups whose smallest body is under this many parse nodes."
+    ),
+    budget: int = typer.Option(2000, "--budget"),
+) -> None:
+    """Report duplicated symbol bodies.
+
+    ``exact`` groups are the same code modulo formatting and comments;
+    ``structural`` groups are the same shape under renaming, and cover callables
+    only.
+    """
+    from devcouncil.devmap_client import DevMapClientError, try_connect
+
+    root = _root(project_root)
+    _warn_if_stale(root, note_unknown=True, quiet=json_output)
+
+    client = try_connect(root)
+    if client is None:
+        # No Python fallback exists: body signatures are produced by the
+        # tree-sitter extraction the Rust kernel owns, and there is nothing to
+        # group without them. Saying so beats printing an empty report that
+        # reads as "no duplicates found".
+        message = (
+            "clone detection is unavailable: it needs the devmap index "
+            "(run `dev map` to build one)"
+        )
+        if json_output:
+            typer.echo(json.dumps({"error": message, "groups": None}, indent=2))
+        else:
+            typer.secho(message, fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(3)
+
+    try:
+        report = client.clones(budget=budget, kind=kind, min_nodes=min_nodes)
+    except DevMapClientError as exc:
+        typer.secho(f"clone query failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "groups": report.groups.items,
+                    "shown": report.groups.shown,
+                    "hidden": report.groups.hidden,
+                    "total": report.groups.total,
+                    "truncated": report.groups.truncated,
+                    "signed_symbols": report.signed_symbols,
+                    "unsigned_symbols": report.unsigned_symbols,
+                },
+                indent=2,
+            )
+        )
+        return
+
+    for group in report.groups.items:
+        members = group.get("members") or []
+        typer.echo(
+            f"{str(group.get('kind', '?')).lower()}  {len(members)} members  "
+            f"{group.get('min_nodes', 0)} nodes"
+        )
+        for member in members:
+            typer.echo(
+                f"    {member.get('file_path')}:{member.get('span_start')}  "
+                f"{member.get('symbol_name')}"
+            )
+        omitted = group.get("members_omitted") or 0
+        if omitted:
+            typer.echo(f"    ... {omitted} more members not listed")
+    # Printed even when nothing was found, so "no duplicates" cannot be confused
+    # with "nothing was examined".
+    typer.echo(
+        f"coverage: {report.signed_symbols} symbols signed, "
+        f"{report.unsigned_symbols} unsigned"
+    )
+    if report.groups.truncated:
+        typer.echo(
+            f"showing {report.groups.shown} of {report.groups.total} groups "
+            f"({report.groups.hidden} withheld by the token budget)"
+        )
 
 
 @app.command("check")

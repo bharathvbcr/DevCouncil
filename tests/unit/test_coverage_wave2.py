@@ -713,11 +713,6 @@ def test_graph_cmd_corpus_and_pdg_text_paths(tmp_path, monkeypatch):
     )
     assert bad_mode.exit_code == 2
 
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.embeddings.semantic_search",
-        lambda *a, **k: {"ok": False},
-    )
-
     class Engine:
         def search(self, q, limit=50):
             return {
@@ -727,8 +722,21 @@ def test_graph_cmd_corpus_and_pdg_text_paths(tmp_path, monkeypatch):
             }
 
     monkeypatch.setattr("devcouncil.codeintel.query.CodeIntelQueryEngine", lambda root: Engine())
+
+    # Plain search still falls back to the Python engine when no devmap index
+    # exists: prefix matching is prefix matching wherever it runs.
+    plain = runner.invoke(gc.app, ["search", "run", "--project-root", str(mapped)])
+    assert plain.exit_code == 0, plain.output
+
+    # `--semantic` does not. It used to fall through to this same keyword
+    # engine whenever the embedding index was missing — which it was by
+    # default — and return prefix matches under a flag that promised ranking by
+    # similarity. Ranking is now the kernel's, and with no index there is no
+    # semantic answer to give, so it says so instead of substituting a
+    # different one.
     sem = runner.invoke(
         gc.app,
         ["search", "run", "--semantic", "--project-root", str(mapped)],
     )
-    assert sem.exit_code == 0, sem.output
+    assert sem.exit_code == 3, sem.output
+    assert "semantic search is unavailable" in sem.output

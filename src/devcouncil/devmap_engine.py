@@ -64,17 +64,13 @@ def find_engine_binary() -> str:
     for candidate in candidates:
         if not (candidate.is_file() and os.access(candidate, os.X_OK)):
             continue
-        try:
-            probe = subprocess.run(
-                [str(candidate), "manifest", "--help"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except (OSError, subprocess.TimeoutExpired):
+        # Through the memoised probe, so the later stamp-capability check reuses
+        # this process launch instead of spending its own.
+        help_text = _manifest_help(str(candidate))
+        if not help_text:
             rejected.append(f"{candidate} (did not respond to --help)")
             continue
-        if "--graph-output" in (probe.stdout or ""):
+        if "--graph-output" in help_text:
             return str(candidate)
         rejected.append(f"{candidate} (too old: no --graph-output)")
 
@@ -83,6 +79,55 @@ def find_engine_binary() -> str:
         "no devmap binary supports this map engine — "
         f"checked: {detail}. Build it with "
         "`cargo build --release -p devmap-cli` in rust-port/."
+    )
+
+
+def _manifest_help(binary: str) -> str:
+    """`devmap manifest --help`, memoised per binary path.
+
+    `find_engine_binary` already runs this probe to reject a kernel too old to
+    write the graph companion, and asking a second time to test a second
+    capability would spend another process launch (~140 ms measured) answering a
+    question the first answer contains. Keyed by path *and* mtime so a rebuilt
+    binary is re-probed rather than judged on its predecessor's capabilities —
+    every build of this workspace reports the same `devmap 0.1.0`, so the path
+    alone is not an identity.
+    """
+    try:
+        stat = Path(binary).stat()
+        key = (binary, stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        key = (binary, 0, 0)
+    cached = _MANIFEST_HELP_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        probe = subprocess.run(
+            [binary, "manifest", "--help"], capture_output=True, text=True, timeout=30
+        )
+        text = probe.stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        # An unprobeable binary is treated as lacking the capability, never as
+        # having it: the fallback path still produces a correctly stamped map.
+        text = ""
+    _MANIFEST_HELP_CACHE[key] = text
+    return text
+
+
+_MANIFEST_HELP_CACHE: dict[tuple[str, int, int], str] = {}
+
+
+def _manifest_accepts_stamp_flags(binary: str) -> bool:
+    """Whether this kernel can be handed the freshness digests directly.
+
+    All three are required. A kernel accepting only some of them would need the
+    read-modify-write path for the rest, and running both is strictly worse than
+    running one — so the capability is all-or-nothing.
+    """
+    help_text = _manifest_help(binary)
+    return all(
+        flag in help_text
+        for flag in ("--generated-head", "--indexed-hash", "--content-fingerprint")
     )
 
 
@@ -106,9 +151,67 @@ def _run(argv: List[str], *, cwd: Path, timeout: float) -> subprocess.CompletedP
     return completed
 
 
+def compute_freshness(root: Path) -> dict[str, str]:
+    """The three freshness digests, computed once from one snapshot of the tree.
+
+    Split out from the old `stamp_freshness` so the values can be handed to the
+    kernel *before* it writes, rather than patched into the artifacts after. See
+    `build_map` for why that matters; the reasoning about which values these are
+    and why they come from `RepoMapper` is unchanged and reproduced below.
+
+    The kernel cannot write two of the three: they are SHA-1 digests over the
+    git file set, and no hashing crate is linked in that workspace. Left empty
+    they are not merely absent — `RepoMapper.map_is_stale` skips its check only
+    when `generated_head` is *also* empty, and the Rust map does carry a head.
+    So `"" != <real digest>` on every call and the map reads permanently stale,
+    which makes `--if-stale` never short-circuit and the watcher rebuild
+    forever.
+
+    `generated_head` is computed here too, and for the same reason. The kernel
+    writes it from the newest *persisted generation* — honest for the store,
+    but a different question from the one `map_is_stale` asks, which is whether
+    this artifact describes the tree at the current `git rev-parse HEAD`. An
+    incremental build that finds no changed file persists no new generation, so
+    after a commit that touches nothing indexed the stamp keeps pointing at the
+    previous commit and the map reads stale the moment `dev map` finishes.
+    Measured on this repository: HEAD `e109d16`, stored `30daf62`, stale on a
+    map one second old.
+
+    All three come from `RepoMapper`, the same object `map_is_stale` uses, read
+    once from one snapshot of the tree — a field written by one rule and read
+    by another is worse than none at all, because it can read fresh when it is
+    not. An unavailable HEAD is the empty string rather than a raised error,
+    matching the Python writer: a repository with no commits still gets a
+    usable map, and staleness then rests on the two fingerprints.
+    """
+    # Imported from the Python indexer deliberately: one owner for the digest,
+    # so writer and checker cannot drift. Relocating these two pure helpers is
+    # part of removing `devcouncil.indexing`, not of this change.
+    from devcouncil.indexing.graph.build import _files_fingerprint, content_fingerprint
+    from devcouncil.indexing.repo_mapper import RepoMapper
+
+    mapper = RepoMapper(project_root=root)
+    try:
+        files = mapper.get_git_files()
+    except Exception as exc:  # noqa: BLE001 - any failure here must fail the stage
+        raise DevMapEngineError(f"cannot enumerate git files to fingerprint: {exc}") from exc
+
+    return {
+        "generated_head": mapper._git_head(),
+        "indexed_hash": _files_fingerprint(files),
+        "content_fingerprint": content_fingerprint(root, files),
+    }
+
+
 def stamp_freshness(root: Path, *artifacts: Path) -> None:
     """Stamp `generated_head` / `indexed_hash` / `content_fingerprint` into
     every Rust-written artifact.
+
+    **Kept as the fallback path only.** `build_map` now passes these values to
+    `devmap manifest`, which writes them itself; this read-modify-write remains
+    for a kernel too old to accept the flags. It is retained rather than deleted
+    because the alternative on such a binary is an unstamped map, which reads
+    permanently stale — the exact failure the docstring below describes.
 
     The kernel cannot write two of the three: they are SHA-1 digests over the
     git file set, and no hashing crate is linked in that workspace. Left empty
@@ -139,23 +242,7 @@ def stamp_freshness(root: Path, *artifacts: Path) -> None:
     graph from one freshness identity on purpose; stamping only one of them
     would reintroduce exactly the drift that single invocation prevents.
     """
-    # Imported from the Python indexer deliberately: one owner for the digest,
-    # so writer and checker cannot drift. Relocating these two pure helpers is
-    # part of removing `devcouncil.indexing`, not of this change.
-    from devcouncil.indexing.graph.build import _files_fingerprint, content_fingerprint
-    from devcouncil.indexing.repo_mapper import RepoMapper
-
-    mapper = RepoMapper(project_root=root)
-    try:
-        files = mapper.get_git_files()
-    except Exception as exc:  # noqa: BLE001 - any failure here must fail the stage
-        raise DevMapEngineError(f"cannot enumerate git files to fingerprint: {exc}") from exc
-
-    freshness = {
-        "generated_head": mapper._git_head(),
-        "indexed_hash": _files_fingerprint(files),
-        "content_fingerprint": content_fingerprint(root, files),
-    }
+    freshness = compute_freshness(root)
 
     for artifact in artifacts:
         try:
@@ -230,19 +317,45 @@ def build_map(
     for line in (built.stderr or "").splitlines():
         if "discovery refused" in line or line.startswith("    "):
             print(line, file=sys.stderr)
+    # Compute the freshness digests *before* the manifest runs so the kernel can
+    # write them itself.
+    #
+    # The alternative — the read-modify-write `stamp_freshness` still does — cost
+    # 1.68 s of a 2.72 s `dev map` on this repository, essentially all of it
+    # Python parsing and re-encoding a 26 MB `code_graph.json` that the kernel
+    # had just encoded, in order to set three scalars. Handing the values to the
+    # writer removes the second serialization entirely.
+    #
+    # A failure to compute them is still fatal, exactly as before: an unstamped
+    # map reads permanently stale to `map_is_stale`, so silently continuing
+    # would leave the watcher rebuilding forever with nothing to show why.
+    freshness = compute_freshness(root)
+    stamp_flags = [
+        argument
+        for key, value in freshness.items()
+        # An empty value is not passed at all. The kernel treats a blank flag as
+        # absent anyway, and omitting it keeps the artifact's "unavailable"
+        # marker for that field — which is the honest state when, say, a
+        # repository has no commits and `generated_head` is genuinely unknown.
+        if value
+        for argument in (f"--{key.replace('_', '-')}", value)
+    ]
+
     # `--force` is required because the artifacts on disk may have been written
     # by the Python engine, which devmap refuses to clobber unprompted. Passing
     # it here is the cutover being explicit, not a guard being bypassed.
+    manifest_argv = [
+        *base,
+        "manifest",
+        "--output",
+        str(map_path),
+        "--graph-output",
+        str(graph_path),
+        "--force",
+    ]
+    stamped_by_kernel = _manifest_accepts_stamp_flags(binary)
     _run(
-        [
-            *base,
-            "manifest",
-            "--output",
-            str(map_path),
-            "--graph-output",
-            str(graph_path),
-            "--force",
-        ],
+        [*manifest_argv, *stamp_flags] if stamped_by_kernel else manifest_argv,
         cwd=root,
         timeout=timeout,
     )
@@ -251,5 +364,8 @@ def build_map(
         if not produced.is_file():
             raise DevMapEngineError(f"devmap reported success but did not write {produced}")
 
-    stamp_freshness(root, map_path, graph_path)
+    # Only a kernel that could not be told the values gets them patched in
+    # afterwards. Doing both would re-serialize the graph for no reason.
+    if not stamped_by_kernel:
+        stamp_freshness(root, map_path, graph_path)
     return map_path

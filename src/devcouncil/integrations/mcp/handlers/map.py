@@ -574,7 +574,6 @@ async def handle_graph_ingest(root: Path, arguments: dict) -> list[TextContent]:
     from devcouncil.codeintel import get_codeintel_service
     from devcouncil.codeintel.build_control import GraphBuildBusy
     from devcouncil.codeintel.sync import get_sync_coordinator
-    from devcouncil.indexing.graph.embeddings import build_embeddings
 
     coordinator = get_sync_coordinator(root)
     changed = list(paths or [])
@@ -615,7 +614,6 @@ async def handle_graph_ingest(root: Path, arguments: dict) -> list[TextContent]:
             from devcouncil.codeintel.build_control import writer_busy_details
 
             return error_text(str(exc), code="graph_writer_busy", **writer_busy_details(root))
-    embedded = await asyncio.to_thread(build_embeddings, root)
     payload = {
         # ``build_incomplete`` means the build timed out but a healthy prior
         # generation was reused. The graph answers queries correctly for the
@@ -623,7 +621,6 @@ async def handle_graph_ingest(root: Path, arguments: dict) -> list[TextContent]:
         # as a fresh ingest, so it is not ``ok``.
         "ok": not (refresh.degraded or refresh.build_incomplete),
         "paths": changed,
-        "embeddings_built": embedded,
         "generation": refresh.generation,
         "mode": refresh.mode,
         "degraded": refresh.degraded,

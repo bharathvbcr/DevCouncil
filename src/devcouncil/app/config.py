@@ -345,13 +345,6 @@ class CorpusConfig(BaseModel):
     auto_refresh_on_verify: bool = True
 
 
-class EmbeddingsConfig(BaseModel):
-    """Opt-in local symbol embeddings for semantic graph search."""
-
-    enabled: bool = False
-    model_name: str = "hash-v1"
-
-
 class IndexingConfig(BaseModel):
     """Repo-map / symbol-index enhancements.
 
@@ -444,7 +437,6 @@ class IndexingConfig(BaseModel):
     unreachable_unreliable_ratio: float = Field(default=0.25, ge=0.0, le=1.0)
     entry_roots: List[str] = Field(default_factory=list)
     corpus: CorpusConfig = Field(default_factory=CorpusConfig)
-    embeddings: EmbeddingsConfig = Field(default_factory=EmbeddingsConfig)
 
     @model_validator(mode="after")
     def _validate_build_timeouts(self) -> "IndexingConfig":

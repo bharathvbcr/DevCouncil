@@ -91,9 +91,6 @@ DEFAULT_CONFIG = {
             "paths": ["docs", "README.md"],
             "auto_refresh_on_verify": True,
         },
-        "embeddings": {
-            "enabled": False,
-        },
     },
     "code_intelligence": {
         "enabled": True,

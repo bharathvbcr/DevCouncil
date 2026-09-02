@@ -8,8 +8,10 @@ import subprocess
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from mcp.types import TextContent
+if TYPE_CHECKING:
+    from mcp.types import TextContent
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,19 @@ def optional_string_list_argument(arguments: dict, name: str) -> tuple[list[str]
 
 
 def json_text(payload: dict[str, object]) -> list[TextContent]:
+    # Imported here, not at module scope, because `mcp` is expensive and this is
+    # the only place in the module that needs it at *runtime* — every other
+    # mention is an annotation, and `from __future__ import annotations` makes
+    # those strings.
+    #
+    # Two modules the CLI always loads reach this one for `allowed_next_tools`
+    # and `lease_ttl_seconds` (`devcouncil.cli.commands.lease` →
+    # `execution.lease_ops` → here), so the module-scope import made every
+    # `dev` invocation pay for the MCP client stack whether or not it spoke MCP:
+    # 208 ms of a 490 ms `devcouncil.cli.main` import, on a command like
+    # `dev map` that never constructs a `TextContent` at all.
+    from mcp.types import TextContent
+
     return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
 

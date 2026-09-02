@@ -140,14 +140,13 @@ def test_graph_sync_watch_search_ingest(tmp_path, monkeypatch):
     search = runner.invoke(app, ["map", "search", "foo", "--project-root", str(tmp_path)])
     assert search.exit_code == 0
 
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.embeddings.semantic_search",
-        lambda *a, **k: {"ok": False},
-    )
+    # `--semantic` is answered by the kernel now, so with no devmap index in
+    # this fixture it reports unavailable rather than silently downgrading to
+    # prefix matching and calling the result semantic.
     sem = runner.invoke(
         app, ["map", "search", "foo", "--semantic", "--json", "--project-root", str(tmp_path)]
     )
-    assert sem.exit_code == 0
+    assert sem.exit_code == 3
 
     refresh = SimpleNamespace(
         generation=1,
@@ -160,10 +159,6 @@ def test_graph_sync_watch_search_ingest(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
         lambda *a, **k: refresh,
-    )
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.embeddings.build_embeddings",
-        lambda root: 3,
     )
     monkeypatch.setattr(
         "devcouncil.codeintel.sync.get_sync_coordinator",

@@ -97,6 +97,21 @@ class BudgetedResponse:
     resolution: Any = None
 
 
+@dataclass
+class CloneReport:
+    """Duplicate-code findings plus the coverage they were computed over.
+
+    ``groups`` alone is not a readable answer: an empty list says the same thing
+    for a tree with no duplication and for one where nothing could be signed.
+    ``signed_symbols`` is the denominator that separates them, so it is carried
+    beside the findings rather than left for the caller to go looking for.
+    """
+
+    groups: BudgetedResponse
+    signed_symbols: int
+    unsigned_symbols: int
+
+
 def resolution_unavailable_reason(resolution: Any) -> Optional[str]:
     """Return the unavailable reason when resolution is fail-closed (X14)."""
     if resolution is None or resolution == "Available":
@@ -623,13 +638,21 @@ class DevMapClient:
             args.extend(["--deleted", ",".join(deleted)])
         return self._run_cli_command(args, timeout=600.0, fail_fast_on_timeout=False)
 
-    def search(self, query: str, limit: int = 2000) -> BudgetedResponse:
+    def search(self, query: str, limit: int = 2000, semantic: bool = False) -> BudgetedResponse:
+        """Symbol search. ``semantic`` ranks by name similarity in the kernel.
+
+        Both modes go to the same engine, so a caller does not have to know
+        whether an embedding index was built — there isn't one. The kernel
+        derives the ranking from the symbol names it already stores.
+        """
         self._validate_query(query)
         self._validate_budget(limit)
-        resp = self._request(
-            {"cmd": "search", "query": query, "budget": limit},
-            ["search", query, "--budget", str(limit)],
-        )
+        payload = {"cmd": "search", "query": query, "budget": limit}
+        args = ["search", query, "--budget", str(limit)]
+        if semantic:
+            payload["semantic"] = True
+            args.append("--semantic")
+        resp = self._request(payload, args)
         return self._budgeted(resp, limit)
 
     def deps(self, target: str, depth: int = 1) -> BudgetedResponse:
@@ -685,6 +708,115 @@ class DevMapClient:
             ["dead", "--budget", str(budget)],
         )
         return self._budgeted(resp, budget)
+
+    def preview(
+        self,
+        file: str,
+        content: str,
+        budget: int = 2000,
+        min_confidence: float = 0.5,
+    ) -> Dict[str, Any]:
+        """What an unsaved edit to ``file`` would do to the graph.
+
+        Nothing is written: the buffer is parsed in memory and compared against
+        the file currently on disk, and the index is consulted only for the
+        caller graph.
+        """
+        self._validate_budget(budget)
+        if not isinstance(file, str) or not file:
+            raise DevMapClientError("preview requires a file path")
+        if not isinstance(content, str):
+            raise DevMapClientError("preview content must be a string")
+        if (
+            not isinstance(min_confidence, (int, float))
+            or isinstance(min_confidence, bool)
+            or not 0.0 <= float(min_confidence) <= 1.0
+        ):
+            raise DevMapClientError("preview min_confidence must be within [0, 1]")
+
+        # The CLI fallback reads the buffer from stdin, which `_run_cli_command`
+        # cannot supply — so this surface is socket-only, and says so rather
+        # than silently shelling out to a command that would block on a tty.
+        payload = {
+            "cmd": "preview",
+            "file": file,
+            "content": content,
+            "budget": budget,
+            "min_confidence": float(min_confidence),
+        }
+        if time.monotonic() < self._transport_unhealthy_until:
+            raise DevMapClientError("devmap transport is unavailable; preview needs the daemon")
+        response = self._send_socket_request(payload)
+        if response is None and self._start_daemon():
+            response = self._send_socket_request(payload)
+        if response is None:
+            raise DevMapClientError("devmap daemon is unavailable; preview needs the daemon")
+        return response
+
+    def savings(self, query: Optional[str] = None, budget: int = 2000) -> Dict[str, Any]:
+        """What the map cost against what reading the files would have.
+
+        CLI-only: the figures come from sizing files on disk, which the daemon
+        has no cheaper access to than a subprocess does, and there is no
+        long-lived state to reuse.
+        """
+        self._validate_budget(budget)
+        args = ["savings", "--budget", str(budget)]
+        if query is not None:
+            self._validate_query(query)
+            args += ["--query", query]
+        return self._run_cli_command(args)
+
+    def workspace(self, action: List[str]) -> Dict[str, Any]:
+        """Run a `devmap workspace` subcommand.
+
+        CLI-only, deliberately: the registry is a file the command owns, and
+        routing mutations through a long-lived daemon would put two writers on
+        it for no gain.
+        """
+        if not action or not all(isinstance(part, str) for part in action):
+            raise DevMapClientError("workspace requires a subcommand")
+        return self._run_cli_command(["workspace", *action])
+
+    def clones(
+        self,
+        budget: int = 2000,
+        kind: Optional[str] = None,
+        min_nodes: int = 0,
+    ) -> CloneReport:
+        """Duplicate symbol bodies in the latest generation.
+
+        ``kind`` is ``exact`` (the same code) or ``structural`` (the same shape
+        under renaming); ``None`` reports both. An unrecognised value is
+        rejected here rather than sent, because a server that ignored it would
+        return an unfiltered report the caller would read as filtered.
+        """
+        self._validate_budget(budget)
+        if kind is not None and kind not in ("exact", "structural"):
+            raise DevMapClientError(
+                f"clone kind must be 'exact' or 'structural', got {kind!r}"
+            )
+        if not isinstance(min_nodes, int) or isinstance(min_nodes, bool) or min_nodes < 0:
+            raise DevMapClientError("clone min_nodes must be a non-negative integer")
+
+        payload: Dict[str, Any] = {"cmd": "clones", "budget": budget, "min_nodes": min_nodes}
+        cli_args = ["clones", "--budget", str(budget), "--min-nodes", str(min_nodes)]
+        if kind is not None:
+            payload["kind"] = kind
+            cli_args += ["--kind", kind]
+
+        resp = self._request(payload, cli_args)
+        if not isinstance(resp.get("groups"), dict):
+            raise DevMapClientError("devmap clone response is missing a groups object")
+        return CloneReport(
+            groups=self._budgeted(resp["groups"], budget),
+            signed_symbols=self._strict_nonnegative_int(
+                resp.get("signed_symbols"), "clone signed_symbols"
+            ),
+            unsigned_symbols=self._strict_nonnegative_int(
+                resp.get("unsigned_symbols"), "clone unsigned_symbols"
+            ),
+        )
 
     def manifest(self, write_path: Optional[pathlib.Path] = None) -> Dict[str, Any]:
         out = write_path or (self.root_dir / ".devcouncil" / "repo_map.json")

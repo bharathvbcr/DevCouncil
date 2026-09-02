@@ -617,34 +617,6 @@ def test_community_timeout_reports_structured_limit(monkeypatch):
     assert summary["limit"]["canonical_store_health"] == "healthy"
     assert summary["limit"]["recovery_command"] == "dev map"
 
-
-def test_embedding_scan_cap_reports_structured_limit(tmp_path, monkeypatch):
-    from devcouncil.indexing.graph import embeddings as emb
-
-    monkeypatch.setattr(emb, "embeddings_enabled", lambda root: True)
-    monkeypatch.setattr(emb, "ensure_embeddings_schema", lambda root: None)
-    monkeypatch.setattr(emb, "_current_generation", lambda root: 1)
-
-    class _Conn:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def execute(self, *a, **k):
-            return [
-                (f"n{i}", f"p{i}.py", f"l{i}", "hash-v1", "[0.1,0.2]")
-                for i in range(600)
-            ]
-
-    monkeypatch.setattr(emb.sqlite3, "connect", lambda *a, **k: _Conn())
-    result = emb.semantic_search(tmp_path, "query", limit=1)
-    assert result["truncated"] is True
-    assert result["limit"]["kind"] == "embedding_scan"
-    assert "dev map search" in result["limit"]["recovery_command"]
-
-
 def test_graph_doctor_json_includes_export_limit(tmp_path, monkeypatch):
     import json
     from types import SimpleNamespace

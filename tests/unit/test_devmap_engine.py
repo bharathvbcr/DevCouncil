@@ -193,3 +193,92 @@ def test_a_commit_that_changes_no_indexed_file_leaves_the_map_fresh(tmp_path):
     assert graph["generated_head"] == head, "the graph shares the map's freshness identity"
     assert graph["indexed_hash"] == payload["indexed_hash"]
     assert graph["content_fingerprint"] == payload["content_fingerprint"]
+
+
+@requires_engine
+def test_the_kernel_stamps_freshness_so_python_never_rewrites_the_graph(tmp_path, monkeypatch):
+    """The digests reach the artifacts without a Python read-modify-write.
+
+    `stamp_freshness` parsed each finished artifact, set three scalars and
+    re-serialized the whole thing — 1.68 s of a 2.72 s `dev map` on this
+    repository, nearly all of it re-encoding a 26 MB `code_graph.json` the
+    kernel had just encoded. Passing the values to the writer removes that
+    second serialization.
+
+    Asserting "the fields are populated" alone would not catch a regression:
+    the fallback path populates them too, just slowly. So the test pins the
+    mechanism — `stamp_freshness` must not run at all when the kernel can be
+    told the values — which is the only observable difference between the fast
+    path and the slow one.
+    """
+    root = _git_repo(tmp_path)
+
+    called: list[tuple] = []
+    real_stamp = devmap_engine.stamp_freshness
+
+    def spy(*args, **kwargs):
+        called.append(args)
+        return real_stamp(*args, **kwargs)
+
+    monkeypatch.setattr(devmap_engine, "stamp_freshness", spy)
+    map_path = build_map(root)
+
+    assert not called, (
+        "the kernel accepts the stamp flags, so the Python read-modify-write "
+        "must not run — it re-serializes the entire graph to set three scalars"
+    )
+
+    graph_path = root / devmap_engine.DEFAULT_GRAPH_RELPATH
+    payloads = {
+        "map": json.loads(map_path.read_text()),
+        "graph": json.loads(graph_path.read_text()),
+    }
+    for name, payload in payloads.items():
+        for field in ("generated_head", "indexed_hash", "content_fingerprint"):
+            assert payload.get(field), f"{name}.{field} was not stamped"
+
+    # One freshness identity for both artifacts, which is the property the
+    # single `manifest` invocation exists to guarantee.
+    for field in ("generated_head", "indexed_hash", "content_fingerprint"):
+        assert payloads["map"][field] == payloads["graph"][field], (
+            f"{field} differs between the map and the graph"
+        )
+
+    # A stamped digest must stop being advertised as uncomputable. Claiming both
+    # would make a consumer skip the check the value could have satisfied.
+    unavailable = payloads["graph"]["meta"]["devmap_rust"]["unavailable"]
+    assert "indexed_hash" not in unavailable
+    assert "content_fingerprint" not in unavailable
+    # Reachability is still genuinely not computed; stamping must not imply it.
+    assert "unreachable_files" in unavailable
+    assert payloads["graph"]["meta"]["liveness_unreachable_unreliable"] is True
+
+
+@requires_engine
+def test_an_older_kernel_without_the_stamp_flags_still_gets_a_stamped_map(tmp_path, monkeypatch):
+    """The fallback survives, because an unstamped map reads permanently stale.
+
+    `map_is_stale` skips its fingerprint check only when `generated_head` is
+    *also* empty, and the Rust map always carries a head — so an artifact with
+    empty digests compares unequal on every call, `--if-stale` never
+    short-circuits and the watcher rebuilds forever. A kernel too old for the
+    flags must therefore still get the values patched in, slowly, rather than
+    going without.
+    """
+    root = _git_repo(tmp_path)
+    monkeypatch.setattr(devmap_engine, "_manifest_accepts_stamp_flags", lambda _binary: False)
+
+    called: list[tuple] = []
+    real_stamp = devmap_engine.stamp_freshness
+
+    def spy(*args, **kwargs):
+        called.append(args)
+        return real_stamp(*args, **kwargs)
+
+    monkeypatch.setattr(devmap_engine, "stamp_freshness", spy)
+    map_path = build_map(root)
+
+    assert called, "an older kernel must fall back to the Python stamp"
+    payload = json.loads(map_path.read_text())
+    for field in ("generated_head", "indexed_hash", "content_fingerprint"):
+        assert payload.get(field), f"{field} was not stamped by the fallback"
