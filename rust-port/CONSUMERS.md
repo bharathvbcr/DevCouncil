@@ -2,6 +2,44 @@
 
 This document tracks all 37 external consumer files in `src/devcouncil/` that interface with code intelligence (`devcouncil.indexing` / `devcouncil.codeintel`), their touched surfaces, expected payload shapes, and tri-state expectations (X14: unknown ≠ verified-zero).
 
+## Correction (2026-09-02, evening): one build path, no Python writers
+
+The "hybrid" column below is historical. Since the kernel audit's second pass:
+
+- **Every write of `repo_map.json` / `code_graph.json` goes through
+  `devcouncil.indexing.map_artifacts.refresh_map_artifacts`**, which runs
+  `devmap build` + `devmap manifest`. Callers: `dev map`, `dev map init|ingest|sync`,
+  `dev init`, `dev plan`, the verify-time and checkout-time refresh
+  (`indexing.map_refresh.refresh_stale_map_if_needed`), the post-tool-use hook
+  (`cli/commands/hook.py`), MCP `devcouncil_graph_ingest` and the MCP
+  `codeintel sync` tool. There is no Python fallback; a build that cannot run
+  raises `DevMapEngineError` carrying `code` / `fix` / `run_id`.
+- **Deleted:** `codeintel/sync/{coordinator,incremental,scope}.py`,
+  `codeintel/build_worker.py`, `build_control.run_isolated_full_build` and its
+  worker helpers, `indexing.graph.build.refresh_map_for_paths`,
+  `indexing.map_refresh.refresh_repo_map_from_graph`. `codeintel/sync/lease.py`
+  and `build_control.graph_build_session` stay: they guard the Python
+  **query cache** (`index.sqlite`), which `load_code_graph` fills from the
+  kernel's `code_graph.json` and which `check` / `process` / `routes` /
+  `cypher` / `pdg` / the HTML visualizers still read.
+- **The MCP server no longer runs a watcher of its own**; its lifespan warms the
+  kernel daemon (`devmap serve`, spawned by `DevMapClient` on demand, retiring
+  itself when idle).
+- **New consumer-facing surfaces:** `dev map status|doctor|runs|abort`,
+  `dev map doctor --fix`, MCP `devcouncil_graph_doctor` and
+  `devcouncil_graph_runs`; the run records are `devmap_run` events in
+  `.devcouncil/logs/traces.jsonl`. Contract in `docs/code-graph.md` → "When a
+  map looks wrong".
+- **Binary discovery is one rule** for the seam and the client
+  (`devmap_engine.find_engine_binary`): `DEVMAP_BINARY`, else the newest
+  *capable* build in `<repo>/rust-port/target`, `<package>/rust-port/target`,
+  `PATH`. **Socket path is one formula** (`devmap_client.default_socket_path`
+  mirrors `devmap-serve::ipc_identity_for`; `devmap serve --print-socket-path`
+  is the oracle).
+
+The state of the Python-side retirement at the moment this was written is in
+`AGENT_PLAN.md` → "Handoff (2026-09-02, evening)".
+
 ## Correction (2026-08-17): the "hybrid" consumers were Python-only in practice
 
 The table below described seven consumers as Rust-primary with a Python

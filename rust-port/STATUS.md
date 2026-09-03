@@ -518,7 +518,7 @@ Passing tests are local/mechanical evidence only. They are not evidence of the r
 - Generation metadata now records a real Git HEAD when available; manifests receive the persisted HEAD and real pending count instead of decorative constants. Persisted search reports `source_unavailable_reason` rather than silently presenting an empty snippet when source is absent.
 - Open: N7 RRF/vector fusion, process-flow precomputation, complete artifact stamps/staleness UI, dynamic-dispatch traces, route/shape capability coverage, and durable source snippets for search after source deletion. Raw source intentionally remains absent from every generation payload.
 
-### Phase 6 — cutover: in progress (consumer hybrid pass)
+### Phase 6 — cutover: build path cut over (2026-09-02); Python deletion interrupted — see "Kernel audit, second pass" and AGENT_PLAN.md → Handoff
 
 - `src/devcouncil/devmap_client.py` remains transport-only; added `try_connect()` and `resolution_unavailable_reason()` (X14).
 - Hybrid migrations (Rust-primary when binary+compatible DB available, else Python fallback):
@@ -836,6 +836,79 @@ idempotent and harmless but was not asked for.
 Not run and not claimed: soak, multi-platform CI, production validation, mutation coverage.
 The Python-side changes (freshness stamping; the TF-IDF embeddings since deleted, see K7) were verified against the
 Python suite, and K2/K3 end-to-end against both corpora, before the concurrent edits began.
+
+## Kernel audit, second pass (2026-09-02, evening)
+
+The full record — every defect, its failing-first test, the live before/after
+numbers — is the root `IMPROVEMENTS.md` → "Dev Map kernel audit, second pass".
+This section is the ledger entry: what is now true of the kernel and its seam,
+and what a contributor must verify before trusting it.
+
+### What changed in the kernel (`rust-port/`)
+
+- **Store/build/drain (K):** pending-queue hygiene (`K1` a–h: canonical enqueue,
+  structural reconcile, refusals are not work, per-path attempt accounting, build
+  reconciles, `devmap repair --pending`, status names stuck paths, drain batch
+  64 → 8192; plus: a whole-tree build supersedes every row queued before it
+  started). Reclaim that lands (`K2`: checkpoint before *and* after, and every
+  row of `PRAGMA incremental_vacuum` stepped — rusqlite's `execute_batch` steps
+  once, so the old code freed one page per build). Schema refusals that name the
+  binary, the store and the remedy; `devmap --version` prints the schema; status
+  never migrates (`K3`). `devmap build --full` (`K4`). Prose/data formats are not
+  parse failures (`K5`). Default `--db` is the seam's store (`K6`). Directories
+  carrying `CACHEDIR.TAG` are never walked, never `--affected`, never enqueued
+  (`K7`). Poisoned mutex is an error (`K12`). Advisory writer lock that names its
+  holder, `BEGIN IMMEDIATE` generation writes (`K13`).
+- **Serve/query (S):** preview contained to the repository (`S1`); budgets
+  honoured on snapshots, workspace search totals and semantic search reads
+  (`S2`, `S4`, `S6`); scoped trace O(V+E) with parent pointers (`S3`: 2.67 s →
+  0.08 s over 19,656 edges); `workspace.json` atomic + flock (`S5`); a timed-out
+  query is cancelled, not abandoned on a pool thread (`S7`); SIGTERM/SIGINT
+  release socket and lock (`S8`); socket path from the canonical root, printable
+  with `devmap serve --print-socket-path` (`S9`); a daemon whose repository or
+  store vanished exits (`S10`).
+- **Verification:** `cargo fmt --all --check` clean, `cargo clippy --workspace
+  --all-targets -- -D warnings` clean, `cargo test --workspace` **835 passed /
+  0 failed** across 62 binaries; 60 new kernel tests, each observed failing
+  before its fix. Known parallelism flake, characterised and made robust:
+  `protocol::hardening_limit_tests::the_probe_refuses_live_endpoints_and_replaces_stale_files`
+  now accepts either fail-closed refusal message.
+
+### What changed in the seam (`src/devcouncil/devmap_engine.py`, `devmap_client.py`, `devmap_health.py`, `indexing/map_artifacts.py`)
+
+- The kernel is the **only** writer of `repo_map.json` / `code_graph.json`;
+  `refresh_map_artifacts` is the one build path and raises `DevMapEngineError`
+  instead of stamping a lean map. See `CONSUMERS.md` → correction of 2026-09-02.
+- One binary-selection rule (newest *capable* build; `DEVMAP_BINARY`), one
+  socket-path formula (parity test against `--print-socket-path`),
+  `DEVMAP_AUTOSPAWN=0` for probes and test suites.
+- **Diagnosable / traceable / fixable while running:** every kernel run is a
+  `devmap_run` trace event; a failing build carries `code` / `fix` / `run_id`;
+  a running build writes `.devcouncil/codeintel/devmap-build.live.json`;
+  `dev map status|doctor|runs|abort`, `dev map doctor --fix`, MCP
+  `devcouncil_graph_doctor` / `devcouncil_graph_runs`. Contract:
+  `docs/code-graph.md` → "When a map looks wrong".
+
+### Live numbers on this repository (release kernel, schema 12)
+
+| Measure | Before | After |
+|---|---:|---:|
+| pending rows / quarantined | 47,095 / 188 | 0 / 0 |
+| files indexed | 2,363 (1,041 cargo output) | 1,318 |
+| store | 669 MB, 66% free | 209 MB, 0% free |
+| `dev map` changed / unchanged tree | refused (schema) | 4 s / 1 s |
+| `dev map doctor` | critical | healthy |
+
+### Phase ledger consequences
+
+- **Phase 6 — cutover: the build path is cut over.** "Hybrid with Python
+  fallback" no longer describes any writer. Query surfaces that still read the
+  Python cache: `check`, `process`, `routes`, `shape-check`, `api-impact`,
+  `cypher`, `explore`, `affected`, `pdg`, the HTML visualizers, and MCP
+  `graph_query` / `graph_trace` / `graph_context`.
+- **Python deletion is in progress and was interrupted** — state and next steps
+  in `AGENT_PLAN.md` → "Handoff (2026-09-02, evening)".
+- Adjuncts (Phase 7) unchanged.
 
 ## Required decisions / external gates
 

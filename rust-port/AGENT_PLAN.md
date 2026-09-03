@@ -322,16 +322,97 @@ code-intelligence kernel; `rust/` is the analysis plane ported from MANVI on 202
 share no crates. `rust/STATUS.md` §1 records why the second workspace was not folded into the
 first — read it before proposing a merge.
 
+### Handoff (2026-09-02, evening) — start here
+
+This is the state a new contributor inherits. Verify it before building on it:
+
+```bash
+DEVMAP_AUTOSPAWN=0 .venv/bin/dev map doctor --json      # expect ok: true (run `dev map` first if freshness warns)
+.venv/bin/python -m pytest tests/unit -q -p no:cacheprovider   # ~4 min; totals at the end of this section
+cd rust-port && cargo test --workspace                   # 835 passed on 2026-09-02
+```
+
+**Done and verified (evidence in root `IMPROVEMENTS.md` → second pass, and `STATUS.md` → "Kernel audit, second pass"):**
+
+1. The Rust kernel is the only writer of the map artifacts. Every caller goes
+   through `indexing.map_artifacts.refresh_map_artifacts`; no Python fallback.
+2. Kernel defects `K1`–`K7`, `K12`, `K13`, `S1`–`S10` fixed with failing-first
+   tests; release binary rebuilt (`rust-port/target/release/devmap`, schema 12).
+3. Seam: binary selection, socket-path parity, probe-safe status, event-driven
+   watcher, bounded query fan-out, guides rebuild, fail-closed artifacts.
+4. Diagnosability: `dev map status|doctor|runs|abort`, `doctor --fix`, MCP
+   `devcouncil_graph_doctor` / `devcouncil_graph_runs`, `devmap_run` trace
+   events, live build marker. Tests: `tests/unit/test_devmap_diagnostics.py`,
+   `tests/unit/test_devmap_seam_hardening.py`, `tests/stress/test_devmap_stress.py`.
+5. Docs: `docs/code-graph.md`, `docs/cli-reference.md`, `CONSUMERS.md`,
+   `DIVERGENCES.md` (`K5`, `K7`, `SEAM-1`, `SEAM-2`), `PLAN.md` §3 pointer.
+
+**Interrupted — the Python writer retirement (an Opus subagent was stopped at its
+final verification step to save usage limits).** Its working-tree changes are
+*kept*, uncommitted, and are the state to continue from:
+
+- Deleted: `src/devcouncil/codeintel/sync/{coordinator,incremental,scope}.py`,
+  `src/devcouncil/codeintel/build_worker.py`; `codeintel/sync/__init__.py`
+  reduced to the lease exports.
+- Rewritten: `codeintel/build_control.py` (−598 lines: `run_isolated_full_build`
+  and its worker helpers gone; `graph_build_session`, `unlock_writer_lease`,
+  `read_build_status` stay), `indexing/map_refresh.py` (−128:
+  `refresh_repo_map_from_graph` gone), `indexing/graph/build.py` and
+  `indexing/graph/__init__.py` (`refresh_map_for_paths` gone),
+  `cli/commands/hook.py` (post-tool-use refresh calls the kernel seam),
+  `integrations/mcp/server.py` (lifespan warms the kernel daemon; no Python
+  watcher), `integrations/mcp/handlers/codeintel.py` (`_sync` has no Python
+  fallback), `codeintel/query/engine.py` (`sync` in the envelope comes from the
+  kernel), `integrations/mcp/handlers/map.py`.
+- Tests rewritten or deleted accordingly: `test_codeintel_runtime_branches.py`,
+  `test_coverage_wave7.py`, `test_coverage_wave8.py`, `test_coverage_wave9.py`,
+  `test_graph_incremental.py`, `tests/integration/test_codeintel_platform_runtime.py`,
+  `tests/performance/{benchmark_harness.py,test_codeintel_benchmark.py,thresholds.json}`.
+- The agent's last message before it was stopped: it had one remaining unit-test
+  failure it believed pre-existing and was proving that with file copies. The
+  suite totals at the end of this section are the authoritative state.
+
+**Next steps, in order:**
+
+1. Run the unit suite; for each failure decide: retired expectation (delete the
+   test and say why in `IMPROVEMENTS.md`) or a real regression of the
+   retirement (fix at the owner). Two deletions need a two-signal proof before
+   they are trusted: `RIPGREP_CONFIG_PATH= rg -uu -n '<name>' --glob '!*.pyc' .`
+   and `DEVMAP_AUTOSPAWN=0 .venv/bin/dev map query <name>`.
+2. **Done in the same evening, after the agent was stopped:** `RepoMapper.map_repo`, the
+   Python graph builder, `indexing/graph/resolve.py` and `extract_ts.py` are gone; the
+   fixture-style tests moved to `tests/unit/support_maps.py`; the two breakages the
+   interruption left (`build_code_graph` re-export, `_files_fingerprint` import in
+   `compute_freshness`) are fixed. Details and the kernel-coverage gaps in `IMPROVEMENTS.md`
+   → "`RepoMapper.map_repo` and the Python graph builder are gone".
+3. Item 6 of the retirement brief may be open: `dev map --pdg` and
+   `dev map pdg build` call `indexing.graph.build.write_code_graph`, which can
+   rewrite `code_graph.json` without the kernel's `meta.map_engine` stamp, and
+   `dev map doctor` then reports `foreign_writer`. Fix at `write_code_graph`:
+   preserve the kernel's `meta` and add only the PDG layer. Test: after the PDG
+   merge on a kernel-built repo, `meta.map_engine == "devmap-rust"` and
+   `run_doctor(root).ok`.
+4. Move the remaining Python-cache query surfaces to the kernel (MCP
+   `graph_query` / `graph_trace` / `graph_context` first — they are what agents
+   call), then delete `codeintel/query`, `indexing/graph/build.py`'s import path
+   and the cache itself.
+5. Toward gortex parity (`STATUS.md` → "Gaps vs. gortex"): tiered map reads for
+   token economy; ship `devmap` with the tool install; grammar breadth; an
+   embedding index; cross-repository contracts; diff-scoped review.
+
+**Conventions that held today and should keep holding:** every fix ships with a
+test that fails first; delete only with two independent proofs of no callers;
+no new dependency without asking; `DEVMAP_AUTOSPAWN=0` in every test shell;
+never run `devmap build` against the repository root's store from a test.
+
 ### Standing warnings — read before touching anything
 
-1. **R1 is being violated in the working tree, right now.** R1 (§1) freezes
-   `src/devcouncil/indexing/`, `src/devcouncil/codeintel/` and
-   `src/devcouncil/cli/commands/map.py`. Two modified files fall inside that freeze:
-   `src/devcouncil/indexing/graph/embeddings.py` (hash-projection ranker replaced with TF-IDF)
-   and `src/devcouncil/cli/commands/map.py` (embedding refresh wired into `_build_once`).
-   STATUS.md **required decision 3** says exactly this needs approval first. The changes are
-   improvements and are tested; that is not the point. **Do not build on them, and do not
-   revert them unilaterally — surface them for the decision 3 call.**
+1. **R1 (the freeze on `src/devcouncil/indexing/`, `codeintel/` and `cli/commands/map.py`)
+   is superseded as of 2026-09-02.** The cutover it protected has happened: the kernel is
+   the only writer, and those trees are being *deleted*, not preserved. Treat the Handoff
+   section above as the authority on what in them is live. The earlier note about
+   `embeddings.py` / decision 3 is moot — the embeddings module was removed with the
+   Python engine.
 
 2. **`dc-verify` stub detection is a capability regression.** `rust/STATUS.md` §4: Python's
    `stub_detector.py` does an AST parse with per-language idioms; `rigor::detect_stubs` does

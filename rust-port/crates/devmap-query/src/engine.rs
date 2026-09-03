@@ -7,6 +7,7 @@ use devmap_store::{Store, StoredEdge};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
+use crate::cancel::{Cancel, QueryCancelled};
 use crate::model::*;
 
 pub struct QueryEngine<'a> {
@@ -18,11 +19,28 @@ pub struct QueryEngine<'a> {
 /// `QueryEngine`, this type never extracts or resolves source files.
 pub struct StoreQueryEngine<'a> {
     store: &'a Store,
+    /// Consulted inside the long loops. Default is a flag nobody sets, so a
+    /// caller that has no way to give up (the CLI) behaves exactly as before.
+    cancel: Cancel,
 }
 
 impl<'a> StoreQueryEngine<'a> {
     pub fn new(store: &'a Store) -> Self {
-        Self { store }
+        Self {
+            store,
+            cancel: Cancel::new(),
+        }
+    }
+
+    /// Answer under a cancellation flag the caller can trip.
+    ///
+    /// The IPC layer bounds a query with a timeout that frees the connection
+    /// but cannot abort the blocking task behind it, so without this the
+    /// abandoned traversal or corpus scan runs to completion on a pool thread
+    /// with nobody left to read it. See [`crate::cancel`].
+    pub fn with_cancel(mut self, cancel: Cancel) -> Self {
+        self.cancel = cancel;
+        self
     }
 
     pub fn search(&self, req: Request<String>) -> anyhow::Result<Response<SymbolHit>> {
@@ -35,8 +53,9 @@ impl<'a> StoreQueryEngine<'a> {
             return Ok(budget_take(Vec::new(), req.token_budget, |_| 0));
         }
         let total = self.store.count_search_symbols(&req.query)?;
-        let page_size = (req.token_budget / 20).saturating_add(1).max(1) as usize;
-        let rows = self.store.search_symbols(&req.query, page_size)?;
+        let rows = self
+            .store
+            .search_symbols(&req.query, budget_page_size(req.token_budget))?;
         let repo_root = self.store.latest_repo_root()?;
         let query = req.query.to_lowercase();
         let mut hits = Vec::with_capacity(rows.len());
@@ -122,13 +141,8 @@ impl<'a> StoreQueryEngine<'a> {
                 reason: "scoped trace endpoints must not be empty".to_string(),
             }));
         }
-        let edges = self
-            .store
-            .latest_edges(req.min_confidence)?
-            .into_iter()
-            .map(stored_edge_to_resolved)
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let path = shortest_path(&edges, from, to, req.max_depth.min(64), 5_000);
+        let edges = self.resolved_edges(req.min_confidence)?;
+        let path = shortest_path(&edges, from, to, req.max_depth.min(64), 5_000, &self.cancel)?;
         let Some(path) = path else {
             return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                 reason: format!("no indexed path from {from:?} to {to:?}"),
@@ -137,17 +151,33 @@ impl<'a> StoreQueryEngine<'a> {
         Ok(atomic_budget_take(path, req.token_budget, |_| 25))
     }
 
+    /// Every edge in the latest generation at or above `min_confidence`, in
+    /// engine form.
+    ///
+    /// One owner for the conversion, and the one place the whole edge set is
+    /// walked before any traversal starts — so it is where an abandoned
+    /// request stops earliest. `latest_edges` takes and releases the store lock
+    /// internally, so nothing here holds it across the walk that follows.
+    fn resolved_edges(&self, min_confidence: f32) -> anyhow::Result<Vec<ResolvedEdge>> {
+        let rows = self.store.latest_edges(min_confidence)?;
+        let mut edges = Vec::with_capacity(rows.len());
+        for (index, row) in rows.into_iter().enumerate() {
+            self.cancel.check_every(index)?;
+            edges.push(stored_edge_to_resolved(row)?);
+        }
+        Ok(edges)
+    }
+
     fn traverse(
         &self,
         req: Request<String>,
         reverse: bool,
     ) -> anyhow::Result<Response<ResolvedEdge>> {
-        let edges = self
-            .store
-            .latest_edges(req.min_confidence)?
-            .into_iter()
-            .map(stored_edge_to_resolved)
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        // The store lock is released by `latest_edges` before it returns — it
+        // locks, reads and drops — so nothing below this line holds it. An
+        // abandoned traversal therefore cannot block the drain loop's writes
+        // while it unwinds.
+        let edges = self.resolved_edges(req.min_confidence)?;
         let target = req.query.trim();
         let start: Vec<String> = edges
             .iter()
@@ -179,6 +209,11 @@ impl<'a> StoreQueryEngine<'a> {
                 reason: format!("{target} has no indexed traversal start"),
             }));
         }
+        // `traverse_graph` is bounded by `max_nodes`/`max_depth` and does not
+        // itself consult the flag; checking on either side of it keeps an
+        // abandoned request from paying for the sort and the budgeting that
+        // follow.
+        self.cancel.check()?;
         let walk = traverse_graph(
             &start,
             &edges,
@@ -188,6 +223,7 @@ impl<'a> StoreQueryEngine<'a> {
                 reverse,
             },
         );
+        self.cancel.check()?;
         let mut traversed = traversed_resolution_edges(&walk, &edges, req.min_confidence);
         traversed.sort_by(|a, b| {
             b.confidence
@@ -293,12 +329,20 @@ impl<'a> StoreQueryEngine<'a> {
             .iter()
             .map(|s| format!("{} {}", s.name, s.qualified_name))
             .collect();
-        let index = crate::semantic::SemanticIndex::build(&texts);
+        let index = crate::semantic::SemanticIndex::build(&texts, &self.cancel)?;
 
         let repo_root = self.store.latest_repo_root()?;
-        let hits: Vec<SymbolHit> = index
-            .score(query)
+        let scored = index.score(query, &self.cancel)?;
+        let total = u32::try_from(scored.len()).unwrap_or(u32::MAX);
+        // Materialise only as far down the ranking as the budget could reach.
+        // Every scored symbol used to be turned into a `SymbolHit` first — one
+        // `read_to_string` each — and budgeted afterwards, so a query matching
+        // a common term opened every file it matched in order to discard almost
+        // all of them. The ranking is already sorted, so the page bound is the
+        // same one keyword search uses.
+        let hits: Vec<SymbolHit> = scored
             .into_iter()
+            .take(budget_page_size(token_budget))
             .map(|(position, score)| {
                 hit_from_stored(
                     symbols[position].clone(),
@@ -308,7 +352,14 @@ impl<'a> StoreQueryEngine<'a> {
                 )
             })
             .collect();
-        Ok(budget_take(hits, token_budget, search_hit_tokens))
+        // `total` is the whole ranked corpus, not the page: budgeting a page
+        // and reporting its length as the total is how a capped sample comes
+        // back labelled complete.
+        let mut response = budget_take(hits, token_budget, search_hit_tokens);
+        response.total = total;
+        response.hidden = total.saturating_sub(response.shown);
+        response.truncated = response.hidden > 0;
+        Ok(response)
     }
 
     /// What the map cost against what reading files would have.
@@ -457,10 +508,11 @@ impl<'a> StoreQueryEngine<'a> {
         // user is, the daemon wherever it was spawned. Reading `path` directly
         // works for one of them and silently finds nothing for the other —
         // which reads as "no such file", i.e. every symbol added.
-        let resolved = match self.store.latest_repo_root()? {
-            Some(root) if !Path::new(path).is_absolute() => Path::new(&root).join(path),
-            _ => PathBuf::from(path),
-        };
+        //
+        // Containment is enforced *before* the read: `path` arrives from an IPC
+        // caller, and this is the only query that reads a file the caller
+        // names. See `contained_repo_path`.
+        let resolved = contained_repo_path(self.store.latest_repo_root()?.as_deref(), path)?;
         let on_disk = std::fs::read_to_string(&resolved).ok();
         let compared_against = if on_disk.is_some() { "disk" } else { "nothing" };
         let previous = on_disk
@@ -645,6 +697,13 @@ pub fn workspace_search(
     let mut all: Vec<FederatedHit> = Vec::new();
     let mut unavailable: Vec<RepoUnavailable> = Vec::new();
     let mut queried = 0usize;
+    // Matches across the workspace *before* any budget was applied. Counting
+    // the union of the returned items instead — which this did — counts what
+    // each repository could afford to send, and every repository has already
+    // spent its budget by then. A repository with 500 matches that fitted four
+    // contributed four, and the federated answer called that the total and set
+    // `truncated: false`.
+    let mut matched_total = 0u32;
 
     for repo in &workspace.repos {
         let db = repo.db_path();
@@ -687,6 +746,7 @@ pub fn workspace_search(
             continue;
         }
         queried += 1;
+        matched_total = matched_total.saturating_add(response.total);
         for hit in response.items {
             all.push(FederatedHit {
                 repo: repo.name.clone(),
@@ -706,16 +766,19 @@ pub fn workspace_search(
             .then_with(|| a.hit.symbol_name.cmp(&b.hit.symbol_name))
     });
 
-    let total = all.len() as u32;
     let budgeted = budget_take(all, token_budget, |entry| search_hit_tokens(&entry.hit));
+    // `matched_total` counts every match each repository found, so it is never
+    // below what was shown; the saturating subtraction is belt-and-braces
+    // against a store that miscounts rather than a state this can reach.
+    let hidden = matched_total.saturating_sub(budgeted.shown);
     Ok(FederatedSearch {
         items: budgeted.items,
         repos_queried: queried,
         unavailable,
-        total,
+        total: matched_total,
         shown: budgeted.shown,
-        hidden: total.saturating_sub(budgeted.shown),
-        truncated: total > budgeted.shown,
+        hidden,
+        truncated: hidden > 0,
     })
 }
 
@@ -956,15 +1019,82 @@ fn edge_node_matches(file: &str, symbol: &str, query: &str) -> bool {
     crate::query_match::traversal_start_matches(query, symbol, file)
 }
 
+/// Stable name of an edge kind, for tie-breaking.
+///
+/// The comparator used `format!("{:?}", kind)`, which allocated two `String`s
+/// per comparison inside a sort over every edge in the generation. These are
+/// the same names `Debug` derives, so the ordering is unchanged and no
+/// allocation happens.
+fn edge_kind_name(kind: EdgeKind) -> &'static str {
+    match kind {
+        EdgeKind::Imports => "Imports",
+        EdgeKind::Calls => "Calls",
+        EdgeKind::Contains => "Contains",
+        EdgeKind::Defines => "Defines",
+        EdgeKind::Instantiates => "Instantiates",
+        EdgeKind::Extends => "Extends",
+        EdgeKind::Implements => "Implements",
+        EdgeKind::SubscribesTo => "SubscribesTo",
+        EdgeKind::HandlesRoute => "HandlesRoute",
+        EdgeKind::WiredTo => "WiredTo",
+        EdgeKind::MemberOf => "MemberOf",
+        EdgeKind::DependsOn => "DependsOn",
+        EdgeKind::TaintFlow => "TaintFlow",
+        EdgeKind::References => "References",
+    }
+}
+
+/// One node reached by the scoped-trace walk, and the edge that reached it.
+///
+/// The walk carries a parent pointer rather than a copy of the path so far.
+/// Cloning the whole path once per *edge considered* made the walk quadratic in
+/// its own output on top of being quadratic in the graph.
+struct Reached {
+    /// Index into the confidence-ordered edge list.
+    edge: usize,
+    /// The entry this one extends, or `None` for a first hop.
+    parent: Option<usize>,
+    node: (String, String),
+    /// Number of edges from the origin, i.e. the length of the path to here.
+    depth: usize,
+}
+
+/// Walk back from `entry` to the origin, producing the path in forward order.
+fn path_to(reached: &[Reached], ordered: &[&ResolvedEdge], entry: usize) -> Vec<ResolvedEdge> {
+    let mut path = Vec::with_capacity(reached[entry].depth);
+    let mut cursor = Some(entry);
+    while let Some(index) = cursor {
+        path.push(ordered[reached[index].edge].clone());
+        cursor = reached[index].parent;
+    }
+    path.reverse();
+    path
+}
+
+/// One deterministic shortest path from `from` to `to`, breadth-first.
+///
+/// The graph is indexed by source node once, up front. The previous
+/// implementation filtered the *entire* edge list for every node it dequeued,
+/// so a trace across a repository-sized generation cost `frontier × edges` —
+/// with the frontier bounded at 5,000 and generations running to tens of
+/// thousands of edges, that is ~10^8 string comparisons per request, each one
+/// also cloning the path built so far. Indexed, the walk touches each edge at
+/// most once and the whole call is `O(E log E)`, dominated by the ordering
+/// sort.
+///
+/// Ordering, and therefore *which* shortest path is returned, is unchanged:
+/// edges are considered in descending confidence with a total tie-break, and
+/// the frontier is explored in the same first-in-first-out order.
 fn shortest_path(
     edges: &[ResolvedEdge],
     from: &str,
     to: &str,
     max_depth: usize,
     max_nodes: usize,
-) -> Option<Vec<ResolvedEdge>> {
+    cancel: &Cancel,
+) -> Result<Option<Vec<ResolvedEdge>>, QueryCancelled> {
     if max_depth == 0 || max_nodes == 0 {
-        return None;
+        return Ok(None);
     }
     let mut ordered: Vec<&ResolvedEdge> = edges.iter().collect();
     ordered.sort_by(|a, b| {
@@ -975,51 +1105,196 @@ fn shortest_path(
             .then_with(|| a.source_symbol.cmp(&b.source_symbol))
             .then_with(|| a.target_file.cmp(&b.target_file))
             .then_with(|| a.target_symbol.cmp(&b.target_symbol))
-            .then_with(|| format!("{:?}", a.edge_kind).cmp(&format!("{:?}", b.edge_kind)))
+            .then_with(|| edge_kind_name(a.edge_kind).cmp(edge_kind_name(b.edge_kind)))
     });
 
-    let mut queue = VecDeque::new();
-    let mut visited = BTreeSet::new();
-    for edge in ordered
-        .iter()
-        .filter(|edge| edge_node_matches(&edge.source_file, &edge.source_symbol, from))
-    {
+    // Source node -> its outgoing edges, in the order above. Built once; every
+    // expansion below is a map lookup instead of a scan of the whole graph.
+    let mut outgoing: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
+    for (index, edge) in ordered.iter().enumerate() {
+        cancel.check_every(index)?;
+        outgoing
+            .entry((edge.source_file.clone(), edge.source_symbol.clone()))
+            .or_default()
+            .push(index);
+    }
+
+    let mut reached: Vec<Reached> = Vec::new();
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    let mut visited: BTreeSet<(String, String)> = BTreeSet::new();
+
+    for (index, edge) in ordered.iter().enumerate() {
+        cancel.check_every(index)?;
+        if !edge_node_matches(&edge.source_file, &edge.source_symbol, from) {
+            continue;
+        }
         let node = (edge.target_file.clone(), edge.target_symbol.clone());
-        let path = vec![(*edge).clone()];
         if edge_node_matches(&node.0, &node.1, to) {
-            return Some(path);
+            return Ok(Some(vec![(*edge).clone()]));
         }
         if visited.len() >= max_nodes {
             break;
         }
         if visited.insert(node.clone()) {
-            queue.push_back((node, path));
+            reached.push(Reached {
+                edge: index,
+                parent: None,
+                node,
+                depth: 1,
+            });
+            queue.push_back(reached.len() - 1);
         }
     }
 
-    while let Some((node, path)) = queue.pop_front() {
-        if path.len() >= max_depth {
+    let mut dequeued = 0usize;
+    while let Some(entry) = queue.pop_front() {
+        cancel.check_every(dequeued)?;
+        dequeued += 1;
+        let depth = reached[entry].depth;
+        if depth >= max_depth {
             continue;
         }
-        for edge in ordered
-            .iter()
-            .filter(|edge| edge.source_file == node.0 && edge.source_symbol == node.1)
-        {
+        let Some(candidates) = outgoing.get(&reached[entry].node) else {
+            continue;
+        };
+        // Copied so the borrow of `reached` ends before it is extended below;
+        // an adjacency list is a handful of entries, not the whole graph.
+        let candidates = candidates.clone();
+        for index in candidates {
+            let edge = ordered[index];
             let next = (edge.target_file.clone(), edge.target_symbol.clone());
-            let mut candidate = path.clone();
-            candidate.push((*edge).clone());
             if edge_node_matches(&next.0, &next.1, to) {
-                return Some(candidate);
+                reached.push(Reached {
+                    edge: index,
+                    parent: Some(entry),
+                    node: next,
+                    depth: depth + 1,
+                });
+                return Ok(Some(path_to(&reached, &ordered, reached.len() - 1)));
             }
             if visited.len() >= max_nodes {
-                return None;
+                return Ok(None);
             }
             if visited.insert(next.clone()) {
-                queue.push_back((next, candidate));
+                reached.push(Reached {
+                    edge: index,
+                    parent: Some(entry),
+                    node: next,
+                    depth: depth + 1,
+                });
+                queue.push_back(reached.len() - 1);
             }
         }
     }
-    None
+    Ok(None)
+}
+
+/// A caller-supplied path that does not resolve inside the indexed repository.
+///
+/// A distinct type rather than a bare `anyhow!` so the IPC layer can answer it
+/// as a rejected *parameter* instead of an internal failure: the caller asked
+/// for something it is not allowed to ask for, and "the request was invalid" is
+/// a different fact from "the query broke".
+#[derive(Debug)]
+pub struct PathOutsideRepoRoot {
+    /// The path exactly as the caller supplied it.
+    pub requested: String,
+    /// Why it was refused.
+    pub reason: String,
+}
+
+impl std::fmt::Display for PathOutsideRepoRoot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:?} {}", self.requested, self.reason)
+    }
+}
+
+impl std::error::Error for PathOutsideRepoRoot {}
+
+/// Resolve a caller-supplied path against the indexed repository root, or
+/// refuse it.
+///
+/// `preview` is the one query that reads a file the *caller* names, and the
+/// name arrives over IPC from any process that can reach the socket. Joined
+/// onto the root unchecked, `../../etc/passwd` reads outside the repository;
+/// used verbatim when absolute, any path at all does. What came back was not a
+/// diff but a listing of every symbol and signature in the target file.
+///
+/// The rule is `daemon.rs::collect_pending_path`'s, which already guards
+/// watcher paths, applied to the same question:
+///
+/// 1. A `..` component is refused outright — a repository-relative path never
+///    needs one, and normalising it away would silently accept the escape.
+/// 2. An absolute path is accepted only when it lies under the root, and is
+///    then treated as the relative path it denotes. This is the daemon's own
+///    convention for watcher paths, so refusing it outright would split the
+///    two surfaces.
+/// 3. The resolved candidate must be lexically under the root, and — when it
+///    exists — its *canonical* form must be too, which is what catches a
+///    symlink whose every component sits inside the repository.
+///
+/// With no recorded root (a pre-v7 generation, or an in-memory store) there is
+/// nothing to contain against, so an absolute path cannot be shown to be
+/// inside the repository and is refused. A relative path is resolved against
+/// the process's working directory exactly as before, which rule 1 keeps from
+/// climbing out of it.
+pub(crate) fn contained_repo_path(
+    repo_root: Option<&str>,
+    path: &str,
+) -> Result<PathBuf, PathOutsideRepoRoot> {
+    let refuse = |reason: &str| PathOutsideRepoRoot {
+        requested: path.to_string(),
+        reason: reason.to_string(),
+    };
+    if path.is_empty() {
+        return Err(refuse("is empty"));
+    }
+    let raw = Path::new(path);
+    if raw
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(refuse("contains a parent traversal component"));
+    }
+
+    let Some(root) = repo_root else {
+        if raw.is_absolute() {
+            return Err(refuse(
+                "is absolute, and this generation records no repository root to \
+                 contain it within",
+            ));
+        }
+        return Ok(PathBuf::from(path));
+    };
+    let root = Path::new(root);
+
+    let candidate = if raw.is_absolute() {
+        match raw.strip_prefix(root) {
+            Ok(relative) => root.join(relative),
+            Err(_) => return Err(refuse("is outside the indexed repository root")),
+        }
+    } else {
+        root.join(raw)
+    };
+    if !candidate.starts_with(root) {
+        return Err(refuse("is outside the indexed repository root"));
+    }
+
+    // Only a path that exists can be canonicalized, and a preview of a file
+    // that does not exist yet is a legitimate request — it is how a new file is
+    // previewed. Rules 1 and 3 already bound where a non-existent path could
+    // point.
+    if candidate.exists() {
+        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        match candidate.canonicalize() {
+            Ok(canonical) if !canonical.starts_with(&canonical_root) => {
+                return Err(refuse("resolves outside the indexed repository root"));
+            }
+            Ok(_) => {}
+            Err(_) => return Err(refuse("could not be resolved for containment checking")),
+        }
+    }
+    Ok(candidate)
 }
 
 /// Stored node paths are repo-relative. Resolving them against the recorded
@@ -1347,6 +1622,24 @@ const SEARCH_HIT_OVERHEAD_TOKENS: u32 = 20;
 /// cost function.
 pub const BYTES_PER_TOKEN: u32 = 4;
 
+/// How many ranked candidates a budget could conceivably show.
+///
+/// A hit costs at least [`SEARCH_HIT_OVERHEAD_TOKENS`], so `budget / overhead`
+/// bounds how many can fit; the `+ 1` keeps the page from cutting a hit the
+/// packer would still have admitted, and the floor of 1 keeps a zero budget
+/// from asking for an empty page and reporting "nothing matched".
+///
+/// Both search paths use this. Keyword search pages the FTS query with it;
+/// semantic search bounds how far down its ranking it materialises hits — and
+/// therefore how many files it reads — before budgeting them. Two copies of the
+/// arithmetic would let the same budget mean different page sizes depending on
+/// which command asked.
+fn budget_page_size(token_budget: u32) -> usize {
+    (token_budget / SEARCH_HIT_OVERHEAD_TOKENS)
+        .saturating_add(1)
+        .max(1) as usize
+}
+
 /// Token cost of one search hit: its source span plus a fixed per-row overhead.
 ///
 /// Shared by keyword and semantic search so the two spend the budget at the
@@ -1356,6 +1649,18 @@ fn search_hit_tokens(hit: &SymbolHit) -> u32 {
     u32::try_from(hit.source_span.len() / BYTES_PER_TOKEN as usize)
         .unwrap_or(u32::MAX)
         .saturating_add(SEARCH_HIT_OVERHEAD_TOKENS)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Source-span reads attempted on this thread.
+    ///
+    /// Reading a file per scored symbol is the cost `search_semantic` used to
+    /// pay for the entire corpus before the budget was applied, and "how many
+    /// files did this query open" is not observable from the response. Counted
+    /// per thread rather than globally so tests running in parallel in one
+    /// binary cannot contaminate each other's count.
+    pub(crate) static SOURCE_SPAN_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Build a hit from a stored symbol row, reading its source span from disk.
@@ -1371,6 +1676,8 @@ fn hit_from_stored(
     score: f32,
 ) -> SymbolHit {
     let owned_root = repo_root.map(str::to_string);
+    #[cfg(test)]
+    SOURCE_SPAN_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
     let source_result = std::fs::read_to_string(resolve_source_path(&owned_root, &row.path));
     let source_unavailable_reason = source_result.as_ref().err().map(|error| {
         format!(
@@ -1711,24 +2018,192 @@ mod tests {
             path_edge("c", "d", 0.9),
             path_edge("d", "a", 1.0),
         ];
-        let path = shortest_path(&edges, "a", "d", 2, 5_000).expect("two-hop path");
+        let path = shortest_path(&edges, "a", "d", 2, 5_000, &Cancel::new())
+            .expect("uncancelled")
+            .expect("two-hop path");
         assert_eq!(
             path.iter()
                 .map(|edge| edge.target_symbol.as_str())
                 .collect::<Vec<_>>(),
             ["c", "d"]
         );
-        assert!(shortest_path(&edges, "a", "d", 1, 5_000).is_none());
+        assert!(shortest_path(&edges, "a", "d", 1, 5_000, &Cancel::new())
+            .expect("uncancelled")
+            .is_none());
 
         let mut with_direct = edges;
         with_direct.push(path_edge("a", "d", 0.1));
-        let path = shortest_path(&with_direct, "a", "d", 2, 5_000).expect("direct path");
+        let path = shortest_path(&with_direct, "a", "d", 2, 5_000, &Cancel::new())
+            .expect("uncancelled")
+            .expect("direct path");
         assert_eq!(
             path.len(),
             1,
             "edge count, not confidence, defines shortest"
         );
         assert_eq!(path[0].target_symbol, "d");
+    }
+
+    /// A scoped trace over a real-sized graph must finish in a moment.
+    ///
+    /// The search rescanned *every* edge for every node it dequeued and cloned
+    /// the whole path vector once per edge, so the cost was
+    /// `frontier × edges`. This fixture is shaped to reach both production
+    /// bounds at once — 64 levels deep (`max_depth`) and just under the
+    /// 5,000-node frontier (`max_nodes`) — across ~20,000 edges, which is
+    /// 4,900 × 19,656 ≈ 96 million string comparisons. Measured pre-fix: 5.9 s.
+    /// An adjacency index built once, plus parent pointers instead of path
+    /// clones, makes the walk linear in the edges: ~40 ms.
+    ///
+    /// One second is deliberately loose — it must not flake on a loaded machine
+    /// — and still an order of magnitude below the behaviour it guards against.
+    #[test]
+    fn a_scoped_trace_over_twenty_thousand_edges_finishes_promptly() {
+        const LEVELS: usize = 64;
+        const WIDTH: usize = 78;
+        const FANOUT: usize = 4;
+
+        // A layered DAG: every node points at four nodes one level down. Wide
+        // enough to fill the frontier, shallow enough that the depth bound
+        // never cuts the walk short, and acyclic so the node count is exact.
+        let mut edges = Vec::with_capacity((LEVELS - 1) * WIDTH * FANOUT);
+        for level in 0..LEVELS - 1 {
+            for column in 0..WIDTH {
+                for step in 0..FANOUT {
+                    let next = (column * FANOUT + step) % WIDTH;
+                    edges.push(path_edge(
+                        &format!("L{level:02}W{column:03}"),
+                        &format!("L{:02}W{next:03}", level + 1),
+                        0.9,
+                    ));
+                }
+            }
+        }
+        assert_eq!(edges.len(), (LEVELS - 1) * WIDTH * FANOUT);
+
+        // A destination no node carries, so the search must exhaust the
+        // frontier instead of returning on an early hit.
+        let started = std::time::Instant::now();
+        let found = shortest_path(
+            &edges,
+            "L00W000",
+            "absent_destination",
+            LEVELS,
+            5_000,
+            &Cancel::new(),
+        )
+        .expect("uncancelled");
+        let elapsed = started.elapsed();
+
+        assert!(found.is_none(), "the destination is not in the graph");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "exhausting a {}-edge graph took {elapsed:?}; the search is rescanning \
+             every edge per dequeued node",
+            edges.len()
+        );
+    }
+
+    /// The index must not change which path is returned. Same fixture as
+    /// `scoped_trace_is_shortest_bounded_and_deterministic`, asserted across
+    /// repeated runs so a map iteration order could not make it wobble.
+    #[test]
+    fn the_scoped_trace_path_is_identical_across_runs() {
+        let edges = vec![
+            path_edge("a", "b", 0.7),
+            path_edge("b", "d", 0.7),
+            path_edge("a", "c", 0.9),
+            path_edge("c", "d", 0.9),
+            path_edge("d", "a", 1.0),
+        ];
+        let first = shortest_path(&edges, "a", "d", 2, 5_000, &Cancel::new())
+            .expect("uncancelled")
+            .expect("two-hop path");
+        for _ in 0..8 {
+            let again = shortest_path(&edges, "a", "d", 2, 5_000, &Cancel::new())
+                .expect("uncancelled")
+                .expect("two-hop path");
+            assert_eq!(
+                again
+                    .iter()
+                    .map(|edge| (edge.source_symbol.clone(), edge.target_symbol.clone()))
+                    .collect::<Vec<_>>(),
+                first
+                    .iter()
+                    .map(|edge| (edge.source_symbol.clone(), edge.target_symbol.clone()))
+                    .collect::<Vec<_>>(),
+                "the scoped trace answered differently on a repeat run"
+            );
+        }
+    }
+
+    /// Semantic search must not read the whole corpus to answer with a page of
+    /// it.
+    ///
+    /// Every scored symbol was materialised into a `SymbolHit` — one
+    /// `read_to_string` each — and only then handed to the budget, so a query
+    /// matching a common term opened every file it matched in order to throw
+    /// almost all of them away. Scoring already yields a ranked list, so the
+    /// bound is the same page size keyword search uses: a hit costs at least
+    /// `SEARCH_HIT_OVERHEAD_TOKENS`, so no more than `budget / overhead` of them
+    /// can ever be shown.
+    #[test]
+    fn semantic_search_reads_only_as_many_files_as_the_budget_could_show() {
+        use devmap_analyze::analyze;
+        use devmap_store::Store;
+
+        const SYMBOLS: usize = 500;
+        const BUDGET: u32 = 200;
+
+        let mut source = String::new();
+        for index in 0..SYMBOLS {
+            // `widget_NNNN` tokenizes to `widget` + `NNNN`, so every symbol
+            // shares the query's single term and the whole corpus scores.
+            source.push_str(&format!("def widget_{index:04}():\n    return {index}\n"));
+        }
+        let ext = extract_file("things.py", &source);
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(std::slice::from_ref(&ext));
+        let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+        let analysis = analyze(std::slice::from_ref(&ext), &resolution);
+        let store = Store::open_in_memory().unwrap();
+        store
+            .save_generation(std::slice::from_ref(&ext), &resolution, &analysis)
+            .unwrap();
+
+        SOURCE_SPAN_READS.with(|reads| reads.set(0));
+        let response = StoreQueryEngine::new(&store)
+            .search_semantic("widget", BUDGET)
+            .expect("semantic search");
+        let reads = SOURCE_SPAN_READS.with(|reads| reads.get());
+
+        assert_eq!(
+            response.total, SYMBOLS as u32,
+            "every scored symbol must still be counted in `total`"
+        );
+        assert!(
+            response.shown > 0,
+            "a {BUDGET}-token budget must show something"
+        );
+        assert!(
+            response.truncated && response.hidden == response.total - response.shown,
+            "the withheld matches must be reported: shown={} hidden={} total={}",
+            response.shown,
+            response.hidden,
+            response.total
+        );
+
+        let ceiling = (BUDGET / SEARCH_HIT_OVERHEAD_TOKENS) as usize + 1;
+        assert!(
+            reads <= ceiling,
+            "scored {SYMBOLS} symbols and read {reads} files for a budget that can \
+             show at most {ceiling}"
+        );
+        assert!(
+            reads >= response.shown as usize,
+            "every shown hit needs its source read: reads={reads} shown={}",
+            response.shown
+        );
     }
 
     #[test]

@@ -16,7 +16,11 @@ fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("devmap-preview-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    // Canonical, because the fixture records this directory as the
+    // generation's `repo_root` and both production writers of that column do
+    // the same. macOS `temp_dir()` is a symlink (`/var` -> `/private/var`), so
+    // a non-canonical root would not prefix-match the paths built from it.
+    dir.canonicalize().unwrap()
 }
 
 const LIB: &str = "\
@@ -58,8 +62,21 @@ fn fixture(dir: &Path) -> Store {
     let resolution = resolver.resolve_all(&extractions);
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
     let store = Store::open_in_memory().unwrap();
+    // `repo_root` is recorded because every production writer of a generation
+    // records it — `devmap build` and the daemon's drain both store the
+    // canonical root — and `preview` refuses a path it cannot show to be inside
+    // that root. A fixture that left the column NULL was exercising a state no
+    // real store is in.
     store
-        .save_generation(&extractions, &resolution, &analysis)
+        .save_generation_with_opts(
+            &extractions,
+            &resolution,
+            &analysis,
+            devmap_store::GenerationWriteOpts {
+                repo_root: Some(dir.to_string_lossy().into_owned()),
+                ..devmap_store::GenerationWriteOpts::default()
+            },
+        )
         .unwrap();
     store
 }
@@ -232,4 +249,83 @@ fn preview_writes_nothing() {
         generation_before,
         "preview committed a generation"
     );
+}
+
+/// The `devmap preview` command refuses a path outside the repository too.
+///
+/// The containment rule lives in the engine, which both callers go through, so
+/// this is here to pin that the CLI really is one of them — a second entry point
+/// that skipped the check would look exactly like this test not existing.
+#[test]
+fn the_cli_refuses_to_preview_a_path_outside_the_repository() {
+    use std::process::Command;
+
+    let dir = scratch("cli_refuses_escape");
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("lib.py"), LIB).unwrap();
+    std::fs::write(
+        dir.join("secrets.py"),
+        "def api_key():\n    return 'hunter2'\n",
+    )
+    .unwrap();
+    let db = repo.join(".devcouncil/codeintel/devmap.sqlite");
+
+    let built = Command::new(env!("CARGO_BIN_EXE_devmap"))
+        .arg("--db")
+        .arg(&db)
+        .arg("build")
+        .arg(&repo)
+        .output()
+        .expect("devmap build must run");
+    assert!(
+        built.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let escaped = Command::new(env!("CARGO_BIN_EXE_devmap"))
+        .arg("--db")
+        .arg(&db)
+        .arg("preview")
+        .arg("--file")
+        .arg("../secrets.py")
+        .arg("--content")
+        .arg("/dev/null")
+        .output()
+        .expect("devmap preview must run");
+    assert!(
+        !escaped.status.success(),
+        "the CLI previewed a file outside the repository: {}",
+        String::from_utf8_lossy(&escaped.stdout)
+    );
+    let complaint = String::from_utf8_lossy(&escaped.stderr);
+    assert!(
+        complaint.contains("traversal") || complaint.contains("outside"),
+        "the refusal must name the containment rule: {complaint}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&escaped.stdout).contains("api_key"),
+        "the refused preview still leaked the target file's symbols"
+    );
+
+    // The same command against a file inside the repository still works, so the
+    // guard is containment rather than a blanket refusal.
+    let allowed = Command::new(env!("CARGO_BIN_EXE_devmap"))
+        .arg("--db")
+        .arg(&db)
+        .arg("preview")
+        .arg("--file")
+        .arg("lib.py")
+        .arg("--content")
+        .arg("/dev/null")
+        .output()
+        .expect("devmap preview must run");
+    assert!(
+        allowed.status.success(),
+        "an in-repository preview was refused: {}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

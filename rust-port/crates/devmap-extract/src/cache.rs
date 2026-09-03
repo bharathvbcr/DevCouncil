@@ -140,7 +140,14 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// every cached file. Without the bump the first incremental build after this
 /// change would report clones found only among the handful of files that
 /// happened to be edited, and report it as a whole-repository answer.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "27";
+/// v28 splits `ExtractionEngine::NotApplicable` out of `Unavailable` (K5): a
+/// prose or data format has no grammar *by design*, and a `.proto` this build
+/// cannot parse is a gap in coverage. Both were `Unavailable` before, so a v27
+/// payload cannot say which it is — and `Extraction::is_parse_failure` asks
+/// exactly that. Reusing v27 rows would keep reporting every Markdown file in
+/// the repository as a parse failure while the classifier that stops doing so
+/// sits right beside them.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "28";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

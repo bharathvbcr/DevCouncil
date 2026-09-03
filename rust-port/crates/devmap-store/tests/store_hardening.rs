@@ -47,19 +47,32 @@ fn pending_queue_survives_reopen() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A watcher event arriving mid-drain is newer work and must survive the
+/// acknowledgement of the batch it interrupted.
+///
+/// The guard used to be `attempts > 0`, which forced the drain to charge an
+/// attempt to every path it was about to succeed at just to make the delete
+/// fire — and that accounting is what let one store-level failure quarantine a
+/// whole batch (K1(d)). The guard is now the `queued_at` the row was claimed
+/// at, which re-enqueueing moves. Same invariant, without the side effect.
 #[test]
 fn requeued_path_survives_post_attempt_acknowledgement() {
     let store = Store::open_in_memory().unwrap();
     store.enqueue_pending_paths(&["a.py".to_string()]).unwrap();
-    store.bump_pending_attempts(&["a.py".to_string()]).unwrap();
+    let claimed = store.claim_pending_batch(16).unwrap();
+    assert_eq!(claimed.len(), 1);
 
     // A watcher event arriving during the rebuild represents newer work and
-    // resets the attempt marker. Acknowledging the old attempt must preserve it.
+    // moves the queue timestamp. Acknowledging the old claim must preserve it.
+    std::thread::sleep(std::time::Duration::from_millis(5));
     store.enqueue_pending_paths(&["a.py".to_string()]).unwrap();
-    store
-        .clear_pending_paths_after_attempt(&["a.py".to_string()])
-        .unwrap();
+    assert_eq!(store.clear_claimed_pending_paths(&claimed).unwrap(), 0);
     assert_eq!(store.get_pending_paths().unwrap(), vec!["a.py".to_string()]);
+    assert_eq!(
+        store.pending_attempts("a.py").unwrap(),
+        Some(0),
+        "claiming and acknowledging must not charge a failed attempt"
+    );
 }
 
 #[test]

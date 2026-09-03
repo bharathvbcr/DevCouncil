@@ -251,7 +251,11 @@ fn validate_request(request: &IpcRequest) -> Result<(), String> {
     Ok(())
 }
 
-fn dispatch(store: &Store, request: IpcRequest) -> anyhow::Result<Value> {
+fn dispatch(
+    store: &Store,
+    request: IpcRequest,
+    cancel: &devmap_query::Cancel,
+) -> anyhow::Result<Value> {
     if request.version != PROTOCOL_VERSION {
         anyhow::bail!(
             "unsupported protocol version {}; server requires {}",
@@ -259,7 +263,7 @@ fn dispatch(store: &Store, request: IpcRequest) -> anyhow::Result<Value> {
             PROTOCOL_VERSION
         );
     }
-    let engine = StoreQueryEngine::new(store);
+    let engine = StoreQueryEngine::new(store).with_cancel(cancel.clone());
     match request.command {
         IpcCommand::Status => {
             let status = store.status("daemon")?;
@@ -504,28 +508,62 @@ where
             Err(error) => failure("invalid_parameters", error),
             Ok(()) => {
                 activity.touch();
-                let query_store = Arc::clone(&store);
-                // Bounded, so a query wedged behind a long generation write
-                // answers with a structured error rather than occupying the
-                // connection for as long as the write holds the store mutex.
-                let dispatched = tokio::time::timeout(
+                dispatch_with_timeout(
+                    Arc::clone(&store),
+                    request,
                     QUERY_TIMEOUT,
-                    tokio::task::spawn_blocking(move || dispatch(&query_store, request)),
+                    devmap_query::Cancel::new(),
                 )
-                .await;
-                match dispatched {
-                    Err(_) => failure("query_timeout", format!("query exceeded {QUERY_TIMEOUT:?}")),
-                    Ok(Err(error)) => {
-                        failure("internal_error", format!("query task failed: {error}"))
-                    }
-                    Ok(Ok(Ok(result))) => success(result),
-                    Ok(Ok(Err(error))) => failure("request_failed", error.to_string()),
-                }
+                .await
             }
         },
         Err(error) => failure("invalid_request", error.to_string()),
     };
     write_envelope(&mut stream, &envelope).await
+}
+
+/// Run one request on the blocking pool, bounded by `limit`.
+///
+/// The bound frees the connection: a query wedged behind a long generation
+/// write answers with a structured error instead of occupying its connection
+/// for as long as the write holds the store mutex. It does **not** free the
+/// work — a `spawn_blocking` task cannot be aborted, and dropping its
+/// `JoinHandle` merely detaches it — so the same deadline that answers the
+/// client also trips `cancel`, which the engine's loops consult. Without that,
+/// every timed-out query kept scanning on a pool thread nobody was reading, and
+/// enough of them fill the pool.
+///
+/// `cancel` is a parameter rather than a local so a test can hold the same
+/// handle the abandoned task was given and assert it was actually tripped.
+async fn dispatch_with_timeout(
+    store: Arc<Store>,
+    request: IpcRequest,
+    limit: Duration,
+    cancel: devmap_query::Cancel,
+) -> Envelope {
+    let worker_cancel = cancel.clone();
+    let dispatched = tokio::time::timeout(
+        limit,
+        tokio::task::spawn_blocking(move || dispatch(&store, request, &worker_cancel)),
+    )
+    .await;
+    match dispatched {
+        Err(_) => {
+            cancel.cancel();
+            failure("query_timeout", format!("query exceeded {limit:?}"))
+        }
+        Ok(Err(error)) => failure("internal_error", format!("query task failed: {error}")),
+        Ok(Ok(Ok(result))) => success(result),
+        // A path the caller was not allowed to name is a rejected *parameter*,
+        // not a query that broke. Reported with the code `validate_request`
+        // already uses for a bad parameter value, so a client cannot read "you
+        // asked for something outside the repository" as a server fault and
+        // retry it.
+        Ok(Ok(Err(error))) => match error.downcast_ref::<devmap_query::PathOutsideRepoRoot>() {
+            Some(_) => failure("invalid_parameters", error.to_string()),
+            None => failure("request_failed", error.to_string()),
+        },
+    }
 }
 
 /// Delay before the next accept attempt after `consecutive` failures.
@@ -555,8 +593,9 @@ pub struct UnixIpcServer {
     _lock: std::fs::File,
 }
 
+/// Where an endpoint's advisory lock lives: beside the socket, named after it.
 #[cfg(unix)]
-fn ipc_lock_path(path: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn ipc_lock_path(path: &std::path::Path) -> std::path::PathBuf {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -727,6 +766,17 @@ impl UnixIpcServer {
 impl Drop for UnixIpcServer {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        // The lock file is unlinked *here*, while `_lock` is still alive and
+        // therefore while this process still holds the flock — struct fields
+        // are dropped after `Drop::drop` returns. Order matters: a starter that
+        // has already opened this inode cannot take the lock until we release
+        // it, and by then the name is gone, so it is locking a detached inode
+        // rather than the one the next daemon will create. Unlinking after the
+        // release would let that starter believe it owned the endpoint. Either
+        // way the bind itself is the backstop — a second listener on a live
+        // socket path fails — but this is the ordering that keeps the window
+        // shut.
+        let _ = std::fs::remove_file(ipc_lock_path(&self.path));
     }
 }
 
@@ -1055,6 +1105,111 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// A timed-out query must stop the work it abandoned, not merely stop
+    /// waiting for it.
+    ///
+    /// `spawn_blocking` tasks cannot be aborted: `timeout` drops the
+    /// `JoinHandle`, which detaches the task and leaves it running on a pool
+    /// thread with no reader. The only thing that stops it is the flag the
+    /// engine's loops consult, so the deadline has to trip it. This asserts on
+    /// the very handle the abandoned task was given.
+    /// A store holding enough symbols that any real query over it takes
+    /// meaningfully longer than the one-millisecond deadline below.
+    fn corpus_store(symbols: usize) -> Store {
+        let mut source = String::new();
+        for index in 0..symbols {
+            source.push_str(&format!("def widget_{index:05}():\n    return {index}\n"));
+        }
+        let extraction = devmap_extract::extract_file("things.py", &source);
+        let mut resolver = devmap_resolve::Resolver::new();
+        resolver.index_extractions(std::slice::from_ref(&extraction));
+        let resolution = resolver.resolve_all(std::slice::from_ref(&extraction));
+        let analysis = devmap_analyze::analyze(std::slice::from_ref(&extraction), &resolution);
+        let store = Store::open_in_memory().expect("in-memory store");
+        store
+            .save_generation(std::slice::from_ref(&extraction), &resolution, &analysis)
+            .expect("generation");
+        store
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_query_cancels_the_work_it_abandoned() {
+        // Semantic search vectorises the whole corpus, so this is real work —
+        // orders of magnitude more than the deadline allows, which is what
+        // makes the timeout deterministic rather than a race.
+        let store = Arc::new(corpus_store(4_000));
+        let request = IpcRequest {
+            version: PROTOCOL_VERSION,
+            command: IpcCommand::Search {
+                query: "widget".to_string(),
+                budget: 2_000,
+                semantic: true,
+            },
+        };
+        let cancel = devmap_query::Cancel::new();
+        let abandoned_before = devmap_query::cancelled_queries();
+
+        let envelope =
+            dispatch_with_timeout(store, request, Duration::from_millis(1), cancel.clone()).await;
+
+        assert!(
+            !envelope.ok,
+            "a one-millisecond deadline over a 4,000-symbol corpus must expire"
+        );
+        assert_eq!(
+            envelope.error.as_ref().map(|error| error.code),
+            Some("query_timeout"),
+            "unexpected refusal: {:?}",
+            envelope.error
+        );
+        assert!(
+            cancel.is_cancelled(),
+            "the deadline answered the client but left the blocking task running"
+        );
+
+        // The flag being set is the signal; this is the effect. The abandoned
+        // task must actually stop — observable because the engine counts the
+        // loops it abandons — rather than run the corpus scan to completion on
+        // a pool thread nobody is reading.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while devmap_query::cancelled_queries() <= abandoned_before
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            devmap_query::cancelled_queries() > abandoned_before,
+            "the abandoned query never stopped: it ran to completion on a blocking \
+             pool thread with no reader"
+        );
+    }
+
+    /// The flag must not be tripped for a query that finished in time — a
+    /// cancellation on every request would be indistinguishable from one on
+    /// none.
+    #[tokio::test]
+    async fn a_query_that_finishes_in_time_is_not_cancelled() {
+        let store = Arc::new(Store::open_in_memory().expect("in-memory store"));
+        let request = IpcRequest {
+            version: PROTOCOL_VERSION,
+            command: IpcCommand::Status,
+        };
+        let cancel = devmap_query::Cancel::new();
+
+        let envelope =
+            dispatch_with_timeout(store, request, Duration::from_secs(30), cancel.clone()).await;
+
+        assert!(
+            envelope.ok,
+            "a status query must succeed: {:?}",
+            envelope.error
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "a query that answered in time must not be marked cancelled"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_ipc_rejects_overlong_paths_before_bind() {
@@ -1374,15 +1529,27 @@ mod hardening_limit_tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(ipc_lock_path(&path));
 
-        // A live listener we do not own: bind must refuse, naming activity.
+        // A live listener we do not own: bind must refuse and leave the file
+        // alone. Two refusals are legitimate — the probe connected ("already
+        // active"), or it got no answer inside its window and the endpoint is
+        // treated as active ("did not answer"). The second one is what a
+        // starved probe thread produces under a parallel test run; it is a
+        // correct fail-closed answer, not a failure of this test.
         let foreign = std::os::unix::net::UnixListener::bind(&path).unwrap();
         match UnixIpcServer::bind(&path) {
             Ok(_) => panic!("a live foreign endpoint must not be replaced"),
-            Err(error) => assert!(
-                error.to_string().contains("already active"),
-                "refusal must name the live endpoint: {error}"
-            ),
+            Err(error) => {
+                let text = error.to_string();
+                assert!(
+                    text.contains("already active") || text.contains("did not answer"),
+                    "refusal must name the live endpoint: {error}"
+                );
+            }
         }
+        assert!(
+            path.exists(),
+            "a refused bind must leave the foreign endpoint in place"
+        );
         drop(foreign);
         std::fs::remove_file(&path).unwrap();
 

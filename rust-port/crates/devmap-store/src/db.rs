@@ -16,7 +16,13 @@ use crate::schema::{
     MIGRATION_V9_TO_V10, UNRESOLVED_TABLE,
 };
 
-const MAX_PENDING_ATTEMPTS: u32 = 5;
+/// Failed drain attempts after which a pending path stops being retried.
+///
+/// Public because the queue's hygiene is now a cross-crate contract: the daemon
+/// bumps it, `devmap build` and `devmap repair --pending` drop rows that reach
+/// it, and `status` names them. A test that asserts quarantine behaviour has to
+/// be able to say what quarantined means without copying the number.
+pub const MAX_PENDING_ATTEMPTS: u32 = 5;
 
 /// Hard ceiling for the git subprocess. `git` can stall on pathological
 /// repositories, network mounts or hook misconfigurations; unbounded, it hung
@@ -93,6 +99,180 @@ pub fn current_git_head(root: &Path) -> anyhow::Result<String> {
     run_git_head_with_deadline("git", root)
 }
 
+/// Whether a pending-queue entry is a control token rather than a path.
+///
+/// The daemon's git-HEAD sentinel is `"\0devmap:git-head-changed"`. A leading
+/// NUL cannot begin a real filesystem path, which makes the namespace safe, and
+/// it lets the store recognise the token without depending on `devmap-serve` —
+/// which depends on *this* crate, so the reverse edge cannot exist. Control
+/// tokens are never path-normalised, never structurally reconciled, and are
+/// retired by a full build like any other superseded work.
+fn is_control_token(entry: &str) -> bool {
+    entry.starts_with('\0')
+}
+
+/// The canonical pending-queue spelling of `raw` relative to `root`, or `None`
+/// when it names something outside the repository.
+///
+/// Canonical means: repo-relative, forward slashes, no `.` or `..` components,
+/// and `"."` for the root itself. Both queue producers now go through this, so
+/// the watcher's absolute paths and the reconcile sweep's relative ones become
+/// the same row instead of two rows for one file — see
+/// [`Store::enqueue_pending_paths_under_root`].
+fn canonical_pending_entry(root: &Path, raw: &str) -> Option<String> {
+    if is_control_token(raw) {
+        return Some(raw.to_string());
+    }
+    let normalized = raw.replace('\\', "/");
+    let candidate = Path::new(&normalized);
+    let relative = if candidate.is_absolute() {
+        // Compare against the canonical root as well: a symlinked temp
+        // directory, or a `.`-rooted daemon, makes the lexical prefix test
+        // fail on paths that are genuinely inside the tree.
+        candidate
+            .strip_prefix(root)
+            .ok()
+            .or_else(|| {
+                root.canonicalize()
+                    .ok()
+                    .and_then(|canonical| candidate.strip_prefix(canonical).ok())
+            })?
+            .to_path_buf()
+    } else {
+        candidate.to_path_buf()
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(part.to_str()?.to_string()),
+            std::path::Component::CurDir => {}
+            // `..` can only ever climb out of the root from a relative entry,
+            // and an absolute entry that needed it was already refused above.
+            std::path::Component::ParentDir => return None,
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    })
+}
+
+/// Whether a canonical pending entry can ever be processed, and why not.
+///
+/// `Err(reason)` means no number of retries will help — see
+/// [`Store::reconcile_pending_paths`] for what that cost in practice.
+fn classify_pending_entry(
+    root: &Path,
+    canonical: &str,
+    indexed: &BTreeSet<String>,
+    caches: &mut devmap_extract::CacheDirectoryCache,
+) -> std::result::Result<(), String> {
+    if canonical == "." {
+        // The root itself: a whole-tree rescan the drain expands.
+        return Ok(());
+    }
+    // K7: a path inside a tagged build cache is not source and never will be.
+    // Discovery no longer walks these directories, so a queued row naming one
+    // can only ever fail — and 47,000 of them were queued from two cargo output
+    // trees on this repository before discovery learned to skip them.
+    if let Some(cache) = caches.tagged_ancestor(root, canonical) {
+        return Err(format!(
+            "inside {cache}, a build cache marked with CACHEDIR.TAG"
+        ));
+    }
+    let absolute = root.join(canonical);
+    match std::fs::symlink_metadata(&absolute) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(metadata) if metadata.is_file() => {
+            if metadata.len() > devmap_extract::MAX_SOURCE_BYTES {
+                return Err(format!(
+                    "{} bytes exceeds the {} byte source ceiling, so extraction can never succeed",
+                    metadata.len(),
+                    devmap_extract::MAX_SOURCE_BYTES
+                ));
+            }
+            if !devmap_extract::is_indexable_source(canonical) {
+                return Err("not an indexable source file".to_string());
+            }
+            Ok(())
+        }
+        // A symlink, socket, fifo or device. Never a source this build reads.
+        Ok(_) => Err("not a regular file or directory".to_string()),
+        Err(_) => {
+            // Absent. This is a deletion the drain must process only if the
+            // graph still claims the path — or claims something beneath it,
+            // which is how a removed directory reaches its indexed children.
+            let prefix = format!("{canonical}/");
+            let still_indexed = indexed.contains(canonical)
+                || indexed
+                    .range(prefix.clone()..)
+                    .next()
+                    .is_some_and(|entry| entry.starts_with(&prefix));
+            if still_indexed {
+                Ok(())
+            } else {
+                Err("no longer exists under the root and is not in the stored graph".to_string())
+            }
+        }
+    }
+}
+
+/// What [`Store::enqueue_pending_paths_under_root`] accepted and refused.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingEnqueueReport {
+    /// Canonical entries actually queued, deduplicated and sorted.
+    pub enqueued: Vec<String>,
+    /// `(raw entry, why)` for entries refused as outside the repository. A
+    /// refusal is reported rather than dropped: a watcher emitting paths from
+    /// outside the tree is a bug in the watcher, and silently swallowing them
+    /// is how it stays one.
+    pub refused: Vec<(String, String)>,
+}
+
+/// What [`Store::reconcile_pending_paths`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingReconcile {
+    /// `(path, why)` for rows deleted as structurally unprocessable.
+    pub dropped: Vec<(String, String)>,
+    /// `(old spelling, canonical spelling)` for rows normalised in place.
+    pub rewritten: Vec<(String, String)>,
+    /// Rows left queued because they still name real work.
+    pub retained: usize,
+}
+
+/// What a committed build proved about the pending queue.
+///
+/// The distinction is the fix for K1(e2): "which paths did this build write"
+/// and "what did this build read" are different questions, and only the second
+/// can retire a row that names a directory.
+#[derive(Debug, Clone, Copy)]
+pub enum PendingSupersede<'a> {
+    /// A build with no `--affected` narrowing: it walked the whole tree, so it
+    /// answered every request queued at or before the instant it started.
+    /// Carries that instant on [`Store::queue_clock_now`]'s clock.
+    WholeTreeBuiltAt(f64),
+    /// A narrowed build: it read only the paths it was handed, so only those
+    /// rows are answered.
+    IndexedPaths(&'a [String]),
+}
+
+/// One pending row claimed for a drain attempt.
+///
+/// Carries `queued_at` because that is what makes the acknowledgement safe: a
+/// watcher event arriving mid-drain re-enqueues the path with a *new*
+/// `queued_at`, so clearing the claim leaves the newer request queued. The
+/// previous mechanism used `attempts > 0`, which forced the drain to bump the
+/// attempt counter of every path it was about to succeed at — the accounting
+/// that made one store-level failure quarantine an entire batch (K1(d)).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingClaim {
+    pub path: String,
+    pub queued_at: f64,
+}
+
 /// Fail closed: poisoned mutex is an error, never a panic.
 fn lock_conn(
     mutex: &Mutex<Connection>,
@@ -108,6 +288,56 @@ fn lock_conn(
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// The file this store was opened from, when it has one.
+    ///
+    /// Remembered solely so [`Store::lock_writer`] can find the sibling
+    /// `.writer.lock`. `None` for an in-memory store, which no other process
+    /// can reach and therefore has nothing to serialise against.
+    db_path: Option<std::path::PathBuf>,
+}
+
+/// A held cross-process writer lock on one store (K13).
+///
+/// Released when dropped — and, because it is an `flock`, also when the holding
+/// process dies. That is the whole reason for using one rather than a marker
+/// file: a build killed with SIGKILL leaves nothing behind to clean up, whereas
+/// a stale marker would wedge every later build until someone deleted it by
+/// hand.
+///
+/// An in-memory store holds `file: None`. That is not a check being skipped: an
+/// in-memory database is private to one process and one `Store`, whose own
+/// mutex already serialises writers, so there is no second writer for a
+/// cross-process lock to exclude.
+#[derive(Debug)]
+pub struct WriterLock {
+    file: Option<std::fs::File>,
+    path: Option<std::path::PathBuf>,
+}
+
+impl WriterLock {
+    /// The lock file backing this guard, or `None` for an in-memory store.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Whether a real cross-process lock is held, as opposed to the in-memory
+    /// no-op. Callers that need to *assert* exclusivity ask this rather than
+    /// inferring it from the guard's existence.
+    pub fn is_held(&self) -> bool {
+        self.file.is_some()
+    }
+}
+
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            // Explicit rather than relying on close-releases-flock, so the
+            // release is a statement in the code and not a side effect of drop
+            // order. A failure here is not actionable — the descriptor closes
+            // on the next line either way, which releases the lock.
+            let _ = file.unlock();
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +349,20 @@ pub struct StoreStatus {
     pub edge_count: usize,
     pub degraded_reason: Option<String>,
     pub quarantined_count: usize,
+    /// Up to [`Store::DEGRADED_SAMPLE`] of the quarantined paths, oldest first.
+    ///
+    /// K1(g): the degraded reason used to be a bare count — "64 path(s)
+    /// exceeded the retry threshold" — which tells an operator that something
+    /// is stuck and nothing about what. On the store this was measured against,
+    /// the 64 were paths under a *previous* location of the repository, a 30 MB
+    /// vendored `parser.c` that can never fit under `MAX_SOURCE_BYTES`, and
+    /// directories: every one of them diagnosable on sight, and none of them
+    /// visible.
+    ///
+    /// A sample, and labelled as one. `quarantined_count` carries the true
+    /// total, because a capped list that reads as the whole set is the failure
+    /// this codebase treats as worse than a visible gap.
+    pub quarantined_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +455,36 @@ pub struct VacuumOutcome {
     pub freelist_before: i64,
     pub page_count_before: i64,
     pub action: VacuumAction,
+    /// The WAL checkpoint that decides whether the reclaim reached the file.
+    ///
+    /// K2: `PRAGMA incremental_vacuum` truncates the database, and in WAL mode
+    /// that truncation is a WAL frame like any other — it does not touch the
+    /// main file until a checkpoint folds it back. `vacuum_if_needed`
+    /// checkpointed only *before* reading the page accounting, so the reclaim
+    /// ran, reported pages, and left the file exactly as large as it found it:
+    /// measured at 42% freelist, unchanged file size across eight builds, and a
+    /// 109 MB WAL.
+    ///
+    /// `None` means the checkpoint could not be run at all. A `busy` other than
+    /// zero means an active reader held the WAL and the truncation is still
+    /// pending — the build reports that rather than discarding it, because
+    /// "reclaimed and the file shrank" and "reclaimed and nothing moved" are
+    /// otherwise indistinguishable from the outside.
+    pub checkpoint: Option<WalCheckpointResult>,
+    /// Free pages this call actually returned to the end of the file.
+    ///
+    /// Counted, not assumed. `PRAGMA incremental_vacuum(N)` frees **one page
+    /// per row stepped**, and rusqlite 0.31's `execute_batch` steps exactly
+    /// once (`lib.rs::execute_batch`: `stmt.step()?`, then straight to the
+    /// tail) — so the pragma freed a single page per build while the action
+    /// beside it reported the 65,536 it had been asked for. Measured on the
+    /// live 701 MB store: four consecutive builds moved the freelist 116,116 ->
+    /// 116,045 and the file never left 701 MB. Fully stepping the same pragma
+    /// on a copy took the freelist to 49,545 and the file to 429 MB in 4.5 s.
+    ///
+    /// Carrying the count is what makes the difference visible: a request and a
+    /// result that print identically cannot be told apart from a log.
+    pub pages_freed: i64,
 }
 
 impl VacuumOutcome {
@@ -227,8 +501,14 @@ impl VacuumOutcome {
 pub enum VacuumAction {
     /// Below the threshold; nothing worth reclaiming.
     Declined,
-    /// Bounded reclaim of up to `pages` free pages.
-    Incremental { pages: i64 },
+    /// Bounded reclaim, asked to move up to `requested` free pages.
+    ///
+    /// `requested` is the ceiling, not the result: read
+    /// [`VacuumOutcome::pages_freed`] for what actually moved. The two were
+    /// conflated, and printing the request as though it were the outcome is how
+    /// a one-page reclaim reported `incremental(65536 pages)` for four builds
+    /// running while the file never shrank.
+    Incremental { requested: i64 },
     /// Whole-file rewrite that also converts a legacy store to incremental
     /// mode, so this is the last time that store pays for one.
     FullConverting,
@@ -238,7 +518,7 @@ impl std::fmt::Display for VacuumAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Declined => write!(f, "declined"),
-            Self::Incremental { pages } => write!(f, "incremental({pages} pages)"),
+            Self::Incremental { requested } => write!(f, "incremental(<={requested} pages)"),
             Self::FullConverting => write!(f, "full+convert"),
         }
     }
@@ -252,6 +532,11 @@ impl Store {
     /// working set does not fit and the same pages are read, evicted and read
     /// again for the length of the transaction.
     const CACHE_SIZE_KIB: i32 = -65_536;
+
+    /// How many quarantined paths [`Store::status`] names in its degraded
+    /// reason. Bounded because the reason is a one-line diagnostic, not a
+    /// dump — the honest total stays in `quarantined_count`.
+    pub const DEGRADED_SAMPLE: usize = 5;
 
     fn configure_connection(conn: &Connection) -> Result<()> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -485,12 +770,58 @@ impl Store {
         Ok(())
     }
 
-    fn migrate(conn: &mut Connection) -> Result<()> {
+    /// Refusal text for a store whose schema this binary cannot handle.
+    ///
+    /// K3: the old messages were `unsupported future schema version 99` and
+    /// `unsupported schema version 2` — no store path, no statement of what
+    /// this binary supports, and no remedy. An operator with several stores on
+    /// disk could not tell which one was refused, and nothing said whether the
+    /// fix was to rebuild the kernel or to rebuild the database. Those are
+    /// opposite actions and getting them the wrong way round destroys an index.
+    fn unsupported_schema(store: &str, found: i32) -> rusqlite::Error {
+        let remedy = if found > CURRENT_SCHEMA_VERSION {
+            "this devmap binary is older than the store; rebuild it with \
+             `cargo build --release -p devmap-cli` or set DEVMAP_BINARY to a newer build"
+        } else {
+            "run `devmap build` to migrate the store — and check `--db` actually names a \
+             devmap store: `.devcouncil/codeintel/index.sqlite` is the Python engine's \
+             database (schema 2), not this kernel's"
+        };
+        rusqlite::Error::InvalidParameterName(format!(
+            "devmap store {store}: schema version {found} is not supported by this binary \
+             (schema {CURRENT_SCHEMA_VERSION}); {remedy}"
+        ))
+    }
+
+    /// The schema version stamped on an existing store, without migrating it.
+    ///
+    /// K3: `Store::open` runs the migration chain under an exclusive
+    /// transaction from *every* open, so a read-only command like
+    /// `devmap status` silently upgraded the store it was asked to describe.
+    /// Opening read-only makes that impossible rather than merely unlikely: the
+    /// connection cannot write, so no migration, WAL switch or file creation
+    /// can happen behind the question.
+    ///
+    /// `None` when no store exists at `db_path`. A file that exists but is not
+    /// a database is an error, not a `None` — "there is nothing here" and "what
+    /// is here is not readable" are different answers.
+    pub fn stored_schema_version<P: AsRef<Path>>(db_path: P) -> Result<Option<i32>> {
+        let path = db_path.as_ref();
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        Ok(Some(version))
+    }
+
+    fn migrate(conn: &mut Connection, store: &str) -> Result<()> {
         let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version > CURRENT_SCHEMA_VERSION {
-            return Err(rusqlite::Error::InvalidParameterName(format!(
-                "unsupported future schema version {version}"
-            )));
+            return Err(Self::unsupported_schema(store, version));
         }
         let mut version = version;
         if version == 0 {
@@ -529,9 +860,7 @@ impl Store {
             // rather than from the stale zero.
             tx.rollback()?;
             if observed > CURRENT_SCHEMA_VERSION {
-                return Err(rusqlite::Error::InvalidParameterName(format!(
-                    "unsupported future schema version {observed}"
-                )));
+                return Err(Self::unsupported_schema(store, observed));
             }
             version = observed;
         }
@@ -662,9 +991,7 @@ impl Store {
             version = 12;
         }
         if version != CURRENT_SCHEMA_VERSION {
-            return Err(rusqlite::Error::InvalidParameterName(format!(
-                "unsupported schema version {version}"
-            )));
+            return Err(Self::unsupported_schema(store, version));
         }
         Self::validate_schema(conn)?;
         Ok(())
@@ -675,10 +1002,144 @@ impl Store {
         let mut conn = Connection::open(path)?;
         Self::configure_connection(&conn)?;
         Self::enable_wal(&conn)?;
-        Self::migrate(&mut conn)?;
+        Self::migrate(&mut conn, &path.display().to_string())?;
         Ok(Self {
             conn: Mutex::new(conn),
+            db_path: Some(path.to_path_buf()),
         })
+    }
+
+    /// The file this store was opened from, or `None` for an in-memory store.
+    ///
+    /// `None` is a fact, not a failure: an in-memory database has no path that
+    /// could be deleted, moved or locked, so a caller asking "is my store still
+    /// there" has its answer.
+    pub fn path(&self) -> Option<&Path> {
+        self.db_path.as_deref()
+    }
+
+    /// Longest a writer waits for another process's writer lock before giving
+    /// up and naming the holder.
+    ///
+    /// A full build of a large repository takes seconds, not minutes, so a
+    /// minute is generous headroom rather than a guess. Bounded because an
+    /// unbounded wait turns a crashed-but-not-dead holder into a hang with no
+    /// diagnostic, which is strictly worse than a refusal that names a pid.
+    pub const WRITER_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Poll interval while waiting for the writer lock. Short enough that a
+    /// released lock is picked up promptly, long enough not to spin a core.
+    const WRITER_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+    /// Transaction behaviour for a generation write.
+    ///
+    /// K13: `Immediate`, matching the prunes, which already use it and document
+    /// why — the write lock is taken at `BEGIN` rather than at whichever
+    /// statement first needs it, so two writers queue on the busy handler
+    /// instead of discovering the conflict partway through and failing an
+    /// upgrade that SQLite does not retry.
+    ///
+    /// Exposed as a named constant because the effect is not observable: SQLite
+    /// offers no way to read a transaction's behaviour back, so the policy is
+    /// asserted directly rather than inferred from a race that reproduces only
+    /// sometimes. The same reason `should_vacuum` and
+    /// `should_retire_for_new_binary` are pure functions.
+    pub const GENERATION_TX_BEHAVIOR: TransactionBehavior = TransactionBehavior::Immediate;
+
+    /// Path of the advisory writer lock guarding `db_path`.
+    pub fn writer_lock_path(db_path: &Path) -> std::path::PathBuf {
+        let mut name = db_path.file_name().map_or_else(
+            || std::ffi::OsString::from("devmap-store"),
+            |name| name.to_os_string(),
+        );
+        name.push(".writer.lock");
+        match db_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+            _ => std::path::PathBuf::from(name),
+        }
+    }
+
+    /// Take the cross-process writer lock for the store at `db_path` (K13).
+    ///
+    /// There was no such lock. Two `devmap build` processes — or a build and
+    /// the daemon's drain — raced on SQLite's five-second `busy_timeout` alone,
+    /// and the loser surfaced `database is locked` after having already paid
+    /// for a full extraction and resolution. That is the worst possible place
+    /// to fail: all of the cost, none of the result, and an error message that
+    /// names neither the other writer nor anything the caller can do.
+    ///
+    /// An `flock`, mirroring `protocol::lock_ipc_endpoint`: the kernel releases
+    /// it when the holder dies, so no stale-lock cleanup exists to go wrong.
+    /// `try_lock` in a bounded poll rather than the blocking `lock`, because a
+    /// blocking wait cannot be given a deadline and a writer that hangs forever
+    /// behind a wedged peer is not an improvement on one that fails.
+    ///
+    /// The holder writes its pid into the file, so the timeout can say who.
+    pub fn lock_writer_at(db_path: &Path, wait: std::time::Duration) -> anyhow::Result<WriterLock> {
+        use std::io::{Read, Seek, Write};
+
+        let lock_path = Self::writer_lock_path(db_path);
+        if let Some(parent) = lock_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => {
+                    // Record ownership for the *next* waiter's diagnostic.
+                    // Best-effort: a failure to write the pid does not weaken
+                    // the lock, it only makes a future timeout less specific.
+                    let _ = file.set_len(0);
+                    let _ = file.rewind();
+                    let _ = write!(file, "{}", std::process::id());
+                    let _ = file.flush();
+                    return Ok(WriterLock {
+                        file: Some(file),
+                        path: Some(lock_path),
+                    });
+                }
+                Err(_busy) => {
+                    if std::time::Instant::now() >= deadline {
+                        let mut holder = String::new();
+                        let owner = std::fs::File::open(&lock_path)
+                            .and_then(|mut handle| handle.read_to_string(&mut holder))
+                            .ok()
+                            .map(|_| holder.trim().to_string())
+                            .filter(|pid| !pid.is_empty())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        anyhow::bail!(
+                            "another devmap writer holds {lock_path:?} (pid {owner}); \
+                             waited {wait:?}. Wait for it to finish, or stop that process."
+                        );
+                    }
+                    std::thread::sleep(Self::WRITER_LOCK_POLL);
+                }
+            }
+        }
+    }
+
+    /// [`Store::lock_writer_at`] for the file this store was opened from.
+    ///
+    /// An in-memory store returns an unheld guard — see [`WriterLock`]: it is
+    /// private to this process and this `Store`, whose mutex already serialises
+    /// its writers, so there is no second writer to exclude.
+    pub fn lock_writer(&self, wait: std::time::Duration) -> anyhow::Result<WriterLock> {
+        match &self.db_path {
+            Some(path) => Self::lock_writer_at(path, wait),
+            None => Ok(WriterLock {
+                file: None,
+                path: None,
+            }),
+        }
     }
 
     /// Open a store **without creating one**, for read commands.
@@ -704,9 +1165,10 @@ impl Store {
     pub fn open_in_memory() -> Result<Self> {
         let mut conn = Connection::open_in_memory()?;
         Self::configure_connection(&conn)?;
-        Self::migrate(&mut conn)?;
+        Self::migrate(&mut conn, ":memory:")?;
         Ok(Self {
             conn: Mutex::new(conn),
+            db_path: None,
         })
     }
 
@@ -778,25 +1240,293 @@ impl Store {
             .query_row(params![path], |row| row.get(0))
     }
 
+    /// Enqueue verbatim. Callers that know the repository root must use
+    /// [`Store::enqueue_pending_paths_under_root`] instead.
+    ///
+    /// Kept as the raw primitive because the queue is also written by tests and
+    /// by callers replaying rows that are already canonical. It performs no
+    /// normalisation and no containment check, which is exactly what made the
+    /// queue rot: see K1 on `enqueue_pending_paths_under_root`.
     pub fn enqueue_pending_paths(&self, paths: &[String]) -> Result<()> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let now = Self::now_secs();
         let conn = lock_conn(&self.conn)?;
         let tx = conn.unchecked_transaction()?;
         for path in paths {
-            tx.execute(
-                "INSERT INTO pending_paths (path, queued_at, attempts) VALUES (?1, ?2, 0)
-                 ON CONFLICT(path) DO UPDATE SET
-                   queued_at=excluded.queued_at,
-                   attempts=0",
-                params![path, now],
-            )?;
+            Self::upsert_pending(&tx, path, now)?;
         }
         tx.commit()
     }
 
+    fn now_secs() -> f64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+    }
+
+    fn upsert_pending(tx: &rusqlite::Transaction<'_>, path: &str, now: f64) -> Result<()> {
+        tx.prepare_cached(
+            "INSERT INTO pending_paths (path, queued_at, attempts) VALUES (?1, ?2, 0)
+             ON CONFLICT(path) DO UPDATE SET
+               queued_at=excluded.queued_at,
+               attempts=0",
+        )?
+        .execute(params![path, now])?;
+        Ok(())
+    }
+
+    /// Enqueue changed paths in the queue's canonical form: repo-relative,
+    /// forward-slash, deduplicated, and inside `root`.
+    ///
+    /// K1(a): the queue had two producers writing two different things. The
+    /// watcher enqueued **absolute** paths; the connect-time reconcile enqueued
+    /// **repo-relative** ones; `enqueue_pending_paths` inserted whichever it was
+    /// given, verbatim, with no containment check. Nothing ever reconciled the
+    /// two, so a repository that moved on disk left rows naming a directory
+    /// that no longer existed — measured on this store as 64 permanently
+    /// quarantined rows under `/Users/…/Code/DevCouncil` after the checkout
+    /// moved to `/Users/…/Code/devtools/DevCouncil`, which pinned
+    /// `devmap status` at `is_fresh=false` forever.
+    ///
+    /// One canonical form, enforced where rows enter. A path outside `root` is
+    /// refused *here*, where the caller can be told, rather than accepted and
+    /// then failed forever by a drain that has no way to delete it.
+    pub fn enqueue_pending_paths_under_root(
+        &self,
+        root: &Path,
+        paths: &[String],
+    ) -> Result<PendingEnqueueReport> {
+        let mut report = PendingEnqueueReport::default();
+        let mut canonical: BTreeSet<String> = BTreeSet::new();
+        let mut caches = devmap_extract::CacheDirectoryCache::default();
+        for raw in paths {
+            match canonical_pending_entry(root, raw) {
+                Some(entry) => {
+                    // K7: refuse build caches at the door. The watcher fires on
+                    // every write cargo makes into its output directory, and
+                    // those events reached this queue as work — 47,000 rows
+                    // from `target-serve` and `target-store` on this
+                    // repository. Discovery skips the directory, so every one
+                    // of those rows was guaranteed to be dropped later or to
+                    // index something that is not source.
+                    if let Some(cache) = caches.tagged_ancestor(root, &entry) {
+                        report.refused.push((
+                            raw.clone(),
+                            format!("inside {cache}, a build cache marked with CACHEDIR.TAG"),
+                        ));
+                        continue;
+                    }
+                    canonical.insert(entry);
+                }
+                None => report.refused.push((
+                    raw.clone(),
+                    format!("outside the repository root {}", root.display()),
+                )),
+            }
+        }
+        let now = Self::now_secs();
+        {
+            let conn = lock_conn(&self.conn)?;
+            let tx = conn.unchecked_transaction()?;
+            for entry in &canonical {
+                Self::upsert_pending(&tx, entry, now)?;
+            }
+            tx.commit()?;
+        }
+        report.enqueued = canonical.into_iter().collect();
+        Ok(report)
+    }
+
+    /// Failed drain attempts recorded against `path`, or `None` when it is not
+    /// queued. Diagnostic and test-facing: "the queue is stuck" and "the queue
+    /// is retrying" look identical from a row count.
+    pub fn pending_attempts(&self, path: &str) -> Result<Option<u32>> {
+        let conn = lock_conn(&self.conn)?;
+        conn.query_row(
+            "SELECT attempts FROM pending_paths WHERE path = ?1",
+            params![path],
+            |row| row.get(0),
+        )
+        .optional()
+    }
+
+    /// Drop pending rows that no amount of retrying can ever process (K1(b)).
+    ///
+    /// The queue's only deleters were an acknowledgement of *successful* work
+    /// and a test-only clear, so a row that could not succeed was retried five
+    /// times, quarantined, and then kept forever. The 64 rows measured on this
+    /// store were: paths under a previous location of the repository,
+    /// directories, `.md`/`.json` files, and a 30 MB vendored `parser.c` that
+    /// is over `MAX_SOURCE_BYTES` and therefore could never be extracted by
+    /// any number of attempts. None of them was a transient failure; all of
+    /// them were structural, and structural failures are deleted, not retried.
+    ///
+    /// Deletion is **not** applied to a path that is merely absent. A file that
+    /// vanished but is still a node in the latest generation is a deletion the
+    /// drain has to process, and dropping it would leave the graph asserting a
+    /// file that is gone. Only an absent path with nothing indexed under it is
+    /// dropped.
+    ///
+    /// Non-canonical rows are rewritten rather than deleted where they still
+    /// name something inside the root, so a queue written by the old absolute
+    /// path producer converges instead of being thrown away.
+    pub fn reconcile_pending_paths(&self, root: &Path) -> Result<PendingReconcile> {
+        let indexed: BTreeSet<String> = self.latest_file_hashes()?.into_keys().collect();
+        let rows: Vec<(String, f64, u32)> = {
+            let conn = lock_conn(&self.conn)?;
+            let mut stmt =
+                conn.prepare("SELECT path, queued_at, attempts FROM pending_paths ORDER BY path")?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<Result<Vec<_>>>()?;
+            rows
+        };
+
+        let mut outcome = PendingReconcile::default();
+        // One memo for the whole sweep: 51,136 rows were measured on the live
+        // store, and without it each would re-`open` every ancestor's tag.
+        let mut caches = devmap_extract::CacheDirectoryCache::default();
+        let mut deletes: Vec<String> = Vec::new();
+        let mut rewrites: Vec<(String, String, f64, u32)> = Vec::new();
+        for (stored, queued_at, attempts) in rows {
+            if is_control_token(&stored) {
+                outcome.retained += 1;
+                continue;
+            }
+            let Some(canonical) = canonical_pending_entry(root, &stored) else {
+                deletes.push(stored.clone());
+                outcome.dropped.push((
+                    stored,
+                    format!("escapes the repository root {}", root.display()),
+                ));
+                continue;
+            };
+            match classify_pending_entry(root, &canonical, &indexed, &mut caches) {
+                Err(reason) => {
+                    deletes.push(stored.clone());
+                    outcome.dropped.push((stored, reason));
+                }
+                Ok(()) => {
+                    if canonical != stored {
+                        rewrites.push((stored, canonical, queued_at, attempts));
+                    }
+                    outcome.retained += 1;
+                }
+            }
+        }
+
+        if !deletes.is_empty() || !rewrites.is_empty() {
+            let mut conn = lock_conn(&self.conn)?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for path in &deletes {
+                tx.prepare_cached("DELETE FROM pending_paths WHERE path = ?1")?
+                    .execute(params![path])?;
+            }
+            for (stored, canonical, queued_at, attempts) in &rewrites {
+                tx.prepare_cached("DELETE FROM pending_paths WHERE path = ?1")?
+                    .execute(params![stored])?;
+                // Preserve the work: the row still names real pending work,
+                // only under the wrong spelling. `MIN` on attempts so a
+                // rewritten row cannot inherit a *worse* history than the
+                // canonical row it merges into.
+                tx.prepare_cached(
+                    "INSERT INTO pending_paths (path, queued_at, attempts) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(path) DO UPDATE SET
+                       queued_at=MIN(pending_paths.queued_at, excluded.queued_at),
+                       attempts=MIN(pending_paths.attempts, excluded.attempts)",
+                )?
+                .execute(params![canonical, queued_at, attempts])?;
+                outcome.rewritten.push((stored.clone(), canonical.clone()));
+            }
+            tx.commit()?;
+        }
+        Ok(outcome)
+    }
+
+    /// Drop every quarantined row, returning what was dropped (K1(f)).
+    pub fn drop_quarantined_pending_paths(&self) -> Result<Vec<String>> {
+        let mut conn = lock_conn(&self.conn)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let dropped: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT path FROM pending_paths WHERE attempts >= ?1 ORDER BY queued_at, path",
+            )?;
+            let rows = stmt
+                .query_map(params![MAX_PENDING_ATTEMPTS], |row| row.get(0))?
+                .collect::<Result<Vec<_>>>()?;
+            rows
+        };
+        tx.execute(
+            "DELETE FROM pending_paths WHERE attempts >= ?1",
+            params![MAX_PENDING_ATTEMPTS],
+        )?;
+        tx.commit()?;
+        Ok(dropped)
+    }
+
+    /// Retire the pending work a committed build has superseded (K1(e)).
+    ///
+    /// A build that persisted a generation has answered some set of queued
+    /// requests. *Which* set is the question `PendingSupersede` answers, and
+    /// getting it wrong is how 918 rows survived a full `dev map` on the live
+    /// store: the rule used to be "delete rows whose path is in the extraction
+    /// set", and a directory is never an extraction. Every one of those 918
+    /// rows named a directory, all of them still existed, so the structural
+    /// reconcile correctly kept them and `repair --pending` could not touch
+    /// them either — `status` simply reported NOT FRESH forever.
+    ///
+    /// Quarantined rows and control tokens go in both cases: the first are work
+    /// five drains could not do and a build has now either done or proved
+    /// unnecessary, the second is the daemon's git-HEAD sentinel, which a
+    /// generation written at the current HEAD answers by construction.
+    pub fn clear_pending_superseded(&self, rule: PendingSupersede<'_>) -> Result<Vec<String>> {
+        let indexed: BTreeSet<&str> = match rule {
+            PendingSupersede::IndexedPaths(paths) => paths.iter().map(String::as_str).collect(),
+            PendingSupersede::WholeTreeBuiltAt(_) => BTreeSet::new(),
+        };
+        let mut conn = lock_conn(&self.conn)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows: Vec<(String, f64, u32)> = {
+            let mut stmt = tx.prepare("SELECT path, queued_at, attempts FROM pending_paths")?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<Result<Vec<_>>>()?;
+            rows
+        };
+        let mut cleared = Vec::new();
+        for (path, queued_at, attempts) in rows {
+            let answered = match rule {
+                // The build read the whole tree, so it answered every request
+                // that existed when it started — whatever that request named.
+                // Strictly `<=` against the *start*, never the finish: a
+                // watcher event that arrived while the build was extracting
+                // describes an edit the build may not have seen, and deleting
+                // it would drop a real change on the floor.
+                PendingSupersede::WholeTreeBuiltAt(started) => queued_at <= started,
+                // A narrowed build only read what it was told to read.
+                PendingSupersede::IndexedPaths(_) => indexed.contains(path.as_str()),
+            };
+            if answered || attempts >= MAX_PENDING_ATTEMPTS || is_control_token(&path) {
+                tx.prepare_cached("DELETE FROM pending_paths WHERE path = ?1")?
+                    .execute(params![path])?;
+                cleared.push(path);
+            }
+        }
+        tx.commit()?;
+        Ok(cleared)
+    }
+
+    /// Wall clock in the units `pending_paths.queued_at` is written in.
+    ///
+    /// Public so a build can stamp "I started here" on the same clock the queue
+    /// uses, which is what makes [`PendingSupersede::WholeTreeBuiltAt`]
+    /// comparable at all. `Instant` cannot be used: it is monotonic and process
+    /// local, while the queue is durable and written by other processes.
+    pub fn queue_clock_now() -> f64 {
+        Self::now_secs()
+    }
+
+    /// Every queued path a drain may still retry, oldest first.
     pub fn get_pending_paths(&self) -> Result<Vec<String>> {
         self.get_pending_paths_limited(usize::MAX)
     }
@@ -825,6 +1555,55 @@ impl Store {
         Ok(paths)
     }
 
+    /// Claim up to `limit` retryable pending rows for one drain attempt.
+    ///
+    /// Same selection as [`Store::get_pending_paths_limited`], but each row
+    /// carries the `queued_at` it was claimed at so the acknowledgement can be
+    /// conditional on the row not having been re-enqueued meanwhile. See
+    /// [`PendingClaim`].
+    pub fn claim_pending_batch(&self, limit: usize) -> Result<Vec<PendingClaim>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = lock_conn(&self.conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT path, queued_at FROM pending_paths
+             WHERE attempts < ?2
+             ORDER BY queued_at ASC, path ASC
+             LIMIT ?1",
+        )?;
+        let sqlite_limit = limit.min(i64::MAX as usize) as i64;
+        let rows = stmt
+            .query_map(params![sqlite_limit, MAX_PENDING_ATTEMPTS], |row| {
+                Ok(PendingClaim {
+                    path: row.get(0)?,
+                    queued_at: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Acknowledge claimed work, leaving anything re-enqueued since the claim.
+    ///
+    /// The `queued_at` guard replaces the old `attempts > 0` one, which only
+    /// worked because the drain bumped the attempt counter of every path in the
+    /// batch *before* doing any work — so a single failure in a later,
+    /// batch-wide step (a persist, a prune) charged an attempt to all 64 paths
+    /// in the batch and five such failures quarantined the lot. See K1(d).
+    pub fn clear_claimed_pending_paths(&self, claims: &[PendingClaim]) -> Result<usize> {
+        let conn = lock_conn(&self.conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let mut cleared = 0;
+        for claim in claims {
+            cleared += tx
+                .prepare_cached("DELETE FROM pending_paths WHERE path = ?1 AND queued_at = ?2")?
+                .execute(params![claim.path, claim.queued_at])?;
+        }
+        tx.commit()?;
+        Ok(cleared)
+    }
+
     pub fn bump_pending_attempts(&self, paths: &[String]) -> Result<()> {
         let conn = lock_conn(&self.conn)?;
         let tx = conn.unchecked_transaction()?;
@@ -842,22 +1621,6 @@ impl Store {
         let tx = conn.unchecked_transaction()?;
         for path in paths {
             tx.execute("DELETE FROM pending_paths WHERE path = ?1", params![path])?;
-        }
-        tx.commit()
-    }
-
-    /// Acknowledge work claimed by a daemon attempt without deleting a newer
-    /// watcher event. Re-enqueueing a path resets `attempts` to zero, while a
-    /// claimed item has a positive attempt count; therefore a concurrent
-    /// requeue remains pending for the next generation.
-    pub fn clear_pending_paths_after_attempt(&self, paths: &[String]) -> Result<()> {
-        let conn = lock_conn(&self.conn)?;
-        let tx = conn.unchecked_transaction()?;
-        for path in paths {
-            tx.execute(
-                "DELETE FROM pending_paths WHERE path = ?1 AND attempts > 0",
-                params![path],
-            )?;
         }
         tx.commit()
     }
@@ -926,7 +1689,7 @@ impl Store {
             }
         }
         let mut conn = lock_conn(&self.conn)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(Self::GENERATION_TX_BEHAVIOR)?;
         // One path-id memo for the whole generation write. See
         // `ensure_path_id_cached`: the edge loop alone asks for two ids per
         // edge drawn from a file set two orders of magnitude smaller.
@@ -1445,9 +2208,14 @@ impl Store {
             .iter()
             .filter(is_ambiguous)
             .count() as i64;
+        // K5: ask the canonical classifier, not the raw variant. A prose or
+        // data format reports `ParseOutcome::Failed` because no grammar exists
+        // for it, so the raw test counted 294 of this repository's 1,310 files
+        // as parse failures — all Markdown, JSON, YAML, config and HTML — and
+        // buried the 16 files a grammar actually parsed and flagged.
         let parse_failed = extractions
             .iter()
-            .filter(|extraction| matches!(extraction.parse_outcome, ParseOutcome::Failed { .. }))
+            .filter(|extraction| extraction.is_parse_failure())
             .count() as i64;
         let languages_covered = extractions
             .iter()
@@ -1556,7 +2324,7 @@ impl Store {
     /// callers is a different claim depending on whether anything failed to
     /// resolve against it.
     pub fn latest_unresolved(&self, limit: usize) -> Result<Vec<(String, String, String)>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn)?;
         let mut stmt = conn.prepare(
             "SELECT source_symbol, callee_name, reason
              FROM generation_unresolved
@@ -1575,7 +2343,7 @@ impl Store {
     /// Total unresolved rows across every retained generation. Test-facing:
     /// the point is to prove the table is pruned, not just written.
     pub fn count_unresolved_rows(&self) -> Result<usize> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn)?;
         let count: i64 =
             conn.query_row("SELECT COUNT(*) FROM generation_unresolved", [], |row| {
                 row.get(0)
@@ -1657,7 +2425,7 @@ impl Store {
     /// Lets a build decide, before resolving anything, whether the tree it just
     /// scanned is the one already committed.
     pub fn latest_file_hashes(&self) -> Result<BTreeMap<String, u64>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn)?;
         let mut stmt = conn.prepare(
             "SELECT p.path, f.content_hash
              FROM generation_files f
@@ -1678,7 +2446,7 @@ impl Store {
     /// bare name, so that is the granularity at which a definition moving can
     /// change another file's resolution.
     pub fn latest_symbol_names_by_file(&self) -> Result<BTreeMap<String, BTreeSet<String>>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn)?;
         let mut stmt = conn.prepare(
             "SELECT p.path, n.name
              FROM generation_nodes n
@@ -1700,7 +2468,7 @@ impl Store {
     /// Test-facing: proving incremental output equals cold output needs the
     /// whole edge set, not a count.
     pub fn latest_edges_for_test(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = lock_conn(&self.conn)?;
         let mut stmt = conn.prepare(
             "SELECT source_symbol, target_symbol, edge_kind, printf('%.5f', confidence)
              FROM generation_edges
@@ -1784,6 +2552,21 @@ impl Store {
             params![MAX_PENDING_ATTEMPTS],
             |row| row.get::<_, i64>(0).map(|count| count as usize),
         )?;
+        let quarantined_paths: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT path FROM pending_paths
+                 WHERE attempts >= ?1
+                 ORDER BY queued_at ASC, path ASC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(
+                    params![MAX_PENDING_ATTEMPTS, Self::DEGRADED_SAMPLE as i64],
+                    |row| row.get(0),
+                )?
+                .collect::<Result<Vec<_>>>()?;
+            rows
+        };
         Ok(StoreStatus {
             db_path: db_path.to_string(),
             latest_generation: latest,
@@ -1791,13 +2574,29 @@ impl Store {
             node_count,
             edge_count,
             degraded_reason: if quarantined_count > 0 {
-                Some(format!(
-                    "{quarantined_count} path(s) exceeded the retry threshold"
-                ))
+                // Name the paths. See `StoreStatus::quarantined_paths`: the
+                // count alone made a permanently degraded store undiagnosable
+                // without opening the database by hand.
+                let shown = quarantined_paths.join(", ");
+                let elided = quarantined_count.saturating_sub(quarantined_paths.len());
+                Some(if elided > 0 {
+                    format!(
+                        "{quarantined_count} path(s) exceeded the retry threshold \
+                         (attempts >= {MAX_PENDING_ATTEMPTS}): {shown}, and {elided} more \
+                         — `devmap repair --pending` drops them"
+                    )
+                } else {
+                    format!(
+                        "{quarantined_count} path(s) exceeded the retry threshold \
+                         (attempts >= {MAX_PENDING_ATTEMPTS}): {shown} \
+                         — `devmap repair --pending` drops them"
+                    )
+                })
             } else {
                 None
             },
             quarantined_count,
+            quarantined_paths,
         })
     }
 
@@ -2368,6 +3167,10 @@ impl Store {
     /// backlog then drains over consecutive builds instead of stalling one.
     const INCREMENTAL_VACUUM_MAX_PAGES: i64 = 65_536;
 
+    /// How long a TRUNCATE checkpoint waits for a reader before falling back to
+    /// PASSIVE. See [`Store::checkpoint_wal`] for why it is not zero.
+    const CHECKPOINT_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
     /// Reclaim free pages, cheaply where the database allows it.
     ///
     /// **Why not a plain `VACUUM`.** `VACUUM` rebuilds the entire database into
@@ -2418,7 +3221,7 @@ impl Store {
         // as before, so this can only improve the accuracy of the answer, and
         // refusing to reclaim because bookkeeping was unavailable would be
         // worse than reclaiming on a conservative estimate.
-        let _ = self.checkpoint_wal();
+        let checkpoint_before = self.checkpoint_wal().ok();
 
         let conn = lock_conn(&self.conn)?;
         let freelist_count: i64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
@@ -2428,20 +3231,55 @@ impl Store {
                 freelist_before: freelist_count,
                 page_count_before: page_count,
                 action: VacuumAction::Declined,
+                // Nothing was reclaimed, so the checkpoint that matters is the
+                // one taken above to make the accounting current.
+                checkpoint: checkpoint_before,
+                pages_freed: 0,
             });
         }
         // 0 = NONE, 1 = FULL, 2 = INCREMENTAL. Only 2 supports the pragma.
         let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
         if auto_vacuum == 2 {
-            let pages = freelist_count.min(Self::INCREMENTAL_VACUUM_MAX_PAGES);
-            // `execute_batch`, not `execute`: this pragma yields rows, and
-            // `execute` rejects any statement that returns some
-            // (`ExecuteReturnedResults`) rather than running it.
-            conn.execute_batch(&format!("PRAGMA incremental_vacuum({pages});"))?;
+            let requested = freelist_count.min(Self::INCREMENTAL_VACUUM_MAX_PAGES);
+            // Step the pragma to exhaustion, and count what it moved.
+            //
+            // `PRAGMA incremental_vacuum(N)` is not a statement that does its
+            // work on the first step and then reports: it frees **one page per
+            // row stepped**, up to N. Neither `execute` nor `execute_batch`
+            // does that. `execute` refuses a statement that returns rows
+            // outright (`ExecuteReturnedResults`), and `execute_batch` — the
+            // workaround that was here — steps once and moves to the next
+            // statement in the batch (rusqlite 0.31 `lib.rs::execute_batch`).
+            // So the reclaim freed exactly one page per build, for as long as
+            // this code has existed, while printing the number it had asked
+            // for. Measured on the live store: 1 ms, one page, four builds in a
+            // row, 701 MB unchanged at a 67.7% freelist.
+            //
+            // A PRAGMA argument cannot be bound as a parameter; `requested` is
+            // derived from `PRAGMA freelist_count` and a compile-time constant,
+            // never from a caller.
+            let pages_freed = {
+                let mut stmt = conn.prepare(&format!("PRAGMA incremental_vacuum({requested})"))?;
+                let mut rows = stmt.query([])?;
+                let mut freed: i64 = 0;
+                while rows.next()?.is_some() {
+                    freed += 1;
+                }
+                freed
+            };
+            // Checkpoint *after* the reclaim, not only before it. The
+            // truncation the pragma just performed is a WAL frame; without this
+            // it never reaches the main file, and the store reports pages
+            // reclaimed while its size does not move. See
+            // `VacuumOutcome::checkpoint`.
+            drop(conn);
+            let checkpoint = self.checkpoint_wal().ok();
             return Ok(VacuumOutcome {
                 freelist_before: freelist_count,
                 page_count_before: page_count,
-                action: VacuumAction::Incremental { pages },
+                action: VacuumAction::Incremental { requested },
+                checkpoint,
+                pages_freed,
             });
         }
 
@@ -2454,10 +3292,16 @@ impl Store {
         // front of read commands like `devmap status`, which must stay cheap.
         conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         conn.execute("VACUUM", [])?;
+        drop(conn);
+        let checkpoint = self.checkpoint_wal().ok();
         Ok(VacuumOutcome {
             freelist_before: freelist_count,
             page_count_before: page_count,
             action: VacuumAction::FullConverting,
+            checkpoint,
+            // A full `VACUUM` rewrites the file without its free pages, so
+            // every page that was free is gone.
+            pages_freed: freelist_count,
         })
     }
 
@@ -2479,9 +3323,18 @@ impl Store {
         })?;
 
         // TRUNCATE honors busy_timeout and could otherwise monopolize the
-        // store mutex for seconds while a reader holds a snapshot. Probe
-        // without waiting, then use PASSIVE as the non-blocking fallback.
-        conn.busy_timeout(std::time::Duration::ZERO)?;
+        // store mutex for seconds while a reader holds a snapshot. Bound the
+        // wait instead of removing it, then use PASSIVE as the non-blocking
+        // fallback.
+        //
+        // K2: the bound used to be zero, which is not a short wait — it is no
+        // wait at all, and it loses to any reader that happens to hold the WAL
+        // at that instant. PASSIVE then runs, and PASSIVE *cannot truncate*, so
+        // the pages an incremental vacuum just freed stayed in a WAL that grew
+        // to 109 MB while the main file never moved. A quarter of a second is
+        // long enough to outlast a transient reader and short enough that no
+        // build notices it.
+        conn.busy_timeout(Self::CHECKPOINT_BUSY_TIMEOUT)?;
         let checkpoint = (|| {
             let (busy, log_frames, checkpointed_frames) =
                 run(&conn, "PRAGMA wal_checkpoint(TRUNCATE)")?;
@@ -2848,6 +3701,57 @@ mod connection_tests {
             .query_row("PRAGMA temp_store", [], |row| row.get(0))
             .expect("temp_store pragma");
         assert_eq!(temp_store, 2, "expected temp_store=MEMORY (2)");
+    }
+
+    /// K12: every read path fails closed on a poisoned mutex.
+    ///
+    /// `lock_conn` exists precisely so a poisoned store mutex becomes an error
+    /// the caller can report, and five readers bypassed it with
+    /// `.expect("store mutex poisoned")`. Under the release profile's
+    /// `panic = "abort"` those are not recoverable panics — they end the
+    /// process. A daemon serving IPC would vanish mid-request because one
+    /// earlier query panicked while holding the lock; the CLI would die with no
+    /// message a caller could act on.
+    ///
+    /// The lock is poisoned deliberately here rather than by provoking a real
+    /// panic: what is under test is the failure *mode* of these five readers,
+    /// not the cause of the poison.
+    #[test]
+    fn poisoned_store_mutex_is_an_error_on_every_reader() {
+        let store = Store::open_in_memory().expect("store");
+
+        // Poison the mutex: panic while holding it, catching the unwind so the
+        // test process survives. Tests build with the default unwind profile.
+        let poisoner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.conn.lock().expect("first lock");
+            panic!("deliberate poison");
+        }));
+        assert!(poisoner.is_err(), "the poisoning panic must have unwound");
+        assert!(store.conn.is_poisoned(), "the mutex must now be poisoned");
+
+        // Each of these used `.expect("store mutex poisoned")` and therefore
+        // aborted rather than returning. Naming them individually so a
+        // regression says which reader regressed.
+        assert!(
+            store.latest_unresolved(10).is_err(),
+            "latest_unresolved must fail closed on a poisoned mutex"
+        );
+        assert!(
+            store.count_unresolved_rows().is_err(),
+            "count_unresolved_rows must fail closed on a poisoned mutex"
+        );
+        assert!(
+            store.latest_file_hashes().is_err(),
+            "latest_file_hashes must fail closed on a poisoned mutex"
+        );
+        assert!(
+            store.latest_symbol_names_by_file().is_err(),
+            "latest_symbol_names_by_file must fail closed on a poisoned mutex"
+        );
+        assert!(
+            store.latest_edges_for_test().is_err(),
+            "latest_edges_for_test must fail closed on a poisoned mutex"
+        );
     }
 }
 

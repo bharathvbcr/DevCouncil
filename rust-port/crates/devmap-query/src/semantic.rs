@@ -20,6 +20,8 @@
 
 use std::collections::HashMap;
 
+use crate::cancel::{Cancel, QueryCancelled};
+
 /// Split an identifier into lowercase terms on camelCase and non-alphanumerics.
 ///
 /// `parseHTTPResponse` yields `parse`, `http`, `response`: the run of capitals
@@ -92,11 +94,22 @@ impl SemanticIndex {
     /// Build over one text per symbol. Two passes: document frequency, then
     /// weights, because IDF is a property of the corpus and cannot be known
     /// while the first document is still being read.
-    pub fn build(texts: &[String]) -> Self {
-        let tokenized: Vec<Vec<String>> = texts.iter().map(|text| tokenize(text)).collect();
+    ///
+    /// `cancel` is consulted in every pass. This is the longest loop in the
+    /// query engine — it tokenizes and vectorises the *whole* corpus, tens of
+    /// thousands of names on a real repository — so a caller that has already
+    /// been answered with a timeout must be able to stop it here rather than
+    /// pay for it to finish on a blocking-pool thread nobody is reading.
+    pub fn build(texts: &[String], cancel: &Cancel) -> Result<Self, QueryCancelled> {
+        let mut tokenized: Vec<Vec<String>> = Vec::with_capacity(texts.len());
+        for (index, text) in texts.iter().enumerate() {
+            cancel.check_every(index)?;
+            tokenized.push(tokenize(text));
+        }
 
         let mut document_frequency: HashMap<&str, u32> = HashMap::new();
-        for terms in &tokenized {
+        for (index, terms) in tokenized.iter().enumerate() {
+            cancel.check_every(index)?;
             let mut seen: Vec<&str> = terms.iter().map(String::as_str).collect();
             seen.sort_unstable();
             seen.dedup();
@@ -118,12 +131,13 @@ impl SemanticIndex {
             })
             .collect();
 
-        let documents = tokenized
-            .iter()
-            .map(|terms| Self::unit_vector(terms, &idf))
-            .collect();
+        let mut documents = Vec::with_capacity(tokenized.len());
+        for (index, terms) in tokenized.iter().enumerate() {
+            cancel.check_every(index)?;
+            documents.push(Self::unit_vector(terms, &idf));
+        }
 
-        Self { documents, idf }
+        Ok(Self { documents, idf })
     }
 
     fn unit_vector(terms: &[String], idf: &HashMap<String, f32>) -> HashMap<String, f32> {
@@ -150,26 +164,25 @@ impl SemanticIndex {
     /// zero: a symbol sharing no term with the query is not a weak match, it is
     /// not a match, and padding a ranked list with them turns "nothing matched"
     /// into a page of results.
-    pub fn score(&self, query: &str) -> Vec<(usize, f32)> {
+    pub fn score(&self, query: &str, cancel: &Cancel) -> Result<Vec<(usize, f32)>, QueryCancelled> {
         let terms = tokenize(query);
         if terms.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let query_vector = Self::unit_vector(&terms, &self.idf);
-        let mut scored: Vec<(usize, f32)> = self
-            .documents
-            .iter()
-            .enumerate()
-            .filter_map(|(index, document)| {
-                // Iterate the smaller side; a query has a handful of terms and
-                // a document rarely more.
-                let score: f32 = query_vector
-                    .iter()
-                    .filter_map(|(term, weight)| document.get(term).map(|w| w * weight))
-                    .sum();
-                (score > 0.0).then_some((index, score))
-            })
-            .collect();
+        let mut scored: Vec<(usize, f32)> = Vec::new();
+        for (index, document) in self.documents.iter().enumerate() {
+            cancel.check_every(index)?;
+            // Iterate the smaller side; a query has a handful of terms and a
+            // document rarely more.
+            let score: f32 = query_vector
+                .iter()
+                .filter_map(|(term, weight)| document.get(term).map(|w| w * weight))
+                .sum();
+            if score > 0.0 {
+                scored.push((index, score));
+            }
+        }
         // Descending score, then ascending index, so equal scores keep corpus
         // order and the ranking is identical across runs.
         scored.sort_by(|a, b| {
@@ -177,7 +190,7 @@ impl SemanticIndex {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.0.cmp(&b.0))
         });
-        scored
+        Ok(scored)
     }
 }
 
@@ -223,8 +236,10 @@ mod tests {
             "unrelatedHelper parse tokens".into(),
             "writeGraph serialize output".into(),
         ];
-        let index = SemanticIndex::build(&corpus);
-        let scored = index.score("freshness computation");
+        let index = SemanticIndex::build(&corpus, &Cancel::new()).unwrap();
+        let scored = index
+            .score("freshness computation", &Cancel::new())
+            .unwrap();
         assert!(!scored.is_empty(), "the query matched nothing");
         assert_eq!(
             scored[0].0, 0,
@@ -236,9 +251,12 @@ mod tests {
     #[test]
     fn a_query_sharing_no_term_scores_nothing() {
         let corpus: Vec<String> = vec!["alpha beta".into(), "gamma delta".into()];
-        let index = SemanticIndex::build(&corpus);
-        assert!(index.score("zebra quokka").is_empty());
-        assert!(index.score("").is_empty());
+        let index = SemanticIndex::build(&corpus, &Cancel::new()).unwrap();
+        assert!(index
+            .score("zebra quokka", &Cancel::new())
+            .unwrap()
+            .is_empty());
+        assert!(index.score("", &Cancel::new()).unwrap().is_empty());
     }
 
     /// A term in every document still contributes. Unsmoothed IDF would make
@@ -251,8 +269,8 @@ mod tests {
             "cache write".into(),
             "cache evict".into(),
         ];
-        let index = SemanticIndex::build(&corpus);
-        let scored = index.score("cache");
+        let index = SemanticIndex::build(&corpus, &Cancel::new()).unwrap();
+        let scored = index.score("cache", &Cancel::new()).unwrap();
         assert_eq!(
             scored.len(),
             3,
@@ -266,9 +284,9 @@ mod tests {
         let corpus: Vec<String> = (0..50)
             .map(|i| format!("symbol{i} cache handler"))
             .collect();
-        let index = SemanticIndex::build(&corpus);
-        let first = index.score("cache handler");
-        let second = index.score("cache handler");
+        let index = SemanticIndex::build(&corpus, &Cancel::new()).unwrap();
+        let first = index.score("cache handler", &Cancel::new()).unwrap();
+        let second = index.score("cache handler", &Cancel::new()).unwrap();
         assert_eq!(first, second);
         // Ties break on corpus order, so the sequence is total.
         let positions: Vec<usize> = first.iter().map(|(i, _)| *i).collect();
@@ -280,8 +298,8 @@ mod tests {
     #[test]
     fn scores_are_bounded_by_cosine() {
         let corpus: Vec<String> = vec!["exact match here".into(), "something else".into()];
-        let index = SemanticIndex::build(&corpus);
-        for (_, score) in index.score("exact match here") {
+        let index = SemanticIndex::build(&corpus, &Cancel::new()).unwrap();
+        for (_, score) in index.score("exact match here", &Cancel::new()).unwrap() {
             assert!(
                 (0.0..=1.0001).contains(&score),
                 "cosine similarity out of range: {score}"

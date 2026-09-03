@@ -1,4 +1,5 @@
 pub mod artifacts;
+pub mod cancel;
 pub mod code_graph;
 pub mod engine;
 pub mod escape;
@@ -14,13 +15,14 @@ pub use artifacts::{
     render_subsystem_map_html, render_symbol_explorer_html, should_regenerate, write_atomic,
     ArtifactFingerprint,
 };
+pub use cancel::{cancelled_queries, Cancel, QueryCancelled};
 pub use code_graph::{
     generate_code_graph_json, write_code_graph_atomically, CODE_GRAPH_DEFAULT_OUTPUT,
     CODE_GRAPH_SCHEMA_VERSION,
 };
 pub use engine::{
     budget_take, clone_group_tokens, link_candidates, parse_clone_kind, resolved_edge_from_stored,
-    workspace_search, QueryEngine, StoreQueryEngine, BYTES_PER_TOKEN,
+    workspace_search, PathOutsideRepoRoot, QueryEngine, StoreQueryEngine, BYTES_PER_TOKEN,
     PREVIEW_CALLER_MIN_CONFIDENCE,
 };
 pub use escape::{html_escape, render_symbol_label};

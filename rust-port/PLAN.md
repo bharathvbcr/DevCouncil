@@ -174,6 +174,15 @@ above is drawn from it.
 
 ## 3. Findings as specification
 
+> **2026-09-02, second pass.** Thirty-one further defects were found and fixed
+> against the *shipped* kernel and its Python seam — `K1`(a–h), `K2`, `K3`,
+> `K4`, `K5`, `K6`, `K7`, `K12`, `K13` in the store/build/drain, `S1`–`S10` in
+> serve/query, and nine in the seam. They are recorded, with the failing-first
+> test for each and the live before/after numbers, in the root
+> `IMPROVEMENTS.md` → "Dev Map kernel audit, second pass (2026-09-02)" and
+> summarised in `STATUS.md` → "Kernel audit, second pass". This section keeps
+> the original 47 findings and `K1`–`K8` / `G1`–`G8`; it is not restated there.
+
 32 findings plus 7 reference-derived enhancements — 39 items. Each is a property the rewrite must hold,
 with the acceptance test that proves it.
 

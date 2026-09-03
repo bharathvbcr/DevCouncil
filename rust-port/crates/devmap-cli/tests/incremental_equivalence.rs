@@ -24,7 +24,8 @@ fn build(root: &std::path::Path) {
 
 /// Every edge in the committed generation, as a comparable set.
 fn graph(root: &std::path::Path) -> Vec<String> {
-    let store = devmap_store::Store::open(root.join(".devcouncil/codeintel/index.sqlite")).unwrap();
+    let store =
+        devmap_store::Store::open(root.join(".devcouncil/codeintel/devmap.sqlite")).unwrap();
     let mut rows = store.latest_edges_for_test().unwrap();
     rows.sort();
     rows
@@ -37,7 +38,8 @@ fn graph(root: &std::path::Path) -> Vec<String> {
 /// whole test guards against is a part of the generation nobody thought to
 /// compare.
 fn analysis(root: &std::path::Path) -> String {
-    let store = devmap_store::Store::open(root.join(".devcouncil/codeintel/index.sqlite")).unwrap();
+    let store =
+        devmap_store::Store::open(root.join(".devcouncil/codeintel/devmap.sqlite")).unwrap();
     let summary = store
         .latest_analysis()
         .unwrap()
@@ -50,7 +52,8 @@ fn analysis(root: &std::path::Path) -> String {
 /// A separate table from the analysis JSON above, and the one a consumer
 /// actually reads, so it is compared separately rather than assumed to agree.
 fn dead(root: &std::path::Path) -> Vec<String> {
-    let store = devmap_store::Store::open(root.join(".devcouncil/codeintel/index.sqlite")).unwrap();
+    let store =
+        devmap_store::Store::open(root.join(".devcouncil/codeintel/devmap.sqlite")).unwrap();
     let mut rows: Vec<String> = store
         .latest_dead_symbols()
         .unwrap()
@@ -227,7 +230,7 @@ fn write_fixture(src: &std::path::Path, modules: usize) {
 }
 
 fn db_path(root: &std::path::Path) -> std::path::PathBuf {
-    root.join(".devcouncil/codeintel/index.sqlite")
+    root.join(".devcouncil/codeintel/devmap.sqlite")
 }
 
 /// Rewrite the stored payload identity of the latest generation, which is what

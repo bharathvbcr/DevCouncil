@@ -93,17 +93,50 @@ impl Workspace {
         Ok(workspace)
     }
 
+    /// Write the registry through the workspace's one atomic writer.
+    ///
+    /// This built its own temp path — `workspace.json.tmp`, shared by every
+    /// concurrent writer — which is the exact collision
+    /// [`crate::write_atomic`] exists to prevent: the first `rename` moves the
+    /// shared temp away and the second fails with ENOENT. It also skipped
+    /// `sync_all`, so a crash between the rename and the flush could leave the
+    /// registry's *name* pointing at unwritten bytes. `write_atomic` gives a
+    /// per-writer temp name, an fsync before the rename, and cleanup of the
+    /// temp on any failure.
+    ///
+    /// Callers mutating the registry must go through [`Self::update`], which
+    /// serialises the read and the write; this on its own is atomic per write,
+    /// not per read-modify-write.
     pub fn save(&self, root: &Path) -> anyhow::Result<PathBuf> {
         let path = root.join(WORKSPACE_RELPATH);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // tmp+rename, so a killed write leaves the previous registry rather
-        // than a truncated one.
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
-        std::fs::rename(&tmp, &path)?;
+        let body = serde_json::to_string_pretty(self)?;
+        crate::write_atomic(&path, body.as_bytes())?;
         Ok(path)
+    }
+
+    /// Read-modify-write the registry rooted at `root`, under an exclusive
+    /// advisory lock.
+    ///
+    /// `devmap workspace add` loaded the registry, mutated it and saved it with
+    /// nothing serialising the three steps, so two concurrent registrations
+    /// each read the same registry and each wrote their own entry over the
+    /// other's — a silent lost update, on a file whose whole job is to say
+    /// which repositories exist. An atomic *write* cannot fix that; only
+    /// holding a lock across the read and the write can.
+    ///
+    /// The lock is an `flock` on a sibling file, the mechanism
+    /// `protocol.rs::lock_ipc_endpoint` already uses for the IPC endpoint: the
+    /// kernel releases it if the holder dies, so there is no stale lock to
+    /// clean up, and it works across processes as well as threads.
+    pub fn update<T>(
+        root: &Path,
+        mutate: impl FnOnce(&mut Self) -> T,
+    ) -> anyhow::Result<(T, PathBuf)> {
+        let _guard = RegistryLock::acquire(root)?;
+        let mut workspace = Self::load(root)?;
+        let outcome = mutate(&mut workspace);
+        let written = workspace.save(root)?;
+        Ok((outcome, written))
     }
 
     /// Register a repository. Replaces any entry with the same name.
@@ -127,6 +160,65 @@ impl Workspace {
         self.repos.retain(|repo| repo.name != name);
         self.repos.len() != before
     }
+}
+
+/// Longest a writer waits for the registry lock before giving up.
+///
+/// Bounded rather than a blocking `flock`: every holder of this lock does one
+/// small read and one small write, so waiting seconds already means something
+/// is wrong, and a writer that hangs forever on a wedged holder is a worse
+/// failure than one that says so.
+const REGISTRY_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often the lock is retried while waiting.
+const REGISTRY_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// An exclusive advisory lock over one workspace registry, held for as long as
+/// the value lives. The kernel drops the `flock` when the file closes, which
+/// includes the holder dying, so no stale-lock cleanup is ever needed.
+struct RegistryLock {
+    /// Never read: the lock lives exactly as long as this file handle, and is
+    /// released by closing it. Named like `UnixIpcServer::_lock` for the same
+    /// reason.
+    _lock: std::fs::File,
+}
+
+impl RegistryLock {
+    fn acquire(root: &Path) -> anyhow::Result<Self> {
+        let path = registry_lock_path(root);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|error| {
+                anyhow::anyhow!("cannot open workspace lock {}: {error}", path.display())
+            })?;
+
+        let deadline = std::time::Instant::now() + REGISTRY_LOCK_TIMEOUT;
+        loop {
+            if file.try_lock().is_ok() {
+                return Ok(Self { _lock: file });
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "workspace registry lock {} was held by another writer for \
+                     longer than {REGISTRY_LOCK_TIMEOUT:?}",
+                    path.display()
+                );
+            }
+            std::thread::sleep(REGISTRY_LOCK_POLL);
+        }
+    }
+}
+
+/// Where the registry's advisory lock lives: beside the registry itself, so a
+/// workspace rooted anywhere carries its own.
+fn registry_lock_path(root: &Path) -> PathBuf {
+    root.join(format!("{WORKSPACE_RELPATH}.lock"))
 }
 
 /// Derive a workspace name from a repository path.

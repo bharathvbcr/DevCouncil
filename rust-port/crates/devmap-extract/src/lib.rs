@@ -41,6 +41,103 @@ pub struct FileRef<'a> {
 
 pub const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
 
+/// Marker file of the Cache Directory Tagging Standard.
+pub const CACHEDIR_TAG_FILE: &str = "CACHEDIR.TAG";
+
+/// The standard's mandatory first 43 bytes.
+///
+/// A directory is a cache directory if and only if it holds a `CACHEDIR.TAG`
+/// whose content *begins* with exactly this. The signature is checked rather
+/// than the filename alone so a source file that happens to be called
+/// `CACHEDIR.TAG` cannot silently delete a subtree from the index.
+pub const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
+/// Whether `dir` is tagged as a cache directory.
+///
+/// K7: the ignore rules matched a fixed list of directory *names* — `target`,
+/// `node_modules`, `dist`, `build` — so a cargo output directory named anything
+/// else was walked as source. Measured in generation 779 of this repository's
+/// store: 1,041 of 2,363 indexed files were `.fingerprint/*.json` and
+/// `.rustc_info.json` under `rust-port/target-serve` and `target-store`, and
+/// the daemon had queued 47,000 pending rows from them. Neither was gitignored;
+/// neither was named `target`.
+///
+/// Both carried a `CACHEDIR.TAG`. That is the point of the standard: the tool
+/// that created the cache says so, so nothing downstream has to guess a name.
+/// cargo, pip, uv, ccache, tox, ruff and pytest all write one.
+///
+/// A directory this returns true for is skipped whole — not walked, not
+/// indexed, not queued. That is safe because the tag is an explicit,
+/// machine-written declaration by the tool that owns the directory, and it is
+/// checked by signature rather than by filename.
+///
+/// This is **not** a replacement for [`is_ignored_path`]: many caches carry no
+/// tag (this workspace's own long-lived `target/` has none), so the two are
+/// complementary. Absence of a tag says nothing.
+pub fn is_cache_directory(dir: &Path) -> bool {
+    use std::io::Read;
+
+    let Ok(mut file) = fs::File::open(dir.join(CACHEDIR_TAG_FILE)) else {
+        return false;
+    };
+    let mut head = vec![0u8; CACHEDIR_TAG_SIGNATURE.len()];
+    // `read_exact`: a file shorter than the signature cannot carry it, and the
+    // error path is the same "not a cache directory" answer.
+    if file.read_exact(&mut head).is_err() {
+        return false;
+    }
+    head == CACHEDIR_TAG_SIGNATURE
+}
+
+/// Memoised ancestor lookup for [`is_cache_directory`].
+///
+/// One `open` per directory rather than per path. Reconciling the pending queue
+/// asks this of every row — 51,136 of them on the live store — and a repository
+/// is a few thousand directories deep in total, so the memo turns
+/// O(rows x depth) syscalls into O(distinct directories).
+#[derive(Debug, Default)]
+pub struct CacheDirectoryCache {
+    verdict: std::collections::HashMap<String, bool>,
+}
+
+impl CacheDirectoryCache {
+    /// The repo-relative tagged cache directory containing `relative`, if any.
+    ///
+    /// `relative` itself is checked too, so passing a directory answers for the
+    /// directory. The repository root is deliberately **not** checked: a user
+    /// who points `devmap build` at a tagged directory has asked for it, and
+    /// refusing the whole tree would be a worse answer than indexing it.
+    pub fn tagged_ancestor(&mut self, root: &Path, relative: &str) -> Option<String> {
+        let mut prefix = String::new();
+        for part in relative.split('/') {
+            if part.is_empty() || part == "." {
+                continue;
+            }
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            let tagged = match self.verdict.get(&prefix) {
+                Some(known) => *known,
+                None => {
+                    let known = is_cache_directory(&root.join(&prefix));
+                    self.verdict.insert(prefix.clone(), known);
+                    known
+                }
+            };
+            if tagged {
+                return Some(prefix);
+            }
+        }
+        None
+    }
+}
+
+/// One-shot [`CacheDirectoryCache::tagged_ancestor`] for a single question.
+pub fn cache_directory_for(root: &Path, relative: &str) -> Option<String> {
+    CacheDirectoryCache::default().tagged_ancestor(root, relative)
+}
+
 /// Canonical source-content identity shared by extraction, cache, and
 /// connect-time freshness checks.
 pub fn content_hash(source: &str) -> u64 {
@@ -222,9 +319,46 @@ pub fn collect_sources_with_report(
 ) -> anyhow::Result<(Vec<(String, String)>, DiscoveryReport)> {
     let mut out = Vec::new();
     let mut report = DiscoveryReport::default();
+
+    // K7: prune tagged cache directories at the directory, not per file.
+    //
+    // `filter_entry` returning false for a directory stops the walk descending
+    // into it, so a cargo output tree costs one `open` instead of a stat and an
+    // extension test for each of its tens of thousands of files. Doing it here
+    // rather than in `is_indexable_source` is deliberate: that predicate is a
+    // pure function of a path string, and this question can only be answered by
+    // reading the filesystem.
+    //
+    // The pruned directories are recorded so the report can say what was
+    // skipped wholesale. `Arc<Mutex<_>>` because `filter_entry` takes a
+    // `Fn + Send + Sync + 'static`, and this is the honest way to get an answer
+    // back out of it.
+    let pruned: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let walk_root = root.to_path_buf();
+    let pruned_writer = std::sync::Arc::clone(&pruned);
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(true)
+        .filter_entry(move |entry| {
+            if !entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                return true;
+            }
+            // Never prune the root the caller asked for: pointing devmap at a
+            // tagged directory is a request, not an accident.
+            if entry.path() == walk_root {
+                return true;
+            }
+            if !is_cache_directory(entry.path()) {
+                return true;
+            }
+            if let Ok(relative) = entry.path().strip_prefix(&walk_root) {
+                if let Ok(mut pruned) = pruned_writer.lock() {
+                    pruned.insert(relative.to_string_lossy().replace('\\', "/"));
+                }
+            }
+            false
+        })
         .build();
 
     for result in walker {
@@ -285,6 +419,18 @@ pub fn collect_sources_with_report(
             )),
         }
     }
+    // Record each pruned cache directory once, as `NonSource`: a build cache is
+    // the ordinary case, like a README beside the code, not a gap in coverage.
+    // Recording it at all is what keeps the report honest about the subtree it
+    // did not walk.
+    if let Ok(pruned) = pruned.lock() {
+        for directory in pruned.iter() {
+            report
+                .skipped_paths
+                .push((directory.clone(), DiscoverySkipReason::NonSource));
+        }
+    }
+
     out.sort_by(|a, b| a.0.cmp(&b.0));
     report.yielded_paths.sort();
     report

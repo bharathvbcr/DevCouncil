@@ -21,6 +21,37 @@ use devmap_store::{
     GENERATION_RETENTION,
 };
 
+/// One line describing what a reclaim decided, did, and whether it landed.
+///
+/// K2: the reclaim note used to report the decision and the page accounting and
+/// stop there, while `vacuum_if_needed` discarded its checkpoint result with
+/// `let _ =`. In WAL mode that checkpoint is what moves a truncation from the
+/// log into the file, so "reclaimed 50,000 pages" and "reclaimed 50,000 pages
+/// and the file is exactly as large as it was" printed identically — which is
+/// how a store sat at 295 MB across eight builds that each reported success.
+fn reclaim_note(vacuum: &devmap_store::VacuumOutcome) -> String {
+    let base = format!(
+        "{} freed {} page(s) at {:.1}% free ({} of {} pages)",
+        vacuum.action,
+        vacuum.pages_freed,
+        vacuum.freelist_ratio() * 100.0,
+        vacuum.freelist_before,
+        vacuum.page_count_before,
+    );
+    match vacuum.checkpoint {
+        None => format!("{base}; WAL checkpoint could not be run — freed pages stay in the log"),
+        Some(checkpoint) if checkpoint.busy != 0 => format!(
+            "{base}; WAL checkpoint busy after the {:?} fallback ({} of {} frames) — \
+             a reader is pinning the log, so the file has not shrunk yet",
+            checkpoint.mode, checkpoint.checkpointed_frames, checkpoint.log_frames
+        ),
+        Some(checkpoint) => format!(
+            "{base}; WAL {:?} checkpoint folded {} of {} frames back",
+            checkpoint.mode, checkpoint.checkpointed_frames, checkpoint.log_frames
+        ),
+    }
+}
+
 /// `Some(value)` for a non-blank flag, `None` otherwise.
 ///
 /// A flag passed as the empty string is a caller whose own computation failed,
@@ -34,15 +65,45 @@ fn non_empty(value: &Option<String>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// `devmap 0.1.0 (schema 12)` — package identity plus store compatibility.
+///
+/// K3: every build of this workspace reports `devmap 0.1.0`, so the package
+/// version alone cannot tell a caller whether the binary in hand can open the
+/// store in hand. The schema number is the part that answers that, and the only
+/// other way to read it is to open a store — which is exactly what a caller
+/// checking compatibility has not yet established it may do.
+/// Built once into a process-lifetime `OnceLock` rather than formatted per
+/// call: clap's `version` takes a `&'static str`, and the schema number is only
+/// known at runtime because it lives in another crate's constant.
+fn version_line() -> &'static str {
+    static LINE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LINE.get_or_init(|| {
+        format!(
+            "{} (schema {})",
+            env!("CARGO_PKG_VERSION"),
+            devmap_store::CURRENT_SCHEMA_VERSION
+        )
+    })
+    .as_str()
+}
+
 #[derive(Parser)]
 #[command(
     name = "devmap",
     author,
-    version,
+    version = version_line(),
     about = "DevCouncil code-intelligence system (Rust kernel)"
 )]
 struct Cli {
-    #[arg(short, long, default_value = ".devcouncil/codeintel/index.sqlite")]
+    /// Store this kernel reads and writes.
+    ///
+    /// `devmap.sqlite`, not `index.sqlite`. The latter is the *Python* engine's
+    /// store — `user_version = 2`, a schema this binary has no migration for —
+    /// so the old default aimed every un-flagged invocation at a database that
+    /// could only be refused, while the Python seam
+    /// (`devmap_engine.DEFAULT_DB_RELPATH`) had already moved here. Keep the two
+    /// in step: this string and that constant name the same file.
+    #[arg(short, long, default_value = ".devcouncil/codeintel/devmap.sqlite")]
     db: PathBuf,
 
     #[arg(long, default_value_t = false)]
@@ -287,6 +348,17 @@ enum Commands {
         affected: Option<String>,
         #[arg(long)]
         deleted: Option<String>,
+        /// Force a cold rebuild: ignore the unchanged early-return, re-parse
+        /// every source instead of reading the extraction cache, and write a
+        /// full generation.
+        ///
+        /// K4: the Python CLI has exposed `dev map --full` all along, but the
+        /// kernel had no way to honour it — the unchanged check and the cache
+        /// both applied unconditionally, so the only recovery from a store an
+        /// operator distrusted was to delete the database. `--affected` cannot
+        /// stand in: it narrows the write, it does not widen the read.
+        #[arg(long)]
+        full: bool,
     },
     Search {
         query: String,
@@ -434,6 +506,16 @@ enum Commands {
     Repair {
         #[arg(long)]
         fts: bool,
+        /// Drop pending-queue rows that no drain can ever process: quarantined
+        /// rows, paths outside the repository, directories and files that are
+        /// gone, oversized sources, and non-source files.
+        ///
+        /// K1(f): the queue had no operator-facing repair at all. A store whose
+        /// checkout had moved carried 64 rows naming the old location, every
+        /// one of them quarantined, and the only way out was to open the
+        /// database by hand or delete it.
+        #[arg(long)]
+        pending: bool,
     },
     Snapshots {
         #[arg(default_value = "")]
@@ -452,6 +534,16 @@ enum Commands {
         path: PathBuf,
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Print the IPC endpoint this repository would be served on and exit,
+        /// without starting a daemon, opening a store, or creating any file.
+        ///
+        /// Exists so a second implementation of the socket-path formula can be
+        /// checked against this one. The Python client derives the same path
+        /// without spawning anything, and when the two disagree each side
+        /// starts its own daemon against one store — a divergence that is
+        /// invisible from either side.
+        #[arg(long)]
+        print_socket_path: bool,
     },
 }
 
@@ -850,6 +942,7 @@ async fn main() -> anyhow::Result<()> {
             path,
             affected: affected_flag,
             deleted,
+            full,
         } => {
             let progress = ProgressReporter::new(cli.progress, cli.json);
             let build_started = std::time::Instant::now();
@@ -858,8 +951,92 @@ async fn main() -> anyhow::Result<()> {
                 format_args!("scanning and extracting {}", path.display()),
             );
             ensure_parent(&cli.db)?;
+            // K13: take the cross-process writer lock *before* extraction.
+            //
+            // There was no such lock, so two builds — or a build and the
+            // daemon's drain — raced on SQLite's five-second `busy_timeout`
+            // alone and the loser surfaced `database is locked` only at the
+            // persist, having already paid for the whole extract and resolve.
+            // Taking it first means the loser waits for the winner and then
+            // does useful work, or fails immediately with a message naming the
+            // pid that holds the store.
+            let _writer = Store::lock_writer_at(&cli.db, Store::WRITER_LOCK_WAIT)?;
             let store = Store::open(&cli.db)?;
-            let (extractions, discovery) = extract_tree_cached_with_report(&store, path)?;
+            // K1(e2): stamped before discovery, on the queue's own wall clock.
+            //
+            // A build that walks the whole tree answers every request queued at
+            // or before this instant, whatever that request named — which is
+            // the only rule that retires a row naming a *directory*. Taken
+            // before the walk, never after: an event that arrives while this
+            // build is extracting may describe an edit it did not see, and that
+            // row has to survive.
+            let build_start = Store::queue_clock_now();
+
+            // K7: refuse an `--affected` path inside a tagged build cache.
+            //
+            // Discovery no longer walks these directories, so such a path can
+            // only mean the caller computed the wrong change set — a watcher or
+            // hook that saw cargo write into its own output tree. Failing loud
+            // is the point: silently narrowing to nothing, or silently indexing
+            // a `.fingerprint/*.json`, is how 1,041 of 2,363 indexed files came
+            // to be build artifacts.
+            let mut caches = devmap_extract::CacheDirectoryCache::default();
+            for candidate in split_csv(affected_flag) {
+                if let Some(cache) = caches.tagged_ancestor(path, &candidate) {
+                    anyhow::bail!(
+                        "--affected names {candidate}, which is inside {cache} — a build \
+                         cache marked with CACHEDIR.TAG. devmap does not index build \
+                         caches; drop it from the change set."
+                    );
+                }
+            }
+
+            // K1(e): drop pending rows no drain could ever process, before
+            // deciding anything else. A queue full of paths under a previous
+            // location of the repository, directories, and files over the size
+            // ceiling held `devmap status` at `is_fresh=false` permanently —
+            // and the build, which is the one command that could know better,
+            // did not touch the queue at all. This runs on every build
+            // including the unchanged early return below, because a store whose
+            // sources have not moved is exactly where a stale queue hides.
+            let reconciled = store.reconcile_pending_paths(path)?;
+            if !reconciled.dropped.is_empty() {
+                eprintln!(
+                    "  pending queue: dropped {} unprocessable row(s):",
+                    reconciled.dropped.len()
+                );
+                for (dropped, reason) in reconciled.dropped.iter().take(20) {
+                    eprintln!("    {dropped}: {reason}");
+                }
+                if reconciled.dropped.len() > 20 {
+                    eprintln!("    … and {} more", reconciled.dropped.len() - 20);
+                }
+            }
+            if !reconciled.rewritten.is_empty() {
+                eprintln!(
+                    "  pending queue: normalized {} row(s) to repo-relative paths",
+                    reconciled.rewritten.len()
+                );
+            }
+
+            // K4: `--full` re-parses rather than consulting the extraction
+            // cache. Reading the cache would defeat the point — a cache hit
+            // returns the payload this build is trying to reproduce from
+            // source, so a "full" rebuild that used it would recommit exactly
+            // the rows the operator is asking to replace.
+            let (extractions, discovery) = if *full {
+                let (sources, report) = devmap_extract::collect_sources_with_report(path)?;
+                let refs: Vec<devmap_extract::FileRef<'_>> = sources
+                    .iter()
+                    .map(|(file, source)| devmap_extract::FileRef {
+                        path: file.as_str(),
+                        source: source.as_str(),
+                    })
+                    .collect();
+                (devmap_extract::extract_all(&refs), report)
+            } else {
+                extract_tree_cached_with_report(&store, path)?
+            };
             // Report what discovery refused. A file dropped for being oversized
             // or unreadable used to vanish with no record: `repo_map.json` would
             // say five files while two more existed, and nothing distinguished
@@ -907,7 +1084,8 @@ async fn main() -> anyhow::Result<()> {
             // "No source changes; generation #412 still current (1,152 files)"
             // while every row in it came from `extract-v23`.
             let previous = store.latest_file_hashes()?;
-            if !previous.is_empty()
+            if !*full
+                && !previous.is_empty()
                 && previous.len() == extractions.len()
                 && store.latest_generation_payload_is_current()?
             {
@@ -919,11 +1097,44 @@ async fn main() -> anyhow::Result<()> {
                 if unchanged {
                     progress.stage(2, format_args!("{} files unchanged", extractions.len()));
                     let generation = store.latest_generation_id()?.unwrap_or(0);
+                    // K2: reclaim runs on the warm path too.
+                    //
+                    // This return used to jump past prune and vacuum entirely,
+                    // so a store that had accumulated a large freelist stayed
+                    // that way through every no-change build — and a no-change
+                    // build is the common case for a watcher-driven repository.
+                    // `vacuum_if_needed` declines below the threshold on its
+                    // own, so the warm path pays nothing when there is nothing
+                    // to reclaim. Generations are *not* pruned here: no
+                    // generation was written, so there is nothing new to prune,
+                    // and pruning on a read-shaped path would delete history a
+                    // caller did not ask to lose.
+                    let vacuum = progress.timed("persist:vacuum", || store.vacuum_if_needed())?;
+                    progress.note(format_args!("reclaim: {}", reclaim_note(&vacuum)));
+                    // K1(e2): the unchanged check compared *every* file in the
+                    // tree against the stored generation and found them equal.
+                    // That is the same proof a fresh whole-tree build gives —
+                    // the graph on disk already describes this tree — so the
+                    // requests queued before this build started are answered,
+                    // even though no new generation was written. Without this a
+                    // repository that is already current keeps a stale queue,
+                    // and `status` reports NOT FRESH indefinitely.
+                    let retired = store.clear_pending_superseded(
+                        devmap_store::PendingSupersede::WholeTreeBuiltAt(build_start),
+                    )?;
+                    if !retired.is_empty() {
+                        progress.note(format_args!(
+                            "pending queue: retired {} row(s) the current generation \
+                             already answers",
+                            retired.len()
+                        ));
+                    }
                     if cli.json {
                         println!(
-                            "{{\"unchanged\":true,\"files\":{},\"generation\":{}}}",
+                            "{{\"unchanged\":true,\"files\":{},\"generation\":{},\"reclaim\":{}}}",
                             extractions.len(),
-                            generation
+                            generation,
+                            serde_json::to_string(&reclaim_note(&vacuum))?
                         );
                     } else {
                         println!(
@@ -931,6 +1142,7 @@ async fn main() -> anyhow::Result<()> {
                             generation,
                             extractions.len()
                         );
+                        println!("  Reclaim: {}", reclaim_note(&vacuum));
                     }
                     return Ok(());
                 }
@@ -969,7 +1181,14 @@ async fn main() -> anyhow::Result<()> {
             // That is the price of an analysis that means the same thing on
             // both paths, and the no-change tick B3 was written for still
             // returns above without reaching here.
-            let affected = affected_closure(&store, &extractions)?;
+            // K4: `--full` writes a full generation. An empty affected set *is*
+            // the full-rewrite signal to the store, so the closure — whose only
+            // job is to narrow the write — is not computed at all.
+            let affected = if *full {
+                None
+            } else {
+                affected_closure(&store, &extractions)?
+            };
 
             let mut resolver = Resolver::new();
             resolver.index_go_modules(&collect_go_modules(path)?);
@@ -984,6 +1203,10 @@ async fn main() -> anyhow::Result<()> {
 
             let opts = GenerationWriteOpts {
                 affected_paths: match (&affected, split_csv(affected_flag)) {
+                    // `--full` overrides both: an empty list is the
+                    // full-rewrite signal and must not be narrowed by a stale
+                    // `--affected` from the caller.
+                    _ if *full => Vec::new(),
                     // An explicit --affected list wins; otherwise use the
                     // computed closure. Empty means a full rewrite.
                     (_, explicit) if !explicit.is_empty() => explicit,
@@ -1047,18 +1270,36 @@ async fn main() -> anyhow::Result<()> {
             progress.timed("persist:prune_extractions", || {
                 store.prune_extraction_cache()
             })?;
+
+            // K1(e): the generation is committed, so the queued requests to
+            // re-read the files it covers are answered. Leaving them queued made
+            // `devmap status` report the store as stale immediately after a
+            // successful build, and made the next drain resolve the whole
+            // repository again to reproduce rows that already existed.
+            // A build narrowed by an explicit `--affected` list read only what
+            // it was told to; it cannot claim to have answered anything else.
+            let indexed: Vec<String> = extractions
+                .iter()
+                .map(|extraction| extraction.file_path.clone())
+                .collect();
+            let narrowed = !*full && !split_csv(affected_flag).is_empty();
+            let retired = store.clear_pending_superseded(if narrowed {
+                devmap_store::PendingSupersede::IndexedPaths(&indexed)
+            } else {
+                devmap_store::PendingSupersede::WholeTreeBuiltAt(build_start)
+            })?;
+            if !retired.is_empty() {
+                progress.note(format_args!(
+                    "pending queue: retired {} row(s) this generation supersedes",
+                    retired.len()
+                ));
+            }
             let vacuum = progress.timed("persist:vacuum", || store.vacuum_if_needed())?;
             // Report what the reclaim decided, not just how long it took. A
             // decline and a reclaim-that-reclaimed-nothing both take ~0 ms and
             // leave the same file behind, so the duration alone cannot tell a
             // healthy store from one growing without bound.
-            progress.note(format_args!(
-                "reclaim: {} at {:.1}% free ({} of {} pages)",
-                vacuum.action,
-                vacuum.freelist_ratio() * 100.0,
-                vacuum.freelist_before,
-                vacuum.page_count_before,
-            ));
+            progress.note(format_args!("reclaim: {}", reclaim_note(&vacuum)));
 
             progress.complete(gen_id);
 
@@ -1232,7 +1473,11 @@ async fn main() -> anyhow::Result<()> {
                 .and_then(|dir| dir.parent())
                 .map(|dir| dir.to_path_buf())
                 .unwrap_or_else(|| PathBuf::from("."));
-            let mut workspace = devmap_query::workspace::Workspace::load(&root)?;
+            // Mutating actions go through `Workspace::update`, which holds an
+            // advisory lock across the read and the write. Loading here and
+            // saving later — which is what this did — let two concurrent
+            // registrations each read the same registry and write their own
+            // entry over the other's.
             match action {
                 WorkspaceAction::Add { path, name } => {
                     let canonical = path.canonicalize().map_err(|error| {
@@ -1241,8 +1486,10 @@ async fn main() -> anyhow::Result<()> {
                     let label = name
                         .clone()
                         .unwrap_or_else(|| devmap_query::workspace::name_for(&canonical));
-                    workspace.add(label.clone(), canonical.clone());
-                    let written = workspace.save(&root)?;
+                    let (_, written) =
+                        devmap_query::workspace::Workspace::update(&root, |workspace| {
+                            workspace.add(label.clone(), canonical.clone());
+                        })?;
                     if cli.json {
                         emit_json(
                             &cli,
@@ -1263,10 +1510,16 @@ async fn main() -> anyhow::Result<()> {
                 WorkspaceAction::Remove { name } => {
                     // Distinguished from success: a caller retrying a removal
                     // should learn the name was never registered.
-                    let removed = workspace.remove(name);
-                    if removed {
-                        workspace.save(&root)?;
-                    }
+                    //
+                    // The registry is rewritten unconditionally rather than
+                    // only when something was removed: the write is a rename of
+                    // identical bytes when nothing changed, and skipping it
+                    // would mean the "nothing to do" path took a different
+                    // route through the lock than the mutating one.
+                    let (removed, _) =
+                        devmap_query::workspace::Workspace::update(&root, |workspace| {
+                            workspace.remove(name)
+                        })?;
                     if cli.json {
                         emit_json(&cli, &serde_json::json!({"removed": removed, "name": name}))?;
                     } else if removed {
@@ -1276,6 +1529,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 WorkspaceAction::List => {
+                    let workspace = devmap_query::workspace::Workspace::load(&root)?;
                     if cli.json {
                         let repos: Vec<serde_json::Value> = workspace
                             .repos
@@ -1339,6 +1593,7 @@ async fn main() -> anyhow::Result<()> {
                     budget,
                     semantic,
                 } => {
+                    let workspace = devmap_query::workspace::Workspace::load(&root)?;
                     let result =
                         devmap_query::workspace_search(&workspace, query, *budget, *semantic)?;
                     if cli.json {
@@ -1365,6 +1620,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 WorkspaceAction::Links => {
+                    let workspace = devmap_query::workspace::Workspace::load(&root)?;
                     let links = devmap_query::link_candidates(&workspace)?;
                     if cli.json {
                         // An object, not a bare array: the count and the set of
@@ -1531,7 +1787,15 @@ async fn main() -> anyhow::Result<()> {
             // Answers even with no store, but never creates one. The client
             // treats a missing store as "not built yet"; creating it here made
             // that a race (see `Store::open_existing`).
-            let Some(store) = Store::open_existing(&cli.db)? else {
+            //
+            // K3: the schema is probed *before* the store is opened, because
+            // `Store::open` runs the migration chain under an exclusive
+            // transaction from every open. This command used to rewrite the
+            // schema of a store it was only asked to describe, silently, on the
+            // one command a health check runs against a store it does not own.
+            // Migrating is `build`'s job, where the caller asked for a write.
+            let stored_schema = Store::stored_schema_version(&cli.db)?;
+            let Some(stored_schema) = stored_schema else {
                 let payload = serde_json::json!({
                     "generation_id": serde_json::Value::Null,
                     "pending_count": 0,
@@ -1541,9 +1805,42 @@ async fn main() -> anyhow::Result<()> {
                     "db_path": cli.db.display().to_string(),
                     "degraded_reason": "no devmap store at this path (run `devmap build`)",
                     "quarantined_count": 0,
+                    "quarantined_paths": Vec::<String>::new(),
+                    "schema_outdated": false,
+                    "schema_version": serde_json::Value::Null,
+                    "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
                 });
                 println!("{}", serde_json::to_string_pretty(&payload)?);
                 return Ok(());
+            };
+            if stored_schema != devmap_store::CURRENT_SCHEMA_VERSION {
+                let version = stored_schema;
+                let payload = serde_json::json!({
+                    "generation_id": serde_json::Value::Null,
+                    "pending_count": 0,
+                    "node_count": 0,
+                    "edge_count": 0,
+                    "is_fresh": false,
+                    "db_path": cli.db.display().to_string(),
+                    "degraded_reason": format!(
+                        "store schema is {version}, this binary speaks {}; \
+                         run `devmap build` to migrate it",
+                        devmap_store::CURRENT_SCHEMA_VERSION
+                    ),
+                    "quarantined_count": 0,
+                    "quarantined_paths": Vec::<String>::new(),
+                    "schema_outdated": true,
+                    "schema_version": version,
+                    "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
+                });
+                emit_json(&cli, &payload)?;
+                return Ok(());
+            }
+            let Some(store) = Store::open_existing(&cli.db)? else {
+                anyhow::bail!(
+                    "the devmap store at {} vanished between the schema probe and the read",
+                    cli.db.display()
+                );
             };
             let status = store.status(&cli.db.display().to_string())?;
             let payload = serde_json::json!({
@@ -1555,6 +1852,13 @@ async fn main() -> anyhow::Result<()> {
                 "db_path": status.db_path,
                 "degraded_reason": status.degraded_reason,
                 "quarantined_count": status.quarantined_count,
+                // K1(g): naming the stuck paths is what makes a degraded
+                // status actionable — "64 path(s) exceeded the retry
+                // threshold" told an operator nothing about which 64.
+                "quarantined_paths": status.quarantined_paths,
+                "schema_outdated": false,
+                "schema_version": stored_schema,
+                "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
             });
             emit_json(&cli, &payload)?;
         }
@@ -1635,15 +1939,81 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Repair { fts } => {
+        Commands::Repair { fts, pending } => {
             let store = open_for_read(&cli.db)?;
+            if !*fts && !*pending {
+                anyhow::bail!("specify a repair target, e.g. --fts or --pending");
+            }
             if *fts {
                 store.repair_fts()?;
                 if !cli.json {
                     println!("FTS search index repaired.");
                 }
-            } else {
-                anyhow::bail!("specify a repair target, e.g. --fts");
+            }
+            if *pending {
+                // K1(f): report what was dropped, per row, with the reason.
+                // A repair that says "done" is indistinguishable from one that
+                // found nothing, and the whole point of this command is that
+                // the operator could not see what was stuck.
+                //
+                // The structural pass needs a root. The store records the one
+                // the latest generation was built from; without a generation
+                // there is nothing to compare a path against, so only the
+                // quarantined rows are dropped and the payload says so.
+                let root = store.latest_repo_root()?.map(PathBuf::from);
+                let structural = match &root {
+                    Some(root) => store.reconcile_pending_paths(root)?,
+                    None => devmap_store::PendingReconcile::default(),
+                };
+                let quarantined = store.drop_quarantined_pending_paths()?;
+
+                if cli.json {
+                    emit_json(
+                        &cli,
+                        &serde_json::json!({
+                            "repo_root": root.as_ref().map(|root| root.display().to_string()),
+                            "structural_pass_ran": root.is_some(),
+                            "dropped_unprocessable": structural.dropped
+                                .iter()
+                                .map(|(path, reason)| serde_json::json!({
+                                    "path": path, "reason": reason,
+                                }))
+                                .collect::<Vec<_>>(),
+                            "normalized": structural.rewritten
+                                .iter()
+                                .map(|(from, to)| serde_json::json!({ "from": from, "to": to }))
+                                .collect::<Vec<_>>(),
+                            "dropped_quarantined": quarantined,
+                            "retained": structural.retained.saturating_sub(quarantined.len()),
+                        }),
+                    )?;
+                } else {
+                    if root.is_none() {
+                        println!(
+                            "No generation yet, so no repository root to check paths against; \
+                             dropping quarantined rows only."
+                        );
+                    }
+                    for (dropped, reason) in &structural.dropped {
+                        println!("dropped {dropped}: {reason}");
+                    }
+                    for (from, to) in &structural.rewritten {
+                        println!("normalized {from} -> {to}");
+                    }
+                    for dropped in &quarantined {
+                        println!(
+                            "dropped {dropped}: exceeded {} retry attempts",
+                            devmap_store::MAX_PENDING_ATTEMPTS
+                        );
+                    }
+                    println!(
+                        "Pending queue repaired: {} unprocessable, {} quarantined, \
+                         {} normalized.",
+                        structural.dropped.len(),
+                        quarantined.len(),
+                        structural.rewritten.len(),
+                    );
+                }
             }
         }
         Commands::Snapshots { file, budget } => {
@@ -1660,19 +2030,43 @@ async fn main() -> anyhow::Result<()> {
             );
             emit_json(&cli, &serde_json::to_value(&resp)?)?;
         }
-        Commands::Serve { path, socket } => {
-            ensure_parent(&cli.db)?;
-            let store = Store::open(&cli.db)?;
+        Commands::Serve {
+            path,
+            socket,
+            print_socket_path,
+        } => {
             // Canonicalize once, here: the daemon's watcher, reconcile sweep
             // and path-containment guards each canonicalized independently
             // before, and a non-canonical root (a symlinked tmpdir, `.`) made
             // the IPC identity hash — and therefore the socket path — differ
             // between invocations of the same repository.
+            //
+            // `default_ipc_path_for` canonicalizes too, so the two agree; this
+            // one is what the daemon is *rooted* at.
             let root = path.canonicalize()?;
             let ipc_path = socket
                 .clone()
                 .unwrap_or_else(|| default_ipc_path_for(&root));
-            let daemon = Daemon::new(store, root).with_ipc_path(ipc_path);
+
+            // Before the store is touched: `--print-socket-path` must create
+            // nothing, and `Store::open` creates the database file.
+            if *print_socket_path {
+                if cli.json {
+                    emit_json(&cli, &serde_json::json!({"socket": ipc_path}))?;
+                } else {
+                    println!("{}", ipc_path.display());
+                }
+                return Ok(());
+            }
+
+            ensure_parent(&cli.db)?;
+            let store = Store::open(&cli.db)?;
+            let daemon = Daemon::new(store, root)
+                // So the daemon can notice its own store being deleted and
+                // exit, instead of serving a removed inode until its idle bound
+                // expires half an hour later.
+                .with_store_path(cli.db.clone())
+                .with_ipc_path(ipc_path);
             daemon.run_loop().await?;
         }
     }

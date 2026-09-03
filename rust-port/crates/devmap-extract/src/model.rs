@@ -402,6 +402,24 @@ pub enum ExtractionEngine {
     Unavailable {
         requested_language: String,
     },
+    /// No grammar ran, and none was ever expected: `language` is a prose or
+    /// data format that declares nothing.
+    ///
+    /// Distinct from [`Self::Unavailable`], which means a grammar was wanted
+    /// and was not there — a `.proto` or `.ps1` this build cannot parse is a
+    /// gap in coverage, and a `.md` is not. Without the distinction the two
+    /// were indistinguishable, and `history.parse_failed` reported 294 of this
+    /// repository's 1,310 files as parse failures when every one of them was
+    /// Markdown, JSON, YAML, config or HTML. That count hid the 16 files a
+    /// grammar *did* parse and flag errors in, which is the number a reader
+    /// acts on.
+    ///
+    /// The file is still a `File` node and still a valid edge target. "We
+    /// cannot parse declarations out of this" is not "this file does not
+    /// exist".
+    NotApplicable {
+        language: String,
+    },
     /// Code reconstructed from a Jupyter notebook's code cells and parsed with
     /// the kernel's grammar, then relocated back into the raw `.ipynb`.
     ///
@@ -823,6 +841,32 @@ pub struct Extraction {
 }
 
 impl Extraction {
+    /// Whether this file is a genuine parse **failure** — one the extractor
+    /// tried to read declarations out of and could not.
+    ///
+    /// The canonical answer, because it was previously spelled inline as
+    /// `matches!(parse_outcome, ParseOutcome::Failed { .. })` and that is not
+    /// the same question. A prose or data format reports `Failed` for want of a
+    /// grammar that does not exist and never will; counting those made
+    /// `history.parse_failed` read 294 on this repository, all of it Markdown,
+    /// JSON, YAML, config and HTML, and buried the 16 files a grammar actually
+    /// parsed and flagged errors in.
+    ///
+    /// Asked of the *engine*, not of the language. `"notebook"` is one of the
+    /// non-declarative languages, but a malformed `.ipynb` is a real failure —
+    /// its engine records `Unavailable`, meaning a grammar was wanted and did
+    /// not get to run, while a `.md` records
+    /// [`ExtractionEngine::NotApplicable`]. A language-keyed classifier would
+    /// silently swallow the notebook case.
+    ///
+    /// `Partial` is deliberately not a failure here: it means tree-sitter
+    /// parsed the file and reported error ranges, which is a weaker and much
+    /// more common claim, tracked separately.
+    pub fn is_parse_failure(&self) -> bool {
+        matches!(self.parse_outcome, ParseOutcome::Failed { .. })
+            && !matches!(self.engine, ExtractionEngine::NotApplicable { .. })
+    }
+
     /// Method `qualified_name` to declared parameter count, for the Go
     /// interface-satisfaction join.
     pub fn go_method_param_counts(&self) -> BTreeMap<&str, usize> {

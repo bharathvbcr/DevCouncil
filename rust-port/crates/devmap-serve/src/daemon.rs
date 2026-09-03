@@ -23,6 +23,71 @@ impl<T> Drop for AbortTaskOnDrop<T> {
     }
 }
 
+/// Abort the IPC task and *wait* for it to be gone.
+///
+/// `abort()` only schedules the task's future to be dropped, and the socket
+/// file is removed by that drop (`UnixIpcServer::drop`). Returning from
+/// `run_loop` without awaiting leaves a window in which the process can exit
+/// with the endpoint still on disk — which is the same stale-socket state a
+/// `kill -9` leaves, arrived at through the orderly path.
+async fn release_ipc_endpoint<T>(task: &mut AbortTaskOnDrop<T>) {
+    task.0.abort();
+    let _ = (&mut task.0).await;
+}
+
+/// The signals that mean "stop serving".
+///
+/// Held as long-lived streams rather than created per loop iteration: a
+/// listener registered only while a `select!` branch is being polled can miss
+/// the signal that arrives between iterations, and `recv` on these is
+/// cancel-safe, so losing the race to another branch costs nothing.
+struct ShutdownSignals {
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    ctrl_c: tokio::signal::windows::CtrlC,
+    #[cfg(windows)]
+    ctrl_shutdown: tokio::signal::windows::CtrlShutdown,
+}
+
+impl ShutdownSignals {
+    #[cfg(unix)]
+    fn install() -> anyhow::Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Self {
+            terminate: signal(SignalKind::terminate())?,
+            interrupt: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    #[cfg(windows)]
+    fn install() -> anyhow::Result<Self> {
+        Ok(Self {
+            ctrl_c: tokio::signal::windows::ctrl_c()?,
+            ctrl_shutdown: tokio::signal::windows::ctrl_shutdown()?,
+        })
+    }
+
+    /// Resolves with the name of whichever signal arrived.
+    #[cfg(unix)]
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.terminate.recv() => "SIGTERM",
+            _ = self.interrupt.recv() => "SIGINT",
+        }
+    }
+
+    #[cfg(windows)]
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.ctrl_c.recv() => "CTRL_C",
+            _ = self.ctrl_shutdown.recv() => "CTRL_SHUTDOWN",
+        }
+    }
+}
+
 fn read_stable_source(path: &std::path::Path, relative: &str) -> anyhow::Result<String> {
     read_stable_source_with(path, relative, || std::fs::read_to_string(path))
 }
@@ -73,6 +138,15 @@ pub struct Daemon {
     /// `DEVMAP_MAX_IDLE_SECS`, falling back to [`DEFAULT_MAX_IDLE_SECS`];
     /// a zero value disables retirement entirely.
     max_idle: Option<Option<Duration>>,
+    /// Tripped by [`Daemon::request_shutdown`], and by SIGTERM/SIGINT, to end
+    /// [`Daemon::run_loop`] through its orderly-release path.
+    shutdown: Arc<tokio::sync::Notify>,
+    /// The store file this daemon serves, when it has one on disk.
+    ///
+    /// `None` means "not stated" — an in-memory store, or a caller that did not
+    /// say — and the store half of [`Daemon::vanished_reason`] is then skipped
+    /// rather than guessed at. A guess here retires a working daemon.
+    store_path: Option<std::path::PathBuf>,
 }
 
 /// One batch of watcher/discovery work, before it is persisted.
@@ -121,17 +195,61 @@ fn should_retire_for_new_binary(
 /// never-exit daemon.
 pub const DEFAULT_MAX_IDLE_SECS: u64 = 1800;
 
+/// Pending rows one drain generation claims.
+///
+/// K1(h): this was 64, and the cap multiplied whole rebuilds rather than
+/// bounding work. Every drain resolves and analyses the *entire* repository —
+/// resolution is global by design — and commits one generation, so the cost of
+/// a batch is essentially independent of how many paths it carries. Capping at
+/// 64 therefore did not make a tick cheaper; it made a 50,000-path event (a
+/// branch switch, a `git checkout` of a large tree) take about 780 consecutive
+/// full rebuilds, one every two seconds, each writing a generation and pruning
+/// the last.
+///
+/// 8,192 is a bound, not a budget: it exists so a pathological queue cannot
+/// make one transaction unboundedly large, and it is far above any realistic
+/// single event. Beyond it the queue still drains over consecutive ticks, as
+/// before — just 128 times fewer of them.
+pub const DEFAULT_DRAIN_BATCH_LIMIT: usize = 8192;
+
 impl Daemon {
     pub fn new(store: Store, root: std::path::PathBuf) -> Self {
         let ipc_path = default_ipc_path_for(&root);
         Self {
             store: Arc::new(store),
             root,
-            batch_limit: 64,
+            batch_limit: DEFAULT_DRAIN_BATCH_LIMIT,
             idle_poll: Duration::from_secs(2),
             ipc_path,
             max_idle: None,
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            store_path: None,
         }
+    }
+
+    /// Tell the daemon which file its store lives in, so it can notice the file
+    /// being deleted out from under it.
+    ///
+    /// Passed in rather than read back off the `Store`, which does not expose
+    /// the path it was opened from.
+    pub fn with_store_path(mut self, store_path: std::path::PathBuf) -> Self {
+        self.store_path = Some(store_path);
+        self
+    }
+
+    /// End [`Self::run_loop`] the way a signal does: the loop returns, the IPC
+    /// task is dropped, and the endpoint's socket and lock are removed before
+    /// the call to `run_loop` resolves.
+    ///
+    /// Shares the path a SIGTERM takes rather than duplicating it, so a test
+    /// that exercises this exercises the signal handling too — sending the
+    /// process a real signal from inside a test would take down the whole test
+    /// binary, and a second cleanup routine that only tests use would be a
+    /// second thing to keep correct.
+    pub fn request_shutdown(&self) {
+        // `notify_one` stores a permit if nobody is waiting yet, so a shutdown
+        // requested before the loop reaches its select is not lost.
+        self.shutdown.notify_one();
     }
 
     pub fn with_batch_limit(mut self, batch_limit: usize) -> Self {
@@ -177,6 +295,51 @@ impl Daemon {
         }
     }
 
+    /// Why this daemon has nothing left to serve, if that is the case.
+    ///
+    /// A daemon outlives its repository routinely: a test harness builds a map
+    /// under a temporary directory, the directory is deleted, and the daemon
+    /// keeps running against a store that no longer exists. Measured on one
+    /// development machine: **288** live daemons, one per deleted pytest
+    /// temporary directory, each waiting out a 30-minute idle bound.
+    ///
+    /// The idle bound cannot catch this. It bounds *quiet*, and these daemons
+    /// are not quiet — the watcher keeps firing on the deletion itself, the
+    /// drain keeps failing and rescheduling — they are pointless, which is a
+    /// different fact.
+    ///
+    /// Both halves are checked because either can go alone: `rm -rf` of the
+    /// tree takes the store with it, but `rm` of the database leaves a live
+    /// tree behind a daemon answering from a deleted inode.
+    ///
+    /// `None` is returned whenever the question cannot be answered — an
+    /// in-memory store has no path — rather than a guess, because a false
+    /// positive here retires a daemon that was working.
+    fn vanished_reason(&self) -> Option<String> {
+        match self.root.canonicalize() {
+            Err(error) => {
+                return Some(format!(
+                    "repository root {:?} can no longer be resolved ({error})",
+                    self.root
+                ))
+            }
+            Ok(canonical) if !canonical.is_dir() => {
+                return Some(format!(
+                    "repository root {:?} is no longer a directory",
+                    self.root
+                ))
+            }
+            Ok(_) => {}
+        }
+        // Not stated (an in-memory store, or a caller that did not say): there
+        // is nothing on disk this daemon claims, so there is nothing to check.
+        let path = self.store_path.as_ref()?;
+        if !path.exists() {
+            return Some(format!("store {path:?} no longer exists"));
+        }
+        None
+    }
+
     /// Reconcile the durable generation against disk before serving queries.
     /// Watchers are lossy across downtime and can miss racy edits, so startup
     /// must hash the current source set and enqueue changed, new, and deleted
@@ -209,10 +372,25 @@ impl Daemon {
             match reason {
                 DiscoverySkipReason::NonSource => {}
                 DiscoverySkipReason::Oversized { .. } | DiscoverySkipReason::Unreadable { .. } => {
-                    // Preserve failure as durable work. The supervised drain
-                    // loop will retry with backoff and quarantine the path;
-                    // refusing to bind IPC here would make status unavailable.
-                    pending.insert(path);
+                    // K1(c): reported as a refusal, not queued as work.
+                    //
+                    // Queuing these was self-defeating: the drain applies the
+                    // *same* size and readability limits, so an oversized file
+                    // enqueued here was guaranteed to fail every attempt until
+                    // it quarantined, and then to sit in the queue forever
+                    // holding `is_fresh` at false. The 30 MB vendored
+                    // `parser.c` measured on this repository is exactly that —
+                    // it is over `MAX_SOURCE_BYTES` and no retry will shrink
+                    // it. A refusal is a fact about coverage, and the build
+                    // path already prints it; it is not pending work.
+                    //
+                    // A file that later becomes readable or shrinks is picked
+                    // up by the watcher event that changes it, or by the next
+                    // connect-time sweep.
+                    warn!(
+                        "connect-time sweep refused {path:?} ({reason:?}); it is absent from \
+                         the graph and is NOT queued — no retry can change the outcome"
+                    );
                 }
                 DiscoverySkipReason::NonUtf8Path => {
                     // A name that cannot be represented as UTF-8 can never be
@@ -229,8 +407,17 @@ impl Daemon {
             }
         }
         let pending: Vec<_> = pending.into_iter().collect();
-        self.store.enqueue_pending_paths(&pending)?;
-        Ok(pending.len())
+        // K1(a): one canonical spelling. `collect_sources_with_report` already
+        // yields repo-relative paths, so this is a no-op for well-formed input
+        // — and that is the point: the *same* call the watcher callback makes,
+        // so the two producers can no longer write two spellings of one file.
+        let report = self
+            .store
+            .enqueue_pending_paths_under_root(&self.root, &pending)?;
+        for (path, reason) in &report.refused {
+            warn!("connect-time sweep refused pending path {path:?}: {reason}");
+        }
+        Ok(report.enqueued.len())
     }
 
     fn collect_pending_path(
@@ -381,14 +568,21 @@ impl Daemon {
 
     /// after extraction, resolution, analysis, and persistence all succeed.
     pub fn drain_pending_batch(&self) -> anyhow::Result<usize> {
-        let batch = self.store.get_pending_paths_limited(self.batch_limit)?;
-        if batch.is_empty() {
+        let claims = self.store.claim_pending_batch(self.batch_limit)?;
+        if claims.is_empty() {
             return Ok(0);
         }
+        let batch: Vec<String> = claims.iter().map(|claim| claim.path.clone()).collect();
         // Timed from the moment real work starts, so the history row reflects
         // incremental resync cost rather than idle polling.
         let resync_started = std::time::Instant::now();
-        self.store.bump_pending_attempts(&batch)?;
+        // K1(d): attempts are charged *after* the per-path loop, and only to
+        // the paths that actually failed. Bumping the whole batch up front made
+        // every path share one fate: any failure in a later, batch-wide step —
+        // a persist, a prune — returned before the acknowledgement below, so
+        // all 64 claimed paths carried an attempt they had not earned. Five
+        // such failures quarantined the entire batch, which is precisely the
+        // count of permanently stuck rows measured on this repository's store.
 
         let root = self.root.canonicalize().map_err(|error| {
             anyhow::anyhow!("cannot canonicalize daemon root {:?}: {error}", self.root)
@@ -398,8 +592,16 @@ impl Daemon {
         let mut deleted = std::collections::BTreeSet::new();
         let mut fresh = Vec::new();
 
-        let mut succeeded = Vec::new();
+        let mut succeeded: Vec<devmap_store::PendingClaim> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
         let mut failures = Vec::new();
+        let claim_of = |path: &str| {
+            claims
+                .iter()
+                .find(|claim| claim.path == path)
+                .cloned()
+                .expect("every batch path came from a claim")
+        };
         // B5: git moved HEAD or a ref. Not a file to extract — a statement that
         // the generation may describe a tree that no longer exists. Consumed
         // here so `collect_pending_path` never sees a path that is not one, and
@@ -409,7 +611,7 @@ impl Daemon {
             .any(|pending| pending == crate::watcher::GIT_HEAD_SENTINEL);
         let head_moved = head_event && self.head_differs_from_last_generation(&root);
         if head_event {
-            succeeded.push(crate::watcher::GIT_HEAD_SENTINEL.to_string());
+            succeeded.push(claim_of(crate::watcher::GIT_HEAD_SENTINEL));
         }
         for pending in &batch {
             if pending == crate::watcher::GIT_HEAD_SENTINEL {
@@ -420,13 +622,20 @@ impl Daemon {
                     affected.extend(delta.affected);
                     deleted.extend(delta.deleted);
                     fresh.extend(delta.fresh);
-                    succeeded.push(pending.clone());
+                    succeeded.push(claim_of(pending));
                 }
                 Err(error) => {
                     warn!("pending path {pending:?} failed in isolation: {error}");
+                    failed.push(pending.clone());
                     failures.push(format!("{pending}: {error}"));
                 }
             }
+        }
+
+        // Charge the attempt now, to the paths that earned it, before any
+        // batch-wide step can fail and take the whole batch down with it.
+        if !failed.is_empty() {
+            self.store.bump_pending_attempts(&failed)?;
         }
 
         if succeeded.is_empty() {
@@ -480,6 +689,15 @@ impl Daemon {
         let resolution = resolver.resolve_all(&extractions);
         let analysis = analyze(&extractions, &resolution);
         let head_sha = current_git_head(&self.root).unwrap_or_else(|_| "unavailable".to_string());
+        // K13: hold the cross-process writer lock across persist + prune. A
+        // `devmap build` running beside the daemon otherwise races it on
+        // SQLite's busy timeout alone, and the loser surfaces `database is
+        // locked` after paying for a full resolve. Taken *here* rather than at
+        // the top of the drain because everything above is reads and
+        // extraction, which two writers may safely do at once.
+        let _writer = self
+            .store
+            .lock_writer(devmap_store::Store::WRITER_LOCK_WAIT)?;
         self.store.save_generation_with_metadata(
             if full_rebuild { &extractions } else { &fresh },
             &resolution,
@@ -516,8 +734,14 @@ impl Daemon {
         self.store.prune_extraction_cache()?;
 
         // Acknowledge only after a complete durable generation exists. A crash
-        // or any failed stage above leaves the bumped work queued for replay.
-        self.store.clear_pending_paths_after_attempt(&succeeded)?;
+        // or any failed stage above leaves the claimed work queued for replay —
+        // now without an attempt charged against it, so a store-level fault can
+        // no longer quarantine paths that never failed.
+        //
+        // The claim's `queued_at` is the guard: a watcher event that arrived
+        // while this batch was resolving re-enqueued the path with a newer
+        // timestamp, and that row survives the acknowledgement.
+        self.store.clear_claimed_pending_paths(&succeeded)?;
         Ok(succeeded.len())
     }
 
@@ -550,16 +774,33 @@ impl Daemon {
 
         let store = Arc::clone(&self.store);
         let root = self.root.clone();
+        // The watcher canonicalizes its own root, so the absolute paths it
+        // emits are canonical-rooted; normalise against the same form or every
+        // event from a symlinked tree looks like an escape.
+        let enqueue_root = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
         let watcher_activity = Arc::clone(&activity);
         let _watcher = start_file_watcher(root, move |paths| {
             if paths.is_empty() {
                 return;
             }
             watcher_activity.touch();
-            if let Err(err) = store.enqueue_pending_paths(&paths) {
-                warn!("failed to enqueue pending paths: {err}");
-            } else {
-                info!("enqueued {} changed path(s)", paths.len());
+            // K1(a): the watcher emits *absolute* paths while the connect-time
+            // sweep emits repo-relative ones, and the queue used to store both
+            // verbatim. That is how this repository's store came to hold 64
+            // rows naming a directory the checkout had moved out of, none of
+            // which any drain could process and nothing could delete. Both
+            // producers now write the same canonical, root-checked form.
+            match store.enqueue_pending_paths_under_root(&enqueue_root, &paths) {
+                Ok(report) => {
+                    for (path, reason) in &report.refused {
+                        warn!("watcher emitted a path outside the tree: {path:?} ({reason})");
+                    }
+                    info!("enqueued {} changed path(s)", report.enqueued.len());
+                }
+                Err(err) => warn!("failed to enqueue pending paths: {err}"),
             }
         })?;
 
@@ -607,11 +848,31 @@ impl Daemon {
                     Ok(_) => {}
                     Err(err) => warn!("WAL checkpoint failed: {err}"),
                 }
-                if let Err(err) = maintenance_store.vacuum_if_needed() {
-                    warn!("vacuum_if_needed failed: {err}");
+                // K13: reclaim is a write. Take the same cross-process writer
+                // lock a build takes, so a maintenance vacuum and a concurrent
+                // `devmap build` queue instead of racing on SQLite's busy
+                // timeout. The wait is short and a miss is skipped rather than
+                // retried: this loop runs every five minutes, so losing one
+                // pass costs nothing, while blocking a build for a minute to
+                // reclaim pages would be the wrong trade.
+                match maintenance_store.lock_writer(Duration::from_secs(5)) {
+                    Ok(_writer) => {
+                        if let Err(err) = maintenance_store.vacuum_if_needed() {
+                            warn!("vacuum_if_needed failed: {err}");
+                        }
+                    }
+                    Err(err) => {
+                        info!("skipping maintenance vacuum; another writer holds the store: {err}")
+                    }
                 }
             }
         }));
+
+        // Installed before the loop, so a signal arriving between iterations
+        // is queued rather than missed. A daemon that cannot install them is a
+        // daemon whose socket a `kill` would strand, so this is fatal rather
+        // than a warning.
+        let mut signals = ShutdownSignals::install()?;
 
         let mut ticker = tokio::time::interval(self.idle_poll);
         let mut consecutive_failures = 0u32;
@@ -629,7 +890,43 @@ impl Daemon {
                     return result
                         .map_err(|error| anyhow::anyhow!("IPC task join failed: {error}"))?;
                 }
+                // Both shutdown routes converge here. Without them the socket
+                // file was removed only by `UnixIpcServer`'s `Drop`, which a
+                // signal never reaches: `kill` ended the process where it stood
+                // and left `/tmp/devmap-*/ipc.sock` on disk, so the next
+                // daemon's start hung on the liveness probe deciding whether
+                // the corpse was alive.
+                signal = signals.recv() => {
+                    info!(
+                        "{signal} received; releasing the IPC endpoint and exiting \
+                         (pending work stays queued in the store)"
+                    );
+                    release_ipc_endpoint(&mut ipc_task).await;
+                    return Ok(());
+                }
+                _ = self.shutdown.notified() => {
+                    info!(
+                        "shutdown requested; releasing the IPC endpoint and exiting \
+                         (pending work stays queued in the store)"
+                    );
+                    release_ipc_endpoint(&mut ipc_task).await;
+                    return Ok(());
+                }
                 _ = ticker.tick() => {
+                    // Exit when there is nothing left to serve. Checked before
+                    // every other rule on this tick, because a daemon whose
+                    // tree or store is gone has no correct answer to give and
+                    // no idle bound that would ever end it — the watcher keeps
+                    // firing on the deletion and the drain keeps failing, so it
+                    // never looks idle.
+                    if let Some(reason) = self.vanished_reason() {
+                        info!(
+                            "{reason}; releasing the IPC endpoint and exiting \
+                             (nothing left to serve)"
+                        );
+                        release_ipc_endpoint(&mut ipc_task).await;
+                        return Ok(());
+                    }
                     // Retire when the binary that started this process has been
                     // replaced on disk.
                     //
@@ -708,6 +1005,19 @@ impl Daemon {
                             info!("drained {n} pending path(s)");
                         }
                         Err(err) => {
+                            // A failed drain is the loudest symptom of a
+                            // deleted tree or store, and backing off means
+                            // waiting up to 64 seconds before the next tick
+                            // would notice. Ask now rather than schedule a
+                            // retry against something that is gone.
+                            if let Some(reason) = self.vanished_reason() {
+                                info!(
+                                    "pending drain failed and {reason}; releasing the \
+                                     IPC endpoint and exiting (nothing left to serve): {err}"
+                                );
+                                release_ipc_endpoint(&mut ipc_task).await;
+                                return Ok(());
+                            }
                             consecutive_failures = consecutive_failures.saturating_add(1);
                             let exponent = consecutive_failures.saturating_sub(1).min(6);
                             let delay = Duration::from_secs(1u64 << exponent);
@@ -723,18 +1033,68 @@ impl Daemon {
     }
 }
 
+/// Identity of a repository's IPC endpoint.
+///
+/// # The formula, exactly
+///
+/// A second implementation has to reproduce this — the Python client derives
+/// the same path without spawning anything, and when the two disagree each side
+/// starts its own daemon against one store — so every step is stated rather
+/// than implied:
+///
+/// 1. **Input**: the repository root, *canonicalized* (`realpath`): symlinks
+///    resolved, `.`/`..` removed, absolute. Not the string the user typed.
+/// 2. **Encoding**: that canonical path's bytes as UTF-8, with no trailing
+///    separator and no terminator.
+/// 3. **Hash**: FNV-1a, 64-bit. Offset basis `0xcbf29ce484222325`, prime
+///    `0x100000001b3`; per byte, `hash = (hash XOR byte) * prime`, multiplication
+///    wrapping at 64 bits. This is `devmap_extract::content_hash`, reused rather
+///    than re-spelled so the constants have one definition.
+/// 4. **Rendering**: lowercase hexadecimal, zero-padded to exactly 16 digits.
+/// 5. **Directory**: `<system temp dir>/devmap-<hex>`, created mode `0700`.
+/// 6. **Socket**: the file `ipc.sock` inside it. On Windows, the pipe
+///    `\\.\pipe\devmap-<hex>` instead, with no directory.
+///
+/// `devmap serve --print-socket-path <root>` prints exactly this and creates
+/// nothing, so the two implementations can be checked against each other.
+///
+/// FNV-1a rather than a cryptographic digest because this is a namespacing
+/// hash, not a security boundary — the socket's protection is the `0700`
+/// directory and the `0600` socket, not the unguessability of the name.
+///
+/// # Why canonical
+///
+/// It hashed the root *as written*, so `devmap serve .`, `devmap serve
+/// /tmp/repo` and a symlinked path were three endpoints for one repository,
+/// each with its own daemon on the same store.
+///
+/// Canonicalization that fails — the root does not exist, or is unreadable —
+/// falls back to the path as given rather than to a wrong root: a
+/// non-existent repository has no daemon to collide with, and refusing here
+/// would turn a mistyped path into a startup crash instead of a clear "no such
+/// directory" from the store.
+pub fn ipc_identity_for(root: &std::path::Path) -> u64 {
+    let canonical = root.canonicalize();
+    let canonical = canonical.as_deref().unwrap_or(root);
+    devmap_extract::content_hash(&canonical.to_string_lossy())
+}
+
+/// `<temp_dir>/devmap-{ipc_identity_for(root):016x}/ipc.sock`.
+///
+/// The per-repository directory is created 0700 at bind time (see
+/// `UnixIpcServer::bind`), so the socket is not merely owner-only itself but
+/// sits behind an owner-only directory.
 #[cfg(unix)]
 pub fn default_ipc_path_for(root: &std::path::Path) -> std::path::PathBuf {
-    let identity = devmap_extract::content_hash(&root.to_string_lossy());
     std::env::temp_dir()
-        .join(format!("devmap-{identity:016x}"))
+        .join(format!("devmap-{:016x}", ipc_identity_for(root)))
         .join("ipc.sock")
 }
 
+/// `\\.\pipe\devmap-{ipc_identity_for(root):016x}`.
 #[cfg(windows)]
 pub fn default_ipc_path_for(root: &std::path::Path) -> std::path::PathBuf {
-    let identity = devmap_extract::content_hash(&root.to_string_lossy());
-    format!(r"\\.\pipe\devmap-{identity:016x}").into()
+    format!(r"\\.\pipe\devmap-{:016x}", ipc_identity_for(root)).into()
 }
 
 fn stored_path(root: &std::path::Path, candidate: &std::path::Path) -> anyhow::Result<String> {
@@ -1643,6 +2003,245 @@ mod tests {
             "daemon neither drained its queue nor retired cleanly in time"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A `kill` must not leave the endpoint behind.
+    ///
+    /// The socket file was removed only by `UnixIpcServer`'s `Drop`, which a
+    /// signal never reaches: the process dies where it stands, the socket file
+    /// survives, and the next daemon's start depends on the liveness probe
+    /// deciding the stale file is dead. The signal handlers route a SIGTERM or
+    /// SIGINT into the same orderly shutdown this asserts — the loop returns,
+    /// the IPC task is dropped, and the endpoint's socket *and* lock are gone
+    /// when it does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_shutdown_request_releases_the_socket_and_its_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "devmap-daemon-shutdown-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/devmap-shutdown-{:016x}.sock",
+            devmap_extract::content_hash(&root.to_string_lossy())
+        ));
+        let lock = crate::protocol::ipc_lock_path(&socket);
+        let _ = fs::remove_file(&socket);
+        let _ = fs::remove_file(&lock);
+
+        let daemon = Daemon::new(Store::open_in_memory().unwrap(), root.clone())
+            .with_ipc_path(socket.clone())
+            .with_idle_poll(Duration::from_millis(20));
+        let running = daemon.clone();
+        let task = tokio::spawn(async move { running.run_loop().await });
+
+        for _ in 0..200 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(socket.exists(), "daemon IPC socket did not start");
+        assert!(lock.exists(), "daemon IPC lock was never taken");
+
+        daemon.request_shutdown();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the run loop must return on a shutdown request")
+            .expect("the run loop task must not panic");
+        assert!(outcome.is_ok(), "shutdown reported an error: {outcome:?}");
+
+        assert!(
+            !socket.exists(),
+            "an orderly shutdown left its socket at {}",
+            socket.display()
+        );
+        assert!(
+            !lock.exists(),
+            "an orderly shutdown left its lock file at {}",
+            lock.display()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A daemon whose repository was deleted must exit, not wait out its idle
+    /// bound.
+    ///
+    /// Measured on this machine: 288 daemons alive at once, one per deleted
+    /// pytest temporary directory, each holding a store that no longer existed
+    /// and each waiting out a 30-minute idle bound. The idle bound is the wrong
+    /// instrument for this — it is a bound on *quiet*, and a daemon whose tree
+    /// is gone is not quiet, it is pointless.
+    ///
+    /// Idle retirement is disabled here, so nothing but the vanished root can
+    /// end this loop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_daemon_whose_repository_was_deleted_exits() {
+        let root = std::env::temp_dir().join(format!(
+            "devmap-daemon-vanished-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/devmap-vanished-{:016x}.sock",
+            devmap_extract::content_hash(&root.to_string_lossy())
+        ));
+        let lock = crate::protocol::ipc_lock_path(&socket);
+        let _ = fs::remove_file(&socket);
+        let _ = fs::remove_file(&lock);
+
+        let daemon = Daemon::new(Store::open_in_memory().unwrap(), root.clone())
+            .with_ipc_path(socket.clone())
+            .with_idle_poll(Duration::from_millis(20))
+            // `None` disables idle retirement, so nothing but the vanished
+            // repository can end this loop.
+            .with_max_idle(None);
+        let task = tokio::spawn(async move { daemon.run_loop().await });
+
+        for _ in 0..200 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(socket.exists(), "daemon IPC socket did not start");
+
+        // Still serving while the tree is there: this must be the deletion that
+        // ends it, not merely elapsed time.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !task.is_finished(),
+            "the daemon exited before anything vanished"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("a daemon whose repository was deleted must exit")
+            .expect("the run loop task must not panic");
+        assert!(outcome.is_ok(), "exit reported an error: {outcome:?}");
+        assert!(!socket.exists(), "a vanished daemon left its socket behind");
+        assert!(!lock.exists(), "a vanished daemon left its lock behind");
+    }
+
+    /// The store file is the other half: the root can survive a `rm` of the
+    /// database alone, and a daemon serving a store that is gone answers from a
+    /// connection to a deleted inode.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_daemon_whose_store_was_deleted_exits() {
+        let root = std::env::temp_dir().join(format!(
+            "devmap-daemon-nostore-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let db = root.join("devmap.sqlite");
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/devmap-nostore-{:016x}.sock",
+            devmap_extract::content_hash(&root.to_string_lossy())
+        ));
+        let lock = crate::protocol::ipc_lock_path(&socket);
+        let _ = fs::remove_file(&socket);
+        let _ = fs::remove_file(&lock);
+
+        let daemon = Daemon::new(Store::open(&db).unwrap(), root.clone())
+            .with_store_path(db.clone())
+            .with_ipc_path(socket.clone())
+            .with_idle_poll(Duration::from_millis(20))
+            // `None` disables idle retirement, so nothing but the vanished
+            // repository can end this loop.
+            .with_max_idle(None);
+        let task = tokio::spawn(async move { daemon.run_loop().await });
+
+        for _ in 0..200 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(socket.exists(), "daemon IPC socket did not start");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !task.is_finished(),
+            "the daemon exited before anything vanished"
+        );
+
+        fs::remove_file(&db).unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("a daemon whose store was deleted must exit")
+            .expect("the run loop task must not panic");
+        assert!(outcome.is_ok(), "exit reported an error: {outcome:?}");
+        assert!(
+            !socket.exists(),
+            "a storeless daemon left its socket behind"
+        );
+        assert!(!lock.exists(), "a storeless daemon left its lock behind");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The IPC path must be a function of the *canonical* root.
+    ///
+    /// It hashed the root string as given, so `devmap serve .`, `devmap serve
+    /// /tmp/repo` and `devmap serve` through a symlinked path each derived a
+    /// different socket for one repository — and each spawned its own daemon
+    /// against the same store. The Python client mirrors this formula without
+    /// spawning anything, so it has to be stated in terms of something both
+    /// sides can compute: FNV-1a 64 over the UTF-8 bytes of the canonical root.
+    #[cfg(unix)]
+    #[test]
+    fn the_ipc_path_is_a_function_of_the_canonical_root() {
+        let base = std::env::temp_dir().join(format!(
+            "devmap-ipc-canon-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real = base.join("real");
+        fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let direct = default_ipc_path_for(&real);
+        assert_eq!(
+            direct,
+            default_ipc_path_for(&link),
+            "a symlinked root derived a different endpoint than the directory it \
+             points at, so one repository would be served by two daemons"
+        );
+        assert_eq!(
+            direct,
+            default_ipc_path_for(&real.join(".")),
+            "a trailing `.` derived a different endpoint"
+        );
+
+        // The formula itself, so the Python client can mirror it: FNV-1a 64
+        // over the UTF-8 bytes of the canonical root, in a 0700 directory under
+        // the system temp dir.
+        let canonical = real.canonicalize().unwrap();
+        let expected = std::env::temp_dir()
+            .join(format!(
+                "devmap-{:016x}",
+                devmap_extract::content_hash(&canonical.to_string_lossy())
+            ))
+            .join("ipc.sock");
+        assert_eq!(direct, expected);
+
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[cfg(unix)]

@@ -756,7 +756,12 @@ fn python_module_aliases(root: Node, source: &str) -> std::collections::BTreeSet
 /// labelling exists to prevent.
 ///
 fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
-    let scan = if crate::fallback::applies_to(lang) {
+    // Whether a grammar was ever expected for this format. A `.proto` or `.ps1`
+    // with no linked grammar is a gap in coverage; a `.md` is not, and K5 is
+    // the record of what conflating them cost — 294 of 1,310 files reported as
+    // parse failures, all prose and data, hiding the 16 real ones.
+    let declarative = crate::fallback::applies_to(lang);
+    let scan = if declarative {
         crate::fallback::scan_declarations(path, source)
     } else {
         // Prose and data formats declare nothing; see
@@ -822,26 +827,37 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         file_path: path.to_string(),
         language: lang.to_string(),
         content_hash: content_hash(source),
-        engine: if recovered {
-            ExtractionEngine::RegexFallback {
+        engine: match (recovered, declarative) {
+            (true, _) => ExtractionEngine::RegexFallback {
                 requested_language: lang.to_string(),
-            }
-        } else {
-            ExtractionEngine::Unavailable {
+            },
+            // A grammar was wanted for this language and was not there: a real
+            // gap, and `Extraction::is_parse_failure` counts it.
+            (false, true) => ExtractionEngine::Unavailable {
                 requested_language: lang.to_string(),
-            }
+            },
+            // Prose or data. No grammar was ever expected, so this is not a
+            // failure to report — see `ExtractionEngine::NotApplicable`.
+            (false, false) => ExtractionEngine::NotApplicable {
+                language: lang.to_string(),
+            },
         },
-        parse_outcome: if recovered {
-            ParseOutcome::Fallback {
+        parse_outcome: match (recovered, declarative) {
+            (true, _) => ParseOutcome::Fallback {
                 reason: format!(
                     "no linked tree-sitter grammar for {lang}; {} declaration(s) recovered by pattern",
                     recovered_count
                 ),
-            }
-        } else {
-            ParseOutcome::Failed {
+            },
+            (false, true) => ParseOutcome::Failed {
                 reason: format!("no linked tree-sitter grammar for {lang}"),
-            }
+            },
+            (false, false) => ParseOutcome::Failed {
+                reason: format!(
+                    "{lang} is a prose/data format with no declarations to parse; \
+                     indexed as a File node"
+                ),
+            },
         },
         symbols,
         imports: Vec::new(),

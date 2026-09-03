@@ -70,7 +70,7 @@ mod class_a_declined_is_not_success {
         // The type must be able to express "ran", or the distinction above is
         // vacuous — a single-variant enum would satisfy the assertion while
         // meaning nothing.
-        let ran = VacuumAction::Incremental { pages: 1 };
+        let ran = VacuumAction::Incremental { requested: 1 };
         assert!(
             !matches!(ran, VacuumAction::Declined),
             "VacuumAction must distinguish a reclaim that ran from one that declined"
