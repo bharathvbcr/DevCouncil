@@ -6,7 +6,8 @@ import json
 import re
 import subprocess
 
-from devcouncil.indexing.graph.build import build_code_graph, write_code_graph
+from devcouncil.indexing.graph.build import write_code_graph
+from tests.unit.graph_fixtures import kernel_graph
 from devcouncil.indexing.graph.schema import DeadCodeEntry, Confidence
 from devcouncil.indexing.viz import (
     _payload_from_graph,
@@ -41,7 +42,7 @@ def test_render_escapes_script_breakout(tmp_path):
         "pkg/a.py": "def f():\n    return 1\n",
     })
     _commit(tmp_path)
-    graph = build_code_graph(tmp_path, liveness=False)
+    graph = kernel_graph(tmp_path)
     # Inject a hostile name into a node so the embed path must escape <
     graph.nodes[0].name = "</script><script>alert(1)</script>"
     html = render_graph_html(graph)
@@ -57,7 +58,7 @@ def test_render_escapes_script_breakout(tmp_path):
 def test_write_graph_html(tmp_path):
     _write(tmp_path, {"pkg/__init__.py": "", "pkg/a.py": "def f():\n    return 1\n"})
     _commit(tmp_path)
-    write_code_graph(tmp_path, build_code_graph(tmp_path, liveness=False))
+    write_code_graph(tmp_path, kernel_graph(tmp_path))
     out = write_graph_html(tmp_path)
     assert out.is_file()
     text = out.read_text(encoding="utf-8")
@@ -80,7 +81,7 @@ def test_payload_has_file_and_symbol_modes(tmp_path):
         },
     )
     _commit(tmp_path)
-    graph = build_code_graph(tmp_path, liveness=False)
+    graph = kernel_graph(tmp_path)
     payload = _payload_from_graph(graph, file_level=True)
     assert "file" in payload and "symbol" in payload
     assert payload["file"]["nodes"]
@@ -101,7 +102,7 @@ def test_payload_has_file_and_symbol_modes(tmp_path):
 def test_html_has_tabs_lenses_and_path_helpers(tmp_path):
     _write(tmp_path, {"pkg/__init__.py": "", "pkg/a.py": "def f():\n    return 1\n"})
     _commit(tmp_path)
-    graph = build_code_graph(tmp_path, liveness=False)
+    graph = kernel_graph(tmp_path)
     graph.dead_code.append(
         DeadCodeEntry(
             id="pkg/a.py::f",
@@ -149,7 +150,7 @@ def test_html_has_tabs_lenses_and_path_helpers(tmp_path):
 def test_write_graph_html_symbols_flag(tmp_path):
     _write(tmp_path, {"pkg/__init__.py": "", "pkg/a.py": "def f():\n    return 1\n"})
     _commit(tmp_path)
-    write_code_graph(tmp_path, build_code_graph(tmp_path, liveness=False))
+    write_code_graph(tmp_path, kernel_graph(tmp_path))
     out = write_graph_html(tmp_path, symbols=True)
     text = out.read_text(encoding="utf-8")
     assert '"mode":"symbol"' in text or '"mode": "symbol"' in text

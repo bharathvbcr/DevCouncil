@@ -14,6 +14,7 @@ from devcouncil.indexing.ts_imports import (
 )
 from devcouncil.indexing.wiring import is_liveness_code_file
 
+from tests.unit.support_maps import dependents_view
 
 def _git(root, *args):
     subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True)
@@ -63,21 +64,6 @@ def test_tree_sitter_extracts_rust_mod_use():
     assert any(r.get("segments", [])[:2] == ["crate", "services"] for r in uses)
 
 
-def test_go_same_package_co_membership_edges(tmp_path):
-    """Files in the same Go package wire each other (compile unit)."""
-    _write(tmp_path, {
-        "go.mod": "module example.com/app\n\ngo 1.21\n",
-        "pkg/a.go": "package pkg\n\nfunc A() {}\n",
-        "pkg/b.go": "package pkg\n\nfunc B() {}\n",
-    })
-    _commit(tmp_path)
-    repo_map = RepoMapper(tmp_path).map_repo()
-    assert "pkg/a.go" in repo_map.dependents.get("pkg/b.go", [])
-    assert "pkg/b.go" in repo_map.dependents.get("pkg/a.go", [])
-    assert "pkg/b.go" not in repo_map.unwired_candidates
-
-
-
 @pytest.mark.skipif(not tree_sitter_available(), reason="tree-sitter optional extra not installed")
 def test_rust_mod_and_use_edges(tmp_path):
     _write(tmp_path, {
@@ -91,7 +77,7 @@ def test_rust_mod_and_use_edges(tmp_path):
         "src/services/auth.rs": "pub fn login() {}\n",
     })
     _commit(tmp_path)
-    repo_map = RepoMapper(tmp_path).map_repo()
+    repo_map = dependents_view(tmp_path)
     deps = repo_map.dependents
     assert "src/lib.rs" in deps.get("src/foo.rs", [])
     assert "src/lib.rs" in deps.get("src/services/mod.rs", [])
@@ -143,20 +129,3 @@ def test_rust_liveness_gated_on_tree_sitter(monkeypatch):
     assert is_liveness_code_file("src/lib.rs") is True
 
 
-@pytest.mark.skipif(not tree_sitter_available(), reason="tree-sitter optional extra not installed")
-def test_go_map_liveness_parity_imported_package_not_unwired(tmp_path):
-    """File-level Go edges clear unwired for every member of an imported package."""
-    _write(tmp_path, {
-        "go.mod": "module example.com/app\n\ngo 1.21\n",
-        "main.go": (
-            "package main\n\n"
-            "import \"example.com/app/core\"\n\n"
-            "func main() {}\n"
-        ),
-        "core/core.go": "package core\n\nfunc Hello() {}\n",
-        "core/extra.go": "package core\n\nfunc Extra() {}\n",
-    })
-    _commit(tmp_path)
-    repo_map = RepoMapper(tmp_path).map_repo()
-    assert "core/core.go" not in repo_map.unwired_candidates
-    assert "core/extra.go" not in repo_map.unwired_candidates

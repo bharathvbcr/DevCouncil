@@ -56,16 +56,14 @@ def test_cli_map_with_goal_and_output(tmp_path, monkeypatch):
     assert (tmp_path / custom_output).exists()
 
 
-def test_cli_map_no_liveness(tmp_path, monkeypatch):
+def test_cli_map_no_liveness_is_rejected(tmp_path, monkeypatch):
+    """`--no-liveness` went with the Python engine; the kernel always computes
+    liveness. A flag that is accepted and ignored is worse than one that is
+    rejected, so it is rejected."""
     _setup_map_repo(tmp_path, monkeypatch)
-    
+
     res = runner.invoke(app, ["map", "--no-liveness"])
-    assert res.exit_code == 0
-    
-    map_file = tmp_path / ".devcouncil" / "repo_map.json"
-    data = json.loads(map_file.read_text(encoding="utf-8"))
-    # entry_roots and dead_symbol_candidates should be empty or not computed
-    assert len(data.get("entry_roots", [])) == 0
+    assert res.exit_code == 2
 
 
 def test_cli_map_rejects_missing_project_root(tmp_path, monkeypatch):

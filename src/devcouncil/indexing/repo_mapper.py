@@ -6,16 +6,14 @@ import os
 import re
 import subprocess
 import sys
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, cast
 
 from pydantic import BaseModel, Field
 
-from devcouncil.codeintel.languages import code_extensions, language_id_for_suffix
+from devcouncil.codeintel.languages import code_extensions
 from devcouncil.indexing.graph.cache import PARSE_CACHE_VERSION
-from devcouncil.indexing.graph.schema import CodeGraph
-from devcouncil.indexing.lsp import LspInspector
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +67,11 @@ class RepoFileEntry(BaseModel):
     area: str
     kind: str
     language: str | None = None
-    summary: str
+    # Optional: the Rust kernel's `manifest` writes no per-file summary, and a
+    # required field here made every consumer that validates the map — the
+    # wiki, the incremental refresh, the degraded stamp — raise on the artifact
+    # `dev map` itself writes.
+    summary: str = ""
 
 
 class RepoSubsystem(BaseModel):
@@ -98,9 +100,11 @@ class RepoMap(BaseModel):
     # file -> the files that import it (reverse import edges, capped per file). Lets a
     # prompt show the blast radius of changing a file without re-parsing the repo.
     dependents: Dict[str, List[str]] = Field(default_factory=dict)
-    # Full importer counts when ``dependents[path]`` was truncated by ``_DEPENDENTS_MAX``.
-    # Absent / empty when no path was truncated. Agents must treat listed dependents as a
-    # sample whenever ``dependents_total[path] > len(dependents[path])``.
+    # Full importer counts when the writer truncated ``dependents[path]``. Absent /
+    # empty when no path was truncated. Agents must treat listed dependents as a
+    # sample whenever ``dependents_total[path] > len(dependents[path])`` — the cap
+    # belongs to whoever writes the map, which since the Python engine's retirement
+    # is the Rust kernel.
     dependents_total: Dict[str, int] = Field(default_factory=dict)
     # Freshness fingerprints captured at generation: the git HEAD the map was built from
     # and a hash of the tracked file set. Consumers compare against the current repo to
@@ -142,84 +146,20 @@ class RepoMapper:
         # made `map_is_stale` answer True and False for the same map depending
         # on how its caller happened to spell the root.
         self.project_root = Path(project_root) if project_root is not None else Path.cwd()
-        self._DEPENDENTS_MAX = type(self)._DEPENDENTS_MAX
         self._LIVENESS_CAP = type(self)._LIVENESS_CAP
         self._js_alias_cache: Optional[List[Tuple[str, List[str]]]] = None
         try:
             from devcouncil.app.config import load_config
 
             indexing = load_config(self.project_root).indexing
-            self._DEPENDENTS_MAX = min(
-                int(indexing.repo_map_dependents_cap), self.max_dependents_per_file
-            )
             self._LIVENESS_CAP = min(
                 int(indexing.repo_map_liveness_cap), self.max_map_size
             )
         except Exception:
             logger.debug("using default repository-map caps", exc_info=True)
-        # Common source-root prefix of the repo's primary code (e.g. "src/pkg"),
-        # computed once per map_repo run. Drives generic, non-DevCouncil subsystem
-        # inference. None until computed.
-        self._source_root: str | None = None
-        # True when this is not the DevCouncil source tree, so generic inference is used
-        # for area bucketing. Set in map_repo.
-        self._use_generic: bool = False
-        # Import edges (importer -> imported), computed once per map_repo run and reused
-        # by subsystem inference, important-file ranking, and the dependents index.
-        self._edges: List[Tuple[str, str]] | None = None
-        self._last_code_graph: CodeGraph | None = None
-        # Cache of config-file contents (package.json, pyproject.toml, ...) so framework
-        # and test-command detection don't each re-read the same files from disk.
-        self._config_file_cache: Dict[str, str] = {}
 
-    def _read_config_file(self, name: str) -> str:
-        """Read a repo-root config file once and cache its contents for reuse.
-
-        Unreadable or non-UTF-8 config files must not fail the whole map.
-        """
-        if name not in self._config_file_cache:
-            try:
-                self._config_file_cache[name] = (self.project_root / name).read_text(
-                    encoding="utf-8", errors="replace"
-                )
-            except OSError:
-                self._config_file_cache[name] = ""
-        return self._config_file_cache[name]
-
-    _DEPENDENTS_MAX = 1_024  # serialized dependents per file
     _LIVENESS_CAP = 20_000  # serialized entries per liveness debt list
-    max_dependents_per_file = 4_096
     max_map_size = 100_000  # hard safety ceiling for each liveness debt list
-
-    _AREA_SUMMARIES = {
-        "src/devcouncil/cli": "CLI entrypoints and command registration",
-        "src/devcouncil/app": "Orchestration runtime and lifecycle state",
-        "src/devcouncil/artifacts": "Artifact graph, coverage, and serialization",
-        "src/devcouncil/council": "Council prompts and debate scaffolding",
-        "src/devcouncil/domain": "Domain entities for requirements, tasks, and evidence",
-        "src/devcouncil/execution": "Execution plumbing, prompts, permissions, and task runs",
-        "src/devcouncil/executors": "Executor adapters and CLI agent registry",
-        "src/devcouncil/gating": "Blocking policies and guardrails",
-        "src/devcouncil/indexing": "Repo mapping, AST matching, semantic snapshots, and language-server detection",
-        "src/devcouncil/integrations": "External integrations and graph adapters",
-        "src/devcouncil/live": "Live review cards, signals, summaries, and transcripts",
-        "src/devcouncil/llm": "Model provider routing, defaults, and caching",
-        "src/devcouncil/planning": "Planning, critique, repair, and spec services",
-        "src/devcouncil/repo": "Repository helpers and filesystem utilities",
-        "src/devcouncil/reporting": "JSON and markdown report builders",
-        "src/devcouncil/storage": "SQLite persistence and repository layer",
-        "src/devcouncil/telemetry": "Trace logging, pricing, and telemetry tracking",
-        "src/devcouncil/ui": "Dashboard and lightweight UI helpers",
-        "src/devcouncil/utils": "Shared utilities and redaction helpers",
-        "src/devcouncil/verification": "Verification gates and implementation review",
-        "src/devcouncil/campaign": "Multi-agent campaign orchestration and roles",
-        "src/devcouncil/knowledge": "Knowledge sources, OKF, and design docs",
-        "src/devcouncil/skills": "Skill registry and matching",
-        "src/devcouncil/optimization": "Prompt and skill optimization",
-        "docs": "Repository documentation",
-        "tests": "Automated tests",
-        "scripts": "Maintenance and smoke-test scripts",
-    }
 
     _SUBSYSTEM_INDEX: Dict[str, Tuple[str, List[str]]] = {
         "src/devcouncil/council": (
@@ -828,178 +768,6 @@ class RepoMapper:
         "project-status.md": "Subsystem maturity snapshot",
     }
 
-    def _language_for_file(self, path: str) -> str | None:
-        return language_id_for_suffix(Path(path).suffix, include_markup=True)
-
-    def _kind_for_file(self, path: str) -> str:
-        normalized = path.replace("\\", "/")
-        suffix = Path(normalized).suffix.lower()
-        name = Path(normalized).name
-        top = normalized.split("/", 1)[0]
-        if _is_aux_area_root(top) and top.casefold() in {"tests", "test"}:
-            return "test"
-        if name.startswith("test_"):
-            return "test"
-        if _is_aux_area_root(top) and top.casefold() in {"docs", "doc"}:
-            return "doc"
-        if suffix in {".md", ".markdown"}:
-            return "doc"
-        # HTML stays kind "file" (not module): labeled in languages[] / files[].language
-        # via markup overlay, but excluded from code_extensions so static assets do not
-        # seed code subsystems.
-        if suffix in {".html", ".htm"}:
-            return "file"
-        if suffix in {".yaml", ".yml", ".toml", ".json", ".ini"}:
-            return "config"
-        if suffix in {".sh", ".ps1", ".bat"}:
-            return "script"
-        if suffix in {".sqlite", ".db"}:
-            return "database"
-        if suffix in _CODE_EXTENSIONS:
-            return "module" if name != "__init__.py" else "package"
-        return "file"
-
-    def _summary_for_file(self, path: str) -> str:
-        normalized = path.replace("\\", "/")
-        name = Path(normalized).name
-        parts = normalized.split("/")
-        if normalized == "README.md":
-            return self._DOC_SUMMARIES["README.md"]
-        if normalized.startswith("docs/"):
-            stem = Path(name).stem.replace("-", " ")
-            return self._DOC_SUMMARIES.get(name, f"Documentation: {stem}")
-        if normalized.startswith("tests/"):
-            remainder = normalized.removeprefix("tests/")
-            if remainder.startswith("unit/"):
-                return f"Unit tests for {Path(remainder).stem.replace('test_', '').replace('_', ' ').strip() or 'the package'}"
-            return f"Tests for {Path(remainder).stem.replace('test_', '').replace('_', ' ').strip() or 'the package'}"
-        if normalized.startswith("src/devcouncil/cli/commands/"):
-            stem = Path(name).stem
-            return self._COMMAND_SUMMARIES.get(stem, f"CLI command module: {stem}")
-        if normalized == "src/devcouncil/cli/main.py":
-            return "Typer root command composition"
-        if normalized == "src/devcouncil/app/orchestrator.py":
-            return "Orchestration coordinator and run lifecycle"
-        if normalized == "src/devcouncil/app/state_machine.py":
-            return "Allowed project phase transitions"
-        if normalized == "src/devcouncil/artifacts/graph.py":
-            return "Artifact graph and coverage queries"
-        if normalized == "src/devcouncil/indexing/repo_mapper.py":
-            return "Repository mapping and file classification"
-        if normalized == "src/devcouncil/storage/repositories.py":
-            return "Persistence repositories for state and artifacts"
-        if normalized == "src/devcouncil/storage/models.py":
-            return "SQLModel database schema"
-        if normalized == "src/devcouncil/verification/verifier.py":
-            return "Verification gates and evidence checks"
-        if normalized == "src/devcouncil/planning/plan_service.py":
-            return "Plan generation service"
-        if normalized == "src/devcouncil/planning/spec_service.py":
-            return "Spec generation service"
-        if normalized == "src/devcouncil/planning/critique_service.py":
-            return "Plan critique service"
-        if normalized == "src/devcouncil/planning/repair_service.py":
-            return "Repair workflow service"
-        if normalized == "src/devcouncil/planning/arbiter_service.py":
-            return "Plan arbitration service"
-        if normalized == "src/devcouncil/execution/task_runner.py":
-            return "Task execution runner"
-        if normalized == "src/devcouncil/execution/prompt_builder.py":
-            return "Prompt assembly for executors"
-        if normalized == "src/devcouncil/execution/permissions.py":
-            return "Execution permission policy"
-        if normalized == "src/devcouncil/executors/agent_registry.py":
-            return "Built-in and configured CLI agent registry"
-        if normalized == "src/devcouncil/llm/router.py":
-            return "LLM provider routing"
-        if normalized == "src/devcouncil/telemetry/traces.py":
-            return "Trace logging and event persistence"
-        if normalized == "src/devcouncil/live/reviewer.py":
-            return "Live review service"
-        if normalized.startswith("src/devcouncil/"):
-            area = "/".join(parts[:3]) if len(parts) >= 3 else "src/devcouncil"
-            return self._AREA_SUMMARIES.get(area, f"{area} subsystem")
-        if normalized.startswith("scripts/"):
-            return f"Utility script: {name}"
-        if name in self._DOC_SUMMARIES:
-            return self._DOC_SUMMARIES[name]
-        return Path(name).stem.replace("_", " ")
-
-    def _area_for_file(self, path: str) -> str:
-        normalized = path.replace("\\", "/")
-        if normalized.startswith("src/devcouncil/"):
-            parts = normalized.split("/")
-            if len(parts) >= 5 and parts[2] == "cli" and parts[3] == "commands":
-                return "src/devcouncil/cli/commands"
-            if len(parts) >= 4:
-                return "/".join(parts[:3])
-            return "src/devcouncil"
-        if normalized.startswith("tests/"):
-            return "tests"
-        if normalized.startswith("docs/"):
-            return "docs"
-        if normalized.startswith("scripts/"):
-            return "scripts"
-        # Foreign repos: derive the area from the directory tree. Gated on _use_generic
-        # so DevCouncil's own map keeps its existing "root" bucketing.
-        if self._use_generic:
-            return self._generic_area_for_file(normalized, self._source_root or "")
-        return "root"
-
-    def _build_subsystem_index(self, files: List[str]) -> List[RepoSubsystem]:
-        # The hardcoded index is authoritative for DevCouncil's own tree (preserves
-        # its curated summaries/role buckets). For any other repo it matches nothing,
-        # so fall back to generic, import-graph-driven inference.
-        hardcoded = self._build_hardcoded_subsystems(files)
-        if hardcoded:
-            return hardcoded
-        return self._build_generic_subsystems(files)
-
-    def _build_hardcoded_subsystems(self, files: List[str]) -> List[RepoSubsystem]:
-        file_set = set(files)
-        # Single O(n) pass: bucket files by their "src/devcouncil/<area>" prefix so the
-        # per-subsystem loop below uses O(1) dict lookups instead of rescanning every
-        # file for each area (and, previously, again for each neighbor). All subsystem
-        # and neighbor keys are 3-component "src/devcouncil/<area>" prefixes, so this
-        # bucketing reproduces the prior `path.startswith(f"{area}/")` semantics exactly.
-        by_area: Dict[str, List[str]] = {}
-        for path in files:
-            parts = path.split("/")
-            if len(parts) >= 4 and parts[0] == "src" and parts[1] == "devcouncil":
-                by_area.setdefault("/".join(parts[:3]), []).append(path)
-        for bucket in by_area.values():
-            bucket.sort()
-        subsystems: List[RepoSubsystem] = []
-        for area, (summary, entry_points) in self._SUBSYSTEM_INDEX.items():
-            available_entry_points = [path for path in entry_points if path in file_set]
-            if not available_entry_points:
-                continue
-            area_files = by_area.get(area, [])
-            ranked_files = [path for path in available_entry_points if path in file_set]
-            for path in area_files:
-                if path in available_entry_points:
-                    continue
-                if len(ranked_files) >= self._SUBSYSTEM_CRITICAL_MAX:
-                    break
-                ranked_files.append(path)
-            critical_files = ranked_files[: self._SUBSYSTEM_CRITICAL_MAX]
-            neighbors = [n for n in self._SUBSYSTEM_NEIGHBORS.get(area, []) if n in by_area]
-            handoff_paths = self._SUBSYSTEM_HANDOFFS.get(area, [])
-            role_files, role_file_counts = self._build_role_files_with_counts(area, area_files)
-            subsystems.append(
-                RepoSubsystem(
-                    area=area,
-                    summary=summary,
-                    entry_points=available_entry_points,
-                    critical_files=critical_files,
-                    neighbors=neighbors,
-                    handoff_paths=handoff_paths,
-                    role_files=role_files,
-                    role_file_counts=role_file_counts,
-                )
-            )
-        return subsystems
-
     #: Generic role inference, applied to any repository that has no curated
     #: entry in ``_SUBSYSTEM_ROLE_FILES``.
     #:
@@ -1028,162 +796,12 @@ class RepoMapper:
     #: reader can tell a small subsystem from a truncated one.
     _ROLE_FILES_PER_ROLE_MAX = 4
 
-    def _build_role_files(self, area: str, area_files: List[str]) -> Dict[str, List[str]]:
-        """Bucket a subsystem's files by the role they play.
-
-        Curated specs win where they exist; everything else is inferred from
-        conventional path and filename signals.
-
-        Why the fallback exists: ``_SUBSYSTEM_ROLE_FILES`` is keyed on
-        DevCouncil's *own* source paths (``src/devcouncil/council`` and
-        friends), so for every other repository ``role_specs`` was ``None`` and
-        this returned ``{}`` immediately. Measured on a 4,082-file polyglot
-        repo: ``role_files`` was ``{}`` on all 10 subsystems.
-
-        That silence was not confined to the map. The generated ``AGENTS.md``
-        tells agents in *every* mapped project to "use ``role_files`` in
-        ``subsystems`` for subsystem role buckets", and three consumers read it
-        and quietly got nothing: :mod:`devcouncil.verification.test_resolver`
-        (``role_files["tests"]`` — its subsystem-test resolution path was dead
-        outside this repo), :mod:`devcouncil.knowledge.wiki`, and
-        :mod:`devcouncil.indexing.map_viz`. A documented navigation feature that
-        works in exactly one repository is worse than an absent one, because
-        the empty result reads as "this subsystem has no roles".
-        """
-        by_role, _counts = self._build_role_files_with_counts(area, area_files)
-        return by_role
-
-    def _build_role_files_with_counts(
-        self, area: str, area_files: List[str]
-    ) -> Tuple[Dict[str, List[str]], Dict[str, int]]:
-        """As :meth:`_build_role_files`, but also returning the real totals.
-
-        The sampled lists and the counts are produced in one pass so they can
-        never disagree about what was matched.
-        """
-        curated = self._SUBSYSTEM_ROLE_FILES.get(area)
-        by_role, used, counts = (
-            self._apply_curated_roles(curated, area_files)
-            if curated
-            else self._infer_generic_roles(area_files)
-        )
-
-        if not by_role:
-            return {}, {}
-
-        remaining = [path for path in area_files if path not in used]
-        if remaining:
-            by_role.setdefault("other", remaining[: self._ROLE_FILES_PER_ROLE_MAX])
-            counts["other"] = len(remaining)
-
-        return by_role, counts
-
-    def _apply_curated_roles(
-        self, role_specs: List[Tuple[str, List[str]]], area_files: List[str]
-    ) -> Tuple[Dict[str, List[str]], set, Dict[str, int]]:
-        by_role: Dict[str, List[str]] = {}
-        used: set = set()
-        counts: Dict[str, int] = {}
-        for role, tokens in role_specs:
-            matches = [path for path in area_files if any(token in path for token in tokens)]
-            if not matches:
-                continue
-            by_role[role] = matches[: self._ROLE_FILES_PER_ROLE_MAX]
-            counts[role] = len(matches)
-            # Every match, not just the sampled ones: `used` decides what falls
-            # into "other", and a file that matched a role is not unclassified
-            # merely because it lost the cap.
-            used.update(matches)
-        return by_role, used, counts
-
-    def _infer_generic_roles(self, area_files: List[str]) -> Tuple[Dict[str, List[str]], set]:
-        """Assign each file to the first matching role rule.
-
-        First-match-wins is deliberate: the rules are ordered most-specific
-        first, so a test file is a test before it is an ``api`` file, and a
-        migration is a migration before it is an ``entry``. Without that, a
-        single path would appear under several roles and the buckets would stop
-        partitioning the subsystem.
-        """
-        by_role: Dict[str, List[str]] = {}
-        counts: Dict[str, int] = {}
-        used: set = set()
-
-        for path in area_files:
-            lowered = ("/" + path.replace("\\", "/").lstrip("/")).lower()
-            suffix = Path(path).suffix.lower()
-
-            for role, suffixes, tokens in self._GENERIC_ROLE_RULES:
-                if suffixes and suffix not in suffixes:
-                    continue
-                if not any(token in lowered for token in tokens):
-                    continue
-                bucket = by_role.setdefault(role, [])
-                if len(bucket) < self._ROLE_FILES_PER_ROLE_MAX:
-                    bucket.append(path)
-                # Counted and marked used even past the cap, so `other` holds
-                # only genuinely unclassified files and the count is the truth.
-                counts[role] = counts.get(role, 0) + 1
-                used.add(path)
-                break
-
-        return by_role, used, counts
-
     # ------------------------------------------------------------------
     # Generic (non-DevCouncil) subsystem inference
     # ------------------------------------------------------------------
 
     def _code_files(self, files: List[str]) -> List[str]:
         return [f for f in files if Path(f).suffix.lower() in _CODE_EXTENSIONS]
-
-    def _primary_code_files(self, files: List[str]) -> List[str]:
-        """Code files excluding tests/docs/scripts — the ones that define the repo's
-        real structure and so determine the source root."""
-        primary: List[str] = []
-        for f in self._code_files(files):
-            top = f.replace("\\", "/").split("/")[0]
-            name = Path(f).name
-            if (
-                _is_aux_area_root(top)
-                or name.startswith("test_")
-                or name.endswith("_test.go")
-            ):
-                continue
-            primary.append(f)
-        return primary
-
-    def detect_source_root(self, files: List[str]) -> str:
-        """Longest common directory prefix shared by the primary source files
-        (e.g. ``src/mypkg``). Empty when the code spans unrelated top-level dirs."""
-        dirs = [Path(f).parent.as_posix() for f in self._primary_code_files(files)]
-        dirs = [d for d in dirs if d not in ("", ".")]
-        if not dirs:
-            return ""
-        split = [d.split("/") for d in dirs]
-        common = split[0]
-        for parts in split[1:]:
-            limit = min(len(common), len(parts))
-            i = 0
-            while i < limit and common[i] == parts[i]:
-                i += 1
-            common = common[:i]
-            if not common:
-                break
-        return "/".join(common)
-
-    def _generic_area_for_file(self, path: str, source_root: str) -> str:
-        normalized = path.replace("\\", "/")
-        parts = normalized.split("/")
-        if _is_aux_area_root(parts[0]):
-            return parts[0]
-        if source_root and (normalized == source_root or normalized.startswith(f"{source_root}/")):
-            rest = normalized[len(source_root):].lstrip("/").split("/")
-            if len(rest) >= 2:
-                return f"{source_root}/{rest[0]}"
-            return source_root or "root"
-        if len(parts) >= 2:
-            return parts[0]
-        return "root"
 
     def _module_suffix_index(self, py_files: List[str]) -> Dict[str, str]:
         """Map every dotted suffix of each module's path to its file, so an import
@@ -1253,22 +871,11 @@ class RepoMapper:
     _PARSE_CACHE_VERSION = PARSE_CACHE_VERSION
     _JS_SUFFIXES = frozenset({".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"})
 
-    def _parse_cache_path(self) -> Path:
-        from devcouncil.indexing.graph.cache import cache_path
-
-        return cache_path(self.project_root)
-
     def _load_parse_cache(self) -> Dict[str, Dict[str, object]]:
         """Delegate to graph.cache (single version + merge policy)."""
         from devcouncil.indexing.graph.cache import load_parse_cache
 
         return cast(Dict[str, Dict[str, object]], load_parse_cache(self.project_root))
-
-    def _save_parse_cache(self, files: Dict[str, Dict[str, object]]) -> None:
-        """Delegate to graph.cache."""
-        from devcouncil.indexing.graph.cache import save_parse_cache
-
-        save_parse_cache(self.project_root, cast(Dict[str, Dict[str, object]], files))
 
     @staticmethod
     def _is_js_source_path(path: str) -> bool:
@@ -2037,157 +1644,6 @@ class RepoMapper:
             logger.debug("Rust import-edge resolution failed", exc_info=True)
         return edges
 
-    def _rank_area_files(self, area_files: List[str], in_degree: Counter) -> List[str]:
-        def sort_key(path: str) -> Tuple[int, int, str]:
-            name = Path(path).stem.lower()
-            entry_rank = next((i for i, hint in enumerate(_ENTRY_NAME_HINTS) if name == hint), len(_ENTRY_NAME_HINTS))
-            # Most-imported first, then entry-named, then alphabetical for stability.
-            return (-in_degree.get(path, 0), entry_rank, path)
-
-        return sorted(area_files, key=sort_key)
-
-    def _build_generic_subsystems(self, files: List[str]) -> List[RepoSubsystem]:
-        source_root = self._source_root if self._source_root is not None else self.detect_source_root(files)
-        code_files = self._code_files(files)
-        if not code_files:
-            return []
-
-        by_area: Dict[str, List[str]] = defaultdict(list)
-        area_of: Dict[str, str] = {}
-        for f in code_files:
-            area = self._generic_area_for_file(f, source_root)
-            by_area[area].append(f)
-            area_of[f] = area
-
-        edges = self._edges if self._edges is not None else self._python_import_edges(files)
-        in_degree: Counter = Counter(target for _, target in edges)
-        area_neighbors: Dict[str, Set[str]] = defaultdict(set)
-        area_handoffs: Dict[str, List[str]] = defaultdict(list)
-        for importer, imported in edges:
-            a, b = area_of.get(importer), area_of.get(imported)
-            if a and b and a != b:
-                area_neighbors[a].add(b)
-                if len(area_handoffs[a]) < 3:
-                    area_handoffs[a].append(f"{importer} -> {imported}")
-
-        graph_roots: List[str] = []
-        cg = getattr(self, "_last_code_graph", None)
-        if cg is not None:
-            roots_attr = getattr(cg, "entry_roots", None)
-            if roots_attr is not None:
-                graph_roots = [str(r) for r in roots_attr]
-
-        subsystems: List[RepoSubsystem] = []
-        for area in sorted(by_area):
-            area_files = by_area[area]
-            # Skip trivial single-file aux areas (e.g. a lone script) to reduce noise,
-            # but keep every real source subsystem.
-            if len(area_files) < 2 and _is_aux_area_root(area.split("/")[0]):
-                continue
-            area_file_set = set(area_files)
-            area_roots = [r for r in graph_roots if r in area_file_set]
-            ranked = self._rank_area_files(area_files, in_degree)
-
-            def _entry_named(path: str) -> bool:
-                name = Path(path).stem.lower()
-                return any(name == hint for hint in _ENTRY_NAME_HINTS)
-
-            # Prefer real production entry roots + imported hubs over zero-degree
-            # orphans when filling critical_files (avoids listing dead.py as critical).
-            critical_files: List[str] = []
-            for p in area_roots + ranked:
-                if p in critical_files:
-                    continue
-                if p in area_roots or in_degree.get(p, 0) > 0 or _entry_named(p):
-                    critical_files.append(p)
-                if len(critical_files) >= self._SUBSYSTEM_CRITICAL_MAX:
-                    break
-            # Only pad with remaining files when the area is tiny / has no hubs yet.
-            if len(critical_files) < 2:
-                for p in ranked:
-                    if p not in critical_files:
-                        critical_files.append(p)
-                    if len(critical_files) >= min(2, self._SUBSYSTEM_CRITICAL_MAX):
-                        break
-            for p in ranked:
-                if len(critical_files) >= self._SUBSYSTEM_CRITICAL_MAX:
-                    break
-                if p not in critical_files and (
-                    in_degree.get(p, 0) > 0 or _entry_named(p) or p in area_roots
-                ):
-                    critical_files.append(p)
-
-            entry_points = list(area_roots)
-            for p in critical_files:
-                if p in entry_points:
-                    continue
-                if in_degree.get(p, 0) > 0 or _entry_named(p):
-                    entry_points.append(p)
-                if len(entry_points) >= 3:
-                    break
-            if not entry_points:
-                entry_points = critical_files[:1]
-
-            stems = ", ".join(Path(p).stem for p in critical_files[:3])
-            summary = f"{Path(area).name or area}: {stems}" if stems else f"{area} ({len(area_files)} files)"
-            # Optional community label from code graph (generic repos).
-            community = ""
-            if cg is not None:
-                try:
-                    from devcouncil.indexing.graph.communities import community_label_for_area
-
-                    community = community_label_for_area(cg, area)
-                    if community and community not in summary:
-                        summary = f"{summary} [{community}]"
-                except Exception:
-                    community = ""
-            subsystems.append(
-                RepoSubsystem(
-                    area=area,
-                    summary=summary,
-                    entry_points=entry_points[:3],
-                    critical_files=critical_files,
-                    neighbors=sorted(area_neighbors.get(area, set()))[:6],
-                    handoff_paths=area_handoffs.get(area, []),
-                    role_files={},
-                )
-            )
-        return subsystems
-
-    def generic_important_files(self, files: List[str]) -> List[str]:
-        """The most-depended-on source files across the repo (highest import in-degree),
-        used to seed 'important surfaces' on repos without a curated index."""
-        edges = self._edges if self._edges is not None else self._python_import_edges(files)
-        if not edges:
-            return []
-        in_degree = Counter(target for _, target in edges)
-        ranked = [path for path, _ in in_degree.most_common()]
-        return ranked[:8]
-
-    def build_dependents(
-        self, edges: List[Tuple[str, str]]
-    ) -> Tuple[Dict[str, List[str]], Dict[str, int]]:
-        """Reverse the import edges into a file -> dependents map (who imports each file),
-        capped per file. Returns ``(capped_dependents, totals_when_truncated)``.
-
-        ``totals_when_truncated[path]`` is the full importer count when the listed
-        sample was truncated by ``_DEPENDENTS_MAX`` — so agents know the blast radius
-        is incomplete rather than silently missing importers.
-        """
-        reverse: Dict[str, Set[str]] = defaultdict(set)
-        for importer, imported in edges:
-            reverse[imported].add(importer)
-        capped: Dict[str, List[str]] = {}
-        totals: Dict[str, int] = {}
-        for path, importers in sorted(reverse.items()):
-            if not importers:
-                continue
-            full = sorted(importers)
-            capped[path] = full[: self._DEPENDENTS_MAX]
-            if len(full) > self._DEPENDENTS_MAX:
-                totals[path] = len(full)
-        return capped, totals
-
     def import_edges_for(self, files: List[str] | None = None) -> List[Tuple[str, str]]:
         """Public uncapped forward import edges for the given files (or whole repo).
 
@@ -2205,9 +1661,8 @@ class RepoMapper:
     def dependents_for(self, files: List[str] | None = None) -> Dict[str, Set[str]]:
         """Uncapped reverse index (imported -> set of importers) for presence checks.
 
-        Unlike :meth:`build_dependents`, this includes zero-importer keys only when
-        asked about specific files via the returned dict's ``.get``, and never caps
-        the importer lists. Never raises.
+        Includes zero-importer keys only when asked about specific files via the
+        returned dict's ``.get``, and never caps the importer lists. Never raises.
         """
         try:
             edges = self.import_edges_for(files)
@@ -2278,15 +1733,13 @@ class RepoMapper:
     def liveness_snapshot(self) -> Dict[str, object]:
         """Uncapped liveness lists for ratchet baseline / verify-side current.
 
-        Always recomputes import edges (never reuses a stale ``self._edges`` cache).
+        Always recomputes import edges from the current tree.
         Includes ``symbol_index`` (``path::name`` keys) so the ratchet can require
         a symbol to have existed at baseline before calling it stranded.
         Never raises; returns empty lists on failure.
         """
         try:
             files = self.get_git_files()
-            # Invalidate any prior edge cache — snapshot must reflect current tree.
-            self._edges = None
             edges = self._all_import_edges(files)
             use_lsp = False
             try:
@@ -2453,15 +1906,6 @@ class RepoMapper:
             if with_index:
                 return empty, empty
             return empty
-
-    def describe_file(self, path: str) -> RepoFileEntry:
-        return RepoFileEntry(
-            path=path,
-            area=self._area_for_file(path),
-            kind=self._kind_for_file(path),
-            language=self._language_for_file(path),
-            summary=self._summary_for_file(path),
-        )
 
     def _is_runtime_or_generated_file(self, path: str) -> bool:
         normalized = path.replace("\\", "/")
@@ -2649,186 +2093,6 @@ class RepoMapper:
         )
         return sorted(tracked + untracked[:room])
 
-    def detect_languages(self, files: List[str]) -> List[str]:
-        """Stable language ids for map ``languages[]``.
-
-        Includes ``LANGUAGE_SPECS`` code langs plus markup overlay ids
-        (markdown, html, yaml, …) so docs/templates appear when present.
-        Markup suffixes are *not* in ``code_extensions()``, so they label the
-        map without promoting HTML-only asset trees into code subsystems.
-        """
-        langs: set[str] = set()
-        for path in files:
-            lang = language_id_for_suffix(Path(path).suffix, include_markup=True)
-            if lang:
-                langs.add(lang)
-        return sorted(langs)
-
-    @staticmethod
-    def _basenames(files: List[str]) -> set[str]:
-        return {Path(f.replace("\\", "/")).name for f in files}
-
-    @staticmethod
-    def _paths_with_basenames(files: List[str], names: set[str]) -> List[str]:
-        return [f for f in files if Path(f.replace("\\", "/")).name in names]
-
-    def _read_rel(self, rel: str) -> str:
-        """Read a repo-relative file (nested manifests); empty on failure."""
-        try:
-            return (self.project_root / rel).read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return ""
-
-    def detect_frameworks(self, files: List[str]) -> List[str]:
-        frameworks: List[str] = []
-        file_set = set(files)
-        basenames = self._basenames(files)
-        if "package.json" in file_set:
-            content = self._read_config_file("package.json")
-            if "next" in content:
-                frameworks.append("nextjs")
-            if "react" in content:
-                frameworks.append("react")
-            if "vue" in content:
-                frameworks.append("vue")
-            if "express" in content:
-                frameworks.append("express")
-
-        if "requirements.txt" in file_set or "pyproject.toml" in file_set:
-            try:
-                parts: List[str] = []
-                if "requirements.txt" in file_set:
-                    parts.append(self._read_config_file("requirements.txt"))
-                if "pyproject.toml" in file_set:
-                    parts.append(self._read_config_file("pyproject.toml"))
-                content = "".join(parts)
-
-                if "fastapi" in content.lower():
-                    frameworks.append("fastapi")
-                if "flask" in content.lower():
-                    frameworks.append("flask")
-                if "django" in content.lower():
-                    frameworks.append("django")
-            except Exception as e:
-                logger.debug("Failed to read Python config files: %s", e)
-
-        # SwiftPM / Vapor (basename-any so nested Package.swift counts).
-        if "Package.swift" in basenames:
-            frameworks.append("swiftpm")
-            for rel in self._paths_with_basenames(files, {"Package.swift"})[:8]:
-                text = self._read_rel(rel)
-                if "Vapor" in text or ".package(url:" in text and "vapor" in text.lower():
-                    frameworks.append("vapor")
-                    break
-
-        # Android / Kotlin / Compose (shallow content sniff).
-        if "AndroidManifest.xml" in basenames:
-            frameworks.append("android")
-        gradle_names = {
-            "build.gradle", "build.gradle.kts",
-            "settings.gradle", "settings.gradle.kts",
-        }
-        if basenames & gradle_names or "gradlew" in basenames:
-            for rel in self._paths_with_basenames(files, gradle_names)[:8]:
-                text = self._read_rel(rel).lower()
-                if "com.android" in text or "android." in text:
-                    if "android" not in frameworks:
-                        frameworks.append("android")
-                if "org.jetbrains.kotlin" in text or "kotlin(" in text or "kotlin." in text:
-                    if "kotlin" not in frameworks:
-                        frameworks.append("kotlin")
-                if "compose" in text:
-                    if "compose" not in frameworks:
-                        frameworks.append("compose")
-        return frameworks
-
-    def detect_package_managers(self, files: List[str]) -> List[str]:
-        managers: List[str] = []
-        file_set = set(files)
-        basenames = self._basenames(files)
-        if "package-lock.json" in file_set:
-            managers.append("npm")
-        elif "package.json" in file_set:
-            managers.append("npm")
-        if "yarn.lock" in file_set:
-            managers.append("yarn")
-        if "pnpm-lock.yaml" in file_set:
-            managers.append("pnpm")
-        if "requirements.txt" in file_set:
-            managers.append("pip")
-        if "uv.lock" in file_set:
-            managers.append("uv")
-        if "go.mod" in basenames or "go.sum" in basenames:
-            managers.append("go mod")
-        if "Cargo.toml" in basenames:
-            managers.append("cargo")
-        if "Package.swift" in basenames:
-            managers.append("swiftpm")
-        gradle_names = {
-            "build.gradle", "build.gradle.kts",
-            "settings.gradle", "settings.gradle.kts", "gradlew",
-        }
-        if basenames & gradle_names:
-            managers.append("gradle")
-        return managers
-
-    def detect_test_commands(self, files: List[str]) -> List[str]:
-        """Detect test, lint, and typecheck commands from project config."""
-        commands: List[str] = []
-        file_set = set(files)
-        basenames = self._basenames(files)
-
-        # Node.js projects: read scripts from package.json
-        if "package.json" in file_set:
-            try:
-                pkg = json.loads(self._read_config_file("package.json"))
-                scripts = pkg.get("scripts", {})
-                pm = "pnpm" if "pnpm-lock.yaml" in file_set else (
-                    "yarn" if "yarn.lock" in file_set else "npm"
-                )
-                for key in ["test", "lint", "typecheck", "check", "type-check"]:
-                    if key in scripts:
-                        if pm == "npm" and key != "test":
-                            commands.append(f"npm run {key}")
-                        else:
-                            commands.append(f"{pm} {key}")
-            except Exception as e:
-                logger.debug("Failed to parse package.json scripts: %s", e)
-
-        # Python projects
-        if "pyproject.toml" in file_set or "setup.py" in file_set:
-            if any(f.startswith("tests/") or f.startswith("test_") for f in files):
-                commands.append("pytest")
-            commands.append("ruff check .")
-            commands.append("mypy .")
-
-        # Go projects
-        if "go.mod" in basenames:
-            commands.append("go test ./...")
-            commands.append("go vet ./...")
-
-        # Rust projects
-        if "Cargo.toml" in basenames:
-            commands.append("cargo test")
-            commands.append("cargo clippy")
-
-        # SwiftPM
-        if "Package.swift" in basenames:
-            commands.append("swift test")
-
-        # Gradle / Android
-        gradle_names = {
-            "build.gradle", "build.gradle.kts",
-            "settings.gradle", "settings.gradle.kts", "gradlew",
-        }
-        if basenames & gradle_names:
-            if "gradlew" in basenames:
-                commands.append("./gradlew test")
-            else:
-                commands.append("gradle test")
-
-        return commands
-
     def _ripgrep_search(self, goal: str, files: List[str]) -> List[Dict[str, str]]:
         """Rank candidate files for ``goal`` via ripgrep content search, else path tokens.
 
@@ -2945,7 +2209,7 @@ class RepoMapper:
         return candidates
 
     def _scan_dependency_risks(self) -> List[Dict[str, str]]:
-        """Best-effort SCA scan; isolated so map_repo stays simple and never raises."""
+        """Best-effort SCA scan for ``refresh_map_artifacts``; never raises."""
         try:
             from devcouncil.repo.sca import scan_dependency_risks
 
@@ -2953,226 +2217,5 @@ class RepoMapper:
         except Exception:
             logger.debug("Dependency-risk scan failed", exc_info=True)
             return []
-
-    def map_repo(
-        self,
-        goal: str = "",
-        *,
-        scan_dependencies: bool = False,
-        liveness: bool = True,
-        lsp_refs: bool = False,
-    ) -> RepoMap:
-        """Build the repo map.
-
-        ``scan_dependencies`` is opt-in (default off) so the common ``dev map`` path
-        stays fast and never shells out to a vulnerability auditor. When enabled, a
-        best-effort SCA scan runs locally (only if an auditor is installed) and its
-        findings are attached as ``dependency_risks``.
-
-        ``liveness`` (default on) computes entry_roots / unwired / unreachable /
-        dead_symbol candidate lists. Pass False (``--no-liveness``) to skip.
-
-        ``lsp_refs`` (default off) confirms dead-symbol candidates via the optional
-        live LSP client when a language server is available.
-
-        Builds the symbol-level code knowledge graph first, writes
-        ``.devcouncil/graph/code_graph.json``, then derives the summary ``RepoMap``.
-        """
-        files = self.get_git_files()
-        # Decide DevCouncil-vs-generic and the source root BEFORE describing files, so
-        # area bucketing and subsystem inference agree within a single run.
-        self._use_generic = not any(path.startswith("src/devcouncil/") for path in files)
-        self._source_root = self.detect_source_root(files)
-
-        # Single-pass: extract + resolve + liveness/token-scan once; derive map lists
-        # and graph dead_code from that pass (no second _token_scan_dead).
-        changed = getattr(self, "_graph_changed_paths", None)
-        code_graph: CodeGraph | None = getattr(self, "_prebuilt_code_graph", None)
-        prebuilt_graph = code_graph is not None
-        skip_graph_build = bool(getattr(self, "_skip_code_graph_build", False))
-        if code_graph is not None:
-            self._last_code_graph = code_graph
-            self._edges = [
-                (e.source, e.target)
-                for e in code_graph.edges
-                if e.kind == "imports" and "::" not in e.source and "::" not in e.target
-            ]
-        elif skip_graph_build:
-            self._last_code_graph = None
-            self._edges = self._all_import_edges(files)
-        else:
-            try:
-                from devcouncil.indexing.graph.build import build_code_graph, write_code_graph
-
-                code_graph = build_code_graph(
-                    self.project_root,
-                    files,
-                    changed_paths=changed,
-                    liveness=liveness,
-                    lsp_refs=lsp_refs,
-                    mapper=self,
-                )
-                self._last_code_graph = code_graph
-                # File→file import edges only (named-import edges target symbols).
-                self._edges = [
-                    (e.source, e.target)
-                    for e in code_graph.edges
-                    if e.kind == "imports" and "::" not in e.source and "::" not in e.target
-                ]
-            except Exception:
-                logger.warning(
-                    "code graph build failed; falling back to import edges only "
-                    "(dead_symbol_candidates will be omitted — refusing token-only flood)",
-                    exc_info=True,
-                )
-                code_graph = None
-                self._last_code_graph = None
-                self._edges = self._all_import_edges(files)
-
-        if self._edges is None:
-            self._edges = self._all_import_edges(files)
-
-        file_entries = [self.describe_file(path) for path in sorted(files)]
-        file_set = set(files)
-
-        important_candidates = [
-            "README.md",
-            "AGENTS.md",
-            "CLAUDE.md",
-            "package.json",
-            "pyproject.toml",
-            "Package.swift",
-            "Cargo.toml",
-            "go.mod",
-            "build.gradle",
-            "build.gradle.kts",
-            "settings.gradle",
-            "settings.gradle.kts",
-            "AndroidManifest.xml",
-            "src/devcouncil/cli/main.py",
-            "src/devcouncil/app/orchestrator.py",
-            "src/devcouncil/app/state_machine.py",
-            "src/devcouncil/artifacts/graph.py",
-            "src/devcouncil/indexing/repo_mapper.py",
-            "src/devcouncil/storage/repositories.py",
-            "src/devcouncil/execution/task_runner.py",
-            "src/devcouncil/verification/verifier.py",
-        ]
-        # Basename-any: nested manifests (app/build.gradle.kts, Packages/…) count too.
-        important_basename_set = {
-            "Package.swift", "Cargo.toml", "go.mod",
-            "build.gradle", "build.gradle.kts",
-            "settings.gradle", "settings.gradle.kts",
-            "AndroidManifest.xml",
-        }
-        important_files = [path for path in important_candidates if path in file_set]
-        for path in sorted(files):
-            if Path(path.replace("\\", "/")).name in important_basename_set:
-                if path not in important_files:
-                    important_files.append(path)
-        important_files.extend(sorted(path for path in files if path.startswith(".github/workflows/")))
-        # On non-DevCouncil repos the curated candidates above mostly miss, so seed
-        # important surfaces from the most-depended-on source files.
-        if self._use_generic:
-            for path in self.generic_important_files(files):
-                if path not in important_files:
-                    important_files.append(path)
-
-        candidates: List[Dict[str, str]] = []
-        if goal:
-            candidates = self._ripgrep_search(goal, files)
-
-        entry_roots_list: List[str] = []
-        unwired: List[str] = []
-        unreachable: List[str] = []
-        dead_syms: List[str] = []
-        unreachable_unreliable = False
-        liveness_meta: Dict[str, object] = {}
-        if liveness and code_graph is not None:
-            entry_roots_list = list(code_graph.entry_roots)
-            # Caps apply only when serializing repo_map.json (graph stays uncapped).
-            from devcouncil.indexing.graph.liveness import apply_liveness_cap
-
-            cap = self._LIVENESS_CAP
-            unwired, um = apply_liveness_cap(list(code_graph.unwired_candidates), cap)
-            unreachable, rm = apply_liveness_cap(list(code_graph.unreachable_files), cap)
-            dead_syms, dm = apply_liveness_cap(list(code_graph.meta.get("legacy_dead_symbol_candidates") or []), cap)
-            liveness_meta = {"unwired": um, "unreachable": rm, "dead_symbol": dm}
-            unreachable_unreliable = bool(
-                code_graph.meta.get("liveness_unreachable_unreliable")
-            )
-        elif liveness:
-            # Graph assemble failed: keep file-level liveness from import edges,
-            # but do NOT run the token-only dead-symbol scan (misleading flood).
-            logger.warning(
-                "code graph unavailable; leaving dead_symbol_candidates empty"
-            )
-            try:
-                from devcouncil.indexing.graph.liveness import file_liveness
-
-                cap = self._LIVENESS_CAP
-                entry_roots_list, unwired, unreachable, unreachable_unreliable = (
-                    file_liveness(
-                        self.project_root,
-                        files,
-                        self._edges or [],
-                        cap=cap,
-                    )
-                )
-            except Exception:
-                logger.debug("file_liveness fallback after graph failure failed", exc_info=True)
-                entry_roots_list, unwired, unreachable = [], [], []
-                unreachable_unreliable = True
-            dead_syms = []
-
-        if code_graph is not None and not prebuilt_graph:
-            try:
-                from devcouncil.indexing.graph.build import write_code_graph
-
-                code_graph.generated_head = self._git_head()
-                code_graph.indexed_hash = self._files_fingerprint(files)
-                code_graph.content_fingerprint = self._content_fingerprint(files)
-                write_code_graph(self.project_root, code_graph)
-            except Exception:
-                # A missing/stale code_graph.json silently degrades every graph
-                # consumer — this must be visible, not a DEBUG-only whisper.
-                logger.warning(
-                    "failed to write code graph export (.devcouncil/graph/code_graph.json)",
-                    exc_info=True,
-                )
-
-        processes: List[Dict[str, object]] = []
-        if code_graph is not None:
-            raw_procs = code_graph.meta.get("processes") or []
-            if isinstance(raw_procs, list):
-                processes = [p for p in raw_procs[:12] if isinstance(p, dict)]
-
-        dependents, dependents_total = self.build_dependents(self._edges or [])
-        subsystems = self._build_subsystem_index(files)
-
-        return RepoMap(
-            languages=self.detect_languages(files),
-            frameworks=self.detect_frameworks(files),
-            package_managers=self.detect_package_managers(files),
-            test_commands=self.detect_test_commands(files),
-            important_files=important_files,
-            candidate_files=candidates,
-            files=file_entries,
-            subsystems=subsystems,
-            dependents=dependents,
-            dependents_total=dependents_total,
-            generated_head=self._git_head(),
-            indexed_hash=self._files_fingerprint(files),
-            content_fingerprint=self._content_fingerprint(files),
-            lsp=LspInspector(self.project_root).summary(files, client_enabled=lsp_refs),
-            dependency_risks=self._scan_dependency_risks() if scan_dependencies else [],
-            entry_roots=entry_roots_list,
-            unwired_candidates=unwired,
-            unreachable_files=unreachable,
-            dead_symbol_candidates=dead_syms,
-            liveness_unreachable_unreliable=unreachable_unreliable,
-            liveness_meta=liveness_meta,
-            processes=processes,
-        )
 
 RepositoryMapper = RepoMapper

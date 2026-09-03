@@ -22,6 +22,8 @@ from devcouncil.repo.sca import (
     _parse_pip_audit,
     scan_dependency_risks,
 )
+from devcouncil.indexing.map_artifacts import refresh_map_artifacts
+from tests.unit.support_maps import stub_kernel
 
 
 def _runner_returning(stdout: str, returncode: int = 1):
@@ -207,7 +209,10 @@ def test_repo_map_dependency_risks_default_off(tmp_path, monkeypatch):
 
     monkeypatch.setattr(RepoMapper, "_scan_dependency_risks", boom, raising=True)
 
-    repo_map = mapper.map_repo()  # default: scan_dependencies=False
+    stub_kernel(monkeypatch)
+    repo_map = refresh_map_artifacts(
+        mapper.project_root, mapper.project_root / ".devcouncil" / "repo_map.json", quiet=True
+    ).repo_map  # default: scan_dependencies=False
 
     assert repo_map.dependency_risks == []
     assert called["n"] == 0
@@ -225,7 +230,10 @@ def test_repo_map_dependency_risks_opt_in(tmp_path, monkeypatch):
         raising=True,
     )
 
-    repo_map = mapper.map_repo(scan_dependencies=True)
+    stub_kernel(monkeypatch)
+    repo_map = refresh_map_artifacts(
+        mapper.project_root, mapper.project_root / ".devcouncil" / "repo_map.json", quiet=True, scan_dependencies=True
+    ).repo_map
 
     assert repo_map.dependency_risks and repo_map.dependency_risks[0]["package"] == "x"
 

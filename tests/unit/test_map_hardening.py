@@ -4,27 +4,22 @@ Each test here encodes a defect observed in production on 2026-08-11:
 - ``_prune`` deleting FTS5 rows via the UNINDEXED ``generation_id`` column ran a
   single statement for 2+ hours at 100% CPU (full vtab scan + inverted-index
   churn inside one ever-growing WAL transaction).
-- The supervised build worker had no self-enforced deadline: killing the parent
-  ``dev map`` left an orphaned session-leader worker grinding forever while
-  holding ``writer.lock``.
-- ``_terminate_worker`` skipped the group SIGKILL when the leader was already
-  dead, leaking SIGTERM-ignoring stragglers (multiprocessing resource trackers).
 - ``dev map dead`` reported dead-code results from an index frozen at a commit
   five days behind HEAD with no staleness signal at all.
-- ``changed-*.txt`` handoff files accumulated forever when the supervisor died.
+
+The supervised-worker regressions that used to live here (self-enforced
+deadline, group SIGKILL for SIGTERM-ignoring stragglers, ``changed-*.txt``
+handoff GC) went with ``build_worker`` / ``run_isolated_full_build``: the Rust
+kernel builds in its own process and supervises itself.
 """
 
 from __future__ import annotations
 
-import os
-import signal
 import sqlite3
 import subprocess
-import sys
 import time
 from pathlib import Path
 
-import pytest
 from typer.testing import CliRunner
 
 from devcouncil.codeintel.store import CodeIntelStore
@@ -171,66 +166,8 @@ def test_fk_child_columns_are_indexed(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. Worker self-supervision: deadline trip → interrupt → escalate.
+# 2. A long write must be abortable.
 # ---------------------------------------------------------------------------
-
-
-def test_self_supervisor_trips_interrupts_then_escalates() -> None:
-    from devcouncil.codeintel.build_worker import SelfSupervisor
-
-    events: list[str] = []
-    supervisor = SelfSupervisor(
-        total_timeout=0.2,
-        interrupt=lambda: events.append("interrupt"),
-        escalate=lambda: events.append("escalate"),
-        escalate_after=0.4,
-        poll_interval=0.05,
-        on_trip=lambda reason: events.append(f"trip:{reason}"),
-    )
-    supervisor.start()
-    try:
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline and "escalate" not in events:
-            time.sleep(0.05)
-    finally:
-        supervisor.stop()
-    assert any(event.startswith("trip:") for event in events), events
-    assert "interrupt" in events, "supervisor must interrupt the active statement"
-    assert "escalate" in events, "supervisor must escalate when interrupts do not stop the build"
-    assert supervisor.tripped_reason
-
-
-def test_self_supervisor_never_trips_before_deadline() -> None:
-    from devcouncil.codeintel.build_worker import SelfSupervisor
-
-    events: list[str] = []
-    supervisor = SelfSupervisor(
-        total_timeout=60.0,
-        interrupt=lambda: events.append("interrupt"),
-        escalate=lambda: events.append("escalate"),
-        poll_interval=0.05,
-    )
-    supervisor.start()
-    time.sleep(0.3)
-    supervisor.stop()
-    assert not events
-    assert supervisor.tripped_reason == ""
-
-
-def test_worker_command_carries_total_timeout(tmp_path: Path) -> None:
-    from devcouncil.codeintel.build_control import _worker_command
-
-    command = _worker_command(
-        tmp_path,
-        build_id="abc123",
-        heartbeat_interval=5.0,
-        liveness=True,
-        changed_file=None,
-        total_timeout=1234.5,
-    )
-    assert "--total-timeout" in command
-    assert "1234.5" in command
-    assert "--no-liveness" not in command
 
 
 def test_store_interrupt_writes_aborts_running_statement(tmp_path: Path) -> None:
@@ -270,138 +207,7 @@ def test_store_interrupt_writes_aborts_running_statement(tmp_path: Path) -> None
 
 
 # ---------------------------------------------------------------------------
-# 3. Supervisor kill path must reap SIGTERM-ignoring stragglers.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
-def test_terminate_worker_reaps_sigterm_ignoring_stragglers() -> None:
-    from devcouncil.codeintel.build_control import _terminate_worker
-
-    leader_source = (
-        "import os, signal, subprocess, sys, time\n"
-        "child = subprocess.Popen([sys.executable, '-c', "
-        "'import signal, time, sys; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        "print(\"ready\", flush=True); time.sleep(120)'], stdout=subprocess.PIPE, text=True)\n"
-        "child.stdout.readline()\n"  # straggler has installed SIG_IGN before we report it
-        "print(child.pid, flush=True)\n"
-        "time.sleep(120)\n"
-    )
-    process = subprocess.Popen(
-        [sys.executable, "-c", leader_source],
-        stdout=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-    assert process.stdout is not None
-    straggler_pid = int(process.stdout.readline())
-    try:
-        still_alive = _terminate_worker(process)
-        assert not still_alive
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            try:
-                os.kill(straggler_pid, 0)
-            except ProcessLookupError:
-                break
-            time.sleep(0.1)
-        else:
-            pytest.fail(
-                "SIGTERM-ignoring straggler survived _terminate_worker; group "
-                "SIGKILL must always follow leader death"
-            )
-    finally:
-        for pid in (process.pid, straggler_pid):
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-        process.wait(timeout=5.0)
-
-
-# ---------------------------------------------------------------------------
-# 4. Build-artifact garbage collection.
-# ---------------------------------------------------------------------------
-
-
-def test_stale_build_artifacts_are_garbage_collected(tmp_path: Path) -> None:
-    from devcouncil.codeintel.build_control import gc_build_artifacts
-
-    codeintel = tmp_path / ".devcouncil" / "codeintel"
-    codeintel.mkdir(parents=True)
-    old_time = time.time() - 3 * 86400
-
-    old_changed = codeintel / "changed-deadbeef.txt"
-    old_changed.write_text("a.py\n", encoding="utf-8")
-    os.utime(old_changed, (old_time, old_time))
-
-    old_tmp = codeintel / ".build_status.json.abc123.tmp"
-    old_tmp.write_text("{}", encoding="utf-8")
-    os.utime(old_tmp, (old_time, old_time))
-
-    fresh_changed = codeintel / "changed-cafef00d.txt"
-    fresh_changed.write_text("b.py\n", encoding="utf-8")
-
-    removed = gc_build_artifacts(tmp_path)
-
-    assert not old_changed.exists()
-    assert not old_tmp.exists()
-    assert fresh_changed.exists()
-    assert removed >= 2
-
-
-def test_isolated_build_gc_uses_config_derived_handoff_age(tmp_path: Path, monkeypatch) -> None:
-    """The per-build GC must reap handoffs on the worker-deadline scale, not days.
-
-    A SIGKILLed hook supervisor (and its worker) skips both ``finally`` unlinks,
-    so ``changed-*.txt`` cleanup falls to the GC at the start of the next build.
-    The worker self-terminates at ``total_timeout + 30s``; a handoff older than
-    twice that provably belongs to a dead build and must not wait out the 2-day
-    default.
-    """
-    from types import SimpleNamespace
-
-    from devcouncil.codeintel import build_control
-
-    (tmp_path / ".devcouncil").mkdir()
-    total_timeout = 120.0
-    monkeypatch.setattr(
-        "devcouncil.app.config.load_config",
-        lambda _r: SimpleNamespace(
-            indexing=SimpleNamespace(
-                build_stall_timeout_seconds=1.0,
-                build_total_timeout_seconds=total_timeout,
-            )
-        ),
-    )
-    service = SimpleNamespace(store=SimpleNamespace(current_generation=lambda: 0))
-    monkeypatch.setattr(build_control, "get_codeintel_service", lambda _r: service)
-
-    seen: dict[str, float] = {}
-
-    def _capture_gc(root: Path, *, max_age_seconds: float = -1.0) -> int:
-        seen["max_age_seconds"] = max_age_seconds
-        return 0
-
-    monkeypatch.setattr(build_control, "gc_build_artifacts", _capture_gc)
-
-    def _no_spawn(*_a, **_k):
-        raise OSError("spawn blocked by test")
-
-    monkeypatch.setattr(build_control.subprocess, "Popen", _no_spawn)
-
-    with pytest.raises(OSError, match="spawn blocked"):
-        build_control.run_isolated_full_build(tmp_path)
-
-    assert seen["max_age_seconds"] == pytest.approx(2.0 * (total_timeout + 30.0))
-
-
-# ---------------------------------------------------------------------------
-# 5. Index freshness must be computed and surfaced, and `dev map dead`
+# 3. Index freshness must be computed and surfaced, and `dev map dead`
 #    must fail loud on a stale index.
 # ---------------------------------------------------------------------------
 

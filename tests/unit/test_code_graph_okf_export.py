@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import subprocess
 
-from devcouncil.indexing.graph.build import build_code_graph, write_code_graph
+from devcouncil.indexing.graph.build import write_code_graph
+from tests.unit.graph_fixtures import kernel_graph
 from devcouncil.indexing.graph.export import (
     build_code_graph_okf,
     export_graphml,
@@ -45,7 +46,7 @@ def _tiny_graph(tmp_path):
         },
     )
     _commit(tmp_path)
-    return build_code_graph(tmp_path, liveness=False)
+    return kernel_graph(tmp_path)
 
 
 def test_file_doc_rel_convention():

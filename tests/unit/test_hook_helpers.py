@@ -157,12 +157,12 @@ def test_maybe_refresh_map_too_many_paths(tmp_path, monkeypatch):
 
 
 def test_maybe_refresh_map_success(tmp_path, monkeypatch):
-    import devcouncil.indexing.graph.build as graph_build
+    import devcouncil.indexing.map_artifacts as map_artifacts
     monkeypatch.setattr(time, "sleep", lambda s: None)
     refreshed = {}
     monkeypatch.setattr(
-        graph_build, "refresh_map_for_paths",
-        lambda root, batch: refreshed.setdefault("batch", list(batch)),
+        map_artifacts, "refresh_map_artifacts",
+        lambda root, output, *a, paths=None, **k: refreshed.setdefault("batch", list(paths or [])),
     )
     hook._maybe_refresh_map(tmp_path, json.dumps({"tool_name": "Write", "file_path": "src/a.py"}))
     assert refreshed["batch"] == ["src/a.py"]
@@ -327,12 +327,12 @@ def test_read_lock_meta_legacy_bad_timestamp(tmp_path):
 
 
 def test_maybe_refresh_map_absolute_path(tmp_path, monkeypatch):
-    import devcouncil.indexing.graph.build as graph_build
+    import devcouncil.indexing.map_artifacts as map_artifacts
     monkeypatch.setattr(time, "sleep", lambda s: None)
     refreshed = {}
     monkeypatch.setattr(
-        graph_build, "refresh_map_for_paths",
-        lambda root, batch: refreshed.setdefault("batch", list(batch)),
+        map_artifacts, "refresh_map_artifacts",
+        lambda root, output, *a, paths=None, **k: refreshed.setdefault("batch", list(paths or [])),
     )
     abs_path = str((tmp_path / "src" / "a.py"))
     hook._maybe_refresh_map(tmp_path, json.dumps({"file_path": abs_path}))
@@ -340,13 +340,13 @@ def test_maybe_refresh_map_absolute_path(tmp_path, monkeypatch):
 
 
 def test_maybe_refresh_map_refresh_exception_is_swallowed(tmp_path, monkeypatch):
-    import devcouncil.indexing.graph.build as graph_build
+    import devcouncil.indexing.map_artifacts as map_artifacts
     monkeypatch.setattr(time, "sleep", lambda s: None)
 
-    def boom(root, batch):
+    def boom(root, output, *a, **k):
         raise RuntimeError("refresh failed")
 
-    monkeypatch.setattr(graph_build, "refresh_map_for_paths", boom)
+    monkeypatch.setattr(map_artifacts, "refresh_map_artifacts", boom)
     # Must not raise — the finally-block cleans up the lock.
     hook._maybe_refresh_map(tmp_path, json.dumps({"file_path": "src/a.py"}))
     assert not (tmp_path / hook._MAP_REFRESH_LOCK_REL).exists()

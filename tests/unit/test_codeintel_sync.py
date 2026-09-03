@@ -1,300 +1,23 @@
+"""The writer lease, and the kernel seam that is the only map/graph writer.
+
+The watcher (``SyncCoordinator``), the watch scope (``IndexScope``) and the
+Python incremental engine (``sync_affected_paths``) were retired with the
+Python graph engine, and every test that exercised them went with them: they
+asserted the behaviour of a second writer of ``repo_map.json`` /
+``code_graph.json`` that no longer exists.
+"""
+
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import subprocess
-import threading
 import time
+from pathlib import Path
 
 import pytest
 
-from devcouncil.codeintel.service import get_codeintel_service
-from devcouncil.codeintel.sync import IndexScope, SyncCoordinator
-from devcouncil.codeintel.sync.incremental import sync_affected_paths
+from devcouncil.codeintel import sync as sync_package
 from devcouncil.codeintel.sync.lease import WriterLease
-from devcouncil.indexing.graph.schema import CodeGraph, GraphNode, NodeKind
-
-
-def _persist_file(root: Path, rel: str) -> None:
-    service = get_codeintel_service(root)
-    service.persist(CodeGraph(nodes=[
-        GraphNode(id=rel, kind=NodeKind.FILE, path=rel, name=Path(rel).name, language="python")
-    ]))
-
-
-def test_two_watchers_serialize_on_writer_lease_and_both_drain(tmp_path: Path) -> None:
-    """Two SyncCoordinator writers on one project must serialize and both finish.
-
-    Regression for the multi-watcher race: without bounded lease retry the loser
-    stayed ``read_only`` with pending uncleared, and a failed re-acquire could
-    stamp a lean map over a healthy generation.
-    """
-    from concurrent.futures import ThreadPoolExecutor
-
-    (tmp_path / "a.py").write_text("VALUE = 1\n", encoding="utf-8")
-    (tmp_path / "b.py").write_text("VALUE = 2\n", encoding="utf-8")
-    service = get_codeintel_service(tmp_path)
-    service.persist(
-        CodeGraph(
-            nodes=[
-                GraphNode(
-                    id="a.py",
-                    kind=NodeKind.FILE,
-                    path="a.py",
-                    name="a.py",
-                    language="python",
-                ),
-                GraphNode(
-                    id="b.py",
-                    kind=NodeKind.FILE,
-                    path="b.py",
-                    name="b.py",
-                    language="python",
-                ),
-            ]
-        )
-    )
-
-    order: list[str] = []
-    lock = threading.Lock()
-    active = 0
-    max_active = 0
-
-    def make_callback(name: str):
-        def _cb(paths: list[str]) -> None:
-            nonlocal active, max_active
-            with lock:
-                active += 1
-                max_active = max(max_active, active)
-                order.append(f"{name}:start:{','.join(paths)}")
-            time.sleep(0.25)  # hold writer.lock long enough that the peer must backoff
-            with lock:
-                active -= 1
-                order.append(f"{name}:done")
-
-        return _cb
-
-    first = SyncCoordinator(
-        service,
-        sync_callback=make_callback("w1"),
-        debounce_seconds=60.0,
-        reconcile_seconds=300.0,
-    )
-    second = SyncCoordinator(
-        get_codeintel_service(tmp_path),
-        sync_callback=make_callback("w2"),
-        debounce_seconds=60.0,
-        reconcile_seconds=300.0,
-    )
-    first.mark_pending("a.py")
-    second.mark_pending("b.py")
-
-    results: dict[str, bool] = {}
-
-    def run(label: str, coordinator: SyncCoordinator) -> None:
-        results[label] = coordinator.sync_now()
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        f1 = pool.submit(run, "w1", first)
-        f2 = pool.submit(run, "w2", second)
-        assert f1.result(timeout=20) is None or True
-        assert f2.result(timeout=20) is None or True
-
-    assert results == {"w1": True, "w2": True}
-    assert first.status().pending == []
-    assert second.status().pending == []
-    assert max_active == 1, f"writers overlapped: {order}"
-    starts = [item for item in order if ":start:" in item]
-    dones = [item for item in order if item.endswith(":done")]
-    assert len(starts) == 2 and len(dones) == 2
-    # Fully serialized: first done precedes second start.
-    assert order.index(dones[0]) < order.index(starts[1])
-
-
-def test_index_scope_uses_language_manifest_and_ignores_state(tmp_path: Path) -> None:
-    (tmp_path / ".git").mkdir()
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
-    (tmp_path / "src" / "note.txt").write_text("no\n", encoding="utf-8")
-    (tmp_path / ".devcouncil").mkdir()
-    (tmp_path / ".devcouncil" / "x.py").write_text("ignored\n", encoding="utf-8")
-
-    scope = IndexScope(tmp_path)
-    assert scope.includes("src/a.py")
-    assert not scope.includes("src/note.txt")
-    assert not scope.includes(".devcouncil/x.py")
-
-
-def test_index_scope_excludes_nested_vendor_min_js_like_graph_ingestion(
-    tmp_path: Path,
-) -> None:
-    """Watcher scope must match graph exclusion or reconcile loops forever.
-
-    Nested ``assets/vendor/force-graph.min.js`` is not under a root ``vendor/``
-    prefix, so prefix-only ignores miss it while ``is_vendored_path`` / graph
-    build correctly drop it — leaving the path perpetually "changed".
-    """
-    vendor = tmp_path / "src" / "devcouncil" / "assets" / "vendor"
-    vendor.mkdir(parents=True)
-    force_graph = vendor / "force-graph.min.js"
-    force_graph.write_text("/* vendor */\n", encoding="utf-8")
-    (tmp_path / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
-    (tmp_path / ".devcouncil").mkdir()
-
-    scope = IndexScope(tmp_path)
-    rel = "src/devcouncil/assets/vendor/force-graph.min.js"
-    assert not scope.includes(rel)
-    assert rel not in scope.files()
-    assert scope.includes("src/app.py")
-
-    _persist_file(tmp_path, "src/app.py")
-    coordinator = SyncCoordinator(
-        get_codeintel_service(tmp_path),
-        sync_callback=lambda _paths: None,
-    )
-    assert rel not in coordinator.reconcile()
-    assert coordinator.reconcile() == []
-
-
-def test_index_scope_files_does_not_recheck_git_ignored_paths(tmp_path: Path, monkeypatch) -> None:
-    scope = IndexScope(tmp_path)
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, stdout=b"a.py\0note.txt\0"),
-    )
-    monkeypatch.setattr(
-        scope,
-        "_git_ignored",
-        lambda _rel: (_ for _ in ()).throw(AssertionError("redundant check-ignore")),
-    )
-
-    assert scope.files() == ["a.py"]
-
-
-def test_coordinator_start_does_not_block_on_initial_reconcile(tmp_path: Path, monkeypatch) -> None:
-    coordinator = SyncCoordinator(get_codeintel_service(tmp_path), sync_callback=lambda _paths: None)
-    entered = threading.Event()
-    release = threading.Event()
-
-    def slow_reconcile():
-        entered.set()
-        release.wait(timeout=2)
-        return []
-
-    monkeypatch.setattr(coordinator, "_start_observer", lambda: None)
-    monkeypatch.setattr(coordinator, "reconcile", slow_reconcile)
-    started_at = time.monotonic()
-    coordinator.start()
-
-    assert time.monotonic() - started_at < 0.2
-    assert entered.wait(timeout=1)
-    release.set()
-    coordinator.stop()
-
-
-def test_reconcile_detects_modify_create_and_delete(tmp_path: Path) -> None:
-    source = tmp_path / "a.py"
-    source.write_text("x = 1\n", encoding="utf-8")
-    _persist_file(tmp_path, "a.py")
-    source.write_text("x = 2\n", encoding="utf-8")
-    created = tmp_path / "b.py"
-    created.write_text("y = 1\n", encoding="utf-8")
-    coordinator = SyncCoordinator(get_codeintel_service(tmp_path), sync_callback=lambda _paths: None)
-
-    changed = coordinator.reconcile()
-    assert changed == ["a.py", "b.py"]
-
-    source.unlink()
-    assert "a.py" in coordinator.reconcile()
-
-
-def test_sync_batches_pending_and_updates_state(tmp_path: Path) -> None:
-    source = tmp_path / "a.py"
-    source.write_text("x = 1\n", encoding="utf-8")
-    seen: list[list[str]] = []
-    coordinator = SyncCoordinator(
-        get_codeintel_service(tmp_path),
-        debounce_seconds=0.1,
-        sync_callback=lambda paths: seen.append(paths),
-    )
-    coordinator.mark_pending("a.py")
-
-    assert coordinator.sync_now()
-    assert seen == [["a.py"]]
-    assert coordinator.status().pending == []
-
-
-def test_watcher_polling_fallback_is_reported_separately(tmp_path: Path, monkeypatch) -> None:
-    import importlib
-
-    import watchdog.observers
-    import watchdog.observers.polling
-
-    class FailingObserver:
-        emitters: list[object] = []
-
-        def schedule(self, *_args, **_kwargs):
-            raise OSError("native unavailable")
-
-        def stop(self):
-            return None
-
-        def join(self, **_kwargs):
-            return None
-
-    class FakePollingObserver:
-        emitters: list[object] = []
-
-        def __init__(self, **_kwargs):
-            return None
-
-        def schedule(self, *_args, **_kwargs):
-            return None
-
-        def start(self):
-            return None
-
-        def stop(self):
-            return None
-
-        def join(self, **_kwargs):
-            return None
-
-    monkeypatch.setattr(watchdog.observers, "Observer", FailingObserver)
-    try:
-        kqueue = importlib.import_module("watchdog.observers.kqueue")
-    except (ImportError, AttributeError):
-        pass
-    else:
-        monkeypatch.setattr(kqueue, "KqueueObserver", FailingObserver)
-    monkeypatch.setattr(watchdog.observers.polling, "PollingObserver", FakePollingObserver)
-    coordinator = SyncCoordinator(get_codeintel_service(tmp_path), sync_callback=lambda _paths: None)
-
-    coordinator._start_observer()
-
-    state = coordinator.status()
-    assert state.backend_kind == "polling"
-    assert state.state == "degraded"
-    assert "native unavailable" in state.degraded_reason
-    coordinator.stop()
-
-
-def test_fsevents_preflight_retries_transient_timeout(tmp_path: Path, monkeypatch) -> None:
-    from devcouncil.codeintel.sync import coordinator as coordinator_mod
-
-    calls: list[str] = []
-
-    def flaky_run(*_args, **_kwargs):
-        calls.append("run")
-        if len(calls) == 1:
-            raise subprocess.TimeoutExpired(cmd=_args[0], timeout=5.0)
-        return subprocess.CompletedProcess(_args[0], 0, stdout=b"", stderr=b"")
-
-    monkeypatch.setattr(coordinator_mod.subprocess, "run", flaky_run)
-    monkeypatch.setattr(coordinator_mod.time, "sleep", lambda _seconds: None)
-    assert coordinator_mod._fsevents_preflight(tmp_path) is True
-    assert len(calls) == 2
 
 
 def test_writer_lease_is_exclusive(tmp_path: Path) -> None:
@@ -344,914 +67,300 @@ def test_writer_lease_acquire_with_retry_times_out(tmp_path: Path, monkeypatch) 
     holder.release()
 
 
-def test_sync_now_retries_busy_lease_then_succeeds(tmp_path: Path, monkeypatch) -> None:
-    from concurrent.futures import ThreadPoolExecutor
+def _have_kernel() -> bool:
+    from devcouncil.devmap_engine import DevMapEngineError, find_engine_binary
 
-    from devcouncil.codeintel.sync.lease import WriterLease
-
-    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
-    service = get_codeintel_service(tmp_path)
-    calls: list[list[str]] = []
-    coordinator = SyncCoordinator(
-        service,
-        sync_callback=lambda paths: calls.append(list(paths)),
-    )
-    lock = tmp_path / ".devcouncil" / "codeintel" / "writer.lock"
-    holder = WriterLease(lock)
-    assert holder.acquire()
-
-    def release_soon() -> None:
-        time.sleep(0.15)
-        holder.release()
-
-    coordinator.mark_pending("app.py")
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        pool.submit(release_soon)
-        # Use a short sync timeout so the test stays fast; retry still wins.
-        monkeypatch.setattr(
-            "devcouncil.codeintel.build_control._lease_timeouts",
-            lambda _root: (30.0, 2.0),
-        )
-        assert coordinator.sync_now() is True
-    assert calls == [["app.py"]]
-    assert coordinator.status().pending == []
-    assert coordinator.status().state in {"healthy", "degraded"}
+    try:
+        find_engine_binary()
+    except DevMapEngineError:
+        return False
+    return True
 
 
-def test_map_artifacts_does_not_lean_on_graph_build_busy(tmp_path: Path, monkeypatch) -> None:
-    from devcouncil.codeintel.build_control import GraphBuildBusy
+requires_kernel = pytest.mark.skipif(
+    not _have_kernel(), reason="devmap kernel not built (cargo build --release -p devmap-cli)"
+)
+
+
+def test_map_artifacts_propagates_a_kernel_failure_without_writing_a_map(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A kernel that cannot build fails closed: the error propagates, nothing is written.
+
+    This is the kernel-era form of the retired lease-contention case. The
+    Python engine could answer a busy writer lease by stamping a lean,
+    ``graph_degraded`` map over a healthy store; the kernel is the only writer
+    now, so a failed build must leave no artifact behind for ``--if-stale`` to
+    mistake for a fresh one.
+    """
+    from devcouncil.devmap_engine import DevMapEngineError
     from devcouncil.indexing import map_artifacts
 
     (tmp_path / ".devcouncil").mkdir()
     (tmp_path / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
 
     def boom(*_a, **_k):
-        raise GraphBuildBusy(
-            "could not re-acquire the code-intelligence writer lease after isolated build"
+        raise DevMapEngineError(
+            "devmap build failed (exit 1): the store is locked by devmap pid 4242"
         )
 
-    # Patch the module the function imports from (local import inside refresh).
-    monkeypatch.setattr(
-        "devcouncil.codeintel.build_control.run_isolated_full_build",
-        boom,
-    )
-    with pytest.raises(GraphBuildBusy, match="re-acquire"):
+    monkeypatch.setattr("devcouncil.devmap_engine.build_map", boom)
+    with pytest.raises(DevMapEngineError, match="locked"):
         map_artifacts.refresh_map_artifacts(
             tmp_path,
             tmp_path / ".devcouncil" / "repo_map.json",
             quiet=True,
         )
-    # Must not stamp a lean degraded map over lease contention.
-    map_path = tmp_path / ".devcouncil" / "repo_map.json"
-    assert not map_path.is_file() or not json.loads(
-        map_path.read_text(encoding="utf-8")
-    ).get("graph_degraded")
+    assert not (tmp_path / ".devcouncil" / "repo_map.json").exists()
+    assert not (tmp_path / ".devcouncil" / "graph" / "code_graph.json").exists()
 
 
-def test_map_artifacts_recovers_from_graph_build_timeout_with_prior(
+def test_map_artifacts_keeps_the_prior_artifacts_when_the_kernel_times_out(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """A timeout with a loadable prior generation refreshes the map from it.
+    """A timed-out build leaves the previous map and graph byte-identical.
 
-    It must not lean-stamp ``graph_degraded`` (that forces perpetual --if-stale
-    rebuilds while SQLite is fine), must not crash the caller with a traceback,
-    and must not re-stamp current-tree fingerprints — the graph is intact but
-    older than HEAD, so staleness detection has to keep saying stale.
+    The kernel commits a generation in one transaction, so a timeout leaves
+    the store on the prior generation. The seam must leave the prior artifacts
+    alone too: their fingerprints describe the tree the prior generation was
+    built from, and restamping them from today's tree would make a stale map
+    read fresh. (The Python engine used to do exactly that when it recovered
+    from a timeout without a prior generation.)
     """
-    from devcouncil.codeintel.build_control import GraphBuildTimeout
+    from devcouncil.devmap_engine import DevMapEngineError
     from devcouncil.indexing import map_artifacts
 
-    (tmp_path / ".devcouncil").mkdir()
+    devcouncil_dir = tmp_path / ".devcouncil"
+    (devcouncil_dir / "graph").mkdir(parents=True)
     (tmp_path / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
-    _persist_file(tmp_path, "app.py")
-    assert get_codeintel_service(tmp_path).load() is not None
+    map_path = devcouncil_dir / "repo_map.json"
+    graph_path = devcouncil_dir / "graph" / "code_graph.json"
+    map_path.write_text(
+        json.dumps(
+            {
+                "map_engine": "devmap-rust",
+                "generated_head": "prior-head",
+                "indexed_hash": "prior-hash",
+                "content_fingerprint": "prior-fingerprint",
+                "files": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    graph_path.write_text(
+        json.dumps({"meta": {"map_engine": "devmap-rust"}, "nodes": [], "edges": []}),
+        encoding="utf-8",
+    )
+    before = (map_path.read_bytes(), graph_path.read_bytes())
 
     def boom(*_a, **_k):
-        raise GraphBuildTimeout("graph build made no progress for 90.0s")
+        raise DevMapEngineError("devmap timed out after 900s: build")
 
-    monkeypatch.setattr(
-        "devcouncil.codeintel.build_control.run_isolated_full_build",
-        boom,
-    )
-    result = map_artifacts.refresh_map_artifacts(
-        tmp_path,
-        tmp_path / ".devcouncil" / "repo_map.json",
-        quiet=True,
-        full=True,
-    )
-    assert result.build_incomplete is True
-    assert result.degraded is False
-    assert result.mode == "prior_generation"
-    assert "GraphBuildTimeout" in result.reason
+    monkeypatch.setattr("devcouncil.devmap_engine.build_map", boom)
+    with pytest.raises(DevMapEngineError, match="timed out"):
+        map_artifacts.refresh_map_artifacts(tmp_path, map_path, quiet=True, full=True)
 
-    map_path = tmp_path / ".devcouncil" / "repo_map.json"
-    written = json.loads(map_path.read_text(encoding="utf-8"))
-    assert not written.get("graph_degraded")
-    # Fingerprints came from the prior graph, not a fresh scan of the tree.
-    prior = get_codeintel_service(tmp_path).load()
-    assert prior is not None
-    assert written.get("content_fingerprint") == prior.content_fingerprint
+    assert (map_path.read_bytes(), graph_path.read_bytes()) == before
 
 
-def test_map_artifacts_leans_on_graph_build_timeout_without_prior(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """With no usable prior generation a timeout still writes a lean, degraded map."""
-    from devcouncil.codeintel.build_control import GraphBuildTimeout
+@requires_kernel
+def test_map_artifacts_reuses_generation_when_nothing_changed(tmp_path: Path) -> None:
+    """``dev map`` on an unchanged tree must not write a new generation.
+
+    The kernel's unchanged-skip path is what makes the post-tool-use hook and
+    ``--if-stale`` cheap; a second build of the same tree has to come back on
+    the generation the first one committed.
+    """
     from devcouncil.indexing import map_artifacts
 
-    (tmp_path / ".devcouncil").mkdir()
-    (tmp_path / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
-
-    def boom(*_a, **_k):
-        raise GraphBuildTimeout("graph build made no progress for 90.0s")
-
-    monkeypatch.setattr(
-        "devcouncil.codeintel.build_control.run_isolated_full_build",
-        boom,
-    )
-    result = map_artifacts.refresh_map_artifacts(
-        tmp_path,
-        tmp_path / ".devcouncil" / "repo_map.json",
-        quiet=True,
-    )
-    assert result.degraded is True
-    assert result.mode == "lean"
-    assert result.build_incomplete is False
-
-
-def test_map_artifacts_reuses_generation_when_nothing_changed(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """``dev map`` with no drift must not force an isolated full rebuild."""
-    from devcouncil.indexing import map_artifacts
-
-    (tmp_path / ".devcouncil").mkdir()
-    (tmp_path / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
-    _persist_file(tmp_path, "app.py")
-
-    def boom(*_a, **_k):
-        raise AssertionError("full rebuild must not run for an empty change set")
-
-    monkeypatch.setattr(
-        "devcouncil.codeintel.build_control.run_isolated_full_build",
-        boom,
-    )
-    result = map_artifacts.refresh_map_artifacts(
-        tmp_path,
-        tmp_path / ".devcouncil" / "repo_map.json",
-        quiet=True,
-    )
-    assert result.mode == "reused"
-    assert result.degraded is False
-
-
-def test_incremental_sync_re_resolves_reverse_import_closure_without_full_rebuild(
-    tmp_path: Path,
-) -> None:
-    from devcouncil.cli.commands.map import generate_map_artifacts
-
-    (tmp_path / ".devcouncil").mkdir()
-    (tmp_path / "a.py").write_text("def target():\n    return 1\n", encoding="utf-8")
-    (tmp_path / "b.py").write_text(
-        "from a import target\n\ndef caller():\n    return target()\n",
-        encoding="utf-8",
-    )
-    for index in range(8):
-        (tmp_path / f"filler_{index}.py").write_text(
-            f"VALUE_{index} = {index}\n",
-            encoding="utf-8",
-        )
-    generate_map_artifacts(
-        tmp_path,
-        tmp_path / ".devcouncil" / "repo_map.json",
-        quiet=True,
-    )
-    service = get_codeintel_service(tmp_path)
-    first_generation = service.store.current_generation()
-    (tmp_path / "a.py").write_text("def target():\n    return 2\n", encoding="utf-8")
-
-    graph = sync_affected_paths(service, ["a.py"])
-
-    assert service.store.current_generation() == first_generation + 1  # type: ignore[operator]
-    assert graph.meta["resolution_scope"] == "affected"
-    assert graph.meta["affected_paths"] == ["a.py", "b.py"]
-    assert any(
-        edge.source.endswith("::caller")
-        and edge.target.endswith("::target")
-        and edge.kind == "calls"
-        for edge in graph.edges
-    )
-
-
-def test_incremental_dead_confidence_and_repo_map_match_token_scan(
-    tmp_path: Path,
-) -> None:
-    import json
-
-    from devcouncil.cli.commands.map import generate_map_artifacts
-
-    (tmp_path / ".devcouncil").mkdir()
-    (tmp_path / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
-    for index in range(8):
-        (tmp_path / f"filler_{index}.py").write_text(
-            f"VALUE_{index} = {index}\n",
-            encoding="utf-8",
-        )
-    generate_map_artifacts(
-        tmp_path,
-        tmp_path / ".devcouncil" / "repo_map.json",
-        quiet=True,
-    )
-    service = get_codeintel_service(tmp_path)
-    (tmp_path / "app.py").write_text(
-        "def main():\n    return 1\n\ndef newly_dead():\n    return 2\n",
-        encoding="utf-8",
-    )
-    graph = sync_affected_paths(service, ["app.py"])
-
-    candidate = next(entry for entry in graph.dead_code if entry.id.endswith("::newly_dead"))
-    assert candidate.confidence.value == "extracted"
-    assert graph.meta["resolution_scope"] == "full"
-    repo_map = json.loads(
-        (tmp_path / ".devcouncil" / "repo_map.json").read_text(encoding="utf-8")
-    )
-    assert any("newly_dead" in value for value in repo_map["dead_symbol_candidates"])
-
-
-def test_incremental_liveness_reliability_and_deleted_map_filter_match_full_build(
-    tmp_path: Path,
-) -> None:
-    import json
-
-    from devcouncil.cli.commands.map import generate_map_artifacts
-
-    (tmp_path / ".devcouncil").mkdir()
-    (tmp_path / "orphan.py").write_text(
-        "def helper():\n    return 1\n",
-        encoding="utf-8",
-    )
-    for index in range(8):
-        (tmp_path / f"filler_{index}.py").write_text(
-            f"VALUE_{index} = {index}\n",
-            encoding="utf-8",
-        )
-    generate_map_artifacts(
-        tmp_path,
-        tmp_path / ".devcouncil" / "repo_map.json",
-        quiet=True,
-    )
-    service = get_codeintel_service(tmp_path)
-    (tmp_path / "orphan.py").unlink()
-
-    graph = sync_affected_paths(service, ["orphan.py"])
-    repo_map = json.loads(
-        (tmp_path / ".devcouncil" / "repo_map.json").read_text(encoding="utf-8")
-    )
-
-    assert graph.meta["liveness_unreachable_unreliable"] is True
-    assert repo_map["liveness_unreachable_unreliable"] is True
-    assert not any(
-        entry["path"] == "orphan.py" for entry in repo_map["files"]
-    )
-    assert "orphan.py" not in repo_map["unreachable_files"]
-
-
-def test_incremental_framework_alias_and_abstract_dispatch_match_clean_build(
-    tmp_path: Path,
-) -> None:
-    from devcouncil.cli.commands.map import generate_map_artifacts
-    from devcouncil.indexing.graph.build import build_code_graph
-
-    (tmp_path / ".devcouncil").mkdir()
-    (tmp_path / "package.json").write_text(
-        '{"name":"app","main":"src/index.ts"}\n',
-        encoding="utf-8",
-    )
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "handlers.ts").write_text(
-        "export function handler() { return 1; }\n"
-        "export class Service {}\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "src" / "index.ts").write_text(
-        "import { handler as importedHandler, Service as ImportedService }"
-        " from './handlers';\n"
-        "export function main() { return 0; }\n",
-        encoding="utf-8",
-    )
-    for index in range(8):
-        (tmp_path / "src" / f"filler_{index}.ts").write_text(
-            f"export const VALUE_{index} = {index};\n",
-            encoding="utf-8",
-        )
-    generate_map_artifacts(
-        tmp_path,
-        tmp_path / ".devcouncil" / "repo_map.json",
-        quiet=True,
-    )
-    service = get_codeintel_service(tmp_path)
-    (tmp_path / "src" / "index.ts").write_text(
-        "import { handler as importedHandler, Service as ImportedService }"
-        " from './handlers';\n"
-        "const callback = importedHandler;\n"
-        "const token = ImportedService;\n"
-        "app.get('/items', callback);\n"
-        "bus.on('ready', callback);\n"
-        "container.bind(token);\n"
-        "callback();\n"
-        "export function main() { return 0; }\n",
-        encoding="utf-8",
-    )
-
-    incremental = sync_affected_paths(service, ["src/index.ts"])
-    clean = build_code_graph(tmp_path)
-    semantic_kinds = {
-        "registers",
-        "routes_to",
-        "listens",
-        "provides",
-        "calls",
-    }
-
-    def semantic_edges(graph):
-        return {
-            (edge.source, edge.target, edge.kind)
-            for edge in graph.edges
-            if edge.kind in semantic_kinds
-        }
-
-    assert semantic_edges(incremental) == semantic_edges(clean)
-    assert {
-        (entry.id, entry.confidence.value, entry.reason)
-        for entry in incremental.dead_code
-    } == {
-        (entry.id, entry.confidence.value, entry.reason)
-        for entry in clean.dead_code
-    }
-
-
-def test_resolution_surface_change_uses_full_build_and_preserves_dead_code(
-    tmp_path: Path,
-) -> None:
-    from devcouncil.cli.commands.map import generate_map_artifacts
-    from devcouncil.indexing.graph.build import build_code_graph
-
-    (tmp_path / ".devcouncil").mkdir()
-    (tmp_path / "pyproject.toml").write_text(
-        '[project]\nname="fixture"\nversion="0.0.0"\n'
-        '[project.scripts]\nfixture="caller:caller"\n',
-        encoding="utf-8",
-    )
-    (tmp_path / "target.py").write_text(
-        "def target():\n    return 1\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "caller.py").write_text(
-        "from target import target\n\ndef caller():\n    return target()\n",
-        encoding="utf-8",
-    )
-    for index in range(8):
-        (tmp_path / f"filler_{index}.py").write_text(
-            f"VALUE_{index} = {index}\n",
-            encoding="utf-8",
-        )
-    generate_map_artifacts(
-        tmp_path,
-        tmp_path / ".devcouncil" / "repo_map.json",
-        quiet=True,
-    )
-    service = get_codeintel_service(tmp_path)
-    (tmp_path / "caller.py").write_text(
-        "def caller():\n    return 0\n",
-        encoding="utf-8",
-    )
-    clean = build_code_graph(tmp_path)
-
-    graph = sync_affected_paths(service, ["caller.py"])
-
-    assert graph.meta["resolution_scope"] == "full"
-    assert {
-        (entry.id, entry.confidence.value, entry.reason)
-        for entry in graph.dead_code
-    } == {
-        (entry.id, entry.confidence.value, entry.reason)
-        for entry in clean.dead_code
-    }
-
-
-def test_incremental_create_rename_delete_matches_clean_rebuild(tmp_path: Path) -> None:
-    from devcouncil.cli.commands.map import generate_map_artifacts
-    from devcouncil.indexing.graph.build import build_code_graph
-
-    (tmp_path / ".devcouncil").mkdir()
-    (tmp_path / "app.py").write_text(
-        "def main():\n    return 0\n",
-        encoding="utf-8",
-    )
-    for index in range(10):
-        (tmp_path / f"filler_{index}.py").write_text(
-            f"VALUE_{index} = {index}\n",
-            encoding="utf-8",
-        )
-    generate_map_artifacts(
-        tmp_path,
-        tmp_path / ".devcouncil" / "repo_map.json",
-        quiet=True,
-    )
-    service = get_codeintel_service(tmp_path)
-
-    def signature(graph):
-        return (
-            {
-                (node.id, node.kind.value, node.path, node.line, node.end_line)
-                for node in graph.nodes
-            },
-            {
-                (edge.source, edge.target, edge.kind, edge.confidence.value)
-                for edge in graph.edges
-            },
-            {
-                (entry.id, entry.confidence.value, entry.reason)
-                for entry in graph.dead_code
-            },
-        )
-
-    (tmp_path / "helper.py").write_text(
-        "def helper():\n    return 1\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "app.py").write_text(
-        "from helper import helper\n\ndef main():\n    return helper()\n",
-        encoding="utf-8",
-    )
-    created = sync_affected_paths(service, ["helper.py", "app.py"])
-    assert signature(created) == signature(build_code_graph(tmp_path))
-
-    (tmp_path / "helper.py").rename(tmp_path / "renamed.py")
-    (tmp_path / "app.py").write_text(
-        "from renamed import helper\n\ndef main():\n    return helper()\n",
-        encoding="utf-8",
-    )
-    renamed = sync_affected_paths(service, ["helper.py", "renamed.py", "app.py"])
-    assert signature(renamed) == signature(build_code_graph(tmp_path))
-    assert service.store.aliases()
-
-    (tmp_path / "renamed.py").unlink()
-    (tmp_path / "app.py").write_text(
-        "def main():\n    return 0\n",
-        encoding="utf-8",
-    )
-    deleted = sync_affected_paths(service, ["renamed.py", "app.py"])
-    assert signature(deleted) == signature(build_code_graph(tmp_path))
-
-
-def test_incremental_prunes_stale_vendored_analysis_shards(tmp_path: Path) -> None:
-    from devcouncil.indexing.graph.build import build_code_graph, write_code_graph
-
-    (tmp_path / ".devcouncil").mkdir()
-    (tmp_path / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
-    graph = build_code_graph(tmp_path)
-    write_code_graph(tmp_path, graph)
-    service = get_codeintel_service(tmp_path)
-    shards = service.store.analysis_shards()
-    sample = dict(next(iter(shards.values())))
-    extraction = dict(sample["extraction"])
-    extraction["path"] = "src/vendor/bundle.js"
-    sample["extraction"] = extraction
-    shards["src/vendor/bundle.js"] = sample
-    service.persist(graph, analysis_shards=shards)
-
-    (tmp_path / "app.py").write_text("def main():\n    return 2\n", encoding="utf-8")
-    updated = sync_affected_paths(service, ["app.py"])
-
-    assert updated.meta["resolution_scope"] == "affected"
-    assert "src/vendor/bundle.js" not in service.store.analysis_shards()
-    assert not any(node.path == "src/vendor/bundle.js" for node in updated.nodes)
-
-
-def test_incremental_removes_orphaned_pathless_semantic_nodes(tmp_path: Path) -> None:
-    from devcouncil.indexing.graph.build import build_code_graph, write_code_graph
-
-    (tmp_path / ".devcouncil").mkdir()
-    source = tmp_path / "app.js"
-    source.write_text(
-        "function main() {\n  bus.emit('ready');\n}\n",
-        encoding="utf-8",
-    )
-    graph = build_code_graph(tmp_path)
-    write_code_graph(tmp_path, graph)
-    assert any(node.id == "event::ready" for node in graph.nodes)
-
-    source.write_text("function main() {\n  return 1;\n}\n", encoding="utf-8")
-    updated = sync_affected_paths(get_codeintel_service(tmp_path), ["app.js"])
-
-    assert updated.meta["resolution_scope"] == "affected"
-    assert not any(node.id == "event::ready" for node in updated.nodes)
-
-
-def test_new_global_symbol_collision_falls_back_and_matches_clean_build(tmp_path: Path) -> None:
-    from devcouncil.indexing.graph.build import build_code_graph, write_code_graph
-
-    (tmp_path / ".devcouncil").mkdir()
-    (tmp_path / "a.py").write_text("def shared():\n    return 1\n", encoding="utf-8")
-    (tmp_path / "caller.py").write_text(
-        "def caller():\n    return shared()\n",
-        encoding="utf-8",
-    )
-    write_code_graph(tmp_path, build_code_graph(tmp_path))
-    (tmp_path / "b.py").write_text("def shared():\n    return 2\n", encoding="utf-8")
-
-    updated = sync_affected_paths(get_codeintel_service(tmp_path), ["b.py"])
-    clean = build_code_graph(tmp_path)
-    def edge_signature(value):
-        return {
-            (edge.source, edge.target, edge.kind, edge.confidence.value)
-            for edge in value.edges
-        }
-
-    assert updated.meta["resolution_scope"] == "full"
-    assert edge_signature(updated) == edge_signature(clean)
-
-
-def test_incremental_preserves_unchanged_inbound_edges_and_communities(tmp_path: Path) -> None:
-    from devcouncil.indexing.graph.build import build_code_graph, write_code_graph
-
-    (tmp_path / ".devcouncil").mkdir()
-    changed = tmp_path / "changed.py"
-    changed.write_text("def dependency():\n    return 1\n", encoding="utf-8")
-    (tmp_path / "target.py").write_text(
-        "from changed import dependency\n\ndef target_fn():\n    return dependency()\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "caller.py").write_text(
-        "def caller():\n    return target_fn()\n",
-        encoding="utf-8",
-    )
-    write_code_graph(tmp_path, build_code_graph(tmp_path))
-
-    changed.write_text(
-        "# implementation-only edit\ndef dependency():\n    return 1\n",
-        encoding="utf-8",
-    )
-    updated = sync_affected_paths(get_codeintel_service(tmp_path), ["changed.py"])
-    clean = build_code_graph(tmp_path)
-
-    def payloads(values):
-        return sorted(
-            json.dumps(value.model_dump(mode="json"), sort_keys=True)
-            for value in values
-        )
-
-    assert updated.meta["resolution_scope"] == "affected"
-    assert {node.id: node.model_dump(mode="json") for node in updated.nodes} == {
-        node.id: node.model_dump(mode="json") for node in clean.nodes
-    }
-    assert payloads(updated.edges) == payloads(clean.edges)
-    assert payloads(updated.dead_code) == payloads(clean.dead_code)
-    assert updated.unwired_candidates == clean.unwired_candidates
-    assert updated.unreachable_files == clean.unreachable_files
-
-
-def test_incremental_duplicate_aliases_share_symbol_liveness(tmp_path: Path) -> None:
-    from devcouncil.indexing.graph.build import build_code_graph, write_code_graph
-
-    (tmp_path / ".devcouncil").mkdir()
-    changed = tmp_path / "changed.py"
-    changed.write_text("def dependency():\n    return 1\n", encoding="utf-8")
-    (tmp_path / "model.py").write_text(
-        "class Model:\n"
-        "    @property\n"
-        "    def stream(self):\n"
-        "        return None\n\n"
-        "    @stream.setter\n"
-        "    def stream(self, value):\n"
-        "        pass\n",
-        encoding="utf-8",
-    )
-    write_code_graph(tmp_path, build_code_graph(tmp_path))
-
-    changed.write_text(
-        "# implementation-only edit\ndef dependency():\n    return 1\n",
-        encoding="utf-8",
-    )
-    updated = sync_affected_paths(get_codeintel_service(tmp_path), ["changed.py"])
-    clean = build_code_graph(tmp_path)
-
-    def dead_payloads(graph):
-        return sorted(
-            json.dumps(entry.model_dump(mode="json"), sort_keys=True)
-            for entry in graph.dead_code
-        )
-
-    assert updated.meta["resolution_scope"] == "affected"
-    assert dead_payloads(updated) == dead_payloads(clean)
-
-
-def test_shard_liveness_excludes_nonproduction_entry_roots_from_unwired(
-    tmp_path: Path,
-) -> None:
-    from devcouncil.indexing.graph.liveness import file_liveness_from_shards
-
-    roots, unwired, unreachable, unreliable = file_liveness_from_shards(
-        ["script.py"],
-        [],
-        {"script.py": {"allow_unwired": False}},
-        root=tmp_path,
-        entry_roots=["script.py"],
-        production_entry_roots=[],
-    )
-
-    assert roots == []
-    assert unwired == []
-    assert unreachable == []
-    assert unreliable is True
-
-
-def test_shard_liveness_applies_unreachable_ratio_gate(tmp_path: Path) -> None:
-    """Incremental shard liveness fails soft on an unreachable flood.
-
-    Parity with the full build: when static BFS misses most files (dynamic
-    imports / routers), ``file_liveness`` suppresses the flood via the density
-    gate — the shard path must not resurrect it on the next incremental sync.
-    """
-    from devcouncil.indexing.graph.liveness import file_liveness_from_shards
-
-    files = ["main.py"] + [f"mod_{i}.py" for i in range(9)]
-    shards: dict[str, dict[str, object]] = {
-        path: {"allow_unwired": False} for path in files
-    }
-    roots, _unwired, unreachable, unreliable = file_liveness_from_shards(
-        files,
-        [],  # no import edges: 9/10 files look unreachable, far past the gate
-        shards,
-        root=tmp_path,
-        entry_roots=["main.py"],
-        production_entry_roots=["main.py"],
-    )
-
-    assert roots == ["main.py"]
-    assert unreachable == []
-    assert unreliable is True
-
-
-def test_incremental_unsharded_config_references_match_full_liveness(
-    tmp_path: Path,
-) -> None:
-    from devcouncil.indexing.graph.build import build_code_graph, write_code_graph
-
-    (tmp_path / ".devcouncil").mkdir()
-    changed = tmp_path / "changed.py"
-    changed.write_text("def dependency():\n    return 1\n", encoding="utf-8")
-    plugin = tmp_path / "plugin"
-    plugin.mkdir()
-    (plugin / "hatch_build.py").write_text(
-        "def hook():\n    return 1\n",
-        encoding="utf-8",
-    )
-    (plugin / "pyproject.toml").write_text(
-        "[tool.hatch.build.hooks.custom]\npath = 'hatch_build.py'\n",
-        encoding="utf-8",
-    )
-    write_code_graph(tmp_path, build_code_graph(tmp_path))
-
-    changed.write_text(
-        "# implementation-only edit\ndef dependency():\n    return 1\n",
-        encoding="utf-8",
-    )
-    updated = sync_affected_paths(get_codeintel_service(tmp_path), ["changed.py"])
-    clean = build_code_graph(tmp_path)
-
-    assert updated.meta["resolution_scope"] == "affected"
-    assert updated.unwired_candidates == clean.unwired_candidates
-
-def test_incremental_persists_global_community_relabels(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    import devcouncil.indexing.graph.intel as graph_intel
-    from devcouncil.indexing.graph.build import build_code_graph, write_code_graph
-
-    (tmp_path / ".devcouncil").mkdir()
-    changed = tmp_path / "a.py"
-    changed.write_text("def a():\n    return 1\n", encoding="utf-8")
-    (tmp_path / "b.py").write_text("def b():\n    return 2\n", encoding="utf-8")
-    write_code_graph(tmp_path, build_code_graph(tmp_path))
-    original = graph_intel.enrich_graph_intel
-
-    def relabel(graph, *, root, seed=0):
-        result = original(graph, root=root, seed=seed)
-        for node in graph.nodes:
-            if node.path == "b.py":
-                node.community = "forced-global-relabel"
-        return result
-
-    monkeypatch.setattr(graph_intel, "enrich_graph_intel", relabel)
-    changed.write_text(
-        "# implementation-only edit\ndef a():\n    return 1\n",
-        encoding="utf-8",
-    )
-    service = get_codeintel_service(tmp_path)
-    updated = sync_affected_paths(service, ["a.py"])
-    loaded = service.load()
-
-    assert updated.meta["resolution_scope"] == "affected"
-    assert "b.py" in updated.meta["community_changed_paths"]
-    assert loaded is not None
-    assert {
-        node.community for node in loaded.nodes if node.path == "b.py"
-    } == {"forced-global-relabel"}
-
-
-def test_incremental_sync_keeps_go_same_package_callee_wired(tmp_path: Path) -> None:
-    """The call-edge liveness projection must survive incremental refreshes."""
-    import pytest
-
-    try:
-        from devcouncil.codeintel.languages import grammar_status
-
-        go_missing = any(
-            row.get("missing_grammars")
-            for row in grammar_status().get("languages", [])
-            if row.get("language") == "Go"
-        )
-    except Exception:
-        go_missing = True
-    if go_missing:
-        pytest.skip("go grammar not installed")
-
-    from devcouncil.cli.commands.map import generate_map_artifacts
-
-    (tmp_path / ".devcouncil").mkdir()
-    cmd = tmp_path / "cmd" / "server"
-    cmd.mkdir(parents=True)
-    (cmd / "main.go").write_text(
-        "package main\n\nfunc main() {\n\thandle()\n}\n", encoding="utf-8"
-    )
-    (cmd / "handlers.go").write_text("package main\n\nfunc handle() {}\n", encoding="utf-8")
-    generate_map_artifacts(
-        tmp_path,
-        tmp_path / ".devcouncil" / "repo_map.json",
-        quiet=True,
-    )
-    service = get_codeintel_service(tmp_path)
-    full_graph = service.load()
-    assert full_graph is not None
-    assert "cmd/server/handlers.go" not in full_graph.unwired_candidates
-
-    (cmd / "handlers.go").write_text(
-        "package main\n\nfunc handle() {\n\t_ = 1\n}\n", encoding="utf-8"
-    )
-    graph = sync_affected_paths(service, ["cmd/server/handlers.go"])
-    # Body-only edit keeps the resolution surface stable → true incremental path.
-    assert graph.meta.get("incremental") is True
-    assert "cmd/server/handlers.go" not in graph.unwired_candidates
-    assert "cmd/server/handlers.go" not in graph.unreachable_files
-
-
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-_FORCE_GRAPH = "src/devcouncil/assets/vendor/force-graph.min.js"
-
-
-def test_live_repo_force_graph_excluded_from_watcher_scope() -> None:
-    from devcouncil.indexing.wiring import is_vendored_path
-
-    assert is_vendored_path(_FORCE_GRAPH)
-    scope = IndexScope(_REPO_ROOT)
-    assert not scope.includes(_FORCE_GRAPH)
-    assert _FORCE_GRAPH not in scope.files()
-
-
-def test_live_repo_reconcile_does_not_flag_force_graph() -> None:
-    service = get_codeintel_service(_REPO_ROOT)
-    coordinator = SyncCoordinator(service, sync_callback=lambda _paths: None)
-    assert _FORCE_GRAPH not in coordinator.reconcile()
-
-
-def test_full_refresh_then_single_edit_parity_with_vendor_present(tmp_path: Path) -> None:
-    from devcouncil.indexing.graph.build import build_code_graph, write_code_graph
-
-    (tmp_path / ".devcouncil").mkdir()
-    helper = tmp_path / "helper.py"
-    app = tmp_path / "app.py"
-    helper.write_text("def helper():\n    return 1\n", encoding="utf-8")
-    app.write_text(
-        "from helper import helper\n\ndef main():\n    return helper()\n",
-        encoding="utf-8",
-    )
-    for index in range(6):
-        (tmp_path / f"filler_{index}.py").write_text(
-            f"VALUE_{index} = {index}\n",
-            encoding="utf-8",
-        )
-    vendor = tmp_path / "assets" / "vendor"
-    vendor.mkdir(parents=True)
-    (vendor / "force-graph.min.js").write_text("/* vendor */\n", encoding="utf-8")
-
-    write_code_graph(tmp_path, build_code_graph(tmp_path))
-    service = get_codeintel_service(tmp_path)
-    before = service.store.current_generation()
-
-    app.write_text(
-        "from helper import helper\n\ndef main():\n    return helper() + 1\n",
-        encoding="utf-8",
-    )
-    incremental = sync_affected_paths(service, ["app.py"])
-    full = build_code_graph(tmp_path)
-
-    def signature(graph):
-        return (
-            sorted((n.id, n.kind.value, n.path, n.name) for n in graph.nodes),
-            sorted((e.source, e.target, e.kind) for e in graph.edges),
-        )
-
-    assert service.store.current_generation() == before + 1  # type: ignore[operator]
-    assert signature(incremental) == signature(full)
-    assert not any("vendor" in (n.path or "") for n in incremental.nodes)
-    coordinator = SyncCoordinator(service, sync_callback=lambda _paths: None)
-    assert "assets/vendor/force-graph.min.js" not in coordinator.reconcile()
-
-
-def test_change_set_probe_ignores_non_code_files(tmp_path: Path) -> None:
-    """Docs/config must not register as permanent additions.
-
-    ``generation_files`` only holds files the graph gives nodes to, so comparing
-    the whole inventory reported every .md/.yml as "added" on every run and the
-    change set never converged — `dev map` would sync the same paths forever.
-    """
-    from devcouncil.indexing.map_artifacts import _auto_change_set
-
-    (tmp_path / ".devcouncil").mkdir()
-    (tmp_path / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
-    (tmp_path / "README.md").write_text("# docs\n", encoding="utf-8")
-    (tmp_path / "config.yml").write_text("key: value\n", encoding="utf-8")
-    _persist_file(tmp_path, "app.py")
-
-    assert _auto_change_set(tmp_path, get_codeintel_service(tmp_path)) == []
-
-    (tmp_path / "app.py").write_text("def main():\n    return 2\n", encoding="utf-8")
-    assert _auto_change_set(tmp_path, get_codeintel_service(tmp_path)) == ["app.py"]
-
-
-def test_change_set_probe_falls_back_to_full_when_large(tmp_path: Path, monkeypatch) -> None:
-    """A big change set is cheaper as one full rebuild than as incremental sync."""
-    from devcouncil.indexing import map_artifacts
-
-    (tmp_path / ".devcouncil").mkdir()
-    (tmp_path / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
-    _persist_file(tmp_path, "app.py")
-    for index in range(50):
-        (tmp_path / f"new_{index}.py").write_text(f"X = {index}\n", encoding="utf-8")
-
-    monkeypatch.setattr(map_artifacts, "_INCREMENTAL_MAX_CHANGED_FILES", 5)
-    assert map_artifacts._auto_change_set(tmp_path, get_codeintel_service(tmp_path)) is None
-
-
-def test_change_set_probe_returns_none_without_a_generation(tmp_path: Path) -> None:
-    from devcouncil.indexing.map_artifacts import _auto_change_set
-
-    (tmp_path / ".devcouncil").mkdir()
-    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
-
-    assert _auto_change_set(tmp_path, get_codeintel_service(tmp_path)) is None
-
-
-def test_untracked_indexing_preserves_call_edges_into_tracked_symbols(tmp_path: Path) -> None:
-    """Tracked-only indexing produces false dead-code signals, not a smaller index.
-
-    A file an agent just wrote and has not staged still calls tracked symbols.
-    Dropping it from the inventory strips those call edges, so the tracked
-    callee looks unwired. This is why ``include_untracked`` defaults to on.
-    """
-    from devcouncil.indexing.graph.build import build_code_graph
-    from devcouncil.indexing.repo_mapper import RepoMapper
-
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "base.py").write_text(
-        "def helper():\n    return 1\n", encoding="utf-8"
-    )
-    (tmp_path / "src" / "brand_new.py").write_text(
-        "from src.base import helper\n\n\ndef fresh():\n    return helper() + 1\n",
-        encoding="utf-8",
-    )
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "add", "src/base.py"], cwd=tmp_path, check=True)
-    # src/brand_new.py is deliberately left untracked.
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+    map_path = tmp_path / ".devcouncil" / "repo_map.json"
 
-    def _graph_with(include_untracked: bool):
-        mapper = RepoMapper(tmp_path)
-        mapper._inventory_limits = lambda: (include_untracked, 50_000)  # type: ignore[method-assign]
-        return build_code_graph(tmp_path, mapper.get_git_files(), liveness=False, mapper=mapper)
+    first = map_artifacts.refresh_map_artifacts(tmp_path, map_path, quiet=True)
+    second = map_artifacts.refresh_map_artifacts(tmp_path, map_path, quiet=True)
 
-    with_untracked = _graph_with(True)
-    tracked_only = _graph_with(False)
+    assert first.generation is not None
+    assert second.generation == first.generation
+    assert second.degraded is False
+    assert second.mode == map_artifacts.MAP_ENGINE
+    assert json.loads(map_path.read_text(encoding="utf-8"))["map_engine"] == "devmap-rust"
 
-    def _calls_into_helper(graph) -> bool:  # noqa: ANN001
-        return any(edge.target.endswith("::helper") for edge in graph.edges if edge.kind == "calls")
 
-    assert "src/brand_new.py" in {node.path for node in with_untracked.nodes}
-    assert _calls_into_helper(with_untracked)
+# --- The kernel is the only writer -------------------------------------------
 
-    # Tracked-only: the new file is gone and so is the evidence that helper is live.
-    assert "src/brand_new.py" not in {node.path for node in tracked_only.nodes}
-    assert not _calls_into_helper(tracked_only)
+
+def test_mcp_lifespan_warms_the_kernel_daemon_and_starts_no_python_watcher(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """MCP auto-sync is a kernel warm-up, not a second writer.
+
+    ``_lifespan`` used to start a ``SyncCoordinator``, which re-extracted with
+    the Python engine and rewrote ``repo_map.json`` / ``code_graph.json`` on
+    every edit for the life of the MCP process. The kernel daemon watches,
+    drains and retires itself, so all the lifespan owes it is one status call.
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    from devcouncil.integrations.mcp import server as mcp_server
+
+    (tmp_path / ".devcouncil").mkdir()
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        "devcouncil.app.config.load_config",
+        lambda _root: SimpleNamespace(
+            code_intelligence=SimpleNamespace(enabled=True, auto_sync=True)
+        ),
+    )
+
+    warmed: list[Path] = []
+
+    class _Client:
+        def __init__(self, root, *_a, **_k):
+            self.root = Path(root)
+
+        def status(self):
+            warmed.append(self.root)
+            return SimpleNamespace(generation_id=1, pending_count=0, is_fresh=True)
+
+    monkeypatch.setattr("devcouncil.devmap_client.DevMapClient", _Client)
+
+    async def _enter() -> dict:
+        async with mcp_server._lifespan(None) as context:
+            return context
+
+    context = asyncio.run(_enter())
+    # The warm-up runs on its own thread; give it a bounded moment to land.
+    for _ in range(200):
+        if warmed:
+            break
+        time.sleep(0.01)
+
+    assert warmed == [tmp_path.resolve()], "the lifespan must warm the kernel daemon"
+    assert context == {"codeintel": None}
+    assert not hasattr(sync_package, "get_sync_coordinator")
+    assert not hasattr(sync_package, "SyncCoordinator")
+
+
+def test_mcp_sync_without_a_kernel_reports_engine_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``devcouncil_code_sync`` must never hand off to a Python engine.
+
+    It used to fall back to ``SyncCoordinator.sync_now`` whenever the daemon
+    could not be reached — a second engine answering, writing both artifacts,
+    with nothing in the payload saying which one had run.
+    """
+    import asyncio
+
+    from devcouncil.devmap_engine import DevMapEngineError
+    from devcouncil.integrations.mcp.handlers import codeintel as mcp_codeintel
+
+    monkeypatch.setattr(mcp_codeintel, "try_connect", lambda _root: None)
+
+    def _unavailable(*_a, **_k):
+        raise DevMapEngineError("no devmap binary supports this map engine")
+
+    monkeypatch.setattr(
+        "devcouncil.indexing.map_artifacts.refresh_map_artifacts", _unavailable
+    )
+
+    result = asyncio.run(mcp_codeintel._sync(tmp_path, {"paths": ["app.py"]}))
+    payload = json.loads(result[0].text)
+
+    assert payload["ok"] is False
+    assert payload["code"] == "engine_unavailable"
+    assert "no devmap binary" in payload["error"]
+    assert payload["reconciled"] == ["app.py"]
+
+
+def test_query_envelope_reports_kernel_freshness_not_a_python_watcher(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The envelope's ``sync`` block answers for the kernel's store.
+
+    It used to report the Python ``SyncCoordinator``'s state — a watcher over a
+    store the kernel does not write. An unreachable kernel is now reported as
+    ``unavailable`` with the reason, never as a second store's healthy verdict.
+    """
+    from types import SimpleNamespace
+
+    from devcouncil.codeintel.query import CodeIntelQueryEngine
+    from devcouncil.devmap_client import DevMapClientError
+
+    engine = CodeIntelQueryEngine(tmp_path)
+    monkeypatch.setattr(
+        engine.service, "status", lambda: {"generation": 4, "schema_version": 2}
+    )
+
+    class _Fresh:
+        def status(self):
+            return SimpleNamespace(
+                generation_id=9,
+                pending_count=0,
+                is_fresh=True,
+                degraded_reason=None,
+            )
+
+    engine._devmap_client = _Fresh()
+    envelope = engine._envelope({})
+    assert envelope["sync"] == {
+        "state": "fresh",
+        "generation": 9,
+        "pending": 0,
+        "degraded_reason": "",
+    }
+
+    class _Broken:
+        def status(self):
+            raise DevMapClientError("devmap store is missing; run `dev map`")
+
+    engine._devmap_client = _Broken()
+    degraded = engine._envelope({})["sync"]
+    assert degraded["state"] == "unavailable"
+    assert degraded["generation"] is None
+    assert "devmap store is missing" in degraded["degraded_reason"]
+
+
+def test_hook_map_refresh_defers_loudly_when_the_kernel_cannot_build(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """A hook must not fail the tool call, and must not swallow the reason.
+
+    The post-tool-use refresher used to call ``refresh_map_for_paths`` inside a
+    blanket ``except Exception: logger.debug(...)``, so a kernel that could not
+    run left no record at any level a user sees and the batch it was holding
+    was dropped. The kernel seam raises ``DevMapEngineError``; the hook logs it
+    at WARNING and re-queues the batch for the next hook.
+    """
+    import logging
+
+    from devcouncil.cli.commands.hook import _maybe_refresh_map
+    from devcouncil.devmap_engine import DevMapEngineError
+
+    monkeypatch.setattr("devcouncil.cli.commands.hook.MAP_REFRESH_DEBOUNCE_S", 0.0)
+    calls: list[dict] = []
+
+    def _unavailable(root, output, *_a, paths=None, **_k):
+        calls.append({"root": Path(root), "output": Path(output), "paths": list(paths or [])})
+        raise DevMapEngineError("another devmap writer (pid 4242) holds the store")
+
+    monkeypatch.setattr(
+        "devcouncil.indexing.map_artifacts.refresh_map_artifacts", _unavailable
+    )
+
+    payload = json.dumps({"tool_name": "Write", "file_path": "src/app.py"})
+    with caplog.at_level(logging.WARNING, logger="devcouncil.cli.commands.hook"):
+        _maybe_refresh_map(tmp_path, payload)
+
+    assert calls, "the hook must refresh through the kernel seam"
+    assert calls[0]["paths"] == ["src/app.py"]
+    assert calls[0]["output"] == tmp_path / ".devcouncil" / "repo_map.json"
+    assert any("map refresh deferred" in record.message for record in caplog.records)
+    assert len(calls) == 1, "a kernel that just failed must not be retried in the same hook"
+    queue = tmp_path / ".devcouncil" / "cache" / "map_refresh_queue.json"
+    assert json.loads(queue.read_text(encoding="utf-8"))["paths"] == ["src/app.py"], (
+        "an undelivered batch must go back on the queue, not be dropped"
+    )

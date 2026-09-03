@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from .benchmark_harness import (
     FixtureSpec,
     fixture_paths,
@@ -29,6 +31,20 @@ def test_profiles_preserve_exact_fixture_size_and_monorepo_shape() -> None:
         assert all(path.startswith("packages/pkg_") for path in paths)
 
 
+def _have_kernel() -> bool:
+    from devcouncil.devmap_engine import DevMapEngineError, find_engine_binary
+
+    try:
+        find_engine_binary()
+    except DevMapEngineError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(
+    not _have_kernel(),
+    reason="devmap kernel not built (cargo build --release -p devmap-cli)",
+)
 def test_fast_profile_satisfies_codeintel_performance_ratchets(tmp_path: Path) -> None:
     result = run_benchmark(tmp_path / "fixture", profile="fast")
 
@@ -36,9 +52,9 @@ def test_fast_profile_satisfies_codeintel_performance_ratchets(tmp_path: Path) -
     assert result["violations"] == []
     assert result["schema_version"] == 2
     assert result["fixture"]["file_count"] == 256
-    assert result["one_file"]["affected_files"] == 1
-    assert result["one_file"]["payload_rows_written"] <= 8
-    assert result["one_file"]["write_stats"]["node_memberships"] == result["cold"]["node_count"]
+    # The one-file stage is a kernel refresh; it must commit a generation.
+    assert result["one_file"]["engine"] == "devmap-rust"
+    assert result["one_file"]["generation"]
 
 
 def test_benchmark_artifacts_are_machine_and_human_readable(tmp_path: Path) -> None:
@@ -48,8 +64,8 @@ def test_benchmark_artifacts_are_machine_and_human_readable(tmp_path: Path) -> N
         "cold": {"wall_seconds": 1.25},
         "one_file": {
             "wall_seconds": 0.05,
-            "affected_files": 1,
-            "payload_rows_written": 2,
+            "engine": "devmap-rust",
+            "generation": 3,
         },
         "memory": {"peak_rss_bytes": 64 * 1024 * 1024},
         "storage": {

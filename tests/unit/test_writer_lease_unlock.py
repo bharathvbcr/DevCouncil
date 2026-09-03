@@ -13,8 +13,6 @@ from typer.testing import CliRunner
 from devcouncil.codeintel.build_control import (
     BuildStatus,
     unlock_writer_lease,
-    update_inline_build_progress,
-    writer_busy_details,
     _write_status,
 )
 from devcouncil.codeintel.sync.lease import WriterLease, read_holder
@@ -235,48 +233,6 @@ def test_unlock_age_stall_without_stalled_state(tmp_path: Path, monkeypatch) -> 
     assert result["action"] == "killed"
 
 
-def test_writer_busy_details_include_recovery_hint(tmp_path: Path) -> None:
-    lock = tmp_path / ".devcouncil" / "codeintel" / "writer.lock"
-    lock.parent.mkdir(parents=True)
-    lock.write_text(json.dumps({"pid": 55, "started_at": 1.0}), encoding="utf-8")
-    _write_status(
-        tmp_path,
-        BuildStatus(state="stalled", pid=55, phase="liveness", build_id="x"),
-    )
-    details = writer_busy_details(tmp_path)
-    assert details["hint"] == "dev map unlock"
-    assert details["build_pid"] == 55
-    assert details["build_state"] == "stalled"
-
-
-def test_update_inline_build_progress_preserves_build_id(tmp_path: Path) -> None:
-    from devcouncil.codeintel.build_control import record_inline_build_status, read_build_status
-
-    first = record_inline_build_status(
-        tmp_path,
-        state="building",
-        mode="incremental",
-        phase="liveness",
-        generation_before=1,
-        generation_after=None,
-        completed=0,
-        total=3,
-    )
-    second = update_inline_build_progress(
-        tmp_path,
-        phase="liveness:tokens",
-        completed=1,
-        total=3,
-    )
-    assert second.build_id == first.build_id
-    assert second.started_at == first.started_at
-    assert second.phase == "liveness:tokens"
-    assert second.pid == os.getpid()
-    loaded = read_build_status(tmp_path)
-    assert loaded.phase == "liveness:tokens"
-    assert loaded.completed == 1
-
-
 def test_busy_unlock_then_acquire(tmp_path: Path, monkeypatch) -> None:
     """Unlock of a stalled busy holder frees the flock so a contender can acquire."""
     from types import SimpleNamespace
@@ -304,7 +260,7 @@ def test_busy_unlock_then_acquire(tmp_path: Path, monkeypatch) -> None:
     assert contender.acquire() is False
 
     monkeypatch.setattr(
-        "devcouncil.codeintel.sync.lease.read_holder",
+        "devcouncil.codeintel.build_control.read_holder",
         lambda _path: SimpleNamespace(pid=9001, started_at=started),
     )
     alive = {9001: True}

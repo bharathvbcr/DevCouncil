@@ -1,5 +1,6 @@
 import json
 import logging
+import threading
 from pathlib import Path
 
 import typer
@@ -14,7 +15,6 @@ from devcouncil.indexing.map_artifacts import (
 from devcouncil.indexing.repo_mapper import RepoMap, RepoMapper
 from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
 from devcouncil.storage.db import get_db
-from devcouncil.telemetry.stages import log_stage, log_step
 from devcouncil.utils.json_persist import dump_json
 
 # Back-compat aliases for tests / external importers.
@@ -87,19 +87,6 @@ def map_repo(
         "--scan-deps",
         help="Run available dependency auditors (pip-audit/npm audit/osv-scanner) and record dependency_risks in the map. Off by default.",
     ),
-    liveness: bool = typer.Option(
-        True,
-        "--liveness/--no-liveness",
-        help="Compute entry_roots / unwired / unreachable / dead_symbol candidate lists (on by default).",
-    ),
-    lsp_refs: bool = typer.Option(
-        False,
-        "--lsp-refs/--no-lsp-refs",
-        help=(
-            "Confirm dead-symbol candidates via live LSP references when a language "
-            "server is on PATH. Also set indexing.lsp_refs in config.yaml. Off by default."
-        ),
-    ),
     refresh_wiki: bool = typer.Option(
         True,
         "--wiki/--no-wiki",
@@ -124,8 +111,8 @@ def map_repo(
         False,
         "--full",
         help=(
-            "Force a full isolated rebuild. Without it, a small change set since the "
-            "last committed generation is applied incrementally."
+            "Force a full cold rebuild in the kernel. Without it, an unchanged tree is "
+            "a no-op and a changed one is rebuilt incrementally."
         ),
     ),
     pdg: bool = typer.Option(
@@ -134,7 +121,20 @@ def map_repo(
         help="Build opt-in PDG/CFG/taint layer after map (Python-only, intra-procedural).",
     ),
 ):
-    """Build the deterministic repository map without calling an LLM."""
+    """Build the deterministic repository map without calling an LLM.
+
+    The Rust kernel is the map engine and the only writer of `repo_map.json`
+    and `code_graph.json`. There is no Python fallback: two engines answering
+    the same question differently, with no signal which one answered, is how a
+    stale map comes to look like a fresh one. Anything the kernel does not do —
+    goal ranking, dependency auditing, agent guides, the wiki, the PDG layer —
+    is layered on top of its artifacts here, never computed by a second index.
+
+    Flags the kernel cannot honour are gone rather than ignored: `--no-liveness`
+    (the kernel always computes liveness) and `--lsp-refs` (the LSP adjunct was
+    cut with the Python engine). A flag that is accepted and does nothing is
+    worse than one that is rejected.
+    """
     import sys
 
     if ctx.info_name == "graph":
@@ -163,19 +163,9 @@ def map_repo(
             )
     from devcouncil.telemetry.logging_setup import set_log_dir
     set_log_dir(root)
-
-    # CLI flag OR config; flag alone is enough without rewriting config.
-    use_lsp = lsp_refs
-    if not use_lsp:
-        try:
-            from devcouncil.app.config import load_config
-
-            use_lsp = bool(load_config(root).indexing.lsp_refs)
-        except Exception:
-            use_lsp = False
     logger.info(
-        "dev map: goal=%r scan_deps=%s liveness=%s lsp_refs=%s if_stale=%s",
-        goal, scan_deps, liveness, use_lsp, if_stale,
+        "dev map: goal=%r scan_deps=%s if_stale=%s full=%s pdg=%s",
+        goal, scan_deps, if_stale, full, pdg,
     )
 
     enclosing = _enclosing_project_root(root)
@@ -246,189 +236,149 @@ def map_repo(
         except Exception:
             logger.debug("if-stale freshness check failed; rebuilding", exc_info=True)
 
-    # --- The Rust kernel is the map engine. There is no Python fallback. ---
-    #
-    # `devcouncil.indexing` and the Rust kernel answer the same questions
-    # differently, and a fallback gives no signal which one answered. That is
-    # how SC23 stayed hidden for a whole pass: every "hybrid" consumer raised,
-    # silently took the Python path, and reported success. Any failure below
-    # ends the stage red.
-    import json as _json
-
-    from devcouncil.devmap_engine import DevMapEngineError, build_map
-
-    def _map_payload() -> dict:
-        try:
-            return _json.loads(output.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
+    from devcouncil.devmap_engine import DevMapEngineError
+    from devcouncil.indexing.map_artifacts import refresh_map_artifacts
 
     def _build_once() -> None:
-        written = build_map(root, output=output)
-        payload = _map_payload()
+        refresh = refresh_map_artifacts(
+            root,
+            output,
+            goal,
+            scan_dependencies=scan_deps,
+            full=full,
+            quiet=True,
+        )
+        # Echo the artifact as written, not a re-serialization of the model: the
+        # kernel writes fields the Python model does not declare, and a reader
+        # piping `dev map` must see the same bytes `repo_map.json` holds.
+        try:
+            payload = json.loads(output.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = refresh.repo_map.model_dump()
         try:
             typer.echo(dump_json(payload, indent=2))
         except BrokenPipeError:
+            # Consumer closed stdout early (`dev map | head`). The artifacts are
+            # already written — a closed pipe must not turn the stage red.
             import os as _os
-            import sys as _sys
 
             logger.debug("stdout pipe closed while streaming repo map JSON")
             try:
-                _os.dup2(_os.open(_os.devnull, _os.O_WRONLY), _sys.stdout.fileno())
+                _os.dup2(_os.open(_os.devnull, _os.O_WRONLY), sys.stdout.fileno())
             except OSError:
                 pass
-        status_console.print(f"[green]Wrote repository map to {written}[/green]")
+        status_console.print(f"[green]Wrote repository map to {output}[/green]")
+        graph_out = root / ".devcouncil" / "graph" / "code_graph.json"
+        if graph_out.is_file():
+            status_console.print(f"[green]Wrote code graph to {graph_out}[/green]")
+            if pdg:
+                _build_pdg_layer(root)
+            _write_graph_html_if_configured(root)
+        kernel = getattr(refresh, "kernel_status", None)
+        if kernel is not None and (not kernel.is_fresh or kernel.degraded_reason):
+            # `devmap status` said `is_fresh: false, 64 quarantined` for days
+            # while this command printed a green line. A build that leaves the
+            # store degraded says so, in the same breath, with the way out.
+            status_console.print(
+                "[yellow]Kernel store is not fresh after this build: "
+                f"{kernel.degraded_reason or 'pending paths remain'} "
+                f"(pending {kernel.pending_count}, quarantined {kernel.quarantined_count}). "
+                "Files the kernel could not index are absent from the graph — see "
+                "`dev map status`; `dev map repair --pending` drops stuck entries.[/yellow]"
+            )
+        summary = _liveness_summary(refresh.repo_map)
+        if summary:
+            status_console.print(f"[cyan]{summary}[/cyan]")
+        if refresh_wiki:
+            _refresh_wiki_skeletons(root, refresh.repo_map)
+
+    from devcouncil.telemetry.stages import log_stage, log_step
 
     try:
-        _build_once()
+        with log_stage("map", project_root=root, scan_deps=scan_deps, full=full):
+            log_step("map/1: building through the devmap kernel", project_root=root, trace=True)
+            _build_once()
+            log_step("map/complete", project_root=root, trace=True)
         if watch:
             # Through the existing `_watch_map` seam, not an inline loop: the
             # loop bypassed the very hook `test_map_watch_flag_invokes_watch_map`
             # monkeypatches, so under a test runner it never returned and the
             # suite hung instead of failing.
-            _watch_map(root, liveness=liveness)
+            _watch_map(root)
     except DevMapEngineError as exc:
-        status_console.print(f"[red]devmap (Rust) could not build the map: {exc}[/red]")
+        # The code is what an agent branches on, the fix is what it runs, and
+        # the run id is where the full record lives. A bare message was all
+        # three folded into prose nobody could act on without reading it.
+        # markup=False: `[store_locked]` is a diagnosis code, and Rich would
+        # otherwise read it as a style tag and print nothing where it stood.
+        status_console.print(
+            f"devmap (Rust) could not build the map [{exc.code}]: {exc}",
+            style="red",
+            markup=False,
+            highlight=False,
+        )
+        if exc.fix:
+            status_console.print(f"fix: {exc.fix}", markup=False, highlight=False)
+        if exc.run_id:
+            status_console.print(
+                f"run: {exc.run_id} — `dev map runs --last 1 --json` has the record",
+                markup=False,
+                highlight=False,
+            )
         raise typer.Exit(code=1) from exc
     raise typer.Exit(code=0)
 
-    with log_stage("map", project_root=root, scan_deps=scan_deps):
-        log_step("map/1: generating repository map", project_root=root, trace=True)
-        from devcouncil.codeintel.build_control import (
-            GraphBuildBusy,
-            GraphBuildFailed,
-            GraphBuildTimeout,
+
+def _build_pdg_layer(root: Path) -> None:
+    """Opt-in PDG/CFG/taint layer, computed by the Python analyser over the
+    kernel's graph and merged into the JSON export. Failure is reported, never
+    fatal: the map is already written."""
+    try:
+        from devcouncil.indexing.graph.build import (
+            build_pdg_for_paths,
+            load_code_graph,
+            merge_pdg_into_graph,
+            write_code_graph,
         )
 
+        graph = load_code_graph(root)
+        if graph is None:
+            status_console.print("[yellow]PDG layer skipped: no code graph to analyse[/yellow]")
+            return
+        layer = build_pdg_for_paths(root, graph)
+        shards = merge_pdg_into_graph(graph, layer)
+        merged: dict = {}
         try:
-            from devcouncil.indexing.map_artifacts import refresh_map_artifacts
+            from devcouncil.codeintel import get_codeintel_service
 
-            refresh = refresh_map_artifacts(
-                root,
-                output,
-                goal,
-                scan_dependencies=scan_deps,
-                liveness=liveness,
-                lsp_refs=use_lsp,
-                full=full,
-            )
-            repo_map = refresh.repo_map
-        except GraphBuildBusy as exc:
-            status_console.print(f"[red]{exc}[/red]")
-            status_console.print(
-                "[dim]Recover with `dev map unlock` (add --force if the holder is "
-                "wedged but still reporting progress).[/dim]"
-            )
-            raise typer.Exit(code=1) from exc
-        except (GraphBuildTimeout, GraphBuildFailed) as exc:
-            # These reached the CLI as an uncaught traceback + CRITICAL log. Print
-            # the failure and the three things that actually unblock a big repo.
-            logger.warning("dev map: graph build did not complete", exc_info=True)
-            status_console.print(f"[red]Graph build did not complete: {exc}[/red]")
-            status_console.print(
-                "[dim]Try: `dev map unlock` to free a stuck writer; `dev map "
-                "--no-liveness` to skip the liveness pass; or raise "
-                "indexing.build_stall_timeout_seconds / "
-                "indexing.build_total_timeout_seconds in .devcouncil/config.yaml.[/dim]"
-            )
-            raise typer.Exit(code=1) from exc
-        if refresh.build_incomplete:
-            status_console.print(
-                f"[yellow]Graph build did not finish; refreshed the map from the last "
-                f"committed generation ({refresh.reason}).[/yellow]"
-            )
-            raise typer.Exit(code=1)
-        if refresh.degraded:
-            status_console.print(
-                f"[red]Map wrote lean/degraded artifacts: {refresh.reason or refresh.mode}[/red]"
-            )
-            raise typer.Exit(code=1)
-        if refresh.compatibility_export_degraded:
-            status_console.print(
-                f"[yellow]Compatibility export degraded (canonical SQLite ok): "
-                f"{refresh.reason}[/yellow]"
-            )
-        try:
-            typer.echo(dump_json(repo_map.model_dump(), indent=2))
-        except BrokenPipeError:
-            # Consumer closed stdout early (`dev map | head`). The artifacts are
-            # already written — a closed pipe must not turn the stage red.
-            import os
-            import sys
+            merged = dict(get_codeintel_service(root).store.analysis_shards())
+        except Exception:
+            pass
+        for path, payload in shards.items():
+            merged.setdefault(path, {}).update(payload)
+        write_code_graph(root, graph, analysis_shards=merged)
+        stats = (graph.meta.get("pdg") or {}).get("stats") or {}
+        status_console.print(
+            f"[green]Wrote PDG layer[/green] "
+            f"({stats.get('function_count', 0)} functions, "
+            f"{stats.get('taint_count', 0)} taint findings)"
+        )
+    except Exception as exc:
+        logger.warning("PDG build after map failed: %s", exc)
+        status_console.print(f"[yellow]PDG layer failed: {exc}[/yellow]")
 
-            logger.debug("stdout pipe closed while streaming repo map JSON")
-            try:
-                os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-            except OSError:
-                pass
-        status_console.print(f"[green]Wrote repository map to {output}[/green]")
-        graph_out = root / ".devcouncil" / "graph" / "code_graph.json"
-        if not graph_out.is_file():
-            # The export write failed or an external cleanup removed the JSON
-            # while SQLite (canonical) still holds the graph — re-export instead
-            # of exiting green without the documented artifact.
-            from devcouncil.indexing.graph.build import export_code_graph_json
 
-            if export_code_graph_json(root) is not None:
-                status_console.print(
-                    f"[yellow]Code graph JSON was missing; re-exported from store to {graph_out}[/yellow]"
-                )
-            else:
-                status_console.print(
-                    f"[yellow]Code graph JSON missing and store re-export failed ({graph_out}); "
-                    "run `dev map doctor`[/yellow]"
-                )
-        if graph_out.is_file():
-            status_console.print(f"[green]Wrote code graph to {graph_out}[/green]")
-            if pdg:
-                try:
-                    from devcouncil.indexing.graph.build import (
-                        build_pdg_for_paths,
-                        load_code_graph,
-                        merge_pdg_into_graph,
-                        write_code_graph,
-                    )
+def _write_graph_html_if_configured(root: Path) -> None:
+    try:
+        from devcouncil.app.config import load_config
 
-                    graph = load_code_graph(root)
-                    if graph is not None:
-                        layer = build_pdg_for_paths(root, graph)
-                        shards = merge_pdg_into_graph(graph, layer)
-                        merged: dict = {}
-                        try:
-                            from devcouncil.codeintel import get_codeintel_service
+        if bool(load_config(root).indexing.write_graph_html):
+            from devcouncil.indexing.viz import write_graph_html
 
-                            merged = dict(get_codeintel_service(root).store.analysis_shards())
-                        except Exception:
-                            pass
-                        for path, payload in shards.items():
-                            merged.setdefault(path, {}).update(payload)
-                        write_code_graph(root, graph, analysis_shards=merged)
-                        stats = (graph.meta.get("pdg") or {}).get("stats") or {}
-                        status_console.print(
-                            f"[green]Wrote PDG layer[/green] "
-                            f"({stats.get('function_count', 0)} functions, "
-                            f"{stats.get('taint_count', 0)} taint findings)"
-                        )
-                except Exception as exc:
-                    logger.warning("PDG build after map failed: %s", exc)
-            try:
-                from devcouncil.app.config import load_config
-
-                if bool(load_config(root).indexing.write_graph_html):
-                    from devcouncil.indexing.viz import write_graph_html
-
-                    html_out = write_graph_html(root, open_browser=False)
-                    status_console.print(f"[green]Wrote graph HTML to {html_out}[/green]")
-            except Exception as exc:
-                logger.warning("Failed to write graph.html after map: %s", exc)
-        summary = _liveness_summary(repo_map)
-        if summary:
-            status_console.print(f"[cyan]{summary}[/cyan]")
-        if refresh_wiki:
-            _refresh_wiki_skeletons(root, repo_map)
-        log_step("map/complete", project_root=root, trace=True)
-        if watch:
-            _watch_map(root, liveness=liveness)
+            html_out = write_graph_html(root, open_browser=False)
+            status_console.print(f"[green]Wrote graph HTML to {html_out}[/green]")
+    except Exception as exc:
+        logger.warning("Failed to write graph.html after map: %s", exc)
 
 
 def _enclosing_project_root(root: Path) -> Path | None:
@@ -537,22 +487,90 @@ def _refresh_wiki_skeletons(root: Path, repo_map: RepoMap) -> None:
         logger.warning("Wiki refresh after map failed: %s", exc)
 
 
+#: Seconds between fingerprint checks when no filesystem event has arrived.
+#: With a working observer this is only a safety net (an event the observer
+#: missed — an overflow, a bind mount, a network filesystem) and can be long.
+WATCH_POLL_INTERVAL_SECONDS = 30.0
+#: Polling cadence when no observer could be started at all.
+WATCH_FALLBACK_INTERVAL_SECONDS = 2.0
+#: Quiet period after the first event of a burst before the fingerprint is
+#: checked, so one `git checkout` costs one check rather than thousands.
+WATCH_DEBOUNCE_SECONDS = 0.5
+
+_WATCH_IGNORED_SEGMENTS = ("/.devcouncil/", "/.git/")
+
+
+def _start_change_observer(root: Path, changed: threading.Event):
+    """Start a filesystem observer that sets ``changed`` on any event under ``root``.
+
+    Returns the observer, or ``None`` when one cannot be started — the caller
+    then polls. Events under `.devcouncil/` (the artifacts a rebuild writes)
+    and `.git/` (whose ref churn is already reflected by the working-tree
+    events a checkout produces) are ignored so a rebuild does not wake itself.
+    """
+    try:
+        from watchdog.events import FileSystemEventHandler
+        from watchdog.observers import Observer
+    except Exception:  # noqa: BLE001 - optional at runtime; polling covers it
+        return None
+
+    class _Handler(FileSystemEventHandler):
+        def on_any_event(self, event) -> None:  # noqa: ANN001
+            source = str(getattr(event, "src_path", "") or "").replace("\\", "/")
+            if any(segment in source + "/" for segment in _WATCH_IGNORED_SEGMENTS):
+                return
+            changed.set()
+
+    try:
+        observer = Observer()
+        observer.schedule(_Handler(), str(root), recursive=True)
+        observer.daemon = True
+        observer.start()
+    except Exception:  # noqa: BLE001 - fall back to polling rather than fail the watch
+        logger.debug("filesystem observer unavailable; polling instead", exc_info=True)
+        return None
+    return observer
+
+
+def _wait_for_change(changed: threading.Event, timeout: float) -> bool:
+    """Block until an event arrives or ``timeout`` elapses. Patch point for tests."""
+    return changed.wait(timeout)
+
+
 def _watch_map(root: Path, *, liveness: bool = True) -> None:
     """Rebuild through the Rust kernel whenever the repository fingerprint moves.
 
-    Polls exactly the fingerprint `--if-stale` reads, so a watch rebuild and an
-    `--if-stale` rebuild fire on the same evidence rather than on two rules that
-    can disagree. Ctrl-C is a clean stop, not a failure.
+    Event-driven, not polled. The previous loop re-ran `map_is_stale` every two
+    seconds — three git subprocesses and two stats per tracked file, measured at
+    ~90 ms per tick on this repository (4.5% of a core, continuously) and
+    extrapolated to several seconds per tick at 70,000 files, where the poll no
+    longer fits in its own interval. Now a filesystem event wakes the loop, a
+    short debounce coalesces the burst, and only then is the fingerprint read —
+    still exactly the evidence `--if-stale` reads, so a watch rebuild and an
+    `--if-stale` rebuild fire on the same rule. A slow poll remains as the
+    safety net for events the observer misses. Ctrl-C is a clean stop.
     """
     import time
 
     from devcouncil.devmap_engine import DevMapEngineError, build_map
 
     del liveness  # the Rust kernel always computes liveness; no partial mode
+    changed = threading.Event()
+    observer = _start_change_observer(root, changed)
+    interval = WATCH_POLL_INTERVAL_SECONDS if observer else WATCH_FALLBACK_INTERVAL_SECONDS
+    if observer is None:
+        status_console.print(
+            "[yellow]No filesystem observer available; polling the fingerprint "
+            f"every {interval:.0f}s instead.[/yellow]"
+        )
     status_console.print("[cyan]Watching for changes (Ctrl-C to stop)…[/cyan]")
     try:
         while True:
-            time.sleep(2.0)
+            fired = _wait_for_change(changed, interval)
+            if fired:
+                changed.clear()
+                time.sleep(WATCH_DEBOUNCE_SECONDS)
+                changed.clear()
             payload: dict = {}
             map_path = root / ".devcouncil" / "repo_map.json"
             try:
@@ -577,6 +595,13 @@ def _watch_map(root: Path, *, liveness: bool = True) -> None:
                 status_console.print(f"[red]devmap rebuild failed: {exc}[/red]")
     except KeyboardInterrupt:
         status_console.print("\n[cyan]Stopped watching.[/cyan]")
+    finally:
+        if observer is not None:
+            try:
+                observer.stop()
+                observer.join(timeout=2.0)
+            except Exception:  # noqa: BLE001 - shutdown must not raise
+                pass
 
 
 def _mount_graph_commands(target: typer.Typer) -> None:

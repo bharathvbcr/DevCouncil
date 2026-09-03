@@ -19,21 +19,25 @@ dev e2e "goal" --executor codex --agent # Agent preset: JSON plus .devcouncil/re
 dev e2e "goal" --executor codex --force  # Proceed past advisory planning gaps automatically
 dev e2e "goal" --executor codex --json --report-file .devcouncil/reports/latest.json # Write machine-readable report
 dev go "goal" --executor codex # Short alias for dev e2e
-dev map                     # Build the map + code graph (no LLM); incremental when the change set is small
-dev map --full              # Force a full isolated rebuild instead of incremental sync
+dev map                     # Build the map + code graph through the devmap kernel (no LLM); no-op on an unchanged tree
+dev map --full              # Force a cold rebuild in the kernel (re-parse everything, new generation)
 dev map --goal "…"          # Optional goal text for candidate-file ranking (was a positional arg)
 dev map --if-stale          # Skip rebuild when the on-disk map fingerprint is still fresh
-dev map --no-liveness       # Skip entry_roots / unwired / unreachable / dead_symbol lists
-dev map --lsp-refs          # Confirm dead-symbol candidates via live LSP references
+dev map --pdg               # Also compute the opt-in Python PDG/CFG/taint layer
 dev map --wiki / --no-wiki  # Refresh codebase-wiki skeletons after map (default on)
 dev map --scan-deps         # Opt-in SCA auditors → dependency_risks (off by default)
-dev map --watch             # Incrementally refresh the map on code edits
+dev map --watch             # Rebuild on filesystem events (debounced; slow poll as the safety net)
 dev map html                # Write interactive .devcouncil/map.html (subsystem view)
 dev map html --open         # Write and open the subsystem map HTML
 dev map graph-html          # Write symbol-level .devcouncil/graph/graph.html
 dev map html --symbols      # Same as graph-html (alias path: `dev graph html`)
-dev map ingest              # Unified analyze: codeintel sync → graph export → repo map write
-dev map ingest PATH...      # Path-scoped ingest (full reconcile when paths omitted)
+dev map init | ingest | sync  # The same kernel build as `dev map`, JSON-friendly (`--json`); ingest reports the paths back
+dev map status              # Engine binary, store (schema, size, free pages, WAL), kernel freshness, daemon, artifact writers
+dev map doctor              # Verdicts with fixes; exit 1 on a critical finding (no kernel, store newer than kernel, foreign writer)
+dev map repair --pending    # Drop pending-queue entries the kernel can never index (quarantined, moved, oversized)
+dev map doctor --fix        # Apply every fix a repository can apply (marker, quarantine, repair, one build), then re-check
+dev map runs --last 10      # Records of recent kernel runs: argv, exit, duration, notes, diagnosis code (`--failed`, `--json`)
+dev map abort               # Stop the running kernel build safely (store stays on the prior generation)
 dev map query NAME          # 360° symbol view: definition, callers, callees, importers
 dev map trace A B           # Shortest path between two graph nodes
 dev map dead                # Dead-code report with confidence tiers (extracted|inferred|ambiguous); uncapped
@@ -45,7 +49,7 @@ dev map check               # God nodes (top-connected) and circular-import dete
 dev map process [ENTRY]     # BFS call-flows from entry roots
 dev map impact PATH...      # Blast radius for paths (or --diff for working-tree changes)
 dev map search QUERY        # FTS5 symbol/path search over the committed generation
-dev map search QUERY --semantic  # Opt-in local embeddings when indexing.embeddings.enabled
+dev map search QUERY --semantic  # Name-similarity ranking in the kernel (no embedding index)
 dev map cypher 'MATCH … RETURN …'  # Supported Cypher subset over native SQLite graph store
 dev map explain --category command-injection  # PDG taint findings (opt-in PDG layer)
 dev map pdg-query --mode controls --target SYMBOL  # PDG control dependence

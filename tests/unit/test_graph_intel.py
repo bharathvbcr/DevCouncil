@@ -9,7 +9,8 @@ import pytest
 from typer.testing import CliRunner
 
 from devcouncil.cli.commands.graph_cmd import app as graph_app
-from devcouncil.indexing.graph.build import build_code_graph, write_code_graph
+from devcouncil.indexing.graph.build import write_code_graph
+from tests.unit.graph_fixtures import kernel_graph
 from devcouncil.indexing.graph.intel import (
     circular_imports,
     compute_communities,
@@ -71,7 +72,7 @@ def call_chain(tmp_path):
         },
     )
     _commit(tmp_path)
-    graph = build_code_graph(tmp_path)
+    graph = kernel_graph(tmp_path)
     write_code_graph(tmp_path, graph)
     return tmp_path, graph
 
@@ -80,7 +81,7 @@ def test_communities_deterministic(call_chain):
     root, graph = call_chain
     a = compute_communities(graph, seed=0)
     # Rebuild a fresh graph and recompute — labels/membership must match.
-    g2 = build_code_graph(root)
+    g2 = kernel_graph(root)
     b = compute_communities(g2, seed=0)
     assert a["count"] == b["count"]
     labels_a = sorted(c["label"] for c in a["communities"])
@@ -89,14 +90,6 @@ def test_communities_deterministic(call_chain):
     # Nodes carry community strings after enrich
     assert any(n.community for n in g2.nodes)
     assert "communities" in (g2.meta or {}) or any(n.community for n in g2.nodes)
-
-
-def test_communities_persisted_on_assemble(call_chain):
-    root, _ = call_chain
-    g = build_code_graph(root)
-    assert g.meta.get("communities") is not None
-    assert g.meta.get("processes") is not None
-    assert any(n.community for n in g.nodes if n.path.endswith(".py"))
 
 
 def test_god_nodes_and_cycles(call_chain):
@@ -146,7 +139,7 @@ def test_circular_import_detected(tmp_path):
         },
     )
     _commit(tmp_path)
-    graph = build_code_graph(tmp_path)
+    graph = kernel_graph(tmp_path)
     report = graph_check(graph)
     cycles = report["circular_imports"]
     assert cycles == [{"nodes": ["a.py", "b.py"], "length": 2}]
@@ -242,7 +235,8 @@ def test_cli_graph_check_process_impact(call_chain):
     )
     assert r3.exit_code == 0
     impact = json.loads(r3.stdout)
-    assert impact.get("path_count", 0) >= 1
+    # The kernel answers with `paths` (the Python engine said `path_count`).
+    assert len(impact.get("paths") or []) >= 1
 
 
 def test_mcp_graph_impact(call_chain):
@@ -357,7 +351,7 @@ def test_pdg_taint_command_injection():
 
 
 def test_pdg_build_merge_meta(tmp_path):
-    from devcouncil.indexing.graph.build import build_code_graph, build_pdg_for_paths, merge_pdg_into_graph, write_code_graph
+    from devcouncil.indexing.graph.build import build_pdg_for_paths, merge_pdg_into_graph, write_code_graph
 
     _write(
         tmp_path,
@@ -368,35 +362,12 @@ def test_pdg_build_merge_meta(tmp_path):
         },
     )
     _commit(tmp_path)
-    graph = build_code_graph(tmp_path)
+    graph = kernel_graph(tmp_path)
     layer = build_pdg_for_paths(tmp_path, graph, paths=["pkg/run.py"])
     shards = merge_pdg_into_graph(graph, layer)
     write_code_graph(tmp_path, graph, analysis_shards=shards)
     assert graph.meta.get("pdg")
     assert graph.meta["pdg"]["stats"]["taint_count"] >= 0
-
-
-def test_pdg_cli_explain_json(tmp_path):
-    from devcouncil.indexing.graph.build import build_code_graph, build_pdg_for_paths, merge_pdg_into_graph, write_code_graph
-
-    _write(
-        tmp_path,
-        {
-            "pyproject.toml": '[project]\nname="t"\nversion="0"\n',
-            "pkg/__init__.py": "",
-            "pkg/run.py": "def run():\n    return 1\n",
-        },
-    )
-    _commit(tmp_path)
-    graph = build_code_graph(tmp_path)
-    layer = build_pdg_for_paths(tmp_path, graph, paths=["pkg/run.py"])
-    shards = merge_pdg_into_graph(graph, layer)
-    write_code_graph(tmp_path, graph, analysis_shards=shards)
-    runner = CliRunner()
-    result = runner.invoke(graph_app, ["explain", "--project-root", str(tmp_path), "--json"])
-    assert result.exit_code == 0
-    payload = json.loads(result.stdout)
-    assert payload.get("ok") is True
 
 
 def test_pagerank_pure_python_fallback_matches_networkx(call_chain):
@@ -617,59 +588,41 @@ def test_community_timeout_reports_structured_limit(monkeypatch):
     assert summary["limit"]["canonical_store_health"] == "healthy"
     assert summary["limit"]["recovery_command"] == "dev map"
 
-def test_graph_doctor_json_includes_export_limit(tmp_path, monkeypatch):
+def test_graph_doctor_json_reports_a_foreign_artifact_writer(tmp_path, monkeypatch):
+    """An artifact not written by the kernel is a critical finding with a fix.
+
+    Doctor used to report the Python engine's compatibility-export limits.
+    The kernel writes both artifacts from one generation, so the failure that
+    matters now is the opposite one: something *else* wrote `repo_map.json`
+    (an old engine, a hand edit) and the map no longer describes the store.
+    """
     import json
-    from types import SimpleNamespace
 
     from typer.testing import CliRunner
 
     from devcouncil.cli.main import app
-    import devcouncil.codeintel as codeintel
-    import devcouncil.codeintel.languages as codeintel_languages
-    import devcouncil.codeintel.build_control as build_control
 
     monkeypatch.setattr(
-        codeintel,
-        "get_codeintel_service",
-        lambda root: SimpleNamespace(
-            status=lambda: {"state": "committed", "schema_version": 1},
-            store=SimpleNamespace(compatibility_export_state=lambda: ("", None)),
-        ),
-    )
-    monkeypatch.setattr(
-        codeintel_languages,
-        "grammar_status",
-        lambda: {
-            "ok": True,
-            "available_count": 1,
-            "required_count": 1,
-            "languages": [],
-            "action": "",
+        "devcouncil.devmap_health.engine_info",
+        lambda root: {
+            "binary": "/opt/devmap",
+            "built_at": "2026-09-02T16:51:00",
+            "version": "devmap 0.1.0 (schema 12)",
+            "schema_version": 12,
+            "error": None,
         },
     )
-    monkeypatch.setattr(
-        build_control,
-        "read_build_status",
-        lambda root: SimpleNamespace(
-            state="complete",
-            compatibility_export="degraded",
-            degraded_reason="stub export",
-        ),
-    )
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.graph_path",
-        lambda root: tmp_path / "missing.json",
-    )
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph",
-        lambda root: None,
-    )
+    map_path = tmp_path / ".devcouncil" / "repo_map.json"
+    map_path.parent.mkdir(parents=True)
+    map_path.write_text('{"files": [], "map_engine": "python-indexer"}', encoding="utf-8")
+
     runner = CliRunner()
     result = runner.invoke(app, ["map", "doctor", "--json", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
     payload = json.loads(result.stdout)
-    limit = payload["compatibility_export"]["limit"]
-    assert limit["degraded"] is True
-    assert limit["kind"] == "compatibility_export"
-    assert limit["canonical_store_health"] == "healthy"
-    assert limit["recovery_command"] == "dev map query <symbol>"
+    assert payload["ok"] is False
+    finding = next(check for check in payload["checks"] if check["name"] == "repo_map")
+    assert finding["ok"] is False
+    assert finding["critical"] is True
+    assert "python-indexer" in finding["detail"]
+    assert finding["fix"].startswith("dev map")

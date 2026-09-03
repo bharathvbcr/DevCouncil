@@ -7,7 +7,6 @@ and query budgeting are strictly owned by devmap (Rust).
 
 from dataclasses import dataclass, field
 import errno
-import hashlib
 import json
 import os
 import pathlib
@@ -17,8 +16,6 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Union, cast
 
-
-DEFAULT_SOCKET_PATH = "/tmp/devmap.sock"
 
 # The Rust kernel's own store, deliberately NOT the Python index.
 #
@@ -43,26 +40,18 @@ MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_QUERY_BYTES = 4 * 1024
 MAX_TOKEN_BUDGET = 100_000
 MAX_TRAVERSAL_DEPTH = 64
-# Whole-exchange ceiling for one socket request: connect, send, and receive
-# must all finish inside this budget. The per-call socket timeout (2s) bounds a
-# single recv; without an overall deadline a peer that trickles one byte at a
-# time keeps every recv under its timeout while the exchange runs for hours
-# (measured: a 1-byte/0.5s drip holds the client until MAX_RESPONSE_BYTES
-# accumulates — months). When the deadline trips, the daemon is treated as
-# unavailable and the request degrades to the CLI path.
-RESPONSE_DEADLINE_SECONDS = 5.0
-# After a transport-level failure (timeout, reset, frame breakage), skip this
-# daemon endpoint for a bounded cool-down instead of paying the full deadline
-# on every subsequent call. The endpoint is retried after the window so a
-# recovered daemon is picked up without restarting the process.
-SOCKET_COOLDOWN_SECONDS = 30.0
 # Per-read socket timeout. Bounds one recv(2) call; the response deadline below
 # bounds the exchange as a whole. Without the deadline, a server that dribbles
 # one byte per timeout-1 forever keeps this loop alive for weeks — measured in
 # stress (slowloris), where only MAX_RESPONSE_BYTES capped the loop.
 SOCKET_TIMEOUT_SECONDS = 2.0
-# Total wall clock allowed for one daemon exchange (connect + write + framed
-# read). Every transport path must respect it.
+# Whole-exchange ceiling for one socket request: connect, send, and receive
+# must all finish inside this budget. Without it a peer that trickles one byte
+# at a time keeps every recv under its timeout while the exchange runs for
+# hours (measured: a 1-byte/0.5s drip holds the client until MAX_RESPONSE_BYTES
+# accumulates — months). When the deadline trips, the daemon is treated as
+# unavailable and the request degrades to the CLI path. This constant used to
+# be defined twice in this module, 5.0 and then 30.0; the second silently won.
 RESPONSE_DEADLINE_SECONDS = 30.0
 # After a transport-level failure (timeout, reset, deadline) the daemon side is
 # skipped entirely for this long: subsequent calls fail over straight to the CLI
@@ -73,6 +62,8 @@ TRANSPORT_COOLDOWN_SECONDS = 60.0
 CLI_COOLDOWN_SECONDS = 60.0
 DAEMON_READINESS_SECONDS = 3.0
 SERVE_PROBE_TIMEOUT_SECONDS = 10.0
+#: Set to ``0`` to stop every client in the process from spawning a daemon.
+AUTOSPAWN_ENV_VAR = "DEVMAP_AUTOSPAWN"
 
 @dataclass
 class DevMapStatus:
@@ -170,6 +161,63 @@ class DevMapClientError(Exception):
     """Raised when devmap server/CLI fails or returns an error."""
 
 
+# The kernel's IPC identity, spelled once here and once in
+# `devmap-serve/src/daemon.rs::ipc_identity_for`. `devmap serve
+# --print-socket-path <root>` prints the kernel's answer and creates nothing, and
+# a test compares the two. Before this the client hashed the root with SHA-256
+# into `/tmp/devmap-<hex>.sock` while the kernel used FNV-1a into
+# `<tmp>/devmap-<hex>/ipc.sock` — measured: two daemons per repository, one
+# spawned by the client on its own path and one by `devmap serve`, each
+# reconciling the same store.
+FNV1A64_OFFSET_BASIS = 0xCBF29CE484222325
+FNV1A64_PRIME = 0x100000001B3
+_U64 = 0xFFFFFFFFFFFFFFFF
+
+
+def fnv1a64(data: bytes) -> int:
+    """FNV-1a, 64-bit: ``hash = (hash XOR byte) * prime`` per byte, wrapping."""
+    digest = FNV1A64_OFFSET_BASIS
+    for byte in data:
+        digest = ((digest ^ byte) * FNV1A64_PRIME) & _U64
+    return digest
+
+
+def ipc_identity(root: Union[str, pathlib.Path]) -> str:
+    """The 16-hex-digit identity the kernel derives for a repository root.
+
+    Canonical root (symlinks resolved, ``.``/``..`` removed, absolute) as UTF-8
+    with no trailing separator, hashed with FNV-1a 64 and rendered as lowercase
+    zero-padded hex. A root that cannot be canonicalized -- it does not exist --
+    is hashed as given, exactly as the kernel does: there is no daemon for a
+    missing repository to collide with.
+    """
+    path = pathlib.Path(root)
+    try:
+        canonical = path.resolve(strict=True)
+    except OSError:
+        canonical = path if path.is_absolute() else pathlib.Path(os.getcwd()) / path
+    return f"{fnv1a64(str(canonical).encode('utf-8')):016x}"
+
+
+def _kernel_temp_dir() -> str:
+    """Where Rust's ``std::env::temp_dir`` points on this platform, as a string.
+
+    On Unix that is ``$TMPDIR`` when set, else ``/tmp`` -- *not* Python's
+    ``tempfile.gettempdir()``, which also consults ``TEMP``/``TMP`` and falls
+    through ``/var/tmp`` and ``/usr/tmp``; the two must agree on the same
+    directory or the client connects to a socket the daemon never bound.
+    """
+    return os.environ.get("TMPDIR") or "/tmp"
+
+
+def default_socket_path(root: Union[str, pathlib.Path]) -> str:
+    """``<temp dir>/devmap-<identity>/ipc.sock``; a named pipe of the same identity on Windows."""
+    identity = ipc_identity(root)
+    if os.name == "nt":
+        return "\\\\.\\pipe\\devmap-" + identity
+    return os.path.join(_kernel_temp_dir(), f"devmap-{identity}", "ipc.sock")
+
+
 class DevMapClient:
     """Thin IPC/CLI client for devmap (Rust)."""
 
@@ -179,10 +227,25 @@ class DevMapClient:
         socket_path: Optional[str] = None,
         db_path: Optional[str] = None,
         response_deadline_seconds: float = RESPONSE_DEADLINE_SECONDS,
+        autospawn: bool = True,
     ):
+        """``autospawn=False`` never starts a daemon: a request that finds no
+        live socket goes straight to the CLI. A status probe after a build, or
+        from `dev map status`, must not leave a 30-minute daemon behind as a
+        side effect of asking a question — measured: a probe-spawned daemon
+        reconciled the tree and committed a generation of its own seconds
+        after the CLI build, so "one build, one generation" no longer held."""
         self.root_dir = pathlib.Path(root_dir or os.getcwd()).resolve()
         self.socket_path = socket_path or self._default_socket_path()
         self.db_path = db_path or DEFAULT_DB_PATH
+        # `DEVMAP_AUTOSPAWN=0` disables spawning process-wide. Test suites set
+        # it: measured, one unit-test run left 20 daemons behind, one per
+        # temporary repository, each holding a store for its 30-minute idle
+        # bound after the directory had been deleted.
+        env_allows = os.environ.get(AUTOSPAWN_ENV_VAR, "1").strip().lower() not in {
+            "0", "false", "no", "off",
+        }
+        self._autospawn = bool(autospawn) and env_allows
         if not 0 < response_deadline_seconds <= 3600:
             raise DevMapClientError(
                 f"response deadline must be within (0, 3600] seconds, got {response_deadline_seconds!r}"
@@ -200,32 +263,31 @@ class DevMapClient:
         self._cli_unhealthy_until = 0.0
 
     def _default_socket_path(self) -> str:
-        if os.name == "nt":
-            digest = hashlib.sha256(str(self.root_dir).encode("utf-8")).hexdigest()[:16]
-            return rf"\\.\pipe\devmap-{digest}"
-        digest = hashlib.sha256(str(self.root_dir).encode("utf-8")).hexdigest()[:16]
-        return f"/tmp/devmap-{digest}.sock"
+        return default_socket_path(self.root_dir)
 
     def _find_devmap_binary(self) -> str:
+        """The kernel this client drives — by the engine's rule, not a second one.
+
+        This used to search `<root_dir>/rust-port/target` and then `PATH` with
+        no capability probe, while `devmap_engine.find_engine_binary` searched
+        the *package* and probed. Two rules, two binaries: on any repository
+        other than DevCouncil a query ran `~/.cargo/bin/devmap` while a build
+        ran the packaged kernel, with no signal that the answers came from
+        different code. One owner for the question now.
+
+        The engine raises when nothing capable exists; this client must keep
+        degrading (``try_connect`` returns ``None``), so the bare name is kept
+        as the last resort — it fails on first use with a clear error rather
+        than here, where callers expect no exception.
+        """
         if self._binary_path:
             return self._binary_path
+        from devcouncil.devmap_engine import DevMapEngineError, find_engine_binary
 
-        rust_port_dir = self.root_dir / "rust-port" / "target"
-        for candidate in [
-            rust_port_dir / "release" / "devmap",
-            rust_port_dir / "debug" / "devmap",
-        ]:
-            if candidate.is_file() and os.access(candidate, os.X_OK):
-                self._binary_path = str(candidate)
-                return self._binary_path
-
-        import shutil
-        found = shutil.which("devmap")
-        if found:
-            self._binary_path = found
-            return self._binary_path
-
-        self._binary_path = "devmap"
+        try:
+            self._binary_path = find_engine_binary(self.root_dir)
+        except DevMapEngineError:
+            self._binary_path = "devmap"
         return self._binary_path
 
     def _supports_serve(self, binary: str) -> bool:
@@ -395,7 +457,7 @@ class DevMapClient:
                 response = self._read_named_pipe_response(pipe)
         except FileNotFoundError:
             return None
-        except (OSError, ValueError) as err:
+        except (OSError, ValueError):
             # ValueError covers reads unwound by the watchdog's close(); OSError
             # covers every other transport failure including the deadline.
             self._transport_unhealthy_until = (
@@ -435,7 +497,7 @@ class DevMapClient:
         return result
 
     def _start_daemon(self) -> bool:
-        if self._spawn_attempted:
+        if self._spawn_attempted or not self._autospawn:
             return False
         self._spawn_attempted = True
         binary = self._find_devmap_binary()

@@ -26,11 +26,9 @@ from devcouncil.codeintel.debug.protocol import (
 from devcouncil.codeintel.debug.python_trace_runner import run_trace
 from devcouncil.codeintel.debug.session import DebugSession, DebugSessionManager
 from devcouncil.codeintel.languages import workers
-from devcouncil.codeintel.languages.generic_extractor import extract_generic
 from devcouncil.codeintel.query import CodeIntelQueryEngine
 from devcouncil.codeintel.service import CodeIntelService
 from devcouncil.codeintel.store.sqlite import CodeIntelStore
-from devcouncil.codeintel.sync.coordinator import SyncCoordinator
 from devcouncil.indexing.graph.schema import (
     CodeGraph,
     Confidence,
@@ -776,33 +774,6 @@ def test_graph_cli_status_sync_search_explore_and_affected(
 ) -> None:
     import devcouncil.codeintel as codeintel
     import devcouncil.codeintel.query as query_module
-    import devcouncil.codeintel.sync as sync_module
-
-    class State:
-        state = "degraded"
-        backend = "FakeObserver"
-        degraded_reason = "fixture fallback"
-        pending = ["app.py"]
-        last_error = ""
-
-        def as_dict(self):
-            return {
-                "state": self.state,
-                "backend": self.backend,
-                "degraded_reason": self.degraded_reason,
-                "pending": self.pending,
-                "last_error": self.last_error,
-            }
-
-    class Coordinator:
-        def status(self):
-            return State()
-
-        def reconcile(self):
-            return ["app.py"]
-
-        def sync_now(self, paths):
-            return paths != ["fail.py"]
 
     class Engine:
         def __init__(self, root):
@@ -849,13 +820,33 @@ def test_graph_cli_status_sync_search_explore_and_affected(
             }
         ),
     )
-    monkeypatch.setattr(sync_module, "get_sync_coordinator", lambda _root, **_k: Coordinator())
     monkeypatch.setattr(query_module, "CodeIntelQueryEngine", Engine)
+    # `status` and `sync` read and drive the kernel now, not the coordinator.
+    monkeypatch.setattr(
+        "devcouncil.devmap_health.kernel_status",
+        lambda root: {
+            "generation_id": 3,
+            "pending_count": 1,
+            "quarantined_count": 0,
+            "node_count": 4,
+            "edge_count": 2,
+            "is_fresh": False,
+            "degraded_reason": "fixture fallback",
+        },
+    )
+    from devcouncil.devmap_engine import DevMapEngineError
+
+    def _kernel_refresh(root, output, *_a, **_k):
+        return types.SimpleNamespace(
+            generation=3, mode="devmap-rust", degraded=False, reason="", kernel_status=None
+        )
+
+    monkeypatch.setattr("devcouncil.indexing.map_artifacts.refresh_map_artifacts", _kernel_refresh)
 
     for arguments, expected in [
-        (["status"], "pending: app.py"),
+        (["status"], "pending 1"),
         (["status", "--json"], '"generation": 3'),
-        (["sync"], "Synced 1 path"),
+        (["sync"], "Synced: generation 3"),
         (["search", "target"], "app.py::target"),
         (["search", "target", "--json"], '"matches"'),
         (["explore", "target"], "callers=1"),
@@ -867,6 +858,10 @@ def test_graph_cli_status_sync_search_explore_and_affected(
         )
         assert result.exit_code == 0, result.output
         assert expected in result.output
+    monkeypatch.setattr(
+        "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
+        lambda *a, **k: (_ for _ in ()).throw(DevMapEngineError("kernel unavailable")),
+    )
     failed = runner.invoke(
         app,
         [
@@ -880,6 +875,7 @@ def test_graph_cli_status_sync_search_explore_and_affected(
     )
     assert failed.exit_code == 1
     assert '"ok": false' in failed.output
+    assert '"engine_unavailable"' in failed.output
 
 
 def test_graph_cli_init_watch_doctor_and_hooks(
@@ -887,10 +883,7 @@ def test_graph_cli_init_watch_doctor_and_hooks(
 ) -> None:
     import devcouncil.cli.commands.map as map_command
     import devcouncil.codeintel as codeintel
-    import devcouncil.codeintel.languages as languages
-    import devcouncil.codeintel.sync as sync_module
     import devcouncil.indexing.map_artifacts as map_artifacts
-    import time
 
     generated: list[tuple] = []
 
@@ -926,60 +919,37 @@ def test_graph_cli_init_watch_doctor_and_hooks(
         [
             "map",
             "init",
-            "--no-liveness",
             "--json",
             "--project-root",
             str(tmp_path),
         ],
     )
-    assert initialized.exit_code == 0
-    assert generated[0][1]["liveness"] is False
+    assert initialized.exit_code == 0, initialized.output
+    # The kernel decides incrementality; `init` passes only `full` through.
+    assert generated[0][1]["full"] is False
+    assert json.loads(initialized.output)["generation"] == 7
 
-    class Coordinator:
-        stopped = False
-
-        def start(self):
-            return types.SimpleNamespace(
-                backend="", state="healthy", backend_kind="native"
-            )
-
-        def stop(self, timeout=None):
-            self.stopped = True
-
-    coordinator = Coordinator()
-    monkeypatch.setattr(sync_module, "get_sync_coordinator", lambda _root, **_k: coordinator)
-    monkeypatch.setattr(time, "sleep", lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt()))
+    # `watch` is the kernel watcher: interrupt it at the first wait.
+    monkeypatch.setattr(
+        "devcouncil.cli.commands.map._wait_for_change",
+        lambda _changed, _timeout: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
     watched = runner.invoke(
         app, ["map", "watch", "--project-root", str(tmp_path)]
     )
     assert watched.exit_code == 0
-    assert coordinator.stopped
+    assert "Stopped watching" in watched.output
 
+    # Doctor audits the kernel: a usable binary with no store yet is healthy.
     monkeypatch.setattr(
-        languages,
-        "grammar_status",
-        lambda: {
-            "ok": True,
-            "available_count": 35,
-            "required_count": 35,
-            "languages": [],
-            "action": "",
+        "devcouncil.devmap_health.engine_info",
+        lambda root: {
+            "binary": "/opt/devmap",
+            "built_at": "2026-09-02T16:51:00",
+            "version": "devmap 0.1.0 (schema 12)",
+            "schema_version": 12,
+            "error": None,
         },
-    )
-    # Doctor now audits the compatibility-export handshake for committed
-    # stores; an uninitialized store with installed grammars is healthy.
-    monkeypatch.setattr(
-        codeintel,
-        "get_codeintel_service",
-        lambda _root: types.SimpleNamespace(
-            status=lambda: {
-                "state": "uninitialized",
-                "generation": None,
-                "schema_version": 2,
-                "node_count": 0,
-                "edge_count": 0,
-            }
-        ),
     )
     doctor = runner.invoke(
         app, ["map", "doctor", "--json", "--project-root", str(tmp_path)]
@@ -1006,58 +976,12 @@ def test_graph_cli_init_watch_doctor_and_hooks(
     assert conflict.exit_code == 1
 
 
-def test_sync_coordinator_failure_paths_and_freshness(
+def test_language_registry_detection_and_grammar_status(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    service = CodeIntelService(tmp_path)
-    coordinator = SyncCoordinator(
-        service, sync_callback=lambda _paths: (_ for _ in ()).throw(RuntimeError("boom"))
-    )
-    assert coordinator.debounce_seconds == 0.75
-    coordinator.mark_pending(tmp_path.parent / "outside.py")
-    coordinator.mark_pending("ignored.txt")
-    assert coordinator.status().pending == []
-
-    source = tmp_path / "app.py"
-    source.write_text("x = 1\n", encoding="utf-8")
-    coordinator.mark_pending("app.py")
-    assert coordinator.sync_now() is False
-    assert "RuntimeError: boom" in coordinator.status().last_error
-
-    coordinator.sync_callback = lambda _paths: None
-    coordinator.mark_pending("app.py")
-    monkeypatch.setattr(coordinator._lease, "acquire_with_retry", lambda **_kwargs: False)
-    monkeypatch.setattr(
-        "devcouncil.codeintel.build_control._lease_timeouts",
-        lambda _root: (0.1, 0.05),
-    )
-    assert coordinator.sync_now() is False
-    assert coordinator.status().state in {"pending", "read_only"}
-
-    monkeypatch.setattr(coordinator._lease, "acquire_with_retry", lambda **_kwargs: True)
-    monkeypatch.setattr(coordinator._lease, "release", lambda: None)
-    assert coordinator.sync_now() is True
-    assert coordinator.wait_until_fresh(timeout=0) is True
-
-
-def test_fsevents_preflight_errors_and_registry_status(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+    """The FSEvents-preflight half went with the Python watcher; the kernel
+    daemon does its own watching and preflighting."""
     from devcouncil.codeintel.languages import registry
-    from devcouncil.codeintel.sync import coordinator
-
-    monkeypatch.setattr(
-        coordinator.subprocess,
-        "run",
-        lambda *_args, **_kwargs: types.SimpleNamespace(returncode=0),
-    )
-    assert coordinator._fsevents_preflight(tmp_path) is True
-    monkeypatch.setattr(
-        coordinator.subprocess,
-        "run",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("no process")),
-    )
-    assert coordinator._fsevents_preflight(tmp_path) is False
 
     assert registry.detect_language("Component.VUE").name == "Vue"
     assert registry.detect_language("README") is None
@@ -1311,130 +1235,6 @@ def test_store_missing_files_analysis_runtime_and_search_fallback(
     assert store.add_runtime_observations("absent", []) == 0
 
 
-def test_generic_extractor_deduplicates_and_falls_back_to_call_regex(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    assert extract_generic("README", "run()").language == ""
-    result = {
-        "structure": [
-            {
-                "name": "Container",
-                "kind": "module",
-                "start_line": 0,
-                "end_line": 5,
-                "children": [
-                    {
-                        "name": "run",
-                        "kind": "procedure",
-                        "start_line": 1,
-                        "end_line": 3,
-                        "children": [],
-                    },
-                    {
-                        "name": "run",
-                        "kind": "procedure",
-                        "start_line": 1,
-                        "end_line": 3,
-                        "children": [],
-                    },
-                ],
-            },
-            {"name": "", "kind": "unknown", "children": []},
-        ],
-        "imports": [
-            {"source": "", "items": []},
-            {"source": '"pkg"', "items": ["Thing"], "alias": "alias"},
-            {"source": '"pkg"', "items": [], "alias": ""},
-        ],
-        "exports": [{"name": "run"}, {"name": ""}],
-    }
-    monkeypatch.setattr(
-        "devcouncil.codeintel.languages.generic_extractor.process_tree_sitter",
-        lambda _language, _source: result,
-    )
-    extracted = extract_generic(
-        "worker.go",
-        "func run() {\n if (ready) {}\n svc.run()\n svc.run()\n}\n",
-    )
-    assert [symbol.qualname for symbol in extracted.symbols] == [
-        "Container",
-        "Container.run",
-    ]
-    assert extracted.imports == ["pkg"]
-    assert extracted.import_details[0].alias_map == {"alias": "pkg"}
-    assert [call.name for call in extracted.calls] == ["run", "run", "run"]
-    # Callee-hint convention (receiver.name / bare name), matching the dedicated
-    # extractors. Owner-style hints made resolve_calls bind every bare
-    # in-function call back to its enclosing symbol as a self-loop.
-    assert extracted.calls[0].qualname_hint == "run"
-    assert all(
-        call.qualname_hint == "svc.run" for call in extracted.calls[1:]
-    )
-
-
-def test_generic_bare_call_resolves_to_sibling_not_enclosing() -> None:
-    """A bare call inside a function must bind to the real same-file callee.
-
-    Regression: owner-style qualname hints made the same-file ladder step
-    resolve every bare in-function call to its own enclosing symbol, emitting
-    caller→caller self-loops and leaving true callees with no inbound edges
-    (false dead-code flags across the generic language matrix, e.g. C).
-    """
-    from devcouncil.indexing.graph.extract_python import (
-        ExtractedCall,
-        ExtractedSymbol,
-        FileExtraction,
-    )
-    from devcouncil.indexing.graph.resolve import (
-        build_file_and_symbol_nodes,
-        resolve_calls,
-    )
-
-    ext = FileExtraction(
-        path="main.c",
-        language="c",
-        symbols=[
-            ExtractedSymbol(
-                kind="function", name="main", qualname="main", line=1, end_line=10
-            ),
-            ExtractedSymbol(
-                kind="function", name="helper", qualname="helper", line=12, end_line=20
-            ),
-        ],
-        calls=[
-            ExtractedCall(name="helper", line=5, receiver="", qualname_hint="helper")
-        ],
-    )
-    extractions = {"main.c": ext}
-    _nodes, symbol_index = build_file_and_symbol_nodes(extractions)
-    edges = resolve_calls(extractions, symbol_index, [])
-    call_edges = {(e.source, e.target) for e in edges if e.kind == "calls"}
-    main_id = symbol_index["main.c::main"]
-    helper_id = symbol_index["main.c::helper"]
-    assert (main_id, helper_id) in call_edges
-    assert (main_id, main_id) not in call_edges
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        ("constructor_declaration", "method"),
-        ("interface declaration", "interface"),
-        ("record_type", "struct"),
-        ("trait_item", "trait"),
-        ("enum_definition", "enum"),
-        ("type_alias", "type"),
-        ("field_declaration", "property"),
-        ("constant_declaration", "variable"),
-        ("unknown", ""),
-    ],
-)
-def test_generic_kind_normalization(raw: str, expected: str) -> None:
-    from devcouncil.codeintel.languages.generic_extractor import _kind
-
-    assert _kind(raw) == expected
-
-
 def test_debug_session_manager_control_inspect_evaluate_stop_and_errors(
     tmp_path: Path,
 ) -> None:
@@ -1606,35 +1406,23 @@ def test_mcp_codeintel_dispatch_all_handlers_and_errors(
         def affected_tests(self, targets, max_depth):
             return {"operation": "affected", "targets": targets, "depth": max_depth}
 
-    class Coordinator:
-        last_error = ""
-        degraded_reason = ""
+    def _kernel_cli_refresh(_root, _output, *_a, **_k):
+        return types.SimpleNamespace(
+            generation=11,
+            mode="devmap-rust",
+            reason="",
+            degraded=False,
+            kernel_status=types.SimpleNamespace(
+                generation_id=11,
+                pending_count=0,
+                is_fresh=True,
+                degraded_reason=None,
+            ),
+        )
 
-        def wait_until_fresh(self, timeout):
-            assert timeout == 2
-
-        def reconcile(self):
-            return ["app.py"]
-
-        def sync_now(self, changed):
-            return changed != ["fail.py"]
-
-        def status(self):
-            return types.SimpleNamespace(
-                last_error=self.last_error,
-                degraded_reason=self.degraded_reason,
-                as_dict=lambda: {"state": "healthy"},
-            )
-
-    coordinator = Coordinator()
     monkeypatch.setattr(mcp_codeintel, "CodeIntelQueryEngine", Engine)
     monkeypatch.setattr(
-        mcp_codeintel, "get_sync_coordinator", lambda _root, **_k: coordinator
-    )
-    monkeypatch.setattr(
-        mcp_codeintel,
-        "get_codeintel_service",
-        lambda _root: types.SimpleNamespace(status=lambda: {"state": "committed"}),
+        "devcouncil.indexing.map_artifacts.refresh_map_artifacts", _kernel_cli_refresh
     )
 
     async def invoke(name, arguments):
@@ -1652,9 +1440,12 @@ def test_mcp_codeintel_dispatch_all_handlers_and_errors(
     ]
     for name, arguments, operation in calls:
         assert asyncio.run(invoke(name, arguments))["operation"] == operation
-    assert asyncio.run(
-        invoke("devcouncil_code_sync", {"paths": []})
-    )["reconciled"] == ["app.py"]
+    # No daemon in this fixture, so `_sync` falls through to the kernel CLI —
+    # never to a Python coordinator, which no longer exists.
+    synced = asyncio.run(invoke("devcouncil_code_sync", {"paths": ["app.py"]}))
+    assert synced["reconciled"] == ["app.py"]
+    assert synced["source"] == "devmap-cli"
+    assert synced["generation"] == 11
     # `committed` came from the stubbed Python engine while a fallback existed.
     # The Rust kernel is primary now and this fixture never builds a devmap
     # store, so `uninitialized` is the honest answer — the tri-state saying "I
@@ -1664,10 +1455,18 @@ def test_mcp_codeintel_dispatch_all_handlers_and_errors(
     assert status_payload["state"] == "uninitialized"
     assert status_payload["ok"] is False, "an unbuilt store must not read as a verified zero"
     assert "Unavailable" in status_payload["resolution"], "the reason must be carried, not dropped"
+    from devcouncil.devmap_engine import DevMapEngineError
+
+    def _kernel_unavailable(*_a, **_k):
+        raise DevMapEngineError("no devmap binary supports this map engine")
+
+    monkeypatch.setattr(
+        "devcouncil.indexing.map_artifacts.refresh_map_artifacts", _kernel_unavailable
+    )
     failed = asyncio.run(
         invoke("devcouncil_code_sync", {"paths": ["fail.py"]})
     )
-    assert failed["code"] == "codeintel_sync_failed"
+    assert failed["code"] == "engine_unavailable"
     invalid = asyncio.run(invoke("devcouncil_code_explore", {}))
     assert invalid["code"] == "invalid_arguments"
     assert asyncio.run(mcp_codeintel.dispatch("missing", tmp_path, {})) is None
@@ -1678,9 +1477,7 @@ def test_graph_cli_remaining_output_branches(
 ) -> None:
     import devcouncil.cli.commands.map as map_command
     import devcouncil.codeintel as codeintel
-    import devcouncil.codeintel.languages as languages
     import devcouncil.codeintel.query as query_module
-    import devcouncil.codeintel.sync as sync_module
     import devcouncil.indexing.graph.build as graph_build
     import devcouncil.indexing.graph.intel as intel
     import devcouncil.indexing.map_artifacts as map_artifacts
@@ -1713,20 +1510,6 @@ def test_graph_cli_remaining_output_branches(
         ),
     )
 
-    class EmptyState:
-        def as_dict(self):
-            return {
-                "state": "healthy",
-                "backend": "",
-                "pending": [],
-                "degraded_reason": "",
-            }
-
-    monkeypatch.setattr(
-        sync_module,
-        "get_sync_coordinator",
-        lambda _root: types.SimpleNamespace(status=lambda: EmptyState()),
-    )
     assert runner.invoke(
         app, ["map", "init", "--project-root", str(tmp_path)]
     ).exit_code == 0
@@ -1734,23 +1517,17 @@ def test_graph_cli_remaining_output_branches(
         app, ["map", "status", "--project-root", str(tmp_path)]
     )
     assert status_result.exit_code == 0
-    assert "not started" in status_result.output
+    assert "not running" in status_result.output
 
+    # Doctor fails when no kernel can run — the one thing that stops `dev map`.
     monkeypatch.setattr(
-        languages,
-        "grammar_status",
-        lambda: {
-            "ok": False,
-            "available_count": 0,
-            "required_count": 1,
-            "languages": [
-                {
-                    "available": True,
-                    "language": "Python",
-                    "missing_grammars": [],
-                }
-            ],
-            "action": "",
+        "devcouncil.devmap_health.engine_info",
+        lambda root: {
+            "binary": None,
+            "built_at": None,
+            "version": None,
+            "schema_version": None,
+            "error": "no devmap binary supports this map engine",
         },
     )
     failed_doctor = runner.invoke(
@@ -1943,57 +1720,3 @@ def test_store_export_status_search_and_runtime_filter_branches(
         limit=200_000,
     )
     assert rows[0]["fingerprint_matches"] is False
-
-
-def test_sync_observer_events_start_and_stop(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source = tmp_path / "app.py"
-    destination = tmp_path / "renamed.py"
-    source.write_text("x = 1\n", encoding="utf-8")
-    destination.write_text("x = 1\n", encoding="utf-8")
-    service = CodeIntelService(tmp_path)
-    scheduled: list[object] = []
-
-    class Observer:
-        emitters = [types.SimpleNamespace(is_alive=lambda: True)]
-
-        def schedule(self, handler, _root, recursive):
-            assert recursive is True
-            scheduled.append(handler)
-
-        def start(self):
-            return None
-
-        def stop(self):
-            return None
-
-        def join(self, timeout=None):
-            return None
-
-    monkeypatch.setattr("watchdog.observers.Observer", Observer)
-    try:
-        import watchdog.observers.kqueue as kqueue
-    except (ImportError, AttributeError):
-        pass
-    else:
-        monkeypatch.setattr(kqueue, "KqueueObserver", Observer)
-    coordinator = SyncCoordinator(service, sync_callback=lambda _paths: None)
-    coordinator._start_observer()
-    assert coordinator.status().backend_kind == "native"
-    handler = scheduled[0]
-    handler.on_any_event(types.SimpleNamespace(is_directory=True))
-    handler.on_any_event(
-        types.SimpleNamespace(
-            is_directory=False,
-            src_path=str(source),
-            dest_path=str(destination),
-        )
-    )
-    assert coordinator.status().pending == ["app.py", "renamed.py"]
-    coordinator.stop()
-    assert coordinator.status().state == "disabled"
-
-    alive = types.SimpleNamespace(is_alive=lambda: True)
-    coordinator._worker = alive
-    assert coordinator.start().state == "disabled"

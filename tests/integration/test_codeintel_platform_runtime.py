@@ -16,8 +16,6 @@ from devcouncil.codeintel.debug.fingerprint import source_fingerprint
 from devcouncil.codeintel.debug.session import DebugSessionManager
 from devcouncil.codeintel.debug.tracing import NodeCpuProfileProvider
 from devcouncil.codeintel.service import get_codeintel_service
-from devcouncil.codeintel.sync.coordinator import SyncCoordinator
-from devcouncil.indexing.graph.schema import CodeGraph, GraphNode, NodeKind
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "codeintel_runtime"
 
@@ -75,83 +73,6 @@ def test_dashboard_real_loopback_socket_smoke(tmp_path: Path, monkeypatch: pytes
         server.shutdown()
         server.server_close()
         thread.join(timeout=5.0)
-
-
-def test_native_watcher_handles_bursts_renames_atomic_saves_pressure_and_reconciliation(
-    tmp_path: Path,
-) -> None:
-    original = tmp_path / "rename_old.py"
-    atomic = tmp_path / "atomic.py"
-    original.write_text("VALUE = 1\n", encoding="utf-8")
-    atomic.write_text("VALUE = 1\n", encoding="utf-8")
-    service = get_codeintel_service(tmp_path)
-    service.persist(CodeGraph(nodes=[
-        GraphNode(id=path.name, kind=NodeKind.FILE, path=path.name, name=path.name, language="python")
-        for path in (original, atomic)
-    ]))
-    batches: list[list[str]] = []
-    lock = threading.Lock()
-
-    def capture(paths: list[str]) -> None:
-        with lock:
-            batches.append(paths)
-
-    coordinator = SyncCoordinator(
-        service,
-        debounce_seconds=0.1,
-        reconcile_seconds=300.0,
-        sync_callback=capture,
-        allow_polling_fallback=False,
-    )
-    state = coordinator.start()
-    try:
-        assert state.backend_kind == "native", state.degraded_reason
-
-        expected = {f"burst_{index}.py" for index in range(20)}
-        for rel in sorted(expected):
-            (tmp_path / rel).write_text("VALUE = 1\n", encoding="utf-8")
-
-        renamed = tmp_path / "rename_new.py"
-        original.rename(renamed)
-        expected.update({"rename_old.py", "rename_new.py"})
-
-        temporary = tmp_path / ".atomic.py.tmp"
-        temporary.write_text("VALUE = 2\n", encoding="utf-8")
-        os.replace(temporary, atomic)
-        expected.add("atomic.py")
-
-        recreated = tmp_path / "recreated.py"
-        recreated.write_text("VALUE = 1\n", encoding="utf-8")
-        service.persist(CodeGraph(nodes=[
-            GraphNode(id="recreated.py", kind=NodeKind.FILE, path="recreated.py", name="recreated.py", language="python")
-        ]))
-        recreated.unlink()
-        recreated.write_text("VALUE = 2\n", encoding="utf-8")
-        expected.add("recreated.py")
-
-        for index in range(48):
-            directory = tmp_path / f"pressure_{index}"
-            directory.mkdir()
-            (directory / "module.py").write_text(f"VALUE = {index}\n", encoding="utf-8")
-            expected.add(f"pressure_{index}/module.py")
-
-        def observed() -> bool:
-            with lock:
-                return expected <= {path for batch in batches for path in batch}
-
-        _wait_until(observed)
-
-        missed = tmp_path / "missed.py"
-        observer = coordinator._observer
-        observer.stop()
-        observer.join(timeout=5.0)
-        missed.write_text("VALUE = 1\n", encoding="utf-8")
-        assert "missed.py" in coordinator.reconcile()
-        assert coordinator.sync_now()
-        with lock:
-            assert "missed.py" in {path for batch in batches for path in batch}
-    finally:
-        coordinator.stop()
 
 
 def test_real_node_runtime_profile_records_fingerprint_scoped_observations(tmp_path: Path) -> None:

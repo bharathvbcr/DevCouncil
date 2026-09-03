@@ -15,8 +15,7 @@ from typing import Any, Awaitable, Callable
 from mcp.types import TextContent, Tool
 
 from devcouncil.codeintel.query import CodeIntelQueryEngine
-from devcouncil.codeintel.service import canonical_project_root, get_codeintel_service
-from devcouncil.codeintel.sync import get_sync_coordinator
+from devcouncil.codeintel.service import canonical_project_root
 from devcouncil.devmap_client import (
     BudgetedResponse,
     DevMapClient,
@@ -575,10 +574,18 @@ async def _affected(root: Path, arguments: dict) -> list[TextContent]:
 
 
 async def _sync(root: Path, arguments: dict) -> list[TextContent]:
+    """Build through the kernel — over IPC when the daemon answers, else the CLI.
+
+    There is no Python fallback. This used to hand off to the Python
+    ``SyncCoordinator``, which re-extracted with the retired Python engine and
+    rewrote both artifacts; the kernel is the only writer, so an unreachable
+    kernel is reported as ``engine_unavailable`` rather than answered by a
+    second engine the caller never asked for.
+    """
+    supplied = [str(value) for value in arguments.get("paths") or []]
     client = try_connect(root)
     if client is not None:
         try:
-            supplied = [str(value) for value in arguments.get("paths") or []]
             result = client.build(affected=supplied or None)
             status = client.status()
             return json_text({
@@ -593,20 +600,32 @@ async def _sync(root: Path, arguments: dict) -> list[TextContent]:
             })
         except DevMapClientError as exc:
             logger.warning(
-            "devmap (Rust) sync/build failed and this call fell back to the Python "
-            "path: %s. The Rust kernel is primary; a fallback here is a defect.",
-            exc,
-        )
-    coordinator = get_sync_coordinator(root)
-    supplied = [str(value) for value in arguments.get("paths") or []]
-    changed = supplied or await asyncio.to_thread(coordinator.reconcile)
-    ok = await asyncio.to_thread(coordinator.sync_now, changed)
-    payload = {"ok": ok, "reconciled": changed, **coordinator.status().as_dict()}
-    return json_text(payload) if ok else error_text(
-        coordinator.status().last_error or coordinator.status().degraded_reason or "sync failed",
-        code="codeintel_sync_failed",
-        **payload,
-    )
+                "devmap (Rust) daemon build failed; retrying through the kernel CLI: %s",
+                exc,
+            )
+    from devcouncil.devmap_engine import DevMapEngineError
+    from devcouncil.indexing.map_artifacts import refresh_map_artifacts
+
+    map_path = root / ".devcouncil" / "repo_map.json"
+    try:
+        refresh = await asyncio.to_thread(refresh_map_artifacts, root, map_path, quiet=True)
+    except DevMapEngineError as exc:
+        return error_text(str(exc), code="engine_unavailable", reconciled=supplied)
+    kernel = getattr(refresh, "kernel_status", None)
+    return json_text({
+        "ok": True,
+        "reconciled": supplied,
+        "source": "devmap-cli",
+        "generation": refresh.generation,
+        "pending": kernel.pending_count if kernel is not None else None,
+        "state": (
+            "fresh" if (kernel is not None and kernel.is_fresh)
+            else "pending" if kernel is not None
+            else "unknown"
+        ),
+        "fresh": kernel.is_fresh if kernel is not None else None,
+        "build": {"mode": refresh.mode, "reason": refresh.reason},
+    })
 
 
 async def _status(root: Path, _arguments: dict) -> list[TextContent]:

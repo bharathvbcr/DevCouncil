@@ -10,8 +10,15 @@ runner = CliRunner()
 
 def _setup_graph_env(tmp_path: Path, monkeypatch) -> Path:
     monkeypatch.chdir(tmp_path)
-    runner.invoke(app, ["init"])
-    
+    # No initial map: `dev init` now builds a kernel store from whatever files
+    # exist (the agent guides it writes are enough for a non-empty generation),
+    # and the kernel then answers ahead of the hand-built Python graph below.
+    # These tests exercise the CLI rendering of the compatibility read path, so
+    # they must start with no kernel store at all.
+    from devcouncil.cli.commands.init import initialize_project
+
+    initialize_project(tmp_path, quiet=True, with_map=False, with_skills=False)
+
     # Construct a mock CodeGraph
     nodes = [
         GraphNode(id="src/a.py", kind=NodeKind.FILE, path="src/a.py", name="a.py"),

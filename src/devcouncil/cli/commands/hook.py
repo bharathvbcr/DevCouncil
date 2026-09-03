@@ -531,18 +531,35 @@ def _maybe_refresh_map(root: Path, payload_text: str) -> None:
         logger.debug("map refresh in progress; queued %d path(s)", len(rels))
         return
 
+    map_path = root / ".devcouncil" / "repo_map.json"
+    # Set when the kernel could not build. The paths go back on the queue and
+    # the leftover drain is skipped: retrying the same unavailable kernel in the
+    # same hook invocation only pays the failure twice.
+    deferred = False
     try:
         # Debounce burst edits so a multi-file edit lands as one refresh.
         time.sleep(MAP_REFRESH_DEBOUNCE_S)
         pending = set(rels)
         # Queue files may predate the nested-checkout filter — re-filter on drain.
         pending.update(p for p in _take_queued_paths(queue_path) if not should_skip_path(p))
-        from devcouncil.indexing.graph.build import refresh_map_for_paths
+        from devcouncil.devmap_engine import DevMapEngineError
+        from devcouncil.indexing.map_artifacts import refresh_map_artifacts
 
         while pending:
             batch = sorted(pending)
             pending.clear()
-            refresh_map_for_paths(root, batch)
+            try:
+                refresh_map_artifacts(root, map_path, quiet=True, paths=batch)
+            except DevMapEngineError as exc:
+                # A hook must never fail the tool call it runs after. The map
+                # stays where the last successful build left it, the paths go
+                # back on the queue so the next hook retries them instead of
+                # dropping the edits, and the reason is logged rather than
+                # swallowed.
+                deferred = True
+                logger.warning("map refresh deferred: %s", exc)
+                _enqueue_refresh_paths(queue_path, batch)
+                break
             log_step(
                 f"hook/post_tool_use: refreshed map for {len(batch)} path(s)",
                 project_root=root,
@@ -559,13 +576,18 @@ def _maybe_refresh_map(root: Path, payload_text: str) -> None:
         # If anything arrived after we released but before unlink races settle,
         # a subsequent PostToolUse will pick it up; also try a best-effort drain
         # by re-acquiring if the queue is non-empty.
-        if queue_path.is_file() and _try_acquire_refresh_lock(lock):
+        if not deferred and queue_path.is_file() and _try_acquire_refresh_lock(lock):
             try:
                 leftover = [p for p in _take_queued_paths(queue_path) if not should_skip_path(p)]
                 if leftover:
-                    from devcouncil.indexing.graph.build import refresh_map_for_paths
+                    from devcouncil.devmap_engine import DevMapEngineError
+                    from devcouncil.indexing.map_artifacts import refresh_map_artifacts
 
-                    refresh_map_for_paths(root, leftover)
+                    try:
+                        refresh_map_artifacts(root, map_path, quiet=True, paths=leftover)
+                    except DevMapEngineError as exc:
+                        logger.warning("map refresh deferred: %s", exc)
+                        _enqueue_refresh_paths(queue_path, leftover)
             except Exception:
                 logger.debug("map refresh leftover drain failed", exc_info=True)
             finally:

@@ -5,6 +5,7 @@ import subprocess
 
 from devcouncil.indexing.repo_mapper import RepoMapper
 
+from tests.unit.support_maps import dependents_view
 
 def _git(root, *args):
     subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True)
@@ -40,7 +41,7 @@ def test_js_relative_imports_resolve_to_files(tmp_path):
         "src/index.ts": "export { handle } from './handlers';\n",
     })
     _commit(tmp_path)
-    repo_map = RepoMapper(tmp_path).map_repo()
+    repo_map = dependents_view(tmp_path)
     deps = repo_map.dependents
     assert "src/handlers.ts" in deps.get("src/models.ts", [])
     assert "src/handlers.ts" in deps.get("src/util.ts", [])
@@ -54,7 +55,7 @@ def test_js_require_and_index_resolution(tmp_path):
         "lib/app.js": "const core = require('./core');\n",
     })
     _commit(tmp_path)
-    repo_map = RepoMapper(tmp_path).map_repo()
+    repo_map = dependents_view(tmp_path)
     # './core' resolves to lib/core/index.js
     assert "lib/app.js" in repo_map.dependents.get("lib/core/index.js", [])
 
@@ -65,7 +66,7 @@ def test_js_bare_package_imports_are_not_edges(tmp_path):
         "src/a.ts": "import React from 'react';\nexport const x = 1;\n",
     })
     _commit(tmp_path)
-    repo_map = RepoMapper(tmp_path).map_repo()
+    repo_map = dependents_view(tmp_path)
     # No relative edges -> no dependents at all from this file.
     assert repo_map.dependents == {} or "react" not in str(repo_map.dependents)
 
@@ -88,7 +89,7 @@ def test_go_package_imports_resolve(tmp_path):
         "core/core.go": "package core\n\nfunc Hello() string { return \"hi\" }\n",
     })
     _commit(tmp_path)
-    repo_map = RepoMapper(tmp_path).map_repo()
+    repo_map = dependents_view(tmp_path)
     deps = repo_map.dependents
     assert "main.go" in deps.get("core/core.go", [])
     # stdlib import (fmt) creates no edge.
@@ -105,7 +106,7 @@ def test_go_external_imports_ignored(tmp_path):
         ),
     })
     _commit(tmp_path)
-    repo_map = RepoMapper(tmp_path).map_repo()
+    repo_map = dependents_view(tmp_path)
     assert repo_map.dependents == {}
 
 
@@ -126,11 +127,3 @@ def test_all_import_edges_never_raises(tmp_path):
     assert isinstance(edges, list)
 
 
-def test_dependents_respect_max_cap(tmp_path):
-    importers = {f"src/m{i}.ts": "import { X } from './target';\n" for i in range(20)}
-    files = {"package.json": "{}\n", "src/target.ts": "export const X = 1;\n", **importers}
-    _write(tmp_path, files)
-    _commit(tmp_path)
-    repo_map = RepoMapper(tmp_path).map_repo()
-    dep_list = repo_map.dependents.get("src/target.ts", [])
-    assert len(dep_list) <= RepoMapper._DEPENDENTS_MAX

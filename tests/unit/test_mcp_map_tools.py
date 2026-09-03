@@ -688,22 +688,18 @@ async def test_liveness_globally_empty_roots_still_unreliable(tmp_path, monkeypa
 
 
 @pytest.mark.anyio
-async def test_graph_ingest_paths_branch_reports_writer_busy(tmp_path, monkeypatch):
-    """A held writer lease during explicit-paths ingest must return the
-    structured graph_writer_busy error, not raise through MCP."""
-    from devcouncil.codeintel.build_control import GraphBuildBusy
-
-    class _Coordinator:
-        def sync_now(self, _paths):
-            raise GraphBuildBusy("another process owns the code-intelligence writer lease")
-
-        def status(self):  # pragma: no cover - not reached
-            raise AssertionError
+async def test_graph_ingest_paths_branch_reports_engine_unavailable(tmp_path, monkeypatch):
+    """A kernel that cannot build during explicit-paths ingest must return the
+    structured engine_unavailable error, not raise through MCP."""
+    from devcouncil.devmap_engine import DevMapEngineError
 
     monkeypatch.setattr(
-        "devcouncil.codeintel.sync.get_sync_coordinator", lambda _root: _Coordinator()
+        "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
+        lambda *a, **k: (_ for _ in ()).throw(
+            DevMapEngineError("another devmap writer holds the store lock")
+        ),
     )
     result = await mapmod.handle_graph_ingest(tmp_path, {"paths": ["a.py"]})
     payload = json.loads(result[0].text)
     assert payload["ok"] is False
-    assert payload["code"] == "graph_writer_busy"
+    assert payload["code"] == "engine_unavailable"

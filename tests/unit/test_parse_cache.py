@@ -8,6 +8,7 @@ import subprocess
 from devcouncil.indexing.graph.cache import load_parse_cache, save_parse_cache
 from devcouncil.indexing.repo_mapper import RepoMapper
 
+from tests.unit.support_maps import dependents_view
 
 def _git(root, *args):
     subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True)
@@ -34,8 +35,7 @@ def test_js_parse_cache_reused_across_runs(tmp_path, monkeypatch):
     })
     _commit(tmp_path)
 
-    mapper = RepoMapper(tmp_path)
-    first = mapper.map_repo(liveness=False)
+    first = dependents_view(tmp_path)
     assert "src/handlers.ts" in first.dependents.get("src/models.ts", [])
 
     cache_path = tmp_path / ".devcouncil" / "cache" / "repo_map_parse.json"
@@ -54,7 +54,7 @@ def test_js_parse_cache_reused_across_runs(tmp_path, monkeypatch):
         return real(self, source)
 
     monkeypatch.setattr(RepoMapper, "_extract_js_import_specs", tracking)
-    second = RepoMapper(tmp_path).map_repo(liveness=False)
+    second = dependents_view(tmp_path)
     assert "src/handlers.ts" in second.dependents.get("src/models.ts", [])
     assert calls == []  # cache hit — no re-extraction
 
@@ -68,7 +68,7 @@ def test_js_and_python_share_parse_cache(tmp_path):
         "src/app.ts": "import { n } from './util';\nexport const v = n;\n",
     })
     _commit(tmp_path)
-    RepoMapper(tmp_path).map_repo(liveness=False)
+    dependents_view(tmp_path)
     data = json.loads(
         (tmp_path / ".devcouncil" / "cache" / "repo_map_parse.json").read_text(
             encoding="utf-8"
@@ -97,7 +97,7 @@ def test_parse_cache_version_mismatch_is_ignored(tmp_path):
         }),
         encoding="utf-8",
     )
-    repo_map = RepoMapper(tmp_path).map_repo(liveness=False)
+    repo_map = dependents_view(tmp_path)
     assert "src/a.ts" in repo_map.dependents.get("src/b.ts", [])
     data = json.loads(
         (cache_dir / "repo_map_parse.json").read_text(encoding="utf-8")
@@ -129,21 +129,3 @@ def test_save_parse_cache_is_atomic(tmp_path, monkeypatch):
     assert loaded == files
 
 
-def test_extract_cached_survives_extractor_crash_without_poisoning_cache(tmp_path, monkeypatch):
-    """A file that crashes its extractor is indexed as opaque and never cached."""
-    from devcouncil.indexing.graph import cache as cache_mod
-
-    target = tmp_path / "hostile.py"
-    target.write_text("x = 1\n", encoding="utf-8")
-
-    def exploding(path, source):  # noqa: ANN001
-        raise RecursionError("maximum recursion depth exceeded")
-
-    monkeypatch.setattr(cache_mod, "extract_file", exploding)
-    extraction, entry = cache_mod.extract_cached(tmp_path, "hostile.py", cache={})
-
-    assert extraction.path == "hostile.py"
-    assert extraction.symbols == []
-    # sha256 stays empty so this entry can never satisfy a warm-cache hit and
-    # the file is retried once the extractor is fixed.
-    assert entry["sha256"] == ""

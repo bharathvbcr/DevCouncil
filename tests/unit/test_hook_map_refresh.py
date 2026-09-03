@@ -20,9 +20,9 @@ from devcouncil.cli.commands.hook import (
     _try_acquire_refresh_lock,
     app as hook_app,
 )
-from devcouncil.indexing.repo_mapper import RepoMapper
 from devcouncil.integrations.clients.hooks import _install_claude_hooks
 
+from tests.unit.support_maps import write_stamped_map
 
 def _git(root, *args):
     subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True)
@@ -56,7 +56,7 @@ def test_post_tool_use_refresh_best_effort(tmp_path):
     })
     _commit(tmp_path)
     (tmp_path / ".devcouncil").mkdir(exist_ok=True)
-    RepoMapper(tmp_path).map_repo(liveness=False)
+    write_stamped_map(tmp_path)
 
     (tmp_path / "pkg" / "a.py").write_text(
         "def foo():\n    return 1\ndef added():\n    return 2\n", encoding="utf-8"
@@ -129,7 +129,7 @@ def test_refresh_queue_on_lock_conflict(tmp_path, monkeypatch):
     })
     _commit(tmp_path)
     (tmp_path / ".devcouncil").mkdir(exist_ok=True)
-    RepoMapper(tmp_path).map_repo(liveness=False)
+    write_stamped_map(tmp_path)
 
     lock = tmp_path / ".devcouncil" / "cache" / "map_refresh.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
@@ -141,12 +141,12 @@ def test_refresh_queue_on_lock_conflict(tmp_path, monkeypatch):
 
     refreshed: list[list[str]] = []
 
-    def _fake_refresh(root, paths, **kwargs):  # noqa: ANN001
-        refreshed.append(list(paths))
+    def _fake_refresh(root, output, *_a, paths=None, **_k):  # noqa: ANN001
+        refreshed.append(list(paths or []))
         return None
 
     monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.refresh_map_for_paths",
+        "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
         _fake_refresh,
     )
     monkeypatch.setattr(
@@ -174,19 +174,19 @@ def test_refresh_holder_drains_queue(tmp_path, monkeypatch):
     })
     _commit(tmp_path)
     (tmp_path / ".devcouncil").mkdir(exist_ok=True)
-    RepoMapper(tmp_path).map_repo(liveness=False)
+    write_stamped_map(tmp_path)
 
     queue = tmp_path / ".devcouncil" / "cache" / "map_refresh_queue.json"
     _enqueue_refresh_paths(queue, ["pkg/b.py"])
 
     refreshed: list[list[str]] = []
 
-    def _fake_refresh(root, paths, **kwargs):  # noqa: ANN001
-        refreshed.append(sorted(paths))
+    def _fake_refresh(root, output, *_a, paths=None, **_k):  # noqa: ANN001
+        refreshed.append(sorted(paths or []))
         return None
 
     monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.refresh_map_for_paths",
+        "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
         _fake_refresh,
     )
     monkeypatch.setattr(
@@ -213,8 +213,8 @@ def test_nested_worktree_edits_not_ingested_into_main_root(tmp_path, monkeypatch
     graph — they would duplicate every edited symbol and trigger spurious rebuilds."""
     refreshed: list[list[str]] = []
     monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.refresh_map_for_paths",
-        lambda root, paths, **kwargs: refreshed.append(sorted(paths)),
+        "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
+        lambda root, output, *_a, paths=None, **_k: refreshed.append(sorted(paths or [])),
     )
     monkeypatch.setattr("devcouncil.cli.commands.hook.MAP_REFRESH_DEBOUNCE_S", 0.0)
 
@@ -245,8 +245,8 @@ def test_stale_queue_with_worktree_paths_filtered_on_drain(tmp_path, monkeypatch
     worktree paths; the drain must drop them instead of refreshing them."""
     refreshed: list[list[str]] = []
     monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.refresh_map_for_paths",
-        lambda root, paths, **kwargs: refreshed.append(sorted(paths)),
+        "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
+        lambda root, output, *_a, paths=None, **_k: refreshed.append(sorted(paths or [])),
     )
     monkeypatch.setattr("devcouncil.cli.commands.hook.MAP_REFRESH_DEBOUNCE_S", 0.0)
 
@@ -307,19 +307,19 @@ def test_enqueue_during_holder_refresh_merged(tmp_path, monkeypatch):
     })
     _commit(tmp_path)
     (tmp_path / ".devcouncil").mkdir(exist_ok=True)
-    RepoMapper(tmp_path).map_repo(liveness=False)
+    write_stamped_map(tmp_path)
 
     refreshed: list[list[str]] = []
     queue = tmp_path / ".devcouncil" / "cache" / "map_refresh_queue.json"
 
-    def _fake_refresh(root, paths, **kwargs):  # noqa: ANN001
-        refreshed.append(sorted(paths))
+    def _fake_refresh(root, output, *_a, paths=None, **_k):  # noqa: ANN001
+        refreshed.append(sorted(paths or []))
         # Concurrent PostToolUse while we hold the lock.
         if len(refreshed) == 1:
             _enqueue_refresh_paths(queue, ["pkg/c.py"])
 
     monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.refresh_map_for_paths",
+        "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
         _fake_refresh,
     )
     monkeypatch.setattr(

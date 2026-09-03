@@ -642,3 +642,244 @@ consecutive clean runs. Pre-existing and not a product bug: `flock` is released
 by the OS on process exit, so the leftover PID-named `.lock` files in TMPDIR are
 harmless. Left alone deliberately — retiming a locking test could mask a real
 regression, and the honest report is worth more than a green run.
+
+## Dev Map kernel audit, second pass (2026-09-02)
+
+Scope: everything between `dev map` and the store — the Python seam, the kernel's
+store/build/drain, the daemon and query surfaces — audited against the gortex
+feature set, with every fix carrying a test that failed first and the whole thing
+run against this repository's live 700 MB store. Nothing here is committed.
+
+### The defect that mattered most: two engines, one artifact
+
+The Rust kernel built the map, but the retired Python engine still ran on every
+verify, checkout, `dev plan`, `dev init`, `dev map init|ingest|sync`, MCP
+`graph_ingest`, the post-tool-use hook, and — through the `SyncCoordinator` the
+MCP server started in its lifespan — on every file edit. Each of those rewrote
+`repo_map.json` and `code_graph.json` from a generation built at an older HEAD,
+after the kernel had written them. The last writer won, silently.
+
+Now `indexing.map_artifacts.refresh_map_artifacts` is the only path to the
+artifacts and it builds through the kernel; there is no fallback (it raises
+`DevMapEngineError`; verify/checkout catch it). The Python store
+`.devcouncil/codeintel/index.sqlite` is a read cache that `load_code_graph`
+fills from the kernel's JSON. The Python watcher, incremental sync, isolated-build
+worker and hook refresher are deleted; the MCP server warms the kernel daemon
+instead of running its own.
+
+### Python seam — defects fixed (each with a failing-first test)
+
+| # | Defect | How it showed | Fix |
+|---|--------|---------------|-----|
+| 1 | Stale binary chosen: the release build was older than the debug build and the uv tool fell through to `~/.cargo/bin/devmap`; each refused the schema-12 store with a bare version number | `dev map` exit 1 | `find_engine_binary`: `DEVMAP_BINARY` override, else the newest *capable* build (capability probed via `manifest --help`, because every build prints the same version) across `<repo>/rust-port/target`, `<package>/rust-port/target`, PATH; the refusal names the binary, its build time, the store's schema and the rebuild command |
+| 2 | A status probe auto-spawned a daemon that reconciled the tree and committed its own generation seconds after the CLI build | generation 1 → 3 after one build; 288 daemons left behind by one test run | `DevMapClient(autospawn=False)` for probes; `DEVMAP_AUTOSPAWN=0` process-wide; the test suite sets it |
+| 3 | Client and kernel derived different socket paths (SHA-256 `/tmp/devmap-<hex>.sock` vs FNV-1a `<tmp>/devmap-<hex>/ipc.sock`, root hashed as spelled) | two daemons per repository | one formula, owned by the kernel (`devmap serve --print-socket-path`), mirrored in `devmap_client.default_socket_path`, pinned by FNV vectors and a parity test |
+| 4 | The guides a build writes made the map stale one second later | three-file repository stale on a fresh map | rebuild after a guide changes (two files, incremental); a repository without guides commits two generations on its first build, explicitly pinned |
+| 5 | `dev map --watch` polled | timer loop | watchdog events, 0.5 s debounce, 30 s poll as the safety net; a 2,000-file burst is one rebuild |
+| 6 | `dev map query` measured edges for every definition matching a name | unbounded fan-out | exact matches first; edges for the first five; the rest say why they were not measured |
+| 7 | `--no-liveness` / `--lsp-refs` accepted and ignored | silent | rejected (exit 2) |
+| 8 | Status/doctor described the retired engine | `dev map status` | `devmap_health`: binary + build time, store schema vs kernel schema, free pages, WAL, kernel freshness with stuck paths named, daemon, who wrote each artifact; doctor verdicts with fixes, exit 1 on critical |
+| 9 | Map artifacts could be stamped over a failed build | `graph_degraded` lean maps | fail closed: a failed or timed-out kernel build leaves the prior artifacts byte-identical |
+
+### Kernel — store/build/drain (K) and serve/query (S)
+
+Two Opus agents, one per crate group; 27 new store/CLI tests, 10 serve fixes.
+`cargo test --workspace`: 828 passed after their passes.
+
+- **K1 pending queue.** 51,136 rows on the live store (799 consecutive full rebuilds at the old 64-row batch), 188 quarantined including the *old* checkout path, directories and `README.md`. Canonical enqueue with escape refusal, structural reconcile at every build, refusals are not work, per-path attempt accounting (a failing path no longer charges its batch mates), `devmap repair --pending`, status names the stuck paths, batch bound 64 → 8192.
+- **K2 reclaim.** Checkpoint result discarded, then (found live) `execute_batch` steps `PRAGMA incremental_vacuum(N)` exactly once, so one page per build: 66% → 68% free across four builds of a 701 MB file. Reproduced on a copy: unstepped → −1 page; 65,536 rows stepped → 702 MB → 429 MB in 4.5 s. Fixed by stepping every row and reporting pages freed.
+- **K3** schema refusals name the store, versions and remedy; `--version` prints the schema; status never migrates. **K4** `--full`. **K5** prose/data formats are not parse failures. **K6** default `--db` is the seam's store. **K12** poisoned mutex is an error. **K13** advisory writer lock names the holder instead of "database is locked"; generation writes are `BEGIN IMMEDIATE`.
+- **Directory rows survive a build** (found live: 918 `target-*/debug/.fingerprint/<crate>-<hash>` directories after two full builds, status NOT FRESH forever). A whole-tree build now supersedes every row queued before it started.
+- **Cache directories indexed** (found live: 1,041 of 2,363 files in generation 779 were cargo `.fingerprint/*.json` under untracked, unignored `target-serve`/`target-store`). Directories carrying a `CACHEDIR.TAG` are skipped by discovery, affected builds and the watcher.
+- **S1** preview path traversal (`../secrets.py` answered). **S2/S4/S6** budgets honoured (snapshots charged a flat 50 tokens; workspace search reported partial totals as complete; semantic search read 500 files to show 11). **S3** scoped trace O(V×E) → 2.67 s to 0.08 s. **S5** `workspace.json` atomic + flock. **S7** a timed-out query is cancelled, not abandoned on a pool thread. **S8** SIGTERM/SIGINT release socket and lock. **S9** socket path from the canonical root. **S10** a daemon whose repository or store vanished exits.
+
+### Field results (this repository, rebuilt release kernel)
+
+| Measure | Before | After first build | After follow-ups |
+|---|---|---|---|
+| pending rows | 47,095 | 918 (directories) | 0 |
+| quarantined | 188 | 0 | 0 |
+| files indexed | 2,363 | 2,363 (1,041 cargo output) | 1,318 |
+| store | 669 MB, 66% free | 669 MB, 68% free | 209 MB, 0% free |
+| `dev map`, changed tree | refused (schema) | 10 s | 4 s |
+| `dev map`, unchanged tree | refused (schema) | 3 s, no new generation | 1 s, no new generation |
+| doctor | critical | healthy, 2 warnings | healthy |
+
+Kernel verification after the follow-ups: `cargo fmt --all --check` clean,
+`cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo test
+--workspace` 835 passed / 0 failed (60 new kernel tests in all). Python stress
+suite (8 concurrent builds, SIGKILL mid-persist, hostile tree, 2,000-file burst,
+silent daemon, budget contract) 7 passed; the client's socket-path parity test
+passes against `devmap serve --print-socket-path`.
+
+### Tests deleted, and why
+
+`test_codeintel_sync.py` lost the tests of the Python incremental sync, the
+change-set probe and the lease-contention lean map — they tested code that no
+longer exists and encoded the two-writer behaviour this pass removes. Their
+invariants that still apply (fail closed, keep the prior artifacts, reuse a
+generation on an unchanged tree) are re-expressed against the kernel in the
+same file. The isolated-build tests in `test_graph_build_control.py` and
+`test_coverage_wave7.py` went with `run_isolated_full_build`.
+
+### Toward a gortex-class tool
+
+Closed: daemon lifecycle and endpoint identity, transactional store with repair,
+agent-facing budgets, actionable status. Next: serve `graph_query` / `trace` /
+`context` from the kernel rather than the Python cache; tiered map reads for
+token economy; ship `devmap` with the tool install. Gaps: grammar breadth (30
+linked vs gortex's 257 claim), an embedding index, cross-repository contracts,
+diff-scoped review.
+
+### `RepoMapper.map_repo` and the Python graph builder are gone (2026-09-02, evening)
+
+`RepoMapper.map_repo` built a Python `CodeGraph` (`indexing.graph.build.build_code_graph`)
+and wrote `.devcouncil/graph/code_graph.json` — the retired engine, and a second writer of an
+artifact the Rust kernel owns. Two signals said it had no production callers (`rg -uu` over
+`src/` found no `.map_repo(` call; the only remaining `map_repo` the kernel resolves is the
+unrelated `dev map` CLI command), and `refresh_map_artifacts` had stopped calling it. The
+Python-writer retirement agent had already removed the method (−948 lines) and
+`build_code_graph` (−485) before it was stopped; this pass finished the job so the tree is
+coherent again:
+
+- **Deleted** `indexing/graph/resolve.py` (1,020 lines) and `indexing/graph/extract_ts.py`
+  (1,205): no importer anywhere in `src/` once the builder was gone (`rg -ln` empty, both
+  with and without ignore rules).
+- **The extraction cluster went too, one layer deeper than the first pass expected.**
+  `extract_python.py` was left standing on the grounds that the generic extractor and the
+  semantic resolver still imported `FileExtraction` — true, but those two importers were
+  themselves reachable only from `assemble_graph`: `enrich_semantic_edges` had exactly one
+  call site (`graph/build.py`), and `extract_generic` exactly one (`extract_ts.py`). With the
+  builder gone the whole cluster was unreachable, so it went as one piece —
+  `codeintel/resolution/` (`semantic.py`, `abstract_state.py`, `frameworks/{base,di,events,routes}.py`,
+  1,485 lines), `codeintel/languages/generic_extractor.py` (236) and
+  `indexing/graph/extract_python.py` (307). Deleting a leaf because its only caller is dead
+  is only safe when you check the *caller's* callers too; stopping at the first live-looking
+  import would have left 2,028 lines of unreachable code behind a plausible-sounding reason.
+- **Two modules were only half dead, and the half that lives is a verification gate.**
+  `graph/liveness.py` (1,124 → 226) and `graph/cache.py` (329 → 77) both looked like pure
+  builder dependencies. They are not: `RepoMapper.liveness_snapshot` → `_compute_liveness` →
+  `file_liveness` feeds the **liveness ratchet**, and the Python/JS import-edge passes behind
+  the same snapshot read and write the `modules`/`specs` parse cache. Deleting either file
+  outright — which a file-level reachability pass recommends — would have silently disarmed a
+  verify gate. Only the extraction halves went (`symbol_reachability_dead`,
+  `token_dead_from_shards`, `build_liveness_shard`, `extract_cached`,
+  `extraction_{to,from}_cache_entry`, …); `file_liveness`, `confidence_at_least` and the
+  parse cache stayed. `PARSE_CACHE_VERSION` is deliberately *not* bumped: the surviving
+  `modules`/`specs` entries are byte-identical in meaning, and a bump would discard every
+  warm cache to drop keys nothing reads.
+- **`graph/build.py`** (941 → 523) kept what reads and exports a kernel-built graph
+  (`load_code_graph`, `write_code_graph`, the slim/compact/stub export tiers, the PDG layer)
+  and lost what built one (`build_code_graph`, `assemble_graph`, `extract_all`,
+  `extract_paths`, `_build_liveness_shards`, `_area_fn_for`, `_PENDING_ANALYSIS_SHARDS`).
+  `content_fingerprint` stays — `RepoMapper.map_is_stale` is its caller — but the sibling
+  `_git_head` / `_files_fingerprint` / `_code_files` went with `assemble_graph`.
+- **Deleted** `RepoMapper._primary_code_files` and `detect_languages`: reachable only from
+  `map_repo`. Every other method is still reached from `map_is_stale`, `get_git_files`,
+  `dependents_for` (verify's wiring check), `liveness_snapshot` (the liveness ratchet),
+  `_ripgrep_search` and `_scan_dependency_risks` (the seam's enrichment) — checked with an
+  AST reachability pass, not by eye.
+- **Fixed** two breakages the interrupted retirement had left: `indexing.graph.__init__`
+  re-exported the removed `build_code_graph` (so `import devcouncil.indexing.graph` failed,
+  taking `load_code_graph`, `query_symbol` and MCP with it), and
+  `devmap_engine.compute_freshness` imported `_files_fingerprint` from the removed builder.
+  The freshness digests now come from `RepoMapper._files_fingerprint` /
+  `_content_fingerprint` — the checker's own methods, so writer and checker cannot drift.
+- **Tests.** Fixture-style uses of `map_repo` moved to `tests/unit/support_maps.py`:
+  `stamped_repo_map` / `write_stamped_map` (a kernel-shaped map whose stamps match the tree,
+  for the stale-map gate, the hook refresher and the verify-time refresh), `stub_kernel` (for
+  the seam's goal ranking and opt-in SCA), and `dependents_view` (the live
+  `RepoMapper.dependents_for`, so the JS/TS/Go/Rust import-edge claims in
+  `test_companion_import_edges`, `test_jsts_resolution`, `test_ts_imports`, `test_parse_cache`
+  and `test_review_fixes` keep being tested at the owner verify actually uses).
+  Tests whose *subject* was the deleted engine were removed: `test_map_liveness`,
+  `test_graph_dead_code`, `test_code_graph`, `test_graph_incremental`, `test_map_verify_parity`
+  (both sides now read the same kernel generation), `test_repo_mapper_generic`,
+  `test_extract_ts_ast`, and individual tests in `test_repo_mapper_helpers`,
+  `test_phase0_liveness_audit`, `test_primary_stack_map_languages`,
+  `test_swift_map_language_fix`, `test_ts_imports`, `test_jsts_resolution` and
+  `test_coverage_wave5` that named a retired helper. The pruning was mechanical: a test was
+  removed only when it failed *because* it named a symbol that exists in `HEAD` and not in the
+  working tree (175 such names), iterated to a fixed point.
+- **Kernel coverage of the deleted claims** (test names in `rust-port/crates/*/tests`):
+  entry roots / unwired / dead-code tiers (`entry_root_paths`, `unwired_candidates`,
+  `unwired_discounts_test_only_importers_and_spares_entry_roots`,
+  `a_genuinely_uncalled_private_function_in_the_same_file_is_still_confident`,
+  `python_dunder_all_*`, `test_x20_g14_decorators`, `is_wiring_decorator`); JS/TS resolution
+  (`tsx_relative_imports_use_the_jsts_resolution_ladder`,
+  `re_exports_carry_their_source_module_only_when_they_have_one`,
+  `ordinary_javascript_export_forms_are_unchanged`); Go packages (`go_package_*`,
+  `test_g20_go_package_star_topology`); Rust `use` (`names_in_a_rust_use_list_are_not_uses`);
+  Python re-exports (`a_reexporting_package_still_binds_to_its_init`,
+  `a_python_reexport_alias_resolves_the_import_that_names_it`).
+  **Gaps found, not covered by a kernel test today** (record them before adding the
+  behaviour back): tsconfig `extends` / project-reference path mapping; generic subsystem
+  inference for non-DevCouncil trees; the primary-stack ordering of `languages`; comment
+  stripping not skewing dead-symbol detection (moot with tree-sitter, but unpinned).
+- **Route registrations were already gone before the delete.** `api_routes.map_routes` reads
+  a `registers` edge for a route's middleware/registration list, and only
+  `codeintel/resolution/frameworks/routes.py` ever produced one — the kernel's
+  `edge_kind_label` has no `registers` case. So `registrations` has been empty on every
+  kernel-written graph since the kernel became the only writer; deleting the producer changed
+  nothing and only made the absence visible. Recorded rather than papered over: the consumer
+  branch stays, so a future kernel edge kind fills it instead of being re-invented.
+- **What the kernel does not yet write, found by converting the tests** (each pinned as a
+  strict `xfail` in `tests/`, so the day the kernel fills one the suite says so instead of
+  staying quietly green). `rust-port/crates/devmap-query/src/manifest.rs:224-229` writes
+  `frameworks`, `package_managers`, `test_commands` and `candidate_files` as constant `[]`,
+  and leaves `lsp: {}` / `processes: []` empty; the Python writer detected uv/npm from
+  lockfiles and the LSP languages, and `knowledge/wiki.py:151,253` plus
+  `mcp/handlers/map.py:212` still render those fields, so they are silently empty rather
+  than absent. Every one of the 14 subsystems has `role_files: {}` with no `neighbors` or
+  `handoff_paths` — the fields steps 5-6 of the generated agent guide tell agents to
+  navigate by, so the guide currently promises what the manifest does not fill. Every file
+  is `kind: "code"` (1,298 of 1,298, `README.md` included) where the Python writer
+  classified doc/config/test; no `src/` consumer branches on `kind`, so that one is
+  degraded rather than broken. No route metadata reaches `code_graph.json` (the
+  `HandlesRoute` edges are in the store but not the export), which is what leaves
+  `indexing/graph/api_routes.py` — the route map, shape check, api impact, `dev map routes`
+  and the MCP `route_map` — without input. And `dev map query <leaf> --json` reports
+  `callees_unavailable: "… is not indexed"` for a symbol that *is* indexed and simply has
+  no callees, which is a wording bug that reads as a data-loss bug. Subsystem granularity
+  also changed (14 whole-repo areas against the old per-package split under
+  `src/devcouncil/`); that is the kernel's design, not a gap.
+- **One config knob lost its reader and was deliberately left in place.**
+  `IndexingConfig.repo_map_dependents_cap` (`app/config.py:384`) had exactly one reader,
+  `repo_mapper.py:153`, which went with `build_dependents`. `dev map` still writes
+  `dependents`; the kernel writes it now, and does not read this cap — so the knob is
+  validated and then ignored, which this codebase elsewhere calls out as worse than
+  rejecting it. It stays anyway: it is asserted on by `tests/benchmarks/test_map_caps.py`,
+  and its bounds are an acceptance-criterion surface (`_attach_repo_map_unwired_cap_bounds`,
+  AC-2.1). The fix is to plumb it to the kernel, not to delete it. Noted here rather than
+  done, because plumbing a cap into the Rust writer is a feature, not a retirement.
+  `repo_map_unwired_cap` beside it has no reader either and did not before this pass —
+  pre-existing, recorded, untouched.
+- **Total: 6,786 lines out of `src/`** — 4,259 in deleted files, 2,527 trimmed from
+  `repo_mapper.py` (3,178 → 2,219), `liveness.py` (1,124 → 226), `build.py` (941 → 523) and
+  `cache.py` (329 → 77).
+- **A four-space prefix stopped meaning what it used to, and corrupted `--json`.**
+  `devmap_engine.build_map` re-prints the kernel's discovery refusals to stderr — a refused
+  file is absent from the graph, so swallowing that line makes "not in this repository"
+  indistinguishable from "refused by the indexer". It selected them with
+  `"discovery refused" in line or line.startswith("    ")`. That held until the build began
+  running with `--progress always`: the kernel indents a progress line with **six** spaces
+  (`main.rs:195,234,253`) and a refusal continuation with exactly **four**
+  (`main.rs:1061,1064`), so the prefix test began matching the whole progress stream.
+  `CliRunner` folds stderr into `result.output`, so every `dev … --json` command that
+  triggers a map refresh emitted JSON followed by progress text — 7 tests across
+  `test_cli_check_gate`, `test_cli_commands`, `test_cli_lease`, `test_cli_status` and
+  `test_rigor_analytics`. Real terminals were unaffected (stderr is a separate stream), but
+  any agent running `dev … --json 2>&1` got unparseable output. The block is now tracked by
+  state (`iter_refusal_lines`) instead of by prefix.
+  **The same predicate had a second, quieter victim.** `_is_note` fed the run record's
+  `notes`, which is tail-capped at 40 — so once progress lines matched, they did not merely
+  add noise, they *evicted the refusals the record exists to preserve*, while
+  `stderr_tail` beside it already kept the raw tail. Both call sites now share one stateful
+  classifier; a 200-line progress flood no longer pushes a refusal out of `notes`.
+- **Verified, not assumed.** `ruff check src/` clean; all 400+ `devcouncil.*` modules import
+  (a `pkgutil.walk_packages` sweep, since a deleted method is invisible to a linter); and on
+  this repository `liveness_snapshot` still returns 20 entry roots / 18 unwired / 32
+  unreachable / 10 dead symbols / 1,268 indexed symbols, `import_edges_for` 5,743 edges,
+  `dependents_for` 469 keys — i.e. the ratchet's inputs survived. End to end, `dev map` wrote
+  both `repo_map.json` and `code_graph.json` through the kernel and reported 20 entry roots
+  and 179 dead symbols.

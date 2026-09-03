@@ -1,4 +1,12 @@
-"""Build / load / incrementally refresh the code knowledge graph (schema v2)."""
+"""Load, export and PDG-annotate the code knowledge graph (schema v2).
+
+The graph itself is built by the Rust kernel; this module reads it back from
+the canonical SQLite store (:func:`load_code_graph`), writes the compatibility
+``code_graph.json`` export (:func:`write_code_graph`), and computes the opt-in
+Python PDG layer over it. The Python extractor and resolver that used to build
+the graph here (``build_code_graph``, ``assemble_graph``, ``extract_all``) were
+retired once the kernel became the only writer of both map artifacts.
+"""
 
 from __future__ import annotations
 
@@ -8,50 +16,15 @@ import json
 import logging
 import os
 import tempfile
-import weakref
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set
+from typing import Callable, Dict, Iterable, List, Optional, Set
 
-from devcouncil.codeintel.languages.registry import LANGUAGE_SPECS
-from devcouncil.indexing.graph.cache import (
-    PARSE_CACHE_VERSION,
-    extract_cached,
-    load_parse_cache,
-    merge_parse_cache,
-)
-from devcouncil.indexing.graph.extract_python import FileExtraction
-from devcouncil.indexing.graph.liveness import (
-    build_liveness_shard,
-    file_liveness,
-    legacy_dead_strings,
-    symbol_reachability_dead,
-    token_dead_from_shards,
-    _token_scan_dead,
-)
-from devcouncil.indexing.graph.resolve import (
-    build_file_and_symbol_nodes,
-    contains_and_defines_edges,
-    decorator_edges,
-    inherit_edges,
-    named_import_edges,
-    resolve_calls,
-    resolve_import_edges,
-    import_graph_edges,
-)
-from devcouncil.indexing.graph.schema import NodeKind
-from devcouncil.indexing.graph.schema import CodeGraph, SCHEMA_VERSION
+from devcouncil.indexing.graph.schema import CodeGraph
 from devcouncil.utils.json_persist import read_json
 
 logger = logging.getLogger(__name__)
-_PENDING_ANALYSIS_SHARDS: dict[int, dict[str, dict[str, object]]] = {}
 
 GRAPH_REL = Path(".devcouncil") / "graph" / "code_graph.json"
-
-_CODE_SUFFIXES = {
-    extension.lower()
-    for spec in LANGUAGE_SPECS
-    for extension in spec.extensions
-}
 
 
 class CompatibilityGraphTooLarge(ValueError):
@@ -73,388 +46,6 @@ def content_fingerprint(root: Path, files: List[str]) -> str:
             lines.append(f"{rel}\0-1\0-1")
     return hashlib.sha1("\n".join(lines).encode("utf-8")).hexdigest()
 
-
-def _git_head(root: Path) -> str:
-    from devcouncil.utils.proc import git_output
-
-    return git_output(["rev-parse", "HEAD"], cwd=root, default="").strip()
-
-
-def _files_fingerprint(files: List[str]) -> str:
-    return hashlib.sha1("\n".join(sorted(files)).encode("utf-8")).hexdigest()
-
-
-def _code_files(files: Iterable[str]) -> List[str]:
-    from devcouncil.indexing.wiring import is_vendored_path
-
-    return sorted(
-        f
-        for f in files
-        if Path(f).suffix.lower() in _CODE_SUFFIXES and not is_vendored_path(f)
-    )
-
-
-def _area_fn_for(root: Path, mapper: Optional[Any] = None):
-    """Prefer RepoMapper area bucketing; reuse one shared mapper instance."""
-
-    def _area(path: str) -> str:
-        try:
-            if mapper is not None:
-                return str(mapper._area_for_file(path))
-            from devcouncil.indexing.repo_mapper import RepoMapper
-
-            return RepoMapper(root)._area_for_file(path)
-        except Exception:
-            parts = path.replace("\\", "/").split("/")
-            return parts[0] if parts else "root"
-
-    return _area
-
-
-def _cache_entry_matches_disk(root: Path, rel: str, entry: dict) -> bool:
-    """True when cached sha256 (and size/mtime when present) still match disk."""
-    path = root / rel
-    try:
-        st = path.stat()
-    except OSError:
-        return False
-    if "size" in entry and entry["size"] is not None:
-        try:
-            if int(entry["size"]) != st.st_size:
-                return False
-        except (TypeError, ValueError):
-            return False
-    if "mtime_ns" in entry and entry["mtime_ns"] is not None:
-        try:
-            if int(entry["mtime_ns"]) != st.st_mtime_ns:
-                return False
-        except (TypeError, ValueError):
-            return False
-    stored = entry.get("sha256")
-    if not isinstance(stored, str) or not stored:
-        return False
-    try:
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError:
-        return False
-    return stored == digest
-
-
-def extract_all(
-    root: Path,
-    files: List[str],
-    *,
-    changed_paths: Optional[Set[str]] = None,
-    progress: Callable[[str, int, int], None] | None = None,
-) -> Dict[str, FileExtraction]:
-    """Extract (cache v5) all code files; only force-reparse ``changed_paths`` when set.
-
-    Incremental cache hits still verify sha256 (and size/mtime if stored) so a
-    concurrent edit to a non-listed path cannot stamp a fresh fingerprint over
-    stale symbols. Cache-hit entries stay in ``updates`` so merge does not evict them.
-    """
-    code = _code_files(files)
-    cache = load_parse_cache(root)
-    extractions: Dict[str, FileExtraction] = {}
-    updates: Dict[str, dict] = {}
-    force_set = changed_paths if changed_paths is not None else None
-
-    for index, rel in enumerate(code, start=1):
-        if progress is not None:
-            progress("extract", index - 1, len(code))
-        force = force_set is not None and rel in force_set
-        # When incremental: prefer warm cache for non-listed paths, but never
-        # trust an entry whose digests no longer match disk.
-        if force_set is not None and rel not in force_set:
-            entry = cache.get(rel)
-            if (
-                isinstance(entry, dict)
-                and isinstance(entry.get("symbols"), list)
-                and isinstance(entry.get("import_details"), list)
-                and _cache_entry_matches_disk(root, rel, entry)
-            ):
-                from devcouncil.indexing.graph.cache import extraction_from_cache_entry
-
-                extractions[rel] = extraction_from_cache_entry(rel, entry)
-                # Keep cache-hit entries in ``updates`` — ``merge_parse_cache``
-                # prunes managed paths absent from updates, so omitting them
-                # would evict every unchanged file from the warm cache.
-                updates[rel] = entry
-                if progress is not None:
-                    progress("extract", index, len(code))
-                continue
-        ext, entry = extract_cached(root, rel, cache=cache, force=bool(force))
-        extractions[rel] = ext
-        updates[rel] = entry
-
-        if progress is not None:
-            progress("extract", index, len(code))
-
-    managed = {k for k in cache if Path(k).suffix.lower() in _CODE_SUFFIXES} | set(code)
-    if updates:
-        merge_parse_cache(root, updates, managed)
-    return extractions
-
-
-def extract_paths(
-    root: Path,
-    paths: Iterable[str],
-) -> Dict[str, FileExtraction]:
-    """Extract only existing changed paths and evict deleted cache entries."""
-    selected = {
-        path.replace("\\", "/")
-        for path in paths
-        if Path(path).suffix.lower() in _CODE_SUFFIXES
-    }
-    cache = load_parse_cache(root)
-    updates: Dict[str, dict] = {}
-    extractions: Dict[str, FileExtraction] = {}
-    for rel in sorted(selected):
-        if not (root / rel).is_file():
-            continue
-        extraction, entry = extract_cached(root, rel, cache=cache, force=True)
-        extractions[rel] = extraction
-        updates[rel] = entry
-    merge_parse_cache(root, updates, selected)
-    return extractions
-
-
-# Files per ``liveness:tokens`` progress tick. Small enough that a large repo
-# reports in well inside the stall window, large enough that the callback is
-# not itself a cost.
-_SHARD_PROGRESS_STRIDE = 100
-
-
-def _build_liveness_shards(
-    root: Path,
-    extractions: Dict[str, FileExtraction],
-    *,
-    progress: Callable[[str, int, int], None] | None = None,
-) -> Dict[str, dict[str, object]]:
-    """Tokenize every extraction into a liveness shard, reporting as it goes.
-
-    This used to be a silent dict comprehension. On a repo with thousands of
-    extractions it reads and tokenizes every file with no observable progress
-    for tens of minutes, which the build supervisor cannot distinguish from a
-    wedged worker — so it killed healthy builds. Progress ticks per chunk fix
-    the observability half; the supervisor's CPU heartbeat covers the rest.
-    """
-    total = len(extractions)
-    if progress is not None:
-        progress("liveness:tokens", 0, total)
-    shards: Dict[str, dict[str, object]] = {}
-    for index, (path, extraction) in enumerate(extractions.items(), start=1):
-        shards[path] = build_liveness_shard(root, extraction)
-        if progress is not None and (
-            index % _SHARD_PROGRESS_STRIDE == 0 or index == total
-        ):
-            progress("liveness:tokens", index, total)
-    if progress is not None and total == 0:
-        progress("liveness:tokens", 0, 0)
-    return shards
-
-
-def assemble_graph(
-    root: Path,
-    files: List[str],
-    extractions: Dict[str, FileExtraction],
-    *,
-    liveness: bool = True,
-    lsp_refs: bool = False,
-    mapper: Optional[Any] = None,
-    progress: Callable[[str, int, int], None] | None = None,
-) -> CodeGraph:
-    """Resolve + liveness over extractions; always full resolve."""
-    from devcouncil.indexing.repo_mapper import RepoMapper
-
-    if mapper is None:
-        mapper = RepoMapper(root)
-    if progress is not None:
-        progress("assemble_nodes", 0, 1)
-    area_fn = _area_fn_for(root, mapper=mapper)
-    nodes, symbol_index = build_file_and_symbol_nodes(extractions, area_fn=area_fn)
-    class_ids = {n.id for n in nodes if n.kind == NodeKind.CLASS}
-    edges = []
-    edges.extend(contains_and_defines_edges(extractions))
-    edges.extend(inherit_edges(extractions, symbol_index))
-    edges.extend(decorator_edges(extractions, symbol_index))
-
-    file_edges = resolve_import_edges(extractions, files, root=root, mapper=mapper)
-    edges.extend(import_graph_edges(file_edges))
-    edges.extend(named_import_edges(extractions, symbol_index, file_edges))
-    edges.extend(
-        resolve_calls(extractions, symbol_index, file_edges, class_ids=class_ids)
-    )
-    if progress is not None:
-        progress("assemble_nodes", 1, 1)
-
-    semantic_meta: Dict[str, Any] = {}
-    try:
-        from devcouncil.codeintel.resolution import enrich_semantic_edges
-
-        enrich_budget = 120.0
-        try:
-            from devcouncil.app.config import load_config
-
-            enrich_budget = float(
-                load_config(root).indexing.semantic_enrich_timeout_seconds
-            )
-        except Exception:
-            logger.debug("semantic enrich budget config load failed", exc_info=True)
-
-        semantic_graph = CodeGraph(nodes=nodes, edges=edges)
-        enrich_semantic_edges(
-            semantic_graph,
-            root=root,
-            extractions=extractions,
-            progress=progress,
-            budget_seconds=enrich_budget,
-        )
-        nodes = semantic_graph.nodes
-        edges = semantic_graph.edges
-        semantic_meta = semantic_graph.meta
-    except Exception:
-        logger.debug("semantic graph enrichment failed", exc_info=True)
-
-    entry_roots: List[str] = []
-    unwired: List[str] = []
-    unreachable: List[str] = []
-    unreachable_unreliable = False
-    dead_code = []
-    pending_shards: Optional[Dict[str, dict[str, object]]] = None
-    if liveness:
-        if progress is not None:
-            progress("liveness", 0, 1)
-        from devcouncil.indexing.graph.liveness import project_call_edges_to_files
-        from devcouncil.indexing.wiring import build_dynamic_import_index
-
-        # One dynamic-import index for file + symbol liveness (avoid double scan).
-        dynamic_index = build_dynamic_import_index(root, files)
-        liveness_edges = sorted(set(file_edges) | project_call_edges_to_files(edges))
-
-        if progress is not None:
-            progress("liveness:files", 0, 1)
-        entry_roots, unwired, unreachable, unreachable_unreliable = file_liveness(
-            root, files, liveness_edges, cap=0, dynamic_index=dynamic_index
-        )
-        if progress is not None:
-            progress("liveness:files", 1, 1)
-
-        # Empty prod roots → fail-soft empty unreachable (already); keep symbol
-        # reachability from treating every file as unreachable.
-        reach_unreachable = [] if unreachable_unreliable else unreachable
-
-        # Prefer shard token-dead on the full path (same tokenize as analysis shards)
-        # unless LSP refs need the mapper scan.
-        if not lsp_refs:
-            # Full-file read + tokenize per extraction. On a large repo this is
-            # tens of minutes; emitting progress per chunk is what keeps the
-            # supervisor from reading it as a hang.
-            pending_shards = _build_liveness_shards(root, extractions, progress=progress)
-            if progress is not None:
-                progress("liveness:token_dead", 0, 1)
-            token_dead, _idx, token_keys = token_dead_from_shards(nodes, pending_shards)
-            if progress is not None:
-                progress("liveness:token_dead", 1, 1)
-        else:
-            if progress is not None:
-                progress("liveness:tokens", 0, 1)
-            token_dead, _idx, token_keys = _token_scan_dead(
-                root, files, cap=0, lsp_refs=lsp_refs, mapper=mapper
-            )
-            if progress is not None:
-                progress("liveness:tokens", 1, 1)
-
-        dead_code = symbol_reachability_dead(
-            root,
-            files,
-            nodes,
-            edges,
-            extractions,
-            entry_roots,
-            token_dead_keys=token_keys,
-            file_edges=file_edges,
-            unreachable=reach_unreachable,
-            dynamic_index=dynamic_index,
-            progress=progress,
-        )
-        # Uncapped in code_graph meta; repo_map.json applies _LIVENESS_CAP on write.
-        legacy = legacy_dead_strings(dead_code, token_dead, cap=None)
-        if progress is not None:
-            progress("liveness", 1, 1)
-    else:
-        legacy = []
-        token_dead = []
-
-    graph = CodeGraph(
-        schema_version=SCHEMA_VERSION,
-        nodes=nodes,
-        edges=edges,
-        dead_code=dead_code,
-        entry_roots=entry_roots,
-        unwired_candidates=unwired,
-        unreachable_files=unreachable,
-        generated_head=_git_head(root),
-        indexed_hash=_files_fingerprint(files),
-        content_fingerprint=content_fingerprint(root, files),
-        meta={
-            "parse_cache_version": PARSE_CACHE_VERSION,
-            "legacy_dead_symbol_candidates": legacy,
-            "file_edge_count": len(file_edges),
-            "token_dead_count": len(token_dead) if liveness else 0,
-            "liveness_unreachable_unreliable": unreachable_unreliable,
-            **semantic_meta,
-        },
-    )
-    if pending_shards is not None:
-        _PENDING_ANALYSIS_SHARDS[id(graph)] = pending_shards
-        weakref.finalize(graph, _PENDING_ANALYSIS_SHARDS.pop, id(graph), None)
-    try:
-        from devcouncil.indexing.graph.intel import enrich_graph_intel
-
-        enrich_graph_intel(graph, root=root)
-    except Exception:
-        logger.debug("graph intel enrichment failed", exc_info=True)
-    return graph
-
-
-def build_code_graph(
-    root: Path,
-    files: Optional[List[str]] = None,
-    *,
-    changed_paths: Optional[Iterable[str]] = None,
-    liveness: bool = True,
-    lsp_refs: bool = False,
-    mapper: Optional[Any] = None,
-    progress: Callable[[str, int, int], None] | None = None,
-) -> CodeGraph:
-    """Full (or incremental-extract) graph build."""
-    from devcouncil.indexing.repo_mapper import RepoMapper
-
-    root = root.expanduser().resolve()
-    if mapper is None:
-        mapper = RepoMapper(root)
-    if files is None:
-        files = mapper.get_git_files()
-    changed = {p.replace("\\", "/") for p in changed_paths} if changed_paths else None
-    extractions = extract_all(root, files, changed_paths=changed, progress=progress)
-    graph = assemble_graph(
-        root,
-        files,
-        extractions,
-        liveness=liveness,
-        lsp_refs=lsp_refs,
-        mapper=mapper,
-        progress=progress,
-    )
-    # assemble_graph already stashes shards when it builds them for token-dead;
-    # only rebuild when liveness was skipped or LSP forced the mapper scan.
-    if id(graph) not in _PENDING_ANALYSIS_SHARDS:
-        _PENDING_ANALYSIS_SHARDS[id(graph)] = _build_liveness_shards(
-            root, extractions, progress=progress
-        )
-        weakref.finalize(graph, _PENDING_ANALYSIS_SHARDS.pop, id(graph), None)
-    return graph
 
 
 def _slim_graph_export(graph: CodeGraph) -> CodeGraph:
@@ -673,11 +264,10 @@ def write_code_graph(
     from devcouncil.codeintel import get_codeintel_service
 
     root = root.expanduser().resolve()
-    shards = analysis_shards or _PENDING_ANALYSIS_SHARDS.pop(id(graph), None)
     get_codeintel_service(root).persist(
         graph,
         changed_paths=changed_paths,
-        analysis_shards=shards,
+        analysis_shards=analysis_shards,
         progress=progress,
     )
     path = graph_path(root)
@@ -761,6 +351,21 @@ def load_code_graph(root: Path) -> Optional[CodeGraph]:
                 exported = CodeGraph.model_validate(data)
                 if compatibility_graph_digest(exported) == recorded_digest:
                     service.store.record_compatibility_export(path, exported)
+                elif _written_by_kernel(exported):
+                    # The Rust kernel is the engine and this JSON is its
+                    # export. "SQLite wins" was written when SQLite was the
+                    # engine's own store; now it is a read cache for the
+                    # Python-only query commands, and a cache that refuses
+                    # the source it caches serves generation 76 against a
+                    # kernel at 511 — every `_require_graph` command did,
+                    # measured on this repository. Import once per build,
+                    # then serve from the cache as before.
+                    from devcouncil.codeintel.build_control import graph_build_session
+
+                    with graph_build_session(root):
+                        service.persist(exported)
+                        service.store.record_compatibility_export(path, exported)
+                    return _annotate_graph_degraded(root, exported)
                 else:
                     logger.info(
                         "ignoring external compatibility graph that diverges from "
@@ -792,6 +397,12 @@ def load_code_graph(root: Path) -> Optional[CodeGraph]:
         return None
 
 
+def _written_by_kernel(graph: CodeGraph) -> bool:
+    """Whether a graph export carries the Rust kernel's engine stamp."""
+    meta = graph.meta if isinstance(graph.meta, dict) else {}
+    return meta.get("map_engine") == "devmap-rust"
+
+
 def _annotate_graph_degraded(root: Path, graph: CodeGraph) -> CodeGraph:
     """Surface repo_map lean/degraded handshake on graph payloads for consumers."""
     map_path = root / ".devcouncil" / "repo_map.json"
@@ -806,35 +417,6 @@ def _annotate_graph_degraded(root: Path, graph: CodeGraph) -> CodeGraph:
     except Exception:
         logger.debug("graph_degraded annotation failed", exc_info=True)
     return graph
-
-
-def refresh_map_for_paths(
-    root: Path,
-    paths: List[str],
-    *,
-    liveness: bool = True,
-    fail_on_degraded: bool = True,
-) -> CodeGraph | None:
-    """Refresh graph and repo map once; never retry a failed graph assembly.
-
-    When ``fail_on_degraded`` is True (default for watch/sync), a lean/degraded
-    refresh raises so ``sync_now`` returns False and pending work is not cleared
-    as healthy. One-shot CLI callers that intentionally accept lean maps should
-    pass ``fail_on_degraded=False`` or call ``refresh_map_artifacts`` directly.
-    """
-    from devcouncil.indexing.map_artifacts import refresh_map_artifacts
-
-    root = root.expanduser().resolve()
-    result = refresh_map_artifacts(
-        root,
-        root / ".devcouncil" / "repo_map.json",
-        paths=paths,
-        liveness=liveness,
-        quiet=True,
-    )
-    if fail_on_degraded and result.degraded:
-        raise RuntimeError(result.reason or "graph refresh degraded")
-    return result.graph
 
 
 # --- Opt-in PDG layer (CFG / reaching-def / CDG / taint) ---

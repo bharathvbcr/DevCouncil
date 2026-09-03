@@ -10,20 +10,11 @@ from devcouncil.indexing.graph.build import (
     CompatibilityGraphTooLarge,
     _write_graph_json_bounded,
     _slim_graph_export,
-    build_code_graph,
-    extract_all,
     write_code_graph,
 )
-from devcouncil.indexing.graph.resolve import (
-    AMBIGUOUS_CANDIDATES_CAP,
-    _stable_candidate_ids,
-    build_file_and_symbol_nodes,
-    named_import_edges,
-    resolve_calls,
-    resolve_import_edges,
-)
-from devcouncil.indexing.graph.schema import CodeGraph, Confidence, GraphNode, NodeKind
+from devcouncil.indexing.graph.schema import CodeGraph, GraphNode, NodeKind
 
+from tests.unit.graph_fixtures import kernel_graph
 
 def _git(root, *args):
     subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True)
@@ -40,98 +31,6 @@ def _write(tmp_path, files):
         p = tmp_path / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
-
-
-def test_ambiguous_fanout_attaches_candidates_once(tmp_path: Path):
-    """Fan-out keeps all edges; ``candidates`` extras appear on at most one edge."""
-    pkg = tmp_path / "pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-    for name in ("a", "b", "c"):
-        (pkg / f"{name}.py").write_text(f"def shared():\n    return {name!r}\n", encoding="utf-8")
-    (pkg / "caller.py").write_text("def caller():\n    return shared()\n", encoding="utf-8")
-    files = [f"pkg/{n}.py" for n in ("__init__", "a", "b", "c", "caller")]
-    extractions = extract_all(tmp_path, files)
-    _nodes, index = build_file_and_symbol_nodes(extractions)
-    edges = resolve_calls(extractions, index, [])
-    ambig = [e for e in edges if e.kind == "calls" and e.confidence == Confidence.AMBIGUOUS]
-    assert len(ambig) >= 2
-    with_cands = [e for e in ambig if e.extras.get("candidates")]
-    assert len(with_cands) == 1
-    assert len(with_cands[0].extras["candidates"]) >= 2
-    assert len(with_cands[0].extras["candidates"]) <= AMBIGUOUS_CANDIDATES_CAP
-
-
-def test_ambiguous_candidates_capped(tmp_path: Path):
-    """More than CAP same-name defs → extras list truncated with truncated count."""
-    pkg = tmp_path / "pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-    n = AMBIGUOUS_CANDIDATES_CAP + 4
-    for i in range(n):
-        (pkg / f"m{i}.py").write_text("def shared():\n    return 1\n", encoding="utf-8")
-    (pkg / "caller.py").write_text("def caller():\n    return shared()\n", encoding="utf-8")
-    files = ["pkg/__init__.py"] + [f"pkg/m{i}.py" for i in range(n)] + ["pkg/caller.py"]
-    extractions = extract_all(tmp_path, files)
-    _nodes, index = build_file_and_symbol_nodes(extractions)
-    edges = resolve_calls(extractions, index, [])
-    ambig = [e for e in edges if e.kind == "calls" and e.confidence == Confidence.AMBIGUOUS]
-    with_cands = [e for e in ambig if e.extras.get("candidates")]
-    assert len(with_cands) == 1
-    assert len(with_cands[0].extras["candidates"]) == AMBIGUOUS_CANDIDATES_CAP
-    assert with_cands[0].extras.get("candidates_truncated", 0) >= 4
-    # Fan-out still reaches every candidate for liveness.
-    targets = {e.target for e in ambig}
-    assert len(targets) >= n
-
-
-def test_ambiguous_fanout_candidates_are_sorted(tmp_path: Path):
-    """Ambiguous fan-out targets and extras.candidates follow sorted id order."""
-    pkg = tmp_path / "pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-    # Reverse creation order vs lexicographic id order.
-    for name in ("z", "m", "a"):
-        (pkg / f"{name}.py").write_text(f"def shared():\n    return {name!r}\n", encoding="utf-8")
-    (pkg / "caller.py").write_text("def caller():\n    return shared()\n", encoding="utf-8")
-    files = [f"pkg/{n}.py" for n in ("__init__", "z", "m", "a", "caller")]
-    extractions = extract_all(tmp_path, files)
-    _nodes, index = build_file_and_symbol_nodes(extractions)
-    edges = resolve_calls(extractions, index, [])
-    ambig = [e for e in edges if e.kind == "calls" and e.confidence == Confidence.AMBIGUOUS]
-    targets = [e.target for e in ambig]
-    assert targets == sorted(targets)
-    with_cands = [e for e in ambig if e.extras.get("candidates")]
-    assert len(with_cands) == 1
-    assert with_cands[0].extras["candidates"] == _stable_candidate_ids(
-        with_cands[0].extras["candidates"]
-    )
-
-
-def test_named_import_skips_submodule_and_is_deterministic(tmp_path: Path):
-    """``from pkg import show`` must not bind a sibling ``show()`` hash-order flip."""
-    pkg = tmp_path / "pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-    (pkg / "show.py").write_text("def run():\n    return 1\n", encoding="utf-8")
-    (pkg / "cost.py").write_text("def show():\n    return 2\n", encoding="utf-8")
-    (pkg / "design.py").write_text("def show():\n    return 3\n", encoding="utf-8")
-    (pkg / "main.py").write_text(
-        "from pkg import show, cost, design\n\ndef main():\n    return show\n",
-        encoding="utf-8",
-    )
-    files = [f"pkg/{n}.py" for n in ("__init__", "show", "cost", "design", "main")]
-    extractions = extract_all(tmp_path, files)
-    _nodes, index = build_file_and_symbol_nodes(extractions)
-    file_edges = resolve_import_edges(extractions, files, root=tmp_path)
-    edges = named_import_edges(extractions, index, file_edges)
-    named = [e for e in edges if e.reason == "named import" and e.source == "pkg/main.py"]
-    targets = {e.target for e in named}
-    assert "pkg/cost.py::show" not in targets
-    assert "pkg/design.py::show" not in targets
-    # Stable across repeated resolution.
-    again = named_import_edges(extractions, index, file_edges)
-    assert [(e.source, e.target) for e in edges] == [(e.source, e.target) for e in again]
 
 
 def test_slim_graph_export_drops_bulky_meta_and_pagerank():
@@ -172,7 +71,7 @@ def test_tiered_export_writes_stub_when_full_exceeds_limit(tmp_path: Path, monke
         },
     )
     _commit(tmp_path)
-    graph = build_code_graph(tmp_path, liveness=False)
+    graph = kernel_graph(tmp_path)
     # Force every non-stub tier to fail the byte cap.
     monkeypatch.setattr(build, "_graph_json_max_bytes", lambda _root: 256)
     path = tmp_path / ".devcouncil" / "graph" / "code_graph.json"
@@ -240,7 +139,7 @@ def test_incremental_write_uses_slim_compact_export(tmp_path: Path):
         },
     )
     _commit(tmp_path)
-    graph = build_code_graph(tmp_path, liveness=True)
+    graph = kernel_graph(tmp_path)
     graph.meta["node_communities"] = {"x": "y"}
     graph.meta["legacy_dead_symbol_candidates"] = ["pkg/main.py::ghost"]
     graph.meta["god_nodes"] = [{"id": "pkg/main.py", "degree": 1, "pagerank": 0.123456}]
@@ -269,7 +168,7 @@ def test_write_code_graph_compact_and_slim(tmp_path: Path):
         },
     )
     _commit(tmp_path)
-    graph = build_code_graph(tmp_path, liveness=True)
+    graph = kernel_graph(tmp_path)
     graph.meta["node_communities"] = {"x": "y"}
     graph.meta["legacy_dead_symbol_candidates"] = ["pkg/main.py::ghost"]
     path = write_code_graph(tmp_path, graph)
@@ -329,7 +228,7 @@ def test_export_code_graph_json_self_heals_deleted_artifact(tmp_path: Path):
         },
     )
     _commit(tmp_path)
-    graph = build_code_graph(tmp_path, liveness=False)
+    graph = kernel_graph(tmp_path)
     path = write_code_graph(tmp_path, graph)
     assert path.is_file()
     path.unlink()

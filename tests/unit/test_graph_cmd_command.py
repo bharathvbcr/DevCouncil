@@ -3,8 +3,6 @@ missing-graph guard on graph-backed subcommands)."""
 
 import json
 
-import devcouncil.codeintel as codeintel
-import devcouncil.codeintel.languages as codeintel_languages
 import devcouncil.indexing.graph as graph_pkg
 import devcouncil.indexing.graph.build as graph_build
 import devcouncil.indexing.viz as viz
@@ -14,47 +12,53 @@ from typer.testing import CliRunner
 runner = CliRunner()
 
 
-def test_graph_doctor_reports_actionable_embedded_grammar_gaps(tmp_path, monkeypatch):
-    from types import SimpleNamespace
+def test_graph_doctor_reports_a_kernel_older_than_the_store(tmp_path, monkeypatch):
+    """The failure that took `dev map` down on 2026-09-02, as doctor must show it.
+
+    Doctor used to audit the Python engine — grammar wheels, `index.sqlite`,
+    the writer lease — none of which the kernel uses. The one thing an operator
+    needed it to say that day was: the binary that will run is older than the
+    store it is asked to open, and here is the command that fixes it.
+    """
+    import sqlite3
+
+    store = tmp_path / ".devcouncil" / "codeintel" / "devmap.sqlite"
+    store.parent.mkdir(parents=True)
+    conn = sqlite3.connect(store)
+    conn.execute("PRAGMA user_version = 12")
+    conn.execute("CREATE TABLE t (x)")
+    conn.commit()
+    conn.close()
 
     monkeypatch.setattr(
-        codeintel,
-        "get_codeintel_service",
-        lambda root: SimpleNamespace(
-            status=lambda: {"state": "committed", "schema_version": 1},
-            store=SimpleNamespace(
-                compatibility_export_state=lambda: ("", None),
-            ),
-        ),
-    )
-    monkeypatch.setattr(
-        codeintel_languages,
-        "grammar_status",
-        lambda: {
-            "ok": False,
-            "available_count": 34,
-            "required_count": 35,
-            "languages": [{
-                "language": "Svelte",
-                "available": False,
-                "missing_grammars": ["css", "html"],
-            }],
-            "action": (
-                "Install the platform-matched devcouncil-codeintel-grammars wheel; "
-                "runtime grammar downloads are disabled."
-            ),
+        "devcouncil.devmap_health.engine_info",
+        lambda root: {
+            "binary": "/opt/old/devmap",
+            "built_at": "2026-09-01T13:37:00",
+            "version": "devmap 0.1.0 (schema 11)",
+            "schema_version": 11,
+            "error": None,
         },
     )
-
-    result = runner.invoke(
-        app,
-        ["map", "doctor", "--project-root", str(tmp_path)],
+    monkeypatch.setattr(
+        "devcouncil.devmap_health.kernel_status",
+        lambda root: {"error": "unsupported future schema version 12"},
     )
 
+    result = runner.invoke(app, ["map", "doctor", "--project-root", str(tmp_path)])
+
     assert result.exit_code == 1
-    assert "Svelte (css, html)" in result.output
-    assert "platform-matched devcouncil-codeintel-grammars" in result.output
-    assert "runtime grammar downloads are disabled" in result.output
+    said = " ".join(result.output.split())
+    assert "schema 12" in said
+    assert "kernel supports 11" in said
+    assert "cargo build --release -p devmap-cli" in said
+
+    as_json = runner.invoke(app, ["map", "doctor", "--json", "--project-root", str(tmp_path)])
+    assert as_json.exit_code == 1
+    payload = json.loads(as_json.output)
+    assert payload["ok"] is False
+    schema = next(check for check in payload["checks"] if check["name"] == "schema")
+    assert schema["ok"] is False and schema["critical"] is True
 
 
 # --- query ------------------------------------------------------------------------

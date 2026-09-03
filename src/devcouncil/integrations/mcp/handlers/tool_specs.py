@@ -330,6 +330,32 @@ def all_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="devcouncil_graph_doctor",
+            description=(
+                "Diagnose the map engine: coded checks with exact fix commands, the build "
+                "running now, the last build. fix=true applies every fix the doctor can "
+                "apply inside the repository and re-checks."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {"fix": {"type": "boolean", "default": False}},
+            },
+        ),
+        Tool(
+            name="devcouncil_graph_runs",
+            description=(
+                "Records of recent kernel runs (build / manifest / repair): argv, exit code, "
+                "duration, the kernel's notes, and the diagnosis code of a failure."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 10},
+                    "failedOnly": {"type": "boolean", "default": False},
+                },
+            },
+        ),
+        Tool(
             name="devcouncil_graph_cypher",
             description="Run a supported Cypher subset over the native code graph store.",
             inputSchema={

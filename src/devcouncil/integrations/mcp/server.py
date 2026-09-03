@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
@@ -73,34 +74,46 @@ _allowed_next_tools = _mcp_util.allowed_next_tools
 logger = logging.getLogger(__name__)
 
 
+def _warm_devmap_daemon(root: Path) -> None:
+    """Ask the kernel daemon for status, starting it if it is not up yet.
+
+    This is the whole of MCP's auto-sync now. It used to start a Python
+    ``SyncCoordinator`` that re-extracted with the Python engine and rewrote
+    ``repo_map.json`` / ``code_graph.json`` on every edit — a second writer
+    racing the kernel for the same two files. The daemon watches the tree,
+    drains its own queue and retires itself after idle, so one status call is
+    all the warm-up there is.
+    """
+    from devcouncil.devmap_client import DevMapClient, DevMapClientError
+
+    try:
+        DevMapClient(root).status()
+    except DevMapClientError as exc:
+        logger.warning("devmap daemon warm-up failed: %s", exc)
+    except Exception:  # noqa: BLE001 - warm-up must never take the server down
+        logger.warning("devmap daemon warm-up failed", exc_info=True)
+
+
 @asynccontextmanager
 async def _lifespan(_server):  # noqa: ANN001
-    """Keep one native watcher alive for the MCP process lifecycle."""
-    coordinator = None
+    """Warm the devmap kernel daemon for the MCP process lifecycle."""
     root = _project_root().expanduser().resolve()
     try:
         from devcouncil.app.config import load_config
-        from devcouncil.codeintel import get_codeintel_service
-        from devcouncil.codeintel.sync import get_sync_coordinator
 
         config = load_config(root).code_intelligence
-        service = get_codeintel_service(root)
-        graph_export = root / ".devcouncil" / "graph" / "code_graph.json"
-        if config.enabled and config.auto_sync and (service.store.exists() or graph_export.is_file()):
-            coordinator = get_sync_coordinator(
-                root,
-                debounce_seconds=config.debounce_ms / 1000.0,
-                reconcile_seconds=float(config.reconcile_seconds),
-                allow_polling_fallback=config.allow_polling_fallback,
-            )
-            coordinator.start()
+        if config.enabled and config.auto_sync:
+            # Off the event loop and off the critical path: initialize /
+            # list_tools must not wait on a daemon spawn.
+            threading.Thread(
+                target=_warm_devmap_daemon,
+                args=(root,),
+                name="devcouncil-devmap-warmup",
+                daemon=True,
+            ).start()
     except Exception:
-        logger.warning("MCP code-intelligence watcher did not start", exc_info=True)
-    try:
-        yield {"codeintel": coordinator}
-    finally:
-        if coordinator is not None:
-            coordinator.stop()
+        logger.warning("MCP code-intelligence warm-up did not start", exc_info=True)
+    yield {"codeintel": None}
 
 
 _DB_REQUIRED_TOOLS = {
@@ -258,6 +271,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     if name == "devcouncil_graph_ingest":
         return await map_handlers.handle_graph_ingest(root, arguments)
+
+    if name == "devcouncil_graph_doctor":
+        return await map_handlers.handle_graph_doctor(root, arguments)
+
+    if name == "devcouncil_graph_runs":
+        return await map_handlers.handle_graph_runs(root, arguments)
 
     if name == "devcouncil_graph_cypher":
         return await map_handlers.handle_graph_cypher(root, arguments)

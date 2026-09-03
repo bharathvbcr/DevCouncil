@@ -23,8 +23,8 @@ except ImportError:  # Windows has no resource module
 
 from devcouncil.codeintel.query import CodeIntelQueryEngine
 from devcouncil.codeintel.service import get_codeintel_service
-from devcouncil.codeintel.sync.incremental import sync_affected_paths
-from devcouncil.indexing.graph.build import build_code_graph, graph_path, write_code_graph
+from devcouncil.indexing.graph.build import graph_path, load_code_graph
+from devcouncil.indexing.map_artifacts import refresh_map_artifacts
 
 THRESHOLDS_PATH = Path(__file__).with_name("thresholds.json")
 
@@ -158,12 +158,35 @@ def run_benchmark(root: Path, *, profile: str = "fast") -> dict[str, Any]:
     thresholds = load_thresholds(profile)
     paths = materialize_fixture(root, spec)
 
+    # The cold build is the kernel's: `build_code_graph` (the Python engine)
+    # was retired on 2026-09-02 and the kernel is the only writer of the export.
     started = time.perf_counter()
-    graph = build_code_graph(root, paths, liveness=True)
-    write_code_graph(root, graph)
+    refresh_map_artifacts(root, root / ".devcouncil" / "repo_map.json", quiet=True)
     cold_seconds = time.perf_counter() - started
+    # Fill the Python query cache from that export so the storage ratio below
+    # compares the cache against the artifact it was built from.
+    graph = load_code_graph(root)
+    assert graph is not None, "the kernel's export must load into the query cache"
 
     service = get_codeintel_service(root)
+    # Storage is measured against the cold build's own artifacts, before the
+    # kernel rewrites `code_graph.json`: a SQLite-to-JSON ratio across two
+    # different engines' outputs would not be a ratio of anything.
+    compatibility_path = graph_path(root)
+    database = _database_metrics(service.store.path)
+    compatibility_bytes = compatibility_path.stat().st_size
+    database_ratio = float(database["allocated_bytes"]) / max(1, compatibility_bytes)
+
+    # One-file refresh, measured against the *kernel* — the only writer of
+    # `repo_map.json` / `code_graph.json`. This stage used to time
+    # ``sync_affected_paths`` (the retired Python incremental engine) and
+    # ratchet its per-edit SQLite payload rows; neither the function nor the
+    # store it wrote to is on the edit path any more. The untimed warm-up
+    # commits the kernel's own baseline generation so the timed call measures
+    # an incremental build, not a cold one.
+    map_path = root / ".devcouncil" / "repo_map.json"
+    refresh_map_artifacts(root, map_path, quiet=True)
+
     changed_path = paths[0]
     changed_index = 0
     next_index = spec.package_count
@@ -176,22 +199,8 @@ def run_benchmark(root: Path, *, profile: str = "fast") -> dict[str, Any]:
         encoding="utf-8",
     )
     started = time.perf_counter()
-    updated = sync_affected_paths(service, [changed_path], liveness=True)
+    refreshed = refresh_map_artifacts(root, map_path, quiet=True, paths=[changed_path])
     one_file_seconds = time.perf_counter() - started
-
-    write_stats = dict(service.store.last_write_stats)
-    payload_rows = sum(
-        int(write_stats.get(key, 0))
-        for key in (
-            "node_payloads_written",
-            "edge_payloads_written",
-            "dead_payloads_written",
-        )
-    )
-    compatibility_path = graph_path(root)
-    database = _database_metrics(service.store.path)
-    compatibility_bytes = compatibility_path.stat().st_size
-    database_ratio = float(database["allocated_bytes"]) / max(1, compatibility_bytes)
 
     query = CodeIntelQueryEngine(service)
     iterations = int(thresholds["query_iterations"])
@@ -212,7 +221,7 @@ def run_benchmark(root: Path, *, profile: str = "fast") -> dict[str, Any]:
     }
 
     result: dict[str, Any] = {
-        "schema_version": updated.schema_version,
+        "schema_version": graph.schema_version,
         "profile": profile,
         "fixture": {
             "file_count": len(paths),
@@ -227,10 +236,8 @@ def run_benchmark(root: Path, *, profile: str = "fast") -> dict[str, Any]:
         },
         "one_file": {
             "wall_seconds": one_file_seconds,
-            "affected_files": len(updated.meta.get("affected_paths") or []),
-            "affected_fraction": float(updated.meta.get("affected_fraction") or 0.0),
-            "payload_rows_written": payload_rows,
-            "write_stats": write_stats,
+            "engine": refreshed.mode,
+            "generation": refreshed.generation,
         },
         "memory": {"peak_rss_bytes": _peak_rss_bytes()},
         "storage": {
@@ -254,11 +261,12 @@ def timing_enforced() -> bool:
     been observed at 15s and 29s in back-to-back runs), and local developer
     machines are noisier still (background load, thermals, Spotlight), so
     enforcing them there produces false failures on unchanged code. The
-    deterministic structural ratchets (payload_rows_written, affected_files,
-    db ratio, RSS) still run everywhere and catch real regressions — e.g. a
-    fall-back-to-full-rebuild shows up as payload_rows_written jumping from 0
-    to ~1500. Timing actuals are always recorded in the result/summary either
-    way. Override with DEVCOUNCIL_BENCH_ENFORCE_TIMING=1 (force on) or =0
+    deterministic structural ratchets (db ratio, RSS, fixture shape) still run
+    everywhere and catch real regressions. The per-edit SQLite payload-row and
+    affected-file ratchets went with ``sync_affected_paths``: they measured the
+    retired Python incremental engine, which no longer runs on any edit path.
+    Timing actuals are always recorded in the result/summary either way.
+    Override with DEVCOUNCIL_BENCH_ENFORCE_TIMING=1 (force on) or =0
     (force off)."""
     override = os.environ.get("DEVCOUNCIL_BENCH_ENFORCE_TIMING")
     if override is not None:
@@ -315,16 +323,6 @@ def ratchet_violations(result: dict[str, Any]) -> list[str]:
         float(result["storage"]["database"]["freelist_ratio"]),
         float(threshold["freelist_ratio_max"]),
     )
-    maximum(
-        "one_file.payload_rows_written",
-        float(result["one_file"]["payload_rows_written"]),
-        float(threshold["incremental_payload_rows_max"]),
-    )
-    maximum(
-        "one_file.affected_files",
-        float(result["one_file"]["affected_files"]),
-        float(threshold["affected_files_max"]),
-    )
     if enforce_timing:
         for query_name, limit in threshold["query_p95_ms_max"].items():
             maximum(
@@ -346,9 +344,8 @@ def render_summary(result: dict[str, Any]) -> str:
         f"({result['fixture']['file_count']} files / {result['fixture']['package_count']} packages)",
         f"- Cold index: {result['cold']['wall_seconds']:.3f}s; "
         f"peak RSS: {result['memory']['peak_rss_bytes'] / (1024 ** 2):.1f} MiB",
-        f"- One-file sync: {one_file['wall_seconds']:.3f}s; "
-        f"{one_file['affected_files']} affected; "
-        f"{one_file['payload_rows_written']} payload rows written",
+        f"- One-file kernel refresh: {one_file['wall_seconds']:.3f}s "
+        f"({one_file.get('engine', 'unknown')}, generation {one_file.get('generation')})",
         f"- Storage: {storage['database']['allocated_bytes']} SQLite bytes / "
         f"{storage['compatibility_export_bytes']} JSON bytes "
         f"({storage['database_to_compatibility_ratio']:.3f}x); "

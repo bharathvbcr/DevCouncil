@@ -1,4 +1,4 @@
-"""Wave-7: build_control, build_worker, and map_artifacts stable coverage."""
+"""Wave-7: build_control and map_artifacts stable coverage."""
 
 from __future__ import annotations
 
@@ -12,22 +12,16 @@ import pytest
 from devcouncil.codeintel.build_control import (
     BuildStatus,
     GraphBuildBusy,
-    GraphBuildFailed,
-    GraphBuildTimeout,
-    _terminate_worker,
     _write_status,
     graph_build_session,
     read_build_status,
-    run_isolated_full_build,
     status_path,
 )
-from devcouncil.indexing.graph.schema import CodeGraph
 from devcouncil.indexing.map_artifacts import (
     AGENT_GUIDE_MARKER,
     _important_surfaces,
     _wiki_index_rel,
     agent_guide_text,
-    generate_map_artifacts,
     refresh_map_artifacts,
     write_agent_guides,
 )
@@ -64,333 +58,7 @@ def test_graph_build_session_nested_and_busy(tmp_path):
     lease.acquire_with_retry.assert_called()
 
 
-def test_terminate_worker_paths(monkeypatch):
-    done = MagicMock()
-    done.poll.return_value = 0
-    assert _terminate_worker(done) is False
-
-    alive = MagicMock()
-    # Still alive through SIGTERM wait, SIGKILL wait, and process.kill wait.
-    alive.poll.side_effect = [None, None, None, None]
-    alive.pid = 4242
-    alive.wait.side_effect = subprocess.TimeoutExpired(cmd="x", timeout=1)
-    kills = []
-    kill_calls = []
-
-    monkeypatch.setattr("devcouncil.codeintel.build_control.os.name", "posix")
-    monkeypatch.setattr(
-        "devcouncil.codeintel.build_control.os.killpg",
-        lambda pid, sig: kills.append((pid, sig)),
-    )
-    alive.kill.side_effect = lambda: kill_calls.append("kill")
-    status = SimpleNamespace(degraded_reason="", pid=4242)
-    assert _terminate_worker(alive, status=status) is True
-    assert kills  # SIGTERM + SIGKILL via killpg
-    assert kill_calls == ["kill"]
-    assert status.degraded_reason == "worker_still_alive_after_kill"
-    assert status.pid == 4242
-
-
-def test_terminate_worker_killpg_fail_falls_back_to_process_kill(monkeypatch):
-    """killpg OSError must fall through to process.kill(); still-alive keeps pid."""
-    alive = MagicMock()
-    # start + after SIGTERM + after SIGKILL + after process.kill
-    alive.poll.side_effect = [None, None, None, None]
-    alive.pid = 5151
-    alive.wait.side_effect = subprocess.TimeoutExpired(cmd="x", timeout=1)
-    kill_calls: list[str] = []
-
-    monkeypatch.setattr("devcouncil.codeintel.build_control.os.name", "posix")
-
-    def boom_killpg(_pid, _sig):
-        raise OSError("no such process group")
-
-    monkeypatch.setattr("devcouncil.codeintel.build_control.os.killpg", boom_killpg)
-    alive.kill.side_effect = lambda: kill_calls.append("kill")
-    status = SimpleNamespace(degraded_reason="", pid=5151)
-    assert _terminate_worker(alive, status=status) is True
-    assert kill_calls == ["kill"]
-    assert status.degraded_reason == "worker_still_alive_after_kill"
-    assert status.pid == 5151
-
-
-def test_run_isolated_full_build_success_when_generation_advances_nonzero_exit(
-    tmp_path, monkeypatch
-):
-    """Non-zero worker exit is success if the SQLite generation advanced (post-commit)."""
-    from devcouncil.cli.commands.init import initialize_project
-
-    initialize_project(tmp_path, quiet=True, with_map=False, with_skills=False)
-
-    graph = CodeGraph(nodes=[], edges=[])
-    service = SimpleNamespace(
-        store=SimpleNamespace(current_generation=lambda: 1),
-        load=lambda: graph,
-    )
-    monkeypatch.setattr(
-        "devcouncil.codeintel.build_control.get_codeintel_service",
-        lambda _r: service,
-    )
-    monkeypatch.setattr(
-        "devcouncil.app.config.load_config",
-        lambda _r: SimpleNamespace(
-            indexing=SimpleNamespace(
-                build_stall_timeout_seconds=30.0,
-                build_total_timeout_seconds=60.0,
-            )
-        ),
-    )
-
-    lines = [
-        json.dumps(
-            {
-                "state": "complete",
-                "phase": "complete",
-                "completed": 1,
-                "total": 1,
-                "compatibility_export": "healthy",
-            }
-        )
-        + "\n",
-    ]
-
-    class FakeStdout:
-        def __iter__(self):
-            return iter(lines)
-
-    class FakeProc:
-        def __init__(self):
-            self.pid = 99
-            self.stdout = FakeStdout()
-            self.stderr = MagicMock(__iter__=lambda self: iter([]))
-            self.returncode = 1  # non-zero after successful commit
-            self._polls = 0
-
-        def poll(self):
-            self._polls += 1
-            return 1 if self._polls > 2 else None
-
-        def wait(self, timeout=None):
-            return 1
-
-        def terminate(self):
-            return None
-
-        def kill(self):
-            return None
-
-    monkeypatch.setattr(
-        "devcouncil.codeintel.build_control.subprocess.Popen",
-        lambda *a, **k: FakeProc(),
-    )
-    gens = {"n": 0}
-
-    def gen():
-        gens["n"] += 1
-        return 1 if gens["n"] == 1 else 2
-
-    service.store.current_generation = gen
-    result = run_isolated_full_build(tmp_path, liveness=False)
-    assert result.graph is graph
-    assert result.status.state == "complete"
-    assert result.status.generation_after == 2
-
-
-def test_run_isolated_full_build_success(tmp_path, monkeypatch):
-    from devcouncil.cli.commands.init import initialize_project
-
-    initialize_project(tmp_path, quiet=True, with_map=False, with_skills=False)
-
-    graph = CodeGraph(nodes=[], edges=[])
-    service = SimpleNamespace(
-        store=SimpleNamespace(current_generation=lambda: 1),
-        load=lambda: graph,
-    )
-    monkeypatch.setattr(
-        "devcouncil.codeintel.build_control.get_codeintel_service",
-        lambda _r: service,
-    )
-    monkeypatch.setattr(
-        "devcouncil.app.config.load_config",
-        lambda _r: SimpleNamespace(
-            indexing=SimpleNamespace(
-                build_stall_timeout_seconds=30.0,
-                build_total_timeout_seconds=60.0,
-            )
-        ),
-    )
-
-    lines = [
-        json.dumps(
-            {
-                "phase": "extract",
-                "completed": 1,
-                "total": 2,
-                "compatibility_export": "healthy",
-            }
-        )
-        + "\n",
-        "not-json\n",
-        json.dumps(
-            {
-                "state": "complete",
-                "phase": "complete",
-                "completed": 2,
-                "total": 2,
-                "compatibility_export": "healthy",
-            }
-        )
-        + "\n",
-    ]
-
-    class FakeStdout:
-        def __iter__(self):
-            return iter(lines)
-
-    class FakeProc:
-        def __init__(self):
-            self.pid = 99
-            self.stdout = FakeStdout()
-            self.stderr = MagicMock(read=lambda: "")
-            self.returncode = 0
-            self._polls = 0
-
-        def poll(self):
-            self._polls += 1
-            return 0 if self._polls > 2 else None
-
-        def wait(self, timeout=None):
-            return 0
-
-        def terminate(self):
-            return None
-
-        def kill(self):
-            return None
-
-    monkeypatch.setattr(
-        "devcouncil.codeintel.build_control.subprocess.Popen",
-        lambda *a, **k: FakeProc(),
-    )
-    gens = {"n": 0}
-
-    def gen():
-        gens["n"] += 1
-        return 1 if gens["n"] == 1 else 2
-
-    service.store.current_generation = gen
-    result = run_isolated_full_build(tmp_path, changed_paths={"a.py"}, liveness=False)
-    assert result.graph is graph
-    assert result.status.state == "complete"
-
-
-def test_run_isolated_full_build_timeout_and_fail(tmp_path, monkeypatch):
-    from devcouncil.cli.commands.init import initialize_project
-
-    initialize_project(tmp_path, quiet=True, with_map=False, with_skills=False)
-    service = SimpleNamespace(
-        store=SimpleNamespace(current_generation=lambda: 1),
-        load=lambda: None,
-    )
-    monkeypatch.setattr(
-        "devcouncil.codeintel.build_control.get_codeintel_service",
-        lambda _r: service,
-    )
-    monkeypatch.setattr(
-        "devcouncil.app.config.load_config",
-        lambda _r: SimpleNamespace(
-            indexing=SimpleNamespace(
-                build_stall_timeout_seconds=0.01,
-                build_total_timeout_seconds=0.01,
-            )
-        ),
-    )
-
-    class FakeProc:
-        def __init__(self):
-            self.pid = 1
-            self.stdout = MagicMock(__iter__=lambda self: iter([]))
-            self.stderr = MagicMock(read=lambda: "boom")
-            self.returncode = 1
-
-        def poll(self):
-            return None
-
-        def wait(self, timeout=None):
-            raise subprocess.TimeoutExpired(cmd="x", timeout=1)
-
-        def terminate(self):
-            return None
-
-        def kill(self):
-            return None
-
-    monkeypatch.setattr(
-        "devcouncil.codeintel.build_control.subprocess.Popen",
-        lambda *a, **k: FakeProc(),
-    )
-    monkeypatch.setattr("devcouncil.codeintel.build_control.os.name", "posix")
-    monkeypatch.setattr("devcouncil.codeintel.build_control.os.killpg", lambda *a, **k: None)
-
-    with pytest.raises(GraphBuildTimeout):
-        run_isolated_full_build(tmp_path)
-
-    class FailProc(FakeProc):
-        def poll(self):
-            return 1
-
-        def wait(self, timeout=None):
-            return 1
-
-    monkeypatch.setattr(
-        "devcouncil.codeintel.build_control.subprocess.Popen",
-        lambda *a, **k: FailProc(),
-    )
-    monkeypatch.setattr(
-        "devcouncil.app.config.load_config",
-        lambda _r: SimpleNamespace(
-            indexing=SimpleNamespace(
-                build_stall_timeout_seconds=30.0,
-                build_total_timeout_seconds=60.0,
-            )
-        ),
-    )
-    with pytest.raises(GraphBuildFailed):
-        run_isolated_full_build(tmp_path)
-
-
 # --- build_worker -------------------------------------------------------------
-
-
-def test_build_worker_main_complete_and_degraded(monkeypatch, tmp_path):
-    from devcouncil.codeintel import build_worker as bw
-
-    graph = CodeGraph(nodes=[], edges=[])
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.build_code_graph",
-        lambda *a, **k: graph,
-    )
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.write_code_graph",
-        lambda *a, **k: None,
-    )
-    monkeypatch.setattr(
-        "sys.argv",
-        ["build_worker", "--root", str(tmp_path), "--build-id", "id1", "--changed-path", "a.py"],
-    )
-    assert bw.main() == 0
-
-    from devcouncil.indexing.graph.build import CompatibilityGraphTooLarge
-
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.write_code_graph",
-        lambda *a, **k: (_ for _ in ()).throw(CompatibilityGraphTooLarge("too big")),
-    )
-    monkeypatch.setattr(
-        "sys.argv",
-        ["build_worker", "--root", str(tmp_path), "--build-id", "id2", "--no-liveness"],
-    )
-    assert bw.main() == 0
 
 
 # --- map_artifacts ------------------------------------------------------------
@@ -455,43 +123,31 @@ def test_map_artifact_helpers(tmp_path):
     assert (tmp_path / "CLAUDE.md").read_bytes() == b"custom \xff guide\n"
 
 
-def test_refresh_map_artifacts_lean_fallback(tmp_path, monkeypatch):
-    from contextlib import nullcontext
+def test_refresh_map_artifacts_fails_closed_without_a_kernel(tmp_path, monkeypatch):
+    """There is no lean fallback any more.
+
+    The Python engine used to write a fingerprint-stamped, `graph_degraded`
+    map when the graph build failed. That map read fresh to every consumer that
+    did not check the degraded flag. With the kernel as the only engine, a
+    build that cannot run raises and leaves whatever was on disk untouched.
+    """
+    import pytest
 
     from devcouncil.cli.commands.init import initialize_project
+    from devcouncil.devmap_engine import DevMapEngineError
 
     initialize_project(tmp_path, quiet=True, with_map=False, with_skills=False)
     out = tmp_path / ".devcouncil" / "repo_map.json"
+    out.write_text('{"seed": true}', encoding="utf-8")
 
     monkeypatch.setattr(
-        "devcouncil.codeintel.build_control.graph_build_session",
-        lambda root, **k: nullcontext(),
-    )
-    monkeypatch.setattr(
-        "devcouncil.codeintel.build_control.run_isolated_full_build",
-        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no graph")),
-    )
-    monkeypatch.setattr(
-        "devcouncil.indexing.map_artifacts.CodeReviewGraphAdapter",
-        lambda _r: SimpleNamespace(get_context=lambda: SimpleNamespace(available=False)),
-    )
-    monkeypatch.setattr(
-        "devcouncil.codeintel.get_codeintel_service",
-        lambda _r: SimpleNamespace(store=SimpleNamespace(current_generation=lambda: None)),
+        "devcouncil.devmap_engine.build_map",
+        lambda *a, **k: (_ for _ in ()).throw(DevMapEngineError("no kernel")),
     )
 
-    result = refresh_map_artifacts(tmp_path, out, quiet=True)
-    assert result.degraded is True
-    assert result.mode == "lean"
-    assert out.is_file()
-    data = json.loads(out.read_text(encoding="utf-8"))
-    assert data.get("graph_degraded") is True
-    from devcouncil.indexing.repo_mapper import RepoMapper
-
-    assert RepoMapper(tmp_path).map_is_stale(data) is True
-
-    again = generate_map_artifacts(tmp_path, out, quiet=True)
-    assert again.languages is not None
+    with pytest.raises(DevMapEngineError):
+        refresh_map_artifacts(tmp_path, out, quiet=True)
+    assert json.loads(out.read_text(encoding="utf-8")) == {"seed": True}
 
 
 # --- doctor + map CLI branches -------------------------------------------------

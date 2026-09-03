@@ -8,7 +8,6 @@ from types import SimpleNamespace
 from typer.testing import CliRunner
 
 from devcouncil.cli.main import app
-from devcouncil.codeintel.build_control import GraphBuildBusy
 
 runner = CliRunner()
 
@@ -45,42 +44,40 @@ def test_graph_init_busy_and_status_text(tmp_path, monkeypatch):
 
     initialize_project(tmp_path, quiet=True, with_map=False, with_skills=False)
 
+    from devcouncil.devmap_engine import DevMapEngineError
+
     monkeypatch.setattr(
         "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
-        lambda *a, **k: (_ for _ in ()).throw(GraphBuildBusy("busy")),
+        lambda *a, **k: (_ for _ in ()).throw(DevMapEngineError("kernel unavailable")),
     )
     assert runner.invoke(app, ["map", "init", "--project-root", str(tmp_path)]).exit_code == 1
-    busy_json = runner.invoke(app, ["map", "init", "--json", "--project-root", str(tmp_path)])
-    assert busy_json.exit_code == 1
-    assert "graph_writer_busy" in busy_json.output
+    down_json = runner.invoke(app, ["map", "init", "--json", "--project-root", str(tmp_path)])
+    assert down_json.exit_code == 1
+    assert "engine_unavailable" in down_json.output
 
     monkeypatch.setattr(
         "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
         lambda *a, **k: SimpleNamespace(
             degraded=False,
             reason="",
-            mode="full",
+            mode="devmap-rust",
             generation=3,
-            compatibility_export_degraded=False,
-            build_incomplete=False,
-        ),
-    )
-    monkeypatch.setattr(
-        "devcouncil.codeintel.get_codeintel_service",
-        lambda _r: SimpleNamespace(
-            status=lambda: {
-                "generation": 3,
-                "node_count": 10,
-                "edge_count": 20,
-                "state": "ready",
-            }
+            kernel_status=None,
         ),
     )
     assert runner.invoke(app, ["map", "init", "--project-root", str(tmp_path)]).exit_code == 0
 
     monkeypatch.setattr(
-        "devcouncil.codeintel.sync.get_sync_coordinator",
-        lambda _r, **_k: _coord(),
+        "devcouncil.devmap_health.kernel_status",
+        lambda root: {
+            "generation_id": 3,
+            "pending_count": 1,
+            "quarantined_count": 1,
+            "node_count": 10,
+            "edge_count": 20,
+            "is_fresh": False,
+            "degraded_reason": "slow",
+        },
     )
     st = runner.invoke(app, ["map", "status", "--project-root", str(tmp_path)])
     assert st.exit_code == 0
@@ -91,35 +88,35 @@ def test_graph_init_busy_and_status_text(tmp_path, monkeypatch):
 def test_graph_sync_watch_search_ingest(tmp_path, monkeypatch):
     from devcouncil.cli.commands.init import initialize_project
 
+    from devcouncil.devmap_engine import DevMapEngineError
+
     initialize_project(tmp_path, quiet=True, with_map=False, with_skills=False)
+    healthy = SimpleNamespace(
+        generation=2, mode="devmap-rust", degraded=False, reason="", kernel_status=None
+    )
     monkeypatch.setattr(
-        "devcouncil.codeintel.sync.get_sync_coordinator",
-        lambda _r, **_k: _coord(),
+        "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
+        lambda *a, **k: healthy,
     )
     ok = runner.invoke(app, ["map", "sync", "--project-root", str(tmp_path)])
     assert ok.exit_code == 0
     js = runner.invoke(app, ["map", "sync", "--json", "--project-root", str(tmp_path)])
     assert js.exit_code == 0
+    assert json.loads(js.output)["generation"] == 2
 
     monkeypatch.setattr(
-        "devcouncil.codeintel.sync.get_sync_coordinator",
-        lambda _r, **_k: _coord(sync_now=lambda paths: False),
+        "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
+        lambda *a, **k: (_ for _ in ()).throw(DevMapEngineError("kernel unavailable")),
     )
     bad = runner.invoke(app, ["map", "sync", "--project-root", str(tmp_path)])
     assert bad.exit_code == 1
 
-    # watch: interrupt immediately
-    import time
-
-    monkeypatch.setattr(
-        "devcouncil.codeintel.sync.get_sync_coordinator",
-        lambda _r, **_k: _coord(),
-    )
-
-    def _sleep(_s):
+    # watch: interrupt at the first wait — the loop is event-driven now, so
+    # `time.sleep` is not the seam; the wait is.
+    def _interrupt(_changed, _timeout):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(time, "sleep", _sleep)
+    monkeypatch.setattr("devcouncil.cli.commands.map._wait_for_change", _interrupt)
     watch = runner.invoke(app, ["map", "watch", "--project-root", str(tmp_path)])
     assert watch.exit_code == 0
     assert "Stopped" in watch.output
@@ -150,42 +147,27 @@ def test_graph_sync_watch_search_ingest(tmp_path, monkeypatch):
 
     refresh = SimpleNamespace(
         generation=1,
-        mode="full",
+        mode="devmap-rust",
         degraded=False,
-        reason=None,
-        compatibility_export_degraded=False,
-        build_incomplete=False,
+        reason="",
+        kernel_status=None,
     )
     monkeypatch.setattr(
         "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
         lambda *a, **k: refresh,
-    )
-    monkeypatch.setattr(
-        "devcouncil.codeintel.sync.get_sync_coordinator",
-        lambda _r, **_k: _coord(),
-    )
-    monkeypatch.setattr(
-        "devcouncil.codeintel.get_codeintel_service",
-        lambda _r: SimpleNamespace(load=lambda: SimpleNamespace()),
     )
     ingest = runner.invoke(app, ["map", "ingest", "--json", "--project-root", str(tmp_path)])
     assert ingest.exit_code == 0
+    assert json.loads(ingest.output)["mode"] == "devmap-rust"
 
     monkeypatch.setattr(
         "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
-        lambda *a, **k: (_ for _ in ()).throw(GraphBuildBusy("busy")),
+        lambda *a, **k: (_ for _ in ()).throw(DevMapEngineError("writer lock held")),
     )
     busy = runner.invoke(app, ["map", "ingest", "--json", "--project-root", str(tmp_path)])
     assert busy.exit_code == 1
+    assert "engine_unavailable" in busy.output
 
-    monkeypatch.setattr(
-        "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
-        lambda *a, **k: refresh,
-    )
-    monkeypatch.setattr(
-        "devcouncil.codeintel.sync.get_sync_coordinator",
-        lambda _r, **_k: _coord(sync_now=lambda paths: False),
-    )
     path_fail = runner.invoke(
         app, ["map", "ingest", "a.py", "--project-root", str(tmp_path)]
     )

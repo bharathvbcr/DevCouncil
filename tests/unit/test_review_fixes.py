@@ -2,10 +2,10 @@
 
 from devcouncil.domain.evidence import CommandResult
 from devcouncil.execution.policy_engine import TaskPolicyEngine
-from devcouncil.indexing.repo_mapper import RepoMapper
 from devcouncil.integrations.mcp.util import diff_target_paths as _diff_target_paths
 from devcouncil.verification.verifier import Verifier
 
+from tests.unit.support_maps import dependents_view
 
 # --- verifier: malformed-command classification (pre-existing design preserved) ---
 
@@ -81,7 +81,7 @@ def _make_pkg(tmp_path):
 
 def test_submodule_import_edge_and_no_stdlib_false_edge(tmp_path):
     _make_pkg(tmp_path)
-    repo_map = RepoMapper(tmp_path).map_repo()
+    repo_map = dependents_view(tmp_path)
     deps = repo_map.dependents
     # `from . import helpers` must produce feature -> helpers (previously dropped).
     assert "src/pkg/feature.py" in deps.get("src/pkg/helpers.py", [])

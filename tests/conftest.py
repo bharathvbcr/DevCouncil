@@ -29,11 +29,21 @@ def _isolate_devcouncil_logs(tmp_path_factory):
     log_dir = tmp_path_factory.mktemp("devcouncil-test-logs")
     previous = os.environ.get("DEVCOUNCIL_LOG_DIR")
     os.environ["DEVCOUNCIL_LOG_DIR"] = str(log_dir)
+    # Never let a test spawn a `devmap serve` daemon. Measured on 2026-09-02:
+    # one run of the map tests left 288 daemons behind — one per temporary
+    # repository, each holding a deleted store for its 30-minute idle bound.
+    # A test that needs the daemon starts it explicitly and reaps it.
+    previous_spawn = os.environ.get("DEVMAP_AUTOSPAWN")
+    os.environ["DEVMAP_AUTOSPAWN"] = "0"
     yield
     if previous is None:
         os.environ.pop("DEVCOUNCIL_LOG_DIR", None)
     else:
         os.environ["DEVCOUNCIL_LOG_DIR"] = previous
+    if previous_spawn is None:
+        os.environ.pop("DEVMAP_AUTOSPAWN", None)
+    else:
+        os.environ["DEVMAP_AUTOSPAWN"] = previous_spawn
 
 
 def _reset_all_caches() -> None:

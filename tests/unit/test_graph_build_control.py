@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from types import SimpleNamespace
 import json
 import threading
 import time
@@ -12,17 +11,10 @@ from typer.testing import CliRunner
 
 from devcouncil.codeintel.build_control import (
     BuildStatus,
-    GraphBuildTimeout,
     _write_status,
     read_build_status,
-    run_isolated_full_build,
 )
 from devcouncil.codeintel.service import get_codeintel_service
-from devcouncil.codeintel.sync.coordinator import (
-    _COORDINATORS,
-    get_sync_coordinator,
-    stop_all_coordinators,
-)
 from devcouncil.indexing.map_artifacts import generate_map_artifacts
 
 
@@ -31,18 +23,47 @@ def anyio_backend():
     return "asyncio"
 
 
+def _have_kernel() -> bool:
+    from devcouncil.devmap_engine import DevMapEngineError, find_engine_binary
+
+    try:
+        find_engine_binary()
+    except DevMapEngineError:
+        return False
+    return True
+
+
+requires_kernel = pytest.mark.skipif(
+    not _have_kernel(), reason="devmap kernel not built (cargo build --release -p devmap-cli)"
+)
+
+
+@requires_kernel
 def test_full_map_commits_one_generation_and_records_progress(tmp_path: Path) -> None:
+    """`generate_map_artifacts` builds the *kernel* store and the Python cache reads it.
+
+    This used to assert a Python `index.sqlite` generation. The kernel is the
+    engine now; the Python store is a read cache that `load_code_graph` fills
+    from the kernel's `code_graph.json` on first use.
+    """
+    from devcouncil.devmap_client import DevMapClient
+    from devcouncil.indexing.graph.build import load_code_graph
+
     (tmp_path / ".devcouncil").mkdir()
     (tmp_path / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
 
     generate_map_artifacts(tmp_path, tmp_path / ".devcouncil" / "repo_map.json", quiet=True)
 
-    service = get_codeintel_service(tmp_path)
-    status = read_build_status(tmp_path)
-    assert service.store.current_generation() == 1
-    assert status.state in {"complete", "idle", "degraded"}
-    assert status.generation_after in {None, 1}
-    assert service.load() is not None
+    status = DevMapClient(tmp_path).status()
+    # Two generations, not one: the kernel's build, then the build that
+    # indexes the AGENTS.md / CLAUDE.md the first one caused to be written.
+    # A repository that already carries its guides commits exactly one.
+    assert status.generation_id == 2
+    assert status.node_count > 0
+    graph = load_code_graph(tmp_path)
+    assert graph is not None
+    assert graph.meta.get("map_engine") == "devmap-rust"
+    assert get_codeintel_service(tmp_path).store.current_generation() is not None
 
 
 def test_read_build_status_marks_dead_worker_stale(tmp_path: Path) -> None:
@@ -95,41 +116,17 @@ def test_read_build_status_returns_idle_on_missing_or_invalid_file(tmp_path: Pat
     assert read_build_status(tmp_path).state == "idle"
 
 
-def test_stop_all_coordinators_clears_registry(tmp_path: Path) -> None:
-    (tmp_path / ".devcouncil").mkdir()
-    (tmp_path / "a.py").write_text("VALUE = 1\n", encoding="utf-8")
-    coordinator = get_sync_coordinator(tmp_path)
-    root = tmp_path.resolve()
-    try:
-        coordinator.start()
-        assert root in _COORDINATORS
-        stop_all_coordinators()
-        assert root not in _COORDINATORS
-    finally:
-        stop_all_coordinators()
-
-
-def test_get_sync_coordinator_is_singleton_per_root(tmp_path: Path) -> None:
-    (tmp_path / ".devcouncil").mkdir()
-    try:
-        first = get_sync_coordinator(tmp_path)
-        second = get_sync_coordinator(tmp_path)
-        assert first is second
-        with pytest.raises(ValueError, match="already uses"):
-            get_sync_coordinator(tmp_path, debounce_seconds=9.0)
-    finally:
-        stop_all_coordinators()
-
-
+@requires_kernel
 def test_incremental_map_after_full_map_commits_one_generation(tmp_path: Path) -> None:
+    from devcouncil.devmap_client import DevMapClient
+
     (tmp_path / ".devcouncil").mkdir()
     app = tmp_path / "app.py"
     app.write_text("def main():\n    return 1\n", encoding="utf-8")
 
     generate_map_artifacts(tmp_path, tmp_path / ".devcouncil" / "repo_map.json", quiet=True)
-    service = get_codeintel_service(tmp_path)
-    gen_after_full = service.store.current_generation()
-    assert gen_after_full == 1
+    gen_after_full = DevMapClient(tmp_path).status().generation_id
+    assert gen_after_full == 2  # kernel build + the guides it wrote (see above)
 
     app.write_text("def main():\n    return 2\n", encoding="utf-8")
     generate_map_artifacts(
@@ -138,39 +135,19 @@ def test_incremental_map_after_full_map_commits_one_generation(tmp_path: Path) -
         quiet=True,
         paths=["app.py"],
     )
-    assert service.store.current_generation() == gen_after_full + 1  # type: ignore[operator]
+    assert DevMapClient(tmp_path).status().generation_id == gen_after_full + 1
+
+    # An unchanged tree is a no-op in the kernel: no new generation.
+    generate_map_artifacts(tmp_path, tmp_path / ".devcouncil" / "repo_map.json", quiet=True)
+    assert DevMapClient(tmp_path).status().generation_id == gen_after_full + 1
 
 
-def test_map_cli_surfaces_build_status_fields(tmp_path: Path, monkeypatch) -> None:
+def test_map_cli_surfaces_build_status_fields(tmp_path: Path) -> None:
     from devcouncil.cli.commands.init import initialize_project
     from devcouncil.cli.main import app
 
     initialize_project(tmp_path, quiet=True, with_map=False, with_skills=False)
     (tmp_path / "a.py").write_text("def a():\n    return 1\n", encoding="utf-8")
-
-    monkeypatch.setattr(
-        "devcouncil.codeintel.sync.get_sync_coordinator",
-        lambda _r: SimpleNamespace(
-            status=lambda: SimpleNamespace(
-                as_dict=lambda: {
-                    "state": "healthy",
-                    "backend": "FSEventsObserver",
-                    "backend_kind": "native",
-                    "build_id": "b1",
-                    "build_state": "complete",
-                    "build_phase": "complete",
-                    "build_completed": 2,
-                    "build_total": 2,
-                    "build_pid": 42,
-                    "compatibility_export": "healthy",
-                    "degraded_reason": "",
-                    "pending": [],
-                    "last_error": "",
-                    "generation": 1,
-                }
-            )
-        ),
-    )
 
     runner = CliRunner()
     result = runner.invoke(app, ["map", "status", "--project-root", str(tmp_path)])
@@ -180,79 +157,23 @@ def test_map_cli_surfaces_build_status_fields(tmp_path: Path, monkeypatch) -> No
 
 @pytest.mark.anyio
 async def test_graph_ingest_busy_returns_structured_error(tmp_path: Path, monkeypatch) -> None:
-    from devcouncil.codeintel.build_control import GraphBuildBusy
+    """A kernel that cannot build (not built, older than the store, another
+    writer holding its lock) is a structured error, never an MCP exception."""
+    from devcouncil.devmap_engine import DevMapEngineError
     from devcouncil.integrations.mcp.handlers import map as mapmod
 
-    class _Coordinator:
-        def sync_now(self, _paths):
-            raise GraphBuildBusy("writer lease held")
-
-        def status(self):  # pragma: no cover
-            raise AssertionError
-
     monkeypatch.setattr(
-        "devcouncil.codeintel.sync.get_sync_coordinator",
-        lambda _root: _Coordinator(),
+        "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
+        lambda *a, **k: (_ for _ in ()).throw(
+            DevMapEngineError("another devmap writer (pid 4242) holds the store")
+        ),
     )
-    if not hasattr(mapmod, "handle_graph_ingest"):
-        pytest.skip("handle_graph_ingest not exported")
     result = await mapmod.handle_graph_ingest(tmp_path, {"paths": ["a.py"]})
     payload = json.loads(result[0].text)
     assert payload["ok"] is False
-
-
-def test_run_isolated_full_build_timeout_records_status(tmp_path: Path, monkeypatch) -> None:
-    import subprocess
-
-    from devcouncil.cli.commands.init import initialize_project
-
-    initialize_project(tmp_path, quiet=True, with_map=False, with_skills=False)
-    service = SimpleNamespace(store=SimpleNamespace(current_generation=lambda: 0))
-    monkeypatch.setattr(
-        "devcouncil.codeintel.build_control.get_codeintel_service",
-        lambda _r: service,
-    )
-    monkeypatch.setattr(
-        "devcouncil.app.config.load_config",
-        lambda _r: SimpleNamespace(
-            indexing=SimpleNamespace(
-                build_stall_timeout_seconds=0.01,
-                build_total_timeout_seconds=0.01,
-            )
-        ),
-    )
-
-    class _Proc:
-        pid = 1
-        returncode = None
-        stdout = iter([])
-        stderr = iter([])
-
-        def poll(self):
-            return None
-
-        def wait(self, timeout=None):
-            raise subprocess.TimeoutExpired(cmd="worker", timeout=1)
-
-        def terminate(self):
-            return None
-
-        def kill(self):
-            return None
-
-    monkeypatch.setattr(
-        "devcouncil.codeintel.build_control.subprocess.Popen",
-        lambda *a, **k: _Proc(),
-    )
-    monkeypatch.setattr("devcouncil.codeintel.build_control.os.name", "posix")
-    monkeypatch.setattr("devcouncil.codeintel.build_control.os.killpg", lambda *a, **k: None)
-
-    with pytest.raises(GraphBuildTimeout):
-        run_isolated_full_build(tmp_path)
-
-    status = read_build_status(tmp_path)
-    assert status.state in {"timed_out", "stale", "stalled", "failed"}
-    assert status.degraded_reason or status.state != "building"
+    assert payload["code"] == "engine_unavailable"
+    assert "pid 4242" in payload["error"]
+    assert payload["paths"] == ["a.py"]
 
 
 def test_lease_held_flag_allows_write_without_owning_writer_lease(tmp_path: Path) -> None:
@@ -384,137 +305,6 @@ def test_graph_build_session_serializes_writers(tmp_path: Path) -> None:
     assert results.get("rival_got_lease") is False
 
 
-def test_yield_writer_lease_reacquires_with_backoff(tmp_path: Path, monkeypatch) -> None:
-    """A rival watcher holding the lock after child yield must not permanently starve re-acquire."""
-    from concurrent.futures import ThreadPoolExecutor
-
-    from devcouncil.codeintel.build_control import (
-        graph_build_session,
-        yield_writer_lease_for_child,
-    )
-    from devcouncil.codeintel.sync.lease import WriterLease
-
-    (tmp_path / ".devcouncil").mkdir()
-    lock = tmp_path / ".devcouncil" / "codeintel" / "writer.lock"
-    barrier = threading.Barrier(2)
-    results: dict[str, object] = {}
-
-    def parent() -> None:
-        with graph_build_session(tmp_path, timeout=2.0):
-            with yield_writer_lease_for_child(tmp_path):
-                barrier.wait()
-                time.sleep(0.05)  # let rival grab the free lock
-            results["reacquired"] = True
-
-    def rival() -> None:
-        barrier.wait()
-        lease = WriterLease(lock)
-        # Hold briefly so parent must backoff, then release.
-        assert lease.acquire_with_retry(timeout=1.0)
-        results["rival_held"] = True
-        time.sleep(0.2)
-        lease.release()
-
-    monkeypatch.setattr(
-        "devcouncil.codeintel.build_control._lease_timeouts",
-        lambda _root: (2.0, 0.5),
-    )
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        f1 = pool.submit(parent)
-        f2 = pool.submit(rival)
-        f1.result(timeout=5)
-        f2.result(timeout=5)
-
-    assert results.get("rival_held") is True
-    assert results.get("reacquired") is True
-    # Lock is free after both finish.
-    probe = WriterLease(lock)
-    assert probe.acquire()
-    probe.release()
-
-
-def test_yield_writer_lease_reacquire_timeout_raises(tmp_path: Path, monkeypatch) -> None:
-    from concurrent.futures import ThreadPoolExecutor
-
-    from devcouncil.codeintel.build_control import (
-        GraphBuildBusy,
-        graph_build_session,
-        yield_writer_lease_for_child,
-    )
-    from devcouncil.codeintel.sync.lease import WriterLease
-
-    (tmp_path / ".devcouncil").mkdir()
-    lock = tmp_path / ".devcouncil" / "codeintel" / "writer.lock"
-    barrier = threading.Barrier(2)
-
-    def parent() -> None:
-        with graph_build_session(tmp_path, timeout=1.0):
-            with yield_writer_lease_for_child(tmp_path):
-                barrier.wait()
-                time.sleep(0.05)
-
-    def rival() -> None:
-        barrier.wait()
-        lease = WriterLease(lock)
-        assert lease.acquire_with_retry(timeout=1.0)
-        time.sleep(1.5)  # outlast the re-acquire budget
-        lease.release()
-
-    monkeypatch.setattr(
-        "devcouncil.codeintel.build_control._lease_timeouts",
-        lambda _root: (0.3, 0.1),
-    )
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        f1 = pool.submit(parent)
-        f2 = pool.submit(rival)
-        with pytest.raises(GraphBuildBusy, match="re-acquire"):
-            f1.result(timeout=5)
-        f2.result(timeout=5)
-
-
-def test_yield_writer_lease_preserves_timeout_when_reacquire_fails(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """Failed re-acquire must not silently replace GraphBuildTimeout with Busy."""
-    from concurrent.futures import ThreadPoolExecutor
-
-    from devcouncil.codeintel.build_control import (
-        GraphBuildTimeout,
-        graph_build_session,
-        yield_writer_lease_for_child,
-    )
-    from devcouncil.codeintel.sync.lease import WriterLease
-
-    (tmp_path / ".devcouncil").mkdir()
-    lock = tmp_path / ".devcouncil" / "codeintel" / "writer.lock"
-    barrier = threading.Barrier(2)
-
-    def parent() -> None:
-        with graph_build_session(tmp_path, timeout=1.0):
-            with yield_writer_lease_for_child(tmp_path):
-                barrier.wait()
-                time.sleep(0.05)
-                raise GraphBuildTimeout("graph build made no progress for 90.0s")
-
-    def rival() -> None:
-        barrier.wait()
-        lease = WriterLease(lock)
-        assert lease.acquire_with_retry(timeout=1.0)
-        time.sleep(1.5)
-        lease.release()
-
-    monkeypatch.setattr(
-        "devcouncil.codeintel.build_control._lease_timeouts",
-        lambda _root: (0.3, 0.1),
-    )
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        f1 = pool.submit(parent)
-        f2 = pool.submit(rival)
-        with pytest.raises(GraphBuildTimeout, match="no progress"):
-            f1.result(timeout=5)
-        f2.result(timeout=5)
-
-
 def test_cpu_heartbeat_keeps_a_working_worker_out_of_stalled_state(tmp_path: Path) -> None:
     """Phase counters flat + CPU climbing is a slow phase, not a stall.
 
@@ -565,35 +355,6 @@ def test_stall_still_fires_when_cpu_is_flat_too(tmp_path: Path) -> None:
     assert "no graph progress or worker CPU" in loaded.degraded_reason
 
 
-def test_changed_paths_go_through_a_file_not_argv(tmp_path: Path) -> None:
-    """A repo-scale change set must not be one --changed-path arg per entry.
-
-    Regression for ``OSError: [Errno 7] Argument list too long``.
-    """
-    from devcouncil.codeintel.build_control import _write_changed_paths_file
-
-    paths = {f"src/pkg/module_{index}.py" for index in range(5_000)}
-    target = _write_changed_paths_file(tmp_path, "buildid", paths)
-    assert target is not None
-    written = [line for line in target.read_text(encoding="utf-8").splitlines() if line]
-    assert set(written) == paths
-
-    assert _write_changed_paths_file(tmp_path, "buildid", set()) is None
-    assert _write_changed_paths_file(tmp_path, "buildid", None) is None
-
-
-def test_worker_parses_changed_paths_from_file_and_argv() -> None:
-    import argparse
-
-    from devcouncil.codeintel import build_worker
-
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--changed-path", action="append", default=[])
-    parser.add_argument("--changed-paths-file", default="")
-    args = parser.parse_args(["--changed-path", "a.py"])
-    assert build_worker._changed_paths(args) == {"a.py"}
-
-
 def _incomplete_refresh(**over):
     from devcouncil.indexing.map_artifacts import GraphRefreshResult
 
@@ -611,22 +372,92 @@ def _incomplete_refresh(**over):
     return GraphRefreshResult(**base)
 
 
-def test_mcp_graph_ingest_reports_a_prior_generation_as_not_ok(tmp_path: Path, monkeypatch) -> None:
-    """An agent must not read a graph older than HEAD as a fresh ingest."""
+def test_mcp_graph_ingest_reports_a_not_fresh_kernel_store(tmp_path: Path, monkeypatch) -> None:
+    """An agent must be told when the kernel could not index part of the tree.
+
+    The kernel fails closed instead of serving a prior generation, so the
+    "older than HEAD" case this test used to pin no longer exists. What can
+    still happen is a committed generation with paths the kernel could not
+    process — absent from the graph — and that must be in the payload.
+    """
     import asyncio
     import json as _json
 
+    from devcouncil.devmap_client import DevMapStatus
     from devcouncil.integrations.mcp.handlers import map as map_handler
 
+    refresh = _incomplete_refresh(
+        build_incomplete=False,
+        reason="2 path(s) exceeded the retry threshold",
+        kernel_status=DevMapStatus(
+            generation_id=7,
+            pending_count=2,
+            node_count=10,
+            edge_count=5,
+            is_fresh=False,
+            degraded_reason="2 path(s) exceeded the retry threshold",
+            quarantined_count=2,
+        ),
+    )
     monkeypatch.setattr(
         "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
-        lambda *a, **k: _incomplete_refresh(),
+        lambda *a, **k: refresh,
     )
     result = asyncio.run(map_handler.handle_graph_ingest(tmp_path, {}))
     payload = _json.loads(result[0].text)
 
-    assert payload["ok"] is False
-    assert payload["build_incomplete"] is True
-    assert payload["code"] == "graph_build_incomplete"
-    assert "older than HEAD" in payload["detail"]
     assert payload["generation"] == 7
+    assert payload["kernel"]["is_fresh"] is False
+    assert payload["kernel"]["quarantined_count"] == 2
+    assert "not fresh" in payload["detail"]
+    assert "repair --pending" in payload["detail"]
+
+
+@requires_kernel
+def test_pdg_merge_preserves_the_kernel_stamp_and_freshness(tmp_path: Path) -> None:
+    """`dev map --pdg` must not turn the graph into a foreign artifact.
+
+    ``_build_pdg_layer`` re-writes ``code_graph.json`` through the Python
+    ``write_code_graph``. If that dropped ``meta.map_engine`` or restamped
+    freshness from today's tree, ``dev map doctor`` would report a foreign
+    writer (CRITICAL) immediately after a successful build. It does not: the
+    slim export copies ``meta`` and the fingerprints ride on the graph object,
+    and this test is what keeps it that way.
+    """
+    import subprocess
+
+    from devcouncil import devmap_health
+    from devcouncil.indexing.graph.build import (
+        build_pdg_for_paths,
+        load_code_graph,
+        merge_pdg_into_graph,
+        write_code_graph,
+    )
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / ".devcouncil").mkdir()
+    (tmp_path / "app.py").write_text(
+        "import os\n\n\ndef read_input():\n    return os.environ.get('X', '')\n\n\n"
+        "def main():\n    return eval(read_input())\n",
+        encoding="utf-8",
+    )
+    map_path = tmp_path / ".devcouncil" / "repo_map.json"
+    generate_map_artifacts(tmp_path, map_path, quiet=True)
+
+    graph_path = tmp_path / ".devcouncil" / "graph" / "code_graph.json"
+    before = json.loads(graph_path.read_text(encoding="utf-8"))
+    assert before["meta"]["map_engine"] == "devmap-rust"
+
+    graph = load_code_graph(tmp_path)
+    assert graph is not None
+    merge_pdg_into_graph(graph, build_pdg_for_paths(tmp_path, graph))
+    write_code_graph(tmp_path, graph)
+
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    assert after["meta"]["map_engine"] == "devmap-rust", "PDG export orphaned the graph"
+    assert "pdg" in after["meta"], "the PDG layer must actually be on disk"
+    for stamp in ("generated_head", "indexed_hash", "content_fingerprint"):
+        assert after[stamp] == before[stamp], f"PDG export restamped {stamp}"
+    doctor = devmap_health.run_doctor(tmp_path)
+    failed = [check["name"] for check in doctor["checks"] if check["ok"] is False]
+    assert doctor["ok"], f"doctor failed after --pdg: {failed}"

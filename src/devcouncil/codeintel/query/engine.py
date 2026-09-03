@@ -13,6 +13,9 @@ from devcouncil.indexing.graph.schema import CodeGraph, Confidence, GraphEdge, G
 class CodeIntelQueryEngine:
     def __init__(self, root: Path | CodeIntelService):
         self.service = root if isinstance(root, CodeIntelService) else get_codeintel_service(root)
+        # One client per engine: constructing it resolves (and capability-probes)
+        # the kernel binary, which is not worth repeating for every envelope.
+        self._devmap_client: Any | None = None
 
     def _graph(self) -> CodeGraph:
         graph = self.service.load()
@@ -51,11 +54,41 @@ class CodeIntelQueryEngine:
             existing.add(key)
         return graph
 
-    def _envelope(self, payload: dict[str, Any]) -> dict[str, Any]:
-        from devcouncil.codeintel.sync import get_sync_coordinator
+    def _sync_state(self) -> dict[str, Any]:
+        """Freshness as the *kernel* reports it, or ``unavailable`` with a reason.
 
+        This used to report the Python ``SyncCoordinator``'s state — a watcher
+        over a store the kernel does not write. Answering "is the index fresh?"
+        from the wrong store is how a caller ends up confident about an index
+        nobody built, so an unreachable kernel says so instead.
+        """
+        from devcouncil.devmap_client import DevMapClient, DevMapClientError
+
+        try:
+            if self._devmap_client is None:
+                # A probe, not a session: never spawn a daemon to answer a
+                # query envelope.
+                self._devmap_client = DevMapClient(
+                    self.service.project_root, autospawn=False
+                )
+            status = self._devmap_client.status()
+        except DevMapClientError as exc:
+            return {
+                "state": "unavailable",
+                "generation": None,
+                "pending": None,
+                "degraded_reason": str(exc),
+            }
+        return {
+            "state": "fresh" if status.is_fresh else "pending",
+            "generation": status.generation_id,
+            "pending": status.pending_count,
+            "degraded_reason": status.degraded_reason or "",
+        }
+
+    def _envelope(self, payload: dict[str, Any]) -> dict[str, Any]:
         status = self.service.status()
-        sync = get_sync_coordinator(self.service.project_root).status().as_dict()
+        sync = self._sync_state()
         graph_degraded = False
         graph_degraded_reason = ""
         try:

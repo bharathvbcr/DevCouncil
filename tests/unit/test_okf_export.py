@@ -9,7 +9,7 @@ from devcouncil.domain.evidence import DiffEvidence
 from devcouncil.domain.gap import Gap
 from devcouncil.domain.requirement import AcceptanceCriterion, Requirement
 from devcouncil.domain.task import PlannedFile, Task
-from devcouncil.indexing.graph.build import build_code_graph
+from tests.unit.graph_fixtures import kernel_graph
 from devcouncil.indexing.graph.export import (
     export_graphml,
     file_doc_rel,
@@ -130,7 +130,7 @@ def test_code_graph_okf_frontmatter_and_indexes(tmp_path):
         },
     )
     _commit(tmp_path)
-    graph = build_code_graph(tmp_path, liveness=False)
+    graph = kernel_graph(tmp_path)
     # Enrich community when present; fallback path still works without it
     for n in graph.nodes:
         if n.path == "pkg/a.py" and n.kind.value == "file":
@@ -165,7 +165,7 @@ def test_code_graph_okf_frontmatter_and_indexes(tmp_path):
 def test_graphml_includes_attributes(tmp_path):
     _write(tmp_path, {"pkg/__init__.py": "", "pkg/a.py": "def f():\n    return 1\n"})
     _commit(tmp_path)
-    graph = build_code_graph(tmp_path, liveness=False)
+    graph = kernel_graph(tmp_path)
     xml = graph_to_graphml(graph)
     assert 'attr.name="kind"' in xml
     assert 'attr.name="confidence"' in xml

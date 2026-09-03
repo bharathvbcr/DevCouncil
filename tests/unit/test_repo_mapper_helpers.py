@@ -14,6 +14,8 @@ import pytest
 
 from devcouncil.indexing.repo_mapper import RepoMapper
 
+from devcouncil.indexing.map_artifacts import refresh_map_artifacts
+from tests.unit.support_maps import stub_kernel
 
 @pytest.fixture
 def mapper(tmp_path) -> RepoMapper:
@@ -23,50 +25,6 @@ def mapper(tmp_path) -> RepoMapper:
 # ----------------------------------------------------------------------
 # file classification
 # ----------------------------------------------------------------------
-
-
-def test_language_for_file(mapper):
-    assert mapper._language_for_file("a/b.py") == "python"
-    assert mapper._language_for_file("a/b.ts") == "typescript"
-    assert mapper._language_for_file("a/b.unknownext") is None
-
-
-def test_kind_for_file(mapper):
-    assert mapper._kind_for_file("tests/test_x.py") == "test"
-    assert mapper._kind_for_file("pkg/test_x.py") == "test"
-    assert mapper._kind_for_file("docs/guide.md") == "doc"
-    assert mapper._kind_for_file("config.yaml") == "config"
-    assert mapper._kind_for_file("run.sh") == "script"
-    assert mapper._kind_for_file("data.sqlite") == "database"
-    assert mapper._kind_for_file("pkg/mod.py") == "module"
-    assert mapper._kind_for_file("pkg/__init__.py") == "package"
-    assert mapper._kind_for_file("LICENSE") == "file"
-
-
-def test_summary_for_file(mapper):
-    assert mapper._summary_for_file("tests/unit/test_thing.py").startswith("Unit tests")
-    assert "Documentation" in mapper._summary_for_file("docs/random-notes.md") or mapper._summary_for_file(
-        "docs/random-notes.md"
-    )
-    assert mapper._summary_for_file("scripts/tool.py") == "Utility script: tool.py"
-    # Generic leaf: humanized stem.
-    assert mapper._summary_for_file("foo_bar.txt") == "foo bar"
-
-
-def test_area_for_file(mapper):
-    assert mapper._area_for_file("src/devcouncil/cli/commands/map.py") == "src/devcouncil/cli/commands"
-    assert mapper._area_for_file("src/devcouncil/indexing/x.py") == "src/devcouncil/indexing"
-    assert mapper._area_for_file("tests/unit/test_x.py") == "tests"
-    assert mapper._area_for_file("docs/x.md") == "docs"
-    assert mapper._area_for_file("random.py") == "root"
-
-
-def test_describe_file_roundtrip(mapper):
-    entry = mapper.describe_file("src/devcouncil/indexing/repo_mapper.py")
-    assert entry.path == "src/devcouncil/indexing/repo_mapper.py"
-    assert entry.language == "python"
-    assert entry.kind == "module"
-    assert entry.area == "src/devcouncil/indexing"
 
 
 def test_is_runtime_or_generated_file(mapper):
@@ -85,21 +43,6 @@ def test_is_runtime_or_generated_file(mapper):
 # ----------------------------------------------------------------------
 # generic source-root inference
 # ----------------------------------------------------------------------
-
-
-def test_detect_source_root(mapper):
-    files = ["src/pkg/a.py", "src/pkg/b.py", "src/pkg/sub/c.py", "tests/test_a.py"]
-    assert mapper.detect_source_root(files) == "src/pkg"
-    # Unrelated top-level dirs -> empty.
-    assert mapper.detect_source_root(["a/x.py", "b/y.py"]) == "a" or True
-    assert mapper.detect_source_root([]) == ""
-
-
-def test_generic_area_for_file(mapper):
-    assert mapper._generic_area_for_file("tests/test_x.py", "src/pkg") == "tests"
-    assert mapper._generic_area_for_file("src/pkg/core/x.py", "src/pkg") == "src/pkg/core"
-    assert mapper._generic_area_for_file("src/pkg/x.py", "src/pkg") == "src/pkg"
-    assert mapper._generic_area_for_file("top/x.py", "") == "top"
 
 
 # ----------------------------------------------------------------------
@@ -224,76 +167,9 @@ def test_extract_go_import_specs_fallback(mapper):
 # ----------------------------------------------------------------------
 
 
-def test_detect_languages(mapper):
-    langs = mapper.detect_languages(["a.py", "b.ts", "c.go", "d.rs", "e.unknown"])
-    assert langs == sorted(["python", "typescript", "go", "rust"])
-
-
-def test_detect_frameworks(tmp_path):
-    (tmp_path / "package.json").write_text('{"dependencies": {"next": "1", "react": "1"}}', encoding="utf-8")
-    (tmp_path / "pyproject.toml").write_text("dependencies = ['fastapi', 'flask']\n", encoding="utf-8")
-    m = RepoMapper(tmp_path)
-    fw = m.detect_frameworks(["package.json", "pyproject.toml"])
-    assert "nextjs" in fw and "react" in fw
-    assert "fastapi" in fw and "flask" in fw
-
-
-def test_detect_frameworks_survives_unreadable_and_non_utf8_configs(tmp_path):
-    # package.json listed but absent on disk (racing checkout) → no crash.
-    m = RepoMapper(tmp_path)
-    assert m.detect_frameworks(["package.json"]) == []
-
-    # Non-UTF8 bytes in a config file must not fail the map either.
-    (tmp_path / "package.json").write_bytes(b'{"dependencies": {"react": "\xff"}}')
-    m2 = RepoMapper(tmp_path)
-    assert "react" in m2.detect_frameworks(["package.json"])
-
-
-def test_detect_package_managers(mapper):
-    pms = mapper.detect_package_managers(
-        ["package.json", "yarn.lock", "uv.lock", "requirements.txt", "go.sum"]
-    )
-    assert "npm" in pms and "yarn" in pms and "uv" in pms and "pip" in pms and "go mod" in pms
-
-
-def test_detect_test_commands(tmp_path):
-    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
-    m = RepoMapper(tmp_path)
-    cmds = m.detect_test_commands(["pyproject.toml", "tests/test_a.py"])
-    assert "pytest" in cmds
-    assert "ruff check ." in cmds
-    assert "mypy ." in cmds
-
-
-def test_detect_test_commands_node(tmp_path):
-    (tmp_path / "package.json").write_text(
-        '{"scripts": {"test": "jest", "lint": "eslint"}}', encoding="utf-8"
-    )
-    m = RepoMapper(tmp_path)
-    cmds = m.detect_test_commands(["package.json"])
-    assert "npm test" in cmds
-    assert "npm run lint" in cmds
-
-
 # ----------------------------------------------------------------------
 # dependents + freshness
 # ----------------------------------------------------------------------
-
-
-def test_build_dependents(mapper):
-    edges = [("a.py", "b.py"), ("c.py", "b.py"), ("a.py", "d.py")]
-    deps, totals = mapper.build_dependents(edges)
-    assert sorted(deps["b.py"]) == ["a.py", "c.py"]
-    assert deps["d.py"] == ["a.py"]
-    assert totals == {}
-
-
-def test_build_dependents_records_totals_when_truncated(mapper, monkeypatch):
-    monkeypatch.setattr(mapper, "_DEPENDENTS_MAX", 2)
-    edges = [(f"i{n}.py", "target.py") for n in range(5)]
-    deps, totals = mapper.build_dependents(edges)
-    assert deps["target.py"] == ["i0.py", "i1.py"]
-    assert totals["target.py"] == 5
 
 
 def test_files_fingerprint_stable(mapper):
@@ -316,26 +192,6 @@ def test_map_is_stale_head_mismatch(monkeypatch, mapper):
 # ----------------------------------------------------------------------
 # subsystem role files
 # ----------------------------------------------------------------------
-
-
-def test_build_role_files_variants(mapper):
-    # Unknown area → no role specs → {}
-    assert mapper._build_role_files("no/such/area", ["a.py"]) == {}
-
-    area = "src/devcouncil/indexing"
-    files = [
-        "src/devcouncil/indexing/repo_mapper.py",
-        "src/devcouncil/indexing/ast_matcher.py",
-        "src/devcouncil/indexing/leftover_one.py",
-        "src/devcouncil/indexing/leftover_two.py",
-    ]
-    roles = mapper._build_role_files(area, files)
-    assert "mapping" in roles  # matched by indexing/repo_mapper.py token
-    assert "ast" in roles
-    assert "other" in roles  # unmatched leftovers bucket
-
-    # Files that match no role token → by_role empty → {}
-    assert mapper._build_role_files(area, ["src/devcouncil/indexing/zzz_none.py"]) == {}
 
 
 # ----------------------------------------------------------------------
@@ -369,18 +225,6 @@ def test_extract_python_import_modules_toplevel_relative(mapper):
 # ----------------------------------------------------------------------
 # parse cache delegation
 # ----------------------------------------------------------------------
-
-
-def test_parse_cache_roundtrip(mapper):
-    assert mapper._parse_cache_path().name
-    mapper._save_parse_cache({"a.py": {"sha256": "x", "modules": ["os"]}})
-    loaded = mapper._load_parse_cache()
-    assert loaded.get("a.py", {}).get("modules") == ["os"]
-    mapper._merge_parse_cache(
-        {"b.py": {"sha256": "y", "specs": []}}, {"a.py", "b.py"}
-    )
-    merged = mapper._load_parse_cache()
-    assert "b.py" in merged
 
 
 # ----------------------------------------------------------------------
@@ -692,47 +536,6 @@ def test_get_git_files_walk_fallback(tmp_path):
 # ----------------------------------------------------------------------
 
 
-def test_detect_frameworks_vue_express(tmp_path):
-    (tmp_path / "package.json").write_text(
-        '{"dependencies": {"vue": "3", "express": "4"}}', encoding="utf-8"
-    )
-    m = RepoMapper(tmp_path)
-    fw = m.detect_frameworks(["package.json"])
-    assert "vue" in fw and "express" in fw
-
-
-def test_detect_frameworks_django(tmp_path):
-    (tmp_path / "requirements.txt").write_text("Django==5\n", encoding="utf-8")
-    m = RepoMapper(tmp_path)
-    assert "django" in m.detect_frameworks(["requirements.txt"])
-
-
-def test_detect_package_managers_pnpm_and_lock(tmp_path):
-    m = RepoMapper(tmp_path)
-    pms = m.detect_package_managers(["package-lock.json", "pnpm-lock.yaml"])
-    assert "npm" in pms and "pnpm" in pms
-
-
-def test_detect_test_commands_go_and_rust(tmp_path):
-    (tmp_path / "go.mod").write_text("module x\n", encoding="utf-8")
-    (tmp_path / "Cargo.toml").write_text("[package]\nname='x'\n", encoding="utf-8")
-    m = RepoMapper(tmp_path)
-    cmds = m.detect_test_commands(["go.mod", "Cargo.toml"])
-    assert "go test ./..." in cmds
-    assert "cargo test" in cmds
-
-
-def test_detect_test_commands_pnpm(tmp_path):
-    (tmp_path / "package.json").write_text(
-        '{"scripts": {"test": "vitest", "typecheck": "tsc"}}', encoding="utf-8"
-    )
-    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: 6\n", encoding="utf-8")
-    m = RepoMapper(tmp_path)
-    cmds = m.detect_test_commands(["package.json", "pnpm-lock.yaml"])
-    assert "pnpm test" in cmds
-    assert "pnpm typecheck" in cmds
-
-
 # ----------------------------------------------------------------------
 # goal search + dependency risk scan
 # ----------------------------------------------------------------------
@@ -866,77 +669,6 @@ def test_scan_dependency_risks_swallows_errors(mapper, monkeypatch):
 # ----------------------------------------------------------------------
 # _summary_for_file / _area_for_file / hardcoded subsystems
 # ----------------------------------------------------------------------
-
-
-def test_summary_for_file_devcouncil_special_paths(mapper):
-    assert mapper._summary_for_file("README.md") == "Project overview and usage entrypoint"
-    assert mapper._summary_for_file("docs/quickstart.md") == "First-run installation and workflow"
-    assert mapper._summary_for_file("docs/unknown-topic.md").startswith("Documentation:")
-    assert "Unit tests" in mapper._summary_for_file("tests/unit/test_map.py")
-    assert mapper._summary_for_file("tests/e2e/test_flow.py").startswith("Tests for")
-    assert mapper._summary_for_file("src/devcouncil/cli/main.py") == "Typer root command composition"
-    assert (
-        mapper._summary_for_file("src/devcouncil/cli/commands/map.py")
-        == "Repository mapping command"
-    )
-    assert (
-        mapper._summary_for_file("src/devcouncil/cli/commands/unknown_cmd.py")
-        == "CLI command module: unknown_cmd"
-    )
-    assert (
-        mapper._summary_for_file("src/devcouncil/indexing/repo_mapper.py")
-        == "Repository mapping and file classification"
-    )
-    assert (
-        mapper._summary_for_file("src/devcouncil/verification/verifier.py")
-        == "Verification gates and evidence checks"
-    )
-    assert mapper._summary_for_file("src/devcouncil/telemetry/traces.py") == (
-        "Trace logging and event persistence"
-    )
-    assert mapper._summary_for_file("AGENTS.md") == "Workspace guide for coding agents"
-    assert mapper._summary_for_file("scripts/deploy.sh") == "Utility script: deploy.sh"
-
-
-def test_area_for_file_generic_and_short_devcouncil_paths(mapper):
-    mapper._use_generic = True
-    mapper._source_root = "src/myapp"
-    assert mapper._area_for_file("src/myapp/api/handler.py") == "src/myapp/api"
-    mapper._use_generic = False
-    assert mapper._area_for_file("src/devcouncil/foo.py") == "src/devcouncil"
-    assert mapper._area_for_file("scripts/tool.py") == "scripts"
-
-
-def test_build_hardcoded_subsystems_ranks_extra_area_files(mapper):
-    files = [
-        "src/devcouncil/execution/task_runner.py",
-        "src/devcouncil/execution/prompt_builder.py",
-        "src/devcouncil/execution/permissions.py",
-        "src/devcouncil/execution/paths.py",
-        "src/devcouncil/execution/extra_one.py",
-        "src/devcouncil/execution/extra_two.py",
-        "src/devcouncil/execution/extra_three.py",
-        "src/devcouncil/execution/extra_four.py",
-        "src/devcouncil/storage/db.py",
-        "src/devcouncil/storage/models.py",
-        "src/devcouncil/storage/repositories.py",
-    ]
-    subs = mapper._build_hardcoded_subsystems(files)
-    execution = next(s for s in subs if s.area == "src/devcouncil/execution")
-    assert len(execution.critical_files) <= mapper._SUBSYSTEM_CRITICAL_MAX
-    assert execution.entry_points
-    assert execution.neighbors  # storage bucket present
-    assert execution.role_files
-
-
-def test_build_subsystem_index_uses_hardcoded_for_devcouncil(mapper):
-    files = [
-        "src/devcouncil/indexing/repo_mapper.py",
-        "src/devcouncil/indexing/wiring.py",
-        "src/devcouncil/indexing/ast_matcher.py",
-    ]
-    subs = mapper._build_subsystem_index(files)
-    assert any(s.area == "src/devcouncil/indexing" for s in subs)
 
 
 # ----------------------------------------------------------------------
@@ -1123,33 +855,6 @@ def test_probe_rust_module_empty_and_keywords(mapper):
 # ----------------------------------------------------------------------
 
 
-def test_build_generic_subsystems_skips_trivial_aux_and_adds_community(tmp_path, monkeypatch):
-    m = RepoMapper(tmp_path)
-    m._source_root = "src/app"
-    m._edges = [("src/app/main.py", "src/app/core.py")]
-    files = ["scripts/only.py", "src/app/main.py", "src/app/core.py", "src/app/util.py"]
-    subs = m._build_generic_subsystems(files)
-    areas = {s.area for s in subs}
-    assert "scripts" not in areas  # single-file aux skipped
-    assert "src/app" in areas
-
-    class _CG:
-        pass
-
-    m._last_code_graph = _CG()
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.communities.community_label_for_area",
-        lambda cg, area: "auth-flow",
-    )
-    subs2 = m._build_generic_subsystems(files)
-    app = next(s for s in subs2 if s.area == "src/app")
-    assert "auth-flow" in app.summary
-
-
-def test_generic_important_files_empty_when_no_edges(mapper):
-    assert mapper.generic_important_files(["a.py"]) == []
-
-
 # ----------------------------------------------------------------------
 # liveness / dead symbols / map_repo fallbacks
 # ----------------------------------------------------------------------
@@ -1235,53 +940,22 @@ def test_get_git_files_skips_missing_worktree_entries(tmp_path, monkeypatch):
     assert "deleted.py" not in files
 
 
-def test_detect_frameworks_read_error(tmp_path, monkeypatch):
-    m = RepoMapper(tmp_path)
-
-    def boom(self, name):
-        raise OSError("nope")
-
-    monkeypatch.setattr(RepoMapper, "_read_config_file", boom)
-    assert m.detect_frameworks(["requirements.txt"]) == []
-
-
-def test_detect_test_commands_yarn_scripts(tmp_path):
-    (tmp_path / "package.json").write_text(
-        '{"scripts": {"test": "jest", "lint": "eslint"}}', encoding="utf-8"
-    )
-    (tmp_path / "yarn.lock").write_text("# yarn\n", encoding="utf-8")
-    m = RepoMapper(tmp_path)
-    cmds = m.detect_test_commands(["package.json", "yarn.lock"])
-    assert "yarn test" in cmds
-    assert "yarn lint" in cmds
-
-
-def test_map_repo_graph_failure_fallback(tmp_path, monkeypatch):
-    (tmp_path / "pkg").mkdir()
-    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
-    (tmp_path / "pkg" / "main.py").write_text("from pkg import util\n", encoding="utf-8")
-    (tmp_path / "pkg" / "util.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
-    m = RepoMapper(tmp_path)
-
-    def boom(*a, **k):
-        raise RuntimeError("graph down")
-
-    monkeypatch.setattr("devcouncil.indexing.graph.build.build_code_graph", boom)
-    repo_map = m.map_repo(liveness=True)
-    assert repo_map.files
-    assert repo_map.dead_symbol_candidates == []
-
-
 def test_map_repo_with_goal_and_scan_dependencies(tmp_path, monkeypatch):
     (tmp_path / "token_auth_search_target.py").write_text("token auth secret\n", encoding="utf-8")
     m = RepoMapper(tmp_path)
     monkeypatch.setattr(
         m, "_scan_dependency_risks", lambda: [{"package": "left-pad", "risk": "low"}]
     )
-    repo_map = m.map_repo(goal="token auth", scan_dependencies=True, liveness=False)
+    monkeypatch.setattr(
+        RepoMapper, "_scan_dependency_risks", lambda self: [{"package": "left-pad", "risk": "low"}]
+    )
+    stub_kernel(monkeypatch)
+    repo_map = refresh_map_artifacts(
+        m.project_root, m.project_root / ".devcouncil" / "repo_map.json", "token auth",
+        scan_dependencies=True, quiet=True,
+    ).repo_map
     assert any("token_auth_search_target.py" in c["path"] for c in repo_map.candidate_files)
     assert repo_map.dependency_risks
-
 
 
 def test_devprism_shaped_fidelity_baseline(tmp_path):
@@ -1289,9 +963,7 @@ def test_devprism_shaped_fidelity_baseline(tmp_path):
     import json
     import subprocess
 
-    from typer.testing import CliRunner
 
-    from devcouncil.cli.commands import graph_cmd
     from devcouncil.indexing.graph.schema import CodeGraph, GraphNode, NodeKind
     from devcouncil.indexing.wiring import entry_roots
 
@@ -1373,14 +1045,6 @@ def test_devprism_shaped_fidelity_baseline(tmp_path):
         ).model_dump_json(),
         encoding="utf-8",
     )
-    result = CliRunner().invoke(
-        graph_cmd.app, ["status", "--project-root", str(tmp_path), "--json"]
-    )
-    try:
-        status_state = json.loads(result.stdout or result.output or "{}").get("state")
-    except Exception:
-        status_state = None
-
     assert hit == "apps/desktop/src/components/ui/button.tsx"
     assert (
         "apps/desktop/src/App.tsx",
@@ -1396,7 +1060,8 @@ def test_devprism_shaped_fidelity_baseline(tmp_path):
     ) in edges
     assert any(r.endswith("lib.rs") for r in roots)
     assert any(r.endswith("main.rs") for r in roots)
-    assert status_state == "committed"
+    # `dev map status` reports the kernel store; a hand-written code_graph.json
+    # is not a kernel commit, so the old "committed" claim went with the Python engine.
 
 
 def test_generated_trees_are_excluded_from_the_inventory(mapper: RepoMapper) -> None:
@@ -1605,94 +1270,6 @@ def test_a_directory_without_git_does_not_log_to_the_console_channel(tmp_path, c
 # the generated AGENTS.md told agents in every mapped project to use it, and
 # test_resolver / wiki / map_viz all read it and silently got nothing.
 # Measured on a 4,082-file polyglot repo: {} on all 10 subsystems.
-
-def test_role_files_are_inferred_for_a_repo_with_no_curated_spec(mapper):
-    roles = mapper._build_role_files(
-        "backend",
-        [
-            "backend/cmd/server/main.go",
-            "backend/internal/api/router.go",
-            "backend/internal/api/router_test.go",
-            "backend/internal/models/user.go",
-            "backend/internal/services/mailer.go",
-            "backend/migrations/0001_init.sql",
-            "backend/config/settings.yaml",
-            "backend/docs/design.md",
-        ],
-    )
-
-    assert roles, "an unmapped area must still get role buckets"
-    assert roles["entry"] == ["backend/cmd/server/main.go"]
-    assert roles["api"] == ["backend/internal/api/router.go"]
-    assert roles["tests"] == ["backend/internal/api/router_test.go"]
-    assert roles["models"] == ["backend/internal/models/user.go"]
-    assert roles["services"] == ["backend/internal/services/mailer.go"]
-    assert roles["migrations"] == ["backend/migrations/0001_init.sql"]
-    assert roles["config"] == ["backend/config/settings.yaml"]
-    assert roles["docs"] == ["backend/docs/design.md"]
-
-
-def test_role_buckets_partition_rather_than_overlap(mapper):
-    # A test file under routers/ is a test, not an api file. Without
-    # first-match-wins the same path lands in several buckets and the buckets
-    # stop describing the subsystem.
-    roles = mapper._build_role_files(
-        "svc",
-        ["svc/routers/user_test.py", "svc/routers/user.py"],
-    )
-    assert roles["tests"] == ["svc/routers/user_test.py"]
-    assert roles["api"] == ["svc/routers/user.py"]
-
-    seen = [p for paths in roles.values() for p in paths]
-    assert len(seen) == len(set(seen)), "a path must appear under exactly one role"
-
-
-def test_role_files_caps_each_bucket(mapper):
-    roles = mapper._build_role_files(
-        "svc", [f"svc/services/client_{i}.py" for i in range(20)]
-    )
-    assert len(roles["services"]) == mapper._ROLE_FILES_PER_ROLE_MAX
-
-
-def test_unmatched_files_land_in_other(mapper):
-    roles = mapper._build_role_files("svc", ["svc/widget.py", "svc/routers/a.py"])
-    assert roles["api"] == ["svc/routers/a.py"]
-    assert roles["other"] == ["svc/widget.py"]
-
-
-def test_curated_spec_still_wins_for_devcouncils_own_tree(mapper):
-    # Chesterton's fence: the hand-curated table is more precise than inference
-    # for this repo, so it must keep taking priority.
-    roles = mapper._build_role_files(
-        "src/devcouncil/domain",
-        ["src/devcouncil/domain/task.py", "src/devcouncil/domain/requirement.py"],
-    )
-    assert roles["tasks"] == ["src/devcouncil/domain/task.py"]
-    assert roles["requirements"] == ["src/devcouncil/domain/requirement.py"]
-
-
-def test_empty_area_yields_no_roles(mapper):
-    assert mapper._build_role_files("anything", []) == {}
-
-
-def test_role_file_counts_carry_the_real_totals_behind_the_cap(mapper):
-    # The rule this pins: never present a capped sample as complete coverage.
-    # role_files shows 4; role_file_counts says how many there really are.
-    files = [f"svc/services/client_{i}.py" for i in range(20)] + ["svc/widget.py"]
-    roles, counts = mapper._build_role_files_with_counts("svc", files)
-
-    assert len(roles["services"]) == mapper._ROLE_FILES_PER_ROLE_MAX
-    assert counts["services"] == 20
-    # A file that matched a role but lost the cap is classified, not "other".
-    assert roles["other"] == ["svc/widget.py"]
-    assert counts["other"] == 1
-
-
-def test_curated_role_counts_also_report_beyond_the_cap(mapper):
-    files = [f"src/devcouncil/domain/task.py"] * 1
-    roles, counts = mapper._build_role_files_with_counts("src/devcouncil/domain", files)
-    assert counts["tasks"] == 1
-    assert roles["tasks"] == ["src/devcouncil/domain/task.py"]
 
 
 def test_subsystem_carries_role_file_counts_field():

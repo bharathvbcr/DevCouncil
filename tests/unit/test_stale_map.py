@@ -9,6 +9,7 @@ from devcouncil.indexing.repo_mapper import RepoMapper
 from devcouncil.verification.checks.stale_map import detect_stale_map_gaps
 from devcouncil.verification.difficulty import resolve_rigor_policy
 
+from tests.unit.support_maps import stamped_repo_map
 
 def _git(root, *args):
     subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True)
@@ -52,7 +53,7 @@ def test_fresh_map_produces_no_gap(tmp_path):
     _commit(tmp_path)
     map_path = tmp_path / ".devcouncil" / "repo_map.json"
     map_path.parent.mkdir(parents=True)
-    repo_map = RepoMapper(tmp_path).map_repo(liveness=False)
+    repo_map = stamped_repo_map(tmp_path)
     map_path.write_text(repo_map.model_dump_json(), encoding="utf-8")
 
     gaps = detect_stale_map_gaps(
@@ -69,7 +70,7 @@ def test_generated_archive_does_not_change_map_or_freshness(tmp_path):
     (tmp_path / "src" / "debug_runtime.py").write_text("x = 1\n", encoding="utf-8")
     _commit(tmp_path)
     mapper = RepoMapper(tmp_path)
-    repo_map = mapper.map_repo(liveness=False)
+    repo_map = stamped_repo_map(tmp_path)
 
     assert any(item.path == "src/debug_runtime.py" for item in repo_map.files)
     archive = tmp_path / "devcouncil-0.4.0.tgz"
@@ -84,7 +85,7 @@ def test_stale_map_flagged_blocking_on_hard(tmp_path):
     _commit(tmp_path)
     map_path = tmp_path / ".devcouncil" / "repo_map.json"
     map_path.parent.mkdir(parents=True)
-    repo_map = RepoMapper(tmp_path).map_repo(liveness=False)
+    repo_map = stamped_repo_map(tmp_path)
     map_path.write_text(repo_map.model_dump_json(), encoding="utf-8")
 
     (tmp_path / "src" / "b.py").write_text("y = 2\n", encoding="utf-8")
@@ -161,7 +162,7 @@ def test_map_is_stale_fail_closed_on_git_files_error(tmp_path, monkeypatch):
     (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
     _commit(tmp_path)
     mapper = RepoMapper(tmp_path)
-    dumped = mapper.map_repo(liveness=False).model_dump()
+    dumped = stamped_repo_map(tmp_path).model_dump()
     assert not mapper.map_is_stale(dumped)
 
     def boom(self):  # noqa: ANN001
@@ -175,7 +176,7 @@ def test_map_is_stale_fail_closed_on_content_fingerprint_error(tmp_path, monkeyp
     (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
     _commit(tmp_path)
     mapper = RepoMapper(tmp_path)
-    dumped = mapper.map_repo(liveness=False).model_dump()
+    dumped = stamped_repo_map(tmp_path).model_dump()
     assert dumped.get("content_fingerprint")
     assert not mapper.map_is_stale(dumped)
 
@@ -191,7 +192,7 @@ def test_legacy_missing_content_fingerprint_still_not_stale_by_content(tmp_path)
     (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
     _commit(tmp_path)
     mapper = RepoMapper(tmp_path)
-    dumped = mapper.map_repo(liveness=False).model_dump()
+    dumped = stamped_repo_map(tmp_path).model_dump()
     dumped.pop("content_fingerprint", None)
     (tmp_path / "a.py").write_text("x = 2\n", encoding="utf-8")
     assert not mapper.map_is_stale(dumped)

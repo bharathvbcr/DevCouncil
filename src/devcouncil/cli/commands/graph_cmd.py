@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -39,38 +38,16 @@ def run_foreground_watch(
     liveness: bool = True,
     out: Console | None = None,
 ) -> None:
-    """Run the shared code-intelligence coordinator until interrupted.
+    """Watch the tree and rebuild through the Rust kernel until interrupted.
 
-    All watch entry points must use the same coordinator kwargs so a second
-    call does not raise ``ValueError`` on mismatched debounce/callback.
+    `dev map watch` and `dev map --watch` used to be two watchers on two
+    engines: this one drove the Python coordinator into `index.sqlite`, the
+    other rebuilt the kernel store. Same word, opposite store. One seam now.
     """
-    from devcouncil.codeintel.sync import get_sync_coordinator
-    from devcouncil.indexing.graph.build import refresh_map_for_paths
+    del out  # the map watcher reports on its own status console
+    from devcouncil.cli.commands.map import _watch_map
 
-    printer = out or status
-    coordinator = get_sync_coordinator(
-        root,
-        debounce_seconds=WATCH_DEBOUNCE_SECONDS,
-        sync_callback=lambda paths: refresh_map_for_paths(root, paths, liveness=liveness),
-    )
-    state = coordinator.start()
-    printer.print(
-        f"[cyan]Watching {root} with {state.backend or 'reconciliation'} "
-        f"(state={state.state}, debounce {WATCH_DEBOUNCE_SECONDS}s). Ctrl-C to stop.[/cyan]"
-    )
-    try:
-        while True:
-            time.sleep(WATCH_DEBOUNCE_SECONDS)
-            before = coordinator.status().pending
-            if before and not coordinator.sync_now():
-                failure = coordinator.status().last_error or coordinator.status().degraded_reason
-                printer.print(f"[yellow]Watch refresh failed (ignored): {failure}[/yellow]")
-            elif before:
-                printer.print(f"[green]Refreshed map for {len(before)} path(s)[/green]")
-    except KeyboardInterrupt:
-        printer.print("Stopped watching.")
-    finally:
-        coordinator.stop(timeout=2)
+    _watch_map(root, liveness=liveness)
 
 
 def _root(project_root: Path) -> Path:
@@ -181,6 +158,26 @@ def _call_edges(client, method: str, target: str, symbol_key: str, file_key: str
         if node:
             edges.append(node)
     return edges, None
+
+
+#: Definitions per `dev map query` whose caller/callee edges are measured.
+#: Each costs two kernel round-trips; beyond this the lists are reported as
+#: unmeasured instead of spending 40 calls on partial matches.
+_QUERY_EDGE_DEFINITION_CAP = 5
+
+
+def _is_exact_query_match(item: dict, query: str) -> bool:
+    """Whether a search hit *is* the queried symbol rather than a partial match."""
+    name = str(item.get("symbol_name") or "")
+    path_s = str(item.get("file_path") or "")
+    node_id = f"{path_s}::{name}" if path_s and name else name or path_s
+    wanted = query.strip()
+    return bool(wanted) and (
+        name == wanted
+        or node_id == wanted
+        or node_id.endswith(f"::{wanted}")
+        or (not name and path_s == wanted)
+    )
 
 
 def _render_edge_field(definition: dict, field: str) -> str:
@@ -307,25 +304,42 @@ def _devmap_query_payload(root: Path, kind: str, **kwargs):
             if resp.total > 0 and not resp.items and resp.truncated:
                 raise DevMapClientError("truncated empty query")
             defs = []
-            for item in resp.items[:20]:
+            # Edge lists cost two kernel round-trips per definition (`impact`
+            # and `deps`), and a bare name matches partially all over a large
+            # graph: one `dev map query` issued 41 calls, most of them for
+            # symbols the caller never asked about. Exact matches come first
+            # and only the first few definitions get their edges measured;
+            # the rest say so, rather than pretending to have been measured.
+            ranked = sorted(
+                resp.items[:20],
+                key=lambda item: 0 if _is_exact_query_match(item, name_or_path) else 1,
+            )
+            for position, item in enumerate(ranked):
                 path_s = str(item.get("file_path") or "")
                 name = str(item.get("symbol_name") or "")
                 span = item.get("span") or (0, 0)
                 line = int(span[0]) if isinstance(span, (list, tuple)) and span else 0
                 node_id = f"{path_s}::{name}" if path_s and name else name or path_s
                 target = node_id if name else path_s or name_or_path
-                callers, callers_unavailable = _call_edges(
-                    client, "impact", target, "source_symbol", "source_file"
-                )
-                # Symbol-scoped, like the inbound side. This used to pass
-                # `path_s` — the FILE — so a function's "callees" were the whole
-                # file's outbound edges. `IsRestatement` reported 35 callees
-                # where the symbol-scoped answer is 0, and the list included
-                # `Contains`/`MemberOf` structural edges, which is why symbols
-                # appeared to call themselves.
-                callees, callees_unavailable = _call_edges(
-                    client, "deps", target, "target_symbol", "target_file"
-                )
+                if position < _QUERY_EDGE_DEFINITION_CAP:
+                    callers, callers_unavailable = _call_edges(
+                        client, "impact", target, "source_symbol", "source_file"
+                    )
+                    # Symbol-scoped, like the inbound side. This used to pass
+                    # `path_s` — the FILE — so a function's "callees" were the
+                    # whole file's outbound edges. `IsRestatement` reported 35
+                    # callees where the symbol-scoped answer is 0, and the list
+                    # included `Contains`/`MemberOf` structural edges, which is
+                    # why symbols appeared to call themselves.
+                    callees, callees_unavailable = _call_edges(
+                        client, "deps", target, "target_symbol", "target_file"
+                    )
+                else:
+                    callers, callees = None, None
+                    callers_unavailable = callees_unavailable = (
+                        f"not measured: beyond the first {_QUERY_EDGE_DEFINITION_CAP} "
+                        "definitions; query the symbol by its full id"
+                    )
                 defs.append({
                     "id": node_id,
                     "kind": str(item.get("kind") or "symbol"),
@@ -462,90 +476,82 @@ def _require_graph(root: Path, *, warn_stale: bool = True):
     return graph
 
 
+def _kernel_build_payload(refresh) -> dict:  # noqa: ANN001
+    """The JSON a kernel-backed build command reports."""
+    kernel = getattr(refresh, "kernel_status", None)
+    payload: dict = {
+        "ok": not getattr(refresh, "degraded", False),
+        "generation": getattr(refresh, "generation", None),
+        "mode": getattr(refresh, "mode", "devmap-rust"),
+        "degraded": bool(getattr(refresh, "degraded", False)),
+        "reason": getattr(refresh, "reason", "") or "",
+    }
+    if kernel is not None:
+        payload["node_count"] = kernel.node_count
+        payload["edge_count"] = kernel.edge_count
+        payload["kernel"] = {
+            "is_fresh": kernel.is_fresh,
+            "pending_count": kernel.pending_count,
+            "quarantined_count": kernel.quarantined_count,
+            "degraded_reason": kernel.degraded_reason,
+        }
+    return payload
+
+
+def _run_kernel_build(
+    root: Path,
+    *,
+    json_output: bool,
+    label: str,
+    full: bool = False,
+    paths: Optional[List[str]] = None,
+) -> dict:
+    """Shared body of `init` / `ingest` / `sync`: one writer, one report.
+
+    A kernel that cannot build ends the command red with the engine's own
+    explanation (which names the binary and the fix); there is no fallback.
+    """
+    from devcouncil.devmap_engine import DevMapEngineError
+    from devcouncil.indexing.map_artifacts import refresh_map_artifacts
+
+    map_path = root / ".devcouncil" / "repo_map.json"
+    try:
+        refresh = refresh_map_artifacts(root, map_path, quiet=True, full=full)
+    except DevMapEngineError as exc:
+        payload = {"ok": False, "code": "engine_unavailable", "error": str(exc)}
+        if paths is not None:
+            payload["paths"] = list(paths)
+        if json_output:
+            typer.echo(json.dumps(payload, indent=2))
+        else:
+            status.print(f"[red]{label} failed: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    payload = _kernel_build_payload(refresh)
+    payload["map"] = str(map_path.relative_to(root))
+    if paths is not None:
+        payload["paths"] = list(paths)
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2))
+    else:
+        color = "green" if payload["ok"] and not payload["reason"] else "yellow"
+        status.print(
+            f"[{color}]{label}: generation {payload.get('generation') or '(none)'} — "
+            f"{payload.get('node_count', 0)} nodes, {payload.get('edge_count', 0)} edges"
+            f"{f'; {payload['reason']}' if payload['reason'] else ''}[/{color}]"
+        )
+    if not payload["ok"]:
+        raise typer.Exit(code=1)
+    return payload
+
+
 @app.command("init")
 def graph_init(
     project_root: Path = typer.Option(Path("."), "--project-root"),
-    no_liveness: bool = typer.Option(False, "--no-liveness"),
+    full: bool = typer.Option(False, "--full", help="Force a cold rebuild in the kernel."),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Build the canonical SQLite graph and deterministic compatibility exports."""
-    from devcouncil.codeintel import get_codeintel_service
-    from devcouncil.codeintel.build_control import GraphBuildBusy
-    from devcouncil.indexing.map_artifacts import refresh_map_artifacts
-
-    root = _root(project_root)
-    try:
-        refresh = refresh_map_artifacts(
-            root,
-            root / ".devcouncil" / "repo_map.json",
-            liveness=not no_liveness,
-            quiet=True,
-        )
-    except GraphBuildBusy as exc:
-        from devcouncil.codeintel.build_control import writer_busy_details
-
-        payload = {
-            "ok": False,
-            "code": "graph_writer_busy",
-            "error": str(exc),
-            **writer_busy_details(root),
-        }
-        if json_output:
-            typer.echo(json.dumps(payload, indent=2))
-        else:
-            status.print(f"[red]{exc}[/red]")
-            status.print(f"[dim]hint: {payload.get('hint') or 'dev map unlock'}[/dim]")
-        raise typer.Exit(code=1) from exc
-    if refresh.degraded:
-        payload = {
-            "ok": False,
-            "degraded": True,
-            "reason": refresh.reason,
-            "mode": refresh.mode,
-        }
-        if json_output:
-            typer.echo(json.dumps(payload, indent=2))
-        else:
-            status.print(f"[red]Graph init degraded: {refresh.reason}[/red]")
-        raise typer.Exit(code=1)
-    if refresh.build_incomplete:
-        # SQLite is intact but older than HEAD — never report a green index.
-        payload = {
-            "ok": False,
-            "build_incomplete": True,
-            "reason": refresh.reason,
-            "mode": refresh.mode,
-        }
-        if json_output:
-            typer.echo(json.dumps(payload, indent=2))
-        else:
-            status.print(
-                f"[yellow]Graph build did not finish; indexed state came from the "
-                f"last committed generation ({refresh.reason})[/yellow]"
-            )
-        raise typer.Exit(code=1)
-    result = get_codeintel_service(root).status()
-    if refresh.compatibility_export_degraded:
-        from devcouncil.indexing.graph.communities import compatibility_export_limit
-
-        result["limit"] = compatibility_export_limit(
-            canonical_store_health=_canonical_store_health(root),
-            reason=refresh.reason or "compatibility export degraded",
-        ).as_dict()
-        result["compatibility_export"] = "degraded"
-        result["degraded_reason"] = refresh.reason
-    if json_output:
-        typer.echo(json.dumps(result, indent=2))
-    else:
-        color = "yellow" if refresh.compatibility_export_degraded else "green"
-        status.print(
-            f"[{color}]Indexed generation {result.get('generation')} — "
-            f"{result.get('node_count')} nodes, {result.get('edge_count')} edges"
-            f"{f'; export degraded: {refresh.reason}' if refresh.compatibility_export_degraded else ''}"
-            f"[/{color}]"
-        )
-        if refresh.compatibility_export_degraded and result.get("limit"):
-            _emit_limit(status, result["limit"])
+    """Build the kernel store and write repo_map.json + code_graph.json."""
+    _run_kernel_build(_root(project_root), json_output=json_output, label="Indexed", full=full)
 
 
 @app.command("status")
@@ -553,95 +559,21 @@ def graph_status(
     project_root: Path = typer.Option(Path("."), "--project-root"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Show canonical generation, watcher health, and pending files."""
-    from devcouncil.codeintel import get_codeintel_service
-    from devcouncil.codeintel.build_control import read_build_status, writer_busy_details
-    from devcouncil.codeintel.sync import get_sync_coordinator
-    from devcouncil.codeintel.sync.lease import read_holder
+    """Engine, store, kernel freshness, daemon and artifact state of the map.
+
+    Reads only what the Rust kernel owns. This used to merge the Python
+    engine's `index.sqlite` status (generation 76, "STALE", a dead writer pid)
+    over the kernel's, and described an engine `dev map` no longer uses.
+    """
+    from devcouncil.devmap_health import collect_map_status, render_status
 
     root = _root(project_root)
-    rust_status = _devmap_query_payload(root, "status")
-    result = get_codeintel_service(root).status()
-    if rust_status is not None:
-        # Prefer Rust generation/freshness when the binary+DB are available.
-        result = {**result, **{k: v for k, v in rust_status.items() if k != "sync"}}
-        sync = result.get("sync") if isinstance(result.get("sync"), dict) else {}
-        result["sync"] = {**sync, **(rust_status.get("sync") or {})}
-        result["source"] = "devmap+python"
-    # Cold start: existing compatibility JSON is enough to bootstrap queries/status
-    # without requiring a full ``dev map`` rebuild first.
-    if result.get("state") in {"uninitialized", "empty"}:
-        try:
-            from devcouncil.indexing.graph.build import graph_path, load_code_graph
-
-            if graph_path(root).is_file():
-                load_code_graph(root)
-                result = get_codeintel_service(root).status()
-        except Exception:
-            logger.debug("graph status cold-start bootstrap failed", exc_info=True)
-    result["sync"] = get_sync_coordinator(root).status().as_dict()
-    holder = read_holder(root / ".devcouncil" / "codeintel" / "writer.lock")
-    build = read_build_status(root)
-    result["writer_holder"] = {
-        "pid": holder.pid,
-        "started_at": holder.started_at,
-    }
-    busy_like = build.state in {"building", "stalled", "timed_out", "stale"} or holder.pid is not None
-    if busy_like:
-        details = writer_busy_details(root)
-        result["hint"] = details["hint"]
-        result["build_pid"] = details["build_pid"]
-        result["build_state"] = details["build_state"]
-    if result["sync"].get("compatibility_export") == "degraded":
-        from devcouncil.indexing.graph.communities import (
-            collect_limit_reports,
-            compatibility_export_limit,
-        )
-
-        result["limit"] = compatibility_export_limit(
-            canonical_store_health=_canonical_store_health(root),
-            reason=str(result["sync"].get("degraded_reason") or "compatibility export degraded"),
-        ).as_dict()
-        result["limits"] = collect_limit_reports(result.get("limit"))
-    result["index_freshness"] = _index_freshness_fields(root)
+    result = collect_map_status(root)
     if json_output:
-        typer.echo(json.dumps(result, indent=2))
+        typer.echo(json.dumps(result, indent=2, default=str))
         return
-    console.print(f"state: {result['state']}")
-    console.print(f"generation: {result.get('generation') or '(none)'}")
-    freshness = result["index_freshness"]
-    if freshness.get("fresh") is False:
-        console.print(f"[red]index: STALE — {freshness.get('reason')}[/red]")
-    elif freshness.get("fresh") is True:
-        head = str(freshness.get("index_head") or "")
-        console.print(f"index: fresh (HEAD {head[:12]})")
-    console.print(f"nodes/edges: {result.get('node_count', 0)}/{result.get('edge_count', 0)}")
-    sync = result["sync"]
-    console.print(f"watcher: {sync['state']} ({sync.get('backend') or 'not started'})")
-    if sync.get("state") in {"disabled", "stopped", ""} or not sync.get("backend"):
-        console.print(
-            "[dim]hint: run `dev map watch` or `dev map --watch` to enable auto-refresh[/dim]"
-        )
-    if sync.get("build_id") or holder.pid is not None:
-        progress = f"{sync.get('build_completed', 0)}/{sync.get('build_total', 0)}"
-        pid = sync.get("build_pid") or holder.pid or "n/a"
-        console.print(
-            f"build: {sync.get('build_state') or 'unknown'} / "
-            f"{sync.get('build_phase') or 'unknown'} ({progress}, "
-            f"pid={pid})"
-        )
-    if holder.pid is not None:
-        console.print(f"writer holder: pid={holder.pid}")
-    if result.get("hint"):
-        console.print(f"[dim]hint: if stuck, run `{result['hint']}`[/dim]")
-    if sync.get("compatibility_export") == "degraded":
-        console.print("compatibility export: degraded")
-        if result.get("limit"):
-            _emit_limit(console, result["limit"])
-    if sync.get("pending"):
-        console.print("pending: " + ", ".join(sync["pending"]))
-    if sync.get("degraded_reason"):
-        console.print(f"degraded: {sync['degraded_reason']}")
+    for line in render_status(result):
+        console.print(line, markup=False, highlight=False)
 
 
 @app.command("unlock")
@@ -654,7 +586,12 @@ def graph_unlock(
     ),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Free a stuck code-intelligence writer lease (prefer over raw kill).
+    """Free a stuck *legacy* Python writer lease (`.devcouncil/codeintel/writer.lock`).
+
+    The kernel's own writer lock is an advisory file lock released by the OS
+    when the holder dies, so a killed `dev map` never needs unlocking. This
+    command remains for the Python query cache's lease, which `load_code_graph`
+    still takes when it imports the kernel's graph.
 
     Default recovery: free when the recorded holder is dead; if status is
     stalled/timed_out/stale or the holder is older than the stall timeout,
@@ -690,30 +627,22 @@ def graph_sync(
     project_root: Path = typer.Option(Path("."), "--project-root"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Reconcile and commit pending filesystem changes now."""
-    from devcouncil.codeintel.sync import get_sync_coordinator
+    """Rebuild the map now through the kernel (incremental when the tree allows).
 
-    root = _root(project_root)
-    coordinator = get_sync_coordinator(root)
-    changed = list(paths or coordinator.reconcile())
-    ok = coordinator.sync_now(changed)
-    result = coordinator.status().as_dict()
-    result["ok"] = ok
-    result["reconciled"] = changed
-    if json_output:
-        typer.echo(json.dumps(result, indent=2))
-    else:
-        color = "green" if ok else "yellow"
-        status.print(f"[{color}]Synced {len(changed)} path(s); state={result['state']}[/{color}]")
-    if not ok:
-        raise typer.Exit(code=1)
+    ``paths`` are accepted for callers that pass them and reported back; the
+    kernel computes the affected set from content hashes itself, so an explicit
+    list cannot narrow a build below what correctness requires.
+    """
+    _run_kernel_build(
+        _root(project_root), json_output=json_output, label="Synced", paths=list(paths or [])
+    )
 
 
 @app.command("watch")
 def graph_watch(
     project_root: Path = typer.Option(Path("."), "--project-root"),
 ) -> None:
-    """Run native auto-sync in the foreground until interrupted."""
+    """Watch the tree and rebuild through the kernel until interrupted."""
     run_foreground_watch(_root(project_root), liveness=True, out=status)
 
 
@@ -721,151 +650,111 @@ def graph_watch(
 def graph_doctor(
     project_root: Path = typer.Option(Path("."), "--project-root"),
     json_output: bool = typer.Option(False, "--json"),
+    fix: bool = typer.Option(
+        False,
+        "--fix",
+        help="Apply every fix the doctor can apply from inside the repository, then re-check.",
+    ),
 ) -> None:
-    """Verify SQLite, native watcher selection, and installed grammar assets."""
-    from watchdog.observers import Observer
+    """Check the kernel binary, its store, the artifacts and their freshness.
 
-    from devcouncil.codeintel import get_codeintel_service
-    from devcouncil.codeintel.build_control import read_build_status
-    from devcouncil.codeintel.languages import grammar_status
-    from devcouncil.codeintel.store.sqlite import compatibility_graph_digest
-    from devcouncil.indexing.graph.build import graph_path
-    from devcouncil.utils.json_persist import read_json
+    Every check carries a stable `code`, a sentence for a person (`fix`) and
+    the exact command for an agent (`fix_command`). Critical failures (no
+    usable kernel, a store newer than the kernel, an artifact written by a
+    foreign engine) exit 1; reclaim pressure, a large WAL, a stale map,
+    quarantined paths, a stuck build and a failed last build warn.
+
+    `--fix` clears a dead build's marker, quarantines an unreadable store,
+    drops stuck queue rows and runs one build for everything a build resolves;
+    it never touches a running build and never rebuilds the kernel binary.
+    """
+    from devcouncil.devmap_health import apply_fixes, render_doctor, render_fixes, run_doctor
 
     root = _root(project_root)
-    service = get_codeintel_service(root)
-    store = service.status()
-    grammars = grammar_status()
-    watcher_backend = getattr(Observer, "__name__", type(Observer).__name__)
-    build = read_build_status(root)
-    export_path = graph_path(root)
-    export_health = "missing"
-    export_detail = ""
-    if store["state"] == "committed":
-        recorded_digest, recorded_mtime = service.store.compatibility_export_state()
-        if not export_path.is_file():
-            export_health = "missing"
-            export_detail = "compatibility JSON absent while store is committed"
+    if fix:
+        result = apply_fixes(root)
+        if json_output:
+            typer.echo(json.dumps(result, indent=2, default=str))
         else:
-            try:
-                data = read_json(export_path)
-                from devcouncil.indexing.graph.schema import CodeGraph
-
-                exported = CodeGraph.model_validate(data)
-                digest = compatibility_graph_digest(exported)
-                if recorded_digest and digest != recorded_digest:
-                    export_health = "drift"
-                    export_detail = "JSON digest diverges from store handshake"
-                elif build.compatibility_export == "degraded":
-                    export_health = "degraded"
-                    export_detail = build.degraded_reason or "last build skipped JSON export"
-                else:
-                    export_health = "healthy"
-            except Exception as exc:  # noqa: BLE001
-                export_health = "corrupt"
-                export_detail = f"{type(exc).__name__}: {exc}"
-    elif build.compatibility_export == "degraded":
-        export_health = "degraded"
-        export_detail = build.degraded_reason or "compatibility export degraded"
-    # The canonical graph and its JSON export are separate axes. A size-capped
-    # export is an export-tier limit, not a broken graph: SQLite is canonical and
-    # fully queryable, so it must not stamp the whole map as failed. Real
-    # inconsistencies (drift / corrupt / missing-while-committed) still fail.
-    graph_ok = store["state"] == "committed"
-    json_export_ok = export_health == "healthy"
-    export_only_size_capped = export_health == "degraded"
-    result = {
-        "ok": graph_ok
-        and grammars["ok"]
-        and (json_export_ok or export_only_size_capped),
-        "graph_ok": graph_ok,
-        "json_export_ok": json_export_ok,
-        "store": store,
-        "watcher_backend": watcher_backend,
-        "grammars": grammars,
-        "compatibility_export": {
-            "health": export_health,
-            "detail": export_detail,
-            "build_state": build.state,
-            "build_compatibility_export": build.compatibility_export,
-        },
-    }
-    # Uninitialized projects are healthy when grammars are installed.
-    if store["state"] in {"uninitialized", "empty"}:
-        result["ok"] = bool(grammars["ok"])
-    if store["state"] == "corrupt":
-        result["store_action"] = (
-            "index.sqlite is damaged — run `dev map` to quarantine it and rebuild"
-        )
-    from devcouncil.indexing.graph.build import load_code_graph
-    from devcouncil.indexing.graph.communities import (
-        collect_limit_reports,
-        compatibility_export_limit,
-        community_detection_limit,
-    )
-
-    _doctor_limits: list[dict] = []
-    _doctor_health = _canonical_store_health(root)
-    if export_health != "healthy":
-        _export_limit = compatibility_export_limit(
-            canonical_store_health=_doctor_health,
-            reason=export_detail or export_health,
-        ).as_dict()
-        result["compatibility_export"]["limit"] = _export_limit
-        _doctor_limits.append(_export_limit)
-    try:
-        _graph = load_code_graph(root)
-        _communities = ((_graph.meta or {}) if _graph is not None else {}).get("communities") or {}
-        if isinstance(_communities, dict) and _communities.get("skipped"):
-            raw_limit = _communities.get("limit")
-            if isinstance(raw_limit, dict) and raw_limit.get("degraded"):
-                _comm_limit = raw_limit
-            else:
-                _comm_limit = community_detection_limit(
-                    canonical_store_health=_doctor_health,
-                    reason=str(_communities.get("reason") or "community_detection_skipped"),
-                ).as_dict()
-            _doctor_limits.append(_comm_limit)
-    except Exception:
-        logger.debug("graph doctor community limit probe failed", exc_info=True)
-    if _doctor_limits:
-        result["limits"] = collect_limit_reports(*_doctor_limits)
-    if json_output:
-        typer.echo(json.dumps(result, indent=2))
+            for line in render_fixes(result):
+                console.print(line, markup=False, highlight=False)
         if not result["ok"]:
             raise typer.Exit(code=1)
         return
-    console.print(f"store: {store['state']} (schema {store['schema_version']})")
-    if result.get("store_action"):
-        console.print(f"store action: {result['store_action']}")
-    console.print(f"watcher backend: {watcher_backend}")
-    console.print(f"graph (canonical SQLite): {'ok' if graph_ok else 'not ok'}")
-    console.print(
-        f"compatibility export: {export_health}"
-        + (f" — {export_detail}" if export_detail else "")
-        + (" (JSON export only; the graph itself is fine)" if export_only_size_capped else "")
-    )
-    for _limit in result.get("limits") or []:
-        _emit_limit(console, _limit)
-    console.print(
-        f"grammars: {grammars['available_count']}/{grammars['required_count']} available locally"
-    )
-    for row in grammars["languages"]:
-        if not row["available"]:
-            # Python parses via stdlib ast regardless of the tree-sitter wheel —
-            # don't let a Python-heavy repo read this line as broken indexing.
-            native_note = (
-                " — extraction unaffected (native stdlib-ast parser)"
-                if row.get("grammar") == "python"
-                else ""
-            )
-            console.print(
-                f"  missing: {row['language']} "
-                f"({', '.join(row['missing_grammars'])}){native_note}"
-            )
-    if grammars["action"]:
-        console.print(f"grammar action: {grammars['action']}")
+    result = run_doctor(root)
+    if json_output:
+        typer.echo(json.dumps(result, indent=2, default=str))
+    else:
+        for line in render_doctor(result):
+            console.print(line, markup=False, highlight=False)
     if not result["ok"]:
+        raise typer.Exit(code=1)
+
+
+@app.command("runs")
+def graph_runs(
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    last: int = typer.Option(10, "--last", min=1, max=200, help="How many runs to show."),
+    failed: bool = typer.Option(False, "--failed", help="Only runs that failed."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Records of recent kernel runs: what ran, how long, how it ended, and why.
+
+    Every `devmap build` / `manifest` / `repair` the seam launches is recorded
+    in the project trace log (`.devcouncil/logs/traces.jsonl`, the same log
+    `devcouncil_tail_trace` reads) with its argv, exit code, duration, the
+    kernel's notes (discovery refusals, reclaim, progress) and, on failure,
+    the diagnosis code. The run id printed by a failing `dev map` is the key.
+    """
+    from devcouncil.devmap_engine import read_runs
+    from devcouncil.devmap_health import _iso
+
+    root = _root(project_root)
+    runs = read_runs(root, limit=last, failed_only=failed)
+    if json_output:
+        typer.echo(json.dumps({"ok": True, "runs": runs}, indent=2, default=str))
+        return
+    if not runs:
+        console.print("no kernel runs recorded yet", markup=False)
+        return
+    for run in runs:
+        when = _iso(float(run["started_at"])) if run.get("started_at") else run.get("timestamp")
+        verdict = "ok" if run.get("ok") else f"FAIL {run.get('code')}"
+        console.print(
+            f"{when} {run.get('stage', ''):<9} {verdict:<28} {run.get('duration_s', 0):>7}s "
+            f"exit {run.get('exit_code')} run {run.get('run_id')}",
+            markup=False,
+            highlight=False,
+        )
+        for note in (run.get("notes") or [])[-4:]:
+            console.print(f"    {note.strip()}", markup=False, highlight=False)
+
+
+@app.command("abort")
+def graph_abort(
+    project_root: Path = typer.Option(Path("."), "--project-root"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Stop the kernel build that is running for this repository.
+
+    SIGTERM, then SIGKILL after five seconds. Safe: a generation is one
+    transaction, so the store stays on the prior generation and the OS
+    releases the writer lock. Refuses a pid that is not a devmap process.
+    """
+    from devcouncil.devmap_health import abort_build
+
+    root = _root(project_root)
+    result = abort_build(root)
+    if json_output:
+        typer.echo(json.dumps(result, indent=2, default=str))
+    elif result.get("aborted"):
+        console.print(
+            f"aborted build pid {result['pid']} with {result['signal']} (run {result.get('run_id')})",
+            markup=False,
+        )
+    else:
+        console.print(f"{result.get('code')}: nothing aborted", markup=False)
+    if not result.get("ok"):
         raise typer.Exit(code=1)
 
 
@@ -926,94 +815,18 @@ def graph_ingest(
     no_liveness: bool = typer.Option(False, "--no-liveness"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Unified analyze entry: codeintel sync → graph export → repo map write."""
-    from devcouncil.indexing.map_artifacts import refresh_map_artifacts
-    from devcouncil.codeintel.sync import get_sync_coordinator
-    from devcouncil.codeintel import get_codeintel_service
-    from devcouncil.codeintel.build_control import GraphBuildBusy
+    """Rebuild the map through the kernel and report the generation it committed.
 
-    root = _root(project_root)
-    coordinator = get_sync_coordinator(root)
-    changed = list(paths or [])
-    map_path = root / ".devcouncil" / "repo_map.json"
-    if paths is None:
-        try:
-            refresh = refresh_map_artifacts(
-                root,
-                map_path,
-                liveness=not no_liveness,
-                quiet=True,
-            )
-        except GraphBuildBusy as exc:
-            from devcouncil.codeintel.build_control import writer_busy_details
-
-            payload = {
-                "ok": False,
-                "code": "graph_writer_busy",
-                "error": str(exc),
-                "paths": changed,
-                **writer_busy_details(root),
-            }
-            if json_output:
-                typer.echo(json.dumps(payload, indent=2))
-            else:
-                status.print(f"[red]{exc}[/red]")
-                status.print(f"[dim]hint: {payload.get('hint') or 'dev map unlock'}[/dim]")
-            raise typer.Exit(code=1) from exc
-    else:
-        synced = coordinator.sync_now(changed)
-        if not synced:
-            payload = {"ok": False, "paths": changed, **coordinator.status().as_dict()}
-            if json_output:
-                typer.echo(json.dumps(payload, indent=2))
-            else:
-                status.print(f"[red]Graph ingest failed: {payload.get('last_error') or payload.get('degraded_reason')}[/red]")
-            raise typer.Exit(code=1)
-        refresh = refresh_map_artifacts(
-            root,
-            map_path,
-            liveness=not no_liveness,
-            quiet=True,
-            graph=get_codeintel_service(root).load(),
-            paths=changed,
-        )
-    payload = {
-        # A map rebuilt from a prior generation after a build timeout is not a
-        # successful ingest: the graph is intact but older than HEAD. Reporting
-        # ok/green here is exactly the confusion the recovery path exists to
-        # avoid, so it fails alongside `degraded`.
-        "ok": not (refresh.degraded or refresh.build_incomplete),
-        "paths": changed,
-        "map": str(map_path.relative_to(root)),
-        "generation": refresh.generation,
-        "mode": refresh.mode,
-        "degraded": refresh.degraded,
-        "build_incomplete": refresh.build_incomplete,
-        "reason": refresh.reason,
-    }
-    if refresh.compatibility_export_degraded:
-        from devcouncil.indexing.graph.communities import compatibility_export_limit
-
-        payload["compatibility_export"] = "degraded"
-        payload["compatibility_export_reason"] = refresh.reason
-        payload["limit"] = compatibility_export_limit(
-            canonical_store_health=_canonical_store_health(root),
-            reason=refresh.reason or "compatibility export degraded",
-        ).as_dict()
-    if json_output:
-        typer.echo(json.dumps(payload, indent=2))
-    else:
-        color = "yellow" if (refresh.degraded or refresh.build_incomplete) else "green"
-        status.print(
-            f"[{color}]Ingested {len(changed)} path(s); map at {payload['map']}"
-            f"{f'; degraded: {refresh.reason}' if refresh.degraded else ''}"
-            f"{f'; graph build did not finish — map came from the last committed '
-               f'generation ({refresh.reason})' if refresh.build_incomplete else ''}[/{color}]"
-        )
-        if refresh.compatibility_export_degraded and payload.get("limit"):
-            _emit_limit(status, payload["limit"])
-    if refresh.degraded or refresh.build_incomplete:
-        raise typer.Exit(code=1)
+    ``paths`` are reported back for callers that pass them; the kernel derives
+    the affected set from content hashes itself, so the build is incremental
+    exactly when the tree allows and never narrower than correctness needs.
+    ``--no-liveness`` is accepted for old callers and ignored: the kernel
+    always computes liveness.
+    """
+    del no_liveness
+    _run_kernel_build(
+        _root(project_root), json_output=json_output, label="Ingested", paths=list(paths or [])
+    )
 
 
 @app.command("cypher")

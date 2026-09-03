@@ -28,8 +28,9 @@ All map and graph operations live under **`dev map`**. `dev graph …` is a comp
 | Path | Role |
 | :--- | :--- |
 | `.devcouncil/repo_map.json` | File inventory, subsystems, entry roots, unwired/unreachable/dead-symbol candidate lists, reverse-import dependents |
-| `.devcouncil/graph/code_graph.json` | Compact compatibility export of symbol nodes + edges (imports, named imports, calls, inherits, contains) and tiered `dead_code`. **SQLite is canonical**; this JSON is a size-sensitive export (`indexing.compact_graph_json`, default on; 128 MiB default limit). Oversized graphs fall back through slim → compact → stub tiers so a pointer JSON is still written; prefer SQLite-backed `dev map` commands when the stub tier is used. |
-| `.devcouncil/codeintel/index.sqlite` | Canonical WAL-mode graph, source cache, FTS, generations, unresolved references, diagnostics, and fingerprinted runtime observations |
+| `.devcouncil/graph/code_graph.json` | Compact export of symbol nodes + edges (imports, named imports, calls, inherits, contains) and tiered `dead_code`, written by the kernel from the same generation as the map. **The kernel store is canonical**; prefer `dev map query` / `trace` / `dead` when the JSON is missing. |
+| `.devcouncil/codeintel/devmap.sqlite` | **Canonical.** The Rust kernel's WAL-mode store: generations, nodes, edges, unresolved references, FTS5, the pending-path queue, build history. Written only by `devmap build` (every `dev map`, `init`, `ingest`, `sync`, verify/checkout refresh and MCP `devcouncil_graph_ingest` go through it). |
+| `.devcouncil/codeintel/index.sqlite` | The Python query cache. Not an engine: `load_code_graph` imports the kernel's `code_graph.json` into it on first read after a build, and the Python-only commands (`check`, `process`, `routes`, `cypher`, `pdg`, …) answer from that cache. Safe to delete; it is rebuilt from the JSON. |
 | `.devcouncil/graph/graph.html` | Self-contained interactive visualizer (`dev map graph-html` / `dev map html --symbols` / alias `dev graph html`; **not** written by default on bare `dev map`) |
 | `.devcouncil/map.html` | Self-contained subsystem map visualizer (`dev map html`; slim payload — no `files[]` / `dependents{}`) |
 | `.devcouncil/graph/demo.html` | Sample self-contained interactive UI from `dev map demo` (no map required; primary demo artifact) |
@@ -39,40 +40,49 @@ All map and graph operations live under **`dev map`**. `dev graph …` is a comp
 ## Build / refresh
 
 ```bash
-dev map                     # Full rebuild (liveness on by default)
-dev map --goal "…"          # Optional goal text for candidate-file ranking (was positional)
-dev map --if-stale          # No-op when fingerprints still match
-dev map --no-liveness       # Skip entry/unwired/unreachable/dead lists
-dev map --lsp-refs          # Confirm dead symbols via live LSP references
+dev map                     # Build through the kernel: no-op on an unchanged tree, incremental otherwise
+dev map --full              # Force a cold rebuild in the kernel
+dev map --goal "…"          # Rank candidate_files for a goal (ripgrep-based, layered on the kernel's map)
+dev map --if-stale          # Exit 0 without building when fingerprints still match; never starts a cold build
 dev map --wiki / --no-wiki  # Refresh codebase-wiki skeletons after map (on by default)
 dev map --scan-deps         # Opt-in SCA (pip-audit / npm audit / osv-scanner) → dependency_risks
-dev map --watch             # Debounced incremental refresh on edits (same as `dev map watch`)
+dev map --pdg               # Opt-in Python PDG/CFG/taint layer over the kernel's graph
+dev map --watch             # Event-driven rebuild on edits (same as `dev map watch`)
 dev map html                # Write interactive .devcouncil/map.html (subsystems)
 dev map html --open         # Write and open the subsystem map
 dev map graph-html          # Write symbol-level .devcouncil/graph/graph.html
 dev map html --symbols      # Same as graph-html
-dev map init                # Build canonical SQLite + compatibility exports
-dev map ingest              # Unified analyze: codeintel sync → graph export → repo map write
-dev map ingest src/foo      # Path-scoped ingest (full reconcile when paths omitted)
-dev map status              # Generation, pending paths, watcher/degraded state
-dev map --full              # Force a full isolated rebuild (default is incremental when the change set is small)
-dev map unlock              # Free a stuck writer lease (dead / stalled / timed_out)
-dev map unlock --force      # Kill even if the holder still looks progressive
-dev map sync                # Reconcile and commit now
-dev map watch               # Native FSEvents/inotify/ReadDirectoryChangesW foreground watcher
-dev map doctor              # SQLite, watcher, and offline grammar verification
+dev map init                # Same build as `dev map`, JSON-friendly report (`--json`)
+dev map ingest [paths]      # Same build; paths are reported back, the kernel decides incrementality
+dev map sync                # Same build
+dev map status              # Engine binary, store (schema, size, free pages, WAL), kernel freshness, daemon, artifacts
+dev map doctor              # Verdicts with fixes: kernel present/capable, store no newer than kernel, artifacts kernel-written, reclaim/WAL pressure
+dev map repair --pending    # Drop pending-queue entries the kernel can never index
+dev map unlock              # Free a stuck *legacy* Python query-cache lease (the kernel's lock is released on process death)
 ```
 
-### Writer-lease recovery runbook
+`--no-liveness` and `--lsp-refs` are gone: the kernel always computes liveness, and the LSP adjunct was cut with the Python engine. A flag that is accepted and ignored is worse than one that is rejected, so both are rejected.
 
-When `dev map` / `--if-stale` / verify remaps keep failing with `graph_writer_busy`, or `dev map status` shows a stalled build:
+### One writer
 
-1. **Inspect** — `dev map status` (holder pid, phase, `stalled` / `timed_out`, last progress).
-2. **Unlock** — `dev map unlock` (dead holder or stalled/timed-out). Use `dev map unlock --force` only if the holder still looks progressive but you need to reclaim the lease.
-3. **Rebuild** — `dev map` or `dev map ingest` once the lease is free.
-4. **Do not raw-kill** under contain write-gate — `kill` / `pkill` stay denied without a task lease. Prefer `dev map unlock` (lease-lifecycle allowlisted even with `task=None`).
+The kernel is the only writer of `repo_map.json` and `code_graph.json`. `dev map`, `dev map init` / `ingest` / `sync`, the verify-time and checkout-time refresh, `dev plan`, `dev init`, and MCP `devcouncil_graph_ingest` all call `refresh_map_artifacts`, which runs `devmap build` + `devmap manifest` and then layers on what the kernel does not do: goal ranking, dependency auditing, the marker-guarded agent guides (`AGENTS.md` / `CLAUDE.md`), the wiki skeletons. Before 2026-09-02 those callers ran the retired Python engine into `index.sqlite` and rewrote the map from a generation built from an old HEAD — two writers, one artifact, and the last one to run won.
 
-Freshness uses git HEAD, a tracked-file hash, and a content fingerprint so plain edits mark the map stale. Fingerprint / git errors fail closed (treat as stale). A **missing** `.devcouncil/repo_map.json` is also stale — hard rigor blocks checkout/verify until `dev map` or `dev map ingest` runs. Post-tool-use hooks and `dev map --watch` refresh incrementally; incremental extract still verifies parse-cache sha256 so a concurrent edit to an unlisted path cannot stamp a fresh fingerprint over stale symbols.
+### When a map looks wrong — for a person or an agent
+
+Every kernel run the seam launches (`build`, `manifest`, `repair`) is recorded in the project trace log (`.devcouncil/logs/traces.jsonl`, event type `devmap_run`) with its argv, exit code, duration, the kernel's notes (discovery refusals, reclaim, progress) and, on failure, a diagnosis code. A failing `dev map` prints `[code]`, the fix, and the run id. While a build runs, `.devcouncil/codeintel/devmap-build.live.json` carries its pid and latest progress line so another process can see it.
+
+1. **`dev map status`** (`--json`) — which binary will run and when it was built, the store's schema against the binary's, free-page ratio and WAL size, the kernel's own `is_fresh` / pending / quarantined counts, whether a daemon holds the socket, who wrote each artifact, whether a build is **running** (pid, stage, elapsed, seconds since its last progress line) or left a marker behind, and the **last build** with its run id.
+2. **`dev map doctor`** (`--json`) — the same facts as verdicts. Every check carries `code` (what an agent branches on), `fix` (a sentence) and `fix_command` (what it runs). Critical (exit 1): `engine_missing`, `schema_newer_than_kernel` (rebuild it: `cargo build --release -p devmap-cli`, or point `DEVMAP_BINARY` at a newer build), `foreign_writer`, `store_unreadable`. Warnings: `reclaim_pressure`, `wal_large`, `stale_map`, `pending_paths`, `stale_build_marker`, `build_stuck` (no progress for 10 min while the pid lives), `last_build_failed:<code>`.
+3. **`dev map doctor --fix`** — applies every fix a repository can apply and re-checks: clears a dead build's marker, quarantines an unreadable store (kept as `devmap.sqlite.corrupt-<stamp>`), drops stuck queue rows, and runs **one** build for everything a build resolves. It never touches a running build and never rebuilds the kernel binary; those are listed under `not_applied` with their commands.
+4. **`dev map runs [--last N] [--failed] [--json]`** — the records. The run id from a failure is the key.
+5. **`dev map abort`** — stops the build the live marker names (SIGTERM, then SIGKILL after five seconds). Safe: a generation is one transaction, so the store stays on the prior generation and the OS releases the writer lock. Refuses a pid that is not a devmap process.
+6. **`dev map --full`** — when the store should be rebuilt from nothing.
+
+The same surfaces exist over MCP: `devcouncil_graph_doctor` (`fix: true` applies), `devcouncil_graph_runs` (`limit`, `failedOnly`), and `devcouncil_graph_ingest` returns the diagnosis (`kernel_code`, `fix`, `run_id`, `stage`) alongside `engine_unavailable` when a build fails. `devcouncil_tail_trace` shows the run records among the other trace events.
+
+Failure codes a build can raise: `binary_missing`, `schema_newer_than_kernel`, `store_locked` (another writer holds the store; status shows it, `dev map abort` if it is stuck), `store_corrupt`, `store_unwritable`, `kernel_flag_unsupported` (the binary predates a flag the seam passes), `kernel_timeout` (the record carries the last progress line), `kernel_failed` (anything else, with the kernel's last lines as evidence).
+
+Freshness uses git HEAD, a tracked-file hash, and a content fingerprint so plain edits mark the map stale. Fingerprint / git errors fail closed (treat as stale). A **missing** `.devcouncil/repo_map.json` is also stale — hard rigor blocks checkout/verify until `dev map` runs. The guides a build writes are restamped into the fingerprint, so a build never makes its own map read stale. Post-tool-use hooks run `dev map --if-stale --no-wiki`; `dev map --watch` wakes on filesystem events (debounced, with a slow poll as the safety net) and checks exactly the fingerprint `--if-stale` reads.
 
 HTML visualizers: set `indexing.write_graph_html: true` in config if you want bare `dev map` to also write `graph.html`. Otherwise use `dev map graph-html` / `dev map view` (or alias `dev graph html`) for the file/symbol graph, and `dev map html` for the subsystem map.
 
@@ -124,7 +134,7 @@ dev map pdg-query --mode flows --target my_fn --variable x
 ## Query the graph
 
 ```bash
-dev map query build_code_graph     # definition + callers/callees/importers
+dev map query refresh_map_artifacts  # definition + callers/callees/importers
 dev map trace path/a.py path/b.py
 dev map dead                       # full dead-code report (uncapped)
 dev map dead --min-confidence inferred
@@ -141,60 +151,31 @@ dev map graph-html                 # write symbol graph.html
 dev map html --symbols             # same as graph-html
 dev map view                       # serve/open the HTML
 dev map export -o out.graphml      # GraphML (or --format okf)
-dev map search request_handler     # FTS5 symbol/path search
-dev map search "auth flow" --semantic  # Opt-in local embeddings (indexing.embeddings.enabled)
+dev map search request_handler     # FTS5 symbol/path search (kernel)
+dev map search "auth flow" --semantic  # Name-similarity ranking in the kernel; no embedding index
 dev map cypher 'MATCH (a)-[r:CALLS]->(b) RETURN a.id, b.id LIMIT 20'
 dev map explore request_handler    # source + semantic paths + blast radius
 dev map affected src/foo.py        # tests in the inbound impact closure
 ```
 
-## Transactional code intelligence
+## How a build works
 
-SQLite is canonical; graph v2 JSON remains a deterministic compatibility export. A refresh writes a complete generation in one transaction and advances the current-generation pointer only after every file, node, edge, liveness record, and FTS row is committed. Readers therefore see the complete previous or complete next graph. The store retains two committed generations for rollback/debugging and caches compressed source and extraction facts by content, grammar, analyzer, and configuration hashes.
+`devmap build` extracts every source file with tree-sitter (30 linked grammars; grammarless declaration languages such as `.proto` and `.ps1` get pattern-recovered symbols stamped as fallback; prose and data formats contribute a `File` node and are not counted as parse failures), resolves imports and calls across the whole tree, runs liveness and community detection, and persists one generation in a single transaction. An unchanged tree (same content hashes, same kernel) returns without writing; a changed one carries unaffected files forward and rewrites the affected closure. The store keeps two generations, prunes the extraction cache to what they reference, and reclaims free pages with an incremental vacuum followed by a WAL checkpoint — on the unchanged path too, so a quiet repository does not sit at 40% free pages.
 
-MCP starts one project watcher for its server lifespan. Queries wait up to two seconds for a pending batch without blocking the async server; if syncing cannot finish, responses retain the last committed generation and identify pending/degraded state. Full builds run in a supervised child that **acquires the per-project writer lease itself**; the parent releases any held lease while supervising so an orphaned worker still serializes against watchers/MCP writers. Lease acquisition uses bounded exponential backoff (`code_intelligence.writer_lease_timeout_seconds`, default 30s for builds / re-acquire; `writer_lease_sync_timeout_seconds`, default 5s for watch `sync_now`) so multi-watcher contention does not stamp lean/degraded maps over a healthy SQLite generation. After the child commits, the parent reloads the graph under the re-acquired lease. `dev map status` / `dev map doctor` expose phase, progress, worker PID, consumed worker CPU, and compatibility-export health (missing/drift/degraded/corrupt). `dev map doctor` reports `graph_ok` (canonical SQLite) separately from `json_export_ok` — a size-capped JSON export no longer marks an otherwise healthy graph as failed. External edits to `code_graph.json` do **not** clobber SQLite — the store wins unless the store is empty. `dev map watch` and `dev map --watch` both refresh graph **and** rebuild `repo_map.json` subsystems/dependents.
+Concurrent writers (`dev map` in two shells, a daemon drain and a build) serialise on an advisory file lock next to the store with a bounded wait; the loser fails with the holder's pid rather than a bare `database is locked`, and the lock is released by the operating system when the holder dies.
 
-### Stall detection is CPU-aware
+The daemon (`devmap serve`, started on demand by the Python client for queries) watches the tree, coalesces events, and drains pending paths into the same store. Paths it cannot process — outside the root, no longer existing, oversized, not a source file — are dropped, not retried forever; `dev map status` names any that remain quarantined and `dev map repair --pending` drops them. The daemon retires after 30 idle minutes, when its executable changes, on SIGTERM, and when its root or store disappears.
 
-Long phases (liveness tokenize, semantic enrichment, SQLite persist) can run for many minutes without advancing a phase counter. The worker therefore emits a **timer-driven heartbeat carrying its consumed CPU time** every `indexing.build_heartbeat_interval_seconds` (default 5s), independent of phase counters, and every long phase also reports incremental progress (`liveness:tokens`, `semantic`, `persist:nodes`, `persist:edges`, `persist:files`, `export:json`).
+### File inventory (Python side)
 
-The supervisor declares a stall only when phase progress **and** worker CPU are both flat past the budget, so a worker at 90%+ CPU is never killed as "hung"; a genuinely wedged (zero-CPU) worker still is. The applied budget is `max(indexing.build_stall_timeout_seconds, indexing.semantic_enrich_timeout_seconds + 30s)`, so a short stall timeout cannot expire inside the semantic budget. `indexing.build_total_timeout_seconds` (default 15 min) remains a hard ceiling. A timed-out worker's writer-lock metadata is cleared automatically, and a dead holder is reclaimed on the next acquire — recovery no longer requires a manual `dev map unlock`.
+The freshness fingerprint and the goal ranking are computed over the git inventory (`RepoMapper.get_git_files`):
 
-If a build does time out with a healthy committed generation, the map is refreshed **from that generation** rather than crashing the CLI: `dev map` prints the reason, exits non-zero, and keeps the prior graph's fingerprints so `--if-stale` correctly still reports stale.
+- `indexing.include_untracked` (default **on**) — include untracked-but-not-ignored files. **Keep this on**: a file an agent just wrote and has not staged is otherwise absent from the fingerprint, so a build after that write reads fresh.
+- `indexing.max_indexed_files` (default 50000) — hard ceiling on the inventory. Untracked paths are dropped first and the overflow is logged, never silently truncated. Generated trees (`node_modules`, `target`, `coverage`, `vendor`, `Pods`, `.next`, `.devcouncil`, binaries, archives, …) are excluded at any depth regardless.
 
-### Incremental by default
+## Rust engine (`devmap`)
 
-`dev map` with no path arguments probes the change set against the committed generation using each file's recorded size/mtime (no hashing, no re-reads):
-
-- **No changes** → the generation is reused and only the map artifacts are rewritten.
-- **Small change set** (≤500 files and ≤20% of the tree) → incremental sync.
-- **Larger, corrupt store, or `--full`** → supervised full rebuild.
-
-Incremental sync itself is deliberately conservative. Body-only edits with an unchanged declaration/import resolution surface replace the affected closure in-process. Creates, deletes, renames, or changes to symbols, bases, decorators, exports, imports, re-exports, or aliases trigger a full resolve from warm extraction caches. Persisted analysis shards are pruned to the current non-vendored code-file set before either path. Configure the boundaries with `indexing.build_isolation: hybrid`, `indexing.build_stall_timeout_seconds`, `indexing.build_total_timeout_seconds`, and `indexing.graph_json_max_bytes`.
-
-### Index size and file inventory
-
-- `indexing.store_file_contents` (default **off**) — persist compressed file bytes in `file_contents`. Path, content hash, size, and mtime are always retained; with blobs off, `content_for_path` reads the working tree. Turning this on is what grows `index.sqlite` into the gigabytes on a large repo.
-- `indexing.store_write_batch_size` (default 2000) — rows per batched persist write. Each batch also emits a progress heartbeat. The WAL is truncated after every committed generation so it cannot grow unbounded across runs.
-- `indexing.include_untracked` (default **on**) — index untracked-but-not-ignored files. **Keep this on.** Turning it off does more than hide new files: a file an agent just wrote and has not staged leaves the graph entirely, so the tracked symbols it calls lose those call edges and surface as dead/unwired candidates. Tracked-only indexing produces *false dead-code signals*, not just a smaller index. The generated-tree filter and `max_indexed_files` are the real bound on inventory size.
-- `indexing.max_indexed_files` (default 50000) — hard ceiling on the inventory. Untracked paths are dropped first and the overflow is logged, never silently truncated. Generated trees (`node_modules`, `target`, `coverage`, `vendor`, `Pods`, `.next`, binaries, archives, …) are excluded at any depth regardless.
-
-A repo-scale change set is handed to the build worker through a file, not one `--changed-path` argv entry per path (which overflowed `ARG_MAX`), and the incremental membership copy stages large exclusion sets in a temp table instead of one bind parameter per path.
-
-The 35-language grammar matrix is delivered through platform-specific
-`devcouncil-codeintel-grammars` wheels. Every pull request and push explicitly
-prefetches the required grammars into a cached build directory, builds the wheel,
-verifies every checksum, parses one fixture per grammar plus embedded Svelte/Vue/Astro/Liquid
-regions in an isolated environment, and uploads the artifact. Dispatch release builds may
-add an OIDC Sigstore signature. Runtime analysis never downloads grammars silently: the
-installed companion is activated once before parser workers start. `dev map doctor`
-reports `35/35` when the wheel is complete, otherwise it lists missing primary and embedded
-grammars and tells the user to install the matching platform wheel.
-
-## Rust engine (`devmap`) — in progress
-
-The `dev map` subsystem is being rewritten in Rust as **`devmap`**, a clean-room seven-crate
-workspace under [`rust-port/`](../rust-port/):
+The `dev map` engine is **`devmap`**, a seven-crate workspace under [`rust-port/`](../rust-port/):
 
 | Crate | Responsibility |
 | :--- | :--- |
@@ -206,17 +187,26 @@ workspace under [`rust-port/`](../rust-port/):
 | `devmap-serve` | file watcher and durable pending drain |
 | `devmap-cli` | the `devmap` binary |
 
-**The Python engine in `indexing/` and `codeintel/` is still the production path.** Nothing has
-been cut over or deleted. The Rust engine is opt-in and reached over IPC: when a `devmap serve`
-daemon is listening (default socket `/tmp/devmap.sock`), consumers route through the thin client
-in `src/devcouncil/devmap_client.py`, and every one of them falls back to Python when it is not.
-Current hybrid consumers are `dev graph`, the MCP `map` / `codeintel` handlers, and the
-`dead_symbols`, `stale_map`, and `wiring` verify checks.
+**The kernel is the production map engine; there is no Python fallback for building.** The
+Python seam is two files: `src/devcouncil/devmap_engine.py` runs `devmap build` and
+`devmap manifest` and stamps freshness, and `src/devcouncil/devmap_client.py` speaks the
+newline-framed JSON IPC to a `devmap serve` daemon (one per repository, socket derived from the
+canonical root; spawned on demand, never by a status probe, and never when `DEVMAP_AUTOSPAWN=0`)
+with a CLI fallback for every request. The kernel binary is located by one rule for both:
+`DEVMAP_BINARY` if set, else the newest capable build among `<repo>/rust-port/target/{release,debug}`,
+`<package>/rust-port/target/{release,debug}` and `PATH` — "capable" being what `manifest --help`
+advertises, because every build reports the same version string.
+
+Query surfaces that still run on the Python side (`check`, `process`, `routes`, `shape-check`,
+`api-impact`, `cypher`, `explore`, `affected`, `pdg`, the HTML visualizers) read the Python
+query cache, which `load_code_graph` fills from the kernel's `code_graph.json` after each build.
 
 ```bash
 cd rust-port && ./verify.sh
-cargo run -p devmap-cli -- --db /tmp/devmap-test.sqlite --progress always build ./testdata
-cargo run -p devmap-cli -- --db /tmp/devmap-test.sqlite search helper --budget 500
+cargo build --release -p devmap-cli
+./target/release/devmap --version                       # devmap 0.1.0 (schema N)
+./target/release/devmap --db /tmp/t.sqlite --progress always build ./testdata
+./target/release/devmap --db /tmp/t.sqlite search helper --budget 500
 ```
 
 Known limits, kept explicit rather than papered over:
@@ -257,15 +247,27 @@ Runtime edges never become timeless static facts. Every session records reposito
 | `inferred` | Only callers are themselves dead (transitive island), or methods with no inbound calls |
 | `ambiguous` | Graph-dead but token-scan or name-only refs suggest a possible false positive |
 
-Full and incremental builds enrich framework semantics before liveness. Unambiguous
-`routes_to`, `listens`, and `provides` bindings make their handler/provider target live
-even when the framework invokes it without an ordinary source-level call. Ambiguous
-name matches remain unresolved and never suppress a dead-code candidate.
-Routing, DI, and event matchers are isolated behind the framework manifest and covered
-by one fixture per advertised family. Imported aliases and bounded callback/type aliases
-may resolve a target, but multiple candidates remain ambiguous. Liveness follows the
-registration owner through the registration node to its target; a registration inside a
-dead setup function does not make a route, provider, or observer callback live.
+Framework-invoked symbols are kept live by the kernel, which resolves them during the
+build rather than in a Python enrichment pass afterwards. Two mechanisms do it. Edges:
+an unambiguous `routes_to` (kernel `EdgeKind::HandlesRoute`) or `subscribes`
+(`SubscribesTo`) makes its handler target live even though nothing calls it from source.
+Exemptions: `WiringKind` marks a symbol the runtime invokes with no observable call site
+at all — `FrameworkDecorator`, `RuntimeEntryPoint` (`func init`, `#[test]`,
+`componentDidMount`, `pytest_*`), `ScriptEntry`, `Launcher`, `ReExportPackage`,
+`StructuralExempt` (a Rust trait-impl method cannot carry `pub`, so `is_exported` says
+nothing about it) — and an exempt symbol reports the reason it was exempted, per symbol
+or per file. Ambiguous name matches stay unresolved and never suppress a dead-code
+candidate.
+
+The Python framework manifest that used to do this — `codeintel/resolution/frameworks/`,
+with its routing/DI/event matchers and one fixture per advertised family — was retired
+with `build_code_graph` on 2026-09-02. Two of its outputs have no kernel equivalent
+today and are therefore absent, not merely quiet: `provides` and `listens` edges (DI
+providers and observer registration), and the `registers` edge that let liveness follow
+a registration owner through a registration node, so that a route registered inside a
+dead setup function stayed dead. Both had already stopped being produced when the kernel
+became the sole writer; the deletion only made that visible. Restore them in the kernel,
+not in Python, if they are wanted back.
 
 Prefer `dev map dead --confidence extracted` plus file greps before deleting anything.
 Treat `inferred` as **unconfirmed**. If `entry_roots` are empty or
@@ -273,8 +275,10 @@ Treat `inferred` as **unconfirmed**. If `entry_roots` are empty or
 
 `dev map` stores a **capped** (5000) `dead_symbol_candidates` list for agents:
 **extracted ∩ token-scan** (methods excluded). `dev map dead` reports the **uncapped**
-graph tiers with reasons. Prefer reviewing `ambiguous` before deleting anything. If graph
-assemble fails, the map omits dead-symbol candidates rather than falling back to a token-only flood.
+graph tiers with reasons. Prefer reviewing `ambiguous` before deleting anything. A failed
+build leaves the prior artifacts byte-identical rather than stamping a lean map over them —
+the Python `assemble_graph` fallback that used to omit dead-symbol candidates on failure went
+with the retired builder, and the kernel fails closed in its place.
 
 Map liveness lists (`unwired_candidates`, `unreachable_files`, `dead_symbol_candidates`) are
 capped at **5000** each; `dependents[path]` is capped at **256** per file. When a list hits

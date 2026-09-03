@@ -569,72 +569,95 @@ def _structured_dead_code(
 
 
 async def handle_graph_ingest(root: Path, arguments: dict) -> list[TextContent]:
-    paths, _ = optional_string_list_argument(arguments, "paths")
-    from devcouncil.indexing.map_artifacts import refresh_map_artifacts
-    from devcouncil.codeintel import get_codeintel_service
-    from devcouncil.codeintel.build_control import GraphBuildBusy
-    from devcouncil.codeintel.sync import get_sync_coordinator
+    """Rebuild the map through the Rust kernel — the same writer `dev map` uses.
 
-    coordinator = get_sync_coordinator(root)
+    This used to run the Python engine into `index.sqlite` and rewrite
+    `repo_map.json` from it. The SessionStart hook recommends this tool as the
+    equivalent of `dev map`; it refreshed a store that `dev map query` does
+    not read and overwrote the map the kernel had just written.
+    """
+    paths, _ = optional_string_list_argument(arguments, "paths")
+    from devcouncil.devmap_engine import DevMapEngineError
+    from devcouncil.indexing.map_artifacts import refresh_map_artifacts
+
     changed = list(paths or [])
     map_path = root / ".devcouncil" / "repo_map.json"
-    if paths is None:
-        try:
-            refresh = await asyncio.to_thread(
-                refresh_map_artifacts,
-                root,
-                map_path,
-                quiet=True,
-            )
-        except GraphBuildBusy as exc:
-            from devcouncil.codeintel.build_control import writer_busy_details
-
-            return error_text(str(exc), code="graph_writer_busy", **writer_busy_details(root))
-    else:
-        try:
-            ok = await asyncio.to_thread(coordinator.sync_now, changed)
-            if not ok:
-                state = coordinator.status().as_dict()
-                return error_text(
-                    str(state.get("last_error") or state.get("degraded_reason") or "sync failed"),
-                    code="codeintel_sync_failed",
-                    **state,
-                )
-            refresh = await asyncio.to_thread(
-                refresh_map_artifacts,
-                root,
-                map_path,
-                quiet=True,
-                graph=get_codeintel_service(root).load(),
-                paths=changed,
-            )
-        except GraphBuildBusy as exc:
-            # Same structured error as the full-refresh branch — a held writer
-            # lease must not surface as an unhandled MCP exception.
-            from devcouncil.codeintel.build_control import writer_busy_details
-
-            return error_text(str(exc), code="graph_writer_busy", **writer_busy_details(root))
-    payload = {
-        # ``build_incomplete`` means the build timed out but a healthy prior
-        # generation was reused. The graph answers queries correctly for the
-        # code it covers, but it predates HEAD — an agent must not read that
-        # as a fresh ingest, so it is not ``ok``.
-        "ok": not (refresh.degraded or refresh.build_incomplete),
+    try:
+        refresh = await asyncio.to_thread(refresh_map_artifacts, root, map_path, quiet=True)
+    except DevMapEngineError as exc:
+        # `code` stays the MCP-level class; the kernel's own diagnosis rides
+        # along so the caller can branch on it and run the fix.
+        return error_text(
+            str(exc),
+            code="engine_unavailable",
+            paths=changed,
+            kernel_code=exc.code,
+            fix=exc.fix,
+            run_id=exc.run_id,
+            stage=exc.stage,
+        )
+    kernel = getattr(refresh, "kernel_status", None)
+    payload: dict[str, Any] = {
+        "ok": not refresh.degraded,
         "paths": changed,
         "generation": refresh.generation,
         "mode": refresh.mode,
         "degraded": refresh.degraded,
-        "build_incomplete": refresh.build_incomplete,
         "reason": refresh.reason,
     }
-    if refresh.build_incomplete:
-        payload["code"] = "graph_build_incomplete"
-        payload["detail"] = (
-            "Graph build did not finish; served from the last committed generation "
-            "(older than HEAD). Re-run `dev map` — see build_status for the phase "
-            "it stopped in."
-        )
+    if kernel is not None:
+        payload["node_count"] = kernel.node_count
+        payload["edge_count"] = kernel.edge_count
+        payload["kernel"] = {
+            "is_fresh": kernel.is_fresh,
+            "pending_count": kernel.pending_count,
+            "quarantined_count": kernel.quarantined_count,
+            "degraded_reason": kernel.degraded_reason,
+        }
+        if not kernel.is_fresh or kernel.degraded_reason:
+            payload["detail"] = (
+                "The kernel store is not fresh after this build: "
+                f"{kernel.degraded_reason or 'pending paths remain'}. Files it could not "
+                "index are absent from the graph; `dev map repair --pending` drops stuck entries."
+            )
     return json_text(payload)
+
+
+async def handle_graph_doctor(root: Path, arguments: dict) -> list[TextContent]:
+    """Coded checks with exact fixes; `fix: true` applies what can be applied."""
+    import asyncio
+
+    from devcouncil.devmap_health import apply_fixes, run_doctor
+
+    if bool(arguments.get("fix")):
+        result = await asyncio.to_thread(apply_fixes, root)
+        return json_text({
+            "ok": result["ok"],
+            "applied": result["applied"],
+            "not_applied": result["not_applied"],
+            "checks": result["after"]["checks"],
+            "build": result["after"]["status"]["build"],
+        })
+    result = await asyncio.to_thread(run_doctor, root)
+    return json_text({
+        "ok": result["ok"],
+        "checks": result["checks"],
+        "build": result["status"]["build"],
+        "last_build": result["status"]["last_build"],
+    })
+
+
+async def handle_graph_runs(root: Path, arguments: dict) -> list[TextContent]:
+    """Records of recent kernel runs from the project trace log."""
+    import asyncio
+
+    from devcouncil.devmap_engine import read_runs
+    from devcouncil.integrations.mcp.util import int_argument
+
+    limit = int_argument(arguments, "limit", 10, minimum=1, maximum=200)
+    failed_only = bool(arguments.get("failedOnly"))
+    runs = await asyncio.to_thread(read_runs, root, limit=limit, failed_only=failed_only)
+    return json_text({"ok": True, "runs": runs})
 
 
 async def handle_graph_cypher(root: Path, arguments: dict) -> list[TextContent]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -276,6 +277,9 @@ def test_start_daemon_reaps_child_when_readiness_times_out(
 
     process = Process()
     times = iter([0.0, 4.0])
+    # This test is *about* spawning; the suite-wide DEVMAP_AUTOSPAWN=0 must
+    # not apply here (the fake Popen never starts a real process).
+    monkeypatch.setenv("DEVMAP_AUTOSPAWN", "1")
     client = DevMapClient(tmp_path)
     monkeypatch.setattr(client, "_find_devmap_binary", lambda: "devmap")
     monkeypatch.setattr(client, "_supports_serve", lambda _binary: True)
@@ -537,7 +541,6 @@ def test_cooldown_skips_the_socket_entirely_after_a_transport_failure(
                 pass
 
             def connect(self, _p):
-                import socket as socket_module
 
                 raise OSError(errno.EIO, "simulated wedge")
 
@@ -715,7 +718,6 @@ def test_a_wedged_binary_fails_fast_after_one_bounded_probe(
     client = DevMapClient(tmp_path)
     monkeypatch.setattr(client, "_find_devmap_binary", lambda: str(hung_binary))
 
-    started = time.monotonic()
     assert client._supports_serve(str(hung_binary)) is False
     assert client._cli_unhealthy_until > time.monotonic(), (
         "a probe timeout must engage the CLI fail-fast cooldown"
@@ -730,3 +732,78 @@ def test_a_wedged_binary_fails_fast_after_one_bounded_probe(
     with pytest.raises(DevMapClientError, match="failing fast"):
         client._run_cli_command(["status"])
     assert time.monotonic() - fast_started < 1.0
+
+
+# --- socket-path parity with the kernel ---------------------------------------
+
+
+def test_fnv1a64_matches_the_published_vectors() -> None:
+    """The hash is pinned to the FNV-1a reference values so the Python and Rust
+    spellings cannot drift apart silently even on a machine without a kernel."""
+    from devcouncil.devmap_client import FNV1A64_OFFSET_BASIS, fnv1a64
+
+    assert fnv1a64(b"") == FNV1A64_OFFSET_BASIS == 0xCBF29CE484222325
+    assert fnv1a64(b"a") == 0xAF63DC4C8601EC8C
+    assert fnv1a64(b"foobar") == 0x85944171F73967E8
+
+
+def test_default_socket_path_is_a_function_of_the_canonical_root(tmp_path) -> None:
+    """Every spelling of one repository — direct, through a symlink, with a
+    trailing slash, relative — must name the same endpoint, or two daemons
+    end up reconciling the same store."""
+    from devcouncil.devmap_client import DevMapClient, default_socket_path
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(repo)
+
+    canonical = default_socket_path(repo)
+    assert canonical.endswith(os.path.join("ipc.sock"))
+    assert "/devmap-" in canonical and len(canonical.split("devmap-")[-1].split("/")[0]) == 16
+    assert default_socket_path(link) == canonical
+    assert default_socket_path(str(repo) + "/") == canonical
+    assert DevMapClient(link, autospawn=False).socket_path == canonical
+    assert default_socket_path(tmp_path / "other") != canonical
+
+
+def _kernel_prints_socket_paths() -> str | None:
+    from devcouncil.devmap_engine import DevMapEngineError, find_engine_binary
+
+    try:
+        binary = find_engine_binary()
+    except DevMapEngineError:
+        return None
+    probe = subprocess.run(
+        [binary, "serve", "--help"], capture_output=True, text=True, timeout=30, check=False
+    )
+    return binary if "--print-socket-path" in probe.stdout else None
+
+
+@pytest.mark.skipif(
+    _kernel_prints_socket_paths() is None,
+    reason="devmap kernel without `serve --print-socket-path` (rebuild it)",
+)
+def test_default_socket_path_matches_what_the_kernel_binds(tmp_path) -> None:
+    """Parity test: the kernel is the owner of the formula; the client predicts it."""
+    from devcouncil.devmap_client import default_socket_path
+
+    binary = _kernel_prints_socket_paths()
+    assert binary is not None
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(repo)
+
+    for spelling in (repo, link, Path(str(repo) + "/")):
+        printed = subprocess.run(
+            [binary, "serve", "--print-socket-path", str(spelling)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        ).stdout.strip()
+        assert printed == default_socket_path(spelling), spelling
+    # Printing must create nothing: no endpoint directory, no store.
+    assert not Path(printed).parent.exists()
+    assert not (repo / ".devcouncil").exists()

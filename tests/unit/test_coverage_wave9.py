@@ -1,4 +1,4 @@
-"""Wave-9: build_worker, graph doctor/cypher/explore/corpus/pdg, lease tip-over."""
+"""Wave-9: graph doctor/cypher/explore/corpus/pdg, lease tip-over."""
 
 from __future__ import annotations
 
@@ -12,55 +12,6 @@ from devcouncil.codeintel.sync.lease import WriterLease
 from devcouncil.indexing.graph.build import CompatibilityGraphTooLarge
 
 runner = CliRunner()
-
-
-def test_build_worker_main_healthy_and_degraded(tmp_path, monkeypatch, capsys):
-    from devcouncil.codeintel import build_worker
-
-    graph = SimpleNamespace(meta={})
-
-    def _build(root, changed_paths=None, liveness=True, progress=None):
-        if progress:
-            progress("extract", 0, 1)
-            progress("extract", 1, 1)
-        return graph
-
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.build_code_graph",
-        _build,
-    )
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.write_code_graph",
-        lambda *a, **k: None,
-    )
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "build_worker",
-            "--root",
-            str(tmp_path),
-            "--build-id",
-            "b1",
-            "--changed-path",
-            "a.py",
-        ],
-    )
-    assert build_worker.main() == 0
-    out = capsys.readouterr().out
-    assert "complete" in out
-    assert "healthy" in out or '"compatibility_export":"healthy"' in out
-
-    def _boom(*a, **k):
-        raise CompatibilityGraphTooLarge("too big")
-
-    monkeypatch.setattr("devcouncil.indexing.graph.build.write_code_graph", _boom)
-    monkeypatch.setattr(
-        "sys.argv",
-        ["build_worker", "--root", str(tmp_path), "--build-id", "b2", "--no-liveness"],
-    )
-    assert build_worker.main() == 0
-    out2 = capsys.readouterr().out
-    assert "degraded" in out2
 
 
 def test_writer_lease_busy_and_context(tmp_path, monkeypatch):
@@ -102,22 +53,15 @@ def test_graph_doctor_cypher_explore_affected_corpus(tmp_path, monkeypatch):
 
     initialize_project(tmp_path, quiet=True, with_map=False, with_skills=False)
 
-    # Doctor audits the compatibility-export handshake for committed stores;
-    # an uninitialized store with installed grammars reports healthy.
+    # Doctor audits the kernel: a usable binary with no store yet is healthy.
     monkeypatch.setattr(
-        "devcouncil.codeintel.get_codeintel_service",
-        lambda root: SimpleNamespace(
-            status=lambda: {"state": "uninitialized", "schema_version": 1}
-        ),
-    )
-    monkeypatch.setattr(
-        "devcouncil.codeintel.languages.grammar_status",
-        lambda: {
-            "ok": True,
-            "available_count": 35,
-            "required_count": 35,
-            "languages": [],
-            "action": "",
+        "devcouncil.devmap_health.engine_info",
+        lambda root: {
+            "binary": "/opt/devmap",
+            "built_at": "2026-09-02T16:51:00",
+            "version": "devmap 0.1.0 (schema 12)",
+            "schema_version": 12,
+            "error": None,
         },
     )
     ok = runner.invoke(app, ["map", "doctor", "--json", "--project-root", str(tmp_path)])
@@ -369,14 +313,6 @@ def test_graph_status_json_and_hooks_refuse(tmp_path, monkeypatch):
         "devcouncil.codeintel.get_codeintel_service",
         lambda root: SimpleNamespace(
             status=lambda: {"state": "ready", "generation": 1, "node_count": 1, "edge_count": 1}
-        ),
-    )
-    monkeypatch.setattr(
-        "devcouncil.codeintel.sync.get_sync_coordinator",
-        lambda root: SimpleNamespace(
-            status=lambda: SimpleNamespace(
-                as_dict=lambda: {"state": "idle", "backend": None, "pending": []}
-            )
         ),
     )
     js = runner.invoke(app, ["map", "status", "--json", "--project-root", str(tmp_path)])

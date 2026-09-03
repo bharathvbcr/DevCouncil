@@ -6,6 +6,7 @@ import subprocess
 
 from devcouncil.indexing.repo_mapper import RepoMapper
 
+from tests.unit.support_maps import dependents_view
 
 def _git(root, *args):
     subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True)
@@ -33,7 +34,7 @@ def test_barrel_export_star_followed(tmp_path):
         "src/app.ts": "import { Model } from './index';\n",
     })
     _commit(tmp_path)
-    repo_map = RepoMapper(tmp_path).map_repo()
+    repo_map = dependents_view(tmp_path)
     deps = repo_map.dependents
     assert "src/app.ts" in deps.get("src/index.ts", [])
     assert "src/app.ts" in deps.get("src/models.ts", [])
@@ -47,7 +48,7 @@ def test_barrel_named_reexport_followed(tmp_path):
         "src/consumer.ts": "import { helper } from './barrel';\n",
     })
     _commit(tmp_path)
-    repo_map = RepoMapper(tmp_path).map_repo()
+    repo_map = dependents_view(tmp_path)
     assert "src/consumer.ts" in repo_map.dependents.get("src/util.ts", [])
 
 
@@ -69,7 +70,7 @@ def test_tsconfig_extends_merges_paths(tmp_path):
         ),
     })
     _commit(tmp_path)
-    repo_map = RepoMapper(tmp_path).map_repo()
+    repo_map = dependents_view(tmp_path)
     assert "src/app.ts" in repo_map.dependents.get("src/models.ts", [])
     assert "src/app.ts" in repo_map.dependents.get("lib/core.ts", [])
 
@@ -87,7 +88,7 @@ def test_tsconfig_project_references_merge_paths(tmp_path):
         "packages/ui/src/app.ts": "import { Button } from '@ui/Button';\n",
     })
     _commit(tmp_path)
-    repo_map = RepoMapper(tmp_path).map_repo()
+    repo_map = dependents_view(tmp_path)
     assert "packages/ui/src/app.ts" in repo_map.dependents.get(
         "packages/ui/src/Button.ts", []
     )
@@ -128,11 +129,3 @@ def test_nested_tsconfig_without_root_references(tmp_path):
     assert ("apps/desktop/src/App.ts", "apps/desktop/src/components/Button.ts") in edges
 
 
-def test_graph_ts_named_export_list_marks_exported():
-    from devcouncil.indexing.graph.extract_ts import extract_ts_js
-    ext = extract_ts_js(
-        "src/x.ts",
-        "function helper() { return 1 }\nexport { helper }\n",
-    )
-    sym = next(s for s in ext.symbols if s.qualname == "helper")
-    assert sym.exported is True

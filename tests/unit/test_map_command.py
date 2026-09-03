@@ -296,15 +296,15 @@ def test_watch_map_rebuilds_when_the_fingerprint_moves(tmp_path, monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(engine, "build_map", lambda r, **_k: calls.append("built"))
     monkeypatch.setattr(map_cmd.RepoMapper, "map_is_stale", lambda self, data: True)
+    # No observer: the loop must poll and still rebuild on stale evidence.
+    monkeypatch.setattr(map_cmd, "_start_change_observer", lambda root, changed: None)
 
-    real_sleep = time.sleep
-
-    def _stop_after_one(_seconds):
-        real_sleep(0)
+    def _stop_after_one(_changed, _timeout):
         if calls:
             raise KeyboardInterrupt
+        return False
 
-    monkeypatch.setattr(time, "sleep", _stop_after_one)
+    monkeypatch.setattr(map_cmd, "_wait_for_change", _stop_after_one)
     map_cmd._watch_map(root)
     assert calls == ["built"], "a stale fingerprint must trigger exactly one rebuild"
 
@@ -330,17 +330,51 @@ def test_watch_map_reports_a_failed_rebuild_and_keeps_watching(tmp_path, monkeyp
 
     monkeypatch.setattr(engine, "build_map", _always_fails)
     monkeypatch.setattr(map_cmd.RepoMapper, "map_is_stale", lambda self, data: True)
+    monkeypatch.setattr(map_cmd, "_start_change_observer", lambda root, changed: None)
 
-    real_sleep = time.sleep
-
-    def _stop_after_two(_seconds):
-        real_sleep(0)
+    def _stop_after_two(_changed, _timeout):
         if len(attempts) >= 2:
             raise KeyboardInterrupt
+        return False
 
-    monkeypatch.setattr(time, "sleep", _stop_after_two)
+    monkeypatch.setattr(map_cmd, "_wait_for_change", _stop_after_two)
     map_cmd._watch_map(root)
     assert len(attempts) >= 2, "a failed rebuild must not end the watch"
+
+
+def test_watch_map_wakes_on_a_filesystem_event_not_a_timer(tmp_path, monkeypatch):
+    """The old loop polled `map_is_stale` every two seconds — three git
+    subprocesses and two stats per file, ~90 ms/tick here, seconds/tick at
+    70k files. A write must wake the loop long before the slow poll fires."""
+    import threading
+
+    import devcouncil.devmap_engine as engine
+
+    root = tmp_path.resolve()
+    (root / ".devcouncil").mkdir(parents=True, exist_ok=True)
+    (root / ".devcouncil" / "repo_map.json").write_text('{"files": []}', encoding="utf-8")
+
+    built = threading.Event()
+
+    def _build(_root, **_kwargs):
+        built.set()
+        raise KeyboardInterrupt  # end the watch from inside the rebuild
+
+    monkeypatch.setattr(engine, "build_map", _build)
+    monkeypatch.setattr(map_cmd.RepoMapper, "map_is_stale", lambda self, data: True)
+    # A poll interval far longer than the test: only an event can wake the loop.
+    monkeypatch.setattr(map_cmd, "WATCH_POLL_INTERVAL_SECONDS", 600.0)
+    monkeypatch.setattr(map_cmd, "WATCH_DEBOUNCE_SECONDS", 0.05)
+
+    def _write_later() -> None:
+        time.sleep(0.6)
+        (root / "k.py").write_text("x = 1\n", encoding="utf-8")
+
+    threading.Thread(target=_write_later, daemon=True).start()
+    started = time.monotonic()
+    map_cmd._watch_map(root)
+    assert built.is_set()
+    assert time.monotonic() - started < 30.0, "the rebuild waited for the poll, not the event"
 
 
 def test_map_watch_flag_invokes_watch_map(tmp_path, monkeypatch):

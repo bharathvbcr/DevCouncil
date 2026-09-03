@@ -333,7 +333,6 @@ def test_emit_additional_context_and_system_message(capsys):
     assert payload["hookSpecificOutput"]["systemMessage"] == "toast"
 
 
-
 def test_session_start_context_compact_branch(tmp_path, monkeypatch):
     from devcouncil.cli.commands import hook as hook_cmd
 
@@ -396,38 +395,6 @@ def test_emit_decision_gemini_warn(capsys):
 
 
 # --- build.py -------------------------------------------------------------------
-
-
-def test_build_graph_path_and_fingerprints(tmp_path):
-    from devcouncil.indexing.graph import build as graph_build
-
-    assert graph_build.graph_path(tmp_path) == tmp_path / ".devcouncil" / "graph" / "code_graph.json"
-
-    rel = "src/a.py"
-    path = tmp_path / rel
-    path.parent.mkdir(parents=True)
-    path.write_text("x = 1\n", encoding="utf-8")
-    fp = graph_build.content_fingerprint(tmp_path, [rel])
-    assert len(fp) == 40
-
-    path.write_text("x = 2\n", encoding="utf-8")
-    assert graph_build.content_fingerprint(tmp_path, [rel]) != fp
-
-    assert graph_build._files_fingerprint(["b.py", "a.py"]) == graph_build._files_fingerprint(["a.py", "b.py"])
-
-
-def test_build_code_files_filters_vendored(tmp_path):
-    from devcouncil.indexing.graph import build as graph_build
-
-    files = [
-        "src/app.py",
-        "vendor/lib.py",
-        "node_modules/pkg/index.js",
-        "README.md",
-    ]
-    out = graph_build._code_files(files)
-    assert "src/app.py" in out
-    assert "README.md" not in out
 
 
 def test_build_graph_json_indent_honors_config(tmp_path, monkeypatch):
@@ -730,22 +697,6 @@ def test_system_message_and_merge_branches():
         claim_results=[], blocking_gaps=3, decision="block", notify_on_pass=False
     )
     assert msg2 and "blocked" in msg2
-
-
-def test_build_more_helpers(tmp_path, monkeypatch):
-    from devcouncil.indexing.graph import build as build_mod
-
-    assert build_mod.graph_path(tmp_path).name.endswith("json") or "graph" in str(
-        build_mod.graph_path(tmp_path)
-    )
-    files = ["a.py", "b.ts", "vendor/x.py", "node_modules/y.js", "readme.md"]
-    code = build_mod._code_files(files)
-    assert "a.py" in code and "b.ts" in code
-    assert "readme.md" not in code
-
-    (tmp_path / "a.py").write_text("x=1\n", encoding="utf-8")
-    fp = build_mod.content_fingerprint(tmp_path, ["a.py"])
-    assert isinstance(fp, str) and len(fp) > 8
 
 
 # --- wave6 additions (also in test_coverage_wave6.py when scope allows) --------

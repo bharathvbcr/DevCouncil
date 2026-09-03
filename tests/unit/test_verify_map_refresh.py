@@ -10,6 +10,7 @@ from devcouncil.domain.task import Task
 from devcouncil.indexing.repo_mapper import RepoMapper
 from devcouncil.verification.verifier import Verifier
 
+from tests.unit.support_maps import stamped_repo_map
 
 def _git(root, *args):
     subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True)
@@ -24,7 +25,7 @@ def test_verify_refreshes_stale_map_before_gates(tmp_path, monkeypatch):
 
     map_path = tmp_path / ".devcouncil" / "repo_map.json"
     map_path.parent.mkdir(parents=True, exist_ok=True)
-    stale = RepoMapper(tmp_path).map_repo(liveness=False).model_dump()
+    stale = stamped_repo_map(tmp_path).model_dump()
     stale["generated_head"] = "deadbeef"
     stale["indexed_hash"] = "oldhash"
     map_path.write_text(json.dumps(stale), encoding="utf-8")

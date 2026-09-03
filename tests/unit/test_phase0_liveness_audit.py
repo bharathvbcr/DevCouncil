@@ -63,23 +63,6 @@ def test_strip_js_comments_preserves_newlines_in_blocks():
     assert "export function f" in cleaned.splitlines()[3]
 
 
-def test_comment_strip_does_not_skew_dead_symbol_detection(tmp_path):
-    """Leading comments must not falsely clear a dead symbol via line skew."""
-    _write(tmp_path, {
-        "pkg/__init__.py": "",
-        "pkg/mod.py": (
-            "# header comment\n"
-            "# another header\n"
-            "def never_called():\n"
-            "    return 1\n"
-        ),
-    })
-    _commit(tmp_path)
-    repo_map = RepoMapper(tmp_path).map_repo()
-    joined = " ".join(repo_map.dead_symbol_candidates)
-    assert "never_called" in joined
-
-
 def test_entry_roots_exclude_structural_exemptions(tmp_path):
     _write(tmp_path, {
         "pyproject.toml": (
@@ -104,24 +87,6 @@ def test_entry_roots_exclude_structural_exemptions(tmp_path):
     assert "benchmarks/bench_foo.py" not in roots
     assert "app/dashboard/page.tsx" not in roots
     assert "migrations/001_init.py" not in roots
-
-
-def test_entry_roots_not_capped_in_map(tmp_path):
-    """Debt lists are capped; entry_roots must keep every config/convention seed."""
-    scripts = "\n".join(f'cli{i} = "pkg.cli{i}:main"' for i in range(220))
-    files = {
-        "pyproject.toml": (
-            f"[project]\nname = \"x\"\nversion = \"0\"\n[project.scripts]\n{scripts}\n"
-        ),
-        "pkg/__init__.py": "",
-    }
-    for i in range(220):
-        files[f"pkg/cli{i}.py"] = "def main():\n    pass\n"
-    _write(tmp_path, files)
-    _commit(tmp_path)
-    repo_map = RepoMapper(tmp_path).map_repo()
-    assert len(repo_map.entry_roots) >= 220
-    assert len(repo_map.unwired_candidates) <= RepoMapper(tmp_path)._LIVENESS_CAP
 
 
 def test_short_stem_does_not_overmatch(tmp_path):

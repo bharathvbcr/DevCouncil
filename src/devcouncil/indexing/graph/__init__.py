@@ -1,16 +1,19 @@
 """Symbol-level code knowledge graph for DevCouncil repo mapping.
 
-Public entry points: :func:`build_code_graph`, :func:`refresh_map_for_paths`,
-:func:`load_code_graph`, :func:`query_symbol`, :func:`trace_path`, plus
-graph intelligence (:func:`enrich_graph_intel`, :func:`diff_impact`, …).
+Public entry points: :func:`load_code_graph`, :func:`write_code_graph`,
+:func:`query_symbol`, :func:`trace_path`, plus graph intelligence
+(:func:`enrich_graph_intel`, :func:`diff_impact`, …).
+
+Neither building the graph nor refreshing the artifacts is one of them. The Rust
+kernel extracts and resolves the graph and writes both ``.devcouncil/repo_map.json``
+and ``.devcouncil/graph/code_graph.json``, through
+:func:`devcouncil.indexing.map_artifacts.refresh_map_artifacts`.
 """
 
 from __future__ import annotations
 
 from devcouncil.indexing.graph.build import (
-    build_code_graph,
     load_code_graph,
-    refresh_map_for_paths,
     write_code_graph,
 )
 from devcouncil.indexing.graph.export import (
@@ -49,7 +52,6 @@ __all__ = [
     "GraphNode",
     "NodeKind",
     "blast_radius",
-    "build_code_graph",
     "build_code_graph_okf",
     "circular_imports",
     "compute_communities",
@@ -62,7 +64,6 @@ __all__ = [
     "graph_check",
     "load_code_graph",
     "query_symbol",
-    "refresh_map_for_paths",
     "trace_path",
     "write_code_graph",
     "write_code_graph_okf",
