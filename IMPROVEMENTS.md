@@ -843,17 +843,33 @@ coherent again:
   no callees, which is a wording bug that reads as a data-loss bug. Subsystem granularity
   also changed (14 whole-repo areas against the old per-package split under
   `src/devcouncil/`); that is the kernel's design, not a gap.
-- **One config knob lost its reader and was deliberately left in place.**
-  `IndexingConfig.repo_map_dependents_cap` (`app/config.py:384`) had exactly one reader,
-  `repo_mapper.py:153`, which went with `build_dependents`. `dev map` still writes
-  `dependents`; the kernel writes it now, and does not read this cap — so the knob is
-  validated and then ignored, which this codebase elsewhere calls out as worse than
-  rejecting it. It stays anyway: it is asserted on by `tests/benchmarks/test_map_caps.py`,
-  and its bounds are an acceptance-criterion surface (`_attach_repo_map_unwired_cap_bounds`,
-  AC-2.1). The fix is to plumb it to the kernel, not to delete it. Noted here rather than
-  done, because plumbing a cap into the Rust writer is a feature, not a retirement.
-  `repo_map_unwired_cap` beside it has no reader either and did not before this pass —
-  pre-existing, recorded, untouched.
+- **Two config knobs with no reader are gone, and a removed key no longer goes quiet.**
+  `IndexingConfig.repo_map_dependents_cap` had exactly one reader, `repo_mapper.py:153`,
+  which went with `build_dependents`; the kernel writes `dependents` now and does not read
+  the cap. `repo_map_unwired_cap` beside it had no reader at all, and none at `HEAD` either
+  — `unwired_candidates` has always been bounded by `repo_map_liveness_cap`. Both were
+  validated and then ignored, which is what this codebase already refuses for CLI flags
+  (`docs/code-graph.md`: "a flag that is accepted and ignored is worse than one that is
+  rejected").
+  The first pass left them, on the reasoning that their bounds were an acceptance-criterion
+  surface. That reasoning was wrong and checking it was cheap: **AC-2.1** reads *"the
+  repo_mapper.py file has configurable upper bounds for map size that are significantly
+  higher than current limits"* — it names no field, it is satisfied by
+  `repo_map_liveness_cap`, which is read, and it exists only in a July 2026 plan run under
+  `.devcouncil/runs/`, not in the live ledger. The only thing tying it to
+  `repo_map_unwired_cap` was one agent's interpretation, preserved in two leftover scratch
+  scripts (`tests/unit/_patch_unwired_cap.py`, which *edits* `config.py` through a lease
+  token, and `_patch_coverage_omit.py`, which asserts the field's bounds and prints
+  "AC-2.1 pass"). Both scripts went with the fields, as did
+  `_attach_repo_map_unwired_cap_bounds`, ~40 lines of pydantic-v2 `FieldInfo` surgery whose
+  entire purpose was to make `hasattr(IndexingConfig, "repo_map_unwired_cap")` true for
+  that check.
+  Removing a key is only half the job, because these models take pydantic's default
+  `extra="ignore"`: a config still setting `repo_map_dependents_cap` would have gone from
+  validated-and-ignored to silently dropped, which is the same defect one layer down. So
+  `load_config` now warns through `RETIRED_CONFIG_KEYS`, beside the existing
+  `_migrate_verify_on_post_task` seam — a named home for every future removal rather than a
+  one-off. Pinned by `test_a_config_that_still_sets_a_retired_cap_is_told_so`.
 - **Total: 6,786 lines out of `src/`** — 4,259 in deleted files, 2,527 trimmed from
   `repo_mapper.py` (3,178 → 2,219), `liveness.py` (1,124 → 226), `build.py` (941 → 523) and
   `cache.py` (329 → 77).

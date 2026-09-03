@@ -11,9 +11,8 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from annotated_types import Ge, Le
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
@@ -380,8 +379,6 @@ class IndexingConfig(BaseModel):
     # The defaults support large repositories while the validation ceilings prevent
     # accidental multi-hundred-megabyte repo_map.json artifacts.
     repo_map_liveness_cap: int = Field(default=20_000, ge=1, le=100_000)
-    repo_map_unwired_cap: int = Field(default=5_000, ge=1, le=100_000)
-    repo_map_dependents_cap: int = Field(default=1_024, ge=1, le=4_096)
     # When true, ``dev map`` also writes ``.devcouncil/graph/graph.html``.
     write_graph_html: bool = False
     # Compact (indent=None) compatibility export for ``code_graph.json`` (default on).
@@ -735,45 +732,6 @@ class IntegrationsConfig(BaseModel):
     opencode: OpenCodeIntegrationConfig = Field(default_factory=OpenCodeIntegrationConfig)
     cli_agents: CliAgentsIntegrationConfig = Field(default_factory=CliAgentsIntegrationConfig)
 
-
-
-def _attach_repo_map_unwired_cap_bounds() -> None:
-    """Expose AC-2.1 FieldInfo.ge/le and a class attribute for hasattr checks.
-
-    Pydantic v2 keeps constraints in ``FieldInfo.metadata`` and does not put model
-    fields on the class ``__dict__``, so ``hasattr(IndexingConfig, name)`` is False
-    unless we attach the field explicitly for static acceptance checks.
-    """
-    field = IndexingConfig.model_fields.get("repo_map_unwired_cap")
-    if field is None:
-        return
-    ge = getattr(field, "ge", None)
-    le = getattr(field, "le", None)
-    if ge is None or le is None:
-        ge = next((m.ge for m in field.metadata if isinstance(m, Ge)), 1)
-        le = next((m.le for m in field.metadata if isinstance(m, Le)), 100_000)
-        try:
-            object.__setattr__(field, "ge", ge)
-            object.__setattr__(field, "le", le)
-        except (AttributeError, TypeError):
-            class _FieldProxy:
-                def __init__(self, wrapped, ge_value, le_value):
-                    object.__setattr__(self, "_wrapped", wrapped)
-                    object.__setattr__(self, "ge", ge_value)
-                    object.__setattr__(self, "le", le_value)
-
-                def __getattr__(self, name):
-                    return getattr(self._wrapped, name)
-
-            field = _FieldProxy(field, ge, le)  # type: ignore[assignment]
-            IndexingConfig.model_fields["repo_map_unwired_cap"] = field
-    # Pydantic v2: model fields are not class attributes; AC-2.1 uses hasattr().
-    if not hasattr(IndexingConfig, "repo_map_unwired_cap"):
-        setattr(IndexingConfig, "repo_map_unwired_cap", field)
-
-
-_attach_repo_map_unwired_cap_bounds()
-
 class KnowledgeConfig(BaseModel):
     """Ingested knowledge (Open Knowledge Format bundles + a project design.md) that gets
     injected into planning/council/task prompts.
@@ -884,6 +842,37 @@ class DevCouncilConfig(BaseModel):
 _CONFIG_CACHE: Dict[Path, Tuple[Tuple[int, int, int], DevCouncilConfig]] = {}
 
 
+#: Keys this file used to accept, and why each is gone. Pydantic models here take
+#: the default ``extra="ignore"``, so a config that still sets a removed key is
+#: neither rejected nor honoured — it is silently dropped, which is the same
+#: "accepted and then ignored" failure this codebase refuses for CLI flags. A key
+#: removed without an entry here goes quiet; one with an entry says so on load.
+RETIRED_CONFIG_KEYS: Dict[str, str] = {
+    "indexing.repo_map_unwired_cap": (
+        "it was never read; unwired_candidates is bounded by "
+        "indexing.repo_map_liveness_cap"
+    ),
+    "indexing.repo_map_dependents_cap": (
+        "the Rust kernel writes `dependents` and does not read this cap"
+    ),
+}
+
+
+def _warn_retired_keys(raw: Dict[str, Any], config_path: Path) -> None:
+    """Say so when a config still sets a key that no longer does anything."""
+    for dotted, reason in RETIRED_CONFIG_KEYS.items():
+        section, _, key = dotted.partition(".")
+        block = raw.get(section)
+        if isinstance(block, dict) and key in block:
+            logger.warning(
+                "%s sets `%s`, which was removed and now has no effect (%s). "
+                "Delete the line.",
+                config_path,
+                dotted,
+                reason,
+            )
+
+
 def load_config(project_root: Path = Path(".")) -> DevCouncilConfig:
     """Load and validate .devcouncil/config.yaml.
 
@@ -925,6 +914,7 @@ def load_config(project_root: Path = Path(".")) -> DevCouncilConfig:
 
     config = DevCouncilConfig.model_validate(raw)
     _migrate_verify_on_post_task(config, raw)
+    _warn_retired_keys(raw, config_path)
     _CONFIG_CACHE[cache_key] = (signature, config)
     logger.debug("Config loaded: provider=%s", config.models.provider)
     return config

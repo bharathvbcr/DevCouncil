@@ -67,8 +67,9 @@ def are_neighbors(area_a: str | None, area_b: str | None, data: Mapping | None) 
 def dependents_of(path: str, data: Mapping | None) -> list[str]:
     """Files that import ``path`` (reverse-import blast radius), from the map.
 
-    The list may be truncated by the mapper's ``_DEPENDENTS_MAX``; see
-    :func:`dependents_total_of` for the full importer count when truncated.
+    The list may be truncated by whichever writer produced the map — the Rust kernel
+    since the Python engine's retirement; see :func:`dependents_total_of` for the full
+    importer count when truncated.
     """
     dependents = (data or {}).get("dependents") or {}
     if not isinstance(dependents, dict):
