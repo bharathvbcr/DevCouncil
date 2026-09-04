@@ -161,8 +161,9 @@ def write_agent_guides(repo_root: Path, repo_map_path: Path, repo_map: RepoMap) 
             if AGENT_GUIDE_MARKER not in existing:
                 continue
         text = agent_guide_text(repo_map_path, repo_root, repo_map) + "\n"
-        # Skip rewrite when unchanged so content_fingerprint (size+mtime) stays stable
-        # across consecutive identical `dev map` runs.
+        # Skip the rewrite when the text is unchanged. content_fingerprint hashes
+        # bytes now, so an identical rewrite no longer moves it, but writing a file
+        # for no reason still churns mtime for every other watcher.
         if existing == text:
             continue
         path.write_text(text, encoding="utf-8")

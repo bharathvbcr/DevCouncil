@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Set
 
 from devcouncil.indexing.graph.schema import CodeGraph
-from devcouncil.utils.json_persist import read_json
+from devcouncil.utils.fsio import atomic_write_text
+from devcouncil.utils.json_persist import dump_json, read_json
 
 logger = logging.getLogger(__name__)
 
@@ -35,16 +36,114 @@ def graph_path(root: Path) -> Path:
     return root / GRAPH_REL
 
 
+# Bumped whenever the digest algorithm changes: a fingerprint stamped under an
+# older scheme must never compare equal to one computed under a newer one, so
+# an upgrade reads stale exactly once and then rebuilds.
+_CONTENT_SCHEME = "c2"
+_HASH_CHUNK = 1 << 20
+_CONTENT_CACHE_REL = Path(".devcouncil") / "cache" / "content_hashes.json"
+
+
+def _content_cache_path(root: Path) -> Path:
+    return root / _CONTENT_CACHE_REL
+
+
+def _stat_key(st: os.stat_result) -> str:
+    """Cheap identity for a file's bytes, used only to reuse a cached digest.
+
+    ``ctime_ns`` is what makes this safe. It is the inode-change time, and
+    unlike ``mtime_ns`` it cannot be back-dated by ``os.utime``, ``cp -p``,
+    ``rsync --times`` or tar extraction, so a rewrite that restores the old
+    mtime still moves ctime and can never present the key of the content it
+    replaced.
+    """
+    return f"{st.st_size}:{st.st_mtime_ns}:{st.st_ctime_ns}"
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.blake2b(digest_size=16)
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(_HASH_CHUNK)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_content_cache(root: Path) -> Dict[str, List[str]]:
+    """Advisory only: an absent, unreadable or foreign-scheme cache is a rehash."""
+    try:
+        raw = read_json(_content_cache_path(root))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict) or raw.get("scheme") != _CONTENT_SCHEME:
+        return {}
+    entries = raw.get("entries")
+    return entries if isinstance(entries, dict) else {}
+
+
+def _save_content_cache(root: Path, entries: Dict[str, List[str]]) -> None:
+    try:
+        path = _content_cache_path(root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(
+            path, dump_json({"scheme": _CONTENT_SCHEME, "entries": entries}) + "\n"
+        )
+    except OSError:
+        # A cache we cannot persist costs time on the next call, never accuracy.
+        logger.debug("content-hash cache not written under %s", root, exc_info=True)
+
+
 def content_fingerprint(root: Path, files: List[str]) -> str:
-    """sha1 over sorted ``(path, size, mtime_ns)`` so content edits mark staleness."""
+    """sha1 over sorted ``(path, digest-of-bytes)`` — identical bytes fingerprint
+    identically, however many times they were rewritten.
+
+    This hashed ``(path, size, mtime_ns)`` until 2026-09-04, which answered a
+    different question than the one every caller asks, and was wrong in both
+    directions. A formatter, a branch checkout, or any byte-identical rewrite
+    moved mtime and marked a current map stale; an edit that happened to
+    preserve size and mtime marked a changed tree fresh. In a repository whose
+    files are rewritten by hooks and build workers the first case fired
+    constantly, so ``repo map stale`` was on permanently and stopped carrying
+    information — the reason it was ignored.
+
+    Hashing a 4.3k-file tree costs ~3s, too slow for a per-prompt hook, so
+    digests are memoised in ``.devcouncil/cache/content_hashes.json`` behind a
+    ``(size, mtime_ns, ctime_ns)`` key and the unchanged path stays a bare
+    stat. The cache is advisory: losing it costs time, never correctness. The
+    cache lives under ``.devcouncil``, which ``_is_runtime_or_generated_file``
+    excludes from the inventory, so it can never fingerprint itself.
+    """
+    cache = _load_content_cache(root)
+    entries: Dict[str, List[str]] = {}
     lines: List[str] = []
+    recomputed = False
     for rel in sorted(files):
+        path = root / rel
         try:
-            st = (root / rel).stat()
-            lines.append(f"{rel}\0{st.st_size}\0{st.st_mtime_ns}")
+            st = path.stat()
         except OSError:
-            lines.append(f"{rel}\0-1\0-1")
-    return hashlib.sha1("\n".join(lines).encode("utf-8")).hexdigest()
+            # Distinct from every real digest, and stable while it stays gone.
+            lines.append(f"{rel}\0-")
+            continue
+        key = _stat_key(st)
+        cached = cache.get(rel)
+        if isinstance(cached, list) and len(cached) == 2 and cached[0] == key:
+            digest = str(cached[1])
+        else:
+            try:
+                digest = _file_digest(path)
+            except OSError:
+                lines.append(f"{rel}\0-")
+                continue
+            recomputed = True
+        entries[rel] = [key, digest]
+        lines.append(f"{rel}\0{digest}")
+    if recomputed or entries.keys() != cache.keys():
+        _save_content_cache(root, entries)
+    body = hashlib.sha1("\n".join(lines).encode("utf-8")).hexdigest()
+    return f"{_CONTENT_SCHEME}:{body}"
 
 
 

@@ -82,8 +82,6 @@ def test_freshness_is_stamped_and_actually_detects_change(tmp_path):
     unstamped map reads permanently stale and `--if-stale` never short-circuits.
     Both directions are asserted; the second is the one that matters.
     """
-    import time
-
     from devcouncil.indexing.repo_mapper import RepoMapper
 
     root = _git_repo(tmp_path)
@@ -96,7 +94,9 @@ def test_freshness_is_stamped_and_actually_detects_change(tmp_path):
     mapper = RepoMapper(project_root=root)
     assert mapper.map_is_stale(payload) is False, "a just-built map must read fresh"
 
-    time.sleep(1.1)  # content_fingerprint carries mtime_ns; force a distinct stat
+    # No sleep: content_fingerprint hashes bytes, not mtime, so a changed file is
+    # detected immediately. Under the old scheme this needed 1.1s to outrun stat
+    # granularity — which was the tell that it was timing edits, not reading them.
     (root / "k.py").write_text("def helper(a): return a + 1\ndef main(): return helper(1)\n")
     assert mapper.map_is_stale(payload) is True, "an edited file must read stale"
 

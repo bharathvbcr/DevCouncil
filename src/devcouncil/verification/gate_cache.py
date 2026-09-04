@@ -119,20 +119,24 @@ class GateResultCache:
             return _ABSENT
 
     def _config_fingerprint(self) -> str:
-        """Hash mtime+size of known project config files that affect gate behavior."""
+        """Hash the *bytes* of known project config files that affect gate behavior.
+
+        This hashed ``mtime+size`` until 2026-09-04, which quietly broke the
+        promise ``is_green`` makes to its caller. Gate *inputs* have always been
+        compared by content via ``_file_hash``; config files were compared by
+        timestamp, so a config edit that left size and mtime intact (``cp -p``,
+        ``rsync --times``, a restored backup, a checkout tool that preserves
+        times) kept a gate's green mark and skipped verification on inputs
+        nobody had checked. It also fired the harmless way round: ``touch
+        pyproject.toml`` invalidated every cached gate.
+
+        There are nine such files, so hashing bytes costs nothing measurable.
+        """
         digest = hashlib.sha256()
         for name in _CONFIG_FILES:
-            fp = self.project_root / name
             digest.update(name.encode("utf-8"))
             digest.update(b"=")
-            try:
-                if not fp.is_file():
-                    digest.update(_ABSENT.encode("utf-8"))
-                else:
-                    stat = fp.stat()
-                    digest.update(f"{stat.st_mtime_ns}:{stat.st_size}".encode("utf-8"))
-            except OSError:
-                digest.update(_ABSENT.encode("utf-8"))
+            digest.update(self._file_hash(name).encode("utf-8"))
             digest.update(b"\0")
         return digest.hexdigest()
 

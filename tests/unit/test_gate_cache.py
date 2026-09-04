@@ -92,3 +92,56 @@ def test_config_change_invalidates_green_gate(tmp_path):
 
     (tmp_path / "pyproject.toml").write_text("[project]\nname = 'y'\n", encoding="utf-8")
     assert cache.is_green(gate) is False
+
+
+def test_config_edit_that_preserves_size_and_mtime_still_invalidates(tmp_path):
+    """`is_green` promises "byte-identical inputs". Config files used to be
+    compared by mtime+size while gate inputs were compared by content, so an
+    edit that restored the timestamp (`cp -p`, `rsync --times`, a restored
+    backup) kept the green mark and skipped verification on unchecked config.
+    """
+    import os
+
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    config = tmp_path / "pyproject.toml"
+    config.write_text('[tool.ruff]\nline-length = 88\n', encoding="utf-8")
+
+    cache = GateResultCache(tmp_path)
+    gate = _gate()
+    cache.record(gate, passed=True, summary="ok")
+    assert cache.is_green(gate) is True
+
+    before = config.stat()
+    # Same byte count, different rules; then hide the edit behind the old mtime.
+    config.write_text('[tool.ruff]\nline-length = 79\n', encoding="utf-8")
+    os.utime(config, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert config.stat().st_size == before.st_size
+    assert config.stat().st_mtime_ns == before.st_mtime_ns
+
+    assert cache.is_green(gate) is False, (
+        "a changed gate config must invalidate the cached pass even when its "
+        "size and mtime are indistinguishable from the config that passed"
+    )
+
+
+def test_touching_config_without_editing_it_keeps_the_gate_green(tmp_path):
+    """The other half: re-running a formatter or `touch`ing pyproject.toml used
+    to invalidate every cached gate and re-run the whole suite for nothing."""
+    import os
+
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    config = tmp_path / "pyproject.toml"
+    config.write_text('[tool.ruff]\nline-length = 88\n', encoding="utf-8")
+
+    cache = GateResultCache(tmp_path)
+    gate = _gate()
+    cache.record(gate, passed=True, summary="ok")
+    assert cache.is_green(gate) is True
+
+    data = config.read_bytes()
+    os.utime(config, None)
+    config.write_bytes(data)  # byte-identical rewrite
+
+    assert cache.is_green(gate) is True, (
+        "an unchanged config must not invalidate a cached pass"
+    )

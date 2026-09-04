@@ -111,7 +111,11 @@ class RepoMap(BaseModel):
     # detect a stale map before trusting its structure.
     generated_head: str = ""
     indexed_hash: str = ""
-    # sha1 over sorted (path, size, mtime_ns) so plain content edits mark the map stale.
+    # sha1 over sorted (path, digest-of-bytes), prefixed with its scheme ("c2:").
+    # It hashed (path, size, mtime_ns) until 2026-09-04, which marked a current map
+    # stale on any byte-identical rewrite and a changed one fresh whenever size and
+    # mtime survived the edit. A fingerprint carrying an older scheme prefix compares
+    # unequal by construction, so an upgrade reads stale once and rebuilds.
     # Legacy maps without this field stay non-stale (no false alarms).
     content_fingerprint: str = ""
     # True when the last map write used lean/degraded graph fallback. Consumers must

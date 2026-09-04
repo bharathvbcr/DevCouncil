@@ -493,7 +493,7 @@ enum Commands {
         /// Caller-computed `indexed_hash` (SHA-1 over the git file list).
         #[arg(long)]
         indexed_hash: Option<String>,
-        /// Caller-computed `content_fingerprint` (SHA-1 over size+mtime).
+        /// Caller-computed `content_fingerprint` (scheme-prefixed SHA-1 over file bytes).
         #[arg(long)]
         content_fingerprint: Option<String>,
     },
