@@ -79,51 +79,116 @@ func realisticGraph() []byte {
 
 // graphFixture writes the document once for the whole run and returns its path
 // and bytes. Regenerating it per benchmark would cost more than the benchmarks.
+//
+// Both encodings come from the one document, so the two columns of every table
+// below are the same graph and nothing but the wire differs.
 var graphFixture = struct {
-	once bool
-	path string
-	raw  []byte
+	once        bool
+	path        string
+	raw         []byte
+	compactPath string
+	compact     []byte
 }{}
 
-func fixture(b *testing.B) (string, []byte) {
+// encodings is what every Load and Decode benchmark runs twice over.
+type encoding struct {
+	name string
+	path string
+	raw  []byte
+}
+
+func fixture(b *testing.B) []encoding {
 	b.Helper()
 	if !graphFixture.once {
 		graphFixture.raw = realisticGraph()
-		graphFixture.path = filepath.Join(b.TempDir(), "code_graph.json")
-		if err := os.WriteFile(graphFixture.path, graphFixture.raw, 0o644); err != nil {
-			b.Fatal(err)
-		}
+		graphFixture.compact = internTables(b, graphFixture.raw)
 		graphFixture.once = true
 	}
-	// A later b.TempDir() is a different directory, so the file is rewritten if
-	// the first one has gone; the bytes are what is expensive, not the write.
+	// A later b.TempDir() is a different directory, so the files are rewritten
+	// if the first ones have gone; the bytes are what is expensive, not the
+	// write.
 	if _, err := os.Stat(graphFixture.path); err != nil {
-		graphFixture.path = filepath.Join(b.TempDir(), "code_graph.json")
-		if err := os.WriteFile(graphFixture.path, graphFixture.raw, 0o644); err != nil {
-			b.Fatal(err)
+		dir := b.TempDir()
+		graphFixture.path = filepath.Join(dir, "code_graph.json")
+		graphFixture.compactPath = filepath.Join(dir, "code_graph.compact.json")
+		for path, body := range map[string][]byte{
+			graphFixture.path:        graphFixture.raw,
+			graphFixture.compactPath: graphFixture.compact,
+		} {
+			if err := os.WriteFile(path, body, 0o644); err != nil {
+				b.Fatal(err)
+			}
 		}
 	}
-	return graphFixture.path, graphFixture.raw
+	return []encoding{
+		{name: "verbose", path: graphFixture.path, raw: graphFixture.raw},
+		{name: "interned", path: graphFixture.compactPath, raw: graphFixture.compact},
+	}
+}
+
+// verbose is the fixture in the encoding every existing consumer reads, for the
+// benchmarks that are not about the wire.
+func verbose(b *testing.B) (string, []byte) {
+	b.Helper()
+	one := fixture(b)[0]
+	return one.path, one.raw
 }
 
 // BenchmarkLoadRealisticGraph is the session-start cost: read the artifact and
 // derive the map. It is the figure MaxGraphBytes is set against.
+//
+// It runs on both wires because that is the whole claim the interned encoding
+// makes — it buys bytes, parse time and allocation and nothing else — and a
+// claim about cost with no second column is not a comparison. `artifact_B`
+// reports the file each column read, so the size and the time sit together.
+//
+// One caveat travels with these numbers. Every column of this fixture holds a
+// string, so the encoder interns all of them and the decoder skips nothing;
+// the producer's own artifact has four columns per node that are numbers,
+// booleans or objects, which are written out in full and stepped over on the
+// way past. This is therefore the encoding's best case, and STATUS.md carries
+// the measurement on a real 85 MB artifact beside it.
 func BenchmarkLoadRealisticGraph(b *testing.B) {
-	path, raw := fixture(b)
-	b.SetBytes(int64(len(raw)))
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if _, err := Load(path); err != nil {
-			b.Fatal(err)
-		}
+	for _, wire := range fixture(b) {
+		b.Run(wire.name, func(b *testing.B) {
+			b.SetBytes(int64(len(wire.raw)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := Load(wire.path); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(len(wire.raw)), "artifact_B")
+		})
 	}
 }
 
 // BenchmarkDecodeRealisticGraph is the same work without the derivation, so the
 // two halves can be told apart rather than guessed at.
 func BenchmarkDecodeRealisticGraph(b *testing.B) {
-	_, raw := fixture(b)
+	for _, wire := range fixture(b) {
+		b.Run(wire.name, func(b *testing.B) {
+			b.SetBytes(int64(len(wire.raw)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := decodeGraph(wire.raw); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(len(wire.raw)), "artifact_B")
+		})
+	}
+}
+
+// BenchmarkUnmarshalRealisticGraph is the decode this package did before it
+// dispatched on the shape of each table: one json.Unmarshal of the whole
+// verbose document. It stays because the shape dispatch had to be shown not to
+// cost the encoding every consumer actually reads anything, and a claim that it
+// did not needs the number it is compared against.
+func BenchmarkUnmarshalRealisticGraph(b *testing.B) {
+	_, raw := verbose(b)
 	b.SetBytes(int64(len(raw)))
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -138,7 +203,7 @@ func BenchmarkDecodeRealisticGraph(b *testing.B) {
 // BenchmarkBuildRealisticGraph is the derivation alone: one pass over 14,330
 // nodes and 74,061 edges, which is the only part of Load this package owns.
 func BenchmarkBuildRealisticGraph(b *testing.B) {
-	_, raw := fixture(b)
+	_, raw := verbose(b)
 	var g graph
 	if err := json.Unmarshal(raw, &g); err != nil {
 		b.Fatal(err)
@@ -154,7 +219,7 @@ func BenchmarkBuildRealisticGraph(b *testing.B) {
 // arrives in: already indexed, new inside an indexed area, and outside
 // everything. The third was the one that scaled with the size of the map.
 func BenchmarkAreaForPath(b *testing.B) {
-	path, _ := fixture(b)
+	path, _ := verbose(b)
 	m, err := Load(path)
 	if err != nil {
 		b.Fatal(err)
@@ -181,7 +246,7 @@ func BenchmarkAreaForPath(b *testing.B) {
 // them per area, and the harness calls it to tell a model what the repository
 // is made of.
 func BenchmarkAreas(b *testing.B) {
-	path, _ := fixture(b)
+	path, _ := verbose(b)
 	m, err := Load(path)
 	if err != nil {
 		b.Fatal(err)
@@ -196,7 +261,7 @@ func BenchmarkAreas(b *testing.B) {
 // BenchmarkAreNeighbors is the question the scope rung actually asks, once the
 // two areas are known.
 func BenchmarkAreNeighbors(b *testing.B) {
-	path, _ := fixture(b)
+	path, _ := verbose(b)
 	m, err := Load(path)
 	if err != nil {
 		b.Fatal(err)

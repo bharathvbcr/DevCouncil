@@ -45,7 +45,6 @@
 package repomap
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -271,12 +270,18 @@ func (m *Map) Stats() Stats { return m.stats }
 // there is nothing to fall back on.
 //
 // The cost is not the file. Loading it holds the bytes and the decoded tree at
-// once: 68 MiB of allocation for a 20 MiB artifact, measured by
-// BenchmarkLoadRealisticGraph, so the bound has to be set against roughly three
-// and a half times itself in transient memory. At 1.5 KiB per node this admits
-// a graph of some 170,000 symbols, which is a very large monorepo, and refuses
+// once: 59 MiB of allocation for a 13.5 MiB artifact, measured by
+// BenchmarkLoadRealisticGraph/verbose, so the bound has to be set against
+// several times itself in transient memory. At 1.5 KiB per node this admits a
+// graph of some 170,000 symbols, which is a very large monorepo, and refuses
 // the runaway or corrupt file that would otherwise be read in full before
 // anything noticed its size.
+//
+// It bounds both wires. The interned encoding is smaller for the same graph —
+// 17 MB against 85 MB on a 4,499-file corpus — and costs less to load, but its
+// string table and row indices are still proportional to the file, and the
+// producer is what decides which of the two a consumer is pointed at. A bound
+// that held on one encoding and not the other would be no bound at all.
 //
 // Refusing is the right failure. A caller that cannot load the map records the
 // scope rung as unavailable, which is the same honest answer it gives for a
@@ -306,8 +311,15 @@ func loadBounded(graphPath string, max int64) (*Map, error) {
 	if err != nil {
 		return nil, fmt.Errorf("repomap: reading %s: %w", graphPath, err)
 	}
-	var g graph
-	if err := json.Unmarshal(raw, &g); err != nil {
+	g, err := decodeGraph(raw)
+	if err != nil {
+		// A layout this build cannot read is a different report from a file it
+		// cannot parse, and keeping them apart is the difference between "the
+		// producer moved ahead of this harness" and "the artifact is damaged".
+		// They send an operator to different places.
+		if errors.Is(err, ErrUnknownCompactLayout) {
+			return nil, fmt.Errorf("repomap: %s: %w", graphPath, err)
+		}
 		return nil, fmt.Errorf("repomap: %s is not a code graph: %w", graphPath, err)
 	}
 	if len(g.Nodes) == 0 {
@@ -466,10 +478,21 @@ func build(g graph) *Map {
 	m.stats.Edges = len(g.Edges)
 	for area, neighbours := range m.adjacent {
 		m.stats.Adjacencies += len(neighbours)
-		if len(neighbours) > m.stats.MaxDegree {
-			m.stats.MaxDegree = len(neighbours)
-			m.stats.WidestArea = area
+		// Ties are broken by name rather than by whichever key the runtime
+		// handed over first. `adjacent` is a map, a tie is the ordinary case on
+		// a repository whose areas are evenly coupled, and the effect was that
+		// one artifact loaded twice in one process named two different areas as
+		// its widest. WidestArea is read by an operator deciding whether the
+		// neighbour rule is worth relying on; a name that changes under them
+		// with nothing about the repository having changed is not a report.
+		switch {
+		case len(neighbours) > m.stats.MaxDegree:
+		case len(neighbours) == m.stats.MaxDegree && m.stats.WidestArea != "" && area < m.stats.WidestArea:
+		default:
+			continue
 		}
+		m.stats.MaxDegree = len(neighbours)
+		m.stats.WidestArea = area
 	}
 	return m
 }
