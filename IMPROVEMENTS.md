@@ -1269,8 +1269,9 @@ against a spec taken from the first row.
 
 **It does not make the graph agent-readable.** 5.3M tokens to 1.25M is still unopenable. It
 buys bytes, parse time and disk churn; `devmap search` / `impact` / `trace` remain the way to
-read the graph. **No consumer reads it yet** — the intended first one is
-`backend/go_orchestrator/repomap`, whose benchmark shows `Load` is 88% JSON decode.
+read the graph. Its first consumer landed the same day: `backend/go_orchestrator/repomap`
+reads both wires from one `Load`, and on a 4,499-file corpus that is 405.0 ms and 242.6 MiB
+against 114.9 ms and 112.0 MiB for the identical `Map`.
 
 ### Provenance: one name, two counts
 
@@ -1433,9 +1434,29 @@ observed once earlier; it stays recorded as observed-once, not as a defect.
   graph schema 2)`, naming both numbers instead of one. The store number stays first on
   purpose: `devmap_health.binary_info` takes the first digit group after the word `schema`,
   and that is the number that decides whether a kernel can open a store.
-* `repomap` and `devmap.Client` have **no production caller** in this repository — no `main`
-  package, and the only importer is a test.
-* Nothing reads the interned `code_graph` encoding yet.
+* ~~Nothing reads the interned `code_graph` encoding.~~ **Closed 2026-09-05** —
+  `backend/go_orchestrator/repomap` reads both wires from one `Load`, dispatching on the shape
+  of each table so `build` is unchanged and the two encodings cannot answer differently.
+  Measured on a 4,499-file corpus, both artifacts written from one generation: 85,001,360 B ->
+  17,104,715 B, `Load` 405.0 ms -> 114.9 ms (3.5x), 242.6 MiB -> 112.0 MiB allocated, 1,291,942
+  -> 79,699 allocations. The verbose wire pays +3,009 B and +41 allocations per load for the
+  shape dispatch. Equivalence is asserted against the **real** producer
+  (`dc/devmap/interop_test.go::TestTheLiveCompactGraphBuildsTheSameMap`, which CI already
+  fails on if it skips), not against a fixture. See STATUS.md -> "Go: the compact graph has a
+  reader".
+* `repomap` and `devmap.Client` have no caller **in this repository** — no `main` package, and
+  the only importer is a test. They are not dead: MANVI holds its own copies at
+  `manvi/repomap` and `manvi/dc/devmap` with five production call sites, and the copy here is
+  the upstream — 809 lines against MANVI's 584, and the only one carrying `MaxGraphBytes`,
+  `SchemaDeclared`, `DistinctOrphanEndpoints` and the interned decoder. The register entry is
+  therefore "port the accumulated fixes across", not "delete". Two proofs and the Chesterton's
+  fence are in STATUS.md.
+* **New, and load-bearing:** `devmap-query/src/manifest.rs:302` writes `"neighbors": []` as a
+  literal, and `src/devcouncil/indexing/subsystem_map.py::are_neighbors` reads that field. The
+  "allow a write into a neighbouring subsystem" rung in `execution/policy_engine.py:628` can
+  therefore never fire, and `verification/checks/subsystem_boundary.py` flags every cross-area
+  change as drift. Measured: 0 of this repository's 16 subsystems and 0 of the scholarlm map's
+  12 carry a non-empty `neighbors`. See STATUS.md for the two candidate owners.
 
 ## Python typing: mypy to zero (2026-09-05)
 

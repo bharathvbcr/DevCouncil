@@ -3596,3 +3596,219 @@ through their unit tests, and one of those checks is why defect 5 is complete:
 `collect_sources_with_report` was fixed, the test went green, and the binary
 still exited 1 — because `collect_go_modules` carried the same `result?` and
 `devmap build` calls it over the same root two lines later.
+
+---
+
+## Go: the compact graph has a reader (2026-09-05)
+
+X39 closed the producer half of the interned encoding on 2026-09-05 and left the
+row that mattered: **nothing read it**. `devmap manifest --compact-graph-output`
+wrote a second encoding of the same model, `AGENT_PLAN.md` named
+`backend/go_orchestrator/repomap` as its intended first consumer, and `repomap`
+went on decoding the verbose artifact whole. This closes that: `repomap.Load`
+now accepts either encoding and builds the identical `Map` from both.
+
+### What was built
+
+`backend/go_orchestrator/repomap/compact.go` — a decoder for the
+`devmap-compact-v1` layout, wired into `Load` so **one** entry point reads both
+wires. `Load` dispatches on the shape of each table, not on a flag, and both
+converge on the same `graph` value before `build` sees it; `build` is unchanged.
+Two decode paths that each produced a `Map` would be two implementations of the
+map, and the failure mode would not be a crash — it would be a gate answering
+"not a neighbour" on one wire and "neighbour" on the other with nothing to
+notice which file it had read.
+
+It decodes rather than reconstructs. Rust's `decode_compact` rebuilds the whole
+verbose document because its contract is the round trip; `repomap` reads nine
+string columns out of seventeen, so it fills `[]node` and `[]edge` directly and
+steps over `extras`, `line`, `end_line`, `exported`, `language`, `name` and
+`reason` without materialising them. That is where most of the difference in
+cost comes from.
+
+### The equivalence test
+
+Both artifacts generated from one store by the final round-2 kernel, on a copy
+of the 4,499-file scholarlm corpus (41,196 nodes / 271,240 edges, generation 1):
+
+```
+devmap manifest . --graph-output code_graph.json \
+                  --compact-graph-output code_graph.compact.json
+```
+
+The two `Map` values are equal by `reflect.DeepEqual` over the whole struct —
+`areaOf`, `areas`, `adjacent`, stats, provenance and the vocabulary record — and
+separately by stats, provenance, the 287 areas, the neighbour list of every one
+of those areas, and `Degraded()`. Committed as
+`dc/devmap/interop_test.go::TestTheLiveCompactGraphBuildsTheSameMap`, which
+drives the **real** binary rather than a fixture: every part of the layout is a
+contract with a producer built from another workspace, and a hand-written
+fixture asserting it would assert only that the fixture and the decoder were
+written by the same hand. It also checks the producer's `encoding` string
+against `repomap.CompactEncoding` and refuses to compare two documents when the
+artifact interned nothing, so it cannot pass by comparing two verbose files. CI
+already fails on a `--- SKIP` from any `TestTheLive*` in that package, so this
+one is covered without a workflow change.
+
+The hermetic half is `repomap/compact_test.go::TestTheInternedEncodingBuildsTheSameMap`.
+
+### What the encoding bought
+
+`BenchmarkLoadRealisticGraph`, darwin/arm64, Apple M5 Pro, `-benchtime 5x
+-count=3`, on the package's existing 14,608-node / 74,061-edge fixture:
+
+| | verbose | interned | |
+|---|---|---|---|
+| artifact | 13,481,813 B | 2,388,876 B | **−82.3%** |
+| `Load` | 80.6–87.7 ms | 26.1–26.2 ms | **3.2x** |
+| `Load` B/op | 59,384,083 | 24,840,873 | **2.4x less** |
+| `Load` allocs/op | 371,488 | 17,237 | **21.6x fewer** |
+| `decodeGraph` | 69.9–71.8 ms | 18.3–18.6 ms | **3.8x** |
+| `decodeGraph` allocs/op | 369,385 | 15,134 | **24.4x fewer** |
+
+Two honesty notes on that table. Every column of that fixture holds a string, so
+the encoder interns all of them and the decoder skips nothing — it is the
+encoding's best case. And the measurement that matters is the real artifact,
+which has four raw columns per node to step over. On the scholarlm pair above,
+`Load` best-of-5 with allocation counted by `runtime.MemStats`:
+
+| | verbose | interned | |
+|---|---|---|---|
+| artifact | 85,001,360 B | 17,104,715 B | **−79.9%** |
+| `Load` | 405.0 ms | 114.9 ms | **3.5x** |
+| allocated | 242.6 MiB | 112.0 MiB | **2.2x less** |
+| allocations | 1,291,942 | 79,699 | **16.2x fewer** |
+
+**What it cost the verbose wire — the encoding every existing consumer reads —
+is essentially nothing, and that took two attempts.** The first row reader used
+`json.Decoder.Token` per cell and was *slower in allocations than the verbose
+path it was beating in time*: 12.6 M allocations against 1.6 M on the scholarlm
+artifact, because `Token` boxes every value and reading an index exactly
+requires `UseNumber`, which turns each one into a heap string. Rows are now
+scanned in place; nothing outside a row is hand-parsed. Separately, the shape
+dispatch first decoded the verbose array element by element, and `&row` escaping
+into the decoder's interface argument put every row on the heap twice: +90,811
+allocations and +5.9 MB per load, paid by the wire that was not supposed to be
+charged anything. `BenchmarkUnmarshalRealisticGraph` is kept as the baseline —
+one `json.Unmarshal` of the whole document, which is what `Load` did before —
+and against it the current verbose decode is **+3,009 B and +41 allocations per
+op**, with the time inside the run-to-run spread.
+
+### A defect the equivalence test found
+
+`Stats.WidestArea` was decided by Go map iteration order. `build` walked
+`adjacent` keeping the first area with a degree *strictly* greater than the best
+so far, so on a tie — the ordinary case on an evenly coupled repository — the
+name reported was whichever key the runtime handed over first, and one file
+loaded twice in one process named two different areas. An operator reads that
+field to decide whether the neighbour rule is worth relying on. Ties now break
+by name. Red first:
+`repomap/compact_test.go::TestTheWidestAreaIsTheSameAreaOnEveryLoad` failed on
+the unmodified `build` at load 26 of 64.
+
+### The adversarial pass
+
+`repomap/compact_test.go::TestAnInternedGraphIsRefusedRatherThanShortened` and
+its neighbours. Every case is a document that could have been read as a
+*smaller* graph, which is what makes a gate answer "not a neighbour" with
+confidence, so each is a refusal that names what it found: an unknown layout
+identity (`ErrUnknownCompactLayout`, reported separately from a parse failure —
+the remedies differ), a missing string table, an index past the end of the
+table, a column declaring a storage kind that is neither `s` nor `j`, a field
+list naming one column twice, a row whose cell count is not the declared width,
+an interned cell holding a string, a truncated file, an interned layout carrying
+no `encoding`, an `interned_tables` list that disagrees with the shape the rows
+actually arrived in, and a table whose rows precede its field list. An interned
+document with zero rows is refused with the same "holds no nodes" as an empty
+verbose one, a `verbatim_tables` table inside a compact document is still read,
+duplicate node ids resolve identically on both wires, and `MaxGraphBytes` bounds
+both — the producer chooses which file a consumer is pointed at, so a bound that
+held on one encoding would be no bound at all.
+
+### Verification
+
+`backend/go_orchestrator`, go1.26.4 darwin/arm64, `MANVI_MAP_BINARY` pointed at
+the final round-2 kernel so the live tests ran rather than skipped:
+
+| gate | result |
+|---|---|
+| `gofmt -l .` | no output |
+| `go vet ./...` | exit 0 |
+| `go test ./... -count=1` | all 7 packages `ok` |
+| `go test -race ./repomap/... ./dc/devmap/...` | both `ok` |
+| `go test ./dc/devmap/ -run TestTheLive -v` | 4 PASS, 0 SKIP |
+
+### `repomap` and `dc/devmap` still have no caller in this repository — and must not be deleted
+
+The register asks whether the two packages should go. Both proofs the contract
+requires say there is no caller **here**, and a third piece of evidence says
+deleting them would be a mistake.
+
+1. `RIPGREP_CONFIG_PATH= rg -uu` over the whole worktree (excluding only
+   `.git/`, the generated `.devcouncil/`, cargo `target*/` and `*.sqlite`):
+   no `package main` anywhere under `backend/go_orchestrator`, and the only
+   importer of either package is `dc/devmap/interop_test.go`. Nothing in
+   `src/`, `tests/` or `.github/` names them except the workflow's path filter.
+2. In a scratch copy with `repomap` removed, `go build ./...` exits 0 and
+   `go vet ./...` fails only on that one test file; with `dc/devmap` removed too,
+   both exit 0.
+
+**Why they exist.** MANVI (`module manvi`) holds its own copies at
+`manvi/repomap` and `manvi/dc/devmap`, and there they have five production call
+sites — `repomap.LoadIfPresent` in `cmd/manvi/main.go` (four) and
+`cmd/manvi/tui.go`, `Subsystems *repomap.Map` and `Map *devmap.Client` in
+`devcouncil/tools.go`, `devmap.New` at `cmd/manvi/main.go:427`. MANVI does not
+import this module; it vendors by copy, which is the arrangement `rust/README.md`
+§Consumers and `rust/STATUS.md` §1 describe for the whole analysis plane. The
+copy here is the **upstream**: 809 lines against MANVI's 584, and it alone
+carries `MaxGraphBytes`, `SchemaDeclared`, `DistinctOrphanEndpoints` and now the
+interned decoder — every one of which is a defect fixed here and not yet carried
+across (MANVI's copy last moved 2026-08-31). Deleting it would destroy the
+upstream of a package with live callers and freeze those callers at a version
+with no bound on the artifact it reads.
+
+So the answer is **(b) with the deletion refused**: the two proofs establish "no
+caller in this repository", which is not the same claim as "no caller", and the
+difference is exactly what the two-signal rule exists to catch.
+
+**A `package main` was considered and not written.** It would serve nobody now:
+MANVI links the package rather than spawning a binary, and DevCouncil's Python
+already owns the same three questions in `src/devcouncil/indexing/subsystem_map.py`
+(`area_for_path`, `are_neighbors`, `neighbors_for_area`), read by
+`execution/policy_engine.py`, `verification/checks/subsystem_boundary.py`,
+`execution/prompt_builder.py` and `integrations/mcp/handlers/map.py`. Spawning a
+Go binary from Python would put a second owner of the neighbour rule beside the
+Python one. What that Python owner needs is not a Go CLI — see the next section.
+
+### Left open, for the Python and Rust lanes: the neighbour rule is answering from a field the kernel stubs
+
+Found while looking for a consumer, and it is a live defect rather than a
+tidiness note. `devmap-query/src/manifest.rs:302` emits `"neighbors": []` as a
+literal for every subsystem. `subsystem_map.are_neighbors` reads exactly that
+field. So:
+
+- `execution/policy_engine.py:628` allows a write into a *neighbouring*
+  subsystem of a planned file — a rung that can now never fire. Every unplanned
+  cross-subsystem write falls through to `deny`.
+- `verification/checks/subsystem_boundary.py` raises an `architecture_drift`
+  gap for every cross-area change, because `cross_boundary_pairs` reads "no
+  declared neighbours" as "not adjacent".
+
+Measured: this repository's `.devcouncil/repo_map.json` has 16 subsystems, 0
+with a non-empty `neighbors`; the scholarlm map written by the final kernel has
+12 subsystems, 0 with a non-empty `neighbors`. The Python map writer was retired
+2026-09-02, so the kernel is the only writer and the field is always empty.
+
+This is reason 1 in `repomap`'s own package doc, live in the Python half: *a
+consumer reading the field cannot tell "this repository has no adjacent
+subsystems" from "this producer does not compute the field"*, and the first is a
+decision while the second is a missing feature. The Go package sidesteps it by
+deriving adjacency from cross-area `extracted` edges. The fix belongs to one of
+two owners and not to this lane:
+
+- **Rust** — `manifest.rs` `build_repo_map_value` (the literal at line 302):
+  compute `neighbors` from cross-area edges the way `repomap.build` does, or
+- **Python** — `indexing/subsystem_map.py::neighbors_for_area`: derive adjacency
+  from the code graph instead of reading the stubbed field, and until then have
+  `are_neighbors` report *unknown* rather than *not adjacent* so the deny reason
+  does not claim something the map never established.
