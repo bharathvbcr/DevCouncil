@@ -67,7 +67,9 @@ def detect_stale_map_gaps(
         # writes — are what actually answer "does this map still describe the
         # code", so they are always consulted, and either signal reporting stale
         # makes it stale.
-        stale = None
+        # Tri-state on purpose: True/False are the kernel's answer, None means
+        # it had none to give and the fingerprints decide.
+        stale: bool | None = None
         try:
             from devcouncil.devmap_client import try_connect
 

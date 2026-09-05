@@ -2,7 +2,7 @@ import logging
 from dataclasses import replace
 from collections import deque
 from pydantic import BaseModel
-from typing import Any, List, Literal, Optional, cast, get_args
+from typing import Any, List, Literal, Optional, cast, get_args, overload
 from pathlib import Path
 
 from devcouncil.domain.requirement import Requirement
@@ -106,8 +106,22 @@ def effective_artifact_graph(graph, *, mode: GateMode):  # noqa: ANN001
     )
 
 
+@overload
+def effective_live_review(live_review: dict, *, mode: GateMode) -> dict: ...
+
+
+@overload
+def effective_live_review(live_review: None, *, mode: GateMode) -> None: ...
+
+
 def effective_live_review(live_review: dict | None, *, mode: GateMode) -> dict | None:
-    """Demote live-review cards as progress blockers outside enforce mode."""
+    """Demote live-review cards as progress blockers outside enforce mode.
+
+    Overloaded because the ``None`` in the return type is only ever the ``None``
+    that came in: a real summary always comes back as a summary. Without that,
+    `dev report` and `dev go` both had to treat a summary they had just built as
+    possibly absent.
+    """
     if live_review is None or mode == "enforce":
         return live_review
     effective = dict(live_review)

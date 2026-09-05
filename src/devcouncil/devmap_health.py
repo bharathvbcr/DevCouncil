@@ -291,7 +291,8 @@ def _artifact(path: Path, *, engine_key: str) -> Dict[str, Any]:
         return info
     if isinstance(payload, dict):
         if engine_key == "meta":
-            meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+            raw_meta = payload.get("meta")
+            meta = raw_meta if isinstance(raw_meta, dict) else {}
             info["map_engine"] = meta.get("map_engine")
         else:
             info["map_engine"] = payload.get("map_engine")

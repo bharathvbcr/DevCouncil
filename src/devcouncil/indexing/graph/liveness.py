@@ -217,10 +217,20 @@ def file_liveness(
 # Framework targets are live only through a reachable registration owner.
 
 
+def confidence_label(conf: object) -> str:
+    """The tier as a string, whether an entry carries the enum or a raw value.
+
+    Two producers reach the dead-code report: the Rust kernel's rows, whose
+    ``confidence`` is whatever JSON held (a string, or absent), and the Python
+    graph's entries, which carry an enum. Unwrapping that in each consumer is
+    how the two start disagreeing about what ``ambiguous`` is called, so it is
+    unwrapped here, once.
+    """
+    return str(getattr(conf, "value", conf))
+
+
 def confidence_at_least(conf: object, minimum: str) -> bool:
     """True when ``conf`` ranks at or above ``minimum`` (extracted > inferred > ambiguous)."""
     want = _CONFIDENCE_RANK.get(minimum, 0)
-    if hasattr(conf, "value"):
-        conf = conf.value
-    have = _CONFIDENCE_RANK.get(str(conf), 0)
+    have = _CONFIDENCE_RANK.get(confidence_label(conf), 0)
     return have >= want

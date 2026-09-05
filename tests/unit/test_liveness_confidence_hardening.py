@@ -91,3 +91,35 @@ def test_go_liveness_disabled_without_tree_sitter(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+
+
+# ---------------------------------------------------------------------------
+# 8. One reading of a tier, whichever producer supplied it
+# ---------------------------------------------------------------------------
+
+
+def test_confidence_label_reads_both_producers_the_same_way():
+    """`dev map dead` merges two producers; the tier must read identically.
+
+    The Rust kernel's rows carry whatever JSON held -- a bare string, or nothing
+    at all -- while the Python graph's entries carry a `Confidence` enum. Each
+    consumer used to unwrap that itself, so the string a filter compared and the
+    string the report printed were two separate derivations of one fact.
+    """
+    from devcouncil.indexing.graph.liveness import confidence_at_least, confidence_label
+    from devcouncil.indexing.graph.schema import Confidence
+
+    assert confidence_label(Confidence.EXTRACTED) == "extracted"
+    assert confidence_label("extracted") == "extracted"
+    # A row the kernel emitted without the key. "None" is deliberate: an empty
+    # string would read as a tier that was checked and found blank.
+    assert confidence_label(None) == "None"
+
+    # The ranking owner reads through the same unwrap, so a filter and the
+    # printed tier can never disagree about what an entry is.
+    assert confidence_at_least(Confidence.EXTRACTED, "inferred") is True
+    assert confidence_at_least("ambiguous", "inferred") is False
+    assert confidence_at_least(None, "inferred") is False
+    # Unchanged: an unrankable tier and the lowest tier both rank 0, so
+    # `--min-confidence ambiguous` keeps admitting everything, as it always has.
+    assert confidence_at_least(None, "ambiguous") is True

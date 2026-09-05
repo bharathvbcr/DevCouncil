@@ -68,15 +68,15 @@ def read_mcp_resource(project_root: Path, uri: str) -> str:
         return dump_json({"gaps": gaps}, indent=2)
 
     if key == "devcouncil://cards":
-        graph = None
+        cards_graph = None
         if db:
             with db.get_session() as session:
-                graph = ArtifactGraphRepository(session).load_graph()
-        if graph is None:
+                cards_graph = ArtifactGraphRepository(session).load_graph()
+        if cards_graph is None:
             return dump_json(live_review_summary(project_root), indent=2)
         _graph, live, _mode = _effective_views(
             project_root,
-            graph,
+            cards_graph,
             live_review_summary(project_root),
         )
         return dump_json(live, indent=2)

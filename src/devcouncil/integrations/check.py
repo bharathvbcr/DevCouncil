@@ -826,10 +826,10 @@ def build_integration_check_report(project_root: Path, *, strict: bool = False) 
     for label, hook_path in _hook_config_tamper_targets(root):
         client_key = _HOOK_INTEGRITY_CLIENT_KEYS.get(label, label.lower())
         client_enabled = _client_integration_enabled(integrations_cfg, client_key)
-        status = _hook_config_integrity_status(hook_path, client_enabled=client_enabled)
-        if status is None:
+        integrity_status = _hook_config_integrity_status(hook_path, client_enabled=client_enabled)
+        if integrity_status is None:
             continue
-        if status == "ok":
+        if integrity_status == "ok":
             add(True, f"{label} hook integrity", str(hook_path))
             continue
         if client_enabled and not _hook_config_has_disarmed_gate_events(hook_path):

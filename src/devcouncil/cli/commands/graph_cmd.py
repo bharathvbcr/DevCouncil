@@ -200,7 +200,9 @@ def _neighbor_edges(client, targets: list) -> dict:
         try:
             for entry in batched(targets):
                 target = entry["target"]
-                sides = []
+                # Four slots, alternating: the edges for a direction (or None
+                # when it could not be measured) then the reason (or None).
+                sides: list[list[str] | str | None] = []
                 # `method` is the kernel command each direction stands for,
                 # and it is what the unavailable reason names — the batched and
                 # per-target paths must be indistinguishable to a reader, down
@@ -1207,7 +1209,7 @@ def graph_dead(
     """Full dead-code report with confidence tiers and reasons."""
     from collections import Counter
 
-    from devcouncil.indexing.graph.liveness import confidence_at_least
+    from devcouncil.indexing.graph.liveness import confidence_at_least, confidence_label
 
     root = _root(project_root)
     freshness = _warn_if_stale(root, note_unknown=True, quiet=json_output)
@@ -1239,12 +1241,7 @@ def graph_dead(
         graph = _require_graph(root, warn_stale=False)
         entries = list(graph.dead_code)
     if confidence:
-        entries = [
-            e
-            for e in entries
-            if (e.confidence.value if hasattr(e.confidence, "value") else str(e.confidence))
-            == confidence
-        ]
+        entries = [e for e in entries if confidence_label(e.confidence) == confidence]
     before_min = len(entries)
     if min_confidence:
         entries = [
@@ -1291,7 +1288,7 @@ def graph_dead(
             raise typer.Exit(code=3)
         return
     for e in entries:
-        conf = e.confidence.value if hasattr(e.confidence, "value") else e.confidence
+        conf = confidence_label(e.confidence)
         console.print(
             f"{e.path}:{e.line}  {e.id}  [{conf}/{e.kind}]  {e.reason}"
         )
