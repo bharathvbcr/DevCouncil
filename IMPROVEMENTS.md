@@ -1601,6 +1601,13 @@ every sibling).
 it reads, and that index belongs to the other session's working tree. A guard must observe the
 tree it warns about, never perturb it.
 
+Per-call timeouts do not bound the guard on their own — eight checkouts on a stuck filesystem
+are sixteen git calls, four workers deep, at five seconds each. `_Budget` is one shared
+deadline every git call takes a slice of, so the whole guard is bounded at 8 s: a probe that
+starts after the budget is gone reports `session guard budget exhausted (8s)` instead of the
+empty answer a probe that ran and found nothing would give, and whatever was answered inside
+the budget is still reported.
+
 ### The neighbour rule was answering from a field the kernel stubs (2026-09-05)
 
 Found by the Go/`repomap` review (`rust-port/STATUS.md`, "Left open, for the Python and Rust
