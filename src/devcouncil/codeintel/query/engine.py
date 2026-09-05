@@ -11,6 +11,10 @@ from devcouncil.indexing.graph.schema import CodeGraph, Confidence, GraphEdge, G
 
 
 class CodeIntelQueryEngine:
+    #: Per-definition ceiling on the caller/callee lists. Both are reported
+    #: with their own totals so a capped list never reads as the whole set.
+    _EDGE_SAMPLE = 50
+
     def __init__(self, root: Path | CodeIntelService):
         self.service = root if isinstance(root, CodeIntelService) else get_codeintel_service(root)
         # One client per engine: constructing it resolves (and capability-probes)
@@ -118,18 +122,40 @@ class CodeIntelQueryEngine:
         rows = self.service.cached_query(
             "search", f"{query}\0{limit}", lambda: self.service.store.search(query, limit=limit)
         )
-        return self._envelope({"query": query, "matches": rows})
+        # The store applies the limit inside SQL, so a full row count is never
+        # computed. A filled page therefore reports `total: None` rather than
+        # `len(rows)`: an unmeasured total must not be published as a measured
+        # one. `limit_applied`, not `limit` — `dev map search` reads
+        # `result["limit"]` as a degradation *object*.
+        truncated = len(rows) >= limit
+        payload: dict[str, Any] = {
+            "query": query,
+            "matches": rows,
+            "shown": len(rows),
+            "total": None if truncated else len(rows),
+            "truncated": truncated,
+            "limit_applied": limit,
+        }
+        if truncated:
+            payload["total_reason"] = (
+                "the index applies this limit while querying, so the unfiltered "
+                "match count was not measured; raise `limit` to widen the search"
+            )
+        return self._envelope(payload)
 
     def explore(self, query: str, *, limit: int = 20) -> dict[str, Any]:
         graph = self._graph()
-        matches = self._match(graph, query)[:limit]
+        all_matches = self._match(graph, query)
+        matches = all_matches[:limit]
         inbound, outbound = self._relations(graph.edges)
         definitions: list[dict[str, Any]] = []
         for node in matches:
             content = self.service.store.content_for_path(node.path)
             snippet = self._snippet(content, node.line, node.end_line)
-            callers = [self._edge_dict(edge) for edge in inbound.get(node.id, [])[:50]]
-            callees = [self._edge_dict(edge) for edge in outbound.get(node.id, [])[:50]]
+            all_callers = inbound.get(node.id, [])
+            all_callees = outbound.get(node.id, [])
+            callers = [self._edge_dict(edge) for edge in all_callers[: self._EDGE_SAMPLE]]
+            callees = [self._edge_dict(edge) for edge in all_callees[: self._EDGE_SAMPLE]]
             definitions.append({
                 "id": node.id,
                 "kind": node.kind.value if hasattr(node.kind, "value") else str(node.kind),
@@ -141,11 +167,21 @@ class CodeIntelQueryEngine:
                 "source": snippet,
                 "callers": callers,
                 "callees": callees,
+                "callers_total": len(all_callers),
+                "callers_truncated": len(callers) < len(all_callers),
+                "callees_total": len(all_callees),
+                "callees_truncated": len(callees) < len(all_callees),
             })
         impacted = self._impact_for_ids(graph, [node.id for node in matches], max_depth=3)
         return self._envelope({
             "query": query,
+            # `match_count` keeps its meaning — definitions returned — and the
+            # count it was cut down from now travels beside it. Read alone it
+            # said 20 matches existed when 2000 did.
             "match_count": len(matches),
+            "match_total": len(all_matches),
+            "matches_truncated": len(matches) < len(all_matches),
+            "limit_applied": limit,
             "definitions": definitions,
             "blast_radius": impacted,
         })

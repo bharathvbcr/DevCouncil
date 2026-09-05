@@ -38,10 +38,12 @@ console = _common.console
 OPENCODE_HOOK_PLUGIN_NAME = _common.OPENCODE_HOOK_PLUGIN_NAME
 SUPPORTED_HOOK_TOOLS = _common.SUPPORTED_HOOK_TOOLS
 
-SESSION_START_MATCHER = "startup|resume|clear|compact"
-# Hook `timeout` is expressed in SECONDS, not milliseconds -- see the command-hook
-# fields table in https://code.claude.com/docs/en/hooks.md.
-DEFAULT_HOOK_TIMEOUT_SECONDS = 10
+# Claude Code SessionStart sources.  ``fork`` was added in v2.1.214 for
+# ``--fork-session``, ``/fork`` and ``/branch``; before that a forked session
+# reported ``resume``.  The value is only letters and ``|``, so Claude Code
+# compares it as an exact alternation list rather than a regex — a missing
+# entry silently never fires.
+SESSION_START_MATCHER = "startup|resume|clear|compact|fork"
 GIT_MAP_HOOK_MARKER = "# DevCouncil: refresh repo map"
 # Clients that install PreToolUse / BeforeTool / Cursor pre / OpenCode before containment.
 CONTAINMENT_HOOK_CLIENTS = ("claude", "codex", "cursor", "grok", "opencode", "gemini")
@@ -51,6 +53,16 @@ _opencode_plugin_source = _opencode._opencode_plugin_source
 _opencode_config_path = _opencode._opencode_config_path
 _record_opencode_config = _opencode._record_opencode_config
 
+# Claude Code's hook `timeout` is in SECONDS (command handlers default to 600).
+# Named constants because there is a second generator for the plugin bundle
+# (`integrations/claude_assets._plugin_hooks_json`) that missed the millisecond
+# migration this module performs below and shipped 10000/150000 — a 2.8-hour and
+# a 41.7-hour timeout — in the artifact other people install. One owner for the
+# numbers is what stops that drifting again.
+DEFAULT_HOOK_TIMEOUT_SECONDS = 10
+STOP_GATE_HOOK_TIMEOUT_SECONDS = 150
+
+
 def _stop_hook_timeout_seconds(project_root: Path) -> int:
     """Allow up to 150 seconds when the stop gate runs claims + verification."""
     try:
@@ -59,7 +71,7 @@ def _stop_hook_timeout_seconds(project_root: Path) -> int:
         sg = load_config(project_root).execution.stop_gate
         mode = (sg.mode or "off").strip().lower()
         if mode != "off" and (sg.check_claims or sg.verify_active_task):
-            return 150
+            return STOP_GATE_HOOK_TIMEOUT_SECONDS
     except Exception:
         pass
     return DEFAULT_HOOK_TIMEOUT_SECONDS
@@ -88,6 +100,8 @@ class ClaudeHookSpec:
     """Blocking gate -- installed only under ``--write-gate``, removed otherwise."""
     stop_gate: bool = False
     """Runs the stop gate, so it needs the longer stop-gate timeout."""
+    extra: tuple[str, ...] = ()
+    """Extra argv after the shared hook command (e.g. ``--defer-batch``)."""
 
     def timeout(self, project_root: Path) -> int:
         """Timeout in **seconds** -- Claude Code's ``timeout`` field is seconds, not ms."""
@@ -97,12 +111,21 @@ class ClaudeHookSpec:
 
 
 CLAUDE_TOOL_MATCHER = "Bash|Write|Edit|MultiEdit"
-# Refresh-only PostToolUse is always installed so assist mode keeps the map warm; the
-# blocking PreToolUse gate is the one write_gate=True entry. Lifecycle events after Stop
-# cover status-on-start/prompt, teardown, compaction, subagent finish, and notifications,
-# completing DevCouncil's coverage of the documented Claude Code hook surface.
+# Refresh-only PostToolUse is always installed so assist mode keeps the map warm;
+# ``--defer-batch`` queues paths so PostToolBatch can drain them once per batch.
+# The blocking PreToolUse gate is the one write_gate=True entry. Lifecycle events
+# after Stop cover status-on-start/prompt, teardown, compaction, subagent finish,
+# and notifications. FileChanged/CwdChanged/DirectoryAdded cover map freshness
+# for changes that never pass through a tool call.
 CLAUDE_HOOK_SPECS: tuple[ClaudeHookSpec, ...] = (
-    ClaudeHookSpec("PostToolUse", CLAUDE_TOOL_MATCHER, "post-tool-use", "devcouncil-post-tool-use"),
+    ClaudeHookSpec(
+        "PostToolUse",
+        CLAUDE_TOOL_MATCHER,
+        "post-tool-use",
+        "devcouncil-post-tool-use",
+        extra=("--defer-batch",),
+    ),
+    ClaudeHookSpec("PostToolBatch", "", "post-tool-batch", "devcouncil-post-tool-batch"),
     ClaudeHookSpec("PreToolUse", CLAUDE_TOOL_MATCHER, "pre-tool-use", "devcouncil-pre-tool-use", write_gate=True),
     ClaudeHookSpec("Stop", "", "agent-response", "devcouncil-agent-response-ready", stop_gate=True),
     ClaudeHookSpec("SessionStart", SESSION_START_MATCHER, "session-start", "devcouncil-session-start"),
@@ -112,6 +135,9 @@ CLAUDE_HOOK_SPECS: tuple[ClaudeHookSpec, ...] = (
     ClaudeHookSpec("PostCompact", "", "post-compact", "devcouncil-post-compact"),
     ClaudeHookSpec("SubagentStop", "", "subagent-stop", "devcouncil-subagent-stop", stop_gate=True),
     ClaudeHookSpec("Notification", "", "notification", "devcouncil-notification"),
+    ClaudeHookSpec("FileChanged", "", "file-changed", "devcouncil-file-changed"),
+    ClaudeHookSpec("CwdChanged", "", "cwd-changed", "devcouncil-cwd-changed"),
+    ClaudeHookSpec("DirectoryAdded", "", "directory-added", "devcouncil-directory-added"),
 )
 
 
@@ -120,7 +146,7 @@ def claude_hook_specs(*, write_gate: bool) -> tuple[ClaudeHookSpec, ...]:
     return tuple(spec for spec in CLAUDE_HOOK_SPECS if write_gate or not spec.write_gate)
 
 
-def _hook_command(project_root: Path, client: str, event: str) -> str:
+def _hook_command(project_root: Path, client: str, event: str, *extra: str) -> str:
     # Absolute path to project-venv (or PATH) `dev` so a stale global install cannot
     # shadow the repo's CLI from PostToolUse / PreToolUse hooks.
     executable = resolve_dev_executable(project_root)
@@ -132,13 +158,44 @@ def _hook_command(project_root: Path, client: str, event: str) -> str:
         client,
         "--project-root",
         str(project_root),
+        *extra,
     ])
 
 def _upsert_hook(
-    settings: dict, event: str, matcher: str, command: str, name: str, *, timeout: int = DEFAULT_HOOK_TIMEOUT_SECONDS
+    settings: dict,
+    event: str,
+    matcher: str,
+    command: str,
+    name: str,
+    *,
+    timeout: int = DEFAULT_HOOK_TIMEOUT_SECONDS,
 ) -> None:
     hooks = settings.setdefault("hooks", {})
     groups = hooks.setdefault(event, [])
+
+    # A DevCouncil-owned hook name belongs to exactly one matcher group.  Groups are
+    # keyed by matcher, so when the matcher value changes between releases the old
+    # group is not the target group and the hook would stay registered under *both*
+    # matchers — Claude Code then runs it twice for every event the two matchers
+    # share.  Drop our name from every non-target group first, and prune a group
+    # that held nothing else.  Hooks we do not own keep their group untouched.
+    migrated: list = []
+    for group in groups:
+        if not isinstance(group, dict) or group.get("matcher") == matcher:
+            migrated.append(group)
+            continue
+        inner = group.get("hooks")
+        if not isinstance(inner, list):
+            migrated.append(group)
+            continue
+        kept = [h for h in inner if not (isinstance(h, dict) and h.get("name") == name)]
+        if len(kept) == len(inner):
+            migrated.append(group)
+        elif kept:
+            migrated.append({**group, "hooks": kept})
+    if migrated != groups:
+        groups[:] = migrated
+
     target_group = None
     for group in groups:
         if group.get("matcher") == matcher:
@@ -158,20 +215,20 @@ def _upsert_hook(
 
     group_hooks = target_group.setdefault("hooks", [])
     replaced = False
-    kept: list[dict] = []
+    kept_hooks: list[dict] = []
     for hook in group_hooks:
         if hook.get("name") == name:
             if not replaced:
                 # DevCouncil owns named hooks, including their timeout.  Re-applying
                 # integration therefore migrates old millisecond values to the
                 # seconds expected by Claude Code and Codex.
-                kept.append(hook_payload)
+                kept_hooks.append(hook_payload)
                 replaced = True
             continue
-        kept.append(hook)
+        kept_hooks.append(hook)
     if not replaced:
-        kept.append(hook_payload)
-    target_group["hooks"] = kept
+        kept_hooks.append(hook_payload)
+    target_group["hooks"] = kept_hooks
 
 
 def _remove_named_hook(settings: dict, event: str, name: str) -> None:
@@ -531,7 +588,7 @@ def _install_claude_hooks(project_root: Path, *, write_gate: bool = False) -> li
             settings,
             spec.event,
             spec.matcher,
-            _hook_command(project_root, "claude", spec.hook_event),
+            _hook_command(project_root, "claude", spec.hook_event, *spec.extra),
             spec.name,
             timeout=spec.timeout(project_root),
         )

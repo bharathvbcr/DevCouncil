@@ -385,13 +385,18 @@ final verification step to save usage limits).** Its working-tree changes are
    interruption left (`build_code_graph` re-export, `_files_fingerprint` import in
    `compute_freshness`) are fixed. Details and the kernel-coverage gaps in `IMPROVEMENTS.md`
    → "`RepoMapper.map_repo` and the Python graph builder are gone".
-3. Item 6 of the retirement brief may be open: `dev map --pdg` and
-   `dev map pdg build` call `indexing.graph.build.write_code_graph`, which can
-   rewrite `code_graph.json` without the kernel's `meta.map_engine` stamp, and
-   `dev map doctor` then reports `foreign_writer`. Fix at `write_code_graph`:
-   preserve the kernel's `meta` and add only the PDG layer. Test: after the PDG
-   merge on a kernel-built repo, `meta.map_engine == "devmap-rust"` and
-   `run_doctor(root).ok`.
+3. ~~Item 6 of the retirement brief may be open: `dev map --pdg` rewrites
+   `code_graph.json` without the kernel's `meta.map_engine` stamp and
+   `dev map doctor` then reports `foreign_writer`.~~ **Refuted by measurement,
+   2026-09-04 — this does not reproduce and needs no fix.** Run on a scratch
+   repo: `dev map` (kernel) → `meta.map_engine == "devmap-rust"`,
+   `doctor --json` `ok: true`; then `dev map --pdg` → `map_engine` is still
+   `"devmap-rust"`, `meta` keys are
+   `[compatibility_export_tier, devmap_rust, liveness_unreachable_unreliable,
+   map_engine, pdg]`, and `doctor` is still `ok: true`. The kernel's `meta`
+   survives because `load_code_graph` imports the compatibility artifact (which
+   carries it) when the Python store is empty, and `write_code_graph` re-exports
+   it intact. Do not spend a session on this.
 4. Move the remaining Python-cache query surfaces to the kernel (MCP
    `graph_query` / `graph_trace` / `graph_context` first — they are what agents
    call), then delete `codeintel/query`, `indexing/graph/build.py`'s import path

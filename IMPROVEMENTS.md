@@ -899,3 +899,157 @@ coherent again:
   `dependents_for` 469 keys — i.e. the ratchet's inputs survived. End to end, `dev map` wrote
   both `repo_map.json` and `code_graph.json` through the kernel and reported 20 entry roots
   and 179 dead symbols.
+
+## Dev Map hardening, MCP/hooks/plugins integration, and adversarial pass (2026-09-04)
+
+Branch `claude/dev-map-hardening-perf-1c392c`. One coordinator on the Rust kernel plus four
+parallel Opus agents on disjoint file sets (MCP failure-honesty, MCP boundary/protocol, hooks,
+and a read-only `devmap-extract` audit). Every fix ships a test **verified red against the
+pre-fix tree**; where the honest shape required a new type, the red was reproduced a second time
+by neutering the new logic, so the test pins behaviour and not the type's existence.
+
+**Gates.** Rust workspace **849 passed / 0 failed**; `cargo fmt --all --check` and
+`cargo clippy --workspace --all-targets` clean; release binary rebuilt. Python suite results are
+recorded with the individual lanes.
+
+The full kernel record — every defect, its failing test, and the measurements — is
+`rust-port/STATUS.md` → the three 2026-09-04 sections. Highlights:
+
+### Correctness the agent-facing surfaces were getting wrong
+
+- `repo_map.json` asserted `graph_degraded: false` unconditionally, which made
+  `RepoMapper.map_is_stale`'s fail-closed branch **dead code** — `--if-stale`, `watch` and
+  `verify` accepted maps built from a partition that never converged.
+- `unwired_candidates` was a hardcoded `[]` in `repo_map.json` while `code_graph.json` computed
+  it from the same inputs in the same build.
+- `trace` reported *"no indexed path from X to Y"* when it had merely hit `--depth`; `impact`
+  reported `truncated: false` on a walk that stopped early, on essentially every call.
+- A public class was reported dead at **0.90 confidence in 21 languages**, because
+  `generic_is_exported` read the declaration's whole subtree text and any `private ` inside a
+  member decided the enclosing type's visibility.
+- The MCP map/graph family returned confident empty successes for kernel-down, store-locked,
+  mid-build and timeout; `graph_query`/`graph_trace` returned `ok: true` carrying an `error`.
+- `devcouncil_liveness` reported "no dead code, analysis reliable" when nothing had run.
+
+### Security
+
+`projectPath` escaped the server's root on 16 MCP tools — reads, the debugger, and one **write**
+(`devcouncil_code_sync` → `refresh_map_artifacts` into an arbitrary directory). Now contained at
+one canonical resolver; `additionalProperties: false` applied across all 73 tool schemas after an
+AST pass confirmed `create_planned_files` was the only undeclared key a handler read.
+
+### Liveness and robustness
+
+- The IPC daemon failed to start **~30% of runs under load** (`devmap-serve --lib` failed 6 of
+  14) because `lock_ipc_endpoint` treated a transient `WouldBlock` as permanent, and reported an
+  unusable lock file as *"owned by another live daemon"*. Fixed and measured: **0 failures in 15
+  runs**.
+- **The Dev Map had never refreshed inside a git worktree** — `--project-root` was baked to the
+  main checkout and the worktree's own paths were dropped as a nested checkout. Live in this very
+  checkout, not theoretical.
+- A new adversarial sweep (35 language specs × 14 hostile inputs) found a **4 KB C++ file that
+  took 199 seconds to extract**. The first diagnosis — a pathological parse — was wrong:
+  instrumenting showed the parse completing in **2.98 ms**, with all the cost after it. Bounded
+  by a single budget covering parse *and* walk, returning an explicit refusal rather than a
+  truncated symbol set.
+- **A six-byte COBOL file containing NUL bytes hangs the indexer forever.** NUL is now refused at
+  the boundary for every grammar; the BOM variant is not coverable in-process. Recorded as a
+  decision in `rust-port/STATUS.md`, with the sweep excluding COBOL *loudly* (printed, and the
+  coverage assertion carries `covered + excluded == total`).
+
+### Performance, measured
+
+- `devcouncil_graph_context`: **688.5 ms → 0.83 ms** by deleting a subprocess that re-entered
+  Python to call a function the handler already had three lines below as its fallback.
+- `tools/list` shipped `ttlMs: 0` on every request; now a 300 s hint, justified by verifying the
+  tool list is a pure function of the code and that no `list_changed` notification is ever sent.
+- A repository containing the hostile `.cbl` file builds in **0.026 s** instead of never.
+- Characterised but **not landed**: `impact`/`trace` cost ~100 ms flat regardless of `--depth`
+  because `Store::latest_edges` rescans all 71,598 edges per request. A generation-keyed cache is
+  the fix; it is held pending the repository's open decision on a peak-memory gate rather than
+  landed without an RSS measurement.
+
+### Integration
+
+Hooks brought to the current 33-event specification (from ~9), adding `PostToolBatch` batching,
+`FileChanged` + `SessionStart.watchPaths` for branch-switch refresh, and `CwdChanged` /
+`DirectoryAdded`; `WorktreeCreate` was **declined** with a reason (registering it replaces Claude
+Code's default worktree behaviour and any non-zero exit aborts creation). The plugin bundle now
+passes `claude plugin validate --strict` for both the plugin and marketplace manifests — it did
+not before. Hook timeouts in the plugin generator were **milliseconds where Claude Code expects
+seconds** (10000 → 2.8 hours, 150000 → 41.7 hours); both generators now share one constant.
+
+### Ledger corrections — three documented claims refuted by measurement
+
+1. `dev map --pdg` losing `meta.map_engine` and tripping `doctor`'s `foreign_writer`: **does not
+   reproduce.**
+2. SC34's "roughly 26 of 35 languages have no call graph": the real figure is **12 of 35**.
+3. "Plugin packaging has no owner": `build_plugin_bundle` already existed; what was missing was
+   that nobody had ever run the validator against it.
+
+### Follow-up in the same session: both open decisions closed, and the read path moved to the kernel
+
+The three items left open above were closed rather than handed on.
+
+**1. COBOL — closed by measuring what the grammar was worth.** It was framed as a human decision
+between dropping the language, replacing the grammar, or moving extraction into a killable
+subprocess. That framing was wrong: on a realistic COBOL program the grammar parsed `Clean` and
+yielded **only the File node** — zero declarations, zero calls — and the bounded fallback scanner
+recovers nothing either. There was no trade-off. `cobol` is now in `UNSAFE_GRAMMARS` and refused
+before any parser sees the source, with a reason a maintainer cannot miss. Consequently the
+adversarial sweep's exclusion list is **empty**: all 35 specs × 14 hostile inputs run in 6.3 s
+with COBOL back under test exercising the refusal.
+
+**2. The edge cache — closed by taking the measurement instead of citing its absence.** Withheld
+above pending an RSS number. Measured, A/B on one settled store (gen 799, 14,189 nodes, 71,598
+edges), same harness, warm daemon: `impact` median **96.2 ms → 38.5 ms (−60%)** for **+19.4 MB
+(+4%)** of steady-state RSS. The memory intuition was backwards — the uncached daemon already
+allocated a fresh 71,598-edge vector per query and did not return it (531.6 → 801.4 MB over 26
+queries), so the cache replaces an unbounded series of transient allocations with one bounded
+retained one.
+
+Its invariant test was **first written vacuous and caught as such**: both generations of the
+original fixture had 13 edges, so the length assertion passed with the generation key
+deliberately disabled. The fixture now makes the second generation strictly larger, and the test
+is red with the key off.
+
+**3. `graph_query` / `graph_trace` now ask the Rust kernel first**, falling back to Python only
+when the kernel declines — and naming which engine answered, because the two do not always
+agree. Measured against a settled store over the CLI transport:
+
+| tool | before | after | |
+|---|---|---|---|
+| `graph_trace` | 1014.6 ms | **379.2 ms** | −63% |
+| `graph_query` | 1099.1 ms | **503.1 ms** | −54%, and `callees` now answered |
+
+**`graph_query` did not improve from the routing alone, and the reason mattered.** Its kernel
+path is a *composition* — one `search` plus `impact` + `deps` for each of the first five
+definitions, so 9-11 kernel calls — and `DevMapClient` falls back to a `devmap` subprocess
+whenever no daemon socket is live, making each one a process spawn. Rewriting the analysis in
+Rust could not touch that; only removing the fan-out could.
+
+So the fan-out was removed: a composed `neighbors` command answering both directions for several
+targets in one exchange, implemented once in `StoreQueryEngine::neighbors` and exposed on both
+transports (`IpcCommand::Neighbors`, `devmap neighbors`). Measured same-process, same store, same
+binary, min-of-5, with the batch disabled to reproduce the old path exactly: **828.3 ms →
+359.9 ms, 2.30x**, with **byte-identical payloads**.
+
+That measurement then exposed a gap worth more than the speed: `callees` never carried anything.
+For a symbol-shaped target the outbound side was always `Unavailable`, because `dependencies`
+resolves a file path and a symbol id is not one — honest, and useless. `neighbors` now picks the
+query by target shape (`latest_file`, the store's own notion of a file, not a `::` sniff): files
+keep `dependencies`, symbols get the symbol-scoped forward traversal. Answering that field costs
+real work, so the shipped end-to-end number is **1398.8 ms → 503.1 ms, 2.78x**, while taking definitions with a real
+callee list from **0 to 4 of 6**. The equivalence is the load-bearing
+assertion, not the timing — a faster query that answers something different is a regression with
+a good benchmark — and it is verified red by swapping the two directions. The fan-out bound is
+refused rather than trimmed (verified red against a trimming implementation), and a `devmap`
+binary predating the command degrades to the slower per-target path rather than failing.
+
+Two seams worth recording. First, `graph_trace`'s answers **change**: Python's BFS is undirected
+over five edge kinds, the kernel's is directed over resolved edges, and the kernel is correct —
+on a real probe Python reported a path between two functions through a shared test module where
+the kernel correctly reported none. Second, the first version of this wiring passed `query=` where
+the callee reads `kwargs["name_or_path"]`, which would have raised on every call while every
+mocked test stayed green; `test_handlers_call_the_kernel_with_the_kwargs_it_actually_declares`
+drives the real function to pin the keyword contract, and is red against that bug.

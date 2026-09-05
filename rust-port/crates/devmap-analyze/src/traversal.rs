@@ -34,11 +34,73 @@ impl Default for TraversalOptions {
     }
 }
 
+/// What the walk gave up on, so a caller can tell a complete blast radius from
+/// a capped one.
+///
+/// `TraversalResult` carried only what was found. Five paths in
+/// `traverse_graph` decline silently — starts beyond `max_nodes`, a frontier
+/// pruned at `max_depth`, the node cap, the enqueue cap, and the recorded-edge
+/// cap — and every one produced a result indistinguishable from a walk that
+/// ran to completion. `impact` and `trace` then reported `truncated: false`
+/// with `total` equal to what survived, because the truncation function counted
+/// what it *received* rather than what existed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TraversalStop {
+    /// Start nodes dropped by `max_nodes` before the walk began.
+    pub starts_dropped: usize,
+    /// A node with unexpanded neighbours sat at `max_depth`.
+    pub depth_capped: bool,
+    /// `max_nodes` stopped an expansion or an enqueue.
+    pub node_capped: bool,
+    /// Edges the walk crossed but did not record, capped by `max_nodes`.
+    pub edges_unrecorded: usize,
+}
+
+impl TraversalStop {
+    /// True when the walk withheld something it would otherwise have reported.
+    pub fn is_incomplete(&self) -> bool {
+        self.starts_dropped > 0
+            || self.depth_capped
+            || self.node_capped
+            || self.edges_unrecorded > 0
+    }
+
+    /// A caller-facing sentence, or `None` when the walk was complete.
+    pub fn reason(&self, max_depth: usize, max_nodes: usize) -> Option<String> {
+        if !self.is_incomplete() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if self.depth_capped {
+            parts.push(format!("stopped at depth {max_depth}"));
+        }
+        if self.node_capped {
+            parts.push(format!("stopped at {max_nodes} nodes"));
+        }
+        if self.starts_dropped > 0 {
+            parts.push(format!("{} start nodes dropped", self.starts_dropped));
+        }
+        if self.edges_unrecorded > 0 {
+            parts.push(format!(
+                "{} traversed edges unrecorded",
+                self.edges_unrecorded
+            ));
+        }
+        Some(format!(
+            "the walk did not complete: {}; the result is a lower bound, not the \
+             full blast radius",
+            parts.join(", ")
+        ))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TraversalResult {
     pub visited_nodes: BTreeSet<String>,
     pub traversed_edges: Vec<EdgeIdentity>,
     pub max_depth_reached: usize,
+    /// Why the walk ended, if it ended early. See [`TraversalStop`].
+    pub stop: TraversalStop,
 }
 
 pub fn traverse_graph(
@@ -61,6 +123,10 @@ pub fn traverse_graph(
     let mut queue: VecDeque<(String, usize)> = VecDeque::new();
     let mut traversed_edges = Vec::new();
     let mut max_depth_reached = 0;
+    let mut stop = TraversalStop {
+        starts_dropped: start_nodes.len().saturating_sub(opts.max_nodes),
+        ..TraversalStop::default()
+    };
 
     for start in start_nodes.iter().take(opts.max_nodes) {
         if enqueued.insert(start.clone()) {
@@ -74,6 +140,17 @@ pub fn traverse_graph(
         }
         max_depth_reached = max_depth_reached.max(depth);
         if depth >= opts.max_depth || visited.len() >= opts.max_nodes {
+            // Only a prune that actually cost the walk an expansion is a
+            // decline. A node with no outgoing edges is fully explored, and
+            // counting it would make every bounded walk call itself partial.
+            if adj.contains_key(&curr) {
+                if depth >= opts.max_depth {
+                    stop.depth_capped = true;
+                }
+                if visited.len() >= opts.max_nodes {
+                    stop.node_capped = true;
+                }
+            }
             continue;
         }
 
@@ -133,6 +210,7 @@ pub fn traverse_graph(
                 };
 
                 if !enqueued.contains(&next_node) && enqueued.len() >= opts.max_nodes {
+                    stop.node_capped = true;
                     continue;
                 }
 
@@ -145,6 +223,10 @@ pub fn traverse_graph(
                 };
                 if traversed_edges.len() < opts.max_nodes.saturating_sub(1) {
                     traversed_edges.push(edge_id);
+                } else {
+                    // Walked, but never reported: without this counter the edge
+                    // is simply absent from `total`.
+                    stop.edges_unrecorded += 1;
                 }
 
                 if !enqueued.contains(&next_node) {
@@ -156,6 +238,7 @@ pub fn traverse_graph(
     }
 
     TraversalResult {
+        stop,
         visited_nodes: visited,
         traversed_edges,
         max_depth_reached,
@@ -335,6 +418,87 @@ mod tests {
     /// `traversed_edges.len() < max_nodes - 1` was mutable to `<=`, recording
     /// one edge more than the budget allows — the kind of off-by-one that only
     /// shows up when a result is already truncated.
+    /// A walk that stopped at a cap must say so.
+    ///
+    /// Every decline in `traverse_graph` produced a `TraversalResult`
+    /// indistinguishable from a complete walk, so `impact` reported a
+    /// depth-limited blast radius as the whole answer. The default depth is 3
+    /// and any real graph is deeper, so this fired on essentially every call.
+    #[test]
+    fn a_capped_walk_reports_that_it_stopped_early() {
+        // a -> b -> c -> d, walked only two levels deep.
+        let edges = vec![
+            edge("a", "b", EdgeKind::Calls),
+            edge("b", "c", EdgeKind::Calls),
+            edge("c", "d", EdgeKind::Calls),
+        ];
+        let shallow = traverse_graph(
+            &["a".to_string()],
+            &edges,
+            &TraversalOptions {
+                max_depth: 2,
+                max_nodes: 1000,
+                reverse: false,
+            },
+        );
+        assert!(
+            shallow.stop.depth_capped,
+            "the depth cap pruned a node with unexplored neighbours"
+        );
+        assert!(shallow.stop.is_incomplete());
+        assert!(shallow
+            .stop
+            .reason(2, 1000)
+            .expect("a capped walk has a reason")
+            .contains("depth 2"));
+
+        // Deep enough to finish: no claim of incompleteness.
+        let full = traverse_graph(
+            &["a".to_string()],
+            &edges,
+            &TraversalOptions {
+                max_depth: 10,
+                max_nodes: 1000,
+                reverse: false,
+            },
+        );
+        assert!(
+            !full.stop.is_incomplete(),
+            "a walk that ran out of graph is complete, not capped: {:?}",
+            full.stop
+        );
+        assert_eq!(full.stop.reason(10, 1000), None);
+
+        // The node cap is its own reason and is reported separately.
+        let narrow = traverse_graph(
+            &["a".to_string()],
+            &edges,
+            &TraversalOptions {
+                max_depth: 10,
+                max_nodes: 2,
+                reverse: false,
+            },
+        );
+        assert!(
+            narrow.stop.node_capped,
+            "the node cap stopped this walk: {:?}",
+            narrow.stop
+        );
+
+        // Start nodes dropped before the walk begins are counted too.
+        let starts: Vec<String> = (0..5).map(|i| format!("s{i}")).collect();
+        let dropped = traverse_graph(
+            &starts,
+            &edges,
+            &TraversalOptions {
+                max_depth: 10,
+                max_nodes: 2,
+                reverse: false,
+            },
+        );
+        assert_eq!(dropped.stop.starts_dropped, 3);
+    }
+
     #[test]
     fn recorded_edges_stay_within_their_budget() {
         // Several edges land on the SAME two targets, so edges outnumber nodes

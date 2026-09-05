@@ -330,7 +330,10 @@ def test_emit_additional_context_and_system_message(capsys):
 
     hook_cmd._emit_system_message("toast")
     payload = json.loads(capsys.readouterr().out)
-    assert payload["hookSpecificOutput"]["systemMessage"] == "toast"
+    # systemMessage is a universal *top-level* field; nesting it inside
+    # hookSpecificOutput (as this asserted before) silently dropped the message.
+    assert payload["systemMessage"] == "toast"
+    assert "hookSpecificOutput" not in payload
 
 
 def test_session_start_context_compact_branch(tmp_path, monkeypatch):

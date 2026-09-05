@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from mcp.types import TextContent
@@ -34,7 +35,7 @@ async def handle_run_command(root: Path, db: object, arguments: dict) -> list[Te
         "--command", command,
         "--json",
     ])
-    payload, cli_error = parse_cli_json(run_cli_command(cli_args, root))
+    payload, cli_error = parse_cli_json(await asyncio.to_thread(run_cli_command, cli_args, root))
     if cli_error:
         return cli_error
     assert payload is not None

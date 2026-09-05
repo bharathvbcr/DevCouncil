@@ -328,7 +328,12 @@ async def test_mcp_impact_precise_false_keeps_import_dependents(tmp_path, monkey
         (await call_tool("devcouncil_impact", {"paths": ["mod.py"], "precise": False}))[0].text
     )
     assert body["paths"][0]["dependents"] == ["import_only.py"]
-    assert "resolution" not in body["paths"][0]
+    # Rewritten: this used to assert `"resolution" not in ...`, which encoded the
+    # defect — a non-precise answer hid which engine produced it, so heuristic
+    # dependents were indistinguishable from symbol-level ones. Provenance is
+    # emitted on every item now, and it must say `import` here.
+    assert body["paths"][0]["resolution"] == "import"
+    assert body["paths"][0]["resolution_reason"]
 
 
 def test_dead_symbol_gate_clears_with_lsp(tmp_path, monkeypatch):

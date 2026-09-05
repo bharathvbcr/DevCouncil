@@ -11,7 +11,7 @@ from devcouncil.codeintel.debug.consent import require_debug_consent, set_debug_
 from devcouncil.codeintel.debug.discovery import adapter_by_id, discover_adapters
 from devcouncil.codeintel.debug.session import get_debug_manager
 from devcouncil.codeintel.debug.tracing import NodeCpuProfileProvider, PythonTraceProvider, import_runtime_trace
-from devcouncil.codeintel.service import canonical_project_root
+from devcouncil.integrations.mcp.handlers.codeintel import ProjectPathOutsideRoot, resolve_root
 from devcouncil.integrations.mcp.util import error_text, json_text
 
 Handler = Callable[[Path, dict], Awaitable[list[TextContent]]]
@@ -19,7 +19,7 @@ Handler = Callable[[Path, dict], Awaitable[list[TextContent]]]
 
 def _schema(properties: dict, required: list[str] | None = None) -> dict:
     schema: dict = {"type": "object", "properties": {
-        "projectPath": {"type": "string", "description": "Explicit repository path."},
+        "projectPath": {"type": "string", "description": "Repository path inside the server root."},
         **properties,
     }}
     if required:
@@ -224,8 +224,19 @@ async def dispatch(name: str, default_root: Path, arguments: dict) -> list[TextC
     handler = REGISTRY.get(name)
     if handler is None:
         return None
-    explicit = arguments.get("projectPath")
-    root = canonical_project_root(Path(explicit) if isinstance(explicit, str) and explicit else default_root)
+    # One owner for "which root does this call act on": this used to be a second
+    # copy of `resolve_root`'s body, and a containment check added to one copy
+    # would have left the debugger — which launches processes and grants
+    # per-root debug consent — reachable outside the server's root.
+    try:
+        root = resolve_root(default_root, arguments)
+    except ProjectPathOutsideRoot as exc:
+        return error_text(str(exc), code="project_path_outside_root", tool=name)
+    except (OSError, ValueError) as exc:
+        return error_text(
+            f"projectPath is not a usable path: {exc}",
+            code="invalid_arguments", tool=name, argument="projectPath",
+        )
     try:
         return await handler(root, arguments)
     except PermissionError as exc:

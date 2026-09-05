@@ -79,20 +79,50 @@ class TraceLogger:
         return trace
 
 
-def read_trace_events(project_root: Path) -> Iterable[TraceEvent]:
-    trace_file = project_root / ".devcouncil" / "logs" / "traces.jsonl"
-    if not trace_file.exists():
-        return []
+def trace_file_path(project_root: Path) -> Path:
+    """The project's trace log.
 
-    events: list[TraceEvent] = []
+    One owner for a path that was written out three times in this module. A
+    caller that needs to distinguish "no log" from "no events" has to ask about
+    the file, and it should not have to reconstruct the path to do it.
+    """
+    return Path(project_root) / ".devcouncil" / "logs" / "traces.jsonl"
+
+
+def read_trace_events_counted(project_root: Path) -> Tuple[List[TraceEvent], bool, int]:
+    """``(events, log_present, unparsed_lines)``.
+
+    `read_trace_events` drops unreadable lines at *debug* level and returns the
+    same empty list for a missing log, a wholly corrupt one, and a genuinely
+    quiet project. Callers that publish an answer to somebody else cannot make
+    that conflation: a check that could not run must not report what a check
+    that ran and passed reports. This is the same read, with what it discarded
+    still attached.
+    """
+    trace_file = trace_file_path(project_root)
+    if not trace_file.exists():
+        return [], False, 0
+
+    events: List[TraceEvent] = []
+    unparsed = 0
     for line in trace_file.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         try:
             events.append(TraceEvent.from_legacy(json.loads(line)))
         except Exception as exc:
+            unparsed += 1
             logger.debug("Skipping invalid trace line: %s", exc)
-    return events
+    return events, True, unparsed
+
+
+def read_trace_events(project_root: Path) -> Iterable[TraceEvent]:
+    """Just the events. A thin adapter over `read_trace_events_counted`.
+
+    Kept because twelve call sites want exactly this and nothing more; it
+    delegates rather than reimplementing, so the two cannot drift.
+    """
+    return read_trace_events_counted(project_root)[0]
 
 
 def read_trace_events_since(
@@ -109,7 +139,7 @@ def read_trace_events_since(
     ``cursor`` past the current end-of-file (e.g. the log was rotated/truncated)
     is treated as a reset so the caller still makes progress.
     """
-    trace_file = project_root / ".devcouncil" / "logs" / "traces.jsonl"
+    trace_file = trace_file_path(project_root)
     start = cursor if isinstance(cursor, int) and cursor >= 0 else 0
     if not trace_file.exists():
         return [], start

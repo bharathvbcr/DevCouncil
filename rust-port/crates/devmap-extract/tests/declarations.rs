@@ -1131,3 +1131,58 @@ fn declaration_extraction_is_deterministic_across_repeated_runs() {
         }
     }
 }
+
+/// A member's visibility must never decide its enclosing declaration's.
+///
+/// `generic_is_exported` read `get_node_text(node, source)` — the *whole*
+/// subtree, bodies included — and returned `false` on any `private `/`protected `
+/// substring anywhere inside it. So a public Scala class holding one private
+/// field persisted with `is_exported = 0`, and `devmap dead` reported it at the
+/// 0.90 confidence tier with no exemption reason: a proposal to delete working
+/// code, on evidence that is not about the class at all.
+///
+/// Java survived only by accident — `"public "` is tested first, and Java
+/// spells the modifier — which is why the Scala/PHP cases below are the ones
+/// that pin the rule.
+#[test]
+fn a_private_member_does_not_make_its_enclosing_declaration_private() {
+    // Scala: no `public` keyword, so nothing masks the member scan.
+    let scala = extract_file(
+        "Reg.scala",
+        "class Registry {\n  private val store = 1\n  def get(): Int = store\n}\n",
+    );
+    let registry = symbols(&scala)
+        .into_iter()
+        .find(|(name, _, _)| name.contains("Registry"))
+        .expect("the class is extracted");
+    assert!(
+        registry.2,
+        "a public Scala class with a private member must stay exported \
+         (pre-fix: is_exported = false, dead at 0.90): {registry:?}"
+    );
+
+    // PHP: same shape, and `protected` on the member rather than `private`.
+    let php = extract_file(
+        "Reg.php",
+        "<?php\nclass Registry {\n    protected $store = 1;\n    function get() { return 1; }\n}\n",
+    );
+    let php_class = symbols(&php)
+        .into_iter()
+        .find(|(name, _, _)| name.contains("Registry"))
+        .expect("the class is extracted");
+    assert!(
+        php_class.2,
+        "a protected member must not make its class private: {php_class:?}"
+    );
+
+    // The rule still reads a modifier that really is the declaration's own.
+    let private_scala = extract_file("P.scala", "private class Hidden {\n  def f(): Int = 1\n}\n");
+    let hidden = symbols(&private_scala)
+        .into_iter()
+        .find(|(name, _, _)| name.contains("Hidden"))
+        .expect("the class is extracted");
+    assert!(
+        !hidden.2,
+        "a modifier on the declaration itself is still evidence: {hidden:?}"
+    );
+}

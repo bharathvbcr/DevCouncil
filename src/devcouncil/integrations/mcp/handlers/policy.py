@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from mcp.types import TextContent
@@ -30,7 +31,7 @@ async def handle_policy_check_write(root: Path, db: object, arguments: dict) -> 
     cli_args = ["policy-check", path, "--json"]
     if task_id:
         cli_args.extend(["--task-id", task_id])
-    payload, cli_error = parse_cli_json(run_cli_command(cli_args, root))
+    payload, cli_error = parse_cli_json(await asyncio.to_thread(run_cli_command, cli_args, root))
     if cli_error:
         return cli_error
     assert payload is not None
@@ -73,7 +74,7 @@ async def handle_record_command(root: Path, db: object, arguments: dict) -> list
     reason = str(arguments.get("reason") or "")
     if reason:
         cli_args.extend(["--reason", reason])
-    payload, cli_error = parse_cli_json(run_cli_command(cli_args, root))
+    payload, cli_error = parse_cli_json(await asyncio.to_thread(run_cli_command, cli_args, root))
     if cli_error:
         return cli_error
     assert payload is not None

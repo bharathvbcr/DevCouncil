@@ -506,3 +506,34 @@ def test_mcp_get_unknown_prompt_raises():
 
     with pytest.raises(ValueError):
         asyncio.run(server.get_prompt("does_not_exist", {}))
+
+
+def test_marketplace_manifest_passes_strict_plugin_validation():
+    """The generated marketplace must satisfy `claude plugin validate --strict`.
+
+    Verified against the real validator (Claude Code 2.1.259) on a generated
+    bundle::
+
+        $ claude plugin validate <bundle>/.devcouncil/claude-plugin --strict
+        ⚠ Found 1 warning:
+          ❯ description: No marketplace description provided. Adding a
+            description helps users understand what this marketplace offers
+        ✘ Validation failed (--strict treats warnings as errors)
+
+    The plugin manifest itself passes strict cleanly; only the marketplace was
+    missing the field. `--strict` is what a publishing pipeline runs, so a
+    warning here is a release blocker rather than a cosmetic note.
+    """
+    import json
+
+    from devcouncil.integrations import claude_assets
+
+    manifest = json.loads(claude_assets._marketplace_json("0.1.0"))
+
+    description = manifest.get("description")
+    assert isinstance(description, str) and description.strip(), (
+        "the marketplace manifest needs a non-empty description or "
+        "`claude plugin validate --strict` fails: " + repr(manifest)
+    )
+    # The plugin entry's own description is separate and was already present.
+    assert manifest["plugins"][0]["description"]

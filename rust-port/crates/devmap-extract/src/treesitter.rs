@@ -58,7 +58,131 @@ fn is_metal_path(path: &str) -> bool {
         == Some(crate::languages::ExtractorId::Metal)
 }
 
+/// How long one file may spend inside tree-sitter before the parse is abandoned.
+///
+/// Measured, not guessed. A 4,000-byte C++ source consisting of 2,000 nested
+/// braces takes **131 seconds** to parse (`tree-sitter-cpp` 0.23, release
+/// build); the same input costs Ruby 8.8 s and Python 58 ms. Generated,
+/// minified and machine-emitted sources hit exactly this shape, and until now a
+/// single such file stalled the whole build with no diagnostic — a `dev map` on
+/// a repository containing one would look like a hang, and a daemon rebuild
+/// would hold its lock for the duration.
+///
+/// Five seconds is far above any legitimate file measured on the corpora in
+/// this repository (the slowest real source parses in single-digit
+/// milliseconds) and far below the pathological case.
+pub const DEFAULT_PARSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Grammars deliberately not routed to, and why.
+///
+/// `cobol`: the vendored grammar **does not terminate** on malformed input —
+/// `"a\0b\0c\n"` (six bytes) and `"\u{feff}????\n"` each ran past three minutes,
+/// while the same 14 hostile inputs across the other 34 grammars complete in
+/// 5.03 s total. No in-process bound stops it: tree-sitter's progress callback
+/// is never reached from inside a scanner that is spinning, and a spinning
+/// thread cannot be killed. One `.cbl` file with a stray NUL or a mangled
+/// header hung `dev map` outright and left a daemon holding its writer lock.
+///
+/// Unlinking costs nothing measurable, which is what settled it: on a realistic
+/// COBOL program the grammar parsed `Clean` and yielded **only the File node**
+/// — zero declarations, zero calls — and the bounded fallback scanner recovers
+/// nothing either. COBOL was already one of the twelve languages with no call
+/// extraction. Files still get a File node and stay addressable as edge
+/// targets.
+///
+/// Re-linking requires a grammar that terminates, proven against
+/// `devmap-extract/tests/adversarial_corpus.rs`.
+const UNSAFE_GRAMMARS: &[(&str, &str)] = &[(
+    "cobol",
+    "the vendored tree-sitter-cobol grammar does not terminate on malformed \
+     input and cannot be bounded in-process; it yielded no declarations or \
+     calls even on well-formed source, so it is not linked",
+)];
+
 pub fn extract_treesitter(path: &str, lang: &str, source: &str) -> Extraction {
+    extract_treesitter_with_budget(path, lang, source, DEFAULT_PARSE_BUDGET)
+}
+
+/// What a bounded parse attempt produced.
+///
+/// Distinguishing these is the point: before, "no grammar arm for this
+/// language", "the grammar is linked but refused to load", and "the parser gave
+/// up" all fell through to the same `unavailable_extraction`, which then
+/// asserted *"no linked tree-sitter grammar for {lang}"* — false for the last
+/// two, and in the grammar-load case exactly what a tree-sitter ABI regression
+/// would look like while the build stayed green.
+enum ParseAttempt {
+    Parsed(tree_sitter::Tree),
+    /// The parser exceeded its budget and was cancelled.
+    Budget(std::time::Duration),
+    /// `set_language` refused a grammar that *is* linked.
+    GrammarLoadFailed,
+    /// The parser returned no tree for a reason it did not name.
+    NoTree,
+}
+
+fn parse_within_budget(
+    parser: &mut Parser,
+    source: &str,
+    budget: std::time::Duration,
+) -> ParseAttempt {
+    let started = std::time::Instant::now();
+    let mut over_budget = false;
+    let tree = {
+        // The progress callback is polled by tree-sitter during the parse and
+        // returning `true` cancels it; this is the only way to bound a parse
+        // that has already entered a pathological state.
+        let mut cancel = |_: &tree_sitter::ParseState| -> bool {
+            if started.elapsed() >= budget {
+                over_budget = true;
+                return true;
+            }
+            false
+        };
+        let options = tree_sitter::ParseOptions::new().progress_callback(&mut cancel);
+        let bytes = source.as_bytes();
+        parser.parse_with_options(
+            &mut |offset: usize, _| {
+                if offset < bytes.len() {
+                    &bytes[offset..]
+                } else {
+                    &[][..]
+                }
+            },
+            None,
+            Some(options),
+        )
+    };
+    match tree {
+        Some(tree) if !over_budget => ParseAttempt::Parsed(tree),
+        // A cancelled parse can still hand back a partial tree. It describes a
+        // prefix of the file, so accepting it would publish a truncated symbol
+        // set as a complete one — the shape this codebase treats as worse than
+        // a visible failure.
+        _ if over_budget => ParseAttempt::Budget(started.elapsed()),
+        _ => ParseAttempt::NoTree,
+    }
+}
+
+pub fn extract_treesitter_with_budget(
+    path: &str,
+    lang: &str,
+    source: &str,
+    budget: std::time::Duration,
+) -> Extraction {
+    // Before anything else: a language whose grammar is deliberately not linked
+    // must be refused here, not fall through to `unavailable_extraction`. That
+    // path's reason — "no linked tree-sitter grammar for {lang}" — is true but
+    // useless: it reads as "upstream has no grammar", which is why VB.NET is
+    // absent, and would leave a maintainer free to re-link a grammar that hangs.
+    if let Some(why) = UNSAFE_GRAMMARS
+        .iter()
+        .find(|(unsafe_lang, _)| *unsafe_lang == lang)
+        .map(|(_, why)| *why)
+    {
+        return refused_extraction(path, lang, source, why.to_string());
+    }
+
     let mut parser = Parser::new();
 
     let ts_lang: Option<(&str, Language)> = match lang {
@@ -73,7 +197,6 @@ pub fn extract_treesitter(path: &str, lang: &str, source: &str) -> Extraction {
         "go" => Some(("go", tree_sitter_go::LANGUAGE.into())),
         "hcl" => Some(("hcl", tree_sitter_hcl::LANGUAGE.into())),
         "vue" => Some(("vue", vendored::vue())),
-        "cobol" => Some(("cobol", vendored::cobol())),
         "liquid" => Some(("liquid", vendored::liquid())),
         "astro" => Some(("astro", tree_sitter_astro_next::LANGUAGE.into())),
         "kotlin" => Some(("kotlin", tree_sitter_kotlin_ng::LANGUAGE.into())),
@@ -105,8 +228,69 @@ pub fn extract_treesitter(path: &str, lang: &str, source: &str) -> Extraction {
     };
 
     if let Some((grammar, ts_l)) = ts_lang {
-        if parser.set_language(&ts_l).is_ok() {
-            if let Some(tree) = parser.parse(source, None) {
+        // A NUL byte means this is not source text, and some grammars do not
+        // merely mis-parse it — they hang. Measured: `"a\0b\0c\n"`, six bytes,
+        // ran for over three minutes in `tree-sitter-cobol` with no sign of
+        // terminating, and the parse budget could not stop it because the
+        // progress callback is never reached from inside a scanner that is
+        // spinning. A `.cbl` file with a stray NUL would hang `dev map`
+        // outright, and a daemon would hold its lock forever.
+        //
+        // Rejecting at the boundary is the only bound that holds for every
+        // grammar, including a vendored one whose scanner this repository does
+        // not control. It is also correct on its own terms: a file containing a
+        // NUL is binary, and every extractor here assumes text.
+        if source.as_bytes().contains(&0) {
+            return refused_extraction(
+                path,
+                lang,
+                source,
+                format!(
+                    "source contains a NUL byte at offset {} and is not text; refused before \
+                     parsing because some grammars do not terminate on it",
+                    source.as_bytes().iter().position(|b| *b == 0).unwrap_or(0)
+                ),
+            );
+        }
+        let attempt = if parser.set_language(&ts_l).is_ok() {
+            parse_within_budget(&mut parser, source, budget)
+        } else {
+            ParseAttempt::GrammarLoadFailed
+        };
+        match &attempt {
+            ParseAttempt::Budget(elapsed) => {
+                return refused_extraction(
+                    path,
+                    lang,
+                    source,
+                    format!(
+                        "parse of {} bytes exceeded the {:?} budget for grammar {grammar} \
+                         (stopped at {elapsed:?}); no symbols are claimed for this file",
+                        source.len(),
+                        budget
+                    ),
+                );
+            }
+            ParseAttempt::GrammarLoadFailed => {
+                return refused_extraction(
+                    path,
+                    lang,
+                    source,
+                    format!(
+                        "grammar {grammar} for {lang} is linked but failed to load; this is a \
+                         grammar/ABI fault, not an absent grammar"
+                    ),
+                );
+            }
+            ParseAttempt::NoTree | ParseAttempt::Parsed(_) => {}
+        }
+        if let ParseAttempt::Parsed(tree) = attempt {
+            {
+                // The budget covers parse *and* walk. Measured: a 4,000-byte
+                // C++ file of 2,000 nested braces parses in 3 ms and then
+                // spends 199 s in the walk, so bounding the parse alone bounds
+                // nothing that actually hurts.
+                let walk_deadline = std::time::Instant::now() + budget;
                 let content_hash = content_hash(source);
 
                 let root = tree.root_node();
@@ -139,7 +323,7 @@ pub fn extract_treesitter(path: &str, lang: &str, source: &str) -> Extraction {
                 // precedes the symbol-scoped ones and stays the file's reason.
                 let mut wiring = extract_wiring_annotations(path, source);
 
-                walk_tree(
+                let walk_completed = walk_tree(
                     root,
                     source,
                     lang,
@@ -150,7 +334,26 @@ pub fn extract_treesitter(path: &str, lang: &str, source: &str) -> Extraction {
                     &mut exports,
                     &mut references,
                     &mut wiring,
+                    walk_deadline,
                 );
+                if !walk_completed {
+                    // The partial `symbols`/`calls` collected so far describe a
+                    // prefix of the tree. Publishing them would be a truncated
+                    // extraction wearing a clean outcome, and every consumer
+                    // reads an absent symbol as one that does not exist.
+                    return refused_extraction(
+                        path,
+                        lang,
+                        source,
+                        format!(
+                            "extraction of {} bytes exceeded the {:?} budget for grammar \
+                             {grammar} while walking the syntax tree; no symbols are claimed \
+                             for this file",
+                            source.len(),
+                            budget
+                        ),
+                    );
+                }
 
                 let (go_interface_methods, go_method_params) = if lang == "go" {
                     let sets = go_method_sets(root, source, &file_symbol_name);
@@ -755,6 +958,61 @@ fn python_module_aliases(root: Node, source: &str) -> std::collections::BTreeSet
 /// declaration — reporting success on the strength of it would be the lie the
 /// labelling exists to prevent.
 ///
+/// A parse this build *refused to complete*, reported as such.
+///
+/// Distinct from `unavailable_extraction`, which answers "there is no grammar
+/// for this language". Here a grammar exists and something went wrong with it —
+/// a budget overrun or a load fault — and saying "no linked tree-sitter grammar
+/// for {lang}" would be false. It matters most for the case that looks like
+/// nothing: a tree-sitter ABI break would otherwise downgrade every file of a
+/// language to regex fallback, be cache-admitted, exempt them all from
+/// dead-code analysis, and leave the build green.
+///
+/// No declarations are recovered by pattern here. A file whose parse was
+/// abandoned has an unknown structure, and a pattern scan over it would produce
+/// a plausible-looking symbol set that nothing verified.
+fn refused_extraction(path: &str, lang: &str, source: &str, reason: String) -> Extraction {
+    Extraction {
+        file_path: path.to_string(),
+        language: lang.to_string(),
+        content_hash: content_hash(source),
+        engine: ExtractionEngine::Unavailable {
+            requested_language: lang.to_string(),
+        },
+        parse_outcome: ParseOutcome::Failed { reason },
+        // The File node is still emitted: being unable to parse a file is not a
+        // reason to deny it exists, and every edge that targets it needs a node.
+        symbols: vec![ExtractedSymbol {
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            qualified_name: path.to_string(),
+            kind: SymbolKind::File,
+            span: Span {
+                start_byte: 0,
+                end_byte: source.len(),
+            },
+            is_exported: true,
+            docstring: None,
+            signature: None,
+            parent_symbol: None,
+            body_signature: None,
+            declaration_hash: None,
+        }],
+        imports: Vec::new(),
+        calls: Vec::new(),
+        exports: Vec::new(),
+        references: Vec::new(),
+        diagnostics: Vec::new(),
+        routes: Vec::new(),
+        wiring: extract_wiring_annotations(path, source),
+        go_package: None,
+        go_build_constrained: false,
+        go_interface_methods: Vec::new(),
+        go_method_params: Vec::new(),
+        scope_locals: Vec::new(),
+        source_code: Some(source.to_string()),
+    }
+}
+
 fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
     // Whether a grammar was ever expected for this format. A `.proto` or `.ps1`
     // with no linked grammar is a gap in coverage; a `.md` is not, and K5 is
@@ -843,11 +1101,29 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
             },
         },
         parse_outcome: match (recovered, declarative) {
+            // The dropped count rides on the *reason*, not on `diagnostics`.
+            // `for_durable_store` clears `diagnostics` before the payload is
+            // written to `generation_files.extraction_json` and the extraction
+            // cache, and nothing in the workspace reads that field in
+            // production — so the truncation the scanner correctly computed was
+            // erased on the way to storage, and the stored record of a 2,500
+            // declaration file read as a complete recovery of 2,000. A
+            // truncation is part of the result, not a note about it.
             (true, _) => ParseOutcome::Fallback {
-                reason: format!(
-                    "no linked tree-sitter grammar for {lang}; {} declaration(s) recovered by pattern",
-                    recovered_count
-                ),
+                reason: if scan.truncated > 0 {
+                    format!(
+                        "no linked tree-sitter grammar for {lang}; {recovered_count} of {} \
+                         declaration(s) recovered by pattern, {} dropped at the scan cap — \
+                         the symbol list is a prefix, not a set",
+                        recovered_count + scan.truncated,
+                        scan.truncated
+                    )
+                } else {
+                    format!(
+                        "no linked tree-sitter grammar for {lang}; {recovered_count} \
+                         declaration(s) recovered by pattern"
+                    )
+                },
             },
             (false, true) => ParseOutcome::Failed {
                 reason: format!("no linked tree-sitter grammar for {lang}"),
@@ -890,10 +1166,23 @@ fn walk_tree(
     exports: &mut Vec<ExtractedExport>,
     references: &mut Vec<ExtractedReference>,
     wiring: &mut Vec<WiringAnnotation>,
-) {
+    deadline: std::time::Instant,
+) -> bool {
     reset_scope_locals();
     let mut worklist = vec![root];
+    let mut since_check = 0u32;
     while let Some(node) = worklist.pop() {
+        // The clock is read every `DEADLINE_CHECK_STRIDE` nodes rather than
+        // every node: an ordinary file walks millions of nodes and each read is
+        // a real cost, while the pathological case that needs bounding takes
+        // orders of magnitude longer than the stride can hide.
+        since_check += 1;
+        if since_check >= DEADLINE_CHECK_STRIDE {
+            since_check = 0;
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+        }
         extract_node(
             node,
             source,
@@ -912,7 +1201,11 @@ fn walk_tree(
             }
         }
     }
+    true
 }
+
+/// Nodes walked between deadline checks. See `walk_tree`.
+const DEADLINE_CHECK_STRIDE: u32 = 256;
 
 fn find_string_child(node: Node, source: &str) -> Option<String> {
     if let Some(s) = node.child_by_field_name("source") {
@@ -1664,14 +1957,55 @@ pub(crate) fn generic_enclosing_type(node: Node, source: &str) -> Option<String>
     None
 }
 
+/// The declaration's own header: everything before its body.
+///
+/// A visibility modifier precedes the name in every language that has one, so
+/// this is the region a modifier can legally occupy. Returns the whole node
+/// when no body can be identified, which is the previous behaviour and is safe
+/// for declarations that have no body to confuse it with.
+fn declaration_header<'a>(node: Node, source: &'a str) -> &'a str {
+    let body_start = node
+        .child_by_field_name("body")
+        .map(|body| body.start_byte())
+        .or_else(|| {
+            let mut cursor = node.walk();
+            let found = node
+                .children(&mut cursor)
+                .find(|child| {
+                    let kind = child.kind();
+                    kind.ends_with("_body")
+                        || kind == "block"
+                        || kind == "declaration_list"
+                        || kind == "field_declaration_list"
+                        || kind == "template_body"
+                })
+                .map(|body| body.start_byte());
+            found
+        })
+        .unwrap_or_else(|| node.end_byte());
+    source
+        .get(node.start_byte()..body_start.max(node.start_byte()))
+        .unwrap_or("")
+}
+
 /// Visibility for grammars without a single export keyword.
 ///
 /// Falls back to the leading-character convention only where a language
 /// actually uses one; otherwise a declaration is treated as visible, which is
 /// the safe direction — treating a public symbol as private would make it a
 /// dead-code candidate on no evidence.
+///
+/// The scan is bounded to [`declaration_header`] because it previously read
+/// `get_node_text(node, source)` — the whole subtree, bodies included — and so
+/// answered a question about the declaration from text belonging to its
+/// members. One `private val` inside a public Scala class returned `false`, and
+/// `devmap dead` then reported that class at the 0.90 tier with no exemption
+/// reason. Java escaped it only because `"public "` is tested first and Java
+/// spells the modifier; that is an accident of one keyword set, not a rule.
+/// The doc contract above — every `false` rests on evidence the language
+/// actually provides — is only true once the evidence is the declaration's own.
 pub(crate) fn generic_is_exported(node: Node, source: &str, name: &str) -> bool {
-    let text = get_node_text(node, source);
+    let text = declaration_header(node, source);
     if text.starts_with("pub ") || text.contains("public ") || text.contains("export ") {
         return true;
     }

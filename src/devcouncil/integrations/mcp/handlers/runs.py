@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from mcp.types import TextContent
@@ -25,7 +26,7 @@ async def handle_list_agent_runs(root: Path, arguments: dict) -> list[TextConten
     cli_args = ["runs", "list", "--json", "--limit", str(limit)]
     if status_filter:
         cli_args.extend(["--status", status_filter])
-    payload, cli_error = run_cli_json(cli_args, root)
+    payload, cli_error = await asyncio.to_thread(run_cli_json, cli_args, root)
     if cli_error:
         return cli_error
     assert payload is not None
@@ -46,7 +47,7 @@ async def handle_get_run(root: Path, arguments: dict) -> list[TextContent]:
     if arg_error:
         return arg_error
     assert run_id is not None
-    payload, cli_error = run_cli_json(["runs", "show", run_id, "--json"], root)
+    payload, cli_error = await asyncio.to_thread(run_cli_json, ["runs", "show", run_id, "--json"], root)
     if cli_error:
         return cli_error
     assert payload is not None

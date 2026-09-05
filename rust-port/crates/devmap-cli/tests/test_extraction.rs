@@ -68,13 +68,32 @@ fn test_adversarial_inputs() {
         .iter()
         .any(|symbol| symbol.name == "fn_long"));
 
-    // Null bytes / binary string
+    // Null bytes / binary string.
+    //
+    // This asserted `Partial` — "we parsed it and found errors" — which is what
+    // tree-sitter-rust happens to do. It is now `Failed`, because a NUL-bearing
+    // source is refused at the boundary before any grammar sees it. That is not
+    // a style preference: the vendored COBOL grammar **does not terminate** on
+    // this input (measured 2026-09-04: six bytes, over three minutes, no end),
+    // and tree-sitter's progress callback is never reached from inside a
+    // scanner that is spinning, so there is no in-process bound that would stop
+    // it. The guard has to be uniform — a per-language exemption would
+    // reintroduce the hang for exactly the language that hangs.
+    //
+    // The test's intent is unchanged and better served: adversarial input is
+    // still handled without crashing, and is now reported honestly rather than
+    // yielding symbols extracted from binary.
     let bin_code = "fn main() { \0\0\0 }";
     let ext_bin = extract_file("src/bin.rs", bin_code);
-    assert!(matches!(
-        ext_bin.parse_outcome,
-        ParseOutcome::Partial { .. }
-    ));
+    match &ext_bin.parse_outcome {
+        ParseOutcome::Failed { reason } => {
+            assert!(
+                reason.contains("NUL"),
+                "the refusal must name why: {reason:?}"
+            )
+        }
+        other => panic!("a NUL-bearing source must be refused, got {other:?}"),
+    }
 }
 
 #[test]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Callable
 
@@ -45,13 +46,13 @@ async def handle_checkout_task(
         cli_args.extend(["--agent", agent])
     if force_value:
         cli_args.append("--force")
-    payload, cli_error = parse_cli_json(run_cli_command(cli_args, root))
+    payload, cli_error = parse_cli_json(await asyncio.to_thread(run_cli_command, cli_args, root))
     if cli_error:
         return cli_error
     assert payload is not None
     if isinstance(payload, dict) and "applied_skills" not in payload:
         task: dict = {}
-        show_payload, _show_error = run_cli_json(["show", task_id, "--json"], root)
+        show_payload, _show_error = await asyncio.to_thread(run_cli_json, ["show", task_id, "--json"], root)
         if isinstance(show_payload, dict) and isinstance(show_payload.get("task"), dict):
             task = show_payload["task"]
         payload = {**payload, "applied_skills": _applied_skill_names(root, task)}

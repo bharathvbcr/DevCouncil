@@ -294,6 +294,29 @@ pub struct Store {
     /// `.writer.lock`. `None` for an in-memory store, which no other process
     /// can reach and therefore has nothing to serialise against.
     db_path: Option<std::path::PathBuf>,
+    /// The latest generation's full edge set, kept for the life of that
+    /// generation.
+    ///
+    /// `latest_edges` re-ran a two-JOIN, fully-ordered scan of every edge on
+    /// **every** request. Measured on this repository (71,598 edges, warm
+    /// daemon): `impact` and `trace` cost 99.6-160 ms *regardless of `--depth`*
+    /// — depth 1, 3 and 8 all landed within noise of each other — because the
+    /// cost is the load, not the traversal.
+    ///
+    /// Caching it also *reduces* memory rather than adding to it, which is the
+    /// opposite of what it looks like. The uncached daemon allocated a fresh
+    /// 71,598-edge vector per query and did not give the memory back: RSS went
+    /// 531.6 MB after startup -> 625.2 MB after 6 queries -> 801.4 MB after 26,
+    /// about 10 MB per query of allocator churn. One retained copy replaces an
+    /// unbounded series of transient ones.
+    ///
+    /// Keyed by generation id, so a build that commits a new generation
+    /// invalidates it by construction — there is no separate invalidation path
+    /// to forget to call. Only the newest generation is held, so the memory is
+    /// bounded by one edge set and not by the number of generations retained.
+    /// The cached set is unfiltered; `min_confidence` is applied per request
+    /// against the same rounding rule the SQL used, so the answer is unchanged.
+    edge_cache: Mutex<Option<(u32, std::sync::Arc<Vec<StoredEdge>>)>>,
 }
 
 /// A held cross-process writer lock on one store (K13).
@@ -522,6 +545,32 @@ impl std::fmt::Display for VacuumAction {
             Self::FullConverting => write!(f, "full+convert"),
         }
     }
+}
+
+/// Refuse a confidence threshold that no comparison can evaluate.
+///
+/// `min_confidence` is compared two ways in this file — in SQL for the
+/// file-scoped query, and in Rust for the cached whole-generation one — and on
+/// NaN they disagree completely rather than at a boundary: Rust admits every
+/// edge, SQLite admits none. Whichever answered, the caller could not tell that
+/// the filter had not run, because an empty edge list is also what a real
+/// filter returns.
+///
+/// Refused rather than clamped or defaulted. NaN means the caller does not know
+/// what it is asking for, and picking a threshold on its behalf publishes a
+/// number nobody chose. Infinities are left alone: `>= inf` and `>= -inf` are
+/// degenerate but both implementations agree on them, and so is any finite
+/// value outside 0.0..=1.0 — an empty answer there is a filter that ran and
+/// matched nothing, which is a real result.
+fn checked_min_confidence(value: f32) -> Result<f32> {
+    if value.is_nan() {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "min_confidence must be a number; got NaN, which no confidence \
+             comparison can evaluate"
+                .to_string(),
+        ));
+    }
+    Ok(value)
 }
 
 impl Store {
@@ -1005,6 +1054,7 @@ impl Store {
         Self::migrate(&mut conn, &path.display().to_string())?;
         Ok(Self {
             conn: Mutex::new(conn),
+            edge_cache: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
         })
     }
@@ -1168,6 +1218,7 @@ impl Store {
         Self::migrate(&mut conn, ":memory:")?;
         Ok(Self {
             conn: Mutex::new(conn),
+            edge_cache: Mutex::new(None),
             db_path: None,
         })
     }
@@ -2945,6 +2996,7 @@ impl Store {
         path: &str,
         min_confidence: f32,
     ) -> Result<Vec<StoredEdge>> {
+        let min_confidence = checked_min_confidence(min_confidence)?;
         let conn = lock_conn(&self.conn)?;
         let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
             return Ok(Vec::new());
@@ -2974,7 +3026,57 @@ impl Store {
         rows.collect()
     }
 
+    /// Every edge in the latest generation at or above `min_confidence`.
+    ///
+    /// Served from [`Store::edge_cache`] when the generation has not moved. See
+    /// that field for the measurements that motivate it.
     pub fn latest_edges(&self, min_confidence: f32) -> Result<Vec<StoredEdge>> {
+        // The confidence comparison is the SQL's, moved into Rust unchanged, so
+        // a cached answer and a freshly-queried one cannot disagree — *given a
+        // finite threshold*. That qualifier was missing and the claim was false:
+        // on NaN the two implementations disagreed completely. Rust saturates
+        // `(NaN * 1000.0).round() as i64` to 0 and admits everything; SQLite
+        // stores NaN as NULL and `>= NULL` is NULL, so the SQL admits nothing.
+        // A caller got "this depends on nothing" — a positive claim — from a
+        // comparison that never ran. `checked_min_confidence` refuses the input
+        // instead, so neither implementation is asked an unanswerable question.
+        fn admits(confidence: f32, min_confidence: f32) -> bool {
+            (confidence * 1000.0).round() as i64 >= (min_confidence * 1000.0).round() as i64
+        }
+
+        let min_confidence = checked_min_confidence(min_confidence)?;
+
+        let current = {
+            let conn = lock_conn(&self.conn)?;
+            Self::latest_generation_id_locked(&conn)?
+        };
+        let Some(current) = current else {
+            return Ok(Vec::new());
+        };
+        if let Ok(cache) = self.edge_cache.lock() {
+            if let Some((generation, edges)) = cache.as_ref() {
+                if *generation == current {
+                    return Ok(edges
+                        .iter()
+                        .filter(|edge| admits(edge.confidence, min_confidence))
+                        .cloned()
+                        .collect());
+                }
+            }
+        }
+        let all = self.latest_edges_uncached(0.0)?;
+        let filtered: Vec<StoredEdge> = all
+            .iter()
+            .filter(|edge| admits(edge.confidence, min_confidence))
+            .cloned()
+            .collect();
+        if let Ok(mut cache) = self.edge_cache.lock() {
+            *cache = Some((current, std::sync::Arc::new(all)));
+        }
+        Ok(filtered)
+    }
+
+    fn latest_edges_uncached(&self, min_confidence: f32) -> Result<Vec<StoredEdge>> {
         let conn = lock_conn(&self.conn)?;
         let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
             return Ok(Vec::new());

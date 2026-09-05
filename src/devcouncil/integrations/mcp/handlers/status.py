@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 from mcp.types import TextContent
 
 from devcouncil.integrations.mcp.util import (
+    cli_timeout_error,
     error_text,
     int_argument,
     json_text,
@@ -84,7 +86,9 @@ def _status_cli_error(cli_error: list[TextContent]) -> list[TextContent]:
 
 async def handle_status(root: Path, db: object, arguments: dict) -> list[TextContent]:
     del db, arguments
-    payload, cli_error = parse_cli_json(run_cli_command(["status", "--json"], root, truncate=False))
+    payload, cli_error = parse_cli_json(
+        await asyncio.to_thread(run_cli_command, ["status", "--json"], root, truncate=False)
+    )
     if cli_error:
         return _status_cli_error(cli_error)
     assert payload is not None
@@ -114,7 +118,13 @@ async def handle_status(root: Path, db: object, arguments: dict) -> list[TextCon
 
 async def handle_report(root: Path, db: object, arguments: dict) -> list[TextContent]:
     del db, arguments
-    result = run_cli_command(["report"], root, truncate=True)
+    result = await asyncio.to_thread(run_cli_command, ["report"], root, truncate=True)
+    # Report is the one CLI surface that does not go through `parse_cli_json`
+    # (its answer is prose, not JSON), so the timeout branch is repeated rather
+    # than inherited: a killed `report` used to arrive as `cli_failed` with an
+    # empty stderr, indistinguishable from a report that ran and refused.
+    if result.get("timed_out"):
+        return cli_timeout_error(result, what="report command")
     if not result.get("ok"):
         stderr = str(result.get("stderr") or "report command failed")
         return error_text(stderr, code="cli_failed")
@@ -131,7 +141,7 @@ async def handle_get_gaps(root: Path, db: object, arguments: dict) -> list[TextC
     cli_args = ["gaps", "--json", "--task-id", task_id]
     if blocking_only:
         cli_args.append("--blocking-only")
-    payload, cli_error = run_cli_json(cli_args, root)
+    payload, cli_error = await asyncio.to_thread(run_cli_json, cli_args, root)
     if cli_error:
         return cli_error
     assert payload is not None
@@ -153,7 +163,9 @@ async def handle_get_next_actions(root: Path, db: object, arguments: dict) -> li
     if arg_error:
         return arg_error
     assert task_id is not None
-    payload, cli_error = run_cli_json(["gaps", "--json", "--task-id", task_id, "--next-actions"], root)
+    payload, cli_error = await asyncio.to_thread(
+        run_cli_json, ["gaps", "--json", "--task-id", task_id, "--next-actions"], root
+    )
     if cli_error:
         return cli_error
     assert payload is not None
@@ -186,7 +198,7 @@ async def handle_list_tasks(root: Path, db: object, arguments: dict) -> list[Tex
     cli_args = ["tasks", "--json", "--limit", str(limit), "--offset", str(offset)]
     if status_filter:
         cli_args.extend(["--status", status_filter])
-    payload, cli_error = run_cli_json(cli_args, root)
+    payload, cli_error = await asyncio.to_thread(run_cli_json, cli_args, root)
     if cli_error:
         return cli_error
     assert payload is not None

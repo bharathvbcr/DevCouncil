@@ -28,7 +28,7 @@ from pathlib import Path
 
 from devcouncil.executors.advisor_tool import ADVISOR_STEERING_NUDGE
 from devcouncil.knowledge.frontmatter import build_frontmatter_markdown
-from devcouncil.integrations.clients.hooks import claude_hook_specs
+from devcouncil.integrations.clients.hooks import ClaudeHookSpec, claude_hook_specs
 
 # Tools a DevCouncil subagent should be allowed to use: the standard read/edit/run set
 # plus the DevCouncil MCP tools it drives the task loop with. Listing the MCP tools keeps
@@ -412,12 +412,29 @@ def _plugin_dir(root: Path) -> Path:
     return root / PLUGIN_ROOT_REL / _PLUGIN_NAME
 
 
+# Project identity for the published plugin manifest. `homepage`/`repository` mirror
+# pyproject.toml's [project.urls]; `license` mirrors the repo's LICENSE (Apache 2.0),
+# which pyproject does not record as metadata. Kept as literals so the builders stay pure
+# (`_plugin_json` takes only `version`); `test_plugin_manifest_metadata.py` asserts they
+# stay in sync with pyproject/LICENSE so the copies cannot drift.
+_PLUGIN_HOMEPAGE = "https://github.com/bharathvbcr/DevCouncil"
+_PLUGIN_REPOSITORY = "https://github.com/bharathvbcr/DevCouncil.git"
+_PLUGIN_LICENSE = "Apache-2.0"
+
+
 def _plugin_json(version: str) -> str:
     manifest = {
         "name": _PLUGIN_NAME,
         "description": "DevCouncil: evidence-gated planning, execution, and verification for coding agents.",
         "version": version,
-        "author": {"name": "DevCouncil"},
+        "author": {"name": "DevCouncil", "url": _PLUGIN_HOMEPAGE},
+        # Optional per the Plugins spec, but this is a *published, installable* artifact:
+        # without them an installed plugin cannot tell the user its terms or where it came
+        # from. All three are recognized manifest fields (verified against
+        # `claude plugin validate --strict`, Claude Code 2.1.259).
+        "homepage": _PLUGIN_HOMEPAGE,
+        "repository": _PLUGIN_REPOSITORY,
+        "license": _PLUGIN_LICENSE,
         "keywords": ["devcouncil", "verification", "planning", "mcp", "code-review"],
     }
     return json.dumps(manifest, indent=2) + "\n"
@@ -426,6 +443,16 @@ def _plugin_json(version: str) -> str:
 def _marketplace_json(version: str) -> str:
     manifest = {
         "name": _MARKETPLACE_NAME,
+        # `claude plugin validate --strict` (Claude Code 2.1.259) treats a
+        # missing marketplace description as a warning, and `--strict` promotes
+        # warnings to errors — so without this the bundle fails the exact check
+        # a publishing pipeline runs. The plugin manifest itself already passes
+        # strict; only the marketplace was short.
+        "description": (
+            "DevCouncil's own marketplace: the evidence-gated planning, execution and "
+            "verification toolchain, plus the Dev Map code-intelligence graph, for this "
+            "repository."
+        ),
         "owner": {"name": "DevCouncil"},
         "plugins": [
             {
@@ -451,8 +478,13 @@ def _plugin_hooks_json(root: Path, *, write_gate: bool = False) -> str:
     Assist-mode by default installs refresh-only PostToolUse (never gates writes) plus
     lifecycle hooks. The blocking PreToolUse write-gate is included only when
     ``write_gate`` is True."""
-    def cmd(event: str) -> str:
-        return f'devcouncil hook {event} --client claude --project-root "${{CLAUDE_PROJECT_DIR}}"'
+
+    def cmd(spec: ClaudeHookSpec) -> str:
+        extra = f" {' '.join(spec.extra)}" if spec.extra else ""
+        return (
+            f'devcouncil hook {spec.hook_event} --client claude '
+            f'--project-root "${{CLAUDE_PROJECT_DIR}}"{extra}'
+        )
 
     hooks: dict[str, list] = {}
     for spec in claude_hook_specs(write_gate=write_gate):
@@ -460,7 +492,7 @@ def _plugin_hooks_json(root: Path, *, write_gate: bool = False) -> str:
         if spec.matcher:
             group["matcher"] = spec.matcher
         # timeout is in SECONDS -- Claude Code's documented unit for the hook field.
-        group["hooks"] = [{"type": "command", "command": cmd(spec.hook_event), "timeout": spec.timeout(root)}]
+        group["hooks"] = [{"type": "command", "command": cmd(spec), "timeout": spec.timeout(root)}]
         hooks.setdefault(spec.event, []).append(group)
     return json.dumps({"hooks": hooks}, indent=2) + "\n"
 

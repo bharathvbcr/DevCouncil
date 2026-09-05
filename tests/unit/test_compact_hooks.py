@@ -105,9 +105,11 @@ def test_pre_compact_writes_snapshot_and_optional_toast(tmp_path):
     assert snapshot["phase"] == "TASK_EXECUTING"
     assert "blocking gap" in (snapshot.get("blocking_gaps_summary") or "").lower()
     payload = json.loads(result.stdout)
-    assert payload["hookSpecificOutput"]["hookEventName"] == "PreCompact"
-    assert "compact snapshot" in payload["hookSpecificOutput"]["systemMessage"].lower()
-    assert "additionalContext" not in payload["hookSpecificOutput"]
+    # systemMessage is a universal *top-level* field, not a hookSpecificOutput
+    # member. PreCompact carries no event-specific output at all, so emitting a
+    # hookSpecificOutput object here would only add an empty hookEventName.
+    assert "compact snapshot" in payload["systemMessage"].lower()
+    assert "hookSpecificOutput" not in payload
 
 
 def test_pre_compact_never_blocks_when_db_missing(tmp_path):

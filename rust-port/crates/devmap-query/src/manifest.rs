@@ -10,6 +10,11 @@ use serde_json::{json, Value};
 
 pub(crate) const CONSUMER_MAP_ENGINE: &str = "devmap-rust";
 const DEAD_CANDIDATE_CAP: usize = 200;
+/// Unwired candidates share the dead-symbol cap: both are debt lists read by an
+/// agent for orientation, both are budget-bearing, and a second constant would
+/// only let the two drift. The true total travels beside the list in
+/// `liveness_meta.unwired`, so the cap costs no information.
+const UNWIRED_CANDIDATE_CAP: usize = DEAD_CANDIDATE_CAP;
 const DEPENDENTS_CAP: usize = 1_024;
 
 pub fn generate_manifest(
@@ -170,6 +175,11 @@ fn consumer_manifest_json(
     });
 
     let (dependents, dependents_total) = build_dependents(edges);
+    let dead_symbol_total = analysis
+        .dead_symbols
+        .iter()
+        .filter(|report| !report.is_exempt)
+        .count();
     let dead_symbol_candidates: Vec<String> = analysis
         .dead_symbols
         .iter()
@@ -219,7 +229,18 @@ fn consumer_manifest_json(
         })
         .collect();
 
-    let liveness_unreliable = lean.entry_roots.is_empty();
+    let (graph_degraded, graph_degraded_reason) = match &analysis.status {
+        AnalysisStatus::Ok => (false, String::new()),
+        AnalysisStatus::Partial { reason } => (true, format!("partial: {reason}")),
+        AnalysisStatus::Timeout { reason } => (true, format!("timeout: {reason}")),
+    };
+    let entry_root_total = entry_root_paths(extractions).len();
+    let all_unwired = crate::code_graph::unwired_candidates(extractions, edges);
+    let unwired_total = all_unwired.len();
+    let unwired_shown: Vec<String> = all_unwired
+        .into_iter()
+        .take(UNWIRED_CANDIDATE_CAP)
+        .collect();
     let payload = json!({
         "languages": languages.into_iter().collect::<Vec<_>>(),
         "frameworks": [],
@@ -241,19 +262,62 @@ fn consumer_manifest_json(
             .content_fingerprint
             .clone()
             .unwrap_or_default(),
-        "graph_degraded": false,
-        "graph_degraded_reason": "",
+        // Derived from the same `AnalysisSummary` `code_graph.json` renders as
+        // `analysis_status`, because the two artifacts of one build must not
+        // disagree about whether the graph settled. These were literals, and
+        // `RepoMapper.map_is_stale`'s fail-closed branch
+        // (`if bool(repo_map.get("graph_degraded")): return True`) could
+        // therefore never fire: a map built from a partition that never
+        // converged was accepted as healthy by `--if-stale`, `watch` and
+        // `verify`.
+        "graph_degraded": graph_degraded,
+        "graph_degraded_reason": graph_degraded_reason,
         "lsp": {},
         "dependency_risks": [],
         "entry_roots": lean.entry_roots,
-        "unwired_candidates": [],
+        // Computed, not asserted empty. `code_graph.json` has always derived
+        // this from the same `extractions` and `edges` this function already
+        // receives; emitting `[]` here made the two artifacts contradict each
+        // other, and read to a consumer as "nothing is unwired".
+        "unwired_candidates": unwired_shown,
+        // Genuinely never computed by this kernel — see
+        // `liveness_meta.unavailable.unreachable_files` and the now
+        // unconditional `liveness_unreachable_unreliable`, which is how
+        // `code_graph.json` has always stated it.
         "unreachable_files": [],
         "dead_symbol_candidates": dead_symbol_candidates,
-        "liveness_unreachable_unreliable": liveness_unreliable,
+        "liveness_unreachable_unreliable": true,
         "liveness_meta": {
             "engine": CONSUMER_MAP_ENGINE,
-            "dead_symbol": { "count": analysis.dead_symbols.iter().filter(|r| !r.is_exempt).count() },
-            "entry_roots": { "count": lean.entry_roots.len() },
+            "dead_symbol": {
+                "shown": dead_symbol_candidates.len(),
+                "total": dead_symbol_total,
+                "truncated": dead_symbol_total > dead_symbol_candidates.len(),
+                // Retained under its original name for readers that predate
+                // the shown/total split; it has always meant the true total.
+                "count": dead_symbol_total,
+            },
+            // `entry_roots` is capped at ENTRY_ROOT_CAP to hold the token
+            // budget, so `count` — which was the post-truncation length —
+            // reported the cap as the total. `is_entry_root` in
+            // `subsystem_map.py` reads the capped list, so every genuine entry
+            // root sorting after the cap was answered `false`; `truncated`
+            // is what lets a consumer tell that answer is not knowable here.
+            "entry_roots": {
+                "shown": lean.entry_roots.len(),
+                "total": entry_root_total,
+                "truncated": entry_root_total > lean.entry_roots.len(),
+            },
+            "unwired": {
+                "shown": unwired_shown.len(),
+                "total": unwired_total,
+                "truncated": unwired_total > unwired_shown.len(),
+            },
+            "unavailable": {
+                "unreachable_files": "file-level reachability BFS is not \
+                     implemented in the Rust kernel; the empty list is not a \
+                     computed result",
+            },
         },
         "processes": [],
         "map_engine": CONSUMER_MAP_ENGINE,
@@ -589,6 +653,143 @@ mod tests {
             !languages.contains(&"unknown"),
             "`unknown` must never be advertised: {languages:?}"
         );
+    }
+
+    /// Build the consumer manifest the way `generate_manifest_with_edges` does.
+    fn consumer_json(
+        extractions: &[Extraction],
+        analysis: &AnalysisSummary,
+        edges: &[ResolvedEdge],
+    ) -> Value {
+        let fresh = freshness();
+        let lean = lean_manifest(extractions, analysis, fresh.clone());
+        let json = consumer_manifest_json(extractions, analysis, &fresh, &lean, edges);
+        serde_json::from_str(&json).expect("consumer manifest parses")
+    }
+
+    fn script_entry(path: &str) -> Extraction {
+        let mut ext = extract_file(path, "def main(): pass\n");
+        ext.wiring.push(devmap_extract::model::WiringAnnotation {
+            kind: WiringKind::ScriptEntry,
+            target_symbol: path.to_string(),
+            details: "entry".to_string(),
+        });
+        ext
+    }
+
+    /// `repo_map.json` must not claim a healthy graph when the analysis degraded.
+    ///
+    /// `graph_degraded` was a literal `false` on every path while the same
+    /// `AnalysisSummary` could say `Partial`, and `code_graph.json` — written in
+    /// the same build from the same value — rendered it honestly. The consumer
+    /// that matters is `RepoMapper.map_is_stale`
+    /// (`src/devcouncil/indexing/repo_mapper.py`), whose fail-closed branch
+    /// `if bool(repo_map.get("graph_degraded")): return True` could never fire,
+    /// so `--if-stale`, `watch` and `verify` accepted a map built from a
+    /// partition that never settled.
+    #[test]
+    fn a_degraded_analysis_is_not_reported_as_a_healthy_graph() {
+        let extractions = vec![script_entry("main.py")];
+        let mut analysis = empty_analysis();
+        analysis.status = AnalysisStatus::Partial {
+            reason: "louvain hit MAX_PASSES without converging".to_string(),
+        };
+
+        let value = consumer_json(&extractions, &analysis, &[]);
+
+        assert_eq!(
+            value["graph_degraded"], true,
+            "a Partial analysis must degrade the map: {value}"
+        );
+        let reason = value["graph_degraded_reason"].as_str().unwrap_or("");
+        assert!(
+            reason.contains("louvain"),
+            "the reason must name the cause, got {reason:?}"
+        );
+
+        // The healthy case must stay healthy, or the fail-closed branch becomes
+        // an unconditional rebuild.
+        let healthy = consumer_json(&extractions, &empty_analysis(), &[]);
+        assert_eq!(healthy["graph_degraded"], false);
+        assert_eq!(healthy["graph_degraded_reason"], "");
+    }
+
+    /// The two artifacts of one build must not contradict each other about
+    /// liveness.
+    ///
+    /// `unwired_candidates` was a literal `[]` in `repo_map.json` while
+    /// `code_graph.json` computed it from the same `extractions` and `edges`
+    /// that `consumer_manifest_json` already receives. `unreachable_files` is
+    /// never computed by this kernel at all, yet `repo_map.json` gated its
+    /// unreliability flag on `entry_roots.is_empty()` — false on any repository
+    /// with an entry root — while `code_graph.json` sets the same flag
+    /// unconditionally.
+    #[test]
+    fn the_manifest_reports_liveness_it_computed_and_flags_what_it_did_not() {
+        let orphan = extract_file("orphan.py", "def g(): pass\n");
+        let used = extract_file("used.py", "def h(): pass\n");
+        let app = extract_file("app.py", "import used\n");
+        let extractions = vec![script_entry("main.py"), orphan, used, app];
+        let edges = vec![import_edge("app.py", "used.py")];
+
+        let value = consumer_json(&extractions, &empty_analysis(), &edges);
+
+        let unwired: Vec<&str> = value["unwired_candidates"]
+            .as_array()
+            .expect("unwired_candidates array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            unwired.contains(&"orphan.py"),
+            "an unimported non-entry file is an unwired candidate: {unwired:?}"
+        );
+        assert!(
+            !unwired.contains(&"main.py"),
+            "an entry root is never unwired: {unwired:?}"
+        );
+
+        assert_eq!(
+            value["liveness_unreachable_unreliable"], true,
+            "file-level reachability is never computed here, so the flag is \
+             unconditional — `code_graph.json` already sets it that way"
+        );
+        let marker = value["liveness_meta"]["unavailable"]["unreachable_files"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            marker.contains("not"),
+            "the empty `unreachable_files` needs a marker saying it was never \
+             computed, got {marker:?}"
+        );
+    }
+
+    /// A truncated list must not report its truncated length as the total.
+    ///
+    /// `entry_roots` is capped at 20 for the token budget, and
+    /// `liveness_meta.entry_roots.count` was `lean.entry_roots.len()` — the
+    /// post-truncation length. `code_graph.json` emits the same list uncapped,
+    /// so a 25-root repository had one artifact saying 25 and the other 20.
+    #[test]
+    fn entry_root_count_is_the_true_total_not_the_truncated_length() {
+        let extractions: Vec<Extraction> = (0..25)
+            .map(|i| script_entry(&format!("svc{i:02}/main.py")))
+            .collect();
+
+        let value = consumer_json(&extractions, &empty_analysis(), &[]);
+
+        assert_eq!(
+            value["entry_roots"].as_array().map(Vec::len),
+            Some(20),
+            "the list itself stays capped"
+        );
+        let meta = &value["liveness_meta"]["entry_roots"];
+        assert_eq!(
+            meta["total"], 25,
+            "the count must be the real total, not the cap: {meta}"
+        );
+        assert_eq!(meta["shown"], 20);
+        assert_eq!(meta["truncated"], true);
     }
 
     fn import_edge(source: &str, target: &str) -> ResolvedEdge {

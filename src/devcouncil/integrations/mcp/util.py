@@ -84,16 +84,24 @@ def annotate_stale(contents: list[TextContent], coordinator: object) -> list[Tex
     return json_text(payload)
 
 
-def _map_artifact_is_stale(root: Path) -> bool:
+def _map_artifact_freshness(root: Path) -> tuple[bool | None, str]:
     """Whether `repo_map.json` still describes the code, by fingerprint.
 
     Reads the artifact the Rust kernel writes (fingerprints stamped by
     `devmap_engine.stamp_freshness`) and compares it against git. Not a second
     engine's opinion — the kernel's own output, checked.
 
-    An unreadable or absent map is **not** reported stale here: the caller
-    distinguishes "no map" from "map is behind", and returning True would
-    collapse the two.
+    Returns ``(stale, reason)`` as a tri-state:
+
+    * ``(True, "")``  — fingerprints disagree with git: verified stale.
+    * ``(False, "")`` — fingerprints match: verified *not* stale.
+    * ``(None, why)`` — the check could not run, so freshness is **unknown**.
+
+    The third case used to collapse into ``False``. An absent map, an
+    unreadable one and a probe that raised all reported exactly what a check
+    that ran and passed reports, which is the one thing this codebase's Class A
+    rule forbids. The caller decides what to do with the unknown; it no longer
+    has to guess that it happened.
     """
     try:
         from devcouncil.indexing.repo_mapper import RepoMapper
@@ -101,14 +109,24 @@ def _map_artifact_is_stale(root: Path) -> bool:
 
         map_path = root / ".devcouncil" / "repo_map.json"
         if not map_path.is_file():
-            return False
+            return None, "no repo map at .devcouncil/repo_map.json (run `dev map`)"
         data = read_json(map_path) or {}
         if not isinstance(data, dict) or not data:
-            return False
-        return bool(RepoMapper(project_root=root).map_is_stale(data))
-    except Exception:
+            return None, "repo_map.json is empty or not a JSON object"
+        return bool(RepoMapper(project_root=root).map_is_stale(data)), ""
+    except Exception as exc:  # noqa: BLE001 - a probe that failed stays unknown
         logger.debug("repo-map fingerprint check failed", exc_info=True)
-        return False
+        return None, f"repo-map fingerprint check failed: {exc}"
+
+
+def _map_artifact_is_stale(root: Path) -> bool:
+    """Boolean view for the branch where the kernel already gave an answer.
+
+    Only a *verified* stale overrides the kernel here; unknown leaves the
+    kernel's verdict standing rather than manufacturing one.
+    """
+    stale, _ = _map_artifact_freshness(root)
+    return stale is True
 
 
 class _MapFreshness:
@@ -161,6 +179,50 @@ def annotate_freshness_unknown(
         "reason": reason,
     }
     return json_text(payload)
+
+
+def annotate_freshness_from_artifact(
+    contents: list[TextContent], kernel_reason: str
+) -> list[TextContent]:
+    """Record that freshness was proved by the map artifact, not by the kernel.
+
+    The fingerprint check in `repo_map.json` ran and passed, so `stale` stays a
+    verified `False` — dropping to `unknown` here would discard evidence we
+    actually have. What must not vanish is *which* check answered: the kernel
+    was unreachable, and a reader who cannot tell "the kernel confirmed this"
+    from "the kernel never answered" is one step from treating an unbuilt store
+    as a healthy one. That reason used to be computed and then thrown away.
+    """
+    text = contents[0].text if contents else ""
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return contents
+    if not isinstance(payload, dict):
+        return contents
+    existing_sync = payload.get("sync")
+    sync_base = existing_sync if isinstance(existing_sync, dict) else {}
+    payload["stale"] = False
+    payload["fresh"] = True
+    payload["sync"] = {
+        **sync_base,
+        "pending": [],
+        "state": "artifact",
+        "fresh": True,
+        "verified_by": "repo_map_fingerprint",
+        "kernel_unavailable": kernel_reason,
+    }
+    return json_text(payload)
+
+
+def _payload_asserts_stale(contents: list[TextContent]) -> bool:
+    """Whether the handler's own payload already claims a verified stale map."""
+    text = contents[0].text if contents else ""
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(payload, dict) and payload.get("stale") is True
 
 
 async def with_codeintel_freshness(
@@ -236,13 +298,22 @@ async def with_codeintel_freshness(
     contents = await produce()
     if not contents:
         return contents
-    map_path = root / ".devcouncil" / "repo_map.json"
-    if map_path.is_file():
-        if _map_artifact_is_stale(root):
-            return annotate_stale(contents, _MapFreshness(unavailable))
-        return contents
-    # No kernel and no map: unknown, never a verified `fresh`.
-    return annotate_freshness_unknown(contents, unavailable)
+    artifact_stale, artifact_reason = _map_artifact_freshness(root)
+    if artifact_stale is True:
+        return annotate_stale(contents, _MapFreshness(unavailable))
+    if artifact_stale is None:
+        # Neither the kernel nor the artifact could answer. This used to be
+        # reached only when the map file was absent; with the map present and a
+        # fingerprint probe that raised, the response went out untouched — a
+        # `stale: False` nobody had verified, and the kernel's own reason
+        # dropped on the floor.
+        reason = "; ".join(part for part in (unavailable, artifact_reason) if part)
+        if _payload_asserts_stale(contents):
+            # Stale wins: a handler that already fail-closed keeps its verdict.
+            # Unknown must never soften a stale another signal proved.
+            return annotate_stale(contents, _MapFreshness(reason))
+        return annotate_freshness_unknown(contents, reason)
+    return annotate_freshness_from_artifact(contents, unavailable)
 
 
 def normalize_arguments(arguments: object) -> dict:
@@ -386,8 +457,34 @@ def allowed_next_tools(status: str, has_blocking_gaps: bool) -> list[str]:
     ]
 
 
+def cli_timeout_error(result: dict[str, object], *, what: str = "CLI command") -> list[TextContent]:
+    """The refusal for a subprocess that hit the wall and was killed.
+
+    Its own code, not ``cli_failed``: a command that ran and exited non-zero
+    produced a verdict, and a command that was killed at ``_CLI_TIMEOUT_SECONDS``
+    produced nothing. Reporting both the same way is the shape this codebase
+    calls Class A — a check that could not run answering as one that ran.
+    """
+    seconds = result.get("timeout_seconds", _CLI_TIMEOUT_SECONDS)
+    return error_text(
+        f"{what} exceeded its {seconds}s timeout and was killed; no result was produced.",
+        code="cli_timeout",
+        timed_out=True,
+        timeout_seconds=seconds,
+    )
+
+
 def parse_cli_json(result: dict[str, object]) -> tuple[dict | None, list[TextContent] | None]:
-    """Parse JSON stdout from a CLI subprocess, even when exit code is non-zero."""
+    """Parse JSON stdout from a CLI subprocess, even when exit code is non-zero.
+
+    A timed-out call is refused before its stdout is read. ``run_cli_command``
+    hands back whatever the process had flushed before it was killed, and that
+    is a partial view of the answer, not the answer: a ``tasks`` array cut off
+    at the wall still parses as JSON, so the old order returned it as a
+    finished result with nothing marking it incomplete.
+    """
+    if result.get("timed_out"):
+        return None, cli_timeout_error(result)
     stdout = str(result.get("stdout") or "").strip()
     if stdout:
         try:
@@ -417,6 +514,18 @@ def run_cli_command(args: list[str], root: Path, *, truncate: bool = False) -> d
     By default stdout/stderr are kept intact so structured JSON handlers can
     parse large payloads. Pass ``truncate=True`` only for external raw-text
     surfaces such as ``devcouncil_cli`` and report previews.
+
+    **Blocking: an async handler must call this through**
+    ``await asyncio.to_thread(run_cli_command, ...)``. ``subprocess.run`` is
+    synchronous and bounded only by ``_CLI_TIMEOUT_SECONDS``, so calling it
+    directly from a coroutine parks the whole event loop for up to that long:
+    the server stops answering ``ping``, stops serving every other tool call,
+    and — because the read loop is parked too — cannot even receive the
+    ``notifications/cancelled`` that would abandon the call. The SDK applies
+    that notification as a scope cancel (``mcp/shared/jsonrpc_dispatcher.py``
+    ``PeerCancelMode`` ``"interrupt"``), and a scope cancel needs an await
+    point to land on; a blocking handler offers none. It stays synchronous
+    here so the existing monkeypatch seams in the handler modules keep working.
     """
     command = [sys.executable, "-m", "devcouncil", *args, "--project-root", str(root)]
     try:

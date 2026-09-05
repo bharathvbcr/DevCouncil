@@ -34,7 +34,7 @@ def _schema(properties: dict, required: list[str] | None = None) -> dict:
     schema: dict = {"type": "object", "properties": {
         "projectPath": {
             "type": "string",
-            "description": "Explicit repository path; defaults to the MCP server project.",
+            "description": "Repository path inside the server root; defaults to that root.",
         },
         **properties,
     }}
@@ -112,9 +112,50 @@ def tools() -> list[Tool]:
     ]
 
 
+class ProjectPathOutsideRoot(ValueError):
+    """A caller-supplied ``projectPath`` resolved outside the server's own root."""
+
+
 def resolve_root(default_root: Path, arguments: dict) -> Path:
+    """Resolve ``projectPath`` inside the server's root, or refuse it.
+
+    ``canonical_project_root`` walks *upward* to the nearest ``.git`` /
+    ``.devcouncil`` marker, so before this containment check any caller-supplied
+    path selected any repository on the machine: ``{"projectPath": "/etc"}``
+    resolved to ``/private/etc`` and ``{"projectPath": "~"}`` to the user's home.
+    Sixteen tools took the argument and one of them, ``devcouncil_code_sync``,
+    writes ``<root>/.devcouncil/repo_map.json`` — so an unconstrained path was a
+    write outside the project the server was started for.
+
+    ``DEVCOUNCIL_PROJECT_ROOT`` is the boundary, canonicalized exactly as the
+    no-argument case already canonicalizes it, so every path that worked before
+    and stayed inside the project still resolves to the same root. Both sides are
+    fully resolved (symlinks included) before comparison, so neither a symlink
+    inside the root pointing out nor one outside pointing in changes the verdict.
+    A relative ``projectPath`` is taken against that boundary rather than the
+    server process's working directory — the same rule ``within_root`` uses for
+    every other path argument — because a relative path resolved against a CWD
+    the caller cannot see is a different directory than the one it named.
+
+    Raises:
+        ProjectPathOutsideRoot: when the resolved path is not inside the root.
+    """
+    boundary = canonical_project_root(default_root)
     explicit = arguments.get("projectPath")
-    return canonical_project_root(Path(explicit) if isinstance(explicit, str) and explicit else default_root)
+    if not isinstance(explicit, str) or not explicit:
+        return boundary
+    candidate = Path(explicit).expanduser()
+    if not candidate.is_absolute():
+        candidate = boundary / candidate
+    resolved = canonical_project_root(candidate)
+    try:
+        resolved.relative_to(boundary)
+    except ValueError:
+        raise ProjectPathOutsideRoot(
+            f"projectPath {explicit!r} resolves to {resolved}, which is outside "
+            f"this server's project root {boundary}"
+        ) from None
+    return resolved
 
 
 def _client_envelope(
@@ -267,17 +308,23 @@ def _path_via_client(root: Path, start: str, end: str, max_depth: int) -> dict[s
         resp = client.trace(start, depth=depth, to_symbol=end)
         reason = resolution_unavailable_reason(resp.resolution)
         if reason:
-            return _client_envelope(
+            # "The index could not answer" is not "there is no path". This
+            # branch used to return `_client_envelope`, whose `ok` is True, so
+            # the two arrived at the caller as the same `found: false` — and
+            # with `operation` left at "", the very key `_client_envelope`'s
+            # docstring names as the gap a fallback once hid. Every sibling
+            # operation routes an unavailable resolution through `_unavailable`;
+            # this one now does too.
+            return _unavailable(
                 root,
-                client,
-                {
-                    "from": start,
-                    "to": end,
-                    "found": False,
-                    "path": [],
-                    "reason": reason,
-                },
+                "path",
+                reason,
+                {"from": start, "to": end, "found": False, "path": [], "length": 0, "truncated": False},
             )
+        # A trace capped to nothing with work still outstanding is not a
+        # verified absence either; `_require_usable` raises, and the handler
+        # below turns that into the same unavailable answer.
+        _require_usable(resp, label="path")
         steps = []
         for item in resp.items:
             node = str(
@@ -657,7 +704,22 @@ async def dispatch(name: str, default_root: Path, arguments: dict) -> list[TextC
         # says so. Returning a tri-state envelope here would claim the tool
         # exists but could not run.
         return None
-    root = resolve_root(default_root, arguments)
+    try:
+        root = resolve_root(default_root, arguments)
+    except ProjectPathOutsideRoot as exc:
+        # A distinct code, not `invalid_arguments`: the argument was well-formed
+        # and the server refused it, and a caller that cannot tell those apart
+        # will retry the same path forever. Listed first — it is a ValueError.
+        return error_text(str(exc), code="project_path_outside_root", tool=name)
+    except (OSError, ValueError) as exc:
+        # An embedded NUL or an over-long component makes the OS refuse to stat
+        # the path, so containment cannot be decided. Unanswerable is not
+        # allowed, so this is a refusal with its reason rather than an
+        # unhandled error at the transport boundary.
+        return error_text(
+            f"projectPath is not a usable path: {exc}",
+            code="invalid_arguments", tool=name, argument="projectPath",
+        )
     try:
         if name in {"devcouncil_code_sync", "devcouncil_code_status"}:
             return await handler(root, arguments)

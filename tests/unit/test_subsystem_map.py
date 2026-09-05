@@ -7,6 +7,7 @@ from devcouncil.indexing.subsystem_map import (
     cross_boundary_pairs,
     dependents_of,
     impact_targets,
+    is_entry_root,
     neighbors_for_area,
 )
 
@@ -71,3 +72,61 @@ def test_areas_touched_and_cross_boundary_pairs():
 
 def test_cross_boundary_pairs_empty_when_all_neighbors():
     assert cross_boundary_pairs(["src/ui/a.py", "src/api/b.py"], _MAP) == []
+
+
+# --- entry-root truncation ------------------------------------------------------
+#
+# The kernel caps `entry_roots` at 20 for the token budget, so a genuine entry
+# root sorting after the cap is absent from the list. Answering `False` there
+# reports a capped sample as a complete one: the check could not run, and said
+# the same thing as a check that ran and found nothing.
+
+
+def test_is_entry_root_true_for_a_listed_path():
+    data = {"entry_roots": ["src/main.py", "src/cli.py"]}
+    assert is_entry_root("src/main.py", data) is True
+
+
+def test_is_entry_root_false_when_the_list_is_provably_complete():
+    data = {
+        "entry_roots": ["src/main.py"],
+        "liveness_meta": {"entry_roots": {"shown": 1, "total": 1, "truncated": False}},
+    }
+    assert is_entry_root("src/other.py", data) is False
+
+
+def test_is_entry_root_unknown_when_the_list_is_truncated():
+    data = {
+        "entry_roots": ["src/main.py"],
+        "liveness_meta": {"entry_roots": {"shown": 1, "total": 25, "truncated": True}},
+    }
+    assert is_entry_root("src/other.py", data) is None
+
+
+def test_is_entry_root_listed_path_stays_true_under_truncation():
+    """Presence is still provable when the list is capped; only absence is not."""
+    data = {
+        "entry_roots": ["src/main.py"],
+        "liveness_meta": {"entry_roots": {"shown": 1, "total": 25, "truncated": True}},
+    }
+    assert is_entry_root("src/main.py", data) is True
+
+
+def test_is_entry_root_unknown_when_shown_is_below_total():
+    """`truncated` absent but the counts disagree: still not a knowable `False`."""
+    data = {
+        "entry_roots": ["src/main.py"],
+        "liveness_meta": {"entry_roots": {"shown": 1, "total": 25}},
+    }
+    assert is_entry_root("src/other.py", data) is None
+
+
+def test_is_entry_root_without_metadata_keeps_the_prior_answer():
+    """A map carrying no truncation metadata claims none; behaviour is unchanged."""
+    assert is_entry_root("src/other.py", {"entry_roots": ["src/main.py"]}) is False
+    assert is_entry_root("src/other.py", None) is False
+
+
+def test_is_entry_root_survives_malformed_metadata():
+    for meta in ("nonsense", {"entry_roots": "nonsense"}, {"entry_roots": {"total": "x"}}):
+        assert is_entry_root("src/other.py", {"entry_roots": ["src/main.py"], "liveness_meta": meta}) is False

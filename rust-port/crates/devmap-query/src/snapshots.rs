@@ -126,6 +126,7 @@ pub fn semantic_snapshots(
         tokens_used: resp.tokens_used,
         items: resp.items,
         resolution: resp.resolution,
+        walk_incomplete: None,
     }
 }
 

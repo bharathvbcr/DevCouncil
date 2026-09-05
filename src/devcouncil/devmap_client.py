@@ -86,6 +86,18 @@ class BudgetedResponse:
     tokens_used: int
     items: List[Dict[str, Any]] = field(default_factory=list)
     resolution: Any = None
+    #: Set when the *producer* of `items` stopped early — a depth or node cap —
+    #: as distinct from the token budgeter trimming a complete set.
+    #:
+    #: These are different failures and only one of them fits the counters
+    #: above: a walk that withheld an unknown quantity cannot be expressed in
+    #: `shown`/`hidden`/`total` without breaking `shown + hidden == total`, which
+    #: `_budgeted` enforces. The kernel has always sent this; the client dropped
+    #: it, so a capped walk arrived here wearing the shape of a complete one.
+    #: That is the common case rather than an exotic one — at the default depth
+    #: of 1 the reverse walk routinely reports it with `truncated: false` and
+    #: `hidden: 0`.
+    walk_incomplete: Optional[str] = None
 
 
 @dataclass
@@ -101,6 +113,23 @@ class CloneReport:
     groups: BudgetedResponse
     signed_symbols: int
     unsigned_symbols: int
+
+
+def _positional(*values: str) -> List[str]:
+    """Argv tail that the kernel's parser must read as values, never as flags.
+
+    The CLI transport builds argv from caller-supplied strings, and clap reads
+    a leading ``-`` as an option wherever one may appear: a search for ``--help``
+    made the kernel print its usage text to stdout and exit 0, which this client
+    then tried to decode as a JSON response, and a search for ``--db`` was read
+    as the store-path option. Everything after ``--`` is a positional value, so
+    the terminator goes here — which also means every option flag has to be
+    appended *before* this tail, since clap will not accept one after it.
+
+    This is a parser-confusion fix, not a shell-injection one: argv is a list
+    and no shell is involved.
+    """
+    return ["--", *values]
 
 
 def resolution_unavailable_reason(resolution: Any) -> Optional[str]:
@@ -648,6 +677,9 @@ class DevMapClient:
             raise DevMapClientError(
                 f"devmap response exceeded budget: used={tokens_used} budget={budget}"
             )
+        walk_incomplete = resp.get("walk_incomplete")
+        if walk_incomplete is not None and not isinstance(walk_incomplete, str):
+            raise DevMapClientError("devmap response walk_incomplete must be a string")
         return BudgetedResponse(
             shown=shown,
             hidden=hidden,
@@ -656,6 +688,7 @@ class DevMapClient:
             tokens_used=tokens_used,
             items=list(items),
             resolution=resp.get("resolution"),
+            walk_incomplete=walk_incomplete,
         )
 
     def status(self) -> DevMapStatus:
@@ -710,10 +743,11 @@ class DevMapClient:
         self._validate_query(query)
         self._validate_budget(limit)
         payload = {"cmd": "search", "query": query, "budget": limit}
-        args = ["search", query, "--budget", str(limit)]
+        args = ["search", "--budget", str(limit)]
         if semantic:
             payload["semantic"] = True
             args.append("--semantic")
+        args += _positional(query)
         resp = self._request(payload, args)
         return self._budgeted(resp, limit)
 
@@ -724,9 +758,84 @@ class DevMapClient:
         budget = 2000
         resp = self._request(
             {"cmd": "deps", "target": target, "budget": budget},
-            ["deps", target, "--budget", str(budget)],
+            ["deps", "--budget", str(budget), *_positional(target)],
         )
         return self._budgeted(resp, budget)
+
+    def neighbors(
+        self, targets: List[str], depth: int = 1, min_confidence: float = 0.0
+    ) -> List[Dict[str, Any]]:
+        """Callers and callees for several targets in one exchange.
+
+        Composes what :meth:`impact` and :meth:`deps` answer per target, in the
+        kernel rather than here. The point is transport, not analysis: this
+        client falls back to a ``devmap`` subprocess whenever no daemon socket
+        is live, so a five-definition view cost eleven process spawns and stayed
+        at ~1.1 s however fast the store got. It now costs one.
+
+        No target-count limit is duplicated here on purpose. The kernel owns the
+        bound and *refuses* an over-long list rather than trimming it, so drift
+        between the two surfaces shows up as a loud error instead of a short
+        answer that reads as a complete one.
+
+        Each direction is validated by :meth:`_budgeted` exactly as it would be
+        on its own, so a composed answer cannot smuggle past the count and
+        truncation invariants the separate calls enforce.
+        """
+        if not isinstance(targets, list):
+            raise DevMapClientError("devmap neighbors targets must be a list")
+        for target in targets:
+            self._validate_query(target, "target")
+        budget = 2000
+        resp = self._request(
+            {
+                "cmd": "neighbors",
+                "targets": list(targets),
+                "budget": budget,
+                "depth": depth,
+                "min_confidence": min_confidence,
+            },
+            [
+                "neighbors",
+                "--budget",
+                str(budget),
+                "--depth",
+                str(depth),
+                "--min-confidence",
+                str(min_confidence),
+                *_positional(*targets),
+            ],
+        )
+        entries = resp.get("neighbors")
+        if not isinstance(entries, list):
+            raise DevMapClientError("devmap neighbors response must carry a list")
+        if len(entries) != len(targets):
+            raise DevMapClientError(
+                "devmap neighbors returned "
+                f"{len(entries)} entries for {len(targets)} targets"
+            )
+        answers: List[Dict[str, Any]] = []
+        for entry, requested in zip(entries, targets):
+            if not isinstance(entry, dict):
+                raise DevMapClientError("devmap neighbors entry must be an object")
+            # The kernel echoes the target back; if it ever stops matching, the
+            # caller would silently attribute one symbol's callers to another.
+            if entry.get("target") != requested:
+                raise DevMapClientError(
+                    "devmap neighbors answer is misaligned: asked for "
+                    f"{requested!r}, got {entry.get('target')!r}"
+                )
+            for side in ("callers", "callees"):
+                if not isinstance(entry.get(side), dict):
+                    raise DevMapClientError(
+                        f"devmap neighbors entry is missing {side}"
+                    )
+            answers.append({
+                "target": requested,
+                "callers": self._budgeted(entry["callers"], budget),
+                "callees": self._budgeted(entry["callees"], budget),
+            })
+        return answers
 
     def impact(self, target: str, depth: int = 3) -> BudgetedResponse:
         self._validate_query(target, "target")
@@ -734,7 +843,7 @@ class DevMapClient:
         budget = 2000
         resp = self._request(
             {"cmd": "impact", "target": target, "budget": budget, "depth": depth},
-            ["impact", target, "--budget", str(budget), "--depth", str(depth)],
+            ["impact", "--budget", str(budget), "--depth", str(depth), *_positional(target)],
         )
         return self._budgeted(resp, budget)
 
@@ -752,11 +861,15 @@ class DevMapClient:
             "budget": budget,
             "depth": depth,
         }
-        args = ["trace", from_symbol]
-        if to_symbol is not None:
+        # Options first, then the terminator, then FROM (and TO) in order: clap
+        # accepts no option after `--`, and the two endpoints are positional so
+        # their order still carries meaning.
+        args = ["trace", "--budget", str(budget), "--depth", str(depth)]
+        if to_symbol is None:
+            args += _positional(from_symbol)
+        else:
             payload["to"] = to_symbol
-            args.append(to_symbol)
-        args.extend(["--budget", str(budget), "--depth", str(depth)])
+            args += _positional(from_symbol, to_symbol)
         resp = self._request(
             payload,
             args,
@@ -904,7 +1017,9 @@ class DevMapClient:
     def semantic_snapshots(self, file_path: str = "", budget: int = 2000) -> BudgetedResponse:
         self._validate_query(file_path, "snapshot file")
         self._validate_budget(budget)
-        resp = self._run_cli_command(["snapshots", file_path, "--budget", str(budget)])
+        resp = self._run_cli_command(
+            ["snapshots", "--budget", str(budget), *_positional(file_path)]
+        )
         return self._budgeted(resp, budget)
 
     def is_map_stale(self) -> bool:

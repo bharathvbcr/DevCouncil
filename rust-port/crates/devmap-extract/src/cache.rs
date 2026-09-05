@@ -147,7 +147,14 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// exactly that. Reusing v27 rows would keep reporting every Markdown file in
 /// the repository as a parse failure while the classifier that stops doing so
 /// sits right beside them.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "28";
+/// v29 moves the fallback scan's truncation count out of `diagnostics` and into
+/// the `ParseOutcome::Fallback` reason. `for_durable_store` clears
+/// `diagnostics` before the payload reaches `generation_files.extraction_json`
+/// and this cache, and nothing in the workspace reads that field in production,
+/// so a v28 row for a 2,500-declaration file says "2000 declaration(s)
+/// recovered by pattern" with no trace of the 500 that were dropped. Reusing
+/// those rows would keep serving a prefix under a reason that reads as a set.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "29";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
