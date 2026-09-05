@@ -51,6 +51,14 @@ fn reclaim_note(vacuum: &devmap_store::VacuumOutcome) -> String {
     }
 }
 
+/// How many refused paths a build names on stderr before eliding the rest.
+///
+/// A sample, and said to be one: the header carries `shown` and the true total
+/// so a reader can never mistake the list for the set. See
+/// `StoreStatus::quarantined_paths`, which caps the same way for the same
+/// reason.
+const REFUSAL_SAMPLE: usize = 20;
+
 /// `Some(value)` for a non-blank flag, `None` otherwise.
 ///
 /// A flag passed as the empty string is a caller whose own computation failed,
@@ -64,13 +72,30 @@ fn non_empty(value: &Option<String>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// `devmap 0.1.0 (schema 13)` — package identity plus store compatibility.
+/// `devmap 0.1.0 (store schema 13, code graph schema 2)` — package identity
+/// plus both compatibility numbers, each said to be the one it is.
 ///
 /// K3: every build of this workspace reports `devmap 0.1.0`, so the package
 /// version alone cannot tell a caller whether the binary in hand can open the
 /// store in hand. The schema number is the part that answers that, and the only
 /// other way to read it is to open a store — which is exactly what a caller
 /// checking compatibility has not yet established it may do.
+///
+/// There are *two* numbers called "schema" in this system and they are not
+/// related: `devmap_store::CURRENT_SCHEMA_VERSION` is the SQLite
+/// `user_version` that decides whether this binary can open a store, and
+/// `CODE_GRAPH_SCHEMA_VERSION` is the `schema_version` field of the
+/// `code_graph.json` this binary writes, which decides whether a Python
+/// consumer can read the artifact. An unqualified "schema 13" beside an
+/// artifact declaring `"schema_version": 2` reads as a contradiction, and the
+/// only way to tell which was meant was to know the codebase.
+///
+/// The store number stays first. `devmap_health.probe` parses this line by
+/// splitting on the first `"schema"` and taking the first integer after it
+/// (`src/devcouncil/devmap_health.py`), so the store schema must remain the
+/// first one named or that probe silently starts reporting the artifact
+/// version as the store's.
+///
 /// Built once into a process-lifetime `OnceLock` rather than formatted per
 /// call: clap's `version` takes a `&'static str`, and the schema number is only
 /// known at runtime because it lives in another crate's constant.
@@ -78,9 +103,10 @@ fn version_line() -> &'static str {
     static LINE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     LINE.get_or_init(|| {
         format!(
-            "{} (schema {})",
+            "{} (store schema {}, code graph schema {})",
             env!("CARGO_PKG_VERSION"),
-            devmap_store::CURRENT_SCHEMA_VERSION
+            devmap_store::CURRENT_SCHEMA_VERSION,
+            devmap_query::CODE_GRAPH_SCHEMA_VERSION
         )
     })
     .as_str()
@@ -1169,8 +1195,152 @@ fn affected_closure(
     Ok(Some(affected))
 }
 
+// The token-budget and traversal-depth ceilings are `devmap_query`'s — the
+// engine applies them — and both transports import them, so a bound that
+// holds over the socket also holds over argv without a second spelling.
+use devmap_query::{MAX_TOKEN_BUDGET, MAX_TRAVERSAL_DEPTH};
+
+/// Reject a numeric argument the engine cannot honour, before it reaches the
+/// engine.
+///
+/// S-1 follow-up. `validate_request` bounds every one of these over the IPC
+/// transport — finite confidence inside `[0, 1]`, a budget and a depth under
+/// the ceilings — while argv reached `StoreQueryEngine` unchecked. The
+/// asymmetry is not cosmetic: `--min-confidence nan` makes every `>=` comparison
+/// in the edge filter false, so the answer is an empty edge list that reads
+/// exactly like "this symbol has no callers"; `--budget 0` returns an empty
+/// result with `truncated` unset for the same reason; and a depth past the
+/// engine's clamp is silently rewritten.
+///
+/// Refused, never clamped. Clamping is what makes a capped answer
+/// indistinguishable from a complete one, which is the failure this codebase
+/// treats as worse than an error.
+fn validate_limits(command: &Commands) -> Result<(), String> {
+    let check_budget = |budget: u32| -> Result<(), String> {
+        if budget == 0 {
+            return Err(
+                "--budget must be at least 1: a zero token budget returns an empty result \
+                 that cannot be told apart from a complete one"
+                    .to_string(),
+            );
+        }
+        if budget > MAX_TOKEN_BUDGET {
+            return Err(format!(
+                "--budget must be at most {MAX_TOKEN_BUDGET}, got {budget}"
+            ));
+        }
+        Ok(())
+    };
+    let check_depth = |depth: usize| -> Result<(), String> {
+        if depth == 0 {
+            return Err("--depth must be at least 1: depth 0 walks nothing".to_string());
+        }
+        if depth > MAX_TRAVERSAL_DEPTH {
+            return Err(format!(
+                "--depth must be at most {MAX_TRAVERSAL_DEPTH}, got {depth} — the engine \
+                 clamps past that and would answer a question you did not ask"
+            ));
+        }
+        Ok(())
+    };
+    let check_confidence = |value: f32| -> Result<(), String> {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(format!(
+                "--min-confidence must be finite and within [0, 1], got {value}"
+            ));
+        }
+        Ok(())
+    };
+
+    match command {
+        Commands::Search { budget, .. }
+        | Commands::Snapshots { budget, .. }
+        | Commands::Savings { budget, .. } => check_budget(*budget),
+        Commands::Dead { budget } => check_budget(*budget),
+        Commands::Deps {
+            budget,
+            min_confidence,
+            ..
+        } => {
+            check_budget(*budget)?;
+            check_confidence(*min_confidence)
+        }
+        Commands::Impact { budget, depth, .. } | Commands::Trace { budget, depth, .. } => {
+            check_budget(*budget)?;
+            check_depth(*depth)
+        }
+        Commands::Neighbors {
+            targets,
+            budget,
+            depth,
+            min_confidence,
+        } => {
+            // Refused, not trimmed, exactly as `validate_request` does over the
+            // socket: answering the first sixteen of twenty hands back a short
+            // list that reads like a complete one.
+            if targets.len() > devmap_query::MAX_NEIGHBOR_TARGETS {
+                return Err(format!(
+                    "neighbors accepts at most {} targets, got {}",
+                    devmap_query::MAX_NEIGHBOR_TARGETS,
+                    targets.len()
+                ));
+            }
+            check_budget(*budget)?;
+            check_depth(*depth)?;
+            check_confidence(*min_confidence)
+        }
+        Commands::Explore {
+            limit,
+            budget,
+            depth,
+            min_confidence,
+            ..
+        } => {
+            if *limit == 0 {
+                return Err("--limit must be at least 1".to_string());
+            }
+            check_budget(*budget)?;
+            check_depth(*depth)?;
+            check_confidence(*min_confidence)
+        }
+        Commands::Affected {
+            budget,
+            depth,
+            min_confidence,
+            ..
+        } => {
+            check_budget(*budget)?;
+            check_depth(*depth)?;
+            check_confidence(*min_confidence)
+        }
+        Commands::Preview {
+            budget,
+            min_confidence,
+            ..
+        } => {
+            check_budget(*budget)?;
+            check_confidence(*min_confidence)
+        }
+        Commands::Clones { budget, .. } => check_budget(*budget),
+        Commands::History { last } => {
+            if *last == 0 {
+                return Err("--last must be at least 1".to_string());
+            }
+            Ok(())
+        }
+        // No numeric query arguments reach the engine from these.
+        Commands::Build { .. }
+        | Commands::Status
+        | Commands::Manifest { .. }
+        | Commands::Repair { .. }
+        | Commands::Workspace { .. }
+        | Commands::Serve { .. }
+        | Commands::Mcp { .. } => Ok(()),
+    }
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
     // stderr, not the builder's default stdout. Every command that emits a
     // payload emits it on stdout — `emit_json` prints there, and `devmap mcp`
     // speaks JSON-RPC there — so a log line on stdout is not noise beside the
@@ -1183,7 +1353,32 @@ async fn main() -> anyhow::Result<()> {
     tracing::subscriber::set_global_default(subscriber).ok();
 
     let cli = Cli::parse();
+    let outcome = match validate_limits(&cli.command) {
+        Ok(()) => run(&cli).await,
+        Err(message) => Err(anyhow::anyhow!(message)),
+    };
+    match outcome {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            // The human line always, on stderr where every other diagnostic
+            // this binary writes goes. Under `--json`, the same failure *also*
+            // goes out as one line of JSON on stdout, because that is what
+            // `--json` promises on every exit and the failing paths are the
+            // ones a caller most needs to handle: returning the error from
+            // `main` left stdout empty, so a caller reading one line and
+            // parsing it saw an empty string and could not tell a failure from
+            // a command that answered nothing. Two channels, one message —
+            // stdout stays exactly one JSON line either way.
+            eprintln!("Error: {error:#}");
+            if cli.json {
+                println!("{}", serde_json::json!({ "error": format!("{error:#}") }));
+            }
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
 
+async fn run(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
         Commands::Build {
             path,
@@ -1294,17 +1489,24 @@ async fn main() -> anyhow::Result<()> {
             let refused: Vec<&(String, devmap_extract::model::DiscoverySkipReason)> =
                 discovery.refusals().collect();
             if !refused.is_empty() {
+                // Both numbers in the header. A bare list of twenty under a
+                // count of two hundred is a capped sample presented as the set,
+                // which is the one thing this codebase never lets a report do.
+                let shown = refused.len().min(REFUSAL_SAMPLE);
                 eprintln!(
-                    "  discovery refused {} file(s) — these are absent from the graph:",
+                    "  discovery refused {} file(s) — these are absent from the graph \
+                     (showing {shown} of {}):",
+                    refused.len(),
                     refused.len()
                 );
-                for (path, reason) in refused.iter().take(20) {
+                for (path, reason) in refused.iter().take(REFUSAL_SAMPLE) {
                     eprintln!("    {path}: {reason:?}");
                 }
-                if refused.len() > 20 {
-                    eprintln!("    … and {} more", refused.len() - 20);
+                if refused.len() > REFUSAL_SAMPLE {
+                    eprintln!("    … and {} more", refused.len() - REFUSAL_SAMPLE);
                 }
             }
+            let refused_count = refused.len();
 
             // B3/SC2: if the tree that was just scanned is byte-for-byte the one
             // already committed, the graph it would produce is the graph that is
@@ -1382,10 +1584,15 @@ async fn main() -> anyhow::Result<()> {
                         // changed, and it runs the reclaim decision, both of
                         // which are already timed stages.
                         emit_json(
-                            &cli,
+                            cli,
                             &serde_json::json!({
                                 "unchanged": true,
                                 "files": extractions.len(),
+                                // Recomputed by this scan, not carried over: a
+                                // build that proves nothing changed has just
+                                // re-asked discovery the same question, and the
+                                // answer is part of what it proved.
+                                "discovery_refused_files": refused_count,
                                 "generation": generation,
                                 "reclaim": reclaim_note(&vacuum),
                                 "timings": progress.timings_json(),
@@ -1595,10 +1802,15 @@ async fn main() -> anyhow::Result<()> {
 
             if cli.json {
                 emit_json(
-                    &cli,
+                    cli,
                     &serde_json::json!({
                         "generation_id": gen_id,
                         "files_indexed": analysis.total_files,
+                        // Its own number, never folded into the parse-failure
+                        // count: a refused file is fixed by making it smaller or
+                        // readable, a parse failure by a grammar, and an operator
+                        // reading one total cannot tell which they have.
+                        "discovery_refused_files": refused_count,
                         "symbols": analysis.total_symbols,
                         "edges": analysis.total_edges,
                         "dead_candidates": analysis.dead_symbols.iter().filter(|d| !d.is_exempt).count(),
@@ -1619,6 +1831,15 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 println!("Successfully built generation #{gen_id}");
                 println!("  Files indexed: {}", analysis.total_files);
+                if refused_count > 0 {
+                    // Said here as well as on stderr: the count belongs beside
+                    // the file total it is part of, or a reader takes the total
+                    // for a count of files that were read.
+                    println!(
+                        "    of which refused by discovery: {refused_count} \
+                         (recorded as lost coverage, not parsed)"
+                    );
+                }
                 println!("  Symbols extracted: {}", analysis.total_symbols);
                 println!("  Edges resolved: {}", analysis.total_edges);
                 // R5: a call we could not attribute is reported, not dropped.
@@ -1649,7 +1870,7 @@ async fn main() -> anyhow::Result<()> {
                 })?
             };
             if cli.json {
-                emit_json(&cli, &serde_json::to_value(&resp)?)?;
+                emit_json(cli, &serde_json::to_value(&resp)?)?;
             } else {
                 emit_search(&resp);
             }
@@ -1668,7 +1889,7 @@ async fn main() -> anyhow::Result<()> {
                 max_depth: 1,
             })?;
             if cli.json {
-                emit_json(&cli, &serde_json::to_value(&resp)?)?;
+                emit_json(cli, &serde_json::to_value(&resp)?)?;
             } else {
                 emit_edges(&resp);
             }
@@ -1687,7 +1908,7 @@ async fn main() -> anyhow::Result<()> {
                 max_depth: *depth,
             })?;
             if cli.json {
-                emit_json(&cli, &serde_json::to_value(&resp)?)?;
+                emit_json(cli, &serde_json::to_value(&resp)?)?;
             } else {
                 emit_edges(&resp);
             }
@@ -1702,7 +1923,7 @@ async fn main() -> anyhow::Result<()> {
             let engine = StoreQueryEngine::new(&store);
             let answers = engine.neighbors(targets, *budget, *min_confidence, *depth)?;
             if cli.json {
-                emit_json(&cli, &serde_json::json!({ "neighbors": answers }))?;
+                emit_json(cli, &serde_json::json!({ "neighbors": answers }))?;
             } else {
                 for entry in &answers {
                     println!("{}", entry.target);
@@ -1737,7 +1958,7 @@ async fn main() -> anyhow::Result<()> {
                 })?
             };
             if cli.json {
-                emit_json(&cli, &serde_json::to_value(&resp)?)?;
+                emit_json(cli, &serde_json::to_value(&resp)?)?;
             } else {
                 emit_edges(&resp);
             }
@@ -1746,7 +1967,7 @@ async fn main() -> anyhow::Result<()> {
             let store = open_for_read(&cli.db)?;
             let payload = StoreQueryEngine::new(&store).dead_symbols(*budget)?;
             if cli.json {
-                emit_json(&cli, &serde_json::to_value(&payload)?)?;
+                emit_json(cli, &serde_json::to_value(&payload)?)?;
             } else {
                 emit_dead(&payload);
             }
@@ -1767,7 +1988,7 @@ async fn main() -> anyhow::Result<()> {
                 *depth,
             )?;
             if cli.json {
-                emit_json(&cli, &serde_json::to_value(&report)?)?;
+                emit_json(cli, &serde_json::to_value(&report)?)?;
             } else {
                 emit_explore(&report);
             }
@@ -1786,7 +2007,7 @@ async fn main() -> anyhow::Result<()> {
                 *depth,
             )?;
             if cli.json {
-                emit_json(&cli, &serde_json::to_value(&report)?)?;
+                emit_json(cli, &serde_json::to_value(&report)?)?;
             } else {
                 emit_affected(&report);
             }
@@ -1820,7 +2041,7 @@ async fn main() -> anyhow::Result<()> {
                         })?;
                     if cli.json {
                         emit_json(
-                            &cli,
+                            cli,
                             &serde_json::json!({
                                 "added": label,
                                 "root": canonical,
@@ -1849,7 +2070,7 @@ async fn main() -> anyhow::Result<()> {
                             workspace.remove(name)
                         })?;
                     if cli.json {
-                        emit_json(&cli, &serde_json::json!({"removed": removed, "name": name}))?;
+                        emit_json(cli, &serde_json::json!({"removed": removed, "name": name}))?;
                     } else if removed {
                         println!("removed {name}");
                     } else {
@@ -1883,7 +2104,7 @@ async fn main() -> anyhow::Result<()> {
                             })
                             .collect();
                         emit_json(
-                            &cli,
+                            cli,
                             &serde_json::json!({"repos": repos, "registry_root": root}),
                         )?;
                         return Ok(());
@@ -1925,7 +2146,7 @@ async fn main() -> anyhow::Result<()> {
                     let result =
                         devmap_query::workspace_search(&workspace, query, *budget, *semantic)?;
                     if cli.json {
-                        emit_json(&cli, &serde_json::to_value(&result)?)?;
+                        emit_json(cli, &serde_json::to_value(&result)?)?;
                     } else {
                         for entry in &result.items {
                             println!(
@@ -1956,7 +2177,7 @@ async fn main() -> anyhow::Result<()> {
                         // reader seeing `[]` should be able to tell "no links"
                         // from "no repositories were examined".
                         emit_json(
-                            &cli,
+                            cli,
                             &serde_json::json!({
                                 "links": links,
                                 "count": links.len(),
@@ -1987,7 +2208,7 @@ async fn main() -> anyhow::Result<()> {
             let store = open_for_read(&cli.db)?;
             let report = StoreQueryEngine::new(&store).savings(query.as_deref(), *budget)?;
             if cli.json {
-                emit_json(&cli, &serde_json::to_value(&report)?)?;
+                emit_json(cli, &serde_json::to_value(&report)?)?;
             } else {
                 emit_savings(&report);
             }
@@ -2010,7 +2231,7 @@ async fn main() -> anyhow::Result<()> {
             let report =
                 StoreQueryEngine::new(&store).preview(file, &source, *budget, *min_confidence)?;
             if cli.json {
-                emit_json(&cli, &serde_json::to_value(&report)?)?;
+                emit_json(cli, &serde_json::to_value(&report)?)?;
             } else {
                 emit_preview(&report);
             }
@@ -2026,7 +2247,7 @@ async fn main() -> anyhow::Result<()> {
             let wanted = kind.as_deref().and_then(devmap_query::parse_clone_kind);
             let report = StoreQueryEngine::new(&store).clones(*budget, wanted, *min_nodes)?;
             if cli.json {
-                emit_json(&cli, &serde_json::to_value(&report)?)?;
+                emit_json(cli, &serde_json::to_value(&report)?)?;
             } else {
                 emit_clones(&report);
             }
@@ -2121,7 +2342,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             } else {
                 emit_json(
-                    &cli,
+                    cli,
                     &serde_json::json!({
                         "output": dest,
                         "graph_output": graph_dest,
@@ -2160,7 +2381,13 @@ async fn main() -> anyhow::Result<()> {
                     "schema_version": serde_json::Value::Null,
                     "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
                 });
-                println!("{}", serde_json::to_string_pretty(&payload)?);
+                // Through `emit_json` like every other exit from this command.
+                // Printed pretty regardless of `--json`, this was the one
+                // `--json` path in the binary that emitted a multi-line
+                // document, so a caller reading a line at a time got a `{` and
+                // a parse error out of the case it most needs to handle: no
+                // store yet.
+                emit_json(cli, &payload)?;
                 return Ok(());
             };
             if stored_schema != devmap_store::CURRENT_SCHEMA_VERSION {
@@ -2183,7 +2410,7 @@ async fn main() -> anyhow::Result<()> {
                     "schema_version": version,
                     "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
                 });
-                emit_json(&cli, &payload)?;
+                emit_json(cli, &payload)?;
                 return Ok(());
             }
             let Some(store) = Store::open_existing(&cli.db)? else {
@@ -2193,6 +2420,32 @@ async fn main() -> anyhow::Result<()> {
                 );
             };
             let status = store.status(&cli.db.display().to_string())?;
+            // K-A2: the graph's own degradation belongs in the answer a health
+            // check reads.
+            //
+            // `freshness_degraded_reason` describes the *index* — no generation
+            // persisted, paths stuck in the retry queue — and said nothing
+            // about a generation built from a corpus the extractor could not
+            // read in full. That is how a repository whose only caller of a
+            // symbol was refused for being oversized reported
+            // `degraded_reason: null` while both artifacts of the same build
+            // carried `graph_degraded: true`. Both degradations can hold at
+            // once and neither may shadow the other, so they are joined with
+            // `devmap_analyze::combine_reasons`, the same joiner the analysis
+            // uses for its own pair.
+            let analysis_degraded = match store.latest_analysis_status()? {
+                Some(devmap_analyze::model::AnalysisStatus::Ok) | None => None,
+                Some(devmap_analyze::model::AnalysisStatus::Partial { reason }) => {
+                    Some(format!("partial: {reason}"))
+                }
+                Some(devmap_analyze::model::AnalysisStatus::Timeout { reason }) => {
+                    Some(format!("timeout: {reason}"))
+                }
+            };
+            let degraded_reason = devmap_analyze::combine_reasons(
+                devmap_serve::freshness_degraded_reason(&status),
+                analysis_degraded,
+            );
             let payload = serde_json::json!({
                 "generation_id": status.latest_generation,
                 "pending_count": status.pending_count,
@@ -2203,7 +2456,7 @@ async fn main() -> anyhow::Result<()> {
                 // let a store with no generation at all report as current.
                 "is_fresh": devmap_serve::index_is_fresh(&status),
                 "db_path": status.db_path,
-                "degraded_reason": devmap_serve::freshness_degraded_reason(&status),
+                "degraded_reason": degraded_reason,
                 "quarantined_count": status.quarantined_count,
                 // K1(g): naming the stuck paths is what makes a degraded
                 // status actionable — "64 path(s) exceeded the retry
@@ -2213,7 +2466,7 @@ async fn main() -> anyhow::Result<()> {
                 "schema_version": stored_schema,
                 "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
             });
-            emit_json(&cli, &payload)?;
+            emit_json(cli, &payload)?;
         }
         Commands::History { last } => {
             let store = open_for_read(&cli.db)?;
@@ -2253,7 +2506,7 @@ async fn main() -> anyhow::Result<()> {
                     })
                     .collect();
                 emit_json(
-                    &cli,
+                    cli,
                     &serde_json::json!({ "shown": rows.len(), "history": entries }),
                 )?;
             } else if rows.is_empty() {
@@ -2322,7 +2575,7 @@ async fn main() -> anyhow::Result<()> {
 
                 if cli.json {
                     emit_json(
-                        &cli,
+                        cli,
                         &serde_json::json!({
                             "repo_root": root.as_ref().map(|root| root.display().to_string()),
                             "structural_pass_ran": root.is_some(),
@@ -2381,7 +2634,7 @@ async fn main() -> anyhow::Result<()> {
                     max_depth: 1,
                 },
             );
-            emit_json(&cli, &serde_json::to_value(&resp)?)?;
+            emit_json(cli, &serde_json::to_value(&resp)?)?;
         }
         Commands::Mcp { http, print_config } => {
             // Nothing but JSON-RPC frames may reach stdout on this transport.
@@ -2413,7 +2666,7 @@ async fn main() -> anyhow::Result<()> {
                         "args": ["--db", db.display().to_string(), "mcp"],
                     }),
                 };
-                emit_json(&cli, &serde_json::json!({"mcpServers": {"devmap": entry}}))?;
+                emit_json(cli, &serde_json::json!({"mcpServers": {"devmap": entry}}))?;
                 return Ok(());
             }
 
@@ -2458,7 +2711,7 @@ async fn main() -> anyhow::Result<()> {
             // nothing, and `Store::open` creates the database file.
             if *print_socket_path {
                 if cli.json {
-                    emit_json(&cli, &serde_json::json!({"socket": ipc_path}))?;
+                    emit_json(cli, &serde_json::json!({"socket": ipc_path}))?;
                 } else {
                     println!("{}", ipc_path.display());
                 }
