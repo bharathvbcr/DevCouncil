@@ -52,6 +52,7 @@ use devmap_store::Store;
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
+use crate::admission::Admission;
 use crate::protocol::{dispatch, validate_request, IpcCommand, IpcRequest, PROTOCOL_VERSION};
 
 /// The store, opened on first successful use rather than at startup.
@@ -189,6 +190,28 @@ const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// gets a structured error it can report and retry instead of a hang it can
 /// only kill.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Ceiling on requests in flight at once on one stdio session.
+///
+/// The loop spawned a task per line and reaped the finished ones, which bounds
+/// the *handle* vector and nothing else: a client that pipelines faster than
+/// the server answers decided the fan-out, and each in-flight request holds a
+/// frame, a blocking-pool slot and a claim on the store mutex. 32 is well above
+/// what an agent host ever has outstanding — the reference client is
+/// request/response with cancellation — and far below the point at which the
+/// blocking pool is the real limit.
+const MAX_IN_FLIGHT_REQUESTS: usize = 32;
+
+/// How long a request waits for a slot before it is refused.
+///
+/// The wait *is* the backpressure. While it is held this loop is not reading
+/// the next line, so the pipe buffer fills and the pressure reaches the client
+/// where it belongs, rather than being absorbed into this process's heap. The
+/// bound on the wait is what keeps that from becoming a hang: past it the
+/// request is answered — with an error naming the ceiling — rather than left
+/// unanswered, because a client waiting on a response that will never come is
+/// worse off than one told to slow down.
+const ADMISSION_WAIT: Duration = Duration::from_secs(5);
 
 /// JSON-RPC 2.0 reserved error codes, plus the one MCP adds.
 mod codes {
@@ -1371,6 +1394,32 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    serve_streams_with_admission(
+        store,
+        reader,
+        writer,
+        Admission::new(MAX_IN_FLIGHT_REQUESTS),
+    )
+    .await
+}
+
+/// The transport loop under a caller-supplied ceiling on requests in flight.
+///
+/// The [`Admission`] is passed in rather than built here for the reason
+/// `serve_http_on_with_admission` gives: one host process may run several
+/// sessions that should share a budget, and the pool's counters — the
+/// high-water mark, and how many requests were shed — are the only way to see a
+/// ceiling doing its job.
+pub async fn serve_streams_with_admission<R, W>(
+    store: Arc<StoreSlot>,
+    reader: BufReader<R>,
+    writer: W,
+    admission: Admission,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let session = Arc::new(Session::new(store));
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
     let mut reader = reader;
@@ -1432,9 +1481,36 @@ continued for {seen} bytes in total before terminating"
             }
         };
 
+        // Backpressure, then a refusal — never an unbounded fan-out and never
+        // silence. A request that cannot get a slot inside `ADMISSION_WAIT` is
+        // answered against its own id, so the client can match the refusal to
+        // the request it made and retry that one.
+        let Some(admitted) = admission.admit_within(ADMISSION_WAIT).await else {
+            let id = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|value| value.get("id").cloned());
+            // A notification has no id and expects no frame; answering one
+            // would put a response on the wire the client is not reading for.
+            if let Some(id) = id {
+                let refusal = rpc_error_frame(
+                    Some(id),
+                    codes::INTERNAL_ERROR,
+                    format!(
+                        "this session is already running its ceiling of {} concurrent \
+requests and could not admit another within {:?}; retry this request",
+                        admission.limit(),
+                        ADMISSION_WAIT
+                    ),
+                );
+                write_frame(&writer, &refusal).await?;
+            }
+            continue;
+        };
+
         let session = Arc::clone(&session);
         let writer = Arc::clone(&writer);
         tasks.push(tokio::spawn(async move {
+            let _admitted = admitted;
             if let Some(frame) = handle_line_in(&session, &text).await {
                 let _ = write_frame(&writer, &frame).await;
             }

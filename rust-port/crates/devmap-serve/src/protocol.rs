@@ -954,7 +954,7 @@ impl UnixIpcServer {
     }
 
     pub async fn run(self, store: Arc<Store>, activity: Arc<Activity>) -> anyhow::Result<()> {
-        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+        let admission = crate::admission::Admission::new(MAX_CONCURRENT_CONNECTIONS);
         let mut consecutive_accept_errors: u32 = 0;
         loop {
             match self.listener.accept().await {
@@ -962,10 +962,14 @@ impl UnixIpcServer {
                     consecutive_accept_errors = 0;
                     // Saturated pool => accept pauses here: backpressure lands
                     // in the kernel backlog rather than unbounded task memory.
-                    let permit = Arc::clone(&permits)
-                        .acquire_owned()
+                    // This is the one transport for which waiting is the right
+                    // answer — the peer is a local client on a Unix socket that
+                    // will simply wait — and `Admission` spells the other two
+                    // choices for the two transports that need them.
+                    let permit = admission
+                        .admit()
                         .await
-                        .map_err(|_| anyhow::anyhow!("connection semaphore closed"))?;
+                        .ok_or_else(|| anyhow::anyhow!("connection semaphore closed"))?;
                     let store = Arc::clone(&store);
                     let activity = Arc::clone(&activity);
                     tokio::spawn(async move {
@@ -1026,7 +1030,7 @@ pub async fn run_named_pipe(
     let mut server = ServerOptions::new()
         .first_pipe_instance(true)
         .create(name)?;
-    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let admission = crate::admission::Admission::new(MAX_CONCURRENT_CONNECTIONS);
     let mut consecutive_connect_errors: u32 = 0;
     loop {
         match server.connect().await {
@@ -1051,10 +1055,10 @@ pub async fn run_named_pipe(
         // Same bound as the Unix transport: saturated pool => stop creating
         // pipe instances until a slot frees, instead of fanning out without
         // limit.
-        let permit = Arc::clone(&permits)
-            .acquire_owned()
+        let permit = admission
+            .admit()
             .await
-            .map_err(|_| anyhow::anyhow!("connection semaphore closed"))?;
+            .ok_or_else(|| anyhow::anyhow!("connection semaphore closed"))?;
         let connected = server;
         server = ServerOptions::new().create(name)?;
         let store = Arc::clone(&store);
