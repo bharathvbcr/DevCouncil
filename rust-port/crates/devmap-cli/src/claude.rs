@@ -1994,4 +1994,94 @@ mod tests {
         assert!(Report::new(warned.clone(), false).ok());
         assert!(!Report::new(warned, true).ok());
     }
+
+    /// `--http 8080` must mean this machine, not every interface.
+    ///
+    /// A Dev Map store is a symbol-level map of a private repository. Binding
+    /// it to a routable interface publishes that map to anything that can reach
+    /// the port, with no authentication in front of it. `mcp_http.rs` guards
+    /// against DNS rebinding *onto a loopback listener*, but nothing can
+    /// un-publish a listener bound to `0.0.0.0` in the first place.
+    ///
+    /// `normalize_http_address` decides that and had no test of any kind: it
+    /// appeared twice in the tree, both times in production code. A default
+    /// exercised only by running the binary is one a refactor can simplify away
+    /// with nothing failing.
+    #[test]
+    fn a_bare_port_binds_loopback_and_an_ambiguous_address_binds_nothing() {
+        // What the CLI does end to end: normalize, then parse before binding.
+        let resolve = |address: &str| -> Result<std::net::SocketAddr, String> {
+            normalize_http_address(address)
+                .parse()
+                .map_err(|e| format!("{e}"))
+        };
+
+        for port in ["1", "80", "8080", "65535"] {
+            let addr = resolve(port).unwrap_or_else(|e| panic!("bare port {port}: {e}"));
+            assert!(
+                addr.ip().is_loopback(),
+                "--http {port} resolved to {addr}, which is not loopback. A bare port \
+                 is what a user types without thinking about interfaces, and this \
+                 store is a map of a private repository."
+            );
+            assert_eq!(addr.port().to_string(), port, "port changed: {addr}");
+        }
+
+        // An explicit routable bind stays allowed — deliberate is spelled with
+        // an address. Rewriting it to loopback would make it appear to work
+        // somewhere the caller did not ask for.
+        let explicit = resolve("0.0.0.0:8080").expect("an explicit address resolves");
+        assert!(
+            !explicit.ip().is_loopback(),
+            "0.0.0.0 was rewritten to loopback"
+        );
+
+        assert!(
+            resolve("[::1]:8080")
+                .expect("bracketed IPv6")
+                .ip()
+                .is_loopback(),
+            "[::1] is loopback"
+        );
+
+        // Ambiguous forms carry a colon, so they bypass the loopback default.
+        // Each must fail at the parse rather than bind a guess.
+        for ambiguous in [":8080", "::1", "", "8080:", "*:8080", "localhost:8080"] {
+            assert!(
+                resolve(ambiguous).is_err(),
+                "'{ambiguous}' resolved to {:?} instead of being refused; an address \
+                 the user did not clearly specify must not be guessed into a bind",
+                resolve(ambiguous)
+            );
+        }
+    }
+
+    /// The URL an agent is handed must be the address the server binds.
+    ///
+    /// `mcp_entry` writes `http://{normalize_http_address(..)}` into the client
+    /// config while the serve path binds `normalize_http_address(..)`. One
+    /// owner, so they cannot disagree; this pins that they still share it.
+    #[test]
+    fn the_url_an_agent_is_given_is_the_address_the_server_binds() {
+        let executable = Path::new("/usr/local/bin/devmap");
+        let db = Path::new("/repo/.devcouncil/codeintel/devmap.sqlite");
+        for address in ["8080", "127.0.0.1:9000", "[::1]:9100"] {
+            let entry = mcp_entry(executable, db, Some(address)).expect("http entry renders");
+            let url = entry["url"]
+                .as_str()
+                .unwrap_or_else(|| panic!("the http entry must carry a url: {entry}"));
+            let bound = normalize_http_address(address);
+            assert_eq!(
+                url,
+                format!("http://{bound}"),
+                "the agent is told to reach {url} while the server binds {bound}"
+            );
+            if !address.contains(':') {
+                assert!(
+                    url.starts_with("http://127.0.0.1:"),
+                    "a bare port put {url} into an agent's config"
+                );
+            }
+        }
+    }
 }
