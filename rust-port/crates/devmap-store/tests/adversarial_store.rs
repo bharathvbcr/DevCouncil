@@ -30,7 +30,7 @@ use devmap_extract::extract_file;
 use devmap_extract::model::Extraction;
 use devmap_resolve::model::ResolutionResult;
 use devmap_resolve::Resolver;
-use devmap_store::{Store, CURRENT_SCHEMA_VERSION};
+use devmap_store::{Store, CURRENT_SCHEMA_VERSION, GENERATION_RETENTION};
 
 fn tmp_dir(label: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -951,4 +951,372 @@ fn count_callers_of_matches_the_listing_it_replaces() {
             .expect("empty"),
         0
     );
+}
+
+// ---------------------------------------------------------------------------
+// Class A — an answer a check could not produce must not look like an answer
+// the check produced and found nothing.
+// ---------------------------------------------------------------------------
+
+/// A search whose index is gone must refuse, not report "no matches".
+///
+/// The FTS index is a *separate* structure from `generation_nodes`, and the
+/// store already assumes it can be lost independently: `devmap repair --fts`
+/// and [`Store::repair_fts`] exist for exactly that state. Nothing detected it.
+/// With the generation's index rows removed and its 4 symbol rows untouched,
+/// the pre-fix store answered:
+///
+/// ```text
+/// all_symbols  = 4
+/// search_page  = Some(SearchPage { generation: 1, total: 0, rows: [] })
+/// status       = node_count 4, degraded_reason: None
+/// ```
+///
+/// `total: 0` with `rows: []` is byte-identical to a query that ran against a
+/// healthy index and matched nothing — so every `search` against that store
+/// returns "this repository does not contain that symbol", forever, and the one
+/// command that would fix it is the one nothing tells the operator to run.
+///
+/// Both halves of the desync are exercised because they fail differently: the
+/// posting list can be lost while the map survives, and the map can be lost
+/// while the postings survive. The rows are deleted out of band because that is
+/// the state under test; the mechanism that produces it in the field is
+/// whatever `repair --fts` was written for.
+#[test]
+fn a_search_whose_index_is_missing_is_refused_rather_than_answered_as_empty() {
+    for (label, damage) in [
+        ("postings lost", "DELETE FROM nodes_fts"),
+        ("map lost", "DELETE FROM nodes_fts_map"),
+    ] {
+        let dir = tmp_dir("fts-desync");
+        let db_path = dir.join("index.sqlite");
+        {
+            let store = Store::open(&db_path).unwrap();
+            let (extractions, resolution, analysis) = pipeline(&[
+                ("src/a.py", "def alpha():\n    return 1\n"),
+                ("src/b.py", "def beta():\n    return 2\n"),
+            ]);
+            store
+                .save_generation(&extractions, &resolution, &analysis)
+                .unwrap();
+            store.checkpoint_wal().unwrap();
+        }
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(damage, []).unwrap();
+        drop(conn);
+
+        let store = Store::open(&db_path).unwrap();
+        // Guard the guard: the graph itself is intact, so an empty search below
+        // cannot be blamed on an empty store.
+        assert_eq!(
+            store.all_symbols().unwrap().len(),
+            4,
+            "{label}: the damage was supposed to touch only the search index"
+        );
+
+        for (surface, outcome) in [
+            (
+                "search_page",
+                store.search_page("alpha", 10).map(|page| {
+                    page.map_or("None".to_string(), |page| {
+                        format!("total={} rows={}", page.total, page.rows.len())
+                    })
+                }),
+            ),
+            (
+                "search_symbols",
+                store
+                    .search_symbols("alpha", 10)
+                    .map(|r| format!("{}", r.len())),
+            ),
+            (
+                "count_search_symbols",
+                store.count_search_symbols("alpha").map(|c| format!("{c}")),
+            ),
+            (
+                "search_fts",
+                store
+                    .search_fts("alpha", 10)
+                    .map(|r| format!("{}", r.len())),
+            ),
+        ] {
+            let error = outcome.err().unwrap_or_else(|| {
+                panic!(
+                    "{label}: {surface} answered from a search index that is not \
+                     there; an absent index and a query that matched nothing are \
+                     the two answers this store may never conflate"
+                )
+            });
+            let text = error.to_string();
+            assert!(
+                text.contains("repair --fts"),
+                "{label}: {surface} refused without naming the remedy: {text}"
+            );
+        }
+
+        // The remedy named in the refusal must actually work, and the same
+        // queries must answer normally afterwards.
+        store.repair_fts().unwrap();
+        assert_eq!(
+            store.search_page("alpha", 10).unwrap().unwrap().total,
+            1,
+            "{label}: `repair_fts` did not restore the index it was named for"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// An empty generation is a real answer, not a missing index.
+///
+/// The check above must not fire for a generation that genuinely holds no
+/// symbols: there is nothing for the index to contain, so "no matches" is the
+/// truth. Without this the refusal would replace one false answer with another.
+#[test]
+fn a_generation_with_no_symbols_still_answers_a_search_as_empty() {
+    let store = Store::open_in_memory().unwrap();
+    let (extractions, resolution, analysis) = pipeline(&[]);
+    store
+        .save_generation(&extractions, &resolution, &analysis)
+        .unwrap();
+    let page = store
+        .search_page("alpha", 10)
+        .expect("an empty generation is searchable")
+        .expect("a generation exists");
+    assert_eq!((page.total, page.rows.len()), (0, 0));
+    assert_eq!(store.count_search_symbols("alpha").unwrap(), 0);
+    assert!(store.search_fts("alpha", 10).unwrap().is_empty());
+}
+
+/// A generation the store does not hold must be refused, not answered `[]`.
+///
+/// [`Store::list_generation_paths`] is the one reader that takes a generation
+/// id from its caller, and every caller resolves that id in a *separate* call:
+/// `devmap-query`'s `savings` does `latest_generation_id()` and then
+/// `list_generation_paths(gen)`, with a prune-capable writer free to commit in
+/// between. Pre-fix, all three of these returned the same `Ok([])`:
+///
+/// * a generation that is still in the store and holds one file — `["src/a.py"]`
+/// * the same generation after `prune_generations_except_latest` removed it
+/// * generation 9999, which never existed
+///
+/// So `savings` reported `corpus_bytes: 0, corpus_files_unreadable: 0` — a
+/// repository with nothing in it — for a store full of files, and the report
+/// whose own documentation refuses to count unreadable files as zero bytes did
+/// exactly that one level up.
+#[test]
+fn a_generation_the_store_does_not_hold_is_refused_rather_than_answered_empty() {
+    let dir = tmp_dir("missing-generation");
+    let db_path = dir.join("index.sqlite");
+    let store = Store::open(&db_path).unwrap();
+    let (extractions, resolution, analysis) =
+        pipeline(&[("src/a.py", "def alpha():\n    return 1\n")]);
+    let first = store
+        .save_generation(&extractions, &resolution, &analysis)
+        .unwrap();
+    assert_eq!(
+        store.list_generation_paths(first).unwrap(),
+        vec!["src/a.py".to_string()],
+        "a live generation must still list its files"
+    );
+
+    for round in 0..3 {
+        let source = format!("def alpha():\n    return {round}\n");
+        let (extractions, resolution, analysis) = pipeline(&[("src/a.py", source.as_str())]);
+        store
+            .save_generation(&extractions, &resolution, &analysis)
+            .unwrap();
+        store
+            .prune_generations_except_latest(GENERATION_RETENTION)
+            .unwrap();
+    }
+    let latest = store.latest_generation_id().unwrap().expect("a generation");
+    assert!(
+        latest > first,
+        "the fixture did not actually prune the generation under test"
+    );
+
+    for (label, generation) in [("pruned", first), ("never written", 9_999)] {
+        let error = store
+            .list_generation_paths(generation)
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "a {label} generation listed its files as `[]`; a generation that \
+                 is not in the store and a generation that indexed nothing are \
+                 the two answers this store may never conflate"
+                )
+            });
+        let text = error.to_string();
+        assert!(
+            text.contains(&generation.to_string()),
+            "the refusal for a {label} generation does not name it: {text}"
+        );
+    }
+
+    // The live generation still answers, so the refusal is not blanket.
+    assert!(!store.list_generation_paths(latest).unwrap().is_empty());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The writer half of the cross-process probe below: a real second process,
+/// committing and pruning against the same file until told to stop.
+///
+/// `#[ignore]` because it is not a test — it is the peer process, re-executed
+/// out of this same binary so it runs the store's real write path rather than
+/// an approximation of it in SQL.
+#[test]
+#[ignore]
+fn concurrent_prune_writer_child() {
+    let db = std::env::var("DEVMAP_PROBE_DB").expect("DEVMAP_PROBE_DB");
+    let stop = std::env::var("DEVMAP_PROBE_STOP").expect("DEVMAP_PROBE_STOP");
+    let store = Store::open(&db).expect("child opens the store");
+    let mut salt = 0usize;
+    while !std::path::Path::new(&stop).exists() {
+        salt += 1;
+        let source = format!("def alpha_one():\n    return {salt}\n");
+        let (extractions, resolution, analysis) = pipeline(&[("src/a.py", source.as_str())]);
+        store
+            .save_generation(&extractions, &resolution, &analysis)
+            .expect("child commits");
+        // `1`, not `GENERATION_RETENTION`: the narrowest retention the store
+        // supports is the schedule that makes the window widest, and it is the
+        // one `a_reader_during_prune_sees_a_consistent_store` already uses.
+        store
+            .prune_generations_except_latest(1)
+            .expect("child prunes");
+    }
+}
+
+/// A reader must never answer from a generation a second *process* pruned
+/// underneath it — and this is the probe, not the guard.
+///
+/// Every latest-generation reader resolved the generation with one statement
+/// and read its rows with another. In SQLite's autocommit mode those are two
+/// snapshots, and `lock_conn` does not change that: it is a Rust mutex over
+/// this process's own threads. A second process committing and pruning between
+/// them left the reader holding a generation that no longer existed, whose rows
+/// it then read as zero.
+///
+/// Measured against the pre-fix code with this exact schedule, release build,
+/// 20 s runs:
+///
+/// | retention | reads | false-empty answers |
+/// |---|---|---|
+/// | `prune(1)` | 182,781 | 31 |
+/// | `prune(GENERATION_RETENTION)` | 192,970 | 1 |
+///
+/// After the fix: 0 false-empty answers in 488,420 reads at `prune(1)`.
+///
+/// **A green run here is not evidence of correctness, and the rate is
+/// measured, not asserted.** Run against the pre-fix behaviour at this test's
+/// own three-second budget, it fired in **0 of 5 debug runs** and **2 of 5
+/// release runs** (1 and 3 violations out of ~78,000 reads) — so in the
+/// configuration `cargo test` uses by default it caught a fully present defect
+/// *never*. Only a red run here carries information. The guard that holds the
+/// fix in place is `db::connection_tests::
+/// a_pinned_generation_keeps_its_rows_when_another_connection_prunes_it`,
+/// which forces the schedule instead of racing for it, and which goes red
+/// against a one-statement mutation of the fix.
+///
+/// This is kept for what it does cover deterministically: a reader running
+/// against a genuinely concurrent second *process* must never error and must
+/// never empty. Two OS processes is the shape DevCouncil runs — a daemon drain
+/// and a developer's `dev map` — and it is the shape
+/// `a_reader_in_another_process_never_sees_a_partially_pruned_generation`
+/// describes but does not actually use: that test spawns a thread.
+#[test]
+fn a_reader_never_answers_from_a_generation_another_process_pruned() {
+    let dir = tmp_dir("cross-process-straddle");
+    let db_path = dir.join("index.sqlite");
+    let stop = dir.join("STOP");
+    {
+        let store = Store::open(&db_path).unwrap();
+        let (extractions, resolution, analysis) =
+            pipeline(&[("src/a.py", "def alpha_one():\n    return 0\n")]);
+        store
+            .save_generation(&extractions, &resolution, &analysis)
+            .unwrap();
+    }
+
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "concurrent_prune_writer_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("DEVMAP_PROBE_DB", &db_path)
+        .env("DEVMAP_PROBE_STOP", &stop)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the second writer process");
+
+    let reader = Store::open_existing(&db_path).unwrap().unwrap();
+    let mut reads = 0u64;
+    let mut violations: Vec<String> = Vec::new();
+    // Bounded by wall clock *and* by read count, so a machine where the child
+    // never gets scheduled ends the probe instead of spinning for the deadline.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline && reads < 400_000 {
+        reads += 1;
+        match reader.search_page("alpha_one", 20) {
+            Ok(Some(page)) if page.total == 0 || page.rows.is_empty() => violations.push(format!(
+                "search_page: total={} rows={}",
+                page.total,
+                page.rows.len()
+            )),
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                violations.push("search_page: None on a store that holds a generation".into())
+            }
+            Err(error) => violations.push(format!("search_page: {error}")),
+        }
+        match reader.all_symbols() {
+            Ok(rows) if rows.is_empty() => violations.push("all_symbols: []".into()),
+            Ok(_) => {}
+            Err(error) => violations.push(format!("all_symbols: {error}")),
+        }
+        match reader.latest_extractions() {
+            Ok(rows) if rows.is_empty() => violations.push("latest_extractions: []".into()),
+            Ok(_) => {}
+            Err(error) => violations.push(format!("latest_extractions: {error}")),
+        }
+    }
+    fs::write(&stop, b"stop").unwrap();
+    // Bounded wait, then kill: a child that fails to notice the stop file must
+    // not turn a three-second probe into a hung suite.
+    let child_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < child_deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+        }
+    }
+
+    assert!(
+        reads > 100,
+        "the probe never got to read: {reads} reads in three seconds"
+    );
+    assert!(
+        violations.is_empty(),
+        "{} of {reads} reads answered emptily for a store that held one file in \
+         every generation; an empty answer and a lost generation are the two \
+         answers this store may never conflate:\n  {}",
+        violations.len(),
+        violations
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+    let _ = fs::remove_dir_all(&dir);
 }

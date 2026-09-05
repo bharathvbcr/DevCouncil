@@ -2985,7 +2985,13 @@ impl Store {
 
     pub fn status(&self, db_path: &str) -> Result<StoreStatus> {
         let conn = lock_conn(&self.conn)?;
-        let latest: Option<u32> = conn
+        // Every number below describes one instant. `status` resolves the
+        // latest generation and then counts that generation's nodes and
+        // edges in separate statements: without a snapshot those are
+        // separate reads, so a second process pruning between them reported
+        // a live generation holding zero symbols. See `latest_snapshot`.
+        let snapshot = conn.unchecked_transaction()?;
+        let latest: Option<u32> = snapshot
             .query_row(
                 "SELECT id FROM generations ORDER BY id DESC LIMIT 1",
                 [],
@@ -2993,16 +2999,16 @@ impl Store {
             )
             .optional()?;
         let pending_count: usize =
-            conn.query_row("SELECT COUNT(*) FROM pending_paths", [], |row| {
+            snapshot.query_row("SELECT COUNT(*) FROM pending_paths", [], |row| {
                 row.get::<_, i64>(0).map(|n| n as usize)
             })?;
         let (node_count, edge_count) = if let Some(g) = latest {
-            let nodes: usize = conn.query_row(
+            let nodes: usize = snapshot.query_row(
                 "SELECT COUNT(*) FROM generation_nodes WHERE generation_id = ?1",
                 params![g],
                 |row| row.get::<_, i64>(0).map(|n| n as usize),
             )?;
-            let edges: usize = conn.query_row(
+            let edges: usize = snapshot.query_row(
                 "SELECT COUNT(*) FROM generation_edges WHERE generation_id = ?1",
                 params![g],
                 |row| row.get::<_, i64>(0).map(|n| n as usize),
@@ -3011,13 +3017,13 @@ impl Store {
         } else {
             (0, 0)
         };
-        let quarantined_count: usize = conn.query_row(
+        let quarantined_count: usize = snapshot.query_row(
             "SELECT COUNT(*) FROM pending_paths WHERE attempts >= ?1",
             params![MAX_PENDING_ATTEMPTS],
             |row| row.get::<_, i64>(0).map(|count| count as usize),
         )?;
         let quarantined_paths: Vec<String> = {
-            let mut stmt = conn.prepare(
+            let mut stmt = snapshot.prepare(
                 "SELECT path FROM pending_paths
                  WHERE attempts >= ?1
                  ORDER BY queued_at ASC, path ASC
@@ -3069,11 +3075,11 @@ impl Store {
             return Ok(Vec::new());
         }
         let conn = lock_conn(&self.conn)?;
-        let gen = match Store::latest_generation_id_locked(&conn)? {
-            Some(g) => g,
+        let (snapshot, gen) = match Self::latest_snapshot(&conn)? {
+            Some(pinned) => pinned,
             None => return Ok(vec![]),
         };
-        let mut stmt = conn.prepare(
+        let mut stmt = snapshot.prepare(
             "SELECT name, qualified_name, path
              FROM nodes_fts
              WHERE rowid IN (SELECT rowid_ref FROM nodes_fts_map WHERE generation_id = ?1)
@@ -3093,6 +3099,9 @@ impl Store {
         for r in rows {
             out.push(r?);
         }
+        if out.is_empty() {
+            Self::require_searchable_index(&snapshot, gen)?;
+        }
         Ok(out)
     }
 
@@ -3107,10 +3116,10 @@ impl Store {
     /// them, and there is nothing to precompute or keep in step.
     pub fn all_symbols(&self) -> Result<Vec<StoredSymbol>> {
         let conn = lock_conn(&self.conn)?;
-        let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
+        let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(Vec::new());
         };
-        let mut stmt = conn.prepare(
+        let mut stmt = snapshot.prepare(
             "SELECT n.name, n.qualified_name, n.kind, p.path,
                     n.span_start, n.span_end, n.is_exported
              FROM generation_nodes n
@@ -3137,11 +3146,11 @@ impl Store {
 
     pub fn search_symbols(&self, query: &str, limit: usize) -> Result<Vec<StoredSymbol>> {
         let conn = lock_conn(&self.conn)?;
-        let gen = match Self::latest_generation_id_locked(&conn)? {
-            Some(generation) => generation,
+        let (snapshot, gen) = match Self::latest_snapshot(&conn)? {
+            Some(pinned) => pinned,
             None => return Ok(Vec::new()),
         };
-        Self::search_symbols_locked(&conn, gen, query, limit)
+        Self::search_symbols_locked(&snapshot, gen, query, limit)
     }
 
     /// The rows, and the count they were drawn from, against **one** generation.
@@ -3164,10 +3173,10 @@ impl Store {
     /// no generation at all, which is a different answer from an empty page.
     pub fn search_page(&self, query: &str, limit: usize) -> Result<Option<SearchPage>> {
         let conn = lock_conn(&self.conn)?;
-        let Some(generation) = Self::latest_generation_id_locked(&conn)? else {
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
             return Ok(None);
         };
-        let repo_root: Option<Option<String>> = conn
+        let repo_root: Option<Option<String>> = snapshot
             .query_row(
                 "SELECT repo_root FROM generations WHERE id = ?1",
                 params![generation],
@@ -3176,8 +3185,8 @@ impl Store {
             .optional()?;
         Ok(Some(SearchPage {
             generation,
-            total: Self::count_search_symbols_locked(&conn, generation, query)?,
-            rows: Self::search_symbols_locked(&conn, generation, query, limit)?,
+            total: Self::count_search_symbols_locked(&snapshot, generation, query)?,
+            rows: Self::search_symbols_locked(&snapshot, generation, query, limit)?,
             repo_root: repo_root.flatten().filter(|root| !root.is_empty()),
         }))
     }
@@ -3219,15 +3228,19 @@ impl Store {
                 is_exported: row.get::<_, i64>(6)? != 0,
             })
         })?;
-        rows.collect()
+        let page = rows.collect::<Result<Vec<_>>>()?;
+        if page.is_empty() {
+            Self::require_searchable_index(conn, gen)?;
+        }
+        Ok(page)
     }
 
     pub fn count_search_symbols(&self, query: &str) -> Result<u32> {
         let conn = lock_conn(&self.conn)?;
-        let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
+        let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(0);
         };
-        Self::count_search_symbols_locked(&conn, gen, query)
+        Self::count_search_symbols_locked(&snapshot, gen, query)
     }
 
     fn count_search_symbols_locked(conn: &Connection, gen: u32, query: &str) -> Result<u32> {
@@ -3250,15 +3263,18 @@ impl Store {
             params![gen, match_query],
             |row| row.get(0),
         )?;
+        if count == 0 {
+            Self::require_searchable_index(conn, gen)?;
+        }
         u32::try_from(count).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count))
     }
 
     pub fn latest_path_is_indexed(&self, path: &str) -> Result<bool> {
         let conn = lock_conn(&self.conn)?;
-        let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
+        let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(false);
         };
-        conn.query_row(
+        snapshot.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM generation_files f
                 JOIN paths p ON p.id = f.file_id
@@ -3271,10 +3287,10 @@ impl Store {
 
     pub fn latest_file(&self, path: &str) -> Result<Option<StoredFile>> {
         let conn = lock_conn(&self.conn)?;
-        let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
+        let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(None);
         };
-        let raw: Option<(String, String, i64, String, String)> = conn
+        let raw: Option<(String, String, i64, String, String)> = snapshot
             .query_row(
                 "SELECT p.path, f.language, f.content_hash,
                         f.parse_outcome_json, f.engine_json
@@ -3310,10 +3326,10 @@ impl Store {
     /// supports differential re-resolution without touching unchanged files.
     pub fn latest_extractions(&self) -> Result<Vec<Extraction>> {
         let conn = lock_conn(&self.conn)?;
-        let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
+        let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(Vec::new());
         };
-        let mut stmt = conn.prepare(
+        let mut stmt = snapshot.prepare(
             "SELECT f.extraction_json, p.path
              FROM generation_files f
              JOIN paths p ON p.id = f.file_id
@@ -3348,10 +3364,10 @@ impl Store {
     /// presenting as a diff against known content.
     pub fn latest_extraction_for_path(&self, path: &str) -> Result<Option<Extraction>> {
         let conn = lock_conn(&self.conn)?;
-        let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
+        let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(None);
         };
-        let json: Option<String> = conn
+        let json: Option<String> = snapshot
             .query_row(
                 "SELECT f.extraction_json
                  FROM generation_files f
@@ -3437,7 +3453,7 @@ impl Store {
             names.iter().filter(|name| seen.insert(*name)).collect()
         };
         let conn = lock_conn(&self.conn)?;
-        let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
+        let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(0);
         };
         let mut total: usize = 0;
@@ -3455,7 +3471,7 @@ impl Store {
                    AND CAST(ROUND(e.confidence * 1000) AS INTEGER) >= CAST(ROUND(?3 * 1000) AS INTEGER)
                    AND e.target_symbol IN ({placeholders})"
             );
-            let mut stmt = conn.prepare(&sql)?;
+            let mut stmt = snapshot.prepare(&sql)?;
             let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 3);
             bound.push(&gen);
             bound.push(&exclude_file);
@@ -3495,7 +3511,7 @@ impl Store {
             names.iter().filter(|name| seen.insert(*name)).collect()
         };
         let conn = lock_conn(&self.conn)?;
-        let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
+        let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(Vec::new());
         };
         let mut out: Vec<StoredEdge> = Vec::new();
@@ -3515,7 +3531,7 @@ impl Store {
                    AND CAST(ROUND(e.confidence * 1000) AS INTEGER) >= CAST(ROUND(?3 * 1000) AS INTEGER)
                    AND e.target_symbol IN ({placeholders})"
             );
-            let mut stmt = conn.prepare(&sql)?;
+            let mut stmt = snapshot.prepare(&sql)?;
             let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 3);
             bound.push(&gen);
             bound.push(&exclude_file);
@@ -3557,10 +3573,10 @@ impl Store {
     ) -> Result<Vec<StoredEdge>> {
         let min_confidence = checked_min_confidence(min_confidence)?;
         let conn = lock_conn(&self.conn)?;
-        let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
+        let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(Vec::new());
         };
-        let mut stmt = conn.prepare(
+        let mut stmt = snapshot.prepare(
             "SELECT sp.path, tp.path, e.source_symbol, e.target_symbol,
                     e.edge_kind, e.confidence
              FROM generation_edges e
@@ -3623,24 +3639,42 @@ impl Store {
                 }
             }
         }
-        let all = self.latest_edges_uncached(0.0)?;
+        // Keyed by the generation the rows were *read from*, not by `current`.
+        //
+        // `current` was sampled by its own statement, above, and the load below
+        // resolves the latest generation again under its own snapshot — this
+        // function is the one place in the store that asks the question twice.
+        // A writer committing between the two made the entry `(N, edges of
+        // N+1)`: a key that can never be hit again, so the cache the doc calls
+        // a bounded replacement for per-query allocation silently stopped being
+        // one until the next load rewrote it. Labelling the entry with the
+        // generation its rows came from makes the key mean what it says.
+        let Some((loaded, all)) = self.latest_edges_uncached(0.0)? else {
+            return Ok(Vec::new());
+        };
         let filtered: Vec<StoredEdge> = all
             .iter()
             .filter(|edge| admits(edge.confidence, min_confidence))
             .cloned()
             .collect();
         if let Ok(mut cache) = self.edge_cache.lock() {
-            *cache = Some((current, std::sync::Arc::new(all)));
+            *cache = Some((loaded, std::sync::Arc::new(all)));
         }
         Ok(filtered)
     }
 
-    fn latest_edges_uncached(&self, min_confidence: f32) -> Result<Vec<StoredEdge>> {
+    /// Every edge of the latest generation, and the generation they came from.
+    ///
+    /// The generation travels with the rows because [`Self::latest_edges`]
+    /// caches them under it; returning only the rows left the caller to label
+    /// them with a generation it had resolved separately. `None` when the store
+    /// holds no generation.
+    fn latest_edges_uncached(&self, min_confidence: f32) -> Result<Option<(u32, Vec<StoredEdge>)>> {
         let conn = lock_conn(&self.conn)?;
-        let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
-            return Ok(Vec::new());
+        let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
         };
-        let mut stmt = conn.prepare(
+        let mut stmt = snapshot.prepare(
             "SELECT sp.path, tp.path, e.source_symbol, e.target_symbol,
                     e.edge_kind, e.confidence
              FROM generation_edges e
@@ -3660,15 +3694,15 @@ impl Store {
                 confidence: row.get(5)?,
             })
         })?;
-        rows.collect()
+        Ok(Some((gen, rows.collect::<Result<Vec<_>>>()?)))
     }
 
     pub fn latest_dead_symbols(&self) -> Result<Vec<DeadSymbolReport>> {
         let conn = lock_conn(&self.conn)?;
-        let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
+        let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(Vec::new());
         };
-        let mut stmt = conn.prepare(
+        let mut stmt = snapshot.prepare(
             "SELECT symbol_name, file_path, confidence, is_exempt, exemption_reason
              FROM generation_dead_symbols
              WHERE generation_id = ?1
@@ -3698,10 +3732,10 @@ impl Store {
     /// primary-key range scan rather than a table scan of every generation.
     pub fn latest_clone_candidates(&self) -> Result<(Vec<CloneCandidate>, usize)> {
         let conn = lock_conn(&self.conn)?;
-        let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
+        let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok((Vec::new(), 0));
         };
-        let mut stmt = conn.prepare(
+        let mut stmt = snapshot.prepare(
             "SELECT p.path, n.name, n.qualified_name, n.kind, n.span_start, n.span_end,
                     n.body_exact, n.body_structural, n.body_nodes
              FROM generation_nodes n
@@ -3762,10 +3796,10 @@ impl Store {
     /// cannot round-trip from `f32`.
     pub fn count_dead_at_least(&self, min: f32) -> Result<u32> {
         let conn = lock_conn(&self.conn)?;
-        let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
+        let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(0);
         };
-        conn.query_row(
+        snapshot.query_row(
             "SELECT COUNT(*) FROM generation_dead_symbols
              WHERE generation_id = ?1
                AND CAST(ROUND(confidence * 1000) AS INTEGER)
@@ -3784,8 +3818,151 @@ impl Store {
         .optional()
     }
 
+    /// The latest generation, and a read snapshot its rows are still in.
+    ///
+    /// Every reader here resolved "the latest generation" with one statement
+    /// and then read that generation's rows with another. Those are two
+    /// statements in SQLite's autocommit mode, which means **two snapshots**:
+    /// `lock_conn` is a Rust mutex and serialises this process's own threads,
+    /// it does not hold a database read. A second *process* — the daemon,
+    /// which is designed to commit while clients query — could therefore
+    /// commit and prune between them, and a reader that had pinned a
+    /// now-deleted generation read zero rows out of it and returned them as
+    /// the answer.
+    ///
+    /// Measured with a real second process committing and pruning in a loop
+    /// against a store that always held twelve files, 20 s per run, release
+    /// build:
+    ///
+    /// | retention | reads | false-empty answers |
+    /// |---|---|---|
+    /// | `prune(1)` | 182,781 | 31 (18 `search_page`, 6 `latest_edges_for_file`, 4 `latest_extractions`, 3 `all_symbols`) |
+    /// | `prune(GENERATION_RETENTION)` | 192,970 | 1 (`latest_edges_for_file`) |
+    ///
+    /// Every one of those is a Class A failure and not merely a stale answer:
+    /// `search_page` returned `total: 0, rows: []`, which is byte-identical to
+    /// a query that ran and matched nothing, and an empty `callers_of` is read
+    /// by `dev verify` as proof a symbol has no callers.
+    ///
+    /// A `DEFERRED` transaction takes its snapshot at its first statement,
+    /// which is the generation lookup below, and holds it for every later read
+    /// — so the generation a reader pins is still there, with its rows, for as
+    /// long as it is reading. It takes no write lock and blocks no writer; the
+    /// only thing it defers is WAL truncation, for the microseconds to
+    /// milliseconds a read takes. Rolled back on drop, which for a read
+    /// transaction is free.
+    ///
+    /// `None` means the store holds no generation at all, which is a different
+    /// answer from a generation that matched nothing.
+    fn latest_snapshot(conn: &Connection) -> Result<Option<(rusqlite::Transaction<'_>, u32)>> {
+        let snapshot = conn.unchecked_transaction()?;
+        match Self::latest_generation_id_locked(&snapshot)? {
+            Some(generation) => Ok(Some((snapshot, generation))),
+            None => Ok(None),
+        }
+    }
+
+    /// Refuse a search whose index is not there, instead of reporting that the
+    /// corpus does not contain the query.
+    ///
+    /// The full-text index lives in `nodes_fts`/`nodes_fts_map`, structures
+    /// separate from `generation_nodes`, and the store already assumes they can
+    /// be lost on their own: [`Store::repair_fts`] and `devmap repair --fts`
+    /// exist for that state and nothing else. Nothing *detected* it. Measured
+    /// on a store whose four symbol rows were intact and whose index rows had
+    /// been removed:
+    ///
+    /// ```text
+    /// all_symbols  = 4
+    /// search_page  = Some(SearchPage { generation: 1, total: 0, rows: [] })
+    /// status       = node_count 4, degraded_reason: None
+    /// ```
+    ///
+    /// `total: 0, rows: []` is byte-identical to a healthy index that matched
+    /// nothing, so every `search` against that store answered "this repository
+    /// does not contain that symbol" — permanently, and without ever naming the
+    /// one command that fixes it.
+    ///
+    /// **What this detects, and what it does not.** It answers "does this
+    /// generation have any searchable row at all", not "is the index complete".
+    /// A *partially* lost index is not caught: with half of one generation's
+    /// postings deleted, search returned 10 of 40 symbols and reported the 10
+    /// as the whole answer, and this check passes that store. Catching a
+    /// partial loss means counting the generation's index rows against its
+    /// symbol rows on every query, which is O(symbols) on a path that is
+    /// otherwise a bounded FTS lookup. `devmap repair --fts` rebuilds the index
+    /// unconditionally and is the complete answer; this is the cheap one that
+    /// turns the total loss from silence into a refusal.
+    ///
+    /// Called only when a search came back empty, so a query that matched
+    /// nothing pays two `EXISTS` probes — both primary-key range lookups on
+    /// `WITHOUT ROWID` tables — and a query that matched pays nothing.
+    fn require_searchable_index(conn: &Connection, gen: u32) -> Result<()> {
+        let has_symbols: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM generation_nodes WHERE generation_id = ?1)",
+            params![gen],
+            |row| row.get::<_, i64>(0).map(|found| found != 0),
+        )?;
+        // A generation that indexed no symbols has nothing for the index to
+        // hold, so its empty answer is the truth rather than a missing check.
+        if !has_symbols {
+            return Ok(());
+        }
+        // Both halves of the desync fail here, and they fail differently: the
+        // map can be lost while the postings survive (no row matches the
+        // generation), and the postings can be lost while the map survives (the
+        // rowid join finds nothing). One query covers both.
+        let searchable: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM nodes_fts_map m
+                JOIN nodes_fts f ON f.rowid = m.rowid_ref
+                WHERE m.generation_id = ?1
+             )",
+            params![gen],
+            |row| row.get::<_, i64>(0).map(|found| found != 0),
+        )?;
+        if searchable {
+            return Ok(());
+        }
+        Err(rusqlite::Error::InvalidParameterName(format!(
+            "generation {gen} has symbol rows but no full-text index rows, so \
+             this search could not run and its empty result is not an answer \
+             about the repository; rebuild the index with `devmap repair --fts`"
+        )))
+    }
+
+    /// Every file indexed by one named generation.
+    ///
+    /// Refuses a generation the store does not hold, rather than answering
+    /// `[]`. This is the only reader that takes its generation id from the
+    /// caller, and every caller resolves that id in a *separate* call —
+    /// `devmap-query`'s `savings` does `latest_generation_id()` and then this,
+    /// with a prune-capable writer free to commit twice in between. Measured
+    /// against the pre-refusal code, all three of these returned the same
+    /// `Ok([])`: a live generation holding one file, that same generation once
+    /// `prune_generations_except_latest` had removed it, and generation 9999,
+    /// which was never written.
+    ///
+    /// So a lost generation reached `savings` as `corpus_bytes: 0,
+    /// corpus_files_unreadable: 0` — a repository with nothing in it — and the
+    /// report whose own documentation refuses to count an unreadable file as
+    /// zero bytes did exactly that one level up. "Not in this store" and
+    /// "indexed no files" are different facts and only one of them is an
+    /// answer.
     pub fn list_generation_paths(&self, generation_id: u32) -> Result<Vec<String>> {
         let conn = lock_conn(&self.conn)?;
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM generations WHERE id = ?1)",
+            params![generation_id],
+            |row| row.get::<_, i64>(0).map(|found| found != 0),
+        )?;
+        if !present {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "generation {generation_id} is not in this store — it was pruned \
+                 or never written — so the files it indexed are unknown, not none; \
+                 re-read the latest generation id and ask again"
+            )));
+        }
         let mut stmt = conn.prepare(
             "SELECT DISTINCT p.path FROM generation_nodes n
              JOIN paths p ON p.id = n.file_id
@@ -4494,6 +4671,137 @@ mod connection_tests {
             store.latest_edges_for_test().is_err(),
             "latest_edges_for_test must fail closed on a poisoned mutex"
         );
+    }
+
+    /// The deterministic guard for [`Store::latest_snapshot`].
+    ///
+    /// The defect it exists for reproduces only probabilistically — a second
+    /// process has to commit *and* prune inside the microseconds between a
+    /// reader's generation lookup and its row read, which took 182,781 reads
+    /// against a continuously rebuilding writer to hit 31 times. A test that
+    /// fires at that rate is not a guard: a green run from it says nothing.
+    ///
+    /// So the guard is stated over the mechanism instead, with the schedule
+    /// forced rather than raced. A second connection — the same thing a second
+    /// process is, as far as SQLite's snapshots are concerned — deletes the
+    /// generation's rows strictly between the pin and the read. Both readers
+    /// are run over that schedule, and they must disagree:
+    ///
+    /// * without a snapshot the pinned generation reads back **empty**, which
+    ///   is the defect, verbatim;
+    /// * with one it reads back its rows.
+    ///
+    /// Asserting both directions is what keeps this honest. A test that only
+    /// checked the snapshot would still pass if the delete silently stopped
+    /// landing, and would then be proving nothing at all.
+    #[test]
+    fn a_pinned_generation_keeps_its_rows_when_another_connection_prunes_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-snapshot-guard-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let db_path = dir.join("index.sqlite");
+        let store = Store::open(&db_path).expect("store");
+        {
+            let conn = lock_conn(&store.conn).expect("connection");
+            conn.execute(
+                "INSERT INTO generations (id, created_at, head_sha, analysis_json)
+                 VALUES (7, 1.0, 'seed', '{}')",
+                [],
+            )
+            .expect("generation");
+            conn.execute("INSERT INTO paths (id, path) VALUES (1, 'src/a.py')", [])
+                .expect("path");
+            conn.execute(
+                "INSERT INTO generation_nodes
+                 (generation_id, ordinal, file_id, name, qualified_name, kind,
+                  span_start, span_end, is_exported)
+                 VALUES (7, 0, 1, 'alpha', 'src/a.py::alpha', 'Function', 0, 1, 0)",
+                [],
+            )
+            .expect("node");
+        }
+
+        // What the pruning writer does, from a connection of its own.
+        let prune = || {
+            let other = Connection::open(&db_path).expect("second connection");
+            other
+                .busy_timeout(std::time::Duration::from_secs(5))
+                .expect("busy timeout");
+            other
+                .execute("DELETE FROM generation_nodes WHERE generation_id = 7", [])
+                .expect("prune");
+            other
+                .execute("DELETE FROM generations WHERE id = 7", [])
+                .expect("prune");
+        };
+        let count_rows = |conn: &Connection, generation: u32| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM generation_nodes WHERE generation_id = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .expect("count")
+        };
+
+        // Reader A: the pre-fix shape — pin, then read, with no snapshot
+        // between them. This is the control, and it must observe the deletion.
+        let unpinned = {
+            let conn = lock_conn(&store.conn).expect("connection");
+            let generation = Store::latest_generation_id_locked(&conn)
+                .expect("pin")
+                .expect("a generation");
+            assert_eq!(generation, 7);
+            prune();
+            count_rows(&conn, generation)
+        };
+        assert_eq!(
+            unpinned, 0,
+            "the control did not actually race: without a snapshot the pinned \
+             generation must read back empty, or this test proves nothing"
+        );
+
+        // Put the generation back and run the same schedule through the
+        // snapshot the fix installs.
+        {
+            let conn = lock_conn(&store.conn).expect("connection");
+            conn.execute(
+                "INSERT INTO generations (id, created_at, head_sha, analysis_json)
+                 VALUES (7, 1.0, 'seed', '{}')",
+                [],
+            )
+            .expect("generation");
+            conn.execute(
+                "INSERT INTO generation_nodes
+                 (generation_id, ordinal, file_id, name, qualified_name, kind,
+                  span_start, span_end, is_exported)
+                 VALUES (7, 0, 1, 'alpha', 'src/a.py::alpha', 'Function', 0, 1, 0)",
+                [],
+            )
+            .expect("node");
+        }
+        let pinned = {
+            let conn = lock_conn(&store.conn).expect("connection");
+            let (snapshot, generation) = Store::latest_snapshot(&conn)
+                .expect("pin")
+                .expect("a generation");
+            assert_eq!(generation, 7);
+            prune();
+            count_rows(&snapshot, generation)
+        };
+        assert_eq!(
+            pinned, 1,
+            "a generation pinned inside a read snapshot lost its rows to a \
+             concurrent prune; the reader would answer `[]` for a store that \
+             holds data, which is the failure `latest_snapshot` exists to stop"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
