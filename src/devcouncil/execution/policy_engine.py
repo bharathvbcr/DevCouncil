@@ -5,7 +5,7 @@ from __future__ import annotations
 import fnmatch
 import re
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, model_validator
 
@@ -81,6 +81,37 @@ class PolicyDecision(BaseModel):
         # the whole point of a new hard rule is that it is neither.
         object.__setattr__(self, "severity", SEVERITY_BY_RULE.get(self.rule, "hard"))
         return self
+
+    @property
+    def allowed(self) -> bool:
+        """Whether the caller may proceed. ``warn`` is a decision to allow."""
+        return self.action in {"allow", "warn"}
+
+
+class Decision(Protocol):
+    """The part of a decision a gate seam reads, whichever engine produced it.
+
+    Two engines answer the same question at two altitudes: ``TaskPolicyEngine``
+    returns the full :class:`PolicyDecision` (rule, severity, task), and
+    ``HookPolicy`` returns the narrower ``HookDecision`` — narrower on purpose,
+    because a hook-synthesised verdict such as "hook_gate mode=off allows this"
+    fired no rule, and giving it one would put a fabricated severity into the
+    shared verdict vocabulary.
+
+    Both are the same thing to a caller that only asks whether to proceed and
+    what to say if not, and two such callers pick between the engines at
+    runtime. This names that common surface so the choice type-checks without
+    either side pretending to be the other.
+    """
+
+    @property
+    def action(self) -> str: ...
+
+    @property
+    def reason(self) -> str: ...
+
+    @property
+    def allowed(self) -> bool: ...
 
 
 def normalize_repo_path(project_root: Path, raw_path: str) -> tuple[str, bool]:

@@ -1,7 +1,8 @@
 from pathlib import Path
 
 from devcouncil.domain.task import PlannedFile, Task
-from devcouncil.execution.policy_engine import TaskPolicyEngine
+from devcouncil.execution.hook_policy import HookDecision
+from devcouncil.execution.policy_engine import PolicyDecision, TaskPolicyEngine
 
 
 def _task(**kwargs) -> Task:
@@ -158,3 +159,21 @@ def test_hook_denies_no_verify_and_force_push(tmp_path: Path):
     assert engine.evaluate_hook_command("git commit --no-verify").action == "deny"
     assert engine.evaluate_hook_command("git push origin main --force").action == "deny"
     assert engine.evaluate_hook_command("git reset --hard main").action == "deny"
+
+
+def test_both_engines_agree_on_what_allowed_means():
+    """The seam reads ``allowed``; the two engines must not answer it differently.
+
+    ``PermissionManager.is_file_change_allowed`` and
+    ``task_gate_ops.run_command_payload`` pick between ``TaskPolicyEngine`` and
+    ``HookPolicy`` at runtime and read one verdict from whichever answered. The
+    two decision types stay separate on purpose — a hook-synthesised verdict
+    fired no rule and must not carry a fabricated severity — so the contract
+    that makes the choice safe is that this one predicate agrees.
+    """
+    for action, expected in (("allow", True), ("warn", True), ("deny", False)):
+        policy = PolicyDecision(action=action, reason="r", target="src/app.py")
+        hook = HookDecision(action, "r", "src/app.py")
+
+        assert policy.allowed is expected
+        assert hook.allowed is expected

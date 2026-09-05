@@ -5,7 +5,7 @@ from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
 from devcouncil.domain.task import PlannedFile, Task
 from devcouncil.app.errors import GatingError
-from devcouncil.execution.policy_engine import TaskPolicyEngine
+from devcouncil.execution.policy_engine import Decision, TaskPolicyEngine
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,7 @@ class PermissionManager:
         for restricted in self.dynamic_ignores:
             if fnmatch.fnmatch(path, restricted) or path.startswith(restricted.strip("*")):
                 return False
+        decision: Decision
         if not self.enforce_task_scope:
             from devcouncil.execution.hook_policy import HookPolicy
 
@@ -65,11 +66,11 @@ class PermissionManager:
                 task,
                 enforce_task_scope=False,
             )
-            return decision.allowed
-        decision = self.policy_engine.evaluate_file_change(
-            path, task, operation, internal=internal
-        )
-        return decision.action in {"allow", "warn"}
+        else:
+            decision = self.policy_engine.evaluate_file_change(
+                path, task, operation, internal=internal
+            )
+        return decision.allowed
 
     def _planned_file_for(self, path: str, task: Task) -> Optional[PlannedFile]:
         normalized = path.replace("\\", "/")

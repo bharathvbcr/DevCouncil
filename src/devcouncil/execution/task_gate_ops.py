@@ -12,6 +12,7 @@ from typing import Any
 from devcouncil.domain.evidence import CommandResult, DiffCoverageEvidence, DiffEvidence, TestEvidence
 from devcouncil.execution.hook_policy import HookPolicy
 from devcouncil.execution.lease_validation import require_valid_lease
+from devcouncil.execution.policy_engine import Decision
 from devcouncil.integrations.mcp.util import allowed_next_tools, read_log_file, truncate_text
 from devcouncil.storage.native import ShellCommandRepository, TaskLeaseRepository
 from devcouncil.storage.repositories import (
@@ -522,6 +523,7 @@ def run_command_payload(
         if enforce and not task:
             return {"ok": False, "error": f"Task {task_id} not found.", "code": "not_found", "task_id": task_id}
 
+        policy_decision: Decision
         if enforce:
             from devcouncil.execution.policy_engine import TaskPolicyEngine
 
