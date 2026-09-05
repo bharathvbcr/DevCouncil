@@ -2486,3 +2486,37 @@ list; a store with no generation returns `None` rather than an empty page,
 which is a different answer; and `search` reports the current generation's
 count across a generation change. Those hold the fix in place without depending
 on winning a race.
+
+### Q-9 — the configuration an embedder ships had never been tested
+
+`parse` exists so an embedder can link the query half without tree-sitter and
+its 32 C grammars: `devmap-extract`'s manifest says so at length, and GitPulse
+is named as the consumer. The feature-off build worked. Its **tests did not
+compile at all**.
+
+```
+cargo test -p devmap-extract --no-default-features
+    error[E0432]: unresolved import `devmap_extract::extract_file`
+    error[E0433]: cannot find `treesitter` in `devmap_extract`
+```
+
+Thirteen integration tests, one example and three inline tests import items that
+are `#[cfg(feature = "parse")]`. One unresolved import fails a whole target, so
+the command returned a build error instead of results — and a build error is
+easy to read as "this configuration is not meant to be tested", which is how it
+survived. Zero tests had ever run against the shape an embedder actually links.
+
+Fixed with `required-features = ["parse"]` on the fourteen affected targets, so
+they are *skipped* when the feature is off rather than failing the build, and
+`#[cfg(feature = "parse")]` on the three inline tests and the one helper that
+needs a real extraction. `ignore_rule_tolerance` touches only the model and the
+walker and runs in both configurations.
+
+```
+--no-default-features   before: build error, 0 tests   after: 60 passed, 0 failed
+default features        before: 318 passed / 16 targets  after: 318 passed / 16 targets
+```
+
+The second line is the one that matters as much as the first: gating tests is
+one careless attribute away from silently deleting them from the build everyone
+actually runs, so the default count and target count are asserted unchanged.

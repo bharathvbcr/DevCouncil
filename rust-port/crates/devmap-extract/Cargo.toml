@@ -96,3 +96,81 @@ parse = [
     "dep:tree-sitter-svelte-ng",
     "dep:tree-sitter-astro-next",
 ]
+
+# Which integration tests need a grammar.
+#
+# `--no-default-features` is the shape GitPulse actually links, and its test
+# suite did not compile: every one of these imports `extract_file`, `treesitter`,
+# `langcalls` or `cache`, all of which are `#[cfg(feature = "parse")]`. One
+# unresolved import fails the whole target, so `cargo test -p devmap-extract
+# --no-default-features` reported a build error rather than results — meaning the
+# configuration an embedder ships had never had a single test run against it.
+#
+# `required-features` skips these targets when `parse` is off instead of failing
+# the build, so the feature-off configuration is testable. The two tests absent
+# from this list — `ignore_rule_tolerance` — touches only the model and the
+# walker, and runs in both configurations. The `budget_probe` example is
+# gated for the same reason: it drives the parser directly.
+#
+# Nothing changes with default features on: `parse` is in `default`, so all
+# fifteen targets build and run exactly as before.
+
+[[test]]
+name = "adversarial_corpus"
+required-features = ["parse"]
+
+[[test]]
+name = "budget_is_a_real_bound"
+required-features = ["parse"]
+
+[[test]]
+name = "c_family"
+required-features = ["parse"]
+
+[[test]]
+name = "capped_reads_say_so"
+required-features = ["parse"]
+
+[[test]]
+name = "cprobe"
+required-features = ["parse"]
+
+[[test]]
+name = "declarations"
+required-features = ["parse"]
+
+[[test]]
+name = "grammar_matrix"
+required-features = ["parse"]
+
+[[test]]
+name = "langcalls_jvm_dotnet"
+required-features = ["parse"]
+
+[[test]]
+name = "langcalls_lua_r"
+required-features = ["parse"]
+
+[[test]]
+name = "langcalls_ruby_php"
+required-features = ["parse"]
+
+[[test]]
+name = "langcalls_swift_scala"
+required-features = ["parse"]
+
+[[test]]
+name = "stress_hardening"
+required-features = ["parse"]
+
+[[test]]
+name = "test_phase2_hardening"
+required-features = ["parse"]
+
+[[test]]
+name = "metal_coverage"
+required-features = ["parse"]
+
+[[example]]
+name = "budget_probe"
+required-features = ["parse"]

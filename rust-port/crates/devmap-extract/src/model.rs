@@ -1164,6 +1164,11 @@ mod go_interface_exemption_tests {
 
     /// A real extraction to mutate, so the fixture cannot drift from the
     /// struct the pipeline actually produces.
+    // Needs a real extraction, so it needs a grammar. Without `parse` the
+    // crate has no `extract_file` at all, and an ungated test made the whole
+    // lib-test target fail to compile — which is why the configuration
+    // GitPulse actually embeds had never had its tests run.
+    #[cfg(feature = "parse")]
     fn base_extraction() -> Extraction {
         crate::extract_file("fixture.go", "package main\n")
     }
@@ -1266,6 +1271,7 @@ mod go_interface_exemption_tests {
     /// `""` or `"xyzzy"`. The join above looks up `symbol.qualified_name`, so a
     /// wrong key silently drops every method out of the arity check.
     #[test]
+    #[cfg(feature = "parse")]
     fn param_counts_are_keyed_by_qualified_name() {
         let mut extraction = base_extraction();
         extraction.go_method_params = vec![
@@ -1300,6 +1306,7 @@ mod go_interface_exemption_tests {
     /// store, so nothing errors; the graph just loses every type annotation and
     /// name use while double-counting calls.
     #[test]
+    #[cfg(feature = "parse")]
     fn durable_store_drops_call_kind_references_only() {
         let reference = |kind: ReferenceKind, name: &str| ExtractedReference {
             name: name.into(),
@@ -1349,6 +1356,7 @@ mod go_interface_exemption_tests {
     /// recomputed it. Measured on a 1,610-file tree: 172,161 edges against a
     /// cold 172,046, stable across further rebuilds.
     #[test]
+    #[cfg(feature = "parse")]
     fn a_receiver_binding_survives_durable_persist() {
         let extraction = crate::extract_file(
             "app.py",
