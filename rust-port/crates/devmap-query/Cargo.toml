@@ -30,9 +30,32 @@ parse = ["devmap-extract/parse", "devmap-resolve/parse", "devmap-analyze/parse",
 #
 # `required-features` skips these when `parse` is off rather than failing the
 # build. Nothing changes with default features on, where `parse` is enabled.
+#
+# Examples count too, and were missed: `--all-targets` builds them, so an
+# example that calls `extract_file` fails the no-parse check exactly as a test
+# does. `workspace_registry_concurrency` and `freshness_parity` are deliberately
+# absent — they exercise the workspace registry and the freshness stamp, neither
+# of which needs a parser, and they must keep being compiled and run in the
+# no-parse configuration.
 
 [[test]]
 name = "coverage_loss_artifacts"
+required-features = ["parse"]
+
+[[test]]
+name = "edge_index_under_writes"
+required-features = ["parse"]
+
+[[test]]
+name = "query_work_is_bounded_by_the_answer"
+required-features = ["parse"]
+
+[[example]]
+name = "answer_snapshot"
+required-features = ["parse"]
+
+[[example]]
+name = "query_bench"
 required-features = ["parse"]
 
 [[test]]

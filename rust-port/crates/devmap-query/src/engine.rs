@@ -84,7 +84,7 @@ impl<'a> StoreQueryEngine<'a> {
         if req.query.trim().is_empty() {
             return Ok(budget_take(Vec::new(), req.token_budget, |_| 0));
         }
-        let page = budget_page_size(req.token_budget);
+        let page = search_page_size(req.token_budget);
         let pool = search_rank_pool_size(req.token_budget);
         // One snapshot. The count, the rows and the root used to be three
         // independent reads, each resolving "the latest generation" for itself,
@@ -122,10 +122,11 @@ impl<'a> StoreQueryEngine<'a> {
         // building a hit reads the file off disk. So a ten-times wider pool
         // costs ten times the string comparisons and not one extra file read —
         // `page`, not `pool`, bounds what is materialised.
-        let mut ranked: Vec<(f32, devmap_store::StoredSymbol)> = rows
-            .into_iter()
-            .map(|row| (name_match_score(&row, &query), row))
-            .collect();
+        let mut ranked: Vec<(f32, devmap_store::StoredSymbol)> = Vec::with_capacity(rows.len());
+        for (index, row) in rows.into_iter().enumerate() {
+            self.cancel.check_every(index)?;
+            ranked.push((name_match_score(&row, &query), row));
+        }
         ranked.sort_by(|(left_score, left), (right_score, right)| {
             right_score
                 .total_cmp(left_score)
@@ -136,6 +137,11 @@ impl<'a> StoreQueryEngine<'a> {
         });
         let mut hits = Vec::with_capacity(ranked.len().min(page));
         for (score, row) in ranked.into_iter().take(page) {
+            // Every iteration here opens a file. Checked per row rather than
+            // per `CHECK_INTERVAL` because the unit of work is an I/O, not a
+            // string comparison: a page of 200 abandoned reads is 200 reads
+            // nobody is waiting for.
+            self.cancel.check()?;
             hits.push(hit_from_stored(
                 row,
                 repo_root.as_deref(),
@@ -3077,6 +3083,32 @@ fn budget_page_size(token_budget: u32) -> usize {
         .max(1) as usize
 }
 
+/// Hard ceiling on hits one `search` may materialise, whatever the budget asks.
+///
+/// K-B1: every hit on a search page is a file opened and read, and the page was
+/// `token_budget / 20 + 1` — 5,001 rows at a 100,000-token budget. The token
+/// budget is a *presentation* limit the caller chooses; letting it set the
+/// number of files opened turns "give me a generous budget" into "open five
+/// thousand files". 200 is far past any page a reader consumes and far below
+/// anything that reads a corpus.
+///
+/// It applies to `search` and not to `explore`, and the difference is where the
+/// I/O is: `explore` scores stored rows and opens a file only for the
+/// definitions that survive its own `limit` —
+/// `explore_reads_one_file_per_definition_it_returns_not_per_candidate` pins
+/// that — so capping its candidate page would cost ranking quality on a
+/// high-match query and buy no bounded-ness at all.
+///
+/// The cap trims the page, never the count: `total` is still measured over the
+/// whole index and a trimmed page still reports `truncated` and `hidden`.
+pub const SEARCH_PAGE_MAX: usize = 200;
+
+/// Hits `search` will materialise for this budget: what it can show, capped at
+/// what it is allowed to open. See [`SEARCH_PAGE_MAX`].
+fn search_page_size(token_budget: u32) -> usize {
+    budget_page_size(token_budget).min(SEARCH_PAGE_MAX)
+}
+
 /// How many candidates keyword search pulls from the store before ranking them.
 ///
 /// The store orders its page by bm25 and this crate ranks by exact/prefix/other
@@ -3096,7 +3128,10 @@ const SEARCH_RANK_OVERSAMPLE: usize = 10;
 const SEARCH_RANK_POOL_MAX: usize = 2_000;
 
 fn search_rank_pool_size(token_budget: u32) -> usize {
-    let page = budget_page_size(token_budget);
+    // The *capped* page: the floor below exists so the pool can never be
+    // narrower than what will be shown, and taking it from the uncapped page
+    // would let a large budget reopen the ceiling the cap just closed.
+    let page = search_page_size(token_budget);
     // Never below the page: a pool smaller than what the budget could show
     // would drop results the caller has already paid for.
     page.saturating_mul(SEARCH_RANK_OVERSAMPLE)
@@ -3179,6 +3214,65 @@ thread_local! {
     /// per thread rather than globally so tests running in parallel in one
     /// binary cannot contaminate each other's count.
     pub(crate) static SOURCE_SPAN_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// Bytes those reads pulled off disk on this thread.
+    ///
+    /// The count above says how many files were opened; it says nothing about
+    /// how much of each was read, and `read_to_string` read all of it. A 50 MB
+    /// vendored bundle answered a one-line span with 50 MB of I/O and 50 MB of
+    /// resident string, per hit, and neither the response nor the read counter
+    /// showed it.
+    pub(crate) static SOURCE_SPAN_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Read only as much of a file as a span ending at `span_end` can need.
+///
+/// K-B1: this was `fs::read_to_string`, so one search hit cost the size of the
+/// file it lives in — a 50 MB generated bundle answered a one-line span with
+/// 50 MB of I/O and 50 MB of resident `String`, per hit, per query, bounded by
+/// nothing. A span at byte 40 needs bytes `0..40`: the prefix, because the line
+/// number is the count of newlines before it, and not one byte more.
+///
+/// Up to three bytes past `span_end` are read and then discarded so a prefix
+/// that lands mid-character still decodes. A file that is shorter than
+/// `span_end` — the working tree moved on since the generation was written —
+/// comes back as whatever is there, exactly as reading the whole file did, and
+/// the caller's span lookup fails the same way it failed before.
+///
+/// The error is preserved rather than collapsed: a file that cannot be read
+/// must not look like a file with nothing in it.
+fn read_source_prefix(path: &std::path::Path, span_end: usize) -> std::io::Result<String> {
+    use std::io::Read;
+
+    // One UTF-8 character is at most four bytes, so three extra can complete
+    // whatever character `span_end` lands inside.
+    let wanted = span_end.saturating_add(3);
+    let mut file = std::fs::File::open(path)?;
+    let mut buffer = Vec::new();
+    // `take` bounds the read at the source, so a hostile or generated file
+    // cannot make this allocate more than the span asked for.
+    file.by_ref().take(wanted as u64).read_to_end(&mut buffer)?;
+    #[cfg(test)]
+    SOURCE_SPAN_BYTES.with(|bytes| bytes.set(bytes.get().saturating_add(buffer.len() as u64)));
+    match String::from_utf8(buffer) {
+        Ok(text) => Ok(text),
+        Err(error) => {
+            // Either the file is not UTF-8 — the same failure `read_to_string`
+            // reported — or the cut landed mid-character. Keep the longest
+            // valid prefix when it still covers the span, and report the error
+            // otherwise, so a truncated read is never passed off as the file.
+            let valid = error.utf8_error().valid_up_to();
+            let bytes = error.into_bytes();
+            if valid >= span_end {
+                Ok(String::from_utf8_lossy(&bytes[..valid]).into_owned())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "stream did not contain valid UTF-8",
+                ))
+            }
+        }
+    }
 }
 
 /// Build a hit from a stored symbol row, reading its source span from disk.
@@ -3196,7 +3290,8 @@ fn hit_from_stored(
     let owned_root = repo_root.map(str::to_string);
     #[cfg(test)]
     SOURCE_SPAN_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
-    let source_result = std::fs::read_to_string(resolve_source_path(&owned_root, &row.path));
+    let source_result =
+        read_source_prefix(&resolve_source_path(&owned_root, &row.path), row.span_end);
     let source_unavailable_reason = source_result.as_ref().err().map(|error| {
         format!(
             "source unavailable at query time for {:?}: {error}",
@@ -4357,3 +4452,186 @@ mod indexed_start_equivalence_tests {
 // source. Without `parse` the crate answers questions about a persisted map and
 // cannot make one, so these are compiled out rather than left to break the
 // `--no-default-features` build.
+#[cfg(all(test, feature = "parse"))]
+mod search_bounds_tests {
+    use super::*;
+    use devmap_analyze::analyze;
+    use devmap_extract::extract_file;
+    use devmap_resolve::Resolver;
+    use devmap_store::Store;
+
+    /// A store whose only file is `path`, holding `source`.
+    fn store_of(path: &str, source: &str) -> Store {
+        let ext = extract_file(path, source);
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(std::slice::from_ref(&ext));
+        let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+        let analysis = analyze(std::slice::from_ref(&ext), &resolution);
+        let store = Store::open_in_memory().expect("store");
+        store
+            .save_generation(std::slice::from_ref(&ext), &resolution, &analysis)
+            .expect("generation");
+        store
+    }
+
+    /// A hit near the top of a huge file must not read the whole file.
+    ///
+    /// K-B1: `hit_from_stored` called `fs::read_to_string`, so the cost of one
+    /// search hit was the size of the file it lives in, however far the span
+    /// was from the end. On a repository carrying a generated or vendored
+    /// bundle that is tens of megabytes of I/O and tens of megabytes resident,
+    /// per hit, per query — bounded by nothing.
+    #[test]
+    fn a_hit_near_the_top_of_a_huge_file_reads_a_bounded_prefix() {
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-hugefile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+
+        // The symbol is in the first 100 bytes; the rest is filler the answer
+        // never names.
+        const FILLER: usize = 50 * 1024 * 1024;
+        let mut source = String::with_capacity(FILLER + 128);
+        source.push_str("def findable_symbol():\n    return 1\n");
+        let head = source.len();
+        source.push_str("# ");
+        while source.len() < FILLER {
+            source.push('x');
+        }
+        source.push('\n');
+        std::fs::write(dir.join("huge.py"), &source).expect("write fixture");
+
+        let store = store_of("huge.py", &source);
+        // The engine resolves spans against the generation's recorded root.
+        {
+            let ext = extract_file("huge.py", &source);
+            let mut resolver = Resolver::new();
+            resolver.index_extractions(std::slice::from_ref(&ext));
+            let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+            let analysis = analyze(std::slice::from_ref(&ext), &resolution);
+            store
+                .save_generation_with_opts(
+                    std::slice::from_ref(&ext),
+                    &resolution,
+                    &analysis,
+                    devmap_store::GenerationWriteOpts {
+                        repo_root: Some(dir.to_string_lossy().to_string()),
+                        ..Default::default()
+                    },
+                )
+                .expect("generation with a root");
+        }
+
+        SOURCE_SPAN_READS.with(|reads| reads.set(0));
+        SOURCE_SPAN_BYTES.with(|bytes| bytes.set(0));
+        let response = StoreQueryEngine::new(&store)
+            .search(Request {
+                query: "findable_symbol".to_string(),
+                token_budget: 2_000,
+                min_confidence: 0.0,
+                max_depth: 1,
+            })
+            .expect("search");
+        let bytes = SOURCE_SPAN_BYTES.with(|bytes| bytes.get());
+
+        assert_eq!(
+            response.shown, 1,
+            "the fixture must produce exactly one hit"
+        );
+        assert!(
+            response.items[0].source_span.contains("findable_symbol"),
+            "the span must still be the symbol's own text: {:?}",
+            response.items[0].source_span
+        );
+        assert!(
+            bytes < (head as u64) * 8 + 4096,
+            "one hit whose span ends at byte {head} read {bytes} bytes of a \
+             {FILLER}-byte file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cancelled search stops instead of opening every file on its page.
+    #[test]
+    fn a_cancelled_search_stops_before_materialising_its_page() {
+        const SYMBOLS: usize = 4_000;
+        let mut source = String::new();
+        for index in 0..SYMBOLS {
+            source.push_str(&format!("def widget_{index:05}():\n    return {index}\n"));
+        }
+        let store = store_of("things.py", &source);
+
+        let cancel = Cancel::new();
+        cancel.cancel();
+        SOURCE_SPAN_READS.with(|reads| reads.set(0));
+        let outcome = StoreQueryEngine::new(&store)
+            .with_cancel(cancel)
+            .search(Request {
+                query: "widget".to_string(),
+                token_budget: 100_000,
+                min_confidence: 0.0,
+                max_depth: 1,
+            });
+        let reads = SOURCE_SPAN_READS.with(|reads| reads.get());
+
+        assert!(
+            outcome.is_err(),
+            "a cancelled search answered instead of stopping"
+        );
+        assert!(
+            reads < 64,
+            "a cancelled search opened {reads} files before noticing"
+        );
+    }
+
+    /// The number of files one search may open is capped by the page ceiling,
+    /// not by whatever token budget the caller asked for.
+    ///
+    /// K-B1: `budget_page_size(100_000)` is 5,001, and every row on the page is
+    /// a file read. The token budget is a *presentation* limit chosen by the
+    /// caller; letting it set the number of files opened makes a large budget a
+    /// request for thousands of file reads.
+    #[test]
+    fn a_huge_token_budget_does_not_buy_thousands_of_file_reads() {
+        const SYMBOLS: usize = 4_000;
+        let mut source = String::new();
+        for index in 0..SYMBOLS {
+            source.push_str(&format!("def widget_{index:05}():\n    return {index}\n"));
+        }
+        let store = store_of("things.py", &source);
+
+        SOURCE_SPAN_READS.with(|reads| reads.set(0));
+        let response = StoreQueryEngine::new(&store)
+            .search(Request {
+                query: "widget".to_string(),
+                token_budget: 100_000,
+                min_confidence: 0.0,
+                max_depth: 1,
+            })
+            .expect("search");
+        let reads = SOURCE_SPAN_READS.with(|reads| reads.get());
+
+        assert_eq!(
+            response.total, SYMBOLS as u32,
+            "the index-wide count must stay honest whatever the page cap"
+        );
+        assert!(
+            reads <= SEARCH_PAGE_MAX,
+            "a 100,000-token budget opened {reads} files; the page ceiling is \
+             {SEARCH_PAGE_MAX}"
+        );
+        assert!(
+            response.truncated && response.hidden > 0,
+            "a capped page must say it was capped: shown={} total={} hidden={}",
+            response.shown,
+            response.total,
+            response.hidden
+        );
+    }
+}
