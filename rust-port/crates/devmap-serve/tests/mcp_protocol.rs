@@ -688,7 +688,11 @@ async fn tools_list_carries_its_cache_hint_on_the_shared_dispatcher() {
         .await
         .expect("answered");
     assert_eq!(response["result"]["ttlMs"], json!(300_000), "{response}");
-    assert_eq!(response["result"]["cacheScope"], json!("private"), "{response}");
+    assert_eq!(
+        response["result"]["cacheScope"],
+        json!("private"),
+        "{response}"
+    );
 
     // And nothing else claims to be cacheable: an un-annotated result is
     // uncacheable, and saying otherwise would let a client serve a stale answer

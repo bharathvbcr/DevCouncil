@@ -108,7 +108,11 @@ fn main() -> anyhow::Result<()> {
     // Both target shapes: a qualified id resolves through the path matcher, a
     // bare name does not, and the rewrite of that matcher has to leave both
     // alone.
-    for (label, target) in [("symbol", symbol.as_str()), ("bare", bare.as_str()), ("file", file.as_str())] {
+    for (label, target) in [
+        ("symbol", symbol.as_str()),
+        ("bare", bare.as_str()),
+        ("file", file.as_str()),
+    ] {
         answers.insert(
             format!("impact_{label}"),
             serde_json::to_value(engine.impact(request(target, 5))?)?,

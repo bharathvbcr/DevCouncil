@@ -295,7 +295,10 @@ async fn session(slot: &Arc<StoreSlot>, lines: &[String]) -> Vec<Value> {
     ));
     let (client_read, mut client_write) = tokio::io::split(client);
     for line in lines {
-        client_write.write_all(line.as_bytes()).await.expect("write");
+        client_write
+            .write_all(line.as_bytes())
+            .await
+            .expect("write");
         client_write.write_all(b"\n").await.expect("newline");
     }
     client_write.shutdown().await.expect("shutdown");
@@ -333,11 +336,7 @@ async fn session(slot: &Arc<StoreSlot>, lines: &[String]) -> Vec<Value> {
 async fn deeply_nested_objects_are_bounded_by_something_that_answers() {
     let slot = corpus();
     for depth in [32usize, 200, 5_000, 200_000] {
-        let nest = format!(
-            "{}null{}",
-            r#"{"a":"#.repeat(depth),
-            "}".repeat(depth)
-        );
+        let nest = format!("{}null{}", r#"{"a":"#.repeat(depth), "}".repeat(depth));
         let input = format!(
             r#"{{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{{"name":"devmap_search","arguments":{{"query":"x"}},"deep":{nest}}}}}"#
         );
@@ -420,7 +419,10 @@ async fn an_over_limit_frame_is_refused_and_the_session_continues() {
     .to_string();
     let frames = session(
         &slot,
-        &[huge, r#"{"jsonrpc":"2.0","id":15,"method":"ping"}"#.to_string()],
+        &[
+            huge,
+            r#"{"jsonrpc":"2.0","id":15,"method":"ping"}"#.to_string(),
+        ],
     )
     .await;
 
@@ -559,7 +561,11 @@ async fn every_field_of_a_request_is_type_checked_or_refused() {
                 // exactly — including when the id itself is the wrong type.
                 assert_eq!(
                     response["id"],
-                    if field == "id" { value.clone() } else { json!(21) },
+                    if field == "id" {
+                        value.clone()
+                    } else {
+                        json!(21)
+                    },
                     "the id was altered by a fault in {field}: {input}"
                 );
             }
@@ -607,8 +613,7 @@ async fn unknown_methods_are_refused_by_name() {
         " ",
         "tools/call/",
     ] {
-        let input =
-            json!({"jsonrpc": "2.0", "id": 31, "method": method, "params": {}}).to_string();
+        let input = json!({"jsonrpc": "2.0", "id": 31, "method": method, "params": {}}).to_string();
         let frame = handle_line(&slot, &input)
             .await
             .unwrap_or_else(|| panic!("a request with an id must be answered: {input}"));
@@ -685,7 +690,10 @@ async fn a_hostile_batch_answers_every_request_and_no_notification() {
             r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call","params":{{"name":"devmap_search","arguments":{{"query":"helper","bogus":1}}}}}}"#,
             id + 2
         ));
-        members.push(format!(r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call"}}"#, id + 3));
+        members.push(format!(
+            r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call"}}"#,
+            id + 3
+        ));
         expected_requests += 4;
         // No id: never answered.
         members.push(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string());
