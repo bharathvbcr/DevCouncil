@@ -8,7 +8,9 @@
 //! during development (hyper panics at setup if a read timeout is configured
 //! with no timer to drive it).
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use devmap_serve::mcp::StoreSlot;
 use devmap_store::Store;
@@ -1014,5 +1016,290 @@ async fn no_response_carries_a_code_the_specification_reserves() {
         "{inspected} of {} hostile requests produced an error to inspect; the rest were answered \
          successfully, which this sweep cannot vouch for",
         hostile.len() + 1
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `serve_http`: the entry point that binds
+// ---------------------------------------------------------------------------
+//
+// Everything above starts from `serve_http_on`, which is handed a listener the
+// test bound itself. `serve_http` is the one the CLI calls (`dev map serve
+// --http`), and what it adds is exactly what a listener-first fixture cannot
+// reach: it binds the caller's `SocketAddr`, and it fails if it cannot. A
+// `serve_http` whose body were replaced with `Ok(())` would leave every test
+// above green and every `--http` server dead on arrival.
+
+/// The address a client dials to reach a server bound at `addr`.
+///
+/// A wildcard bind is every interface at once and is not itself a destination;
+/// loopback is the interface every machine has.
+fn dial(addr: SocketAddr) -> SocketAddr {
+    if addr.ip().is_unspecified() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
+    } else {
+        addr
+    }
+}
+
+/// Every message the crate logged, in the order it logged them.
+///
+/// The bound address reaches nothing else. `serve_http` serves until the
+/// process ends, so it never hands the address back, and its one `tracing` line
+/// is the whole of what an operator — or a test — gets to see. Reading it is
+/// also the only way to tell a bind that honoured a wildcard address from one
+/// that quietly rewrote it to loopback: both answer on `127.0.0.1` identically.
+///
+/// Hand-rolled, for the same reason the HTTP client above is: `tracing` is
+/// already a dependency of this crate, `tracing-subscriber` is not, and one
+/// assertion is not a reason to make it one.
+static LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Pulls the formatted `message` field out of an event and leaves the rest.
+struct Message(String);
+
+impl tracing::field::Visit for Message {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+}
+
+struct CaptureLog;
+
+impl tracing::Subscriber for CaptureLog {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        // Nothing here reads spans back, and an id is required to be non-zero.
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        LOG.lock()
+            .expect("the capture holds no lock across a panic")
+            .push(message.0);
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Install the capture, once for the whole test binary.
+fn capture_log() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::subscriber::set_global_default(CaptureLog)
+            .expect("nothing else in this test binary installs a subscriber");
+    });
+}
+
+/// The line `serve_http` writes once it has bound `port`.
+///
+/// Matched on the port as well as the text because the tests in this file run
+/// concurrently and several of them start a server; the port is what makes the
+/// line this caller's. Polled rather than read once: the log is written by the
+/// server task between binding and its first `accept`, and a client can connect
+/// to a listening socket in that window.
+async fn bound_log_line(port: u16) -> String {
+    for _ in 0..400 {
+        let found = LOG
+            .lock()
+            .expect("the capture holds no lock across a panic")
+            .iter()
+            .find(|line| {
+                line.contains("listening on http://") && line.ends_with(&format!(":{port}"))
+            })
+            .cloned();
+        if let Some(line) = found {
+            return line;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("serve_http logged no bound address for port {port}");
+}
+
+/// Run the real `serve_http` on an ephemeral port of `ip`, and return the
+/// address it was told to bind.
+///
+/// The port has to be chosen before the call, because `serve_http` takes an
+/// address rather than a listener and never hands the bound one back: it serves
+/// until the process ends, and the port it got only ever reaches a `tracing`
+/// line. So this takes an ephemeral port from the kernel and gives it straight
+/// back — never a hardcoded one, which would fail on a machine that happens to
+/// be using it. That hand-back is a race with everything else on the machine,
+/// so it is retried rather than assumed, and the server that comes up is
+/// confirmed to be *this* one by the exchange each caller then performs
+/// against it.
+async fn start_serve_http(ip: IpAddr) -> SocketAddr {
+    // Before the first spawn, or the line the server writes on the way up is
+    // written to nobody.
+    capture_log();
+    for _ in 0..64 {
+        let probe = TcpListener::bind(SocketAddr::new(ip, 0))
+            .await
+            .expect("an ephemeral port");
+        let addr = probe.local_addr().expect("the probe's address");
+        drop(probe);
+
+        let server = tokio::spawn(devmap_serve::mcp_http::serve_http(corpus(), addr));
+        let target = dial(addr);
+        for _ in 0..200 {
+            if server.is_finished() {
+                // The port went to someone else between the probe and the
+                // bind. Take another one rather than reporting a race as a
+                // failure of the thing under test.
+                break;
+            }
+            if tokio::net::TcpStream::connect(target).await.is_ok() {
+                return addr;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        server.abort();
+    }
+    panic!("serve_http never came up on an ephemeral port of {ip}");
+}
+
+/// The entry point the CLI calls binds the address it is handed, and what
+/// answers there is the dispatcher every other transport reaches.
+///
+/// Nothing else in this crate calls `serve_http`. What it does is bind, report
+/// and delegate, and a regression in any of the three — an address that is not
+/// the caller's, a listener that is dropped, a delegation that is dropped — is
+/// invisible to every test that starts from a listener it bound itself.
+#[tokio::test]
+async fn serve_http_binds_the_address_it_is_handed_and_serves_the_shared_dispatcher() {
+    let addr = start_serve_http(IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
+    assert!(
+        addr.ip().is_loopback(),
+        "the fixture asked for a loopback port and must have been given one"
+    );
+
+    let (status, body) = request(
+        &dial(addr).to_string(),
+        &post(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["result"]["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()),
+        "the port serve_http bound must answer with the same tool list the other \
+         transports serve: {body}"
+    );
+}
+
+/// `serve_http` binds what the caller asked for, loopback or not.
+///
+/// The module says so in as many words — "Loopback by default, and the bind
+/// address is the caller's to choose" — and the default lives a layer up, in
+/// `dev map serve --http`, which spells a bare `8080` out as `127.0.0.1:8080`
+/// before it ever reaches here. `serve_http` itself has no opinion: handed
+/// `0.0.0.0` it publishes a private repository's code index on every interface,
+/// and nothing in this crate stops it.
+///
+/// Pinned because that is the kind of thing that gets "fixed" in passing. A
+/// clamp added here would silently break a deployment that binds a routable
+/// interface on purpose; this test is what makes whoever adds one say so out
+/// loud and correct the contract the module documents.
+#[tokio::test]
+async fn serve_http_binds_a_non_loopback_address_when_the_caller_asks_for_one() {
+    let addr = start_serve_http(IpAddr::V4(Ipv4Addr::UNSPECIFIED)).await;
+    assert!(
+        !addr.ip().is_loopback(),
+        "0.0.0.0 is every interface, not the loopback one"
+    );
+
+    let (status, body) = request(
+        &dial(addr).to_string(),
+        &post(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the wildcard bind was accepted and is serving the private index: {body}"
+    );
+
+    // Dialling it proves it is serving, not *where*: a server clamped to
+    // 127.0.0.1 would answer the exchange above exactly as this one does, and
+    // the clamp is the change worth catching. What the two cases cannot both
+    // produce is the same log line, so that is what is read back.
+    let line = bound_log_line(addr.port()).await;
+    assert!(
+        line.contains(&format!("http://{addr}")),
+        "serve_http must report binding the address it was handed, not one it rewrote: \
+         {line}"
+    );
+}
+
+/// The rebinding guard is decided per connection, not per listener.
+///
+/// `host_is_acceptable` fires only when the socket a request arrived on is a
+/// loopback one, and the address it reads is `stream.local_addr()` — this
+/// connection's local address, filled in by the kernel — not the listener's. On
+/// a wildcard bind the two disagree: the listener's address is `0.0.0.0`, which
+/// is not loopback, while a connection that arrived over loopback reports
+/// `127.0.0.1`.
+///
+/// Reading it once outside the accept loop looks like an obvious tidy-up and
+/// would turn the guard off for every connection a wildcard server ever
+/// accepts: no error, no log, just a `Host: evil.example` that starts being
+/// answered. Every other `Host` test in this file starts from a `127.0.0.1`
+/// listener, where the two addresses agree and the substitution is invisible.
+#[tokio::test]
+async fn the_rebinding_guard_reads_the_connection_not_the_wildcard_listener() {
+    let addr = start_serve_http(IpAddr::V4(Ipv4Addr::UNSPECIFIED)).await;
+    let target = dial(addr).to_string();
+    let body = with_request_meta(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+
+    let rebound =
+        raw_post(&body, &mirrored_headers(&body)).replace("Host: localhost", "Host: evil.example");
+    let (status, response) = request(&target, &rebound).await;
+    assert_eq!(
+        status, 403,
+        "this connection arrived over loopback, so a routable Host must still be refused \
+         however wide the listener was bound: {response}"
+    );
+
+    // And the guard has not merely become "refuse everything": the same
+    // connection under a loopback name is served.
+    let (status, response) = request(&target, &raw_post(&body, &mirrored_headers(&body))).await;
+    assert_eq!(status, 200, "Host: localhost must keep working: {response}");
+}
+
+/// A port that cannot be had is refused, naming the address that could not be
+/// had rather than only the errno.
+///
+/// This is the one failure `serve_http` owns alone, and the message is the
+/// whole of what the operator gets: `dev map serve --http 8080` normalises a
+/// bare port into `127.0.0.1:8080` before the call, so "Address already in use
+/// (os error 48)" on its own names nothing the user typed and nothing they can
+/// go and look at. Failing silently is worse still — a server that returned
+/// `Ok(())` here would exit zero having served nobody.
+#[tokio::test]
+async fn a_port_already_in_use_is_refused_and_names_the_address() {
+    let held = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = held.local_addr().expect("the held address");
+
+    let error = devmap_serve::mcp_http::serve_http(corpus(), addr)
+        .await
+        .expect_err("the port is held for the whole call, so the bind cannot succeed");
+
+    let reported = format!("{error:#}");
+    assert!(
+        reported.contains(&addr.to_string()),
+        "the failure must name the address it could not bind, got: {reported}"
     );
 }

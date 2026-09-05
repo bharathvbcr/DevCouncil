@@ -904,11 +904,25 @@ fn with_error_data(mut frame: Value, error: &crate::mcp::RpcError) -> Value {
 
 /// Serve the modern transport on `addr` until the process ends.
 ///
-/// Returns the bound address before serving, so a caller binding port 0 can
-/// learn which port it got — a test that has to guess a free port is a test that
-/// fails on a busy machine.
+/// `addr` is bound exactly as given and is never clamped. The module's contract
+/// is that the bind address belongs to the caller, and the loopback default
+/// lives a layer up in `dev map serve --http`, where a bare port becomes
+/// `127.0.0.1:<port>`; hand this `0.0.0.0` and a private repository's index is
+/// published on every interface. That is a deployment decision, not a mistake
+/// this function is in a position to catch.
+///
+/// The bound address is logged rather than returned — the function serves until
+/// the process ends, so there is no point at which it could hand anything back.
+/// A caller that needs to know the port it got binds its own listener and calls
+/// [`serve_http_on`] with it.
 pub async fn serve_http(store: Arc<StoreSlot>, addr: SocketAddr) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // Named, because the errno alone is not actionable: `--http 8080` was
+    // rewritten into a full address before it reached here, so "Address already
+    // in use (os error 48)" reports a failure to bind something the operator
+    // never typed and cannot go and look at.
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|error| {
+        anyhow::Error::new(error).context(format!("cannot serve MCP over HTTP on {addr}"))
+    })?;
     let bound = listener.local_addr()?;
     tracing::info!("MCP 2.0 (2026-07-28) listening on http://{bound}");
     serve_http_on(store, listener).await

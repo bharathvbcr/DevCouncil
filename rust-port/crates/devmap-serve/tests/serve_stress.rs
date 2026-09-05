@@ -957,6 +957,101 @@ async fn http_connections_past_the_ceiling_are_shed_with_a_retry_after() {
     }
 }
 
+/// The ceiling the *default* path installs, measured through that path.
+///
+/// The test above hands the server an `Admission` of its own, which is the only
+/// way to read `peak` and `shed` back — and is also why it says nothing about
+/// the pool `serve_http_on` builds when no caller supplies one. That is the
+/// pool every real client meets: `dev map serve --http` reaches it through
+/// `serve_http` and never names an `Admission`. Replacing the default with
+/// `Admission::new(usize::MAX)` would leave that test green and every other
+/// test in this crate green, and put the transport back where it started.
+///
+/// So the numbers are asserted from outside, where a client stands. Twice the
+/// ceiling of connections that will not finish: the first `DEFAULT_CEILING` are
+/// admitted and sit holding their permits until the body deadline, and the rest
+/// are shed at once. The read window is what settles the counts rather than the
+/// sleep — nothing releases a permit inside it, because an admitted slow peer
+/// is held by `BODY_READ_TIMEOUT`, which is longer.
+///
+/// `DEFAULT_CEILING` restates `MAX_CONCURRENT_HTTP_CONNECTIONS`, which is
+/// private to `mcp_http`. That is deliberate: a default nobody states is a
+/// default nobody notices changing, so if it moves, this moves with it as an
+/// edit somebody had to make.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_default_http_ceiling_admits_its_budget_and_sheds_the_rest() {
+    const DEFAULT_CEILING: usize = 64;
+
+    let address = start_http().await;
+    let mut held = Vec::new();
+    for _ in 0..DEFAULT_CEILING * 2 {
+        if let Some(stream) = slow_post(&address).await {
+            held.push(stream);
+        }
+    }
+    assert_eq!(
+        held.len(),
+        DEFAULT_CEILING * 2,
+        "every connection must be accepted: shedding happens above the socket, not on it"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Concurrently: read sequentially and the admitted half's deadlines would
+    // be served one after another, turning a three-second window into minutes.
+    let readers: Vec<_> = held
+        .into_iter()
+        .map(|mut stream| {
+            tokio::spawn(async move {
+                let mut response = Vec::new();
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
+                        .await;
+                String::from_utf8_lossy(&response).to_string()
+            })
+        })
+        .collect();
+
+    let mut shed = 0usize;
+    let mut admitted = 0usize;
+    let mut retry_after = 0usize;
+    for reader in readers {
+        let text = reader.await.expect("no reader task may panic");
+        if text.starts_with("HTTP/1.1 503") {
+            shed += 1;
+            if text.to_ascii_lowercase().contains("retry-after:") {
+                retry_after += 1;
+            }
+            assert!(
+                text.contains("ceiling"),
+                "a shed connection must be told which bound it hit: {text}"
+            );
+        } else {
+            assert!(
+                text.is_empty(),
+                "a connection that was not shed is still waiting out its body deadline and \
+                 must have been answered nothing yet, got: {text}"
+            );
+            admitted += 1;
+        }
+    }
+
+    assert_eq!(
+        admitted,
+        DEFAULT_CEILING,
+        "the default path must admit its budget and no more; it admitted {admitted} of \
+         {} offered",
+        DEFAULT_CEILING * 2
+    );
+    assert_eq!(
+        shed, DEFAULT_CEILING,
+        "and must refuse the overflow rather than serve or silently drop it"
+    );
+    assert_eq!(
+        retry_after, shed,
+        "a 503 without `Retry-After` tells a client it failed but not what to do"
+    );
+}
+
 /// A reader that hands over a fixed script of bytes as fast as it is asked.
 ///
 /// Models a client that pipelines: every request is already in the pipe before
