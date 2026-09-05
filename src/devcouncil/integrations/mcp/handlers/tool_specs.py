@@ -19,7 +19,7 @@ def all_tools() -> list[Tool]:
                 "Default responses stay within a ~32 KB agent context budget; use "
                 "devcouncil_get_task / get_gaps / get_next_actions for detail by ID."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {}
             }
@@ -27,12 +27,12 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_integration_status",
             description="Get read-only coding CLI integration status, capability rows, detected clients, and recommended executor.",
-            inputSchema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {}},
         ),
         Tool(
             name="devcouncil_report",
             description="Get the full coverage report and a list of all requirements and blocking gaps.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {}
             }
@@ -40,7 +40,7 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_get_task",
             description="Get details, constraints, and requirements for a specific implementation task.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {
@@ -59,7 +59,7 @@ def all_tools() -> list[Tool]:
                 "file/line) within a ~32 KB context budget; use get_task for full "
                 "detail. Cheap and idempotent for resume/repair decisions."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string"},
@@ -76,7 +76,7 @@ def all_tools() -> list[Tool]:
                 "~32 KB context budget). Returns blocking next_actions, advisory_actions, "
                 "and allowed_next_tools."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"task_id": {"type": "string"}},
                 "required": ["task_id"],
@@ -91,7 +91,7 @@ def all_tools() -> list[Tool]:
                 "correction manifest. Read-only — lets a developer or agent trust what "
                 "actually happened on disk."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"task_id": {"type": "string"}},
                 "required": ["task_id"],
@@ -100,7 +100,7 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_live_review",
             description="Get live coding-agent review status, pending signals, critique-card counts, and blockers.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {
@@ -113,7 +113,7 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_live_cards",
             description="List live-review critique cards with optional task, status, verdict, and client filters.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {
@@ -146,7 +146,7 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_live_repair_prompt",
             description="Generate a ready-to-paste repair prompt for a live-review critique card.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "card_id": {
@@ -160,7 +160,7 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_live_repair_all",
             description="Generate one repair prompt for all blocking live-review critique cards in scope.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {
@@ -177,7 +177,7 @@ def all_tools() -> list[Tool]:
                 "requirements/lease) within a ~32 KB context budget. Supports status "
                 "filter and limit/offset paging; use get_task for full detail."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "status": {"type": "string", "description": "Optional status filter (e.g. planned, running, blocked, verified, done)."},
@@ -189,7 +189,7 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_get_prompt",
             description="Get the raw implementation prompt for a DevCouncil task.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string", "description": "The ID of the task, e.g. TASK-001"},
@@ -200,7 +200,7 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_tail_trace",
             description="Return recent DevCouncil trace events as JSON.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20},
@@ -210,7 +210,7 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_policy_check_write",
             description="Check whether a file write is allowed for a task or the active running task.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Repository-relative or absolute path to check."},
@@ -222,7 +222,7 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_graph_context",
             description="Get optional code-review-graph structural context for changed or planned files.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "files": {
@@ -240,7 +240,7 @@ def all_tools() -> list[Tool]:
                 "detail (entry_points, critical_files, neighbors, role_files). Optional "
                 "path resolves a file to its subsystem area. Includes stale freshness flag."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "subsystem": {
@@ -262,7 +262,7 @@ def all_tools() -> list[Tool]:
                 "Set precise=true to resolve dependents via live LSP references when "
                 "a language server is available (falls back to import-level dependents)."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "paths": {
@@ -293,7 +293,7 @@ def all_tools() -> list[Tool]:
                 "If entry_roots are empty or unreachable_unreliable is true, ignore unreachable_files "
                 "and mass inferred dead."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "area": {
@@ -318,7 +318,7 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_graph_ingest",
             description="Unified native ingest: codeintel sync, graph export, repo map write.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "paths": {
@@ -336,7 +336,7 @@ def all_tools() -> list[Tool]:
                 "running now, the last build. fix=true applies every fix the doctor can "
                 "apply inside the repository and re-checks."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"fix": {"type": "boolean", "default": False}},
             },
@@ -347,7 +347,7 @@ def all_tools() -> list[Tool]:
                 "Records of recent kernel runs (build / manifest / repair): argv, exit code, "
                 "duration, the kernel's notes, and the diagnosis code of a failure."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 10},
@@ -358,7 +358,7 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_graph_cypher",
             description="Run a supported Cypher subset over the native code graph store.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "MATCH … RETURN … query."},
@@ -372,7 +372,7 @@ def all_tools() -> list[Tool]:
                 "Query opt-in PDG control or data dependence for a symbol qualname or file path. "
                 "Requires `dev map --pdg` or `dev map pdg build` first."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "mode": {
@@ -398,7 +398,7 @@ def all_tools() -> list[Tool]:
                 "Report heuristic PDG taint findings (source→sink) from the opt-in PDG layer. "
                 "Filter by file path and/or taint category."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "path": {
@@ -418,7 +418,7 @@ def all_tools() -> list[Tool]:
                 "360° symbol/file query over the code knowledge graph: definition, callers, "
                 "callees, and importers. Requires `dev map` (writes .devcouncil/graph/code_graph.json)."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "name_or_path": {
@@ -435,7 +435,7 @@ def all_tools() -> list[Tool]:
                 "Shortest path between two nodes in the code knowledge graph "
                 "(imports/calls/contains)."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "from": {
@@ -458,7 +458,7 @@ def all_tools() -> list[Tool]:
                 "importers at depth 1/2/3 with confidence tiers. Distinct from "
                 "devcouncil_impact (file-level repo-map dependents)."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "paths": {
@@ -483,7 +483,7 @@ def all_tools() -> list[Tool]:
                 "Map HTTP routes (ROUTE nodes) to handlers, registration owners, "
                 "and client fetch/axios/requests/httpx consumers from the code graph."
             ),
-            inputSchema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {}},
         ),
         Tool(
             name="devcouncil_shape_check",
@@ -491,7 +491,7 @@ def all_tools() -> list[Tool]:
                 "Compare handler return dict keys vs keys accessed by API consumers "
                 "after fetch calls; flags shape mismatches."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "route": {
@@ -507,7 +507,7 @@ def all_tools() -> list[Tool]:
                 "API route blast radius: consumers, middleware (registers edges), "
                 "response-shape mismatches, and risk tier (high/medium/low/none)."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "route_or_path": {
@@ -524,12 +524,12 @@ def all_tools() -> list[Tool]:
                 "Return detected language servers and mode (detection-only or client). "
                 "Client mode reflects indexing.lsp_refs / live references capability."
             ),
-            inputSchema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {}},
         ),
         Tool(
             name="devcouncil_ast_match",
             description="Search code symbols structurally using optional tree-sitter support and deterministic fallbacks.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
@@ -542,7 +542,7 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_cli",
             description="Run a safe DevCouncil CLI command for status, tasks, report, map, prompt, show, trace, lsp, or ast.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "args": {
@@ -557,7 +557,7 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_prepare_execution",
             description="Return a task prompt plus planned files and allowed commands for external execution tooling.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string", "description": "The ID of the task, e.g. TASK-001"},
@@ -568,7 +568,7 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_checkout_task",
             description="Acquire a task lease and return scope for MCP write tools.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string"},
@@ -582,7 +582,7 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_release_task",
             description="Release a task lease using its token.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string"},
@@ -597,7 +597,7 @@ def all_tools() -> list[Tool]:
                 "Extend a held task lease's TTL so a long-running agent does not lose it "
                 "to expiry. Returns the new expires_at."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string"},
@@ -613,7 +613,7 @@ def all_tools() -> list[Tool]:
                 "List task leases for fleet supervision — task_id, owner, agent, "
                 "expires_at, and whether each is expired. Defaults to active leases."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"active_only": {"type": "boolean", "default": True}},
             },
@@ -625,7 +625,7 @@ def all_tools() -> list[Tool]:
                 "(modify-op only) for a leased task. Use planned_files to authorize "
                 "editing an intended caller when wiring a new module."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string"},
@@ -647,7 +647,7 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_append_evidence",
             description="Append command evidence for a leased task.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string"},
@@ -662,7 +662,7 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_record_command",
             description="Record a shell command event for a leased task.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string"},
@@ -682,7 +682,7 @@ def all_tools() -> list[Tool]:
                 "task scope are required; advisory/off relax coordination and scope gates. "
                 "Hard safety is always checked before the atomic write."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {
@@ -703,7 +703,7 @@ def all_tools() -> list[Tool]:
                 "lease and task scope are required; advisory/off relax those gates. Every "
                 "target still passes hard-safety checks before atomic application."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {
@@ -722,7 +722,7 @@ def all_tools() -> list[Tool]:
                 "Process task completion under gates.mode: enforce blocks, advisory records "
                 "non-safety findings, and off skips quality verification."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string"},
@@ -735,7 +735,7 @@ def all_tools() -> list[Tool]:
         Tool(
             name="devcouncil_handoff_agent",
             description="Hand off a task between coding CLI agents.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string"},
@@ -757,7 +757,7 @@ def all_tools() -> list[Tool]:
                 "files (fail-closed; never broadens scope). Supports offset/limit or "
                 "line_range windowing. Returns content (truncated), sha256, and line_count."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Repository-relative or absolute path inside the project."},
@@ -786,7 +786,7 @@ def all_tools() -> list[Tool]:
                 "Set staged=true to include the staged (git diff --cached) changes. Returns "
                 "per-file status with additions/deletions and the truncated unified diff."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string", "description": "Optional task to scope the diff to its files."},
@@ -806,7 +806,7 @@ def all_tools() -> list[Tool]:
                 "stdout/stderr from the stored log files (best-effort; tolerates missing "
                 "files). Pairs with verification to close the diagnose leg of the loop."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string"},
@@ -823,7 +823,7 @@ def all_tools() -> list[Tool]:
                 "lease and task allowlist; advisory/off retain dangerous-Git safety while "
                 "relaxing those gates. Uses a clean environment and bounded timeout."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "task_id": {
@@ -844,7 +844,7 @@ def all_tools() -> list[Tool]:
                 "started time, and an orphaned flag for runs still marked running whose "
                 "manifest has gone stale (executor likely crashed). Read-only."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "status": {"type": "string", "description": "Optional status filter (e.g. running, finished, failed, timeout)."},
@@ -859,7 +859,7 @@ def all_tools() -> list[Tool]:
                 "transcript tail when a transcript/log file exists in the run directory. "
                 "Includes the resolved CLI invocation and an orphaned flag. Read-only."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "run_id": {"type": "string", "description": "The run id to inspect."},
@@ -875,7 +875,7 @@ def all_tools() -> list[Tool]:
                 "deterministically instead of racing list_tasks. Includes a blocking-gap "
                 "summary and a ready_to_checkout flag."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "client_id": {"type": "string", "description": "Optional client id (informational)."},
@@ -893,7 +893,7 @@ def all_tools() -> list[Tool]:
                 "documents are matched on goal keywords. Returns the matched sources "
                 "and the rendered preamble."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "goal": {"type": "string", "description": "The task or goal to find applicable knowledge for."},
@@ -911,7 +911,7 @@ def all_tools() -> list[Tool]:
                 "find pages whose title/tags/description match. Read-only; refresh "
                 "with `dev wiki update`."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "page": {"type": "string", "description": "Bundle-relative page path (e.g. subsystems/<slug>.md)."},
@@ -927,7 +927,7 @@ def all_tools() -> list[Tool]:
                 "the run is reversible. Accepts a run id or task id. Read-only — use "
                 "`dev runs revert <ref>` to reverse a run's workspace effects."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "reference": {"type": "string", "description": "A run id or task id."},
@@ -945,7 +945,7 @@ def all_tools() -> list[Tool]:
                 "heuristics. Never modifies the workspace; the verdict is logged to the "
                 "trace and reverting stays an explicit separate step."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "reference": {"type": "string", "description": "A run id or task id."},
