@@ -3113,13 +3113,15 @@ impl Store {
     /// fall out of.
     ///
     /// Not the same reader as [`devmap_analyze::model::AnalysisDisclosure`],
-    /// deliberately, and the difference is where the bytes stop. The disclosure
-    /// steps serde over the summary's vectors, which still transfers the whole
-    /// blob out of SQLite — the right trade inside `dead_page`, which is
-    /// already reading that snapshot and needs five fields from it. This wants
-    /// one field on a surface a health check polls, so the extraction happens
-    /// in SQLite and the blob never crosses. Both decode `AnalysisStatus`
-    /// through its own derive, so neither can drift from the writer.
+    /// deliberately, but the difference is no longer where the bytes stop.
+    /// When this was written the disclosure still transferred the whole blob
+    /// and stepped serde over its vectors; `dead_page` now strips them in
+    /// SQLite too, with `json_remove`, so neither reader carries the summary
+    /// across. What remains is the shape of the question: the disclosure wants
+    /// five fields inside a snapshot `dead_page` is already holding, and this
+    /// wants one field on a surface a health check polls often enough to cache
+    /// it per generation. Both decode `AnalysisStatus` through its own derive,
+    /// so neither can drift from the writer.
     pub fn latest_analysis_status(&self) -> Result<Option<AnalysisStatus>> {
         let conn = lock_conn(&self.conn)?;
         // One snapshot for the generation id and the row it names, for the same
@@ -3988,9 +3990,23 @@ impl Store {
         let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
             return Ok(None);
         };
+        // The two big arrays are dropped *inside SQLite*, so they never cross
+        // into this process. `AnalysisDisclosure` already skipped them, but
+        // skipping is per token and there are 10 MB of tokens: measured on the
+        // benchmark corpus this column is 10,122,764 bytes and what survives
+        // the strip is 200. `dead_symbols` is the duplicate being paged;
+        // `communities` is the other unbounded array and no disclosure reads
+        // it.
+        //
+        // Absence and corruption stay distinguishable, which is the whole
+        // reason this is safe: `json_remove(NULL, ...)` is NULL, so a
+        // generation with no analysis still reads as none, while a malformed
+        // blob makes SQLite raise ("malformed JSON") rather than quietly
+        // returning NULL — a corrupt analysis must not read as an absent one.
         let raw: Option<String> = snapshot
             .query_row(
-                "SELECT analysis_json FROM generations WHERE id = ?1",
+                "SELECT json_remove(analysis_json, '$.dead_symbols', '$.communities')
+                 FROM generations WHERE id = ?1",
                 params![generation],
                 |row| row.get(0),
             )

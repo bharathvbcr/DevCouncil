@@ -2925,13 +2925,15 @@ is reported rather than dropped.
 
 **What this did not fix, measured.** Allocations fell 78x (4,065 to 52) but
 wall clock only 2.8x, and the gap is the point: the 10 MB blob is still
-`SELECT`ed whole into a Rust `String` and still lexed end to end. Skipping a
-field is cheap per token but there are 10 MB of tokens. Two further fixes
-remain, in increasing order of value and risk: extract the scalars with
-`json_extract` inside SQLite so the blob never crosses into Rust at all; or,
-at the root, stop storing `dead_symbols` in `analysis_json` when
-`generation_dead_symbols` already holds it — a stored-format change, so a
-migration question rather than a patch.
+`SELECT`ed whole into a Rust `String` and still lexed end to end.
+
+The follow-up is Q-18 below, and it is worth reading for how the prediction
+came out: stripping the arrays inside SQLite cut what crosses the boundary by
+50,613x and moved wall clock by 4.5%. The blob still has to be *parsed* to be
+stripped; the parse moved from serde to SQLite's JSON1 and did not disappear.
+The only fix that removes it is to stop storing `dead_symbols` in
+`analysis_json` when `generation_dead_symbols` already holds it — a
+stored-format change, so a migration question rather than a patch.
 
 `Store::latest_dead_symbols` stays unbounded and unfiltered on purpose. Its
 callers compare whole generations for incremental-vs-cold equivalence, where an
@@ -2939,6 +2941,130 @@ omitted row is the failure they exist to detect. Conflating the two reads broke
 exactly those seven tests during this work, which is how the distinction got
 documented on the function.
 
+## The MCP / hooks / plugins fan-out
+
+Three lanes, file-disjoint, each with its own `CARGO_TARGET_DIR`, briefed to
+read the live specification rather than recall it and to say plainly when a
+test is a structural guard rather than a watched-red proof. Every claim below
+was re-verified against the code before its commit landed; the reports were not
+taken at face value.
+
+### Q-15 — the MCP server did not conform to the spec it advertised (`49be1c5`)
+
+Twelve defects. The three that matter are honesty failures rather than crashes.
+
+`server/discover` answered on stdio advertising `2026-07-28`, telling dual-era
+clients to probe with it, and the request handler then read no version at all.
+`id: null` was answered with a *successful result* — one the client is obliged
+to reject. And every success emitted `structuredContent` with no `outputSchema`
+declared anywhere, so the fields a client would use to detect an incomplete
+answer — `truncated`, `walk_incomplete`, `shown`/`hidden`/`total`, the whole
+basis of the honesty contract in this file — were undeclared. A client could
+not have validated the very markers that exist to stop it over-trusting us.
+
+`devmap_neighbors` also declared a budget it multiplies by up to 32:
+`neighbors_once` spends the full `token_budget` per target *and* per direction,
+over up to `MAX_NEIGHBOR_TARGETS` (16) targets. The behaviour is right — each
+walk needs its own budget — so the declaration was fixed, and it now derives
+the multiplier from the constant so it cannot drift.
+
+Left as a genuine conflict rather than a guess: error frames emit `"id": null`
+when the id is unrecoverable. JSON-RPC 2.0 §5 says it MUST be Null; the MCP
+schema types `id` as `string | number`, implying omission. The existing test
+encoding the JSON-RPC reading was **not** weakened to suit the change.
+
+### Q-16 — Dev Map could not integrate itself (`4f4ec2f`)
+
+Hook specs and plugin manifests were emitted only by the Python layer. The Rust
+CLI now emits and validates its own: `devmap claude hooks | events | plugin |
+validate`.
+
+33 hook events exist; Dev Map handles 2 and records a machine-readable reason
+for the other 31, and `devmap claude events` reports "2 of 33" rather than just
+the handled count — a table showing only what it covers reads as coverage it
+does not have.
+
+`PreToolUse`, `PermissionRequest` and `PermissionDenied` are the events whose
+output can allow or deny a tool call, rewrite its input, or persist a rule up to
+`bypassPermissions`. Nothing is implemented on them, and that is *enforced*:
+the writer bails on any spec whose event is in `PERMISSION_DECIDING_EVENTS`. A
+code index has nothing to contribute to an authorization decision. The writer
+also refuses a hook naming a `devmap` subcommand the binary does not register —
+such a hook fails on every fire, silently, for ever.
+
+The `claude plugin validate --strict` acceptance test is `#[ignore]`d because CI
+has no `claude` binary, so an ordinary run reports it *ignored* and never as a
+pass.
+
+### Q-17 — the drain read its own mistake back as proof (`0db537e`)
+
+The drain read git HEAD twice: once to decide whether to rebuild, once to stamp
+the generation, seconds apart across a full resolve. A checkout landing between
+them made it decide "unmoved, carry forward" and then stamp the generation with
+the HEAD it *had* moved to — and that stamp makes the error permanent, because
+the next drain compares HEAD against the stamp, finds them equal, and carries
+forward again. One read now, returning `{sha, moved}`, with the stamp being that
+same reading.
+
+Four more of the same family: a file removed mid-read was charged a retry toward
+*permanent quarantine*; `exists()`/`is_file()` collapsed every stat failure
+(symlink loop, lost `+x`, stale NFS handle) into "deleted", which drops the
+file's rows and hands the dead-code pass symbols to call unreferenced; the
+watcher fabricated U+FFFD paths for non-UTF-8 names and recorded deletions of
+files nothing had ever indexed; and `Err(_) => return Ok(())` in the IPC handler
+returned exactly the `Ok(())` a *served* request returns.
+
+The O(batch²) claim lookup is the one performance fix here, measured at the real
+8192 bound: 62.35 ms → 348.6 µs (178.9x), with 16 ms → 62 ms across a 2x batch
+confirming the quadratic. **It ships with no red test, stated rather than
+implied** — identical observable behaviour, so nothing can fail against the
+pre-fix code. The measurement is the evidence.
+
+The watcher event-queue overflow, recorded under K-B2 as argued-from-
+construction because it needed the notify thread to outrun the consumer, is now
+staged deterministically with no OS involvement: the flag stays clear for all
+4,096 events, the 4,097th sets it, and the rescan is delivered *ahead* of the
+itemised paths still queued behind it.
+
+
+### Q-18 — a 10 MB blob crossed the boundary to deliver 200 bytes
+
+Q-14 stopped `dead_page` *materialising* the analysis summary's embedded
+dead-symbol list, but not *transferring* it: the column was still `SELECT`ed
+whole into a Rust `String`. It is now stripped inside SQLite —
+`json_remove(analysis_json, '$.dead_symbols', '$.communities')` — so only the
+disclosure fields cross. Measured on the benchmark corpus: **10,122,764 bytes
+in the column, 200 bytes out**.
+
+**Call this what it is: a memory bound, not a speed-up.** Interleaved, three
+rounds, both binaries warm:
+
+```text
+dead_symbols warm p50   before  13.48  13.62  13.47   median 13.48 ms
+                        after   12.96  12.87  12.67   median 12.87 ms
+                                                      -4.5%
+```
+
+The ranges do not overlap, so the 4.5% is real — and it is far less than the
+byte reduction suggests, which is the useful part of the result. SQLite must
+still parse 10 MB of JSON in order to strip it; the parse moved out of serde
+and into JSON1 rather than going away. What genuinely changed is the transient
+allocation: a 10 MB `String` per call became 200 bytes, and with the MCP server
+now admitting up to 256 in-flight requests that is the difference between a
+bounded read and one whose peak memory is set by the size of the corpus.
+
+The safety of the strip rests on corruption and absence staying
+distinguishable. They do, and by SQLite's own behaviour rather than by a guard
+of ours: a malformed blob **raises**, where `json_extract` on a missing path
+would have returned `NULL` — and `NULL` is exactly what a generation with no
+analysis produces, so that spelling would have turned "could not be read" into
+"is not there" with nothing failing.
+
+`a_corrupt_analysis_is_not_an_absent_one.rs` pins it, and **is a structural
+guard, not a red test — checked, not assumed.** Run against the previous
+`SELECT analysis_json` spelling it still passes, because serde rejected the
+malformed blob just as SQLite now does. There is no pre-fix state in which it
+fails; what it guards is the future change that would reintroduce the hazard.
 ## Seam lane: the per-tool-call refresh moved onto the kernel (2026-09-05)
 
 `dev hook post-tool-use` runs after every tool call an agent makes. On an
