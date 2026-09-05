@@ -362,6 +362,50 @@ pub struct DiscoveryReport {
     pub skipped_paths: Vec<(String, DiscoverySkipReason)>,
 }
 
+impl DiscoverySkipReason {
+    /// Is this skip a hole in the graph, or the ordinary case?
+    ///
+    /// `NonSource` is a README beside the code, or a pruned build cache: the
+    /// walker was *meant* to pass it over, and counting it as coverage loss
+    /// would leave every repository permanently degraded — a marker that is
+    /// always on tells a reader nothing. Every other variant is a file this
+    /// indexer was meant to read and could not, so whatever it declared or
+    /// called is absent from the graph and cannot be reasoned about.
+    ///
+    /// This predicate is the *only* place that distinction is drawn. It was
+    /// previously an inline closure in the CLI's build path, which meant the
+    /// daemon — the other consumer of a [`DiscoveryReport`] — had no way to
+    /// agree with it except by copying it, and a copy that drifts turns one of
+    /// the two paths back into a silent lie.
+    ///
+    /// Written as an exhaustive `match` rather than `!matches!(.., NonSource)`
+    /// on purpose: a skip reason added later stops compiling here until someone
+    /// decides which side of the line it falls on. The default a wildcard would
+    /// pick — "not a refusal" — is the one that loses coverage silently.
+    pub fn is_refusal(&self) -> bool {
+        match self {
+            DiscoverySkipReason::NonSource => false,
+            DiscoverySkipReason::Oversized { .. }
+            | DiscoverySkipReason::NonUtf8Path
+            | DiscoverySkipReason::Unreadable { .. } => true,
+        }
+    }
+}
+
+impl DiscoveryReport {
+    /// The skipped paths that are genuine coverage loss, in discovery order.
+    pub fn refusals(&self) -> impl Iterator<Item = &(String, DiscoverySkipReason)> {
+        self.skipped_paths
+            .iter()
+            .filter(|(_, reason)| reason.is_refusal())
+    }
+
+    /// How many files discovery was meant to read and could not.
+    pub fn refused_count(&self) -> usize {
+        self.refusals().count()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParseOutcome {
     Clean,

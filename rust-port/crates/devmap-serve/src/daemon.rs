@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-use devmap_analyze::analyze;
+use devmap_analyze::{analyze_with_discovery, DiscoveryCoverage};
 use devmap_extract::{
     collect_go_modules, collect_sources_with_report, content_hash, extract_file,
     is_indexable_source, DiscoverySkipReason, MAX_SOURCE_BYTES,
@@ -680,17 +680,55 @@ impl Daemon {
         // every file it holds that this batch did not touch may now differ.
         // Carrying them forward would leave the graph describing a mixture of
         // two commits, which is worse than describing the old one.
-        let (mut extractions, full_rebuild) = if payload_is_current && !head_moved {
+        // K-A2, daemon half. What discovery refused cannot be seen in
+        // `extractions` — a file turned away has no `Extraction` at all — so it
+        // must travel beside them, or the analysis below reports full coverage
+        // of a corpus it never fully saw. Getting this wrong here does not just
+        // produce one bad answer: the drain *overwrites* the stored
+        // `analysis_json`, so it also erases the correct `Partial` that
+        // `devmap build` recorded, and one watcher event is enough to do it.
+        let (mut extractions, full_rebuild, discovery) = if payload_is_current && !head_moved {
             let mut carried: Vec<_> = previous
                 .into_iter()
                 .filter(|extraction| !affected.contains(&extraction.file_path))
                 .collect();
             carried.extend(fresh.iter().cloned());
-            (carried, false)
+            // This branch never re-walks discovery, so it cannot measure
+            // refusals — but it can decline to *deny* them. The previous
+            // generation measured this same tree, and a file it could not read
+            // is still unread unless something changed it.
+            //
+            // Known residual: once the refused file is fixed — shrunk below the
+            // ceiling, made readable — this count stays high until a full
+            // re-extraction or a `devmap build` re-measures. That under-claims
+            // coverage rather than over-claiming it, which is the side of the
+            // trade the rest of the kernel is built on: an unread file wrongly
+            // reported as read is what deletes working code.
+            let discovery = match self
+                .store
+                .latest_analysis()?
+                .and_then(|summary| summary.discovery_refused_files)
+            {
+                Some(refused) => DiscoveryCoverage::refused(refused),
+                // Only reachable for a generation written before the count was
+                // recorded at all. `none()` leaves it honestly unmeasured
+                // instead of asserting zero — and the payload check above sends
+                // a store that old down the full-rebuild branch regardless.
+                None => DiscoveryCoverage::none(),
+            };
+            (carried, false, discovery)
         } else {
-            let (whole_tree, _report) =
+            // The branch that actually walks the tree is the one that can
+            // measure it. This report was discarded as `_report`, which is what
+            // made a full re-extraction the *most* confident thing the daemon
+            // did and the least entitled to be.
+            let (whole_tree, report) =
                 devmap_store::extract_tree_cached_with_report(&self.store, &self.root)?;
-            (whole_tree, true)
+            (
+                whole_tree,
+                true,
+                DiscoveryCoverage::refused(report.refused_count()),
+            )
         };
         extractions.sort_by(|left, right| left.file_path.cmp(&right.file_path));
         let mut resolver = Resolver::new();
@@ -700,7 +738,7 @@ impl Daemon {
         }
         resolver.index_extractions(&extractions);
         let resolution = resolver.resolve_all(&extractions);
-        let analysis = analyze(&extractions, &resolution);
+        let analysis = analyze_with_discovery(&extractions, &resolution, discovery);
         let head_sha = current_git_head(&self.root).unwrap_or_else(|_| "unavailable".to_string());
         // K13: hold the cross-process writer lock across persist + prune. A
         // `devmap build` running beside the daemon otherwise races it on
@@ -1166,6 +1204,10 @@ fn stored_path(root: &std::path::Path, candidate: &std::path::Path) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The fixtures below build their own corpora, so the plain two-argument
+    // form is the correct one for them: no discovery step ran over what they
+    // assembled. The drain itself must never use it.
+    use devmap_analyze::analyze;
 
     /// The stat-read-stat loop refuses a file that changed under it, and the
     /// size limit is exclusive.

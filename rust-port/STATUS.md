@@ -2369,9 +2369,77 @@ Both controls — a fully-discovered corpus is **not** marked partial, and the
 plain `analyze` entry point still reports a complete corpus — stayed green under
 that revert, so the tests are not trivially red.
 
-**Left undone:** the daemon's own drain (`daemon.rs`) still calls plain
-`analyze`; its discovery refusals are handled separately as pending-path policy
-(K1(c)) and the count is not in scope at that call. A daemon-committed
-generation therefore does not yet carry the discovery half of the degraded
-reason, though it does carry the parse-failure half. `devmap build` — the path
-both audit proofs used — is fixed.
+### K-A2, daemon half — the resync that erased the refusal
+
+The note that stood here said the daemon's drain still called plain `analyze`
+and left this "not in scope at that call". That was wrong about the
+consequence, and the consequence is what matters: **the drain overwrites
+`analysis_json`.** So the `Partial` that `devmap build` correctly recorded had a
+lifetime of one watcher event. Someone saves an unrelated file, the daemon
+resyncs, and a corpus with unread files is relabelled `Ok` — with dead-code
+confidence back at 0.9. Fixing only the build path bought nothing in the state a
+repository actually sits in, because the daemon is the long-running path.
+
+Two branches, two different defects:
+
+* **Full rebuild** (stale payload or moved HEAD) walked the tree and discarded
+  the answer — literally `let (whole_tree, _report) = …`. The one branch that
+  *could* measure refusals was the one that threw the measurement away.
+* **Incremental resync** — the common case — carries the previous generation's
+  extractions forward and never re-walks discovery, so it cannot measure. It
+  called `analyze()`, which *asserts* nothing was refused.
+
+The full-rebuild branch now measures via `report.refused_count()`. The
+incremental branch carries the previous generation's count forward, which
+required persisting it: `AnalysisSummary.discovery_refused_files:
+Option<usize>`. It cannot be recomputed from the stored graph, because a file
+discovery turned away has no rows to count.
+
+`Option`, not `usize`. `None` means *not recorded*; `Some(0)` means *measured,
+nothing refused*. Rounding the first to zero is the same class of lie this whole
+item is about, so `DiscoveryCoverage` gained the same split —
+`DiscoveryCoverage::none()` now records `None` rather than `0`, and `charged()`
+is what counts against coverage. An unmeasured discovery charges nothing on
+purpose: every test and the single-file preview path build their own corpora,
+and degrading all of them would make the marker useless.
+
+**One canonical owner for "is this skip coverage loss".** The rule was an inline
+closure in the CLI. The daemon reads the same `DiscoveryReport` and needed the
+same verdict, and a *third* copy already existed in the connect-time sweep. It
+now lives once, as `DiscoverySkipReason::is_refusal`, written as an exhaustive
+`match` so a skip reason added later fails to compile until someone decides
+which side it falls on — the default a wildcard picks ("not a refusal") is the
+one that loses coverage silently.
+
+Four tests, `crates/devmap-serve/tests/daemon_discovery_refusals.rs`. Both
+defects were watched failing against the unmodified daemon:
+
+```
+a_full_rebuild_that_refused_a_file_does_not_persist_a_clean_status  FAILED
+an_incremental_resync_does_not_erase_a_recorded_refusal             FAILED
+a_full_rebuild_with_nothing_refused_stays_clean                     ok
+an_incremental_resync_of_a_clean_corpus_stays_clean                 ok
+```
+
+The two controls passed while the defects were still live, so they constrain the
+fix rather than following it: a change that marked every rebuild degraded would
+satisfy the first two and break these. That matters more than usual here —
+`NonSource` skips are constant and everywhere, so "always degraded" is one
+careless predicate away.
+
+End-to-end through the real binary, on a corpus whose only caller of `helper` is
+past the 1 MiB ceiling:
+
+```
+degraded:  devmap dead -> 0.35   status Partial "… 1 refused"   discovery_refused_files: 1
+clean:     devmap dead -> 0.90   status Ok                      discovery_refused_files: 0
+```
+
+**Known residual, stated rather than hidden.** Once a refused file is *fixed* —
+shrunk below the ceiling, made readable — the incremental branch keeps carrying
+the old count until a full re-extraction or a `devmap build` re-measures. That
+under-claims coverage instead of over-claiming it. It is the correct direction
+for this failure: an unread file wrongly reported as read is what deletes
+working code, and the reverse merely caps confidence until the next full pass.
+Making it exact would mean persisting the refused *paths* and maintaining that
+set across batches, which is real state for a bounded and self-clearing gain.

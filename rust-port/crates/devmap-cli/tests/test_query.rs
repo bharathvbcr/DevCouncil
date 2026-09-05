@@ -55,6 +55,9 @@ fn test_manifest_budget_t1() {
         extract_file("README.md", "# DevCouncil\n"),
     ];
     let analysis = AnalysisSummary {
+        // No discovery step ran over this hand-built corpus, so there is no
+        // refusal count to report. `None` says that; `0` would claim a walk.
+        discovery_refused_files: None,
         total_files: 3,
         total_symbols: 1,
         total_edges: 0,
@@ -78,6 +81,9 @@ fn test_manifest_budget_t1() {
 #[test]
 fn manifest_reports_supplied_head_and_pending_count() {
     let analysis = AnalysisSummary {
+        // No discovery step ran over this hand-built corpus, so there is no
+        // refusal count to report. `None` says that; `0` would claim a walk.
+        discovery_refused_files: None,
         total_files: 0,
         total_symbols: 0,
         total_edges: 0,
@@ -106,6 +112,9 @@ fn manifest_reports_supplied_head_and_pending_count() {
 fn test_manifest_budget_resists_hostile_paths() {
     let long_path = format!("src/{}.ts", "x".repeat(9_000));
     let analysis = AnalysisSummary {
+        // No discovery step ran over this hand-built corpus, so there is no
+        // refusal count to report. `None` says that; `0` would claim a walk.
+        discovery_refused_files: None,
         total_files: 1,
         total_symbols: 1,
         total_edges: 0,
@@ -170,6 +179,9 @@ fn test_manifest_order_is_deterministic_for_tied_communities() {
         extract_file("a.py", "if __name__ == '__main__':\n    pass\n"),
     ];
     let analysis = AnalysisSummary {
+        // No discovery step ran over this hand-built corpus, so there is no
+        // refusal count to report. `None` says that; `0` would claim a walk.
+        discovery_refused_files: None,
         total_files: 2,
         total_symbols: 2,
         total_edges: 0,

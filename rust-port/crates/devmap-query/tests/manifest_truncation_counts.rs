@@ -61,6 +61,9 @@ fn plans(count: u32) -> Vec<Extraction> {
 
 fn render(extractions: &[Extraction], communities: Vec<CommunityReport>) -> Value {
     let analysis = AnalysisSummary {
+        // No discovery step ran over this hand-built corpus, so there is no
+        // refusal count to report. `None` says that; `0` would claim a walk.
+        discovery_refused_files: None,
         total_files: extractions.len(),
         total_symbols: 0,
         total_edges: 0,

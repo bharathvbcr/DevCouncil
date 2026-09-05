@@ -478,6 +478,9 @@ mod wire_format_tests {
             extract_file("src/b.py", "def two():\n    return 2\n"),
         ];
         let analysis = AnalysisSummary {
+            // No discovery step ran over this hand-built corpus, so there is no
+            // refusal count to report. `None` says that; `0` would claim a walk.
+            discovery_refused_files: None,
             total_files: 2,
             total_symbols: 2,
             total_edges: 0,
@@ -648,6 +651,9 @@ mod tests {
 
     fn empty_analysis() -> AnalysisSummary {
         AnalysisSummary {
+            // No discovery step ran over this hand-built corpus, so there is no
+            // refusal count to report. `None` says that; `0` would claim a walk.
+            discovery_refused_files: None,
             total_files: 0,
             total_symbols: 0,
             total_edges: 0,

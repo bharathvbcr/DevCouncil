@@ -46,6 +46,25 @@ pub struct AnalysisSummary {
     /// them: nothing was examined.
     #[serde(default)]
     pub clone_coverage: crate::clones::CloneCoverage,
+    /// How many files discovery refused to read when this generation was built.
+    ///
+    /// Persisted because it cannot be recovered from the stored graph: a file
+    /// discovery turned away has no rows at all, so a later reader cannot count
+    /// what is missing by looking at what is there.
+    ///
+    /// The daemon is why this matters. Its incremental resync carries the
+    /// previous generation's extractions forward and never re-walks discovery,
+    /// so it cannot measure refusals itself — and it overwrites this summary on
+    /// every drain. Without the count to carry forward, the `Partial` that
+    /// `devmap build` correctly recorded survived only until the next watcher
+    /// event, and a corpus with unread files was relabelled complete.
+    ///
+    /// `None` means **not recorded** — no discovery step's result was reported
+    /// — and is not the same as `Some(0)`, which is a measurement that found
+    /// nothing refused. `serde(default)` yields `None` for generations written
+    /// before this field existed, which is the honest reading of them.
+    #[serde(default)]
+    pub discovery_refused_files: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -78,6 +78,11 @@ pub fn analyze_with_discovery(
         },
         unresolved_calls: resolution.unresolved.len(),
         clone_coverage,
+        // Recorded verbatim, unmeasured included. A caller that walked a tree
+        // reports what it refused; one that supplied its own corpus reports
+        // `None`, and the difference is what lets the daemon carry a real
+        // measurement forward without inventing one.
+        discovery_refused_files: discovery.refused_files(),
     }
 }
 

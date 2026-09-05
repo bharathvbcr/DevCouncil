@@ -242,21 +242,49 @@ pub struct ExtractionCoverage {
 /// is spelled [`DiscoveryCoverage::none`] rather than `0`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DiscoveryCoverage {
-    pub refused_files: usize,
+    /// `None` means no discovery result is being reported — which is **not**
+    /// the same as a discovery step that ran and refused nothing. Keeping the
+    /// two apart is the whole reason this is an `Option` and not a `usize`: a
+    /// summary that records `0` for the first case tells a later reader the
+    /// tree was fully walked when nobody walked it.
+    refused_files: Option<usize>,
 }
 
 impl DiscoveryCoverage {
-    /// No discovery step ran, so nothing was refused.
+    /// No discovery step ran, so there is no refusal count to report.
     ///
     /// Correct for a caller that supplies its own corpus directly — a test, or
     /// the single-file preview path. Wrong for anything that walked a tree, and
     /// that is the distinction this exists to keep visible.
     pub fn none() -> Self {
-        Self { refused_files: 0 }
+        Self {
+            refused_files: None,
+        }
     }
 
+    /// A discovery step ran and refused this many files. `refused(0)` is a
+    /// measurement, and says more than [`DiscoveryCoverage::none`] does.
     pub fn refused(refused_files: usize) -> Self {
-        Self { refused_files }
+        Self {
+            refused_files: Some(refused_files),
+        }
+    }
+
+    /// The measurement, or `None` when none was taken. Persisted verbatim so a
+    /// later generation can tell "measured, nothing refused" from "never
+    /// measured" instead of rounding both to zero.
+    pub fn refused_files(&self) -> Option<usize> {
+        self.refused_files
+    }
+
+    /// What to charge against coverage.
+    ///
+    /// An unmeasured discovery contributes nothing, deliberately. Charging it
+    /// would put every caller that builds its own corpus — every test, and the
+    /// single-file preview path — permanently in a degraded state, and a marker
+    /// that is always on is worth exactly as much as one that is never on.
+    pub fn charged(&self) -> usize {
+        self.refused_files.unwrap_or(0)
     }
 }
 
@@ -369,7 +397,7 @@ pub fn analyze_liveness_with_coverage(
     // Folded in before the cap is applied, not after the reports are built: a
     // file discovery never read may hold the only call to a symbol here, so a
     // refusal has to reach `coverage.cap()` the same way a parse failure does.
-    coverage.discovery_refused_files = discovery.refused_files;
+    coverage.discovery_refused_files = discovery.charged();
     let go_interface_specs = go_interface_specs_by_package(extractions);
     let c_header_exports = c_header_exported_names(extractions);
     let go_build_variants = go_build_variant_identities(extractions);

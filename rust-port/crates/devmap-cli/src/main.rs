@@ -6,7 +6,6 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
-use devmap_analyze::analyze;
 use devmap_extract::collect_go_modules;
 use devmap_query::{
     generate_code_graph_encodings, generate_manifest_with_edges, resolve_manifest_output,
@@ -1288,19 +1287,12 @@ async fn main() -> anyhow::Result<()> {
             // Report what discovery refused. A file dropped for being oversized
             // or unreadable used to vanish with no record: `repo_map.json` would
             // say five files while two more existed, and nothing distinguished
-            // "not in this repository" from "refused by the indexer". Only
-            // genuine refusals are counted — `NonSource` is the ordinary case of
-            // a README next to the code, not a gap in coverage.
-            let refused: Vec<&(String, devmap_extract::model::DiscoverySkipReason)> = discovery
-                .skipped_paths
-                .iter()
-                .filter(|(_, reason)| {
-                    !matches!(
-                        reason,
-                        devmap_extract::model::DiscoverySkipReason::NonSource
-                    )
-                })
-                .collect();
+            // "not in this repository" from "refused by the indexer". Which
+            // skips count as loss is decided by `DiscoverySkipReason::is_refusal`
+            // and nowhere else — the daemon reads the same report and must reach
+            // the same verdict, and it cannot do that against a copy of the rule.
+            let refused: Vec<&(String, devmap_extract::model::DiscoverySkipReason)> =
+                discovery.refusals().collect();
             if !refused.is_empty() {
                 eprintln!(
                     "  discovery refused {} file(s) — these are absent from the graph:",

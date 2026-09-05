@@ -275,6 +275,9 @@ fn dead_symbol_candidates_rank_by_confidence_before_truncating() {
     });
 
     let analysis = AnalysisSummary {
+        // No discovery step ran over this hand-built corpus, so there is no
+        // refusal count to report. `None` says that; `0` would claim a walk.
+        discovery_refused_files: None,
         total_files: 2,
         total_symbols: 255,
         total_edges: 0,

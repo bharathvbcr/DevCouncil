@@ -1083,6 +1083,9 @@ mod tests {
 
     fn analysis(dead: Vec<DeadSymbolReport>, communities: Vec<CommunityReport>) -> AnalysisSummary {
         AnalysisSummary {
+            // No discovery step ran over this hand-built corpus, so there is no
+            // refusal count to report. `None` says that; `0` would claim a walk.
+            discovery_refused_files: None,
             total_files: 0,
             total_symbols: 0,
             total_edges: 0,
