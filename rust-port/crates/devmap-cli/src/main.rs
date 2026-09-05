@@ -2757,7 +2757,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 .with_ipc_path(ipc_path);
             daemon.run_loop().await?;
         }
-        Commands::Claude { action } => run_claude(&cli, action)?,
+        Commands::Claude { action } => run_claude(cli, action)?,
     }
 
     Ok(())
