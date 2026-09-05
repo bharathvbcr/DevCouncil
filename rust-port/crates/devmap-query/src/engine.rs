@@ -1,6 +1,6 @@
 use devmap_analyze::clones::group_clones;
 use devmap_analyze::traversal::{
-    traverse_graph, traverse_indexed, TraversalOptions, TraversalStop,
+    traverse_graph, traverse_graph_indexed, TraversalLimits, TraversalOptions, TraversalStop,
 };
 use devmap_extract::model::*;
 use devmap_resolve::model::*;
@@ -309,9 +309,13 @@ impl<'a> StoreQueryEngine<'a> {
         // other. The generation straddle check in [`Self::neighbors`] still
         // wraps this, because the load is not the only store read here.
         //
-        // What is hoisted is the *index*, not a converted copy of the edge
-        // table: the store builds it once per generation, so the fan-out pays
-        // a hash lookup per target rather than a whole-generation scan.
+        // What is hoisted is the *index*, and it is not built here at all: the
+        // store keeps one per generation, so the fan-out pays a hash lookup per
+        // target rather than a whole-generation scan — and so does a single
+        // `impact`, which is the half a per-request index cannot reach. One
+        // directed view per direction, three words each over the shared index,
+        // because a walk must not be given a direction that disagrees with the
+        // adjacency it reads.
         devmap_store::checked_min_confidence(min_confidence)?;
         let Some(index) = self.generation_edges()? else {
             return Ok(targets
@@ -330,6 +334,8 @@ impl<'a> StoreQueryEngine<'a> {
                 })
                 .collect());
         };
+        let inbound = index.directed(true, min_confidence);
+        let outbound = index.directed(false, min_confidence);
         let mut answers = Vec::with_capacity(targets.len());
         for target in targets {
             // Plain `check`, not `check_every`: the latter consults the flag
@@ -353,13 +359,13 @@ impl<'a> StoreQueryEngine<'a> {
             // by construction rather than by both remembering to pass it.
             let callers = self.traverse_over(
                 &index,
+                &inbound,
                 Request {
                     query: target.clone(),
                     token_budget,
                     min_confidence,
                     max_depth,
                 },
-                true,
             )?;
             // Outbound edges come from whichever query can actually answer
             // for this target's shape.
@@ -398,13 +404,13 @@ impl<'a> StoreQueryEngine<'a> {
             // tightened to what the field has always claimed to be.
             let callees = self.traverse_over(
                 &index,
+                &outbound,
                 Request {
                     query: target.clone(),
                     token_budget,
                     min_confidence,
                     max_depth: 1,
                 },
-                false,
             )?;
             answers.push(Neighbors {
                 target: target.clone(),
@@ -546,7 +552,8 @@ impl<'a> StoreQueryEngine<'a> {
                 reason: "no persisted generation is available".to_string(),
             }));
         };
-        self.traverse_over(&index, req, reverse)
+        let direction = index.directed(reverse, req.min_confidence);
+        self.traverse_over(&index, &direction, req)
     }
 
     /// The traversal itself, over an index the caller already holds.
@@ -561,10 +568,15 @@ impl<'a> StoreQueryEngine<'a> {
     fn traverse_over(
         &self,
         index: &GenerationEdges,
+        direction: &devmap_store::DirectedEdges<'_>,
         req: Request<String>,
-        reverse: bool,
     ) -> anyhow::Result<Response<ResolvedEdge>> {
         let min_confidence = devmap_store::checked_min_confidence(req.min_confidence)?;
+        // The direction is the view's, not a second argument that could
+        // disagree with it. A reversed walk over a forward index answers
+        // plausibly and wrongly rather than failing, so the two are not
+        // separable here.
+        let reverse = devmap_analyze::traversal::GraphIndex::reverse(direction);
         let target = req.query.trim();
         let start: Vec<String> =
             indexed_traversal_starts(index, target, reverse, min_confidence, &self.cancel)?
@@ -583,13 +595,12 @@ impl<'a> StoreQueryEngine<'a> {
         self.cancel.check()?;
         let max_depth = req.max_depth.min(MAX_TRAVERSAL_DEPTH);
         let max_nodes = TRAVERSAL_MAX_NODES;
-        let walk = traverse_indexed(
+        let walk = traverse_graph_indexed(
             &start,
-            &index.directed(reverse, min_confidence),
-            &TraversalOptions {
+            direction,
+            TraversalLimits {
                 max_depth,
                 max_nodes,
-                reverse,
             },
         );
         self.cancel.check()?;
@@ -749,6 +760,11 @@ impl<'a> StoreQueryEngine<'a> {
         let Some(index) = self.generation_edges()? else {
             return Ok(empty("no persisted generation is available".to_string()));
         };
+        // One directed view per direction for the whole fan-out. There are only
+        // ever two directions, so there are only ever two views, and each is a
+        // borrow of the generation index the store already holds.
+        let inbound = index.directed(true, min_confidence);
+        let outbound = index.directed(false, min_confidence);
         let per_direction = edges_per_direction(&budget, definitions.shown);
         let mut budget = budget;
         budget.edges_per_direction = per_direction;
@@ -756,23 +772,23 @@ impl<'a> StoreQueryEngine<'a> {
             self.cancel.check()?;
             definition.callers = self.traverse_over(
                 &index,
+                &inbound,
                 Request {
                     query: definition.id.clone(),
                     token_budget: per_direction,
                     min_confidence,
                     max_depth: 1,
                 },
-                true,
             )?;
             definition.callees = self.traverse_over(
                 &index,
+                &outbound,
                 Request {
                     query: definition.id.clone(),
                     token_budget: per_direction,
                     min_confidence,
                     max_depth: 1,
                 },
-                false,
             )?;
         }
 
@@ -1041,20 +1057,36 @@ impl<'a> StoreQueryEngine<'a> {
         &self,
         token_budget: u32,
     ) -> anyhow::Result<Response<devmap_analyze::DeadSymbolReport>> {
-        if self.store.latest_generation_id()?.is_none() {
+        // One snapshot. This resolved the generation three times — an existence
+        // check, the analysis, then the rows — so the coverage disclosure could
+        // describe a different generation than the findings it was attached to.
+        // That combination is what promotes a row from "look at this" to "safe
+        // to delete": a disclosure saying the corpus was fully covered, over
+        // rows from a generation where it was not.
+        //
+        // Bounded by the answer, not by the corpus. The exempt filter and the
+        // cut both run in SQL now; this used to materialise every dead row of
+        // the generation and drop almost all of them here — 80,000 read to show
+        // 66 on the benchmark corpus. One more row than the budget can seat is
+        // read on purpose, so `budget_take` still sees something it cannot fit
+        // and reports `truncated` for the right reason.
+        let limit = (token_budget / DEAD_SYMBOL_TOKENS) as usize + 1;
+        let Some(page) = self.store.dead_page(limit)? else {
             return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
-        }
-        let analysis = self.store.latest_analysis()?;
-        let dead = self
-            .store
-            .latest_dead_symbols()?
-            .into_iter()
-            .filter(|row| !row.is_exempt)
-            .collect();
-        let mut response = budget_take(dead, token_budget, |_| 30);
-        response.walk_incomplete = dead_symbol_coverage_gap(analysis.as_ref());
+        };
+        let mut response = budget_take(page.rows, token_budget, |_| DEAD_SYMBOL_TOKENS);
+        // `budget_take` counts the page it was handed, and the page is now a
+        // bounded read — so the generation-wide count has to be restored as the
+        // denominator, exactly as `explore` does for definitions. Without this
+        // a capped list would report itself as the whole truth.
+        response.total = u32::try_from(page.total_non_exempt)
+            .unwrap_or(u32::MAX)
+            .max(response.shown);
+        response.hidden = response.total.saturating_sub(response.shown);
+        response.truncated = response.hidden > 0;
+        response.walk_incomplete = dead_symbol_coverage_gap(page.analysis.as_ref());
         Ok(response)
     }
 
@@ -1454,9 +1486,19 @@ impl<'a> StoreQueryEngine<'a> {
             // for this feature to do nothing.
             .map(|s| s.qualified_name.clone())
             .collect();
-        let callers: Vec<PreviewCaller> = self
-            .store
-            .callers_of(&at_risk, path, min_confidence)?
+        // One snapshot for the list and the denominator it is measured
+        // against. Read separately they could describe two generations, and the
+        // `saturating_sub` below turns that into silence: when the newer
+        // generation holds fewer callers the difference clamps to zero and this
+        // reports that the confidence floor hid nothing. Drawn from one
+        // generation the floored set is a subset of the unfiltered one, so the
+        // subtraction cannot underflow at all.
+        let page = self.store.callers_page(&at_risk, path, min_confidence)?;
+        let (caller_edges, total_unfiltered) = match page {
+            Some(page) => (page.callers, page.total_unfiltered),
+            None => (Vec::new(), 0),
+        };
+        let callers: Vec<PreviewCaller> = caller_edges
             .into_iter()
             .map(|edge| PreviewCaller {
                 target_symbol: edge.target_symbol,
@@ -1473,10 +1515,7 @@ impl<'a> StoreQueryEngine<'a> {
         // six `String` allocations per row — solely to take `.len()`. On this
         // repository the busiest symbol has 918 callers, so previewing a file
         // that declares one materialised ~1,836 rows and kept none of them.
-        let ambiguous_callers = self
-            .store
-            .count_callers_of(&at_risk, path, 0.0)?
-            .saturating_sub(callers.len());
+        let ambiguous_callers = total_unfiltered.saturating_sub(callers.len());
 
         let degraded_reason = match &candidate.parse_outcome {
             ParseOutcome::Partial { .. } => Some(
@@ -2610,6 +2649,9 @@ const TRAVERSAL_MAX_NODES: usize = 5_000;
 
 /// Token cost the budgeter charges for one graph edge, everywhere.
 const EDGE_TOKENS: u32 = 25;
+/// Token cost of one dead-symbol row, and so the divisor that turns a budget
+/// into how many rows are worth reading.
+const DEAD_SYMBOL_TOKENS: u32 = 30;
 
 /// Node ids listed per blast-radius band. The band's exact size travels in
 /// `node_count` regardless, so this trims the listing, never the count.
@@ -2633,11 +2675,6 @@ fn node_id_of(file_path: &str, symbol_name: &str) -> String {
     format!("{file_path}::{symbol_name}")
 }
 
-/// Nodes a walk from `target` would start at, in the given direction.
-///
-/// Lifted out of `traverse` so the blast radius resolves its seeds through the
-/// same matcher the traversal does. Resolving them two ways is how a radius
-/// ends up seeded from a symbol the trace never visits.
 /// The edges a walk crossed, read out of the index instead of scanned for.
 ///
 /// Same answer as [`traversed_resolution_edges`] over the whole generation,
@@ -2707,6 +2744,10 @@ fn indexed_traversed_edges(
 /// the answer. What changes is the cost: a symbol query tests the distinct
 /// symbols (41,276 on the ScholarLM corpus) and a path query the distinct
 /// files (4,499), instead of testing every one of 271,543 edges.
+///
+/// Lifted out of `traverse` so the blast radius resolves its seeds through the
+/// same matcher the traversal does. Resolving them two ways is how a radius
+/// ends up seeded from a symbol the trace never visits.
 fn indexed_traversal_starts(
     index: &GenerationEdges,
     target: &str,
@@ -3147,7 +3188,7 @@ fn search_rank_pool_size(token_budget: u32) -> usize {
 /// attributed is the load-bearing case: a marker that appears on every answer
 /// leaves a caller exactly where it started.
 fn dead_symbol_coverage_gap(
-    analysis: Option<&devmap_analyze::model::AnalysisSummary>,
+    analysis: Option<&devmap_analyze::model::AnalysisDisclosure>,
 ) -> Option<String> {
     use devmap_analyze::model::AnalysisStatus;
     // A generation exists but its analysis blob does not read back. That is a
@@ -3248,7 +3289,18 @@ fn read_source_prefix(path: &std::path::Path, span_end: usize) -> std::io::Resul
     // whatever character `span_end` lands inside.
     let wanted = span_end.saturating_add(3);
     let mut file = std::fs::File::open(path)?;
-    let mut buffer = Vec::new();
+    // Sized from the smaller of what is wanted and what is there, so the common
+    // case — a small file, read whole — costs one allocation, as
+    // `read_to_string` did. Growing from empty instead cost 14% of `search`
+    // (2.37 ms -> 2.70 ms p50 on this repository's store, interleaved), because
+    // a search page is a hundred files and almost all of them are small. A file
+    // whose length cannot be read falls back to growth rather than failing:
+    // the read below is the thing that must succeed, not the hint.
+    let hint = file
+        .metadata()
+        .map(|meta| (meta.len() as usize).min(wanted))
+        .unwrap_or(0);
+    let mut buffer = Vec::with_capacity(hint);
     // `take` bounds the read at the source, so a hostile or generated file
     // cannot make this allocate more than the span asked for.
     file.by_ref().take(wanted as u64).read_to_end(&mut buffer)?;
@@ -4267,8 +4319,11 @@ mod indexed_start_equivalence_tests {
                             reverse,
                         };
                         let scanned = traverse_graph(&start, &edges, &opts);
-                        let walked =
-                            traverse_indexed(&start, &index.directed(reverse, floor), &opts);
+                        let walked = traverse_graph_indexed(
+                            &start,
+                            &index.directed(reverse, floor),
+                            opts.limits(),
+                        );
                         assert_eq!(
                             scanned.visited_nodes, walked.visited_nodes,
                             "{query:?} reverse={reverse} floor={floor} depth={max_depth}"
@@ -4373,13 +4428,12 @@ mod indexed_start_equivalence_tests {
         ];
         let index = GenerationEdges::build(std::sync::Arc::new(rows)).expect("index");
         for reverse in [false, true] {
-            let walk = traverse_indexed(
+            let walk = traverse_graph_indexed(
                 &["a".to_string()],
                 &index.directed(reverse, 0.0),
-                &TraversalOptions {
+                TraversalLimits {
                     max_depth: 64,
                     max_nodes: TRAVERSAL_MAX_NODES,
-                    reverse,
                 },
             );
             assert_eq!(walk.visited_nodes.len(), 3, "reverse={reverse}");
@@ -4403,13 +4457,12 @@ mod indexed_start_equivalence_tests {
             })
             .collect();
         let index = GenerationEdges::build(std::sync::Arc::new(rows)).expect("index");
-        let walk = traverse_indexed(
+        let walk = traverse_graph_indexed(
             &["n0".to_string()],
             &index.directed(false, 0.0),
-            &TraversalOptions {
+            TraversalLimits {
                 max_depth: 64,
                 max_nodes: TRAVERSAL_MAX_NODES,
-                reverse: false,
             },
         );
         assert!(

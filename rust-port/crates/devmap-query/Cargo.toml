@@ -31,12 +31,10 @@ parse = ["devmap-extract/parse", "devmap-resolve/parse", "devmap-analyze/parse",
 # `required-features` skips these when `parse` is off rather than failing the
 # build. Nothing changes with default features on, where `parse` is enabled.
 #
-# Examples count too, and were missed: `--all-targets` builds them, so an
-# example that calls `extract_file` fails the no-parse check exactly as a test
-# does. `workspace_registry_concurrency` and `freshness_parity` are deliberately
+# `workspace_registry_concurrency` and `freshness_parity` are deliberately
 # absent — they exercise the workspace registry and the freshness stamp, neither
 # of which needs a parser, and they must keep being compiled and run in the
-# no-parse configuration.
+# no-parse configuration. See the note below the list for the examples.
 
 [[test]]
 name = "coverage_loss_artifacts"
@@ -46,16 +44,8 @@ required-features = ["parse"]
 name = "edge_index_under_writes"
 required-features = ["parse"]
 
-[[test]]
-name = "query_work_is_bounded_by_the_answer"
-required-features = ["parse"]
-
 [[example]]
 name = "answer_snapshot"
-required-features = ["parse"]
-
-[[example]]
-name = "query_bench"
 required-features = ["parse"]
 
 [[test]]
@@ -104,4 +94,30 @@ required-features = ["parse"]
 
 [[test]]
 name = "workspace_search_totals"
+required-features = ["parse"]
+
+[[test]]
+name = "paired_reads_are_one_generation"
+required-features = ["parse"]
+
+[[test]]
+name = "query_work_is_bounded_by_the_answer"
+required-features = ["parse"]
+
+# Examples are targets too, and `--all-targets` builds them. `query_bench`
+# builds a store to measure against, so it needs the frontend for the same
+# reason the tests above do. The other three examples compile without `parse`
+# and are deliberately left ungated: `required-features` means "skip", and
+# skipping a target that would have built is coverage quietly deleted.
+
+[[example]]
+name = "query_bench"
+required-features = ["parse"]
+
+[[test]]
+name = "a_fan_out_pays_for_its_index_once_per_direction"
+required-features = ["parse"]
+
+[[test]]
+name = "a_delete_this_list_reads_for_its_answer"
 required-features = ["parse"]

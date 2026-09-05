@@ -66,6 +66,46 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # The shape an embedder links: this workspace's five parsing crates each
+  # build without tree-sitter, answering questions about a persisted map
+  # instead of building one. Nothing in CI had ever compiled that shape.
+  #
+  # It has now silently broken twice. Targets that import `#[cfg(feature =
+  # "parse")]` items fail the whole target when the feature is off, and a
+  # build error reads as "not meant to be tested" rather than as a failure,
+  # so `required-features` gaps survive review. The second time, two targets
+  # were added after the gating pass and simply never gated.
+  #
+  # This MUST stay per-crate. `cargo check --workspace --no-default-features`
+  # passes while `cargo check -p devmap-query --no-default-features` fails:
+  # `--no-default-features` turns off the workspace members' own defaults, but
+  # devmap-cli and devmap-serve depend on devmap-query without
+  # `default-features = false`, so unification switches `parse` back on for the
+  # shared graph. The workspace-wide spelling is a check that cannot fail for
+  # this class — it reports the same green as a check that actually ran.
+  #
+  # `cargo test` runs alongside `cargo check` on purpose: `required-features`
+  # means "skip", so gating is coverage removed, and the tests that do survive
+  # feature-off are the only ones proving that configuration works at all.
+  feature-off:
+    name: embedder shape (--no-default-features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-port
+      - name: Per-crate feature-off build and test
+        run: |
+          set -euo pipefail
+          for crate in devmap-extract devmap-resolve devmap-analyze devmap-store devmap-query; do
+            echo "::group::$crate"
+            cargo check -p "$crate" --no-default-features --all-targets
+            cargo test -p "$crate" --no-default-features
+            echo "::endgroup::"
+          done
+
   gates:
     name: verify.sh gates
     runs-on: ubuntu-latest

@@ -17,6 +17,31 @@ pub struct CommunityReport {
     pub cohesion_score: f32, // R6: every community reports cohesion
 }
 
+/// The scalar half of [`AnalysisSummary`]: what a coverage disclosure needs.
+///
+/// `AnalysisSummary` embeds `dead_symbols: Vec<DeadSymbolReport>`, which is a
+/// second complete copy of the list `dead_symbols` pages. Measured on the
+/// benchmark corpus, the stored blob is 10,122,764 bytes and 10,084,001 of
+/// them — 99.6% — are that list. Deserializing the whole summary to read a
+/// status field therefore re-materialises the entire corpus, which is what made
+/// bounding the row read achieve nothing on its own.
+///
+/// Deserializing into this instead skips both vectors: serde ignores unknown
+/// fields, so the tokens are stepped over rather than turned into `String`s.
+/// It reads from exactly the same JSON — no second format, no second writer.
+///
+/// `analysis_disclosure_agrees_with_the_summary_it_reads` pins the two together;
+/// a field that drifts out of this struct silently becomes "not recorded".
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnalysisDisclosure {
+    pub total_files: usize,
+    pub total_symbols: usize,
+    pub total_edges: usize,
+    pub status: AnalysisStatus,
+    #[serde(default)]
+    pub unresolved_calls: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisSummary {
     pub total_files: usize,
@@ -72,4 +97,72 @@ pub enum AnalysisStatus {
     Ok,
     Partial { reason: String },
     Timeout { reason: String },
+}
+
+#[cfg(test)]
+mod disclosure_tests {
+    use super::*;
+
+    fn summary(status: AnalysisStatus, dead: usize) -> AnalysisSummary {
+        AnalysisSummary {
+            total_files: 7,
+            total_symbols: 41,
+            total_edges: 93,
+            dead_symbols: (0..dead)
+                .map(|index| DeadSymbolReport {
+                    symbol_name: format!("mod.py::orphan_{index}"),
+                    file_path: "mod.py".to_string(),
+                    confidence: 0.9,
+                    is_exempt: false,
+                    exemption_reason: None,
+                })
+                .collect(),
+            communities: Vec::new(),
+            status,
+            unresolved_calls: 13,
+            clone_coverage: crate::clones::CloneCoverage::default(),
+            discovery_refused_files: Some(2),
+        }
+    }
+
+    /// The disclosure reads the summary's own JSON, so the two must not drift.
+    ///
+    /// [`AnalysisDisclosure`] exists so `dead_page` can read a coverage status
+    /// without deserializing the summary's embedded copy of the dead-symbol
+    /// list. It relies on serde ignoring unknown fields, which means a field
+    /// renamed on `AnalysisSummary` would not fail to compile here — it would
+    /// silently start reading as its `Default`, and a disclosure that quietly
+    /// reports "nothing unattributed" is exactly the reassuring answer this
+    /// type must never invent.
+    #[test]
+    fn analysis_disclosure_agrees_with_the_summary_it_reads() {
+        for status in [
+            AnalysisStatus::Ok,
+            AnalysisStatus::Partial {
+                reason: "app.py did not parse".to_string(),
+            },
+            AnalysisStatus::Timeout {
+                reason: "budget exhausted".to_string(),
+            },
+        ] {
+            let full = summary(status.clone(), 4);
+            let json = serde_json::to_string(&full).expect("summary serializes");
+            let disclosure: AnalysisDisclosure =
+                serde_json::from_str(&json).expect("disclosure reads the summary's own JSON");
+
+            assert_eq!(disclosure.total_files, full.total_files);
+            assert_eq!(disclosure.total_symbols, full.total_symbols);
+            assert_eq!(disclosure.total_edges, full.total_edges);
+            assert_eq!(
+                disclosure.unresolved_calls, full.unresolved_calls,
+                "unresolved_calls drifting to its default would turn \"13 calls \
+                 are unattributed\" into \"this list is complete\""
+            );
+            assert_eq!(
+                format!("{:?}", disclosure.status),
+                format!("{:?}", full.status),
+                "the disclosure must carry the same status the summary recorded"
+            );
+        }
+    }
 }

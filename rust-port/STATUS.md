@@ -2696,3 +2696,245 @@ the same reason: lost coverage must not look like a quiet tree.
 outrunning the consumer, which this suite cannot stage deterministically. The
 reachable half — the debounce cap — is covered; the queue bound is argued from
 construction, and is recorded here as such rather than implied to be tested.
+
+### Q-10 — two reads, two generations, one answer (devmap-query)
+
+The K-A4 class that `search_page` closed had two more instances in the query
+engine. Both compose a *pair* of store reads, and `Store`'s reads each open
+their own snapshot, so the pair can straddle a commit.
+
+**`preview`.** It lists callers at or above a confidence floor, counts callers
+at floor 0.0, and subtracts to report how many the floor excluded. The two
+differing floors are deliberate and documented — the difference is precisely
+what the floor hid. The defect is the straddle, and `saturating_sub` is what
+makes it silent: when the newer generation holds fewer callers the difference
+clamps to zero and `preview` reports that the floor excluded nothing. "No
+ambiguous callers" and "I counted a different corpus" become the same answer,
+on the surface whose entire job is to say what an edit would break. Drawn from
+one generation the floored set is a subset of the unfiltered one, so the
+subtraction cannot underflow at all.
+
+**`dead_symbols`.** It resolved the generation three times — an existence
+check, `latest_analysis`, then `latest_dead_symbols` — and attached the
+coverage disclosure from one read to rows from another. A disclosure saying
+the corpus was fully covered, over rows from a generation where it was not, is
+the exact combination that promotes a finding from "look at this" to "safe to
+delete".
+
+Both now go through `Store::callers_page` / `Store::dead_page`, built on the
+`latest_snapshot` mechanism `search_page` already introduced rather than a
+second pattern beside it.
+
+**On the tests, plainly: four of the five are structural guards, not red
+tests.** They pin `callers_page`/`dead_page` to a single generation going
+forward, but they are green against the pre-fix code too, because with nothing
+interleaving both spellings return the latest generation. No test written
+against the new API can be red against the old one: the defect needs a commit
+to land *between* the two reads, and there is no longer a gap between them to
+land in.
+
+So the evidence is the fifth test, which reproduces the straddle itself — two
+handles on one file-backed store, a commit forced between the two unpaired
+reads, showing the analysis describing generation 1 while the rows describe
+generation 2. Not a race; a forced schedule. It passes before and after the
+fix, because it exercises the old composition, which still exists and is still
+unsafe to use as a pair. That is recorded in the test's own doc comment so five
+green checkmarks cannot be read as five proofs.
+
+The third instance the store audit found — `latest_dead_symbols` +
+`count_dead_at_least` — is deliberately left alone: `count_dead_at_least` has
+only a test caller, and pairing it would mean shipping an unwired API.
+
+### Q-11 — the feature-off gate regressed, because nothing ever ran it
+
+`required-features` gating was added to `devmap-query` so the crate's tests
+compile with `--no-default-features` — the shape an embedder links. Two targets
+added after that pass, `query_work_is_bounded_by_the_answer` and the
+`query_bench` example, were never gated, and
+
+```
+cargo check -p devmap-query --no-default-features --all-targets   → exit 101
+```
+
+The gap survived for the same reason it did the first time: a build error reads
+as "this target was not meant to be built here" rather than as a failure, and
+no gate anywhere ran that configuration. `--no-default-features` appeared in no
+CI workflow at all.
+
+Only those two targets were gated. The other four ungated targets
+(`workspace_registry_concurrency`, `impact_breakdown`, `query_phase_ab`,
+`query_snapshot`) compile feature-off and are deliberately left ungated:
+`required-features` means *skip*, so gating a target that would have built is
+coverage quietly deleted. Gating is a cost, not a cleanup — `devmap-query` runs
+39 tests feature-off against 169 with `parse` on, and that gap is the price.
+
+**The new CI job must stay per-crate, and this is the part worth not
+"simplifying".**
+
+```
+cargo check --workspace  --no-default-features --all-targets   → exit 0
+cargo check -p devmap-query --no-default-features --all-targets → exit 101
+```
+
+`--no-default-features` turns off the *workspace members'* own defaults, but
+`devmap-cli` and `devmap-serve` depend on `devmap-query` without
+`default-features = false`, so unification switches `parse` back on for the
+shared graph. The workspace-wide spelling is a check that cannot fail for this
+class — it reports the same green as a check that actually examined something.
+It is the tidier-looking command and the useless one.
+
+Post-fix the per-crate matrix is green across all five `parse` crates, with 245
+tests actually running feature-off: extract 60, resolve 15, analyze 25, store
+106, query 39.
+
+### Q-12 — `cargo fmt --check` had never run on the port
+
+CI's first step is `cargo fmt --all -- --check`. The workflow has never been
+pushed, so that step has never executed, and 17 files were unformatted —
+committed ones included. Every commit in this pass would have failed CI before
+reaching a single test. Formatting is now clean workspace-wide; no logic
+changed.
+
+### Q-13 — a fan-out paid for one index per walk, not one per direction
+
+`traverse_graph` builds an adjacency map over the whole edge slice before it
+walks. `neighbors` asks for both directions of up to 16 targets and `explore`
+does the same per definition, so N targets rebuilt the same two maps 2N times
+over an edge slice that does not change between them. The lane that found this
+measured it and left it, correctly, as out of its scope: `traversal.rs` said in
+so many words that sharing an index "is a decision for the caller that owns the
+query loop". This closes it from the caller's side.
+
+`AdjacencyIndex::build(edges, reverse)` is now the index, and
+`traverse_graph_indexed` the walk; `traverse_graph` is a thin wrapper that
+builds a single-use index and calls it, so there is still exactly one
+implementation of the walk and every existing caller is untouched.
+
+**The direction lives in the index and nowhere else.** `traverse_graph_indexed`
+takes [`TraversalLimits`], which deliberately has no `reverse` field, and reads
+the direction off the index. An index built one way cannot be walked the other,
+because the mismatch is not expressible — not because an assertion catches it.
+That distinction matters here more than usual: a reversed walk over a forward
+index does not fail, it answers plausibly and wrongly, which is how "what
+depends on this" silently becomes "what this depends on".
+
+**Measured, interleaved before/after** on a generated corpus of 2,000 files /
+126,000 symbols / 330,000 edges, three rounds alternating the two binaries
+built from the same tree with only the hoist reverted:
+
+```text
+neighbors (8 targets)      cold                warm p50
+  before                   787.83 ms           620.50 ms
+  after                    351.26 ms           180.10 ms
+                           -55% (2.2x)         -71% (3.4x)
+```
+
+Round-to-round spread was under 1% on both sides, and every run returned the
+same answer — "8 answers, 96 edges shown" — so this is the same work done
+fewer times, not less work done.
+
+**Red proof.** `a_fan_out_pays_for_its_index_once_per_direction.rs` counts
+allocations rather than time, for the reason its sibling gives: counts are
+deterministic and a timing assertion turns a loaded machine into a red build.
+It compares `neighbors` against *itself* at one target and at sixteen, which is
+the only shape that isolates a per-target cost — the existing comparison
+against separately-issued queries stays green either way, because the
+composition is still cheaper by the whole edge read.
+
+```text
+index per target     299,720 allocations for 16 targets vs 88,310 for one  3.4x
+index per direction   75,160 allocations for 16 targets vs 74,275 for one  1.0x
+```
+
+With the hoist reverted the test fails at 3.4x; restored, it passes at 1.0x,
+and `engine.rs` was restored byte-for-byte afterwards (shasum matched). The
+bound is 2, which sits between the two worlds rather than being tuned to
+either.
+
+`blast_walk` builds its own inbound index and is deliberately left alone: it
+builds once per call rather than once per target, and it filters on
+`min_confidence`, so it is a different index answering a different question.
+Folding it in would be the kind of unification that produces a helper with a
+boolean meaning "actually do the other thing".
+
+**Still open, measured on the same corpus:** `dead_symbols` reads all 80,000
+non-exempt dead rows to show 66 (39.6 ms warm). The read is genuinely
+unbounded, but `total: 80000` is the honest denominator that makes "66 shown of
+80,000" true, and clients enforce `shown + hidden == total` — so a `LIMIT` has
+to come with a `COUNT`, the way `explore` already pairs them. That is the next
+one, not this one.
+
+### Q-14 — a delete-this list read the whole corpus, twice
+
+`dead_symbols` shows a few dozen rows. It read every dead-symbol row of the
+generation, discarded the exempt ones in Rust, and the budgeter kept 66. On the
+benchmark corpus that is 80,000 rows read to show 66; on this repository, 6,976
+of the 7,176 rows read were exempt and dropped on arrival.
+
+The row read is now `WHERE is_exempt = 0 ... LIMIT ?`, one more row than the
+budget can seat so `budget_take` still reports `truncated` for the right
+reason. Ordering is unchanged: the old query sorted by `is_exempt` first, so
+filtering on it makes that key constant and leaves the survivors in the order
+they already had.
+
+**The bound is only safe because the count survives it.** `Response` carries
+`shown + hidden == total` and clients enforce it, so a bounded read that also
+shrank `total` would turn "66 of 80,000" into "66 of 66" — a capped list
+reporting itself as the whole truth. `DeadPage` therefore carries
+`total_non_exempt` from a `COUNT(*)` in the same pinned snapshot, and the
+engine restores it as the denominator, the way `explore` already does.
+
+**Writing the test corrected the diagnosis.** With the SQL bound in place the
+allocation test still failed, at 8.8x. The cause was not the row read at all:
+`AnalysisSummary` embeds `dead_symbols: Vec<DeadSymbolReport>`, a second
+complete copy of the very list being paged, and `dead_page` deserialized the
+whole summary to read one status field. Measured on the benchmark corpus, the
+stored blob is 10,122,764 bytes and 10,084,001 of them — 99.6% — are that list.
+Bounding the SQL read while parsing the blob accomplishes nothing.
+
+So the fix is two halves, and each was proved load-bearing by reverting it
+alone:
+
+```text
+both applied                          52 allocations vs 52     1.0x   pass
+SQL bound reverted, disclosure kept 4,016 vs 413              9.7x   FAIL
+disclosure reverted, SQL bound kept 4,065 vs 462              8.8x   FAIL
+```
+
+The second half is `AnalysisDisclosure`: the scalar fields a coverage
+disclosure needs, read from the same JSON, with serde stepping over the two
+vectors instead of building them. No second format and no second writer —
+`analysis_disclosure_agrees_with_the_summary_it_reads` pins the two together,
+because a field that drifts out of the disclosure would silently start reading
+as its default, and "0 unattributed calls" is exactly the reassuring answer
+this type must never invent.
+
+**Measured, interleaved, both binaries warm**, four rounds on the 330,000-edge
+corpus:
+
+```text
+dead_symbols warm p50   before  42.96  40.69  39.15  49.19   median 41.83 ms
+                        after   14.93  25.39  14.60  13.78   median 14.77 ms
+                                                             -65% (2.8x)
+```
+
+All eight runs answered `shown=66 total=80000`, so neither the answer nor the
+denominator moved. Three of the four `after` rounds sit in 13.8–14.9 ms; the
+25.39 outlier was three concurrent agent lanes competing for the machine, and
+is reported rather than dropped.
+
+**What this did not fix, measured.** Allocations fell 78x (4,065 to 52) but
+wall clock only 2.8x, and the gap is the point: the 10 MB blob is still
+`SELECT`ed whole into a Rust `String` and still lexed end to end. Skipping a
+field is cheap per token but there are 10 MB of tokens. Two further fixes
+remain, in increasing order of value and risk: extract the scalars with
+`json_extract` inside SQLite so the blob never crosses into Rust at all; or,
+at the root, stop storing `dead_symbols` in `analysis_json` when
+`generation_dead_symbols` already holds it — a stored-format change, so a
+migration question rather than a patch.
+
+`Store::latest_dead_symbols` stays unbounded and unfiltered on purpose. Its
+callers compare whole generations for incremental-vs-cold equivalence, where an
+omitted row is the failure they exist to detect. Conflating the two reads broke
+exactly those seven tests during this work, which is how the distinction got
+documented on the function.

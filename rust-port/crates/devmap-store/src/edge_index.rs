@@ -224,8 +224,10 @@ impl GenerationEdges {
 
     /// A one-direction view a bounded walk can consume.
     ///
-    /// `reverse` must match the `TraversalOptions::reverse` the view is handed
-    /// to; that is the whole contract of [`GraphIndex`].
+    /// The direction travels with the view, so a walk cannot be given a
+    /// direction that disagrees with the adjacency it reads — see
+    /// [`GraphIndex::reverse`]. Three words over the shared index, so a caller
+    /// that needs both directions holds both for the cost of two pointers.
     pub fn directed(&self, reverse: bool, min_confidence: f32) -> DirectedEdges<'_> {
         DirectedEdges {
             index: self,
@@ -274,7 +276,18 @@ pub struct DirectedEdges<'a> {
     min_confidence: f32,
 }
 
+impl DirectedEdges<'_> {
+    /// The confidence floor this view was built with.
+    pub fn min_confidence(&self) -> f32 {
+        self.min_confidence
+    }
+}
+
 impl GraphIndex for DirectedEdges<'_> {
+    fn reverse(&self) -> bool {
+        self.reverse
+    }
+
     fn neighbors(&self, node: &str) -> &[u32] {
         if self.reverse {
             self.index.into_target_symbol(node)

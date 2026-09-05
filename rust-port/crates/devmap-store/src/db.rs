@@ -480,6 +480,49 @@ pub struct WalCheckpointResult {
     pub checkpointed_frames: i64,
 }
 
+/// A caller listing and the unfiltered total it is measured against, from one
+/// generation.
+///
+/// `preview` reports how many callers the confidence floor excluded, as
+/// `count_callers_of(.., 0.0) - callers.len()`. Taken from two separate reads
+/// those numbers can describe two generations, and the subtraction is
+/// saturating — so when the newer generation has fewer callers the difference
+/// clamps to zero and `preview` reports that the floor hid nothing. "No
+/// ambiguous callers" and "I counted a different corpus" then look identical,
+/// which is the reading that lets an edit through as safe.
+#[derive(Debug, Clone)]
+pub struct CallersPage {
+    pub generation: u32,
+    /// Callers at or above the requested floor.
+    pub callers: Vec<StoredEdge>,
+    /// Callers at floor 0.0 — the denominator the floor is measured against.
+    pub total_unfiltered: usize,
+}
+
+/// The dead-symbol rows and the analysis that qualifies them, from one
+/// generation.
+///
+/// `dead_symbols` attaches a coverage disclosure derived from
+/// `AnalysisSummary` to rows read separately. Two reads, two generations: the
+/// disclosure could say the corpus was fully covered while the rows came from a
+/// generation that was not, which is the exact combination that promotes a
+/// finding from "look at this" to "safe to delete".
+#[derive(Debug, Clone)]
+pub struct DeadPage {
+    pub generation: u32,
+    pub analysis: Option<AnalysisDisclosure>,
+    /// Non-exempt rows, ranked, at most the requested limit.
+    pub rows: Vec<DeadSymbolReport>,
+    /// Every non-exempt row in this generation, independent of the limit.
+    ///
+    /// The denominator, and the reason the limit is safe. `Response` carries
+    /// `shown + hidden == total` and clients enforce it, so a bounded read that
+    /// also shrank the count would not merely under-report — it would turn
+    /// "66 of 80,000" into "66 of 66", which is the flattering reading of a
+    /// list that was cut off.
+    pub total_non_exempt: usize,
+}
+
 /// One consistent snapshot of a search: the matching rows, the count they were
 /// drawn from, and the repo root they resolve against — all from the same
 /// generation. See [`Store::search_page`] for why they must travel together.
@@ -3068,6 +3111,15 @@ impl Store {
     /// encoding of `AnalysisStatus` stays owned by its derive, and this method
     /// does not hand-decode variant names that a future variant would silently
     /// fall out of.
+    ///
+    /// Not the same reader as [`devmap_analyze::model::AnalysisDisclosure`],
+    /// deliberately, and the difference is where the bytes stop. The disclosure
+    /// steps serde over the summary's vectors, which still transfers the whole
+    /// blob out of SQLite — the right trade inside `dead_page`, which is
+    /// already reading that snapshot and needs five fields from it. This wants
+    /// one field on a surface a health check polls, so the extraction happens
+    /// in SQLite and the blob never crosses. Both decode `AnalysisStatus`
+    /// through its own derive, so neither can drift from the writer.
     pub fn latest_analysis_status(&self) -> Result<Option<AnalysisStatus>> {
         let conn = lock_conn(&self.conn)?;
         // One snapshot for the generation id and the row it names, for the same
@@ -3576,6 +3628,16 @@ impl Store {
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(0);
         };
+        Self::count_callers_in(&snapshot, gen, &unique, exclude_file, min_confidence)
+    }
+
+    fn count_callers_in(
+        snapshot: &Connection,
+        gen: u32,
+        unique: &[&String],
+        exclude_file: &str,
+        min_confidence: f32,
+    ) -> Result<usize> {
         let mut total: usize = 0;
         for chunk in unique.chunks(Self::MAX_CALLER_BATCH) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
@@ -3634,6 +3696,16 @@ impl Store {
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(Vec::new());
         };
+        Self::callers_in(&snapshot, gen, &unique, exclude_file, min_confidence)
+    }
+
+    fn callers_in(
+        snapshot: &Connection,
+        gen: u32,
+        unique: &[&String],
+        exclude_file: &str,
+        min_confidence: f32,
+    ) -> Result<Vec<StoredEdge>> {
         let mut out: Vec<StoredEdge> = Vec::new();
         for chunk in unique.chunks(Self::MAX_CALLER_BATCH) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
@@ -3861,11 +3933,151 @@ impl Store {
         Ok(Some((gen, rows.collect::<Result<Vec<_>>>()?)))
     }
 
+    /// The callers of `names` and the unfiltered total, against one generation.
+    ///
+    /// `callers_of` and `count_callers_of` each open their own snapshot, so a
+    /// caller that needs both numbers to agree cannot get that by calling them
+    /// in sequence — which is what `preview` was doing. See [`CallersPage`].
+    pub fn callers_page(
+        &self,
+        names: &[String],
+        exclude_file: &str,
+        min_confidence: f32,
+    ) -> Result<Option<CallersPage>> {
+        let min_confidence = checked_min_confidence(min_confidence)?;
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        if names.is_empty() {
+            return Ok(Some(CallersPage {
+                generation,
+                callers: Vec::new(),
+                total_unfiltered: 0,
+            }));
+        }
+        let unique: Vec<&String> = {
+            let mut seen = BTreeSet::new();
+            names.iter().filter(|name| seen.insert(*name)).collect()
+        };
+        Ok(Some(CallersPage {
+            generation,
+            callers: Self::callers_in(
+                &snapshot,
+                generation,
+                &unique,
+                exclude_file,
+                min_confidence,
+            )?,
+            // The denominator is deliberately unfiltered: the difference from
+            // `callers` is precisely what the floor excluded.
+            total_unfiltered: Self::count_callers_in(
+                &snapshot,
+                generation,
+                &unique,
+                exclude_file,
+                0.0,
+            )?,
+        }))
+    }
+
+    /// The dead-symbol rows and the analysis that qualifies them, against one
+    /// generation. See [`DeadPage`].
+    pub fn dead_page(&self, limit: usize) -> Result<Option<DeadPage>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        let raw: Option<String> = snapshot
+            .query_row(
+                "SELECT analysis_json FROM generations WHERE id = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // Into the disclosure, not the whole summary: the summary embeds a
+        // second copy of the dead-symbol list, so parsing it here would undo
+        // the bound above. See `AnalysisDisclosure`.
+        let analysis = raw
+            .map(|json| {
+                serde_json::from_str::<AnalysisDisclosure>(&json).map_err(|error| {
+                    rusqlite::Error::InvalidParameterName(format!(
+                        "stored generation analysis is invalid: {error}"
+                    ))
+                })
+            })
+            .transpose()?;
+        Ok(Some(DeadPage {
+            generation,
+            analysis,
+            rows: Self::dead_symbols_page_in(&snapshot, generation, limit)?,
+            total_non_exempt: Self::count_dead_non_exempt_in(&snapshot, generation)?,
+        }))
+    }
+
+    /// The ranked head of the non-exempt dead rows.
+    ///
+    /// The exempt filter and the limit both belong in SQL. `dead_symbols`
+    /// discarded exempt rows in Rust after materialising every row of the
+    /// generation, and then the budgeter kept a few dozen: measured at 80,000
+    /// rows read to show 66, and on this repository 6,976 of 7,176 rows read
+    /// were exempt and dropped on arrival. The work was proportional to the
+    /// corpus, never to the answer.
+    ///
+    /// Ordering is unchanged. The old query sorted by `is_exempt` first, so
+    /// filtering on it makes that key constant and leaves the surviving rows in
+    /// exactly the order they already had.
+    fn dead_symbols_page_in(
+        snapshot: &Connection,
+        gen: u32,
+        limit: usize,
+    ) -> Result<Vec<DeadSymbolReport>> {
+        let mut stmt = snapshot.prepare(
+            "SELECT symbol_name, file_path, confidence, is_exempt, exemption_reason
+             FROM generation_dead_symbols
+             WHERE generation_id = ?1 AND is_exempt = 0
+             ORDER BY confidence DESC, file_path, symbol_name, ordinal
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![gen, i64::try_from(limit).unwrap_or(i64::MAX)],
+            |row| {
+                Ok(DeadSymbolReport {
+                    symbol_name: row.get(0)?,
+                    file_path: row.get(1)?,
+                    confidence: row.get(2)?,
+                    is_exempt: row.get::<_, i64>(3)? != 0,
+                    exemption_reason: row.get(4)?,
+                })
+            },
+        )?;
+        rows.collect()
+    }
+
+    fn count_dead_non_exempt_in(snapshot: &Connection, gen: u32) -> Result<usize> {
+        snapshot.query_row(
+            "SELECT COUNT(*) FROM generation_dead_symbols
+             WHERE generation_id = ?1 AND is_exempt = 0",
+            params![gen],
+            |row| row.get::<_, i64>(0).map(|count| count as usize),
+        )
+    }
+
     pub fn latest_dead_symbols(&self) -> Result<Vec<DeadSymbolReport>> {
         let conn = lock_conn(&self.conn)?;
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(Vec::new());
         };
+        Self::dead_symbols_in(&snapshot, gen)
+    }
+
+    /// Every dead-symbol row of a generation, exempt ones included.
+    ///
+    /// Deliberately unbounded and unfiltered: its callers compare whole
+    /// generations for incremental-vs-cold equivalence, where an omitted row is
+    /// the failure they exist to detect. The bounded, non-exempt read the query
+    /// engine wants is [`Store::dead_symbols_page_in`].
+    fn dead_symbols_in(snapshot: &Connection, gen: u32) -> Result<Vec<DeadSymbolReport>> {
         let mut stmt = snapshot.prepare(
             "SELECT symbol_name, file_path, confidence, is_exempt, exemption_reason
              FROM generation_dead_symbols

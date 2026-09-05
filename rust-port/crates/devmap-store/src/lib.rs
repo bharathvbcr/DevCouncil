@@ -7,10 +7,10 @@ pub mod extract_cache;
 pub mod schema;
 
 pub use db::{
-    checked_min_confidence, current_git_head, BuildHistoryRow, GenerationWriteOpts, PendingClaim,
-    PendingEnqueueReport, PendingReconcile, PendingSupersede, SearchPage, Store, StoreStatus,
-    StoredEdge, StoredFile, StoredSymbol, VacuumAction, VacuumOutcome, WalCheckpointMode,
-    WalCheckpointResult, WriterLock, MAX_PENDING_ATTEMPTS,
+    checked_min_confidence, current_git_head, BuildHistoryRow, CallersPage, DeadPage,
+    GenerationWriteOpts, PendingClaim, PendingEnqueueReport, PendingReconcile, PendingSupersede,
+    SearchPage, Store, StoreStatus, StoredEdge, StoredFile, StoredSymbol, VacuumAction,
+    VacuumOutcome, WalCheckpointMode, WalCheckpointResult, WriterLock, MAX_PENDING_ATTEMPTS,
 };
 pub use edge_index::{edge_kind_from_stored, DirectedEdges, GenerationEdges, UnknownEdgeKind};
 #[cfg(feature = "parse")]
