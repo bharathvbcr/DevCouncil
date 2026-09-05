@@ -28,7 +28,7 @@ from pathlib import Path
 
 from devcouncil.executors.advisor_tool import ADVISOR_STEERING_NUDGE
 from devcouncil.knowledge.frontmatter import build_frontmatter_markdown
-from devcouncil.integrations.clients.hooks import SESSION_START_MATCHER
+from devcouncil.integrations.clients.hooks import claude_hook_specs
 
 # Tools a DevCouncil subagent should be allowed to use: the standard read/edit/run set
 # plus the DevCouncil MCP tools it drives the task loop with. Listing the MCP tools keeps
@@ -439,8 +439,14 @@ def _marketplace_json(version: str) -> str:
     return json.dumps(manifest, indent=2) + "\n"
 
 
-def _plugin_hooks_json(*, write_gate: bool = False) -> str:
+def _plugin_hooks_json(root: Path, *, write_gate: bool = False) -> str:
     """hooks.json for the plugin, resolving the project root via ${CLAUDE_PROJECT_DIR}.
+
+    The event/matcher/timeout table is the shared ``claude_hook_specs`` one that
+    ``_install_claude_hooks`` writes into ``.claude/settings.local.json``, so the plugin
+    bundle and the settings file cannot describe different hooks. Only the command string
+    differs: the plugin resolves the project at runtime via ``${CLAUDE_PROJECT_DIR}``
+    instead of baking in an absolute path.
 
     Assist-mode by default installs refresh-only PostToolUse (never gates writes) plus
     lifecycle hooks. The blocking PreToolUse write-gate is included only when
@@ -448,20 +454,14 @@ def _plugin_hooks_json(*, write_gate: bool = False) -> str:
     def cmd(event: str) -> str:
         return f'devcouncil hook {event} --client claude --project-root "${{CLAUDE_PROJECT_DIR}}"'
 
-    tool_matcher = "Bash|Write|Edit|MultiEdit"
-    hooks: dict[str, list] = {
-        "PostToolUse": [{"matcher": tool_matcher, "hooks": [{"type": "command", "command": cmd("post-tool-use"), "timeout": 10000}]}],
-        "Stop": [{"hooks": [{"type": "command", "command": cmd("agent-response"), "timeout": 150000}]}],
-        "SessionStart": [{"matcher": SESSION_START_MATCHER, "hooks": [{"type": "command", "command": cmd("session-start"), "timeout": 10000}]}],
-        "UserPromptSubmit": [{"hooks": [{"type": "command", "command": cmd("user-prompt-submit"), "timeout": 10000}]}],
-        "SessionEnd": [{"hooks": [{"type": "command", "command": cmd("session-end"), "timeout": 10000}]}],
-        "PreCompact": [{"hooks": [{"type": "command", "command": cmd("pre-compact"), "timeout": 10000}]}],
-        "PostCompact": [{"hooks": [{"type": "command", "command": cmd("post-compact"), "timeout": 10000}]}],
-        "SubagentStop": [{"hooks": [{"type": "command", "command": cmd("subagent-stop"), "timeout": 150000}]}],
-        "Notification": [{"hooks": [{"type": "command", "command": cmd("notification"), "timeout": 10000}]}],
-    }
-    if write_gate:
-        hooks["PreToolUse"] = [{"matcher": tool_matcher, "hooks": [{"type": "command", "command": cmd("pre-tool-use"), "timeout": 10000}]}]
+    hooks: dict[str, list] = {}
+    for spec in claude_hook_specs(write_gate=write_gate):
+        group: dict = {}
+        if spec.matcher:
+            group["matcher"] = spec.matcher
+        # timeout is in SECONDS -- Claude Code's documented unit for the hook field.
+        group["hooks"] = [{"type": "command", "command": cmd(spec.hook_event), "timeout": spec.timeout(root)}]
+        hooks.setdefault(spec.event, []).append(group)
     return json.dumps({"hooks": hooks}, indent=2) + "\n"
 
 
@@ -619,7 +619,7 @@ def build_plugin_bundle(
     assets: list[GeneratedAsset] = [
         GeneratedAsset(market_root / ".claude-plugin" / "marketplace.json", _marketplace_json(version)),
         GeneratedAsset(plugin / ".claude-plugin" / "plugin.json", _plugin_json(version)),
-        GeneratedAsset(plugin / "hooks" / "hooks.json", _plugin_hooks_json(write_gate=write_gate)),
+        GeneratedAsset(plugin / "hooks" / "hooks.json", _plugin_hooks_json(root, write_gate=write_gate)),
         GeneratedAsset(plugin / ".mcp.json", _plugin_mcp_json(root)),
         GeneratedAsset(plugin / "README.md", _plugin_readme()),
     ]
