@@ -49,12 +49,12 @@ def gate_mode_of(config: object) -> GateMode:
 def gate_mode(project_root: Path) -> GateMode:
     """Resolve the project's gate posture, preserving the fail-closed default.
 
-    The one owner of a shape that had been copied into nine modules: load the
-    config, read ``gates.mode``, and answer ``enforce`` if anything at all goes
-    wrong (no project yet, unreadable YAML, a validation error). Because each
-    copy re-derived the type from ``getattr``, every consumer of
-    :func:`apply_gate_enforcement` and :func:`effective_artifact_graph` received
-    an unchecked ``str``.
+    The one owner of a shape that had been written out twelve times across
+    eleven modules: load the config, read ``gates.mode``, and answer ``enforce``
+    if anything at all goes wrong (no project yet, unreadable YAML, a validation
+    error). Because each copy re-derived the type from ``getattr``, every
+    consumer of :func:`apply_gate_enforcement` and
+    :func:`effective_artifact_graph` received an unchecked ``str``.
     """
     try:
         from devcouncil.app.config import load_config

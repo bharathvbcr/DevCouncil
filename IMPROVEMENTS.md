@@ -1436,3 +1436,97 @@ observed once earlier; it stays recorded as observed-once, not as a defect.
 * `repomap` and `devmap.Client` have **no production caller** in this repository — no `main`
   package, and the only importer is a test.
 * Nothing reads the interned `code_graph` encoding yet.
+
+## Python typing: mypy to zero (2026-09-05)
+
+CI runs `uv run --python 3.12 mypy src` as a hard gate (`.github/workflows/ci.yml`), and the
+tree had drifted to **44 errors across 23 files**. They were not 44 problems. They were six
+shapes, each with an owner, and the count is what a per-site suppression pass would have
+hidden. `mypy src` now reports `Success: no issues found in 387 source files`; `ruff check
+src tests` is clean; no `# type: ignore` was added, and nothing was widened to `Any`.
+
+**No behaviour was changed anywhere.** Five of the six classes were purely a type the code
+had outgrown. The sixth turned out to close a real fail-open, described below.
+
+### The six classes, and where each was fixed
+
+1. **`Tool(inputSchema=...)` / `Resource(mimeType=...)` — 18 sites.** `0a6b97d` had already
+   moved `handlers/tool_specs.py` off the camelCase wire aliases (mypy rejects them; the SDK
+   accepts both via `populate_by_name`), but the three handlers that build their own literals
+   were left behind. All now use the field names, so the package has one spelling rather than
+   two that happen to agree. Serialization is `by_alias`, so the wire is untouched — pinned by
+   `test_mcp_contract.py::test_every_advertised_tool_serialises_its_schema_as_inputschema`
+   and its resource twin, which are discriminating: the same assertion over
+   `model_dump(by_alias=False)` names all 73 tools.
+
+2. **Task-status strings into a `Literal` — 7 sites, one expression.** Every one was
+   `task.status = verification_task_status(...)`, and that producer returned a bare `str`. It
+   now declares the three statuses it can actually produce, and `Task.status` names its
+   vocabulary as `domain.task.TaskStatus`. One of the seven was in another lane's file
+   (`cli/commands/hook.py`); fixing the owner closed it without touching it.
+   `campaign/orchestrator.py` was the same shape one layer out — `TaskOutcome.status` was a
+   `str` with its vocabulary written as a trailing comment, now `CampaignStatus`. Not a logic
+   defect: "failed" vs "blocked" is the real distinction between an executor that produced
+   nothing and a gate that refused, and `_coordinator_rollup` already counts them together.
+
+3. **Gate mode — 4 errors, 12 copies, and a fail-open.** Eleven modules had written the
+   resolution out twelve times, in one of two hand-rolled shapes. `gating.policy` already owned `GateMode` and
+   all three consumers, so it now owns the resolution: `gate_mode(project_root)` and
+   `gate_mode_of(config)`, the first defined in terms of the second, both narrowing at the
+   boundary. That narrowing is a real hardening. `apply_gate_enforcement` branches on
+   `mode == "enforce"` and demotes every non-safety blocker otherwise, so **any value it did
+   not recognise read as "relax the gates"** — with `gates.mode = "Off"` a blocking gap came
+   back `blocking=False`. Unreachable through a validated config, reachable through the two
+   sites that read an already-loaded config object. `cli/commands/status.py` and
+   `cli/commands/report.py` keep their direct reads: they deliberately have no fallback, and
+   routing them through the owner would turn a broken config from a visible error into a
+   silent `enforce`.
+
+4. **`HookDecision` vs `PolicyDecision` — 2 seams.** Not merged: `HookDecision` is narrower on
+   purpose, because a hook-synthesised verdict ("hook_gate mode=off allows this") fired no
+   rule, and `PolicyDecision` derives `severity` from `rule` with an unknown rule failing
+   closed to "hard" — so giving such a verdict a `PolicyDecision` would put a fabricated
+   severity into the vocabulary `contracts/verdict.schema.json` shares with Manvi. The seam is
+   named instead: `policy_engine.Decision`, a protocol of the three members a gate reads, and
+   `PolicyDecision` gains the `allowed` property `HookDecision` already had.
+   `is_command_allowed` keeps its asymmetry (`action == "allow"` on one branch, `.allowed` on
+   the other) — those are different predicates, and reconciling them is a policy decision.
+
+5. **Nine optionals.** Every one already survived a `None` at runtime, so each was fixed by
+   making the code say what it does. Three were a local that meant two things (a 300-line
+   function in `integrations/check.py` used `status` for a config row and, 200 lines later,
+   for hook-file integrity); two were an annotation the value had outgrown; two were one
+   imprecise signature (`effective_live_review` returns `None` only for the `None` it was
+   given — now two overloads); and the last two were one duplicated unwrap. `dev map dead`
+   merges rows from the Rust kernel (confidence is whatever JSON held, possibly absent) with
+   entries from the Python graph (a `Confidence` enum) and unwrapped that inline in the filter
+   and again in the printer, right next to `confidence_at_least`, which already owned the same
+   unwrap. Now `liveness.confidence_label`, used by all three, verified byte-identical to both
+   old expressions across enum / str / "" / None / int.
+
+6. **The lazy CLI group.** `LazyCommandGroup.list_commands` and `.get_command` were annotated
+   `typer.Context`; Click passes a `click.Context` and Typer's is a subclass, so the overrides
+   narrowed a parameter the caller never promised — a Liskov violation on two supertypes at
+   once. `get_command` also bound its local from the first branch (`get_group` returns a
+   `TyperGroup`), so the leaf from the other branch did not fit; both are `click.Command`.
+   `_LAZY_COMMANDS`'s `kind` is now `Literal["typer", "command"]`, so a typo in one of the 75
+   rows is a type error rather than a command that silently resolves to nothing.
+
+### What the tests pin
+
+Five tests, each written against the unmodified code and watched fail:
+
+| test | pre-fix failure |
+|---|---|
+| `test_verifier.py::test_verification_task_status_only_produces_task_statuses` | `assert set() == {'blocked', 'done', 'verified'}` (`get_args(str)` is empty) |
+| `test_gate_policy.py::test_a_posture_outside_the_vocabulary_does_not_disable_enforcement` | `assert [False] == [True]` — the fail-open above |
+| `test_task_policy_engine.py::test_both_engines_agree_on_what_allowed_means` | `AttributeError: 'PolicyDecision' object has no attribute 'allowed'` |
+| `test_mcp_contract.py` (2 tests) | contract pins, not bug repros: labelled as such |
+| `test_liveness_confidence_hardening.py::test_confidence_label_reads_both_producers_the_same_way` | `ImportError` — the shared owner did not exist |
+
+### Still open
+
+* `mypy src` checks only `src/`. `tests/` is unchecked, and `[tool.mypy]` sets neither
+  `disallow_untyped_defs` nor `check_untyped_defs`, so mypy skipped the bodies of every
+  untyped function — it reported that as three `annotation-unchecked` notes. Turning either on
+  is a much larger pass and a decision for the maintainer, not a side effect of this one.
