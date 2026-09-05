@@ -41,8 +41,8 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use devmap_analyze::traversal::{traverse_graph, TraversalOptions};
-use devmap_extract::extract_file;
-use devmap_extract::model::{Confidence, EdgeKind};
+use devmap_extract::model::{Confidence, EdgeKind, ParseOutcome};
+use devmap_extract::treesitter::extract_treesitter_with_budget;
 use devmap_query::{Request, StoreQueryEngine};
 use devmap_resolve::model::ResolvedEdge;
 use devmap_resolve::Resolver;
@@ -113,9 +113,17 @@ fn synthetic_edges(count: usize) -> Vec<ResolvedEdge> {
         .collect()
 }
 
+/// A budget no machine can exhaust — see the note in
+/// `a_fan_out_pays_for_its_index_once_per_direction.rs`. `extract_file` gives a
+/// file five seconds of wall clock and then claims *no symbols at all* for it,
+/// so a fixture sized to hold thousands of edges is one loaded machine away
+/// from holding none, and this file's assertions would then compare two empty
+/// answers while reporting a defect in the query engine.
+const FIXTURE_PARSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// One module with a long call chain plus a caller module, so the store holds
-/// thousands of edges from two `extract_file` calls rather than from thousands
-/// of them. The fan-out cost under test is per *call*, not per edge walked.
+/// thousands of edges from two extractions rather than from thousands of them.
+/// The fan-out cost under test is per *call*, not per edge walked.
 fn chain_store(links: usize) -> (Store, Vec<String>) {
     let mut core = String::new();
     for index in 0..links {
@@ -134,9 +142,17 @@ fn chain_store(links: usize) -> (Store, Vec<String>) {
     }
 
     let extractions = vec![
-        extract_file("core.py", &core),
-        extract_file("callers.py", &callers),
+        extract_treesitter_with_budget("core.py", "python", &core, FIXTURE_PARSE_BUDGET),
+        extract_treesitter_with_budget("callers.py", "python", &callers, FIXTURE_PARSE_BUDGET),
     ];
+    for extraction in &extractions {
+        assert!(
+            matches!(extraction.parse_outcome, ParseOutcome::Clean),
+            "the fixture must be extracted completely, got {:?} for {}",
+            extraction.parse_outcome,
+            extraction.file_path
+        );
+    }
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
     let resolution = resolver.resolve_all(&extractions);

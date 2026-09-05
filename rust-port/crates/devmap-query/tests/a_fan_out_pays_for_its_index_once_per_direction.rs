@@ -24,7 +24,8 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use devmap_extract::extract_file;
+use devmap_extract::model::ParseOutcome;
+use devmap_extract::treesitter::extract_treesitter_with_budget;
 use devmap_query::StoreQueryEngine;
 use devmap_resolve::Resolver;
 use devmap_store::{GenerationWriteOpts, Store};
@@ -65,9 +66,23 @@ fn allocations_during<T>(call: impl FnOnce() -> T) -> (usize, T) {
 
 // ------------------------------------------------------------------ fixture
 
+/// A budget no machine can exhaust, because this fixture's *size* is the
+/// point and its parse time is not.
+///
+/// `extract_file` applies `DEFAULT_PARSE_BUDGET` — five seconds of wall clock,
+/// after which the parse is abandoned and **no symbols are claimed for the
+/// file**. The 312 KB `core.py` below costs 2.9 s of that in a debug build on
+/// an idle machine and 5.0 s on a busy one; measured here, the same fixture
+/// produced `ParseOutcome::Failed { "extraction of 312038 bytes exceeded the 5s
+/// budget … no symbols are claimed for this file" }`, a store holding 9 edges
+/// instead of 12,018, and this test failing on `the fixture must produce real
+/// callers` — a message that reads like a defect in `neighbors` and is not one.
+/// A test whose fixture is decided by machine load reports the machine.
+const FIXTURE_PARSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// One long call chain plus a caller module, so the store holds thousands of
-/// edges from two `extract_file` calls. The cost under test is per *target*,
-/// not per edge walked, so the walks themselves are kept shallow.
+/// edges from two extractions. The cost under test is per *target*, not per
+/// edge walked, so the walks themselves are kept shallow.
 fn chain_store(links: usize) -> (Store, Vec<String>) {
     let mut core = String::new();
     for index in 0..links {
@@ -86,9 +101,21 @@ fn chain_store(links: usize) -> (Store, Vec<String>) {
     }
 
     let extractions = vec![
-        extract_file("core.py", &core),
-        extract_file("callers.py", &callers),
+        extract_treesitter_with_budget("core.py", "python", &core, FIXTURE_PARSE_BUDGET),
+        extract_treesitter_with_budget("callers.py", "python", &callers, FIXTURE_PARSE_BUDGET),
     ];
+    // The fixture states its own precondition. Without this, a refused
+    // extraction surfaces two hundred lines later as an assertion about
+    // `neighbors`, and the first thing a reader does is go looking for a defect
+    // in the query engine.
+    for extraction in &extractions {
+        assert!(
+            matches!(extraction.parse_outcome, ParseOutcome::Clean),
+            "the fixture must be extracted completely, got {:?} for {}",
+            extraction.parse_outcome,
+            extraction.file_path
+        );
+    }
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
     let resolution = resolver.resolve_all(&extractions);
