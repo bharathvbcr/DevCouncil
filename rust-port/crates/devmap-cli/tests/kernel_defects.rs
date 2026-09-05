@@ -694,6 +694,39 @@ fn k7_a_cachedir_tagged_directory_is_never_walked_or_indexed() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// K7: `--affected` naming a path that is not repo-relative is refused.
+///
+/// The MCP `sync` tool forwards `arguments["paths"]` to `--affected` verbatim
+/// (`integrations/mcp/handlers/codeintel.py`), so these strings are agent
+/// input, not just a developer's shell history. `..` and a leading `/` were
+/// walked as if they were repo-relative: the cache check joined them onto the
+/// root and probed a sibling checkout, then reported "no tagged ancestor" —
+/// the same answer it gives a file it checked and cleared. Refusing names the
+/// rule the path broke instead.
+#[test]
+fn k7_affected_paths_that_escape_the_root_are_refused() {
+    let root = fixture("k7-affected-escape");
+    assert!(run(&root, &["build", "."]).status.success());
+
+    for (candidate, expected) in [
+        ("../outside.py", "`..`"),
+        ("src/../../outside.py", "`..`"),
+        ("/etc/passwd", "absolute"),
+    ] {
+        let output = run(&root, &["build", ".", "--affected", candidate]);
+        assert!(
+            !output.status.success(),
+            "--affected {candidate} must be refused, not walked"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(candidate) && stderr.contains(expected),
+            "the refusal must name the path and the rule it broke: {stderr}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// K7: `--affected` naming a path inside a tagged cache directory is refused.
 ///
 /// Fail loud rather than quietly narrow to nothing: a caller passing a cache

@@ -1953,12 +1953,23 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // to be build artifacts.
             let mut caches = devmap_extract::CacheDirectoryCache::default();
             for candidate in split_csv(affected_flag) {
-                if let Some(cache) = caches.tagged_ancestor(path, &candidate) {
-                    anyhow::bail!(
+                match caches.tagged_ancestor(path, &candidate) {
+                    devmap_extract::CacheVerdict::Inside(cache) => anyhow::bail!(
                         "--affected names {candidate}, which is inside {cache} — a build \
                          cache marked with CACHEDIR.TAG. devmap does not index build \
                          caches; drop it from the change set."
-                    );
+                    ),
+                    // Raw command-line input, so this is the one caller that
+                    // can actually be handed `../x` or `/abs/x`. Such a path
+                    // cannot be checked for a tagged ancestor at all, and it
+                    // cannot name a file this build would index either, so
+                    // failing loud beats narrowing the change set in silence.
+                    devmap_extract::CacheVerdict::NotRepoRelative(why) => anyhow::bail!(
+                        "--affected names {candidate}, which {why}. Paths must be \
+                         relative to the repository root {}; drop it from the change set.",
+                        path.display()
+                    ),
+                    devmap_extract::CacheVerdict::Outside => {}
                 }
             }
 
