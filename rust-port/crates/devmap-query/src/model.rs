@@ -1,3 +1,4 @@
+use devmap_resolve::model::ResolvedEdge;
 use serde::{Deserialize, Serialize};
 
 pub struct Budget;
@@ -17,6 +18,30 @@ pub struct Request<Q> {
     pub max_depth: usize,
 }
 
+/// Both call-graph directions for one target, answered in a single pass.
+///
+/// The MCP `graph_query` view needs callers *and* callees for each of the
+/// first few definitions a search returns. Asking for them one at a time cost
+/// two round trips per definition — eleven for a five-definition view — and
+/// under the CLI transport a round trip is a process spawn, which is why that
+/// view stayed at ~1.1 s no matter how fast the store got. The composition is
+/// the cost, so the composition is what moved into the kernel.
+///
+/// `callers` and `callees` are whole [`Response`] values, not bare edge lists,
+/// so each direction keeps its own `resolution`, budget counters and
+/// `walk_incomplete`. A target whose inbound walk was capped must not be
+/// readable as one that has no callers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Neighbors {
+    /// Echoed verbatim from the request, so a caller can align the answers
+    /// with what it asked for without assuming the kernel preserved order.
+    pub target: String,
+    /// Inbound edges — what reaches this target.
+    pub callers: Response<ResolvedEdge>,
+    /// Outbound edges — what this target reaches.
+    pub callees: Response<ResolvedEdge>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolutionAvailability {
     Available,
@@ -32,6 +57,16 @@ pub struct Response<T> {
     pub truncated: bool,
     pub tokens_used: u32,
     pub resolution: ResolutionAvailability,
+    /// Set when the *producer* of `items` stopped early, as distinct from the
+    /// token budgeter trimming a complete set.
+    ///
+    /// `shown`/`hidden`/`total`/`truncated` describe the budget, and clients
+    /// enforce `shown + hidden == total` against them, so a walk that withheld
+    /// an unknown quantity cannot be expressed there without breaking that
+    /// invariant. It is `None` on a complete answer and omitted from the wire
+    /// form, so nothing changes for a query that ran to completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub walk_incomplete: Option<String>,
 }
 
 /// What a map query cost, against what answering it by reading files would have.

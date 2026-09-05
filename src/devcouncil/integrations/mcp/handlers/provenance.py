@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from mcp.types import Resource, TextContent
@@ -36,7 +37,7 @@ async def handle_get_task_provenance(root: Path, db: object, arguments: dict) ->
     if arg_error:
         return arg_error
     assert task_id is not None
-    payload, cli_error = run_cli_json(["provenance", task_id, "--json"], root)
+    payload, cli_error = await asyncio.to_thread(run_cli_json, ["provenance", task_id, "--json"], root)
     if cli_error:
         return cli_error
     assert payload is not None
@@ -46,7 +47,7 @@ async def handle_get_task_provenance(root: Path, db: object, arguments: dict) ->
 async def list_resources(root: Path) -> list[Resource]:
     """Expose the DevCouncil corpus as browsable MCP resources."""
     payload, _cli_error = parse_cli_json(
-        run_cli_command(["resource", "list", "--json"], root, truncate=False),
+        await asyncio.to_thread(run_cli_command, ["resource", "list", "--json"], root, truncate=False),
     )
     if payload is not None:
         descriptors = payload.get("resources") or []
@@ -77,7 +78,7 @@ async def list_resources(root: Path) -> list[Resource]:
 
 async def read_resource(root: Path, uri: str) -> str:
     key = uri.rstrip("/")
-    result = run_cli_command(["resource", "read", key], root, truncate=False)
+    result = await asyncio.to_thread(run_cli_command, ["resource", "read", key], root, truncate=False)
     stdout = result.get("stdout")
     if result.get("ok") and stdout is not None:
         return str(stdout)

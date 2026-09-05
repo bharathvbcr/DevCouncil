@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from mcp.types import TextContent
@@ -32,7 +33,7 @@ async def handle_get_task(root: Path, db: object, arguments: dict) -> list[TextC
     if arg_error:
         return arg_error
     assert task_id is not None
-    payload, cli_error = run_cli_json(["show", task_id, "--json"], root)
+    payload, cli_error = await asyncio.to_thread(run_cli_json, ["show", task_id, "--json"], root)
     if cli_error:
         return cli_error
     assert payload is not None
@@ -48,7 +49,7 @@ async def handle_get_prompt(root: Path, db: object, arguments: dict) -> list[Tex
     if arg_error:
         return arg_error
     assert task_id is not None
-    payload, cli_error = run_cli_json(["prompt", task_id, "--json"], root)
+    payload, cli_error = await asyncio.to_thread(run_cli_json, ["prompt", task_id, "--json"], root)
     if cli_error:
         return cli_error
     assert payload is not None
@@ -70,14 +71,14 @@ async def handle_prepare_execution(root: Path, db: object, arguments: dict) -> l
     if arg_error:
         return arg_error
     assert task_id is not None
-    show_payload, show_error = run_cli_json(["show", task_id, "--json"], root)
+    show_payload, show_error = await asyncio.to_thread(run_cli_json, ["show", task_id, "--json"], root)
     if show_error:
         return show_error
     assert show_payload is not None
     task = show_payload.get("task")
     if not isinstance(task, dict):
         return error_text(f"Task {task_id} not found.", code="not_found", task_id=str(task_id))
-    prompt_payload, prompt_error = run_cli_json(["prompt", task_id, "--json"], root)
+    prompt_payload, prompt_error = await asyncio.to_thread(run_cli_json, ["prompt", task_id, "--json"], root)
     if prompt_error:
         return prompt_error
     assert prompt_payload is not None

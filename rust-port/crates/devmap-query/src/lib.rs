@@ -23,7 +23,7 @@ pub use code_graph::{
 pub use engine::{
     budget_take, clone_group_tokens, link_candidates, parse_clone_kind, resolved_edge_from_stored,
     workspace_search, PathOutsideRepoRoot, QueryEngine, StoreQueryEngine, BYTES_PER_TOKEN,
-    PREVIEW_CALLER_MIN_CONFIDENCE,
+    MAX_NEIGHBOR_TARGETS, PREVIEW_CALLER_MIN_CONFIDENCE,
 };
 pub use escape::{html_escape, render_symbol_label};
 pub use manifest::{

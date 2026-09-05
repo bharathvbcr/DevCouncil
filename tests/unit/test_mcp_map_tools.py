@@ -439,9 +439,12 @@ async def test_repo_map_summary_symbols_listed(tmp_path, monkeypatch):
     assert out["symbols"] == []  # top_level.py has no graph nodes
 
 
-def test_symbols_for_path_no_graph(tmp_path, monkeypatch):
+def test_symbols_for_path_no_graph_is_unavailable(tmp_path, monkeypatch):
     monkeypatch.setattr("devcouncil.indexing.graph.build.load_code_graph", lambda root: None)
-    assert mapmod._symbols_for_path(tmp_path, "a.py") == []
+    scan = mapmod._symbols_for_path(tmp_path, "a.py")
+    assert scan.ok is False
+    assert scan.items == []
+    assert "no code graph" in scan.reason
 
 
 def test_symbols_for_path_lists_symbols(tmp_path, monkeypatch):
@@ -456,17 +459,22 @@ def test_symbols_for_path_lists_symbols(tmp_path, monkeypatch):
         "devcouncil.indexing.graph.build.load_code_graph",
         lambda root: SimpleNamespace(nodes=nodes),
     )
-    out = mapmod._symbols_for_path(tmp_path, "a.py")
-    names = {s["name"] for s in out}
+    scan = mapmod._symbols_for_path(tmp_path, "a.py")
+    assert scan.ok is True
+    names = {s["name"] for s in scan.items}
     assert names == {"f", "C"}  # 'file' kind excluded
+    assert scan.total == 2 and scan.truncated is False
 
 
-def test_symbols_for_path_swallows_error(tmp_path, monkeypatch):
+def test_symbols_for_path_reports_the_error_it_used_to_swallow(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "devcouncil.indexing.graph.build.load_code_graph",
         lambda root: (_ for _ in ()).throw(RuntimeError("boom")),
     )
-    assert mapmod._symbols_for_path(tmp_path, "a.py") == []
+    scan = mapmod._symbols_for_path(tmp_path, "a.py")
+    assert scan.ok is False
+    assert scan.items == []
+    assert "boom" in scan.reason
 
 
 # ---- handle_impact branches ---------------------------------------------------
@@ -558,17 +566,31 @@ async def test_liveness_non_list_entry_roots(tmp_path, monkeypatch):
 
 # ---- _structured_dead_code ----------------------------------------------------
 
-def test_structured_dead_code_no_graph(tmp_path, monkeypatch):
+def test_structured_dead_code_no_graph_is_unavailable_not_clean(tmp_path, monkeypatch):
+    """No graph is "could not look", not "looked and found nothing"."""
     monkeypatch.setattr("devcouncil.indexing.graph.build.load_code_graph", lambda root: None)
-    assert mapmod._structured_dead_code(tmp_path, area=None, path_prefix=None) == ([], 0)
+    scan = mapmod._structured_dead_code(tmp_path, area=None, path_prefix=None)
+    assert scan.ok is False
+    assert scan.items == []
+    assert "no code graph" in scan.reason
 
 
-def test_structured_dead_code_swallows_error(tmp_path, monkeypatch):
+def test_structured_dead_code_reports_the_error_it_used_to_swallow(tmp_path, monkeypatch):
+    """Rewritten: this test used to assert the swallow (``== ([], 0)``).
+
+    That encoded the defect as the contract — a crashing dead-code scan was
+    indistinguishable from a repository with no dead code, which is exactly the
+    Class A failure this module exists to prevent. The honest contract is an
+    unavailable scan carrying the reason.
+    """
     monkeypatch.setattr(
         "devcouncil.indexing.graph.build.load_code_graph",
         lambda root: (_ for _ in ()).throw(RuntimeError("boom")),
     )
-    assert mapmod._structured_dead_code(tmp_path, area=None, path_prefix=None) == ([], 0)
+    scan = mapmod._structured_dead_code(tmp_path, area=None, path_prefix=None)
+    assert scan.ok is False
+    assert scan.items == []
+    assert "boom" in scan.reason
 
 
 # ---- graph query / trace / impact ---------------------------------------------
@@ -670,7 +692,11 @@ async def test_liveness_scope_without_entry_roots_stays_reliable(tmp_path, monke
     payload = json.loads(result[0].text)
     assert payload["ok"] is True
     assert payload["unreachable_unreliable"] is False
-    assert "warning" not in payload
+    # Narrowed from `"warning" not in payload`: this fixture has no code graph,
+    # so the response now also carries an honest "dead-code scan unavailable"
+    # warning. The subject of this test is the *unreachable* warning, which must
+    # still be absent.
+    assert "unreachable_files omitted" not in payload.get("warning", "")
     assert payload["unreachable_files"] == ["src/orphan.py"]
     # The scoped entry_roots view is empty — that's fine and expected.
     assert payload["entry_roots"] == []
@@ -703,3 +729,262 @@ async def test_graph_ingest_paths_branch_reports_engine_unavailable(tmp_path, mo
     payload = json.loads(result[0].text)
     assert payload["ok"] is False
     assert payload["code"] == "engine_unavailable"
+
+
+# ---- Class A: unavailable is never a clean bill of health ----------------------
+
+
+def _fake_dead_graph(count, *, confidence=None):
+    from devcouncil.indexing.graph.schema import CodeGraph, Confidence, DeadCodeEntry
+
+    conf = confidence or Confidence.INFERRED
+    return CodeGraph(
+        schema_version=2,
+        nodes=[],
+        edges=[],
+        dead_code=[
+            DeadCodeEntry(
+                id=f"a.py::dead_{i}",
+                path="a.py",
+                line=i + 1,
+                kind="function",
+                confidence=conf,
+                reason="no inbound call edges",
+            )
+            for i in range(count)
+        ],
+    )
+
+
+@pytest.mark.anyio
+async def test_liveness_dead_code_unavailable_is_not_a_clean_bill(tmp_path, monkeypatch):
+    _write_repo_map(tmp_path)
+    monkeypatch.setattr(
+        "devcouncil.integrations.mcp.handlers.map.RepoMapper.map_is_stale", lambda self, d: False
+    )
+    monkeypatch.setattr("devcouncil.devmap_client.try_connect", lambda root: None)
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.build.load_code_graph",
+        lambda root: (_ for _ in ()).throw(RuntimeError("store locked")),
+    )
+
+    out = _parse(await mapmod.handle_liveness(tmp_path, {}))
+
+    assert out["dead_code"] == []
+    assert out["dead_code_available"] is False
+    assert "store locked" in out["dead_code_reason"]
+    assert out["dead_code_hidden"] is None
+    assert out["dead_code_total"] is None
+    assert "dead-code scan unavailable" in out["warning"]
+
+
+@pytest.mark.anyio
+async def test_liveness_dead_code_carries_total_beside_the_cap(tmp_path, monkeypatch):
+    _write_repo_map(tmp_path)
+    monkeypatch.setattr(
+        "devcouncil.integrations.mcp.handlers.map.RepoMapper.map_is_stale", lambda self, d: False
+    )
+    monkeypatch.setattr("devcouncil.devmap_client.try_connect", lambda root: None)
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.build.load_code_graph", lambda root: _fake_dead_graph(250)
+    )
+
+    out = _parse(await mapmod.handle_liveness(tmp_path, {}))
+
+    assert len(out["dead_code"]) == 200
+    assert out["dead_code_available"] is True
+    assert out["dead_code_shown"] == 200
+    assert out["dead_code_total"] == 250
+    assert out["dead_code_truncated"] is True
+    # 50 candidates were dropped by the 200 cap; `dead_code_hidden` used to
+    # count only the confidence filter and so reported 0 here.
+    assert out["dead_code_hidden"] == 50
+    assert out["dead_code_hidden_low_confidence"] == 0
+
+
+@pytest.mark.anyio
+async def test_liveness_dead_code_hidden_sums_confidence_and_cap(tmp_path, monkeypatch):
+    from devcouncil.indexing.graph.schema import CodeGraph, Confidence, DeadCodeEntry
+
+    _write_repo_map(tmp_path)
+    monkeypatch.setattr(
+        "devcouncil.integrations.mcp.handlers.map.RepoMapper.map_is_stale", lambda self, d: False
+    )
+    monkeypatch.setattr("devcouncil.devmap_client.try_connect", lambda root: None)
+    graph = CodeGraph(
+        schema_version=2,
+        nodes=[],
+        edges=[],
+        dead_code=[
+            DeadCodeEntry(
+                id=f"a.py::dead_{i}",
+                path="a.py",
+                line=i + 1,
+                kind="function",
+                confidence=Confidence.INFERRED if i < 250 else Confidence.AMBIGUOUS,
+                reason="no inbound call edges",
+            )
+            for i in range(255)
+        ],
+    )
+    monkeypatch.setattr("devcouncil.indexing.graph.build.load_code_graph", lambda root: graph)
+
+    out = _parse(await mapmod.handle_liveness(tmp_path, {}))
+
+    assert out["dead_code_total"] == 255
+    assert out["dead_code_shown"] == 200
+    assert out["dead_code_hidden_low_confidence"] == 5
+    assert out["dead_code_hidden"] == 55
+
+
+def test_graph_degraded_fields_unknown_without_a_map(tmp_path):
+    fields = mapmod._graph_degraded_fields(tmp_path)
+    assert fields["graph_degraded"] is None
+    assert "repo map" in fields["graph_degraded_reason"]
+
+
+def test_graph_degraded_fields_known_with_a_map(tmp_path):
+    dev = tmp_path / ".devcouncil"
+    dev.mkdir()
+    (dev / "repo_map.json").write_text(json.dumps({"languages": []}), encoding="utf-8")
+    assert mapmod._graph_degraded_fields(tmp_path)["graph_degraded"] is False
+
+
+# ---- Class A: `ok` is derived from the payload, never asserted -----------------
+
+
+@pytest.mark.anyio
+async def test_graph_query_error_payload_is_not_ok(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.query_symbol",
+        lambda root, name: {"error": "no code graph; run `dev map` first", "query": name},
+    )
+    out = _parse(await mapmod.handle_graph_query(tmp_path, {"name_or_path": "foo"}))
+    assert out["ok"] is False
+    assert out["code"] == "graph_unavailable"
+    assert out["error"] == "no code graph; run `dev map` first"
+
+
+@pytest.mark.anyio
+async def test_graph_trace_error_payload_is_not_ok(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.trace_path",
+        lambda root, a, b: {"error": "no code graph; run `dev map` first", "from": a, "to": b},
+    )
+    out = _parse(await mapmod.handle_graph_trace(tmp_path, {"from": "a", "to": "b"}))
+    assert out["ok"] is False
+    assert out["code"] == "graph_unavailable"
+
+
+# ---- Class A: impact always says which engine answered ------------------------
+
+
+@pytest.mark.anyio
+async def test_impact_emits_resolution_without_precise(tmp_path, monkeypatch):
+    _write_repo_map(tmp_path)
+    monkeypatch.setattr(
+        "devcouncil.integrations.mcp.handlers.map.RepoMapper.map_is_stale", lambda self, d: False
+    )
+    monkeypatch.setattr("devcouncil.devmap_client.try_connect", lambda root: None)
+    out = _parse(await mapmod.handle_impact(tmp_path, {"paths": ["src/payments/models.py"]}))
+    item = out["paths"][0]
+    assert item["resolution"] == "import"
+    assert item["resolution_reason"]
+
+
+@pytest.mark.anyio
+async def test_impact_names_the_kernel_failure_behind_the_import_heuristic(tmp_path, monkeypatch):
+    from devcouncil.devmap_client import DevMapClientError
+
+    _write_repo_map(tmp_path)
+    monkeypatch.setattr(
+        "devcouncil.integrations.mcp.handlers.map.RepoMapper.map_is_stale", lambda self, d: False
+    )
+
+    class Broken:
+        def impact(self, path, depth=1):
+            raise DevMapClientError("kernel down")
+
+        def is_map_stale(self):
+            raise DevMapClientError("kernel down")
+
+    monkeypatch.setattr("devcouncil.devmap_client.try_connect", lambda root: Broken())
+    out = _parse(await mapmod.handle_impact(tmp_path, {"paths": ["src/payments/models.py"]}))
+    item = out["paths"][0]
+    assert item["resolution"] == "import"
+    assert "kernel down" in item["resolution_reason"]
+
+
+@pytest.mark.anyio
+async def test_repo_map_symbols_unavailable_is_not_an_empty_file(tmp_path, monkeypatch):
+    _write_repo_map(tmp_path)
+    monkeypatch.setattr(
+        "devcouncil.integrations.mcp.handlers.map.RepoMapper.map_is_stale", lambda self, d: False
+    )
+    monkeypatch.setattr("devcouncil.devmap_client.try_connect", lambda root: None)
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.build.load_code_graph",
+        lambda root: (_ for _ in ()).throw(RuntimeError("graph unreadable")),
+    )
+    out = _parse(await mapmod.handle_repo_map(tmp_path, {"path": "top_level.py"}))
+    assert out["symbols"] == []
+    assert out["symbols_available"] is False
+    assert "graph unreadable" in out["symbols_reason"]
+
+
+@pytest.mark.anyio
+async def test_impact_dependents_total_is_scoped_to_the_engine_that_answered(tmp_path, monkeypatch):
+    """`dependents_total` describes the repo map's import universe.
+
+    When LSP or the kernel replaced `dependents`, that total counts a different
+    set, so pairing it with the replacement list is a wrong "shown of total".
+    """
+    _write_repo_map(
+        tmp_path,
+        dependents={"src/payments/models.py": ["src/payments/gateway.py"]},
+        dependents_total={"src/payments/models.py": 40},
+    )
+    monkeypatch.setattr(
+        "devcouncil.integrations.mcp.handlers.map.RepoMapper.map_is_stale", lambda self, d: False
+    )
+
+    class FakePool:
+        def __init__(self, root):
+            pass
+
+        def dependents_of_file(self, path):
+            return ["src/lsp_caller.py"]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("devcouncil.indexing.lsp_client.LspSessionPool", FakePool)
+    out = _parse(
+        await mapmod.handle_impact(
+            tmp_path, {"paths": ["src/payments/models.py"], "precise": True}
+        )
+    )
+    item = out["paths"][0]
+    assert item["resolution"] == "lsp"
+    assert "dependents_total" not in item
+
+
+@pytest.mark.anyio
+async def test_impact_reports_why_the_lsp_pool_could_not_be_built(tmp_path, monkeypatch):
+    _write_repo_map(tmp_path)
+    monkeypatch.setattr(
+        "devcouncil.integrations.mcp.handlers.map.RepoMapper.map_is_stale", lambda self, d: False
+    )
+
+    def boom(root):
+        raise RuntimeError("pyright missing")
+
+    monkeypatch.setattr("devcouncil.indexing.lsp_client.LspSessionPool", boom)
+    out = _parse(
+        await mapmod.handle_impact(
+            tmp_path, {"paths": ["src/payments/models.py"], "precise": True}
+        )
+    )
+    item = out["paths"][0]
+    assert item["resolution"] == "import"
+    assert "pyright missing" in item["resolution_reason"]

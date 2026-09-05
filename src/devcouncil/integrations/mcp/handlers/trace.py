@@ -19,8 +19,17 @@ from devcouncil.telemetry.traces import read_trace_events
 
 async def handle_tail_trace(root: Path, arguments: dict) -> list[TextContent]:
     limit = int_argument(arguments, "limit", 20, minimum=1, maximum=200)
-    events = list(read_trace_events(root))[-limit:]
-    return json_text({"events": [event.model_dump(by_alias=True) for event in events]})
+    # The whole log is already materialised to take the tail, so the total is
+    # free — and a tail returned without it reads as the entire trace.
+    all_events = list(read_trace_events(root))
+    events = all_events[-limit:]
+    return json_text({
+        "events": [event.model_dump(by_alias=True) for event in events],
+        "shown": len(events),
+        "total": len(all_events),
+        "truncated": len(events) < len(all_events),
+        "limit_applied": limit,
+    })
 
 
 async def handle_run_timeline(root: Path, arguments: dict) -> list[TextContent]:

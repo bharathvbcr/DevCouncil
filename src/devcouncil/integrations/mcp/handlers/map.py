@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from mcp.types import TextContent
 
@@ -62,14 +62,51 @@ def _map_stale(root: Path, data: dict[str, Any] | None) -> bool:
         return True
 
 
+#: How many rows a single map response will carry. Every surface that applies
+#: it reports `shown`/`total`/`truncated` so the cap is visible in the payload.
+_ROW_LIMIT = 200
+
+
 def _graph_degraded_fields(root: Path) -> dict[str, Any]:
-    """Surface lean-map handshake on legacy graph tool responses."""
-    data = _load_repo_map(root) or {}
+    """Surface lean-map handshake on legacy graph tool responses.
+
+    ``graph_degraded`` is tri-state. With no repo map there is nothing to read
+    the flag from, and the old ``bool(None)`` published a confident "the graph
+    is fine" for a repository that has never been mapped.
+    """
+    data = _load_repo_map(root)
+    if data is None:
+        return {
+            "graph_degraded": None,
+            "graph_degraded_reason": (
+                "no repo map at .devcouncil/repo_map.json, so lean-map status is "
+                "unknown; run `dev map`"
+            ),
+        }
     degraded = bool(data.get("graph_degraded"))
-    fields: dict[str, Any] = {"graph_degraded": degraded}
-    if degraded:
-        fields["graph_degraded_reason"] = str(data.get("graph_degraded_reason") or "")
-    return fields
+    return {
+        "graph_degraded": degraded,
+        "graph_degraded_reason": (
+            str(data.get("graph_degraded_reason") or "") if degraded else ""
+        ),
+    }
+
+
+def _graph_payload(root: Path, result: dict[str, Any]) -> dict[str, Any]:
+    """Build a graph-tool response whose ``ok`` is *derived*, never asserted.
+
+    ``query_symbol``/``trace_path``/``route_map``/``api_impact`` answer with
+    ``{"error": "no code graph; run `dev map` first"}``. Prepending a literal
+    ``"ok": True`` published that failure as a success, so a caller branching on
+    ``ok`` read "the graph has no callers for this symbol" from a response that
+    means "there is no graph".
+    """
+    error = result.get("error")
+    payload: dict[str, Any] = {"ok": not error, **result, **_graph_degraded_fields(root)}
+    if error:
+        payload["ok"] = False
+        payload.setdefault("code", "graph_unavailable")
+    return payload
 
 
 def _subsystem_summary(sub: dict[str, Any]) -> dict[str, Any]:
@@ -173,6 +210,18 @@ async def handle_repo_map(root: Path, arguments: dict) -> list[TextContent]:
             )
 
         stale = _map_stale(root, data)
+
+        # Computed once and attached to every success return below.
+        #
+        # These fields used to appear on exactly one of the three: a `path`
+        # whose area resolved to a known subsystem took the subsystem branch and
+        # came back with no symbol listing and nothing saying one had not been
+        # attempted — so the better-mapped a file was, the less `repo_map` told
+        # you about it. And the no-path branch carried a bare `symbols: []`,
+        # which reads as "no symbols here" rather than "you did not ask".
+        # A consumer indexing `symbols_available` got a KeyError on two of the
+        # three branches.
+        symbol_fields = _symbol_fields(root, path)
         resolved_area: str | None = None
         if path:
             resolved_area = area_for_path(path, data)
@@ -190,6 +239,7 @@ async def handle_repo_map(root: Path, arguments: dict) -> list[TextContent]:
                     "area": resolved_area,
                     "error": f"Unknown subsystem area: {subsystem}",
                     "code": "unknown_subsystem",
+                    **symbol_fields,
                 })
             return json_text({
                 "ok": True,
@@ -197,6 +247,7 @@ async def handle_repo_map(root: Path, arguments: dict) -> list[TextContent]:
                 "path": path,
                 "area": resolved_area or subsystem,
                 "subsystem": _subsystem_detail(sub),
+                **symbol_fields,
             })
 
         subsystems = [
@@ -204,7 +255,7 @@ async def handle_repo_map(root: Path, arguments: dict) -> list[TextContent]:
             for s in (data.get("subsystems") or [])
             if isinstance(s, dict) and s.get("area")
         ]
-        return json_text({
+        payload: dict[str, Any] = {
             "ok": True,
             "stale": stale,
             "languages": list(data.get("languages") or []),
@@ -213,15 +264,82 @@ async def handle_repo_map(root: Path, arguments: dict) -> list[TextContent]:
             "subsystems": subsystems,
             "path": path,
             "area": resolved_area,
-            "symbols": _symbols_for_path(root, path) if path else [],
-        })
+            **symbol_fields,
+        }
+        return json_text(payload)
 
     return await with_codeintel_freshness(root, _run)
 
 
-def _symbols_for_path(root: Path, path: str) -> list[dict[str, Any]]:
-    """Per-path symbol listings from the code graph (empty when unavailable)."""
+def _symbol_fields(root: Path, path: str | None) -> dict[str, Any]:
+    """The symbol listing for `path`, in the one shape every branch publishes.
+
+    `symbols_available` is the discriminator: ``True``/``False`` is a determined
+    answer, and ``None`` means the question was never put — no path was asked
+    about. A caller must never have to test whether the key is present to find
+    out which of the three it got, and ``[]`` must never stand in for "not
+    determined".
+    """
+    if not path:
+        return {
+            "symbols": [],
+            "symbols_available": None,
+            "symbols_source": None,
+            "symbols_shown": 0,
+            "symbols_total": None,
+            "symbols_truncated": False,
+            "symbols_reason": "not requested: no path argument",
+        }
+    symbols = _symbols_for_path(root, path)
+    fields: dict[str, Any] = {
+        "symbols": symbols.items,
+        "symbols_available": symbols.ok,
+        "symbols_source": symbols.source,
+        "symbols_shown": len(symbols.items),
+        "symbols_total": symbols.total if symbols.ok else None,
+        "symbols_truncated": symbols.truncated,
+    }
+    if not symbols.ok:
+        fields["symbols_reason"] = symbols.reason
+    return fields
+
+
+class SymbolScan(NamedTuple):
+    """A per-path symbol listing plus whether the listing could be produced.
+
+    ``ok=False`` means no engine answered — never "this file has no symbols".
+    The two used to be the same empty list.
+    """
+
+    ok: bool
+    source: str
+    reason: str
+    items: list[dict[str, Any]]
+    total: int
+    truncated: bool
+
+
+def _scan_ok(items: list[dict[str, Any]], source: str) -> SymbolScan:
+    shown = items[:_ROW_LIMIT]
+    return SymbolScan(
+        ok=True,
+        source=source,
+        reason="",
+        items=shown,
+        total=len(items),
+        truncated=len(shown) < len(items),
+    )
+
+
+def _symbols_for_path(root: Path, path: str) -> SymbolScan:
+    """Per-path symbol listings from the code graph, or an explicit failure.
+
+    Both engines are tried in order. Every reason one of them declined is kept
+    and reported: a missing kernel, a locked store, a mid-build truncation and a
+    file that genuinely defines nothing all used to return the same ``[]``.
+    """
     norm = path.replace("\\", "/")
+    reasons: list[str] = []
     try:
         from devcouncil.devmap_client import (
             DevMapClientError,
@@ -230,13 +348,17 @@ def _symbols_for_path(root: Path, path: str) -> list[dict[str, Any]]:
         )
 
         client = try_connect(root)
-        if client is not None:
+        if client is None:
+            reasons.append("no built devmap store (run `dev map`)")
+        else:
             resp = client.search(norm, limit=2000)
             reason = resolution_unavailable_reason(resp.resolution)
             if reason:
                 raise DevMapClientError(reason)
             if resp.total > 0 and not resp.items and resp.truncated:
-                raise DevMapClientError("truncated empty symbols")
+                raise DevMapClientError(
+                    f"devmap search returned truncated empty items (total={resp.total})"
+                )
             out: list[dict[str, Any]] = []
             for item in resp.items:
                 file_path = str(item.get("file_path") or "").replace("\\", "/")
@@ -256,15 +378,16 @@ def _symbols_for_path(root: Path, path: str) -> list[dict[str, Any]]:
                     "name": name,
                     "line": line,
                 })
-            return out[:200]
-    except Exception:
-        pass
+            return _scan_ok(out, "devmap")
+    except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+        reasons.append(f"devmap: {exc}")
     try:
         from devcouncil.indexing.graph.build import load_code_graph
 
         graph = load_code_graph(root)
         if graph is None:
-            return []
+            reasons.append("no code graph (run `dev map`)")
+            return SymbolScan(False, "", "; ".join(reasons), [], 0, False)
         out = []
         for n in graph.nodes:
             if n.path != norm:
@@ -280,9 +403,10 @@ def _symbols_for_path(root: Path, path: str) -> list[dict[str, Any]]:
                     "line": n.line,
                 }
             )
-        return out[:200]
-    except Exception:
-        return []
+        return _scan_ok(out, "code_graph")
+    except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+        reasons.append(f"code graph: {exc}")
+        return SymbolScan(False, "", "; ".join(reasons), [], 0, False)
 
 
 async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
@@ -306,13 +430,15 @@ async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
 
         stale = _map_stale(root, data)
         lsp_pool = None
+        lsp_pool_error = ""
         if precise:
             try:
                 from devcouncil.indexing.lsp_client import LspSessionPool
 
                 lsp_pool = LspSessionPool(root)
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 - reported, not swallowed
                 lsp_pool = None
+                lsp_pool_error = str(exc)
 
         try:
             items: list[dict[str, Any]] = []
@@ -320,7 +446,13 @@ async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
             for raw in paths:
                 path = raw.replace("\\", "/")
                 dependents, neighbors = impact_targets(path, data)
+                # `import` is the repo-map heuristic — the weakest of the three.
+                # Which engine actually answered rides on every item now: it used
+                # to be emitted only under `precise`, so a kernel failure left
+                # heuristic dependents looking like a symbol-level answer.
                 resolution = "import"
+                resolution_reason = ""
+                fallback = "; dependents come from the repo-map import heuristic"
                 if not precise:
                     try:
                         from devcouncil.devmap_client import (
@@ -330,7 +462,11 @@ async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
                         )
 
                         client = try_connect(root)
-                        if client is not None:
+                        if client is None:
+                            resolution_reason = (
+                                "no built devmap store (run `dev map`)" + fallback
+                            )
+                        else:
                             resp = client.impact(path, depth=1)
                             reason = resolution_unavailable_reason(resp.resolution)
                             if reason:
@@ -343,16 +479,27 @@ async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
                             if rust_deps:
                                 dependents = rust_deps
                                 resolution = "devmap"
-                    except Exception:
-                        pass
-                if precise and lsp_pool is not None:
+                            else:
+                                resolution_reason = (
+                                    "devmap reported no dependent edges" + fallback
+                                )
+                    except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                        resolution_reason = f"devmap unavailable: {exc}{fallback}"
+                elif lsp_pool is None:
+                    detail = f": {lsp_pool_error}" if lsp_pool_error else ""
+                    resolution_reason = f"LSP session pool unavailable{detail}{fallback}"
+                else:
                     try:
                         lsp_deps = lsp_pool.dependents_of_file(path)
                         if lsp_deps is not None:
                             dependents = lsp_deps
                             resolution = "lsp"
-                    except Exception:
-                        pass
+                        else:
+                            resolution_reason = (
+                                "LSP returned no dependents for this file" + fallback
+                            )
+                    except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                        resolution_reason = f"LSP dependents failed: {exc}{fallback}"
                 area = area_for_path(path, data)
                 all_neighbor_areas.update(neighbors)
                 item: dict[str, Any] = {
@@ -361,12 +508,17 @@ async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
                     "is_entry_root": is_entry_root(path, data),
                     "dependents": dependents,
                     "neighbors": neighbors,
+                    "resolution": resolution,
+                    "resolution_reason": resolution_reason,
                 }
-                dep_total = dependents_total_of(path, data)
-                if dep_total is not None and dep_total > len(dependents):
-                    item["dependents_total"] = dep_total
-                if precise:
-                    item["resolution"] = resolution
+                # `dependents_total` counts the repo map's *import* universe. It
+                # is a valid "shown of total" only while `dependents` is that
+                # same list; pairing it with a devmap or LSP answer would report
+                # a total for a set the response does not contain.
+                if resolution == "import":
+                    dep_total = dependents_total_of(path, data)
+                    if dep_total is not None and dep_total > len(dependents):
+                        item["dependents_total"] = dep_total
                 items.append(item)
 
             crossings = [
@@ -439,7 +591,7 @@ async def handle_liveness(root: Path, arguments: dict) -> list[TextContent]:
         if area or path_prefix:
             entry_roots = _filter_paths(entry_roots, data, area=area, path_prefix=path_prefix)
 
-        dead_code, hidden = _structured_dead_code(
+        dead_scan = _structured_dead_code(
             root,
             area=area,
             path_prefix=path_prefix,
@@ -464,6 +616,14 @@ async def handle_liveness(root: Path, arguments: dict) -> list[TextContent]:
                 (warn + "; " if warn else "")
                 + "graph_degraded: lean map — treat liveness/dead tiers as unreliable"
             )
+        if not dead_scan.ok:
+            # An empty `dead_code` from a scan that never ran used to be
+            # indistinguishable from a clean repository. It says so now, and it
+            # says so in the field callers already read for reliability.
+            warn = (
+                (warn + "; " if warn else "")
+                + f"dead-code scan unavailable: {dead_scan.reason}"
+            )
         payload: dict[str, object] = {
             "ok": True,
             "stale": stale,
@@ -475,16 +635,71 @@ async def handle_liveness(root: Path, arguments: dict) -> list[TextContent]:
             "unwired_candidates": unwired,
             "unreachable_files": unreachable,
             "dead_symbol_candidates": dead_symbols,
-            "dead_code": dead_code,
-            "dead_code_hidden": hidden,
+            "dead_code": dead_scan.items,
+            "dead_code_available": dead_scan.ok,
+            "dead_code_source": dead_scan.source,
+            "dead_code_shown": len(dead_scan.items),
+            "dead_code_total": dead_scan.total if dead_scan.ok else None,
+            "dead_code_truncated": dead_scan.truncated,
+            # Every in-scope candidate this response does not carry: the
+            # confidence filter *and* the row cap. It used to count only the
+            # filter, so 500 candidates reported 200 items and 0 hidden.
+            "dead_code_hidden": dead_scan.hidden if dead_scan.ok else None,
+            "dead_code_hidden_low_confidence": (
+                dead_scan.hidden_low_confidence if dead_scan.ok else None
+            ),
             "unreachable_unreliable": unreachable_unreliable
             or bool(data.get("graph_degraded")),
         }
+        if not dead_scan.ok:
+            payload["dead_code_reason"] = dead_scan.reason
         if warn:
             payload["warning"] = warn
         return json_text(payload)
 
     return await with_codeintel_freshness(root, _run)
+
+
+class DeadCodeScan(NamedTuple):
+    """A dead-code listing plus proof that the scan actually ran.
+
+    ``ok=False`` means no engine produced a listing — a missing kernel, a
+    locked store, a mid-build truncation or a raising graph load. It never
+    means "this repository has no dead code", which is what the old
+    ``([], 0)`` said in all four cases.
+
+    ``total`` counts every candidate the scan saw within the requested scope,
+    before the confidence filter and before the row cap, so a caller can always
+    reconstruct what it is not being shown.
+    """
+
+    ok: bool
+    source: str
+    reason: str
+    items: list[dict[str, Any]]
+    total: int
+    hidden_low_confidence: int
+    truncated: bool
+
+    @property
+    def hidden(self) -> int:
+        """Candidates in scope that this response does not carry."""
+        return self.total - len(self.items)
+
+
+def _dead_scan_ok(
+    matched: list[dict[str, Any]], *, source: str, total: int, hidden_low_confidence: int
+) -> DeadCodeScan:
+    shown = matched[:_ROW_LIMIT]
+    return DeadCodeScan(
+        ok=True,
+        source=source,
+        reason="",
+        items=shown,
+        total=total,
+        hidden_low_confidence=hidden_low_confidence,
+        truncated=len(shown) < len(matched),
+    )
 
 
 def _structured_dead_code(
@@ -493,8 +708,9 @@ def _structured_dead_code(
     area: str | None,
     path_prefix: str | None,
     min_confidence: str = "inferred",
-) -> tuple[list[dict[str, Any]], int]:
+) -> DeadCodeScan:
     data = _load_repo_map(root) or {}
+    reasons: list[str] = []
     try:
         from devcouncil.devmap_client import (
             DevMapClientError,
@@ -504,19 +720,25 @@ def _structured_dead_code(
         from devcouncil.indexing.graph.liveness import confidence_at_least
 
         client = try_connect(root)
-        if client is not None:
+        if client is None:
+            reasons.append("no built devmap store (run `dev map`)")
+        else:
             resp = client.dead_symbols(budget=2000)
             reason = resolution_unavailable_reason(resp.resolution)
             if reason:
                 raise DevMapClientError(reason)
             if resp.total > 0 and not resp.items and resp.truncated:
-                raise DevMapClientError("truncated empty dead")
+                raise DevMapClientError(
+                    f"devmap dead_symbols returned truncated empty items (total={resp.total})"
+                )
             matched: list[dict[str, Any]] = []
+            in_scope = 0
             hidden = 0
             for item in resp.items:
                 path = str(item.get("file_path") or item.get("path") or "")
                 if not _matches_filters(path, data, area=area, path_prefix=path_prefix):
                     continue
+                in_scope += 1
                 conf = item.get("confidence", "inferred")
                 if isinstance(conf, (int, float)):
                     score = float(conf)
@@ -544,28 +766,36 @@ def _structured_dead_code(
                     "line": line,
                     "confidence": str(conf),
                 })
-            return matched[:200], hidden
-    except Exception:
-        pass
+            return _dead_scan_ok(
+                matched, source="devmap", total=in_scope, hidden_low_confidence=hidden
+            )
+    except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+        reasons.append(f"devmap: {exc}")
     try:
         from devcouncil.indexing.graph.build import load_code_graph
         from devcouncil.indexing.graph.liveness import confidence_at_least
 
         graph = load_code_graph(root)
         if graph is None:
-            return [], 0
-        matched: list[dict[str, Any]] = []
+            reasons.append("no code graph (run `dev map`)")
+            return DeadCodeScan(False, "", "; ".join(reasons), [], 0, 0, False)
+        matched = []
+        in_scope = 0
         hidden = 0
         for d in graph.dead_code:
             if not _matches_filters(d.path, data, area=area, path_prefix=path_prefix):
                 continue
+            in_scope += 1
             if not confidence_at_least(d.confidence, min_confidence):
                 hidden += 1
                 continue
             matched.append(d.model_dump())
-        return matched[:200], hidden
-    except Exception:
-        return [], 0
+        return _dead_scan_ok(
+            matched, source="code_graph", total=in_scope, hidden_low_confidence=hidden
+        )
+    except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+        reasons.append(f"code graph: {exc}")
+        return DeadCodeScan(False, "", "; ".join(reasons), [], 0, 0, False)
 
 
 async def handle_graph_ingest(root: Path, arguments: dict) -> list[TextContent]:
@@ -651,13 +881,27 @@ async def handle_graph_runs(root: Path, arguments: dict) -> list[TextContent]:
     """Records of recent kernel runs from the project trace log."""
     import asyncio
 
-    from devcouncil.devmap_engine import read_runs
+    from devcouncil.devmap_engine import read_run_history
     from devcouncil.integrations.mcp.util import int_argument
 
     limit = int_argument(arguments, "limit", 10, minimum=1, maximum=200)
     failed_only = bool(arguments.get("failedOnly"))
-    runs = await asyncio.to_thread(read_runs, root, limit=limit, failed_only=failed_only)
-    return json_text({"ok": True, "runs": runs})
+    history = await asyncio.to_thread(
+        read_run_history, root, limit=limit, failed_only=failed_only
+    )
+    # `runs: []` used to be the answer for three different things: no trace log,
+    # a log whose every line was unreadable, and a kernel that has genuinely not
+    # run. Only the last is what an empty list reads as, and a caller asking
+    # "has this been built?" acted on the other two as if it had been answered.
+    return json_text({
+        "ok": True,
+        "runs": history.runs,
+        "log_present": history.log_present,
+        "unparsed_lines": history.unparsed_lines,
+        "shown": len(history.runs),
+        "total": history.total,
+        "truncated": history.truncated,
+    })
 
 
 async def handle_graph_cypher(root: Path, arguments: dict) -> list[TextContent]:
@@ -707,21 +951,82 @@ async def handle_explain(root: Path, arguments: dict) -> list[TextContent]:
     return await with_codeintel_freshness(root, _run)
 
 
+def _devmap_query_payload(root: Path, kind: str, **kwargs):
+    """Kernel-backed answer for a query surface, or ``None`` to fall back.
+
+    Deliberately re-exported from the CLI rather than reimplemented: the
+    composition (search, then bounded `impact`/`deps` per definition, with
+    `importers` reported as *not computed* because devmap exposes no Imports
+    edges) is already proven there, and a second copy is how the two answers
+    start to differ. The import is lazy because it pulls the CLI module; the MCP
+    server is long-lived, so that cost is paid once per process.
+
+    Follow-up worth doing: move `_devmap_query_payload` to a module that neither
+    the CLI nor MCP owns, and have both import it, rather than MCP reaching into
+    `cli.commands`.
+    """
+    from devcouncil.cli.commands.graph_cmd import (
+        _devmap_query_payload as _cli_devmap_query_payload,
+    )
+
+    return _cli_devmap_query_payload(root, kind, **kwargs)
+
+
 async def handle_graph_query(root: Path, arguments: dict) -> list[TextContent]:
+    """Symbol lookup, kernel-first.
+
+    This answered entirely from Python: `query_symbol` -> `load_code_graph` ->
+    `index.sqlite`, re-materialising 14,057 nodes and 71,195 edges as pydantic
+    models on **every** call. Measured at 1.057 s against 0.154 s for the
+    kernel-backed `devcouncil_code_search` answering the same class of question,
+    with ~90% of it in that re-materialisation — and the first call after any
+    kernel build additionally cost 6.5-7.5 s and wrote 242 MB of SQLite under a
+    writer lease, from a tool an agent reads as read-only.
+    """
+
     async def _run() -> list[TextContent]:
         name = optional_string_argument(arguments, "name_or_path")
         if not name:
             return error_text(
                 "Missing name_or_path", code="missing_argument", argument="name_or_path"
             )
+        kernel = await asyncio.to_thread(
+            _devmap_query_payload, root, "query", name_or_path=name
+        )
+        if kernel is not None:
+            # The CLI's payload shape carries `definitions` but not `matches`,
+            # which this tool has always emitted and agents branch on. Switching
+            # engines must not silently drop a field of the tool's contract, so
+            # it is derived here from the definitions the kernel returned rather
+            # than left absent (which a caller reads as zero matches).
+            kernel.setdefault("matches", len(kernel.get("definitions") or []))
+            return json_text(kernel)
         from devcouncil.indexing.graph import query_symbol
 
-        return json_text({"ok": True, **query_symbol(root, name), **_graph_degraded_fields(root)})
+        payload = _graph_payload(root, query_symbol(root, name))
+        # Provenance is not optional here. Two engines can answer this tool and
+        # they do not agree in every case, so a caller that cannot tell which
+        # replied cannot interpret the answer.
+        payload.setdefault("source", "code_graph")
+        return json_text(payload)
 
     return await with_codeintel_freshness(root, _run)
 
 
 async def handle_graph_trace(root: Path, arguments: dict) -> list[TextContent]:
+    """Path between two symbols, kernel-first.
+
+    Measured at 1.133 s in Python against 0.202 s for the kernel.
+
+    **The two engines differ, and the kernel is the correct one.** Python's BFS
+    is *undirected* over `imports`/`calls`/`contains`/`defines`/`inherits`; the
+    kernel walks resolved edges directionally. On a real probe Python reported a
+    two-hop path between two functions through a shared test module while the
+    kernel correctly reported no indexed path. Agents will see fewer, truer
+    paths — and, since the kernel pass in this session, a capped walk now says
+    so rather than being reported as "no path".
+    """
+
     async def _run() -> list[TextContent]:
         start = optional_string_argument(arguments, "from")
         end = optional_string_argument(arguments, "to")
@@ -729,9 +1034,16 @@ async def handle_graph_trace(root: Path, arguments: dict) -> list[TextContent]:
             return error_text("Missing from", code="missing_argument", argument="from")
         if not end:
             return error_text("Missing to", code="missing_argument", argument="to")
+        kernel = await asyncio.to_thread(
+            _devmap_query_payload, root, "trace", start=start, end=end
+        )
+        if kernel is not None:
+            return json_text(kernel)
         from devcouncil.indexing.graph import trace_path
 
-        return json_text({"ok": True, **trace_path(root, start, end), **_graph_degraded_fields(root)})
+        payload = _graph_payload(root, trace_path(root, start, end))
+        payload.setdefault("source", "code_graph")
+        return json_text(payload)
 
     return await with_codeintel_freshness(root, _run)
 
@@ -770,7 +1082,7 @@ async def handle_graph_impact(root: Path, arguments: dict) -> list[TextContent]:
             use_diff=use_diff,
             max_depth=3,
         )
-        return json_text({"ok": True, **result, **_graph_degraded_fields(root)})
+        return json_text(_graph_payload(root, result))
 
     return await with_codeintel_freshness(root, _run)
 
@@ -786,7 +1098,7 @@ async def handle_route_map(root: Path, arguments: dict) -> list[TextContent]:
                 "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
                 code="graph_missing",
             )
-        return json_text({"ok": True, **route_map(root, graph), **_graph_degraded_fields(root)})
+        return json_text(_graph_payload(root, route_map(root, graph)))
 
     return await with_codeintel_freshness(root, _run)
 
@@ -805,11 +1117,7 @@ async def handle_shape_check(root: Path, arguments: dict) -> list[TextContent]:
                 "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
                 code="graph_missing",
             )
-        return json_text({
-            "ok": True,
-            **shape_check(root, graph, route_filter=route),
-            **_graph_degraded_fields(root),
-        })
+        return json_text(_graph_payload(root, shape_check(root, graph, route_filter=route)))
 
     return await with_codeintel_freshness(root, _run)
 
@@ -832,6 +1140,6 @@ async def handle_api_impact(root: Path, arguments: dict) -> list[TextContent]:
                 "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
                 code="graph_missing",
             )
-        return json_text({"ok": True, **api_impact(root, route_or_path, graph), **_graph_degraded_fields(root)})
+        return json_text(_graph_payload(root, api_impact(root, route_or_path, graph)))
 
     return await with_codeintel_freshness(root, _run)

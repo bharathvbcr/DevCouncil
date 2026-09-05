@@ -108,7 +108,28 @@ Passing tests are local/mechanical evidence only. They are not evidence of the r
 
   **Measured (isolated A/B, this repository):** non-identifier callee names **216 → 0**; defect tier 585 → 118 (−79.8%); nodes +289, edges +514; 328 speculative/low-confidence edges replaced by 185 deterministic ones with **zero deterministic edges lost and zero `References` lost**, verified case by case; orphaned call edges 0; parity unmoved. The +15 new dead candidates are all module-level aliases nothing imports — true unused-re-export findings, and no previously-dead symbol became live.
 
-- **Open (SC34, 2026-08-17): the call-graph blackout is not limited to the C family — roughly 26 of 35 languages have no call graph.** SC31 fixed the C family, but its root cause was structural: `treesitter.rs` has **9 `calls.push` sites, all inside language-specific arms**, and every other language falls through to the generic arm that emits declarations only. Verified directly on a one-function-calls-another file per language: **Java, C#, Ruby, Swift and PHP each produce `Contains` edges and zero `Calls`**, though each parses cleanly and emits its symbols. Only Python, JS/TS, Go, Rust and (now) the C family have call extraction.
+- **Correction (2026-09-04): SC34's headline number was wrong, and the shape of the finding changed.**
+  This entry said "roughly 26 of 35 languages have no call graph". Re-measured against the
+  current tree — every `calls.push` site read, then confirmed empirically on an 18-language
+  fixture — the real figure is **12 of 35**: VB.NET, Svelte, Vue, Astro, Liquid, Pascal, CFML,
+  COBOL, Erlang, Solidity, Terraform/HCL and Nix, plus shell and SQL which are outside the spec
+  set. A `langcalls/` module landed after this entry was written and closed eleven languages
+  (Java, C#, Kotlin, Dart, PHP, Ruby, Swift, Scala, Lua, Luau, R); the ledger was never updated,
+  so the number here overstated the gap by more than 2x. The definitive language table is in the
+  2026-09-04 section below.
+
+  **What did *not* improve is the part that matters.** `langcalls/mod.rs:72` defines
+  `CALL_EXTRACTION_LANGUAGES` with the comment "Read by the coverage report so 'this language has
+  no call graph' is a stated fact rather than an indistinguishable zero". That claim is false in
+  two ways: `rg -uu` finds **no production reader** — all five call sites are in `tests/` — and the
+  list omits the ten languages whose calls come from `treesitter.rs` arms rather than `langcalls/`
+  (Python, JS, TS, TSX, Rust, Go, C, C++, ObjC, CUDA), so a consumer that did read it would
+  conclude Python has no call graph. The constant written to carry the fact carries it nowhere.
+  For the twelve, `parse_outcome` is `Clean` and `calls` is `[]` — byte-identical to a symbol with
+  no callers. VB.NET is the sole exception and only by accident: it takes the `Fallback` branch,
+  which `liveness.rs:338` translates into an explicit "no call extraction" exemption.
+
+- **Open (SC34, 2026-08-17, number corrected 2026-09-04): the call-graph blackout is not limited to the C family.** SC31 fixed the C family, but its root cause was structural: `treesitter.rs` has **9 `calls.push` sites, all inside language-specific arms**, and every other language falls through to the generic arm that emits declarations only. Verified directly on a one-function-calls-another file per language: **Java, C#, Ruby, Swift and PHP each produce `Contains` edges and zero `Calls`**, though each parses cleanly and emits its symbols. Only Python, JS/TS, Go, Rust and (now) the C family have call extraction.
 
   This is the same failure the C family had, at 5× the scope: `impact`, `trace`, dead-code and the PDG return answers for those languages built on an empty call graph, with no signal distinguishing "no callers" from "callers were never extracted". Dead-code output is the dangerous surface — a symbol with no extracted calls looks exactly like an unused one. Closing it means a call-extraction arm per language family, measured against a control the way SC19 and SC31 were.
 
@@ -995,3 +1016,621 @@ Remediation follow-up from the build session:
 - D14 is closed for repository-scoped defaults and path-length validation; a caller-supplied socket outside the managed runtime directory still relies on immediate post-bind `0600` hardening.
 - D17 is closed: the durable unresolved-reference ledger landed as schema v9, pruned with its generation.
 - Mutation testing, the kill-at-every-migration-boundary matrix, 30-minute soak, and Windows process CI were not run and are not claimed.
+
+## Kernel hardening and honesty pass (2026-09-04)
+
+Driven by a workspace-wide audit of one defect class — *a check that could not run must never
+report the same result as a check that ran and passed* — plus a measured read-path profile.
+Every fix below ships a test that was **verified red against the unmodified tree** before the
+change; where the honest shape is a new type, the red was reproduced a second time by neutering
+the new logic and re-running, so the test pins behaviour rather than the type's existence.
+
+**Suite: 844 passed / 0 failed** (`cargo test --workspace`), `cargo fmt --all --check` clean,
+`cargo clippy --workspace --all-targets` clean. Release binary rebuilt.
+
+### Fixed
+
+- **`repo_map.json` claimed a healthy graph it had not verified.** `manifest.rs` wrote
+  `"graph_degraded": false` and `"graph_degraded_reason": ""` as literals on every path, while
+  the same `AnalysisSummary` in the same build could say `Partial` — and `code_graph.rs:471`
+  rendered it honestly. The consumer is `RepoMapper.map_is_stale`
+  (`src/devcouncil/indexing/repo_mapper.py:1965`), whose fail-closed branch
+  `if bool(repo_map.get("graph_degraded")): return True` **could never fire**, so `--if-stale`,
+  `watch` and `verify` accepted a map built from a Louvain partition that never converged. Both
+  keys now derive from `analysis.status`.
+  Test: `a_degraded_analysis_is_not_reported_as_a_healthy_graph`.
+
+- **`unwired_candidates` was a hardcoded `[]` in `repo_map.json`** while `code_graph.json`
+  computed it — from the same `extractions` and `edges` that `consumer_manifest_json` already
+  receives — so one build produced two artifacts contradicting each other, and an agent reading
+  the map concluded nothing was unwired. Now computed, capped at `UNWIRED_CANDIDATE_CAP` (=
+  `DEAD_CANDIDATE_CAP`) with the true total beside it.
+
+- **`liveness_unreachable_unreliable` was conditional in the map and unconditional in the
+  graph.** File-level reachability is never computed by this kernel, so `code_graph.rs:559` sets
+  the flag unconditionally; `manifest.rs` gated it on `entry_roots.is_empty()`, which is false on
+  any repository with an entry root — exactly disarming the escape hatch `docs/code-graph.md:274`
+  tells agents to rely on. Now unconditional, with `liveness_meta.unavailable.unreachable_files`
+  carrying the reason.
+  Test: `the_manifest_reports_liveness_it_computed_and_flags_what_it_did_not`.
+
+- **`liveness_meta.entry_roots.count` reported the truncated length as the total.**
+  `entry_roots` is capped at 20 for the token budget and `count` was the post-cap length, so a
+  25-root repository had `code_graph.json` listing 25 and `repo_map.json` saying 20. Downstream,
+  `subsystem_map.py:123` `is_entry_root` reads the capped list and `handlers/map.py:361` emits
+  `is_entry_root: false` for every genuine entry root sorting after the 20th. `entry_roots`,
+  `dead_symbol` and `unwired` now each carry `{shown, total, truncated}`; `dead_symbol.count` is
+  retained and has always meant the true total.
+  Test: `entry_root_count_is_the_true_total_not_the_truncated_length`.
+
+- **`trace` reported "no indexed path" when it had merely hit its depth cap.**
+  `shortest_path` returned `Option<Vec<_>>`, collapsing four outcomes — zero budget, frontier
+  pruned at `max_depth`, node cap, and a genuinely exhausted reachable set — and `trace_between`
+  stated the strongest of them as fact. At the default depth, a path longer than `--depth` read
+  to an agent as proof that two symbols are unrelated. Now `PathSearch::{Found, NoPath,
+  Exhausted{depth_capped, node_capped, visited, ..}}`, and only `NoPath` produces the original
+  sentence. `depth_capped` is raised only when a pruned node actually had unexplored successors,
+  so a bounded walk over a small graph does not call itself uncertain.
+  Test: `a_depth_capped_trace_is_not_reported_as_proof_that_no_path_exists`.
+
+- **`impact` presented a capped walk as a complete blast radius.** `traverse_graph` had five
+  silent decline paths (starts dropped by `max_nodes`, depth prune, node cap, enqueue cap,
+  recorded-edge cap) and `TraversalResult` had no field for any of them; `budget_take` then
+  computed `total` from what it *received*, so a truncated walk reported `truncated: false` with
+  `total == shown`. Since the default depth is 3 and real graphs are deeper, this fired on
+  essentially every call. `TraversalResult` now carries `TraversalStop`, and `Response<T>` gained
+  `walk_incomplete: Option<String>` — deliberately separate from `shown`/`hidden`/`total`, which
+  describe the *budget* and which clients check as `shown + hidden == total`; a walk that
+  withheld an unknown quantity cannot be expressed there without breaking that invariant. Omitted
+  from the wire form when the walk was complete. The CLI prints it beside the truncation line.
+  Test: `a_capped_walk_reports_that_it_stopped_early` (verified red twice: once against the
+  missing type, once by neutering the flag assignment).
+
+- **A public class was reported dead at 0.90 confidence in 21 languages.**
+  `generic_is_exported` read `get_node_text(node, source)` — the *whole* subtree, bodies included
+  — and returned `false` on a `private `/`protected ` substring anywhere inside it. So a public
+  Scala class holding one private field persisted with `is_exported = 0` and `devmap dead`
+  proposed deleting it, on evidence that is not about the class at all. Java escaped only because
+  `"public "` is tested first and Java spells the modifier — an accident of one keyword set.
+  The scan is now bounded to `declaration_header`: the node's text up to the start of its body,
+  which is the only region a visibility modifier can legally occupy. A modifier on the
+  declaration itself is still read.
+  Test: `a_private_member_does_not_make_its_enclosing_declaration_private`
+  (pre-fix: `("Reg.scala::Registry", Class, false)`).
+
+- **Every truncation report in `devmap-extract` was erased before persist.**
+  `fallback::scan_declarations` computes `truncated` correctly and `extract_treesitter` pushes it
+  into `diagnostics` under the comment "Reported, not silently dropped" —
+  `Extraction::for_durable_store` then calls `diagnostics.clear()` on the payload written to
+  `generation_files.extraction_json` and the extraction cache, and **no production code anywhere
+  in the workspace reads `diagnostics`**. A 2,500-declaration `.proto` stored 2,000 symbols under
+  the reason *"2000 declaration(s) recovered by pattern"*, and the missing 500 were
+  indistinguishable from declarations that do not exist. The count now rides on the
+  `ParseOutcome::Fallback` reason, which survives `for_durable_store`.
+  `EXTRACTION_SCHEMA_VERSION` 28 → 29 so v28 rows cannot resurrect the old string.
+  Test: `a_truncated_fallback_scan_survives_the_durable_store`.
+
+- **A daemon start failed spuriously ~30% of the time under load, and said the wrong thing when
+  it did.** `lock_ipc_endpoint` matched `Err(_busy)` over `TryLockError`, collapsing `WouldBlock`
+  (contention) with `Error(io::Error)` (the check could not run) into one sentence asserting
+  another live daemon owned the endpoint — a definite claim about another process, made by a
+  check that never completed. It also treated a transient `WouldBlock` as permanent with no
+  retry. `devmap-serve --lib` failed **6 of 14 runs** on
+  `the_probe_refuses_live_endpoints_and_replaces_stale_files`; instrumenting the error showed
+  `WouldBlock` clearing within 5–20 ms in every observed case, with `lsof` at failure time
+  showing no remaining holder. The two variants are now distinguished, and contention is waited
+  out for a bounded `LOCK_CONTENTION_WINDOW` (125 ms, a quarter of the `LIVENESS_PROBE_TIMEOUT`
+  the very next step already spends). **0 failures in 15 runs** after.
+  Tests: `a_briefly_held_endpoint_lock_is_waited_out_not_refused` (verified red by disabling the
+  retry), `an_unlockable_lock_file_is_not_reported_as_a_live_daemon`.
+
+### Measured, not fixed — characterised for the next session
+
+- **~~`impact`/`trace` cost ~100 ms flat regardless of `--depth`~~ — fixed and measured
+  2026-09-04.** The cost was never traversal: `resolved_edges` → `Store::latest_edges` re-ran a
+  two-JOIN, fully-ordered scan of all 71,598 edges on **every** request. `Store` now holds the
+  latest generation's full edge set, keyed by generation id so a committed build invalidates it
+  by construction; `min_confidence` is applied per request against the same rounding rule the SQL
+  used, so answers are unchanged.
+
+  **A/B on one settled store (gen 799, 14,189 nodes, 71,598 edges), same harness, warm daemon,
+  6 `impact` calls at depth 3:**
+
+  | | cache bypassed | with cache |
+  |---|---|---|
+  | `impact` min | 89.0 ms | **36.6 ms** |
+  | `impact` median | 96.2 ms | **38.5 ms** |
+  | RSS at startup | 162.7 MB | 161.3 MB |
+  | RSS after 26 queries | 480.4 MB | 499.8 MB |
+
+  **Median latency −60% (2.5×) for +19.4 MB (+4%) of steady-state RSS**, which is the one
+  retained edge set and matches the 14–20 MB predicted. Decision #8's memory concern was
+  answered rather than deferred, and the answer inverted the intuition: the *uncached* daemon
+  already allocated a fresh 71,598-edge vector per query and did not return the memory (531.6 →
+  625.2 → 801.4 MB over 26 queries in the first run), so the cache replaces an unbounded series
+  of transient allocations with one bounded retained one. The ~180 MB of growth over 26 queries
+  is present in **both** arms — it is the per-request filtered clone, pre-existing and unchanged
+  by this work.
+
+  Correctness is pinned by `the_edge_cache_is_invalidated_by_a_new_generation`
+  (`devmap-store/tests/test_fault_injection.rs`), which was **first written vacuous and caught
+  as such**: both generations of the original fixture had 13 edges, so a length assertion passed
+  with the generation key deliberately disabled. The fixture now adds callers so the second
+  generation has strictly more edges, and the test fails with the key disabled.
+
+- **Notebook cell truncation has the same shape as the fallback truncation above and is
+  unfixed.** `notebook.rs:190` reports a `MAX_CELLS` overflow into `diagnostics`, which
+  `for_durable_store` clears. A 5,201-cell notebook stores `parse_outcome: "Clean"` with one
+  symbol. The honest fix needs a `ParseOutcome` variant (or a durable coverage field) rather than
+  a reason-string edit, because the outcome here is `Clean` rather than `Fallback` — and the same
+  variant is what finding H5 below wants. Left for one deliberate change instead of two partial
+  ones.
+
+- **`ParseOutcome::Failed` is reported for prose and data formats** — 293 of 1,294 files (22.6%)
+  in the live store, engine `NotApplicable`. `Extraction::is_parse_failure()` reads it correctly
+  and `db.rs:2218` uses it, so `history.parse_failed` honestly reports 1, not 294. But three
+  other consumers read the raw outcome: `devmap deps README.md` answers *"README.md could not be
+  parsed"*, `preview` says the buffer did not parse, and `liveness.rs:275` exempts every `.md`
+  as a parse failure. A fifth variant `NotApplicable { language }` is the fix.
+
+- **A grammar that fails to load is reported as a grammar that does not exist.**
+  `extract_treesitter` funnels three outcomes into `unavailable_extraction`: no arm in the
+  grammar table, `set_language` refusing the grammar (an ABI mismatch — i.e. exactly what a
+  tree-sitter upgrade regression looks like), and `parser.parse` returning `None`. The resulting
+  reason string *"no linked tree-sitter grammar for rust"* is false in the second case. A
+  tree-sitter bump that broke the Rust ABI would silently downgrade every `.rs` file to regex
+  fallback, be cached (`cache_admits(Fallback) == true`), exempt every Rust file from dead-code
+  analysis, and leave the build green with no call edges. Nothing anywhere would say a grammar
+  failed.
+
+- **`CALL_EXTRACTION_LANGUAGES` (`langcalls/mod.rs:72`) has no production reader and is wrong by
+  omission.** Its doc says it is "read by the coverage report"; `rg -uu` finds five call sites,
+  all in `tests/`, and no coverage report exists. It also omits the ten languages whose calls
+  come from `treesitter.rs` arms (Python, JS, TS, TSX, Rust, Go, C, C++, ObjC, CUDA), so a
+  consumer that *did* read it would conclude Python has no call graph. See the SC34 correction
+  above for the definitive 23-yes / 12-no table.
+
+### Adversarial sweep (2026-09-04) — one 4 KB file could stall the indexer for over three minutes
+
+Added `devmap-extract/tests/adversarial_corpus.rs`: every one of the 35 language specs against
+14 hostile inputs (empty, whitespace, NUL bytes, BOM, CR-only line endings, a 200 KB single
+line, 500 unbalanced delimiters in each direction, 2,000-deep nesting, polyglot declaration
+soup, dense multibyte, a 50,000-character identifier), asserting no panic, no span outside the
+source, no inverted span, no unnamed symbol, no callee that joins on an empty key, no
+declaration invented from input containing no identifiers, and no non-clean outcome without a
+reason. The sweep is stated over `LANGUAGE_SPECS` rather than a fixture list, and asserts its
+own coverage count — a language nobody wrote a fixture for is exactly where an unchecked
+assumption survives.
+
+**It found a denial-of-service-shaped defect immediately.** A 4,000-byte C++ source consisting
+of 2,000 nested braces took **199 seconds** to extract; Ruby took 8.8 s on the same input and
+Python 58 ms. On a repository containing one generated or minified file of that shape, `dev map`
+looks like a hang and a daemon rebuild holds its lock for the duration. Nothing reported it —
+there was no per-file bound anywhere in the extractor.
+
+**The first diagnosis was wrong, and measuring is what caught it.** The obvious cause is a
+pathological parse, and a `tree_sitter::ParseOptions` progress callback was added to bound it.
+It did not help: instrumenting the callback showed it firing 120 times with the parse
+**completing in 2.98 ms**. The 199 s is entirely post-parse, in `walk_tree` and the per-node
+extraction it drives — a superlinear cost over a 2,000-deep tree. Bounding the parse alone would
+have shipped a bound that bounds nothing, and the test would still have passed on a machine fast
+enough. *(Checked separately: this is pre-existing, not introduced by the `generic_is_exported`
+change in this pass — the 199 s figure was measured with that change reverted, and the fixed
+code is the faster of the two at 131 s.)*
+
+**Fixed** by a single `DEFAULT_PARSE_BUDGET` (5 s) covering parse *and* walk: the parse carries a
+deadline progress callback, and `walk_tree` checks the clock every `DEADLINE_CHECK_STRIDE` (256)
+nodes and returns whether it completed. An overrun returns `refused_extraction` — a new sibling
+of `unavailable_extraction` that reports `ParseOutcome::Failed` naming the budget, emits the
+`File` node and **nothing else**. Two properties are load-bearing there: a cancelled tree-sitter
+parse can still hand back a partial tree describing a prefix of the file, and the walk's
+partially-filled `symbols`/`calls` describe a prefix of the tree — publishing either would be a
+truncated extraction wearing a clean outcome, which every consumer reads as "these symbols do
+not exist". No declarations are recovered by pattern either, because a file whose parse was
+abandoned has an unknown structure.
+
+`refused_extraction` also closes finding **H3**: `set_language` refusing a grammar that *is*
+linked no longer falls through to `unavailable_extraction`'s *"no linked tree-sitter grammar for
+{lang}"*. That sentence was false for an ABI fault — precisely what a tree-sitter upgrade
+regression looks like — and it would have downgraded every file of a language to regex fallback,
+cached the result, exempted them all from dead-code analysis, and left the build green.
+
+5 s is far above any legitimate file measured here (the slowest real source parses in
+single-digit milliseconds) and far below the pathological case.
+Test: `a_pathological_source_is_refused_within_its_budget` — the `devmap-extract`
+`stress_hardening` suite went from **159.87 s to 1.70 s**.
+
+**Not fixed: the underlying superlinear walk.** The bound stops the bleeding; it does not explain
+why 4,000 nodes cost 199 s. The shape points at an ancestor walk that copies node text at each
+level (O(nodes) x O(depth) x O(text)), and `c_declaration_head` / `generic_enclosing_type` are the
+candidates to profile first. Until that is done, a legitimate deeply-nested file will hit the
+budget and be refused rather than indexed — an honest refusal, but a coverage loss.
+
+### CLOSED — the vendored COBOL grammar does not terminate on malformed input (unlinked 2026-09-04)
+
+Found by the adversarial sweep on 2026-09-04, and the most serious thing it turned up.
+
+**Reproducer.** `extract_treesitter_with_budget("h.cbl", "cobol", "a\0b\0c\n", 300ms)` — a
+**six-byte** source — ran past **three minutes** with no sign of finishing. So did
+`"\u{feff}????\n"` (BOM followed by four question marks). For scale, the identical 14 hostile
+inputs across the other **34** grammars complete in **5.03 s total**. COBOL is the only grammar
+of the 35 that does this; that was established by running the sweep with COBOL excluded and
+watching all 476 remaining cases pass in seconds.
+
+**No in-process bound stops it.** The `DEFAULT_PARSE_BUDGET` added in this pass cannot:
+`tree_sitter::ParseOptions`' progress callback is only polled from the parser's action loop
+(`parser.c: ts_parser__check_progress`) and is never reached from inside a scanner that is
+spinning, and Rust cannot kill a spinning thread. The deprecated `cancellation_flag` and
+`end_clock` are checked at the same point and fail the same way.
+
+**Mitigated, not fixed.** A source containing a NUL byte is now refused at the boundary before
+any grammar sees it (`refused_extraction`, reason names the offset) — that closes the NUL case
+for every grammar, including vendored ones this repository does not control, and is correct on
+its own terms since a file containing a NUL is binary and every extractor here assumes text.
+**The BOM case is not covered and there is no boundary rule that would cover it** without
+rejecting legitimate files.
+
+**Exposure.** One `.cbl` file with a stray NUL or a mangled header hangs `dev map` outright.
+Under the daemon it is worse: the build holds its writer lock for the lifetime of the process,
+so every subsequent query degrades and no later build can start.
+
+**Resolved by measuring what the grammar was worth, not by weighing risk against a guess.**
+On a realistic COBOL program — IDENTIFICATION/DATA/PROCEDURE DIVISION, two paragraphs, a
+`PERFORM` — the grammar parsed `Clean` and yielded **only the File node**: zero declarations,
+zero calls. The bounded fallback scanner recovers nothing either. COBOL was already one of the
+twelve languages with no call extraction. So the grammar contributed nothing measurable while
+carrying an unbounded hang, and there was no trade-off to make.
+
+`cobol` is now listed in `UNSAFE_GRAMMARS` (`treesitter.rs`) and refused by
+`refused_extraction` **before any parser sees the source**, with a reason that says why — so a
+maintainer cannot silently re-link a grammar that hangs. COBOL files still get a File node and
+stay addressable as edge targets. `grammar_matrix.rs` carries it as the second documented
+exception beside VB.NET, each with its reason, so adding a third is a deliberate edit.
+
+**The sweep's exclusion list is now empty.** `UNRUNNABLE_GRAMMARS` in
+`adversarial_corpus.rs` is `&[]`: COBOL is back under test, exercising the refusal, and all
+**35** specs × 14 hostile inputs run in 6.3 s with no exclusions. The coverage assertion
+(`covered + excluded == total`) and the loud exclusion reporting stay, for the next grammar that
+needs them.
+
+### The MCP graph read path moved to the kernel (2026-09-04) — and the tool that did *not* get faster was the one worth chasing
+
+`devcouncil_graph_query` and `devcouncil_graph_trace` were the last two Dev Map read tools still
+answered by Python (`code_graph.py` loading `code_graph.json` and walking it in the interpreter).
+Both now ask the Rust kernel first and fall back to Python only when the kernel declines — no
+index, an empty generation, a symbol the store does not carry. Every response names the engine
+that produced it (`source: "devmap"` vs `source: "code_graph"`), because the two do not always
+agree and a caller must be able to tell which answered.
+
+`devcouncil_graph_context` moved in the same pass, from a `subprocess` invocation of the CLI to
+an in-process call.
+
+Measured on a settled store (gen 799, 14,189 nodes, 71,598 edges), `DEVMAP_AUTOSPAWN=0`,
+min-of-4:
+
+*The Python column was measured on this repository (where the kernel declines, because its
+own store carries a `node_count: 0` generation) and the kernel column on an equivalent settled
+store. Same content, different roots — treat the ratio as approximate. The controlled number is
+the same-process A/B below.*
+
+| tool | Python | kernel | |
+|---|---|---|---|
+| `graph_context` | 688.5 ms | **0.83 ms** | −99.9% (subprocess removed) |
+| `graph_trace` | 1014.6 ms | **379.2 ms** | −63% |
+| `graph_query` | 1099.1 ms | **503.1 ms** | −54%, after the fan-out fix below, and now answering `callees` |
+
+**The routing alone did not make `graph_query` faster — 1099.1 ms Python, 1112.1 ms kernel — and
+the reason was that the bottleneck was never the language.** Its kernel path is a *composition*:
+one `search`, then `impact` + `deps` for each of the first five definitions
+(`_QUERY_EDGE_DEFINITION_CAP`), so 9-11 separate kernel calls. `DevMapClient._request` falls back
+to a `devmap` subprocess whenever no daemon socket is live, so each of those was a process spawn.
+Rewriting the analysis in Rust could not touch that. Only removing the fan-out could.
+
+**So the fan-out was removed.** A composed `neighbors` command now answers both call-graph
+directions for several targets in one exchange: `IpcCommand::Neighbors` for the socket transport,
+a `devmap neighbors` subcommand for the subprocess one, and `StoreQueryEngine::neighbors` as the
+single implementation both share. Eleven exchanges became one.
+
+Measured same-process, same store, same binary, min-of-5, with the batch disabled to reproduce
+the old path exactly: **828.3 ms → 359.9 ms, 2.30x** — and the two payloads compare
+**byte-identical**. That equivalence is the load-bearing check, not the timing: a faster query
+that answers something different is a regression with a good benchmark. It is asserted in
+`neighbors_composition.rs` against the very calls it replaces, and verified red by swapping the
+two directions.
+
+The fan-out bound is **refused, never applied**: more than `MAX_NEIGHBOR_TARGETS` (16) targets is
+an error at the IPC boundary and again in the engine, because trimming would hand back a short
+list that reads exactly like a complete one. Verified red against a trimming implementation. The
+Python client duplicates no limit of its own, so drift between the two surfaces appears as a loud
+refusal rather than a quiet short answer. A `devmap` binary predating the command makes the batch
+request fail and the per-target path answers instead — slower, identical, not broken. *Identical*
+is enforced, not assumed: that fallback had to learn the same shape rule (fall through to the
+traversal when `deps` declines), because otherwise a stale binary would report every symbol's
+callees as unknown while the batched path reported them, and two paths that quietly answer
+differently are worse than one that is merely slower.
+
+**That fallback was, at first, broken in exactly the way it existed to prevent.** It called
+`client.neighbors(...)` inside `try/except DevMapClientError` — which does not catch
+`AttributeError`, and a client predating the method raises precisely that. So the case the
+fallback was written for took the whole query down. The full Python suite caught it (five tests
+in `test_graph_cmd_command.py`, whose `_FakeClient` is exactly that older shape) and it is worth
+recording that the *unit* tests around the new code all passed, because their stubs had the
+method. The fix probes rather than catches — `callable(getattr(client, "neighbors", None))` —
+because an `except AttributeError` around the call would also swallow one raised inside the
+response handling, turning a genuine shape error into a silent downgrade. `trace` is probed the
+same way, and a client lacking it keeps the reason `deps` gave rather than losing it.
+`test_a_client_without_the_batched_command_falls_back_instead_of_crashing` is red against the
+original version.
+
+**The measurement also exposed a gap that was then closed: `callees` never carried anything.**
+For a symbol-shaped target the outbound side was *always* `Unavailable`, because `dependencies`
+resolves a file path and a symbol id is not one. The field was honest and useless — and the
+earlier attempt to fix it by asking about the containing file was worse, since a function's
+"callees" became its whole file's outbound edges, which is why symbols appeared to call
+themselves.
+
+`neighbors` now picks the query by target shape, using `latest_file` — the store's own notion of
+what a file is — rather than sniffing for `::`. A file keeps `dependencies`; a symbol gets the
+forward traversal, which is symbol-scoped and answers exactly the question. On a live probe,
+`RepoMapper.map_is_stale` went from `deps resolution unavailable: … is not indexed` to its six
+real outbound `Calls` edges. `a_symbol_target_gets_its_own_callees_not_its_file_s` pins both
+failure modes — reporting nothing, and reporting the file's edges — and is red against the
+pre-fix engine with the exact "is not indexed" message.
+
+**This is a behaviour change, and it costs time.** Callees now do real traversal work where they
+used to fail instantly, so the end-to-end number is not the pure transport figure:
+
+| | per-target fan-out | batched | |
+|---|---|---|---|
+| transport only, identical semantics | 828.3 ms | **359.9 ms** | 2.30x |
+| as shipped, with callees answered | 1398.8 ms | **503.1 ms** | 2.78x |
+
+The second row describes the shipped tool: 2.78x faster *and* 4 of 6 definitions gained a callee
+list they never had (0 before). Both rows moved after an adversarial sweep rewrote what `callees`
+means — see the next entry.
+
+**`graph_trace`'s answers change, and the kernel is the correct one.** Python's BFS is
+undirected across five edge kinds; the kernel's is directed over resolved edges. On a live probe
+Python reported a path between two functions that ran through a test module importing both,
+where the kernel correctly reported none. Callers relying on the old permissive behaviour will
+see fewer paths.
+
+**`handle_graph_impact` was deliberately left on Python.** The MCP tool is path/diff-shaped
+("what does changing these files affect") while the kernel's `impact` is symbol-rooted. Routing
+it would have silently changed the question the tool answers. Not a gap — a different tool.
+
+Two process notes worth keeping. The first version of this wiring passed `query=` where the
+callee reads `kwargs["name_or_path"]`; it would have raised on **every** call, and every mocked
+test stayed green. `test_handlers_call_the_kernel_with_the_kwargs_it_actually_declares` drives
+the real function so the keyword contract is pinned, and it is red against that bug. And the
+first measurement returned `source="code_graph"` for both tools — the kernel had correctly
+declined, because this repository's own store carries a `node_count: 0` generation. The numbers
+above come from a store built and settled specifically for the measurement; a benchmark against
+a store that is still sweeping measures the sweep.
+
+**Follow-up left in the code:** `_devmap_query_payload` lazily imports from
+`cli.commands.graph_cmd`, so the MCP layer now depends on the CLI layer. It belongs in a module
+neither owns.
+
+### `graph_runs` reported "I could not look" as "nothing happened" (2026-09-04)
+
+Found by auditing the Dev Map MCP handlers for the Class A shape rather than by a failing test.
+`devcouncil_graph_runs` returned `{"ok": True, "runs": []}` for **three** different outcomes:
+
+1. the project has no trace log at all (`telemetry/traces.py:84` returns `[]` for a missing file),
+2. the log exists but every line failed to parse — they are skipped at *debug* level
+   (`traces.py:91-94`), and
+3. the kernel has genuinely never run.
+
+Only the third is what an empty list reads as, and a caller asking "has this been built?" acted
+on the other two as though it had been answered. Separately `limit` truncated silently: a caller
+asking for 10 got 10 whether the log held 10 or 10,000.
+
+The fix keeps **one** reader. `read_trace_events_counted` returns `(events, log_present,
+unparsed_lines)` and `read_trace_events` — twelve call sites — becomes a thin adapter over it, so
+the two cannot drift. `devmap_engine.read_run_history` returns a `RunHistory` carrying
+`log_present`, `unparsed_lines`, `total` and `truncated`; `read_runs` stays a thin adapter for
+`devmap_health` and `dev map runs`, which want the runs and nothing else. `trace_file_path` now
+owns a path that was written out three times in `traces.py` — this pass removed two of those.
+
+`tests/unit/test_graph_runs_provenance.py` (6 tests) is **red on 5 of 6** against the pre-fix
+handler; the sixth pins `read_runs`' unchanged list contract and is correctly green either way.
+
+One existing test had to be corrected rather than satisfied: `test_devmap_diagnostics.py`
+asserted `runs == {"ok": True, "runs": []}`, which **encoded the conflation as a requirement**.
+The empty list is still right for that fixture — it has run nothing — so the assertion now checks
+that alongside `log_present is False`, and says why in a comment. It was not weakened to make the
+change pass; it was wrong.
+
+### `repo_map` told you less about a file the better it was mapped (2026-09-04)
+
+`handle_repo_map` has four success-shaped returns, and the symbol listing was attached to exactly
+one of them.
+
+A `path` argument resolves an area, and if that area names a known subsystem the handler takes
+the **subsystem** branch — which returned no `symbols` and no field saying a listing had not been
+attempted. A path in an *unmapped* corner fell through to the summary branch and got the full
+listing. So `devcouncil_repo_map --path src/payments/models.py` (mapped) told you less about the
+file than `--path top_level.py` (unmapped). That is exactly backwards, and nothing in the payload
+disclosed it.
+
+The no-path branch had the other half of the problem: a bare `symbols: []` with none of the
+discriminating fields, so `[]` read as "this has no symbols" rather than "you did not ask", and a
+consumer indexing `symbols_available` — the field that exists to separate those — got a
+`KeyError` on two of the three branches.
+
+`_symbol_fields(root, path)` now builds the block once and every success return spreads it.
+`symbols_available` is the discriminator: `True`/`False` is a determined answer, `None` means the
+question was never put, and `symbols_reason` says why. `[]` never stands in for "not determined".
+
+Not found by a failing test — found by reading every `return` in the handler and asking which of
+them could be mistaken for a determined answer. `tests/unit/test_repo_map_symbol_shape.py`
+(3 tests) is red against the pre-fix handler; the 53 existing tests in `test_mcp_map_tools.py`
+still pass unchanged, including the one that blesses the subsystem branch — it asserted what that
+branch *returns*, never that symbols were absent from it.
+
+### The write gate authorized against the wrong repository inside a worktree (2026-09-04)
+
+**Security-relevant, and changed only on an explicit decision from the repository owner.**
+
+`dev hook pre-tool-use` is DevCouncil's write authorization gate: the project root it resolves
+decides whose lease, whose allowlist and whose active task authorize a tool call. It used the
+*baked* `--project-root` — the directory the session started in, which does not follow Claude
+Code into a git worktree — while all thirteen other hooks were moved onto the payload's `cwd`.
+
+So inside a worktree the gate evaluated a **different repository's** active task than the one
+being worked on. That is not "fail closed", it is checking the wrong thing: able to block
+legitimate worktree work, and able to allow work the worktree's own task scope forbids. A
+worktree carries its own `.devcouncil/` with its own `state.sqlite`, so the task the gate read
+was not the task in progress.
+
+The subagent that found it correctly declined to change it and escalated instead, because
+widening access is not a drive-by. The decision was put to the owner, who chose consistency with
+the other hooks.
+
+**What this widens, stated plainly:** a worktree holding its own initialized `.devcouncil/` now
+governs its own writes, so a permissive policy there is no longer overridden by the parent's.
+The containment is that `_effective_root` switches *only* when `cwd` resolves to a directory that
+is itself an initialized DevCouncil project **and** differs from the baked root. A plain
+subdirectory, a missing or blank `cwd`, a non-dict payload, and an uninitialized worktree all
+keep the baked root — those negative cases are the thing standing between this and a general
+escape from the gate, so they are asserted individually in
+`tests/unit/test_hooks_write_gate_root.py` rather than left implied.
+
+The end-to-end test drives `pre_tool_use` itself rather than the helper, and that distinction is
+load-bearing: the five helper-level assertions passed *before* the change, because the helper was
+always correct — the gate simply never called it. Only the end-to-end test was red.
+
+Two other hook gaps from the same audit, both red-verified by the subagent before fixing: seven
+further call sites still used the baked root (`pre_compact` wrote its snapshot to the parent while
+`session_start` read it from the worktree, so the post-compaction briefing was empty every time
+inside a worktree), and `_emit_stop_result` was the only Claude-facing emit path that bypassed the
+10,000-character output cap — its `reason` embeds failing-claim output tails bounded by `_tail` to
+50 *lines*, not characters, so over the cap the gate still blocked while the corrective
+instructions became an unreadable file path.
+
+### The adversarial sweep found four defects in the composition it was pointed at (2026-09-04)
+
+A subagent was given `neighbors` and told to break it. It did, four times, each with a failing
+test. Three were in code written hours earlier in this same pass; the fourth was pre-existing and
+inherited. Recorded because the composition had already passed a byte-identical equivalence check
+against the calls it replaced — equivalence to the old behaviour proves you did not *change* the
+answer, not that the answer was right.
+
+**1. A filter that could not be evaluated answered `Available` with an empty list.** The same
+documented comparison had two implementations that disagreed completely on NaN: the Rust
+`admits` in the edge cache saturates `(NaN * 1000.0).round() as i64` to `0` and admits
+everything, while SQLite stores NaN as NULL and `>= NULL` admits nothing. The comment sitting
+directly above `admits` claimed the two "cannot disagree at a boundary value" — that claim was
+mine, and it was false. Reproduced end to end: the IPC layer rejects non-finite input but the CLI
+does not, so `devmap neighbors --min-confidence nan core.py` returned a populated `callers` list
+beside `"callees":{"resolution":"Available","total":0,"items":[]}` — a positive claim that a file
+depends on nothing, from a comparison that never ran. `checked_min_confidence` now refuses NaN at
+the store boundary. Infinities and out-of-range finite values are deliberately *not* refused:
+both implementations agree on them, and an empty answer there is a filter that ran and matched
+nothing, which is a real result.
+
+**2. `min_confidence` reached only half the answer.** `neighbors` hardcoded `min_confidence: 0.0`
+into its `impact` call, so one composed answer reported every caller while reporting only the
+callees that cleared the threshold. Its doc claimed "the same budget and confidence". `traverse`
+honours the field, so there was never a reason not to pass it.
+
+**3. `callees` carried edges pointing *into* the target.** `latest_edges_for_file` matches
+`sp.path = ?2 OR tp.path = ?2`, so a file's "outbound" edges included its inbound ones and a file
+appeared in its own callee list — the same "symbols appeared to call themselves" shape the symbol
+path had already been fixed for, surviving on the file path.
+
+**4. Two resolvers made one answer incoherent.** `impact` matches a path by suffix
+(`path_matches`: `ends_with("/{query}")`) while `dependencies` matches exactly. With `core.py`
+and `pkg/core.py` both indexed, a single composed answer's callers described one file and its
+callees another: "what calls core.py before I delete it" answered with a file that does not.
+
+**3 and 4 have one fix.** Both directions now resolve through the forward traversal — one
+resolver, directed by construction — so `callees` cannot contain inbound edges and the two halves
+cannot name different files. `deps` the command is untouched; only this composition tightened.
+This **changed the file-target answer** (`core.py`'s callees went 6 → 2 on the equivalence
+fixture; the 4 dropped were inbound and structural edges that were never callees), so the
+equivalence test was retargeted from `dependencies` to `trace` and says why.
+
+It also closed a fifth gap for free: a **partially parsed** file used to answer `Available` with
+an empty list and no incompleteness marker, because `dependencies` refused only
+`ParseOutcome::Failed`. It now reports `Unavailable` naming the reason.
+
+**5. A composed answer could straddle two generations, silently.** The fan-out is
+`2 * targets.len()` sub-queries, each taking and releasing the store lock on its own. Under
+contention, 25 of 62 composed answers carried symbols from two generations with nothing in the
+response disclosing it. Not a regression — the separate `impact`/`deps` calls straddled the same
+way — but those were visibly separate exchanges and this is sold as one. Holding the lock across
+the whole fan-out would block the writer for the duration of a composed query, a worse trade, so
+the composition **detects** instead: it compares the generation id before and after, retries once
+(commits are rare, so this resolves nearly all of them), and if the index moves again marks every
+direction's `walk_incomplete`. A straddle is tolerable; a caller unable to detect one is not.
+
+Three of the subagent's tests had to be rewritten rather than satisfied, and each for a reason
+worth stating. Its NaN test named "either a refusal, or `Unavailable`" as acceptable and then
+`expect()`ed an `Ok`, so its code contradicted its own message. Its `min_confidence` test compared
+thresholds 0.0 and 1.0 on a fixture where every edge has confidence >= 1.0 — it passed whether or
+not the filter was applied, and only its callees half, which used 1.1, could tell. And two more
+were written to fail *informatively when the behaviour improves*, which is how the partial-parse
+gap surfaced at all.
+
+### Index: the 2026-09-04 four-lane pass
+
+Four subagents ran in parallel on non-overlapping file ownership, plus this session's own lane.
+What each found, and where it is written up above.
+
+| Lane | Owned | Outcome |
+|---|---|---|
+| Hooks | `clients/hooks.py`, `cli/commands/hook.py` | 13 events installed (14 with `--write-gate`) of 33 in the spec. 4 of 6 mechanical checks clean. Two gaps fixed: 7 hooks ignored the worktree; the stop-gate reason bypassed the 10,000-char cap. Escalated the write-gate root rather than changing it. |
+| MCP 2.0 | `integrations/mcp/**` | Tool annotations 0/73 → 73/73. Four defects fixed, incl. a killed CLI call reported as a result, and 33 blocking `subprocess.run` calls on the event loop. Declined `outputSchema`, elicitation, resource links with reasons. |
+| Plugins 1.0 | `claude_assets.py` | The "passes `--strict`" claim was half wrong and its test asserted a proxy, never running the validator. Added the real-validator test plus `homepage`/`repository`/`license`. |
+| Adversarial | new test files only | Four defects in `neighbors`, three of them written hours earlier in this same pass. See the entry above. |
+| This session | `map.py`, `graph_cmd.py`, kernel | `graph_runs` and `repo_map` Class A defects; the composed `neighbors` command; the write-gate decision once the owner made it. |
+
+**What this pass is actually evidence for.** Three separate ledger claims and two of this
+session's own claims were falsified by measurement or by an adversary. The pattern is consistent
+enough to plan around: *a claim written next to the code it describes is the least reliable kind*
+— `admits`' "cannot disagree at a boundary value", `neighbors`' "the same budget and confidence",
+and the plugin test's docstring were all wrong, and all three sat directly above the thing they
+described. The tests that caught them were written by someone who did not write the code.
+
+**Process notes worth keeping.** Two of four agents reached for `git stash` / `git checkout --`
+for a red-check in a worktree carrying four lanes of uncommitted work; both restored what they
+destroyed, one only because it had copied the file seconds earlier. Brief agents to use
+file-level backups and tell them the tree is dirty — the session's own `gitStatus` says "clean"
+and is a snapshot taken at session start. Separately, the venv's editable install resolves
+`devcouncil` to the **main checkout**: `pythonpath = ["src"]` is set only under
+`[tool.pytest.ini_options]`, so pytest sees worktree code and a bare `python script.py` does not.
+That silently validated main-checkout code once before it was caught.
+
+**Known and unfixed**, carried forward deliberately: `impact`'s suffix path matching still answers
+about every file sharing a basename (now at least coherently across both directions);
+`handle_graph_impact` stays on Python because the MCP tool is path/diff-shaped and the kernel's
+`impact` is symbol-rooted; `_devmap_query_payload` still lives in `cli.commands.graph_cmd`, so the
+MCP layer imports the CLI layer; `mypy src` reports 98 pre-existing errors (57 in `tool_specs.py`)
+which `ci.yml` gates on.
+
+
+### The Python seam dropped the kernel's "I stopped looking" signal (2026-09-04)
+
+Found by the adversarial lane, fixed here because `devmap_client.py` is this session's file.
+
+The kernel distinguishes two ways an answer can be short: the token budgeter trimmed a complete
+set (reported in `shown`/`hidden`/`total`/`truncated`) and the *walk itself* stopped at a depth or
+node cap (reported in `walk_incomplete`, because a walk that withheld an unknown quantity cannot
+be expressed in those counters without breaking `shown + hidden == total`, which the client
+enforces). `BudgetedResponse` carried the first and silently dropped the second.
+
+That is the common case, not an exotic one: at the **default** depth of 1 — the default in the
+CLI, in the client, and in the IPC schema — the reverse walk routinely reports `walk_incomplete`
+alongside `truncated: false` and `hidden: 0`. So a partial answer reached Python wearing the exact
+shape of a complete one.
+
+`BudgetedResponse.walk_incomplete` now carries it, type-checked on the way in. And the place where
+it actually misleads is closed: an **empty** edge list from a capped walk is no longer rendered as
+`[]` — which reads as "nothing calls this", the reading that gets a live function deleted — but as
+`{method} walk incomplete: {reason}` with the list reported as unknown. A non-empty list is left
+alone; the caller has real edges, and the signal is on the response for anyone who wants it.
+`test_walk_incomplete_survives_the_seam.py` (4 tests) and one test in
+`test_neighbors_batching.py` are red against the pre-fix client, including a case asserting the
+new field cannot become an escape hatch from the budget invariants.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from mcp.types import TextContent
@@ -31,7 +32,7 @@ async def handle_wiki_page(root: Path, arguments: dict) -> list[TextContent]:
     page = optional_string_argument(arguments, "page")
     query = optional_string_argument(arguments, "query")
     payload, _cli_error = parse_cli_json(
-        run_cli_command(_wiki_cli_args(page=page, query=query), root, truncate=False),
+        await asyncio.to_thread(run_cli_command, _wiki_cli_args(page=page, query=query), root, truncate=False),
     )
     if payload is None:
         payload = read_wiki_page(root, page=page, query=query)

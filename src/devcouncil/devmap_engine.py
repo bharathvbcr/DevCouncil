@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 import os
 import subprocess
 import sys
@@ -331,19 +332,57 @@ def _record_run(root: Path, payload: Dict[str, Any], *, run_id: str, summary: st
         logger.debug("could not record devmap run %s", run_id, exc_info=True)
 
 
-def read_runs(root: Path, *, limit: int = 20, failed_only: bool = False) -> List[Dict[str, Any]]:
-    """The last *limit* kernel runs, oldest first, as plain dicts."""
-    from devcouncil.telemetry.traces import read_trace_events
+@dataclass(frozen=True)
+class RunHistory:
+    """Kernel runs, plus what the read of them could and could not establish.
+
+    `runs` alone cannot answer "has the kernel run here?", because an empty list
+    is also what a missing log and a wholly corrupt one produce. The rest of
+    these fields are what separates those cases, and `total`/`truncated` keep a
+    capped sample from reading as complete coverage.
+    """
+
+    runs: List[Dict[str, Any]]
+    log_present: bool
+    unparsed_lines: int
+    total: int
+    truncated: bool
+
+
+def read_run_history(
+    root: Path, *, limit: int = 20, failed_only: bool = False
+) -> RunHistory:
+    """The last *limit* kernel runs, oldest first, with the provenance of the read."""
+    from devcouncil.telemetry.traces import read_trace_events_counted
 
     root = Path(root).expanduser().resolve()
+    events, log_present, unparsed = read_trace_events_counted(root)
     runs: List[Dict[str, Any]] = []
-    for event in read_trace_events(root):
+    for event in events:
         if event.type != RUN_EVENT_TYPE:
             continue
         if failed_only and event.details.get("ok", True):
             continue
         runs.append({"run_id": event.run_id, "timestamp": event.timestamp, **event.details})
-    return runs[-limit:] if limit else runs
+    total = len(runs)
+    shown = runs[-limit:] if limit else runs
+    return RunHistory(
+        runs=shown,
+        log_present=log_present,
+        unparsed_lines=unparsed,
+        total=total,
+        truncated=len(shown) < total,
+    )
+
+
+def read_runs(root: Path, *, limit: int = 20, failed_only: bool = False) -> List[Dict[str, Any]]:
+    """The last *limit* kernel runs, oldest first, as plain dicts.
+
+    A thin adapter over :func:`read_run_history` for the callers that want the
+    runs and nothing else (`devmap_health`, `dev map runs`). It delegates rather
+    than reimplementing the read, so the two cannot drift.
+    """
+    return read_run_history(root, limit=limit, failed_only=failed_only).runs
 
 
 #: The kernel indents a `--progress` line with six spaces

@@ -150,14 +150,120 @@ def _call_edges(client, method: str, target: str, symbol_key: str, file_key: str
     if reason:
         return None, f"{method} resolution unavailable: {reason}"
 
+    return _edge_nodes(resp.items, symbol_key, file_key), None
+
+
+def _edge_nodes(items, symbol_key: str, file_key: str) -> list:
+    """Call-graph node names from one direction's raw edge list.
+
+    Split out of :func:`_call_edges` so the batched and single-target paths
+    share it verbatim. Two copies of this filter would drift, and the drift
+    would be silent: it decides which edge kinds count as calls at all.
+    """
     edges = []
-    for edge in resp.items:
+    for edge in items:
         if str(edge.get("edge_kind") or "") not in _CALL_EDGE_KINDS:
             continue
         node = str(edge.get(symbol_key) or edge.get(file_key) or "")
         if node:
             edges.append(node)
-    return edges, None
+    return edges
+
+
+def _neighbor_edges(client, targets: list) -> dict:
+    """Both directions for every target, in one kernel exchange where possible.
+
+    Returns ``{target: (callers, callers_unavailable, callees,
+    callees_unavailable)}`` with exactly the fail-closed contract
+    :func:`_call_edges` documents: ``None`` for a direction that could not be
+    measured, never ``[]``.
+
+    The batched kernel command is an optimisation, not a requirement. A
+    ``devmap`` binary predating it — an older release on ``PATH``, a partial
+    upgrade — makes the request fail, and the per-target path answers instead.
+    Slower, identical answers; the alternative is a hard error on a stale
+    binary.
+    """
+    from devcouncil.devmap_client import (
+        DevMapClientError,
+        resolution_unavailable_reason,
+    )
+
+    answers: dict = {}
+    # Probed, not caught. An `except AttributeError` around the call would also
+    # swallow one raised *inside* the response handling below — a genuine shape
+    # error — and quietly answer from the slow path instead of failing. This
+    # asks only the question that matters: does this client have the command?
+    batched = getattr(client, "neighbors", None)
+    if targets and callable(batched):
+        try:
+            for entry in batched(targets):
+                target = entry["target"]
+                sides = []
+                # `method` is the kernel command each direction stands for,
+                # and it is what the unavailable reason names — the batched and
+                # per-target paths must be indistinguishable to a reader, down
+                # to the wording, or "which code path answered" leaks into a
+                # message that is supposed to describe the store.
+                for side, method, symbol_key, file_key in (
+                    ("callers", "impact", "source_symbol", "source_file"),
+                    ("callees", "deps", "target_symbol", "target_file"),
+                ):
+                    resp = entry[side]
+                    reason = resolution_unavailable_reason(resp.resolution)
+                    if reason:
+                        sides += [None, f"{method} resolution unavailable: {reason}"]
+                        continue
+                    nodes = _edge_nodes(resp.items, symbol_key, file_key)
+                    # An empty list from a walk that stopped early is the case
+                    # that misleads: it reads as "nothing calls this" when the
+                    # honest answer is "I stopped looking". The kernel reports
+                    # that in `walk_incomplete`, which the counters cannot carry
+                    # (a walk withholding an unknown quantity would break
+                    # `shown + hidden == total`). A non-empty list is left
+                    # alone — the caller has real edges, and the signal is on
+                    # the response for anyone who wants it.
+                    incomplete = getattr(resp, "walk_incomplete", None)
+                    if not nodes and incomplete:
+                        sides += [None, f"{method} walk incomplete: {incomplete}"]
+                    else:
+                        sides += [nodes, None]
+                answers[target] = tuple(sides)
+            return answers
+        except DevMapClientError:
+            answers.clear()
+
+    for target in targets:
+        callers, callers_unavailable = _call_edges(
+            client, "impact", target, "source_symbol", "source_file"
+        )
+        callees, callees_unavailable = _call_edges(
+            client, "deps", target, "target_symbol", "target_file"
+        )
+        # `trace` is likewise probed rather than assumed: a client old enough
+        # to lack `neighbors` may lack this too, and a missing method must
+        # leave the reason `deps` gave, not raise.
+        if callees is None and callable(getattr(client, "trace", None)):
+            # `deps` resolves a *file* path, so for a symbol id it always
+            # answers "not indexed". The kernel picks between `deps` and the
+            # symbol-scoped forward traversal by asking the store what the
+            # target is; here that is not observable, so the outcome stands in
+            # for it. Without this, a stale binary would report every symbol's
+            # callees as unknown while the batched path reported them — two
+            # paths that silently answer differently is worse than one that is
+            # merely slower.
+            traced, _traced_unavailable = _call_edges(
+                client, "trace", target, "target_symbol", "target_file"
+            )
+            if traced is not None:
+                callees, callees_unavailable = traced, None
+        answers[target] = (
+            callers,
+            callers_unavailable,
+            callees,
+            callees_unavailable,
+        )
+    return answers
 
 
 #: Definitions per `dev map query` whose caller/callee edges are measured.
@@ -314,26 +420,48 @@ def _devmap_query_payload(root: Path, kind: str, **kwargs):
                 resp.items[:20],
                 key=lambda item: 0 if _is_exact_query_match(item, name_or_path) else 1,
             )
+            # One exchange for every measured definition, not two per
+            # definition. `graph_query` was the last Dev Map read path that did
+            # not get faster when the store did, and this fan-out was why: the
+            # client falls back to a `devmap` subprocess whenever no daemon
+            # socket is live, so five definitions meant eleven process spawns.
+            #
+            # Symbol-scoped on both sides. The outbound side used to be asked
+            # about `path_s` — the FILE — so a function's "callees" were the
+            # whole file's outbound edges: `IsRestatement` reported 35 callees
+            # where the symbol-scoped answer is 0, and the list included
+            # `Contains`/`MemberOf` structural edges, which is why symbols
+            # appeared to call themselves.
+            def _target_of(item: dict) -> str:
+                path_s = str(item.get("file_path") or "")
+                name = str(item.get("symbol_name") or "")
+                node_id = f"{path_s}::{name}" if path_s and name else name or path_s
+                return node_id if name else path_s or name_or_path
+
+            measured = ranked[:_QUERY_EDGE_DEFINITION_CAP]
+            # De-duplicated: two hits can share a target, and asking twice
+            # spends a slot in a bounded batch on an answer already held.
+            batch: list = []
+            for item in measured:
+                target = _target_of(item)
+                if target not in batch:
+                    batch.append(target)
+            edges_by_target = _neighbor_edges(client, batch)
+
             for position, item in enumerate(ranked):
                 path_s = str(item.get("file_path") or "")
                 name = str(item.get("symbol_name") or "")
                 span = item.get("span") or (0, 0)
                 line = int(span[0]) if isinstance(span, (list, tuple)) and span else 0
                 node_id = f"{path_s}::{name}" if path_s and name else name or path_s
-                target = node_id if name else path_s or name_or_path
+                target = _target_of(item)
                 if position < _QUERY_EDGE_DEFINITION_CAP:
-                    callers, callers_unavailable = _call_edges(
-                        client, "impact", target, "source_symbol", "source_file"
-                    )
-                    # Symbol-scoped, like the inbound side. This used to pass
-                    # `path_s` — the FILE — so a function's "callees" were the
-                    # whole file's outbound edges. `IsRestatement` reported 35
-                    # callees where the symbol-scoped answer is 0, and the list
-                    # included `Contains`/`MemberOf` structural edges, which is
-                    # why symbols appeared to call themselves.
-                    callees, callees_unavailable = _call_edges(
-                        client, "deps", target, "target_symbol", "target_file"
-                    )
+                    (
+                        callers,
+                        callers_unavailable,
+                        callees,
+                        callees_unavailable,
+                    ) = edges_by_target[target]
                 else:
                     callers, callees = None, None
                     callers_unavailable = callees_unavailable = (

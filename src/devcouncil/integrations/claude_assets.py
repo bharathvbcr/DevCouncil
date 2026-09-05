@@ -412,12 +412,29 @@ def _plugin_dir(root: Path) -> Path:
     return root / PLUGIN_ROOT_REL / _PLUGIN_NAME
 
 
+# Project identity for the published plugin manifest. `homepage`/`repository` mirror
+# pyproject.toml's [project.urls]; `license` mirrors the repo's LICENSE (Apache 2.0),
+# which pyproject does not record as metadata. Kept as literals so the builders stay pure
+# (`_plugin_json` takes only `version`); `test_plugin_manifest_metadata.py` asserts they
+# stay in sync with pyproject/LICENSE so the copies cannot drift.
+_PLUGIN_HOMEPAGE = "https://github.com/bharathvbcr/DevCouncil"
+_PLUGIN_REPOSITORY = "https://github.com/bharathvbcr/DevCouncil.git"
+_PLUGIN_LICENSE = "Apache-2.0"
+
+
 def _plugin_json(version: str) -> str:
     manifest = {
         "name": _PLUGIN_NAME,
         "description": "DevCouncil: evidence-gated planning, execution, and verification for coding agents.",
         "version": version,
-        "author": {"name": "DevCouncil"},
+        "author": {"name": "DevCouncil", "url": _PLUGIN_HOMEPAGE},
+        # Optional per the Plugins spec, but this is a *published, installable* artifact:
+        # without them an installed plugin cannot tell the user its terms or where it came
+        # from. All three are recognized manifest fields (verified against
+        # `claude plugin validate --strict`, Claude Code 2.1.259).
+        "homepage": _PLUGIN_HOMEPAGE,
+        "repository": _PLUGIN_REPOSITORY,
+        "license": _PLUGIN_LICENSE,
         "keywords": ["devcouncil", "verification", "planning", "mcp", "code-review"],
     }
     return json.dumps(manifest, indent=2) + "\n"
@@ -426,6 +443,16 @@ def _plugin_json(version: str) -> str:
 def _marketplace_json(version: str) -> str:
     manifest = {
         "name": _MARKETPLACE_NAME,
+        # `claude plugin validate --strict` (Claude Code 2.1.259) treats a
+        # missing marketplace description as a warning, and `--strict` promotes
+        # warnings to errors — so without this the bundle fails the exact check
+        # a publishing pipeline runs. The plugin manifest itself already passes
+        # strict; only the marketplace was short.
+        "description": (
+            "DevCouncil's own marketplace: the evidence-gated planning, execution and "
+            "verification toolchain, plus the Dev Map code-intelligence graph, for this "
+            "repository."
+        ),
         "owner": {"name": "DevCouncil"},
         "plugins": [
             {
@@ -445,23 +472,32 @@ def _plugin_hooks_json(*, write_gate: bool = False) -> str:
     Assist-mode by default installs refresh-only PostToolUse (never gates writes) plus
     lifecycle hooks. The blocking PreToolUse write-gate is included only when
     ``write_gate`` is True."""
+    # Seconds, from the one module that owns these numbers. This generator used
+    # to carry its own literals — 10000 and 150000 — which are the pre-migration
+    # millisecond values `clients/hooks.py` explicitly converts away from, and
+    # which Claude Code reads as a 2.8-hour and a 41.7-hour timeout.
+    from devcouncil.integrations.clients.hooks import (
+        DEFAULT_HOOK_TIMEOUT_SECONDS,
+        STOP_GATE_HOOK_TIMEOUT_SECONDS,
+    )
+
     def cmd(event: str) -> str:
         return f'devcouncil hook {event} --client claude --project-root "${{CLAUDE_PROJECT_DIR}}"'
 
     tool_matcher = "Bash|Write|Edit|MultiEdit"
     hooks: dict[str, list] = {
-        "PostToolUse": [{"matcher": tool_matcher, "hooks": [{"type": "command", "command": cmd("post-tool-use"), "timeout": 10000}]}],
-        "Stop": [{"hooks": [{"type": "command", "command": cmd("agent-response"), "timeout": 150000}]}],
-        "SessionStart": [{"matcher": SESSION_START_MATCHER, "hooks": [{"type": "command", "command": cmd("session-start"), "timeout": 10000}]}],
-        "UserPromptSubmit": [{"hooks": [{"type": "command", "command": cmd("user-prompt-submit"), "timeout": 10000}]}],
-        "SessionEnd": [{"hooks": [{"type": "command", "command": cmd("session-end"), "timeout": 10000}]}],
-        "PreCompact": [{"hooks": [{"type": "command", "command": cmd("pre-compact"), "timeout": 10000}]}],
-        "PostCompact": [{"hooks": [{"type": "command", "command": cmd("post-compact"), "timeout": 10000}]}],
-        "SubagentStop": [{"hooks": [{"type": "command", "command": cmd("subagent-stop"), "timeout": 150000}]}],
-        "Notification": [{"hooks": [{"type": "command", "command": cmd("notification"), "timeout": 10000}]}],
+        "PostToolUse": [{"matcher": tool_matcher, "hooks": [{"type": "command", "command": cmd("post-tool-use"), "timeout": DEFAULT_HOOK_TIMEOUT_SECONDS}]}],
+        "Stop": [{"hooks": [{"type": "command", "command": cmd("agent-response"), "timeout": STOP_GATE_HOOK_TIMEOUT_SECONDS}]}],
+        "SessionStart": [{"matcher": SESSION_START_MATCHER, "hooks": [{"type": "command", "command": cmd("session-start"), "timeout": DEFAULT_HOOK_TIMEOUT_SECONDS}]}],
+        "UserPromptSubmit": [{"hooks": [{"type": "command", "command": cmd("user-prompt-submit"), "timeout": DEFAULT_HOOK_TIMEOUT_SECONDS}]}],
+        "SessionEnd": [{"hooks": [{"type": "command", "command": cmd("session-end"), "timeout": DEFAULT_HOOK_TIMEOUT_SECONDS}]}],
+        "PreCompact": [{"hooks": [{"type": "command", "command": cmd("pre-compact"), "timeout": DEFAULT_HOOK_TIMEOUT_SECONDS}]}],
+        "PostCompact": [{"hooks": [{"type": "command", "command": cmd("post-compact"), "timeout": DEFAULT_HOOK_TIMEOUT_SECONDS}]}],
+        "SubagentStop": [{"hooks": [{"type": "command", "command": cmd("subagent-stop"), "timeout": STOP_GATE_HOOK_TIMEOUT_SECONDS}]}],
+        "Notification": [{"hooks": [{"type": "command", "command": cmd("notification"), "timeout": DEFAULT_HOOK_TIMEOUT_SECONDS}]}],
     }
     if write_gate:
-        hooks["PreToolUse"] = [{"matcher": tool_matcher, "hooks": [{"type": "command", "command": cmd("pre-tool-use"), "timeout": 10000}]}]
+        hooks["PreToolUse"] = [{"matcher": tool_matcher, "hooks": [{"type": "command", "command": cmd("pre-tool-use"), "timeout": DEFAULT_HOOK_TIMEOUT_SECONDS}]}]
     return json.dumps({"hooks": hooks}, indent=2) + "\n"
 
 

@@ -74,4 +74,21 @@ async def handle_ast_match(root: Path, arguments: dict) -> list[TextContent]:
         kind=kind,
         limit=limit,
     )
-    return [TextContent(type="text", text=json.dumps({"matches": [item.model_dump() for item in matches]}, indent=2))]
+    # `AstMatcher.match` stops walking files as soon as it has `limit` hits, so
+    # a full match count was never computed. Reporting `len(matches)` as the
+    # total would turn "we stopped looking" into "this is all there is"; the
+    # total is reported as unmeasured instead, with the reason.
+    truncated = len(matches) >= limit
+    payload: dict[str, object] = {
+        "matches": [item.model_dump() for item in matches],
+        "shown": len(matches),
+        "total": None if truncated else len(matches),
+        "truncated": truncated,
+        "limit_applied": limit,
+    }
+    if truncated:
+        payload["total_reason"] = (
+            "matching stops at the limit, so the unfiltered match count was not "
+            "measured; raise `limit` to widen the scan"
+        )
+    return [TextContent(type="text", text=json.dumps(payload, indent=2))]

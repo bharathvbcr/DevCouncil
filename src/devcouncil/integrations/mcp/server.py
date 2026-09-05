@@ -8,6 +8,7 @@ from pathlib import Path
 
 import jsonschema
 from mcp.server import Server, ServerRequestContext
+from mcp.server.caching import CacheHint
 from mcp.server.stdio import stdio_server
 from mcp.types import (
     CallToolRequestParams,
@@ -486,9 +487,40 @@ async def _on_call_tool(
     return CallToolResult(content=list(contents), is_error=False)
 
 
+# `tools/list` is a ~40 KB / ~10k-token answer that is the same on every request:
+# `tool_specs.all_tools()` is built from literals only — verified byte-identical
+# across repeat calls and across changes to DEVCOUNCIL_PROJECT_ROOT and the
+# process working directory — and nothing in this package can add, remove, or
+# reshape a tool while the process runs. Without a hint the SDK stamps the
+# `CacheableResult` defaults (`ttl_ms=0`, immediately stale — mcp_types
+# `_types.py:207-213`), so a client that re-lists pays the full payload every
+# time for an answer that provably did not change.
+#
+# Five minutes, not longer: this server never emits `notifications/tools/list_changed`
+# (and correctly advertises `tools.listChanged: false`), so a cached list has no
+# invalidation signal other than its own expiry, and the TTL is the entire bound
+# on how stale a client may be if the list ever stops being static. `private` is
+# the SDK default and stays: the list is per-server, a stdio server has one
+# client, and a shared cache would gain nothing.
+#
+# Inert as this server currently runs, and kept deliberately. `ttlMs`/`cacheScope`
+# are 2026-07-28 vocabulary; `run()` below speaks stdio, whose `initialize`
+# handshake can only negotiate a version from `HANDSHAKE_PROTOCOL_VERSIONS`
+# (`ServerRunner._negotiate_initialize`, mcp `server/runner.py:425`) — and that
+# tuple stops at 2025-11-25. `ServerRunner._serialize` applies the hint and then
+# sieves the result through the negotiated version's surface, which drops both
+# fields on every version this transport can reach. So the hint is correct
+# configuration that nothing consumes yet: it costs one dict at construction and
+# goes live the moment this server gains a modern-era transport or the handshake
+# reaches 2026. `test_the_tools_list_cache_hint_cannot_reach_a_handshake_client`
+# pins that, and fails when the situation changes rather than when it doesn't.
+_TOOLS_LIST_CACHE_TTL_MS = 5 * 60 * 1000
+
+
 app = Server(
     "devcouncil",
     lifespan=_lifespan,
+    cache_hints={"tools/list": CacheHint(ttl_ms=_TOOLS_LIST_CACHE_TTL_MS, scope="private")},
     on_list_tools=_on_list_tools,
     on_call_tool=_on_call_tool,
     on_list_resources=_on_list_resources,

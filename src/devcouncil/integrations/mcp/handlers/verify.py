@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Callable
 
@@ -36,7 +37,7 @@ async def handle_verify_task(
         "--sandbox", sandbox,
         "--json",
     ]
-    payload, cli_error = parse_cli_json(run_cli_command(cli_args, root))
+    payload, cli_error = parse_cli_json(await asyncio.to_thread(run_cli_command, cli_args, root))
     if cli_error:
         return cli_error
     assert payload is not None

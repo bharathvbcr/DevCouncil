@@ -195,3 +195,42 @@ def test_load_file_pdg_and_match_functions(tmp_path: Path):
         assert hits
         hits2 = _match_pdg_functions(tmp_path, _graph(), "foo")
         assert hits2
+
+
+def _wide_graph(match_count: int = 25, caller_count: int = 60) -> CodeGraph:
+    nodes = [
+        GraphNode(id=f"pkg/a.py::foo_{i}", kind=NodeKind.FUNCTION, path="pkg/a.py", name=f"foo_{i}")
+        for i in range(match_count)
+    ]
+    edges = []
+    for i in range(caller_count):
+        nodes.append(
+            GraphNode(
+                id=f"pkg/c{i}.py::caller_{i}",
+                kind=NodeKind.FUNCTION,
+                path=f"pkg/c{i}.py",
+                name=f"caller_{i}",
+            )
+        )
+        edges.append(
+            GraphEdge(source=f"pkg/c{i}.py::caller_{i}", target="pkg/a.py::foo_0", kind="calls")
+        )
+    return CodeGraph(nodes=nodes, edges=edges)
+
+
+def test_query_symbol_reports_definition_totals_beside_the_cap(tmp_path: Path):
+    result = query_symbol(tmp_path, "foo_", graph=_wide_graph())
+    assert len(result["definitions"]) == 20
+    assert result["definitions_shown"] == 20
+    assert result["definitions_total"] == 25
+    assert result["definitions_truncated"] is True
+
+
+def test_query_symbol_reports_edge_totals_beside_the_cap(tmp_path: Path):
+    result = query_symbol(tmp_path, "foo_", graph=_wide_graph())
+    definition = next(d for d in result["definitions"] if d["id"] == "pkg/a.py::foo_0")
+    assert len(definition["callers"]) == 50
+    assert definition["callers_total"] == 60
+    assert definition["callers_truncated"] is True
+    assert definition["callees_total"] == 0
+    assert definition["callees_truncated"] is False

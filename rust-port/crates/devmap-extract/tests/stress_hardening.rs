@@ -205,3 +205,231 @@ fn many_distinct_parameters_keep_distinct_qualifiers() {
         );
     }
 }
+
+/// A truncated symbol list must still say so after it is persisted.
+///
+/// `fallback::scan_declarations` computes `truncated` correctly and
+/// `extract_treesitter` pushes it into `diagnostics` with the comment
+/// "Reported, not silently dropped". `Extraction::for_durable_store` — the
+/// payload written to `generation_files.extraction_json` and the extraction
+/// cache — then calls `diagnostics.clear()`, and `diagnostics` has no
+/// production reader anywhere in the workspace. So the stored record of a
+/// 2,500-declaration file was 2,000 symbols under a reason string that reads as
+/// a complete recovery, and the missing 500 were indistinguishable from
+/// declarations that do not exist.
+#[test]
+fn a_truncated_fallback_scan_survives_the_durable_store() {
+    let total = devmap_extract::fallback::MAX_FALLBACK_SYMBOLS + 500;
+    let mut source = String::from("syntax = \"proto3\";\n");
+    for i in 0..total {
+        source.push_str(&format!("message Msg{i} {{\n}}\n"));
+    }
+
+    let extraction = devmap_extract::extract_file("big.proto", &source);
+    let durable = extraction.for_durable_store();
+
+    let reason = match &durable.parse_outcome {
+        devmap_extract::model::ParseOutcome::Fallback { reason } => reason.clone(),
+        other => {
+            panic!("a grammarless language with recovered declarations is Fallback: {other:?}")
+        }
+    };
+    assert!(
+        reason.contains("500"),
+        "the persisted outcome must name the dropped declarations, got {reason:?}"
+    );
+    assert!(
+        reason.contains(&total.to_string()),
+        "the persisted outcome must name the true total, got {reason:?}"
+    );
+    // The prefix itself is unchanged; only the honesty about it is new.
+    assert_eq!(
+        durable.symbols.len(),
+        devmap_extract::fallback::MAX_FALLBACK_SYMBOLS + 1,
+        "the cap still applies (plus the File node)"
+    );
+}
+
+/// A pathological source must not stall the build, and must not be described as
+/// anything other than refused.
+///
+/// Measured before this bound existed (release build, tree-sitter-cpp 0.23): a
+/// 4,000-byte C++ file of 2,000 nested braces took **130,994 ms** — over two
+/// minutes for one file. Ruby took 8,807 ms on the same input; Python 58 ms. A
+/// repository containing one generated or minified file of this shape made
+/// `dev map` look like a hang, and made a daemon rebuild hold its lock for the
+/// duration. Nothing reported it.
+///
+/// The bound is only half the fix. A cancelled tree-sitter parse can still hand
+/// back a partial tree describing a prefix of the file; publishing that would
+/// be a truncated symbol set presented as a complete one. The refusal is
+/// explicit instead, and it must never claim the grammar is missing — that
+/// sentence is reserved for a language with no grammar at all.
+#[test]
+fn a_pathological_source_is_refused_within_its_budget() {
+    use std::time::{Duration, Instant};
+
+    let hostile = format!("{}{}", "{".repeat(2_000), "}".repeat(2_000));
+    let budget = Duration::from_millis(200);
+
+    let started = Instant::now();
+    let extraction = devmap_extract::treesitter::extract_treesitter_with_budget(
+        "h.cpp", "cpp", &hostile, budget,
+    );
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "a {:?} budget must bound the parse; took {elapsed:?}",
+        budget
+    );
+
+    let reason = match &extraction.parse_outcome {
+        devmap_extract::model::ParseOutcome::Failed { reason } => reason.clone(),
+        other => panic!("an abandoned parse must be Failed, not {other:?}"),
+    };
+    assert!(
+        reason.contains("budget"),
+        "the refusal must name the budget, got {reason:?}"
+    );
+    assert!(
+        !reason.contains("no linked tree-sitter grammar"),
+        "a grammar that exists must never be reported missing: {reason:?}"
+    );
+
+    // Exactly the File node, and no symbols recovered from an unparsed file.
+    let declarations: Vec<_> = extraction
+        .symbols
+        .iter()
+        .filter(|s| s.kind != devmap_extract::model::SymbolKind::File)
+        .collect();
+    assert!(
+        declarations.is_empty(),
+        "an abandoned parse must claim no declarations, got {declarations:?}"
+    );
+    assert_eq!(
+        extraction.symbols.len(),
+        1,
+        "the File node is still emitted"
+    );
+
+    // A legitimate file of the same language is unaffected by the bound.
+    let ok = devmap_extract::treesitter::extract_treesitter_with_budget(
+        "fine.cpp",
+        "cpp",
+        "int add(int a, int b) { return a + b; }\n",
+        budget,
+    );
+    assert!(
+        matches!(ok.parse_outcome, devmap_extract::model::ParseOutcome::Clean),
+        "ordinary source still parses cleanly: {:?}",
+        ok.parse_outcome
+    );
+}
+
+/// A source containing a NUL byte is refused before any grammar sees it.
+///
+/// Not a style rule — a liveness one. Measured 2026-09-04: `"a\0b\0c\n"`, six
+/// bytes, run through the vendored `tree-sitter-cobol` grammar did not
+/// terminate within three minutes, while the same input costs every other
+/// grammar microseconds. The parse budget cannot save this: tree-sitter's
+/// progress callback is never reached from inside a scanner that is spinning,
+/// and a spinning thread cannot be killed in-process. A single `.cbl` file with
+/// a stray NUL would hang `dev map` outright and leave a daemon holding its
+/// lock forever.
+///
+/// The boundary check is also correct on its own terms — a file containing a
+/// NUL is binary, and every extractor here assumes text — and it holds for
+/// every grammar, including vendored ones this repository does not control.
+#[test]
+fn a_source_containing_a_nul_byte_is_refused_before_parsing() {
+    use std::time::{Duration, Instant};
+
+    // `.cbl` is deliberately absent: COBOL is refused earlier still, by
+    // `UNSAFE_GRAMMARS`, for a stronger reason than the NUL byte — see
+    // `cobol_is_refused_promptly_rather_than_parsed_by_a_nonterminating_grammar`.
+    for (path, _lang) in [("b.py", "python"), ("b.rs", "rust"), ("b.ts", "typescript")] {
+        let started = Instant::now();
+        let extraction = devmap_extract::extract_file(path, "a\0b\0c\n");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{path}: the refusal must be immediate, took {:?}",
+            started.elapsed()
+        );
+
+        let reason = match &extraction.parse_outcome {
+            devmap_extract::model::ParseOutcome::Failed { reason } => reason.clone(),
+            other => panic!("{path}: a NUL-bearing source must be Failed, not {other:?}"),
+        };
+        assert!(
+            reason.contains("NUL"),
+            "{path}: the refusal must name the cause, got {reason:?}"
+        );
+        assert!(
+            !reason.contains("no linked tree-sitter grammar"),
+            "{path}: a grammar that exists must not be reported missing: {reason:?}"
+        );
+        // The File node survives so the file stays addressable as an edge target.
+        assert_eq!(extraction.symbols.len(), 1, "{path}: only the File node");
+    }
+
+    // Text without a NUL is unaffected.
+    let ok = devmap_extract::extract_file("fine.py", "def f():\n    return 1\n");
+    assert!(
+        matches!(ok.parse_outcome, devmap_extract::model::ParseOutcome::Clean),
+        "ordinary source is untouched: {:?}",
+        ok.parse_outcome
+    );
+}
+
+/// COBOL is refused rather than parsed, and the refusal is prompt.
+///
+/// The vendored `tree-sitter-cobol` grammar **does not terminate** on malformed
+/// input. Measured 2026-09-04: `"a\0b\0c\n"` (six bytes) and `"\u{feff}????\n"`
+/// each ran past three minutes, while the same 14 hostile inputs across the
+/// other 34 grammars complete in 5.03 s total. No in-process bound stops it —
+/// tree-sitter's progress callback is never reached from inside a scanner that
+/// is spinning, and a spinning thread cannot be killed.
+///
+/// What settled it was measuring what the grammar was *worth*. On a realistic
+/// COBOL program (IDENTIFICATION/DATA/PROCEDURE DIVISION, two paragraphs, a
+/// PERFORM) it parsed `Clean` and yielded **only the File node** — zero
+/// declarations, zero calls — and the bounded fallback scanner recovers nothing
+/// either. So the grammar contributed nothing measurable and carried an
+/// unbounded hang, and unlinking it costs no coverage.
+///
+/// COBOL files remain indexed as File nodes, so they stay addressable as edge
+/// targets and are honestly labelled.
+#[test]
+fn cobol_is_refused_promptly_rather_than_parsed_by_a_nonterminating_grammar() {
+    use std::time::{Duration, Instant};
+
+    // The two inputs that hung, plus an ordinary program.
+    for source in [
+        "a\0b\0c\n",
+        "\u{feff}????\n",
+        "       IDENTIFICATION DIVISION.\n       PROGRAM-ID. PAYROLL.\n",
+    ] {
+        let started = Instant::now();
+        let extraction = devmap_extract::extract_file("pay.cbl", source);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "COBOL must be refused immediately, took {:?} on {source:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(
+                extraction.parse_outcome,
+                devmap_extract::model::ParseOutcome::Failed { .. }
+            ),
+            "COBOL must be refused, got {:?}",
+            extraction.parse_outcome
+        );
+        // Still addressable: the File node survives so edges can target it.
+        assert_eq!(
+            extraction.symbols.len(),
+            1,
+            "the File node is still emitted for {source:?}"
+        );
+    }
+}

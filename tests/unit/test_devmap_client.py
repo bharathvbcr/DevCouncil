@@ -165,14 +165,18 @@ def test_scoped_trace_forwards_destination_to_ipc_and_cli(
         "budget": 2000,
         "depth": 7,
     }
+    # Options precede the `--` terminator (clap accepts none after it) and the
+    # two endpoints follow it in FROM, TO order, where the kernel reads them as
+    # values rather than as flags.
     assert captured["cli_args"] == [
         "trace",
-        "caller",
-        "destination",
         "--budget",
         "2000",
         "--depth",
         "7",
+        "--",
+        "caller",
+        "destination",
     ]
 
 

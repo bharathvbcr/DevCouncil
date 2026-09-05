@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from mcp.types import TextContent
@@ -38,7 +39,7 @@ async def handle_write_file(root: Path, db: object, arguments: dict) -> list[Tex
         "--content", content,
         "--json",
     ])
-    payload, cli_error = parse_cli_json(run_cli_command(cli_args, root))
+    payload, cli_error = parse_cli_json(await asyncio.to_thread(run_cli_command, cli_args, root))
     if cli_error:
         return cli_error
     assert payload is not None
@@ -62,7 +63,7 @@ async def handle_apply_patch(root: Path, db: object, arguments: dict) -> list[Te
         "--unified-diff", unified_diff,
         "--json",
     ])
-    payload, cli_error = parse_cli_json(run_cli_command(cli_args, root))
+    payload, cli_error = parse_cli_json(await asyncio.to_thread(run_cli_command, cli_args, root))
     if cli_error:
         return cli_error
     assert payload is not None

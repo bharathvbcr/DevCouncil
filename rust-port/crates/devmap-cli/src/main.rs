@@ -384,6 +384,23 @@ enum Commands {
         #[arg(long, default_value_t = 3)]
         depth: usize,
     },
+    /// Callers and callees for several targets in one invocation.
+    ///
+    /// Exists because the composed views above it were paying a process spawn
+    /// per direction per target: a five-definition `graph_query` cost eleven
+    /// `devmap` invocations, and the spawn — not the query — was the wall
+    /// clock. More than `MAX_NEIGHBOR_TARGETS` targets is refused rather than
+    /// trimmed, so a short answer is never mistaken for a complete one.
+    Neighbors {
+        #[arg(required = true, num_args = 1..)]
+        targets: Vec<String>,
+        #[arg(short, long, default_value_t = 2000)]
+        budget: u32,
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
+        #[arg(long, default_value_t = 0.0)]
+        min_confidence: f32,
+    },
     Trace {
         from: String,
         to: Option<String>,
@@ -636,6 +653,12 @@ fn emit_edges(resp: &devmap_query::Response<devmap_resolve::ResolvedEdge>) {
         );
     }
     emit_truncation(resp.shown, resp.hidden, resp.total, resp.truncated);
+    // Distinct from the truncation line, which describes the token budget. This
+    // one says the walk that produced `items` stopped before the graph ran out,
+    // so `total` is the size of a partial answer.
+    if let Some(reason) = &resp.walk_incomplete {
+        println!("warning: {reason}");
+    }
 }
 
 fn emit_dead(resp: &devmap_query::Response<devmap_analyze::DeadSymbolReport>) {
@@ -1423,6 +1446,27 @@ async fn main() -> anyhow::Result<()> {
                 emit_json(&cli, &serde_json::to_value(&resp)?)?;
             } else {
                 emit_edges(&resp);
+            }
+        }
+        Commands::Neighbors {
+            targets,
+            budget,
+            depth,
+            min_confidence,
+        } => {
+            let store = open_for_read(&cli.db)?;
+            let engine = StoreQueryEngine::new(&store);
+            let answers = engine.neighbors(targets, *budget, *min_confidence, *depth)?;
+            if cli.json {
+                emit_json(&cli, &serde_json::json!({ "neighbors": answers }))?;
+            } else {
+                for entry in &answers {
+                    println!("{}", entry.target);
+                    println!("  callers:");
+                    emit_edges(&entry.callers);
+                    println!("  callees:");
+                    emit_edges(&entry.callees);
+                }
             }
         }
         Commands::Trace {

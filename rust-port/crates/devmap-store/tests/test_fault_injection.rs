@@ -298,3 +298,97 @@ fn a_reader_during_prune_sees_a_consistent_store() {
         "a concurrent reader observed an empty store during pruning: {observations:?}"
     );
 }
+
+/// The edge cache must not outlive the generation it was read from.
+///
+/// `latest_edges` now serves the latest generation's full edge set from an
+/// in-memory cache, because the uncached query re-ran a two-JOIN, fully-ordered
+/// scan of all 71,598 edges on every request — measured at 99.6-160 ms per
+/// `impact`/`trace` *regardless of `--depth`*, since the cost is the load and
+/// not the traversal.
+///
+/// The whole risk of that change is staleness: a build commits a new
+/// generation and the daemon keeps answering from the old edge set, which is a
+/// silently wrong answer rather than a visible failure. The cache is keyed by
+/// generation id so invalidation happens by construction, and this pins it —
+/// dropping the key comparison makes the second assertion fail.
+///
+/// The confidence filter is asserted alongside, because the cached set is
+/// unfiltered and `min_confidence` is now applied in Rust rather than in SQL;
+/// a mismatch at the rounding boundary would be the same class of quiet error.
+#[test]
+fn the_edge_cache_is_invalidated_by_a_new_generation() {
+    let dir = tmp_dir("edge-cache");
+    let store = Store::open(dir.join("devmap.sqlite")).unwrap();
+
+    build_generations(&store, 1);
+    let first = store.latest_edges(0.0).unwrap();
+    assert!(!first.is_empty(), "the fixture must produce edges");
+    // Second read of the same generation is served from the cache and must be
+    // identical, not merely similar.
+    let cached = store.latest_edges(0.0).unwrap();
+    assert_eq!(
+        first.len(),
+        cached.len(),
+        "a cached read must return the same edge set"
+    );
+
+    // A filtered read of the same generation goes through the in-Rust
+    // confidence predicate; it must agree with what the unfiltered set holds.
+    let high = store.latest_edges(0.95).unwrap();
+    let expected_high = first.iter().filter(|e| e.confidence >= 0.95).count();
+    assert_eq!(
+        high.len(),
+        expected_high,
+        "the in-Rust confidence filter must match the cached set's own contents"
+    );
+
+    // Now move the generation, and move it in a way that changes the edge
+    // count. Re-running the same fixture would produce an identical count, and
+    // a length assertion against that is vacuous — a stale cache would pass it.
+    let sources: Vec<(String, String)> = (0..12)
+        .map(|i| {
+            (
+                format!("src/f{i}.py"),
+                format!("def fn{i}():\n    return {i}\n"),
+            )
+        })
+        .chain(std::iter::once((
+            "src/churn.py".to_string(),
+            "def churn():\n    return 0\n".to_string(),
+        )))
+        // New callers, so the second generation has strictly more Calls edges.
+        .chain((0..6).map(|i| {
+            (
+                format!("src/caller{i}.py"),
+                format!("from f{i} import fn{i}\n\n\ndef caller{i}():\n    return fn{i}()\n"),
+            )
+        }))
+        .collect();
+    let extractions: Vec<_> = sources
+        .iter()
+        .map(|(path, source)| extract_file(path, source))
+        .collect();
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions);
+    let analysis = analyze(&extractions, &resolution);
+    store
+        .save_generation(&extractions, &resolution, &analysis)
+        .unwrap();
+
+    let after = store.latest_edges(0.0).unwrap();
+    let direct = store.latest_edges_for_test().unwrap();
+    assert_ne!(
+        after.len(),
+        first.len(),
+        "the fixture must actually change the edge count, or this test cannot \
+         tell a fresh read from a stale one"
+    );
+    assert_eq!(
+        after.len(),
+        direct.len(),
+        "after a new generation, `latest_edges` must reflect it rather than \
+         serving the previous generation's cached set"
+    );
+}

@@ -37,7 +37,12 @@ console = _common.console
 OPENCODE_HOOK_PLUGIN_NAME = _common.OPENCODE_HOOK_PLUGIN_NAME
 SUPPORTED_HOOK_TOOLS = _common.SUPPORTED_HOOK_TOOLS
 
-SESSION_START_MATCHER = "startup|resume|clear|compact"
+# Claude Code SessionStart sources.  ``fork`` was added in v2.1.214 for
+# ``--fork-session``, ``/fork`` and ``/branch``; before that a forked session
+# reported ``resume``.  The value is only letters and ``|``, so Claude Code
+# compares it as an exact alternation list rather than a regex — a missing
+# entry silently never fires.
+SESSION_START_MATCHER = "startup|resume|clear|compact|fork"
 GIT_MAP_HOOK_MARKER = "# DevCouncil: refresh repo map"
 # Clients that install PreToolUse / BeforeTool / Cursor pre / OpenCode before containment.
 CONTAINMENT_HOOK_CLIENTS = ("claude", "codex", "cursor", "grok", "opencode", "gemini")
@@ -47,6 +52,16 @@ _opencode_plugin_source = _opencode._opencode_plugin_source
 _opencode_config_path = _opencode._opencode_config_path
 _record_opencode_config = _opencode._record_opencode_config
 
+# Claude Code's hook `timeout` is in SECONDS (command handlers default to 600).
+# Named constants because there is a second generator for the plugin bundle
+# (`integrations/claude_assets._plugin_hooks_json`) that missed the millisecond
+# migration this module performs below and shipped 10000/150000 — a 2.8-hour and
+# a 41.7-hour timeout — in the artifact other people install. One owner for the
+# numbers is what stops that drifting again.
+DEFAULT_HOOK_TIMEOUT_SECONDS = 10
+STOP_GATE_HOOK_TIMEOUT_SECONDS = 150
+
+
 def _stop_hook_timeout_seconds(project_root: Path) -> int:
     """Allow up to 150 seconds when the stop gate runs claims + verification."""
     try:
@@ -55,13 +70,13 @@ def _stop_hook_timeout_seconds(project_root: Path) -> int:
         sg = load_config(project_root).execution.stop_gate
         mode = (sg.mode or "off").strip().lower()
         if mode != "off" and (sg.check_claims or sg.verify_active_task):
-            return 150
+            return STOP_GATE_HOOK_TIMEOUT_SECONDS
     except Exception:
         pass
-    return 10
+    return DEFAULT_HOOK_TIMEOUT_SECONDS
 
 
-def _hook_command(project_root: Path, client: str, event: str) -> str:
+def _hook_command(project_root: Path, client: str, event: str, *extra: str) -> str:
     # Absolute path to project-venv (or PATH) `dev` so a stale global install cannot
     # shadow the repo's CLI from PostToolUse / PreToolUse hooks.
     executable = resolve_dev_executable(project_root)
@@ -73,11 +88,44 @@ def _hook_command(project_root: Path, client: str, event: str) -> str:
         client,
         "--project-root",
         str(project_root),
+        *extra,
     ])
 
-def _upsert_hook(settings: dict, event: str, matcher: str, command: str, name: str, *, timeout: int = 10) -> None:
+def _upsert_hook(
+    settings: dict,
+    event: str,
+    matcher: str,
+    command: str,
+    name: str,
+    *,
+    timeout: int = DEFAULT_HOOK_TIMEOUT_SECONDS,
+) -> None:
     hooks = settings.setdefault("hooks", {})
     groups = hooks.setdefault(event, [])
+
+    # A DevCouncil-owned hook name belongs to exactly one matcher group.  Groups are
+    # keyed by matcher, so when the matcher value changes between releases the old
+    # group is not the target group and the hook would stay registered under *both*
+    # matchers — Claude Code then runs it twice for every event the two matchers
+    # share.  Drop our name from every non-target group first, and prune a group
+    # that held nothing else.  Hooks we do not own keep their group untouched.
+    migrated: list = []
+    for group in groups:
+        if not isinstance(group, dict) or group.get("matcher") == matcher:
+            migrated.append(group)
+            continue
+        inner = group.get("hooks")
+        if not isinstance(inner, list):
+            migrated.append(group)
+            continue
+        kept = [h for h in inner if not (isinstance(h, dict) and h.get("name") == name)]
+        if len(kept) == len(inner):
+            migrated.append(group)
+        elif kept:
+            migrated.append({**group, "hooks": kept})
+    if migrated != groups:
+        groups[:] = migrated
+
     target_group = None
     for group in groups:
         if group.get("matcher") == matcher:
@@ -461,12 +509,25 @@ def _install_claude_hooks(project_root: Path, *, write_gate: bool = False) -> li
     settings = _load_json(path)
     matcher = "Bash|Write|Edit|MultiEdit"
     # Refresh-only PostToolUse is always installed so assist mode keeps the map warm.
+    # ``--defer-batch`` makes it queue the edited paths instead of building the map:
+    # PostToolUse fires once *per tool* and concurrently across a parallel batch, so
+    # N edits meant N kernel builds contending on one lock.  The PostToolBatch hook
+    # below fires exactly once after the whole batch resolves and drains the queue,
+    # which is still before Claude Code sends the next request to the model.  Only
+    # Claude Code has PostToolBatch, so no other client passes this flag.
     _upsert_hook(
         settings,
         "PostToolUse",
         matcher,
-        _hook_command(project_root, "claude", "post-tool-use"),
+        _hook_command(project_root, "claude", "post-tool-use", "--defer-batch"),
         "devcouncil-post-tool-use",
+    )
+    _upsert_hook(
+        settings,
+        "PostToolBatch",
+        "",
+        _hook_command(project_root, "claude", "post-tool-batch"),
+        "devcouncil-post-tool-batch",
     )
     if write_gate:
         _upsert_hook(
@@ -541,6 +602,40 @@ def _install_claude_hooks(project_root: Path, *, write_gate: bool = False) -> li
         "",
         _hook_command(project_root, "claude", "notification"),
         "devcouncil-notification",
+    )
+    # Map-freshness events.  The repo map is repo-scoped and must survive changes
+    # that never pass through a tool call:
+    #   FileChanged   — a branch switch, pull, rebase or external script rewrites
+    #                   files on disk; PostToolUse structurally cannot see it.  The
+    #                   matcher is *omitted* on purpose: its value doubles as the
+    #                   watch list, so any value here would register a literal
+    #                   filename, while an omitted matcher matches every watched
+    #                   file and contributes nothing.  SessionStart/CwdChanged seed
+    #                   the real watch list via ``watchPaths``.
+    #   CwdChanged    — the map is scoped to one repo, so leaving it must clear the
+    #                   watch list and entering another must re-seed it.
+    #   DirectoryAdded— /add-dir brings a repo the map does not cover; say so rather
+    #                   than let Claude assume the map is authoritative for it.
+    _upsert_hook(
+        settings,
+        "FileChanged",
+        "",
+        _hook_command(project_root, "claude", "file-changed"),
+        "devcouncil-file-changed",
+    )
+    _upsert_hook(
+        settings,
+        "CwdChanged",
+        "",
+        _hook_command(project_root, "claude", "cwd-changed"),
+        "devcouncil-cwd-changed",
+    )
+    _upsert_hook(
+        settings,
+        "DirectoryAdded",
+        "",
+        _hook_command(project_root, "claude", "directory-added"),
+        "devcouncil-directory-added",
     )
     _save_json(path, settings)
     # Keep runtime gate posture and assist/contain flag in sync with --write-gate.

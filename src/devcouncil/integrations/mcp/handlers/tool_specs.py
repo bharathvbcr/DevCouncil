@@ -2,10 +2,179 @@
 
 from __future__ import annotations
 
-from mcp.types import Tool
+from mcp.types import Tool, ToolAnnotations
+
+# (read_only, destructive, idempotent, open_world) for every advertised tool.
+#
+# All four are stated for every tool rather than leaning on the spec's
+# "``destructiveHint`` is meaningful only when ``readOnlyHint`` is false"
+# conditional. Clients differ in how carefully they implement that conditional,
+# and the field's own default is ``true`` — so an unset hint on a read-only
+# query reads as "may perform destructive updates", which is how a status call
+# ends up behind the same confirmation prompt as ``apply_patch``.
+#
+# ``open_world`` is true where the effect leaves this repository: a tool that
+# spawns an arbitrary process, attaches a debugger to one, or calls a network
+# model. Everything else is closed over the project's own files and database.
+#
+# Rows are behaviour claims about the handler, not restatements of the
+# description. Where the two could disagree the handler was read: ``next_task``
+# discards ``client_id`` and takes no lease (``task_gate_ops.py:444``),
+# ``graph_cypher`` rejects every mutating clause (``indexing/graph/cypher.py:46``),
+# and ``devcouncil_cli`` is not read-only because its allowlist
+# (``cli_gate.py:11-18``) includes ``write``, ``apply-patch`` and ``rollback``.
+_RO = (True, False, True, False)  # a pure query over local state
+
+TOOL_BEHAVIOUR: dict[str, tuple[bool, bool, bool, bool]] = {
+    # --- code intelligence ---
+    "devcouncil_code_explore": _RO,
+    "devcouncil_code_search": _RO,
+    "devcouncil_code_path": _RO,
+    "devcouncil_code_impact": _RO,
+    "devcouncil_code_dead": _RO,  # "never deletes code"
+    "devcouncil_code_affected_tests": _RO,
+    "devcouncil_code_sync": (False, False, True, False),  # rebuilds the index in place
+    "devcouncil_code_status": _RO,
+    # --- debugger ---
+    "devcouncil_debug_discover": (False, False, True, True),  # persists consent; scans the host
+    "devcouncil_debug_start": (False, True, False, True),  # launches or attaches to a process
+    "devcouncil_debug_breakpoints": (False, False, True, False),  # replace-all, so repeatable
+    "devcouncil_debug_control": (False, False, False, False),  # stepping advances the debuggee
+    "devcouncil_debug_inspect": _RO,
+    "devcouncil_debug_evaluate": (False, True, False, True),  # "side-effectful" by contract
+    "devcouncil_debug_trace": (False, False, False, True),  # runs a script under a tracer
+    "devcouncil_debug_stop": (False, True, True, True),  # terminates the debuggee by default
+    # --- project state, read side ---
+    "devcouncil_status": _RO,
+    "devcouncil_integration_status": _RO,
+    "devcouncil_report": _RO,
+    "devcouncil_get_task": _RO,
+    "devcouncil_get_gaps": _RO,
+    "devcouncil_get_next_actions": _RO,
+    "devcouncil_get_task_provenance": _RO,
+    "devcouncil_live_review": _RO,
+    "devcouncil_live_cards": _RO,
+    "devcouncil_live_repair_prompt": _RO,
+    "devcouncil_live_repair_all": _RO,
+    "devcouncil_list_tasks": _RO,
+    "devcouncil_get_prompt": _RO,
+    "devcouncil_tail_trace": _RO,
+    "devcouncil_policy_check_write": _RO,  # answers a question, writes nothing
+    "devcouncil_prepare_execution": _RO,  # `show` + `prompt`, both reads
+    "devcouncil_list_leases": _RO,
+    "devcouncil_read_file": _RO,
+    "devcouncil_get_diff": _RO,
+    "devcouncil_get_evidence": _RO,
+    "devcouncil_list_agent_runs": _RO,
+    "devcouncil_get_run": _RO,
+    "devcouncil_next_task": _RO,
+    "devcouncil_select_knowledge": _RO,
+    "devcouncil_wiki_page": _RO,
+    "devcouncil_run_timeline": _RO,
+    # --- map / graph, read side ---
+    "devcouncil_graph_context": _RO,
+    "devcouncil_repo_map": _RO,
+    "devcouncil_impact": _RO,
+    "devcouncil_liveness": _RO,
+    "devcouncil_graph_runs": _RO,
+    "devcouncil_graph_cypher": _RO,
+    "devcouncil_pdg_query": _RO,
+    "devcouncil_explain": _RO,
+    "devcouncil_graph_query": _RO,
+    "devcouncil_graph_trace": _RO,
+    "devcouncil_graph_impact": _RO,
+    "devcouncil_route_map": _RO,
+    "devcouncil_shape_check": _RO,
+    "devcouncil_api_impact": _RO,
+    "devcouncil_lsp_status": _RO,
+    "devcouncil_ast_match": _RO,
+    # --- map / graph, write side ---
+    "devcouncil_graph_ingest": (False, False, True, False),  # sync + export + map write
+    "devcouncil_graph_doctor": (False, False, True, False),  # fix=true repairs the store
+    # --- leases and task state ---
+    "devcouncil_checkout_task": (False, False, False, False),  # a second call is a second claim
+    "devcouncil_release_task": (False, False, True, False),
+    "devcouncil_renew_lease": (False, False, False, False),  # each call extends again
+    "devcouncil_update_task_scope": (False, False, True, False),  # appends *unique* entries
+    "devcouncil_append_evidence": (False, False, False, False),  # appends on every call
+    "devcouncil_record_command": (False, False, False, False),
+    "devcouncil_handoff_agent": (False, False, False, False),
+    # --- the tools that change the working tree ---
+    "devcouncil_write_file": (False, True, True, False),  # overwrites; same content, same result
+    "devcouncil_apply_patch": (False, True, False, False),  # re-applying a diff is not a no-op
+    "devcouncil_run_command": (False, True, False, True),  # runs an allowlisted shell command
+    "devcouncil_cli": (False, True, False, True),  # allowlist reaches write / apply-patch / rollback
+    "devcouncil_verify_task": (False, False, True, True),  # runs the task's own test commands
+    # --- meta-agent ---
+    "devcouncil_run_supervise": (False, False, False, True),  # asks a network model for a verdict
+}
 
 
 def all_tools() -> list[Tool]:
+    """Every advertised tool, with schema and behaviour filled in from one owner.
+
+    The closing happens here rather than in 73 literals so there is one owner
+    for the rule and no schema can be added that quietly opts out of it. It was
+    the absence of this that let ``create_planned_files`` — a field that widens
+    a task's write scope — be read by a handler while the advertised contract
+    said it did not exist: an undeclared field validated silently, so nothing
+    ever reported the gap.
+
+    Behaviour annotations are attached the same way and for the same reason: a
+    tool added without a ``TOOL_BEHAVIOUR`` row ships unannotated, and an
+    unannotated tool is one the spec tells clients to assume may be
+    destructive. The gap is silent in the payload, so a test asserts the table
+    covers every advertised name instead.
+    """
+    return [_annotated(_closed(tool)) for tool in _tools()]
+
+
+def _closed(tool: Tool) -> Tool:
+    """Return *tool* with ``additionalProperties: false`` on its root schema.
+
+    Only the root object is closed. Nested ``additionalProperties`` (the
+    per-source breakpoint map, DAP ``configuration``/``arguments`` passthroughs)
+    describe payloads this server forwards rather than reads, and stay open.
+    A schema that already states its own answer is left alone.
+    """
+    schema = tool.input_schema
+    if "additionalProperties" in schema:
+        return tool
+    return tool.model_copy(update={"input_schema": {**schema, "additionalProperties": False}})
+
+
+def _annotated(tool: Tool) -> Tool:
+    """Return *tool* with its ``TOOL_BEHAVIOUR`` row as ``annotations``.
+
+    A tool the table does not name is left unannotated rather than given a
+    guessed row: a wrong ``readOnlyHint`` is worse than an absent one, because
+    a client acts on the wrong answer instead of falling back to its own
+    conservative default. The missing row is caught by the coverage test.
+    A tool that already carries its own annotations keeps them.
+    """
+    if tool.annotations is not None:
+        return tool
+    behaviour = TOOL_BEHAVIOUR.get(tool.name)
+    if behaviour is None:
+        return tool
+    read_only, destructive, idempotent, open_world = behaviour
+    return tool.model_copy(
+        update={
+            # Field names, not the wire aliases the ``Tool`` literals below use:
+            # the two build the same object, and only this form type-checks.
+            # Serialization is ``by_alias``, so the wire still says
+            # ``readOnlyHint``.
+            "annotations": ToolAnnotations(
+                read_only_hint=read_only,
+                destructive_hint=destructive,
+                idempotent_hint=idempotent,
+                open_world_hint=open_world,
+            )
+        }
+    )
+
+
+def _tools() -> list[Tool]:
     from devcouncil.integrations.mcp.handlers.codeintel import tools as codeintel_tools
     from devcouncil.integrations.mcp.handlers.debug import tools as debug_tools
 
@@ -622,8 +791,9 @@ def all_tools() -> list[Tool]:
             name="devcouncil_update_task_scope",
             description=(
                 "Append unique expected tests, allowed commands, or planned files "
-                "(modify-op only) for a leased task. Use planned_files to authorize "
-                "editing an intended caller when wiring a new module."
+                "for a leased task. Use planned_files to authorize editing an "
+                "intended caller when wiring a new module, and create_planned_files "
+                "to authorize creating a new one."
             ),
             inputSchema={
                 "type": "object",
@@ -638,6 +808,14 @@ def all_tools() -> list[Tool]:
                         "description": (
                             "Paths to append as modify-op planned files "
                             "(secret/restricted paths rejected)."
+                        ),
+                    },
+                    "create_planned_files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Paths to append as create-op planned files, authorizing "
+                            "the task to create them (secret/restricted paths rejected)."
                         ),
                     },
                 },
@@ -768,8 +946,22 @@ def all_tools() -> list[Tool]:
                             "that task may be read."
                         ),
                     },
-                    "offset": {"type": "integer", "minimum": 0, "description": "0-based line offset to start from."},
-                    "limit": {"type": "integer", "minimum": 1, "description": "Max number of lines to return."},
+                    # Both ceilings mirror the handler's own clamp
+                    # (`int_argument(..., maximum=10_000_000)`), so the advertised
+                    # range is the range that is actually enforced. `limit` had no
+                    # ceiling anywhere: the handler only floors it at 1.
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 10_000_000,
+                        "description": "0-based line offset to start from.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10_000_000,
+                        "description": "Max number of lines to return.",
+                    },
                     "line_range": {
                         "type": "string",
                         "description": "Inclusive 1-based line range like '10-40' (overrides offset/limit).",

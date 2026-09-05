@@ -425,3 +425,71 @@ def test_mcp_get_unknown_prompt_raises():
 
     with pytest.raises(ValueError):
         asyncio.run(server.get_prompt("does_not_exist", {}))
+
+
+def test_marketplace_manifest_passes_strict_plugin_validation():
+    """The generated marketplace must satisfy `claude plugin validate --strict`.
+
+    Verified against the real validator (Claude Code 2.1.259) on a generated
+    bundle::
+
+        $ claude plugin validate <bundle>/.devcouncil/claude-plugin --strict
+        ⚠ Found 1 warning:
+          ❯ description: No marketplace description provided. Adding a
+            description helps users understand what this marketplace offers
+        ✘ Validation failed (--strict treats warnings as errors)
+
+    The plugin manifest itself passes strict cleanly; only the marketplace was
+    missing the field. `--strict` is what a publishing pipeline runs, so a
+    warning here is a release blocker rather than a cosmetic note.
+    """
+    import json
+
+    from devcouncil.integrations import claude_assets
+
+    manifest = json.loads(claude_assets._marketplace_json("0.1.0"))
+
+    description = manifest.get("description")
+    assert isinstance(description, str) and description.strip(), (
+        "the marketplace manifest needs a non-empty description or "
+        "`claude plugin validate --strict` fails: " + repr(manifest)
+    )
+    # The plugin entry's own description is separate and was already present.
+    assert manifest["plugins"][0]["description"]
+
+
+def test_plugin_hook_timeouts_are_seconds_not_milliseconds():
+    """The plugin bundle's hooks.json must use the same unit as the settings hooks.
+
+    Claude Code's hook `timeout` is in **seconds** (command handlers default to
+    600). `integrations/clients/hooks.py` knows this — it defaults to `10`, its
+    stop-gate helper is literally named `_stop_hook_timeout_seconds`, and its
+    comment at `hooks.py:135` says the integration "migrates old millisecond
+    values to the seconds expected by Claude Code and Codex".
+
+    `claude_assets._plugin_hooks_json` is a second generator that never got the
+    migration: it emitted `10000` and `150000`, i.e. 2.8-hour and 41.7-hour
+    timeouts. A hook that hangs would hold the session for the rest of the day
+    instead of being cut off after ten seconds — and because the bundle is the
+    *published* artifact, this is the copy other people would install.
+    """
+    import json
+
+    from devcouncil.integrations import claude_assets
+
+    config = json.loads(claude_assets._plugin_hooks_json(write_gate=True))
+
+    seen = []
+    for event, groups in config["hooks"].items():
+        for group in groups:
+            for handler in group.get("hooks", []):
+                timeout = handler.get("timeout")
+                if timeout is None:
+                    continue
+                seen.append((event, timeout))
+                assert timeout <= 600, (
+                    f"{event}: timeout {timeout} is not seconds — Claude Code's "
+                    "command-handler default is 600s, so anything above that is a "
+                    "millisecond value that was never migrated"
+                )
+    assert seen, "the plugin hooks must declare timeouts at all"

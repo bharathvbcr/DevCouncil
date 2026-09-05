@@ -10,6 +10,16 @@ use std::path::{Path, PathBuf};
 use crate::cancel::{Cancel, QueryCancelled};
 use crate::model::*;
 
+/// Most targets one composed `neighbors` request may ask about.
+///
+/// Sized above the five definitions the `graph_query` view measures, with room
+/// for a caller that wants a few more, and far below anything that would let
+/// one request monopolise the daemon: the worst case is
+/// `2 * MAX_NEIGHBOR_TARGETS` sub-queries, which a client could already issue
+/// as separate calls. It adds no reach the client did not have — it makes that
+/// reach cost one round trip instead of thirty-two.
+pub const MAX_NEIGHBOR_TARGETS: usize = 16;
+
 pub struct QueryEngine<'a> {
     extractions: &'a [Extraction],
     resolution: &'a ResolutionResult,
@@ -115,6 +125,161 @@ impl<'a> StoreQueryEngine<'a> {
         self.traverse(req, true)
     }
 
+    /// Answer both call-graph directions for several targets in one pass.
+    ///
+    /// This is a composition, not new analysis: each target still gets exactly
+    /// the [`Self::impact`] and [`Self::trace`] it would have got on its own,
+    /// under the same budget and the same `min_confidence` — both directions,
+    /// so the two halves of one answer cannot disagree about what the filter
+    /// meant, nor about which file the target names. What it removes is the
+    /// per-direction round trip — the caller pays one, not `2 * targets.len()`.
+    ///
+    /// The fan-out is bounded and the bound is *refused*, never silently
+    /// applied: more than [`MAX_NEIGHBOR_TARGETS`] targets is an error, so
+    /// nobody can read a truncated answer as a complete one. A caller that
+    /// needs more must ask again, and know that it did.
+    ///
+    /// Cancellation is checked between targets, so a composed request cannot
+    /// outlive its client by the whole fan-out.
+    pub fn neighbors(
+        &self,
+        targets: &[String],
+        token_budget: u32,
+        min_confidence: f32,
+        max_depth: usize,
+    ) -> anyhow::Result<Vec<Neighbors>> {
+        if targets.len() > MAX_NEIGHBOR_TARGETS {
+            anyhow::bail!(
+                "neighbors accepts at most {} targets, got {}",
+                MAX_NEIGHBOR_TARGETS,
+                targets.len()
+            );
+        }
+        // A composed answer must come from one generation.
+        //
+        // The fan-out is `2 * targets.len()` sub-queries, each taking and
+        // releasing the store lock on its own. A build committing mid-fan-out
+        // left one answer describing two different snapshots of the repository —
+        // measured at 25 of 62 composed answers under contention — and nothing
+        // in the response disclosed it. That is not a regression against the
+        // separate `impact`/`deps` calls this replaced, which straddled the same
+        // way; but those were visibly separate exchanges and this is sold as one.
+        //
+        // Detected rather than locked out: holding the store lock across the
+        // whole fan-out would block the writer for the duration of a composed
+        // query, which is a worse trade. Commits are rare, so one retry
+        // resolves nearly all of them; a second straddle is reported on every
+        // direction instead of being smoothed over, because a caller that
+        // cannot tell is the actual defect.
+        for attempt in 0..2 {
+            let before = self.store.latest_generation_id()?;
+            let mut answers =
+                self.neighbors_once(targets, token_budget, min_confidence, max_depth)?;
+            let after = self.store.latest_generation_id()?;
+            if before == after {
+                return Ok(answers);
+            }
+            if attempt == 1 {
+                let note = format!(
+                    "the index moved from generation {before:?} to {after:?} while this \
+                     composed answer was being assembled, twice in a row; its parts may \
+                     describe different snapshots"
+                );
+                for entry in &mut answers {
+                    entry.callers.walk_incomplete = Some(note.clone());
+                    entry.callees.walk_incomplete = Some(note.clone());
+                }
+                return Ok(answers);
+            }
+        }
+        unreachable!("the loop returns on both attempts")
+    }
+
+    /// One pass of the composition. See [`Self::neighbors`] for the retry that
+    /// keeps a composed answer inside a single generation.
+    fn neighbors_once(
+        &self,
+        targets: &[String],
+        token_budget: u32,
+        min_confidence: f32,
+        max_depth: usize,
+    ) -> anyhow::Result<Vec<Neighbors>> {
+        let mut answers = Vec::with_capacity(targets.len());
+        for target in targets {
+            // Plain `check`, not `check_every`: the latter consults the flag
+            // once per CHECK_INTERVAL (512) iterations, and this loop runs at
+            // most MAX_NEIGHBOR_TARGETS (16) times, so it would fire on target
+            // 0 and never again.
+            //
+            // In practice cancellation already lands inside `impact`, whose
+            // traversal checks the flag as it walks, so this is not what
+            // rescues a cancelled request — measurement confirms a composition
+            // stops partway through either way. It closes the gap *between*
+            // sub-queries, and costs one relaxed load per target.
+            self.cancel.check()?;
+            // `min_confidence` applies to *both* directions. It was hardcoded to
+            // 0.0 here, which silently discarded the caller's filter on the
+            // inbound side: one composed answer would report every caller while
+            // reporting only the callees that cleared the threshold, so its two
+            // halves disagreed about what the filter meant. `traverse` honours
+            // the field (`resolved_edges(req.min_confidence)`), so there was
+            // never a reason not to pass it.
+            let callers = self.impact(Request {
+                query: target.clone(),
+                token_budget,
+                min_confidence,
+                max_depth,
+            })?;
+            // Outbound edges come from whichever query can actually answer
+            // for this target's shape.
+            //
+            // `dependencies` resolves a *file* path, so for a symbol id it
+            // returned `Unavailable: … is not indexed` — every time. The
+            // composed `query` view therefore reported its callees as unknown
+            // for every symbol-shaped query, which is honest but useless, and
+            // the earlier attempt to fix it by asking about the containing file
+            // was worse: a function's "callees" became the whole file's
+            // outbound edges, so symbols appeared to call themselves.
+            //
+            // The forward traversal is symbol-scoped and answers exactly the
+            // question. `latest_file` — the store's own notion of what is a
+            // file — picks between them, rather than sniffing for `::`.
+            // Outbound edges come from the forward traversal, for every target
+            // shape — not from `dependencies`.
+            //
+            // `dependencies` resolves a *file* path, so for a symbol id it
+            // always answered `Unavailable: … is not indexed` and `callees`
+            // never carried anything for a symbol query. For a file it answered,
+            // but wrongly for this field: its SQL matches
+            // `sp.path = ?2 OR tp.path = ?2`, so "outbound edges" included
+            // edges pointing *into* the file, and a file appeared in its own
+            // callee list — the same "symbols appeared to call themselves"
+            // shape, surviving on the file path.
+            //
+            // Worse, mixing the two resolvers made one answer incoherent:
+            // `impact` matches by suffix (`path_matches`: `ends_with("/{query}")`)
+            // while `dependencies` matches exactly, so with both `core.py` and
+            // `pkg/core.py` indexed, the callers described one file and the
+            // callees another. One resolver for both directions removes that by
+            // construction.
+            //
+            // `deps` the command is unchanged; only this composition's `callees`
+            // tightened to what the field has always claimed to be.
+            let callees = self.trace(Request {
+                query: target.clone(),
+                token_budget,
+                min_confidence,
+                max_depth: 1,
+            })?;
+            answers.push(Neighbors {
+                target: target.clone(),
+                callers,
+                callees,
+            });
+        }
+        Ok(answers)
+    }
+
     pub fn trace(&self, req: Request<String>) -> anyhow::Result<Response<ResolvedEdge>> {
         self.traverse(req, false)
     }
@@ -142,11 +307,49 @@ impl<'a> StoreQueryEngine<'a> {
             }));
         }
         let edges = self.resolved_edges(req.min_confidence)?;
-        let path = shortest_path(&edges, from, to, req.max_depth.min(64), 5_000, &self.cancel)?;
-        let Some(path) = path else {
-            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
-                reason: format!("no indexed path from {from:?} to {to:?}"),
-            }));
+        let path = match shortest_path(
+            &edges,
+            from,
+            to,
+            req.max_depth.min(64),
+            5_000,
+            &self.cancel,
+        )? {
+            PathSearch::Found(path) => path,
+            // The only outcome that is a claim about the graph.
+            PathSearch::NoPath => {
+                return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+                    reason: format!("no indexed path from {from:?} to {to:?}"),
+                }))
+            }
+            // A limit stopped the walk, so the graph was never asked. Saying
+            // "no path" here is how an agent concludes two symbols are
+            // unrelated when the path is merely longer than `--depth`.
+            PathSearch::Exhausted {
+                depth_capped,
+                node_capped,
+                visited,
+                max_depth,
+                max_nodes,
+            } => {
+                let mut limits = Vec::new();
+                if depth_capped {
+                    limits.push(format!("depth {max_depth}"));
+                }
+                if node_capped {
+                    limits.push(format!("{max_nodes} nodes"));
+                }
+                let limits = if limits.is_empty() {
+                    "its budget".to_string()
+                } else {
+                    limits.join(" and ")
+                };
+                return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+                    reason: format!(
+                        "search from {from:?} to {to:?} stopped at {limits} after                          visiting {visited} nodes without reaching the target;                          whether a path exists is unknown — retry with a larger                          --depth"
+                    ),
+                }));
+            }
         };
         Ok(atomic_budget_take(path, req.token_budget, |_| 25))
     }
@@ -214,12 +417,14 @@ impl<'a> StoreQueryEngine<'a> {
         // abandoned request from paying for the sort and the budgeting that
         // follow.
         self.cancel.check()?;
+        let max_depth = req.max_depth.min(64);
+        let max_nodes = 5_000;
         let walk = traverse_graph(
             &start,
             &edges,
             &TraversalOptions {
-                max_depth: req.max_depth.min(64),
-                max_nodes: 5_000,
+                max_depth,
+                max_nodes,
                 reverse,
             },
         );
@@ -233,7 +438,13 @@ impl<'a> StoreQueryEngine<'a> {
                 .then_with(|| a.target_file.cmp(&b.target_file))
                 .then_with(|| a.source_symbol.cmp(&b.source_symbol))
         });
-        Ok(budget_take(traversed, req.token_budget, |_| 25))
+        let mut response = budget_take(traversed, req.token_budget, |_| 25);
+        // The budgeter counts what it received. When the walk itself stopped
+        // early, `total` is the size of a partial answer and `truncated: false`
+        // is a claim the walk never earned — this is where `impact` said "here
+        // is the blast radius" after visiting three levels of a deeper graph.
+        response.walk_incomplete = walk.stop.reason(max_depth, max_nodes);
+        Ok(response)
     }
 
     pub fn dead_symbols(
@@ -474,6 +685,7 @@ impl<'a> StoreQueryEngine<'a> {
             truncated: false,
             tokens_used: 0,
             resolution: ResolutionAvailability::Available,
+            walk_incomplete: None,
         };
 
         if let ParseOutcome::Failed { reason } = &candidate.parse_outcome {
@@ -1082,6 +1294,32 @@ fn path_to(reached: &[Reached], ordered: &[&ResolvedEdge], entry: usize) -> Vec<
 /// most once and the whole call is `O(E log E)`, dominated by the ordering
 /// sort.
 ///
+/// Why a scoped trace ended, so a caller can tell an answer from a decline.
+///
+/// A bare `Option<Vec<_>>` made four outcomes one value: a zero budget, a
+/// frontier pruned at `max_depth`, the node cap stopping the walk, and the
+/// reachable set genuinely not containing the target. Only the last of those
+/// licenses the sentence `trace_between` was printing — "no indexed path from
+/// X to Y" — and an agent that reads it concludes two symbols are unrelated.
+#[derive(Debug)]
+pub(crate) enum PathSearch {
+    /// The target was reached; these are the edges, source-first.
+    Found(Vec<ResolvedEdge>),
+    /// The reachable set from `from` was explored to exhaustion without
+    /// reaching `to`. This is the only outcome that is a fact about the graph.
+    NoPath,
+    /// A limit stopped the walk before it could answer. `depth_capped` means a
+    /// node with unexplored successors sat at `max_depth`; `node_capped` means
+    /// the frontier hit `max_nodes`. Both can be true.
+    Exhausted {
+        depth_capped: bool,
+        node_capped: bool,
+        visited: usize,
+        max_depth: usize,
+        max_nodes: usize,
+    },
+}
+
 /// Ordering, and therefore *which* shortest path is returned, is unchanged:
 /// edges are considered in descending confidence with a total tie-break, and
 /// the frontier is explored in the same first-in-first-out order.
@@ -1092,10 +1330,21 @@ fn shortest_path(
     max_depth: usize,
     max_nodes: usize,
     cancel: &Cancel,
-) -> Result<Option<Vec<ResolvedEdge>>, QueryCancelled> {
+) -> Result<PathSearch, QueryCancelled> {
     if max_depth == 0 || max_nodes == 0 {
-        return Ok(None);
+        return Ok(PathSearch::Exhausted {
+            depth_capped: max_depth == 0,
+            node_capped: max_nodes == 0,
+            visited: 0,
+            max_depth,
+            max_nodes,
+        });
     }
+    // Set the instant a limit actually costs the walk a successor it would
+    // otherwise have expanded. Reaching a cap with nothing left to explore is
+    // not a decline, so neither flag is raised for it.
+    let mut depth_capped = false;
+    let mut node_capped = false;
     let mut ordered: Vec<&ResolvedEdge> = edges.iter().collect();
     ordered.sort_by(|a, b| {
         b.confidence
@@ -1130,9 +1379,10 @@ fn shortest_path(
         }
         let node = (edge.target_file.clone(), edge.target_symbol.clone());
         if edge_node_matches(&node.0, &node.1, to) {
-            return Ok(Some(vec![(*edge).clone()]));
+            return Ok(PathSearch::Found(vec![(*edge).clone()]));
         }
         if visited.len() >= max_nodes {
+            node_capped = true;
             break;
         }
         if visited.insert(node.clone()) {
@@ -1152,6 +1402,12 @@ fn shortest_path(
         dequeued += 1;
         let depth = reached[entry].depth;
         if depth >= max_depth {
+            // Only a pruned node that *had* somewhere to go cost us anything.
+            // A leaf at `max_depth` is fully explored, and counting it would
+            // make every trace on a bounded graph report itself uncertain.
+            if outgoing.contains_key(&reached[entry].node) {
+                depth_capped = true;
+            }
             continue;
         }
         let Some(candidates) = outgoing.get(&reached[entry].node) else {
@@ -1170,10 +1426,20 @@ fn shortest_path(
                     node: next,
                     depth: depth + 1,
                 });
-                return Ok(Some(path_to(&reached, &ordered, reached.len() - 1)));
+                return Ok(PathSearch::Found(path_to(
+                    &reached,
+                    &ordered,
+                    reached.len() - 1,
+                )));
             }
             if visited.len() >= max_nodes {
-                return Ok(None);
+                return Ok(PathSearch::Exhausted {
+                    depth_capped,
+                    node_capped: true,
+                    visited: visited.len(),
+                    max_depth,
+                    max_nodes,
+                });
             }
             if visited.insert(next.clone()) {
                 reached.push(Reached {
@@ -1186,7 +1452,16 @@ fn shortest_path(
             }
         }
     }
-    Ok(None)
+    if depth_capped || node_capped {
+        return Ok(PathSearch::Exhausted {
+            depth_capped,
+            node_capped,
+            visited: visited.len(),
+            max_depth,
+            max_nodes,
+        });
+    }
+    Ok(PathSearch::NoPath)
 }
 
 /// A caller-supplied path that does not resolve inside the indexed repository.
@@ -1361,6 +1636,7 @@ impl<'a> QueryEngine<'a> {
                 truncated: false,
                 tokens_used: 0,
                 resolution: ResolutionAvailability::Available,
+                walk_incomplete: None,
             };
         }
         let q_lower = req.query.to_lowercase();
@@ -1597,6 +1873,7 @@ fn unavailable_response<T>(resolution: ResolutionAvailability) -> Response<T> {
         truncated: false,
         tokens_used: 0,
         resolution,
+        walk_incomplete: None,
     }
 }
 
@@ -1791,6 +2068,7 @@ where
         tokens_used: current_tokens,
         items: out,
         resolution: ResolutionAvailability::Available,
+        walk_incomplete: None,
     }
 }
 
@@ -1811,6 +2089,7 @@ where
             truncated: total > 0,
             tokens_used: 0,
             resolution: ResolutionAvailability::Available,
+            walk_incomplete: None,
         };
     }
     Response {
@@ -1821,6 +2100,7 @@ where
         tokens_used: required,
         items,
         resolution: ResolutionAvailability::Available,
+        walk_incomplete: None,
     }
 }
 
@@ -2009,6 +2289,52 @@ mod tests {
         }
     }
 
+    /// A depth-capped walk must not be reported as proof that no path exists.
+    ///
+    /// `shortest_path` returned a bare `Option`, so "the frontier was pruned at
+    /// `max_depth`", "the node cap stopped the walk", "the budget was zero" and
+    /// "the reachable set really does not contain the target" were one value.
+    /// `trace_between` then stated the strongest of those as fact —
+    /// `no indexed path from {from} to {to}` — and an agent concluded two
+    /// symbols were unrelated when the path was simply longer than `--depth`.
+    #[test]
+    fn a_depth_capped_trace_is_not_reported_as_proof_that_no_path_exists() {
+        // a -> b -> c -> d is three hops; ask for two.
+        let chain = vec![
+            path_edge("a", "b", 0.9),
+            path_edge("b", "c", 0.9),
+            path_edge("c", "d", 0.9),
+        ];
+        match shortest_path(&chain, "a", "d", 2, 5_000, &Cancel::new()).expect("uncancelled") {
+            PathSearch::Exhausted { depth_capped, .. } => {
+                assert!(depth_capped, "the depth cap is what stopped this walk");
+            }
+            other => panic!("a depth-capped walk must report Exhausted, got {other:?}"),
+        }
+
+        // With the same graph and enough depth, the answer is the path.
+        match shortest_path(&chain, "a", "d", 3, 5_000, &Cancel::new()).expect("uncancelled") {
+            PathSearch::Found(path) => assert_eq!(path.len(), 3),
+            other => panic!("the path is reachable at depth 3, got {other:?}"),
+        }
+
+        // A target that genuinely is not in the reachable set is NoPath, and
+        // must stay distinguishable from the capped case above.
+        let disjoint = vec![path_edge("a", "b", 0.9), path_edge("y", "z", 0.9)];
+        match shortest_path(&disjoint, "a", "z", 64, 5_000, &Cancel::new()).expect("uncancelled") {
+            PathSearch::NoPath => {}
+            other => panic!("an exhausted reachable set is NoPath, got {other:?}"),
+        }
+
+        // The node cap is its own reason, not the depth cap's.
+        match shortest_path(&chain, "a", "d", 64, 1, &Cancel::new()).expect("uncancelled") {
+            PathSearch::Exhausted { node_capped, .. } => {
+                assert!(node_capped, "the node cap is what stopped this walk");
+            }
+            other => panic!("a node-capped walk must report Exhausted, got {other:?}"),
+        }
+    }
+
     #[test]
     fn scoped_trace_is_shortest_bounded_and_deterministic() {
         let edges = vec![
@@ -2018,24 +2344,36 @@ mod tests {
             path_edge("c", "d", 0.9),
             path_edge("d", "a", 1.0),
         ];
-        let path = shortest_path(&edges, "a", "d", 2, 5_000, &Cancel::new())
-            .expect("uncancelled")
-            .expect("two-hop path");
+        let PathSearch::Found(path) =
+            shortest_path(&edges, "a", "d", 2, 5_000, &Cancel::new()).expect("uncancelled")
+        else {
+            panic!("two-hop path");
+        };
         assert_eq!(
             path.iter()
                 .map(|edge| edge.target_symbol.as_str())
                 .collect::<Vec<_>>(),
             ["c", "d"]
         );
-        assert!(shortest_path(&edges, "a", "d", 1, 5_000, &Cancel::new())
-            .expect("uncancelled")
-            .is_none());
+        assert!(
+            matches!(
+                shortest_path(&edges, "a", "d", 1, 5_000, &Cancel::new()).expect("uncancelled"),
+                PathSearch::Exhausted {
+                    depth_capped: true,
+                    ..
+                }
+            ),
+            "depth 1 cannot reach a two-hop target, and that is a cap, not a fact \
+             about the graph"
+        );
 
         let mut with_direct = edges;
         with_direct.push(path_edge("a", "d", 0.1));
-        let path = shortest_path(&with_direct, "a", "d", 2, 5_000, &Cancel::new())
-            .expect("uncancelled")
-            .expect("direct path");
+        let PathSearch::Found(path) =
+            shortest_path(&with_direct, "a", "d", 2, 5_000, &Cancel::new()).expect("uncancelled")
+        else {
+            panic!("direct path");
+        };
         assert_eq!(
             path.len(),
             1,
@@ -2095,7 +2433,10 @@ mod tests {
         .expect("uncancelled");
         let elapsed = started.elapsed();
 
-        assert!(found.is_none(), "the destination is not in the graph");
+        assert!(
+            !matches!(found, PathSearch::Found(_)),
+            "the destination is not in the graph, got {found:?}"
+        );
         assert!(
             elapsed < std::time::Duration::from_secs(1),
             "exhausting a {}-edge graph took {elapsed:?}; the search is rescanning \
@@ -2116,13 +2457,17 @@ mod tests {
             path_edge("c", "d", 0.9),
             path_edge("d", "a", 1.0),
         ];
-        let first = shortest_path(&edges, "a", "d", 2, 5_000, &Cancel::new())
-            .expect("uncancelled")
-            .expect("two-hop path");
+        let PathSearch::Found(first) =
+            shortest_path(&edges, "a", "d", 2, 5_000, &Cancel::new()).expect("uncancelled")
+        else {
+            panic!("two-hop path");
+        };
         for _ in 0..8 {
-            let again = shortest_path(&edges, "a", "d", 2, 5_000, &Cancel::new())
-                .expect("uncancelled")
-                .expect("two-hop path");
+            let PathSearch::Found(again) =
+                shortest_path(&edges, "a", "d", 2, 5_000, &Cancel::new()).expect("uncancelled")
+            else {
+                panic!("two-hop path");
+            };
             assert_eq!(
                 again
                     .iter()

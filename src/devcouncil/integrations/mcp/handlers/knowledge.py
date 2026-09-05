@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from mcp.types import TextContent
@@ -21,7 +22,7 @@ async def handle_select_knowledge(root: Path, arguments: dict) -> list[TextConte
         return arg_error
     assert goal is not None
     payload, _cli_error = parse_cli_json(
-        run_cli_command(["okf", "select", "--json", "--goal", goal], root, truncate=False),
+        await asyncio.to_thread(run_cli_command, ["okf", "select", "--json", "--goal", goal], root, truncate=False),
     )
     if payload is not None:
         return json_text(payload)

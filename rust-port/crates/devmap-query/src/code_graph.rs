@@ -207,7 +207,10 @@ fn community_by_file(analysis: &AnalysisSummary) -> BTreeMap<&str, &str> {
 /// Structurally exempt files are excluded outright — a test, a vendored
 /// dependency or a generated file having no importer is its normal state, not a
 /// finding.
-fn unwired_candidates(extractions: &[Extraction], edges: &[ResolvedEdge]) -> Vec<String> {
+pub(crate) fn unwired_candidates(
+    extractions: &[Extraction],
+    edges: &[ResolvedEdge],
+) -> Vec<String> {
     let test_files: BTreeSet<&str> = extractions
         .iter()
         .filter(|ext| ext.wiring.iter().any(|w| w.kind == WiringKind::TestFile))

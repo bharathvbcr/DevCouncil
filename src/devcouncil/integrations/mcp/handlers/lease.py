@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from mcp.types import TextContent
@@ -25,7 +26,7 @@ async def handle_release_task(root: Path, db: object, arguments: dict) -> list[T
         return arg_error
     assert task_id is not None and lease_token is not None
     payload, cli_error = parse_cli_json(
-        run_cli_command(["release", task_id, "--lease-token", lease_token, "--json"], root),
+        await asyncio.to_thread(run_cli_command, ["release", task_id, "--lease-token", lease_token, "--json"], root),
     )
     if cli_error:
         return cli_error
@@ -48,7 +49,7 @@ async def handle_renew_lease(root: Path, db: object, arguments: dict) -> list[Te
     cli_args = ["lease", "renew", task_id, "--lease-token", lease_token, "--json"]
     if isinstance(ttl_value, int) and not isinstance(ttl_value, bool):
         cli_args.extend(["--ttl-seconds", str(ttl_value)])
-    payload, cli_error = parse_cli_json(run_cli_command(cli_args, root))
+    payload, cli_error = parse_cli_json(await asyncio.to_thread(run_cli_command, cli_args, root))
     if cli_error:
         return cli_error
     assert payload is not None
@@ -63,7 +64,7 @@ async def handle_list_leases(root: Path, db: object, arguments: dict) -> list[Te
     cli_args = ["lease", "list", "--json"]
     if not active_only:
         cli_args.append("--all")
-    payload, cli_error = parse_cli_json(run_cli_command(cli_args, root))
+    payload, cli_error = parse_cli_json(await asyncio.to_thread(run_cli_command, cli_args, root))
     if cli_error:
         return cli_error
     assert payload is not None

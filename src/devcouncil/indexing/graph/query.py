@@ -13,6 +13,12 @@ from devcouncil.indexing.graph.build import load_code_graph
 from devcouncil.indexing.graph.schema import CodeGraph, GraphNode
 
 
+#: Definitions returned by ``query_symbol``, and per-definition relation rows.
+#: Both are reported with their own totals so a cut list never reads as whole.
+_DEFINITION_LIMIT = 20
+_EDGE_LIMIT = 50
+
+
 def _load(root: Path, graph: Optional[CodeGraph] = None) -> Optional[CodeGraph]:
     return graph if graph is not None else load_code_graph(root)
 
@@ -56,22 +62,39 @@ def query_symbol(
             imports[e.source].append(e.target)
 
     results = []
-    for n in nodes[:20]:
-        results.append(
-            {
-                "id": n.id,
-                "kind": n.kind.value if hasattr(n.kind, "value") else n.kind,
-                "path": n.path,
-                "name": n.name,
-                "line": n.line,
-                "area": n.area,
-                "callers": sorted(set(callers.get(n.id, [])))[:50],
-                "callees": sorted(set(callees.get(n.id, [])))[:50],
-                "importers": sorted(set(importers.get(n.id, [])))[:50],
-                "imports": sorted(set(imports.get(n.id, [])))[:50],
-            }
-        )
-    return {"query": name_or_path, "matches": len(nodes), "definitions": results}
+    shown_nodes = nodes[:_DEFINITION_LIMIT]
+    for n in shown_nodes:
+        entry: Dict[str, Any] = {
+            "id": n.id,
+            "kind": n.kind.value if hasattr(n.kind, "value") else n.kind,
+            "path": n.path,
+            "name": n.name,
+            "line": n.line,
+            "area": n.area,
+        }
+        # Each relation list is capped. The cap used to be invisible, so a
+        # symbol with 400 callers and one with exactly 50 rendered identically.
+        for key, index in (
+            ("callers", callers),
+            ("callees", callees),
+            ("importers", importers),
+            ("imports", imports),
+        ):
+            related = sorted(set(index.get(n.id, [])))
+            entry[key] = related[:_EDGE_LIMIT]
+            entry[f"{key}_total"] = len(related)
+            entry[f"{key}_truncated"] = len(related) > _EDGE_LIMIT
+        results.append(entry)
+    return {
+        "query": name_or_path,
+        # `matches` keeps its meaning: the full match count, which is already
+        # the total the `definitions` cap is measured against.
+        "matches": len(nodes),
+        "definitions": results,
+        "definitions_shown": len(results),
+        "definitions_total": len(nodes),
+        "definitions_truncated": len(results) < len(nodes),
+    }
 
 
 def symbol_has_non_test_inbound(

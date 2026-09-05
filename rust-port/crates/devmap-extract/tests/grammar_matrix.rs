@@ -42,7 +42,6 @@ fn every_declared_language_reaches_a_grammar_or_is_a_known_exception() {
         ("a.luau", "local function f() return 1 end\n"),
         ("a.R", "f <- function() { 1 }\n"),
         ("a.cfm", "<cfset x = 1>\n"),
-        ("a.cbl", "IDENTIFICATION DIVISION.\n"),
         ("a.erl", "-module(a).\n"),
         ("a.sol", "contract C {}\n"),
         ("a.nix", "{ x = 1; }\n"),
@@ -65,12 +64,36 @@ fn every_declared_language_reaches_a_grammar_or_is_a_known_exception() {
         "these languages are declared but reach no grammar: {unavailable:?}"
     );
 
-    // The one documented exception: no tree-sitter VB.NET grammar exists on
-    // crates.io or in any reachable upstream repository. It is declared in the
-    // registry, and reports `Unavailable` honestly rather than pretending.
+    // The documented exceptions. Both are declared in the registry and report
+    // `Unavailable` honestly rather than pretending; each is listed here so
+    // adding a third is a deliberate edit rather than a quiet omission.
+    //
+    // VB.NET: no tree-sitter grammar exists on crates.io or in any reachable
+    // upstream repository.
     let vb = extract_file("a.vb", "Class A\nEnd Class\n");
     assert!(
         format!("{:?}", vb.engine).contains("Unavailable"),
         "VB.NET has no grammar and must report so rather than silently degrade"
     );
+
+    // COBOL: a grammar exists and is vendored, but it **does not terminate** on
+    // malformed input (measured 2026-09-04: six bytes of NUL, and a BOM
+    // followed by garbage, each ran past three minutes; the other 34 grammars
+    // clear all 14 hostile inputs in 5.03 s total), and it cannot be bounded
+    // in-process. Unlinking cost nothing measurable: on a realistic COBOL
+    // program it parsed `Clean` and yielded only the File node — zero
+    // declarations, zero calls. See `UNSAFE_GRAMMARS` in `treesitter.rs`.
+    let cobol = extract_file("a.cbl", "       IDENTIFICATION DIVISION.\n");
+    assert!(
+        format!("{:?}", cobol.engine).contains("Unavailable"),
+        "COBOL is deliberately unlinked and must report so: {:?}",
+        cobol.engine
+    );
+    match &cobol.parse_outcome {
+        devmap_extract::model::ParseOutcome::Failed { reason } => assert!(
+            reason.contains("does not terminate"),
+            "the refusal must say why COBOL is unlinked, got {reason:?}"
+        ),
+        other => panic!("COBOL must be refused, got {other:?}"),
+    }
 }

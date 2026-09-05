@@ -295,7 +295,14 @@ def test_mcp_doctor_and_runs_tools_return_the_same_diagnosis(tmp_path: Path) -> 
     assert "checks" in doctor and "build" in doctor
     assert all("code" in c and "fix_command" in c for c in doctor["checks"])
     runs = json.loads(asyncio.run(handle_graph_runs(root, {"limit": 5}))[0].text)
-    assert runs == {"ok": True, "runs": []}
+    # This used to assert the whole payload was `{"ok": True, "runs": []}`, which
+    # encoded a conflation rather than a requirement: that same answer came back
+    # for a project with no trace log, one whose log was entirely unreadable, and
+    # one whose kernel had genuinely never run. The empty list is still correct
+    # here — the fixture has run nothing — but the payload now says which of the
+    # three it is. See tests/unit/test_graph_runs_provenance.py.
+    assert runs["ok"] is True and runs["runs"] == []
+    assert runs["log_present"] is False and runs["total"] == 0
 
 
 def test_dev_map_prints_the_code_the_fix_and_the_run_id_on_failure(tmp_path: Path, monkeypatch) -> None:

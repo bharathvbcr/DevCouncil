@@ -120,13 +120,55 @@ def dead_symbol_candidates_of(data: Mapping | None) -> list[str]:
     return [str(p) for p in vals]
 
 
-def is_entry_root(path: str, data: Mapping | None) -> bool:
-    """True when ``path`` is listed in the map's ``entry_roots``."""
+def is_entry_root(path: str, data: Mapping | None) -> bool | None:
+    """Whether ``path`` is an entry root: ``True``/``False``, or ``None`` for unknown.
+
+    The kernel caps ``entry_roots`` at a token budget before writing
+    ``repo_map.json``, so absence from the list is only evidence of *not* being
+    an entry root when the list is known to be complete. A genuine entry root
+    sorting past the cap used to be reported as a flat ``False`` — a capped
+    sample answering as a complete one, which is how "not checked" comes to read
+    as "checked and negative".
+
+    Presence stays provable either way: a path *in* the list is an entry root
+    whether or not the list was cut short.
+
+    ``None`` means unknown, and the caller emits it as a JSON ``null`` rather
+    than picking a side. A map whose ``liveness_meta.entry_roots`` says
+    ``truncated`` (or whose ``shown`` is below its ``total``) cannot answer a
+    negative; a map that says it is complete can. A map carrying no such
+    metadata claims no truncation and is answered as before — the producer is
+    the only thing that can know, and it now says so.
+    """
     roots = (data or {}).get("entry_roots") or []
     if not isinstance(roots, list):
         return False
     norm = _norm(path)
-    return any(_norm(str(r)) == norm for r in roots)
+    if any(_norm(str(r)) == norm for r in roots):
+        return True
+    return None if _entry_roots_truncated(data) else False
+
+
+def _entry_roots_truncated(data: Mapping | None) -> bool:
+    """Whether the map states that its ``entry_roots`` list was cut short.
+
+    Only a positive claim counts. Both the explicit ``truncated`` flag and a
+    ``shown``/``total`` disagreement are read, because a producer may carry one
+    without the other; anything missing or malformed is not a claim, and never
+    invents one.
+    """
+    meta = (data or {}).get("liveness_meta")
+    if not isinstance(meta, Mapping):
+        return False
+    entry = meta.get("entry_roots")
+    if not isinstance(entry, Mapping):
+        return False
+    if entry.get("truncated") is True:
+        return True
+    shown, total = entry.get("shown"), entry.get("total")
+    if isinstance(shown, int) and isinstance(total, int) and not isinstance(shown, bool):
+        return total > shown
+    return False
 
 
 def areas_touched(paths: Iterable[str], data: Mapping | None) -> list[str]:

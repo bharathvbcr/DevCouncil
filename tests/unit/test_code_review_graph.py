@@ -74,3 +74,42 @@ def test_code_review_graph_parses_nested_file_objects(tmp_path, monkeypatch):
 
     assert context.impacted_files == ["src/app.py", "src/lib.py"]
     assert context.related_tests == ["tests/test_app.py"]
+
+
+def test_graph_context_answers_in_process_without_spawning_an_interpreter(tmp_path, monkeypatch):
+    """`devcouncil_graph_context` must not pay a second Python startup.
+
+    The handler shelled out to ``python -m devcouncil graph-context --json``,
+    whose whole body is ``CodeReviewGraphAdapter(root).get_context(files)`` —
+    the same call the handler already makes three lines below as its fallback.
+    Measured at 0.69s per invocation for a constant negative answer, effectively
+    all of it interpreter and import time, on a tool the reviewer subagent is
+    instructed to call.
+    """
+    import asyncio
+    import json
+    import subprocess
+
+    from devcouncil.integrations.mcp.handlers import graph as graph_handlers
+
+    _write_config(tmp_path, enabled=False)
+
+    # Spy at the process boundary rather than on a helper, so the assertion
+    # keeps meaning after the helper is gone.
+    spawned: list[object] = []
+    real_run = subprocess.run
+
+    def _spy(*args, **kwargs):
+        spawned.append(args[0] if args else kwargs.get("args"))
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", _spy)
+
+    result = asyncio.run(
+        graph_handlers.handle_graph_context(tmp_path, {"files": ["src/app.py"]})
+    )
+
+    assert spawned == [], f"no subprocess may be spawned, saw {spawned}"
+    payload = json.loads(result[0].text)
+    assert payload["available"] is False
+    assert payload["changed_files"] == ["src/app.py"]
