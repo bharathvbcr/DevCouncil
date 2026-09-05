@@ -425,3 +425,135 @@ fn dependencies_over_a_clean_parse_carry_no_coverage_caveat() {
         "the fixture must actually produce edges, or the assertion above is vacuous"
     );
 }
+
+/// `impact` answered "nothing calls this" over a corpus it had not fully read.
+///
+/// `dead_symbols` has carried the analysis coverage on `walk_incomplete` since
+/// Q-8, and it is the *safer* of the two surfaces: it is explicitly a
+/// candidate list, and its exemption rules already drop symbols in unread
+/// files. `impact` is the one a reader consults immediately before deleting or
+/// changing a symbol — the MCP tool description says exactly that — and it
+/// published `items: [], resolution: Available, walk_incomplete: None` on a
+/// generation whose call extraction never covered the file that might hold the
+/// caller. An empty blast radius and an unsearched one were the same answer.
+///
+/// `trace` is the same walk in the other direction and gets it from the same
+/// place: there is one `traverse_over`.
+#[test]
+fn a_traversal_over_a_partly_read_corpus_says_so() {
+    // `app.py` contributed no calls at all, so nothing in it can appear as a
+    // caller of `helper` — which is precisely the file a reader would need to
+    // have been searched before believing an empty answer.
+    let store = store_of(
+        &[
+            ("lib.py", "def helper():\n    return 1\n"),
+            (
+                "app.py",
+                "from lib import helper\n\n\ndef main():\n    return helper()\n",
+            ),
+        ],
+        &["app.py"],
+    );
+    let engine = StoreQueryEngine::new(&store);
+    let request = |query: &str| Request {
+        query: query.to_string(),
+        token_budget: 10_000,
+        min_confidence: 0.0,
+        max_depth: 3,
+    };
+
+    let blast = engine.impact(request("helper")).unwrap();
+    let reason = blast
+        .walk_incomplete
+        .as_deref()
+        .unwrap_or_else(|| panic!("impact over a partial analysis must qualify itself: {blast:?}"));
+    assert!(
+        reason.contains("did not cover the whole corpus"),
+        "the qualification must carry the coverage numbers, not just an adjective: {reason:?}"
+    );
+
+    // `helper` has no forward edges, and `trace` says so outright with
+    // `Unavailable` — an honest refusal, not a silent empty answer, so it is
+    // not the case worth pinning. `lib.py` does have forward edges (it contains
+    // `helper`), and that is where the same walk must carry the same signal.
+    let forward = engine.trace(request("lib.py")).unwrap();
+    assert!(
+        !forward.items.is_empty(),
+        "the fixture must give trace something to walk: {forward:?}"
+    );
+    assert!(
+        forward.walk_incomplete.is_some(),
+        "trace shares one traversal with impact and must carry the same signal: {forward:?}"
+    );
+}
+
+/// The corpus caveat must not displace the walk's own stop reason.
+///
+/// Two independent qualifications — "the graph I walked has holes" and "I
+/// stopped before the graph ran out" — and a reader deciding whether to delete
+/// a symbol needs both. Assigning rather than composing would have silently
+/// dropped whichever ran second.
+#[test]
+fn a_capped_walk_over_a_partly_read_corpus_reports_both_reasons() {
+    let store = store_of(
+        &[
+            ("d.py", "def d():\n    return 1\n"),
+            ("c.py", "from d import d\n\n\ndef c():\n    return d()\n"),
+            ("b.py", "from c import c\n\n\ndef b():\n    return c()\n"),
+            ("a.py", "from b import b\n\n\ndef a():\n    return b()\n"),
+            ("unread.py", "def spare():\n    return 2\n"),
+        ],
+        &["unread.py"],
+    );
+    let capped = StoreQueryEngine::new(&store)
+        .impact(Request {
+            query: "d".to_string(),
+            token_budget: 10_000,
+            min_confidence: 0.0,
+            max_depth: 1,
+        })
+        .unwrap();
+    let reason = capped
+        .walk_incomplete
+        .as_deref()
+        .unwrap_or_else(|| panic!("a capped walk must report its cap: {capped:?}"));
+    assert!(
+        reason.contains("depth"),
+        "the walk's own stop reason must survive: {reason:?}"
+    );
+    assert!(
+        reason.contains("did not cover the whole corpus"),
+        "the corpus coverage gap must survive alongside it: {reason:?}"
+    );
+}
+
+/// A complete analysis leaves a complete walk unqualified.
+#[test]
+fn a_complete_traversal_over_a_complete_corpus_claims_nothing() {
+    let store = store_of(
+        &[
+            ("lib.py", "def helper():\n    return 1\n"),
+            (
+                "app.py",
+                "from lib import helper\n\n\ndef main():\n    return helper()\n",
+            ),
+        ],
+        &[],
+    );
+    let blast = StoreQueryEngine::new(&store)
+        .impact(Request {
+            query: "helper".to_string(),
+            token_budget: 10_000,
+            min_confidence: 0.0,
+            max_depth: 5,
+        })
+        .unwrap();
+    assert!(
+        !blast.items.is_empty(),
+        "the fixture must produce a real blast radius, or the assertion below is vacuous"
+    );
+    assert_eq!(
+        blast.walk_incomplete, None,
+        "a complete walk over a fully read corpus must claim nothing: {blast:?}"
+    );
+}

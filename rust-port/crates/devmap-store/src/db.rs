@@ -3911,8 +3911,11 @@ impl Store {
                 u32::MAX
             )));
         }
+        // Read for `current` specifically — the generation the rows came from,
+        // which may already be behind the store's latest.
+        let analysis = self.analysis_disclosure_for(current)?;
         let index = std::sync::Arc::new(
-            GenerationEdges::build(rows)
+            GenerationEdges::build(rows, analysis)
                 .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?,
         );
         if let Ok(mut cache) = self.edge_index.lock() {
@@ -4003,26 +4006,28 @@ impl Store {
         }))
     }
 
-    /// The dead-symbol rows and the analysis that qualifies them, against one
-    /// generation. See [`DeadPage`].
-    pub fn dead_page(&self, limit: usize) -> Result<Option<DeadPage>> {
-        let conn = lock_conn(&self.conn)?;
-        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
-            return Ok(None);
-        };
-        // The two big arrays are dropped *inside SQLite*, so they never cross
-        // into this process. `AnalysisDisclosure` already skipped them, but
-        // skipping is per token and there are 10 MB of tokens: measured on the
-        // benchmark corpus this column is 10,122,764 bytes and what survives
-        // the strip is 200. `dead_symbols` is the duplicate being paged;
-        // `communities` is the other unbounded array and no disclosure reads
-        // it.
-        //
-        // Absence and corruption stay distinguishable, which is the whole
-        // reason this is safe: `json_remove(NULL, ...)` is NULL, so a
-        // generation with no analysis still reads as none, while a malformed
-        // blob makes SQLite raise ("malformed JSON") rather than quietly
-        // returning NULL — a corrupt analysis must not read as an absent one.
+    /// How much of the corpus one generation's analysis actually covered.
+    ///
+    /// The two big arrays are dropped *inside SQLite*, so they never cross into
+    /// this process. `AnalysisDisclosure` already skipped them, but skipping is
+    /// per token and there are 10 MB of tokens: measured on the benchmark
+    /// corpus this column is 10,122,764 bytes and what survives the strip is
+    /// 200. `dead_symbols` is the list being paged beside this; `communities`
+    /// is the other unbounded array and no disclosure reads it.
+    ///
+    /// Absence and corruption stay distinguishable, which is the whole reason
+    /// this is safe: `json_remove(NULL, ...)` is NULL, so a generation with no
+    /// analysis still reads as none, while a malformed blob makes SQLite raise
+    /// ("malformed JSON") rather than quietly returning NULL — a corrupt
+    /// analysis must not read as an absent one.
+    ///
+    /// One owner because two readers of the same column would eventually
+    /// disagree about which arrays to strip, and the caller that strips less
+    /// pulls 10 MB per query without anything saying so.
+    fn analysis_disclosure_in(
+        snapshot: &Connection,
+        generation: u32,
+    ) -> Result<Option<AnalysisDisclosure>> {
         let raw: Option<String> = snapshot
             .query_row(
                 "SELECT json_remove(analysis_json, '$.dead_symbols', '$.communities')
@@ -4034,15 +4039,38 @@ impl Store {
         // Into the disclosure, not the whole summary: the summary embeds a
         // second copy of the dead-symbol list, so parsing it here would undo
         // the bound above. See `AnalysisDisclosure`.
-        let analysis = raw
-            .map(|json| {
-                serde_json::from_str::<AnalysisDisclosure>(&json).map_err(|error| {
-                    rusqlite::Error::InvalidParameterName(format!(
-                        "stored generation analysis is invalid: {error}"
-                    ))
-                })
+        raw.map(|json| {
+            serde_json::from_str::<AnalysisDisclosure>(&json).map_err(|error| {
+                rusqlite::Error::InvalidParameterName(format!(
+                    "stored generation analysis is invalid: {error}"
+                ))
             })
-            .transpose()?;
+        })
+        .transpose()
+    }
+
+    /// [`Self::analysis_disclosure_in`] for a generation the caller already
+    /// resolved.
+    ///
+    /// Addressed by id rather than by "latest" on purpose: the edge rows this
+    /// qualifies may have come from a cache filled before a newer generation
+    /// landed, and a disclosure describing a snapshot the answer did not come
+    /// from is worse than none. A generation pruned between the two reads has
+    /// no row here, which reads as `None` — "could not be read" — and that is
+    /// the honest answer.
+    fn analysis_disclosure_for(&self, generation: u32) -> Result<Option<AnalysisDisclosure>> {
+        let conn = lock_conn(&self.conn)?;
+        Self::analysis_disclosure_in(&conn, generation)
+    }
+
+    /// The dead-symbol rows and the analysis that qualifies them, against one
+    /// generation. See [`DeadPage`].
+    pub fn dead_page(&self, limit: usize) -> Result<Option<DeadPage>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        let analysis = Self::analysis_disclosure_in(&snapshot, generation)?;
         Ok(Some(DeadPage {
             generation,
             analysis,
