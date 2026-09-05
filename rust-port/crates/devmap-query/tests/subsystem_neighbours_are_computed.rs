@@ -148,3 +148,87 @@ fn the_neighbour_lists_are_deterministic() {
         "two renderings of one generation disagree"
     );
 }
+
+/// Every neighbour must be an area a path can actually resolve to.
+///
+/// `subsystem_map.area_for_path` answers with a subsystem prefix or a file's
+/// parent directory — always a directory. The resolver also emits edges whose
+/// endpoint is the *synthetic* Go package node (`package:<dir>/<pkg>`), which is
+/// not a file and whose "parent directory" is a string no path will ever match.
+/// Measured on this repository's own store before the guard:
+/// `backend/go_orchestrator/dc/dcgrep` listed both
+/// `backend/go_orchestrator/internal/proc` and
+/// `package:backend/go_orchestrator/internal/proc` — the same coupling twice,
+/// once in a vocabulary the consumer cannot use, spending a slot of the cap to
+/// say it.
+#[test]
+fn no_neighbour_is_a_synthetic_node_the_consumer_can_never_match() {
+    let extractions = vec![
+        devmap_extract::extract_file(
+            "gopkg/lib/lib.go",
+            "package lib\n\nfunc Helper() int { return 1 }\n",
+        ),
+        devmap_extract::extract_file(
+            "gopkg/app/app.go",
+            "package app\n\nimport \"gopkg/lib\"\n\nfunc Run() int { return lib.Helper() }\n",
+        ),
+    ];
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions);
+
+    let communities = ["gopkg/lib/lib.go", "gopkg/app/app.go"]
+        .iter()
+        .enumerate()
+        .map(|(index, path)| CommunityReport {
+            community_id: index as u32,
+            name: format!("community-{index}"),
+            members: vec![(*path).to_string()],
+            cohesion_score: 1.0,
+        })
+        .collect();
+    let analysis = AnalysisSummary {
+        discovery_refused_files: None,
+        total_files: extractions.len(),
+        total_symbols: 2,
+        total_edges: resolution.edges.len(),
+        dead_symbols: Vec::new(),
+        communities,
+        status: AnalysisStatus::Ok,
+        unresolved_calls: 0,
+        clone_coverage: Default::default(),
+    };
+    let (_, json) = generate_manifest_with_edges(
+        &extractions,
+        &analysis,
+        FreshnessInfo::new("head".into(), 1, 0),
+        &resolution.edges,
+    );
+    let map: serde_json::Value = serde_json::from_str(&json).expect("the manifest is JSON");
+
+    let subsystems = map["subsystems"].as_array().expect("subsystems");
+    assert!(
+        !subsystems.is_empty(),
+        "the Go fixture produced no subsystems, so this proves nothing"
+    );
+    // The coupling itself must survive. Dropping the synthetic endpoint would
+    // also satisfy the assertion below, and would be a worse answer than the
+    // duplicate it replaced: `gopkg/app` genuinely imports `gopkg/lib`, and the
+    // only edge saying so points at the package node.
+    assert_eq!(
+        neighbours_of(&map, "gopkg/app"),
+        vec!["gopkg/lib".to_string()],
+        "the Go import must reach the package's own directory, not vanish"
+    );
+    for entry in subsystems {
+        for neighbour in entry["neighbors"].as_array().expect("neighbors") {
+            let name = neighbour.as_str().unwrap_or_default();
+            assert!(
+                !name.contains("package:"),
+                "{} names the synthetic node {name:?} as a neighbour; \
+                 no file path resolves to it",
+                entry["area"]
+            );
+        }
+    }
+}

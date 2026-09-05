@@ -302,7 +302,7 @@ fn consumer_manifest_json(
     // vocabulary the lookup will use rather than in a second one beside it.
     let mut lookup_areas: Vec<String> = kept.iter().map(|(_, area)| area.clone()).collect();
     lookup_areas.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
-    let adjacency = area_adjacency(&lookup_areas, edges);
+    let (adjacency, unresolved_endpoints) = area_adjacency(&lookup_areas, &file_paths, edges);
     let mut neighbors_shown = 0usize;
     let mut neighbors_total = 0usize;
     let subsystems: Vec<Value> = kept
@@ -470,6 +470,11 @@ fn consumer_manifest_json(
                 "neighbors_shown": neighbors_shown,
                 "neighbors_total": neighbors_total,
                 "neighbors_truncated": neighbors_total > neighbors_shown,
+                // Coupling edges whose endpoint named nothing this generation
+                // indexed, so no area could be assigned to it. Zero on every
+                // corpus measured; carried because "no neighbours" and "some
+                // couplings could not be placed" are different answers.
+                "neighbors_endpoints_unresolved": unresolved_endpoints,
             },
             "important_files": {
                 "shown": lean.important_files.len(),
@@ -631,15 +636,44 @@ const SUBSYSTEM_NEIGHBOR_CAP: usize = 32;
 /// not use is an empty relation with extra steps. That exact mismatch
 /// (`community-4` against a directory path) is why the field joined nothing
 /// before it was a literal.
+/// Returns the adjacency and the number of coupling edges whose endpoint could
+/// not be placed in any area.
 fn area_adjacency(
     lookup_areas: &[String],
+    file_paths: &BTreeSet<&str>,
     edges: &[ResolvedEdge],
-) -> BTreeMap<String, BTreeMap<String, usize>> {
-    // One memo for the sweep. A generation has tens of files and hundreds of
-    // thousands of edges, so resolving the area per edge would repeat the
-    // prefix scan 271,000 times on the benchmark corpus.
-    let mut area_of: BTreeMap<&str, String> = BTreeMap::new();
+) -> (BTreeMap<String, BTreeMap<String, usize>>, usize) {
+    // Not every endpoint is a file. The resolver emits a synthetic node for
+    // each Go package (`package:<dir>/<pkg>`) and points the package's imports
+    // at it, so `backend/.../dcgrep` came out coupled to both
+    // `backend/go_orchestrator/internal/proc` and
+    // `package:backend/go_orchestrator/internal/proc` — the same coupling
+    // twice, once in a vocabulary `area_for_path` can never produce, spending a
+    // slot of the cap to say it.
+    //
+    // Resolved through the graph rather than by knowing how the node is spelled:
+    // each file of a package carries a `MemberOf` edge to its package node, so
+    // the node's own area is the area of any member. A generation this reads
+    // holds those edges by construction.
+    let mut member_file: BTreeMap<&str, &str> = BTreeMap::new();
+    for edge in edges {
+        if edge.edge_kind == EdgeKind::MemberOf
+            && !file_paths.contains(edge.target_file.as_str())
+            && file_paths.contains(edge.source_file.as_str())
+        {
+            member_file
+                .entry(edge.target_file.as_str())
+                .or_insert(edge.source_file.as_str());
+        }
+    }
+    // One memo for the sweep. A generation has thousands of files and hundreds
+    // of thousands of edges, so resolving the area per edge would repeat the
+    // prefix scan 271,000 times on the benchmark corpus. Keyed by an owned
+    // string: the map outlives each edge's borrow, and the miss path allocates
+    // once per distinct endpoint rather than once per edge.
+    let mut area_of: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut adjacency: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut unresolved = 0usize;
     for edge in edges {
         if !matches!(
             edge.edge_kind,
@@ -653,14 +687,28 @@ fn area_adjacency(
         if edge.source_file == edge.target_file {
             continue;
         }
-        let from = area_of
-            .entry(edge.source_file.as_str())
-            .or_insert_with(|| resolved_area(&edge.source_file, lookup_areas))
-            .clone();
-        let to = area_of
-            .entry(edge.target_file.as_str())
-            .or_insert_with(|| resolved_area(&edge.target_file, lookup_areas))
-            .clone();
+        let (Some(from), Some(to)) = (
+            endpoint_area(
+                &edge.source_file,
+                lookup_areas,
+                file_paths,
+                &member_file,
+                &mut area_of,
+            ),
+            endpoint_area(
+                &edge.target_file,
+                lookup_areas,
+                file_paths,
+                &member_file,
+                &mut area_of,
+            ),
+        ) else {
+            // An endpoint naming nothing this generation indexed. Counted, not
+            // dropped in silence: a relation missing an edge and a relation
+            // that found none are different answers.
+            unresolved += 1;
+            continue;
+        };
         if from == to {
             continue;
         }
@@ -671,7 +719,30 @@ fn area_adjacency(
             .or_default() += 1;
         *adjacency.entry(to).or_default().entry(from).or_default() += 1;
     }
-    adjacency
+    (adjacency, unresolved)
+}
+
+/// The area one edge endpoint belongs to, or `None` when it belongs to nothing
+/// this generation indexed.
+fn endpoint_area(
+    endpoint: &str,
+    lookup_areas: &[String],
+    file_paths: &BTreeSet<&str>,
+    member_file: &BTreeMap<&str, &str>,
+    memo: &mut BTreeMap<String, Option<String>>,
+) -> Option<String> {
+    if let Some(known) = memo.get(endpoint) {
+        return known.clone();
+    }
+    let answer = if file_paths.contains(endpoint) {
+        Some(resolved_area(endpoint, lookup_areas))
+    } else {
+        member_file
+            .get(endpoint)
+            .map(|file| resolved_area(file, lookup_areas))
+    };
+    memo.insert(endpoint.to_string(), answer.clone());
+    answer
 }
 
 /// `subsystem_map.area_for_path`, in this kernel: the longest declared
