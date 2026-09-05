@@ -92,6 +92,28 @@ pub struct ArtifactRecord {
     /// of the same length whose mtime was restored with it.
     #[serde(default)]
     pub ino: u64,
+    /// Inode change time, the field userspace cannot back-date. `-1` off unix,
+    /// where there is none.
+    ///
+    /// `len`+`mtime_ns`+`ino` alone are all restorable: an in-place rewrite of
+    /// the same number of bytes keeps the length and the inode, and
+    /// `utimensat` — which is what `cp -p`, `rsync --times`, `tar -x` and
+    /// `File::set_times` all reach for — puts the modification time back. The
+    /// stamp then matched a file whose contents had changed, and the skip that
+    /// quotes it reported `artifacts_unchanged` over bytes belonging to another
+    /// generation, permanently: every later run compared against the same
+    /// doctored stat. `ctime` moves on any write and cannot be set, which is
+    /// the same reason `freshness::stat_key` carries it.
+    #[serde(default = "unknown_ctime")]
+    pub ctime_ns: i128,
+}
+
+/// A stamp written before `ctime_ns` existed has no value for it. `-1` is the
+/// same value an unreadable clock yields and matches no real `ctime`, so such a
+/// stamp is a miss and its artifacts regenerate once — which is the fail-closed
+/// direction.
+fn unknown_ctime() -> i128 {
+    -1
 }
 
 impl ArtifactRecord {
@@ -102,6 +124,7 @@ impl ArtifactRecord {
             len: meta.len(),
             mtime_ns: mtime_ns(&meta),
             ino: ino_of(&meta),
+            ctime_ns: ctime_ns(&meta),
         })
     }
 }
@@ -125,9 +148,22 @@ fn ino_of(_meta: &fs::Metadata) -> u64 {
     0
 }
 
+#[cfg(unix)]
+fn ctime_ns(meta: &fs::Metadata) -> i128 {
+    use std::os::unix::fs::MetadataExt;
+    meta.ctime() as i128 * 1_000_000_000 + meta.ctime_nsec() as i128
+}
+
+/// No `st_ctime` off unix. `-1` costs a regeneration on every run there and
+/// never a wrong skip, which is the trade the whole sidecar is built on.
+#[cfg(not(unix))]
+fn ctime_ns(_meta: &fs::Metadata) -> i128 {
+    -1
+}
+
 /// The layout of the sidecar. A stamp written under a different layout is not
 /// read as though it were this one; it is a miss, and the artifacts regenerate.
-const ARTIFACT_STAMP_VERSION: u32 = 1;
+const ARTIFACT_STAMP_VERSION: u32 = 2;
 
 /// The sidecar: what produced the consumer artifacts, and from what.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
