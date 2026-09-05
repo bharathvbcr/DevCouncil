@@ -31,8 +31,8 @@ from devcouncil.domain.task import Task
 from devcouncil.indexing.subsystem_map import (
     area_for_path,
     areas_touched,
+    can_rule_out_adjacency,
     cross_boundary_pairs,
-    neighbors_established,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,7 +63,7 @@ def detect_subsystem_boundary_gaps(
     if len(touched) < 2:
         return []
 
-    if not neighbors_established(repo_map):
+    if not can_rule_out_adjacency(repo_map):
         # The change spans areas and the map cannot say whether any two of them
         # are adjacent, so there is nothing to compare the crossing against.
         # Returning `[]` here would be this gate's "ran and found nothing",
@@ -91,8 +91,9 @@ def detect_subsystem_boundary_gaps(
             ),
             evidence=[
                 "areas touched: " + ", ".join(touched[:_MAX_CROSSINGS]),
-                "repo_map.json: every subsystem's `neighbors` is empty and no "
-                "`meta.devmap_rust.neighbors_computed` marker claims they were derived",
+                "repo_map.json: `meta.devmap_rust.neighbors_computed` does not "
+                "claim the relation was derived, or "
+                "`liveness_meta.subsystems` reports it capped or partly unplaced",
             ],
             recommended_fix=(
                 "Run `dev map` with a current kernel to derive subsystem neighbors, "

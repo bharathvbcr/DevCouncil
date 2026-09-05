@@ -149,3 +149,38 @@ def test_a_single_area_change_still_needs_no_check():
         repo_map=_NEIGHBORS_NEVER_COMPUTED, next_gap_id=_ids(),
     )
     assert gaps == []
+
+
+_NEIGHBORS_COMPUTED_BUT_CAPPED = {
+    "meta": {"devmap_rust": {"neighbors_computed": True}},
+    "liveness_meta": {
+        "subsystems": {
+            "neighbors_shown": 2,
+            "neighbors_total": 11,
+            "neighbors_truncated": True,
+            "neighbors_endpoints_unresolved": 0,
+        }
+    },
+    "subsystems": [
+        {"area": "src/ui", "neighbors": ["src/api"]},
+        {"area": "src/api", "neighbors": ["src/ui"]},
+        {"area": "src/storage", "neighbors": []},
+    ],
+}
+
+
+def test_a_capped_relation_is_also_a_check_that_could_not_run():
+    """Computed is not the same as complete.
+
+    This map derived neighbours and says so, but reports its per-area lists
+    capped — so `src/storage` missing from `src/ui`'s list proves nothing, and a
+    gate that only asked "were they computed" would report a clean check off a
+    relation it holds two entries of.
+    """
+    gaps = detect_subsystem_boundary_gaps(
+        task=_task(["src/ui/a.py"]),
+        changed_files=["src/ui/a.py", "src/storage/b.py"],
+        repo_map=_NEIGHBORS_COMPUTED_BUT_CAPPED, next_gap_id=_ids(),
+    )
+    assert [g.gap_type for g in gaps] == ["architecture_check_unavailable"]
+    assert gaps[0].blocking is False

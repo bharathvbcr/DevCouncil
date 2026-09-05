@@ -1670,3 +1670,12 @@ couplings whose endpoint could not be placed in any area are counted separately
 as a complete one, the same trap `is_entry_root` two functions below already documents.
 `are_neighbors` now degrades the negative to unknown when the map makes either claim. The
 positive is untouched in both cases: a listed neighbour is listed whatever the cap dropped.
+
+That distinction has one owner, because otherwise it grows a second: `can_rule_out_adjacency`
+is the question every consumer of a *negative* is really asking (computed **and** complete),
+and the boundary gate and `cross_boundary_checked` both ask it. `neighbors_established` stays
+as the narrower provenance question — did the producer compute the field at all — which is
+what `devcouncil_map`'s `neighbors_computed` row reports and what the kernel's own marker
+means. Asking only the narrow one at a consumer would have pushed the same defect one level
+up: a map that derived neighbours and capped them would have reported a clean check off a
+relation it holds two entries of.

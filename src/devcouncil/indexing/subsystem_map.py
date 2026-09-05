@@ -111,6 +111,19 @@ def _neighbors_answer_is_partial(data: Mapping | None) -> bool:
     return False
 
 
+def can_rule_out_adjacency(data: Mapping | None) -> bool:
+    """Whether an area's absence from another's neighbor list is evidence.
+
+    The question every consumer of a *negative* adjacency answer is really
+    asking, and it takes both halves: :func:`neighbors_established` says the
+    producer computed the relation, and it must also claim to hold all of it.
+    Checking only the first pushes the same defect one level up — a map that
+    computed neighbors but capped the lists would let a caller read "no
+    crossings found" off a relation it only partly has.
+    """
+    return neighbors_established(data) and not _neighbors_answer_is_partial(data)
+
+
 def are_neighbors(
     area_a: str | None,
     area_b: str | None,
@@ -139,9 +152,7 @@ def are_neighbors(
         return True
     if area_a in neighbors_for_area(area_b, data):
         return True
-    if not neighbors_established(data) or _neighbors_answer_is_partial(data):
-        return None
-    return False
+    return False if can_rule_out_adjacency(data) else None
 
 
 def dependents_of(path: str, data: Mapping | None) -> list[str]:
@@ -283,7 +294,7 @@ def cross_boundary_pairs(
         for area_b in areas[i + 1:]:
             # `is False`, not falsiness: an unknown relation (``None``) is not a
             # crossing. Callers that need to tell "no crossings" from "could not
-            # look" ask :func:`neighbors_established` — see the boundary gate.
+            # look" ask :func:`can_rule_out_adjacency` — see the boundary gate.
             if are_neighbors(area_a, area_b, data) is False:
                 crossings.add(tuple(sorted((area_a, area_b))))  # type: ignore[arg-type]
     return sorted(crossings)

@@ -30,6 +30,7 @@ from mcp.types import TextContent
 from devcouncil.indexing.repo_mapper import RepoMapper
 from devcouncil.indexing.subsystem_map import (
     area_for_path,
+    can_rule_out_adjacency,
     cross_boundary_pairs,
     neighbors_established,
     dead_symbol_candidates_of,
@@ -656,11 +657,11 @@ async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
             ]
             # An empty `cross_boundary_pairs` means one of two different things,
             # and a client cannot tell them apart from the list alone: every
-            # touched pair is adjacent, or this map never established adjacency
-            # at all (the kernel writes `"neighbors": []` for every subsystem).
-            # Same rule as `is_entry_root` and `walk_incomplete` above — the
+            # touched pair is adjacent, or this map cannot rule adjacency out —
+            # it never derived the relation, or holds only a capped part of it.
+            # Same rule as `is_entry_root` and `walk_incomplete` above: the
             # answer carries whether it could be given.
-            crossings_checked = neighbors_established(data)
+            crossings_checked = can_rule_out_adjacency(data)
             payload: dict[str, Any] = {
                 "ok": True,
                 "stale": stale,
