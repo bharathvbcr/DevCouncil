@@ -358,9 +358,17 @@ ALTER TABLE generation_nodes ADD COLUMN body_nodes INTEGER;
 /// | before | 2.311 s | 2.619 s | 4.543 s |
 /// | after  | 0.690 s | 0.724 s | 0.826 s |
 ///
-/// **3.3x on the median**, and the scaling changes shape with it: the same
-/// build over 2,000 files took 0.25 s, so before this the cost grew ~18x for 4x
-/// the files and after it grows ~2.9x.
+/// **3.3x on the median.** Those two rows were taken when the index landed and
+/// are not re-measured here; the "before" one cannot be without reverting the
+/// migration.
+///
+/// The *scaling* was re-measured on 2026-09-05 against the merged tree, release
+/// binary, `benchmarks/map_bench.py --synthetic N --repeat 5`, minimum
+/// reported: the no-op build is **110 ms over 2,001 files and 444 ms over
+/// 8,001** — 4.0x the time for 4.0x the files, so the cost is linear in corpus
+/// size rather than in corpus size times stored bytes. Cold build over the same
+/// pair is 657 ms -> 3.37 s (5.1x), and throughput falls only 3,047 -> 2,375
+/// files/s across the 4x.
 ///
 /// `CREATE INDEX IF NOT EXISTS` is idempotent, so this step needs no probe —
 /// unlike the `ADD COLUMN` migrations. Index build cost measured at 24 ms on a

@@ -1381,6 +1381,43 @@ tree to *prove* nothing changed, and it runs the reclaim decision. Both are alre
 stages; only the reporting was missing. It now goes through `emit_json` with
 `progress.timings_json()`, like every other build result.
 
+### Benchmarks after the merge (2026-09-05, `6f7716f`)
+
+`benchmarks/map_bench.py --repeat 7`, release binary, this repository (1,053 code files).
+The machine was **not quiet** — load averaged 10-14 with other agent sessions running — so
+`touch` (91%), `manifest` (143%) and `impact` (85%) exceeded the harness's spread gate and
+their minima are not comparable to a quiet baseline. Reported rather than dropped, because a
+missing row and a noisy row are different things.
+
+| stage | min | median | spread | peak RSS | throughput |
+|---|---|---|---|---|---|
+| `cold` | 2.53s | 2.65s | 31% | 592 MiB | 417 files/s |
+| `warm` | 264ms | 269ms | 24% | 150 MiB | — |
+| `e2e` | 1.24s | 1.29s | 15% | — | — |
+| `search` | 10ms | 11ms | 12% | 13 MiB | — |
+| `path` | 101ms | 125ms | 30% | 119 MiB | — |
+| `dead` | 16ms | 17ms | 16% | 19 MiB | — |
+
+**The synthetic sweep is the comparable measurement**, because the corpus is fixed and the
+stage is the one a watcher actually runs. `--synthetic N --repeat 5`, minimum reported:
+
+| files | cold | warm (no-op) | touch | manifest | throughput | `code_graph.json` |
+|---|---|---|---|---|---|---|
+| 2,001 | 657ms | 110ms | 412ms | 219ms | 3,047 files/s | 11.05 MB |
+| 8,001 | 3.37s | 444ms | 1.79s | 720ms | 2,375 files/s | 44.49 MB |
+
+**4.0x the no-op build time for 4.0x the files** — linear in corpus size, which is the shape
+the v13 cache-identity index was added to produce. Cold is 5.1x over the same pair and
+throughput falls only 22%. The prior note in `schema.rs` claimed "~2.9x"; that figure did not
+follow from its own table and has been replaced with this one.
+
+**Store growth is bounded, re-confirmed.** Ten rounds with one file's content changed between
+builds, so every round is a real new generation: 128.3 MB -> 257.7 MB = **2.01x**, exactly
+`GENERATION_RETENTION`, with a **0.0% spread over the second half** and a **0.0% freelist**
+after the last build (0.1% peak), read from the file rather than from the vacuum's own report.
+This is the second independent measurement failing to reproduce the 306 MB / 33%-free store
+observed once earlier; it stays recorded as observed-once, not as a defect.
+
 ### Still open
 
 * `traverse_graph` rebuilds its index per query. Inherent to being handed an unindexed slice;

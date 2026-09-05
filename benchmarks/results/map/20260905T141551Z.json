@@ -1,0 +1,63 @@
+{
+  "binary": {
+    "mtime": "2026-09-05T14:13:09.786243+00:00",
+    "path": "/Users/bharath/Code/devtools/DevCouncil/rust-port/target/release/devmap",
+    "size_bytes": 71783824,
+    "version": "devmap 0.1.0 (schema 13)"
+  },
+  "corpus": {
+    "code_bytes": 1589120,
+    "code_files": 2001,
+    "tracked_files": 2001
+  },
+  "corpus_kind": "synthetic",
+  "generated_at": "2026-09-05T14:15:51+00:00",
+  "label": "post-merge 6f7716f synthetic-2000",
+  "python": "3.12.13",
+  "repeat": 5,
+  "repo": "/var/folders/wl/qc_0nnp91cd5kfy179krkjxr0000gn/T/devmap-synth-e29jjzpu",
+  "stages": {
+    "cold": {
+      "max_s": 0.7880319999985659,
+      "mean_s": 0.7142754665997927,
+      "median_s": 0.7119983749998937,
+      "min_s": 0.6566344160000881,
+      "rel_spread": 0.20010767147858444,
+      "rss_bytes": 180731904.0,
+      "samples": 5,
+      "stdev_s": 0.056465150140341494
+    },
+    "manifest": {
+      "graph_bytes": 11051070.0,
+      "map_bytes": 390169.0,
+      "max_s": 0.2367508330007695,
+      "mean_s": 0.22663748320046578,
+      "median_s": 0.22429079200082924,
+      "min_s": 0.21851016599975992,
+      "rel_spread": 0.08347742960860507,
+      "samples": 5,
+      "stdev_s": 0.007594147253470411
+    },
+    "touch": {
+      "max_s": 0.656138500000452,
+      "mean_s": 0.5852024663996417,
+      "median_s": 0.6206462909995025,
+      "min_s": 0.4122958749994723,
+      "rel_spread": 0.5914263027765967,
+      "rss_bytes": 206389248.0,
+      "samples": 5,
+      "stdev_s": 0.09919696383550239
+    },
+    "warm": {
+      "max_s": 0.11287133300174901,
+      "mean_s": 0.11107251659996109,
+      "median_s": 0.11070237499916402,
+      "min_s": 0.10996529200019722,
+      "rel_spread": 0.02642689296497819,
+      "rss_bytes": 61702144.0,
+      "samples": 5,
+      "stdev_s": 0.0011406588653094054
+    }
+  },
+  "synthetic_files": 2000
+}
