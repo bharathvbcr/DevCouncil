@@ -882,3 +882,137 @@ async fn hostile_header_values_are_refused_without_dropping_the_connection() {
          that the tool does not exist (status {status}): {response}"
     );
 }
+
+/// `initialize` is not a method of the revision this endpoint serves.
+///
+/// The handshake was removed in `2026-07-28` and `server/discover` replaces it,
+/// so a request that arrives with the modern envelope and calls `initialize` is
+/// asking for a method this server does not have on this transport. It used to
+/// be answered — with `protocolVersion: "2025-11-25"`, a revision this endpoint
+/// refuses on every other request, reported to a client that had just declared
+/// `2026-07-28` in the header and the body.
+///
+/// `404` and not `400`: "If the server does not implement the requested RPC
+/// method, it **MUST** respond with `404 Not Found` and a JSON-RPC error with
+/// code `-32601`."
+#[tokio::test]
+async fn initialize_is_refused_as_an_unknown_method_on_the_modern_transport() {
+    let address = start().await;
+    let (status, body) = request(
+        &address,
+        &post(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#),
+    )
+    .await;
+    assert_eq!(status, 404, "an unimplemented method is 404: {body}");
+    assert_eq!(body["error"]["code"], json!(-32601), "{body}");
+    assert_eq!(
+        body["id"],
+        json!(1),
+        "the id must survive so the client can match the failure: {body}"
+    );
+    assert!(
+        body["result"].is_null(),
+        "no negotiation may be reported for a handshake this transport does not perform: {body}"
+    );
+}
+
+/// The id narrowing reaches this transport too.
+///
+/// "Requests **MUST** include a string or integer ID. Unlike base JSON-RPC, the
+/// ID **MUST NOT** be `null`." A body carrying an `id` member is a request, so
+/// it is owed an answer; a body carrying an *illegal* id is owed a refusal,
+/// addressed to the id it sent so the client can still resolve the call.
+#[tokio::test]
+async fn an_id_that_is_not_a_string_or_integer_is_refused_over_http() {
+    let address = start().await;
+    for illegal in [json!(null), json!(1.5), json!(true), json!([]), json!({})] {
+        let body = json!({"jsonrpc": "2.0", "id": illegal, "method": "ping"}).to_string();
+        let (status, response) = request(&address, &post(&body)).await;
+        assert_eq!(status, 400, "{illegal}: {response}");
+        assert_eq!(
+            response["error"]["code"],
+            json!(-32600),
+            "a malformed id is an Invalid Request: {illegal} -> {response}"
+        );
+        assert!(
+            response["result"].is_null(),
+            "an illegal id must not be answered with a result: {illegal} -> {response}"
+        );
+    }
+
+    // And a legal one still works, so the bound refuses only what it was meant to.
+    let (status, response) = request(
+        &address,
+        &post(r#"{"jsonrpc":"2.0","id":"call-1","method":"ping"}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(response["id"], json!("call-1"), "{response}");
+}
+
+/// Every code this server emits is one the specification allows it to emit.
+///
+/// "`-32000` to `-32019` — legacy. New codes **MUST NOT** be allocated in this
+/// sub-range, and new implementations **SHOULD NOT** use codes from this
+/// sub-range at all." and "`-32020` to `-32099` — reserved for the MCP
+/// specification. Implementations **MUST NOT** emit any code from this
+/// sub-range that is not defined by this specification."
+///
+/// A sweep rather than a spot check, because the failure this guards against is
+/// a *new* refusal added later reaching for a spare-looking number. Both counts
+/// are reported: a sweep that exercised fewer cases than it listed would be
+/// claiming coverage it did not have.
+#[tokio::test]
+async fn no_response_carries_a_code_the_specification_reserves() {
+    let address = start().await;
+    let hostile: &[&str] = &[
+        r#"{"jsonrpc":"2.0","id":1,"method":"resources/list"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"prompts/list"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"completion/complete"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"subscriptions/listen"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        r#"{"jsonrpc":"1.0","id":1,"method":"ping"}"#,
+        r#"{"jsonrpc":"2.0","id":1}"#,
+        r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
+        r#"{"jsonrpc":"2.0","id":{},"method":"ping"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"cursor":"made-up"}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nope"}}"#,
+        "{not json",
+        "[]",
+    ];
+    // The two the specification defines, plus the standard JSON-RPC set.
+    let allowed = [-32700, -32600, -32601, -32602, -32603, -32020, -32022];
+    let mut inspected = 0usize;
+    for raw in hostile {
+        let (_, response) = request(&address, &post(raw)).await;
+        let Some(code) = response["error"]["code"].as_i64() else {
+            continue;
+        };
+        inspected += 1;
+        assert!(
+            allowed.contains(&code),
+            "{code} is not a code this server may emit ({raw}): the JSON-RPC reserved range is \
+             partitioned and {code} is either in the retired -32000..-32019 band or is an \
+             undefined code in the range the specification keeps for itself"
+        );
+    }
+    // An unsupported version, which is the one MCP-allocated code a client can
+    // provoke, reached through its own body because `post` mirrors the headers.
+    let (_, response) = request(
+        &address,
+        &post(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1999-01-01"}}}"#,
+        ),
+    )
+    .await;
+    assert_eq!(response["error"]["code"], json!(-32022), "{response}");
+    inspected += 1;
+    assert_eq!(
+        inspected,
+        hostile.len() + 1,
+        "{inspected} of {} hostile requests produced an error to inspect; the rest were answered \
+         successfully, which this sweep cannot vouch for",
+        hostile.len() + 1
+    );
+}

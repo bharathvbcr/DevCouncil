@@ -677,6 +677,43 @@ where
     }
 }
 
+/// The answer a peer gets when its request frame could not be read.
+///
+/// `None` means there is nothing to say to it, and the caller must report the
+/// failure instead of returning success.
+///
+/// The match is exhaustive on purpose. It was `Err(FrameReadError::…)` twice
+/// and then `Err(_) => return Ok(())`, and the wildcard is what swallowed
+/// `DeadlineExceeded`: a peer holding a connection open by dribbling bytes was
+/// cut off with **no answer and no log**, and the handler returned exactly the
+/// `Ok(())` it returns after serving a request. From the outside that is a
+/// closed socket, which is what a crashed daemon also looks like; from the
+/// inside it is a connection nobody knows was refused. A frame that ran out of
+/// time is a refusal the peer can act on, so it gets one — the same shape the
+/// other two refusals already had.
+///
+/// Without the wildcard, a variant added later cannot silently inherit
+/// "answer nothing, report success"; it has to be given an answer here.
+fn frame_read_refusal(error: &FrameReadError) -> Option<Envelope> {
+    match error {
+        FrameReadError::ClosedBeforeNewline => Some(failure(
+            "incomplete_request",
+            "connection closed before newline",
+        )),
+        FrameReadError::TooLarge(limit) => Some(failure(
+            "request_too_large",
+            format!("request exceeds {limit} bytes"),
+        )),
+        FrameReadError::DeadlineExceeded => Some(failure(
+            "request_timeout",
+            format!("request frame did not complete within {REQUEST_DEADLINE:?}"),
+        )),
+        // The transport failed or went silent past `IO_TIMEOUT`. There is no
+        // working channel to answer on, so the report goes to the caller.
+        FrameReadError::Io(_) => None,
+    }
+}
+
 pub async fn handle_stream_with_activity<S>(
     mut stream: S,
     store: Arc<Store>,
@@ -693,21 +730,16 @@ where
     .await
     {
         Ok(payload) => payload,
-        // Answer a closed-before-newline peer with the same structured
-        // refusal as before; every other read failure means the peer is gone
-        // or hostile, and there is nothing useful to say to it.
-        Err(FrameReadError::ClosedBeforeNewline) => {
-            let envelope = failure("incomplete_request", "connection closed before newline");
-            return write_envelope(&mut stream, &envelope).await;
+        Err(error) => {
+            return match frame_read_refusal(&error) {
+                Some(envelope) => write_envelope(&mut stream, &envelope).await,
+                // Nothing to say to the peer — the transport itself failed, so
+                // there is no channel to say it on. It is still reported: the
+                // caller logs an `Err`, and returning `Ok(())` here made an
+                // abandoned connection indistinguishable from a served one.
+                None => Err(anyhow::Error::new(error).context("IPC request frame")),
+            };
         }
-        Err(FrameReadError::TooLarge(limit)) => {
-            let envelope = failure(
-                "request_too_large",
-                format!("request exceeds {limit} bytes"),
-            );
-            return write_envelope(&mut stream, &envelope).await;
-        }
-        Err(_) => return Ok(()),
     };
 
     let envelope = match serde_json::from_slice::<IpcRequest>(&payload) {
@@ -1135,6 +1167,78 @@ mod tests {
         .await
         .expect("a complete frame must read cleanly");
         assert_eq!(payload, br#"{"version":1,"cmd":"status"}"#.to_vec());
+    }
+
+    /// Every way a frame can fail to arrive has an answer, and none of them is
+    /// silence-plus-success.
+    ///
+    /// The handler matched two variants and swept the rest into
+    /// `Err(_) => return Ok(())`. `DeadlineExceeded` lives in that wildcard, so
+    /// a peer that held a connection open by dribbling bytes was cut off with
+    /// no reply and no log, and the handler returned the *same* `Ok(())` it
+    /// returns after answering a request. A refusal that reports success is the
+    /// one shape this kernel treats as worse than a visible failure.
+    ///
+    /// Driven off the error type rather than the socket because the deadline is
+    /// ten seconds of wall clock: a test that waited it out would assert on a
+    /// duration, and the property here is what the peer is told, not when.
+    #[test]
+    fn every_unreadable_frame_is_either_answered_or_reported() {
+        let code_of = |error: FrameReadError| {
+            frame_read_refusal(&error).map(|envelope| {
+                assert!(!envelope.ok, "a refusal envelope must not claim success");
+                envelope.error.expect("a refusal must carry an error").code
+            })
+        };
+
+        assert_eq!(
+            code_of(FrameReadError::ClosedBeforeNewline),
+            Some("incomplete_request")
+        );
+        assert_eq!(
+            code_of(FrameReadError::TooLarge(MAX_REQUEST_BYTES)),
+            Some("request_too_large")
+        );
+        assert_eq!(
+            code_of(FrameReadError::DeadlineExceeded),
+            Some("request_timeout"),
+            "a frame that ran out of time is a refusal the peer can report, not a \
+             socket that closes for no stated reason"
+        );
+        assert_eq!(
+            code_of(FrameReadError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "peer went away"
+            ))),
+            None,
+            "a broken transport has no channel to answer on — but the caller must \
+             report it, which is what `handle_stream_with_activity` now does"
+        );
+    }
+
+    /// The other half of the same rule: the handler must turn the unanswerable
+    /// case into an `Err`, so a dead connection cannot be logged as a served
+    /// one.
+    #[tokio::test]
+    async fn a_transport_failure_is_reported_rather_than_returned_as_success() {
+        let (client, server) = tokio::io::duplex(64);
+        // No bytes, and the write half is never shut: the read blocks until
+        // `IO_TIMEOUT`, which `read_frame` surfaces as an `Io` error.
+        let handled = tokio::time::timeout(
+            IO_TIMEOUT * 3,
+            handle_stream(server, Arc::new(Store::open_in_memory().unwrap())),
+        )
+        .await
+        .expect("the handler must return, not hang");
+        let error = handled.expect_err(
+            "an abandoned connection must not report the same Ok(()) a served \
+                                request does",
+        );
+        assert!(
+            error.to_string().contains("IPC request frame"),
+            "and the report must name what failed: {error}"
+        );
+        drop(client);
     }
 
     /// Accept-error backoff grows and then caps, and zero errors cost nothing.

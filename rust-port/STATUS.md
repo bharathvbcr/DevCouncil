@@ -3128,8 +3128,8 @@ below says what was kept from each side.
 | CLI boundary validation, one-line `--json`, `--version` naming both schemas, `Store::latest_analysis_status` | **ported**, `d6ac670` | Kept `main`'s freshness and refusal owners (above). `combine_reasons` is `main`'s joiner and does the joining here. Tests `cli_json_contract.rs` (5), `discovery_refusal_is_coverage_loss.rs` (4) |
 | Per-generation edge index | **folded**, `1dcbc69` + merge `c063a89` | Both lines answered "stop rebuilding the adjacency map per question". `main`'s `e8c3521` hoisted it to once per direction per request; this branch caches it on the store per generation. Kept: `main`'s `GraphIndex` API shape and `TraversalLimits` (direction lives in the index, so a mismatch is not expressible), `main`'s allocation work in full, `main`'s `path_matches`, `latest_snapshot`, and `latest_edge_rows` keying the cache by the generation the rows were *read* from. Kept from the port: `GenerationEdges` / `DirectedEdges` as the storage, and `traverse_indexed` as the one walk. `AdjacencyIndex` stays for callers holding a loose edge slice — `main`'s per-direction path is intact, just no longer the only one |
 | K-B1: bounded search page and per-hit read | **ported**, `2f9916a` | The half `14560f7` / `ec1e862` did not cover: those made `{total, shown, hidden, truncated}` come from one generation; this bounds the I/O the page buys (`SEARCH_PAGE_MAX = 200`, `read_source_prefix`). Fixed a feature-off regression `e8c3521` had introduced (`query_bench` / `query_work_is_bounded_by_the_answer` call `extract_file` without `required-features`) |
-| Admission control on three transports, `BODY_READ_TIMEOUT` | **ported**, `177abbd` | `devmap-serve/src/admission.rs` is the one implementation; the socket's existing semaphore is *replaced* by it, not joined by it. Tests `serve_stress.rs` (9), `daemon_binary_retirement.rs` |
-| K-B4: claim index | **ported**, `3425d76` | Straight port; re-measured here rather than carried over (8,192 claims 48.2 ms -> 414 µs; 50,000 claims 1.83 s -> 2.2 ms). No red test — a cost, not an answer |
+| Admission control on three transports, `BODY_READ_TIMEOUT` | **ported**, `177abbd`, then **folded** against `49be1c5` | `devmap-serve/src/admission.rs` is the one implementation; the socket's existing semaphore is *replaced* by it, not joined by it. `main` then added its own stdio ceiling, and the merge is described below. Tests `serve_stress.rs` (9), `daemon_binary_retirement.rs` |
+| K-B4: claim index | **folded**, `3425d76` + merge with `0db537e` | Both lines found it and wrote the same `HashMap`. `main`'s code was kept; the port's comment contributed the equivalence argument `main`'s lacked — `pending_paths.path` is the table's conflict target, so a claim set holds each path once and the map is *exactly* the scan, same claim and same panic. `main`'s measurements stand (batch 1024 898.8 µs -> 45.5 µs; 4096 16.18 ms -> 286.3 µs; 8192 62.35 ms -> 348.6 µs). No red test on either side — a cost, not an answer |
 | E-8 `recover_lock`, the `ignore_rule_tolerance` diagnostic pin, `mutation_fuzz.rs`, the `budget_probe` throughput table | **ported**, `0306e9e` | Not ported: the `test_process_recovery.rs` fixture change, which existed only to work around the round-1 branch's refusal-as-`ParseOutcome::Failed` fold. `main` records refusals through `DiscoveryCoverage` and still leaves an oversized file queued, so that fixture passes unchanged |
 | `extract_tree_with_report` as the one fold owner; `DiscoveryReport::refusals` in the daemon | **ported**, `4795d23` | Adapted to `main`'s refusal owner rather than adding a second. The daemon's two `!matches!(reason, NonSource)` wildcard copies now call `discovery.refusals()`, so a skip reason added later cannot silently default to "not a refusal" on one path only |
 | MCP client entry (`mcp --print-config`) | **main's kept**, merge `d5fbeb0` | `main`'s `claude::mcp_entry`, which the plugin bundle also calls, so a host configured from `--print-config` cannot point at a different server than one configured from the emitted plugin. The port's inline builder is gone |
@@ -3162,6 +3162,56 @@ which is also the strongest available equivalence check on the port.
 adds no I/O — while the whole `impact("helper")` call falls 17.57 ms -> 0.88 ms
 and 45.98 ms -> 2.69 ms. The read is now 563% and 660% of the call it feeds,
 which is the point: what remains is the read, not the walk.
+
+### The second merge: `main`'s `49be1c5` and `0db537e` (2026-09-05, later)
+
+`main` moved two more commits after the port had landed, and both touched
+`devmap-serve`. Both are folds, not additions, and both left two implementations
+of one behaviour in the auto-merge:
+
+**The stdio in-flight ceiling.** The port bounded it with `Admission` at 32,
+waiting up to 5 s and then answering a JSON-RPC refusal that named the ceiling.
+`main` bounded it at 256 by waiting on the oldest task, and its commit message
+records that its own first attempt *shed* at 64 and was caught by
+`concurrent_requests_never_interleave_or_lose_an_id`. Git merged the two
+cleanly into a file carrying **both** ceilings — the failure mode this whole
+pass exists to prevent.
+
+`main`'s policy wins, and its reasoning is now the reason in the source: a bound
+that discards a well-formed request from a client doing nothing wrong is data
+loss wearing a good error message, and an agent host draining a plan pipelines
+hundreds of requests as a matter of course. The port's *structure* wins: the
+ceiling is held by `Admission`, the one implementation the socket and HTTP
+transports already use, so the number is visible (`peak()`, `shed()`) instead of
+being a `while tasks.len() >= N` nobody can measure. So: `MAX_IN_FLIGHT_REQUESTS
+= 256` (`main`'s number and doc), enforced by `Admission::admit()` (waiting,
+`main`'s policy — the same call the socket transport makes), and `main`'s
+`while tasks.len() >= …` loop removed as the second ceiling.
+
+`Admission::admit_within` — the wait-then-shed method — had exactly one caller,
+this one, and is **deleted** rather than left as an unused public method that
+re-invites the policy `main` rejected. Verified callerless with
+`rg --no-ignore --hidden` over every `.rs`/`.py`/`.md`/`.toml`/`.go` file and by
+the crate building without it. Its unit test is replaced by one for the policy
+that is actually in force: `a_full_pool_queues_the_waiter_and_a_freed_permit_wakes_it`
+asserts both halves — a full pool queues rather than refusing, and `shed()` stays
+zero while it waits.
+
+`serve_stress.rs::ten_thousand_pipelined_stdio_requests_stay_inside_the_ceiling`
+was strengthened accordingly: it accepted "a result, or a refusal naming the
+ceiling" and now requires a result, with `shed() == 0`. Measured under the new
+policy: in-flight peak **8,333 unbounded against 32 bounded**, 10,000 requests,
+none shed, none lost. `main`'s
+`a_pipeline_deeper_than_the_in_flight_bound_answers_every_id_exactly_once`
+(1,024-deep) passes unchanged.
+
+**The drain's claim index (K-B4).** The port's `3425d76` and `main`'s `0db537e`
+are the same `HashMap`, arrived at independently. `main`'s code was kept; the
+port's comment contributed the equivalence argument `main`'s lacked.
+
+`cargo test -p devmap-serve --no-fail-fast` after the fold: **231 passed, 0
+failed, 0 ignored**, which includes `main`'s new `mcp_spec_conformance.rs` and
+`daemon_drain_races.rs` alongside the ported `serve_stress.rs`.
 
 **`search` is 5-7% slower than `main`, and that is the price of K-B1**, not
 noise. Bounding each hit's read to `span_end + 3` bytes replaces one

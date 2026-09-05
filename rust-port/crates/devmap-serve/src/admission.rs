@@ -18,18 +18,22 @@
 //! * the HTTP transport **sheds** ([`Admission::try_admit`]) — a `503` with
 //!   `Retry-After` is something an HTTP client already knows how to act on,
 //!   while a paused accept loop is indistinguishable from a dead server;
-//! * the stdio transport **waits briefly, then sheds**
-//!   ([`Admission::admit_within`]) — the wait is real backpressure on the
-//!   reader, and the shed is a JSON-RPC error naming the bound, so a request is
-//!   never silently dropped and never hangs.
+//! * the stdio transport **waits** ([`Admission::admit`]) — same policy as the
+//!   socket, and for a sharper reason. A bounded wait that sheds afterwards was
+//!   written here first and was wrong: an agent host draining a plan pipelines
+//!   hundreds of requests as a matter of course, and discarding a well-formed
+//!   request from a client doing nothing wrong is data loss wearing a good
+//!   error message. Waiting costs latency and loses nothing, and each admitted
+//!   call is itself bounded by `mcp::CALL_TIMEOUT`, so the wait cannot become a
+//!   hang.
 //!
-//! The counters exist because shedding is invisible otherwise. A server that
+//! The counters exist because a ceiling is invisible otherwise. A server that
 //! quietly refuses one request in ten looks exactly like one that is merely
-//! busy, and [`Admission::shed`] is the difference.
+//! busy, and [`Admission::shed`] is the difference; [`Admission::peak`] is the
+//! matching evidence that a bound that never fired was actually in force.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -127,23 +131,12 @@ impl Admission {
             Err(_) => self.refuse(),
         }
     }
-
-    /// Wait up to `wait` for a permit, then refuse.
-    ///
-    /// The wait is the backpressure: while it is held the caller is not reading
-    /// its next request, so the pressure reaches the peer through the pipe
-    /// rather than through this process's heap.
-    pub async fn admit_within(&self, wait: Duration) -> Option<Admitted> {
-        match tokio::time::timeout(wait, Arc::clone(&self.permits).acquire_owned()).await {
-            Ok(Ok(permit)) => Some(self.hold(permit)),
-            Ok(Err(_)) => None,
-            Err(_) => self.refuse(),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -185,27 +178,36 @@ mod tests {
         assert_eq!(admission.peak(), 2);
     }
 
+    /// The waiting policy: a full pool queues, it does not refuse.
+    ///
+    /// Both halves matter. A waiter that returned `None` would be a shed under
+    /// another name, and a waiter that never woke would be the hang the
+    /// ceiling was supposed to replace — the transports that use `admit` have
+    /// no answer to give a request they neither admitted nor refused.
     #[tokio::test]
-    async fn a_bounded_wait_sheds_rather_than_hanging() {
+    async fn a_full_pool_queues_the_waiter_and_a_freed_permit_wakes_it() {
         let admission = Admission::new(1);
         let held = admission.try_admit().expect("held");
-        let started = std::time::Instant::now();
+
         assert!(
-            admission
-                .admit_within(Duration::from_millis(50))
+            tokio::time::timeout(Duration::from_millis(50), admission.admit())
                 .await
-                .is_none(),
-            "a full pool must refuse the waiter, not queue it forever"
+                .is_err(),
+            "a full pool must hold the waiter, not hand it a refusal"
         );
-        assert!(started.elapsed() < Duration::from_secs(5));
-        assert_eq!(admission.shed(), 1);
+        assert_eq!(
+            admission.shed(),
+            0,
+            "waiting is not shedding, and must not be counted as it"
+        );
+
         drop(held);
-        assert!(
-            admission
-                .admit_within(Duration::from_millis(500))
-                .await
-                .is_some(),
-            "and a freed permit ends the wait"
-        );
+        let admitted = tokio::time::timeout(Duration::from_millis(500), admission.admit())
+            .await
+            .expect("a freed permit must end the wait")
+            .expect("the pool is open, so the wait resolves to a permit");
+        assert_eq!(admission.in_flight(), 1);
+        drop(admitted);
+        assert_eq!(admission.in_flight(), 0);
     }
 }

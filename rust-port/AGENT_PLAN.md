@@ -465,7 +465,7 @@ never run `devmap build` against the repository root's store from a test.
 | Per-generation edge index (`devmap-store/src/edge_index.rs`), replacing the per-question read; `impact` 18.6 ms -> 0.95 ms and 73.2 ms -> 3.04 ms p50, `status` 866 µs -> 15 µs and 2.77 ms -> 13 µs | `1dcbc69` |
 | K-B1: a search page is bounded in files and in bytes | `2f9916a` |
 | Admission control across the three transports, plus an HTTP body deadline | `177abbd` |
-| K-B4: the drain batch's claims are indexed once instead of scanned per path | `3425d76` |
+| K-B4: the drain batch's claims are indexed once instead of scanned per path (`main` found the same defect independently in `0db537e`; its implementation is the one that survived the merge) | `3425d76` |
 | E-8: `recover_lock`, and grammar mutation fuzzing | `0306e9e` |
 | One owner for uncached tree extraction and for the refusal rule | `4795d23` |
 | Seam: one kernel invocation per map refresh, skip-on-unchanged artifacts, kernel-side freshness digests (`hook.py` import cost 149 ms -> 31 ms) | `035fe1e` |

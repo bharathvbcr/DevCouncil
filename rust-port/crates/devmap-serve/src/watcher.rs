@@ -319,7 +319,30 @@ fn admitted_watch_path(
     ignore_cache: &mut IgnoreVerdictCache,
 ) -> Option<String> {
     let relative = path.strip_prefix(root).ok()?;
-    let relative = relative.to_string_lossy().replace('\\', "/");
+    // A name whose bytes are not UTF-8 cannot be a queue entry: the pending
+    // queue is keyed by `String` and so is every stored extraction. Lossy
+    // conversion does not produce this path, it produces a *different* one —
+    // `U+FFFD` where the bytes were — naming a file that does not exist. The
+    // drain then took its `!exists()` branch and recorded a **deletion** of a
+    // path nothing had ever indexed, so an edit to a real file arrived at the
+    // store as the removal of an imaginary one and the real file went
+    // unindexed with nothing saying so.
+    //
+    // Refused and named instead, which is what `collect_sources_with_report`
+    // already answers for the same name (`DiscoverySkipReason::NonUtf8Path`)
+    // and what the connect-time sweep already logs. `None` is honest here in a
+    // way it would not be for an undecidable ignore verdict: this is a settled
+    // fact about the name, not a check that failed to run, and no retry can
+    // change it.
+    let (Some(absolute), Some(relative)) = (path.to_str(), relative.to_str()) else {
+        warn!(
+            "watcher skipped unrepresentable non-UTF-8 path {path:?}; it cannot be a \
+             queue entry and is absent from the graph — this is a refusal, not a \
+             clean tree"
+        );
+        return None;
+    };
+    let relative = relative.replace('\\', "/");
     if is_ignored_path(&relative) {
         return None;
     }
@@ -346,13 +369,13 @@ fn admitted_watch_path(
     }
     match metadata {
         Ok(metadata) if metadata.is_dir() || is_indexable_source(&relative) => {
-            Some(path.to_string_lossy().into_owned())
+            Some(absolute.to_string())
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // Removed files and directories no longer have metadata. Admit
             // them so deletion reconciliation can remove previously indexed
             // descendants; the daemon re-checks indexability and scope.
-            Some(path.to_string_lossy().into_owned())
+            Some(absolute.to_string())
         }
         _ => None,
     }
@@ -435,6 +458,85 @@ fn watch_error_paths(root: &Path, error: &notify::Error) -> Vec<String> {
     whole_tree_rescan(root)
 }
 
+/// Hand one raw notify event to the consumer thread, or record that it could
+/// not be handed over.
+///
+/// Never blocks. This runs on the thread notify delivers to, and blocking it is
+/// precisely what makes the OS drop events — so a full queue is a *refusal*,
+/// and `overflowed` is what keeps that refusal from passing for a quiet tree.
+/// The flag is a plain `bool` because there is nothing to order against it: the
+/// consumer's answer is the same whether one event was refused or a million.
+///
+/// Split out of the closure so the refusal can be produced deterministically:
+/// staging it through the real OS means racing a real `git checkout` against a
+/// real consumer, which the suite cannot schedule.
+fn offer_watch_event(
+    tx: &std::sync::mpsc::SyncSender<notify::Result<notify::Event>>,
+    overflowed: &AtomicBool,
+    event: notify::Result<notify::Event>,
+) {
+    if tx.try_send(event).is_err() {
+        overflowed.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The watcher's consumer loop: debounce, answer refusals, deliver batches.
+///
+/// `debounce` is a parameter rather than the constant so a test can drive the
+/// loop on events alone instead of on elapsed time.
+fn run_watch_loop<F: Fn(Vec<String>)>(
+    root: &Path,
+    rx: std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+    stop_rx: std::sync::mpsc::Receiver<()>,
+    overflowed: &AtomicBool,
+    debounce: Duration,
+    callback: F,
+) {
+    let mut buffer = DebounceBuffer::new(debounce, whole_tree_rescan(root));
+    let mut ignore_cache = IgnoreVerdictCache::default();
+
+    loop {
+        if stop_rx.try_recv().is_ok() {
+            break;
+        }
+        // Deliver matured batches on the event path too: a tree under
+        // continuous churn never lets `recv_timeout` expire, so a flush
+        // evaluated only on silence would never run again.
+        // A refused event is answered before anything else: the rescan it
+        // asks for supersedes whatever individual paths are queued behind
+        // it, and delaying it would let the batch flush as though the queue
+        // had never overflowed.
+        if overflowed.swap(false, Ordering::Relaxed) {
+            warn!(
+                "watcher event queue overflowed ({WATCH_QUEUE_CAPACITY} events); \
+                 requesting a whole-tree rescan of {root:?} rather than reporting \
+                 the tree quiet"
+            );
+            buffer.push(whole_tree_rescan(root), Instant::now());
+        }
+        let now = Instant::now();
+        if let Some(paths) = buffer.take_ready(now) {
+            callback(paths);
+        }
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(Ok(event)) => {
+                let admitted = watch_event_paths(root, event, &mut ignore_cache);
+                buffer.push(admitted, Instant::now());
+            }
+            Ok(Err(error)) => {
+                let admitted = watch_error_paths(root, &error);
+                buffer.push(admitted, Instant::now());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(paths) = buffer.take_ready(Instant::now()) {
+                    callback(paths);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
 /// Start a debounced recursive file watcher. The watcher thread owns the
 /// `RecommendedWatcher` so it is not dropped immediately (previous bug).
 pub fn start_file_watcher<P: AsRef<Path>, F: Fn(Vec<String>) + Send + 'static>(
@@ -444,69 +546,28 @@ pub fn start_file_watcher<P: AsRef<Path>, F: Fn(Vec<String>) + Send + 'static>(
     let root = root_path.as_ref().canonicalize()?;
     let (tx, rx) = sync_channel(WATCH_QUEUE_CAPACITY);
     let (stop_tx, stop_rx) = channel();
-    // Set when the queue refuses an event. Read and cleared by the loop below,
-    // which answers it with a rescan. An event that cannot be queued is lost
+    // Set when the queue refuses an event. Read and cleared by the loop, which
+    // answers it with a rescan. An event that cannot be queued is lost
     // coverage, and lost coverage must not be indistinguishable from a quiet
     // tree — the same rule K-A3 applies to the kernel's own drop notice.
     let overflowed = Arc::new(AtomicBool::new(false));
     let overflow_writer = Arc::clone(&overflowed);
     let mut watcher = RecommendedWatcher::new(
-        move |event| {
-            // Never block here. This runs on the thread notify delivers to, and
-            // blocking it is precisely what makes the OS drop events.
-            if tx.try_send(event).is_err() {
-                overflow_writer.store(true, Ordering::Relaxed);
-            }
-        },
+        move |event| offer_watch_event(&tx, &overflow_writer, event),
         Config::default(),
     )?;
     watcher.watch(&root, RecursiveMode::Recursive)?;
 
     let thread = std::thread::spawn(move || {
         let _watcher = watcher; // keep alive for the thread lifetime
-        let mut buffer = DebounceBuffer::new(Duration::from_secs(2), whole_tree_rescan(&root));
-        let mut ignore_cache = IgnoreVerdictCache::default();
-
-        loop {
-            if stop_rx.try_recv().is_ok() {
-                break;
-            }
-            // Deliver matured batches on the event path too: a tree under
-            // continuous churn never lets `recv_timeout` expire, so a flush
-            // evaluated only on silence would never run again.
-            // A refused event is answered before anything else: the rescan it
-            // asks for supersedes whatever individual paths are queued behind
-            // it, and delaying it would let the batch flush as though the queue
-            // had never overflowed.
-            if overflowed.swap(false, Ordering::Relaxed) {
-                warn!(
-                    "watcher event queue overflowed ({WATCH_QUEUE_CAPACITY} events); \
-                     requesting a whole-tree rescan of {root:?} rather than reporting \
-                     the tree quiet"
-                );
-                buffer.push(whole_tree_rescan(&root), Instant::now());
-            }
-            let now = Instant::now();
-            if let Some(paths) = buffer.take_ready(now) {
-                callback(paths);
-            }
-            match rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(Ok(event)) => {
-                    let admitted = watch_event_paths(&root, event, &mut ignore_cache);
-                    buffer.push(admitted, Instant::now());
-                }
-                Ok(Err(error)) => {
-                    let admitted = watch_error_paths(&root, &error);
-                    buffer.push(admitted, Instant::now());
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if let Some(paths) = buffer.take_ready(Instant::now()) {
-                        callback(paths);
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
+        run_watch_loop(
+            &root,
+            rx,
+            stop_rx,
+            &overflowed,
+            Duration::from_secs(2),
+            callback,
+        );
     });
 
     Ok(WatcherHandle {
@@ -698,6 +759,202 @@ mod tests {
             "a computable verdict of `ignored` must still drop the path"
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A name whose bytes are not UTF-8 must be refused, not fabricated into a
+    /// different path.
+    ///
+    /// The queue is string-keyed, and so is every stored extraction. The
+    /// watcher answered that by lossily converting, which does not produce the
+    /// path — it produces a *different* one, with `U+FFFD` where the bytes
+    /// were, naming a file that does not exist. The drain then found no such
+    /// file, took its `!exists()` branch, and recorded a **deletion** of a path
+    /// nothing had ever indexed. So an edit to a real file arrived at the store
+    /// as the removal of an imaginary one, and nothing anywhere recorded that
+    /// the real file had gone unindexed.
+    ///
+    /// `collect_sources_with_report` already refuses these
+    /// (`DiscoverySkipReason::NonUtf8Path`) and the connect-time sweep already
+    /// logs the refusal. This is the same fact reaching the queue by the other
+    /// producer, and it gets the same answer.
+    /// The fixture is a path that does not exist, which is the shape this
+    /// reaches the watcher in on macOS — APFS rejects a non-UTF-8 name with
+    /// `EILSEQ`, so only removals and events for names created elsewhere can
+    /// carry one. On Linux the same name is an ordinary file and the create and
+    /// modify events carry it too; both take this branch of
+    /// `admitted_watch_path`, and both used to fabricate.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_path_is_refused_rather_than_fabricated() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = scratch_root("non-utf8");
+        // `caf<0xE9>.py`: latin-1 `é`, which is not valid UTF-8.
+        let path = root.join(std::ffi::OsStr::from_bytes(b"caf\xe9.py"));
+        assert!(
+            path.to_str().is_none(),
+            "the fixture must actually be unrepresentable"
+        );
+        let mut cache = IgnoreVerdictCache::default();
+
+        assert_eq!(
+            admitted_watch_path(&root, &path, &mut cache),
+            None,
+            "a path that cannot be a queue entry must be refused; the lossy \
+             spelling names a file that does not exist, and the drain reconciles \
+             that as a deletion"
+        );
+
+        // Positive control: refusing the unrepresentable must not start
+        // refusing the ordinary.
+        let ordinary = root.join("cafe.py");
+        std::fs::write(&ordinary, "def cafe():\n    return 1\n").unwrap();
+        assert_eq!(
+            admitted_watch_path(&root, &ordinary, &mut cache),
+            Some(ordinary.to_string_lossy().into_owned()),
+            "a representable source is still queued"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A refused event must reach the daemon as a whole-tree rescan, ahead of
+    /// everything the queue still holds.
+    ///
+    /// The event queue is a `sync_channel` and the notify callback `try_send`s
+    /// into it, because blocking the thread the OS delivers on is precisely how
+    /// events get dropped. That makes a full queue a *refusal*, and a refused
+    /// event is lost coverage — which must never be indistinguishable from a
+    /// quiet tree (K-A3).
+    ///
+    /// Staged without the OS: `offer_watch_event` is the producer the notify
+    /// callback calls and `run_watch_loop` is the consumer thread, so the
+    /// overflow can be produced by filling the queue directly instead of hoping
+    /// a real `git checkout` outruns a real consumer. The loop is driven with a
+    /// zero debounce so the flush is a function of the events, not of elapsed
+    /// time — this asserts ordering and content, never a duration.
+    #[test]
+    fn a_refused_event_becomes_a_rescan_ahead_of_the_queued_batch() {
+        let root = scratch_root("overflow");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.py"), "def a():\n    return 1\n").unwrap();
+        let edited = || {
+            Ok(
+                notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                    .add_path(root.join("src/a.py")),
+            )
+        };
+
+        let (tx, rx) = sync_channel(WATCH_QUEUE_CAPACITY);
+        let overflowed = Arc::new(AtomicBool::new(false));
+
+        for filled in 0..WATCH_QUEUE_CAPACITY {
+            offer_watch_event(&tx, &overflowed, edited());
+            assert!(
+                !overflowed.load(Ordering::Relaxed),
+                "the queue still had room at {filled} of {WATCH_QUEUE_CAPACITY}; \
+                 an overflow flag that trips early would ask for a whole-tree \
+                 rescan on every busy moment"
+            );
+        }
+        offer_watch_event(&tx, &overflowed, edited());
+        assert!(
+            overflowed.load(Ordering::Relaxed),
+            "the {}st event has nowhere to go and must be recorded as refused, \
+             not dropped in silence",
+            WATCH_QUEUE_CAPACITY + 1
+        );
+
+        let (stop_tx, stop_rx) = channel();
+        let (batches_tx, batches_rx) = channel();
+        let loop_root = root.clone();
+        let loop_flag = Arc::clone(&overflowed);
+        let thread = std::thread::spawn(move || {
+            run_watch_loop(
+                &loop_root,
+                rx,
+                stop_rx,
+                &loop_flag,
+                Duration::ZERO,
+                move |paths| {
+                    let _ = batches_tx.send(paths);
+                },
+            );
+        });
+
+        let first = batches_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the loop must deliver the refusal's answer");
+        assert_eq!(
+            first,
+            whole_tree_rescan(&root),
+            "the first thing delivered after a refusal must be the whole-tree \
+             rescan: the individual paths still queued behind it cannot cover \
+             the events that were turned away, and flushing them first lets the \
+             batch land as though the queue had never overflowed"
+        );
+        assert!(
+            !overflowed.load(Ordering::Relaxed),
+            "and the flag must be consumed, or every later tick re-requests a \
+             rescan that already ran"
+        );
+
+        let _ = stop_tx.send(());
+        drop(tx);
+        thread.join().expect("the watch loop must stop cleanly");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The OFF direction: a queue with room never sets the flag, and the loop
+    /// delivers the itemised paths rather than a rescan.
+    #[test]
+    fn an_unrefused_queue_delivers_itemised_paths() {
+        let root = scratch_root("no-overflow");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.py"), "def a():\n    return 1\n").unwrap();
+
+        let (tx, rx) = sync_channel(WATCH_QUEUE_CAPACITY);
+        let overflowed = Arc::new(AtomicBool::new(false));
+        offer_watch_event(
+            &tx,
+            &overflowed,
+            Ok(
+                notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                    .add_path(root.join("src/a.py")),
+            ),
+        );
+        assert!(!overflowed.load(Ordering::Relaxed));
+
+        let (stop_tx, stop_rx) = channel();
+        let (batches_tx, batches_rx) = channel();
+        let loop_root = root.clone();
+        let loop_flag = Arc::clone(&overflowed);
+        let thread = std::thread::spawn(move || {
+            run_watch_loop(
+                &loop_root,
+                rx,
+                stop_rx,
+                &loop_flag,
+                Duration::ZERO,
+                move |paths| {
+                    let _ = batches_tx.send(paths);
+                },
+            );
+        });
+
+        let first = batches_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the loop must deliver the edit");
+        assert_eq!(
+            first,
+            vec![root.join("src/a.py").to_string_lossy().into_owned()],
+            "one edit is one edit, not a reason to re-index the tree"
+        );
+
+        let _ = stop_tx.send(());
+        drop(tx);
+        thread.join().expect("the watch loop must stop cleanly");
         let _ = std::fs::remove_dir_all(&root);
     }
 

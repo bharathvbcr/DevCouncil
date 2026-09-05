@@ -989,9 +989,11 @@ impl tokio::io::AsyncRead for Scripted {
 ///
 /// Bounding it must not turn into losing requests, so both halves are asserted:
 /// the in-flight peak stays inside the ceiling, and every one of the ten
-/// thousand ids comes back exactly once — as a result, or as a refusal that
-/// names the ceiling so the client knows to retry that request rather than
-/// wondering whether it was received.
+/// thousand ids comes back exactly once, as a result. Not "as a result or a
+/// refusal" — the first version of this ceiling shed past a bounded wait, and
+/// a bound that discards a well-formed request from a client doing nothing
+/// wrong is data loss wearing a good error message. The policy is to wait, so
+/// `shed()` must be zero however deep the pipeline goes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ten_thousand_pipelined_stdio_requests_stay_inside_the_ceiling() {
     const REQUESTS: u64 = 10_000;
@@ -1067,19 +1069,21 @@ async fn ten_thousand_pipelined_stdio_requests_stay_inside_the_ceiling() {
             panic!("every answer must carry the id it was asked against: {frame}")
         });
         assert!(answered.insert(id), "request {id} was answered twice");
-        if let Some(error) = frame.get("error") {
-            let message = error["message"].as_str().unwrap_or_default();
-            assert!(
-                message.contains("ceiling"),
-                "a refusal must name the bound so the client can act on it: {frame}"
-            );
-        } else {
-            assert!(
-                frame["result"]["tools"].is_array(),
-                "an accepted request must be answered, not acknowledged: {frame}"
-            );
-        }
+        assert!(
+            frame.get("error").is_none(),
+            "the stdio ceiling is backpressure, not shedding: a well-formed \
+             request must be delayed, never refused: {frame}"
+        );
+        assert!(
+            frame["result"]["tools"].is_array(),
+            "an accepted request must be answered, not acknowledged: {frame}"
+        );
     }
+    assert_eq!(
+        admission.shed(),
+        0,
+        "nothing may be shed on stdio; the ceiling is held by waiting"
+    );
     assert_eq!(
         answered.len() as u64,
         REQUESTS,

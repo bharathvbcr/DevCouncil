@@ -72,7 +72,8 @@ rather than dead, and stays.
 implementations above are the ones on the reconcile branch
 `claude/devmap-reconcile-1a2151`, which is `main` plus the round-1 work ported
 onto it; K-A2, K-A4, K-A6, K-B2 and K-B3 are `main`'s own implementations kept
-in the merge, and K-B1, K-B4, E-8 and Q-12 are the ported ones. Where both lines
+in the merge, K-B1, E-8 and Q-12 are the ported ones, and K-B4 was written
+independently on both lines (`main`'s implementation kept). Where both lines
 had an implementation, exactly one survives — see STATUS.md, "Port of the 1a2151
 round-1 work onto main (2026-09-05)", for which side each piece came from.
 
