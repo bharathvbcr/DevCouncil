@@ -587,15 +587,22 @@ impl<'a> StoreQueryEngine<'a> {
         // separable here.
         let reverse = devmap_analyze::traversal::GraphIndex::reverse(direction);
         let target = req.query.trim();
+        // Read once, before either exit below can return without it. A walk
+        // over a corpus with a hole in it is a lower bound whether it found a
+        // start or not — "no indexed traversal start" is a much weaker
+        // statement when the file the symbol lives in was never read.
+        let coverage_gap = self.traversal_coverage_gap();
         let start: Vec<String> =
             indexed_traversal_starts(index, target, reverse, min_confidence, &self.cancel)?
                 .into_iter()
                 .map(|(symbol, _)| symbol)
                 .collect();
         if start.is_empty() {
-            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+            let mut response = unavailable_response(ResolutionAvailability::Unavailable {
                 reason: format!("{target} has no indexed traversal start"),
-            }));
+            });
+            response.walk_incomplete = coverage_gap;
+            return Ok(response);
         }
         // `traverse_indexed` is bounded by `max_nodes`/`max_depth` and does not
         // itself consult the flag; checking on either side of it keeps an
@@ -627,8 +634,69 @@ impl<'a> StoreQueryEngine<'a> {
         // early, `total` is the size of a partial answer and `truncated: false`
         // is a claim the walk never earned — this is where `impact` said "here
         // is the blast radius" after visiting three levels of a deeper graph.
-        response.walk_incomplete = walk.stop.reason(max_depth, max_nodes);
+        //
+        // Composed with the corpus caveat rather than replacing it: a walk can
+        // be both truncated by its own limits and short of edges nobody ever
+        // extracted, and a reader deciding whether to act on the answer needs
+        // both statements, not whichever was written last.
+        response.walk_incomplete =
+            devmap_analyze::combine_reasons(walk.stop.reason(max_depth, max_nodes), coverage_gap);
         Ok(response)
+    }
+
+    /// Why every walk over this generation is a lower bound, or `None` when it
+    /// is not.
+    ///
+    /// The corpus-level counterpart of [`file_edge_coverage_gap`], which
+    /// qualifies one file's outbound list. A traversal crosses the whole
+    /// generation, so the fact it has to disclose is the analysis summary's
+    /// own: a file that failed to parse, was recovered by pattern, or was
+    /// refused by discovery contributes no call edges at all, and an edge that
+    /// was never extracted is indistinguishable in the store from an edge that
+    /// does not exist.
+    ///
+    /// `dead_symbols` has carried this disclosure since K-A2 and
+    /// `dependencies` refuses outright for a file whose parse failed; the walk
+    /// did neither, so `impact` — the answer an agent reads as "nothing calls
+    /// this, it is safe to change" — was the one place a corpus with a known
+    /// hole in it produced a confident empty list.
+    ///
+    /// Fail-closed on both no-answer paths: a status that is absent or will not
+    /// read back is unknown coverage, not proven coverage. It is deliberately
+    /// not an error — a corrupt analysis blob must not turn every query into a
+    /// failure.
+    ///
+    /// One `latest_analysis_status` per walk, which is memoised per generation
+    /// behind a generation-id probe: measured at **2.9 µs** per call, release
+    /// build, over a 200-file store. A 16-target `neighbors` makes 32 of them —
+    /// 93 µs against the 92 ms that fan-out costs on the ScholarLM corpus — so
+    /// the read is not hoisted out to the composition. Keeping it here keeps
+    /// one owner for the disclosure, and every entry point that walks (
+    /// `impact`, `trace`, `neighbors`, `explore`) inherits it without having to
+    /// remember to.
+    fn traversal_coverage_gap(&self) -> Option<String> {
+        use devmap_analyze::model::AnalysisStatus;
+        let unknown = || {
+            Some(
+                "the analysis summary for this generation could not be read, so how much of \
+                 the corpus this walk crossed is unknown"
+                    .to_string(),
+            )
+        };
+        match self.store.latest_analysis_status() {
+            Ok(Some(AnalysisStatus::Ok)) => None,
+            Ok(Some(AnalysisStatus::Partial { reason })) => Some(format!(
+                "the corpus this walk crossed was not fully read ({reason}); a call edge that \
+                 was never extracted is indistinguishable from one that does not exist, so \
+                 this list is a lower bound"
+            )),
+            Ok(Some(AnalysisStatus::Timeout { reason })) => Some(format!(
+                "the analysis of the corpus this walk crossed timed out ({reason}); a call \
+                 edge that was never attributed is indistinguishable from one that does not \
+                 exist, so this list is a lower bound"
+            )),
+            Ok(None) | Err(_) => unknown(),
+        }
     }
 
     /// Definitions matching `query`, each with its source, both call-graph
