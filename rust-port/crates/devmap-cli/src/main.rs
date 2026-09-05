@@ -1462,7 +1462,19 @@ async fn main() -> anyhow::Result<()> {
                 3,
                 format_args!("analyzing {} resolved edges", resolution.edges.len()),
             );
-            let analysis = analyze(&extractions, &resolution);
+            // The refusal count reaches the analysis, not just stderr. A file
+            // discovery turned away has no `Extraction`, so nothing computed
+            // from that slice can see it — and the one thing that most needs to
+            // is the dead-code pass, because the file never read may hold the
+            // only call to a symbol this build is about to call dead. The
+            // persisted `AnalysisSummary` carries the degraded status onward, so
+            // a later `devmap manifest` reading the store inherits it rather
+            // than recomputing a clean answer.
+            let analysis = devmap_analyze::analyze_with_discovery(
+                &extractions,
+                &resolution,
+                devmap_analyze::DiscoveryCoverage::refused(refused.len()),
+            );
 
             let opts = GenerationWriteOpts {
                 affected_paths: match (&affected, split_csv(affected_flag)) {

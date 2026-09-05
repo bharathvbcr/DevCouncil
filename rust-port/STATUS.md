@@ -2305,3 +2305,73 @@ what "fresh" means for a long-lived `devmap mcp` process. That is a scope call
 for the owner rather than something to slip into a hardening pass. The
 measurement and the harness are checked in so the decision can be made against
 numbers.
+
+## K-A2 closed: discovery refusals are coverage loss (2026-09-05)
+
+The audit's highest-severity finding, and the half that survived the first fix.
+`graph_degraded` was made honest about files that **failed to parse**; it stayed
+blind to files discovery **refused to read at all** — oversized, unreadable, or
+a non-UTF-8 path.
+
+The reason the second half outlived the first is worth stating, because it is
+the shape of the bug rather than an accident: every coverage check is computed
+from the `&[Extraction]` slice, and a file discovery turned away has no
+`Extraction` in that slice. So the check ran, found every file it could see
+intact, and reported a complete corpus. **The count cannot be derived; it has to
+be carried in.**
+
+Audit proof C, reproduced and then closed against the release binary. `lib.py`
+defines `helper()`; its only caller `app.py` is 1,134,064 bytes, over
+`MAX_SOURCE_BYTES`:
+
+| | before | after |
+| --- | --- | --- |
+| `repo_map.graph_degraded` | `false` | **`true`** |
+| `graph_degraded_reason` | `''` | `…1 refused by discovery and never read at all` |
+| `code_graph.dead_code` confidence | `extracted` | **`ambiguous`** |
+| `devmap dead` | **0.9** — the confident tier | **0.35** |
+
+The map no longer proposes deleting a live function because the file that calls
+it was never read.
+
+**Shape of the fix.** `ExtractionCoverage` gains `discovery_refused_files`, and
+a `DiscoveryCoverage` input type carries it in — a type rather than a bare
+`usize` so that "no discovery step ran" is spelled `DiscoveryCoverage::none()`
+and cannot be confused with a count that happens to be zero. That distinction is
+load-bearing: `analyze` (a caller supplying its own corpus — the single-file
+preview path, and tests) is correct to report full coverage, and
+`analyze_with_discovery` (a caller that walked a tree) is not.
+
+The count is folded into coverage **before** the confidence cap, not after the
+reports are built. A file never read may hold the only call to a symbol, so a
+refusal has to reach `coverage.cap()` by the same route a parse failure does —
+setting a flag on the way out would satisfy `graph_degraded` and still offer
+`helper` at 0.9.
+
+**No schema change was needed.** `Commands::Manifest` reads the *persisted*
+`AnalysisSummary`, so once the count reaches `analyze()` at build time the
+degraded status propagates to `repo_map.json`, `code_graph.json` and a later
+standalone `devmap manifest` for free. A new table was considered and rejected
+on that basis.
+
+Tests: `devmap-analyze/tests/discovery_refusals_are_coverage_loss.rs` (4). Red
+proof, with the single line carrying the count reverted:
+
+```
+a_refused_file_makes_the_analysis_partial
+  … reporting Ok is a check that could not run answering like one that ran and passed
+a_refused_file_caps_dead_symbol_confidence
+  a refused file may hold the only call to `helper`, so the finding must be
+  downgraded: 0.9 is not below 0.9
+```
+
+Both controls — a fully-discovered corpus is **not** marked partial, and the
+plain `analyze` entry point still reports a complete corpus — stayed green under
+that revert, so the tests are not trivially red.
+
+**Left undone:** the daemon's own drain (`daemon.rs`) still calls plain
+`analyze`; its discovery refusals are handled separately as pending-path policy
+(K1(c)) and the count is not in scope at that call. A daemon-committed
+generation therefore does not yet carry the discovery half of the degraded
+reason, though it does carry the parse-failure half. `devmap build` — the path
+both audit proofs used — is fixed.

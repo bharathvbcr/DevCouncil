@@ -250,7 +250,7 @@ fn both_liveness_entry_points_apply_the_same_cap() {
     let resolution = resolver.resolve_all(&extractions);
 
     let bare = analyze_liveness(&extractions, &resolution);
-    let full = analyze_liveness_with_coverage(&extractions, &resolution);
+    let full = analyze_liveness_with_coverage(&extractions, &resolution, DiscoveryCoverage::none());
 
     assert_eq!(full.coverage.parse_failed_files, 1);
     assert_eq!(bare.len(), full.reports.len());

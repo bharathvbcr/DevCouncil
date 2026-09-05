@@ -219,12 +219,53 @@ pub struct ExtractionCoverage {
     /// coverage — see [`ExtractionEngine::NotApplicable`]'s own docs drawing
     /// exactly this line against a `.md`.
     pub pattern_recovered_files: usize,
+    /// Files discovery refused before any extractor saw them — oversized,
+    /// unreadable, or a non-UTF-8 path.
+    ///
+    /// **Not derivable from `extractions`**, which is precisely why this gap
+    /// outlived the parse-failure one it otherwise resembles: a refused file has
+    /// no `Extraction` at all, so every coverage check computed from that slice
+    /// reported a complete corpus. The count has to be carried in from
+    /// discovery, and the two production build paths do that.
+    ///
+    /// The cost of missing it, measured: `lib.py` defines `helper()`, its only
+    /// caller `app.py` is over `MAX_SOURCE_BYTES`, and `devmap dead` proposed
+    /// deleting `helper` at 0.9 — the confident tier — because the file that
+    /// calls it was never read.
+    pub discovery_refused_files: usize,
+}
+
+/// What discovery refused, for the analysis that cannot see it.
+///
+/// A separate type rather than a bare `usize` so a caller cannot pass the wrong
+/// count positionally, and so the one place that means "no discovery step ran"
+/// is spelled [`DiscoveryCoverage::none`] rather than `0`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiscoveryCoverage {
+    pub refused_files: usize,
+}
+
+impl DiscoveryCoverage {
+    /// No discovery step ran, so nothing was refused.
+    ///
+    /// Correct for a caller that supplies its own corpus directly — a test, or
+    /// the single-file preview path. Wrong for anything that walked a tree, and
+    /// that is the distinction this exists to keep visible.
+    pub fn none() -> Self {
+        Self { refused_files: 0 }
+    }
+
+    pub fn refused(refused_files: usize) -> Self {
+        Self { refused_files }
+    }
 }
 
 impl ExtractionCoverage {
     /// Whether every file in the corpus had its calls looked for.
     pub fn is_complete(&self) -> bool {
-        self.parse_failed_files == 0 && self.pattern_recovered_files == 0
+        self.parse_failed_files == 0
+            && self.pattern_recovered_files == 0
+            && self.discovery_refused_files == 0
     }
 
     /// Files that contributed no call edges, of either kind.
@@ -244,9 +285,10 @@ impl ExtractionCoverage {
         }
         Some(format!(
             "call extraction did not cover the whole corpus: {} file(s) failed to parse, \
-             {} recovered by pattern (no calls extracted) — dead-code and unwired findings \
-             are a lower bound and are capped below the confident tier",
-            self.parse_failed_files, self.pattern_recovered_files
+             {} recovered by pattern (no calls extracted), {} refused by discovery and never \
+             read at all — dead-code and unwired findings are a lower bound and are capped \
+             below the confident tier",
+            self.parse_failed_files, self.pattern_recovered_files, self.discovery_refused_files
         ))
     }
 
@@ -315,14 +357,19 @@ pub fn analyze_liveness(
     extractions: &[Extraction],
     resolution: &ResolutionResult,
 ) -> Vec<DeadSymbolReport> {
-    analyze_liveness_with_coverage(extractions, resolution).reports
+    analyze_liveness_with_coverage(extractions, resolution, DiscoveryCoverage::none()).reports
 }
 
 pub fn analyze_liveness_with_coverage(
     extractions: &[Extraction],
     resolution: &ResolutionResult,
+    discovery: DiscoveryCoverage,
 ) -> LivenessOutcome {
-    let coverage = extraction_coverage(extractions);
+    let mut coverage = extraction_coverage(extractions);
+    // Folded in before the cap is applied, not after the reports are built: a
+    // file discovery never read may hold the only call to a symbol here, so a
+    // refusal has to reach `coverage.cap()` the same way a parse failure does.
+    coverage.discovery_refused_files = discovery.refused_files;
     let go_interface_specs = go_interface_specs_by_package(extractions);
     let c_header_exports = c_header_exported_names(extractions);
     let go_build_variants = go_build_variant_identities(extractions);
