@@ -76,7 +76,7 @@ fn a_dead_page_reports_the_analysis_of_the_generation_it_listed() {
     commit(&store, &[("lib.py", LIB), ("app.py", APP)], &[]);
 
     let page = store
-        .dead_page()
+        .dead_page(usize::MAX)
         .unwrap()
         .expect("the store holds a generation");
 
@@ -107,7 +107,10 @@ fn a_dead_page_over_a_degraded_generation_still_says_so() {
     let store = Store::open_in_memory().unwrap();
     commit(&store, &[("lib.py", LIB), ("app.py", APP)], &["app.py"]);
 
-    let page = store.dead_page().unwrap().expect("a generation exists");
+    let page = store
+        .dead_page(usize::MAX)
+        .unwrap()
+        .expect("a generation exists");
     let analysis = page.analysis.expect("analysis stored");
     assert!(
         matches!(
@@ -169,7 +172,7 @@ fn an_empty_name_list_still_answers_from_a_generation() {
         "a store with no generation has nothing to answer from, which is a \
          different statement from answering zero"
     );
-    assert!(empty.dead_page().unwrap().is_none());
+    assert!(empty.dead_page(usize::MAX).unwrap().is_none());
 }
 
 /// A scratch directory named for the test using it. No `tempfile`
@@ -228,7 +231,10 @@ fn reading_the_analysis_and_the_rows_separately_can_straddle_two_generations() {
     commit(&writer, &[("lib.py", LIB), ("app.py", APP)], &[]);
 
     // The second half now reads a different generation.
-    let paired = reader.dead_page().unwrap().expect("a generation exists");
+    let paired = reader
+        .dead_page(usize::MAX)
+        .unwrap()
+        .expect("a generation exists");
     assert_eq!(paired.generation, 2);
     assert!(
         matches!(

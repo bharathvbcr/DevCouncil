@@ -104,3 +104,7 @@ required-features = ["parse"]
 [[test]]
 name = "a_fan_out_pays_for_its_index_once_per_direction"
 required-features = ["parse"]
+
+[[test]]
+name = "a_delete_this_list_reads_for_its_answer"
+required-features = ["parse"]

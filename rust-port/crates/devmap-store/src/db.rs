@@ -479,8 +479,17 @@ pub struct CallersPage {
 #[derive(Debug, Clone)]
 pub struct DeadPage {
     pub generation: u32,
-    pub analysis: Option<AnalysisSummary>,
+    pub analysis: Option<AnalysisDisclosure>,
+    /// Non-exempt rows, ranked, at most the requested limit.
     pub rows: Vec<DeadSymbolReport>,
+    /// Every non-exempt row in this generation, independent of the limit.
+    ///
+    /// The denominator, and the reason the limit is safe. `Response` carries
+    /// `shown + hidden == total` and clients enforce it, so a bounded read that
+    /// also shrank the count would not merely under-report — it would turn
+    /// "66 of 80,000" into "66 of 66", which is the flattering reading of a
+    /// list that was cut off.
+    pub total_non_exempt: usize,
 }
 
 /// One consistent snapshot of a search: the matching rows, the count they were
@@ -3801,7 +3810,7 @@ impl Store {
 
     /// The dead-symbol rows and the analysis that qualifies them, against one
     /// generation. See [`DeadPage`].
-    pub fn dead_page(&self) -> Result<Option<DeadPage>> {
+    pub fn dead_page(&self, limit: usize) -> Result<Option<DeadPage>> {
         let conn = lock_conn(&self.conn)?;
         let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
             return Ok(None);
@@ -3813,9 +3822,12 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?;
+        // Into the disclosure, not the whole summary: the summary embeds a
+        // second copy of the dead-symbol list, so parsing it here would undo
+        // the bound above. See `AnalysisDisclosure`.
         let analysis = raw
             .map(|json| {
-                serde_json::from_str::<AnalysisSummary>(&json).map_err(|error| {
+                serde_json::from_str::<AnalysisDisclosure>(&json).map_err(|error| {
                     rusqlite::Error::InvalidParameterName(format!(
                         "stored generation analysis is invalid: {error}"
                     ))
@@ -3825,8 +3837,57 @@ impl Store {
         Ok(Some(DeadPage {
             generation,
             analysis,
-            rows: Self::dead_symbols_in(&snapshot, generation)?,
+            rows: Self::dead_symbols_page_in(&snapshot, generation, limit)?,
+            total_non_exempt: Self::count_dead_non_exempt_in(&snapshot, generation)?,
         }))
+    }
+
+    /// The ranked head of the non-exempt dead rows.
+    ///
+    /// The exempt filter and the limit both belong in SQL. `dead_symbols`
+    /// discarded exempt rows in Rust after materialising every row of the
+    /// generation, and then the budgeter kept a few dozen: measured at 80,000
+    /// rows read to show 66, and on this repository 6,976 of 7,176 rows read
+    /// were exempt and dropped on arrival. The work was proportional to the
+    /// corpus, never to the answer.
+    ///
+    /// Ordering is unchanged. The old query sorted by `is_exempt` first, so
+    /// filtering on it makes that key constant and leaves the surviving rows in
+    /// exactly the order they already had.
+    fn dead_symbols_page_in(
+        snapshot: &Connection,
+        gen: u32,
+        limit: usize,
+    ) -> Result<Vec<DeadSymbolReport>> {
+        let mut stmt = snapshot.prepare(
+            "SELECT symbol_name, file_path, confidence, is_exempt, exemption_reason
+             FROM generation_dead_symbols
+             WHERE generation_id = ?1 AND is_exempt = 0
+             ORDER BY confidence DESC, file_path, symbol_name, ordinal
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![gen, i64::try_from(limit).unwrap_or(i64::MAX)],
+            |row| {
+                Ok(DeadSymbolReport {
+                    symbol_name: row.get(0)?,
+                    file_path: row.get(1)?,
+                    confidence: row.get(2)?,
+                    is_exempt: row.get::<_, i64>(3)? != 0,
+                    exemption_reason: row.get(4)?,
+                })
+            },
+        )?;
+        rows.collect()
+    }
+
+    fn count_dead_non_exempt_in(snapshot: &Connection, gen: u32) -> Result<usize> {
+        snapshot.query_row(
+            "SELECT COUNT(*) FROM generation_dead_symbols
+             WHERE generation_id = ?1 AND is_exempt = 0",
+            params![gen],
+            |row| row.get::<_, i64>(0).map(|count| count as usize),
+        )
     }
 
     pub fn latest_dead_symbols(&self) -> Result<Vec<DeadSymbolReport>> {
@@ -3837,6 +3898,12 @@ impl Store {
         Self::dead_symbols_in(&snapshot, gen)
     }
 
+    /// Every dead-symbol row of a generation, exempt ones included.
+    ///
+    /// Deliberately unbounded and unfiltered: its callers compare whole
+    /// generations for incremental-vs-cold equivalence, where an omitted row is
+    /// the failure they exist to detect. The bounded, non-exempt read the query
+    /// engine wants is [`Store::dead_symbols_page_in`].
     fn dead_symbols_in(snapshot: &Connection, gen: u32) -> Result<Vec<DeadSymbolReport>> {
         let mut stmt = snapshot.prepare(
             "SELECT symbol_name, file_path, confidence, is_exempt, exemption_reason

@@ -964,13 +964,29 @@ impl<'a> StoreQueryEngine<'a> {
         // That combination is what promotes a row from "look at this" to "safe
         // to delete": a disclosure saying the corpus was fully covered, over
         // rows from a generation where it was not.
-        let Some(page) = self.store.dead_page()? else {
+        //
+        // Bounded by the answer, not by the corpus. The exempt filter and the
+        // cut both run in SQL now; this used to materialise every dead row of
+        // the generation and drop almost all of them here — 80,000 read to show
+        // 66 on the benchmark corpus. One more row than the budget can seat is
+        // read on purpose, so `budget_take` still sees something it cannot fit
+        // and reports `truncated` for the right reason.
+        let limit = (token_budget / DEAD_SYMBOL_TOKENS) as usize + 1;
+        let Some(page) = self.store.dead_page(limit)? else {
             return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
         };
-        let dead = page.rows.into_iter().filter(|row| !row.is_exempt).collect();
-        let mut response = budget_take(dead, token_budget, |_| 30);
+        let mut response = budget_take(page.rows, token_budget, |_| DEAD_SYMBOL_TOKENS);
+        // `budget_take` counts the page it was handed, and the page is now a
+        // bounded read — so the generation-wide count has to be restored as the
+        // denominator, exactly as `explore` does for definitions. Without this
+        // a capped list would report itself as the whole truth.
+        response.total = u32::try_from(page.total_non_exempt)
+            .unwrap_or(u32::MAX)
+            .max(response.shown);
+        response.hidden = response.total.saturating_sub(response.shown);
+        response.truncated = response.hidden > 0;
         response.walk_incomplete = dead_symbol_coverage_gap(page.analysis.as_ref());
         Ok(response)
     }
@@ -2547,6 +2563,9 @@ const TRAVERSAL_MAX_NODES: usize = 5_000;
 
 /// Token cost the budgeter charges for one graph edge, everywhere.
 const EDGE_TOKENS: u32 = 25;
+/// Token cost of one dead-symbol row, and so the divisor that turns a budget
+/// into how many rows are worth reading.
+const DEAD_SYMBOL_TOKENS: u32 = 30;
 
 /// Node ids listed per blast-radius band. The band's exact size travels in
 /// `node_count` regardless, so this trims the listing, never the count.
@@ -2925,7 +2944,7 @@ fn search_rank_pool_size(token_budget: u32) -> usize {
 /// attributed is the load-bearing case: a marker that appears on every answer
 /// leaves a caller exactly where it started.
 fn dead_symbol_coverage_gap(
-    analysis: Option<&devmap_analyze::model::AnalysisSummary>,
+    analysis: Option<&devmap_analyze::model::AnalysisDisclosure>,
 ) -> Option<String> {
     use devmap_analyze::model::AnalysisStatus;
     // A generation exists but its analysis blob does not read back. That is a

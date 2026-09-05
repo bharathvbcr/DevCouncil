@@ -2863,3 +2863,78 @@ unbounded, but `total: 80000` is the honest denominator that makes "66 shown of
 80,000" true, and clients enforce `shown + hidden == total` — so a `LIMIT` has
 to come with a `COUNT`, the way `explore` already pairs them. That is the next
 one, not this one.
+
+### Q-14 — a delete-this list read the whole corpus, twice
+
+`dead_symbols` shows a few dozen rows. It read every dead-symbol row of the
+generation, discarded the exempt ones in Rust, and the budgeter kept 66. On the
+benchmark corpus that is 80,000 rows read to show 66; on this repository, 6,976
+of the 7,176 rows read were exempt and dropped on arrival.
+
+The row read is now `WHERE is_exempt = 0 ... LIMIT ?`, one more row than the
+budget can seat so `budget_take` still reports `truncated` for the right
+reason. Ordering is unchanged: the old query sorted by `is_exempt` first, so
+filtering on it makes that key constant and leaves the survivors in the order
+they already had.
+
+**The bound is only safe because the count survives it.** `Response` carries
+`shown + hidden == total` and clients enforce it, so a bounded read that also
+shrank `total` would turn "66 of 80,000" into "66 of 66" — a capped list
+reporting itself as the whole truth. `DeadPage` therefore carries
+`total_non_exempt` from a `COUNT(*)` in the same pinned snapshot, and the
+engine restores it as the denominator, the way `explore` already does.
+
+**Writing the test corrected the diagnosis.** With the SQL bound in place the
+allocation test still failed, at 8.8x. The cause was not the row read at all:
+`AnalysisSummary` embeds `dead_symbols: Vec<DeadSymbolReport>`, a second
+complete copy of the very list being paged, and `dead_page` deserialized the
+whole summary to read one status field. Measured on the benchmark corpus, the
+stored blob is 10,122,764 bytes and 10,084,001 of them — 99.6% — are that list.
+Bounding the SQL read while parsing the blob accomplishes nothing.
+
+So the fix is two halves, and each was proved load-bearing by reverting it
+alone:
+
+```text
+both applied                          52 allocations vs 52     1.0x   pass
+SQL bound reverted, disclosure kept 4,016 vs 413              9.7x   FAIL
+disclosure reverted, SQL bound kept 4,065 vs 462              8.8x   FAIL
+```
+
+The second half is `AnalysisDisclosure`: the scalar fields a coverage
+disclosure needs, read from the same JSON, with serde stepping over the two
+vectors instead of building them. No second format and no second writer —
+`analysis_disclosure_agrees_with_the_summary_it_reads` pins the two together,
+because a field that drifts out of the disclosure would silently start reading
+as its default, and "0 unattributed calls" is exactly the reassuring answer
+this type must never invent.
+
+**Measured, interleaved, both binaries warm**, four rounds on the 330,000-edge
+corpus:
+
+```text
+dead_symbols warm p50   before  42.96  40.69  39.15  49.19   median 41.83 ms
+                        after   14.93  25.39  14.60  13.78   median 14.77 ms
+                                                             -65% (2.8x)
+```
+
+All eight runs answered `shown=66 total=80000`, so neither the answer nor the
+denominator moved. Three of the four `after` rounds sit in 13.8–14.9 ms; the
+25.39 outlier was three concurrent agent lanes competing for the machine, and
+is reported rather than dropped.
+
+**What this did not fix, measured.** Allocations fell 78x (4,065 to 52) but
+wall clock only 2.8x, and the gap is the point: the 10 MB blob is still
+`SELECT`ed whole into a Rust `String` and still lexed end to end. Skipping a
+field is cheap per token but there are 10 MB of tokens. Two further fixes
+remain, in increasing order of value and risk: extract the scalars with
+`json_extract` inside SQLite so the blob never crosses into Rust at all; or,
+at the root, stop storing `dead_symbols` in `analysis_json` when
+`generation_dead_symbols` already holds it — a stored-format change, so a
+migration question rather than a patch.
+
+`Store::latest_dead_symbols` stays unbounded and unfiltered on purpose. Its
+callers compare whole generations for incremental-vs-cold equivalence, where an
+omitted row is the failure they exist to detect. Conflating the two reads broke
+exactly those seven tests during this work, which is how the distinction got
+documented on the function.
