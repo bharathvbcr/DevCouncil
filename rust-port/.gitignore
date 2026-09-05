@@ -1,5 +1,6 @@
 # Rust build artifacts
 /target/
+/target-*/
 
 # Generated DevCouncil artifacts (regenerate with dev map)
 .devcouncil/
