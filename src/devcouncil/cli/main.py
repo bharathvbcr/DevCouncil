@@ -29,7 +29,9 @@ def _configure_stdio() -> None:
 _configure_stdio()
 
 import importlib  # noqa: E402 - imports follow stdio reconfiguration
+from typing import Literal  # noqa: E402 - same reason
 
+import click  # noqa: E402 - same reason
 from typer.core import TyperGroup  # noqa: E402 - same reason
 
 #: `dev <name>` -> (module under `devcouncil.cli.commands`, attribute, kind).
@@ -49,7 +51,7 @@ from typer.core import TyperGroup  # noqa: E402 - same reason
 #: `tests/unit/test_cli_lazy_commands.py` pins the full list against what it was
 #: before this table existed, so a typo removes a command loudly rather than
 #: silently.
-_LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
+_LAZY_COMMANDS: dict[str, tuple[str, str, Literal["typer", "command"]]] = {
     # Sub-command groups.
     "init": ("init", "app", "typer"),
     "doctor": ("doctor", "app", "typer"),
@@ -161,10 +163,13 @@ class LazyCommandGroup(TyperGroup):
     `dev <one command>`, which now imports one.
     """
 
-    def list_commands(self, ctx: "typer.Context") -> list[str]:
+    # `click.Context`, not `typer.Context`: Click hands these two the context it
+    # built, so narrowing the parameter to Typer's subclass would be a promise
+    # the caller never made.
+    def list_commands(self, ctx: click.Context) -> list[str]:
         return sorted({*super().list_commands(ctx), *_LAZY_COMMANDS})
 
-    def get_command(self, ctx: "typer.Context", name: str):
+    def get_command(self, ctx: click.Context, name: str) -> click.Command | None:
         found = super().get_command(ctx, name)
         if found is not None:
             return found
@@ -175,6 +180,10 @@ class LazyCommandGroup(TyperGroup):
         module_name, attribute, kind = spec
         module = importlib.import_module(f"devcouncil.cli.commands.{module_name}")
         target = getattr(module, attribute)
+        # A group and a leaf are both `click.Command`; which one this is depends
+        # on `kind`, so the branches must not narrow the variable to whichever
+        # ran first.
+        command: click.Command
         if kind == "typer":
             prepare = _BEFORE_BUILD.get(name)
             if prepare is not None:
