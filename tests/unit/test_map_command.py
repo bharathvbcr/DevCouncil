@@ -90,6 +90,12 @@ def test_liveness_summary_none_when_all_empty():
 
 
 def test_liveness_summary_reports_counts():
+    """A payload with no `liveness_meta` renders its counts as floors.
+
+    This fixture predates the disclosure and carries none, so no total is
+    knowable for the three capped lists; `unreachable_files` is not capped and
+    still reads as a plain count.
+    """
     repo_map = SimpleNamespace(
         entry_roots=["main"],
         unwired_candidates=["u.py"],
@@ -98,7 +104,9 @@ def test_liveness_summary_reports_counts():
     )
     summary = map_cmd._liveness_summary(repo_map)
     assert "liveness:" in summary
-    assert "1 entry roots" in summary
+    assert "1+ entry roots" in summary
+    assert "1 unreachable" in summary
+    assert "disclosed no total" in summary
 
 
 # --- map command: an unusable engine fails the stage -------------------------------
@@ -465,3 +473,101 @@ def test_enclosing_project_root_ignores_a_directory_without_a_config(tmp_path):
     child.mkdir(parents=True)
     (parent / ".devcouncil").mkdir()          # dir exists, no config.yaml
     assert map_cmd._enclosing_project_root(child) is None
+
+
+# --- _liveness_summary: the capped lists carry their denominators -----------------
+#
+# `dev map` printed `liveness: 20 entry roots, 200 unwired, ... 200 dead symbols`
+# on a repository whose own `repo_map.json` recorded 136 entry roots, 540 unwired
+# and 208 dead symbols. Every one of those lists is capped by the kernel before it
+# reaches the artifact, and the cap is invisible in the list itself, so the status
+# line an agent reads before deciding "that is all of them" was a capped sample
+# presented as complete coverage. The totals were already in `liveness_meta`; only
+# this renderer dropped them.
+
+
+def _meta_map(**buckets):
+    """A RepoMap-shaped stand-in carrying a `liveness_meta` disclosure."""
+    return SimpleNamespace(
+        entry_roots=["e%d" % i for i in range(buckets.pop("entry_shown", 0))],
+        unwired_candidates=["u%d.py" % i for i in range(buckets.pop("unwired_shown", 0))],
+        unreachable_files=[],
+        dead_symbol_candidates=["d%d.f" % i for i in range(buckets.pop("dead_shown", 0))],
+        liveness_unreachable_unreliable=True,
+        liveness_meta=buckets.pop("liveness_meta", {}),
+        **buckets,
+    )
+
+
+def test_liveness_summary_prints_the_totals_the_map_disclosed():
+    repo_map = _meta_map(
+        entry_shown=20,
+        unwired_shown=200,
+        dead_shown=200,
+        liveness_meta={
+            "entry_roots": {"shown": 20, "total": 136, "truncated": True},
+            "unwired": {"shown": 200, "total": 540, "truncated": True},
+            "dead_symbol": {"shown": 200, "total": 208, "truncated": True},
+        },
+    )
+    summary = map_cmd._liveness_summary(repo_map)
+    assert "20 of 136 entry roots" in summary
+    assert "200 of 540 unwired" in summary
+    assert "200 of 208 dead symbols" in summary
+    # No floor marker: every bucket answered.
+    assert "+" not in summary.split("(prefer")[0]
+
+
+def test_liveness_summary_states_a_complete_list_plainly():
+    """A list that was not cut reads as a count, not as `N of N`."""
+    repo_map = _meta_map(
+        entry_shown=3,
+        unwired_shown=2,
+        dead_shown=1,
+        liveness_meta={
+            "entry_roots": {"shown": 3, "total": 3, "truncated": False},
+            "unwired": {"shown": 2, "total": 2, "truncated": False},
+            "dead_symbol": {"shown": 1, "total": 1, "truncated": False},
+        },
+    )
+    summary = map_cmd._liveness_summary(repo_map)
+    assert "3 entry roots" in summary
+    assert " of " not in summary
+    assert "disclosed no total" not in summary
+
+
+def test_liveness_summary_marks_an_undisclosed_total_as_a_floor():
+    """No disclosure is not the same answer as "the list is complete"."""
+    repo_map = _meta_map(entry_shown=1, unwired_shown=200, dead_shown=4, liveness_meta={})
+    summary = map_cmd._liveness_summary(repo_map)
+    assert "200+ unwired" in summary
+    assert "1+ entry roots" in summary
+    assert "4+ dead symbols" in summary
+    assert "disclosed no total" in summary
+
+
+def test_liveness_summary_distrusts_a_total_its_own_list_disproves():
+    """`total` below the number of entries present is incoherent, not authoritative."""
+    repo_map = _meta_map(
+        unwired_shown=200,
+        liveness_meta={"unwired": {"shown": 200, "total": 7, "truncated": False}},
+    )
+    summary = map_cmd._liveness_summary(repo_map)
+    assert "200+ unwired" in summary
+    assert "of 7" not in summary
+
+
+def test_liveness_summary_reports_files_unwired_could_not_examine():
+    """Files whose imports never extracted are excluded from the unwired population.
+
+    `liveness_meta.unwired.total` counts only the files the question could be
+    asked of; `excluded_coverage_loss` counts the ones it could not.
+    """
+    repo_map = _meta_map(
+        unwired_shown=2,
+        liveness_meta={
+            "unwired": {"shown": 2, "total": 2, "truncated": False, "excluded_coverage_loss": 3},
+        },
+    )
+    summary = map_cmd._liveness_summary(repo_map)
+    assert "3 files excluded from unwired" in summary
