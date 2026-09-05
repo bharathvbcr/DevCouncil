@@ -3374,3 +3374,57 @@ query whose page was already smaller. Recorded rather than smoothed over: the
 unbounded version was faster and would open 5,001 files for a generous budget.
 Both figures are within 20% of `d2fb25e` on every row, which was the gate this
 port had to clear.
+
+### The third merge: `main` merged this branch, then moved on
+
+`main` integrated the reconcile branch (`862c619`, `f21f816`) while this pass was
+finishing, and added four commits after it. Merged back with no conflicts:
+`db.rs` keeps `latest_analysis_status` beside `f892725`'s `json_remove` strip —
+including `main`'s correction of that method's doc comment, which had explained
+the split between it and `AnalysisDisclosure` by a fact `f892725` had since made
+false — and this ledger keeps both sessions' sections.
+
+**One defect `main`'s merge carried, found here and fixed:**
+`tests/unit/test_devmap_engine.py::test_an_older_kernel_without_the_stamp_flags_still_gets_a_stamped_map`.
+It simulates an old kernel by turning off *one* of the two capability probes the
+seam makes, and read green for exactly as long as the CLI half of
+`build --manifest` was held back. Once that landed, `_build_accepts_manifest`
+answered for the real binary, the engine took the fused path, and the fallback
+the test exists to protect stopped being exercised — the assertion the test
+makes (`assert called`) went red rather than silently passing, which is the good
+outcome, but only because the spy was on the fallback itself.
+
+The production fallback was never broken: a genuinely old kernel has neither
+capability, `_write_manifest_separately` runs and `stamp_freshness` patches the
+digests in. The *fixture* was wrong, so the fixture was fixed — both probes off,
+which is what an old kernel looks like — and the reason they can be switched
+together is now pinned rather than assumed:
+`test_the_two_kernel_capabilities_the_seam_probes_ship_together` asserts against
+the real binary that `build --manifest` and `manifest`'s three stamp flags are
+one capability, because in the CLI they are one `StampFlags` group flattened
+into both subcommands. Removing the added `monkeypatch` line reproduces the
+failure, so the fix is load-bearing. `main` verified its merge with cargo only,
+which is why this reached it.
+
+### Verification on the final tree
+
+| gate | result |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0, no output |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
+| `cargo test --workspace --no-fail-fast` | **1,345 passed, 0 failed, 2 ignored**; zero `test result: FAILED` lines |
+| `cargo check -p devmap-{extract,query,store,analyze} --no-default-features --all-targets` | 4/4 exit 0 |
+| `cargo build --release` (worktree's own target) | exit 0; `devmap 0.1.0 (store schema 13, code graph schema 2)` |
+| `pytest tests/unit -q` | **4,162 passed, 0 failed, 9 xfailed** in 450 s |
+| `ruff check src tests` | `All checks passed!` |
+| `dev map doctor --json` | `ok: true` |
+| `dev hook post-tool-use`, unchanged tree | **0.83 s** (min of 8 at load 5.4; 0.85 s min of 5 at load 7.8), against the 1.5 s pre-seam baseline |
+
+The two ignored tests are pre-existing and self-describing:
+`the_emitted_bundle_passes_claude_plugin_validate_strict` needs the `claude` CLI
+on PATH, and `concurrent_prune_writer_child` is a child-process helper.
+
+The hook figure does not reproduce the seam lane's 0.77 s and is not claimed to:
+this machine ran at load 5-10 throughout (several sibling sessions building), and
+0.83 s is what it gives under that. The shape of the improvement holds; the last
+60 ms is not evidence either way.
