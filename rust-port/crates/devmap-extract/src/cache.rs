@@ -154,7 +154,15 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// so a v28 row for a 2,500-declaration file says "2000 declaration(s)
 /// recovered by pattern" with no trace of the 500 that were dropped. Reusing
 /// those rows would keep serving a prefix under a reason that reads as a set.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "29";
+/// v30 moves the notebook cell cap and the unlocatable-symbol count out of
+/// `diagnostics` and into the `ParseOutcome::Fallback` reason, for exactly the
+/// reason v29 did it for the pattern scanner: `for_durable_store` clears
+/// `diagnostics`, so a v29 row for a 6,000-cell notebook says `Clean` with no
+/// trace of the 1,000 cells never read. It also adds the pattern scanner's
+/// `skipped_long_lines` to that reason — a v29 row for a file with an
+/// over-long declaration line reports only what it kept. Reusing either would
+/// keep serving a prefix under an outcome that reads as a set.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "30";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

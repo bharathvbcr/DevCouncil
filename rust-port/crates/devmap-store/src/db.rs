@@ -111,33 +111,64 @@ fn is_control_token(entry: &str) -> bool {
     entry.starts_with('\0')
 }
 
-/// The canonical pending-queue spelling of `raw` relative to `root`, or `None`
-/// when it names something outside the repository.
+/// What [`canonical_pending_entry`] could establish about a raw queue entry.
+///
+/// Three states, not two. "Outside the repository" is a positive claim that
+/// costs the row its place in the queue, and it must not be the answer given
+/// when the containment test itself could not run.
+enum PendingEntry {
+    /// The canonical repo-relative spelling.
+    Canonical(String),
+    /// Structurally outside the repository: no retry can change this.
+    Outside,
+    /// Containment is unknown because `root.canonicalize()` failed — a symlink
+    /// loop, a parent that lost `+x`, a stale handle on a network mount. The
+    /// caller must not treat this as either answer.
+    Undecidable(std::io::Error),
+}
+
+/// The canonical pending-queue spelling of `raw` relative to `root`.
 ///
 /// Canonical means: repo-relative, forward slashes, no `.` or `..` components,
 /// and `"."` for the root itself. Both queue producers now go through this, so
 /// the watcher's absolute paths and the reconcile sweep's relative ones become
 /// the same row instead of two rows for one file — see
 /// [`Store::enqueue_pending_paths_under_root`].
-fn canonical_pending_entry(root: &Path, raw: &str) -> Option<String> {
+fn canonical_pending_entry(root: &Path, raw: &str) -> PendingEntry {
     if is_control_token(raw) {
-        return Some(raw.to_string());
+        return PendingEntry::Canonical(raw.to_string());
     }
+    // `\` is a path separator on Windows and an ordinary, legal filename
+    // character everywhere else. Rewriting it unconditionally renamed the Unix
+    // file `a\b.py` to `a/b.py`, which then matched nothing on disk, failed
+    // classification, and was deleted from the queue as garbage — the file was
+    // never indexed and `status` still reported fresh.
+    #[cfg(windows)]
     let normalized = raw.replace('\\', "/");
+    #[cfg(windows)]
     let candidate = Path::new(&normalized);
+    #[cfg(not(windows))]
+    let candidate = Path::new(raw);
+
     let relative = if candidate.is_absolute() {
         // Compare against the canonical root as well: a symlinked temp
         // directory, or a `.`-rooted daemon, makes the lexical prefix test
         // fail on paths that are genuinely inside the tree.
-        candidate
-            .strip_prefix(root)
-            .ok()
-            .or_else(|| {
-                root.canonicalize()
-                    .ok()
-                    .and_then(|canonical| candidate.strip_prefix(canonical).ok())
-            })?
-            .to_path_buf()
+        match candidate.strip_prefix(root) {
+            Ok(stripped) => stripped.to_path_buf(),
+            Err(_) => match root.canonicalize() {
+                Ok(canonical) => match candidate.strip_prefix(&canonical) {
+                    Ok(stripped) => stripped.to_path_buf(),
+                    Err(_) => return PendingEntry::Outside,
+                },
+                // The rescue itself failed, so nothing here has established
+                // where the entry lives. `.ok()` used to collapse this into
+                // `None`, which the reconcile sweep deletes as a row that
+                // escapes the root: a definite verdict from a check that never
+                // ran, and the row is gone.
+                Err(error) => return PendingEntry::Undecidable(error),
+            },
+        }
     } else {
         candidate.to_path_buf()
     };
@@ -145,15 +176,20 @@ fn canonical_pending_entry(root: &Path, raw: &str) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     for component in relative.components() {
         match component {
-            std::path::Component::Normal(part) => parts.push(part.to_str()?.to_string()),
+            std::path::Component::Normal(part) => match part.to_str() {
+                Some(text) => parts.push(text.to_string()),
+                None => return PendingEntry::Outside,
+            },
             std::path::Component::CurDir => {}
             // `..` can only ever climb out of the root from a relative entry,
             // and an absolute entry that needed it was already refused above.
-            std::path::Component::ParentDir => return None,
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+            std::path::Component::ParentDir => return PendingEntry::Outside,
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return PendingEntry::Outside
+            }
         }
     }
-    Some(if parts.is_empty() {
+    PendingEntry::Canonical(if parts.is_empty() {
         ".".to_string()
     } else {
         parts.join("/")
@@ -201,7 +237,7 @@ fn classify_pending_entry(
         }
         // A symlink, socket, fifo or device. Never a source this build reads.
         Ok(_) => Err("not a regular file or directory".to_string()),
-        Err(_) => {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // Absent. This is a deletion the drain must process only if the
             // graph still claims the path — or claims something beneath it,
             // which is how a removed directory reaches its indexed children.
@@ -217,6 +253,17 @@ fn classify_pending_entry(
                 Err("no longer exists under the root and is not in the stored graph".to_string())
             }
         }
+        // The stat could not run: ELOOP from a symlink loop in a parent,
+        // EACCES from a parent that lost `+x`, EIO or ESTALE from a network
+        // mount. None of those is evidence that the file is gone, and this
+        // branch's verdict *deletes the row*. Every error used to land here
+        // and be read as absence, so a stat that could not run silently
+        // discarded queued work while `status` went on reporting fresh.
+        //
+        // Keep it. A transient failure is retried, and a path that keeps
+        // failing is quarantined after `MAX_PENDING_ATTEMPTS`, which is a
+        // visible state an operator can act on.
+        Err(_transient) => Ok(()),
     }
 }
 
@@ -562,6 +609,87 @@ impl std::fmt::Display for VacuumAction {
 /// degenerate but both implementations agree on them, and so is any finite
 /// value outside 0.0..=1.0 — an empty answer there is a filter that ran and
 /// matched nothing, which is a real result.
+/// A `usize` row cap as SQLite's `LIMIT` reads it.
+///
+/// SQLite takes `LIMIT` as a signed 64-bit value and treats a **negative** one
+/// as *unbounded*. `limit as i64` therefore inverts the request for every
+/// `usize` at or above `2^63`: `usize::MAX as i64` is `-1`, so a caller asking
+/// for the largest cap it can name got no cap at all. Clamping keeps it a cap
+/// — the largest one SQLite can express — and a caller that wanted everything
+/// still gets everything.
+///
+/// One owner for the rule. Four bounded readers each carried their own copy of
+/// this clamp and a fifth, `latest_unresolved`, was written without it; that is
+/// the shape a shared helper exists to prevent.
+fn sqlite_limit(limit: usize) -> i64 {
+    limit.min(i64::MAX as usize) as i64
+}
+
+/// The stored byte span of a symbol row, or a refusal naming the row.
+///
+/// S-11: three readers decoded the same two columns and two of them disagreed
+/// with the third. `search_symbols` errored on a corrupt span while
+/// `all_symbols` and `latest_clone_candidates` clamped it with `.max(0)` and
+/// published `0..0` — a span that looks real, points at the top of the file,
+/// and is indistinguishable from a zero-length symbol at offset 0. One corrupt
+/// row therefore made `search` fail closed and the other two lie, which is the
+/// exact shape "a check that could not run must not answer like one that ran"
+/// exists to forbid. The loud policy wins: a span is a byte range into a file,
+/// a negative start or an end before the start is not one, and a fabricated
+/// range is worse than a refusal that names the symbol.
+fn checked_span(path: &str, name: &str, start: i64, end: i64) -> Result<(usize, usize)> {
+    let corrupt = || {
+        rusqlite::Error::InvalidParameterName(format!(
+            "stored span for symbol {name:?} in {path} is not a byte range: \
+             span_start={start}, span_end={end}"
+        ))
+    };
+    if end < start {
+        return Err(corrupt());
+    }
+    let start = usize::try_from(start).map_err(|_| corrupt())?;
+    let end = usize::try_from(end).map_err(|_| corrupt())?;
+    Ok((start, end))
+}
+
+/// Decode the two `generation_files` columns that record how a file was read.
+///
+/// One owner: [`Store::latest_file`] and the `build_history` parse-failure
+/// count both need them, and a quiet decode in either would report a store
+/// fault as a fact about the code.
+fn decode_stored_outcome(
+    path: &str,
+    parse_json: &str,
+    engine_json: &str,
+) -> Result<(ParseOutcome, ExtractionEngine)> {
+    let parse_outcome = serde_json::from_str(parse_json).map_err(|error| {
+        rusqlite::Error::InvalidParameterName(format!(
+            "stored parse outcome for {path} is invalid: {error}"
+        ))
+    })?;
+    let engine = serde_json::from_str(engine_json).map_err(|error| {
+        rusqlite::Error::InvalidParameterName(format!(
+            "stored extraction engine for {path} is invalid: {error}"
+        ))
+    })?;
+    Ok((parse_outcome, engine))
+}
+
+/// Is a stored row a parse failure?
+///
+/// The same rule `devmap_extract::model::Extraction::is_parse_failure` applies
+/// in memory, asked of the two columns that carry it. Rehydrating the whole
+/// payload to call the canonical method would mean deserializing every
+/// extraction in the generation — measured at 198 MiB on one corpus — to answer
+/// a yes/no question, so the *rule* is restated over the stored fields and
+/// `the_stored_parse_failure_rule_matches_the_canonical_classifier` fails if
+/// the two ever disagree on a real corpus.
+#[cfg(feature = "parse")]
+fn stored_is_parse_failure(outcome: &ParseOutcome, engine: &ExtractionEngine) -> bool {
+    matches!(outcome, ParseOutcome::Failed { .. })
+        && !matches!(engine, ExtractionEngine::NotApplicable { .. })
+}
+
 fn checked_min_confidence(value: f32) -> Result<f32> {
     if value.is_nan() {
         return Err(rusqlite::Error::InvalidParameterName(
@@ -573,6 +701,171 @@ fn checked_min_confidence(value: f32) -> Result<f32> {
     Ok(value)
 }
 
+/// Every table and column this binary's readers and writers address by name.
+///
+/// S-8: this list is the schema gate, and it was narrower than the schema it
+/// claimed to assert — `generation_files.grammar_version`/`analyzer_version`
+/// (v8) and `generation_unresolved.classification`/`receiver` (v10/v11) were
+/// missing, so a store stamped at the current version without them opened
+/// clean and failed at the first *write* instead of at the gate. A gate that
+/// passes a store it cannot write to is worse than no gate: it moves the
+/// failure from "this store is not usable" to a mid-build error naming a
+/// column.
+///
+/// Completeness is enforced, not asserted:
+/// `the_schema_gate_names_every_column_the_current_schema_creates` builds a
+/// fresh store and fails if any column of these tables is missing here, so a
+/// future migration cannot add a column and silently leave the gate behind.
+/// FTS5's *shadow* tables (`nodes_fts_data`, `_idx`, `_content`, `_docsize`,
+/// `_config`) are deliberately absent — SQLite owns their layout and it is not
+/// this crate's to assert. `nodes_fts` itself is this crate's DDL and is
+/// searched by column name, so it is asserted.
+const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
+    ("paths", &["id", "path"]),
+    (
+        "generations",
+        &["id", "created_at", "head_sha", "analysis_json", "repo_root"],
+    ),
+    (
+        "generation_nodes",
+        &[
+            "generation_id",
+            "ordinal",
+            "file_id",
+            "name",
+            "qualified_name",
+            "kind",
+            "span_start",
+            "span_end",
+            "is_exported",
+            "body_exact",
+            "body_structural",
+            "body_nodes",
+        ],
+    ),
+    (
+        "generation_files",
+        &[
+            "generation_id",
+            "file_id",
+            "language",
+            "content_hash",
+            "parse_outcome_json",
+            "engine_json",
+            "extraction_json",
+            "grammar_version",
+            "analyzer_version",
+        ],
+    ),
+    (
+        "generation_edges",
+        &[
+            "generation_id",
+            "ordinal",
+            "source_file_id",
+            "target_file_id",
+            "source_symbol",
+            "target_symbol",
+            "edge_kind",
+            "confidence",
+        ],
+    ),
+    (
+        "generation_unresolved",
+        &[
+            "generation_id",
+            "ordinal",
+            "source_file",
+            "source_symbol",
+            "callee_name",
+            "reason",
+            "classification",
+            "receiver",
+        ],
+    ),
+    (
+        "generation_dead_symbols",
+        &[
+            "generation_id",
+            "ordinal",
+            "file_path",
+            "symbol_name",
+            "confidence",
+            "is_exempt",
+            "exemption_reason",
+        ],
+    ),
+    (
+        "extraction_cache",
+        &[
+            "content_hash",
+            "language",
+            "grammar_version",
+            "analyzer_version",
+            "payload_json",
+            "accessed_at",
+        ],
+    ),
+    (
+        "extraction_retry",
+        &[
+            "content_hash",
+            "language",
+            "attempts",
+            "last_reason",
+            "updated_at",
+        ],
+    ),
+    ("pending_paths", &["path", "queued_at", "attempts"]),
+    ("nodes_fts", &["name", "qualified_name", "path"]),
+    ("nodes_fts_map", &["rowid_ref", "generation_id"]),
+    (
+        "build_history",
+        &[
+            "generation_id",
+            "built_at",
+            "head_sha",
+            "files",
+            "symbols",
+            "edges",
+            "dead_confident",
+            "dead_ambiguous",
+            "parse_failed",
+            "languages_covered",
+            "build_ms",
+            "db_bytes",
+        ],
+    ),
+];
+
+/// The identity a payload written by *this* build would carry, or `None` when
+/// this build cannot know.
+///
+/// The answer is the compiled grammar versions, so without the `parse` feature
+/// there is no answer — not "current" and not "stale", but *unknown*. That
+/// distinction is the whole reason this is one function: both callers previously
+/// reached straight into `devmap_extract::cache`, which is `#[cfg(feature =
+/// "parse")]`, so `--no-default-features` did not compile at all and the
+/// feature's own documentation ("Off, this crate builds without tree-sitter and
+/// answers questions about a persisted map rather than building one") was false.
+/// That configuration is not hypothetical: `devmap-extract/Cargo.toml` records
+/// GitPulse linking `devmap-query` to answer impact queries in-process, never
+/// indexing, and paying 49 crates and 32 C-compiled grammars for it.
+///
+/// Neither caller may turn `None` into a match. A payload whose currency was
+/// never checked must not be reported as current.
+fn current_payload_identity(language: &str) -> Option<(String, String)> {
+    #[cfg(feature = "parse")]
+    {
+        Some(devmap_extract::cache::current_payload_identity(language))
+    }
+    #[cfg(not(feature = "parse"))]
+    {
+        let _ = language;
+        None
+    }
+}
+
 impl Store {
     /// Page cache for a write connection, in KiB (negative = KiB, per SQLite).
     ///
@@ -582,13 +875,25 @@ impl Store {
     /// again for the length of the transaction.
     const CACHE_SIZE_KIB: i32 = -65_536;
 
+    /// How long any connection waits for a lock before giving up.
+    ///
+    /// S-7: `stored_schema_version` opens its own read-only connection and
+    /// never passes through [`Self::configure_connection`], so the crate's
+    /// contention policy was stated in one place and *inherited* in the other
+    /// — rusqlite happens to default to the same five seconds, which is why
+    /// the two agree today. An inherited default is not a policy: a
+    /// dependency bump that changed it would silently give one reader a
+    /// different wait from every other, and nothing would fail. Stated once
+    /// and applied at both openers instead.
+    const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     /// How many quarantined paths [`Store::status`] names in its degraded
     /// reason. Bounded because the reason is a one-line diagnostic, not a
     /// dump — the honest total stays in `quarantined_count`.
     pub const DEGRADED_SAMPLE: usize = 5;
 
     fn configure_connection(conn: &Connection) -> Result<()> {
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
         // `synchronous = NORMAL`, not the `FULL` default.
@@ -676,121 +981,7 @@ impl Store {
     }
 
     fn validate_schema(conn: &Connection) -> Result<()> {
-        const REQUIRED: &[(&str, &[&str])] = &[
-            ("paths", &["id", "path"]),
-            (
-                "generations",
-                &["id", "created_at", "head_sha", "analysis_json", "repo_root"],
-            ),
-            (
-                "generation_nodes",
-                &[
-                    "generation_id",
-                    "ordinal",
-                    "file_id",
-                    "name",
-                    "qualified_name",
-                    "kind",
-                    "span_start",
-                    "span_end",
-                    "is_exported",
-                    "body_exact",
-                    "body_structural",
-                    "body_nodes",
-                ],
-            ),
-            (
-                "generation_files",
-                &[
-                    "generation_id",
-                    "file_id",
-                    "language",
-                    "content_hash",
-                    "parse_outcome_json",
-                    "engine_json",
-                    "extraction_json",
-                ],
-            ),
-            (
-                "generation_edges",
-                &[
-                    "generation_id",
-                    "ordinal",
-                    "source_file_id",
-                    "target_file_id",
-                    "source_symbol",
-                    "target_symbol",
-                    "edge_kind",
-                    "confidence",
-                ],
-            ),
-            (
-                "generation_unresolved",
-                &[
-                    "generation_id",
-                    "ordinal",
-                    "source_file",
-                    "source_symbol",
-                    "callee_name",
-                    "reason",
-                ],
-            ),
-            (
-                "generation_dead_symbols",
-                &[
-                    "generation_id",
-                    "ordinal",
-                    "file_path",
-                    "symbol_name",
-                    "confidence",
-                    "is_exempt",
-                    "exemption_reason",
-                ],
-            ),
-            ("nodes_fts", &["name", "qualified_name", "path"]),
-            ("nodes_fts_map", &["rowid_ref", "generation_id"]),
-            ("pending_paths", &["path", "queued_at", "attempts"]),
-            (
-                "extraction_cache",
-                &[
-                    "content_hash",
-                    "language",
-                    "grammar_version",
-                    "analyzer_version",
-                    "payload_json",
-                    "accessed_at",
-                ],
-            ),
-            (
-                "extraction_retry",
-                &[
-                    "content_hash",
-                    "language",
-                    "attempts",
-                    "last_reason",
-                    "updated_at",
-                ],
-            ),
-            (
-                "build_history",
-                &[
-                    "generation_id",
-                    "built_at",
-                    "head_sha",
-                    "files",
-                    "symbols",
-                    "edges",
-                    "dead_confident",
-                    "dead_ambiguous",
-                    "parse_failed",
-                    "languages_covered",
-                    "build_ms",
-                    "db_bytes",
-                ],
-            ),
-        ];
-
-        for (table, required_columns) in REQUIRED {
+        for (table, required_columns) in REQUIRED_SCHEMA {
             let object_type: Option<String> = conn
                 .query_row(
                     "SELECT type FROM sqlite_master WHERE name = ?1",
@@ -863,6 +1054,10 @@ impl Store {
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        // The same wait every other connection gets. A store locked for a
+        // moment — a vacuum, a competing opener — must make `status` and
+        // `doctor` wait, not report a failure.
+        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
         let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         Ok(Some(version))
     }
@@ -1126,7 +1321,7 @@ impl Store {
     ///
     /// The holder writes its pid into the file, so the timeout can say who.
     pub fn lock_writer_at(db_path: &Path, wait: std::time::Duration) -> anyhow::Result<WriterLock> {
-        use std::io::{Read, Seek, Write};
+        use std::io::{Seek, Write};
 
         let lock_path = Self::writer_lock_path(db_path);
         if let Some(parent) = lock_path.parent() {
@@ -1141,40 +1336,84 @@ impl Store {
             .truncate(false)
             .open(&lock_path)?;
 
+        Self::poll_writer_lock(|| file.try_lock(), wait, Self::WRITER_LOCK_POLL, &lock_path)?;
+
+        // Record ownership for the *next* waiter's diagnostic. Best-effort: a
+        // failure to write the pid does not weaken the lock, it only makes a
+        // future timeout less specific.
+        let _ = file.set_len(0);
+        let _ = file.rewind();
+        let _ = write!(file, "{}", std::process::id());
+        let _ = file.flush();
+        Ok(WriterLock {
+            file: Some(file),
+            path: Some(lock_path),
+        })
+    }
+
+    /// The bounded `try_lock` poll behind [`Store::lock_writer_at`].
+    ///
+    /// Contention and a failed check are different events and must not share
+    /// an answer. `Err(_busy)` matched both `TryLockError::WouldBlock` — some
+    /// other process holds it, so wait — and `TryLockError::Error` — the lock
+    /// call itself failed, so nothing at all is known about ownership. On a
+    /// filesystem that does not implement `flock` (ENOLCK, EOPNOTSUPP) the
+    /// second is what *every* attempt returns, so a build polled the full
+    /// `wait` and then failed with "another devmap writer holds … (pid
+    /// unknown)": a definite claim about a process that does not exist, made
+    /// by a check that never ran, after a minute spent waiting for it.
+    /// `protocol::lock_ipc_endpoint` refuses that collapse for the IPC
+    /// endpoint; this is the same policy for the store's writer lock.
+    ///
+    /// The attempt arrives as a closure so this decision has exactly one
+    /// owner and can be driven by a test — no filesystem refuses `flock` on
+    /// demand, and an untestable policy is how the collapse survived here
+    /// while being explicitly rejected one crate away.
+    fn poll_writer_lock<F>(
+        mut attempt: F,
+        wait: std::time::Duration,
+        poll: std::time::Duration,
+        lock_path: &Path,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut() -> std::result::Result<(), std::fs::TryLockError>,
+    {
         let deadline = std::time::Instant::now() + wait;
         loop {
-            match file.try_lock() {
-                Ok(()) => {
-                    // Record ownership for the *next* waiter's diagnostic.
-                    // Best-effort: a failure to write the pid does not weaken
-                    // the lock, it only makes a future timeout less specific.
-                    let _ = file.set_len(0);
-                    let _ = file.rewind();
-                    let _ = write!(file, "{}", std::process::id());
-                    let _ = file.flush();
-                    return Ok(WriterLock {
-                        file: Some(file),
-                        path: Some(lock_path),
-                    });
-                }
-                Err(_busy) => {
+            match attempt() {
+                Ok(()) => return Ok(()),
+                Err(std::fs::TryLockError::WouldBlock) => {
                     if std::time::Instant::now() >= deadline {
-                        let mut holder = String::new();
-                        let owner = std::fs::File::open(&lock_path)
-                            .and_then(|mut handle| handle.read_to_string(&mut holder))
-                            .ok()
-                            .map(|_| holder.trim().to_string())
-                            .filter(|pid| !pid.is_empty())
-                            .unwrap_or_else(|| "unknown".to_string());
+                        let owner = Self::writer_lock_holder(lock_path);
                         anyhow::bail!(
                             "another devmap writer holds {lock_path:?} (pid {owner}); \
                              waited {wait:?}. Wait for it to finish, or stop that process."
                         );
                     }
-                    std::thread::sleep(Self::WRITER_LOCK_POLL);
+                    std::thread::sleep(poll);
                 }
+                Err(std::fs::TryLockError::Error(error)) => anyhow::bail!(
+                    "the devmap writer lock {lock_path:?} could not be taken: {error}; \
+                     ownership is unknown, so no claim is made about another writer"
+                ),
             }
         }
+    }
+
+    /// The pid a lock holder recorded in its lock file, or `"unknown"`.
+    ///
+    /// Diagnostic only: the lock is the `flock`, not the file's contents, so
+    /// every failure here degrades the message rather than the exclusion.
+    fn writer_lock_holder(lock_path: &Path) -> String {
+        use std::io::Read;
+
+        let mut holder = String::new();
+        std::fs::File::open(lock_path)
+            .and_then(|mut handle| handle.read_to_string(&mut holder))
+            .ok()
+            .map(|_| holder.trim().to_string())
+            .filter(|pid| !pid.is_empty())
+            .unwrap_or_else(|| "unknown".to_string())
     }
 
     /// [`Store::lock_writer_at`] for the file this store was opened from.
@@ -1272,6 +1511,7 @@ impl Store {
         Ok(id)
     }
 
+    #[cfg(feature = "parse")]
     fn ensure_path_id(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<u32> {
         // `prepare_cached`, not `query_row`/`execute`: those compile the SQL
         // afresh on every call, and this is the most-called statement in the
@@ -1352,7 +1592,7 @@ impl Store {
         let mut caches = devmap_extract::CacheDirectoryCache::default();
         for raw in paths {
             match canonical_pending_entry(root, raw) {
-                Some(entry) => {
+                PendingEntry::Canonical(entry) => {
                     // K7: refuse build caches at the door. The watcher fires on
                     // every write cargo makes into its output directory, and
                     // those events reached this queue as work — 47,000 rows
@@ -1369,9 +1609,20 @@ impl Store {
                     }
                     canonical.insert(entry);
                 }
-                None => report.refused.push((
+                PendingEntry::Outside => report.refused.push((
                     raw.clone(),
                     format!("outside the repository root {}", root.display()),
+                )),
+                // Refused either way — an entry with no canonical spelling
+                // cannot be queued — but the reason is the one the reader can
+                // act on. "Outside the repository root" sends them after the
+                // watcher; the truth is that the root could not be read.
+                PendingEntry::Undecidable(error) => report.refused.push((
+                    raw.clone(),
+                    format!(
+                        "could not be checked against the repository root {}: {error}",
+                        root.display()
+                    ),
                 )),
             }
         }
@@ -1444,13 +1695,24 @@ impl Store {
                 outcome.retained += 1;
                 continue;
             }
-            let Some(canonical) = canonical_pending_entry(root, &stored) else {
-                deletes.push(stored.clone());
-                outcome.dropped.push((
-                    stored,
-                    format!("escapes the repository root {}", root.display()),
-                ));
-                continue;
+            let canonical = match canonical_pending_entry(root, &stored) {
+                PendingEntry::Canonical(entry) => entry,
+                PendingEntry::Outside => {
+                    deletes.push(stored.clone());
+                    outcome.dropped.push((
+                        stored,
+                        format!("escapes the repository root {}", root.display()),
+                    ));
+                    continue;
+                }
+                // The containment test could not run, so this row has not been
+                // shown to escape anything. Keeping it costs one non-canonical
+                // row until the root is readable again; deleting it on this
+                // evidence costs the file.
+                PendingEntry::Undecidable(_) => {
+                    outcome.retained += 1;
+                    continue;
+                }
             };
             match classify_pending_entry(root, &canonical, &indexed, &mut caches) {
                 Err(reason) => {
@@ -1595,8 +1857,7 @@ impl Store {
              ORDER BY queued_at ASC, path ASC
              LIMIT ?1",
         )?;
-        let sqlite_limit = limit.min(i64::MAX as usize) as i64;
-        let rows = stmt.query_map(params![sqlite_limit, MAX_PENDING_ATTEMPTS], |row| {
+        let rows = stmt.query_map(params![sqlite_limit(limit), MAX_PENDING_ATTEMPTS], |row| {
             row.get(0)
         })?;
         let mut paths = Vec::new();
@@ -1623,9 +1884,8 @@ impl Store {
              ORDER BY queued_at ASC, path ASC
              LIMIT ?1",
         )?;
-        let sqlite_limit = limit.min(i64::MAX as usize) as i64;
         let rows = stmt
-            .query_map(params![sqlite_limit, MAX_PENDING_ATTEMPTS], |row| {
+            .query_map(params![sqlite_limit(limit), MAX_PENDING_ATTEMPTS], |row| {
                 Ok(PendingClaim {
                     path: row.get(0)?,
                     queued_at: row.get(1)?,
@@ -1823,10 +2083,16 @@ impl Store {
                     if deleted.contains(&path) || affected.contains(&path) {
                         continue;
                     }
-                    let (current_grammar, current_analyzer) =
-                        devmap_extract::cache::current_payload_identity(&language);
-                    let identity_matches = grammar.as_deref() == Some(current_grammar.as_str())
-                        && analyzer.as_deref() == Some(current_analyzer.as_str());
+                    // `None` (no parsing frontend) is deliberately not a
+                    // match: carrying a row forward on an identity this build
+                    // could not compute would claim a currency nothing checked.
+                    // Not carrying is merely conservative.
+                    let identity_matches = current_payload_identity(&language).is_some_and(
+                        |(current_grammar, current_analyzer)| {
+                            grammar.as_deref() == Some(current_grammar.as_str())
+                                && analyzer.as_deref() == Some(current_analyzer.as_str())
+                        },
+                    );
                     // A content hash that moved without the path being declared
                     // affected means the caller's affected set is wrong; the
                     // stored payload describes different bytes either way.
@@ -2259,20 +2525,53 @@ impl Store {
             .iter()
             .filter(is_ambiguous)
             .count() as i64;
+        // S-2: both of these are counted over the generation's own rows, like
+        // `files`/`symbols`/`edges` above, and not over `extractions`.
+        //
+        // `extractions` is the slice this *write* carried. On an incremental
+        // build that is the handful of edited files, while `files` beside it is
+        // `COUNT(*)` over the whole generation — a partial numerator against a
+        // whole denominator, in the one table whose entire purpose is the
+        // trend. A one-line edit in a twelve-language tree wrote
+        // `languages_covered: 1, parse_failed: 0` next to the real file count,
+        // so `devmap history` showed the repository shedding eleven languages
+        // and repairing every parse failure on each incremental build, then
+        // regaining both on the next cold one.
+        let languages_covered: i64 = tx.query_row(
+            "SELECT COUNT(DISTINCT language) FROM generation_files WHERE generation_id = ?1",
+            params![gen_id],
+            |row| row.get(0),
+        )?;
         // K5: ask the canonical classifier, not the raw variant. A prose or
         // data format reports `ParseOutcome::Failed` because no grammar exists
         // for it, so the raw test counted 294 of this repository's 1,310 files
         // as parse failures — all Markdown, JSON, YAML, config and HTML — and
-        // buried the 16 files a grammar actually parsed and flagged.
-        let parse_failed = extractions
-            .iter()
-            .filter(|extraction| extraction.is_parse_failure())
-            .count() as i64;
-        let languages_covered = extractions
-            .iter()
-            .map(|extraction| extraction.language.as_str())
-            .collect::<std::collections::BTreeSet<_>>()
-            .len() as i64;
+        // buried the 16 files a grammar actually parsed and flagged. Reading it
+        // off the stored columns keeps that rule and applies it to carried-
+        // forward rows too, which the in-memory slice cannot see.
+        let mut parse_failed: i64 = 0;
+        {
+            let mut stmt = tx.prepare(
+                "SELECT p.path, f.parse_outcome_json, f.engine_json
+                 FROM generation_files f
+                 JOIN paths p ON p.id = f.file_id
+                 WHERE f.generation_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![gen_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (path, parse_json, engine_json) = row?;
+                let (outcome, engine) = decode_stored_outcome(&path, &parse_json, &engine_json)?;
+                if stored_is_parse_failure(&outcome, &engine) {
+                    parse_failed += 1;
+                }
+            }
+        }
         let page_count: i64 = tx.query_row("PRAGMA page_count", [], |row| row.get(0))?;
         let page_size: i64 = tx.query_row("PRAGMA page_size", [], |row| row.get(0))?;
         let build_ms = opts
@@ -2384,7 +2683,7 @@ impl Store {
              LIMIT ?1",
         )?;
         let rows = stmt
-            .query_map(params![limit as i64], |row| {
+            .query_map(params![sqlite_limit(limit)], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<Result<Vec<_>>>()?;
@@ -2458,8 +2757,19 @@ impl Store {
         })?;
         for row in rows {
             let (language, grammar, analyzer) = row?;
-            let (current_grammar, current_analyzer) =
-                devmap_extract::cache::current_payload_identity(&language);
+            let Some((current_grammar, current_analyzer)) = current_payload_identity(&language)
+            else {
+                // Loud, not `false`. `false` means "rebuild", and a build with
+                // no parsing frontend cannot rebuild — the caller would loop.
+                // `true` would be worse: a currency claim from a check that did
+                // not run.
+                return Err(rusqlite::Error::InvalidParameterName(format!(
+                    "whether the stored payload is current cannot be decided by this build: \
+                     the answer is the compiled grammar version for {language:?}, and this \
+                     binary was built without the parsing frontend. Build with \
+                     `--features parse` to ask."
+                )));
+            };
             // A NULL version predates these columns: unknown identity is not a
             // matching one.
             if grammar.as_deref() != Some(current_grammar.as_str())
@@ -2673,8 +2983,7 @@ impl Store {
         // parentheses, wildcards, and hyphens remain data rather than syntax.
         let escaped_query = query.replace('"', "\"\"");
         let match_q = format!("\"{}\"*", escaped_query);
-        let sqlite_limit = limit.min(i64::MAX as usize) as i64;
-        let rows = stmt.query_map(params![gen, match_q, sqlite_limit], |row| {
+        let rows = stmt.query_map(params![gen, match_q, sqlite_limit(limit)], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -2711,15 +3020,16 @@ impl Store {
              ORDER BY n.ordinal",
         )?;
         let rows = stmt.query_map(params![gen], |row| {
-            let start: i64 = row.get(4)?;
-            let end: i64 = row.get(5)?;
+            let name: String = row.get(0)?;
+            let path: String = row.get(3)?;
+            let (span_start, span_end) = checked_span(&path, &name, row.get(4)?, row.get(5)?)?;
             Ok(StoredSymbol {
-                name: row.get(0)?,
+                name,
                 qualified_name: row.get(1)?,
                 kind: row.get(2)?,
-                path: row.get(3)?,
-                span_start: start.max(0) as usize,
-                span_end: end.max(0) as usize,
+                path,
+                span_start,
+                span_end,
                 is_exported: row.get::<_, i64>(6)? != 0,
             })
         })?;
@@ -2737,7 +3047,6 @@ impl Store {
         };
         let escaped_query = query.replace('"', "\"\"");
         let match_query = format!("\"{}\"*", escaped_query);
-        let sqlite_limit = limit.min(i64::MAX as usize) as i64;
         let mut stmt = conn.prepare(
             "SELECT n.name, n.qualified_name, n.kind, p.path,
                     n.span_start, n.span_end, n.is_exported
@@ -2751,19 +3060,17 @@ impl Store {
              ORDER BY bm25(nodes_fts), p.path, n.name, n.span_start
              LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![gen, match_query, sqlite_limit], |row| {
-            let start: i64 = row.get(4)?;
-            let end: i64 = row.get(5)?;
-            if start < 0 || end < start {
-                return Err(rusqlite::Error::IntegralValueOutOfRange(4, start));
-            }
+        let rows = stmt.query_map(params![gen, match_query, sqlite_limit(limit)], |row| {
+            let name: String = row.get(0)?;
+            let path: String = row.get(3)?;
+            let (span_start, span_end) = checked_span(&path, &name, row.get(4)?, row.get(5)?)?;
             Ok(StoredSymbol {
-                name: row.get(0)?,
+                name,
                 qualified_name: row.get(1)?,
                 kind: row.get(2)?,
-                path: row.get(3)?,
-                span_start: start as usize,
-                span_end: end as usize,
+                path,
+                span_start,
+                span_end,
                 is_exported: row.get::<_, i64>(6)? != 0,
             })
         })?;
@@ -2839,16 +3146,7 @@ impl Store {
             )
             .optional()?;
         raw.map(|(path, language, content_hash, parse_json, engine_json)| {
-            let parse_outcome = serde_json::from_str(&parse_json).map_err(|error| {
-                rusqlite::Error::InvalidParameterName(format!(
-                    "stored parse outcome for {path} is invalid: {error}"
-                ))
-            })?;
-            let engine = serde_json::from_str(&engine_json).map_err(|error| {
-                rusqlite::Error::InvalidParameterName(format!(
-                    "stored extraction engine for {path} is invalid: {error}"
-                ))
-            })?;
+            let (parse_outcome, engine) = decode_stored_outcome(&path, &parse_json, &engine_json)?;
             Ok(StoredFile {
                 path,
                 language,
@@ -2941,12 +3239,24 @@ impl Store {
     ///
     /// An empty `names` returns no rows without touching the database, rather
     /// than building `IN ()`, which SQLite rejects.
+    ///
+    /// The threshold goes through [`checked_min_confidence`] *before* that
+    /// shortcut. This was the one confidence-filtered edge query that skipped
+    /// it, and skipping it is not a missing error message: rusqlite binds
+    /// `f32::NAN` as a REAL, SQLite stores that as NULL, and the
+    /// `CAST(ROUND(...)) >= CAST(ROUND(?3 * 1000))` predicate below is then
+    /// NULL for every row — so the query returned `Ok(vec![])` and `preview`
+    /// reported "no calls from other files are affected" for callers at
+    /// confidence 1.00, while blaming the omission on the confidence floor.
+    /// An empty edge list is also what a filter that ran returns, so the
+    /// caller had no way to tell that the filter had not run at all.
     pub fn callers_of(
         &self,
         names: &[String],
         exclude_file: &str,
         min_confidence: f32,
     ) -> Result<Vec<StoredEdge>> {
+        let min_confidence = checked_min_confidence(min_confidence)?;
         if names.is_empty() {
             return Ok(Vec::new());
         }
@@ -3181,12 +3491,13 @@ impl Store {
                 unsigned += 1;
                 continue;
             };
+            let (span_start, span_end) = checked_span(&path, &name, start, end)?;
             candidates.push(CloneCandidate {
                 file_path: path,
                 symbol_name: name,
                 qualified_name: qn,
-                span_start: start.max(0) as usize,
-                span_end: end.max(0) as usize,
+                span_start,
+                span_end,
                 kind,
                 // Reverses the bit-preserving cast made on write.
                 exact: exact as u64,
@@ -3603,6 +3914,29 @@ impl Store {
     /// now. Keying on "is this content still referenced by a generation we
     /// kept" bounds the cache to the retained working set.
     ///
+    /// A row is kept only when it is the *only* thing that can answer a lookup
+    /// for its content: reachable from a retained generation, and not already
+    /// answerable from that generation's own payload.
+    ///
+    /// S-4: the rule used to be stated as two clauses — drop what no generation
+    /// references, and drop what a generation holds under the *same* full
+    /// identity — and between them sat the rows an extraction-schema bump
+    /// creates. A file cached under `(hash, python, g1, a1)` and re-extracted
+    /// after a bump into `(hash, python, g2, a2)` kept its `(hash, python)`
+    /// reachability, so clause one spared it, and its identity no longer
+    /// matched, so clause two could not touch it — while the *servable* copy
+    /// was evicted as a duplicate. Nothing could serve it and nothing could
+    /// evict it, so every bump added a full extra copy of every payload to a
+    /// table the paragraph above calls bounded.
+    ///
+    /// Stated as reachability instead: if a retained generation records a
+    /// usable identity for this content, [`Self::try_get_cached_extraction`]
+    /// answers from that generation, so no cache copy of it is reachable —
+    /// whether its identity matches (the generation serves it) or not (nothing
+    /// can). Only content whose generation rows carry NULL identity — written
+    /// before schema v8, and deliberately never eligible for the fallback —
+    /// still needs its cache row, and that row survives.
+    ///
     /// Must run *after* `prune_generations_except_latest`, so `generation_files`
     /// already describes only retained generations.
     pub fn prune_extraction_cache(&self) -> Result<usize> {
@@ -3612,10 +3946,11 @@ impl Store {
             "DELETE FROM extraction_cache
              WHERE (content_hash, language) NOT IN
                    (SELECT content_hash, language FROM generation_files)
-                OR (content_hash, language, grammar_version, analyzer_version) IN
-                   (SELECT content_hash, language, grammar_version, analyzer_version
-                    FROM generation_files
-                    WHERE grammar_version IS NOT NULL AND analyzer_version IS NOT NULL)",
+                OR EXISTS (SELECT 1 FROM generation_files g
+                            WHERE g.content_hash = extraction_cache.content_hash
+                              AND g.language     = extraction_cache.language
+                              AND g.grammar_version  IS NOT NULL
+                              AND g.analyzer_version IS NOT NULL)",
             [],
         )?;
         tx.commit()?;
@@ -3653,7 +3988,7 @@ impl Store {
         // before schema v8 carry NULL there and are therefore never eligible.
         // Absence of a recorded identity is not proof of a matching one.
         let payload = match payload {
-            Some(found) => Some(found),
+            Some(found) => Some(("extraction_cache", found)),
             None => conn
                 .query_row(
                     "SELECT extraction_json FROM generation_files
@@ -3666,11 +4001,31 @@ impl Store {
                         key.grammar_version,
                         key.analyzer_version
                     ],
-                    |row| row.get(0),
+                    |row| row.get::<_, String>(0),
                 )
-                .optional()?,
+                .optional()?
+                .map(|json| ("generation_files", json)),
         };
-        Ok(payload.and_then(|json| serde_json::from_str(&json).ok()))
+        // S-5: a stored payload that will not parse is a store fault, not a
+        // cache miss. `.ok()` here re-extracted the file on every build for
+        // ever and threw away the only evidence that a row was corrupt — the
+        // one JSON read in this file that stayed quiet while every other names
+        // what it could not read.
+        payload
+            .map(|(table, json)| {
+                serde_json::from_str(&json).map_err(|error| {
+                    rusqlite::Error::InvalidParameterName(format!(
+                        "stored extraction payload in {table} for content \
+                         {hash:#018x} ({language}, grammar {grammar}, analyzer \
+                         {analyzer}) is invalid: {error}",
+                        hash = key.content_hash,
+                        language = key.language,
+                        grammar = key.grammar_version,
+                        analyzer = key.analyzer_version,
+                    ))
+                })
+            })
+            .transpose()
     }
 
     #[cfg(feature = "parse")]
@@ -3749,6 +4104,42 @@ impl Store {
 #[cfg(test)]
 mod connection_tests {
     use super::*;
+
+    /// S-8: the gate must not drift behind the schema it asserts.
+    ///
+    /// `REQUIRED_SCHEMA` is hand-written and the schema is not, so the only
+    /// thing keeping them in step is this test. It fails the moment a
+    /// migration adds a column the gate does not name — which is exactly how
+    /// `grammar_version`, `analyzer_version`, `classification` and `receiver`
+    /// came to be missing, leaving a store that opened clean and failed at its
+    /// first write.
+    #[test]
+    fn the_schema_gate_names_every_column_the_current_schema_creates() {
+        let store = Store::open_in_memory().expect("store");
+        let conn = lock_conn(&store.conn).expect("connection");
+        for (table, required) in REQUIRED_SCHEMA {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info(\"{table}\")"))
+                .expect("table_info");
+            let actual: Vec<String> = stmt
+                .query_map([], |row| row.get(1))
+                .expect("columns")
+                .collect::<Result<_>>()
+                .expect("columns");
+            assert!(
+                !actual.is_empty(),
+                "{table} is required by the gate but a freshly created store does not have it"
+            );
+            for column in actual {
+                assert!(
+                    required.contains(&column.as_str()),
+                    "{table}.{column} exists in the current schema but the gate does not \
+                     require it; a store missing that column would open clean and fail at \
+                     the first write instead of at the gate"
+                );
+            }
+        }
+    }
 
     #[test]
     fn store_connections_enable_integrity_and_contention_pragmas() {
@@ -3854,6 +4245,191 @@ mod connection_tests {
             store.latest_edges_for_test().is_err(),
             "latest_edges_for_test must fail closed on a poisoned mutex"
         );
+    }
+}
+
+#[cfg(test)]
+mod bounded_claim_tests {
+    use super::*;
+
+    /// S-6: a lock check that could not run is not another writer.
+    ///
+    /// `lock_writer_at` matched `Err(_)` from `File::try_lock`, which collapses
+    /// `TryLockError::WouldBlock` (contention — wait and retry) with
+    /// `TryLockError::Error` (the check itself failed). On a filesystem that
+    /// does not implement `flock`, the second is what *every* attempt returns:
+    /// each build polled the full 60 s and then failed with "another devmap
+    /// writer holds … (pid unknown)" — a definite claim about a process that
+    /// does not exist, made by a check that never completed, after a minute
+    /// spent waiting for it.
+    #[test]
+    fn s6_a_writer_lock_check_that_failed_is_not_reported_as_another_writer() {
+        let lock_path = std::path::Path::new("/nonexistent/devmap.sqlite.writer.lock");
+        let mut attempts = 0usize;
+        let started = std::time::Instant::now();
+        let error = Store::poll_writer_lock(
+            || {
+                attempts += 1;
+                Err(std::fs::TryLockError::Error(std::io::Error::from(
+                    std::io::ErrorKind::PermissionDenied,
+                )))
+            },
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_millis(10),
+            lock_path,
+        )
+        .expect_err("a failed lock check must not be reported as a taken lock");
+
+        assert_eq!(
+            attempts, 1,
+            "a check that cannot run must not be retried until the deadline"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "must fail immediately, not after the full wait: {:?}",
+            started.elapsed()
+        );
+        let text = error.to_string();
+        assert!(
+            !text.contains("another devmap writer holds"),
+            "must not claim another writer exists: {text}"
+        );
+        assert!(
+            text.contains("could not be taken") && text.contains("permission denied"),
+            "must name the failure that actually happened: {text}"
+        );
+    }
+
+    /// S-6 control: real contention must still wait and still name the holder.
+    ///
+    /// A guard that propagated every error would trade the false claim for a
+    /// build that refuses to wait out a peer, which is the failure the bounded
+    /// poll exists to prevent.
+    #[test]
+    fn s6_writer_lock_contention_still_polls_to_the_deadline_and_names_the_holder() {
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-s6-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock_path = dir.join("index.sqlite.writer.lock");
+        std::fs::write(&lock_path, "4242\n").unwrap();
+
+        let mut attempts = 0usize;
+        let started = std::time::Instant::now();
+        let error = Store::poll_writer_lock(
+            || {
+                attempts += 1;
+                Err(std::fs::TryLockError::WouldBlock)
+            },
+            std::time::Duration::from_millis(60),
+            std::time::Duration::from_millis(10),
+            &lock_path,
+        )
+        .expect_err("a permanently contended lock must time out");
+
+        assert!(attempts >= 2, "contention must be retried, got {attempts}");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(60),
+            "must wait out the deadline: {:?}",
+            started.elapsed()
+        );
+        let text = error.to_string();
+        assert!(
+            text.contains("another devmap writer holds") && text.contains("pid 4242"),
+            "contention must name the recorded holder: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S-6 control: a lock that is granted returns at once.
+    #[test]
+    fn s6_writer_lock_returns_as_soon_as_the_lock_is_granted() {
+        let mut attempts = 0usize;
+        Store::poll_writer_lock(
+            || {
+                attempts += 1;
+                if attempts >= 3 {
+                    Ok(())
+                } else {
+                    Err(std::fs::TryLockError::WouldBlock)
+                }
+            },
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(1),
+            std::path::Path::new("/nonexistent/lock"),
+        )
+        .expect("a lock granted before the deadline must succeed");
+        assert_eq!(attempts, 3);
+    }
+
+    /// S-9: SQLite reads a negative `LIMIT` as *unbounded*.
+    ///
+    /// `latest_unresolved` bound `params![limit as i64]`. `usize::MAX as i64`
+    /// is `-1`, and every `usize` at or above `2^63` casts to a negative
+    /// `i64`, so a caller asking for a very large cap silently got no cap at
+    /// all — the opposite of the request. Four other bounded readers already
+    /// clamped inline; this makes that clamp the one owner of the rule so a
+    /// fifth reader cannot be written without it.
+    ///
+    /// What this gate can and cannot prove: the *row-count* difference between
+    /// an unbounded query and one capped at `i64::MAX` is only observable in a
+    /// table of more than `2^63` rows, so no fixture can exhibit it. The gate
+    /// is therefore on the binding rule itself, plus the SQLite behaviour it
+    /// exists for, asserted in the test below.
+    #[test]
+    fn s9_a_sqlite_limit_is_never_the_negative_that_means_unbounded() {
+        assert_eq!(
+            sqlite_limit(usize::MAX),
+            i64::MAX,
+            "usize::MAX must clamp to the largest cap SQLite can express,              not wrap to -1"
+        );
+        for limit in [
+            usize::MAX,
+            usize::MAX - 1,
+            i64::MAX as usize,
+            i64::MAX as usize + 1,
+        ] {
+            assert!(
+                sqlite_limit(limit) > 0,
+                "{limit} must not bind a non-positive LIMIT, got {}",
+                sqlite_limit(limit)
+            );
+        }
+        // A clamp that flattened everything would be a different silent
+        // wrong answer, so the ordinary range must pass through untouched.
+        for limit in [0usize, 1, 2, 64, 100_000] {
+            assert_eq!(sqlite_limit(limit), limit as i64);
+        }
+    }
+
+    /// S-9, the behaviour the clamp protects: `LIMIT -1` really is unbounded
+    /// in this SQLite build, so the raw cast was not a cosmetic defect.
+    #[test]
+    fn s9_negative_limits_are_unbounded_and_the_clamped_one_is_a_cap() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (n INTEGER);
+             INSERT INTO t (n) VALUES (1), (2), (3);",
+        )
+        .unwrap();
+        let count = |bound: i64| -> usize {
+            conn.prepare("SELECT n FROM t LIMIT ?1")
+                .unwrap()
+                .query_map(params![bound], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .count()
+        };
+        assert_eq!(
+            count(usize::MAX as i64),
+            3,
+            "the unclamped cast asks SQLite for every row"
+        );
+        assert_eq!(count(sqlite_limit(2)), 2, "a real cap still truncates");
     }
 }
 

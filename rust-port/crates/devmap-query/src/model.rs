@@ -178,8 +178,16 @@ pub struct PreviewReport {
     /// caller graph below has anything to say about it; the symbol delta does
     /// not come from the index.
     pub file_is_indexed: bool,
-    /// What the buffer was diffed against: `disk` (the file's current content)
-    /// or `nothing` (no such file, so every symbol is an addition).
+    /// What the buffer was diffed against: `disk` (the file's current content),
+    /// `nothing` (no such file, so every symbol is an addition), or
+    /// `unreadable` (the file exists and could not be read).
+    ///
+    /// `unreadable` is a distinct value rather than a reuse of `nothing`
+    /// because the two license opposite conclusions: `nothing` means there was
+    /// genuinely no prior content, so "every symbol is an addition" is true;
+    /// `unreadable` means the comparison did not happen, and reporting it as
+    /// `nothing` made a real removal disappear behind a clean bill of health.
+    /// `delta_available` is `false` whenever this is `unreadable`.
     pub compared_against: String,
     /// Set when the delta is reported but should be read with care — a partial
     /// parse can hide a symbol and make it look removed.

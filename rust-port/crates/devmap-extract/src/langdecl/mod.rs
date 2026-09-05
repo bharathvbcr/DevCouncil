@@ -211,7 +211,7 @@ pub(crate) fn enclosing_owner_path(
     source: &str,
     declaration: fn(Node, &str) -> Option<Declaration>,
 ) -> Option<String> {
-    let mut ancestor = node.parent();
+    let mut ancestor = crate::treesitter::bounded_parent(node);
     while let Some(parent) = ancestor {
         if let Some(owner) = declaration(parent, source) {
             return Some(match owner.owner {
@@ -219,7 +219,7 @@ pub(crate) fn enclosing_owner_path(
                 None => owner.name,
             });
         }
-        ancestor = parent.parent();
+        ancestor = crate::treesitter::bounded_parent(parent);
     }
     None
 }
@@ -235,7 +235,7 @@ pub(crate) fn enclosing_owner(
     source: &str,
     shallow: fn(Node, &str) -> Option<(SymbolKind, String)>,
 ) -> Option<String> {
-    let mut ancestor = node.parent();
+    let mut ancestor = crate::treesitter::bounded_parent(node);
     while let Some(parent) = ancestor {
         if let Some((kind, name)) = shallow(parent, source) {
             if kind == SymbolKind::Function {
@@ -243,7 +243,7 @@ pub(crate) fn enclosing_owner(
             }
             return (!name.is_empty()).then_some(name);
         }
-        ancestor = parent.parent();
+        ancestor = crate::treesitter::bounded_parent(parent);
     }
     None
 }

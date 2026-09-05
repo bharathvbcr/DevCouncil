@@ -39,35 +39,14 @@ def _cursor_config_path(project_root: Path) -> Path:
     return project_root / ".cursor" / "mcp.json"
 
 
-def _cursor_mcp_command(project_root: Path) -> str:
-    """Prefer the project venv ``devcouncil`` binary for Cursor MCP stdio.
-
-    Absolute paths survive Cursor sessions that lack the project venv on PATH;
-    bare ``devcouncil`` still works when PATH is set. Status checks accept both.
-    """
-    from devcouncil.integrations.clients.common import resolve_dev_executable
-
-    resolved = Path(resolve_dev_executable(project_root))
-    name = resolved.name.lower()
-    if name in {"dev", "dev.exe"}:
-        sibling = resolved.with_name("devcouncil.exe" if name.endswith(".exe") else "devcouncil")
-        if sibling.is_file():
-            return str(sibling)
-    if name in {"devcouncil", "devcouncil.exe"}:
-        return str(resolved)
-    # Fall back to PATH name when no local binary exists.
-    return "devcouncil"
+# Cursor MCP stdio resolution lives in ``common`` so every generator that emits an MCP
+# ``command`` (Cursor's mcp.json, the Claude plugin's .mcp.json) shares one rule.
+_cursor_mcp_command = _common.resolve_devcouncil_executable
 
 
 def _cursor_mcp_config(project_root: Path) -> dict:
     root = project_root.expanduser().resolve()
-    if os.name == "nt":
-        venv_bin = root / ".venv" / "Scripts"
-    else:
-        venv_bin = root / ".venv" / "bin"
-    path_prefix = str(venv_bin) if venv_bin.is_dir() else ""
-    existing_path = os.environ.get("PATH", "/usr/bin:/bin")
-    env_path = f"{path_prefix}{os.pathsep}{existing_path}" if path_prefix else existing_path
+    env_path = _common.venv_augmented_path(root)
     return {
         "mcpServers": {
             "devcouncil": {

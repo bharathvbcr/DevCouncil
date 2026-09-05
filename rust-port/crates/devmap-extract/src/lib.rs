@@ -157,10 +157,42 @@ pub fn content_hash(source: &str) -> u64 {
 /// root down, including parents of `root` when the build is rooted in a
 /// subdirectory. The watcher must use this same stack or incremental
 /// generations admit files the next cold build drops.
+///
+/// "The same way" includes **tolerating the same broken files**. A rule file
+/// is not all-or-nothing: `GitignoreBuilder::add` compiles every line it can
+/// and reports the rest as a *partial* error (`ignore-0.4.33`,
+/// `src/gitignore.rs:405-434` — the loop never breaks for a bad glob), which is
+/// how `WalkBuilder` walks a tree whose `.gitignore` contains a typo like
+/// `[z-a]` without raising anything. Treating that return as fatal made every
+/// verdict under such a tree an `Err`, the watcher read the `Err` as
+/// "ignored", and the incremental index froze while `status` went on reporting
+/// `is_fresh: true` — the divergence this comment claims to prevent, in the
+/// opposite direction and silent. The unusable lines are reported through
+/// [`is_gitignored_reporting`] instead of being thrown away.
 pub fn is_gitignored(root: &Path, path: &Path, is_dir: bool) -> anyhow::Result<bool> {
+    Ok(is_gitignored_reporting(root, path, is_dir)?.0)
+}
+
+/// [`is_gitignored`], plus one diagnostic per rule line that could not be
+/// compiled.
+///
+/// The verdict is computed from the lines that *did* compile, exactly as the
+/// cold walker does. The diagnostics exist so a watcher can say which line of
+/// which file it is not applying: a rule the developer wrote and the kernel
+/// silently drops is precisely the kind of divergence that is invisible from
+/// either side. Empty for a well-formed tree, so a caller pays nothing to
+/// carry it.
+pub fn is_gitignored_reporting(
+    root: &Path,
+    path: &Path,
+    is_dir: bool,
+) -> anyhow::Result<(bool, Vec<String>)> {
     let path_abs = path_under_root(root, path)?;
-    let matchers = ignore_matchers_for(root, &path_abs, is_dir)?;
-    Ok(matches_ignore(&matchers, &path_abs, is_dir).unwrap_or(false))
+    let (matchers, problems) = ignore_matchers_for(root, &path_abs, is_dir)?;
+    Ok((
+        matches_ignore(&matchers, &path_abs, is_dir).unwrap_or(false),
+        problems,
+    ))
 }
 
 /// Ignore-rule files that affect `path`, from the git worktree root (or `root`
@@ -228,17 +260,28 @@ fn ignore_matchers_for(
     root: &Path,
     path: &Path,
     is_dir: bool,
-) -> anyhow::Result<Vec<ignore::gitignore::Gitignore>> {
+) -> anyhow::Result<(Vec<ignore::gitignore::Gitignore>, Vec<String>)> {
     let bases = ignore_rule_bases(root, path, is_dir)?;
     let mut matchers = Vec::new();
+    let mut problems = Vec::new();
     for (base, rules) in &bases {
-        add_ignore_rules(&mut matchers, base, rules)?;
+        add_ignore_rules(&mut matchers, &mut problems, base, rules)?;
     }
-    Ok(matchers)
+    Ok((matchers, problems))
 }
 
+/// Compile one rule file into a matcher, keeping every line that is valid.
+///
+/// The `Option<Error>` from `GitignoreBuilder::add` is a *partial* result, not
+/// a verdict on the file: it holds one entry per line that failed to compile
+/// while the builder retains all the others. It is also how "the file could not
+/// be opened at all" is reported — in which case the builder is simply empty
+/// and no rule applies, which is again what the cold walker does. Neither case
+/// may abort the evaluation: an ignore verdict that fails is a verdict the
+/// watcher reads as "ignored", so one typo would freeze the whole index.
 fn add_ignore_rules(
     matchers: &mut Vec<ignore::gitignore::Gitignore>,
+    problems: &mut Vec<String>,
     base: &Path,
     rules: &Path,
 ) -> anyhow::Result<()> {
@@ -247,7 +290,10 @@ fn add_ignore_rules(
     }
     let mut builder = ignore::gitignore::GitignoreBuilder::new(base);
     if let Some(error) = builder.add(rules) {
-        anyhow::bail!("cannot parse ignore rules {rules:?}: {error}");
+        problems.push(format!(
+            "ignore rules {rules:?} are partly unusable and those lines are not \
+             being applied: {error}"
+        ));
     }
     matchers.push(builder.build()?);
     Ok(())

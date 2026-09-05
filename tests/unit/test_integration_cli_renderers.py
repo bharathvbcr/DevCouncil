@@ -16,6 +16,12 @@ import typer
 from rich.console import Console
 
 import devcouncil.integrations.integration_cli as intcli
+from devcouncil.executors.agent_registry import BUILTIN_CODING_EXECUTOR_NAMES
+from devcouncil.integrations.actions import (
+    MCP_ADAPTER_CLIENTS,
+    VALID_INTEGRATION_TARGETS,
+    normalize_apply_target,
+)
 
 
 def _console():
@@ -68,6 +74,55 @@ def test_print_integration_matrix(tmp_path):
     out = _text(console)
     assert "Integration Matrix" in out
     assert "Enforcement" in out
+
+
+def _matrix_rows(out: str) -> dict[str, list[str]]:
+    """{client: [cell, ...]} parsed from the rendered Rich table body."""
+    rows = {}
+    for line in out.splitlines():
+        if not line.strip().startswith("\u2502"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("\u2502").split("\u2502")]
+        if len(cells) >= 4 and cells[0] in BUILTIN_CODING_EXECUTOR_NAMES:
+            rows[cells[0]] = cells
+    return rows
+
+
+def test_matrix_mcp_column_matches_the_adapter_registry():
+    """Every "MCP setup" cell must match an adapter that actually exists.
+
+    `dev integrate matrix` renders 14 clients but only 9 have an adapter. The column was a
+    hand-maintained boolean on ``CodingCliIntegrationInfo`` and had gone stale: amp,
+    copilot, crush, goose and qwen were all declared ``mcp=True`` and printed
+    "MCP setup: yes" while having no client module, no ``dev integrate`` subcommand and no
+    MCP writer — 5 of 14 rows were false. The boolean is now a property derived from
+    ``actions.MCP_ADAPTER_CLIENTS``, which is the very set
+    ``apply_integration_target`` dispatches on, so a row cannot claim an adapter that no
+    branch implements.
+    """
+    console = _console()
+    intcli.print_integration_matrix(console)
+    rows = _matrix_rows(_text(console))
+
+    assert set(rows) == set(BUILTIN_CODING_EXECUTOR_NAMES), sorted(rows)
+    for client, cells in rows.items():
+        rendered = cells[3]  # Client | Tier | Headless | MCP setup | ...
+        expected = "yes" if client in MCP_ADAPTER_CLIENTS else "no"
+        assert rendered == expected, (
+            f"matrix claims 'MCP setup: {rendered}' for {client!r}, but "
+            f"apply_integration_target {'has no' if expected == 'no' else 'has an'} adapter for it"
+        )
+
+    # The five the audit found false must be reported honestly, not just consistently.
+    for client in ("amp", "copilot", "crush", "goose", "qwen"):
+        assert rows[client][3] == "no", rows[client]
+
+
+def test_mcp_adapter_registry_matches_the_integration_targets():
+    """Every advertised MCP adapter must be a real `dev integrate` target."""
+    assert MCP_ADAPTER_CLIENTS <= VALID_INTEGRATION_TARGETS
+    for client in MCP_ADAPTER_CLIENTS:
+        assert normalize_apply_target(client) == client
 
 
 def _fake_report(*, failures=False):

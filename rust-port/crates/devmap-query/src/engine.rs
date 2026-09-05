@@ -63,22 +63,38 @@ impl<'a> StoreQueryEngine<'a> {
             return Ok(budget_take(Vec::new(), req.token_budget, |_| 0));
         }
         let total = self.store.count_search_symbols(&req.query)?;
-        let rows = self
-            .store
-            .search_symbols(&req.query, budget_page_size(req.token_budget))?;
+        let page = budget_page_size(req.token_budget);
+        let pool = search_rank_pool_size(req.token_budget);
+        let rows = self.store.search_symbols(&req.query, pool)?;
         let repo_root = self.store.latest_repo_root()?;
         let query = req.query.to_lowercase();
-        let mut hits = Vec::with_capacity(rows.len());
-        for row in rows {
-            let name = row.name.to_lowercase();
-            let qualified = row.qualified_name.to_lowercase();
-            let score = if name == query || qualified == query {
-                1.0
-            } else if name.starts_with(&query) {
-                0.95
-            } else {
-                0.8
-            };
+        // Rank, then truncate — R7, and the reason the pool above is wider than
+        // the page below. The store cuts its page with `ORDER BY bm25(...)` and
+        // this function then re-scores what survived with a different ordering
+        // function, so the key that decided which rows *exist* was not the key
+        // that decides which rows *rank*. A symbol named exactly `alpha` that
+        // bm25 puts 150th among 200 prefix matches never entered the page, and
+        // the answer led with 100 worse matches under honest counts.
+        //
+        // Scoring happens on the stored row, before any hit is materialised:
+        // the score reads `name`/`qualified_name` and nothing else, while
+        // building a hit reads the file off disk. So a ten-times wider pool
+        // costs ten times the string comparisons and not one extra file read —
+        // `page`, not `pool`, bounds what is materialised.
+        let mut ranked: Vec<(f32, devmap_store::StoredSymbol)> = rows
+            .into_iter()
+            .map(|row| (name_match_score(&row, &query), row))
+            .collect();
+        ranked.sort_by(|(left_score, left), (right_score, right)| {
+            right_score
+                .total_cmp(left_score)
+                .then_with(|| left.path.cmp(&right.path))
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.span_start.cmp(&right.span_start))
+                .then_with(|| left.span_end.cmp(&right.span_end))
+        });
+        let mut hits = Vec::with_capacity(ranked.len().min(page));
+        for (score, row) in ranked.into_iter().take(page) {
             hits.push(hit_from_stored(
                 row,
                 repo_root.as_deref(),
@@ -86,17 +102,22 @@ impl<'a> StoreQueryEngine<'a> {
                 score,
             ));
         }
-        hits.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| a.file_path.cmp(&b.file_path))
-                .then_with(|| a.symbol_name.cmp(&b.symbol_name))
-                .then_with(|| a.span.cmp(&b.span))
-        });
         let mut response = budget_take(hits, req.token_budget, search_hit_tokens);
         response.total = total;
         response.hidden = total.saturating_sub(response.shown);
         response.truncated = response.hidden > 0;
+        // The pool is bounded, so on a query that matches more than it holds
+        // the ranking really is over a bm25-ordered prefix. `truncated` says
+        // the *list* was cut, which a caller expects; this says the *ordering*
+        // was computed over a sample, which it cannot otherwise know. It is
+        // `None` whenever every match was ranked, which on any ordinary query
+        // is every time.
+        response.walk_incomplete = (total as usize > pool).then(|| {
+            format!(
+                "ranked the first {pool} of {total} matches, in the store's \
+                 relevance order; a closer match may sit outside that page"
+            )
+        });
         Ok(response)
     }
 
@@ -447,6 +468,21 @@ impl<'a> StoreQueryEngine<'a> {
         Ok(response)
     }
 
+    /// Symbols the latest generation found nothing calling.
+    ///
+    /// The answer carries the coverage it was computed over. This list is read
+    /// as "delete these", and without a denominator a generation with 4,242
+    /// unattributed calls answered in exactly the shape of one with none —
+    /// `resolution: Available`, `truncated: false`, and not a word about
+    /// either `AnalysisSummary::status` or `unresolved_calls`, the field whose
+    /// own documentation says it exists so a reader can tell "nothing calls
+    /// this" from "we could not work out what this calls".
+    ///
+    /// It rides on `walk_incomplete` rather than a wrapper struct because that
+    /// is the field this crate already has for "the producer of these items
+    /// did not see everything", it is already rendered by the CLI and already
+    /// read by `DevMapClient._budgeted`, and a second shape for the same
+    /// statement is a second thing for a consumer to miss.
     pub fn dead_symbols(
         &self,
         token_budget: u32,
@@ -456,13 +492,16 @@ impl<'a> StoreQueryEngine<'a> {
                 reason: "no persisted generation is available".to_string(),
             }));
         }
+        let analysis = self.store.latest_analysis()?;
         let dead = self
             .store
             .latest_dead_symbols()?
             .into_iter()
             .filter(|row| !row.is_exempt)
             .collect();
-        Ok(budget_take(dead, token_budget, |_| 30))
+        let mut response = budget_take(dead, token_budget, |_| 30);
+        response.walk_incomplete = dead_symbol_coverage_gap(analysis.as_ref());
+        Ok(response)
     }
 
     /// Duplicate bodies in the latest generation.
@@ -725,8 +764,30 @@ impl<'a> StoreQueryEngine<'a> {
         // caller, and this is the only query that reads a file the caller
         // names. See `contained_repo_path`.
         let resolved = contained_repo_path(self.store.latest_repo_root()?.as_deref(), path)?;
-        let on_disk = std::fs::read_to_string(&resolved).ok();
-        let compared_against = if on_disk.is_some() { "disk" } else { "nothing" };
+        // `.ok()` here used to collapse two different facts into one. "There is
+        // no such file" and "the file is there and I could not read it"
+        // (non-UTF-8, EACCES, EISDIR) both became `None`, and `None` means
+        // `compared_against: "nothing"` — documented as *no such file, so every
+        // symbol is an addition*.
+        //
+        // The consequence is the worst shape this repository has: a genuine
+        // removal **disappears**. Same edit, same file — readable, the report
+        // says `symbols: ["beta:Removed"]`; unreadable, it says
+        // `["mod.py:Added", "alpha:Added"]` with `degraded_reason: null` and
+        // `delta_available: true`. The caller is handed a clean bill of health
+        // by a comparison that never ran.
+        let (on_disk, read_failure) = match std::fs::read_to_string(&resolved) {
+            Ok(source) => (Some(source), None),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (None, None),
+            Err(err) => (None, Some(err)),
+        };
+        let compared_against = match (&on_disk, &read_failure) {
+            (Some(_), _) => "disk",
+            // A third value, never a reuse of `nothing`. A consumer keying off
+            // `nothing` to mean "new file" must not be handed this case.
+            (None, Some(_)) => "unreadable",
+            (None, None) => "nothing",
+        };
         let previous = on_disk
             .as_deref()
             .map(|source| devmap_extract::extract_file(path, source).symbols)
@@ -875,10 +936,26 @@ impl<'a> StoreQueryEngine<'a> {
             _ => None,
         };
 
+        // A read that failed outranks a parse note: without the previous
+        // content there is no comparison at all, so the delta is not merely
+        // "to be read with care", it is absent. `delta_available: false` is the
+        // gate the model documents for exactly this, and stating the errno is
+        // what lets a caller tell a permissions problem from a binary file.
+        let (delta_available, degraded_reason) = match read_failure {
+            Some(err) => (
+                false,
+                Some(format!(
+                    "the file on disk could not be read ({err}), so the buffer was compared \
+against nothing and no symbol can be reported as removed; this is not a clean delta"
+                )),
+            ),
+            None => (true, degraded_reason),
+        };
+
         Ok(PreviewReport {
             file_path: path.to_string(),
             parse_status,
-            delta_available: true,
+            delta_available,
             file_is_indexed,
             compared_against: compared_against.to_string(),
             degraded_reason,
@@ -1173,7 +1250,88 @@ mod specifier_tests {
     }
 }
 
+#[cfg(test)]
+mod span_line_range_tests {
+    use super::byte_span_to_line_range;
+    use devmap_extract::model::Span;
+
+    /// Multi-byte source must not abort the process.
+    ///
+    /// This function counted newlines with `source[..start]` — slicing a `&str`
+    /// at an index that is not a character boundary, which panics. Spans are
+    /// byte offsets recorded at extraction time while the source is re-read
+    /// from disk when the graph is exported, so an offset lands mid-character
+    /// whenever a multi-byte character was inserted before it. One emoji added
+    /// to a file aborted `dev map manifest`, and the release profile is
+    /// `panic = "abort"`, so nothing recovered.
+    ///
+    /// Exhaustive over every offset pair rather than sampled: the failure is
+    /// per-offset, and testing only the boundaries would pass against exactly
+    /// the code that panicked, because boundaries were always the safe case.
+    #[test]
+    fn every_offset_into_multibyte_source_is_answered_rather_than_panicked_on() {
+        let source = "fn a() {}\n// \u{1F980} ferris r\u{e9}\nfn b() {}\n";
+        for start in 0..=source.len() {
+            for end in 0..=source.len() {
+                let span = Span {
+                    start_byte: start,
+                    end_byte: end,
+                };
+                let (first, last) = byte_span_to_line_range(source, &span);
+                assert!(first >= 1, "lines are one-based, got {first}");
+                assert!(
+                    last >= first,
+                    "end line {last} precedes start line {first} for {start}..{end}"
+                );
+            }
+        }
+    }
+
+    /// The line numbers must be right, not merely non-panicking.
+    ///
+    /// A fix that clamped every offset to zero would satisfy the test above.
+    #[test]
+    fn line_numbers_are_correct_across_a_multibyte_character() {
+        let source = "alpha\n\u{1F980}beta\ngamma\n";
+        let crab = source
+            .find('\u{1F980}')
+            .expect("fixture contains the emoji");
+
+        let at_emoji = Span {
+            start_byte: crab,
+            end_byte: crab,
+        };
+        assert_eq!(byte_span_to_line_range(source, &at_emoji), (2, 2));
+
+        // Strictly inside the four-byte emoji — the exact index that panicked.
+        let inside = Span {
+            start_byte: crab + 1,
+            end_byte: crab + 2,
+        };
+        assert_eq!(byte_span_to_line_range(source, &inside), (2, 2));
+
+        let whole = Span {
+            start_byte: 0,
+            end_byte: source.len(),
+        };
+        assert_eq!(byte_span_to_line_range(source, &whole), (1, 4));
+    }
+
+    /// A stored span outliving the file it points into is the everyday case
+    /// after an edit, not a hostile one.
+    #[test]
+    fn offsets_beyond_the_source_are_clamped() {
+        let source = "one\ntwo\n";
+        let span = Span {
+            start_byte: 10_000,
+            end_byte: 20_000,
+        };
+        assert_eq!(byte_span_to_line_range(source, &span), (3, 3));
+    }
+}
+
 /// Token cost of one caller line: two paths and a symbol name.
+#[cfg(feature = "parse")]
 const PREVIEW_CALLER_TOKENS: u32 = 25;
 
 /// Confidence a call edge needs before `preview` will call it a caller.
@@ -1192,6 +1350,7 @@ const PREVIEW_CALLER_TOKENS: u32 = 25;
 pub const PREVIEW_CALLER_MIN_CONFIDENCE: f32 = 0.5;
 
 /// Describe a parse outcome in one word, for a report a human reads.
+#[cfg(feature = "parse")]
 fn parse_status_name(outcome: &ParseOutcome) -> &'static str {
     match outcome {
         ParseOutcome::Clean => "clean",
@@ -1513,6 +1672,7 @@ impl std::error::Error for PathOutsideRepoRoot {}
 /// inside the repository and is refused. A relative path is resolved against
 /// the process's working directory exactly as before, which rule 1 keeps from
 /// climbing out of it.
+#[cfg(feature = "parse")]
 pub(crate) fn contained_repo_path(
     repo_root: Option<&str>,
     path: &str,
@@ -1790,7 +1950,18 @@ impl<'a> QueryEngine<'a> {
                 .then_with(|| a.target_file.cmp(&b.target_file))
                 .then_with(|| a.source_symbol.cmp(&b.source_symbol))
         });
-        budget_take(inbound, req.token_budget, |_| 25)
+        let mut response = budget_take(inbound, req.token_budget, |_| 25);
+        // The walk's own "I stopped looking" signal, carried the way
+        // `StoreQueryEngine::traverse` carries it (engine.rs, `traverse`).
+        // Discarding it published a depth-capped walk as a complete answer:
+        // over a four-hop chain at depth 2 the traversal computes *"stopped at
+        // depth 2; the result is a lower bound, not the full blast radius"* and
+        // the response said `truncated: false, walk_incomplete: None`. For
+        // `impact` in particular that is the reading that gets a live symbol
+        // deleted — an incomplete blast radius is indistinguishable from a small
+        // one.
+        response.walk_incomplete = walk.stop.reason(opts.max_depth, opts.max_nodes);
+        response
     }
 
     /// Outbound trace with parametric depth (closes G8).
@@ -1830,7 +2001,10 @@ impl<'a> QueryEngine<'a> {
                 .then_with(|| a.target_file.cmp(&b.target_file))
                 .then_with(|| a.source_symbol.cmp(&b.source_symbol))
         });
-        budget_take(outbound, req.token_budget, |_| 25)
+        let mut response = budget_take(outbound, req.token_budget, |_| 25);
+        // Same signal, same reason as `impact` above.
+        response.walk_incomplete = walk.stop.reason(opts.max_depth, opts.max_nodes);
+        response
     }
 }
 
@@ -1878,15 +2052,32 @@ fn unavailable_response<T>(resolution: ResolutionAvailability) -> Response<T> {
 }
 
 pub(crate) fn byte_span_to_line_range(source: &str, span: &Span) -> (u32, u32) {
-    let start = span.start_byte.min(source.len());
-    let end = span.end_byte.min(source.len()).max(start);
-    let start_line = source[..start]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count() as u32
-        + 1;
-    let end_line = source[..end].bytes().filter(|byte| *byte == b'\n').count() as u32 + 1;
-    (start_line, end_line)
+    // Delegates the counting to `Span::line_range`, which is the canonical
+    // owner and is already UTF-8-safe.
+    //
+    // This function used to count newlines itself with `source[..start]` —
+    // slicing a `&str`, which **panics** on an index that is not a character
+    // boundary. Spans are byte offsets recorded at extraction time while
+    // `source` is re-read from disk when the graph is exported, so any
+    // multi-byte character inserted before an indexed symbol's end offset put
+    // the offset mid-character: one emoji added to a file aborted
+    // `dev map manifest` outright, and the release profile is `panic = "abort"`,
+    // so there was no recovery.
+    //
+    // Two copies of one computation existed and only one was safe. The wrapper
+    // survives for the single thing it adds beyond the canonical version — the
+    // `max(start)` below — and no longer restates the arithmetic.
+    let clamped = Span {
+        start_byte: span.start_byte.min(source.len()),
+        // A stored span whose end precedes its start would otherwise report an
+        // end line above its start line. Clamping keeps the range orderable for
+        // the consumers that render it as `line..end_line`.
+        end_byte: span
+            .end_byte
+            .min(source.len())
+            .max(span.start_byte.min(source.len())),
+    };
+    clamped.line_range(source)
 }
 
 /// Per-hit token overhead in [`StoreQueryEngine::search`]'s cost function.
@@ -1906,15 +2097,95 @@ pub const BYTES_PER_TOKEN: u32 = 4;
 /// packer would still have admitted, and the floor of 1 keeps a zero budget
 /// from asking for an empty page and reporting "nothing matched".
 ///
-/// Both search paths use this. Keyword search pages the FTS query with it;
-/// semantic search bounds how far down its ranking it materialises hits — and
-/// therefore how many files it reads — before budgeting them. Two copies of the
-/// arithmetic would let the same budget mean different page sizes depending on
-/// which command asked.
+/// Both search paths use this as the ceiling on *materialised* hits — the ones
+/// whose source is read off disk. Keyword search draws its candidates from a
+/// wider page ([`search_rank_pool_size`]) and cuts to this after ranking;
+/// semantic search bounds how far down its ranking it materialises hits before
+/// budgeting them. Two copies of the arithmetic would let the same budget mean
+/// different page sizes depending on which command asked.
 fn budget_page_size(token_budget: u32) -> usize {
     (token_budget / SEARCH_HIT_OVERHEAD_TOKENS)
         .saturating_add(1)
         .max(1) as usize
+}
+
+/// How many candidates keyword search pulls from the store before ranking them.
+///
+/// The store orders its page by bm25 and this crate ranks by exact/prefix/other
+/// match, so the page has to be wider than the answer or the second ranking
+/// only ever sees what the first one liked. Ten times is comfortably past the
+/// gap the audit measured (an exact match 100 rows below the cut on a 200-match
+/// query) without being a licence to walk the corpus: the pool is a hard
+/// ceiling, and when the match set outruns it `search` says so on
+/// `walk_incomplete` rather than presenting a sample's best as the corpus's.
+const SEARCH_RANK_OVERSAMPLE: usize = 10;
+
+/// Hard ceiling on that pool, whatever the budget asks for.
+///
+/// Every pooled row costs a `String` comparison and no file read, so 2,000 is
+/// cheap; it is here so one query can never scan an unbounded number of FTS
+/// rows on a corpus where the query matches everything.
+const SEARCH_RANK_POOL_MAX: usize = 2_000;
+
+fn search_rank_pool_size(token_budget: u32) -> usize {
+    let page = budget_page_size(token_budget);
+    // Never below the page: a pool smaller than what the budget could show
+    // would drop results the caller has already paid for.
+    page.saturating_mul(SEARCH_RANK_OVERSAMPLE)
+        .min(SEARCH_RANK_POOL_MAX)
+        .max(page)
+}
+
+/// Why a dead-symbol list is a lower bound, or `None` when it is not.
+///
+/// Two independent reasons, joined rather than ranked — a reader deciding
+/// whether to act on "delete this" needs every qualification the run holds, not
+/// the first one that fired. `None` on a converged analysis with every call
+/// attributed is the load-bearing case: a marker that appears on every answer
+/// leaves a caller exactly where it started.
+fn dead_symbol_coverage_gap(
+    analysis: Option<&devmap_analyze::model::AnalysisSummary>,
+) -> Option<String> {
+    use devmap_analyze::model::AnalysisStatus;
+    // A generation exists but its analysis blob does not read back. That is a
+    // check that could not run, and it must not answer like one that ran.
+    let Some(analysis) = analysis else {
+        return Some(
+            "the analysis summary for this generation could not be read, so the coverage \
+             behind these findings is unknown"
+                .to_string(),
+        );
+    };
+    let status = match &analysis.status {
+        AnalysisStatus::Ok => None,
+        AnalysisStatus::Partial { reason } => Some(format!("the analysis is partial: {reason}")),
+        AnalysisStatus::Timeout { reason } => Some(format!("the analysis timed out: {reason}")),
+    };
+    let unresolved = (analysis.unresolved_calls > 0).then(|| {
+        format!(
+            "{} call(s) in this generation are unattributed: any of them could be the \
+             caller of a symbol listed here, so this list is a lower bound",
+            analysis.unresolved_calls
+        )
+    });
+    devmap_analyze::combine_reasons(status, unresolved)
+}
+
+/// Rank of one stored symbol against an already-lowercased query.
+///
+/// The single owner of keyword search's ordering. It runs on the stored row
+/// rather than on a built [`SymbolHit`] precisely so that ranking can happen
+/// before the file reads do — which is what lets the candidate pool be wider
+/// than the answer without costing the caller anything.
+fn name_match_score(row: &devmap_store::StoredSymbol, query_lower: &str) -> f32 {
+    let name = row.name.to_lowercase();
+    if name == query_lower || row.qualified_name.to_lowercase() == query_lower {
+        1.0
+    } else if name.starts_with(query_lower) {
+        0.95
+    } else {
+        0.8
+    }
 }
 
 /// Token cost of one search hit: its source span plus a fixed per-row overhead.
@@ -2543,6 +2814,68 @@ mod tests {
             reads <= ceiling,
             "scored {SYMBOLS} symbols and read {reads} files for a budget that can \
              show at most {ceiling}"
+        );
+        assert!(
+            reads >= response.shown as usize,
+            "every shown hit needs its source read: reads={reads} shown={}",
+            response.shown
+        );
+    }
+
+    /// Widening the candidate pool must cost string comparisons, not file
+    /// reads.
+    ///
+    /// Keyword search now draws `SEARCH_RANK_OVERSAMPLE` times the page from
+    /// the store so its ranking is not confined to what bm25 liked. That is
+    /// only free because ranking runs on the stored row and the cut to
+    /// `budget_page_size` happens *before* anything is materialised. Score the
+    /// pool after building the hits instead — the obvious refactor — and this
+    /// query opens ten times as many files to discard nine tenths of them.
+    #[test]
+    fn keyword_search_reads_only_as_many_files_as_the_budget_could_show() {
+        use devmap_analyze::analyze;
+        use devmap_store::Store;
+
+        const SYMBOLS: usize = 500;
+        const BUDGET: u32 = 200;
+
+        let mut source = String::new();
+        for index in 0..SYMBOLS {
+            source.push_str(&format!("def widget_{index:04}():\n    return {index}\n"));
+        }
+        let ext = extract_file("things.py", &source);
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(std::slice::from_ref(&ext));
+        let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+        let analysis = analyze(std::slice::from_ref(&ext), &resolution);
+        let store = Store::open_in_memory().unwrap();
+        store
+            .save_generation(std::slice::from_ref(&ext), &resolution, &analysis)
+            .unwrap();
+
+        let pool = search_rank_pool_size(BUDGET);
+        assert!(
+            pool > budget_page_size(BUDGET),
+            "the point of the pool is that it is wider than the page"
+        );
+
+        SOURCE_SPAN_READS.with(|reads| reads.set(0));
+        let response = StoreQueryEngine::new(&store)
+            .search(Request {
+                query: "widget".to_string(),
+                token_budget: BUDGET,
+                min_confidence: 0.0,
+                max_depth: 1,
+            })
+            .expect("keyword search");
+        let reads = SOURCE_SPAN_READS.with(|reads| reads.get());
+
+        assert_eq!(response.total, SYMBOLS as u32);
+        assert!(response.shown > 0);
+        assert!(
+            reads <= budget_page_size(BUDGET),
+            "ranked a pool of {pool} and read {reads} files for a page of {}",
+            budget_page_size(BUDGET)
         );
         assert!(
             reads >= response.shown as usize,

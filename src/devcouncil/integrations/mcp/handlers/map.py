@@ -1,4 +1,23 @@
-"""Read-only MCP tools for querying ``.devcouncil/repo_map.json``."""
+"""Read-only MCP tools for querying ``.devcouncil/repo_map.json``.
+
+Why ``_body`` runs in a thread
+------------------------------
+
+Every handler here splits into a synchronous ``_body`` and an ``async def
+_run`` that does nothing but ``asyncio.to_thread(_body)``. The bodies are
+blocking end to end — repo-map reads and content fingerprints, devmap IPC (a
+``subprocess.run(timeout=10)`` binary probe, a daemon-readiness loop calling
+``time.sleep(0.05)``, a 30 s socket deadline and a ``subprocess.run(timeout=120)``
+CLI fallback), SQLite graph loads that re-materialise the whole graph, and LSP
+sessions that spawn a language server. Run inline they park the asyncio event
+loop for all of it, which is the failure ``util.run_cli_command``'s docstring
+already spells out: while the loop is parked the server stops answering ``ping``
+and cannot even receive the ``notifications/cancelled`` a client sends to give
+up. That reasoning had been applied to the CLI helper alone.
+
+The split changes only *where* the work runs. Nothing about what these handlers
+answer depends on the thread it is computed on.
+"""
 
 from __future__ import annotations
 
@@ -65,6 +84,16 @@ def _map_stale(root: Path, data: dict[str, Any] | None) -> bool:
 #: How many rows a single map response will carry. Every surface that applies
 #: it reports `shown`/`total`/`truncated` so the cap is visible in the payload.
 _ROW_LIMIT = 200
+
+#: How many paths one `devcouncil_impact` call will analyse.
+#:
+#: Each path costs a kernel `impact` round trip (or an LSP reference query), so
+#: an unbounded array was an unbounded amount of blocking work with no timeout,
+#: no cap and no partial result: 10 000 paths meant 10 000 sequential IPC
+#: exchanges. The schema advertises the same bound, and the response reports
+#: `paths_requested`/`paths_analyzed`/`paths_truncated` so a caller is never
+#: shown a capped answer that looks complete.
+_MAX_IMPACT_PATHS = 100
 
 
 def _graph_degraded_fields(root: Path) -> dict[str, Any]:
@@ -191,7 +220,7 @@ def _filter_dead_symbols(
 
 
 async def handle_repo_map(root: Path, arguments: dict) -> list[TextContent]:
-    async def _run() -> list[TextContent]:
+    def _body() -> list[TextContent]:
         subsystem = optional_string_argument(arguments, "subsystem")
         path = optional_string_argument(arguments, "path")
         for arg_name, value in [("subsystem", subsystem), ("path", path)]:
@@ -268,6 +297,9 @@ async def handle_repo_map(root: Path, arguments: dict) -> list[TextContent]:
         }
         return json_text(payload)
 
+    async def _run() -> list[TextContent]:
+        return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"
+
     return await with_codeintel_freshness(root, _run)
 
 
@@ -287,7 +319,9 @@ def _symbol_fields(root: Path, path: str | None) -> dict[str, Any]:
             "symbols_source": None,
             "symbols_shown": 0,
             "symbols_total": None,
+            "symbols_scan_total": None,
             "symbols_truncated": False,
+            "symbols_walk_incomplete": None,
             "symbols_reason": "not requested: no path argument",
         }
     symbols = _symbols_for_path(root, path)
@@ -297,7 +331,11 @@ def _symbol_fields(root: Path, path: str | None) -> dict[str, Any]:
         "symbols_source": symbols.source,
         "symbols_shown": len(symbols.items),
         "symbols_total": symbols.total if symbols.ok else None,
+        # The producer's own count, carried beside the local one so a capped
+        # scan is never presented as complete coverage.
+        "symbols_scan_total": symbols.scan_total if symbols.ok else None,
         "symbols_truncated": symbols.truncated,
+        "symbols_walk_incomplete": symbols.walk_incomplete,
     }
     if not symbols.ok:
         fields["symbols_reason"] = symbols.reason
@@ -309,25 +347,52 @@ class SymbolScan(NamedTuple):
 
     ``ok=False`` means no engine answered — never "this file has no symbols".
     The two used to be the same empty list.
+
+    ``total`` is the number of symbols found for the path, and it is ``None``
+    when the *producer* truncated: a total counted from the rows that survived a
+    capped scan is not a total, and publishing one is how a 5000-candidate store
+    reported three. ``scan_total`` carries the producer's own count beside it so
+    both numbers travel together rather than one standing in for the other.
     """
 
     ok: bool
     source: str
     reason: str
     items: list[dict[str, Any]]
-    total: int
+    total: int | None
     truncated: bool
+    scan_total: int | None = None
+    walk_incomplete: str | None = None
 
 
-def _scan_ok(items: list[dict[str, Any]], source: str) -> SymbolScan:
+def _scan_ok(
+    items: list[dict[str, Any]],
+    source: str,
+    *,
+    producer_total: int | None = None,
+    producer_truncated: bool = False,
+    walk_incomplete: str | None = None,
+) -> SymbolScan:
+    """Build a successful scan, keeping the producer's own counts intact.
+
+    ``truncated`` is the *union* of the two things that withhold rows: this
+    response's row cap and whatever the engine upstream already withheld. It
+    used to be the row cap alone, so a kernel that answered
+    ``total=5000, truncated=True`` was republished as ``truncated=False`` —
+    a caller was told it had been shown everything by a response that had been
+    shown 3 of 5000.
+    """
     shown = items[:_ROW_LIMIT]
+    row_capped = len(shown) < len(items)
     return SymbolScan(
         ok=True,
         source=source,
         reason="",
         items=shown,
-        total=len(items),
-        truncated=len(shown) < len(items),
+        total=None if producer_truncated else len(items),
+        truncated=row_capped or producer_truncated,
+        scan_total=producer_total,
+        walk_incomplete=walk_incomplete,
     )
 
 
@@ -345,6 +410,7 @@ def _symbols_for_path(root: Path, path: str) -> SymbolScan:
             DevMapClientError,
             resolution_unavailable_reason,
             try_connect,
+            walk_incomplete_reason,
         )
 
         client = try_connect(root)
@@ -359,6 +425,7 @@ def _symbols_for_path(root: Path, path: str) -> SymbolScan:
                 raise DevMapClientError(
                     f"devmap search returned truncated empty items (total={resp.total})"
                 )
+            incomplete = walk_incomplete_reason(resp)
             out: list[dict[str, Any]] = []
             for item in resp.items:
                 file_path = str(item.get("file_path") or "").replace("\\", "/")
@@ -378,7 +445,18 @@ def _symbols_for_path(root: Path, path: str) -> SymbolScan:
                     "name": name,
                     "line": line,
                 })
-            return _scan_ok(out, "devmap")
+            if incomplete and not out:
+                # "I stopped looking" published as "this file defines nothing"
+                # is the reading that gets a live symbol deleted, so it fails
+                # closed to the same unavailable answer a raising engine gets.
+                raise DevMapClientError(f"devmap search walk incomplete: {incomplete}")
+            return _scan_ok(
+                out,
+                "devmap",
+                producer_total=resp.total,
+                producer_truncated=bool(resp.truncated),
+                walk_incomplete=incomplete,
+            )
     except Exception as exc:  # noqa: BLE001 - reported, not swallowed
         reasons.append(f"devmap: {exc}")
     try:
@@ -410,7 +488,7 @@ def _symbols_for_path(root: Path, path: str) -> SymbolScan:
 
 
 async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
-    async def _run() -> list[TextContent]:
+    def _body() -> list[TextContent]:
         paths, list_error = optional_string_list_argument(arguments, "paths")
         if list_error:
             return list_error
@@ -429,6 +507,11 @@ async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
             )
 
         stale = _map_stale(root, data)
+        # Bounded before any per-path work starts. `requested` and `analyzed`
+        # both ride on the response, so a capped answer is never mistaken for
+        # coverage of everything the caller asked about.
+        requested = len(paths)
+        analyzed_paths = paths[:_MAX_IMPACT_PATHS]
         lsp_pool = None
         lsp_pool_error = ""
         if precise:
@@ -440,10 +523,24 @@ async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
                 lsp_pool = None
                 lsp_pool_error = str(exc)
 
+        # Connected once, not once per path. `try_connect` probes the binary
+        # with `subprocess.run(timeout=10)` and may spawn and wait on the
+        # daemon, so doing it inside the loop doubled the IPC round trips per
+        # element for an answer that cannot change between iterations.
+        client = None
+        connect_error = ""
+        if not precise:
+            try:
+                from devcouncil.devmap_client import try_connect
+
+                client = try_connect(root)
+            except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                connect_error = str(exc)
+
         try:
             items: list[dict[str, Any]] = []
             all_neighbor_areas: set[str] = set()
-            for raw in paths:
+            for raw in analyzed_paths:
                 path = raw.replace("\\", "/")
                 dependents, neighbors = impact_targets(path, data)
                 # `import` is the repo-map heuristic — the weakest of the three.
@@ -452,25 +549,29 @@ async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
                 # heuristic dependents looking like a symbol-level answer.
                 resolution = "import"
                 resolution_reason = ""
+                walk_note: str | None = None
                 fallback = "; dependents come from the repo-map import heuristic"
                 if not precise:
                     try:
                         from devcouncil.devmap_client import (
                             DevMapClientError,
                             resolution_unavailable_reason,
-                            try_connect,
+                            walk_incomplete_reason,
                         )
 
-                        client = try_connect(root)
                         if client is None:
-                            resolution_reason = (
-                                "no built devmap store (run `dev map`)" + fallback
+                            detail = (
+                                f"devmap unavailable: {connect_error}"
+                                if connect_error
+                                else "no built devmap store (run `dev map`)"
                             )
+                            resolution_reason = detail + fallback
                         else:
                             resp = client.impact(path, depth=1)
                             reason = resolution_unavailable_reason(resp.resolution)
                             if reason:
                                 raise DevMapClientError(reason)
+                            walk_note = walk_incomplete_reason(resp)
                             rust_deps = sorted({
                                 str(edge.get("source_file") or "")
                                 for edge in resp.items
@@ -479,6 +580,14 @@ async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
                             if rust_deps:
                                 dependents = rust_deps
                                 resolution = "devmap"
+                            elif walk_note:
+                                # No edges from a walk that stopped early is not
+                                # "nothing imports this file" — it is "the walk
+                                # did not finish", and the two must not reach a
+                                # caller wearing the same shape.
+                                resolution_reason = (
+                                    f"devmap walk incomplete: {walk_note}" + fallback
+                                )
                             else:
                                 resolution_reason = (
                                     "devmap reported no dependent edges" + fallback
@@ -510,6 +619,11 @@ async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
                     "neighbors": neighbors,
                     "resolution": resolution,
                     "resolution_reason": resolution_reason,
+                    # Present on every item, `None` when the walk finished, so
+                    # a caller reads one key instead of testing for its
+                    # existence. A non-empty `dependents` keeps its rows and
+                    # still says the walk was capped.
+                    "walk_incomplete": walk_note,
                 }
                 # `dependents_total` counts the repo map's *import* universe. It
                 # is a valid "shown of total" only while `dependents` is that
@@ -523,12 +637,15 @@ async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
 
             crossings = [
                 {"areas": [a, b]}
-                for a, b in cross_boundary_pairs(paths, data)
+                for a, b in cross_boundary_pairs(analyzed_paths, data)
             ]
             payload: dict[str, Any] = {
                 "ok": True,
                 "stale": stale,
                 "paths": items,
+                "paths_requested": requested,
+                "paths_analyzed": len(analyzed_paths),
+                "paths_truncated": len(analyzed_paths) < requested,
                 "neighbor_areas": sorted(all_neighbor_areas),
                 "cross_boundary_pairs": crossings,
             }
@@ -539,11 +656,14 @@ async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
             if lsp_pool is not None:
                 lsp_pool.close()
 
+    async def _run() -> list[TextContent]:
+        return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"
+
     return await with_codeintel_freshness(root, _run)
 
 
 async def handle_liveness(root: Path, arguments: dict) -> list[TextContent]:
-    async def _run() -> list[TextContent]:
+    def _body() -> list[TextContent]:
         area = optional_string_argument(arguments, "area")
         path_prefix = optional_string_argument(arguments, "path_prefix")
         min_confidence = optional_string_argument(arguments, "min_confidence") or "inferred"
@@ -640,7 +760,13 @@ async def handle_liveness(root: Path, arguments: dict) -> list[TextContent]:
             "dead_code_source": dead_scan.source,
             "dead_code_shown": len(dead_scan.items),
             "dead_code_total": dead_scan.total if dead_scan.ok else None,
+            # The producing engine's own candidate count, carried beside the
+            # scoped one: when the producer truncated, `dead_code_total` is
+            # None (unknowable from a capped sample) and this is what the
+            # producer actually saw.
+            "dead_code_scan_total": dead_scan.scan_total if dead_scan.ok else None,
             "dead_code_truncated": dead_scan.truncated,
+            "dead_code_walk_incomplete": dead_scan.walk_incomplete,
             # Every in-scope candidate this response does not carry: the
             # confidence filter *and* the row cap. It used to count only the
             # filter, so 500 candidates reported 200 items and 0 hidden.
@@ -657,6 +783,9 @@ async def handle_liveness(root: Path, arguments: dict) -> list[TextContent]:
             payload["warning"] = warn
         return json_text(payload)
 
+    async def _run() -> list[TextContent]:
+        return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"
+
     return await with_codeintel_freshness(root, _run)
 
 
@@ -670,35 +799,63 @@ class DeadCodeScan(NamedTuple):
 
     ``total`` counts every candidate the scan saw within the requested scope,
     before the confidence filter and before the row cap, so a caller can always
-    reconstruct what it is not being shown.
+    reconstruct what it is not being shown — and it is ``None`` when the
+    *producer* truncated, because a scoped total counted from the rows that
+    survived a capped scan is not a total. ``scan_total`` carries the producer's
+    own count beside it, so both numbers travel together and a capped sample is
+    never published as complete coverage.
     """
 
     ok: bool
     source: str
     reason: str
     items: list[dict[str, Any]]
-    total: int
+    total: int | None
     hidden_low_confidence: int
     truncated: bool
+    scan_total: int | None = None
+    walk_incomplete: str | None = None
 
     @property
-    def hidden(self) -> int:
-        """Candidates in scope that this response does not carry."""
+    def hidden(self) -> int | None:
+        """Candidates in scope that this response does not carry, when known."""
+        if self.total is None:
+            return None
         return self.total - len(self.items)
 
 
 def _dead_scan_ok(
-    matched: list[dict[str, Any]], *, source: str, total: int, hidden_low_confidence: int
+    matched: list[dict[str, Any]],
+    *,
+    source: str,
+    total: int,
+    hidden_low_confidence: int,
+    producer_total: int | None = None,
+    producer_truncated: bool = False,
+    walk_incomplete: str | None = None,
 ) -> DeadCodeScan:
+    """Build a successful scan, keeping the producer's own counts intact.
+
+    ``truncated`` is the union of the row cap here and whatever the engine
+    upstream already withheld. Deriving it from the surviving rows alone is what
+    let a kernel answer of ``total=5000, truncated=True, hidden=4997`` reach
+    ``devcouncil_liveness`` as ``dead_code_total: 3, dead_code_truncated: false,
+    dead_code_hidden: 0`` — a budget-capped scan reported as a clean repository.
+    The sibling ``codeintel._dead_via_client`` always passed the kernel's own
+    numbers through; the two now answer the same question the same way.
+    """
     shown = matched[:_ROW_LIMIT]
+    row_capped = len(shown) < len(matched)
     return DeadCodeScan(
         ok=True,
         source=source,
         reason="",
         items=shown,
-        total=total,
+        total=None if producer_truncated else total,
         hidden_low_confidence=hidden_low_confidence,
-        truncated=len(shown) < len(matched),
+        truncated=row_capped or producer_truncated,
+        scan_total=producer_total,
+        walk_incomplete=walk_incomplete,
     )
 
 
@@ -716,6 +873,7 @@ def _structured_dead_code(
             DevMapClientError,
             resolution_unavailable_reason,
             try_connect,
+            walk_incomplete_reason,
         )
         from devcouncil.indexing.graph.liveness import confidence_at_least
 
@@ -731,6 +889,7 @@ def _structured_dead_code(
                 raise DevMapClientError(
                     f"devmap dead_symbols returned truncated empty items (total={resp.total})"
                 )
+            incomplete = walk_incomplete_reason(resp)
             matched: list[dict[str, Any]] = []
             in_scope = 0
             hidden = 0
@@ -766,8 +925,16 @@ def _structured_dead_code(
                     "line": line,
                     "confidence": str(conf),
                 })
+            if incomplete and not matched:
+                raise DevMapClientError(f"devmap dead_symbols walk incomplete: {incomplete}")
             return _dead_scan_ok(
-                matched, source="devmap", total=in_scope, hidden_low_confidence=hidden
+                matched,
+                source="devmap",
+                total=in_scope,
+                hidden_low_confidence=hidden,
+                producer_total=resp.total,
+                producer_truncated=bool(resp.truncated),
+                walk_incomplete=incomplete,
             )
     except Exception as exc:  # noqa: BLE001 - reported, not swallowed
         reasons.append(f"devmap: {exc}")
@@ -905,7 +1072,7 @@ async def handle_graph_runs(root: Path, arguments: dict) -> list[TextContent]:
 
 
 async def handle_graph_cypher(root: Path, arguments: dict) -> list[TextContent]:
-    async def _run() -> list[TextContent]:
+    def _body() -> list[TextContent]:
         query = optional_string_argument(arguments, "query")
         if not query:
             return error_text("Missing query", code="missing_argument", argument="query")
@@ -913,11 +1080,14 @@ async def handle_graph_cypher(root: Path, arguments: dict) -> list[TextContent]:
 
         return json_text(run_cypher(root, query))
 
+    async def _run() -> list[TextContent]:
+        return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"
+
     return await with_codeintel_freshness(root, _run)
 
 
 async def handle_pdg_query(root: Path, arguments: dict) -> list[TextContent]:
-    async def _run() -> list[TextContent]:
+    def _body() -> list[TextContent]:
         mode = optional_string_argument(arguments, "mode")
         target = optional_string_argument(arguments, "target")
         if not mode:
@@ -937,16 +1107,22 @@ async def handle_pdg_query(root: Path, arguments: dict) -> list[TextContent]:
             argument="mode",
         )
 
+    async def _run() -> list[TextContent]:
+        return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"
+
     return await with_codeintel_freshness(root, _run)
 
 
 async def handle_explain(root: Path, arguments: dict) -> list[TextContent]:
-    async def _run() -> list[TextContent]:
+    def _body() -> list[TextContent]:
         path = optional_string_argument(arguments, "path")
         category = optional_string_argument(arguments, "category")
         from devcouncil.indexing.graph.query import explain_pdg_taint
 
         return json_text(explain_pdg_taint(root, path=path or None, category=category or None))
+
+    async def _run() -> list[TextContent]:
+        return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"
 
     return await with_codeintel_freshness(root, _run)
 
@@ -984,15 +1160,13 @@ async def handle_graph_query(root: Path, arguments: dict) -> list[TextContent]:
     writer lease, from a tool an agent reads as read-only.
     """
 
-    async def _run() -> list[TextContent]:
+    def _body() -> list[TextContent]:
         name = optional_string_argument(arguments, "name_or_path")
         if not name:
             return error_text(
                 "Missing name_or_path", code="missing_argument", argument="name_or_path"
             )
-        kernel = await asyncio.to_thread(
-            _devmap_query_payload, root, "query", name_or_path=name
-        )
+        kernel = _devmap_query_payload(root, "query", name_or_path=name)
         if kernel is not None:
             # The CLI's payload shape carries `definitions` but not `matches`,
             # which this tool has always emitted and agents branch on. Switching
@@ -1009,6 +1183,9 @@ async def handle_graph_query(root: Path, arguments: dict) -> list[TextContent]:
         # replied cannot interpret the answer.
         payload.setdefault("source", "code_graph")
         return json_text(payload)
+
+    async def _run() -> list[TextContent]:
+        return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"
 
     return await with_codeintel_freshness(root, _run)
 
@@ -1027,16 +1204,14 @@ async def handle_graph_trace(root: Path, arguments: dict) -> list[TextContent]:
     so rather than being reported as "no path".
     """
 
-    async def _run() -> list[TextContent]:
+    def _body() -> list[TextContent]:
         start = optional_string_argument(arguments, "from")
         end = optional_string_argument(arguments, "to")
         if not start:
             return error_text("Missing from", code="missing_argument", argument="from")
         if not end:
             return error_text("Missing to", code="missing_argument", argument="to")
-        kernel = await asyncio.to_thread(
-            _devmap_query_payload, root, "trace", start=start, end=end
-        )
+        kernel = _devmap_query_payload(root, "trace", start=start, end=end)
         if kernel is not None:
             return json_text(kernel)
         from devcouncil.indexing.graph import trace_path
@@ -1045,13 +1220,16 @@ async def handle_graph_trace(root: Path, arguments: dict) -> list[TextContent]:
         payload.setdefault("source", "code_graph")
         return json_text(payload)
 
+    async def _run() -> list[TextContent]:
+        return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"
+
     return await with_codeintel_freshness(root, _run)
 
 
 async def handle_graph_impact(root: Path, arguments: dict) -> list[TextContent]:
     """Symbol-level blast radius from paths or working-tree diff (code graph)."""
 
-    async def _run() -> list[TextContent]:
+    def _body() -> list[TextContent]:
         paths, list_error = optional_string_list_argument(arguments, "paths")
         if list_error:
             return list_error
@@ -1084,11 +1262,14 @@ async def handle_graph_impact(root: Path, arguments: dict) -> list[TextContent]:
         )
         return json_text(_graph_payload(root, result))
 
+    async def _run() -> list[TextContent]:
+        return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"
+
     return await with_codeintel_freshness(root, _run)
 
 
 async def handle_route_map(root: Path, arguments: dict) -> list[TextContent]:
-    async def _run() -> list[TextContent]:
+    def _body() -> list[TextContent]:
         from devcouncil.indexing.graph.api_routes import route_map
         from devcouncil.indexing.graph.build import load_code_graph
 
@@ -1100,11 +1281,14 @@ async def handle_route_map(root: Path, arguments: dict) -> list[TextContent]:
             )
         return json_text(_graph_payload(root, route_map(root, graph)))
 
+    async def _run() -> list[TextContent]:
+        return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"
+
     return await with_codeintel_freshness(root, _run)
 
 
 async def handle_shape_check(root: Path, arguments: dict) -> list[TextContent]:
-    async def _run() -> list[TextContent]:
+    def _body() -> list[TextContent]:
         route = optional_string_argument(arguments, "route")
         if route == "":
             return error_text("route must be a string", code="invalid_arguments", argument="route")
@@ -1119,11 +1303,14 @@ async def handle_shape_check(root: Path, arguments: dict) -> list[TextContent]:
             )
         return json_text(_graph_payload(root, shape_check(root, graph, route_filter=route)))
 
+    async def _run() -> list[TextContent]:
+        return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"
+
     return await with_codeintel_freshness(root, _run)
 
 
 async def handle_api_impact(root: Path, arguments: dict) -> list[TextContent]:
-    async def _run() -> list[TextContent]:
+    def _body() -> list[TextContent]:
         route_or_path = optional_string_argument(arguments, "route_or_path")
         if not route_or_path:
             return error_text(
@@ -1141,5 +1328,8 @@ async def handle_api_impact(root: Path, arguments: dict) -> list[TextContent]:
                 code="graph_missing",
             )
         return json_text(_graph_payload(root, api_impact(root, route_or_path, graph)))
+
+    async def _run() -> list[TextContent]:
+        return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"
 
     return await with_codeintel_freshness(root, _run)

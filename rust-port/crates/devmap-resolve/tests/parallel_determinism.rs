@@ -1,6 +1,6 @@
 //! Resolution must not depend on how many threads ran it.
 //!
-//! `Resolver::resolve_subset` resolves files in parallel. That is sound only
+//! `Resolver::resolve_all` resolves files in parallel. That is sound only
 //! because each file's resolution reads the immutable symbol/type indexes and
 //! writes nothing another file observes — but "sound because I read the loop
 //! and saw no shared writes" is an argument, not evidence, and the failure mode
@@ -144,7 +144,17 @@ fn resolution_is_identical_on_one_thread_and_on_eight() {
     );
 
     assert_eq!(serial.receiver_types, parallel.receiver_types);
-    assert_eq!(serial.reexport_chains, parallel.reexport_chains);
+    // `reexport_chains` is deliberately *not* compared for equality here.
+    // Nothing in the crate ever writes it, so comparing two always-empty maps
+    // asserted nothing while reading like a determinism check — a check that
+    // could not fail reporting what a check that ran and passed reports. What
+    // is true is that it is empty, and that is what is asserted, in
+    // `reexport_chains_are_never_computed`.
+    assert!(
+        serial.reexport_chains.is_empty() && parallel.reexport_chains.is_empty(),
+        "no code path computes re-export chains; a non-empty map here means \
+         this test and the field's documentation are both stale"
+    );
 }
 
 /// Repeated runs at the same width must also agree.

@@ -140,7 +140,12 @@ class RepoMap(BaseModel):
     processes: List[Dict[str, object]] = Field(default_factory=list)
 
 class RepoMapper:
-    def __init__(self, project_root: Path | str | None = None):
+    def __init__(
+        self,
+        project_root: Path | str | None = None,
+        *,
+        persist_content_cache: bool = True,
+    ):
         # Coerced, not merely annotated. A `str` root silently changed the
         # answer: `self.project_root / path` raises TypeError for str/str, the
         # blanket except in `get_git_files` caught it, and the inventory
@@ -150,6 +155,14 @@ class RepoMapper:
         # made `map_is_stale` answer True and False for the same map depending
         # on how its caller happened to spell the root.
         self.project_root = Path(project_root) if project_root is not None else Path.cwd()
+        # Whether this mapper may persist the advisory content-hash memo.
+        # `map_is_stale` is asked by read-only consumers -- the MCP freshness
+        # probe runs it on ~20 tools annotated `readOnlyHint: true` -- and the
+        # fingerprint it computes used to rewrite
+        # `.devcouncil/cache/content_hashes.json` on every one of those calls.
+        # A read that writes is the thing the annotation promises will not
+        # happen, so those consumers construct the mapper with this off.
+        self.persist_content_cache = bool(persist_content_cache)
         self._LIVENESS_CAP = type(self)._LIVENESS_CAP
         self._js_alias_cache: Optional[List[Tuple[str, List[str]]]] = None
         try:
@@ -1942,7 +1955,9 @@ class RepoMapper:
     def _content_fingerprint(self, files: List[str]) -> str:
         from devcouncil.indexing.graph.build import content_fingerprint
 
-        return content_fingerprint(self.project_root, files)
+        return content_fingerprint(
+            self.project_root, files, persist_cache=self.persist_content_cache
+        )
 
     def map_is_stale(self, repo_map: Dict[str, object]) -> bool:
         """True when the stored map no longer matches the repo's current git HEAD,

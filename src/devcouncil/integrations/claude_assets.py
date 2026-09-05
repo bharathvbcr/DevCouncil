@@ -12,8 +12,11 @@ complete, installable Claude Code support:
 * **Permissions** — a ``settings.json`` allow-list for the read-only ``dev``/``devcouncil``
   commands so the slash commands and hooks don't prompt on every run.
 * **Plugin bundle** — a self-contained Claude Code plugin + single-repo marketplace under
-  ``.devcouncil/claude-plugin/`` bundling the commands, agents, skills, hooks, and MCP
-  server so the whole integration installs with one ``/plugin install``.
+  ``.devcouncil/claude-plugin/`` bundling the commands, agents, skills, output style,
+  hooks, ``bin/`` launchers, and MCP server so the whole integration installs with one
+  ``/plugin install``. The plugin's layout differs from ``.claude/``: its ``commands/``
+  is **flat** (``commands/status.md`` → ``/devcouncil:status``, namespaced by the plugin
+  name), where ``.claude/`` needs the ``devcouncil/`` directory to get that prefix.
 
 Every builder is pure (returns text); writers return the list of paths actually changed so
 re-running is an idempotent no-op. Keeping the generation here (not in the Typer command)
@@ -23,11 +26,19 @@ keeps it unit-testable without a CLI round-trip.
 from __future__ import annotations
 
 import json
+import os
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
 from devcouncil.executors.advisor_tool import ADVISOR_STEERING_NUDGE
 from devcouncil.knowledge.frontmatter import build_frontmatter_markdown
+from devcouncil.integrations.clients.common import (
+    resolve_dev_executable,
+    resolve_devcouncil_executable,
+    venv_augmented_path,
+    venv_bin_dir,
+)
 from devcouncil.integrations.clients.hooks import ClaudeHookSpec, claude_hook_specs
 
 # Tools a DevCouncil subagent should be allowed to use: the standard read/edit/run set
@@ -39,17 +50,25 @@ _SUBAGENT_CORE_TOOLS = ["Read", "Grep", "Glob", "Bash", "Edit", "Write", "TodoWr
 
 @dataclass(frozen=True)
 class GeneratedAsset:
-    """One generated file: where it goes and what it should contain."""
+    """One generated file: where it goes, what it should contain, and whether it runs."""
 
     path: Path
     content: str
+    executable: bool = False
 
     def write_if_changed(self) -> bool:
-        """Write the file only when its content differs; return True if it changed."""
-        if self.path.exists() and self.path.read_text(encoding="utf-8") == self.content:
+        """Write the file only when its content or mode differs; True if it changed."""
+        exists = self.path.exists()
+        content_ok = exists and self.path.read_text(encoding="utf-8") == self.content
+        # A launcher whose +x bit was stripped is as broken as a stale one, so the mode is
+        # part of "unchanged" -- otherwise a re-run would report a no-op over a dead shim.
+        mode_ok = not self.executable or (exists and os.access(self.path, os.X_OK))
+        if content_ok and mode_ok:
             return False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(self.content, encoding="utf-8")
+        if self.executable:
+            self.path.chmod(self.path.stat().st_mode | 0o111)
         return True
 
 
@@ -373,7 +392,7 @@ def build_subagents(root: Path) -> list[GeneratedAsset]:
 
 # --- Output style ---------------------------------------------------------------
 
-def build_output_style(root: Path) -> list[GeneratedAsset]:
+def _output_style_markdown() -> str:
     meta = {
         "name": "DevCouncil",
         "description": "Evidence-first engineering discipline aligned with DevCouncil's verify loop.",
@@ -394,7 +413,11 @@ def build_output_style(root: Path) -> list[GeneratedAsset]:
         f"- {ADVISOR_STEERING_NUDGE}\n"
         "- Be concise: report what changed, what was verified, and what is still blocking."
     )
-    return [GeneratedAsset(root / ".claude" / "output-styles" / "devcouncil.md", build_frontmatter_markdown(meta, body))]
+    return build_frontmatter_markdown(meta, body)
+
+
+def build_output_style(root: Path) -> list[GeneratedAsset]:
+    return [GeneratedAsset(root / ".claude" / "output-styles" / "devcouncil.md", _output_style_markdown())]
 
 
 # --- Plugin bundle + marketplace ------------------------------------------------
@@ -479,10 +502,16 @@ def _plugin_hooks_json(root: Path, *, write_gate: bool = False) -> str:
     lifecycle hooks. The blocking PreToolUse write-gate is included only when
     ``write_gate`` is True."""
 
+    # The plugin ships no binary of its own, and a hook subprocess inherits the *host's*
+    # PATH -- which on a clean machine has neither `devcouncil` nor `dev` on it. Resolve
+    # the same absolute venv binary `_hook_command` bakes into .claude/settings.local.json
+    # (common.resolve_devcouncil_executable) so all 13 hooks can actually start.
+    executable = resolve_devcouncil_executable(root)
+
     def cmd(spec: ClaudeHookSpec) -> str:
         extra = f" {' '.join(spec.extra)}" if spec.extra else ""
         return (
-            f'devcouncil hook {spec.hook_event} --client claude '
+            f'{shlex.quote(executable)} hook {spec.hook_event} --client claude '
             f'--project-root "${{CLAUDE_PROJECT_DIR}}"{extra}'
         )
 
@@ -498,13 +527,25 @@ def _plugin_hooks_json(root: Path, *, write_gate: bool = False) -> str:
 
 
 def _plugin_mcp_json(root: Path) -> str:
+    """.mcp.json for the plugin: an absolute ``devcouncil`` plus an augmented ``PATH``.
+
+    Same resolution the Cursor adapter uses (``common.resolve_devcouncil_executable`` /
+    ``common.venv_augmented_path``). A bare ``"command": "devcouncil"`` is a PATH lookup in
+    the *host* process, and the plugin ships no binary to satisfy it, so the MCP server
+    simply failed to start anywhere the project venv was not already on PATH.
+    """
+    env = {"DEVCOUNCIL_PROJECT_ROOT": "${CLAUDE_PROJECT_DIR}"}
+    if venv_bin_dir(root) is not None:
+        # Only worth writing when there is a venv to put first: without one this would
+        # just freeze the generating shell's PATH into the bundle for no gain.
+        env["PATH"] = venv_augmented_path(root)
     config = {
         "mcpServers": {
             "devcouncil": {
                 "type": "stdio",
-                "command": "devcouncil",
+                "command": resolve_devcouncil_executable(root),
                 "args": ["mcp-server"],
-                "env": {"DEVCOUNCIL_PROJECT_ROOT": "${CLAUDE_PROJECT_DIR}"},
+                "env": env,
             }
         }
     }
@@ -642,6 +683,33 @@ def _plugin_readme() -> str:
     )
 
 
+def _plugin_bin_launchers(plugin: Path, root: Path) -> list[GeneratedAsset]:
+    """``bin/dev`` + ``bin/devcouncil`` shims that exec the resolved project binaries.
+
+    The bundled slash commands shell out to bare ``dev``; the plugin installs no Python
+    package, so on a clean machine that name resolves to nothing. Claude Code adds an
+    enabled plugin's ``bin/`` to the Bash tool's PATH, so a shim there makes the bare name
+    work without baking a machine-specific absolute path into every command's
+    ``allowed-tools`` matcher. Emitted only when the resolver actually found a local
+    binary -- shimming a bare PATH name would just recurse.
+    """
+    if os.name == "nt":  # no documented Windows launcher form; see build_plugin_bundle
+        return []
+    launchers: list[GeneratedAsset] = []
+    for name, target in (("dev", resolve_dev_executable(root)), ("devcouncil", resolve_devcouncil_executable(root))):
+        if not Path(target).is_absolute():
+            continue
+        launchers.append(GeneratedAsset(
+            plugin / "bin" / name,
+            "#!/bin/sh\n"
+            "# Generated by `dev integrate claude-plugin`. Claude Code puts an enabled\n"
+            "# plugin's bin/ on the Bash tool's PATH; this forwards to the project binary.\n"
+            f"exec {shlex.quote(target)} \"$@\"\n",
+            executable=True,
+        ))
+    return launchers
+
+
 def build_plugin_bundle(
     root: Path, *, version: str, skill_assets: list[GeneratedAsset] | None = None, write_gate: bool = False
 ) -> list[GeneratedAsset]:
@@ -660,10 +728,24 @@ def build_plugin_bundle(
     lsp_config = _plugin_lsp_json(root)
     if lsp_config:
         assets.append(GeneratedAsset(plugin / ".lsp.json", lsp_config))
+    # The DevCouncil output style, so a plugin-only install is not a downgrade from
+    # `dev integrate claude --apply`. `output-styles/` is the plugin spec's default
+    # output-style directory (plugins-reference: Output styles -> `output-styles/`,
+    # manifest field `outputStyles`), so no manifest entry is needed.
+    assets.append(GeneratedAsset(plugin / "output-styles" / "devcouncil.md", _output_style_markdown()))
+    # Launchers so the slash commands' bare `dev ...` shell-outs resolve on a machine that
+    # has no DevCouncil on PATH: the spec adds the plugin's `bin/` to the Bash tool's PATH
+    # while the plugin is enabled. POSIX only -- a `sh` shim is not executable on Windows,
+    # and Claude Code documents no Windows launcher form, so nothing is emitted there
+    # rather than emitting something that cannot run.
+    assets.extend(_plugin_bin_launchers(plugin, root))
     # Bundle command + agent copies into the plugin tree (plugin layout puts them at the
-    # plugin root, not under .claude/).
+    # plugin root, not under .claude/). `commands/` is FLAT: Claude Code discovers
+    # `commands/<name>.md` and namespaces the result by plugin name (`/devcouncil:status`).
+    # A `commands/devcouncil/` subdirectory is discovered by nothing -- `claude plugin
+    # details` reported 0 commands for the nested layout and 10 for this one.
     for cmd in _slash_commands():
-        assets.append(GeneratedAsset(plugin / "commands" / "devcouncil" / f"{cmd.name}.md", _slash_command_markdown(cmd)))
+        assets.append(GeneratedAsset(plugin / "commands" / f"{cmd.name}.md", _slash_command_markdown(cmd)))
     for agent in _subagents():
         assets.append(GeneratedAsset(plugin / "agents" / f"{agent.name}.md", _subagent_markdown(agent)))
     # Bundle the selected skills (passed in so selection logic stays in the skills layer).

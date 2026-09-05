@@ -113,7 +113,14 @@ def _map_artifact_freshness(root: Path) -> tuple[bool | None, str]:
         data = read_json(map_path) or {}
         if not isinstance(data, dict) or not data:
             return None, "repo_map.json is empty or not a JSON object"
-        return bool(RepoMapper(project_root=root).map_is_stale(data)), ""
+        # `persist_content_cache=False`: this probe is on the path of ~20 tools
+        # annotated `readOnlyHint: true`, and the fingerprint it computes used
+        # to write `.devcouncil/cache/content_hashes.json` on every call. The
+        # annotation is what a host reads to decide whether to ask the user
+        # before the call, so the write had to go, not the annotation. The memo
+        # is advisory — it is still *read*; only the rewrite is declined.
+        mapper = RepoMapper(project_root=root, persist_content_cache=False)
+        return bool(mapper.map_is_stale(data)), ""
     except Exception as exc:  # noqa: BLE001 - a probe that failed stays unknown
         logger.debug("repo-map fingerprint check failed", exc_info=True)
         return None, f"repo-map fingerprint check failed: {exc}"
@@ -378,11 +385,32 @@ def is_git_repo(root: Path) -> bool:
         return False
 
 
-def within_root(root: Path, rel_or_abs: str) -> Path | None:
+def resolve_path_argument(root: Path, rel_or_abs: str) -> Path | None:
+    """The real file a caller-supplied path argument names, symlinks followed.
+
+    One owner for "which file is this argument", so that `within_root`'s
+    containment verdict and `is_secret_path`'s secret verdict are answers about
+    the *same* path — the one `open()` and `subprocess.run` receive. They used
+    to be answers about two different strings, which is precisely what let
+    `notes.txt -> .env` past the secret guard: the guard judged `notes.txt` and
+    the read judged `.env`.
+
+    Returns ``None`` when the argument cannot be turned into a path at all
+    (NUL bytes, an unstattable component); the caller refuses on ``None``.
+    """
     raw = rel_or_abs.strip().strip('"').replace("\\", "/")
     try:
         candidate = Path(raw)
-        resolved = candidate.resolve() if candidate.is_absolute() else (root / raw).resolve()
+        return candidate.resolve() if candidate.is_absolute() else (root / raw).resolve()
+    except (OSError, ValueError):
+        return None
+
+
+def within_root(root: Path, rel_or_abs: str) -> Path | None:
+    resolved = resolve_path_argument(root, rel_or_abs)
+    if resolved is None:
+        return None
+    try:
         resolved.relative_to(root.resolve())
         return resolved
     except (OSError, ValueError):
@@ -572,20 +600,66 @@ def run_cli_json(args: list[str], root: Path) -> tuple[dict | None, list[TextCon
 GIT_APPLY_TIMEOUT_SECONDS = _GIT_APPLY_TIMEOUT_SECONDS
 
 
+def _names_the_same_file(left: Path, right: Path) -> bool:
+    """Whether two spellings reach one file — the filesystem's own answer.
+
+    Cheaper and more exact than guessing at the volume's case behaviour: on
+    APFS/NTFS `.ENV` and `.env` share an inode and this is True; on ext4 they
+    are two files (or one of them does not exist) and it is False.
+    """
+    import os
+
+    try:
+        return os.path.samestat(os.stat(left), os.stat(right))
+    except OSError:
+        return False
+
+
 def is_secret_path(root: Path, rel_or_abs: str) -> bool:
-    """True when a path matches a protected secret/credential glob."""
+    """True when a path matches a protected secret/credential glob.
+
+    Judged on the **resolved** path, not the caller's spelling. Two bypasses
+    made that necessary, both executed against the previous version:
+
+    * *Symlink.* `notes.txt -> .env` was matched as ``notes.txt``, missed every
+      pattern, and `devcouncil_read_file` returned the `.env` bytes. Only an
+      absolute argument was resolved here; a relative one never was.
+    * *Case.* `fnmatch` matches through `os.path.normcase`, which is identity
+      on POSIX, so the match was case-sensitive while APFS and NTFS are not.
+      ``.ENV``, ``.ssh/ID_RSA`` and ``certs/Server.PEM`` named exactly the bytes
+      the patterns protect and matched none of them.
+
+    The case fold is not applied blindly: the lower-cased spelling counts only
+    once `os.stat` has confirmed it reaches the *same file*. On a case-sensitive
+    filesystem ``.ENV`` and ``.env`` are two different files and the extra match
+    never fires, so this narrows the guard without over-refusing.
+
+    The caller's raw spelling is still matched too, so a path that escapes the
+    root — ``../../.env`` — keeps answering ``secret_path`` rather than sliding
+    into a different refusal code.
+    """
     from devcouncil.execution.policy_engine import SECRET_PATH_PATTERNS
     import fnmatch as _fnmatch
 
-    normalized = rel_or_abs.strip().strip('"').replace("\\", "/")
-    try:
-        candidate = Path(normalized)
-        if candidate.is_absolute():
-            resolved = candidate.resolve()
-            try:
-                normalized = resolved.relative_to(root.resolve()).as_posix()
-            except ValueError:
-                normalized = resolved.as_posix()
-    except OSError:
-        pass
-    return any(_fnmatch.fnmatch(normalized, pattern) for pattern in SECRET_PATH_PATTERNS)
+    spellings = [rel_or_abs.strip().strip('"').replace("\\", "/")]
+    folded: str | None = None
+    resolved = resolve_path_argument(root, rel_or_abs)
+    if resolved is not None:
+        try:
+            boundary = root.resolve()
+        except OSError:
+            boundary = root
+        try:
+            normalized = resolved.relative_to(boundary).as_posix()
+            lower_probe = boundary / normalized.lower()
+        except (OSError, ValueError):
+            normalized = resolved.as_posix()
+            lower_probe = Path(normalized.lower())
+        spellings.append(normalized)
+        if normalized.lower() != normalized and _names_the_same_file(resolved, lower_probe):
+            folded = normalized.lower()
+    if any(_fnmatch.fnmatch(s, p) for s in spellings for p in SECRET_PATH_PATTERNS):
+        return True
+    return folded is not None and any(
+        _fnmatch.fnmatch(folded, p.lower()) for p in SECRET_PATH_PATTERNS
+    )

@@ -371,8 +371,15 @@ pub enum ParseOutcome {
     Failed {
         reason: String,
     },
-    /// No grammar was available and declarations were recovered by pattern
-    /// instead (see [`crate::fallback`]).
+    /// The symbol list is **not a complete authoritative extraction** of this
+    /// file. Two producers: no grammar was available and declarations were
+    /// recovered by pattern (see [`crate::fallback`]), or the file was parsed
+    /// properly but only a prefix of it was submitted to the parser (a notebook
+    /// past [`crate::notebook`]'s cell cap).
+    ///
+    /// What both have in common is the only thing consumers act on: absence of
+    /// a symbol here is not evidence the file does not declare it, so dead-code
+    /// analysis must not treat this file's silence as a fact.
     ///
     /// Distinct from `Failed` because the two answer different questions and
     /// consumers act on them differently: `Failed` means the file contributed

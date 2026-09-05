@@ -7,14 +7,47 @@ from typing import Awaitable, Callable
 
 from mcp.types import TextContent, Tool
 
-from devcouncil.codeintel.debug.consent import require_debug_consent, set_debug_consent
+from devcouncil.codeintel.debug.consent import debug_consent_enabled, require_debug_consent
 from devcouncil.codeintel.debug.discovery import adapter_by_id, discover_adapters
 from devcouncil.codeintel.debug.session import get_debug_manager
 from devcouncil.codeintel.debug.tracing import NodeCpuProfileProvider, PythonTraceProvider, import_runtime_trace
 from devcouncil.integrations.mcp.handlers.codeintel import ProjectPathOutsideRoot, resolve_root
-from devcouncil.integrations.mcp.util import error_text, json_text
+from devcouncil.integrations.mcp.util import error_text, json_text, within_root
 
 Handler = Callable[[Path, dict], Awaitable[list[TextContent]]]
+
+
+class DebugPathOutsideRoot(ValueError):
+    """A debug path argument that resolves outside the server's project root."""
+
+
+def _contained(root: Path, arguments: dict, name: str) -> Path:
+    """The one containment rule every debug *path* argument passes through.
+
+    `script`, `path` and `source` are filenames a caller supplies and the
+    debugger then executes, reads or breakpoints. `_trace` handed `script`
+    straight to a provider whose first line is
+    ``script if script.is_absolute() else self.root / script`` — no `resolve()`,
+    no containment — and from there to `subprocess.run`, so
+    ``{"provider": "python", "script": "/tmp/x.py"}`` executed an arbitrary file
+    outside the project under the project's interpreter. `resolve_root` only
+    ever constrained `projectPath`.
+
+    Deliberately the *same* owner `projectPath` uses one layer up
+    (`within_root`), not a second copy of the rule: symlinks are followed before
+    the verdict, absolute paths outside the root and `../` traversal are both
+    refused, and a relative path is taken against the root rather than the
+    server process's working directory.
+    """
+    raw = arguments.get(name)
+    if not isinstance(raw, str) or not raw.strip():
+        raise KeyError(name)
+    resolved = within_root(root, raw)
+    if resolved is None:
+        raise DebugPathOutsideRoot(
+            f"{name} {raw!r} resolves outside this server's project root {root}"
+        )
+    return resolved
 
 
 def _schema(properties: dict, required: list[str] | None = None) -> dict:
@@ -35,7 +68,16 @@ def tools() -> list[Tool]:
                 "Discover installed DAP adapters after explicit one-time consent; "
                 "returns paths, versions, hashes, and launch/attach support."
             ),
-            inputSchema=_schema({"consent": {"type": "boolean", "default": False}}),
+            inputSchema=_schema({"consent": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Asks for a consent-state report only. Consent is granted by the user "
+                    "via `dev debug discover --consent` or "
+                    "code_intelligence.debug.auto_discover in .devcouncil/config.yaml; "
+                    "this argument cannot grant it."
+                ),
+            }}),
         ),
         Tool(
             name="devcouncil_debug_start",
@@ -57,7 +99,7 @@ def tools() -> list[Tool]:
             description="Replace all breakpoints for one source in a DAP session.",
             inputSchema=_schema({
                 "sessionId": {"type": "string"},
-                "source": {"type": "string"},
+                "source": {"type": "string", "description": "Source file inside the server root."},
                 "lines": {"type": "array", "items": {"type": "integer"}},
             }, ["sessionId", "source", "lines"]),
         ),
@@ -96,9 +138,9 @@ def tools() -> list[Tool]:
                 "provider": {"type": "string", "enum": ["dap-stack", "python", "node", "import"]},
                 "sessionId": {"type": "string"},
                 "threadId": {"type": "integer"},
-                "script": {"type": "string"},
+                "script": {"type": "string", "description": "Script to run, inside the server root."},
                 "args": {"type": "array", "items": {"type": "string"}},
-                "path": {"type": "string"},
+                "path": {"type": "string", "description": "Trace file to import, inside the server root."},
             }, ["provider"]),
         ),
         Tool(
@@ -113,8 +155,22 @@ def tools() -> list[Tool]:
 
 
 async def _discover(root: Path, arguments: dict) -> list[TextContent]:
-    if arguments.get("consent") is True:
-        set_debug_consent(root, True)
+    """Report adapters once the *user* has consented — never grant that consent.
+
+    This used to call `set_debug_consent(root, True)` when the caller passed
+    ``{"consent": true}``, which writes ``code_intelligence.debug.auto_discover:
+    true`` into `.devcouncil/config.yaml` and permanently unlocks the other
+    seven debug tools — process launch, breakpoints, side-effectful evaluate and
+    script execution among them. A capability gate a caller can set by passing
+    an argument is not a gate; the argument now does the one thing an argument
+    may do, which is say the gate is shut and name the two ways a human opens it.
+    """
+    if arguments.get("consent") is True and not debug_consent_enabled(root):
+        raise PermissionError(
+            "consent=true cannot grant debugger consent from a tool argument. "
+            "Run `dev debug discover --consent` or set "
+            "code_intelligence.debug.auto_discover: true in .devcouncil/config.yaml."
+        )
     require_debug_consent(root)
     return json_text({"consent": True, "adapters": [adapter.as_dict() for adapter in discover_adapters()]})
 
@@ -148,8 +204,9 @@ async def _start(root: Path, arguments: dict) -> list[TextContent]:
 
 async def _breakpoints(root: Path, arguments: dict) -> list[TextContent]:
     require_debug_consent(root)
+    source = _contained(root, arguments, "source")
     return json_text(get_debug_manager().set_breakpoints(
-        str(arguments["sessionId"]), str(arguments["source"]), [int(value) for value in arguments["lines"]]
+        str(arguments["sessionId"]), str(source), [int(value) for value in arguments["lines"]]
     ))
 
 
@@ -190,14 +247,16 @@ async def _trace(root: Path, arguments: dict) -> list[TextContent]:
         ))
     if provider == "python":
         return json_text(PythonTraceProvider(root).run(
-            Path(str(arguments["script"])), [str(value) for value in arguments.get("args") or []]
+            _contained(root, arguments, "script"),
+            [str(value) for value in arguments.get("args") or []],
         ))
     if provider == "node":
         return json_text(NodeCpuProfileProvider(root).run(
-            Path(str(arguments["script"])), [str(value) for value in arguments.get("args") or []]
+            _contained(root, arguments, "script"),
+            [str(value) for value in arguments.get("args") or []],
         ))
     if provider == "import":
-        return json_text(import_runtime_trace(root, Path(str(arguments["path"]))))
+        return json_text(import_runtime_trace(root, _contained(root, arguments, "path")))
     raise ValueError(f"unsupported trace provider: {provider}")
 
 
@@ -241,6 +300,10 @@ async def dispatch(name: str, default_root: Path, arguments: dict) -> list[TextC
         return await handler(root, arguments)
     except PermissionError as exc:
         return error_text(str(exc), code="debug_consent_required", tool=name)
+    # Before the ValueError arm below, which would otherwise flatten a refused
+    # path into the generic `debug_error` an agent reads as "retry differently".
+    except DebugPathOutsideRoot as exc:
+        return error_text(str(exc), code="path_escape", tool=name)
     except FileNotFoundError as exc:
         return error_text(str(exc), code="not_found", tool=name)
     except (KeyError, TypeError, ValueError, RuntimeError, TimeoutError) as exc:

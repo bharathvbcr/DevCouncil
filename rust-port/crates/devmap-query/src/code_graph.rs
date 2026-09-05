@@ -139,7 +139,7 @@ fn edge_kind_label(kind: EdgeKind) -> &'static str {
 /// exactly what `ambiguous` means, and must never read as `inferred` — a
 /// consumer that trusts `inferred` edges as real callers is how a live symbol
 /// stops looking dead for the wrong reason.
-fn confidence_label(value: f32) -> &'static str {
+pub(crate) fn confidence_label(value: f32) -> &'static str {
     let millis = confidence_millis(value);
     if millis >= EXTRACTED_FLOOR_MILLIS {
         "extracted"
@@ -207,10 +207,28 @@ fn community_by_file(analysis: &AnalysisSummary) -> BTreeMap<&str, &str> {
 /// Structurally exempt files are excluded outright — a test, a vendored
 /// dependency or a generated file having no importer is its normal state, not a
 /// finding.
+///
+/// So is a file whose imports were never extracted. "Nothing imports it" is
+/// only evidence when imports were looked for, which is the same sentence
+/// `analyze_liveness` already applies to a parse-failed file's own symbols
+/// (X6). Without this, a file the extractor refused reported as unwired next to
+/// genuinely orphaned modules, under an `{shown, total, truncated}` triple that
+/// was arithmetically honest about a population that was not — and the count of
+/// what the filter removed travels with the list for exactly that reason.
+pub(crate) struct UnwiredScan {
+    pub(crate) paths: Vec<String>,
+    /// Files dropped because their own imports were never extracted.
+    ///
+    /// Reported rather than silently subtracted: a filtered list under a bare
+    /// total is how "we did not look" comes to read as "we looked and found
+    /// nothing".
+    pub(crate) excluded_coverage_loss: usize,
+}
+
 pub(crate) fn unwired_candidates(
     extractions: &[Extraction],
     edges: &[ResolvedEdge],
-) -> Vec<String> {
+) -> UnwiredScan {
     let test_files: BTreeSet<&str> = extractions
         .iter()
         .filter(|ext| ext.wiring.iter().any(|w| w.kind == WiringKind::TestFile))
@@ -228,11 +246,12 @@ pub(crate) fn unwired_candidates(
         imported_by_production.insert(edge.target_file.as_str());
     }
 
+    let mut excluded_coverage_loss = 0usize;
     let mut candidates: Vec<String> = extractions
         .iter()
         .filter(|ext| {
-            !is_entry_root(ext)
-                && !ext.wiring.iter().any(|w| {
+            if is_entry_root(ext)
+                || ext.wiring.iter().any(|w| {
                     matches!(
                         w.kind,
                         WiringKind::TestFile
@@ -242,13 +261,30 @@ pub(crate) fn unwired_candidates(
                             | WiringKind::Launcher
                     )
                 })
-                && !imported_by_production.contains(ext.file_path.as_str())
+                || imported_by_production.contains(ext.file_path.as_str())
+            {
+                return false;
+            }
+            // Counted only among files that would otherwise have been reported,
+            // so the number answers "how much did this filter remove from the
+            // finding" rather than "how many unreadable files exist" — the
+            // second is `meta.devmap_rust.parse_failed_files`, and conflating
+            // the two would let a vendored unparseable file inflate it.
+            if ext.is_parse_failure() || matches!(ext.parse_outcome, ParseOutcome::Fallback { .. })
+            {
+                excluded_coverage_loss += 1;
+                return false;
+            }
+            true
         })
         .map(|ext| ext.file_path.clone())
         .collect();
     candidates.sort();
     candidates.dedup();
-    candidates
+    UnwiredScan {
+        paths: candidates,
+        excluded_coverage_loss,
+    }
 }
 
 /// Counters the artifact reports about its own completeness.
@@ -269,6 +305,20 @@ struct GraphProvenance {
     /// the graph uniformly would over-trust them. It is also the number that
     /// says how much of the tree the engine can only see coarsely.
     regex_fallback_files: usize,
+    /// Files a grammar was wanted for and did not get to read.
+    ///
+    /// The counter the audit found missing entirely: `regex_fallback_files`
+    /// covered one half of extraction loss and nothing counted the other, so a
+    /// generation that lost whole files' call edges rendered a graph
+    /// indistinguishable from one that read everything.
+    ///
+    /// Asked of `Extraction::is_parse_failure`, so a Markdown or JSON file —
+    /// which reports `ParseOutcome::Failed` for want of a grammar that will
+    /// never exist — is not counted here. 294 of this repository's 1,310 files
+    /// are that shape.
+    parse_failed_files: usize,
+    /// Files the unwired filter dropped because their imports were never read.
+    unwired_excluded_coverage_loss: usize,
 }
 
 /// Render `code_graph.json` from a committed generation.
@@ -289,6 +339,14 @@ pub fn generate_code_graph_json(
     }
 
     let mut provenance = GraphProvenance::default();
+    // One owner for "which files contributed no call edges", shared with
+    // `analyze_liveness`, which caps dead-code confidence from the same two
+    // numbers. Counted here rather than inline in the render loop below because
+    // a second `matches!` chain over `parse_outcome` is precisely where the
+    // `Failed`-vs-`NotApplicable` distinction gets dropped in one of the copies.
+    let coverage = devmap_analyze::extraction_coverage(extractions);
+    provenance.regex_fallback_files = coverage.pattern_recovered_files;
+    provenance.parse_failed_files = coverage.parse_failed_files;
     let root = repo_root.map(str::to_string);
     let communities = community_by_file(analysis);
 
@@ -304,9 +362,6 @@ pub fn generate_code_graph_json(
         let source = std::fs::read_to_string(resolve_source_path(&root, &ext.file_path)).ok();
         if source.is_none() {
             provenance.files_without_readable_source += 1;
-        }
-        if matches!(ext.parse_outcome, ParseOutcome::Fallback { .. }) {
-            provenance.regex_fallback_files += 1;
         }
         let area = file_area(&ext.file_path);
         let community = communities
@@ -471,6 +526,9 @@ pub fn generate_code_graph_json(
         }));
     }
 
+    let unwired = unwired_candidates(extractions, edges);
+    provenance.unwired_excluded_coverage_loss = unwired.excluded_coverage_loss;
+
     let analysis_status = match &analysis.status {
         AnalysisStatus::Ok => "ok".to_string(),
         AnalysisStatus::Partial { reason } => format!("partial: {reason}"),
@@ -536,7 +594,7 @@ pub fn generate_code_graph_json(
         "edges": edge_values,
         "dead_code": dead_code,
         "entry_roots": entry_root_paths(extractions),
-        "unwired_candidates": unwired_candidates(extractions, edges),
+        "unwired_candidates": unwired.paths,
         // Never computed. See `meta.devmap_rust.unavailable.unreachable_files`
         // and the unconditional `liveness_unreachable_unreliable` below.
         "unreachable_files": Vec::<String>::new(),
@@ -574,6 +632,12 @@ pub fn generate_code_graph_json(
                 "edge_endpoints_without_node": provenance.edge_endpoints_without_node,
                 "files_without_readable_source": provenance.files_without_readable_source,
                 "regex_fallback_files": provenance.regex_fallback_files,
+                // The coverage half of `analysis_status`. Both numbers travel
+                // with the artifact so a reader can size the hole rather than
+                // only learning that one exists, and `unwired_candidates` says
+                // how much of *it* the same hole removed.
+                "parse_failed_files": provenance.parse_failed_files,
+                "unwired_excluded_coverage_loss": provenance.unwired_excluded_coverage_loss,
                 "unavailable": unavailable,
             },
         },

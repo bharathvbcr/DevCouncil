@@ -55,6 +55,44 @@ def run_git(
         return subprocess.CompletedProcess(cmd, returncode=124, stdout="", stderr=f"timed out after {timeout}s")
 
 
+def git_repo_state(cwd: PathLike, *, timeout: float = GIT_TIMEOUT) -> tuple[Optional[bool], str]:
+    """Is *cwd* inside a git work tree? ``(True|False|None, reason)``.
+
+    Tri-state on purpose. ``git rev-parse --is-inside-work-tree`` has three
+    distinct outcomes and a boolean can only carry two:
+
+    * ``(True, "")``  — git answered ``true``.
+    * ``(False, why)`` — git answered, and the answer is no (exit 128, or
+      ``false`` inside a bare repository's ``.git`` directory).
+    * ``(None, why)`` — the probe could not run: it timed out (``run_git``
+      surfaces that as returncode 124), git is not installed, or the directory
+      could not be entered. Nothing was determined.
+
+    Collapsing the third case into ``False`` is what made a 60-second timeout
+    indistinguishable from an absent repository, so a caller was told "this is
+    not a git repository" about a repository that is one. A check that could not
+    run must never report what a check that ran and answered reports.
+    """
+    try:
+        result = run_git(["rev-parse", "--is-inside-work-tree"], cwd=cwd, timeout=timeout)
+    except OSError as exc:
+        return None, f"could not run git: {exc}"
+    if result.returncode == 124:
+        return None, (result.stderr or f"git rev-parse timed out after {timeout}s").strip()
+    stdout = (result.stdout or "").strip()
+    if result.returncode == 0:
+        if stdout == "true":
+            return True, ""
+        return False, f"git reports the work tree as {stdout or 'unset'}"
+    detail = (result.stderr or result.stdout or "").strip()
+    if "not a git repository" in detail.lower():
+        return False, detail
+    # A non-zero exit that is not the "no repository here" message is a git
+    # failure, not an answer: reporting it as "not a repository" would be the
+    # same conflation one line up.
+    return None, detail or f"git rev-parse exited {result.returncode}"
+
+
 def git_output(
     args: Cmd,
     cwd: PathLike,

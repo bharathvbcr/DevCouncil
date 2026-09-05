@@ -22,6 +22,7 @@ from devcouncil.devmap_client import (
     DevMapClientError,
     resolution_unavailable_reason,
     try_connect,
+    walk_incomplete_reason,
 )
 from devcouncil.integrations.mcp.util import error_text, json_text, with_codeintel_freshness
 
@@ -29,11 +30,24 @@ logger = logging.getLogger(__name__)
 
 Handler = Callable[[Path, dict], Awaitable[list[TextContent]]]
 
+#: Longest accepted value for a free-text argument (query, symbol, path).
+#:
+#: An unbounded string is a payload the server copies into a regex, a socket
+#: frame and a log line before anything rejects it; the kernel's own transport
+#: refuses a query above ``MAX_QUERY_BYTES`` (4 KiB), so accepting more here
+#: only moves the refusal later and makes it less legible. Advertised in the
+#: schema so a client is told the bound rather than discovering it as an error.
+_MAX_STRING_LENGTH = 4096
+#: Longest accepted path/target array. Every element costs at least one kernel
+#: round trip, so an unbounded array is an unbounded amount of blocking work.
+_MAX_ARRAY_ITEMS = 100
+
 
 def _schema(properties: dict, required: list[str] | None = None) -> dict:
     schema: dict = {"type": "object", "properties": {
         "projectPath": {
             "type": "string",
+            "maxLength": _MAX_STRING_LENGTH,
             "description": "Repository path inside the server root; defaults to that root.",
         },
         **properties,
@@ -49,7 +63,7 @@ def tools() -> list[Tool]:
             name="devcouncil_code_explore",
             description="Unified code exploration: source, callers/callees, semantic hops, and blast radius.",
             inputSchema=_schema({
-                "query": {"type": "string"},
+                "query": {"type": "string", "maxLength": _MAX_STRING_LENGTH},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
             }, ["query"]),
         ),
@@ -57,7 +71,7 @@ def tools() -> list[Tool]:
             name="devcouncil_code_search",
             description="FTS5 symbol, qualified-name, and path search over the committed generation.",
             inputSchema=_schema({
-                "query": {"type": "string"},
+                "query": {"type": "string", "maxLength": _MAX_STRING_LENGTH},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
             }, ["query"]),
         ),
@@ -65,8 +79,8 @@ def tools() -> list[Tool]:
             name="devcouncil_code_path",
             description="Shortest call/import/framework path with confidence and provenance per hop.",
             inputSchema=_schema({
-                "from": {"type": "string"},
-                "to": {"type": "string"},
+                "from": {"type": "string", "maxLength": _MAX_STRING_LENGTH},
+                "to": {"type": "string", "maxLength": _MAX_STRING_LENGTH},
                 "maxDepth": {"type": "integer", "minimum": 1, "maximum": 64, "default": 32},
             }, ["from", "to"]),
         ),
@@ -74,7 +88,11 @@ def tools() -> list[Tool]:
             name="devcouncil_code_impact",
             description="Inbound symbol blast radius for one or more paths/symbols.",
             inputSchema=_schema({
-                "targets": {"type": "array", "items": {"type": "string"}},
+                "targets": {
+                    "type": "array",
+                    "items": {"type": "string", "maxLength": _MAX_STRING_LENGTH},
+                    "maxItems": _MAX_ARRAY_ITEMS,
+                },
                 "maxDepth": {"type": "integer", "minimum": 1, "maximum": 8, "default": 3},
             }, ["targets"]),
         ),
@@ -93,7 +111,11 @@ def tools() -> list[Tool]:
             name="devcouncil_code_affected_tests",
             description="Tests reachable through the inbound blast radius of paths/symbols.",
             inputSchema=_schema({
-                "targets": {"type": "array", "items": {"type": "string"}},
+                "targets": {
+                    "type": "array",
+                    "items": {"type": "string", "maxLength": _MAX_STRING_LENGTH},
+                    "maxItems": _MAX_ARRAY_ITEMS,
+                },
                 "maxDepth": {"type": "integer", "minimum": 1, "maximum": 8, "default": 3},
             }, ["targets"]),
         ),
@@ -101,7 +123,11 @@ def tools() -> list[Tool]:
             name="devcouncil_code_sync",
             description="Reconcile and commit pending source changes to the canonical index.",
             inputSchema=_schema({
-                "paths": {"type": "array", "items": {"type": "string"}},
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string", "maxLength": _MAX_STRING_LENGTH},
+                    "maxItems": _MAX_ARRAY_ITEMS,
+                },
             }),
         ),
         Tool(
@@ -225,9 +251,43 @@ def _unavailable(
         "project_root": str(root.resolve()),
         "engine": "devmap-rust",
         "resolution": {"Unavailable": {"reason": f"{label}: {reason}"}},
+        # Present on every envelope this module produces, so a consumer reading
+        # it never has to test whether the key exists to find out whether the
+        # walk finished. `_incomplete_walk_envelope` overrides it with the
+        # kernel's own note when incompleteness is *why* this is unavailable.
+        "walk_incomplete": None,
     }
     payload.update(empty)
     return payload
+
+
+def _incomplete_walk_envelope(
+    root: Path,
+    label: str,
+    resp: BudgetedResponse,
+    rendered: list[Any],
+    empty: dict[str, Any],
+) -> dict[str, Any] | None:
+    """The unavailable envelope for an empty answer from a walk that stopped early.
+
+    Returns ``None`` when there is nothing to refuse — either the walk ran to
+    completion, or it stopped early but still produced rows, in which case the
+    caller keeps its rows and publishes the note beside them.
+
+    This is the MCP half of the rule `walk_incomplete_reason` documents and the
+    CLI already applies at ``graph_cmd._neighbor_edges``. It matters at the
+    *default* depth: the kernel reports a capped reverse walk with
+    ``truncated: false`` and ``hidden: 0``, so every counter on the response
+    says "complete" while the walk withheld an unknown quantity. Published as
+    ``[]`` that reads as "nothing depends on this", which is the answer that
+    gets a live symbol deleted.
+    """
+    note = walk_incomplete_reason(resp)
+    if not note or rendered:
+        return None
+    return _unavailable(
+        root, label, f"walk incomplete: {note}", {**empty, "walk_incomplete": note}
+    )
 
 
 def _hit_to_match(item: dict[str, Any]) -> dict[str, Any]:
@@ -273,6 +333,12 @@ def _search_via_client(root: Path, query: str, limit: int) -> dict[str, Any]:
         resp = client.search(query, limit=2000)
         _require_usable(resp, label="search")
         matches = [_hit_to_match(item) for item in resp.items[: max(1, limit)]]
+        capped = _incomplete_walk_envelope(
+            root, "search", resp, matches,
+            {"query": query, "matches": [], "shown": 0, "total": resp.total, "truncated": resp.truncated},
+        )
+        if capped is not None:
+            return capped
         return _client_envelope(
             root,
             client,
@@ -282,6 +348,7 @@ def _search_via_client(root: Path, query: str, limit: int) -> dict[str, Any]:
                 "shown": len(matches),
                 "total": resp.total,
                 "truncated": resp.truncated or len(resp.items) > limit,
+                "walk_incomplete": walk_incomplete_reason(resp),
             },
             operation="search",
         )
@@ -336,6 +403,16 @@ def _path_via_client(root: Path, start: str, end: str, max_depth: int) -> dict[s
             )
             if node:
                 steps.append({"node": node, "via": item if isinstance(item, dict) else None})
+        # "The walk stopped before it reached the target" is not "there is no
+        # path"; `found: false` from a capped traversal is the same confident
+        # zero the Unavailable branch above refuses.
+        capped = _incomplete_walk_envelope(
+            root, "path", resp, steps,
+            {"from": start, "to": end, "found": False, "path": [], "length": 0,
+             "truncated": resp.truncated},
+        )
+        if capped is not None:
+            return capped
         return _client_envelope(
             root,
             client,
@@ -346,6 +423,7 @@ def _path_via_client(root: Path, start: str, end: str, max_depth: int) -> dict[s
                 "length": max(0, len(steps) - 1) if steps else 0,
                 "path": steps,
                 "truncated": resp.truncated,
+                "walk_incomplete": walk_incomplete_reason(resp),
             },
             operation="path",
         )
@@ -372,6 +450,7 @@ def _impact_via_client(root: Path, targets: list[str], max_depth: int) -> dict[s
         layers_nodes: list[str] = []
         seeds: list[str] = []
         truncated = False
+        incomplete_notes: list[str] = []
         for target in targets:
             resp = client.impact(str(target), depth=depth)
             reason = resolution_unavailable_reason(resp.resolution)
@@ -379,10 +458,28 @@ def _impact_via_client(root: Path, targets: list[str], max_depth: int) -> dict[s
                 raise DevMapClientError(f"impact unavailable for {target}: {reason}")
             _require_usable(resp, label=f"impact:{target}")
             seeds.append(str(target))
-            layers_nodes.extend(_edge_to_layer_nodes(resp.items))
+            nodes = _edge_to_layer_nodes(resp.items)
+            # Per target, not per union: a seed whose own walk stopped with
+            # nothing to show contributes an unknown, and a union that silently
+            # absorbs it is "nothing depends on this file" from a walk that
+            # stopped looking.
+            note = walk_incomplete_reason(resp)
+            if note and not nodes:
+                return _unavailable(
+                    root,
+                    "impact",
+                    f"walk incomplete for {target}: {note}",
+                    {"targets": targets, "nodes": [], "layers": [], "count": 0,
+                     "total_impacted": 0, "truncated": resp.truncated,
+                     "walk_incomplete": note},
+                )
+            if note:
+                incomplete_notes.append(f"{target}: {note}")
+            layers_nodes.extend(nodes)
             truncated = truncated or resp.truncated
         # Preserve envelope shape expected by MCP consumers.
         unique_nodes = sorted(set(layers_nodes))
+        walk_note = "; ".join(incomplete_notes) or None
         blast = {
             "seeds": seeds,
             "layers": [{
@@ -393,11 +490,14 @@ def _impact_via_client(root: Path, targets: list[str], max_depth: int) -> dict[s
             }] if unique_nodes else [],
             "total_impacted": len(unique_nodes),
             "truncated": truncated,
+            # A non-empty radius keeps its nodes and still says the walk was
+            # capped, so `total_impacted` is read as a floor rather than a total.
+            "walk_incomplete": walk_note,
         }
         return _client_envelope(
             root,
             client,
-            {"targets": targets, "blast_radius": blast},
+            {"targets": targets, "blast_radius": blast, "walk_incomplete": walk_note},
             operation="impact",
         )
     except DevMapClientError as exc:
@@ -456,6 +556,13 @@ def _dead_via_client(root: Path, minimum_confidence: str) -> dict[str, Any]:
                     else "unconfirmed/unwired"
                 ),
             })
+        capped = _incomplete_walk_envelope(
+            root, "dead", resp, rows,
+            {"minimum_confidence": minimum_confidence, "dead_code": [],
+             "runtime_proven_live": [], "total": resp.total, "truncated": resp.truncated},
+        )
+        if capped is not None:
+            return capped
         status = client.status()
         return _client_envelope(
             root,
@@ -472,6 +579,7 @@ def _dead_via_client(root: Path, minimum_confidence: str) -> dict[str, Any]:
                 },
                 "truncated": resp.truncated,
                 "total": resp.total,
+                "walk_incomplete": walk_incomplete_reason(resp),
             },
             operation="dead",
         )
@@ -562,11 +670,28 @@ def _status_via_client(root: Path) -> dict[str, Any]:
         )
 
 
+# Every handler below hands its blocking body to a worker thread.
+#
+# All of them are synchronous end to end — a devmap IPC exchange (socket reads
+# bounded at RESPONSE_DEADLINE_SECONDS = 30, a daemon-readiness loop calling
+# time.sleep(0.05), and a CLI fallback at subprocess.run(timeout=120)) or a
+# SQLite graph load. Run inline they park the event loop for all of it, which is
+# the failure `util.run_cli_command` already documents: while the loop is parked
+# the server stops answering `ping` and cannot even receive the
+# `notifications/cancelled` a client sends to give up. That reasoning was
+# applied to the CLI helper and to nothing else. Offloading changes only *where*
+# the work runs, never what it answers.
+
+
 async def _explore(root: Path, arguments: dict) -> list[TextContent]:
     # Explore needs source snippets + caller/callee relations; keep Python primary
     # until Rust exposes an equivalent compose API. Prefer search via client only
     # as a soft enrichment is intentionally not done here (contract mismatch).
-    return json_text(CodeIntelQueryEngine(root).explore(str(arguments["query"]), limit=int(arguments.get("limit", 20))))
+    query = str(arguments["query"])
+    limit = int(arguments.get("limit", 20))
+    return json_text(
+        await asyncio.to_thread(lambda: CodeIntelQueryEngine(root).explore(query, limit=limit))
+    )
 
 
 async def _search(root: Path, arguments: dict) -> list[TextContent]:
@@ -577,7 +702,7 @@ async def _search(root: Path, arguments: dict) -> list[TextContent]:
     # which one answered is the SC23 shape, and an unavailable answer a
     # caller can see beats a confident one from an engine it did not ask
     # for.
-    return json_text(_search_via_client(root, query, limit))
+    return json_text(await asyncio.to_thread(_search_via_client, root, query, limit))
 
 
 async def _path(root: Path, arguments: dict) -> list[TextContent]:
@@ -589,7 +714,7 @@ async def _path(root: Path, arguments: dict) -> list[TextContent]:
     # which one answered is the SC23 shape, and an unavailable answer a
     # caller can see beats a confident one from an engine it did not ask
     # for.
-    return json_text(_path_via_client(root, start, end, max_depth))
+    return json_text(await asyncio.to_thread(_path_via_client, root, start, end, max_depth))
 
 
 async def _impact(root: Path, arguments: dict) -> list[TextContent]:
@@ -600,7 +725,7 @@ async def _impact(root: Path, arguments: dict) -> list[TextContent]:
     # which one answered is the SC23 shape, and an unavailable answer a
     # caller can see beats a confident one from an engine it did not ask
     # for.
-    return json_text(_impact_via_client(root, targets, max_depth))
+    return json_text(await asyncio.to_thread(_impact_via_client, root, targets, max_depth))
 
 
 async def _dead(root: Path, arguments: dict) -> list[TextContent]:
@@ -610,14 +735,17 @@ async def _dead(root: Path, arguments: dict) -> list[TextContent]:
     # which one answered is the SC23 shape, and an unavailable answer a
     # caller can see beats a confident one from an engine it did not ask
     # for.
-    return json_text(_dead_via_client(root, minimum))
+    return json_text(await asyncio.to_thread(_dead_via_client, root, minimum))
 
 
 async def _affected(root: Path, arguments: dict) -> list[TextContent]:
-    return json_text(CodeIntelQueryEngine(root).affected_tests(
-        [str(value) for value in arguments.get("targets") or []],
-        max_depth=int(arguments.get("maxDepth", 3)),
-    ))
+    targets = [str(value) for value in arguments.get("targets") or []]
+    max_depth = int(arguments.get("maxDepth", 3))
+    return json_text(
+        await asyncio.to_thread(
+            lambda: CodeIntelQueryEngine(root).affected_tests(targets, max_depth=max_depth)
+        )
+    )
 
 
 async def _sync(root: Path, arguments: dict) -> list[TextContent]:
@@ -630,26 +758,35 @@ async def _sync(root: Path, arguments: dict) -> list[TextContent]:
     second engine the caller never asked for.
     """
     supplied = [str(value) for value in arguments.get("paths") or []]
-    client = try_connect(root)
-    if client is not None:
-        try:
-            result = client.build(affected=supplied or None)
-            status = client.status()
-            return json_text({
-                "ok": True,
-                "reconciled": supplied,
-                "source": "devmap",
-                "generation": result.get("generation_id", status.generation_id),
-                "pending": status.pending_count,
-                "state": "fresh" if status.is_fresh else "pending",
-                "fresh": status.is_fresh,
-                "build": result,
-            })
-        except DevMapClientError as exc:
-            logger.warning(
-                "devmap (Rust) daemon build failed; retrying through the kernel CLI: %s",
-                exc,
-            )
+
+    def _via_daemon() -> dict[str, Any] | None:
+        """Connect, build and read status in one worker thread, or None."""
+        client = try_connect(root)
+        if client is None:
+            return None
+        result = client.build(affected=supplied or None)
+        status = client.status()
+        return {
+            "ok": True,
+            "reconciled": supplied,
+            "source": "devmap",
+            "generation": result.get("generation_id", status.generation_id),
+            "pending": status.pending_count,
+            "state": "fresh" if status.is_fresh else "pending",
+            "fresh": status.is_fresh,
+            "build": result,
+        }
+
+    try:
+        built = await asyncio.to_thread(_via_daemon)
+    except DevMapClientError as exc:
+        logger.warning(
+            "devmap (Rust) daemon build failed; retrying through the kernel CLI: %s",
+            exc,
+        )
+    else:
+        if built is not None:
+            return json_text(built)
     from devcouncil.devmap_engine import DevMapEngineError
     from devcouncil.indexing.map_artifacts import refresh_map_artifacts
 
@@ -681,7 +818,7 @@ async def _status(root: Path, _arguments: dict) -> list[TextContent]:
     # service is not consulted, because reporting *its* store's state under a
     # question about the Rust kernel is how a caller ends up confident about an
     # index that was never built.
-    return json_text(_status_via_client(root))
+    return json_text(await asyncio.to_thread(_status_via_client, root))
 
 
 REGISTRY: dict[str, Handler] = {

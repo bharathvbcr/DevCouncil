@@ -95,7 +95,7 @@ def _save_content_cache(root: Path, entries: Dict[str, List[str]]) -> None:
         logger.debug("content-hash cache not written under %s", root, exc_info=True)
 
 
-def content_fingerprint(root: Path, files: List[str]) -> str:
+def content_fingerprint(root: Path, files: List[str], *, persist_cache: bool = True) -> str:
     """sha1 over sorted ``(path, digest-of-bytes)`` — identical bytes fingerprint
     identically, however many times they were rewritten.
 
@@ -114,6 +114,14 @@ def content_fingerprint(root: Path, files: List[str]) -> str:
     stat. The cache is advisory: losing it costs time, never correctness. The
     cache lives under ``.devcouncil``, which ``_is_runtime_or_generated_file``
     excludes from the inventory, so it can never fingerprint itself.
+
+    ``persist_cache=False`` reads the memo but never writes it, for callers that
+    must not modify the project. The MCP freshness probe is one: it runs on ~20
+    tools annotated ``readOnlyHint: true``, and that annotation is what a host
+    uses to decide whether to ask the user before the call — so a tool carrying
+    it must not create or rewrite a file in the repository. Because the cache is
+    advisory, declining to write it costs those callers a rehash and nothing
+    else.
     """
     cache = _load_content_cache(root)
     entries: Dict[str, List[str]] = {}
@@ -140,7 +148,7 @@ def content_fingerprint(root: Path, files: List[str]) -> str:
             recomputed = True
         entries[rel] = [key, digest]
         lines.append(f"{rel}\0{digest}")
-    if recomputed or entries.keys() != cache.keys():
+    if persist_cache and (recomputed or entries.keys() != cache.keys()):
         _save_content_cache(root, entries)
     body = hashlib.sha1("\n".join(lines).encode("utf-8")).hexdigest()
     return f"{_CONTENT_SCHEME}:{body}"

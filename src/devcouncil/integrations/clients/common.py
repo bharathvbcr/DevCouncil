@@ -102,6 +102,49 @@ def resolve_dev_executable(project_root: Path) -> str:
     return "dev"
 
 
+def resolve_devcouncil_executable(project_root: Path) -> str:
+    """Resolve the ``devcouncil`` stdio MCP entry point, absolute when one exists.
+
+    A stdio MCP server is spawned by the *host* process with the host's own PATH, which
+    routinely lacks the project venv — so a bare ``devcouncil`` either fails to start or
+    silently binds a different DevCouncil install. Built on :func:`resolve_dev_executable`
+    (same venv-first search) and shared by every generator that emits an MCP ``command``,
+    so there is one resolution rule rather than one per host. Falls back to the bare PATH
+    name when no local binary exists; status checks accept both.
+    """
+    resolved = Path(resolve_dev_executable(project_root))
+    name = resolved.name.lower()
+    if name in {"dev", "dev.exe"}:
+        sibling = resolved.with_name("devcouncil.exe" if name.endswith(".exe") else "devcouncil")
+        if sibling.is_file():
+            return str(sibling)
+    if name in {"devcouncil", "devcouncil.exe"}:
+        return str(resolved)
+    # Fall back to PATH name when no local binary exists.
+    return "devcouncil"
+
+
+def venv_bin_dir(project_root: Path) -> Path | None:
+    """The project venv's executable directory, or None when the repo has no venv."""
+    root = project_root.expanduser().resolve()
+    venv_bin = root / ".venv" / ("Scripts" if os.name == "nt" else "bin")
+    return venv_bin if venv_bin.is_dir() else None
+
+
+def venv_augmented_path(project_root: Path) -> str:
+    """``PATH`` for a spawned MCP server: the project venv's bin dir, then the current PATH.
+
+    Belt-and-braces alongside :func:`resolve_devcouncil_executable` — the absolute command
+    starts the right binary, and this makes any child process it spawns (``dev``, ``git``
+    wrappers) resolve out of the same venv.
+    """
+    existing_path = os.environ.get("PATH", "/usr/bin:/bin")
+    venv_bin = venv_bin_dir(project_root)
+    if venv_bin is not None:
+        return f"{venv_bin}{os.pathsep}{existing_path}"
+    return existing_path
+
+
 def record_hook_dev_executable(project_root: Path, executable: str | None = None) -> Path:
     """Persist the resolved ``dev`` path used in installed hook commands."""
     root = project_root.expanduser().resolve()

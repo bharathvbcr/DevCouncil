@@ -34,6 +34,16 @@ TARGET_ALIASES = {
 # Clients with no PreToolUse/BeforeTool containment surface.
 NO_CONTAINMENT_CLIENTS = frozenset({"aider", "warp", "antigravity"})
 
+# The clients DevCouncil can actually register an MCP server for. These are the exact
+# branch sets `apply_integration_target` dispatches on (below), so nothing can advertise an
+# adapter that no branch here implements — `dev integrate matrix` derives its "MCP setup"
+# column from this rather than from a hand-maintained per-client boolean, which had gone
+# stale and claimed "yes" for five clients (amp, copilot, crush, goose, qwen) that have no
+# adapter, no subcommand, and no MCP writer at all.
+FIRST_PARTY_MCP_CLIENTS = frozenset({"codex", "gemini", "claude"})  # registered via the vendor CLI
+PROJECT_FILE_MCP_CLIENTS = frozenset({"cursor", "grok", "opencode", "antigravity", "warp"})
+MCP_ADAPTER_CLIENTS = FIRST_PARTY_MCP_CLIENTS | PROJECT_FILE_MCP_CLIENTS
+
 
 @dataclass(frozen=True)
 class IntegrationActionReport:
@@ -172,7 +182,7 @@ def apply_integration_target(
         # and native hooks) into one load/save cycle. _batched_raw_config is
         # re-entrant, so apply_hooks()'s own batching participates in this one.
         with integrate._batched_raw_config(root):
-            for name in ("cursor", "grok", "opencode", "antigravity", "warp"):
+            for name in sorted(PROJECT_FILE_MCP_CLIENTS):
                 apply_project_file(name)
             apply_aider()
             if include_hooks:
@@ -184,7 +194,7 @@ def apply_integration_target(
             # Cursor one-shot surface (skills + always-on rule); hooks already covered
             # above when include_hooks is true.
             apply_cursor_assets()
-    elif normalized in {"codex", "gemini", "claude"}:
+    elif normalized in FIRST_PARTY_MCP_CLIENTS:
         if normalized == "gemini":
             warnings.append(GEMINI_DEPRECATION_MESSAGE)
             integrate.console.print(f"[yellow]{GEMINI_DEPRECATION_MESSAGE}[/yellow]")
@@ -196,7 +206,7 @@ def apply_integration_target(
             integrate._install_claude_hooks(root, write_gate=write_gate)
             apply_claude_assets()
             add_result("claude-hooks", True, root / ".claude" / "settings.local.json", "Claude native hooks configured.")
-    elif normalized in {"cursor", "grok", "opencode", "antigravity", "warp"}:
+    elif normalized in PROJECT_FILE_MCP_CLIENTS:
         apply_project_file(normalized)
         if normalized == "cursor":
             if include_hooks:

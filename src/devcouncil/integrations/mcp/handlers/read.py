@@ -61,6 +61,16 @@ async def handle_read_file(
     target = within_root(root, rel_path)
     if target is None:
         return error_text("path escapes the project root", code="path_escape", path=rel_path)
+    # Judge the path that is actually opened, not only the one that was asked
+    # for. The check above ran against the caller's argument; this one runs
+    # against the resolved file `read_bytes` below receives, so the guard and
+    # the read can never be looking at two different files — the shape that let
+    # a symlink named `notes.txt` return `.env`.
+    if is_secret_path(root, target.as_posix()):
+        return error_text(
+            "Refusing to read a secret/credential path.",
+            code="secret_path", path=rel_path,
+        )
     if not target.exists() or not target.is_file():
         return error_text(f"File not found: {rel_path}", code="not_found", path=rel_path)
     try:

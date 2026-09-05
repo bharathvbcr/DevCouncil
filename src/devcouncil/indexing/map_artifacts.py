@@ -181,7 +181,6 @@ def generate_map_artifacts(
     lsp_refs: bool = False,
     quiet: bool = False,
     graph=None,  # noqa: ANN001
-    paths: list[str] | None = None,
 ) -> RepoMap:
     """Build the repo map and write repo_map.json + agent guides (no LLM, no re-init).
 
@@ -199,7 +198,6 @@ def generate_map_artifacts(
         lsp_refs=lsp_refs,
         quiet=quiet,
         graph=graph,
-        paths=paths,
     ).repo_map
 
 
@@ -229,7 +227,6 @@ def refresh_map_artifacts(
     lsp_refs: bool = False,
     quiet: bool = False,
     graph=None,  # noqa: ANN001
-    paths: list[str] | None = None,
     full: bool = False,
 ) -> GraphRefreshResult:
     """Build the map through the Rust kernel and layer on what the kernel does not do.
@@ -247,16 +244,20 @@ def refresh_map_artifacts(
     key, including the freshness stamps and ``map_engine``, is preserved — and
     written atomically.
 
-    ``liveness``, ``lsp_refs``, ``graph`` and ``paths`` are accepted for callers
-    that still pass them and have no effect: the kernel always computes
-    liveness, the LSP adjunct was cut with the Python engine, and the kernel
-    decides for itself whether a build is incremental. ``full`` forces a cold
-    rebuild.
+    ``liveness``, ``lsp_refs`` and ``graph`` are accepted for callers that still
+    pass them and have no effect: the kernel always computes liveness and the
+    LSP adjunct was cut with the Python engine. ``full`` forces a cold rebuild.
+
+    There is deliberately no ``paths`` argument. One existed and was deleted on
+    arrival — ``build_map`` takes no path list, the kernel decides for itself
+    which files a build must revisit — so every caller that computed one was
+    paying for precision this function could not use. Callers that know what
+    changed use that knowledge to decide *whether* to build, not what to build.
 
     Raises ``DevMapEngineError`` when the kernel cannot build. There is no
     fallback; callers that must not fail (verify, checkout) catch it.
     """
-    del liveness, lsp_refs, graph, paths, quiet
+    del liveness, lsp_refs, graph, quiet
     from devcouncil.devmap_engine import (
         DevMapEngineError,
         build_map,

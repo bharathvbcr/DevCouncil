@@ -2,7 +2,7 @@ use crate::content_hash;
 use crate::frameworks::extract_framework_routes;
 use crate::model::*;
 use crate::wiring::extract_wiring_annotations;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use tree_sitter::{Language, Node, Parser};
 
@@ -124,7 +124,7 @@ enum ParseAttempt {
 fn parse_within_budget(
     parser: &mut Parser,
     source: &str,
-    budget: std::time::Duration,
+    deadline: std::time::Instant,
 ) -> ParseAttempt {
     let started = std::time::Instant::now();
     let mut over_budget = false;
@@ -132,8 +132,12 @@ fn parse_within_budget(
         // The progress callback is polled by tree-sitter during the parse and
         // returning `true` cancels it; this is the only way to bound a parse
         // that has already entered a pathological state.
+        //
+        // Against the *shared* deadline, not a budget of its own: the parse is
+        // the first phase of the file's extraction, not a separately funded
+        // one.
         let mut cancel = |_: &tree_sitter::ParseState| -> bool {
-            if started.elapsed() >= budget {
+            if std::time::Instant::now() >= deadline {
                 over_budget = true;
                 return true;
             }
@@ -170,6 +174,19 @@ pub fn extract_treesitter_with_budget(
     source: &str,
     budget: std::time::Duration,
 ) -> Extraction {
+    // One deadline for the whole call, taken once.
+    //
+    // It used to be two: the parse was given `budget`, and then the walk was
+    // given `Instant::now() + budget` *after* the parse had already spent its
+    // own, so a file could legitimately consume twice the budget its caller
+    // asked for and still be published `Clean`. Everything after the walk —
+    // `go_method_sets`, the Python passes, the framework matcher, `clonesig` —
+    // had no deadline at all. `budget` is what the caller is promised; this is
+    // the only clock that decides whether the promise was kept.
+    let started = std::time::Instant::now();
+    let deadline = started + budget;
+    let _budget = BudgetGuard::arm(deadline);
+
     // Before anything else: a language whose grammar is deliberately not linked
     // must be refused here, not fall through to `unavailable_extraction`. That
     // path's reason — "no linked tree-sitter grammar for {lang}" — is true but
@@ -253,7 +270,7 @@ pub fn extract_treesitter_with_budget(
             );
         }
         let attempt = if parser.set_language(&ts_l).is_ok() {
-            parse_within_budget(&mut parser, source, budget)
+            parse_within_budget(&mut parser, source, deadline)
         } else {
             ParseAttempt::GrammarLoadFailed
         };
@@ -282,15 +299,32 @@ pub fn extract_treesitter_with_budget(
                     ),
                 );
             }
-            ParseAttempt::NoTree | ParseAttempt::Parsed(_) => {}
+            ParseAttempt::NoTree => {
+                // The variant that exists to name "the parser returned no tree
+                // and did not say why" was the one not routed to the refusal
+                // path. Falling through published every file of the language as
+                // `RegexFallback` with the reason "no linked tree-sitter grammar
+                // for {lang}" — false, cache-admitted under a real content hash,
+                // and exempting the whole language from dead-code analysis while
+                // the build stayed green. That is the exact scenario
+                // `refused_extraction`'s own doc warns about.
+                return refused_extraction(
+                    path,
+                    lang,
+                    source,
+                    format!(
+                        "grammar {grammar} for {lang} returned no tree and named no reason;                          no symbols are claimed for this file"
+                    ),
+                );
+            }
+            ParseAttempt::Parsed(_) => {}
         }
         if let ParseAttempt::Parsed(tree) = attempt {
             {
-                // The budget covers parse *and* walk. Measured: a 4,000-byte
-                // C++ file of 2,000 nested braces parses in 3 ms and then
-                // spends 199 s in the walk, so bounding the parse alone bounds
-                // nothing that actually hurts.
-                let walk_deadline = std::time::Instant::now() + budget;
+                // The budget covers parse *and* walk *and* everything after it.
+                // Measured: a 4,000-byte C++ file of 2,000 nested braces parses
+                // in 3 ms and then spends 199 s in the walk, so bounding the
+                // parse alone bounds nothing that actually hurts.
                 let content_hash = content_hash(source);
 
                 let root = tree.root_node();
@@ -323,6 +357,16 @@ pub fn extract_treesitter_with_budget(
                 // precedes the symbol-scoped ones and stays the file's reason.
                 let mut wiring = extract_wiring_annotations(path, source);
 
+                // Every phase below shares one refusal, so a file cut short
+                // in the tail cannot be reported differently from one cut short
+                // in the walk.
+                let over_budget = |phase: &str| {
+                    format!(
+                        "extraction of {} bytes exceeded the {budget:?} budget for grammar \
+                         {grammar} while {phase}; no symbols are claimed for this file",
+                        source.len()
+                    )
+                };
                 let walk_completed = walk_tree(
                     root,
                     source,
@@ -334,7 +378,7 @@ pub fn extract_treesitter_with_budget(
                     &mut exports,
                     &mut references,
                     &mut wiring,
-                    walk_deadline,
+                    deadline,
                 );
                 if !walk_completed {
                     // The partial `symbols`/`calls` collected so far describe a
@@ -345,13 +389,7 @@ pub fn extract_treesitter_with_budget(
                         path,
                         lang,
                         source,
-                        format!(
-                            "extraction of {} bytes exceeded the {:?} budget for grammar \
-                             {grammar} while walking the syntax tree; no symbols are claimed \
-                             for this file",
-                            source.len(),
-                            budget
-                        ),
+                        over_budget("walking the syntax tree"),
                     );
                 }
 
@@ -362,6 +400,14 @@ pub fn extract_treesitter_with_budget(
                 } else {
                     (Vec::new(), Vec::new())
                 };
+                if extraction_overran(deadline) {
+                    return refused_extraction(
+                        path,
+                        lang,
+                        source,
+                        over_budget("deriving Go method sets"),
+                    );
+                }
 
                 if lang == "python" {
                     let declared = python_all_exports(source);
@@ -432,6 +478,19 @@ pub fn extract_treesitter_with_budget(
                 crate::clonesig::stamp_signatures(&mut symbols, root, source);
                 crate::clonesig::stamp_declaration_hashes(&mut symbols, root, source);
 
+                // The last gate before the file is published. Everything above
+                // has either finished or latched `WALK_OVERRAN`; this is what
+                // stops a run that went past its budget from being handed out
+                // as a complete read of the file.
+                if extraction_overran(deadline) {
+                    return refused_extraction(
+                        path,
+                        lang,
+                        source,
+                        over_budget("stamping signatures"),
+                    );
+                }
+
                 return Extraction {
                     file_path: path.to_string(),
                     language: lang.to_string(),
@@ -475,12 +534,57 @@ pub fn extract_treesitter_with_budget(
 /// `is_metal` opts a `.metal` file into the second benign class — see
 /// [`is_benign_metal_qualifier`]. It is a language fact, not a grammar fact, so
 /// it cannot be read off the grammar key: Metal and C++ share `"cpp"`.
+/// Push every child of `node` onto a traversal worklist.
+///
+/// **Never iterate children by index.** `Node::child(i)` walks the sibling
+/// chain from the first child on every call, so `for i in 0..node.child_count()`
+/// is O(n^2) in the number of children. That is not a theoretical cost: a
+/// degenerate parse gives the root one child per token, and a 140 KB file of
+/// `"fn (((("` produced a root with 100,000 children. Walking it by index took
+/// **37 s**; walking the same tree with a `TreeCursor` visited the same nodes in
+/// **2.5 ms**. The whole 873x parse-budget overrun measured in
+/// `tests/budget_is_a_real_bound.rs` was this, not tree-sitter.
+///
+/// A `TreeCursor` steps to the next sibling in O(1), so these helpers are
+/// linear. They exist so the fast form has one owner and the slow form has one
+/// place to be warned about.
+fn push_children<'tree>(node: Node<'tree>, worklist: &mut Vec<Node<'tree>>) {
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            worklist.push(cursor.node());
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
+/// [`push_children`], but pushed last-child-first.
+///
+/// Callers that `pop()` from the worklist get first-child-first — document
+/// order — which several walks depend on for deterministic output (R4).
+fn push_children_reversed<'tree>(node: Node<'tree>, worklist: &mut Vec<Node<'tree>>) {
+    let mark = worklist.len();
+    push_children(node, worklist);
+    worklist[mark..].reverse();
+}
+
+/// [`push_children`] over named children only.
+fn push_named_children<'tree>(node: Node<'tree>, worklist: &mut Vec<Node<'tree>>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        worklist.push(child);
+    }
+}
+
 fn parse_outcome_of(root: Node, source: &str, is_metal: bool) -> ParseOutcome {
     if !root.has_error() {
         return ParseOutcome::Clean;
     }
     let mut error_ranges = Vec::new();
     let mut stack = vec![root];
+    let mut cursor = root.walk();
     while let Some(node) = stack.pop() {
         if (node.is_error() || node.is_missing())
             && !is_benign_jsx_ampersand(node, source)
@@ -491,10 +595,15 @@ fn parse_outcome_of(root: Node, source: &str, is_metal: bool) -> ParseOutcome {
                 end_byte: node.end_byte(),
             });
         }
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
+        cursor.reset(node);
+        if cursor.goto_first_child() {
+            loop {
+                let child = cursor.node();
                 if child.has_error() {
                     stack.push(child);
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
                 }
             }
         }
@@ -698,7 +807,7 @@ fn is_benign_jsx_ampersand(node: Node, source: &str) -> bool {
     if !text.contains('&') || text.contains('<') || text.contains('{') || text.contains('}') {
         return false;
     }
-    let mut current = node.parent();
+    let mut current = bounded_parent(node);
     while let Some(parent) = current {
         if matches!(
             parent.kind(),
@@ -710,7 +819,7 @@ fn is_benign_jsx_ampersand(node: Node, source: &str) -> bool {
         ) {
             return true;
         }
-        current = parent.parent();
+        current = bounded_parent(parent);
     }
     false
 }
@@ -1027,6 +1136,7 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         crate::fallback::FallbackScan {
             symbols: Vec::new(),
             truncated: 0,
+            skipped_long_lines: 0,
         }
     };
     let recovered_count = scan.symbols.len();
@@ -1110,19 +1220,49 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
             // declaration file read as a complete recovery of 2,000. A
             // truncation is part of the result, not a note about it.
             (true, _) => ParseOutcome::Fallback {
-                reason: if scan.truncated > 0 {
-                    format!(
-                        "no linked tree-sitter grammar for {lang}; {recovered_count} of {} \
-                         declaration(s) recovered by pattern, {} dropped at the scan cap — \
-                         the symbol list is a prefix, not a set",
-                        recovered_count + scan.truncated,
-                        scan.truncated
-                    )
-                } else {
-                    format!(
-                        "no linked tree-sitter grammar for {lang}; {recovered_count} \
-                         declaration(s) recovered by pattern"
-                    )
+                reason: {
+                    // Two different ways to lose a declaration, and they are
+                    // not interchangeable. The scan cap drops declarations the
+                    // scanner *counted*, so the true total is known exactly.
+                    // A skipped line was never pattern-matched at all, so how
+                    // many declarations it held is unknown — which makes the
+                    // total a lower bound, and saying so is the whole point.
+                    let counted_total = recovered_count + scan.truncated;
+                    let mut caveats = Vec::new();
+                    if scan.truncated > 0 {
+                        caveats.push(format!("{} dropped at the scan cap", scan.truncated));
+                    }
+                    if scan.skipped_long_lines > 0 {
+                        caveats.push(format!(
+                            "{} line(s) over {} bytes never scanned, so the total is a lower \
+                             bound",
+                            scan.skipped_long_lines,
+                            crate::fallback::MAX_LINE_BYTES
+                        ));
+                    }
+                    // The "X of Y" form is used only when Y is genuinely
+                    // known — that is, when every declaration was counted and
+                    // some were dropped afterwards. If a line was never
+                    // scanned, printing "2 of 2" would state a total the
+                    // scanner cannot know, which is the same overclaim in a
+                    // smaller font.
+                    let counted = if scan.truncated > 0 {
+                        format!("{recovered_count} of {counted_total} declaration(s)")
+                    } else {
+                        format!("{recovered_count} declaration(s)")
+                    };
+                    if caveats.is_empty() {
+                        format!(
+                            "no linked tree-sitter grammar for {lang}; {counted} recovered by \
+                             pattern"
+                        )
+                    } else {
+                        format!(
+                            "no linked tree-sitter grammar for {lang}; {counted} recovered by \
+                             pattern, {} — the symbol list is a prefix, not a set",
+                            caveats.join(" and ")
+                        )
+                    }
                 },
             },
             (false, true) => ParseOutcome::Failed {
@@ -1168,10 +1308,13 @@ fn walk_tree(
     wiring: &mut Vec<WiringAnnotation>,
     deadline: std::time::Instant,
 ) -> bool {
-    reset_scope_locals();
     let mut worklist = vec![root];
     let mut since_check = 0u32;
     while let Some(node) = worklist.pop() {
+        // A `Cell` read, cheap enough for every node, unlike a clock read.
+        if walk_overran() {
+            return false;
+        }
         // The clock is read every `DEADLINE_CHECK_STRIDE` nodes rather than
         // every node: an ordinary file walks millions of nodes and each read is
         // a real cost, while the pathological case that needs bounding takes
@@ -1195,17 +1338,52 @@ fn walk_tree(
             references,
             wiring,
         );
-        for index in (0..node.child_count()).rev() {
-            if let Some(child) = node.child(index) {
-                worklist.push(child);
-            }
-        }
+        push_children_reversed(node, &mut worklist);
     }
     true
 }
 
 /// Nodes walked between deadline checks. See `walk_tree`.
 const DEADLINE_CHECK_STRIDE: u32 = 256;
+
+/// The `{ a, b as c }` clause of a JavaScript/TypeScript import or export
+/// statement, or `None` when the statement has no binding clause at all.
+///
+/// Located structurally because the text scan it replaces was wrong in both
+/// directions on ordinary source. `text.find('{')` and `text.find('}')` were
+/// taken independently with no ordering check, so
+/// `export const isClose = (c) => c === '}' || c === '{';` — valid, idiomatic
+/// JavaScript — produced an inverted slice range and panicked, aborting the
+/// whole build (`extract_all` runs under rayon and release sets
+/// `panic = "abort"`). With the two literals the other way round the same scan
+/// did not panic; it fabricated an import *and* an export of a name spelled
+/// `'`, which is the quieter half of the same defect. `export default function
+/// f() { … }` was read the same way, with the function body parsed as a binding
+/// list.
+///
+/// The grammar already answers the question exactly: a binding clause is an
+/// `export_clause` (`export { … }`) or a `named_imports` (`import { … }`,
+/// reached through the statement's `import_clause`), and a statement that has
+/// neither binds no names. Both are direct or once-nested children, so this
+/// looks no deeper and cannot mistake a nested object literal for a clause.
+fn js_binding_clause(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    let mut inner_cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "export_clause" | "named_imports" => return Some(child),
+            "import_clause" => {
+                for inner in child.named_children(&mut inner_cursor) {
+                    if inner.kind() == "named_imports" {
+                        return Some(inner);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
 
 fn find_string_child(node: Node, source: &str) -> Option<String> {
     if let Some(s) = node.child_by_field_name("source") {
@@ -1216,16 +1394,15 @@ fn find_string_child(node: Node, source: &str) -> Option<String> {
                 .to_string(),
         );
     }
-    for i in 0..node.child_count() {
-        if let Some(c) = node.child(i) {
-            if c.kind() == "string" {
-                return Some(
-                    get_node_text(c, source)
-                        .trim_matches('"')
-                        .trim_matches('\'')
-                        .to_string(),
-                );
-            }
+    let mut cursor = node.walk();
+    for c in node.children(&mut cursor) {
+        if c.kind() == "string" {
+            return Some(
+                get_node_text(c, source)
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string(),
+            );
         }
     }
     None
@@ -1242,7 +1419,7 @@ pub(crate) fn enclosing_callable_qualified(
     source: &str,
     file_symbol_name: &str,
 ) -> Option<String> {
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         // The C family derives its name and its owner together: no C-family
         // declaration has a `name` field for `callable_binding_name` to read,
@@ -1288,7 +1465,7 @@ pub(crate) fn enclosing_callable_qualified(
                 None => scoped_qualified_name(parent, source, file_symbol_name, &name),
             });
         }
-        ancestor = parent.parent();
+        ancestor = bounded_parent(parent);
     }
     None
 }
@@ -1342,7 +1519,7 @@ fn callable_binding_name(node: Node, source: &str) -> Option<String> {
     // symbol emitter for `const f = function inner() { … }`, where the emitted
     // symbol is `f`. Falling through to `None` lets the walk continue to an
     // enclosing symbol that does exist, exactly as unnamed arrows already do.
-    let parent = node.parent()?;
+    let parent = bounded_parent(node)?;
     if parent.kind() == "variable_declarator" {
         return get_child_text(parent, "name", source);
     }
@@ -1363,7 +1540,7 @@ fn callable_binding_name(node: Node, source: &str) -> Option<String> {
 /// the distinction that refusal swallowed every property read and every
 /// callback passed by attribute along with it.
 fn member_access_receiver(node: Node, source: &str) -> Option<String> {
-    let parent = node.parent()?;
+    let parent = bounded_parent(node)?;
     // The grammars spell the same shape three ways: `attribute` in Python,
     // `member_expression` in JS/TS, `selector_expression` in Go.
     let object_field = match parent.kind() {
@@ -1407,7 +1584,7 @@ fn extracted_reference(
 }
 
 fn enclosing_type_name(node: Node, source: &str) -> Option<String> {
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         match parent.kind() {
             "class_definition"
@@ -1450,7 +1627,7 @@ fn enclosing_type_name(node: Node, source: &str) -> Option<String> {
             | "function_expression"
             | "arrow_function"
             | "method_definition" => return None,
-            _ => ancestor = parent.parent(),
+            _ => ancestor = bounded_parent(parent),
         }
     }
     None
@@ -1489,7 +1666,7 @@ fn rust_attribute_paths(node: Node, source: &str) -> Vec<String> {
 /// Treating that constant as evidence of deadness is the single highest-volume
 /// Rust false positive.
 fn rust_method_structural_reason(node: Node) -> Option<&'static str> {
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         match parent.kind() {
             "impl_item" => {
@@ -1511,7 +1688,7 @@ fn rust_method_structural_reason(node: Node) -> Option<&'static str> {
             // A nested `fn` is not a method merely because an impl block is
             // farther up the ancestor chain.
             "function_item" | "closure_expression" => return None,
-            _ => ancestor = parent.parent(),
+            _ => ancestor = bounded_parent(parent),
         }
     }
     None
@@ -1520,7 +1697,7 @@ fn rust_method_structural_reason(node: Node) -> Option<&'static str> {
 /// Root of the syntax tree containing `node`.
 fn ast_root(node: Node) -> Node {
     let mut current = node;
-    while let Some(parent) = current.parent() {
+    while let Some(parent) = bounded_parent(current) {
         current = parent;
     }
     current
@@ -1538,12 +1715,12 @@ fn ast_root(node: Node) -> Node {
 /// that reads as "this enum is private and unused" rather than as a bug.
 ///
 /// Two forms are not their own owner:
-/// - `method_definition.parent()` is always `class_body`, so a direct parent
+/// - `bounded_parent(method_definition)` is always `class_body`, so a direct parent
 ///   check can never be true — a method is exported exactly when its class is.
-/// - `variable_declarator.parent()` is the `lexical_declaration`; the export
+/// - `bounded_parent(variable_declarator)` is the `lexical_declaration`; the export
 ///   statement wraps that, not the declarator.
 fn js_symbol_is_exported(node: Node, source: &str) -> bool {
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         match parent.kind() {
             "export_statement" | "export_declaration" => return true,
@@ -1559,7 +1736,7 @@ fn js_symbol_is_exported(node: Node, source: &str) -> bool {
                 {
                     return true;
                 }
-                ancestor = parent.parent();
+                ancestor = bounded_parent(parent);
             }
             // A value bound inside a callable does not escape by being written.
             // Proving that a returned object reaches a caller needs escape
@@ -1570,7 +1747,7 @@ fn js_symbol_is_exported(node: Node, source: &str) -> bool {
             | "function_expression"
             | "arrow_function"
             | "method_definition" => return false,
-            _ => ancestor = parent.parent(),
+            _ => ancestor = bounded_parent(parent),
         }
     }
     false
@@ -1600,10 +1777,8 @@ fn js_target_is_global(left: Node, source: &str) -> bool {
 fn go_param_count(parameters: Node) -> usize {
     let mut cursor = parameters.walk();
     let mut total = 0;
-    for index in 0..parameters.named_child_count() {
-        let Some(declaration) = parameters.named_child(index) else {
-            continue;
-        };
+    let mut param_cursor = parameters.walk();
+    for declaration in parameters.named_children(&mut param_cursor) {
         if !matches!(
             declaration.kind(),
             "parameter_declaration" | "variadic_parameter_declaration"
@@ -1633,7 +1808,20 @@ fn go_method_sets(
     let mut interface_methods = Vec::new();
     let mut method_params = Vec::new();
     let mut worklist = vec![root];
+    // Same stride idiom as `walk_tree`. This pass runs *after* the walk has
+    // returned, over the whole tree again, and until now had no deadline at
+    // all: a tree that the walk finished just inside its budget could spend
+    // unbounded time here and still be published. The caller re-reads the latch
+    // this sets and refuses the file.
+    let mut since_check = 0u32;
     while let Some(node) = worklist.pop() {
+        since_check += 1;
+        if since_check >= DEADLINE_CHECK_STRIDE {
+            since_check = 0;
+            if walk_deadline_passed() {
+                break;
+            }
+        }
         match node.kind() {
             "type_spec" => {
                 if let (Some(name), Some(declared)) = (
@@ -1642,10 +1830,8 @@ fn go_method_sets(
                 ) {
                     if declared.kind() == "interface_type" {
                         let interface_name = get_node_text(name, source);
-                        for index in 0..declared.named_child_count() {
-                            let Some(member) = declared.named_child(index) else {
-                                continue;
-                            };
+                        let mut member_cursor = declared.walk();
+                        for member in declared.named_children(&mut member_cursor) {
                             if !matches!(member.kind(), "method_elem" | "method_spec") {
                                 continue;
                             }
@@ -1680,11 +1866,7 @@ fn go_method_sets(
             }
             _ => {}
         }
-        for index in 0..node.child_count() {
-            if let Some(child) = node.child(index) {
-                worklist.push(child);
-            }
-        }
+        push_children(node, &mut worklist);
     }
     interface_methods.sort_by(|a, b| {
         (&a.method, a.param_count, &a.interface_name).cmp(&(
@@ -1730,7 +1912,7 @@ fn go_interface_method_exemptions(
 /// Module-level bindings are public API surface; a constant declared inside a
 /// function is a local and belongs in nobody's graph.
 fn is_module_level(node: Node) -> bool {
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         if is_callable_node(parent) {
             return false;
@@ -1748,7 +1930,7 @@ fn is_module_level(node: Node) -> bool {
         ) {
             return false;
         }
-        ancestor = parent.parent();
+        ancestor = bounded_parent(parent);
     }
     true
 }
@@ -1864,8 +2046,7 @@ pub(crate) fn generic_declaration(node: Node, source: &str) -> Option<(SymbolKin
     // `function_definition` carries no name field; taking both would emit the
     // same function twice.
     if node.kind() == "function_declarator"
-        && node
-            .parent()
+        && bounded_parent(node)
             .is_some_and(|parent| parent.kind() == "function_definition")
     {
         return None;
@@ -1882,10 +2063,8 @@ fn generic_declaration_name(node: Node, source: &str) -> Option<String> {
     // `object_reference` child, which itself has a required `name` field —
     // taking that rather than the reference's whole text keeps a
     // schema-qualified `analytics.events` from becoming part of the identity.
-    for index in 0..node.named_child_count() {
-        let Some(child) = node.named_child(index) else {
-            continue;
-        };
+    let mut ref_cursor = node.walk();
+    for child in node.named_children(&mut ref_cursor) {
         if child.kind() == "object_reference" {
             if let Some(name) = get_child_text(child, "name", source).filter(|n| !n.is_empty()) {
                 return Some(name);
@@ -1899,8 +2078,8 @@ fn generic_declaration_name(node: Node, source: &str) -> Option<String> {
     {
         return Some(name);
     }
-    for index in 0..declarator.named_child_count() {
-        let child = declarator.named_child(index)?;
+    let mut declarator_cursor = declarator.walk();
+    for child in declarator.named_children(&mut declarator_cursor) {
         if matches!(
             child.kind(),
             "identifier" | "field_identifier" | "type_identifier"
@@ -1943,7 +2122,7 @@ fn metal_shader_entry_reason_of(node: Node, source: &str) -> Option<&'static str
 
 /// Nearest enclosing type-like declaration, so a method is owned by its type.
 pub(crate) fn generic_enclosing_type(node: Node, source: &str) -> Option<String> {
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         if let Some(kind) = generic_symbol_kind(parent.kind()) {
             if !matches!(kind, SymbolKind::Function) {
@@ -1952,7 +2131,7 @@ pub(crate) fn generic_enclosing_type(node: Node, source: &str) -> Option<String>
             // A function inside a function is not owned by a type.
             return None;
         }
-        ancestor = parent.parent();
+        ancestor = bounded_parent(parent);
     }
     None
 }
@@ -2365,22 +2544,20 @@ fn extract_node(
                         module_specifier: (!mod_spec.is_empty()).then(|| mod_spec.clone()),
                         span: span.clone(),
                     });
-                } else if let Some(idx1) = text.find('{') {
-                    if let Some(idx2) = text.find('}') {
-                        let inner = &text[idx1 + 1..idx2];
-                        let (names, locals) = crate::model::parse_import_bindings(inner);
-                        imported_names = names;
-                        local_names = locals;
-                        if text.trim_start().starts_with("export") {
-                            for (local, exported) in imported_names.iter().zip(local_names.iter()) {
-                                exports.push(ExtractedExport {
-                                    exported_name: exported.clone(),
-                                    local_name: Some(local.clone()),
-                                    module_specifier: (!mod_spec.is_empty())
-                                        .then(|| mod_spec.clone()),
-                                    span: span.clone(),
-                                });
-                            }
+                } else if let Some(clause) = js_binding_clause(node) {
+                    // `parse_import_bindings` strips the braces itself.
+                    let inner = get_node_text(clause, source);
+                    let (names, locals) = crate::model::parse_import_bindings(&inner);
+                    imported_names = names;
+                    local_names = locals;
+                    if text.trim_start().starts_with("export") {
+                        for (local, exported) in imported_names.iter().zip(local_names.iter()) {
+                            exports.push(ExtractedExport {
+                                exported_name: exported.clone(),
+                                local_name: Some(local.clone()),
+                                module_specifier: (!mod_spec.is_empty()).then(|| mod_spec.clone()),
+                                span: span.clone(),
+                            });
                         }
                     }
                 } else if text.trim_start().starts_with("import ") {
@@ -3193,6 +3370,13 @@ fn c_declaration_head<'a>(node: Node, source: &'a str) -> &'a str {
         .map_or_else(|| node.end_byte(), |declarator| declarator.start_byte())
         .min(start + HEAD_WINDOW)
         .max(start);
+    // The window edge is an arbitrary byte offset, so it lands mid-character
+    // whenever the head contains any multi-byte text — a comment, an identifier
+    // in a non-ASCII script. `.get()` then yielded `None` and the whole head
+    // became `""`, so `head_has_word("__global__")` answered `false` for a file
+    // whose first ten bytes are `__global__`, and the kernel lost the
+    // entry-point exemption that keeps it out of the dead-code report.
+    let end = crate::langcalls::scope::floor_char_boundary(source, end).max(start);
     source.get(start..end).unwrap_or_default()
 }
 
@@ -3222,12 +3406,12 @@ fn c_declaration_is_explicitly_external(node: Node, source: &str) -> bool {
     // `extern "C" { … }` and `extern "C" int f()` both wrap the declaration in a
     // linkage specification. Stop at the first enclosing body so a declaration
     // merely nested somewhere inside one cannot inherit it.
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         match parent.kind() {
             "linkage_specification" => return true,
             "function_definition" | "compound_statement" | "translation_unit" => return false,
-            _ => ancestor = parent.parent(),
+            _ => ancestor = bounded_parent(parent),
         }
     }
     false
@@ -3432,7 +3616,7 @@ fn objc_interface_is_implemented_here(node: Node, source: &str) -> bool {
         return false;
     };
     let mut root = node;
-    while let Some(parent) = root.parent() {
+    while let Some(parent) = bounded_parent(root) {
         root = parent;
     }
     let mut cursor = root.walk();
@@ -3449,7 +3633,7 @@ fn objc_interface_is_implemented_here(node: Node, source: &str) -> bool {
 /// C spells `struct chunk *prev` and `struct chunk { … }` with the same node
 /// kind and the same `name` field; only the definition carries a body.
 fn is_bodyless_type_specifier_name(node: Node) -> bool {
-    let Some(parent) = node.parent() else {
+    let Some(parent) = bounded_parent(node) else {
         return false;
     };
     matches!(
@@ -3476,7 +3660,7 @@ fn is_objc_declaring_identifier(node: Node) -> bool {
     if node.kind() != "identifier" {
         return false;
     }
-    let Some(parent) = node.parent() else {
+    let Some(parent) = bounded_parent(node) else {
         return false;
     };
     match parent.kind() {
@@ -3598,14 +3782,14 @@ fn is_c_macro_invocation(node: Node) -> bool {
     // An in-class constructor is a bare `identifier` with no return type too, so
     // anything inside a type body is left alone.
     !matches!(
-        node.parent().map(|parent| parent.kind()),
+        bounded_parent(node).map(|parent| parent.kind()),
         Some("field_declaration_list")
     )
 }
 
 /// Nearest enclosing Objective-C class container.
 fn objc_enclosing_container(node: Node, source: &str) -> Option<String> {
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         if matches!(
             parent.kind(),
@@ -3616,7 +3800,7 @@ fn objc_enclosing_container(node: Node, source: &str) -> Option<String> {
         ) {
             return objc_container_name(parent, source);
         }
-        ancestor = parent.parent();
+        ancestor = bounded_parent(parent);
     }
     None
 }
@@ -3627,7 +3811,7 @@ fn objc_enclosing_container(node: Node, source: &str) -> Option<String> {
 /// a definition that merely follows it, and stops at a `function_definition` so
 /// a nested lambda is not made a member.
 fn c_enclosing_type(node: Node, source: &str) -> Option<String> {
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         match parent.kind() {
             "struct_specifier" | "class_specifier" | "union_specifier" => {
@@ -3638,7 +3822,7 @@ fn c_enclosing_type(node: Node, source: &str) -> Option<String> {
             | "category_implementation"
             | "category_interface" => return objc_container_name(parent, source),
             "function_definition" | "compound_statement" => return None,
-            _ => ancestor = parent.parent(),
+            _ => ancestor = bounded_parent(parent),
         }
     }
     None
@@ -3651,7 +3835,7 @@ fn c_enclosing_type(node: Node, source: &str) -> Option<String> {
 /// call to `visibility` — a callee that can never resolve and that names
 /// nothing in the program.
 fn is_inside_c_attribute(node: Node) -> bool {
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     for _ in 0..16 {
         let Some(parent) = ancestor else {
             return false;
@@ -3666,7 +3850,7 @@ fn is_inside_c_attribute(node: Node) -> bool {
         ) {
             return true;
         }
-        ancestor = parent.parent();
+        ancestor = bounded_parent(parent);
     }
     false
 }
@@ -3820,8 +4004,7 @@ fn extract_c_header_export(
         "function_declarator" => {
             // A definition's own declarator is not a declaration of an
             // interface; the definition is already the symbol.
-            if node
-                .parent()
+            if bounded_parent(node)
                 .is_some_and(|parent| parent.kind() == "function_definition")
             {
                 return;
@@ -4134,14 +4317,14 @@ fn split_call_target_inner(
 
 fn go_receiver(node: Node, source: &str) -> Option<(String, String)> {
     let receiver = node.child_by_field_name("receiver")?;
-    for index in 0..receiver.named_child_count() {
-        let param = receiver.named_child(index)?;
+    let mut receiver_cursor = receiver.walk();
+    for param in receiver.named_children(&mut receiver_cursor) {
         if param.kind() != "parameter_declaration" {
             continue;
         }
         let recv_name = get_child_text(param, "name", source).unwrap_or_default();
         let type_node = param.child_by_field_name("type")?;
-        let type_name = go_type_name(type_node, source)?;
+        let type_name = go_type_name(type_node, source, 0)?;
         return Some((recv_name, type_name));
     }
     None
@@ -4175,8 +4358,9 @@ fn rust_macro_calls(
     file_symbol_name: &str,
 ) -> Vec<(String, Option<String>)> {
     let _ = file_symbol_name;
-    let Some(tokens) = (0..node.named_child_count())
-        .filter_map(|index| node.named_child(index))
+    let mut token_cursor = node.walk();
+    let Some(tokens) = node
+        .named_children(&mut token_cursor)
         .find(|child| child.kind() == "token_tree")
     else {
         return Vec::new();
@@ -4271,10 +4455,13 @@ fn probe_macro_body(inner: &str) -> (Vec<(String, Option<String>)>, Vec<String>)
                 }
             }
             "macro_invocation" => {
-                if let Some(tokens) = (0..current.named_child_count())
-                    .filter_map(|index| current.named_child(index))
-                    .find(|child| child.kind() == "token_tree")
-                {
+                let mut nested_cursor = current.walk();
+                // Bound in its own statement so the borrowing iterator is
+                // dropped here rather than living to the end of the `if let`.
+                let tokens = current
+                    .named_children(&mut nested_cursor)
+                    .find(|child| child.kind() == "token_tree");
+                if let Some(tokens) = tokens {
                     if let Some(body) = macro_token_body(&get_node_text(tokens, &probe_source)) {
                         nested.push(body);
                     }
@@ -4282,11 +4469,7 @@ fn probe_macro_body(inner: &str) -> (Vec<(String, Option<String>)>, Vec<String>)
             }
             _ => {}
         }
-        for index in 0..current.named_child_count() {
-            if let Some(child) = current.named_child(index) {
-                stack.push(child);
-            }
-        }
+        push_named_children(current, &mut stack);
     }
     (calls, nested)
 }
@@ -4311,14 +4494,23 @@ fn scoped_qualified_name(node: Node, source: &str, file_symbol_name: &str, name:
 }
 
 /// Strip references, pointers and generics down to a Rust type's bare name.
-fn rust_type_name(node: Node, source: &str) -> Option<String> {
+///
+/// Bounded depth for the same reason as `rust_type_qualifier` below: the
+/// unwrapping arms recurse once per layer, and `&&&…&T` written deeply enough
+/// exhausts the stack. A stack overflow aborts the process, so one hostile or
+/// generated file would take the whole build with it. Past the bound the type
+/// is simply not recovered, which costs a receiver binding and guesses nothing.
+fn rust_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
     match node.kind() {
         "reference_type" | "pointer_type" => node
             .child_by_field_name("type")
-            .and_then(|inner| rust_type_name(inner, source)),
+            .and_then(|inner| rust_type_name(inner, source, depth + 1)),
         "generic_type" => node
             .child_by_field_name("type")
-            .and_then(|inner| rust_type_name(inner, source)),
+            .and_then(|inner| rust_type_name(inner, source, depth + 1)),
         "type_identifier" | "scoped_type_identifier" => {
             let text = get_node_text(node, source);
             let bare = text.rsplit("::").next().unwrap_or(&text);
@@ -4360,14 +4552,14 @@ fn param_type_bindings(
                     .child_by_field_name("pattern")
                     .map(|pattern| get_node_text(pattern, source));
                 let ty_node = child.child_by_field_name("type");
-                let ty = ty_node.and_then(|ty| rust_type_name(ty, source));
+                let ty = ty_node.and_then(|ty| rust_type_name(ty, source, 0));
                 let qualifier = ty_node.and_then(|ty| rust_type_qualifier(ty, source, 0));
                 name.zip(ty).map(|(name, ty)| (name, ty, qualifier))
             }
             ("go", "parameter_declaration") => {
                 let name = get_child_text(child, "name", source);
                 let ty_node = child.child_by_field_name("type");
-                let ty = ty_node.and_then(|ty| go_type_name(ty, source));
+                let ty = ty_node.and_then(|ty| go_type_name(ty, source, 0));
                 let qualifier = ty_node.and_then(|ty| go_type_qualifier(ty, source, 0));
                 name.zip(ty).map(|(name, ty)| (name, ty, qualifier))
             }
@@ -4434,14 +4626,26 @@ fn rust_type_qualifier(node: Node, source: &str, depth: usize) -> Option<String>
     }
 }
 
-fn go_type_name(node: Node, source: &str) -> Option<String> {
+/// The bare name of a Go type, unwrapping the pointers around it.
+///
+/// Bounded depth for the same reason as `go_type_qualifier` above, and measured
+/// rather than assumed: `func (r **…*T) M() {}` at 10,000 levels — a ~10 KB
+/// file, four orders of magnitude under `MAX_SOURCE_BYTES` — overflowed the
+/// stack and aborted `devmap build` with exit 134. The tree walk itself is an
+/// explicit worklist and never recurses, so this function and `rust_type_name`
+/// were the whole of that overflow. Past the bound the receiver is not
+/// recovered and the method is named `file::M` rather than `file::T.M` — a lost
+/// qualification, never a guessed one.
+fn go_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
     match node.kind() {
         "pointer_type" => {
-            for index in 0..node.named_child_count() {
-                if let Some(child) = node.named_child(index) {
-                    if let Some(name) = go_type_name(child, source) {
-                        return Some(name);
-                    }
+            let mut pointer_cursor = node.walk();
+            for child in node.named_children(&mut pointer_cursor) {
+                if let Some(name) = go_type_name(child, source, depth + 1) {
+                    return Some(name);
                 }
             }
             None
@@ -4459,14 +4663,15 @@ fn go_type_name(node: Node, source: &str) -> Option<String> {
 }
 
 fn go_package_name(root: Node, source: &str) -> Option<String> {
-    for index in 0..root.named_child_count() {
-        let child = root.named_child(index)?;
+    let mut package_cursor = root.walk();
+    let mut identifier_cursor = root.walk();
+    for child in root.named_children(&mut package_cursor) {
         if child.kind() != "package_clause" {
             continue;
         }
         let name = get_child_text(child, "name", source).or_else(|| {
-            (0..child.named_child_count())
-                .filter_map(|inner| child.named_child(inner))
+            child
+                .named_children(&mut identifier_cursor)
                 .find(|node| node.kind() == "package_identifier")
                 .map(|node| get_node_text(node, source))
         })?;
@@ -4698,7 +4903,7 @@ fn enclosing_emitted_symbol_for(
 /// bind the other way. Every other `binary_operator` — arithmetic, comparison,
 /// a pipe — has operands that are uses, and this must not suppress them.
 fn is_r_binding_target(node: Node) -> bool {
-    let Some(parent) = node.parent() else {
+    let Some(parent) = bounded_parent(node) else {
         return false;
     };
     if parent.kind() != "binary_operator" {
@@ -4776,7 +4981,7 @@ fn node_contains(haystack: Node, needle: Node) -> bool {
 fn c_declarator_declaration(node: Node) -> Option<Node> {
     let mut current = node;
     let mut climbed = false;
-    while let Some(parent) = current.parent() {
+    while let Some(parent) = bounded_parent(current) {
         if parent
             .child_by_field_name("declarator")
             .is_none_or(|declarator| declarator.id() != current.id())
@@ -4811,8 +5016,7 @@ fn is_defining_name(node: Node) -> bool {
     // symbol it declares — `Main.kt::Mode.FAST` referencing `Main.kt::Mode.FAST`
     // — which is the self-reference shape
     // `c_family_declarations_do_not_reference_themselves` already pins for C.
-    if node
-        .parent()
+    if bounded_parent(node)
         .is_some_and(|parent| parent.kind() == "enum_entry")
     {
         return true;
@@ -4834,15 +5038,14 @@ fn is_defining_name(node: Node) -> bool {
     // self-reference shape `c_family_declarations_do_not_reference_themselves`
     // pins for C. A parameter's identifiers hang off `formal_parameter_list`
     // rather than off the signature, so this reaches only the name.
-    if node
-        .parent()
+    if bounded_parent(node)
         .is_some_and(|parent| parent.kind() == "constructor_signature")
     {
         return true;
     }
     let mut current = node;
     loop {
-        let Some(parent) = current.parent() else {
+        let Some(parent) = bounded_parent(current) else {
             return false;
         };
         if field_contains(parent, "name", node)
@@ -4930,6 +5133,145 @@ fn is_binding_wrapper(kind: &str) -> bool {
 thread_local! {
     static SCOPE_LOCALS: RefCell<HashMap<usize, HashSet<String>>> =
         RefCell::new(HashMap::new());
+    /// The deadline for the current file's extraction, readable by helpers that
+    /// the walk calls but does not pass arguments to.
+    static WALK_DEADLINE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    /// Set once a helper has stopped early because that deadline passed.
+    static WALK_OVERRAN: Cell<bool> = const { Cell::new(false) };
+    /// Ancestor steps taken since the clock was last read. See `bounded_parent`.
+    static PARENT_STEPS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Arms the extraction deadline for exactly as long as one file is being
+/// extracted, and disarms it on the way out of *every* path — including the
+/// early returns that refuse a file.
+///
+/// The deadline used to be armed inside `walk_tree` and never cleared, so it
+/// outlived the walk it belonged to: every phase that runs afterwards
+/// (`go_method_sets`, the Python passes, `clonesig`) saw a live deadline
+/// belonging to the *previous* file, and the next file's pre-walk phases saw
+/// one that had already expired. Nothing consulted it there yet, which is the
+/// only reason it was invisible; extending the bound past the walk — the point
+/// of this type — makes that stale value load-bearing. Tying arm and disarm to
+/// a scope means the invariant cannot be broken by adding a `return`.
+struct BudgetGuard;
+
+impl BudgetGuard {
+    fn arm(deadline: std::time::Instant) -> Self {
+        reset_scope_locals();
+        WALK_DEADLINE.with(|slot| slot.set(Some(deadline)));
+        WALK_OVERRAN.with(|slot| slot.set(false));
+        PARENT_STEPS.with(|slot| slot.set(0));
+        BudgetGuard
+    }
+}
+
+impl Drop for BudgetGuard {
+    fn drop(&mut self) {
+        WALK_DEADLINE.with(|slot| slot.set(None));
+        // `WALK_OVERRAN` is deliberately *not* cleared here. It is read by
+        // `extract_treesitter_with_budget` after the guard's scope ends to
+        // decide whether the file must be refused, and clearing it here would
+        // erase the one signal that says the answer is incomplete.
+    }
+}
+
+/// `bounded_parent(node)`, bounded by the extraction deadline.
+///
+/// **Every ancestor walk in this crate must go through this**, because
+/// `Node::parent()` is not O(1): tree-sitter reconstructs the parent by
+/// descending from the tree root, so one call costs O(depth) and climbing to
+/// the root costs **O(depth^2)**. Measured 2026-09-05 (release, macOS) on
+/// `func (r *…*T) M() {}`: one `parent()` from the deepest node takes 27.8 us
+/// at depth 1,000 and 434 us at depth 16,000, and a full ancestor walk takes
+/// 13.1 ms / 52.7 ms / 204.7 ms / 821.7 ms / 3.46 s at depth 1k / 2k / 4k / 8k
+/// / 16k — four times the cost for twice the depth, which is the signature.
+///
+/// That quadratic is why the stride in `walk_tree` was not a bound. The whole
+/// 13.15 s debug extraction of a 10 KB file was **two ancestor walks on a
+/// single node** — `is_inside_import_or_export` at 1.166 s and
+/// `enclosing_callable_qualified` at 1.145 s in release — so the walk's
+/// per-node clock check had no opportunity to fire between them, and the file
+/// was published `Clean` after running 2.6x past its 5 s budget. A stride is
+/// not a bound if one step is unbounded; this is where that step is bounded.
+///
+/// Returning `None` early reports "no further ancestors", which is a *wrong*
+/// answer, and that is safe only because it is never published: the same check
+/// latches `WALK_OVERRAN`, and `extract_treesitter_with_budget` turns that latch
+/// into a refusal for the whole file. This is the contract
+/// `collect_non_symbol_locals` already relies on.
+///
+/// The clock is read every `PARENT_CHECK_STRIDE` steps rather than every step
+/// because `Instant::now()` costs more than an ordinary ancestor hop on the
+/// happy path, where files nest tens of levels deep, not thousands.
+pub(crate) fn bounded_parent(node: Node<'_>) -> Option<Node<'_>> {
+    let steps = PARENT_STEPS.with(|slot| {
+        let next = slot.get() + 1;
+        slot.set(next);
+        next
+    });
+    if steps >= PARENT_CHECK_STRIDE {
+        PARENT_STEPS.with(|slot| slot.set(0));
+        if walk_deadline_passed() {
+            return None;
+        }
+    }
+    // A walk that has already overrun must not start another climb: the latch
+    // is set for the rest of the file, so every remaining ancestor walk stops
+    // at its first step instead of paying O(depth) apiece to reach the same
+    // refusal.
+    if walk_overran() {
+        return None;
+    }
+    node.parent()
+}
+
+/// Ancestor steps taken between clock reads. See `bounded_parent`.
+///
+/// Smaller than `DEADLINE_CHECK_STRIDE` because the steps are not comparable: a
+/// node visit is O(1) while an ancestor hop is O(depth). At the 1 MiB
+/// `MAX_SOURCE_BYTES` ceiling the deepest reachable nesting is around a million
+/// levels, where one hop measures ~27 ms, so 64 steps bounds the overshoot at
+/// roughly 1.7 s — inside the 5 s `DEFAULT_PARSE_BUDGET` and far inside the 10x
+/// tolerance `tests/budget_is_a_real_bound.rs` allows. A stride of 256 would put
+/// it at 6.9 s, which is past the budget it exists to enforce.
+const PARENT_CHECK_STRIDE: u32 = 64;
+
+/// True once a bounded helper gave up because the walk's deadline passed.
+///
+/// `walk_tree` checks the clock every `DEADLINE_CHECK_STRIDE` nodes, which
+/// bounds the *number* of nodes between checks but not the *work* inside any
+/// one of them. `collect_non_symbol_locals` walks a whole scope subtree per
+/// call, so a single `extract_node` could run for a minute while the stride
+/// counter sat at 1 — a stride is not a bound if one step is unbounded. This
+/// flag is how a helper that stopped early tells the walk to stop too, and it
+/// is a plain `Cell` read so the loop can consult it on every node.
+fn walk_overran() -> bool {
+    WALK_OVERRAN.with(|slot| slot.get())
+}
+
+/// Whether this file's extraction may still publish what it has.
+///
+/// Two ways to fail, and they are not the same question: a helper may have
+/// stopped early and latched `WALK_OVERRAN` — in which case the answers it
+/// returned are incomplete even though the clock may since have been reset —
+/// or the phase just finished may simply have run past the deadline while
+/// checking nothing. Either one means the result is not a complete read of the
+/// file, and a check that could not run must never report what a check that ran
+/// and passed reports.
+fn extraction_overran(deadline: std::time::Instant) -> bool {
+    walk_overran() || std::time::Instant::now() >= deadline
+}
+
+/// Deadline check for a helper running inside the walk. Latches the flag.
+fn walk_deadline_passed() -> bool {
+    match WALK_DEADLINE.with(|slot| slot.get()) {
+        Some(deadline) if std::time::Instant::now() >= deadline => {
+            WALK_OVERRAN.with(|slot| slot.set(true));
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Drop the per-scope local-name cache between files.
@@ -4971,13 +5313,13 @@ fn is_callable_node(node: Node) -> bool {
 
 fn enclosing_scope_node(node: Node) -> Node {
     let mut current = node;
-    let mut ancestor = node.parent();
+    let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         if is_callable_node(parent) {
             return parent;
         }
         current = parent;
-        ancestor = parent.parent();
+        ancestor = bounded_parent(parent);
     }
     current
 }
@@ -4997,7 +5339,7 @@ fn is_symbol_binding(node: Node) -> bool {
     if is_objc_declaring_identifier(node) {
         return true;
     }
-    let Some(parent) = node.parent() else {
+    let Some(parent) = bounded_parent(node) else {
         return false;
     };
     if matches!(
@@ -5036,12 +5378,19 @@ fn is_symbol_binding(node: Node) -> bool {
 fn collect_non_symbol_locals(scope: Node, source: &str) -> HashSet<String> {
     let mut locals = HashSet::new();
     let mut worklist = Vec::new();
-    for index in 0..scope.child_count() {
-        if let Some(child) = scope.child(index) {
-            worklist.push(child);
-        }
-    }
+    push_children(scope, &mut worklist);
+    let mut since_check = 0u32;
     while let Some(node) = worklist.pop() {
+        // Same stride idiom as `walk_tree`: this loop is per-scope and a
+        // pathological tree makes it the dominant cost of the whole
+        // extraction, so it has to be interruptible on its own.
+        since_check += 1;
+        if since_check >= DEADLINE_CHECK_STRIDE {
+            since_check = 0;
+            if walk_deadline_passed() {
+                break;
+            }
+        }
         if is_callable_node(node) {
             continue;
         }
@@ -5058,23 +5407,27 @@ fn collect_non_symbol_locals(scope: Node, source: &str) -> HashSet<String> {
                 locals.insert(name);
             }
         }
-        for index in (0..node.child_count()).rev() {
-            if let Some(child) = node.child(index) {
-                worklist.push(child);
-            }
-        }
+        push_children_reversed(node, &mut worklist);
     }
     locals
 }
 
 /// Run `visit` over one scope's local-name set, computing it once per scope.
 fn with_scope_locals<R>(scope: Node, source: &str, visit: impl FnOnce(&HashSet<String>) -> R) -> R {
-    SCOPE_LOCALS.with(|cache| {
-        let id = scope.id();
-        if !cache.borrow().contains_key(&id) {
-            let locals = collect_non_symbol_locals(scope, source);
-            cache.borrow_mut().insert(id, locals);
+    let id = scope.id();
+    let known = SCOPE_LOCALS.with(|cache| cache.borrow().contains_key(&id));
+    if !known {
+        let locals = collect_non_symbol_locals(scope, source);
+        if walk_overran() {
+            // A set the deadline cut short is not this scope's local-name set.
+            // The file is refused either way, but caching it would serve the
+            // wrong answer to every later lookup of the same scope in the
+            // meantime, so it is used once and not kept.
+            return visit(&locals);
         }
+        SCOPE_LOCALS.with(|cache| cache.borrow_mut().insert(id, locals));
+    }
+    SCOPE_LOCALS.with(|cache| {
         let borrowed = cache.borrow();
         match borrowed.get(&id) {
             Some(locals) => visit(locals),
@@ -5137,8 +5490,9 @@ const PARAMETER_LIST_KINDS: [&str; 5] = [
 /// `type` and `value` fields are not descended into: `def f(x: Widget)` binds
 /// `x` and refers to `Widget`.
 fn collect_parameter_names(callable: Node, source: &str, out: &mut BTreeSet<String>) {
-    let Some(params) = (0..callable.child_count())
-        .filter_map(|index| callable.child(index))
+    let mut params_cursor = callable.walk();
+    let Some(params) = callable
+        .children(&mut params_cursor)
         .find(|child| PARAMETER_LIST_KINDS.contains(&child.kind()))
     else {
         return;
@@ -5186,11 +5540,7 @@ fn collect_scope_locals(root: Node, source: &str, file_symbol_name: &str) -> Vec
                 collect_parameter_names(node, source, entry);
             }
         }
-        for index in 0..node.child_count() {
-            if let Some(child) = node.child(index) {
-                worklist.push(child);
-            }
-        }
+        push_children(node, &mut worklist);
     }
     by_scope
         .into_iter()
@@ -5199,7 +5549,7 @@ fn collect_scope_locals(root: Node, source: &str, file_symbol_name: &str) -> Vec
 }
 
 fn is_inside_import_or_export(node: Node) -> bool {
-    let mut current = node.parent();
+    let mut current = bounded_parent(node);
     while let Some(parent) = current {
         if matches!(
             parent.kind(),
@@ -5243,13 +5593,13 @@ fn is_inside_import_or_export(node: Node) -> bool {
         ) {
             return true;
         }
-        current = parent.parent();
+        current = bounded_parent(parent);
     }
     false
 }
 
 fn is_call_callee(node: Node) -> bool {
-    let Some(parent) = node.parent() else {
+    let Some(parent) = bounded_parent(node) else {
         return false;
     };
     // An Objective-C keyword message has one `method` field per selector part,
@@ -5279,7 +5629,7 @@ fn is_call_callee(node: Node) -> bool {
         if let Some(callee) = callee {
             // A walk up from `node` used to sit here, looking for the callee
             // among its ancestors. It was dead by construction: this branch is
-            // only entered when `node.parent()` *is* the call, so the first
+            // only entered when `bounded_parent(node)` *is* the call, so the first
             // ancestor examined is always that same parent and the walk broke
             // immediately. Instrumented over 4,421 files in five languages it
             // never once reached the callee or iterated twice.
@@ -5308,7 +5658,7 @@ fn is_call_callee(node: Node) -> bool {
             .or_else(|| parent.child_by_field_name("field"))
             .is_some_and(|member| member.id() == node.id());
         if is_member_half {
-            if let Some(grand) = parent.parent() {
+            if let Some(grand) = bounded_parent(parent) {
                 // The `function` check is redundant in every linked grammar —
                 // arguments are wrapped in `arguments`/`argument_list`, so a
                 // member expression that is a direct child of a call is always
@@ -5331,7 +5681,7 @@ fn is_call_callee(node: Node) -> bool {
 
 fn assignment_binding(mut node: Node, source: &str) -> Option<String> {
     for _ in 0..4 {
-        node = node.parent()?;
+        node = bounded_parent(node)?;
         let binding = match node.kind() {
             "assignment"
             | "assignment_expression"

@@ -327,6 +327,123 @@ fn a_pathological_source_is_refused_within_its_budget() {
     );
 }
 
+/// Deep *nesting* must be bounded by the budget, exactly as deep braces are.
+///
+/// The sibling case `a_pathological_source_is_refused_within_its_budget` pins a
+/// C++ file whose cost is in the parse and the walk. This one attacks a
+/// different axis and a different code path, and it is the one that got past
+/// the bound: measured 2026-09-05 against the unfixed extractor, a **10 KB** Go
+/// file — four orders of magnitude under `MAX_SOURCE_BYTES` — holding
+/// `func (r *…*T) M() {}` at depth 10,000 took **13.15 s under a 5 s budget**
+/// and was published `ParseOutcome::Clean`.
+///
+/// Nothing in the walk could stop it. `walk_tree` reads the clock every
+/// `DEADLINE_CHECK_STRIDE` nodes and it did — 78 times over 20,028 nodes — but
+/// 13.15 s of the 13.15 s was spent inside a **single** `extract_node` call on
+/// the innermost `type_identifier`, in two ancestor walks:
+/// `is_inside_import_or_export` (1.166 s) and `enclosing_callable_qualified`
+/// (1.145 s) in release. `Node::parent()` is not O(1) — tree-sitter rebuilds the
+/// parent by descending from the root — so climbing to the root is O(depth^2):
+/// 13.1 ms / 52.7 ms / 204.7 ms / 821.7 ms / 3.46 s at depth 1k / 2k / 4k / 8k /
+/// 16k, four times the cost for twice the depth.
+///
+/// A stride bounds the number of steps between clock reads, not the work inside
+/// one step, so the bound has to live where the unbounded step is —
+/// `bounded_parent`. The quadratic itself is *not* fixed here; it is bounded.
+///
+/// Asserted the way the sibling test asserts: an elapsed bound, and a refusal
+/// that names the budget. `Clean` is the failure this exists to catch —
+/// publishing a file the extractor did not finish reading is the same defect as
+/// presenting a capped sample as complete coverage.
+#[test]
+fn a_deeply_nested_source_is_refused_within_its_budget() {
+    use std::time::{Duration, Instant};
+
+    // The depth the 2026-09-05 measurement used: 13.15 s against the 5 s
+    // `DEFAULT_PARSE_BUDGET`, and 65x the 200 ms budget asserted here. Chosen
+    // over something deeper so that a *red* run of this test against the
+    // unfixed extractor finishes in seconds rather than in twenty minutes —
+    // a test nobody can afford to run in the failing direction is not evidence.
+    let hostile = format!(
+        "package svc\n\ntype T struct{{}}\n\nfunc (r {}T) M() {{}}\n",
+        "*".repeat(10_000)
+    );
+    assert!(
+        (hostile.len() as u64) < devmap_extract::MAX_SOURCE_BYTES,
+        "the input stays under the source ceiling: {} bytes",
+        hostile.len()
+    );
+    let budget = Duration::from_millis(200);
+
+    let started = Instant::now();
+    let extraction = devmap_extract::treesitter::extract_treesitter_with_budget(
+        "svc/deep.go",
+        "go",
+        &hostile,
+        budget,
+    );
+    let elapsed = started.elapsed();
+
+    // The budget must bound the *whole* call, not one phase of it. Before the
+    // fix the parse was given `budget` and the walk was then given a fresh
+    // `budget` of its own, and everything after the walk had none at all.
+    assert!(
+        elapsed < budget * 20,
+        "a {budget:?} budget must bound extraction of {} bytes; it took {elapsed:?} \
+         ({:.0}x over)",
+        hostile.len(),
+        elapsed.as_secs_f64() / budget.as_secs_f64()
+    );
+
+    let reason = match &extraction.parse_outcome {
+        ParseOutcome::Failed { reason } => reason.clone(),
+        other => panic!(
+            "an extraction cut short must be Failed, not {other:?}; it ran for {elapsed:?} \
+             against a {budget:?} budget"
+        ),
+    };
+    assert!(
+        reason.contains("budget"),
+        "the refusal must name the budget, got {reason:?}"
+    );
+    assert!(
+        !reason.contains("no linked tree-sitter grammar"),
+        "a grammar that exists must never be reported missing: {reason:?}"
+    );
+
+    // Exactly the File node: nothing recovered from a file that was not read.
+    let declarations: Vec<_> = extraction
+        .symbols
+        .iter()
+        .filter(|s| s.kind != devmap_extract::model::SymbolKind::File)
+        .collect();
+    assert!(
+        declarations.is_empty(),
+        "an abandoned extraction must claim no declarations, got {declarations:?}"
+    );
+
+    // And the bound was not bought by refusing Go outright.
+    let ok = devmap_extract::treesitter::extract_treesitter_with_budget(
+        "svc/fine.go",
+        "go",
+        "package svc\n\ntype T struct{}\n\nfunc (r *T) M() {}\n",
+        Duration::from_secs(60),
+    );
+    assert!(
+        matches!(ok.parse_outcome, ParseOutcome::Clean),
+        "ordinary Go still parses cleanly: {:?}",
+        ok.parse_outcome
+    );
+    assert!(
+        ok.symbols.iter().any(|s| s.qualified_name == "svc/fine.go::T.M"),
+        "and still qualifies its methods: {:?}",
+        ok.symbols
+            .iter()
+            .map(|s| s.qualified_name.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
 /// A source containing a NUL byte is refused before any grammar sees it.
 ///
 /// Not a style rule — a liveness one. Measured 2026-09-04: `"a\0b\0c\n"`, six
@@ -432,4 +549,213 @@ fn cobol_is_refused_promptly_rather_than_parsed_by_a_nonterminating_grammar() {
             "the File node is still emitted for {source:?}"
         );
     }
+}
+
+/// A Go method whose receiver is pointed at thousands of levels must not abort
+/// the process.
+///
+/// `go_type_name` and `rust_type_name` were the only two of six sibling type
+/// walkers without the `depth > 16` bound the other four carry
+/// (`go_composite_literal_type`, `split_call_target_inner`, `go_type_qualifier`,
+/// `rust_type_qualifier`). Measured through the shipped binary: a ~10 KB Go file
+/// holding `func (r **…*T) M() {}` — four orders of magnitude under
+/// `MAX_SOURCE_BYTES` — ended `devmap build` with `thread '<unknown>' has
+/// overflowed its stack` and `exit=134`. Neither the parse budget nor the tree
+/// walk can catch it: `walk_tree` is an explicit worklist and never recurses, so
+/// the whole overflow lived in these two functions.
+///
+/// The depth here is measured, not guessed. Against the unfixed code on a
+/// 2 MiB libtest thread, 3,000 completes and 4,000 aborts; 6,000 sits at twice
+/// the threshold while costing a third of the audit's 10,000, which is worth
+/// caring about because extraction of this shape is quadratic in the nesting
+/// (0.5 s at 2,000, 3.0 s at 5,000, 12.3 s at 10,000).
+///
+/// That quadratic is why this runs against an explicit budget rather than
+/// `extract_file`'s `DEFAULT_PARSE_BUDGET`. Since the budget became a bound on
+/// the *whole* extraction rather than on the walk alone, a debug build at depth
+/// 6,000 spends its full 5 s in `bounded_parent` and is — correctly — refused,
+/// which would make this test assert the time limit instead of the thing it is
+/// named for. One test, one property: the budget is pinned by
+/// `a_pathological_source_is_refused_within_its_budget` and
+/// `tests/budget_is_a_real_bound.rs`, and this one asks only whether a
+/// thousand-deep type expression can still end the process.
+///
+/// Past the bound the receiver is simply not recovered, so the method is named
+/// `file::M` instead of `file::T.M` — a lost qualification, never a guessed one.
+#[test]
+fn a_deeply_pointed_go_receiver_terminates_without_overflowing() {
+    for depth in [1usize, 12, 6_000] {
+        let source = format!(
+            "package svc\n\ntype T struct{{}}\n\nfunc (r {}T) M() {{}}\n",
+            "*".repeat(depth)
+        );
+        assert!(
+            (source.len() as u64) < devmap_extract::MAX_SOURCE_BYTES,
+            "the input stays under the source ceiling; depth {depth} is {} bytes",
+            source.len()
+        );
+        // Reaching the next line at all is the point.
+        let extraction = devmap_extract::treesitter::extract_treesitter_with_budget(
+            "svc/deep.go",
+            "go",
+            &source,
+            std::time::Duration::from_secs(120),
+        );
+        assert!(
+            !matches!(extraction.parse_outcome, ParseOutcome::Failed { .. }),
+            "depth {depth} must not fail outright: {:?}",
+            extraction.parse_outcome
+        );
+        let method: Vec<&str> = extraction
+            .symbols
+            .iter()
+            .filter(|s| s.name == "M")
+            .map(|s| s.qualified_name.as_str())
+            .collect();
+        if depth <= 16 {
+            assert_eq!(
+                method,
+                vec!["svc/deep.go::T.M"],
+                "within the bound the receiver type still qualifies the method \
+                 at depth {depth}"
+            );
+        } else {
+            assert_eq!(
+                method,
+                vec!["svc/deep.go::M"],
+                "past the bound the method drops its qualification rather than \
+                 guessing one; depth {depth}"
+            );
+        }
+        for symbol in &extraction.symbols {
+            assert!(
+                !symbol.qualified_name.contains('*'),
+                "a type expression must never reach a qualified name: {:?}",
+                symbol.qualified_name
+            );
+        }
+    }
+}
+
+/// A `}` written before a `{` is ordinary JavaScript, and must be indexed.
+///
+/// The import/export arm located the binding clause by scanning the statement's
+/// text for `{` and `}` independently, with no check that the opening brace came
+/// first. `export const isClose = (c) => c === '}' || c === '{';` — a one-line
+/// file of valid, idiomatic JavaScript — inverted the slice range and panicked
+/// (`byte range starts at 51 but ends at 37`). Under `extract_all` that panic
+/// unwinds out of a rayon `par_iter` and takes the whole build with it, and the
+/// release profile sets `panic = "abort"`; measured through the shipped binary,
+/// `devmap build` exited 101 on this single file.
+///
+/// The same scan was also wrong in the *quiet* direction, which is why the fix
+/// is structural rather than an ordering check: with the braces the other way
+/// round it did not panic, it fabricated an import and an export of a name
+/// spelled `'`. Neither statement has a binding clause at all, and the grammar
+/// says so — so the clause is now taken from the `export_clause` /
+/// `named_imports` node instead of from the statement's text.
+#[test]
+fn a_brace_literal_in_an_export_is_indexed_rather_than_aborting_the_build() {
+    for source in [
+        "export const isClose = (c) => c === '}' || c === '{';\n",
+        "export const isClose = (c) => c === '{' || c === '}';\n",
+    ] {
+        let extraction = extract_file("util.js", source);
+        assert!(
+            matches!(extraction.parse_outcome, ParseOutcome::Clean),
+            "{source:?} is valid JavaScript: {:?}",
+            extraction.parse_outcome
+        );
+
+        // Not merely "did not crash": the declaration must actually be indexed.
+        let found: Vec<(&str, &str)> = extraction
+            .symbols
+            .iter()
+            .filter(|s| s.kind != devmap_extract::model::SymbolKind::File)
+            .map(|s| (s.name.as_str(), s.qualified_name.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![("isClose", "util.js::isClose")],
+            "the exported arrow function must be indexed; {source:?}"
+        );
+        assert!(
+            extraction
+                .symbols
+                .iter()
+                .any(|s| s.name == "isClose" && s.is_exported),
+            "`export const` marks the symbol exported; {source:?}"
+        );
+
+        // A brace inside a string literal is not a binding clause.
+        assert!(
+            extraction.imports.is_empty(),
+            "a statement with no module specifier and no binding clause imports \
+             nothing; {source:?} produced {:?}",
+            extraction.imports
+        );
+        let exported: Vec<&str> = extraction
+            .exports
+            .iter()
+            .map(|e| e.exported_name.as_str())
+            .collect();
+        assert!(
+            !exported.contains(&"'"),
+            "a quote is not an exported name; {source:?} produced {exported:?}"
+        );
+        assert!(
+            exported.contains(&"isClose"),
+            "the real export must survive; {source:?} produced {exported:?}"
+        );
+    }
+
+    // The same fabrication in its commonest form: any exported declaration with
+    // a brace in it was read as a binding list. `export function work() {
+    // return {}; }` imported and exported a name spelled `return`, and
+    // `export const o = { k: 'v' };` one spelled `k:`. Both are ordinary code,
+    // and both put a node in the graph that can never join to anything.
+    for (source, real) in [
+        ("export function work() { return {}; }\n", "work"),
+        ("export const o = { k: 'v' };\n", "o"),
+        ("export default function foo() { return 1; }\n", "foo"),
+    ] {
+        let extraction = extract_file("mod.js", source);
+        assert!(
+            extraction.imports.is_empty(),
+            "{source:?} imports nothing; got {:?}",
+            extraction.imports
+        );
+        let exported: Vec<&str> = extraction
+            .exports
+            .iter()
+            .map(|e| e.exported_name.as_str())
+            .collect();
+        assert!(
+            exported.contains(&real),
+            "the real export must survive; {source:?} produced {exported:?}"
+        );
+        for name in &exported {
+            assert!(
+                *name == real || *name == "mod.js",
+                "{source:?} fabricated an export named {name:?}"
+            );
+        }
+    }
+
+    // The control: a genuine binding clause is still read, so the fix removed a
+    // fabrication rather than the feature.
+    let real = extract_file("real.js", "import { a, b as c } from './x';\n");
+    let bound: Vec<(&[String], &[String])> = real
+        .imports
+        .iter()
+        .map(|i| (i.imported_names.as_slice(), i.local_names.as_slice()))
+        .collect();
+    assert_eq!(
+        bound,
+        vec![(
+            ["a".to_string(), "b".to_string()].as_slice(),
+            ["a".to_string(), "c".to_string()].as_slice()
+        )],
+        "a real named-import clause still binds every name"
+    );
 }

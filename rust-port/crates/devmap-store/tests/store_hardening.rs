@@ -1537,3 +1537,863 @@ fn body_signatures_survive_an_incremental_carry_forward() {
         summary.groups
     );
 }
+
+// ---------------------------------------------------------------------------
+// Class A gates: a check that could not run must never answer like a check
+// that ran and passed. Each test below failed against the tree as it stood
+// before its fix; the assertion messages state the old behaviour so a later
+// reader can tell a regression from a deliberate re-specification.
+// ---------------------------------------------------------------------------
+
+/// The fixture behind the `callers_of` gates: two files whose calls into a
+/// third resolve deterministically, so the confidence floor has something real
+/// to include and to exclude.
+fn store_with_two_callers() -> Store {
+    let extractions = vec![
+        extract_file("lib.py", "def helper():\n    return 1\n"),
+        extract_file(
+            "c1.py",
+            "from lib import helper\n\ndef a():\n    return helper()\n",
+        ),
+        extract_file(
+            "c2.py",
+            "from lib import helper\n\ndef b():\n    return helper()\n",
+        ),
+    ];
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions);
+    let analysis = analyze(&extractions, &resolution);
+    let store = Store::open_in_memory().unwrap();
+    store
+        .save_generation(&extractions, &resolution, &analysis)
+        .unwrap();
+    store
+}
+
+/// S-1: `callers_of` must refuse a NaN floor, not answer "nothing calls this".
+///
+/// `callers_of` was the one confidence-filtered edge query that did not pass
+/// its threshold through `checked_min_confidence`. rusqlite binds `f32::NAN`
+/// as a REAL, SQLite stores that as NULL, and
+/// `CAST(ROUND(e.confidence*1000) AS INTEGER) >= CAST(ROUND(?3*1000) AS INTEGER)`
+/// is then NULL for every row — so the query returned `Ok(vec![])` and
+/// `devmap preview --min-confidence nan` printed "no calls from other files
+/// are affected" for two callers at confidence 1.00, then blamed the omission
+/// on "a bare method name matching many definitions". An empty list is also
+/// what a filter that *ran* returns, so the caller could not tell the two
+/// apart. The sibling surfaces already refused this input, which is exactly
+/// what made the gap invisible: `deps` errored on the same store while
+/// `preview` answered.
+#[test]
+fn s1_callers_of_refuses_a_nan_confidence_floor_instead_of_answering_empty() {
+    let store = store_with_two_callers();
+    let names = vec!["lib.py::helper".to_string()];
+
+    // Control: with a real floor the two callers are found, so an empty answer
+    // below can only mean the filter, never an empty fixture.
+    let all = store.callers_of(&names, "lib.py", 0.0).unwrap();
+    assert_eq!(
+        all.len(),
+        2,
+        "fixture must have two cross-file callers: {all:?}"
+    );
+    assert!(
+        all.iter().all(|edge| edge.confidence >= 0.99),
+        "both callers resolve deterministically: {all:?}"
+    );
+
+    let refused = store
+        .callers_of(&names, "lib.py", f32::NAN)
+        .expect_err("a NaN floor must be refused, not answered with an empty list");
+    assert!(
+        refused.to_string().contains("NaN"),
+        "the refusal must name the input it cannot evaluate: {refused}"
+    );
+
+    // The guard must refuse NaN and nothing else. A guard that refuses every
+    // threshold trades one silently wrong answer for another.
+    assert_eq!(
+        store.callers_of(&names, "lib.py", 0.5).unwrap().len(),
+        2,
+        "a finite floor below the edges must still admit them"
+    );
+    assert!(
+        store.callers_of(&names, "lib.py", 1.01).unwrap().is_empty(),
+        "a finite floor above every edge is a filter that ran and matched \
+         nothing, which is a real result and must not be refused"
+    );
+
+    // Sibling parity: same store, same input, same answer.
+    assert!(
+        store.latest_edges_for_file("c1.py", f32::NAN).is_err(),
+        "sibling surfaces already refuse NaN; callers_of must agree"
+    );
+    assert!(store.latest_edges(f32::NAN).is_err());
+}
+
+/// S-1: the exclusion and the empty-`names` shortcut still behave.
+///
+/// The guard is the *first* statement in the function, ahead of the
+/// `names.is_empty()` shortcut: a threshold nobody can evaluate is nonsense
+/// whether or not there is anything to compare it against, and the sibling at
+/// `latest_edges_for_file` refuses it before looking for a generation too.
+/// Pinned so a later reordering cannot re-open the hole for empty input.
+#[test]
+fn s1_callers_of_excludes_the_rewritten_file_and_refuses_nan_even_with_no_names() {
+    let store = store_with_two_callers();
+    let from_c1 = store
+        .callers_of(&["lib.py::helper".to_string()], "c1.py", 0.0)
+        .unwrap();
+    assert_eq!(
+        from_c1.len(),
+        1,
+        "the excluded file's own call must not be reported: {from_c1:?}"
+    );
+    assert_eq!(from_c1[0].source_file, "c2.py");
+
+    assert!(
+        store.callers_of(&[], "lib.py", 0.0).unwrap().is_empty(),
+        "no names is no rows, without touching the database"
+    );
+    assert!(
+        store.callers_of(&[], "lib.py", f32::NAN).is_err(),
+        "an unanswerable threshold is refused before the empty-names shortcut"
+    );
+}
+
+/// S-10: a backslash is a legal character in a Unix filename, not a separator.
+///
+/// `canonical_pending_entry` normalised `\` to `/` unconditionally, so the
+/// queued path `a\b.py` became `a/b.py`: a *different* file, which then failed
+/// classification because nothing is at that path, and was deleted from the
+/// queue as garbage. The file was never indexed and `status` still reported
+/// fresh — the queue's own record of the outstanding work was destroyed by the
+/// normalisation meant to canonicalise it.
+#[cfg(unix)]
+#[test]
+fn s10_a_unix_filename_containing_a_backslash_is_not_rewritten_into_another_path() {
+    let dir = tmp_dir("s10-backslash");
+    let root = dir.join("repo");
+    fs::create_dir_all(&root).unwrap();
+    let odd = "a\\b.py";
+    fs::write(root.join(odd), "def a(): pass\n").unwrap();
+    assert!(
+        root.join(odd).exists(),
+        "the fixture must be one file whose name contains a backslash"
+    );
+
+    let store = Store::open(dir.join("devmap.sqlite")).unwrap();
+    let report = store
+        .enqueue_pending_paths_under_root(&root, &[odd.to_string()])
+        .unwrap();
+    assert_eq!(
+        report.enqueued,
+        vec![odd.to_string()],
+        "the queued spelling must be the filename, not a two-component path"
+    );
+
+    let outcome = store.reconcile_pending_paths(&root).unwrap();
+    assert!(
+        outcome.dropped.is_empty(),
+        "a real indexable source must not be dropped: {:?}",
+        outcome.dropped
+    );
+    assert_eq!(
+        store.get_pending_paths().unwrap(),
+        vec![odd.to_string()],
+        "the row must survive reconcile under its own name"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// S-3: a stat that could not run must not delete the queued path.
+///
+/// `classify_pending_entry` matched every `symlink_metadata` error as "the
+/// file is absent", so ELOOP from a symlink loop in a parent — or EACCES from
+/// a parent that lost `+x`, or EIO/ESTALE from a network mount — deleted the
+/// row exactly as a genuine ENOENT did. The queued file was then never
+/// indexed, the deletion was reported as garbage collection, and `status`
+/// reported fresh. Only `ErrorKind::NotFound` is evidence of absence; every
+/// other errno is transient, so the row is kept, retried, and eventually
+/// quarantined — which is visible.
+#[cfg(unix)]
+#[test]
+fn s3_a_stat_that_could_not_run_keeps_the_pending_row_instead_of_deleting_it() {
+    let dir = tmp_dir("s3-eloop");
+    let root = dir.join("repo");
+    fs::create_dir_all(&root).unwrap();
+    // A self-referential symlink: `symlink_metadata` on anything *below* it
+    // fails with ELOOP while resolving the parent, which is not ENOENT.
+    std::os::unix::fs::symlink("loop", root.join("loop")).unwrap();
+    let probe = std::fs::symlink_metadata(root.join("loop/x.py"))
+        .expect_err("the fixture must make the stat fail");
+    assert_ne!(
+        probe.kind(),
+        std::io::ErrorKind::NotFound,
+        "the fixture must fail for a reason other than absence, got {probe:?}"
+    );
+
+    let store = Store::open(dir.join("devmap.sqlite")).unwrap();
+    store
+        .enqueue_pending_paths(&["loop/x.py".to_string(), "gone.py".to_string()])
+        .unwrap();
+
+    let outcome = store.reconcile_pending_paths(&root).unwrap();
+    let remaining = store.get_pending_paths().unwrap();
+    assert!(
+        remaining.contains(&"loop/x.py".to_string()),
+        "a path whose stat failed is unknown, not absent, and must be retried: \
+         {remaining:?} (dropped {:?})",
+        outcome.dropped
+    );
+    // Positive control: the fix must not turn every drop into a retain. A path
+    // that is genuinely absent with nothing indexed under it is still garbage.
+    assert!(
+        !remaining.contains(&"gone.py".to_string()),
+        "a genuine ENOENT with nothing indexed under it is still dropped: \
+         {remaining:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// S-3, one level up: a `canonicalize` that could not run is not "outside the
+/// repository root".
+///
+/// `canonical_pending_entry` reached for `root.canonicalize().ok()` to rescue
+/// absolute rows written by the old watcher — a symlinked checkout makes the
+/// lexical prefix test fail on paths that are genuinely inside the tree. When
+/// that canonicalize *failed*, the `.ok()` turned "I cannot tell" into `None`,
+/// and `reconcile_pending_paths` deletes a `None` as a row that escapes the
+/// root. The containment test never ran, and the row was destroyed on its
+/// verdict.
+#[cfg(unix)]
+#[test]
+fn s3_an_uncanonicalizable_root_does_not_delete_rows_as_escaping_it() {
+    let dir = tmp_dir("s3-canon");
+    let canonical_dir = dir.canonicalize().unwrap();
+    fs::create_dir_all(dir.join("real")).unwrap();
+    fs::write(dir.join("real/a.py"), "def a(): pass\n").unwrap();
+    std::os::unix::fs::symlink("real", dir.join("link")).unwrap();
+    let root = dir.join("link");
+    // An absolute row of the shape the old watcher produced: inside the tree,
+    // but only reachable through the root's canonical spelling.
+    let absolute = canonical_dir.join("real/a.py").display().to_string();
+
+    let store = Store::open(dir.join("devmap.sqlite")).unwrap();
+    store
+        .enqueue_pending_paths(std::slice::from_ref(&absolute))
+        .unwrap();
+
+    // Control: while the root canonicalizes, the row is recognised as inside
+    // and rewritten to its canonical relative spelling.
+    let rescued = store.reconcile_pending_paths(&root).unwrap();
+    assert!(
+        rescued.dropped.is_empty(),
+        "a row inside the tree must not be dropped: {:?}",
+        rescued.dropped
+    );
+    assert_eq!(store.get_pending_paths().unwrap(), vec!["a.py".to_string()]);
+
+    // Now break the canonicalize itself, leaving the row's containment
+    // genuinely undecidable.
+    store
+        .enqueue_pending_paths(std::slice::from_ref(&absolute))
+        .unwrap();
+    fs::remove_file(dir.join("link")).unwrap();
+    std::os::unix::fs::symlink("link", dir.join("link")).unwrap();
+    assert!(
+        root.canonicalize().is_err(),
+        "the fixture must make the root uncanonicalizable"
+    );
+
+    let outcome = store.reconcile_pending_paths(&root).unwrap();
+    let remaining = store.get_pending_paths().unwrap();
+    assert!(
+        remaining.contains(&absolute),
+        "an undecidable containment must keep the row, not delete it as \
+         escaping the root: {remaining:?} (dropped {:?})",
+        outcome.dropped
+    );
+    assert!(
+        outcome
+            .dropped
+            .iter()
+            .all(|(_, reason)| !reason.contains("escapes")),
+        "no row may be reported as escaping the root on a check that did not \
+         run: {:?}",
+        outcome.dropped
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// S-3, the enqueue door: the same undecidable case must not be *reported* as
+/// a containment failure either.
+///
+/// `enqueue_pending_paths_under_root` surfaces refusals to its caller, and
+/// "outside the repository root" is a positive claim. Made on a canonicalize
+/// that failed, it sends the reader looking for a misconfigured watcher
+/// instead of at the unreadable root that actually caused it.
+#[cfg(unix)]
+#[test]
+fn s3_enqueue_refusal_names_the_failed_check_rather_than_claiming_containment() {
+    let dir = tmp_dir("s3-enqueue");
+    let canonical_dir = dir.canonicalize().unwrap();
+    fs::create_dir_all(dir.join("real")).unwrap();
+    std::os::unix::fs::symlink("link", dir.join("link")).unwrap();
+    let root = dir.join("link");
+    let absolute = canonical_dir.join("real/a.py").display().to_string();
+
+    let store = Store::open_in_memory().unwrap();
+    let report = store
+        .enqueue_pending_paths_under_root(&root, std::slice::from_ref(&absolute))
+        .unwrap();
+    assert_eq!(report.refused.len(), 1, "{report:?}");
+    let (_, reason) = &report.refused[0];
+    assert!(
+        !reason.contains("outside the repository root"),
+        "a check that could not run must not claim the path is outside: {reason}"
+    );
+    assert!(
+        reason.contains("could not be checked"),
+        "the refusal must say the check failed: {reason}"
+    );
+
+    // Positive control: a path that really is outside is still refused as
+    // outside, so the honest message is not the only message.
+    let outside = canonical_dir
+        .parent()
+        .unwrap()
+        .join("elsewhere/x.py")
+        .display()
+        .to_string();
+    let real_root = dir.join("real");
+    let refused_outside = store
+        .enqueue_pending_paths_under_root(&real_root, &[outside])
+        .unwrap();
+    assert_eq!(refused_outside.refused.len(), 1);
+    assert!(
+        refused_outside.refused[0]
+            .1
+            .contains("outside the repository root"),
+        "{:?}",
+        refused_outside.refused
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// R7 gate: a metric row must not put a partial numerator beside a
+// whole-generation denominator. `build_history` exists to show a trend, and a
+// trend drawn from two different populations is not one.
+// ---------------------------------------------------------------------------
+
+/// S-2: `parse_failed` and `languages_covered` describe the generation, not the
+/// slice of extractions this particular write happened to carry.
+///
+/// `files`, `symbols` and `edges` on the same row are `COUNT(*)` over the whole
+/// generation, while these two were computed over the input slice. An
+/// incremental build passes only the fresh extractions, so a one-line edit in a
+/// twelve-language tree wrote `files: N` beside `languages_covered: 1` and
+/// `parse_failed: 0` — `devmap history` showed the repository losing every
+/// other language and repairing every parse failure on each incremental build,
+/// then regaining both on the next cold one.
+#[test]
+fn s2_build_history_counts_the_whole_generation_not_the_written_slice() {
+    // Same `.vb` fixture as the cold-build history gate: a language with no
+    // linked grammar whose content also yields nothing to pattern recovery, so
+    // the canonical classifier calls it a parse failure.
+    let live = extract_file("src/live.py", "def live():\n    return 1\n");
+    let broken = extract_file("src/legacy.vb", "' just a comment\n\n");
+    assert!(
+        broken.is_parse_failure(),
+        "fixture precondition: the `.vb` file must be a parse failure, got {:?}/{:?}",
+        broken.parse_outcome,
+        broken.engine
+    );
+    assert_ne!(
+        live.language, broken.language,
+        "fixture precondition: the two files must be different languages"
+    );
+
+    let cold = vec![live.clone(), broken.clone()];
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&cold);
+    let resolution = resolver.resolve_all(&cold);
+    let analysis = analyze(&cold, &resolution);
+
+    let store = Store::open_in_memory().unwrap();
+    store
+        .save_generation_with_metadata(
+            &cold,
+            &resolution,
+            &analysis,
+            GenerationWriteOpts::default(),
+            "cold-head",
+        )
+        .unwrap();
+
+    // Positive control: the whole-tree write already reported both honestly.
+    let cold_row = store.build_history(10).unwrap().remove(0);
+    assert_eq!(cold_row.files, 2);
+    assert_eq!(cold_row.parse_failed, 1, "cold build");
+    assert_eq!(cold_row.languages_covered, 2, "cold build");
+
+    // Now edit only the Python file. The `.vb` file is carried forward, so it
+    // is still a row of this generation — it is simply not in the slice.
+    let live2 = extract_file("src/live.py", "def live():\n    return 2\n");
+    let fresh = vec![live2];
+    let mut resolver2 = Resolver::new();
+    resolver2.index_extractions(&fresh);
+    let resolution2 = resolver2.resolve_all(&fresh);
+    let analysis2 = analyze(&fresh, &resolution2);
+    store
+        .save_generation_with_metadata(
+            &fresh,
+            &resolution2,
+            &analysis2,
+            GenerationWriteOpts {
+                affected_paths: vec!["src/live.py".into()],
+                deleted_paths: vec![],
+                build_started: None,
+                repo_root: None,
+            },
+            "warm-head",
+        )
+        .unwrap();
+
+    let warm_row = store.build_history(10).unwrap().remove(0);
+    assert_eq!(warm_row.head_sha, "warm-head");
+    assert_eq!(
+        warm_row.files, 2,
+        "the denominator is the whole generation: both files are still in it"
+    );
+    assert_eq!(
+        warm_row.parse_failed, 1,
+        "the carried-forward parse failure is still a file of this generation; \
+         counting only the written slice reported 0 and made `devmap history` \
+         show every parse failure repairing itself on each incremental build"
+    );
+    assert_eq!(
+        warm_row.languages_covered, 2,
+        "the generation still covers both languages; counting only the written \
+         slice reported 1 and made the repository appear to lose a language"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Store-integrity gates: an eviction rule that cannot reach the rows it exists
+// to remove, a gate narrower than the schema it asserts, and a connection that
+// skips the crate's own contention policy.
+// ---------------------------------------------------------------------------
+
+/// A store on disk holding one committed generation for `src/helper.py`,
+/// returned with the cache key that identifies its payload.
+fn store_with_one_cached_file(dir: &std::path::Path) -> (Store, PathBuf, CacheKey) {
+    let db_path = dir.join("index.sqlite");
+    let store = Store::open(&db_path).unwrap();
+    let source = "def helper():\n    return 1\n";
+    let ext = extract_file("src/helper.py", source);
+    let key = CacheKey::for_source(&ext.language, source);
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+    let analysis = analyze(std::slice::from_ref(&ext), &resolution);
+    store
+        .save_generation(std::slice::from_ref(&ext), &resolution, &analysis)
+        .unwrap();
+    store.admit_cached_extraction(&key, &ext).unwrap();
+    (store, db_path, key)
+}
+
+fn cache_identities(db_path: &std::path::Path) -> Vec<(String, String)> {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT grammar_version, analyzer_version FROM extraction_cache \
+             ORDER BY grammar_version, analyzer_version",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    rows
+}
+
+/// S-4: eviction must be able to reach the rows an extraction-schema bump
+/// strands, not only the one row it can already serve.
+///
+/// The predicate spared any row whose `(content_hash, language)` still appeared
+/// in `generation_files` and deleted the row whose *full* identity matched. So
+/// after a bump the table kept exactly the copies nothing can ever serve and
+/// dropped the one it could — a full extra copy of every payload per bump, on a
+/// table the method's own doc says is "bounded to the retained working set".
+#[test]
+fn s4_prune_evicts_a_cache_row_no_retained_generation_can_ever_serve() {
+    let dir = tmp_dir("s4-stale-cache");
+    let (store, db_path, _key) = store_with_one_cached_file(&dir);
+
+    // The same content under a superseded extractor identity: exactly what a
+    // rebuild after a schema bump leaves behind, since the content hash is
+    // unchanged and only the identity moved.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO extraction_cache
+               (content_hash, language, grammar_version, analyzer_version, payload_json, accessed_at)
+             SELECT content_hash, language, grammar_version || '-superseded',
+                    analyzer_version || '-superseded', payload_json, accessed_at
+             FROM extraction_cache",
+            [],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        cache_identities(&db_path).len(),
+        2,
+        "fixture precondition: one current and one superseded copy"
+    );
+
+    store.prune_extraction_cache().unwrap();
+
+    let survivors = cache_identities(&db_path);
+    assert!(
+        survivors.is_empty(),
+        "a retained generation holds this payload under a known identity, so no \
+         cache copy is reachable — the superseded copy survived forever and the \
+         servable one was evicted: {survivors:?}"
+    );
+
+    // Positive control: a cache row that IS the only servable payload must be
+    // kept. A generation row written before schema v8 carries NULL identity and
+    // can never satisfy a lookup, so the cache copy is not redundant.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE generation_files SET grammar_version = NULL, analyzer_version = NULL",
+            [],
+        )
+        .unwrap();
+    }
+    let source = "def helper():\n    return 1\n";
+    let ext = extract_file("src/helper.py", source);
+    let key = CacheKey::for_source(&ext.language, source);
+    store.admit_cached_extraction(&key, &ext).unwrap();
+    store.prune_extraction_cache().unwrap();
+    assert_eq!(
+        cache_identities(&db_path).len(),
+        1,
+        "eviction dropped the only payload any build could still use"
+    );
+    assert!(
+        store.try_get_cached_extraction(&key).unwrap().is_some(),
+        "the surviving row must still serve"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// S-5: an unreadable stored payload is a fault to report, not a cache miss.
+///
+/// `.ok()` mapped a corrupt row to `None`, so the file was silently
+/// re-extracted on every build forever and the corruption signal was lost.
+/// Every other JSON read in this file errors and names what it was reading.
+#[test]
+fn s5_an_unreadable_cached_payload_is_reported_not_answered_as_a_miss() {
+    let dir = tmp_dir("s5-corrupt-cache");
+    let (store, db_path, key) = store_with_one_cached_file(&dir);
+
+    // Positive control: the healthy payload is served.
+    assert!(
+        store.try_get_cached_extraction(&key).unwrap().is_some(),
+        "fixture precondition: the cached payload must be servable"
+    );
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("UPDATE extraction_cache SET payload_json = '{not json'", [])
+            .unwrap();
+    }
+    let error = store
+        .try_get_cached_extraction(&key)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| {
+            panic!("a corrupt cache payload was answered as a cache miss instead of reported")
+        });
+    assert!(
+        error.contains(&key.language) && error.contains("extraction_cache"),
+        "the refusal must name the row it could not read: {error}"
+    );
+
+    // The same rule on the generation fallback: with the cache row gone, an
+    // unreadable generation payload must not read as "nothing cached" either.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("DELETE FROM extraction_cache", []).unwrap();
+        conn.execute(
+            "UPDATE generation_files SET extraction_json = '{not json'",
+            [],
+        )
+        .unwrap();
+    }
+    let error = store
+        .try_get_cached_extraction(&key)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| {
+            panic!("a corrupt generation payload was answered as a cache miss instead of reported")
+        });
+    assert!(
+        error.contains("generation_files"),
+        "the refusal must name the row it could not read: {error}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// S-7: reading the schema version must wait for a lock like every other
+/// connection in this crate.
+///
+/// This one is a **pin, not a repair**. `stored_schema_version` opens its own
+/// connection and never passed through `configure_connection`, so the audit
+/// read it as the one connection with no `busy_timeout` — but rusqlite 0.31
+/// calls `sqlite3_busy_timeout(db, 5000)` on every connection it opens
+/// (`inner_connection.rs:121`), so the wait was inherited rather than absent
+/// and this test passed against the unmodified tree. What was missing is the
+/// *statement*: the crate's five-second contention policy lived in
+/// `configure_connection` and was silently supplied by a dependency default at
+/// the other opener. Swap that default out (`busy_timeout(0)`) and this test
+/// fails with `database is locked`, which is what it exists to catch.
+#[test]
+fn s7_reading_the_schema_version_waits_for_a_lock_like_every_other_reader() {
+    let dir = tmp_dir("s7-busy-version");
+    let db_path = dir.join("legacy.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA user_version = 7; CREATE TABLE t (x);")
+            .unwrap();
+    }
+
+    // Positive control: uncontended, it answers immediately and correctly.
+    assert_eq!(Store::stored_schema_version(&db_path).unwrap(), Some(7));
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let locked = db_path.clone();
+    let holder = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(&locked).unwrap();
+        conn.execute_batch("BEGIN EXCLUSIVE; INSERT INTO t VALUES (1);")
+            .unwrap();
+        ready_tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        conn.execute_batch("COMMIT").unwrap();
+    });
+    ready_rx.recv().unwrap();
+
+    let started = Instant::now();
+    let outcome = Store::stored_schema_version(&db_path);
+    let waited = started.elapsed();
+    holder.join().unwrap();
+
+    let version = outcome.unwrap_or_else(|error| {
+        panic!("a momentary lock made the version read fail instead of wait: {error}")
+    });
+    assert_eq!(version, Some(7));
+    assert!(
+        waited >= std::time::Duration::from_millis(200),
+        "the read returned in {waited:?}, so it cannot have waited for the lock"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// S-8: the schema gate must assert the whole schema it claims to assert.
+///
+/// `REQUIRED` omitted `generation_files.grammar_version`/`analyzer_version`
+/// (v8) and `generation_unresolved.classification`/`receiver` (v10/v11), so a
+/// store stamped at the current version without them opened clean and failed at
+/// the first write instead of at the gate.
+#[test]
+fn s8_the_schema_gate_refuses_a_store_missing_a_column_its_writers_require() {
+    for (table, column) in [
+        ("generation_files", "grammar_version"),
+        ("generation_files", "analyzer_version"),
+        ("generation_unresolved", "classification"),
+        ("generation_unresolved", "receiver"),
+    ] {
+        let dir = tmp_dir(&format!("s8-{table}-{column}"));
+        let db_path = dir.join("index.sqlite");
+        // Positive control: the store this binary just created opens cleanly.
+        Store::open(&db_path).expect("a freshly created store must open");
+        Store::open(&db_path).expect("reopening an intact store must succeed");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch("DROP INDEX IF EXISTS idx_generation_unresolved_class")
+                .unwrap();
+            conn.execute(&format!("ALTER TABLE {table} DROP COLUMN {column}"), [])
+                .unwrap();
+        }
+
+        let error = Store::open(&db_path)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| {
+                panic!(
+                    "a store missing {table}.{column} opened clean; the gate is narrower \
+                     than the schema it asserts, so the failure lands on the first write"
+                )
+            });
+        assert!(
+            error.contains(column) && error.contains(table),
+            "the refusal must name the missing column: {error}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// S-11: every reader of a stored span applies the same policy to a corrupt one.
+///
+/// `search_symbols` errored while `all_symbols` and `latest_clone_candidates`
+/// clamped with `.max(0)` and published a fabricated `0..` span as if it were
+/// real. One row, two answers: one fails closed, the others lie.
+#[test]
+fn s11_every_symbol_reader_refuses_a_corrupt_span_instead_of_publishing_zero() {
+    let dir = tmp_dir("s11-span");
+    let db_path = dir.join("index.sqlite");
+    let store = Store::open(&db_path).unwrap();
+
+    let body = "\n    total = 0\n    for row in rows:\n        if row.active:\n            total += row.amount * rate\n        else:\n            total -= row.penalty\n    return total\n";
+    let ext = extract_file("compute.py", &format!("def compute(rows, rate):{body}"));
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+    let analysis = analyze(std::slice::from_ref(&ext), &resolution);
+    store
+        .save_generation(std::slice::from_ref(&ext), &resolution, &analysis)
+        .unwrap();
+
+    // Positive control: all three readers agree on a healthy row.
+    let healthy = store.all_symbols().unwrap();
+    let compute = healthy
+        .iter()
+        .find(|s| s.name == "compute")
+        .expect("fixture precondition: the symbol must be stored");
+    assert!(compute.span_end > compute.span_start);
+    assert!(!store.search_symbols("compute", 10).unwrap().is_empty());
+    let (candidates, _) = store.latest_clone_candidates().unwrap();
+    assert!(
+        candidates.iter().any(|c| c.symbol_name == "compute"),
+        "fixture precondition: the symbol must carry a body signature, or the \
+         clone reader never reaches its span"
+    );
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("UPDATE generation_nodes SET span_start = -5", [])
+            .unwrap();
+    }
+
+    assert!(
+        store.search_symbols("compute", 10).is_err(),
+        "control: the loud reader must stay loud"
+    );
+    assert!(
+        store.all_symbols().is_err(),
+        "all_symbols clamped the corrupt span to 0 and published it as a real span"
+    );
+    assert!(
+        store.latest_clone_candidates().is_err(),
+        "latest_clone_candidates clamped the corrupt span to 0 and published it \
+         as a real span"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The stored parse-failure rule must be the canonical classifier's rule.
+///
+/// `build_history.parse_failed` is counted off the generation's own
+/// `parse_outcome_json`/`engine_json` columns, because a carried-forward file is
+/// a row of the generation and is not in the written slice. That restates
+/// `Extraction::is_parse_failure` over stored fields, and two statements of one
+/// rule drift. This runs a corpus spanning the outcome and engine tiers that
+/// decide it through both statements — cold, where the slice is the whole
+/// generation, and incremental, where the stored rule counts every file but
+/// one — and fails if the two ever disagree.
+#[test]
+fn the_stored_parse_failure_rule_matches_the_canonical_classifier() {
+    let corpus = vec![
+        extract_file("a.py", "def a():\n    return 1\n"),
+        extract_file("broken.py", "def a(:\n  return\n"),
+        extract_file("README.md", "# hi\n"),
+        extract_file("data.json", "{\"a\": 1}\n"),
+        extract_file("broken.ipynb", "{not json"),
+        extract_file("legacy.vb", "' just a comment\n\n"),
+    ];
+    let canonical = corpus.iter().filter(|e| e.is_parse_failure()).count() as u64;
+    assert!(
+        canonical > 0 && (canonical as usize) < corpus.len(),
+        "fixture precondition: the corpus must hold both failures and non-failures, got {canonical}"
+    );
+    assert!(
+        corpus
+            .iter()
+            .any(|e| format!("{:?}", e.engine).starts_with("NotApplicable")),
+        "fixture precondition: a grammarless prose file is the case that separates \
+         `ParseOutcome::Failed` from a real parse failure"
+    );
+    assert!(
+        corpus
+            .iter()
+            .any(|e| format!("{:?}", e.engine).starts_with("Unavailable")),
+        "fixture precondition: a language with no linked grammar must be present"
+    );
+
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&corpus);
+    let resolution = resolver.resolve_all(&corpus);
+    let analysis = analyze(&corpus, &resolution);
+    let store = Store::open_in_memory().unwrap();
+    store
+        .save_generation(&corpus, &resolution, &analysis)
+        .unwrap();
+    assert_eq!(
+        store.build_history(1).unwrap().remove(0).parse_failed,
+        canonical,
+        "the stored rule disagreed with the canonical classifier on a whole-tree build"
+    );
+
+    // Incremental: only `a.py` is written, so every other row of the generation
+    // is counted by the stored rule alone.
+    let fresh = vec![extract_file("a.py", "def a():\n    return 2\n")];
+    let mut resolver2 = Resolver::new();
+    resolver2.index_extractions(&fresh);
+    let resolution2 = resolver2.resolve_all(&fresh);
+    let analysis2 = analyze(&fresh, &resolution2);
+    store
+        .save_generation_with_opts(
+            &fresh,
+            &resolution2,
+            &analysis2,
+            GenerationWriteOpts {
+                affected_paths: vec!["a.py".into()],
+                deleted_paths: vec![],
+                build_started: None,
+                repo_root: None,
+            },
+        )
+        .unwrap();
+    let row = store.build_history(1).unwrap().remove(0);
+    assert_eq!(
+        row.files as usize,
+        corpus.len(),
+        "the incremental generation must still hold every file"
+    );
+    assert_eq!(
+        row.parse_failed, canonical,
+        "the stored rule disagreed with the canonical classifier on an incremental build"
+    );
+}

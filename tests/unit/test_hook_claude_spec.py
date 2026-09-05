@@ -258,10 +258,10 @@ def test_post_tool_use_refreshes_the_worktree_map_not_the_parent(tmp_path, monke
     _repo(worktree)
     write_stamped_map(worktree)
 
-    seen: list[tuple[Path, list[str]]] = []
+    seen: list[Path] = []
 
     def _fake_refresh(root, output, *args, **kwargs):  # noqa: ANN001
-        seen.append((Path(root), list(kwargs.get("paths") or [])))
+        seen.append(Path(root))
         from devcouncil.indexing.map_artifacts import GraphRefreshResult
 
         return GraphRefreshResult(map_path=output)
@@ -281,8 +281,7 @@ def test_post_tool_use_refreshes_the_worktree_map_not_the_parent(tmp_path, monke
     )
     assert result.exit_code == 0, result.output
     assert seen, "no map refresh ran for an edit made inside the worktree"
-    assert seen[0][0] == worktree.resolve()
-    assert seen[0][1] == ["pkg/a.py"]
+    assert seen == [worktree.resolve()], "the parent root must not be rebuilt instead"
 
 
 # --------------------------------------------------------------------------
@@ -453,10 +452,12 @@ def test_post_tool_batch_refreshes_the_whole_batch_once(tmp_path, monkeypatch):
     _git(tmp_path, "commit", "-m", "b")
     write_stamped_map(tmp_path)
 
-    calls: list[list[str]] = []
+    # A build takes no path list -- the kernel decides what it revisits -- so what
+    # these assert is how many builds ran, which is the property each is named for.
+    calls: list[int] = []
 
     def _fake_refresh(root, output, *args, **kwargs):  # noqa: ANN001
-        calls.append(sorted(kwargs.get("paths") or []))
+        calls.append(1)
         from devcouncil.indexing.map_artifacts import GraphRefreshResult
 
         return GraphRefreshResult(map_path=output)
@@ -477,7 +478,7 @@ def test_post_tool_batch_refreshes_the_whole_batch_once(tmp_path, monkeypatch):
         ["post-tool-batch", json.dumps(payload), "--project-root", str(tmp_path)],
     )
     assert result.exit_code == 0, result.output
-    assert calls == [["pkg/a.py", "pkg/b.py"]], calls
+    assert len(calls) == 1, calls
 
 
 def test_post_tool_use_defers_to_the_batch_hook(tmp_path, monkeypatch):
@@ -485,10 +486,12 @@ def test_post_tool_use_defers_to_the_batch_hook(tmp_path, monkeypatch):
     _repo(tmp_path)
     write_stamped_map(tmp_path)
 
-    calls: list[list[str]] = []
+    # A build takes no path list -- the kernel decides what it revisits -- so what
+    # these assert is how many builds ran, which is the property each is named for.
+    calls: list[int] = []
 
     def _fake_refresh(root, output, *args, **kwargs):  # noqa: ANN001
-        calls.append(sorted(kwargs.get("paths") or []))
+        calls.append(1)
         from devcouncil.indexing.map_artifacts import GraphRefreshResult
 
         return GraphRefreshResult(map_path=output)
@@ -523,7 +526,7 @@ def test_post_tool_use_defers_to_the_batch_hook(tmp_path, monkeypatch):
         ["post-tool-batch", json.dumps(batch), "--project-root", str(tmp_path)],
     )
     assert result.exit_code == 0, result.output
-    assert calls == [["pkg/a.py"]], f"queued path was never drained: {calls}"
+    assert len(calls) == 1, f"queued path was never drained: {calls}"
 
 
 def test_deferred_post_tool_use_falls_back_when_no_batch_hook_drains(tmp_path, monkeypatch):
@@ -536,10 +539,12 @@ def test_deferred_post_tool_use_falls_back_when_no_batch_hook_drains(tmp_path, m
     _repo(tmp_path)
     write_stamped_map(tmp_path)
 
-    calls: list[list[str]] = []
+    # A build takes no path list -- the kernel decides what it revisits -- so what
+    # these assert is how many builds ran, which is the property each is named for.
+    calls: list[int] = []
 
     def _fake_refresh(root, output, *args, **kwargs):  # noqa: ANN001
-        calls.append(sorted(kwargs.get("paths") or []))
+        calls.append(1)
         from devcouncil.indexing.map_artifacts import GraphRefreshResult
 
         return GraphRefreshResult(map_path=output)
@@ -572,7 +577,7 @@ def test_deferred_post_tool_use_falls_back_when_no_batch_hook_drains(tmp_path, m
     os.utime(queue, (old, old))
 
     assert runner.invoke(hook_app, args).exit_code == 0
-    assert calls == [["pkg/a.py"]], f"stranded queue was never reclaimed: {calls}"
+    assert len(calls) == 1, f"stranded queue was never reclaimed: {calls}"
 
 
 def test_file_changed_refreshes_files_that_moved_with_head(tmp_path, monkeypatch):
@@ -591,10 +596,12 @@ def test_file_changed_refreshes_files_that_moved_with_head(tmp_path, monkeypatch
     _git(tmp_path, "add", "-A")
     _git(tmp_path, "commit", "-m", "change a")
 
-    calls: list[list[str]] = []
+    # A build takes no path list -- the kernel decides what it revisits -- so what
+    # these assert is how many builds ran, which is the property each is named for.
+    calls: list[int] = []
 
     def _fake_refresh(root, output, *args, **kwargs):  # noqa: ANN001
-        calls.append(sorted(kwargs.get("paths") or []))
+        calls.append(1)
         from devcouncil.indexing.map_artifacts import GraphRefreshResult
 
         return GraphRefreshResult(map_path=output)
@@ -613,7 +620,7 @@ def test_file_changed_refreshes_files_that_moved_with_head(tmp_path, monkeypatch
         ["file-changed", json.dumps(payload), "--project-root", str(tmp_path)],
     )
     assert result.exit_code == 0, result.output
-    assert calls == [["pkg/a.py"]], calls
+    assert len(calls) == 1, calls
 
 
 def test_cwd_changed_reseeds_watch_paths_for_the_new_repo(tmp_path):
@@ -634,26 +641,61 @@ def test_cwd_changed_reseeds_watch_paths_for_the_new_repo(tmp_path):
     watch = json.loads(result.stdout.strip().splitlines()[-1])["hookSpecificOutput"]["watchPaths"]
     assert watch, "entering a new repo must re-seed the watch list"
     assert all(str(other.resolve()) in p for p in watch)
+    assert not any(str(main.resolve()) in p for p in watch)
 
 
-def test_cwd_changed_clears_watch_paths_outside_a_repo(tmp_path):
-    """An empty array clears the dynamic list -- the documented "left the repo" case."""
-    main = tmp_path / "main"
-    _repo(main)
-    stray = tmp_path / "stray"
-    stray.mkdir()
+def _cwd_changed_watch(main, new_cwd) -> list:
     payload = {
         "hook_event_name": "CwdChanged",
-        "cwd": str(stray),
+        "cwd": str(new_cwd),
         "old_cwd": str(main),
-        "new_cwd": str(stray),
+        "new_cwd": str(new_cwd),
     }
     result = runner.invoke(
         hook_app, ["cwd-changed", json.dumps(payload), "--project-root", str(main)]
     )
     assert result.exit_code == 0, result.output
-    payload_out = json.loads(result.stdout.strip().splitlines()[-1])
-    assert payload_out["hookSpecificOutput"]["watchPaths"] == []
+    return json.loads(result.stdout.strip().splitlines()[-1])["hookSpecificOutput"]["watchPaths"]
+
+
+def test_cwd_changed_keeps_watching_the_repo_it_never_left(tmp_path):
+    """``cd src`` must not disarm FileChanged for the rest of the session.
+
+    ``cwd_changed`` resolved the root itself, requiring ``.devcouncil/`` literally in
+    ``new_cwd`` with no walk upward, so a plain subdirectory read as "no project" and
+    the empty array cleared git's HEAD/index watch — while every other hook went on
+    acting on the same repo through ``_effective_root``. A later branch switch or pull
+    then fired nothing. Fails against the pre-fix code with ``watchPaths == []``.
+    """
+    main = tmp_path / "main"
+    _repo(main)
+    inside = _cwd_changed_watch(main, main / "pkg")
+    assert inside, "a plain subdirectory of the session's own repo must keep the watch"
+    assert all(str(main.resolve()) in path for path in inside)
+    assert inside == _cwd_changed_watch(main, main)
+
+
+def test_cwd_changed_keeps_the_session_repo_when_cwd_leaves_it(tmp_path):
+    """An unrelated directory is not a repo change: DevCouncil's root did not move.
+
+    ``_effective_root`` keeps the baked root for a stray ``cwd``, so PostToolUse still
+    refreshes *this* map — clearing the watch list would disarm FileChanged for a repo
+    the session is still maintaining.
+    """
+    main = tmp_path / "main"
+    _repo(main)
+    stray = tmp_path / "stray"
+    stray.mkdir()
+    assert _cwd_changed_watch(main, stray) == _cwd_changed_watch(main, main)
+
+
+def test_cwd_changed_clears_watch_paths_when_the_resolved_root_has_no_git(tmp_path):
+    """An empty array clears the dynamic list -- there is nothing to watch."""
+    main = tmp_path / "main"
+    (main / ".devcouncil").mkdir(parents=True)
+    stray = tmp_path / "stray"
+    stray.mkdir()
+    assert _cwd_changed_watch(main, stray) == []
 
 
 def test_directory_added_reports_that_the_map_does_not_cover_it(tmp_path):

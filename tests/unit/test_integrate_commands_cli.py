@@ -189,6 +189,71 @@ def test_apply_target_failure_exits_1(monkeypatch, tmp_path, target_cmd):
     assert result.exit_code == 1
 
 
+# --- --write-gate must never be accepted and then dropped -----------------------
+
+@pytest.mark.parametrize("target_cmd", ["grok", "opencode"])
+@pytest.mark.parametrize("flags", [["--apply"], []])
+def test_write_gate_is_refused_where_it_cannot_be_honoured(monkeypatch, tmp_path, target_cmd, flags):
+    """`dev integrate grok|opencode --write-gate` must fail loudly, not no-op.
+
+    Both subcommands declared `--write-gate` and passed it nowhere: the call site is
+    `apply_integration_target(root, "grok")` with no `write_gate=`, and that target's branch
+    installs no hooks at all. A user asking for the blocking containment gate got MCP config
+    only, an exit code of 0, and "integration configured". A requested security control that
+    silently does not exist is worse than a refusal, so this fails closed.
+    """
+    applied = []
+    monkeypatch.setattr(
+        integrate,
+        "apply_integration_target",
+        lambda root, target, **k: applied.append((target, k)) or _ok_report(),
+    )
+    result = runner.invoke(
+        integrate.app, [target_cmd, *flags, "--write-gate", "--project-root", str(tmp_path)]
+    )
+
+    assert result.exit_code == 2, result.output
+    # Rich hard-wraps the console; compare on collapsed whitespace.
+    output = " ".join(result.output.split())
+    assert "--write-gate is not honoured" in output
+    # The error must name where the gate *can* be installed, not just say no.
+    assert f"hooks --tool {target_cmd} --apply --write-gate" in output
+    for host in integrate.WRITE_GATE_APPLY_HOSTS:
+        assert host in output
+    assert applied == [], "refused command still ran the integration"
+
+
+@pytest.mark.parametrize("target_cmd", ["grok", "opencode"])
+def test_apply_without_write_gate_still_works(monkeypatch, tmp_path, target_cmd):
+    """The refusal is scoped to the flag; the ordinary MCP-only apply is untouched."""
+    monkeypatch.setattr(integrate, "apply_integration_target", lambda root, target, **k: _ok_report())
+    result = runner.invoke(integrate.app, [target_cmd, "--apply", "--project-root", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert "configured" in result.output.lower()
+
+
+def test_write_gate_is_still_threaded_through_by_hosts_that_honour_it(monkeypatch, tmp_path):
+    """Cursor's --apply must keep passing write_gate through — the refusal is scoped.
+
+    Cursor is the host whose one-shot --apply really installs the containment hooks
+    (`actions.apply_integration_target` -> `_configure_native_hooks(..., write_gate=...)`),
+    so it is the positive control for the grok/opencode refusal above.
+    """
+    seen = {}
+
+    def fake_apply(root, target, **kwargs):
+        seen[target] = kwargs
+        return _ok_report()
+
+    monkeypatch.setattr(integrate, "apply_integration_target", fake_apply)
+    result = runner.invoke(
+        integrate.app, ["cursor", "--apply", "--write-gate", "--project-root", str(tmp_path)]
+    )
+    assert result.exit_code == 0, result.output
+    assert seen["cursor"]["write_gate"] is True, seen
+    assert "cursor" in integrate.WRITE_GATE_APPLY_HOSTS
+
+
 def test_cursor_preview_uses_configure_cursor(monkeypatch, tmp_path):
     seen = {}
     monkeypatch.setattr(integrate, "_configure_cursor", lambda root, apply: seen.setdefault("apply", apply) or True)

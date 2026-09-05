@@ -12,6 +12,7 @@ from typer.testing import CliRunner
 from devcouncil.cli.commands.hook import (
     MAP_REFRESH_DEBOUNCE_S,
     _enqueue_refresh_paths,
+    _refreshable_rels,
     _extract_written_paths,
     _lock_is_reclaimable,
     _maybe_refresh_map,
@@ -199,11 +200,10 @@ def test_refresh_holder_drains_queue(tmp_path, monkeypatch):
         "tool_input": {"file_path": str(tmp_path / "pkg" / "a.py")},
     })
     _maybe_refresh_map(tmp_path, payload)
-    assert refreshed
-    # Initial path + drained queue path in one batch (or sequential drain).
-    flat = {p for batch in refreshed for p in batch}
-    assert "pkg/a.py" in flat
-    assert "pkg/b.py" in flat
+    # The holder builds once for its own edit *and* the queued one: the build is
+    # whole-repo, so what the drain has to prove is that the queue was emptied,
+    # not that a path list reached the kernel (it takes none).
+    assert len(refreshed) == 1
     assert not queue.is_file() or not _take_queued_paths(queue)
 
 
@@ -211,10 +211,10 @@ def test_nested_worktree_edits_not_ingested_into_main_root(tmp_path, monkeypatch
     """Edits made inside a nested Claude worktree checkout (.claude/worktrees/<name>/…)
     resolve as relative paths under the main root and must never reach the main
     graph — they would duplicate every edited symbol and trigger spurious rebuilds."""
-    refreshed: list[list[str]] = []
+    refreshed: list[int] = []
     monkeypatch.setattr(
         "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
-        lambda root, output, *_a, paths=None, **_k: refreshed.append(sorted(paths or [])),
+        lambda root, output, *_a, **_k: refreshed.append(1),
     )
     monkeypatch.setattr("devcouncil.cli.commands.hook.MAP_REFRESH_DEBOUNCE_S", 0.0)
 
@@ -237,29 +237,37 @@ def test_nested_worktree_edits_not_ingested_into_main_root(tmp_path, monkeypatch
         "tool_input": {"file_path": str(tmp_path / "pkg" / "a.py")},
     })
     _maybe_refresh_map(tmp_path, payload)
-    assert {p for batch in refreshed for p in batch} == {"pkg/a.py"}
+    assert len(refreshed) == 1
 
 
 def test_stale_queue_with_worktree_paths_filtered_on_drain(tmp_path, monkeypatch):
     """Queue files written before the nested-checkout filter may still hold
-    worktree paths; the drain must drop them instead of refreshing them."""
-    refreshed: list[list[str]] = []
+    worktree paths; the drain must drop them instead of refreshing for them.
+
+    A build takes no path list, so what the filter still decides is whether the
+    drain builds at all: a queue holding *only* worktree paths is no reason to
+    rebuild this root, and a queue holding a real path is."""
+    refreshed: list[int] = []
     monkeypatch.setattr(
         "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
-        lambda root, output, *_a, paths=None, **_k: refreshed.append(sorted(paths or [])),
+        lambda root, output, *_a, **_k: refreshed.append(1),
     )
     monkeypatch.setattr("devcouncil.cli.commands.hook.MAP_REFRESH_DEBOUNCE_S", 0.0)
 
     queue = tmp_path / ".devcouncil" / "cache" / "map_refresh_queue.json"
-    _enqueue_refresh_paths(queue, [".claude/worktrees/x/src/pkg/b.py", "pkg/b.py"])
+    _enqueue_refresh_paths(queue, [".claude/worktrees/x/src/pkg/b.py"])
+    # Drain (PostToolBatch) over a queue of nothing but foreign paths: no rebuild.
+    _maybe_refresh_map(tmp_path, "", paths=[], drain=True)
+    assert refreshed == []
 
+    _enqueue_refresh_paths(queue, [".claude/worktrees/x/src/pkg/b.py", "pkg/b.py"])
     payload = json.dumps({
         "tool_name": "Edit",
         "tool_input": {"file_path": str(tmp_path / "pkg" / "a.py")},
     })
     _maybe_refresh_map(tmp_path, payload)
-    flat = {p for batch in refreshed for p in batch}
-    assert flat == {"pkg/a.py", "pkg/b.py"}
+    assert len(refreshed) == 1
+    assert not queue.is_file() or not _take_queued_paths(queue)
 
 
 def test_pid_alive_self():
@@ -309,11 +317,11 @@ def test_enqueue_during_holder_refresh_merged(tmp_path, monkeypatch):
     (tmp_path / ".devcouncil").mkdir(exist_ok=True)
     write_stamped_map(tmp_path)
 
-    refreshed: list[list[str]] = []
+    refreshed: list[int] = []
     queue = tmp_path / ".devcouncil" / "cache" / "map_refresh_queue.json"
 
-    def _fake_refresh(root, output, *_a, paths=None, **_k):  # noqa: ANN001
-        refreshed.append(sorted(paths or []))
+    def _fake_refresh(root, output, *_a, **_k):  # noqa: ANN001
+        refreshed.append(1)
         # Concurrent PostToolUse while we hold the lock.
         if len(refreshed) == 1:
             _enqueue_refresh_paths(queue, ["pkg/c.py"])
@@ -334,10 +342,9 @@ def test_enqueue_during_holder_refresh_merged(tmp_path, monkeypatch):
     _enqueue_refresh_paths(queue, ["pkg/b.py"])
     _maybe_refresh_map(tmp_path, payload)
 
-    flat = {p for batch in refreshed for p in batch}
-    assert "pkg/a.py" in flat
-    assert "pkg/b.py" in flat
-    assert "pkg/c.py" in flat
+    # Work that lands *during* a build is not covered by that build's inventory
+    # snapshot, so it must produce a second build rather than be dropped.
+    assert len(refreshed) == 2
     assert not queue.is_file() or _take_queued_paths(queue) == []
 
 
@@ -358,3 +365,128 @@ def test_map_if_stale_exits_fast_when_fresh(tmp_path):
     )
     assert second.exit_code == 0, second.output
     assert "fresh" in second.output.lower() or "skipping" in second.output.lower()
+
+
+# --- the "too many files changed" case must never mean "no refresh" ---------------
+
+
+def _count_refreshes(monkeypatch) -> list[int]:
+    """Count kernel refreshes, ignoring any arguments the build does not read."""
+    calls: list[int] = []
+    monkeypatch.setattr(
+        "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
+        lambda root, output, *_a, **_k: calls.append(1),
+    )
+    monkeypatch.setattr("devcouncil.cli.commands.hook.MAP_REFRESH_DEBOUNCE_S", 0.0)
+    return calls
+
+
+def test_large_change_still_refreshes_the_map(tmp_path, monkeypatch):
+    """A change bigger than the retired ``auto_refresh_max_files`` cap must refresh.
+
+    The cap early-returned, so a branch switch, ``git pull`` or rebase touching more
+    files than the cap produced *zero* refreshes — the exact class of change the
+    FileChanged hook exists to catch, and the one it silently dropped. Measured
+    against the pre-fix code: 40 paths -> 1 refresh, 41 paths -> 0 refreshes.
+    """
+    calls = _count_refreshes(monkeypatch)
+    _maybe_refresh_map(tmp_path, "", paths=[f"pkg/mod{i}.py" for i in range(41)])
+    assert len(calls) == 1, "a >cap change must still rebuild the map, not be skipped"
+
+
+def test_large_change_refreshes_on_the_drain_path_too(tmp_path, monkeypatch):
+    """PostToolBatch (drain=True) over a >cap batch must rebuild, not drop the batch.
+
+    Pre-fix the cap emptied ``paths`` before the drain, so drain=True over 41 paths
+    also refreshed nothing when the queue was absent.
+    """
+    calls = _count_refreshes(monkeypatch)
+    _maybe_refresh_map(tmp_path, "", paths=[f"pkg/mod{i}.py" for i in range(41)], drain=True)
+    assert len(calls) == 1
+
+
+def test_file_changed_hook_refreshes_a_branch_switch_of_many_files(tmp_path, monkeypatch):
+    """End-to-end: the FileChanged hook on a git HEAD move with >cap changed files.
+
+    ``file_changed`` calls ``_maybe_refresh_map`` with ``drain=False``, so pre-fix a
+    branch switch touching 41 files refreshed nothing at all.
+    """
+    files = {f"pkg/mod{i}.py": f"def f{i}():\n    return {i}\n" for i in range(41)}
+    files["pkg/__init__.py"] = ""
+    _write(tmp_path, files)
+    _commit(tmp_path)
+    (tmp_path / ".devcouncil").mkdir(exist_ok=True)
+    write_stamped_map(tmp_path)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    map_path = tmp_path / ".devcouncil" / "repo_map.json"
+    data = json.loads(map_path.read_text(encoding="utf-8"))
+    data["generated_head"] = head
+    map_path.write_text(json.dumps(data), encoding="utf-8")
+    # Rewrite every file, as a branch switch or pull would.
+    _write(tmp_path, {rel: body + "# changed\n" for rel, body in files.items() if rel.endswith(".py")})
+
+    calls = _count_refreshes(monkeypatch)
+    result = CliRunner().invoke(
+        hook_app,
+        ["file-changed", json.dumps({"file_path": str(tmp_path / ".git" / "HEAD")}),
+         "--project-root", str(tmp_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1, "a branch switch touching >cap files must refresh the map"
+
+
+# --- _refreshable_rels: the selection seam, tested where it is decided ------------
+#
+# It used to be observed indirectly through the ``paths`` argument the hooks handed
+# ``refresh_map_artifacts``. That argument was deleted on arrival and is now gone,
+# so the filter is asserted here, at the one place that owns it.
+
+
+def test_refreshable_rels_normalizes_absolute_paths_under_the_root(tmp_path):
+    assert _refreshable_rels(tmp_path, [str(tmp_path / "src" / "a.py")]) == ["src/a.py"]
+
+
+def test_refreshable_rels_drops_paths_outside_the_root(tmp_path):
+    assert _refreshable_rels(tmp_path, ["/etc/passwd.py"]) == []
+
+
+def test_refreshable_rels_drops_non_code_and_nested_checkouts(tmp_path):
+    rels = _refreshable_rels(tmp_path, [
+        "README.md",
+        "docs/notes.txt",
+        ".claude/worktrees/x/src/pkg/a.py",
+        str(tmp_path / ".claude" / "worktrees" / "x" / "src" / "pkg" / "b.py"),
+        "src/kept.py",
+    ])
+    assert rels == ["src/kept.py"]
+
+
+def test_retired_auto_refresh_max_files_says_so_on_load(tmp_path, caplog):
+    """A config still setting the retired cap must be told, not silently ignored.
+
+    Pydantic's ``extra="ignore"`` drops the key without a word, which is how a
+    repo would keep believing it had a refresh guard that no longer exists (and
+    that, while it existed, dropped the refresh entirely). Fails against the
+    pre-fix code, where the key was live and no warning existed.
+    """
+    import logging
+
+    from devcouncil.app.config import RETIRED_CONFIG_KEYS, load_config
+
+    state = tmp_path / ".devcouncil"
+    state.mkdir()
+    (state / "config.yaml").write_text(
+        "indexing:\n  auto_refresh: true\n  auto_refresh_max_files: 40\n",
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.WARNING, logger="devcouncil.app.config"):
+        config = load_config(tmp_path)
+
+    assert config.indexing.auto_refresh is True
+    assert not hasattr(config.indexing, "auto_refresh_max_files")
+    assert "indexing.auto_refresh_max_files" in RETIRED_CONFIG_KEYS
+    assert "indexing.auto_refresh_max_files" in " ".join(
+        record.getMessage() for record in caplog.records
+    )

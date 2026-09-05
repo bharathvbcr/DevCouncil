@@ -16,6 +16,12 @@ const DEAD_CANDIDATE_CAP: usize = 200;
 /// `liveness_meta.unwired`, so the cap costs no information.
 const UNWIRED_CANDIDATE_CAP: usize = DEAD_CANDIDATE_CAP;
 const DEPENDENTS_CAP: usize = 1_024;
+/// Entry roots the lean manifest carries before the token budget bites.
+const ENTRY_ROOT_CAP: usize = 20;
+/// Subsystems the lean manifest carries.
+const SUBSYSTEM_CAP: usize = 20;
+/// Important files the lean manifest carries.
+const IMPORTANT_FILE_CAP: usize = 15;
 
 pub fn generate_manifest(
     extractions: &[Extraction],
@@ -87,6 +93,48 @@ pub(crate) fn entry_root_paths(extractions: &[Extraction]) -> Vec<String> {
     roots
 }
 
+/// Where an important file sits in the ranking, or `None` if it is not one.
+///
+/// One owner for both halves of the rule, for the same reason `is_entry_root`
+/// has one: the list is truncated and the truncation has to report a
+/// *pre-truncation* total, so membership has to be applicable to the corpus a
+/// second time. A copy of the `ends_with("PLAN.md")` chain beside the counter
+/// is how the count and the list come to disagree about what they are counting,
+/// and a separate predicate beside a separate ranking is how a file comes to be
+/// in the list with no rank, or ranked and not in the list.
+///
+/// The list is cut at [`IMPORTANT_FILE_CAP`], so ordering it by path alone was
+/// R7 inverted in the same shape `dead_symbol_candidates` was: fifteen
+/// `docs/*_PLAN.md` files sort ahead of `package.json` and `pyproject.toml`
+/// and take the whole cap, and the first thing an agent reads to orient itself
+/// in a repository is fifteen plan documents and nothing that says what the
+/// repository *is*. The four named manifests answer "what is this project and
+/// how is it built"; the plan glob is unbounded and answers something narrower,
+/// so the named ones rank first and the glob fills what is left.
+fn important_file_rank(path: &str) -> Option<u8> {
+    match path {
+        "README.md" | "Cargo.toml" | "package.json" | "pyproject.toml" => Some(0),
+        _ if path.ends_with("PLAN.md") => Some(1),
+        _ => None,
+    }
+}
+
+/// Every important file path, ranked and uncapped.
+///
+/// Ranked, then deduplicated by a total order — `(rank, path)` — so two builds
+/// of one generation emit the same list in the same order (R4).
+fn important_file_paths(extractions: &[Extraction]) -> Vec<String> {
+    let mut files: Vec<(u8, String)> = extractions
+        .iter()
+        .filter_map(|ext| {
+            important_file_rank(&ext.file_path).map(|rank| (rank, ext.file_path.clone()))
+        })
+        .collect();
+    files.sort();
+    files.dedup();
+    files.into_iter().map(|(_, path)| path).collect()
+}
+
 fn lean_manifest(
     extractions: &[Extraction],
     analysis: &AnalysisSummary,
@@ -97,22 +145,10 @@ fn lean_manifest(
     let mut important_files = Vec::new();
 
     entry_roots.extend(entry_root_paths(extractions));
+    important_files.extend(important_file_paths(extractions));
 
-    for ext in extractions {
-        if ext.file_path == "README.md"
-            || ext.file_path == "Cargo.toml"
-            || ext.file_path == "package.json"
-            || ext.file_path == "pyproject.toml"
-            || ext.file_path.ends_with("PLAN.md")
-        {
-            important_files.push(ext.file_path.clone());
-        }
-    }
-
-    entry_roots.sort();
-    important_files.sort();
-    entry_roots.truncate(20);
-    important_files.truncate(15);
+    entry_roots.truncate(ENTRY_ROOT_CAP);
+    important_files.truncate(IMPORTANT_FILE_CAP);
 
     let mut sorted_comms = analysis.communities.clone();
     sorted_comms.sort_by(|a, b| {
@@ -123,7 +159,7 @@ fn lean_manifest(
             .then_with(|| a.name.cmp(&b.name))
     });
 
-    for comm in sorted_comms.into_iter().take(20) {
+    for comm in sorted_comms.into_iter().take(SUBSYSTEM_CAP) {
         if let Some(first_member) = comm.members.first() {
             subsystems.push(SubsystemEntry {
                 name: comm.name.clone(),
@@ -139,6 +175,28 @@ fn lean_manifest(
         important_files,
         freshness,
     }
+}
+
+/// Findings per Python `Confidence` tier.
+///
+/// Keyed through `code_graph.rs::confidence_label`, the one owner of the
+/// numeric-to-tier mapping, so `repo_map.json` and `code_graph.json` can never
+/// disagree about which tier a finding is in. Every tier is emitted, zero
+/// included: an absent key would read as "not counted", and "no confident
+/// findings" is a result worth stating.
+fn confidence_histogram<'a>(
+    reports: impl Iterator<Item = &'a DeadSymbolReport>,
+) -> BTreeMap<&'static str, usize> {
+    let mut counts: BTreeMap<&'static str, usize> =
+        [("extracted", 0), ("inferred", 0), ("ambiguous", 0)]
+            .into_iter()
+            .collect();
+    for report in reports {
+        *counts
+            .entry(crate::code_graph::confidence_label(report.confidence))
+            .or_insert(0) += 1;
+    }
+    counts
 }
 
 fn consumer_manifest_json(
@@ -175,18 +233,37 @@ fn consumer_manifest_json(
     });
 
     let (dependents, dependents_total) = build_dependents(edges);
-    let dead_symbol_total = analysis
+    // R7: rank, then truncate. This took the first `DEAD_CANDIDATE_CAP` in
+    // `analyze()`'s extraction order, which is file order — so 250 findings at
+    // 0.4 declared before 5 at 0.9 filled the list and every confident one fell
+    // off the end. The counts were honest (`{shown: 200, total: 255,
+    // truncated: true}`); the cut was not, and a consumer told to prefer the
+    // `extracted` tier saw none of it.
+    //
+    // Sorted by confidence descending, then by the identity itself so two
+    // builds of one generation are byte-identical. `latest_dead_symbols` in the
+    // store already sorts `is_exempt, confidence DESC, …`; this is that rule
+    // applied to the path that reads the analysis blob instead.
+    let mut ranked: Vec<&_> = analysis
         .dead_symbols
         .iter()
         .filter(|report| !report.is_exempt)
-        .count();
-    let dead_symbol_candidates: Vec<String> = analysis
-        .dead_symbols
+        .collect();
+    ranked.sort_by(|left, right| {
+        confidence_millis(right.confidence)
+            .cmp(&confidence_millis(left.confidence))
+            .then_with(|| left.file_path.cmp(&right.file_path))
+            .then_with(|| left.symbol_name.cmp(&right.symbol_name))
+    });
+    let dead_symbol_total = ranked.len();
+    let dead_by_confidence_total = confidence_histogram(ranked.iter().copied());
+    let dead_symbol_candidates: Vec<String> = ranked
         .iter()
-        .filter(|report| !report.is_exempt)
         .take(DEAD_CANDIDATE_CAP)
         .map(|report| format!("{}::{}", report.file_path, report.symbol_name))
         .collect();
+    let dead_by_confidence_shown =
+        confidence_histogram(ranked.iter().copied().take(DEAD_CANDIDATE_CAP));
 
     // A subsystem `area` must be a real directory prefix, not a cluster label.
     //
@@ -228,6 +305,14 @@ fn consumer_manifest_json(
             }))
         })
         .collect();
+    // Two independent narrowings, reported as two numbers. `SUBSYSTEM_CAP` cuts
+    // the ranked communities; the filter above then drops the ones with no
+    // directory area to join against. `total - shown` alone would blame the cap
+    // for both, and a reader deciding whether to ask for a bigger map needs to
+    // know which one it was.
+    let subsystems_total = analysis.communities.len();
+    let subsystems_dropped_no_area = lean.subsystems.len().saturating_sub(subsystems.len());
+    let important_files_total = important_file_paths(extractions).len();
 
     let (graph_degraded, graph_degraded_reason) = match &analysis.status {
         AnalysisStatus::Ok => (false, String::new()),
@@ -236,8 +321,10 @@ fn consumer_manifest_json(
     };
     let entry_root_total = entry_root_paths(extractions).len();
     let all_unwired = crate::code_graph::unwired_candidates(extractions, edges);
-    let unwired_total = all_unwired.len();
+    let unwired_excluded = all_unwired.excluded_coverage_loss;
+    let unwired_total = all_unwired.paths.len();
     let unwired_shown: Vec<String> = all_unwired
+        .paths
         .into_iter()
         .take(UNWIRED_CANDIDATE_CAP)
         .collect();
@@ -296,6 +383,22 @@ fn consumer_manifest_json(
                 // Retained under its original name for readers that predate
                 // the shown/total split; it has always meant the true total.
                 "count": dead_symbol_total,
+                // The tier the flat `dead_symbol_candidates` strings cannot
+                // carry, kept as a per-tier census over both populations
+                // rather than by reshaping the list: `RepoMap` declares
+                // `dead_symbol_candidates: List[str]`
+                // (`repo_mapper.py:134`), and six `model_validate` call sites
+                // would raise on objects, taking the whole map with them.
+                //
+                // Two histograms, not one, because the pair is what proves the
+                // truncation ranked before it cut: equal `extracted` counts
+                // mean no confident finding fell off the end. `CLAUDE.md`
+                // tells agents to act on `extracted` and treat `inferred` as
+                // unconfirmed, so that is the number they need.
+                "by_confidence": {
+                    "shown": dead_by_confidence_shown,
+                    "total": dead_by_confidence_total,
+                },
             },
             // `entry_roots` is capped at ENTRY_ROOT_CAP to hold the token
             // budget, so `count` — which was the post-truncation length —
@@ -308,10 +411,38 @@ fn consumer_manifest_json(
                 "total": entry_root_total,
                 "truncated": entry_root_total > lean.entry_roots.len(),
             },
+            // The two peers `entry_roots` was disclosed without. Both lists are
+            // cut — `subsystems` at `SUBSYSTEM_CAP`, `important_files` at
+            // `IMPORTANT_FILE_CAP`, and both again by `generate_manifest`
+            // popping entries to hold the byte budget — and until now the only
+            // keys that mentioned either were the lists themselves. An agent is
+            // told to navigate this repository by `subsystems`; a repository
+            // with 400 of them and one with 20 handed it the same artifact.
+            //
+            // `shown` counts what was emitted, not what the cap admitted, so it
+            // stays true through every later drop.
+            "subsystems": {
+                "shown": subsystems.len(),
+                "total": subsystems_total,
+                "truncated": subsystems_total > subsystems.len(),
+                "dropped_no_area": subsystems_dropped_no_area,
+            },
+            "important_files": {
+                "shown": lean.important_files.len(),
+                "total": important_files_total,
+                "truncated": important_files_total > lean.important_files.len(),
+            },
             "unwired": {
                 "shown": unwired_shown.len(),
                 "total": unwired_total,
                 "truncated": unwired_total > unwired_shown.len(),
+                // `total` counts the population the filter left behind, so on
+                // its own it is an honest number over a quietly narrowed set.
+                // A file whose imports were never extracted cannot answer
+                // "does anything import it", so it is excluded — and how many
+                // were excluded travels with the count that would otherwise
+                // read as the whole story.
+                "excluded_coverage_loss": unwired_excluded,
             },
             "unavailable": {
                 "unreachable_files": "file-level reachability BFS is not \

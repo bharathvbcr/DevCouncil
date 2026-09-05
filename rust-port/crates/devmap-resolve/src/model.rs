@@ -95,6 +95,90 @@ pub enum Resolution {
     },
 }
 
+impl Resolution {
+    /// The confidence this evidence entitles an edge to. **The only place the
+    /// mapping exists.**
+    ///
+    /// It used to live at each construction site, which is how three of them
+    /// drifted: `reference_edge` stamped every `References` edge
+    /// `DETERMINISTIC`, including the bare-name `UniqueGlobal` rung — the same
+    /// evidence the call ladder rates `HIGH`. A `min_confidence = 1.0` query
+    /// then kept the fabricated reference and dropped the honest call, so the
+    /// overclaim did not merely inflate a number, it inverted the ranking.
+    ///
+    /// The tiers are evidence, not taste:
+    ///
+    /// - `SameFile` — the declaration is in this very file, and this file
+    ///   declares the name exactly once. A fact.
+    /// - `ImportScoped` — an import statement in this file names the target.
+    ///   Also a fact, written by the author.
+    /// - `ReceiverType` — the receiver's type is known and that type declares
+    ///   exactly one method of this name.
+    /// - `UniqueGlobal` — nothing ties the target to this file; it is simply
+    ///   the only match in the language family. Strong, not certain: adding one
+    ///   file elsewhere in the repository can make it wrong.
+    /// - `AmbiguousGlobal` — several matches and no way to choose (G5).
+    /// - `Unresolved` — no edge is ever built from this variant. It scores at
+    ///   the floor so that an edge built from it by mistake sorts below every
+    ///   honest one rather than above them.
+    pub fn confidence(&self) -> Confidence {
+        match self {
+            Resolution::SameFile { .. }
+            | Resolution::ImportScoped { .. }
+            | Resolution::ReceiverType { .. } => Confidence::DETERMINISTIC,
+            Resolution::UniqueGlobal { .. } => Confidence::HIGH,
+            Resolution::AmbiguousGlobal { .. } | Resolution::Unresolved { .. } => {
+                Confidence::SPECULATIVE
+            }
+        }
+    }
+
+    /// The single `(file, symbol)` this resolution names, or `None` for the two
+    /// variants that name no single target.
+    ///
+    /// The resolution *is* the record of what was found. The call ladder used
+    /// to carry a second copy of these two strings beside it and emit edges
+    /// from that copy, which is the same shape as the `confidence`/`resolution`
+    /// drift above: two fields obliged to agree, with nothing obliging them.
+    pub fn target(&self) -> Option<(&str, &str)> {
+        match self {
+            Resolution::SameFile {
+                target_symbol,
+                target_file,
+            }
+            | Resolution::ImportScoped {
+                target_symbol,
+                target_file,
+                ..
+            }
+            | Resolution::ReceiverType {
+                target_symbol,
+                target_file,
+                ..
+            }
+            | Resolution::UniqueGlobal {
+                target_symbol,
+                target_file,
+                ..
+            } => Some((target_file.as_str(), target_symbol.as_str())),
+            // Several targets, or none: neither can answer "which one".
+            Resolution::AmbiguousGlobal { .. } | Resolution::Unresolved { .. } => None,
+        }
+    }
+}
+
+/// Most candidates one ambiguous call site may fan out into.
+///
+/// The `AmbiguousGlobal` rung emits one `Calls` edge per candidate. Uncapped,
+/// a single call to a name with 200 same-family declarations became 200
+/// persisted edge rows from one call site, and the cost grows with
+/// declarations x call sites rather than with either.
+///
+/// Capping *emission* only. `Resolution::AmbiguousGlobal` keeps the complete
+/// candidate list, and every edge of a truncated site carries both numbers in
+/// `details`, so a capped sample is never presented as complete coverage.
+pub const AMBIGUOUS_FANOUT_CAP: usize = 16;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedEdge {
     pub source_file: String,
@@ -116,6 +200,38 @@ pub struct ResolvedEdge {
     /// serialized form are byte-for-byte what they were before.
     pub resolution: Option<Arc<Resolution>>,
     pub details: Option<String>,
+}
+
+impl ResolvedEdge {
+    /// Build an edge from its evidence. **The only constructor this crate
+    /// uses**, so `confidence` cannot disagree with `resolution`.
+    ///
+    /// The fields stay public because `devmap-query`'s `stored_edge_to_resolved`
+    /// rebuilds an edge from a database row that carries no `resolution`
+    /// column, and that read path lives in another crate. Until it gets a type
+    /// of its own, the invariant is held by routing every *write* through here
+    /// and by `every_edge_confidence_matches_the_evidence_it_names`, which
+    /// re-checks it over the whole emitted graph rather than trusting it.
+    pub fn resolved(
+        source_file: String,
+        target_file: String,
+        source_symbol: String,
+        target_symbol: String,
+        edge_kind: EdgeKind,
+        resolution: Arc<Resolution>,
+        details: Option<String>,
+    ) -> Self {
+        ResolvedEdge {
+            source_file,
+            target_file,
+            source_symbol,
+            target_symbol,
+            edge_kind,
+            confidence: resolution.confidence(),
+            resolution: Some(resolution),
+            details,
+        }
+    }
 }
 
 /// Why a call produced no edge.
@@ -194,6 +310,14 @@ pub enum UnresolvedClass {
     /// enclosing scope does not declare and that matched no language builtin,
     /// no host global and no import.
     ///
+    /// Also the tier for a use bound by an import whose specifier is
+    /// **repo-relative** (`.helpers`, `./util`, `super::x`, `crate::y`) and
+    /// whose target is not indexed. Such a specifier resolves against the
+    /// importing file's own directory, so it cannot name anything outside the
+    /// corpus: failing to resolve it is an index gap — gitignored, over the
+    /// size cap, generated — and an index gap is worth acting on. Calling it
+    /// `External` would file it under "expected".
+    ///
     /// **This is the only tier that indicates a defect** — every other outcome
     /// is explained by evidence. It is the tier to read when hunting bugs.
     Unresolved,
@@ -213,18 +337,76 @@ impl UnresolvedClass {
     }
 }
 
-/// A call the resolution ladder could not attribute to any target.
+/// Which edge family a ledger row failed to produce.
 ///
-/// R5 forbids silence: dropping these makes "we could not resolve this call"
-/// indistinguishable from "no call exists here", which silently understates
-/// both the call graph and every liveness conclusion drawn from it. Kept out of
-/// `edges` deliberately — an unresolved call has no target node to point at, so
+/// The ledger used to cover calls only, while an unresolvable *reference* and
+/// an unbindable *route handler* were dropped without trace — so the completeness
+/// ledger `devmap build` prints was a partial denominator presented as a total.
+/// Recording all three in one vector needs a discriminator, or the tiers stop
+/// meaning anything: "uninferred receiver" is a statement about a call, and a
+/// route that failed to bind is not a call at all.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UnresolvedKind {
+    /// An invocation the resolution ladder could not attribute.
+    Call,
+    /// A non-call use — a type annotation, a qualifier, a member access — that
+    /// the resolution rungs ran on and could not attribute.
+    ///
+    /// **Scope, stated because the number is read as coverage:** this covers
+    /// every reference rung that *runs*. It excludes the one the resolver
+    /// declines — a bare `Name` in value position, which
+    /// `resolve_name_reference` stops before the global lookup for, so that
+    /// `except Exception as e` cannot bind to an unrelated `def e`. A `Name`
+    /// carrying a receiver *is* covered, because the member rungs run for it.
+    ///
+    /// The declined rung is not recorded because there is no tier that means
+    /// "not attempted": filing it under `UnresolvedClass::Unresolved` would
+    /// claim a check ran and failed when it never ran, and would put ~33k
+    /// local-variable mentions per 150 files into the tier that holds 9 real
+    /// defects. Closing that gap needs a new `UnresolvedClass` variant, which
+    /// is matched exhaustively outside this crate.
+    Reference,
+    /// A route whose handler name did not bind to any symbol. Distinct because
+    /// `HandlesRoute` is what tells liveness a handler is reached from outside
+    /// the call graph: a route that failed to bind leaves its handler looking
+    /// dead, and that must not read the same as a route with no named handler.
+    Route,
+    /// A **repo-relative** import specifier that named no indexed file, so no
+    /// `Imports` edge exists for it.
+    ///
+    /// Only relative specifiers are recorded. `import "strings"` naming no
+    /// indexed file is the expected case and carries no information; `from
+    /// .helpers import thing` naming no indexed file is an index gap, and the
+    /// edge that should exist is missing.
+    Import,
+}
+
+impl UnresolvedKind {
+    /// Stable name for persistence and reporting.
+    pub fn label(&self) -> &'static str {
+        match self {
+            UnresolvedKind::Call => "call",
+            UnresolvedKind::Reference => "reference",
+            UnresolvedKind::Route => "route",
+            UnresolvedKind::Import => "import",
+        }
+    }
+}
+
+/// Something the resolution ladder could not attribute to any target.
+///
+/// R5 forbids silence: dropping these makes "we could not resolve this"
+/// indistinguishable from "nothing was here", which silently understates both
+/// the graph and every liveness conclusion drawn from it. Kept out of `edges`
+/// deliberately — an unresolved use has no target node to point at, so
 /// materialising one would invent graph structure.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UnresolvedReference {
     pub source_file: String,
     pub source_symbol: String,
     pub callee_name: String,
+    /// Which edge family this row is about. See `UnresolvedKind`.
+    pub kind: UnresolvedKind,
     pub resolution: Resolution,
     /// Why this call has no edge. See `UnresolvedClass`.
     pub class: UnresolvedClass,
@@ -240,7 +422,20 @@ pub struct UnresolvedReference {
 pub struct ResolutionResult {
     pub edges: Vec<ResolvedEdge>,
     pub receiver_types: BTreeMap<String, String>, // var_name -> type_name (deterministic R4)
+    /// **Always empty. Nothing computes this.**
+    ///
+    /// There is no re-export/alias-chain following in this crate — no code path
+    /// writes a single entry, on any input. Reading it as "this repository has
+    /// no re-export chains" is therefore wrong: the honest reading is "never
+    /// computed", and the two must not look alike.
+    ///
+    /// It survives only because `ResolutionResult` is constructed by struct
+    /// literal in four other crates, so removing the field is a cross-crate
+    /// change. `reexport_chains_are_never_computed` pins the emptiness as a
+    /// stated fact rather than leaving a determinism test comparing two empty
+    /// maps and calling that a check.
     pub reexport_chains: BTreeMap<String, String>, // symbol -> resolved_target
-    /// Calls seen but not attributed. Deterministically ordered (R4).
+    /// Calls, references and route handlers seen but not attributed.
+    /// Deterministically ordered (R4).
     pub unresolved: Vec<UnresolvedReference>,
 }

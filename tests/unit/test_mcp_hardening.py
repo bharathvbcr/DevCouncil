@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from devcouncil.devmap_client import DevMapClient
 from devcouncil.integrations.mcp import server as mcp_server
-from devcouncil.integrations.mcp.handlers import codeintel, debug, tool_specs
+from devcouncil.integrations.mcp import util as mcp_util
+from devcouncil.integrations.mcp.handlers import codeintel, debug, read, tool_specs
 
 
 def _payload(result) -> dict:
@@ -417,3 +419,305 @@ def test_impact_reports_an_unknowable_entry_root_as_null(
     assert payload["ok"] is True
     entry = next(p for p in payload["paths"] if p["path"] == "src/late.py")
     assert entry["is_entry_root"] is None
+
+
+# --- 7. the secret guard judges the file that is actually opened ----------------
+#
+# Every case below was executed against the unmodified handler and returned the
+# secret's bytes with ``ok: true``. `.env` itself was refused the whole time --
+# the guard worked, it was simply asked about the wrong string.
+
+
+def _write_secrets(root: Path) -> None:
+    (root / ".env").write_text("OPENAI_API_KEY=sk-REDACTED-PROOF\n", encoding="utf-8")
+    (root / ".ssh").mkdir()
+    (root / ".ssh" / "ID_RSA").write_text("PRIVATE KEY\n", encoding="utf-8")
+    (root / "certs").mkdir()
+    (root / "certs" / "Server.PEM").write_text("CERT\n", encoding="utf-8")
+    (root / "app" / "Credentials").mkdir(parents=True)
+    (root / "app" / "Credentials" / "token.txt").write_text("TOKEN\n", encoding="utf-8")
+
+
+def _case_insensitive(root: Path) -> bool:
+    probe = root / "CaseProbe.tmp"
+    probe.write_text("x", encoding="utf-8")
+    try:
+        return (root / "caseprobe.tmp").exists()
+    finally:
+        probe.unlink()
+
+
+def _read(root: Path, path: str) -> dict:
+    return _payload(asyncio.run(read.handle_read_file(root, {"path": path})))
+
+
+@pytest.mark.parametrize(
+    "path,secret",
+    [
+        (".ENV", "sk-REDACTED-PROOF"),
+        (".env/", "sk-REDACTED-PROOF"),
+        (".ssh/ID_RSA", "PRIVATE KEY"),
+        ("certs/Server.PEM", "CERT"),
+        ("app/Credentials/token.txt", "TOKEN"),
+    ],
+)
+def test_a_secret_spelled_in_another_case_is_still_refused(
+    tmp_path: Path, path: str, secret: str
+) -> None:
+    """``fnmatch`` matches through ``os.path.normcase`` -- identity on POSIX --
+    so the guard was case-sensitive while APFS and NTFS are not. ``.ENV``,
+    ``ID_RSA`` and ``Server.PEM`` named the same bytes as the patterns and
+    missed every one of them."""
+    _write_secrets(tmp_path)
+    if not _case_insensitive(tmp_path):
+        pytest.skip("case-sensitive filesystem: these spellings name different files")
+    payload = _read(tmp_path, path)
+    assert payload["ok"] is False, payload
+    assert payload["code"] == "secret_path"
+    assert secret not in json.dumps(payload)
+
+
+def test_a_symlink_to_a_secret_inside_the_root_is_refused(tmp_path: Path) -> None:
+    """The guard saw ``notes.txt``; ``open()`` saw ``.env``. Judging the
+    caller's spelling instead of the resolved path is the whole defect."""
+    _write_secrets(tmp_path)
+    (tmp_path / "notes.txt").symlink_to(tmp_path / ".env")
+    payload = _read(tmp_path, "notes.txt")
+    assert payload["ok"] is False, payload
+    assert payload["code"] == "secret_path"
+    assert "sk-REDACTED-PROOF" not in json.dumps(payload)
+
+
+def test_a_symlink_pointing_outside_the_root_is_refused(tmp_path: Path) -> None:
+    """Already closed by ``within_root``; pinned so the case fix cannot widen it."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / ".env").write_text("OUTSIDE=sk-OUT\n", encoding="utf-8")
+    (root / "escape.txt").symlink_to(outside / ".env")
+    payload = _read(root, "escape.txt")
+    assert payload["ok"] is False, payload
+    assert payload["code"] in {"secret_path", "path_escape"}
+    assert "sk-OUT" not in json.dumps(payload)
+
+
+def test_parent_traversal_to_a_secret_is_refused(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / ".env").write_text("OUTSIDE=sk-OUT\n", encoding="utf-8")
+    payload = _read(root, "../outside/.env")
+    assert payload["ok"] is False, payload
+    assert payload["code"] in {"secret_path", "path_escape"}
+
+
+def test_an_ordinary_file_and_an_ordinary_symlink_still_read(tmp_path: Path) -> None:
+    """The guard must narrow, not blanket-refuse: a non-secret target still reads."""
+    _write_secrets(tmp_path)
+    (tmp_path / "real.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "alias.py").symlink_to(tmp_path / "real.py")
+    assert _read(tmp_path, "real.py")["content"] == "x = 1"
+    assert _read(tmp_path, "alias.py")["content"] == "x = 1"
+
+
+# --- 8. debug consent is configuration, never a tool argument -------------------
+
+
+def _debug_project(root: Path, *, consent: bool = False) -> Path:
+    (root / ".git").mkdir(parents=True, exist_ok=True)
+    config = root / ".devcouncil" / "config.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    body = "project:\n  name: fixture\n"
+    if consent:
+        body += "code_intelligence:\n  debug:\n    auto_discover: true\n"
+    config.write_text(body, encoding="utf-8")
+    return config
+
+
+def test_debug_consent_cannot_be_granted_from_a_tool_argument(tmp_path: Path) -> None:
+    """``{"consent": true}`` used to call ``set_debug_consent`` and write
+    ``auto_discover: true`` into ``.devcouncil/config.yaml``, unlocking the
+    other seven debug tools -- process launch and script execution among them --
+    from inside the argument dict of the tool it was supposed to gate. A gate a
+    caller can set by passing an argument is not a gate."""
+    config = _debug_project(tmp_path)
+    before = config.read_text(encoding="utf-8")
+
+    granted = _payload(
+        asyncio.run(debug.dispatch("devcouncil_debug_discover", tmp_path, {"consent": True}))
+    )
+    assert granted["ok"] is False, granted
+    assert granted["code"] == "debug_consent_required"
+    assert "dev debug discover --consent" in granted["error"]
+    assert config.read_text(encoding="utf-8") == before
+
+    # ... and the gate is still shut for every tool the grant would have opened.
+    for name, arguments in [
+        ("devcouncil_debug_discover", {}),
+        ("devcouncil_debug_start", {"adapterId": "debugpy"}),
+        ("devcouncil_debug_trace", {"provider": "python", "script": "app.py"}),
+    ]:
+        assert _payload(asyncio.run(debug.dispatch(name, tmp_path, arguments)))["code"] == (
+            "debug_consent_required"
+        )
+
+
+def test_configured_debug_consent_is_still_honoured(tmp_path: Path) -> None:
+    """Narrowing only: consent the *user* set in configuration still works."""
+    _debug_project(tmp_path, consent=True)
+    payload = _payload(
+        asyncio.run(debug.dispatch("devcouncil_debug_discover", tmp_path, {"consent": True}))
+    )
+    assert payload["consent"] is True
+    assert "adapters" in payload
+
+
+# --- 9. debug path arguments are contained in the project root ------------------
+
+
+@pytest.fixture
+def traced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A consented debug project whose trace providers record instead of run."""
+    _debug_project(tmp_path, consent=True)
+    seen: list[str] = []
+
+    class Provider:
+        def __init__(self, root: Path) -> None:
+            self.root = root
+
+        def run(self, script, args):  # noqa: ANN001
+            seen.append(str(script))
+            return {"script": str(script), "args": list(args)}
+
+    monkeypatch.setattr(debug, "PythonTraceProvider", Provider)
+    monkeypatch.setattr(debug, "NodeCpuProfileProvider", Provider)
+    monkeypatch.setattr(
+        debug, "import_runtime_trace", lambda _root, path: seen.append(str(path)) or {}
+    )
+    return seen
+
+
+def _escapes(root: Path) -> dict[str, str]:
+    outside = root.parent / "outside-debug"
+    outside.mkdir(exist_ok=True)
+    (outside / "x.py").write_text("print('executed')\n", encoding="utf-8")
+    link = root / "link.py"
+    if not link.exists():
+        link.symlink_to(outside / "x.py")
+    return {
+        "absolute outside the root": str(outside / "x.py"),
+        "parent traversal": "../outside-debug/x.py",
+        "symlink pointing outside": "link.py",
+        "an absolute system path": "/etc/passwd",
+    }
+
+
+@pytest.mark.parametrize("provider", ["python", "node"])
+def test_debug_trace_refuses_a_script_outside_the_root(
+    tmp_path: Path, traced: list[str], provider: str
+) -> None:
+    """``_trace`` handed ``arguments["script"]`` straight to a provider whose
+    first line is ``script if script.is_absolute() else self.root / script`` --
+    no ``resolve()``, no containment -- and then to ``subprocess.run``. That is
+    arbitrary script execution outside the project the server was started for."""
+    for label, script in _escapes(tmp_path).items():
+        payload = _payload(
+            asyncio.run(
+                debug.dispatch(
+                    "devcouncil_debug_trace", tmp_path, {"provider": provider, "script": script}
+                )
+            )
+        )
+        assert payload["ok"] is False, f"{label}: {payload}"
+        assert payload["code"] == "path_escape", label
+    assert traced == [], f"a refused script still reached a provider: {traced}"
+
+
+def test_debug_trace_refuses_an_import_path_outside_the_root(
+    tmp_path: Path, traced: list[str]
+) -> None:
+    for label, path in _escapes(tmp_path).items():
+        payload = _payload(
+            asyncio.run(
+                debug.dispatch(
+                    "devcouncil_debug_trace", tmp_path, {"provider": "import", "path": path}
+                )
+            )
+        )
+        assert payload["ok"] is False, f"{label}: {payload}"
+        assert payload["code"] == "path_escape", label
+    assert traced == []
+
+
+def test_debug_breakpoint_source_outside_the_root_is_refused(tmp_path: Path) -> None:
+    _debug_project(tmp_path, consent=True)
+    payload = _payload(
+        asyncio.run(
+            debug.dispatch(
+                "devcouncil_debug_breakpoints",
+                tmp_path,
+                {"sessionId": "s", "source": "/etc/passwd", "lines": [1]},
+            )
+        )
+    )
+    assert payload["ok"] is False, payload
+    assert payload["code"] == "path_escape"
+
+
+def test_debug_trace_still_runs_a_script_inside_the_root(
+    tmp_path: Path, traced: list[str]
+) -> None:
+    """Narrowing only: an in-root script still reaches its provider, resolved."""
+    (tmp_path / "app.py").write_text("print(1)\n", encoding="utf-8")
+    payload = _payload(
+        asyncio.run(
+            debug.dispatch(
+                "devcouncil_debug_trace", tmp_path, {"provider": "python", "script": "app.py"}
+            )
+        )
+    )
+    assert payload["script"] == str((tmp_path / "app.py").resolve())
+    assert traced == [str((tmp_path / "app.py").resolve())]
+
+
+# --- 10. a read-only-annotated call writes nothing ------------------------------
+
+
+def test_the_freshness_probe_on_the_read_path_writes_nothing(tmp_path: Path) -> None:
+    """``with_codeintel_freshness`` runs on ~20 tools annotated
+    ``readOnlyHint: true``; its fingerprint check persisted
+    ``.devcouncil/cache/content_hashes.json`` on every call. The annotation is
+    what a host uses to decide whether to ask the user, so the write had to go,
+    not the annotation."""
+    from devcouncil.devmap_engine import compute_freshness
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    for args in (
+        ["git", "init"],
+        ["git", "config", "user.email", "t@t.com"],
+        ["git", "config", "user.name", "t"],
+    ):
+        subprocess.run(args, cwd=root, capture_output=True, text=True)
+    (root / "app.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=root, capture_output=True, text=True)
+    # Stamped by the same owner the kernel uses, so the map reads fresh to
+    # `map_is_stale` exactly as a kernel-written one would.
+    (root / ".devcouncil").mkdir(parents=True, exist_ok=True)
+    (root / ".devcouncil" / "repo_map.json").write_text(
+        json.dumps({"languages": ["python"], "files": [], **compute_freshness(root)}),
+        encoding="utf-8",
+    )
+
+    cache = root / ".devcouncil" / "cache" / "content_hashes.json"
+    if cache.exists():
+        cache.unlink()
+
+    stale, reason = mcp_util._map_artifact_freshness(root)
+    # The probe must really have run -- "wrote nothing" is worthless if the
+    # check bailed out, which is the same class of defect it is guarding.
+    assert stale is False, f"probe did not run: {reason}"
+    assert not cache.exists(), "a readOnlyHint:true call wrote into the project"

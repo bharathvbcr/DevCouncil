@@ -49,7 +49,7 @@ pub const MAX_FALLBACK_SYMBOLS: usize = 2_000;
 /// regexes across them is unbounded work for a result that is meaningless
 /// anyway, since a whole minified bundle on one line has no "declaration at a
 /// line" to find.
-const MAX_LINE_BYTES: usize = 2_000;
+pub(crate) const MAX_LINE_BYTES: usize = 2_000;
 
 /// A declaration recovered by pattern, with the kind its keyword implies.
 struct Pattern {
@@ -194,6 +194,15 @@ pub struct FallbackScan {
     /// Declarations found beyond [`MAX_FALLBACK_SYMBOLS`] and therefore
     /// dropped. Non-zero means the file's symbol list is a prefix, not a set.
     pub truncated: usize,
+    /// Lines skipped for exceeding [`MAX_LINE_BYTES`], and therefore never
+    /// pattern-matched at all.
+    ///
+    /// The symbol cap and the line cap drop declarations for different reasons
+    /// and only the first was counted, so the scanner's "N declaration(s)
+    /// recovered" was a count of what it kept presented as a count of what is
+    /// there. Generated `.proto` and `.ps1` routinely carry lines past this
+    /// limit, so this is the ordinary case, not the exotic one.
+    pub skipped_long_lines: usize,
 }
 
 /// Recover top-level declarations from `source` by line pattern.
@@ -206,6 +215,7 @@ pub struct FallbackScan {
 pub fn scan_declarations(file_path: &str, source: &str) -> FallbackScan {
     let mut symbols: Vec<ExtractedSymbol> = Vec::new();
     let mut truncated = 0usize;
+    let mut skipped_long_lines = 0usize;
     let mut seen: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
     let mut offset = 0usize;
 
@@ -213,7 +223,13 @@ pub fn scan_declarations(file_path: &str, source: &str) -> FallbackScan {
         let line_start = offset;
         offset += line.len();
         let trimmed_len = line.trim_end_matches(['\n', '\r']).len();
-        if trimmed_len == 0 || trimmed_len > MAX_LINE_BYTES || is_comment(line) {
+        if trimmed_len > MAX_LINE_BYTES {
+            // Counted, not silent: a declaration on this line is a declaration
+            // the file has and the scan does not.
+            skipped_long_lines += 1;
+            continue;
+        }
+        if trimmed_len == 0 || is_comment(line) {
             continue;
         }
         let text = &line[..trimmed_len];
@@ -265,7 +281,11 @@ pub fn scan_declarations(file_path: &str, source: &str) -> FallbackScan {
         }
     }
 
-    FallbackScan { symbols, truncated }
+    FallbackScan {
+        symbols,
+        truncated,
+        skipped_long_lines,
+    }
 }
 
 #[cfg(test)]

@@ -590,7 +590,16 @@ impl Daemon {
         let previous = self.store.latest_extractions()?;
         let mut affected = std::collections::BTreeSet::new();
         let mut deleted = std::collections::BTreeSet::new();
-        let mut fresh = Vec::new();
+        // Keyed by path, because two queue entries can cover one file: a
+        // directory and a file inside it arrive together in a single watcher
+        // batch, and a whole-tree rescan sits beside whatever per-path events
+        // survived the drop that caused it. The store refuses a generation
+        // whose input names a path twice, so an overlapping batch used to fail
+        // on every retry — backing off to 64 s while `pending_count` stayed
+        // non-zero — until the paths quarantined. Both entries describe the
+        // same file on disk, so the later read simply wins.
+        let mut fresh: std::collections::BTreeMap<String, devmap_extract::Extraction> =
+            std::collections::BTreeMap::new();
 
         let mut succeeded: Vec<devmap_store::PendingClaim> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
@@ -621,7 +630,9 @@ impl Daemon {
                 Ok(delta) => {
                     affected.extend(delta.affected);
                     deleted.extend(delta.deleted);
-                    fresh.extend(delta.fresh);
+                    for extraction in delta.fresh {
+                        fresh.insert(extraction.file_path.clone(), extraction);
+                    }
                     succeeded.push(claim_of(pending));
                 }
                 Err(error) => {
@@ -641,6 +652,8 @@ impl Daemon {
         if succeeded.is_empty() {
             anyhow::bail!("every pending path failed: {}", failures.join("; "));
         }
+        // One entry per file from here down, whatever the queue asked for.
+        let fresh: Vec<devmap_extract::Extraction> = fresh.into_values().collect();
 
         // Everything below reuses `previous` — the payloads stored by whichever
         // kernel last wrote a generation. After an extractor or grammar upgrade
@@ -772,6 +785,13 @@ impl Daemon {
         let activity = Arc::new(crate::protocol::Activity::default());
         let max_idle = self.resolved_max_idle();
 
+        // Installed before the endpoint is bound, so a signal arriving at any
+        // point after it exists is queued rather than missed — and so this
+        // failure, which is fatal, happens while there is still no socket on
+        // disk to strand. A daemon that cannot install them is a daemon whose
+        // socket a `kill` would leave behind.
+        let mut signals = ShutdownSignals::install()?;
+
         let store = Arc::clone(&self.store);
         let root = self.root.clone();
         // The watcher canonicalizes its own root, so the absolute paths it
@@ -868,12 +888,6 @@ impl Daemon {
             }
         }));
 
-        // Installed before the loop, so a signal arriving between iterations
-        // is queued rather than missed. A daemon that cannot install them is a
-        // daemon whose socket a `kill` would strand, so this is fatal rather
-        // than a warning.
-        let mut signals = ShutdownSignals::install()?;
-
         let mut ticker = tokio::time::interval(self.idle_poll);
         let mut consecutive_failures = 0u32;
         let mut next_attempt = tokio::time::Instant::now();
@@ -884,11 +898,22 @@ impl Daemon {
         // Captured once, at startup, so the tick below compares against what
         // this process was actually launched from. See the retirement check.
         let started_as = executable_identity();
-        loop {
+        // Every way out of this loop is a `break` carrying a [`LoopExit`], and
+        // the single release below is the only caller of
+        // `release_ipc_endpoint`. Two of the six exits — the binary-replacement
+        // retirement and the idle retirement, the latter being the *routine*
+        // one — used to `return` straight out and skip it, which is how the
+        // orderly path arrived at the same stale-socket state a `kill -9`
+        // leaves. Adding a `return` here would reintroduce that; there is
+        // nothing to return to but the `break`.
+        let exit = loop {
             tokio::select! {
                 result = &mut ipc_task.0 => {
-                    return result
-                        .map_err(|error| anyhow::anyhow!("IPC task join failed: {error}"))?;
+                    break LoopExit::IpcTaskEnded(
+                        result
+                            .map_err(|error| anyhow::anyhow!("IPC task join failed: {error}"))
+                            .and_then(|served| served),
+                    );
                 }
                 // Both shutdown routes converge here. Without them the socket
                 // file was removed only by `UnixIpcServer`'s `Drop`, which a
@@ -901,16 +926,14 @@ impl Daemon {
                         "{signal} received; releasing the IPC endpoint and exiting \
                          (pending work stays queued in the store)"
                     );
-                    release_ipc_endpoint(&mut ipc_task).await;
-                    return Ok(());
+                    break LoopExit::ReleaseEndpoint(Ok(()));
                 }
                 _ = self.shutdown.notified() => {
                     info!(
                         "shutdown requested; releasing the IPC endpoint and exiting \
                          (pending work stays queued in the store)"
                     );
-                    release_ipc_endpoint(&mut ipc_task).await;
-                    return Ok(());
+                    break LoopExit::ReleaseEndpoint(Ok(()));
                 }
                 _ = ticker.tick() => {
                     // Exit when there is nothing left to serve. Checked before
@@ -924,8 +947,7 @@ impl Daemon {
                             "{reason}; releasing the IPC endpoint and exiting \
                              (nothing left to serve)"
                         );
-                        release_ipc_endpoint(&mut ipc_task).await;
-                        return Ok(());
+                        break LoopExit::ReleaseEndpoint(Ok(()));
                     }
                     // Retire when the binary that started this process has been
                     // replaced on disk.
@@ -969,7 +991,7 @@ impl Daemon {
                              retiring so the next client gets the current kernel \
                              (pending work stays queued in the store)"
                         );
-                        return Ok(());
+                        break LoopExit::ReleaseEndpoint(Ok(()));
                     }
                     if let Some(limit) = max_idle {
                         let idle_for = activity
@@ -979,12 +1001,22 @@ impl Daemon {
                             // Pending work keeps the daemon alive through its
                             // idle bound: retiring mid-queue would stall the
                             // resync until some future client respawned us.
-                            if self.store.get_pending_paths()?.is_empty() {
-                                info!(
-                                    "no IPC request, pending work or watcher event \
-                                     for {idle_for:?}; retiring daemon"
-                                );
-                                return Ok(());
+                            //
+                            // A store that cannot answer is not evidence that
+                            // the queue is empty, so it ends the loop through
+                            // the release rather than through `?`.
+                            match self.store.get_pending_paths() {
+                                Ok(pending) if pending.is_empty() => {
+                                    info!(
+                                        "no IPC request, pending work or watcher event \
+                                         for {idle_for:?}; retiring daemon"
+                                    );
+                                    break LoopExit::ReleaseEndpoint(Ok(()));
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    break LoopExit::ReleaseEndpoint(Err(error.into()));
+                                }
                             }
                         }
                     }
@@ -1015,8 +1047,7 @@ impl Daemon {
                                     "pending drain failed and {reason}; releasing the \
                                      IPC endpoint and exiting (nothing left to serve): {err}"
                                 );
-                                release_ipc_endpoint(&mut ipc_task).await;
-                                return Ok(());
+                                break LoopExit::ReleaseEndpoint(Ok(()));
                             }
                             consecutive_failures = consecutive_failures.saturating_add(1);
                             let exponent = consecutive_failures.saturating_sub(1).min(6);
@@ -1029,8 +1060,36 @@ impl Daemon {
                     }
                 }
             }
+        };
+
+        match exit {
+            // The IPC future has already completed, so `UnixIpcServer::drop`
+            // has already run and the endpoint is gone. Awaiting the handle
+            // again would poll a `JoinHandle` whose output was taken.
+            LoopExit::IpcTaskEnded(result) => result,
+            LoopExit::ReleaseEndpoint(result) => {
+                release_ipc_endpoint(&mut ipc_task).await;
+                result
+            }
         }
     }
+}
+
+/// How [`Daemon::run_loop`] stopped, and therefore whether the IPC endpoint
+/// still has to be released before the call resolves.
+///
+/// Two states rather than a bare `Result`, because "the endpoint is already
+/// gone" and "the endpoint is still bound" are the only two shapes an exit can
+/// have and the wrong one is invisible: `AbortTaskOnDrop` *schedules* the drop
+/// that removes the socket, so a `return` that skips the await usually looks
+/// fine in a test — the runtime gets around to it — and strands the socket in
+/// production, where the process exits instead.
+enum LoopExit {
+    /// The IPC task ended on its own; its future is complete and its listener
+    /// dropped with it.
+    IpcTaskEnded(anyhow::Result<()>),
+    /// Every other exit. The listener is still live and must be awaited away.
+    ReleaseEndpoint(anyhow::Result<()>),
 }
 
 /// Identity of a repository's IPC endpoint.
@@ -1962,6 +2021,230 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(!socket.exists(), "retired daemon leaked its IPC endpoint");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// K-A3, closing the loop: what the watcher emits when the OS says it
+    /// dropped events must actually re-index the tree, and must make the
+    /// freshness surfaces say so while it is outstanding.
+    ///
+    /// The unit test beside `watch_event_paths` proves the notice produces this
+    /// queue entry. This proves the entry is worth producing: it goes through
+    /// the same `enqueue_pending_paths_under_root` the daemon's watcher
+    /// callback calls, the same `Store::status` the IPC `status` answer derives
+    /// `is_fresh` from, and the same `drain_pending_batch` the tick runs.
+    ///
+    /// The file added here is one no incremental event ever named — exactly
+    /// what a dropped-event window leaves behind.
+    #[test]
+    fn a_rescan_request_re_indexes_the_tree_and_is_not_reported_fresh() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("devmap-daemon-rescan-{stamp}"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("main.py"), "def main():\n    return 1\n").unwrap();
+
+        let initial = extract_tree(&root).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&initial);
+        let resolution = resolver.resolve_all(&initial);
+        let analysis = analyze(&initial, &resolution);
+        let store = Store::open_in_memory().unwrap();
+        store
+            .save_generation(&initial, &resolution, &analysis)
+            .unwrap();
+
+        // The window in which the OS dropped events: this file appears, and no
+        // per-path event for it is ever delivered.
+        fs::write(
+            root.join("missed.py"),
+            "def missed_in_the_gap():\n    return 1\n",
+        )
+        .unwrap();
+
+        let daemon = Daemon::new(store, root.clone());
+        assert!(
+            !daemon
+                .store
+                .latest_extractions()
+                .unwrap()
+                .iter()
+                .any(|extraction| extraction.file_path == "missed.py"),
+            "precondition: the missed file must not already be indexed"
+        );
+        assert_eq!(
+            daemon.store.status("<memory>").unwrap().pending_count,
+            0,
+            "precondition: nothing queued, so `is_fresh` currently answers true"
+        );
+
+        let canonical_root = root.canonicalize().unwrap();
+        let report = daemon
+            .store
+            .enqueue_pending_paths_under_root(
+                &canonical_root,
+                &crate::watcher::whole_tree_rescan(&canonical_root),
+            )
+            .unwrap();
+        assert!(
+            report.refused.is_empty(),
+            "the rescan request must be an acceptable queue entry: {:?}",
+            report.refused
+        );
+        assert!(
+            daemon.store.status("<memory>").unwrap().pending_count > 0,
+            "a repository whose watcher lost coverage must not read as fresh \
+             until the rescan has run"
+        );
+
+        assert_eq!(
+            daemon.drain_pending_batch().unwrap(),
+            1,
+            "the rescan entry must be claimed and acknowledged"
+        );
+        assert!(
+            daemon
+                .store
+                .latest_extractions()
+                .unwrap()
+                .iter()
+                .any(|extraction| extraction.file_path == "missed.py"),
+            "the rescan must pick up the file no event ever named"
+        );
+        assert_eq!(
+            daemon.store.status("<memory>").unwrap().pending_count,
+            0,
+            "and the tree is genuinely fresh again once it has run"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A directory and a file inside it, claimed in the same batch, describe the
+    /// same file twice — and the store refuses a generation whose input names a
+    /// path twice ("duplicate extraction path in generation input").
+    ///
+    /// Found end to end while proving K-A3: a rescan queues the repository root
+    /// beside the per-path events that did survive the drop, every drain then
+    /// failed on the collision, and the retries backed off to 64 s while
+    /// `pending_count` stayed non-zero — a queue that could never drain. The
+    /// same collision was already reachable without a rescan (a new
+    /// subdirectory and a file inside it arrive in one watcher batch); the
+    /// rescan just makes it the normal case.
+    ///
+    /// The extractions are deduplicated where they are collected, so no caller
+    /// has to know that two queue entries can cover one file.
+    #[test]
+    fn a_directory_and_a_file_inside_it_in_one_batch_do_not_collide() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("devmap-daemon-overlap-{stamp}"));
+        fs::create_dir_all(root.join("pkg")).unwrap();
+        fs::write(root.join("main.py"), "def main():\n    return 1\n").unwrap();
+        fs::write(root.join("pkg/mod.py"), "def helper():\n    return 1\n").unwrap();
+
+        let initial = extract_tree(&root).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&initial);
+        let resolution = resolver.resolve_all(&initial);
+        let analysis = analyze(&initial, &resolution);
+        let store = Store::open_in_memory().unwrap();
+        store
+            .save_generation(&initial, &resolution, &analysis)
+            .unwrap();
+
+        fs::write(root.join("pkg/mod.py"), "def helper():\n    return 2\n").unwrap();
+
+        let canonical_root = root.canonicalize().unwrap();
+        let daemon = Daemon::new(store, root.clone());
+        // The whole tree, the subdirectory, and one file inside it: every
+        // combination a rescan-plus-events batch can hold.
+        daemon
+            .store
+            .enqueue_pending_paths_under_root(
+                &canonical_root,
+                &[
+                    canonical_root.to_string_lossy().into_owned(),
+                    canonical_root.join("pkg").to_string_lossy().into_owned(),
+                    canonical_root
+                        .join("pkg/mod.py")
+                        .to_string_lossy()
+                        .into_owned(),
+                ],
+            )
+            .unwrap();
+
+        let drained = daemon
+            .drain_pending_batch()
+            .expect("overlapping queue entries must not make the batch unpersistable");
+        assert_eq!(drained, 3, "every claimed entry must be acknowledged");
+        assert!(
+            daemon.store.get_pending_paths().unwrap().is_empty(),
+            "a batch that cannot drain retries forever and quarantines"
+        );
+
+        // The generation is correct, not merely writable: the re-read file wins
+        // and nothing was lost to the deduplication.
+        let stored = daemon.store.latest_extractions().unwrap();
+        let mut paths: Vec<&str> = stored
+            .iter()
+            .map(|extraction| extraction.file_path.as_str())
+            .collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["main.py", "pkg/mod.py"]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// K-A5: idle retirement is the *routine* exit, and it skipped the release
+    /// the code documents as mandatory.
+    ///
+    /// The distinction the existing retirement test cannot see is timing.
+    /// `AbortTaskOnDrop::drop` only *schedules* the IPC future to be dropped;
+    /// the socket file is removed by that drop. A test that waits a second for
+    /// the file to disappear passes either way — the runtime gets around to it.
+    /// A real daemon does not wait: it returns from `run_loop` and the process
+    /// exits, leaving the endpoint on disk in exactly the state a `kill -9`
+    /// leaves. `probe_endpoint_liveness` then answers `Some(true)` for the
+    /// corpse and the next client's daemon refuses to start.
+    ///
+    /// So this awaits `run_loop` in the test's own task and asserts with no
+    /// intervening `.await`: on a current-thread runtime nothing else can run
+    /// in that gap, which is precisely the window the process exit falls into.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_retirement_releases_the_endpoint_before_run_loop_returns() {
+        let root = short_unix_fixture_dir("idle-release");
+        fs::write(root.join("main.py"), "def main(): pass\n").unwrap();
+
+        let socket = root.join("idle-release.sock");
+        let lock = crate::protocol::ipc_lock_path(&socket);
+        let daemon = Daemon::new(Store::open_in_memory().unwrap(), root.clone())
+            .with_ipc_path(socket.clone())
+            .with_idle_poll(Duration::from_millis(20))
+            .with_max_idle(Some(Duration::from_millis(100)));
+
+        let outcome = tokio::time::timeout(Duration::from_secs(20), daemon.run_loop())
+            .await
+            .expect("the daemon must retire within its idle bound");
+        // NO `.await` between the line above and the assertions below.
+        assert!(outcome.is_ok(), "idle retirement reported: {outcome:?}");
+        assert!(
+            !socket.exists(),
+            "idle retirement returned with its socket still at {} — \
+             the endpoint must be released before `run_loop` resolves",
+            socket.display()
+        );
+        assert!(
+            !lock.exists(),
+            "idle retirement returned with its lock still at {}",
+            lock.display()
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 

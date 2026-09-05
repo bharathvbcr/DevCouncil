@@ -24,6 +24,12 @@
 //! same shape" are different claims, and a caller acting on the second needs to
 //! know it is the second.
 
+// Every item below this point exists only to serve `parse_impl`, so each
+// carries the same gate that module does. Without it, building this crate
+// with `parse` off — the configuration an embedder uses to answer questions
+// about a persisted map without linking 32 C grammars — produced five
+// dead-code warnings, which is what a `-D warnings` build fails on.
+#[cfg(feature = "parse")]
 use crate::model::BodySignature;
 
 /// Below this, a body carries no evidence of duplication.
@@ -46,11 +52,15 @@ use crate::model::BodySignature;
 ///
 /// A symbol under the floor gets no signature at all rather than a signature
 /// that is filtered later, so `None` keeps meaning "not computed" everywhere.
+#[cfg(feature = "parse")]
 pub const MIN_SIGNATURE_NODES: u32 = 32;
 
+#[cfg(feature = "parse")]
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+#[cfg(feature = "parse")]
 const FNV_PRIME: u64 = 0x100000001b3;
 
+#[cfg(feature = "parse")]
 #[inline]
 fn mix(hash: u64, bytes: &[u8]) -> u64 {
     bytes.iter().fold(hash, |acc, byte| {
@@ -66,6 +76,7 @@ fn mix(hash: u64, bytes: &[u8]) -> u64 {
 /// substring covers grammars this file has never been tested against, which is
 /// the point: a grammar added later must not start injecting comment text into
 /// body identity without anyone noticing.
+#[cfg(feature = "parse")]
 #[inline]
 fn is_comment_kind(kind: &str) -> bool {
     kind.contains("comment")

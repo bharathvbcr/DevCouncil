@@ -562,6 +562,47 @@ enum Commands {
         #[arg(long)]
         print_socket_path: bool,
     },
+
+    /// Speak the Model Context Protocol on stdin/stdout, for an agent host.
+    ///
+    /// This is the connection an agent actually makes. It answers `tools/call`
+    /// from the store held open in this process, where the Python seam spawned
+    /// a fresh `devmap` per request whenever no daemon socket was live.
+    ///
+    /// The store is opened on first use, not here: an agent host starts this
+    /// server when its session begins, which on a fresh clone is before any
+    /// index exists. Starting anyway means the agent sees the tools and a
+    /// message naming the build command, rather than seeing no server at all.
+    Mcp {
+        /// Serve MCP 2.0 (protocol 2026-07-28) over HTTP on this address
+        /// instead of speaking stdio.
+        ///
+        /// That revision is not reachable over stdio at all: its requests are
+        /// self-contained POSTs carrying their own protocol version, and the
+        /// `initialize` handshake every stdio client uses tops out at
+        /// 2025-11-25. This flag is the only way to reach it.
+        ///
+        /// Defaults to loopback when given a bare port. A code index is a map of
+        /// a private repository, so binding it to a routable interface publishes
+        /// that map — do that deliberately or not at all.
+        #[arg(long, value_name = "ADDR")]
+        http: Option<String>,
+
+        /// Print the MCP server entry an agent host needs, and exit.
+        ///
+        /// Creates nothing and starts nothing — the same contract as
+        /// `serve --print-socket-path`, and for the same reason: a second
+        /// implementation of "how do I reach this server" living in a host's
+        /// config generator can disagree with this binary, and the disagreement
+        /// is invisible from either side. This is the authority.
+        ///
+        /// The emitted `command` is this executable's own absolute path, not the
+        /// bare name `devmap`. A host config that says `devmap` works only when
+        /// something already put it on PATH, which on a fresh machine is exactly
+        /// what has not happened.
+        #[arg(long)]
+        print_config: bool,
+    },
 }
 
 fn open_for_read(db: &std::path::Path) -> anyhow::Result<Store> {
@@ -953,8 +994,14 @@ fn affected_closure(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // stderr, not the builder's default stdout. Every command that emits a
+    // payload emits it on stdout — `emit_json` prints there, and `devmap mcp`
+    // speaks JSON-RPC there — so a log line on stdout is not noise beside the
+    // answer, it is a line *inside* the answer. `devmap search --json | jq`
+    // fails on it, and an MCP client's next parse fails on it.
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
+        .with_writer(std::io::stderr)
         .finish();
     tracing::subscriber::set_global_default(subscriber).ok();
 
@@ -2073,6 +2120,59 @@ async fn main() -> anyhow::Result<()> {
                 },
             );
             emit_json(&cli, &serde_json::to_value(&resp)?)?;
+        }
+        Commands::Mcp { http, print_config } => {
+            // Nothing but JSON-RPC frames may reach stdout on this transport.
+            // `main` installs the tracing subscriber before this match, and
+            // `FmtSubscriber::builder()` writes to stdout by default — see the
+            // `.with_writer(std::io::stderr)` there, which this transport
+            // depends on and which `--json` output depended on already.
+            if *print_config {
+                // Before the store is touched: this must create no file and open
+                // no database, so it can be run against a repository that has
+                // never been indexed — which is when a user configures a host.
+                let executable = std::env::current_exe()?;
+                let db = cli.db.clone();
+                let entry = match http {
+                    Some(address) => serde_json::json!({
+                        "type": "http",
+                        "url": format!(
+                            "http://{}",
+                            if address.contains(':') {
+                                address.clone()
+                            } else {
+                                format!("127.0.0.1:{address}")
+                            }
+                        ),
+                    }),
+                    None => serde_json::json!({
+                        "type": "stdio",
+                        "command": executable.display().to_string(),
+                        "args": ["--db", db.display().to_string(), "mcp"],
+                    }),
+                };
+                emit_json(&cli, &serde_json::json!({"mcpServers": {"devmap": entry}}))?;
+                return Ok(());
+            }
+
+            let slot = std::sync::Arc::new(devmap_serve::StoreSlot::new(cli.db.clone()));
+            match http {
+                Some(address) => {
+                    // A bare port means loopback. Spelling the default out here
+                    // rather than accepting "8080" as 0.0.0.0 is the difference
+                    // between serving one machine and serving a network.
+                    let address = if address.contains(':') {
+                        address.clone()
+                    } else {
+                        format!("127.0.0.1:{address}")
+                    };
+                    let parsed: std::net::SocketAddr = address.parse().map_err(|err| {
+                        anyhow::anyhow!("could not parse --http address '{address}': {err}")
+                    })?;
+                    devmap_serve::serve_http(slot, parsed).await?;
+                }
+                None => devmap_serve::serve_stdio(slot).await?,
+            }
         }
         Commands::Serve {
             path,

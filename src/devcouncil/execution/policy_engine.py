@@ -242,7 +242,16 @@ SECRET_PATH_PATTERNS = (
     "**/.env.*",
     "**/credentials/**",
     "**/secrets/**",
+    # Both forms, deliberately. `fnmatch` gives `**` no special meaning — it is
+    # just `*`, which still will not cross the `/` that `**/` requires — so
+    # `**/*.pem` matches `certs/key.pem` and does NOT match `key.pem` at the
+    # repository root. Every other entry here already carries its root-level
+    # twin (`.env` beside `**/.env`, `*.pfx` beside `**/*.pfx`); these four were
+    # the omissions, so a private key committed at the top level of a repository
+    # was unprotected while the same file one directory down was not.
+    "*.pem",
     "**/*.pem",
+    "*.key",
     "**/*.key",
     # Private SSH keys and well-known credential/token files. These are never
     # writable through the gate so an agent cannot plant or overwrite credentials.
@@ -251,6 +260,8 @@ SECRET_PATH_PATTERNS = (
     "**/id_ecdsa",
     "**/id_ed25519",
     "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
     "id_ed25519",
     ".npmrc",
     "**/.npmrc",

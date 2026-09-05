@@ -210,7 +210,7 @@ fn failure(code: &'static str, message: impl Into<String>) -> Envelope {
     }
 }
 
-fn validate_request(request: &IpcRequest) -> Result<(), String> {
+pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
     let (text, budget, depth, min_confidence) = match &request.command {
         IpcCommand::Status => return Ok(()),
         IpcCommand::Search { query, budget, .. } => (query.as_str(), *budget, 1, None),
@@ -302,7 +302,7 @@ fn validate_request(request: &IpcRequest) -> Result<(), String> {
     Ok(())
 }
 
-fn dispatch(
+pub(crate) fn dispatch(
     store: &Store,
     request: IpcRequest,
     cancel: &devmap_query::Cancel,

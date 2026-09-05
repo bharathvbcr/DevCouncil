@@ -187,7 +187,15 @@ pub fn extract_notebook(
             diagnostics,
         );
     };
-    if all_cells.len() > MAX_CELLS {
+    // Counted here and carried all the way to `parse_outcome` below. It used
+    // to live only in `diagnostics`, which `for_durable_store()` clears before
+    // the payload reaches `generation_files.extraction_json` and the extraction
+    // cache — so the stored record of a 6,000-cell notebook read `Clean`, was
+    // cache-admitted under a real content hash, and a caller could not tell it
+    // from a notebook read in full. Same defect, same fix, as the fallback
+    // scanner's truncation count in schema v29.
+    let dropped_cells = all_cells.len().saturating_sub(MAX_CELLS);
+    if dropped_cells > 0 {
         diagnostics.push(format!(
             "notebook has {} cells; only the first {MAX_CELLS} were read",
             all_cells.len()
@@ -265,7 +273,12 @@ pub fn extract_notebook(
             // Coarse but true: the cell this symbol came from.
             cells
                 .iter()
-                .find(|cell| cell.code.contains(declaration))
+                // `contains("")` is unconditionally true, so an empty
+                // declaration silently took cell 0's span and was reported as
+                // located — a guessed span presented as a found one, which the
+                // module doc explicitly forbids. The parallel call path already
+                // guards this; the symbol path did not.
+                .find(|cell| !declaration.is_empty() && cell.code.contains(declaration))
                 .and_then(|cell| cell.raw_span.clone())
         });
 
@@ -314,8 +327,39 @@ pub fn extract_notebook(
         ));
     }
 
+    // A prefix read is part of the result, not a note about it.
+    let outcome = match (&parsed.parse_outcome, dropped_cells, unlocatable) {
+        (ParseOutcome::Failed { .. }, _, _) => parsed.parse_outcome,
+        (_, 0, 0) => parsed.parse_outcome,
+        (other, _, _) => {
+            let mut losses = Vec::new();
+            if dropped_cells > 0 {
+                losses.push(format!(
+                    "{MAX_CELLS} of {} cells were read and {dropped_cells} were not",
+                    MAX_CELLS + dropped_cells
+                ));
+            }
+            if unlocatable > 0 {
+                losses.push(format!(
+                    "{unlocatable} symbol(s) could not be located in the raw notebook \
+                     and were dropped"
+                ));
+            }
+            if matches!(other, ParseOutcome::Partial { .. }) {
+                losses.push("the parsed cells also carried syntax errors".to_string());
+            }
+            ParseOutcome::Fallback {
+                reason: format!(
+                    "notebook symbol list is a prefix, not a set: {} — absence of a symbol \
+                     is not evidence it is not declared",
+                    losses.join("; ")
+                ),
+            }
+        }
+    };
+
     let mut extraction = base(
-        parsed.parse_outcome,
+        outcome,
         ExtractionEngine::Notebook {
             kernel_language: language.to_string(),
         },

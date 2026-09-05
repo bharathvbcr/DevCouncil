@@ -399,7 +399,7 @@ Passing tests are local/mechanical evidence only. They are not evidence of the r
 
   The risk is not skipping, it is skipping when something *did* change, so the test drives all four mutations: modify, add, delete, and a rename with byte-identical content — the last is the one a file-count check alone would miss, and it is why the comparison is per-path rather than a count or a set size.
 
-  **A one-file edit now resolves only what the change can reach.** The affected closure is the changed files plus every file mentioning a name whose definition moved. That is the complete dependency surface for one specific reason: the resolver has exactly two genuinely global maps, the symbol index and the type/method index, and *both are keyed by bare symbol name*. Nothing else a file resolves against is global. Measured on a 1,610-file tree, editing one file resolved **13 edges instead of 172,046**.
+  **A one-file edit narrows the store *write*, not the resolve. Corrected 2026-09-05.** The affected closure is the changed files plus every file mentioning a name whose definition moved. That is the complete dependency surface for one specific reason: the resolver has exactly two genuinely global maps, the symbol index and the type/method index, and *both are keyed by bare symbol name*. Nothing else a file resolves against is global. ~~Measured on a 1,610-file tree, editing one file resolved **13 edges instead of 172,046**.~~ That claim was **stale**: narrowing the resolve was reverted as unsound (see `main.rs:1234-1253` — liveness and community detection are global, so a subset resolve committed 433 dead-code candidates instead of 14), and `main.rs:1267` calls `resolve_all` on every build. The `resolve_subset(extractions, only)` entry point had no caller left and has been removed from `devmap-resolve` rather than left as a supported-looking option. The narrowing that survives is the store's edge partition, which still carries unaffected extractions forward.
 
   Two things made this safe rather than a rerun of SC16. The index is still built from every extraction — a subset index would resolve differently, which is the bug itself. And the store's edge partition had to change: carry-forward skipped edges where *either* endpoint was affected while the resolver added them on the same rule, which leaves a hole exactly where a subset resolve stops producing edges — an edge from an unaffected source into an affected target would have been skipped by both and silently vanished. Edges are now partitioned by **source file only**, so each belongs to exactly one bucket: the file whose extraction produced it.
 
@@ -1634,3 +1634,674 @@ alone; the caller has real edges, and the signal is on the response for anyone w
 `test_walk_incomplete_survives_the_seam.py` (4 tests) and one test in
 `test_neighbors_batching.py` are red against the pre-fix client, including a case asserting the
 new field cannot become an escape hatch from the budget invariants.
+### The kernel got its own MCP server, and MCP 2.0 became reachable (2026-09-05)
+
+**Baseline this session started from, measured not assumed:** `cargo test --workspace
+--no-fail-fast` = **889 passed, 0 failed**, 66 suites, exit 0. The handoff's "740/0" is a
+2026-09-02 figure and is stale; nothing was wrong with it, it simply predates 149 tests.
+
+**What was built.** `devmap-serve` gained `mcp.rs` and `mcp_http.rs`, and `devmap` gained an
+`mcp` subcommand. An agent can now speak MCP to the Rust kernel directly:
+
+| Transport | Command | Protocol revisions |
+|---|---|---|
+| stdio | `devmap mcp` | `2024-11-05` … `2025-11-25` (handshake era) |
+| HTTP, single-exchange | `devmap mcp --http <addr>` | `2026-07-28` (modern era) |
+
+Nine tools — `status`, `search`, `dependencies`, `impact`, `trace`, `neighbors`,
+`dead_symbols`, `clones`, `preview` — every one annotated `readOnlyHint: true`,
+`destructiveHint: false`, and deliberately `idempotentHint: false` (the index moves as the
+repository changes; claiming idempotence invites a client to cache past the commit that
+invalidated the answer).
+
+**There is exactly one dispatcher, and that is the whole design.** MCP tool calls are not a
+second implementation of "what does `impact` mean". `IpcCommand` is `#[serde(tag = "cmd")]`, so
+a tool's argument object with `"cmd"` inserted *is* its wire form; it deserializes through the
+same serde defaults and goes to the same `validate_request` and `dispatch` the socket protocol
+uses. A hand-written `match` over tool names would have restated `default_budget` and
+`default_depth`, and a restated default is a default that can disagree.
+`http_and_stdio_answer_the_same_question_identically` compares the two transports' `result`
+payloads on three successes and one failure, because agreeing on success and diverging on
+failure is the shape that would actually ship.
+
+**MCP-2 is closed, and closing it required a transport, not a config change.** The register row
+asks for `ttlMs`/`cacheScope` on `tools/list`. The Python server already sets them correctly and
+they have never reached a client: `HANDSHAKE_PROTOCOL_VERSIONS` (`mcp_types.version`) stops at
+`2025-11-25`, and `ServerRunner._serialize` sieves the result through the negotiated version's
+surface, which drops both fields on every version stdio can negotiate. That analysis, written in
+`server.py`, was **verified correct against the installed SDK** — one of the few claims this
+repository has checked and found true. The consequence is that the fields are not a
+configuration item at all: `2026-07-28` uses a stateless per-request envelope reached over the
+modern HTTP transport, so serving that transport is the only way to make them live. They are now
+live and asserted, on `server/discover` and `tools/list`, by
+`discover_advertises_the_modern_revision_with_live_cache_hints`.
+
+**Measured, on a store built and settled for the purpose** (4,214 nodes / 20,051 edges;
+`node_count > 0` and `pending_count == 0` are *assertions* in the harness, not notes, because
+this repository has produced three wrong numbers from unsettled stores):
+
+| Path | p50 | p95 |
+|---|---|---|
+| in-process `tools/list` | 40.2 µs | 42.2 µs |
+| in-process `status` | 360 µs | 561 µs |
+| in-process `search` | 3.26 ms | 3.77 ms |
+| in-process `impact` | 14.5 ms | 29.2 ms |
+| **subprocess `status`** | **11.6 ms** | 15.4 ms |
+| cold-open + `status` | 640 µs | 961 µs |
+
+**32× on `status`, and the cost is attributed rather than guessed.** The `cold-open` row exists
+precisely so the win is not credited to the wrong cause: opening the store is 640 µs of the
+subprocess path's 11.6 ms, so **~11 ms is process startup**. The lesson from the `neighbors`
+work — count the round trips before writing more Rust — generalises here to *identify what the
+time is actually spent on before claiming a rewrite bought it*.
+
+The harness is `crates/devmap-serve/examples/mcp_bench.rs`, an `examples/` target because no
+new dependency was authorised for benchmarking; `criterion` was offered and declined. It uses
+`std::time::Instant` and reports quantiles with N, and its own doc comment says plainly that
+this is enough to answer "10× or 1.1×" and **not** enough to catch a 3% regression. It refuses
+to benchmark a call that returns `isError`, because measuring an error path and reporting it as
+a query has happened here before.
+
+**Three defects found by running the code, not by reading it.** Recorded because all three were
+invisible to review:
+
+1. `Commands::Mcp` built a `tokio::runtime::Runtime` inside `#[tokio::main]` — "Cannot start a
+   runtime from within a runtime", every invocation, exit 101. Found by the first smoke test.
+2. hyper panics at connection setup when `header_read_timeout` is configured with no timer to
+   drive it. Not a warning, not a degraded mode: **every accepted connection died**. An
+   in-process test of the handler would have passed while the server was unusable, which is why
+   `mcp_http_modern.rs` drives a real socket on port 0.
+3. The tool schemas declared `additionalProperties: false` while serde silently ignored unknown
+   fields. A client misspelling `budget` passed schema validation, had the typo dropped, and
+   received the 2,000-token default while believing it had asked for more — a short,
+   correct-looking answer that is not the one requested.
+
+**Defect 3 is worth more than its size, because the first fix was the defect again.** The fix
+added a hand-written list of accepted property names directly beneath a comment claiming
+"checked against the schema rather than a second hand-written field list, so the promise and the
+enforcement cannot disagree". That is the *exact* pattern this ledger already documents from the
+`admits` NaN comment and `neighbors`' "the same budget and confidence": **a false claim sitting
+directly above the code that contradicts it, written by the person who wrote the code.** It
+survived one self-review and was caught only on re-reading. The list is now derived from
+`describe()`, the same function `tool_specs` publishes.
+
+**One preventive change, labelled as such.** `FmtSubscriber::builder()` writes to **stdout** by
+default, and `main` installed it that way for every command. Every command that emits a payload
+emits it on stdout — `emit_json` prints there, and `devmap mcp` speaks JSON-RPC there — so a log
+line is not noise beside the answer, it is a line *inside* it: `devmap search --json | jq` fails
+on it and an MCP client's next parse fails on it. It is now `.with_writer(std::io::stderr)`.
+**No INFO-level log currently fires on either path** (`devmap-store` and `devmap-query` contain
+none; the 28 in `daemon.rs`/`watcher.rs` are not on it), so this fixes no observed failure and
+ships **without** a red test. Saying so rather than pairing it with a test that passes either
+way, which would be a gate nobody has seen fail.
+
+**Known and unfixed, carried forward deliberately:** `handle_method` accepts a JSON-RPC *batch*
+array nowhere — a batch arrives as a parse-shaped failure rather than a named refusal. The
+modern transport is one-request-per-POST so batches are out of scope there, but stdio clients
+may send them.
+
+### The adversary found eleven defects in the MCP server, and all eleven are closed (2026-09-05)
+
+A subagent was handed `mcp.rs` and told to break it. **44 attacks, 11 landed.** Written up here
+because the denominator matters as much as the hits, and because the shape of what it found —
+and of what it *could not* find — says where the risk in this design actually was.
+
+**The central claim survived.** The module is built on "there is exactly one dispatcher": MCP
+tool calls become the same `IpcCommand` the socket protocol speaks and go to the same
+`dispatch`. The adversary diffed all nine tools, socket `handle_stream` against MCP
+`tools/call`, payload for payload — `status`, `search`, `deps`, `impact`, `trace`, `neighbors`,
+`dead`, `clones`, `preview` — and found them byte-equal every time. **Every one of the eleven
+defects was at an edge — framing or schema publication — and not one was in an answer.** That is
+the outcome the single-dispatcher design was chosen for, and it is the first time in this
+ledger's history that a new surface's core claim held up to a dedicated adversary.
+
+Also attacked and unbroken: tool-name spoofing (`cmd`, `Cmd`, `__proto__`-nested `cmd`,
+case-variant names, a zero-width joiner in a name, `arguments` as a bare string — all refused);
+the schema/serde field-name audit across all nine tools (no declared property serde rejects, none
+accepted that is undeclared); `tools/list` determinism; `StoreSlot`'s lazy open under a
+mid-session build and under concurrent first-calls; 400-deep JSON nesting; and numeric casts —
+`mcp.rs` contains no `as` casts at all, so the saturating-cast shape that produced the `admits`
+NaN bug is structurally absent here.
+
+**The eleven, and what each actually cost a caller.** Five were one root cause: `handle_line`
+took a `&str` and decoded straight into a struct.
+
+| # | Defect | The wrong answer |
+|---|---|---|
+| 1 | `id: null` folded into `None` by `Option<Value>` | JSON-RPC §4 says a notification is a request *without* an id member; `null` is a legal id. A legal request got **zero frames** and its client waited forever |
+| 2 | Frame bound checked after `lines()` had grown the buffer | The refusal named 4 MiB against a 1 MiB limit — the check reported the size of an allocation it had failed to prevent |
+| 3 | Non-UTF-8 returned `Err` from the loop | One stray `0xFF` killed the whole session: no frame for that request **and none for any request after it** |
+| 4 | `neighbors` declared `depth.default = 1`, serde applied 3 | An agent omitting `depth` was told it asked for direct neighbours and got a three-hop closure — two of three reported "callers" of `helper` do not call it |
+| 5 | `preview` declared `min_confidence.default = 0.0`, serde applied 0.5 | The "what would my edit break" tool, with the filter declared off and silently on: a shortened breakage list that reads as "breaks nothing" |
+| 6 | `targets: []` answered instead of refused | `{"neighbors": []}`, `isError: false`, no marker — indistinguishable from "these symbols have no callers or callees" |
+| 7 | Every non-file at the db path reported as "the index has not been built" | `Path::is_file` is false for a directory *and* for any swallowed IO error. A definite claim from a check that never ran, sending the caller to `devmap build`, which fails again for the unstated reason |
+| 8 | Well-formed JSON with a bad `method` reported as `-32700` against a null id | `-32700` means "invalid JSON was received"; this JSON parsed. The id was visible and discarded, so a correlating client hung |
+| 9 | JSON-RPC batch arrays unhandled | Two well-formed requests got one `-32700`; neither id was ever answered |
+| 10 | Declared `minimum`s unenforced | `depth: 0`, `budget: 0`, `min_nodes: 0` all accepted against schemas that forbid them — a client-side validator refuses what this server accepts |
+| 11 | `notifications/cancelled` accepted, wired to nothing | Indistinguishable from honouring it |
+
+**Fixes, by root cause rather than by row.**
+
+*Framing (1, 2, 3, 8, 9).* `handle_line` now parses in two stages. Stage one asks "is this JSON
+at all" — the only place `-32700` and a forced null id are correct. Stage two asks whether it is a
+well-formed *request*, by which point the id is recoverable, so a structural fault is `-32600`
+against its own id. Id presence is read as `object.contains_key("id")`, which is what the
+specification actually says. Batches are handled per §6, including the empty-array `-32600` and
+the all-notifications case that correctly produces no response array. `read_frame` replaces
+`lines()` and applies the bound **while** accumulating, draining an over-long frame to the next
+newline without holding it — so one bad frame costs its own response and not the session; invalid
+UTF-8 is likewise one refused frame.
+
+*Schema truthfulness (4, 5, 6, 10).* The declared defaults now match the applied ones, and
+`preview` reads its default from `PREVIEW_CALLER_MIN_CONFIDENCE` rather than restating it. Every
+other constraint the schema states — `minimum`, `maximum`, `minItems`, `maxItems`, `maxLength`,
+`enum` — is enforced generically from the published schema, so a bound can only be enforced if it
+was advertised and can only be advertised if it is enforced.
+
+*Honesty (7).* `StoreSlot::explain_absence` distinguishes directory, unresolved symlink,
+unreadable, genuinely-absent, and *the check itself failed* — five different problems with five
+different fixes, told apart instead of guessed at.
+
+*Cancellation (11).* This one needed an architecture change, not a patch. The loop read and
+awaited one line at a time, so a cancellation could not be *read* until the call it cancelled had
+already been answered. Requests now run concurrently, one task each, writes serialized behind one
+lock, with a registry of in-flight `Cancel` handles keyed by the id's JSON rendering (so `1` and
+`"1"` stay distinct). A cancelled request gets no response, per the specification. This also
+fixes a limitation nobody had filed: a single 30-second `impact` used to block every other tool
+call on the connection.
+
+**One of the adversary's tests was rewritten rather than satisfied, and the reason is the
+finding.** Its preview test asserted, as a *fixture precondition*, that the schema declares 0.0 —
+encoding the pre-fix state as a premise, so the fix broke the premise rather than the assertion.
+It was also the wrong shape: the same defect existed twice (4 and 5), and a single-instance test
+names one. It is now
+`every_published_default_is_the_default_that_is_applied`, a behavioural class gate: for every
+declared default on every tool, the answer with the field **omitted** must equal the answer with
+it sent **explicitly at the declared value**. Comparing the two literals would only prove two
+constants match; comparing the two answers proves the published contract is the one a client
+gets. **Verified red** by re-introducing the `neighbors` defect alone and watching it fail.
+
+The adversary's frame-bound test parses the first bare number out of the refusal and asserts it
+is within the limit — a proxy for "this is what we buffered". The fix made that proxy stale
+rather than wrong, so the *message* was rephrased to lead with the bound that was enforced
+instead of the total observed, and the test passes unmodified. Rewording a message to satisfy a
+test is only legitimate when the new wording is the more honest one; it is here, because the old
+phrasing led with a number that was the size of an allocation the check had not prevented.
+
+**State after the round:** `cargo test --workspace --no-fail-fast` = **930 passed, 0 failed**
+(baseline 889, +41). `devmap-serve` alone is 124 across five suites. `cargo clippy -p
+devmap-serve --all-targets` clean — which required deleting `RpcRequest`, dead once the two-stage
+parse replaced it. Re-benchmarked after the concurrency change: in-process `status` p50 277 µs
+against subprocess 7.37 ms, ~27×, no regression.
+
+### Two critical MCP containment defects, and a third the regression tests found (2026-09-05)
+
+An audit lane proved two bypasses by execution against the Python MCP server. A fix lane closed
+both and was **interrupted by a rate limit before writing any test**, so the fixes were verified
+here independently and the regressions written afterwards
+(`tests/unit/test_mcp_secret_and_debug_containment.py`, 15 tests).
+
+**The guard and the read were looking at different files.** `handle_read_file` ran
+`is_secret_path` on the caller's raw string, then resolved the path and opened the *resolved*
+one. Anything that changed between those two steps was a bypass, and the failure is silent — the
+tool returns the bytes with `ok: true`:
+
+| Spelling | Before | Now |
+|---|---|---|
+| `.env` | refused | refused |
+| `.ENV`, `.Env` | **returned the secret** (`fnmatch` is case-sensitive; APFS/NTFS are not) | refused |
+| `notes.txt` → `.env` (symlink) | **returned the secret** — nothing in the name suggests one | refused |
+
+**A capability gate the caller could open.** `devcouncil_debug_discover {"consent": true}` called
+`set_debug_consent`, which *wrote* `auto_discover: true` into `.devcouncil/config.yaml` and
+unlocked the other seven debug tools — one of which passed a caller-supplied `script` straight to
+`subprocess.run` with no containment (`resolve_root` only ever constrained `projectPath`). Both
+halves are closed: consent can no longer be granted from a tool argument, and `script`/`path`/
+`source` route through the same `within_root` owner `projectPath` uses. Verified by probe:
+absolute-outside, `../` traversal and a symlink escaping the root are all refused, while a
+legitimate in-root path is still accepted — a containment check that refuses everything is a
+different defect, so that case is asserted too.
+
+**The third defect was found by writing the regressions, not by the audit.**
+`SECRET_PATH_PATTERNS` carried `**/*.pem` and `**/*.key` with **no root-level twin**. `fnmatch`
+gives `**` no special meaning, and `**/*.pem` still requires the `/`, so `certs/key.pem` was
+protected and `key.pem` at the top of the repository was **not**. The list pairs both forms
+everywhere else — `.env` beside `**/.env`, `*.pfx` beside `**/*.pfx`, `id_rsa` beside
+`**/id_rsa` — which is what makes these omissions rather than a policy. `*.pem`, `*.key`,
+`id_dsa` and `id_ecdsa` gained their root-level forms.
+
+**Security impact, stated plainly: every change here narrows.** More paths are refused; nothing
+became reachable that was not reachable before. The one thing to watch is over-refusal, which is
+why `test_a_non_secret_file_is_still_readable` and the in-root debug-path case exist.
+
+**Two notes on method, both of which changed a conclusion.**
+
+*The red-test check reassigned credit.* Reverting the re-check added to `read.py` left all 15
+tests **green** — it is redundant with the hardened `is_secret_path`, which resolves symlinks
+itself. Reverting `util.py` to HEAD is what turns 4 red, and reverting the pattern list turns 2
+red. Two independent guards over the same bypasses is a fine outcome, but without running the
+revert the wrong change would have been recorded as the fix.
+
+*One test asserted the wrong thing, and the code was right.* The first version of the case test
+asserted plain case-insensitivity with no files on disk, and failed. The implementation folds
+case only once `os.stat` confirms both spellings reach the *same file* — deliberate, because an
+unconditional fold would refuse `.ENV` on a case-sensitive filesystem where it is a different,
+ordinary file the patterns were never meant to protect. The test now asserts that condition, and
+asserts the **non**-refusal on case-sensitive filesystems too, so the narrowing is a tested
+property on Linux rather than an untested claim in a docstring.
+
+### Stress: the concurrent transport, asserted rather than assumed (2026-09-05)
+
+Making requests concurrent to support cancellation introduced two failure modes serial
+processing could not have, and neither shows up in low-volume manual testing:
+
+* **Interleaved writes.** Two responses whose bytes cross produce one unparseable line and the
+  client loses both. `mcp_concurrency.rs` fires **200 requests down one connection before reading
+  any response**, deliberately mixing methods that return immediately (`ping`, `tools/list`) with
+  ones that take the store lock (`impact`, `search`) so fast responses race slow ones. The
+  `serde_json::from_str` on every line *is* the interleaving assertion — crossed bytes are not
+  valid JSON.
+* **Lost or duplicated ids.** A client resolves pending calls by id: one missing id hangs that
+  call forever, one duplicate resolves the wrong future. Every id is checked into a set (so a
+  duplicate is caught) and the full range is asserted present at the end (so a loss is caught).
+  Interleaved notifications are included, because one that ever produced a frame would show up as
+  an extra.
+
+A second test drives invalid UTF-8, non-JSON, and a valid-JSON-invalid-request **between** good
+requests and asserts the good ones on both sides still answer — the session used to die on the
+first `0xFF`, taking every later request with it.
+
+**One of these tests was wrong on its first run, and the code was right.** It asserted that the
+request following the bad frames was the *last* frame written. Concurrent responses have no
+ordering guarantee — JSON-RPC does not promise one, and that is precisely the property being
+bought here — so the assertion was rewritten to look the id up rather than take the last frame.
+Worth recording because the tempting reading was "responses are coming back out of order, that is
+the bug".
+
+Workspace after: **932 passed, 0 failed**; `devmap-serve` alone 126 across six suites; `cargo
+clippy -p devmap-serve -p devmap-cli --all-targets` clean.
+
+### Repairing an interrupted fan-out, and the regression it was about to ship (2026-09-05)
+
+A rate limit killed five agents mid-task. Four had landed code; none had finished. Recovering
+that state produced two findings worth more than the recovery.
+
+**The Python suite's real number, and why the first two readings were wrong.** `pytest tests/unit`
+using the venv's `pytest` script gives **17 collection errors** — `tests/__init__.py` does not
+exist, so `from tests.unit.support_maps import …` needs the repository root on `sys.path`, which
+only `python -m pytest` supplies. That is pre-existing and has nothing to do with the fan-out, but
+an agent running the documented command would read 17 errors as damage it had caused. A second
+reading reported `4073 passed` where `--collect-only` said `4123` — a truncated capture, not a
+result. The authoritative run is **4112 passed, 2 failed, 9 xfailed = 4123**, matching collection
+exactly. Two readings disagreed with the collector before one agreed with it; the arithmetic is
+what settled it, and it is worth doing every time.
+
+**Both failures were the interrupted agents' work, and one was a regression about to ship.**
+
+*The stale one.* `test_hook_map_refresh_defers_loudly_when_the_kernel_cannot_build` asserted
+`paths == ["src/app.py"]` was handed to `refresh_map_artifacts` — a function that did
+`del … paths …` on arrival. The test asserted plumbing that had no effect, and passed for as long
+as the feature did nothing. Deleting the parameter (the audit's option (b)) was right; the
+assertion is now a *guard against the plumbing being reintroduced*, and the queue assertion two
+lines below is left alone, because knowing what changed still earns its keep there — it decides
+whether to build at all, not what to build.
+
+*The regression.* The H4 fix made an un-evaluable stop gate say so, which is correct and is the
+Class A rule applied to a gate. But `fail_open` was already set by the blanket
+`except Exception` in `evaluate_stop`, and `load_config` raises `FileNotFoundError` in **any
+directory that has never been `dev init`-ed** — which is most directories a hook ever runs in.
+So the new notice, "DevCouncil stop gate did not evaluate this stop: nothing was checked. This is
+not a pass.", would have fired **on every stop outside an initialized repository**.
+
+The flag was harmless while nothing rendered it; making it visible is what turned a latent
+mislabelling into a user-facing defect. **"There is no DevCouncil project here" is a complete
+answer, not a failure to answer** — and a warning that is always on is a warning nobody reads,
+which would have drowned the real one the fix exists to deliver. `FileNotFoundError` now returns
+a clean pass; every other exception still sets `fail_open`. Both directions are pinned
+(`TestNotAProjectIsNotAFailureToEvaluate`), because a test of only the quiet case would pass
+against a gate that had simply stopped reporting. **Verified red** against the pre-fix code.
+
+**Two critical security fixes were verified independently rather than trusted**, because the
+agent that made them was killed before writing a single test — see the entry above, including the
+third defect the regressions themselves uncovered.
+
+**The general lesson.** An interrupted agent leaves code with no test and no report, and its
+last transcript line ("Now the H3 red tests", "Now the required red-test verification") is
+evidence of intent, not of completion. Every fix recovered here was re-verified by running it,
+and the two that mattered most — a security bypass and a notice that would have fired on every
+stop — were both cases where the landed code looked finished and was not.
+
+### The kernel audit: 53 defects from ~486 candidates, and the first three closed (2026-09-05)
+
+A dedicated read-only audit of `devmap-extract/-resolve/-analyze/-store/-query` and the daemon
+found **53 real defects from ~486 candidates examined**, 6 critical, **7 reproduced end-to-end
+against the shipped binary** rather than through a unit harness. The full report is
+`audit_kernel.md` (785 lines). What follows is this session's own share of the fixes;
+`devmap-extract`, `devmap-analyze`/`code_graph` and `devmap-store` were taken by parallel lanes.
+
+**What the audit found that matters most, in one sentence: `devmap dead` proposes deleting live
+code at the top confidence tier because coverage loss reaches no output at all.** Two independent
+paths converge there — discovery refusals (oversized/unreadable/non-UTF-8) and
+`ParseOutcome::Failed` — and neither is recorded anywhere durable. `graph_degraded` is derived
+*only* from `AnalysisStatus`, so the earlier fix that removed its hardcoded `false` covered the
+analysis half and left the coverage half. Proven with the real CLI: a file whose only caller is
+over the size ceiling is reported `{"confidence":0.9,"resolution":"Available","truncated":false}`
+while `status` says `{"degraded_reason":null,"is_fresh":true}`. The Python fail-closed branch
+`if bool(repo_map.get("graph_degraded")): return True` therefore can never fire.
+
+**Also worth knowing, because it is the reverse of the usual finding:** R4 determinism is
+*genuinely clean* — 0 live violations across ~70 sites, and `devmap-serve` and `devmap-resolve`
+contain no `HashMap`/`HashSet` at all. FTS5 escaping is correct at all three `MATCH` sites against
+17 hostile inputs. Migration atomicity holds, `user_version` was proven transactional, no
+`SQLITE_BUSY` is mapped to an empty result, no SQL injection, no regex built from user input. The
+`(NaN * 1000.0).round() as i64` shape is fixed at its canonical owner. Recording the clean
+results so nobody spends a session re-deriving them.
+
+**Closed here (`devmap-query`), each with a test verified red against the pre-fix code:**
+
+*Q-3 — one emoji aborted `dev map manifest`.* `byte_span_to_line_range` counted newlines with
+`source[..start]`, slicing a `&str` at an index that need not be a character boundary. Spans are
+byte offsets recorded at extraction time while the source is re-read from disk at export, so any
+multi-byte character inserted before an indexed offset put that offset mid-character — and the
+release profile is `panic = "abort"`, so nothing recovered. **Two copies of one computation
+existed and only one was safe**: `Span::line_range` has used `as_bytes()` all along. The wrapper
+now delegates to it and keeps only the one thing it adds (clamping `end` to at least `start`).
+Red-verified with the exact predicted panic: *end byte index 14 is not a char boundary; it is
+inside '🦀'*. The test is exhaustive over every offset pair rather than sampled, because the
+boundaries are precisely the offsets that never failed.
+
+*Q-4 — `preview` returned a clean bill of health for a file it could not read.*
+`read_to_string(..).ok()` collapsed *no such file* and *file present, unreadable* into one `None`,
+and `None` meant `compared_against: "nothing"` — documented as "no such file, so every symbol is
+an addition". So on a non-UTF-8 or unreadable file a genuine **removal disappeared**:
+`symbols: ["mod.py:Added","alpha:Added"]`, `degraded_reason: null`, `delta_available: true`. This
+is the tool whose entire purpose is "what would my edit break", answering "nothing" from a
+comparison that never ran. There is now a third `compared_against` value, `unreadable`, and
+`delta_available: false` with the errno in `degraded_reason`. **All three states are asserted** —
+readable reports the removal, absent still reports `nothing` with `delta_available: true` (an
+absent file is a *complete* comparison against nothing), unreadable reports neither.
+
+*Q-7 — a depth-capped walk published as a complete blast radius.* `QueryEngine::impact`/`trace`
+computed `walk.stop` — *"stopped at depth 2; the result is a lower bound, not the full blast
+radius"* — and discarded it, returning `walk_incomplete: None, truncated: false`.
+`StoreQueryEngine::traverse` has always carried it. For `impact` this is the reading that gets a
+live symbol deleted, because an incomplete blast radius and a small one are indistinguishable.
+The red check was made **discriminating on purpose**: reverting only `impact`'s line fails only
+`impact`'s test while `trace` and the complete-walk control stay green, so the test is pinned to
+the behaviour rather than to compilation. The complete-walk control exists because a fix that
+always set the marker would pass the capped test and make the marker meaningless.
+
+## Parse budget made a real bound (2026-09-05)
+
+`DEFAULT_PARSE_BUDGET` is 5 s and every caller — `dev map build`, the daemon,
+the MCP server — treats it as the guarantee that one hostile file cannot stall
+the index. **It was not a bound.** Measured against the unmodified extractor:
+
+| input (200 ms budget) | before | after |
+| --- | --- | --- |
+| `"fn (((("` x20,000 (140 KB Rust) | **174.69 s — 873x over** | 333 ms — 1.7x |
+| `{` x2,000 / `}` x2,000 (C++) | 226 ms | 243 ms |
+| `{` x10,000 (C++) | 229 ms | 221 ms |
+| 4,000 Go interfaces + impls | 228 ms | 218 ms |
+
+At the shipped 5 s budget the first row extrapolates to over an hour on a single
+file, holding the daemon's writer lock for all of it.
+
+**The cause was not tree-sitter.** Timed directly, that parse finishes in 11 ms
+and polls its cancellation callback 1,400 times without ever needing to cancel
+(`examples/budget_locate.rs`, since removed). Two defects in this crate's own
+code, both of which the existing `stress_hardening.rs` bound test missed because
+it allowed a 200 ms budget to take 5 s — 25x slack:
+
+1. **Child iteration was quadratic.** `for i in 0..node.child_count()` with
+   `node.child(i)` rescans the sibling chain from the first child on every call.
+   A degenerate parse gives the root one child per token — 100,000 children for
+   the file above — so the loop cost 5x10^9 sibling steps. Walking the *same*
+   tree with a `TreeCursor` visited the same 2 nodes in **2.5 ms vs 37.1 s**, a
+   14,800x difference for byte-identical output. 28 sites converted; three
+   helpers (`push_children`, `push_children_reversed`, `push_named_children`)
+   now own the fast form so the slow form has one place to be warned about.
+2. **A stride is not a bound if one step is unbounded.** `walk_tree` reads the
+   clock every `DEADLINE_CHECK_STRIDE` (256) nodes, which bounds the *number* of
+   nodes between checks but not the *work* inside any one of them.
+   `collect_non_symbol_locals` walks an entire scope subtree per call, so a
+   single `extract_node` ran for a minute with the stride counter sitting at 1.
+   It is now bounded by the same deadline and latches a `WALK_OVERRAN` flag that
+   `walk_tree` consults on every node (a `Cell` read, not a clock read).
+
+A set the deadline cut short is never cached in `SCOPE_LOCALS`: it is not that
+scope's local-name set, and the file is refused either way.
+
+**Refusal, not truncation.** A file that exhausts the budget yields only its
+`File` node with `ParseOutcome::Failed`, and the reason names the cause —
+verified end-to-end through the release binary on a repo holding one hostile
+file beside real code:
+
+```
+src/hostile.rs :: {"Failed":{"reason":"extraction of 140000 bytes exceeded the 5s
+budget for grammar rust while walking the syntax tree; no symbols are claimed for
+this file"}}
+```
+
+The whole build took 6.04 s, exit 0; `helper`, `run` and `main` from the
+neighbouring real files were all extracted. Downstream, the map admits the loss
+rather than reporting a clean index: `graph_degraded: true`,
+`parse_failed_files: 1`, and `src/app.py::main` is demoted from `extracted` to
+**`ambiguous`** — "no inbound call edges, but call extraction did not cover every
+file — not evidence of death". That demotion is the Class A rule holding at the
+surface where it decides whether a live symbol gets deleted.
+
+Tests: `tests/budget_is_a_real_bound.rs` (3). The hostile case asserts against
+the budget directly and is build-profile independent, because its elapsed time is
+set by the deadline the code enforces rather than by how fast the code is; the two
+completion cases get their own generous budget, since their wall time is the cost
+of real work and a debug build is an order of magnitude slower. Benchmark harness:
+`examples/budget_probe.rs`, dependency-free.
+
+**Not fixed:** four `(0..node.child_count()).rev()` index walks remain in the
+`#[cfg(test)]` modules of `langcalls/lua.rs` and `langcalls/r.rs`. They walk
+three-line fixtures and ship in no binary.
+
+## Capped reads now say so (E-3 … E-7, 2026-09-05)
+
+Five audit findings in `devmap-extract`, all one rule: **a capped or failed read
+must not report what a complete one reports.** `cache.rs`'s own v29 note already
+records this class being fixed once for the pattern scanner — the case was fixed,
+the class was not. Each fix below was watched failing first.
+
+- **E-5 (`treesitter.rs` `c_declaration_head`)** — a 256-byte head window sliced
+  with `source.get(start..end).unwrap_or_default()`. When the window edge split a
+  multi-byte character `.get()` returned `None`, the head became `""`, and every
+  question asked of it answered "no". Red: `__global__ /* <100 em-dashes> */ void
+  kern(int* p) {}` in a `.cu` file → `wiring=[]`, so the CUDA kernel lost its
+  entry-point exemption and became a dead-code candidate; the same file with ASCII
+  padding kept it. The boundary walk existed already in `clamp_receiver`
+  (`langcalls/scope.rs`) and was not reachable from here, so it is now one owner,
+  `floor_char_boundary`, called by both — a duplicated loop removed, not added.
+- **E-3 (`notebook.rs`)** — the 5,000-cell cap was recorded only in
+  `diagnostics`, which `for_durable_store()` clears before the payload reaches
+  `generation_files.extraction_json` and the extract cache. Red: a 5,100-cell
+  notebook → `durable.parse_outcome == Clean`, `durable.diagnostics == []`, and
+  `cache_admits(Clean)` is true, so a prefix was pinned as complete coverage under
+  a real content hash. The cap and the unlocatable-symbol count now ride on the
+  outcome. A notebook under the cap stays `Clean` (asserted, both directions).
+- **E-4 (`fallback.rs`)** — a line over `MAX_LINE_BYTES` was skipped and counted
+  nowhere, so "N declaration(s) recovered" counted what the scanner kept and read
+  as what the file has. Red: a `.proto` declaring three messages, one on a
+  2,500-byte line → `"2 declaration(s) recovered by pattern"`. Now
+  `FallbackScan::skipped_long_lines` is counted and folded into the reason.
+  **The "X of Y" form is emitted only when Y is genuinely known** — a line that
+  was never pattern-matched cannot contribute a known total, and printing
+  "2 of 2" there would be the same overclaim in a smaller font.
+- **E-6 (`treesitter.rs`)** — `ParseAttempt::NoTree`, the variant that exists to
+  name "the parser returned no tree and did not say why", was the one not routed
+  to `refused_extraction`. `Budget` and `GrammarLoadFailed` were routed correctly.
+  A tree-sitter ABI break would therefore have published every file of a language
+  as `RegexFallback` with the false reason "no linked tree-sitter grammar", been
+  cache-admitted, exempted the whole language from dead-code analysis, and left
+  the build green — the exact scenario `refused_extraction`'s own doc warns about.
+  Fixed structurally; **reachability remains unverified** (a `NoTree` cannot be
+  constructed without editing the crate), so this ships without a red test and is
+  labelled as such.
+- **E-7 (`notebook.rs`)** — `cells.find(|c| c.code.contains(declaration))` with an
+  empty `declaration` matched cell 0 unconditionally, so a symbol took a guessed
+  span and was reported located, contradicting the module doc. The parallel call
+  path already guarded this. Symmetry fix; reachability inferred, not proven.
+
+`EXTRACTION_SCHEMA_VERSION` is bumped **29 → 30**: v29's own doc says reusing
+rows across a change of this kind keeps serving a prefix under a reason that
+reads as a set, and that applies to both new fields.
+
+`ParseOutcome::Fallback`'s doc is widened — it now has two producers (pattern
+recovery, and a parse of only a prefix of the file) and one meaning that
+consumers act on: absence of a symbol here is not evidence the file does not
+declare it.
+
+Tests: `tests/capped_reads_say_so.rs` (6 — three red-then-green, three controls).
+`devmap-extract` 314 passed / 0 failed; clippy `-D warnings` and fmt clean.
+
+## MCP fuzz and resource bounds (2026-09-05)
+
+The four existing MCP test files are 43 hand-picked cases, each naming a defect
+and pinning it. That leaves the shape a hand-picked suite cannot reach: *any*
+byte string a client can send. `tests/mcp_fuzz_and_bounds.rs` asserts four
+invariants over generated input rather than chosen input — no panic; every
+response serializes to one line of valid JSON carrying `jsonrpc: "2.0"` and
+exactly one of `result`/`error`; a request with an id is answered against that
+id and a notification never is; and the work is bounded by the input rather than
+by what the input asks for. The generator is a seeded xorshift64* over six valid
+seed frames with 1–4 byte mutations each (4,000 rounds), so a failure replays.
+
+**It found one: a batch could contain a batch.** `dispatch_value` treated any
+`Value::Array` as a batch, including one nested inside a batch, and recursed
+through `Box::pin`. JSON-RPC 2.0 §6 defines a batch as "an Array of Request
+objects" — it does not nest. Red, at depth 64:
+
+```
+out="[[[[…64 deep…[{"error":{"code":-32600,"message":"a batch must contain at
+least one request"},"id":null,"jsonrpc":"2.0"}]…]]]]"
+```
+
+That is not a response any client can use: it is an array of arrays, the `id` is
+buried 64 levels down, and nothing correlates it to a pending call — the caller
+hangs. It was also the only unbounded recursion on the request path; the sole
+thing standing between `[[[[…` and the stack was the JSON parser's own default
+nesting limit, which is a property of a dependency rather than a decision this
+server made.
+
+Fixed by splitting `dispatch_single` out: only the top-level value may be a
+batch, a member is a request object, and a nested array is answered `-32600`
+naming the rule. The recursion is gone with it — members are dispatched in a
+loop, so `Box::pin` is no longer needed.
+
+Also asserted and **already sound**, recorded so nobody re-derives them: a
+5,000-member batch answers every member exactly once with no duplicate ids;
+control characters, lone-surrogate pairs, RTL overrides and NUL escapes in a
+string argument round-trip without corrupting the response frame; and every
+malformed-but-identified request (`{"id":77}` with no method, wrong `jsonrpc`,
+unknown method, unknown tool, missing/empty/unknown arguments) comes back under
+id 77 unaltered.
+
+`devmap-serve` MCP + IPC suites: 62 passed / 0 failed (`mcp_protocol` 17,
+`mcp_adversarial` 15, `ipc_fuzz` 14, `mcp_http_modern` 9, `mcp_fuzz_and_bounds` 5,
+`mcp_concurrency` 2).
+
+## Audit report preserved
+
+`AUDIT_KERNEL_2026-09-05.md` is the full kernel robustness audit (53 defects
+from ~486 candidates, 6 critical, 7 proven against the shipped binary). It lived
+only in a session scratchpad under `/private/tmp` and is now checked in, because
+roughly a third of its findings are still open. Its per-section **"checked and
+CLEAN — do not redo"** paragraphs and **denominators tables** are what stop the
+next pass re-deriving work that was already done; read those first. The header
+records which findings were closed, and that **S-7 was falsified** rather than
+fixed.
+
+## Q-9: the parse-off build now actually builds (2026-09-05)
+
+`devmap-extract`'s `parse` feature exists so an embedder can read a persisted map
+without linking tree-sitter and its 32 C-compiled grammars. That is not a
+hypothetical configuration — `devmap-extract/Cargo.toml` records GitPulse linking
+`devmap-query` to answer impact queries in-process, never indexing anything, and
+inheriting 49 crates and 32 grammars to do it. `devmap-query`'s own feature doc
+promises "Off, this crate builds without tree-sitter and answers questions about
+a persisted map rather than building one."
+
+**It did not build at all.** Red, executed:
+
+```
+error[E0433]: cannot find `cache` in `devmap_extract`
+  --> crates/devmap-store/src/db.rs
+note: found an item that was configured out
+  --> crates/devmap-extract/src/lib.rs:6  (#[cfg(feature = "parse")] pub mod cache;)
+```
+
+Two sites in `devmap-store` reached straight into the parse-gated
+`devmap_extract::cache::current_payload_identity`. That function cannot move out
+of the gate — it calls `grammar_version_for`, which reads the compiled grammars —
+so the fix belongs at the call sites, and it is a Class A question rather than a
+plumbing one: **without the grammars there is no current identity, so the answer
+is neither "current" nor "stale" but *unknown*.**
+
+One owner, `db.rs::current_payload_identity -> Option<(String, String)>`, returns
+`None` when this build cannot know, and neither caller may turn `None` into a
+match:
+
+- The carry-forward in `save_generation_with_metadata` treats `None` as **not a
+  match**. Carrying a row on an identity this build could not compute would claim
+  a currency nothing checked; not carrying is merely conservative.
+- `latest_generation_payload_is_current` **fails loudly** on `None`, naming the
+  language and the missing frontend. `false` would mean "rebuild", which a build
+  with no parsing frontend cannot do — the caller would loop. `true` would be
+  worse: a currency claim from a check that did not run.
+
+Making the configuration compile then revealed dead-code warnings that had never
+been visible because it had never compiled: five items in `clonesig.rs` used only
+by its own `#[cfg(feature = "parse")] mod parse_impl`, and five more across
+`devmap-store`/`devmap-query` whose single call site is parse-gated. Each now
+carries the gate its only caller has. The compiler reporting them unused with
+`parse` off is itself the proof that those callers are parse-gated.
+
+`cargo check -p devmap-query --no-default-features` passes. **Not closed:**
+`--no-default-features --all-targets` still fails on integration-test targets in
+both crates that need `extract_file`/`preview`; closing that needs
+`[[test]] required-features = ["parse"]` entries, which is a separate decision.
+
+## `impact` costs the whole edge set per call (diagnosed, not fixed — 2026-09-05)
+
+Benchmarked through the MCP surface on a settled 14,989-node / 77,904-edge store
+(`devmap-serve/examples/mcp_bench.rs`, in-process, p50 over 50 calls after 5
+warmups):
+
+| tool | p50 |
+| --- | --- |
+| `tools/list` | 34 µs |
+| `status` | 807 µs |
+| `search` | 2.1 ms |
+| **`impact`** | **35.6 ms** |
+
+`impact` is ~40x the next slowest tool, and the cost is independent of the
+answer: a leaf symbol with two callers pays the same as a hub.
+
+**Where it goes** (`devmap-query/examples/impact_breakdown.rs`):
+
+```
+latest_edges (SQL read only)        p50 =  5.28 ms
+impact (read + convert + walk)      p50 = 33.58 ms
+=> the read is 16% of the whole call
+```
+
+So it is **not I/O**. `traverse` calls `resolved_edges`, which pulls every edge
+in the generation and runs `stored_edge_to_resolved` over all 77,904 rows —
+allocating owned `String`s per edge — *before* it has looked at the target at
+all. The traversal that follows is bounded by `max_depth`/`max_nodes` and
+typically visits a few dozen nodes. The work scales with repository size; the
+answer does not.
+
+**Not fixed, deliberately.** The two real options — memoising the converted edge
+set per generation, or making the walk borrow from the stored rows instead of
+materialising owned ones — are both engine-wide changes, and the first alters
+what "fresh" means for a long-lived `devmap mcp` process. That is a scope call
+for the owner rather than something to slip into a hardening pass. The
+measurement and the harness are checked in so the decision can be made against
+numbers.

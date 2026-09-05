@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from mcp.types import TextContent
@@ -19,13 +20,20 @@ async def handle_graph_context(root: Path, arguments: dict) -> list[TextContent]
     had. The two-branch shape also discarded the CLI's error, leaving a
     subprocess failure and a genuine negative answer indistinguishable — the
     adapter's own ``available``/``summary`` is the honest report either way.
+
+    The adapter is synchronous and reads the code graph off disk, so it runs in
+    a worker thread rather than on the asyncio event loop: a parked loop stops
+    answering ``ping`` and cannot receive the ``notifications/cancelled`` a
+    client sends to give up, which is the reasoning ``util.run_cli_command``
+    already documents for the CLI helper. Only where the work runs changes.
     """
     from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
 
     files = arguments.get("files", [])
     if not isinstance(files, list):
         files = []
-    context = CodeReviewGraphAdapter(root.expanduser().resolve()).get_context(
-        [file for file in files if isinstance(file, str) and file]
+    wanted = [file for file in files if isinstance(file, str) and file]
+    context = await asyncio.to_thread(
+        lambda: CodeReviewGraphAdapter(root.expanduser().resolve()).get_context(wanted)
     )
     return [TextContent(type="text", text=context.model_dump_json(indent=2))]

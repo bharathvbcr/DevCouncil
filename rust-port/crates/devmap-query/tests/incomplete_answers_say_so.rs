@@ -1,0 +1,249 @@
+//! Two surfaces that answered confidently from a check that had not run.
+//!
+//! Both were found by audit and both are the repository's Class A rule: a check
+//! that could not run must never report what a check that ran and passed
+//! reports. The failures are worth restating because neither looks like a bug in
+//! its output — each returns a well-formed, plausible, *wrong* answer.
+//!
+//! * `preview` compared a buffer against a file it could not read and reported
+//!   the result as though there had been no file at all, so a genuine symbol
+//!   **removal disappeared** and the report came back clean.
+//! * `QueryEngine::impact`/`trace` computed "the walk stopped at the depth cap;
+//!   this is a lower bound, not the full blast radius" and then dropped it,
+//!   publishing `walk_incomplete: None`. For `impact` that is the reading that
+//!   gets a live symbol deleted: an incomplete blast radius and a small one look
+//!   identical.
+//! * `StoreQueryEngine::dead_symbols` published a delete-this list with no
+//!   denominator at all — neither `AnalysisSummary::status` nor
+//!   `unresolved_calls`, the field whose own documentation says it exists so a
+//!   reader can tell "nothing calls this" from "we could not work out what
+//!   this calls". A generation with 4,242 unattributed calls answered in the
+//!   exact shape of one with none.
+
+use devmap_extract::extract_file;
+use devmap_extract::model::{Extraction, ExtractionEngine, ParseOutcome, SymbolKind};
+use devmap_query::{QueryEngine, Request, StoreQueryEngine};
+use devmap_resolve::Resolver;
+use devmap_store::{GenerationWriteOpts, Store};
+
+/// A chain `a -> b -> c -> d`, four hops, so a depth-2 walk must stop short.
+fn chain() -> Vec<devmap_extract::model::Extraction> {
+    let files = [
+        ("d.py", "def d():\n    return 1\n"),
+        ("c.py", "from d import d\n\n\ndef c():\n    return d()\n"),
+        ("b.py", "from c import c\n\n\ndef b():\n    return c()\n"),
+        ("a.py", "from b import b\n\n\ndef a():\n    return b()\n"),
+    ];
+    files
+        .iter()
+        .map(|(path, source)| extract_file(path, source))
+        .collect()
+}
+
+#[test]
+fn a_depth_capped_impact_walk_reports_that_it_stopped() {
+    let extractions = chain();
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions);
+    let engine = QueryEngine::new(&extractions, &resolution);
+
+    let capped = engine.impact(Request {
+        query: "d".to_string(),
+        token_budget: 10_000,
+        min_confidence: 0.0,
+        max_depth: 1,
+    });
+
+    assert!(
+        capped.walk_incomplete.is_some(),
+        "a walk stopped by the depth cap must say so; publishing `None` presents a \
+         lower bound as the full blast radius, which is the reading that gets a live \
+         symbol deleted. Got: {capped:?}"
+    );
+    let reason = capped.walk_incomplete.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains("depth"),
+        "the reason must name what stopped the walk, got {reason:?}"
+    );
+}
+
+/// The signal must be *absent* when the walk actually completed.
+///
+/// Without this, a fix that always sets `walk_incomplete` would pass the test
+/// above while making the marker meaningless — every answer would carry it, and
+/// a caller that cannot tell complete from incomplete is back where it started.
+#[test]
+fn a_complete_walk_does_not_claim_to_be_incomplete() {
+    let extractions = chain();
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions);
+    let engine = QueryEngine::new(&extractions, &resolution);
+
+    let complete = engine.impact(Request {
+        query: "d".to_string(),
+        token_budget: 10_000,
+        min_confidence: 0.0,
+        max_depth: 64,
+    });
+
+    assert!(
+        complete.walk_incomplete.is_none(),
+        "a walk that reached the end of the graph must not be marked incomplete, \
+         got {:?}",
+        complete.walk_incomplete
+    );
+}
+
+#[test]
+fn a_depth_capped_trace_walk_reports_that_it_stopped() {
+    let extractions = chain();
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions);
+    let engine = QueryEngine::new(&extractions, &resolution);
+
+    let capped = engine.trace(Request {
+        query: "a".to_string(),
+        token_budget: 10_000,
+        min_confidence: 0.0,
+        max_depth: 1,
+    });
+
+    assert!(
+        capped.walk_incomplete.is_some(),
+        "trace must carry the same signal impact does; got {capped:?}"
+    );
+}
+
+/// A persisted generation over `files`, as `devmap build` would write one.
+fn store_of(files: &[(&str, &str)], refuse: &[&str]) -> Store {
+    let mut extractions: Vec<Extraction> = files
+        .iter()
+        .map(|(path, source)| extract_file(path, source))
+        .collect();
+    for ext in &mut extractions {
+        if !refuse.contains(&ext.file_path.as_str()) {
+            continue;
+        }
+        // Shaped as `refused_extraction` builds one: the File node only.
+        ext.parse_outcome = ParseOutcome::Failed {
+            reason: "forced parse failure".to_string(),
+        };
+        ext.engine = ExtractionEngine::Unavailable {
+            requested_language: ext.language.clone(),
+        };
+        ext.symbols.retain(|sym| sym.kind == SymbolKind::File);
+        ext.imports.clear();
+        ext.calls.clear();
+        ext.wiring.clear();
+    }
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions);
+    let analysis = devmap_analyze::analyze(&extractions, &resolution);
+    let store = Store::open_in_memory().unwrap();
+    store
+        .save_generation_with_opts(
+            &extractions,
+            &resolution,
+            &analysis,
+            GenerationWriteOpts::default(),
+        )
+        .unwrap();
+    store
+}
+
+/// A call the resolution ladder cannot attribute to anything, beside a symbol
+/// nothing calls. The dead-symbol finding and the blind spot that could
+/// contradict it live in the same generation, which is the whole point.
+#[test]
+fn dead_symbols_computed_over_unattributed_calls_say_so() {
+    let store = store_of(
+        &[
+            ("lib.py", "def abandoned():\n    return 1\n"),
+            (
+                "app.py",
+                "def run(thing):\n    return thing.mystery_method()\n",
+            ),
+        ],
+        &[],
+    );
+    let dead = StoreQueryEngine::new(&store).dead_symbols(10_000).unwrap();
+
+    assert!(
+        dead.items.iter().any(|row| row.symbol_name == "abandoned"),
+        "the finding itself must survive — hiding it would be its own lie: {:?}",
+        dead.items
+    );
+    assert!(
+        dead.walk_incomplete.is_some(),
+        "this list is read as 'delete these', and it was computed from a call \
+         graph with holes in it. A generation with unattributed calls must not \
+         answer in the shape of one with none. Got {dead:?}"
+    );
+    let reason = dead.walk_incomplete.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains("unattributed") || reason.contains("unresolved"),
+        "the reason must name the unattributed calls, got {reason:?}"
+    );
+}
+
+/// The status half. Corpus-level extraction loss already reaches
+/// `AnalysisStatus::Partial` and `graph_degraded`; the dead-symbol query is the
+/// surface that most needs it and was the one not carrying it.
+#[test]
+fn dead_symbols_from_a_degraded_analysis_say_so() {
+    let store = store_of(
+        &[
+            ("lib.py", "def helper():\n    return 1\n"),
+            (
+                "app.py",
+                "from lib import helper\n\n\ndef main():\n    return helper()\n",
+            ),
+        ],
+        &["app.py"],
+    );
+    let dead = StoreQueryEngine::new(&store).dead_symbols(10_000).unwrap();
+
+    let reason = dead.walk_incomplete.as_deref().unwrap_or_default();
+    assert!(
+        !reason.is_empty(),
+        "the analysis this list came from is `partial`; the list must not \
+         read as complete. Got {dead:?}"
+    );
+    assert!(
+        reason.contains("partial"),
+        "the reason must carry the analysis status, got {reason:?}"
+    );
+}
+
+/// The OFF direction. A generation where every call resolved and the analysis
+/// converged must answer clean — otherwise the marker is on every answer and a
+/// caller is back to having no way to tell the two apart.
+#[test]
+fn dead_symbols_over_a_complete_analysis_do_not_claim_to_be_incomplete() {
+    let store = store_of(
+        &[
+            ("lib.py", "def helper():\n    return 1\n"),
+            (
+                "app.py",
+                "from lib import helper\n\n\ndef main():\n    return helper()\n",
+            ),
+        ],
+        &[],
+    );
+    let dead = StoreQueryEngine::new(&store).dead_symbols(10_000).unwrap();
+
+    assert!(
+        dead.items.iter().any(|row| row.symbol_name == "main"),
+        "nothing calls `main`, so the query still has an answer: {:?}",
+        dead.items
+    );
+    assert!(
+        dead.walk_incomplete.is_none(),
+        "every call resolved and the analysis converged: {:?}",
+        dead.walk_incomplete
+    );
+}

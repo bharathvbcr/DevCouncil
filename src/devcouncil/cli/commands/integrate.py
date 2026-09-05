@@ -130,6 +130,35 @@ def _reject_teardown_flag_conflicts(
         raise typer.Exit(code=2)
 
 
+# Hosts whose own `dev integrate <host> --apply` installs hooks, and whose --write-gate
+# is therefore actually honoured. Anything else declaring the flag would drop it silently.
+WRITE_GATE_APPLY_HOSTS = ("all", "claude", "codex", "cursor", "hooks")
+
+
+def _reject_unhonoured_write_gate(host: str) -> None:
+    """Refuse --write-gate on a host whose --apply installs no hooks.
+
+    `dev integrate grok|opencode --apply` writes MCP config only. The flag used to be
+    accepted, passed nowhere, and the command still reported success — so a user who asked
+    for the blocking containment gate got no gate and no error. Silently omitting a
+    security control the user explicitly requested is the worse failure; installing hooks
+    from these subcommands to make the flag "work" would widen behaviour by surprise, so
+    this fails closed and names the explicit path instead.
+    """
+    console.print(
+        f"[red]--write-gate is not honoured by `{PREFERRED_COMMAND} {host} --apply`[/red] — "
+        f"it registers MCP config only and installs no hooks."
+    )
+    console.print(
+        f"[dim]--apply honours --write-gate for: {', '.join(WRITE_GATE_APPLY_HOSTS)}.[/dim]"
+    )
+    console.print(
+        f"[dim]Install the {host} containment gate explicitly with:[/dim] "
+        f"[dim]{PREFERRED_COMMAND} hooks --tool {host} --apply --write-gate[/dim]"
+    )
+    raise typer.Exit(code=2)
+
+
 def _print_action_report(action: str, report) -> None:
     label = action.capitalize()
     for item in report.results:
@@ -522,7 +551,9 @@ def grok(
         False,
         "--write-gate/--no-write-gate",
         "--contain/--no-contain",
-        help="Also install blocking PreToolUse write-gate when hooks are applied separately.",
+        help="Not honoured here — `dev integrate grok --apply` installs no hooks. Use "
+        "`dev integrate hooks --tool grok --apply --write-gate` for the blocking "
+        "PreToolUse write-gate.",
     ),
     uninstall: bool = typer.Option(False, "--uninstall", help="Remove DevCouncil Grok MCP registration and hooks."),
     decouple: bool = typer.Option(False, "--decouple", help="Strip PreToolUse containment only; keep PostToolUse."),
@@ -532,6 +563,8 @@ def grok(
     """
     root = _project_root(project_root)
     _reject_teardown_flag_conflicts(apply=apply, write_gate=write_gate, uninstall=uninstall, decouple=decouple)
+    if write_gate:
+        _reject_unhonoured_write_gate("grok")
     if uninstall:
         _print_action_report("uninstall", uninstall_integration_target(root, "grok"))
         return
@@ -558,7 +591,9 @@ def opencode(
         False,
         "--write-gate/--no-write-gate",
         "--contain/--no-contain",
-        help="Also install tool.execute.before containment when hooks are applied separately.",
+        help="Not honoured here — `dev integrate opencode --apply` installs no hooks. Use "
+        "`dev integrate hooks --tool opencode --apply --write-gate` for "
+        "tool.execute.before containment.",
     ),
     uninstall: bool = typer.Option(False, "--uninstall", help="Remove DevCouncil OpenCode MCP entry, plugin, and config enablement."),
     decouple: bool = typer.Option(False, "--decouple", help="Strip tool.execute.before only; keep after-handler and MCP."),
@@ -568,6 +603,8 @@ def opencode(
     """
     root = _project_root(project_root)
     _reject_teardown_flag_conflicts(apply=apply, write_gate=write_gate, uninstall=uninstall, decouple=decouple)
+    if write_gate:
+        _reject_unhonoured_write_gate("opencode")
     if uninstall:
         _print_action_report("uninstall", uninstall_integration_target(root, "opencode"))
         return

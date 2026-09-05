@@ -143,12 +143,24 @@ class CodingCliIntegrationInfo:
     label: str
     tier: int
     headless: bool
-    mcp: bool
     hooks: bool
     launcher_shim: bool
     notes: str
     blocking_hooks: bool = False
     deprecated: bool = False
+
+    @property
+    def mcp(self) -> bool:
+        """Whether an MCP adapter for this client actually exists.
+
+        Derived from the applier's own dispatch table, never declared: as a hand-maintained
+        boolean it went stale and reported "MCP setup: yes" for five clients (amp, copilot,
+        crush, goose, qwen) that have no client module, no `dev integrate` subcommand and
+        no MCP writer — 5 of the 14 rows `dev integrate matrix` prints were false.
+        """
+        from devcouncil.integrations.actions import MCP_ADAPTER_CLIENTS
+
+        return self.name in MCP_ADAPTER_CLIENTS
 
     @property
     def enforcement(self) -> str:
@@ -169,14 +181,12 @@ CODING_CLI_INTEGRATION_INFO: dict[str, CodingCliIntegrationInfo] = {
         True,
         True,
         True,
-        True,
         "dev integrate codex --apply (assist default; --write-gate for PreToolUse)",
     ),
     "gemini": CodingCliIntegrationInfo(
         "gemini",
         "Gemini CLI (deprecated)",
         1,
-        True,
         True,
         True,
         True,
@@ -190,14 +200,12 @@ CODING_CLI_INTEGRATION_INFO: dict[str, CodingCliIntegrationInfo] = {
         True,
         True,
         True,
-        True,
         "dev integrate claude --apply (assist default; --write-gate for PreToolUse)",
     ),
     "cursor": CodingCliIntegrationInfo(
         "cursor",
         "Cursor",
         1,
-        True,
         True,
         True,
         True,
@@ -210,14 +218,12 @@ CODING_CLI_INTEGRATION_INFO: dict[str, CodingCliIntegrationInfo] = {
         True,
         True,
         True,
-        True,
         "dev integrate grok --apply (assist default; --write-gate for PreToolUse)",
     ),
     "opencode": CodingCliIntegrationInfo(
         "opencode",
         "OpenCode",
         1,
-        True,
         True,
         True,
         True,
@@ -228,31 +234,30 @@ CODING_CLI_INTEGRATION_INFO: dict[str, CodingCliIntegrationInfo] = {
         "Google Antigravity CLI",
         1,
         True,
-        True,
         False,
         True,
         "dev integrate antigravity --apply",
     ),
     "warp": CodingCliIntegrationInfo(
-        "warp", "Warp / Oz", 1, True, True, False, True, "dev integrate warp --apply"
+        "warp", "Warp / Oz", 1, True, False, True, "dev integrate warp --apply"
     ),
     "aider": CodingCliIntegrationInfo(
-        "aider", "Aider", 1, True, False, False, True, "dev integrate aider --apply"
+        "aider", "Aider", 1, True, False, True, "dev integrate aider --apply"
     ),
     "copilot": CodingCliIntegrationInfo(
-        "copilot", "GitHub Copilot CLI", 1, True, True, False, True, "dev run TASK-ID --executor copilot"
+        "copilot", "GitHub Copilot CLI", 1, True, False, True, "dev run TASK-ID --executor copilot"
     ),
     "goose": CodingCliIntegrationInfo(
-        "goose", "Goose", 1, True, True, False, True, "dev run TASK-ID --executor goose"
+        "goose", "Goose", 1, True, False, True, "dev run TASK-ID --executor goose"
     ),
     "amp": CodingCliIntegrationInfo(
-        "amp", "Amp (Sourcegraph)", 1, True, True, False, True, "dev run TASK-ID --executor amp"
+        "amp", "Amp (Sourcegraph)", 1, True, False, True, "dev run TASK-ID --executor amp"
     ),
     "qwen": CodingCliIntegrationInfo(
-        "qwen", "Qwen Code", 1, True, True, False, True, "dev run TASK-ID --executor qwen"
+        "qwen", "Qwen Code", 1, True, False, True, "dev run TASK-ID --executor qwen"
     ),
     "crush": CodingCliIntegrationInfo(
-        "crush", "Crush (Charm)", 1, True, True, False, True, "dev run TASK-ID --executor crush"
+        "crush", "Crush (Charm)", 1, True, False, True, "dev run TASK-ID --executor crush"
     ),
 }
 

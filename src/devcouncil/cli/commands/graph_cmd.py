@@ -187,6 +187,7 @@ def _neighbor_edges(client, targets: list) -> dict:
     from devcouncil.devmap_client import (
         DevMapClientError,
         resolution_unavailable_reason,
+        walk_incomplete_reason,
     )
 
     answers: dict = {}
@@ -223,7 +224,11 @@ def _neighbor_edges(client, targets: list) -> dict:
                     # `shown + hidden == total`). A non-empty list is left
                     # alone — the caller has real edges, and the signal is on
                     # the response for anyone who wants it.
-                    incomplete = getattr(resp, "walk_incomplete", None)
+                    #
+                    # Read through the shared accessor rather than off the
+                    # attribute: the MCP handlers apply the same rule, and two
+                    # readings of one signal is how they start to disagree.
+                    incomplete = walk_incomplete_reason(resp)
                     if not nodes and incomplete:
                         sides += [None, f"{method} walk incomplete: {incomplete}"]
                     else:

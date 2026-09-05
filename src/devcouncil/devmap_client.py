@@ -148,6 +148,34 @@ def resolution_unavailable_reason(resolution: Any) -> Optional[str]:
     return None
 
 
+def walk_incomplete_reason(response: Any) -> Optional[str]:
+    """Return the producer's "I stopped looking" note for *response*, else None.
+
+    The companion to :func:`resolution_unavailable_reason`, and it exists for
+    the same reason: the fact that an answer is *not* a verified one has to be
+    read the same way by every consumer, from one place.
+
+    `BudgetedResponse.walk_incomplete` is set when the traversal itself stopped
+    at a depth or node cap, which `shown`/`hidden`/`total` cannot express
+    without breaking the `shown + hidden == total` invariant `_budgeted`
+    enforces. The rule every consumer applies to it:
+
+    * an **empty** rendered result plus a note is *unknown*, never `[]` — "I
+      stopped looking" must not be published as "there is nothing";
+    * a **non-empty** result keeps its rows, and still carries the note so the
+      caller knows the list is a floor rather than a total.
+
+    At the default depth of 1 the reverse walk reports this routinely, with
+    `truncated: false` and `hidden: 0`, so this is the common case rather than
+    an exotic one.
+    """
+    reason = getattr(response, "walk_incomplete", None)
+    if reason is None:
+        return None
+    text = str(reason).strip()
+    return text or None
+
+
 def try_connect(
     root_dir: Optional[Union[str, pathlib.Path]] = None,
     *,

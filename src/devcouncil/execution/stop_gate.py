@@ -355,6 +355,19 @@ def evaluate_stop(project_root: Path, payload: dict[str, Any] | None = None) -> 
             next_actions=next_actions,
             mode=mode,
         )
+    except FileNotFoundError:
+        # "There is no DevCouncil project here" is a complete answer, not a
+        # failure to answer. `load_config` raises this in any directory that has
+        # never been `dev init`-ed, which is most directories a hook ever runs
+        # in, so this must NOT be marked `fail_open`.
+        #
+        # The distinction is the whole point of the flag. `fail_open` means the
+        # gate tried to evaluate and could not, and the caller now surfaces that
+        # to the user on every channel — correctly, because an unexamined stop
+        # must not look like an approved one. Marking "not a project" the same
+        # way fires that notice on literally every stop outside an initialized
+        # repository, and a warning that is always on is a warning nobody reads.
+        return StopGateResult(decision="pass", mode="off")
     except Exception:  # noqa: BLE001 — prime directive: fail open
         try:
             TraceLogger(root).log_event(

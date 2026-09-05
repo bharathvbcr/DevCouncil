@@ -98,3 +98,86 @@ def test_short_reason_is_untouched():
         "claude", StopGateResult(decision="block", reason="two claims failed")
     )
     assert payload["reason"] == "two claims failed"
+
+
+# --- the PreToolUse deny reason: the one emit path that skipped the cap -----------
+
+
+def _deny_stderr(reason: str) -> str:
+    """Run ``_emit_decision(..., "deny", ...)`` and return what Claude would read.
+
+    A PreToolUse hook that blocks by exiting 2 has its *stderr* handed to Claude as
+    the denial reason, so stderr is a Claude-facing output string and the same
+    10,000-character rule applies to it.
+    """
+    import sys
+
+    import typer
+
+    from devcouncil.cli.commands.hook import _emit_decision
+
+    buf = io.StringIO()
+    saved, sys.stderr = sys.stderr, buf
+    try:
+        try:
+            _emit_decision("claude", "deny", reason)
+        except typer.Exit as exit_exc:
+            assert exit_exc.exit_code == 2
+        else:  # pragma: no cover - a deny that does not exit is its own bug
+            raise AssertionError("deny did not exit 2")
+    finally:
+        sys.stderr = saved
+    return buf.getvalue().rstrip("\n")
+
+
+def test_deny_reason_is_capped():
+    """Measured pre-fix: 30,006 chars in, 30,007 out — uncapped on the deny path.
+
+    Every other Claude-facing emit already capped; this one printed straight to
+    stderr, so past the limit Claude Code spills it to a file and hands Claude a
+    preview plus a path. The block still lands, but the corrective instruction the
+    gate exists to deliver does not.
+    """
+    out = _deny_stderr(_huge("DENY"))
+    assert len(out) == HOOK_OUTPUT_MAX_CHARS
+    assert out.startswith("DENY")
+
+
+def test_deny_reason_cap_matches_the_warn_path_on_the_same_call():
+    """One cap, one owner: deny and warn must bound the same reason identically."""
+    import contextlib
+
+    from devcouncil.cli.commands.hook import _emit_decision
+
+    reason = _huge("SAME")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _emit_decision("claude", "warn", reason)
+    warned = json.loads(buf.getvalue().strip())["systemMessage"]
+    assert len(warned) == HOOK_OUTPUT_MAX_CHARS
+    assert len(_deny_stderr(reason)) == len(warned)
+
+
+def test_short_deny_reason_is_untouched():
+    assert _deny_stderr("Write blocked: no active task.") == "Write blocked: no active task."
+
+
+# --- an un-evaluable write gate must not be silent on every channel ---------------
+
+
+def test_empty_tool_call_payload_is_reported_not_silently_allowed():
+    """``pre_tool_use`` with an empty payload allowed the call and emitted nothing.
+
+    No stdout, no stderr, no trace — a gate invocation that examined nothing was
+    byte-identical to one that examined the call and approved it. Fails against the
+    pre-fix code with ``stdout == ''``.
+    """
+    from typer.testing import CliRunner
+
+    from devcouncil.cli.main import app
+
+    result = CliRunner().invoke(app, ["hook", "pre-tool-use", "   ", "--client", "claude"])
+    assert result.exit_code == 0, result.output
+    out = result.stdout.strip()
+    assert out, "an un-evaluable write gate emitted nothing, exactly like a pass"
+    assert "nothing to evaluate" in json.loads(out)["systemMessage"]

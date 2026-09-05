@@ -12,12 +12,12 @@ from devcouncil.execution.planned_scope import matches_planned_path
 from devcouncil.integrations.mcp.util import (
     CLI_TIMEOUT_SECONDS,
     error_text,
-    is_git_repo,
     json_text,
     optional_string_argument,
     optional_string_list_argument,
     truncate_text,
 )
+from devcouncil.utils.proc import git_repo_state
 from devcouncil.storage.db import Database
 from devcouncil.storage.repositories import TaskRepository
 
@@ -166,11 +166,14 @@ async def git_diff(root: Path, paths: list[str], staged: bool) -> dict[str, obje
         return _run_git(root, args)
 
     try:
-        loop = asyncio.get_event_loop()
+        # `asyncio.get_event_loop()` inside a coroutine is deprecated since 3.12
+        # and picks up the wrong loop under a non-default policy; `to_thread`
+        # uses the running loop's executor and is the pattern the rest of these
+        # handlers offload with.
         diff_proc, numstat_proc, namestatus_proc = await asyncio.gather(
-            loop.run_in_executor(None, _run, diff_args),
-            loop.run_in_executor(None, _run, numstat_args),
-            loop.run_in_executor(None, _run, namestatus_args),
+            asyncio.to_thread(_run, diff_args),
+            asyncio.to_thread(_run, numstat_args),
+            asyncio.to_thread(_run, namestatus_args),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"ok": False, "files": [], "unified_diff": "", "truncated": False, "error": str(exc)}
@@ -213,9 +216,8 @@ async def git_diff(root: Path, paths: list[str], staged: bool) -> dict[str, obje
     unified_parts = [diff_proc.stdout.rstrip("\n")] if diff_proc.stdout else []
     if not staged:
         known = {str(entry["path"]) for entry in files}
-        untracked_files, untracked_diff, untracked_err = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: _collect_untracked(root, paths, known_paths=known),
+        untracked_files, untracked_diff, untracked_err = await asyncio.to_thread(
+            _collect_untracked, root, paths, known_paths=known
         )
         if untracked_err is not None:
             return {
@@ -242,7 +244,19 @@ def _empty_diff_payload(staged: bool) -> dict[str, object]:
 
 
 async def handle_get_diff(root: Path, db: Database | None, arguments: dict) -> list[TextContent]:
-    if not is_git_repo(root):
+    # Three outcomes, three answers. The boolean probe this used to call folded
+    # "git timed out" and "git could not be run" into the same `False` as "there
+    # is no repository here", so a hung git — `run_git` waits 60s and reports
+    # returncode 124 — told the caller its directory was not a git repository.
+    # A check that could not run must never report what a check that ran and
+    # answered reports. Offloaded because it spawns a process.
+    in_repo, repo_reason = await asyncio.to_thread(git_repo_state, root)
+    if in_repo is None:
+        return error_text(
+            f"get_diff could not determine whether this is a git repository: {repo_reason}",
+            code="git_repo_undetermined",
+        )
+    if not in_repo:
         return error_text("get_diff requires a git repository.", code="not_a_git_repo")
     task_id = optional_string_argument(arguments, "task_id")
     if task_id == "":

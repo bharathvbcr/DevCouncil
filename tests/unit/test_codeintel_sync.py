@@ -343,8 +343,8 @@ def test_hook_map_refresh_defers_loudly_when_the_kernel_cannot_build(
     monkeypatch.setattr("devcouncil.cli.commands.hook.MAP_REFRESH_DEBOUNCE_S", 0.0)
     calls: list[dict] = []
 
-    def _unavailable(root, output, *_a, paths=None, **_k):
-        calls.append({"root": Path(root), "output": Path(output), "paths": list(paths or [])})
+    def _unavailable(root, output, *_a, **kwargs):
+        calls.append({"root": Path(root), "output": Path(output), "kwargs": dict(kwargs)})
         raise DevMapEngineError("another devmap writer (pid 4242) holds the store")
 
     monkeypatch.setattr(
@@ -356,7 +356,16 @@ def test_hook_map_refresh_defers_loudly_when_the_kernel_cannot_build(
         _maybe_refresh_map(tmp_path, payload)
 
     assert calls, "the hook must refresh through the kernel seam"
-    assert calls[0]["paths"] == ["src/app.py"]
+    # No `paths`, deliberately. The seam used to accept one and `del` it on
+    # arrival — `build_map` has no path list and the kernel decides for itself
+    # which files a build revisits — so every caller computing one was paying
+    # for precision the function could not use. This asserts the plumbing stays
+    # gone; the queue assertion below is where knowing *what* changed still
+    # earns its keep, because that decides whether to build at all.
+    assert "paths" not in calls[0]["kwargs"], (
+        "the dead `paths` plumbing was reintroduced: refresh_map_artifacts discards it, "
+        f"so passing {calls[0]['kwargs'].get('paths')!r} buys nothing and reads as precision"
+    )
     assert calls[0]["output"] == tmp_path / ".devcouncil" / "repo_map.json"
     assert any("map refresh deferred" in record.message for record in caplog.records)
     assert len(calls) == 1, "a kernel that just failed must not be retried in the same hook"

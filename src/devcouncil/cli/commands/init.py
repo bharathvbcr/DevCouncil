@@ -85,7 +85,6 @@ DEFAULT_CONFIG = {
         "lsp_refs": False,
         # Best-effort incremental map refresh from post-tool-use hooks.
         "auto_refresh": True,
-        "auto_refresh_max_files": 40,
         "corpus": {
             "enabled": True,
             "paths": ["docs", "README.md"],

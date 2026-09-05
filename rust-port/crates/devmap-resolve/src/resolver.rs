@@ -44,11 +44,52 @@ pub struct Resolver {
     /// never contained them. Populated alongside `import_bindings` from the same
     /// walk, so a specifier lands in exactly one of the two maps.
     external_imports: BTreeMap<String, BTreeMap<String, String>>,
+    /// Per-file local import name → module specifier, for imports whose
+    /// specifier is **relative** and whose target is not indexed.
+    ///
+    /// Deliberately not `external_imports`. `.helpers`, `./util`, `super::x`
+    /// and `crate::y` are intra-repository by construction: the specifier is
+    /// resolved against this file's own directory, so it cannot name anything
+    /// outside the corpus. Failing to resolve one means the target was not
+    /// indexed — gitignored, over the size cap, generated — which is an index
+    /// gap, not evidence that the name comes from outside. Filing it under
+    /// `External` launders a gap into the tier printed as not-worth-acting-on.
+    ///
+    /// Kept as its own map rather than dropped, so the specifier survives as
+    /// evidence in the ledger's reason string.
+    unindexed_local_imports: BTreeMap<String, BTreeMap<String, String>>,
     /// (file, bare symbol name) → qualified name. Edge endpoints are graph
     /// identities, not bare words: emitting `open` instead of `app.py::open`
     /// makes an edge unjoinable to the node it names.
     qualified_names: BTreeMap<(String, String), String>,
+    /// `(file, qualified name)` → the symbol that declares it, with the file
+    /// path standing for "declared at file level".
+    ///
+    /// A bare `run()` can only reach what is in scope at the call site.
+    /// `file_symbols` lists every symbol in the file, instance methods
+    /// included, so matching a bare callee against it bound
+    /// `def invoke(): run()` to `class C: def run(self)` — code that raises
+    /// `NameError` — at DETERMINISTIC, and handed `C.run` a fabricated caller
+    /// that shields it from the dead-code pass. Answering "what declares this"
+    /// is what makes the scope test possible.
+    symbol_parents: BTreeMap<(String, String), String>,
     go_modules: Vec<GoModule>,
+    /// Whether `go_modules` was supplied for the snapshot currently indexed.
+    ///
+    /// `index_go_modules` and `index_extractions` are two calls that together
+    /// describe one snapshot, and nothing forced them to stay in step: a
+    /// `Resolver` reused for a second `index_extractions` kept the first
+    /// snapshot's module prefixes and `replace` directives and resolved Go
+    /// imports against them — at DETERMINISTIC. Clearing the modules inside
+    /// `index_extractions` is not the fix: `devmap-cli` supplies them *first*
+    /// (main.rs:1264-1265) and the in-crate Go fixture supplies them second, so
+    /// an unconditional clear would break one order or the other.
+    ///
+    /// This flag makes the reset order-independent instead. Modules survive
+    /// exactly one indexing pass; a second pass that was not given a fresh set
+    /// resolves without module prefixes, which under-resolves Go imports rather
+    /// than resolving them confidently against a stale map.
+    go_modules_fresh: bool,
     /// file_path → Go package identifier (`pkg` in `package pkg`).
     go_package_by_file: BTreeMap<String, String>,
     /// `(file, scope, name)` for every value a callable binds itself.
@@ -85,8 +126,11 @@ impl Resolver {
             import_bindings: BTreeMap::new(),
             declared_types: BTreeMap::new(),
             external_imports: BTreeMap::new(),
+            unindexed_local_imports: BTreeMap::new(),
             qualified_names: BTreeMap::new(),
+            symbol_parents: BTreeMap::new(),
             go_modules: Vec::new(),
+            go_modules_fresh: false,
             go_package_by_file: BTreeMap::new(),
             scope_locals: BTreeSet::new(),
         }
@@ -117,8 +161,12 @@ impl Resolver {
         }
     }
 
+    /// Supply the Go module set for the snapshot about to be — or just —
+    /// indexed. Replaces any previous set, and marks it current for exactly one
+    /// `index_extractions` pass (see `go_modules_fresh`).
     pub fn index_go_modules(&mut self, modules: &[GoModule]) {
         self.go_modules = modules.to_vec();
+        self.go_modules_fresh = true;
     }
 
     /// Resolve a (file, bare name) pair to its graph identity, falling back to
@@ -210,6 +258,13 @@ impl Resolver {
             return UnresolvedClass::Builtin;
         }
         let external = self.external_imports.get(file_path);
+        // An import whose specifier is repo-relative and whose target is not
+        // indexed. Consulted at every point `external` is, and *ahead* of it in
+        // no case — the two maps are disjoint by construction — but ahead of the
+        // host-global table for the same reason `external` is: `from .helpers
+        // import fetch` is file-specific evidence about what `fetch` is, and it
+        // must not be answered from a list of runtime globals.
+        let local_gap = self.unindexed_local_imports.get(file_path);
 
         let Some(receiver) = receiver else {
             // `useState()`: the bare name is itself an imported binding.
@@ -217,6 +272,13 @@ impl Resolver {
                 return UnresolvedClass::External {
                     module: module.clone(),
                 };
+            }
+            // `from .helpers import thing`: the import proves the name is
+            // *inside* this repository, so failing to resolve it is an index
+            // gap. That is the tier that means "this may be a defect", never
+            // `External`, which is printed as expected and not worth acting on.
+            if local_gap.is_some_and(|imports| imports.contains_key(callee_name)) {
+                return UnresolvedClass::Unresolved;
             }
             // `setTimeout()` / `fetch()`: no import binds it because the
             // runtime puts it on the global object. Checked *after* the import
@@ -297,10 +359,35 @@ impl Resolver {
             }
         }
 
+        // `helpers.thing()` where `helpers` came from `from . import helpers`
+        // and that module is not indexed. The receiver *is* typed — by an
+        // import — so this is not an uninferred receiver; it is the same index
+        // gap as the bare case above.
+        if local_gap.is_some_and(|imports| imports.contains_key(root)) {
+            return UnresolvedClass::Unresolved;
+        }
+
         // A receiver we could not type. Not a defect — naming its owner needs
         // real type inference — but distinct from a bare-name failure, and by
         // far the larger group.
         UnresolvedClass::UninferredReceiver
+    }
+
+    /// Whether an import specifier names something inside this repository *by
+    /// construction*, whatever the corpus contains.
+    ///
+    /// A relative specifier is resolved against the importing file's own
+    /// directory, so it cannot reach outside the tree. `crate::` and `self::`
+    /// are the Rust spellings of the same fact. Everything else — `requests`,
+    /// `react`, `example.com/m/pkg` — may or may not be external, and only a
+    /// failed lookup plus a non-relative specifier is evidence that it is.
+    fn specifier_is_repo_relative(specifier: &str) -> bool {
+        let specifier = specifier.trim_matches(|c| c == '\'' || c == '"');
+        specifier.starts_with('.')
+            || matches!(specifier, "self" | "super" | "crate")
+            || specifier.starts_with("self::")
+            || specifier.starts_with("super::")
+            || specifier.starts_with("crate::")
     }
 
     /// Return the module path that should be resolved for one imported name.
@@ -331,9 +418,19 @@ impl Resolver {
         self.import_bindings.clear();
         self.declared_types.clear();
         self.external_imports.clear();
+        self.unindexed_local_imports.clear();
         self.qualified_names.clear();
+        self.symbol_parents.clear();
         self.go_package_by_file.clear();
         self.scope_locals.clear();
+        // `go_modules` is the one input this method does not own: it arrives
+        // through `index_go_modules`, which callers may run before *or* after
+        // this. Discard it unless it was supplied for this snapshot, so a
+        // reused `Resolver` under-resolves Go imports rather than resolving
+        // them against the previous snapshot's module map.
+        if !std::mem::take(&mut self.go_modules_fresh) {
+            self.go_modules.clear();
+        }
 
         // Pass one establishes the complete file/symbol universe. Import
         // binding resolution must not depend on whether the importer happens
@@ -367,6 +464,15 @@ impl Resolver {
                 self.qualified_names
                     .entry((ext.file_path.clone(), sym.name.clone()))
                     .or_insert_with(|| sym.qualified_name.clone());
+                // First declaration wins, matching `qualified_names` above, so
+                // the two indexes always describe the same symbol.
+                self.symbol_parents
+                    .entry((ext.file_path.clone(), sym.qualified_name.clone()))
+                    .or_insert_with(|| {
+                        sym.parent_symbol
+                            .clone()
+                            .unwrap_or_else(|| ext.file_path.clone())
+                    });
                 file_syms.push(sym.name.clone());
             }
             self.file_symbols.insert(ext.file_path.clone(), file_syms);
@@ -388,6 +494,16 @@ impl Resolver {
             // module resolved to no indexed file. Recorded from the same walk so
             // the two maps cannot disagree about what an import specifier means.
             let mut file_external: BTreeMap<String, String> = BTreeMap::new();
+            // The half of that mirror whose specifier is repo-relative, and so
+            // proves an index gap rather than an outside origin.
+            let mut file_local_gap: BTreeMap<String, String> = BTreeMap::new();
+            let mut unresolved_import = |local: String, specifier: &str| {
+                if Self::specifier_is_repo_relative(specifier) {
+                    file_local_gap.insert(local, specifier.to_string());
+                } else {
+                    file_external.insert(local, specifier.to_string());
+                }
+            };
             for imp in &ext.imports {
                 if !imp.imported_names.is_empty() {
                     for (idx, name) in imp.imported_names.iter().enumerate() {
@@ -446,7 +562,7 @@ impl Resolver {
                         if let Some(target_f) = resolved {
                             file_bindings.insert(local.to_string(), (target_f, name.clone()));
                         } else {
-                            file_external.insert(local.to_string(), imp.module_specifier.clone());
+                            unresolved_import(local.to_string(), &imp.module_specifier);
                         }
                     }
                 } else {
@@ -467,7 +583,7 @@ impl Resolver {
                         let local = alias.map(str::to_string).unwrap_or_else(|| {
                             Self::import_local_name(&ext.language, &imp.module_specifier)
                         });
-                        file_external.insert(local, imp.module_specifier.clone());
+                        unresolved_import(local, &imp.module_specifier);
                         continue;
                     };
                     if alias == Some(".") {
@@ -491,6 +607,10 @@ impl Resolver {
             if !file_external.is_empty() {
                 self.external_imports
                     .insert(ext.file_path.clone(), file_external);
+            }
+            if !file_local_gap.is_empty() {
+                self.unindexed_local_imports
+                    .insert(ext.file_path.clone(), file_local_gap);
             }
             if !file_bindings.is_empty() {
                 self.import_bindings
@@ -566,22 +686,24 @@ impl Resolver {
         }
     }
 
-    /// Resolve every file. Equivalent to `resolve_subset(extractions, None)`.
-    pub fn resolve_all(&self, extractions: &[Extraction]) -> ResolutionResult {
-        self.resolve_subset(extractions, None)
-    }
-
-    /// Resolve only `only`'s files, if given.
+    /// Resolve every file.
     ///
-    /// The index must still be built from *every* extraction — resolution reads
-    /// a global symbol index, so a subset index would resolve differently. Only
-    /// the emission loop is narrowed, which is what makes the result mergeable
-    /// with carried-forward edges keyed by source file.
-    pub fn resolve_subset(
-        &self,
-        extractions: &[Extraction],
-        only: Option<&BTreeSet<String>>,
-    ) -> ResolutionResult {
+    /// There is deliberately **no subset entry point**. One existed — a
+    /// `resolve_subset(extractions, only)` that narrowed the emission loop to a
+    /// changed-file closure — and it was unsound for a reason that is not
+    /// fixable by narrowing more carefully: `analyze` consumes whatever this
+    /// produces, and liveness and community detection are global by nature.
+    /// They answer "does anything call this symbol" and "what clusters with
+    /// what", questions no subset of the edges can answer. Measured on a
+    /// 155-file fixture, one edited file handed the analyser 63 edges instead
+    /// of 15,017, and the generation committed 433 dead-code candidates instead
+    /// of 14 — plainly-called functions recorded as callerless.
+    ///
+    /// `devmap-cli` reverted to a whole-tree resolve on every build and the
+    /// parameter has had no caller since. It is gone rather than left
+    /// unreachable, because an unused narrowing hook reads as a supported
+    /// option and the next caller would reintroduce the same bug.
+    pub fn resolve_all(&self, extractions: &[Extraction]) -> ResolutionResult {
         // Per-file resolution runs in parallel.
         //
         // Sound because the loop body below reads only `self` — the symbol and
@@ -610,9 +732,6 @@ impl Resolver {
         );
         let per_file: Vec<FileResolution> = extractions
             .par_iter()
-            // "No subset requested, or this file is in it" — the positive form
-            // of the `continue` guard this replaced.
-            .filter(|ext| only.is_none_or(|set| set.contains(&ext.file_path)))
             .map(|ext| {
                 let mut edges: Vec<ResolvedEdge> = Vec::new();
                 let mut unresolved: Vec<UnresolvedReference> = Vec::new();
@@ -626,19 +745,18 @@ impl Resolver {
                     if sym.kind == SymbolKind::File {
                         continue;
                     }
-                    edges.push(ResolvedEdge {
-                        source_file: ext.file_path.clone(),
-                        target_file: ext.file_path.clone(),
-                        source_symbol: ext.file_path.clone(),
-                        target_symbol: sym.qualified_name.clone(),
-                        edge_kind: EdgeKind::Contains,
-                        confidence: Confidence::DETERMINISTIC,
-                        resolution: Some(Arc::new(Resolution::SameFile {
+                    edges.push(ResolvedEdge::resolved(
+                        ext.file_path.clone(),
+                        ext.file_path.clone(),
+                        ext.file_path.clone(),
+                        sym.qualified_name.clone(),
+                        EdgeKind::Contains,
+                        Arc::new(Resolution::SameFile {
                             target_symbol: sym.qualified_name.clone(),
                             target_file: ext.file_path.clone(),
-                        })),
-                        details: None,
-                    });
+                        }),
+                        None,
+                    ));
                     // A method is contained twice: once by the file, once by the
                     // type that declares it. Only emit the second when the parent
                     // is a real type rather than the file itself.
@@ -647,19 +765,18 @@ impl Resolver {
                         .as_deref()
                         .filter(|parent| *parent != ext.file_path)
                     {
-                        edges.push(ResolvedEdge {
-                            source_file: ext.file_path.clone(),
-                            target_file: ext.file_path.clone(),
-                            source_symbol: parent.to_string(),
-                            target_symbol: sym.qualified_name.clone(),
-                            edge_kind: EdgeKind::Contains,
-                            confidence: Confidence::DETERMINISTIC,
-                            resolution: Some(Arc::new(Resolution::SameFile {
+                        edges.push(ResolvedEdge::resolved(
+                            ext.file_path.clone(),
+                            ext.file_path.clone(),
+                            parent.to_string(),
+                            sym.qualified_name.clone(),
+                            EdgeKind::Contains,
+                            Arc::new(Resolution::SameFile {
                                 target_symbol: sym.qualified_name.clone(),
                                 target_file: ext.file_path.clone(),
-                            })),
-                            details: None,
-                        });
+                            }),
+                            None,
+                        ));
                     }
                 }
 
@@ -684,34 +801,62 @@ impl Resolver {
                         &ext.language,
                         &imp.module_specifier,
                     );
+                    // R5. A relative specifier that named no indexed file is an
+                    // index gap: the `Imports` edge that should exist is
+                    // missing, and emitting only on success made that
+                    // indistinguishable from "this file imports nothing".
+                    // Absolute specifiers are not recorded — `import "strings"`
+                    // resolving to nothing is the expected case and carries no
+                    // information.
+                    if targets.is_empty() && Self::specifier_is_repo_relative(&imp.module_specifier)
+                    {
+                        unresolved.push(UnresolvedReference {
+                            source_file: ext.file_path.clone(),
+                            source_symbol: ext.file_path.clone(),
+                            callee_name: imp.module_specifier.clone(),
+                            kind: UnresolvedKind::Import,
+                            resolution: Resolution::Unresolved {
+                                reason: format!(
+                                    "relative import {:?} in {} resolved to no indexed file",
+                                    imp.module_specifier, ext.file_path
+                                ),
+                            },
+                            class: UnresolvedClass::Unresolved,
+                            receiver: None,
+                        });
+                    }
                     let edge_targets = if ext.language == "go" {
                         self.go_import_edge_targets(&targets)
                     } else {
                         targets
                     };
                     for target_f in edge_targets {
-                        edges.push(ResolvedEdge {
-                            source_file: ext.file_path.clone(),
-                            target_file: target_f.clone(),
-                            source_symbol: ext.file_path.clone(),
-                            target_symbol: target_f.clone(),
-                            edge_kind: EdgeKind::Imports,
-                            confidence: Confidence::DETERMINISTIC,
-                            resolution: Some(Arc::new(Resolution::ImportScoped {
+                        edges.push(ResolvedEdge::resolved(
+                            ext.file_path.clone(),
+                            target_f.clone(),
+                            ext.file_path.clone(),
+                            target_f.clone(),
+                            EdgeKind::Imports,
+                            Arc::new(Resolution::ImportScoped {
                                 target_symbol: target_f.clone(),
                                 target_file: target_f,
                                 imported_from: imp.module_specifier.clone(),
-                            })),
-                            details: Some(imp.raw_import.clone()),
-                        });
+                            }),
+                            Some(imp.raw_import.clone()),
+                        ));
                     }
                 }
 
                 // Resolve calls using Resolution Ladder (SameFile -> ImportScoped -> UniqueGlobal -> AmbiguousGlobal)
                 for call in &ext.calls {
-                    let mut resolved_target = None;
-                    let mut resolution = None;
-                    let mut confidence = Confidence::HIGH;
+                    // The resolution is the *only* record of what was found:
+                    // it names the target file and symbol, and
+                    // `Resolution::confidence` scores it. A parallel
+                    // `resolved_target` used to hold the same two strings a
+                    // second time, which is the same shape as the confidence
+                    // drift this crate was audited for — two fields that must
+                    // agree, with nothing making them.
+                    let mut resolution: Option<Arc<Resolution>> = None;
 
                     // 1. Receiver-based resolution (SameFile / Constructor tracking N6)
                     if let Some(recv) = &call.receiver_expr {
@@ -724,33 +869,13 @@ impl Resolver {
                             self.scoped_receiver_types
                                 .get(&format!("{}:{}:{}", ext.file_path, caller, recv))
                         });
-                        // A receiver that *is* a type names it directly:
-                        // `PdgBuilder::new()`, `Config.default()`, `Self::helper()`.
-                        // There is no binding to look up because nothing was bound
-                        // — the type is written at the call site — so without this
-                        // an associated function fell past every receiver-aware
-                        // rung to the global tier, where any other type declaring
-                        // `new` made it ambiguous.
-                        //
-                        // It fires only when a type of exactly that name declares
-                        // exactly that method, so it cannot invent a target: the
-                        // `type_methods` lookup below is the same one a bound
-                        // receiver goes through, asked with the name as written.
-                        let literal_type = self
-                            .type_methods
-                            .contains_key(&(family, recv.clone(), call.callee_name.clone()))
-                            .then(|| recv.clone());
-                        if let Some(class_type) = scoped
-                            .or_else(|| self.receiver_types.get(&recv_key))
-                            .or(literal_type.as_ref())
+                        if let Some(class_type) =
+                            scoped.or_else(|| self.receiver_types.get(&recv_key))
                         {
                             let key = (family, class_type.clone(), call.callee_name.clone());
                             if let Some(hits) = self.type_methods.get(&key) {
                                 if hits.len() == 1 {
                                     let (target_f, target_symbol) = &hits[0];
-                                    resolved_target =
-                                        Some((target_f.clone(), target_symbol.clone()));
-                                    confidence = Confidence::DETERMINISTIC;
                                     resolution = Some(Arc::new(Resolution::ReceiverType {
                                         target_symbol: target_symbol.clone(),
                                         target_file: target_f.clone(),
@@ -762,15 +887,12 @@ impl Resolver {
                     }
 
                     // 2a. Import-scoped named binding (G6 — no silent global widen)
-                    if resolved_target.is_none() {
+                    if resolution.is_none() {
                         if let Some(bindings) = self.import_bindings.get(&ext.file_path) {
                             if let Some((target_f, target_sym)) = bindings.get(&call.callee_name) {
                                 if let Some((resolved_file, resolved_sym)) =
                                     self.lookup_in_package(target_f, target_sym)
                                 {
-                                    resolved_target =
-                                        Some((resolved_file.clone(), resolved_sym.clone()));
-                                    confidence = Confidence::DETERMINISTIC;
                                     resolution = Some(Arc::new(Resolution::ImportScoped {
                                         target_symbol: resolved_sym,
                                         target_file: resolved_file,
@@ -782,7 +904,7 @@ impl Resolver {
                     }
 
                     // 2b. Import-scoped module.method (G6 — no silent global widen)
-                    if resolved_target.is_none() {
+                    if resolution.is_none() {
                         let (recv, method) = if let Some(r) = &call.receiver_expr {
                             (r.clone(), call.callee_name.clone())
                         } else if let Some((r, m)) = call.callee_name.rsplit_once('.') {
@@ -796,9 +918,6 @@ impl Resolver {
                                     if let Some((resolved_file, resolved_sym)) =
                                         self.lookup_in_package(target_f, &method)
                                     {
-                                        resolved_target =
-                                            Some((resolved_file.clone(), resolved_sym.clone()));
-                                        confidence = Confidence::DETERMINISTIC;
                                         resolution = Some(Arc::new(Resolution::ImportScoped {
                                             target_symbol: resolved_sym,
                                             target_file: resolved_file,
@@ -827,22 +946,39 @@ impl Resolver {
                     // A self-reference is the exception, because there the receiver
                     // *is* this scope: `self.helper()` and `this.helper()` name a
                     // sibling declaration, which is exactly what this rung finds.
-                    if resolved_target.is_none()
+                    //
+                    // A *bare* callee is additionally restricted to what is in
+                    // scope at file level. `file_symbols` lists every symbol the
+                    // file declares, instance methods included, so matching a
+                    // bare name against it bound `def invoke(): run()` to
+                    // `class C: def run(self)` — code that raises `NameError` —
+                    // at DETERMINISTIC. `C.run` gained a caller that does not
+                    // exist and was thereby shielded from the dead-code pass.
+                    // The existing duplicate-method guard could not catch it:
+                    // with one class the name occurs once, so the count test
+                    // passes. A `self.`/`this.` receiver keeps reaching methods,
+                    // because there the receiver *is* the declaring type.
+                    if resolution.is_none()
                         && call
                             .receiver_expr
                             .as_deref()
                             .is_none_or(Self::receiver_is_self)
                     {
+                        let bare_call = call.receiver_expr.is_none();
                         if let Some(file_syms) = self.file_symbols.get(&ext.file_path) {
                             if file_syms
                                 .iter()
                                 .filter(|symbol| *symbol == &call.callee_name)
                                 .count()
                                 == 1
+                                && (!bare_call
+                                    || self.bare_name_is_in_scope(
+                                        &ext.file_path,
+                                        family,
+                                        call.caller_symbol.as_deref(),
+                                        &call.callee_name,
+                                    ))
                             {
-                                resolved_target =
-                                    Some((ext.file_path.clone(), call.callee_name.clone()));
-                                confidence = Confidence::DETERMINISTIC;
                                 resolution = Some(Arc::new(Resolution::SameFile {
                                     target_symbol: call.callee_name.clone(),
                                     target_file: ext.file_path.clone(),
@@ -851,9 +987,70 @@ impl Resolver {
                         }
                     }
 
+                    // 2d. A receiver that *is* a type names it directly:
+                    // `PdgBuilder::new()`, `Config.default()`. There is no
+                    // binding to look up because nothing was bound — the type is
+                    // written at the call site — so without this an associated
+                    // function falls to the global tier, where any other type
+                    // declaring `new` makes it ambiguous.
+                    //
+                    // It sat in rung 1, *ahead* of the import rungs, where a
+                    // spelling coincidence outranked explicit import evidence:
+                    // `from real import parser; parser.parse()` bound to an
+                    // unrelated `class parser` in some other file, at
+                    // DETERMINISTIC. Go and lowercase-class Python make that
+                    // collision ordinary — a package handle and a struct share a
+                    // lowercase namespace.
+                    //
+                    // Two things fix it. It runs after 2a/2b, so an import in
+                    // *this* file always wins. And the type must be corroborated
+                    // by this file: declared here, or bound by an import here.
+                    // A type of that name existing somewhere in the repository is
+                    // not evidence about what `recv` means at this call site.
+                    if resolution.is_none() {
+                        if let Some(recv) = &call.receiver_expr {
+                            let key = (family, recv.clone(), call.callee_name.clone());
+                            if let Some(hits) = self.type_methods.get(&key) {
+                                let corroborated = hits.len() == 1
+                                    && (hits[0].0 == ext.file_path
+                                        || self
+                                            .import_bindings
+                                            .get(&ext.file_path)
+                                            .is_some_and(|bindings| bindings.contains_key(recv)));
+                                if corroborated {
+                                    let (target_f, target_symbol) = &hits[0];
+                                    resolution = Some(Arc::new(Resolution::ReceiverType {
+                                        target_symbol: target_symbol.clone(),
+                                        target_file: target_f.clone(),
+                                        receiver_type: recv.clone(),
+                                    }));
+                                }
+                            }
+                        }
+                    }
+
                     // 3. Global lookup (UniqueGlobal vs AmbiguousGlobal - G5, G3)
-                    if resolved_target.is_none() {
+                    if resolution.is_none() {
                         if let Some(hits) = self.symbol_index.get(&call.callee_name) {
+                            // The same scope test rung 2c applies, for the same
+                            // reason: a bare `run()` cannot reach a method of
+                            // some class, and letting the global rung do what
+                            // 2c was stopped from doing would move the
+                            // fabricated edge rather than remove it — the
+                            // fabricated caller still shields the method from
+                            // the dead-code pass, only at HIGH instead of
+                            // DETERMINISTIC.
+                            //
+                            // Cross-file, the sibling shape cannot apply at all:
+                            // an implicit receiver reaches the enclosing type,
+                            // which is a different symbol in a different file.
+                            // So the test is a plain "declared at file level",
+                            // and it is applied only to the families whose
+                            // scoping rules are stated in `bare_name_is_in_scope`
+                            // — a C++ method defined in a `.cpp` and declared in
+                            // its header is exactly the cross-file sibling this
+                            // would otherwise sever.
+                            let bare_call = call.receiver_expr.is_none();
                             let family_hits: Vec<_> = hits
                                 .iter()
                                 .filter(|(path, _, candidate_family)| {
@@ -864,6 +1061,9 @@ impl Resolver {
                                                 path,
                                                 &call.callee_name,
                                             ))
+                                        && (!bare_call
+                                            || !Self::family_needs_explicit_receiver(family)
+                                            || self.declared_at_file_level(path, &call.callee_name))
                                 })
                                 .collect();
                             if family_hits.len() == 1 {
@@ -877,9 +1077,6 @@ impl Resolver {
                                     && target_f != &ext.file_path;
 
                                 if !is_python_stdlib_guard {
-                                    resolved_target =
-                                        Some((target_f.clone(), call.callee_name.clone()));
-                                    confidence = Confidence::HIGH;
                                     resolution = Some(Arc::new(Resolution::UniqueGlobal {
                                         target_symbol: call.callee_name.clone(),
                                         target_file: target_f.clone(),
@@ -888,13 +1085,19 @@ impl Resolver {
                                 }
                             } else if family_hits.len() > 1 {
                                 // G5: Multi-candidate pick MUST NOT emit Extracted / HIGH confidence
-                                let candidates: Vec<(String, String)> = family_hits
+                                let mut candidates: Vec<(String, String)> = family_hits
                                     .iter()
                                     .map(|(f, _, _)| ((*f).clone(), call.callee_name.clone()))
                                     .collect();
-                                resolved_target =
-                                    Some((candidates[0].0.clone(), call.callee_name.clone()));
-                                confidence = Confidence::SPECULATIVE;
+                                // R4. `symbol_index` values are in input-slice
+                                // order, and that order used to flow straight
+                                // into `candidates` — a field of every emitted
+                                // edge, a key in the sort comparator and a term
+                                // in the dedup predicate. Reversing the input
+                                // slice reversed every candidate list. Sorting
+                                // here is also what makes the fan-out cap below
+                                // pick the same subset on every run.
+                                candidates.sort();
                                 resolution = Some(Arc::new(Resolution::AmbiguousGlobal {
                                     candidates,
                                     family,
@@ -907,34 +1110,71 @@ impl Resolver {
                         .caller_symbol
                         .clone()
                         .unwrap_or_else(|| ext.file_path.clone());
-                    if let Some(Resolution::AmbiguousGlobal { candidates, .. }) =
-                        resolution.as_deref()
-                    {
-                        for (target_f, target_sym) in candidates {
-                            edges.push(ResolvedEdge {
-                                source_file: ext.file_path.clone(),
-                                target_file: target_f.clone(),
-                                source_symbol: caller_sym.clone(),
-                                target_symbol: self.qualified_for(target_f, target_sym),
-                                edge_kind: EdgeKind::Calls,
-                                confidence,
-                                resolution: resolution.clone(),
-                                details: None,
-                            });
+                    // Emission is driven entirely by the resolution, and
+                    // anything that emits no edge falls through to the ledger —
+                    // so a rung that ever produced evidence naming no target
+                    // would be *reported*, not silently dropped and not a panic.
+                    let mut emitted = false;
+                    if let Some(resolution) = &resolution {
+                        match resolution.as_ref() {
+                            Resolution::AmbiguousGlobal { candidates, .. } => {
+                                // R7. One ambiguous call site emits one edge per
+                                // candidate. Uncapped, a single call to a name
+                                // with 200 same-family declarations became 200
+                                // persisted rows from one call site.
+                                //
+                                // The cap is on *emission* only: `candidates`
+                                // still carries the complete list, and every
+                                // edge of a truncated site carries both numbers,
+                                // so a capped sample is never presented as
+                                // complete coverage. The subset is the first
+                                // `AMBIGUOUS_FANOUT_CAP` of a sorted list, so it
+                                // is the same subset on every run.
+                                //
+                                // Known consequence, not an oversight: liveness
+                                // reads these edges to downgrade a symbol whose
+                                // only callers are ambiguous, so a candidate
+                                // past the cap loses that downgrade. `details`
+                                // is what says so.
+                                let total = candidates.len();
+                                let details = (total > AMBIGUOUS_FANOUT_CAP).then(|| {
+                                    format!(
+                                        "ambiguous fan-out truncated: \
+                                         {AMBIGUOUS_FANOUT_CAP} of {total} candidates emitted"
+                                    )
+                                });
+                                for (target_f, target_sym) in
+                                    candidates.iter().take(AMBIGUOUS_FANOUT_CAP)
+                                {
+                                    edges.push(ResolvedEdge::resolved(
+                                        ext.file_path.clone(),
+                                        target_f.clone(),
+                                        caller_sym.clone(),
+                                        self.qualified_for(target_f, target_sym),
+                                        EdgeKind::Calls,
+                                        Arc::clone(resolution),
+                                        details.clone(),
+                                    ));
+                                    emitted = true;
+                                }
+                            }
+                            named => {
+                                if let Some((target_file, target_symbol)) = named.target() {
+                                    edges.push(ResolvedEdge::resolved(
+                                        ext.file_path.clone(),
+                                        target_file.to_string(),
+                                        caller_sym.clone(),
+                                        self.qualified_for(target_file, target_symbol),
+                                        EdgeKind::Calls,
+                                        Arc::clone(resolution),
+                                        None,
+                                    ));
+                                    emitted = true;
+                                }
+                            }
                         }
-                    } else if let Some((target_f, target_sym)) = resolved_target {
-                        let target_symbol = self.qualified_for(&target_f, &target_sym);
-                        edges.push(ResolvedEdge {
-                            source_file: ext.file_path.clone(),
-                            target_file: target_f,
-                            source_symbol: caller_sym,
-                            target_symbol,
-                            edge_kind: EdgeKind::Calls,
-                            confidence,
-                            resolution,
-                            details: None,
-                        });
-                    } else {
+                    }
+                    if !emitted {
                         // D17 / R5: a call the ladder could not resolve is recorded,
                         // never dropped. Silence here is indistinguishable from
                         // "there was no call", which is the failure R5 forbids.
@@ -949,6 +1189,7 @@ impl Resolver {
                             source_file: ext.file_path.clone(),
                             source_symbol: caller_sym,
                             callee_name: call.callee_name.clone(),
+                            kind: UnresolvedKind::Call,
                             resolution: Resolution::Unresolved {
                                 reason: format!(
                                     "no resolution ladder rung matched {:?} in {} family {:?}",
@@ -970,82 +1211,170 @@ impl Resolver {
                     }
                     if let Some(edge) = self.resolve_name_reference(ext, family, reference) {
                         edges.push(edge);
+                        continue;
                     }
+                    // R5, the same rule the call ladder above obeys. A reference
+                    // the ladder *ran* and could not attribute used to be
+                    // dropped, so the ledger `devmap build` prints covered one
+                    // edge family and was read as covering both — a partial
+                    // denominator presented as a total.
+                    //
+                    // A reference whose name is empty is not a failed
+                    // attribution: there is nothing to attribute.
+                    let name = reference.name.rsplit('.').next().unwrap_or(&reference.name);
+                    if name.is_empty() {
+                        continue;
+                    }
+                    // A **bare** `Name` is the one rung the resolver declines
+                    // rather than fails: `resolve_name_reference` deliberately
+                    // stops before the global lookup, because `except Exception
+                    // as e` must not bind to some unrelated `def e`. Recording a
+                    // declined check as a failed one is the same Class A error
+                    // in the other direction, and it is not a small one —
+                    // measured over 148 files of this repository it puts 33,243
+                    // local-variable mentions into the tier documented as "the
+                    // only tier that indicates a defect", which today holds 9
+                    // rows. Saying "not attempted" needs an `UnresolvedClass`
+                    // variant, and that enum is matched exhaustively in
+                    // `devmap-cli`; until it has one, the honest ledger is of
+                    // the rungs that ran.
+                    //
+                    // A `Name` *with a receiver* is not declined: the member
+                    // rungs run for it in full, so its failure is recorded.
+                    if reference.kind == ReferenceKind::Name && reference.receiver_expr.is_none() {
+                        continue;
+                    }
+                    let source_symbol = reference
+                        .enclosing_symbol
+                        .clone()
+                        .unwrap_or_else(|| ext.file_path.clone());
+                    let class = self.classify_unresolved(
+                        &ext.file_path,
+                        family,
+                        name,
+                        reference.receiver_expr.as_deref(),
+                        &source_symbol,
+                    );
+                    unresolved.push(UnresolvedReference {
+                        source_file: ext.file_path.clone(),
+                        source_symbol,
+                        callee_name: name.to_string(),
+                        kind: UnresolvedKind::Reference,
+                        resolution: Resolution::Unresolved {
+                            reason: format!(
+                                "no resolution rung matched {:?} reference {:?} in {} family {:?}",
+                                reference.kind, name, ext.file_path, family
+                            ),
+                        },
+                        class,
+                        receiver: reference.receiver_expr.clone(),
+                    });
                 }
 
                 // Resolve routes
                 for route in &ext.routes {
-                    if let Some(hits) = self.symbol_index.get(&route.handler_name) {
+                    // An anonymous handler — an Express arrow function — has no
+                    // name to resolve, so there is nothing to bind and nothing
+                    // to report. Every other route names a handler, and either
+                    // binds it or fails to.
+                    if route.handler_name.is_empty() {
+                        continue;
+                    }
+                    let hits = self.symbol_index.get(&route.handler_name);
+                    let route_source = format!("{} {}", route.http_method, route.path_pattern);
+                    let mut candidate_count = 0usize;
+                    let route_target = hits.and_then(|hits| {
                         let same_file: Vec<_> = hits
                             .iter()
                             .filter(|(path, _, _)| path == &ext.file_path)
                             .collect();
-                        let route_target = if same_file.len() == 1 {
+                        if same_file.len() == 1 {
                             let (target_f, _, _) = same_file[0];
-                            Some((
+                            return Some((
                                 target_f.clone(),
-                                Confidence::DETERMINISTIC,
                                 Resolution::SameFile {
                                     target_symbol: route.handler_name.clone(),
                                     target_file: target_f.clone(),
                                 },
-                            ))
-                        } else if let Some((target_f, target_symbol)) = self
+                            ));
+                        }
+                        if let Some((target_f, target_symbol)) = self
                             .import_bindings
                             .get(&ext.file_path)
                             .and_then(|bindings| bindings.get(&route.handler_name))
                         {
-                            Some((
+                            return Some((
                                 target_f.clone(),
-                                Confidence::DETERMINISTIC,
                                 Resolution::ImportScoped {
                                     target_symbol: target_symbol.clone(),
                                     target_file: target_f.clone(),
                                     imported_from: route.handler_name.clone(),
                                 },
-                            ))
-                        } else {
-                            let family_hits: Vec<_> = hits
-                                .iter()
-                                .filter(|(path, _, candidate_family)| {
-                                    *candidate_family == family
-                                        && (*candidate_family != LangFamily::Go
-                                            || Self::go_symbol_visible_from(
-                                                &ext.file_path,
-                                                path,
-                                                &route.handler_name,
-                                            ))
-                                })
-                                .collect();
-                            (family_hits.len() == 1).then(|| {
-                                let (target_f, _, _) = family_hits[0];
-                                (
-                                    target_f.clone(),
-                                    Confidence::HIGH,
-                                    Resolution::UniqueGlobal {
-                                        target_symbol: route.handler_name.clone(),
-                                        target_file: target_f.clone(),
-                                        family,
-                                    },
-                                )
-                            })
-                        };
-                        if let Some((target_f, confidence, resolution)) = route_target {
-                            edges.push(ResolvedEdge {
-                                source_file: ext.file_path.clone(),
-                                target_file: target_f.clone(),
-                                source_symbol: format!(
-                                    "{} {}",
-                                    route.http_method, route.path_pattern
-                                ),
-                                target_symbol: route.handler_name.clone(),
-                                edge_kind: EdgeKind::HandlesRoute,
-                                confidence,
-                                resolution: Some(Arc::new(resolution)),
-                                details: Some(route.framework.clone()),
-                            });
+                            ));
                         }
-                    }
+                        let family_hits: Vec<_> = hits
+                            .iter()
+                            .filter(|(path, _, candidate_family)| {
+                                *candidate_family == family
+                                    && (*candidate_family != LangFamily::Go
+                                        || Self::go_symbol_visible_from(
+                                            &ext.file_path,
+                                            path,
+                                            &route.handler_name,
+                                        ))
+                            })
+                            .collect();
+                        candidate_count = family_hits.len();
+                        (family_hits.len() == 1).then(|| {
+                            let (target_f, _, _) = family_hits[0];
+                            (
+                                target_f.clone(),
+                                Resolution::UniqueGlobal {
+                                    target_symbol: route.handler_name.clone(),
+                                    target_file: target_f.clone(),
+                                    family,
+                                },
+                            )
+                        })
+                    });
+                    let Some((target_f, resolution)) = route_target else {
+                        // Class A. A route whose handler did not bind used to
+                        // produce no edge and no record, byte-identical to a
+                        // route with no named handler at all. `HandlesRoute` is
+                        // what tells liveness a handler is reached from outside
+                        // the call graph, so both candidates of an ambiguous
+                        // bind were then reported dead with nothing saying the
+                        // route had been checked and had failed.
+                        //
+                        // The candidate count is carried so ambiguity is
+                        // distinguishable from absence: 0 means no file declares
+                        // the name, 2 means the resolver refused to guess.
+                        unresolved.push(UnresolvedReference {
+                            source_file: ext.file_path.clone(),
+                            source_symbol: route_source,
+                            callee_name: route.handler_name.clone(),
+                            kind: UnresolvedKind::Route,
+                            resolution: Resolution::Unresolved {
+                                reason: format!(
+                                    "route handler {:?} in {} bound to none of {} \
+                                     same-family candidates",
+                                    route.handler_name, ext.file_path, candidate_count
+                                ),
+                            },
+                            class: UnresolvedClass::Unresolved,
+                            receiver: None,
+                        });
+                        continue;
+                    };
+                    edges.push(ResolvedEdge::resolved(
+                        ext.file_path.clone(),
+                        target_f,
+                        route_source,
+                        route.handler_name.clone(),
+                        EdgeKind::HandlesRoute,
+                        Arc::new(resolution),
+                        Some(route.framework.clone()),
+                    ));
                 }
                 (edges, unresolved, package_groups)
             })
@@ -1065,19 +1394,18 @@ impl Resolver {
         // G20: Add Go synthetic package star edges
         for (pkg_node, files) in package_groups {
             for file in files {
-                edges.push(ResolvedEdge {
-                    source_file: file.clone(),
-                    target_file: pkg_node.clone(),
-                    source_symbol: file,
-                    target_symbol: pkg_node.clone(),
-                    edge_kind: EdgeKind::MemberOf,
-                    confidence: Confidence::DETERMINISTIC,
-                    resolution: Some(Arc::new(Resolution::SameFile {
+                edges.push(ResolvedEdge::resolved(
+                    file.clone(),
+                    pkg_node.clone(),
+                    file,
+                    pkg_node.clone(),
+                    EdgeKind::MemberOf,
+                    Arc::new(Resolution::SameFile {
                         target_symbol: pkg_node.clone(),
                         target_file: pkg_node.clone(),
-                    })),
-                    details: Some("Go package star topology".to_string()),
-                });
+                    }),
+                    Some("Go package star topology".to_string()),
+                ));
             }
         }
 
@@ -1201,6 +1529,79 @@ impl Resolver {
                 .unwrap_or(specifier)
                 .to_string()
         }
+    }
+
+    /// Whether a bare `name()` written in `caller` can reach the same-file
+    /// symbol of that name.
+    ///
+    /// Two shapes can:
+    ///
+    /// - the symbol is declared at **file level**, which every language allows
+    ///   a bare name to reach; or
+    /// - the symbol and the caller are declared by the **same type**, and the
+    ///   language supplies the receiver implicitly — `g()` inside
+    ///   `class A { void f() { g(); } void g() {} }` is a real call in C++,
+    ///   Java and C#.
+    ///
+    /// The second is refused for the four families where it is demonstrably not
+    /// a call: Python and Go need the receiver written (`self.g()`, `r.g()`),
+    /// JavaScript needs `this.g()`, and Rust needs `self.g()` or `Type::g()`.
+    /// Those are exactly the families this crate resolves with confidence, and
+    /// the audited defect — a top-level `invoke()` binding to `C.run` — is
+    /// refused for every family by the file-level test above.
+    ///
+    /// Permissive elsewhere on purpose: allowing the sibling shape is today's
+    /// behaviour, so a family whose scoping rules are not stated here keeps
+    /// resolving exactly as it did rather than silently losing edges.
+    fn bare_name_is_in_scope(
+        &self,
+        file_path: &str,
+        family: LangFamily,
+        caller: Option<&str>,
+        callee_name: &str,
+    ) -> bool {
+        let parent_of = |qualified: &str| {
+            self.symbol_parents
+                .get(&(file_path.to_string(), qualified.to_string()))
+        };
+        let callee_qualified = self.qualified_for(file_path, callee_name);
+        let Some(callee_parent) = parent_of(&callee_qualified) else {
+            // Not indexed as a symbol of this file, so nothing claims it is in
+            // scope. Abstain rather than assume.
+            return false;
+        };
+        if callee_parent == file_path {
+            return true;
+        }
+        if Self::family_needs_explicit_receiver(family) {
+            return false;
+        }
+        caller
+            .and_then(parent_of)
+            .is_some_and(|caller_parent| caller_parent == callee_parent)
+    }
+
+    /// Families in which a method is unreachable without a written receiver.
+    ///
+    /// Python and Go require it in the signature and at the call site
+    /// (`self.g()`, `r.g()`), JavaScript and TypeScript require `this.g()`, and
+    /// Rust requires `self.g()` or `Type::g()`. C++, Java, C#, Kotlin, Swift,
+    /// Ruby and the rest are *not* listed: they supply the receiver implicitly,
+    /// so a bare sibling call is a real call there and must keep resolving.
+    fn family_needs_explicit_receiver(family: LangFamily) -> bool {
+        matches!(
+            family,
+            LangFamily::Python | LangFamily::JsTs | LangFamily::Go | LangFamily::Rust
+        )
+    }
+
+    /// Whether `file` declares `bare_name` at file level rather than inside a
+    /// type or another callable.
+    fn declared_at_file_level(&self, file: &str, bare_name: &str) -> bool {
+        let qualified = self.qualified_for(file, bare_name);
+        self.symbol_parents
+            .get(&(file.to_string(), qualified))
+            .is_some_and(|parent| parent == file)
     }
 
     /// Whether a receiver expression denotes the enclosing scope itself.
@@ -1611,16 +2012,20 @@ impl Resolver {
             .enclosing_symbol
             .clone()
             .unwrap_or_else(|| ext.file_path.clone());
-        ResolvedEdge {
-            source_file: ext.file_path.clone(),
-            target_file: target_file.to_string(),
+        // The confidence comes from the rung that found the target, exactly as
+        // it does for a call. This function used to stamp every reference
+        // `DETERMINISTIC`, including the bare-name `UniqueGlobal` rung, so a
+        // reference resolved on evidence the call ladder rates `HIGH` outranked
+        // that call — and a `min_confidence = 1.0` query kept the weaker one.
+        ResolvedEdge::resolved(
+            ext.file_path.clone(),
+            target_file.to_string(),
             source_symbol,
             target_symbol,
-            edge_kind: EdgeKind::References,
-            confidence: Confidence::DETERMINISTIC,
-            resolution: Some(Arc::new(resolution)),
-            details: Some(format!("{:?}", reference.kind)),
-        }
+            EdgeKind::References,
+            Arc::new(resolution),
+            Some(format!("{:?}", reference.kind)),
+        )
     }
 
     fn resolve_import_path(

@@ -48,7 +48,11 @@ def _effective_root(project_root: Path | None, payload: object) -> Path:
 
     This is the *single* owner of that rule: every hook command routes its root
     through here, so DevCouncil's state (traces, compact snapshot, live-review
-    signals, repo map) cannot split across two repos.  When only some hooks resolved
+    signals, repo map) cannot split across two repos.  ``cwd_changed`` is included:
+    it spells the field ``new_cwd``, so it aliases that to ``cwd`` and calls this,
+    rather than re-deciding "is there a project here" on its own — which it once did,
+    with a bare ``.devcouncil`` check that made ``cd src`` look like leaving the
+    repository.  When only some hooks resolved
     the worktree, PreCompact wrote its snapshot to the parent while the SessionStart
     that reads it looked in the worktree, and the post-compaction briefing was empty
     every time.  ``pre_tool_use``, the write authorization gate, was
@@ -112,6 +116,18 @@ def _active_task(root: Path):
         return TaskRepository(session).get_by_id(active_id)
 
 
+# A stop gate that could not evaluate must not emit what a gate that evaluated and
+# approved emits.  Both un-evaluable paths converge here: ``evaluate_stop``'s own
+# fail-open (which returns a pass-shaped result carrying ``fail_open=True``) and an
+# exception escaping it entirely.  stderr is not enough — on an exit-0 hook Claude
+# Code routes it to the debug log, which nobody reads, so "approved" and
+# "unexamined" looked the same on every channel the user or the model can see.
+UNEVALUATED_STOP_NOTICE = (
+    "DevCouncil stop gate did not evaluate this stop: nothing was checked. "
+    "This is not a pass."
+)
+
+
 def _emit_stop_result(client: str, result) -> None:
     """Emit the client's native Stop result schema.
 
@@ -132,6 +148,11 @@ def _emit_stop_result(client: str, result) -> None:
     system_message = (
         _cap_hook_output(result.system_message) if result.system_message else result.system_message
     )
+    if getattr(result, "fail_open", False):
+        detail = result.system_message or result.reason
+        system_message = _cap_hook_output(
+            f"{UNEVALUATED_STOP_NOTICE} {detail}" if detail else UNEVALUATED_STOP_NOTICE
+        )
     if result.decision == "block" and reason:
         if normalized == "codex":
             payload: dict[str, object] = {
@@ -198,20 +219,42 @@ def _handle_unified_stop(
     except Exception as exc:  # noqa: BLE001
         print(f"DevCouncil stop hook signal error (ignored): {exc}", file=sys.stderr)
 
+    from devcouncil.execution.stop_gate import StopGateResult
+
     try:
         from devcouncil.execution.stop_gate import evaluate_stop
 
         result = evaluate_stop(root, payload)
-        _emit_stop_result(client, result)
     except Exception as exc:  # noqa: BLE001
+        # Fail open on the *decision* -- a broken gate must not wedge the session --
+        # but never on the *report*.  The same emitter that renders a real result
+        # renders this one, so the client schema stays correct and the notice
+        # cannot drift from the fail-open path inside ``evaluate_stop``.
         print(f"DevCouncil stop hook gate error (fail-open): {exc}", file=sys.stderr)
-        if client.lower() == "gemini":
-            print(dump_json({"decision": "allow", "suppressOutput": True}, separators=(",", ":")))
+        try:
+            TraceLogger(root).log_event(
+                "stop_gate_error",
+                {"client": client.lower(), "hook": hook_kind, "error": str(exc)[:500]},
+                summary="stop gate did not run; stop allowed unexamined",
+            )
+        except Exception:
+            logger.debug("stop gate error trace failed", exc_info=True)
+        result = StopGateResult(
+            decision="pass", fail_open=True, mode="off", system_message=str(exc)[:500]
+        )
+    _emit_stop_result(client, result)
 
 
 def _emit_decision(client: str, action: str, reason: str) -> None:
     if action == "deny":
-        print(reason, file=sys.stderr)
+        # A PreToolUse hook that blocks by exiting 2 has its stderr handed to Claude
+        # as the denial reason, so this is a Claude-facing output string and the same
+        # 10,000-character bound applies.  It was the one emit path that skipped
+        # ``_cap_hook_output``: past the limit Claude Code spills the value to a file
+        # and hands Claude a preview plus a path, so the block landed while the
+        # corrective instruction the gate exists to deliver did not.  One cap, one
+        # owner — the same call's ``warn`` branch already bounded the same string.
+        print(_cap_hook_output(reason), file=sys.stderr)
         raise typer.Exit(code=2)
 
     if client == "codex":
@@ -244,13 +287,19 @@ def _emit_decision(client: str, action: str, reason: str) -> None:
         console.print(f"[yellow]DevCouncil Warning:[/yellow] {reason}")
 
 
-def _emit_unevaluable(client: str, reason: str, strict: bool, *, action: str = "warn") -> None:
+def _emit_unevaluable(client: str, reason: str, strict: bool) -> None:
     """Decide what to do when a tool call cannot be evaluated (empty/malformed/error).
 
-    Fail-closed in strict mode (block), otherwise surface a warning but allow — and
-    never leak an undefined exit code, which would silently disable the only pre-action
-    gate."""
-    _emit_decision(client, "deny" if strict else action, f"{reason}{' (strict mode: blocking)' if strict else ''}")
+    Fail-closed in strict mode (block), otherwise warn and allow — and never leak an
+    undefined exit code, which would silently disable the only pre-action gate.
+
+    Always ``warn``, never a bare ``allow``: the empty-payload case used to allow
+    without emitting anything at all, so a gate invocation that examined nothing was
+    indistinguishable from one that examined the call and approved it — the same
+    defect as the stop gate's fail-open, in the gate that blocks writes.  ``warn``
+    already has a per-client emit path, so this reuses it rather than adding a
+    second one."""
+    _emit_decision(client, "deny" if strict else "warn", f"{reason}{' (strict mode: blocking)' if strict else ''}")
 
 
 @app.command()
@@ -273,10 +322,10 @@ def pre_tool_use(
     try:
         if tool_call_json is None:
             tool_call_json = sys.stdin.read()
-        # Empty payload: nothing to evaluate. Benign in normal use, so allow — but make
-        # it observable, and block under --strict.
+        # Empty payload: nothing to evaluate. Benign in normal use, so allow — but say
+        # so on a channel the user can see, and block under --strict.
         if not tool_call_json.strip():
-            return _emit_unevaluable(normalized_client, "Empty tool-call payload; nothing to evaluate.", strict, action="allow")
+            return _emit_unevaluable(normalized_client, "Empty tool-call payload; nothing to evaluate.", strict)
         try:
             call_data = json.loads(tool_call_json)
         except json.JSONDecodeError:
@@ -605,17 +654,22 @@ def _take_queued_paths(queue_path: Path) -> list[str]:
     return collected
 
 
-def _auto_refresh_limits(root: Path) -> tuple[bool, int]:
-    """``(enabled, max_files)`` for map auto-refresh, from indexing config."""
+def _auto_refresh_enabled(root: Path) -> bool:
+    """Whether the hooks may rebuild the map, from ``indexing.auto_refresh``.
+
+    There is no companion "too many files" cap. ``indexing.auto_refresh_max_files``
+    was one and is retired: it early-returned above the threshold, so a branch
+    switch or pull — the widest change there is, and the one FileChanged exists to
+    catch — refreshed *nothing*. A cap can only bound how much detail a build is
+    given, and this build is given none: the kernel decides for itself which files
+    to revisit. So "many files changed" is a reason to rebuild, never to skip.
+    """
     try:
         from devcouncil.app.config import load_config
 
-        cfg = load_config(root).indexing
-        return bool(getattr(cfg, "auto_refresh", True)), int(
-            getattr(cfg, "auto_refresh_max_files", 40) or 40
-        )
+        return bool(getattr(load_config(root).indexing, "auto_refresh", True))
     except Exception:
-        return True, 40
+        return True
 
 
 def _refreshable_rels(root: Path, paths: list[str]) -> list[str]:
@@ -685,8 +739,7 @@ def _defer_refresh_paths(root: Path, paths: list[str]) -> int:
     the per-tool hook stays cheap (no lock, no debounce sleep, no kernel spawn) and
     the batch hook does one build for the whole parallel batch.
     """
-    enabled, _max_files = _auto_refresh_limits(root)
-    if not enabled:
+    if not _auto_refresh_enabled(root):
         return 0
     rels = _refreshable_rels(root, paths)
     if not rels:
@@ -704,11 +757,17 @@ def _maybe_refresh_map(
     edited files (PostToolBatch, FileChanged).  ``drain`` keeps going when this
     call contributes no paths of its own, so the PostToolBatch hook still flushes
     what the deferred PostToolUse hooks queued.
+
+    The path list decides *whether* to build and what to re-queue when a build
+    fails; it is not an argument to the build.  ``refresh_map_artifacts`` takes no
+    path list — the kernel owns incremental detection — so the only thing the hook
+    layer can honestly do with "which files changed" is skip the work when the
+    answer is "no code files", which is what keeps a kernel build off every Bash
+    call and every read-only tool batch.
     """
     import time
 
-    enabled, max_files = _auto_refresh_limits(root)
-    if not enabled:
+    if not _auto_refresh_enabled(root):
         return
 
     queue_path = root / _MAP_REFRESH_QUEUE_REL
@@ -718,14 +777,6 @@ def _maybe_refresh_map(
             if not drain:
                 return
             paths = []
-    if len(paths) > max_files:
-        logger.debug(
-            "Skipping map auto-refresh: %d paths > max %d", len(paths), max_files
-        )
-        if not drain:
-            return
-        paths = []
-
     # Only refresh code-ish paths under the project (LANGUAGE_SPECS extensions).
     rels = _refreshable_rels(root, paths)
     if not rels and not (drain and queue_path.is_file()):
@@ -759,11 +810,16 @@ def _maybe_refresh_map(
         from devcouncil.devmap_engine import DevMapEngineError
         from devcouncil.indexing.map_artifacts import refresh_map_artifacts
 
+        # One build answers the whole pending set: the kernel rescans for itself,
+        # so the batch is bookkeeping (what to re-queue on failure, how many edits
+        # this build answered), not an argument. The loop still runs more than once
+        # when work arrives *during* a build, because that build's inventory snapshot
+        # predates it.
         while pending:
             batch = sorted(pending)
             pending.clear()
             try:
-                refresh_map_artifacts(root, map_path, quiet=True, paths=batch)
+                refresh_map_artifacts(root, map_path, quiet=True)
             except DevMapEngineError as exc:
                 # A hook must never fail the tool call it runs after. The map
                 # stays where the last successful build left it, the paths go
@@ -801,7 +857,7 @@ def _maybe_refresh_map(
                     from devcouncil.indexing.map_artifacts import refresh_map_artifacts
 
                     try:
-                        refresh_map_artifacts(root, map_path, quiet=True, paths=leftover)
+                        refresh_map_artifacts(root, map_path, quiet=True)
                     except DevMapEngineError as exc:
                         logger.warning("map refresh deferred: %s", exc)
                         _enqueue_refresh_paths(queue_path, leftover)
@@ -1178,9 +1234,11 @@ def file_changed(
 
     The watch list seeded by SessionStart/CwdChanged is git's HEAD and index, so this
     fires on a branch switch, pull, rebase or reset — changes that rewrite many files
-    at once and that PostToolUse structurally cannot observe. The refreshed set is
-    exactly what git reports as different from the commit the map was built at, and
-    stays bounded by ``indexing.auto_refresh_max_files``.
+    at once and that PostToolUse structurally cannot observe. Git's diff against the
+    commit the map was built at answers *whether* anything changed; the rebuild
+    itself is whole-repo and incremental in the kernel, so the size of that diff
+    never suppresses it. A cap here once did, which meant the widest changes — the
+    only ones this hook exists for — were the ones it dropped.
     """
     payload = _read_stdin_payload(event_json)
     root = _effective_root(project_root, payload)
@@ -1213,23 +1271,29 @@ def cwd_changed(
 ):
     """Claude Code CwdChanged hook: re-point the file watch list at the current repo.
 
-    The map is repo-scoped, so the watch list seeded for the old directory is wrong
-    the moment Claude cd's into a different repo. Returning an empty array clears the
-    dynamic list, which is the documented behaviour for leaving a repo entirely.
+    The map is repo-scoped, so the watch list is wrong the moment Claude cd's into a
+    *different* DevCouncil project — and only then.  The root question is answered by
+    ``_effective_root``, the same way every other hook answers it, so the watch list
+    always names the git directory of the repo this session is actually maintaining.
+
+    This hook used to answer it itself, requiring ``.devcouncil/`` literally in
+    ``new_cwd`` with no walk upward, so a plain ``cd src`` resolved to "no project"
+    and emitted ``[]`` — clearing git's HEAD/index watch, and with it the whole
+    FileChanged path, for the rest of the session, while PostToolUse went on
+    refreshing that same repo's map.  An empty array now means only what it says:
+    the resolved root has no git directory to watch.
+
+    CwdChanged names the new directory ``new_cwd``; every other event calls the same
+    thing ``cwd``.  Aliasing it here is what lets the shared resolver stay the single
+    owner of the rule instead of growing a second, event-specific spelling.
     """
     payload = _read_stdin_payload(event_json)
     new_cwd = payload.get("new_cwd")
-    root: Path | None = None
-    if isinstance(new_cwd, str) and new_cwd.strip():
-        try:
-            candidate = Path(new_cwd).expanduser().resolve()
-        except (OSError, ValueError):
-            candidate = None
-        if candidate is not None and (candidate / ".devcouncil").is_dir():
-            root = candidate
-    # No DevCouncil project at the new cwd: clear the dynamic watch list rather than
-    # keep watching the repo we just left.
-    _emit_hook_specific("CwdChanged", watchPaths=_git_watch_paths(root) if root else [])
+    resolved = _effective_root(
+        project_root,
+        {**payload, "cwd": new_cwd} if isinstance(new_cwd, str) else payload,
+    )
+    _emit_hook_specific("CwdChanged", watchPaths=_git_watch_paths(resolved))
 
 
 @app.command()

@@ -145,27 +145,36 @@ def test_maybe_refresh_map_no_code_paths(tmp_path):
     hook._maybe_refresh_map(tmp_path, json.dumps({"file_path": "README.txt"}))
 
 
-def test_maybe_refresh_map_too_many_paths(tmp_path, monkeypatch):
-    import devcouncil.app.config as config_mod
-    from types import SimpleNamespace
+def test_maybe_refresh_map_many_paths_still_refreshes(tmp_path, monkeypatch):
+    """A multi-file edit refreshes once. This used to assert the opposite branch.
+
+    ``indexing.auto_refresh_max_files`` made "more paths than the cap" mean "no
+    refresh at all", and the test that covered it asserted nothing — so the branch
+    that silently dropped the widest changes was exercised and never checked. The
+    cap is retired; what is asserted now is that the refresh happens.
+    """
+    import devcouncil.indexing.map_artifacts as map_artifacts
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    calls = []
     monkeypatch.setattr(
-        config_mod, "load_config",
-        lambda root: SimpleNamespace(indexing=SimpleNamespace(auto_refresh=True, auto_refresh_max_files=1)),
+        map_artifacts, "refresh_map_artifacts",
+        lambda root, output, *a, **k: calls.append(1),
     )
     payload = {"edits": [{"file_path": "a.py"}, {"file_path": "b.py"}]}
     hook._maybe_refresh_map(tmp_path, json.dumps(payload))
+    assert len(calls) == 1
 
 
 def test_maybe_refresh_map_success(tmp_path, monkeypatch):
     import devcouncil.indexing.map_artifacts as map_artifacts
     monkeypatch.setattr(time, "sleep", lambda s: None)
-    refreshed = {}
+    calls = []
     monkeypatch.setattr(
         map_artifacts, "refresh_map_artifacts",
-        lambda root, output, *a, paths=None, **k: refreshed.setdefault("batch", list(paths or [])),
+        lambda root, output, *a, **k: calls.append(1),
     )
     hook._maybe_refresh_map(tmp_path, json.dumps({"tool_name": "Write", "file_path": "src/a.py"}))
-    assert refreshed["batch"] == ["src/a.py"]
+    assert len(calls) == 1
 
 
 def test_maybe_refresh_map_queues_when_locked(tmp_path, monkeypatch):
@@ -327,16 +336,21 @@ def test_read_lock_meta_legacy_bad_timestamp(tmp_path):
 
 
 def test_maybe_refresh_map_absolute_path(tmp_path, monkeypatch):
+    """An absolute payload path is recognised as in-root and triggers a refresh.
+
+    Which repo-relative path it normalizes to is asserted directly against
+    ``_refreshable_rels`` in test_hook_map_refresh.py — the build takes no path list.
+    """
     import devcouncil.indexing.map_artifacts as map_artifacts
     monkeypatch.setattr(time, "sleep", lambda s: None)
-    refreshed = {}
+    calls = []
     monkeypatch.setattr(
         map_artifacts, "refresh_map_artifacts",
-        lambda root, output, *a, paths=None, **k: refreshed.setdefault("batch", list(paths or [])),
+        lambda root, output, *a, **k: calls.append(1),
     )
     abs_path = str((tmp_path / "src" / "a.py"))
     hook._maybe_refresh_map(tmp_path, json.dumps({"file_path": abs_path}))
-    assert refreshed["batch"] == ["src/a.py"]
+    assert len(calls) == 1
 
 
 def test_maybe_refresh_map_refresh_exception_is_swallowed(tmp_path, monkeypatch):

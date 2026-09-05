@@ -187,10 +187,142 @@ fn go_build_variant_identities(extractions: &[Extraction]) -> HashSet<(&str, &st
         .collect()
 }
 
+/// How much of the corpus the extraction tier could not read.
+///
+/// The cross-file half of X6. `analyze_liveness` already refuses to call a
+/// parse-failed file's *own* symbols dead, because "nothing calls it" is only
+/// evidence when calls were looked for. The same sentence is true one hop out:
+/// a file that contributed no call edges was also the only possible caller of
+/// somebody else's symbol, and nothing downstream knew that the reachability
+/// scan had a hole in it.
+///
+/// Kept as two numbers rather than one because they are different claims. A
+/// `Failed` file contributed nothing at all; a `Fallback` file contributed
+/// names and spans but, by construction, no calls and no imports. Both lose
+/// edges, and a reader deciding whether to act on a dead-code finding wants to
+/// know which kind of blindness they are looking at.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExtractionCoverage {
+    /// Files a grammar was wanted for and did not get to read.
+    ///
+    /// Counted through [`Extraction::is_parse_failure`], the canonical owner,
+    /// **not** through a bare `matches!(parse_outcome, Failed { .. })`. Prose
+    /// and data formats report `Failed` for want of a grammar that does not
+    /// exist and never will; on this repository that is 294 of 1,310 files, all
+    /// Markdown, JSON, YAML, config and HTML. Counting those would report every
+    /// build of every real repository as degraded, and a degraded flag that is
+    /// always on carries no information at all.
+    pub parse_failed_files: usize,
+    /// Files whose declarations were recovered by line pattern.
+    ///
+    /// A `.proto` or `.ps1` this build cannot parse is a genuine gap in call
+    /// coverage — see [`ExtractionEngine::NotApplicable`]'s own docs drawing
+    /// exactly this line against a `.md`.
+    pub pattern_recovered_files: usize,
+}
+
+impl ExtractionCoverage {
+    /// Whether every file in the corpus had its calls looked for.
+    pub fn is_complete(&self) -> bool {
+        self.parse_failed_files == 0 && self.pattern_recovered_files == 0
+    }
+
+    /// Files that contributed no call edges, of either kind.
+    pub fn files_without_call_extraction(&self) -> usize {
+        self.parse_failed_files + self.pattern_recovered_files
+    }
+
+    /// Why the corpus-level scan is incomplete, or `None` when it is complete.
+    ///
+    /// `None` on a clean corpus is the whole point: this string is what
+    /// `analyze()` folds into `AnalysisStatus::Partial`, which drives
+    /// `graph_degraded` and `analysis_status`. A repository whose every file
+    /// parsed must keep reporting `ok`.
+    pub fn degraded_reason(&self) -> Option<String> {
+        if self.is_complete() {
+            return None;
+        }
+        Some(format!(
+            "call extraction did not cover the whole corpus: {} file(s) failed to parse, \
+             {} recovered by pattern (no calls extracted) — dead-code and unwired findings \
+             are a lower bound and are capped below the confident tier",
+            self.parse_failed_files, self.pattern_recovered_files
+        ))
+    }
+
+    /// Ceiling applied to a non-exempt dead-code confidence while the scan has
+    /// a hole in it, leaving anything below it untouched.
+    fn cap(&self, confidence: f32) -> f32 {
+        if self.is_complete() {
+            confidence
+        } else {
+            confidence.min(COVERAGE_LOSS_CONFIDENCE_CAP)
+        }
+    }
+}
+
+/// Confidence ceiling for a dead-code finding made against a partially read
+/// corpus.
+///
+/// Sits below `INFERRED_FLOOR_MILLIS` (400) so `code_graph.rs::confidence_label`
+/// renders `ambiguous` rather than `inferred` or `extracted`, and above the
+/// 0.3 the exempt tier uses so the two stay distinguishable. `extracted` is the
+/// tier `CLAUDE.md` tells agents to act on; a check that could not run must
+/// never reach it.
+pub const COVERAGE_LOSS_CONFIDENCE_CAP: f32 = 0.35;
+
+/// Reason carried by a confident finding that the coverage cap demoted.
+///
+/// The unqualified branch previously carried `None`, which `code_graph.rs`
+/// renders as "no inbound call edges and not exported" — a claim the run was
+/// not entitled to make. `only_ambiguous_callers` is deliberately left alone:
+/// it is a machine token three tests match exactly, and its own tier already
+/// reads as unconfirmed.
+pub const COVERAGE_LOSS_REASON: &str =
+    "no inbound call edges, but call extraction did not cover every file — not evidence of death";
+
+/// Count the files whose calls were never extracted.
+///
+/// One owner for the question, shared with `code_graph.rs`, which needs the
+/// same two numbers for `meta.devmap_rust`. Two independent `matches!` chains
+/// over `parse_outcome` is exactly how the `Failed`-vs-`NotApplicable`
+/// distinction gets lost in one of them.
+pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
+    let mut coverage = ExtractionCoverage::default();
+    for ext in extractions {
+        if ext.is_parse_failure() {
+            coverage.parse_failed_files += 1;
+        } else if matches!(ext.parse_outcome, ParseOutcome::Fallback { .. }) {
+            coverage.pattern_recovered_files += 1;
+        }
+    }
+    coverage
+}
+
+/// Dead-symbol findings together with how much of the corpus produced them.
+pub struct LivenessOutcome {
+    pub reports: Vec<DeadSymbolReport>,
+    pub coverage: ExtractionCoverage,
+}
+
+/// Dead-symbol findings only.
+///
+/// Thin delegate over [`analyze_liveness_with_coverage`], kept because callers
+/// that only want the findings should not have to name the coverage record.
+/// The confidence cap is applied by the canonical implementation, so both entry
+/// points report the same tiers.
 pub fn analyze_liveness(
     extractions: &[Extraction],
     resolution: &ResolutionResult,
 ) -> Vec<DeadSymbolReport> {
+    analyze_liveness_with_coverage(extractions, resolution).reports
+}
+
+pub fn analyze_liveness_with_coverage(
+    extractions: &[Extraction],
+    resolution: &ResolutionResult,
+) -> LivenessOutcome {
+    let coverage = extraction_coverage(extractions);
     let go_interface_specs = go_interface_specs_by_package(extractions);
     let c_header_exports = c_header_exported_names(extractions);
     let go_build_variants = go_build_variant_identities(extractions);
@@ -425,7 +557,7 @@ pub fn analyze_liveness(
                 reports.push(DeadSymbolReport {
                     symbol_name: dead_symbol_identity(sym, &ext.file_path),
                     file_path: ext.file_path.clone(),
-                    confidence: 0.4,
+                    confidence: coverage.cap(0.4),
                     is_exempt: false,
                     exemption_reason: Some("only_ambiguous_callers".to_string()),
                 });
@@ -435,12 +567,22 @@ pub fn analyze_liveness(
                 && symbol_exemption.is_none()
                 && !overlaps_parse_error
             {
+                // The corpus-level half of X6. A confident finding here means
+                // "no edge in the whole generation names this symbol" — which
+                // is only evidence when every file got to contribute its edges.
+                // While it did not, the finding stays visible (hiding it would
+                // be its own lie) but must not reach the tier `CLAUDE.md` tells
+                // agents to act on.
                 reports.push(DeadSymbolReport {
                     symbol_name: dead_symbol_identity(sym, &ext.file_path),
                     file_path: ext.file_path.clone(),
-                    confidence: 0.9,
+                    confidence: coverage.cap(0.9),
                     is_exempt: false,
-                    exemption_reason: None,
+                    exemption_reason: if coverage.is_complete() {
+                        None
+                    } else {
+                        Some(COVERAGE_LOSS_REASON.to_string())
+                    },
                 });
             } else if !is_called {
                 reports.push(DeadSymbolReport {
@@ -463,7 +605,7 @@ pub fn analyze_liveness(
         }
     }
 
-    reports
+    LivenessOutcome { reports, coverage }
 }
 
 #[cfg(all(test, feature = "parse"))]

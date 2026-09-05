@@ -5,7 +5,9 @@ use std::sync::mpsc::{channel, Sender};
 use std::time::{Duration, Instant, SystemTime};
 use tracing::warn;
 
-use devmap_extract::{ignore_rule_files, is_gitignored, is_ignored_path, is_indexable_source};
+use devmap_extract::{
+    ignore_rule_files, is_gitignored_reporting, is_ignored_path, is_indexable_source,
+};
 
 const MAX_IGNORE_CACHE_ENTRIES: usize = 8_192;
 
@@ -26,6 +28,12 @@ struct CachedIgnoreVerdict {
 struct IgnoreVerdictCache {
     entries: BTreeMap<(PathBuf, bool), CachedIgnoreVerdict>,
     rebuilds: usize,
+    /// Rule-file diagnostics already logged, so a `.gitignore` line the kernel
+    /// cannot compile is reported once rather than once per event for the life
+    /// of the daemon. Bounded by the number of distinct rule files, and cleared
+    /// with the verdicts whenever a rule file changes — so an edit that fixes
+    /// the line stops the message, and one that breaks a new line prints it.
+    reported_rule_problems: BTreeSet<String>,
 }
 
 impl IgnoreVerdictCache {
@@ -66,7 +74,12 @@ impl IgnoreVerdictCache {
             }
         }
 
-        let ignored = is_gitignored(root, path, is_dir)?;
+        let (ignored, problems) = is_gitignored_reporting(root, path, is_dir)?;
+        for problem in problems {
+            if self.reported_rule_problems.insert(problem.clone()) {
+                warn!("{problem}");
+            }
+        }
         self.rebuilds = self.rebuilds.saturating_add(1);
         if self.entries.len() >= MAX_IGNORE_CACHE_ENTRIES && !self.entries.contains_key(&key) {
             self.entries.clear();
@@ -86,6 +99,9 @@ impl IgnoreVerdictCache {
             || path.ends_with(".git/info/exclude");
         if is_rule {
             self.entries.clear();
+            // The diagnostics describe the file that just changed, so they are
+            // stale for the same reason the verdicts are.
+            self.reported_rule_problems.clear();
         }
         is_rule
     }
@@ -233,24 +249,47 @@ fn is_git_ref_event(root: &Path, path: &Path) -> bool {
     rest == "HEAD" || rest == "packed-refs" || rest.starts_with("refs/")
 }
 
+/// The queue entry one watched path becomes, or `None` if there is nothing to
+/// index there.
+///
+/// `None` is a positive claim — "this path is not work" — so it must never be
+/// the answer given when the question could not be answered. That is why this
+/// returns a plain `Option` and not a `Result`: the caller had an `Err` arm
+/// that logged and returned `None`, which spelled "the ignore check failed"
+/// exactly like "the ignore check said ignore", and a `warn!` nobody reads was
+/// all that separated a frozen index from a quiet one.
 fn admitted_watch_path(
     root: &Path,
     path: &Path,
     ignore_cache: &mut IgnoreVerdictCache,
-) -> anyhow::Result<Option<String>> {
-    let Ok(relative) = path.strip_prefix(root) else {
-        return Ok(None);
-    };
+) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
     let relative = relative.to_string_lossy().replace('\\', "/");
     if is_ignored_path(&relative) {
-        return Ok(None);
+        return None;
     }
     let metadata = std::fs::metadata(path);
     let is_dir = metadata.as_ref().is_ok_and(|metadata| metadata.is_dir());
-    if ignore_cache.is_ignored(root, path, is_dir)? {
-        return Ok(None);
+    // Fail *open*, for the reason `head_differs_from_last_generation` already
+    // states: a redundant re-extract costs time, a dropped one costs
+    // correctness. The undecidable cases are real — a symlink loop, a parent
+    // that lost `+x`, a stale handle on a network mount — and the store's queue
+    // is where an unresolvable path becomes visible (it is retried, then
+    // quarantined), not this filter.
+    let ignored = match ignore_cache.is_ignored(root, path, is_dir) {
+        Ok(ignored) => ignored,
+        Err(error) => {
+            warn!(
+                "cannot evaluate ignore rules for {path:?}; queueing it rather than \
+                 mistaking a check that could not run for one that said `ignore`: {error}"
+            );
+            false
+        }
+    };
+    if ignored {
+        return None;
     }
-    Ok(match metadata {
+    match metadata {
         Ok(metadata) if metadata.is_dir() || is_indexable_source(&relative) => {
             Some(path.to_string_lossy().into_owned())
         }
@@ -261,7 +300,84 @@ fn admitted_watch_path(
             Some(path.to_string_lossy().into_owned())
         }
         _ => None,
-    })
+    }
+}
+
+/// The queue entry that asks for a whole-tree rescan.
+///
+/// Not a new control token: the repository root already *is* the store's
+/// spelling for this — "the root itself: a whole-tree rescan the drain expands"
+/// (`classify_pending_entry`) — and the drain expands a queued directory into a
+/// full discovery pass with deletion reconciliation. Reusing it means a lost
+/// coverage notice also makes `pending_count` non-zero, so `status` answers
+/// `is_fresh: false` until the rescan has actually run.
+pub(crate) fn whole_tree_rescan(root: &Path) -> Vec<String> {
+    vec![root.to_string_lossy().into_owned()]
+}
+
+/// The paths one watcher event asks the daemon to re-examine.
+///
+/// Split out of the receive loop so each class of event can be asserted
+/// directly: the loop itself is driven by the OS, and the notices that matter
+/// most here are exactly the ones a test cannot make the kernel emit on demand.
+fn watch_event_paths(
+    root: &Path,
+    event: notify::Event,
+    ignore_cache: &mut IgnoreVerdictCache,
+) -> Vec<String> {
+    // The OS telling us it dropped events is the one notice that must never be
+    // filtered, and it arrives shaped like nothing else: `EventKind::Other`
+    // carrying `Flag::Rescan` and *no paths at all*
+    // (`notify-6.1.1/src/fsevent.rs:114-123` for FSEvents `MUST_SCAN_SUBDIRS`,
+    // `src/inotify.rs:208-209` for `Q_OVERFLOW`). It therefore fell into the
+    // catch-all below and was discarded — after which `pending_count` stayed 0,
+    // `status` answered `is_fresh: true`, and every later query was served from
+    // a generation missing an arbitrary, unknowable subset of the edits. Since
+    // `reconcile_connect_time` is the only full sweep and runs once at startup,
+    // that gap persisted until the daemon restarted.
+    if event.need_rescan() {
+        warn!(
+            "the OS reported dropped filesystem events for {root:?} \
+             ({:?}); requesting a whole-tree rescan",
+            event.info().unwrap_or("no detail")
+        );
+        return whole_tree_rescan(root);
+    }
+    if matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    ) {
+        event
+            .paths
+            .into_iter()
+            .filter_map(|path| {
+                if ignore_cache.observe_rule_event(&path) {
+                    return None;
+                }
+                // Checked before the ignore rules, because `.git/` is pruned by
+                // them and this is the one thing inside it the daemon has to
+                // see.
+                if is_git_ref_event(root, &path) {
+                    return Some(GIT_HEAD_SENTINEL.to_string());
+                }
+                admitted_watch_path(root, &path, ignore_cache)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// The paths a watcher *error* asks the daemon to re-examine.
+///
+/// Also lost coverage, and treated the same way. `ErrorKind::MaxFilesWatch`
+/// ("OS file watch limit reached") means whole subtrees are no longer watched
+/// at all; the others mean this watcher no longer knows what it is seeing.
+/// Logging and continuing left the daemon reporting fresh about a tree it had
+/// stopped watching.
+fn watch_error_paths(root: &Path, error: &notify::Error) -> Vec<String> {
+    warn!("watch error ({error:?}); requesting a whole-tree rescan of {root:?}");
+    whole_tree_rescan(root)
 }
 
 /// Start a debounced recursive file watcher. The watcher thread owns the
@@ -294,38 +410,13 @@ pub fn start_file_watcher<P: AsRef<Path>, F: Fn(Vec<String>) + Send + 'static>(
             }
             match rx.recv_timeout(Duration::from_millis(250)) {
                 Ok(Ok(event)) => {
-                    let admitted: Vec<String> = if matches!(
-                        event.kind,
-                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                    ) {
-                        event
-                            .paths
-                            .into_iter()
-                            .filter_map(|path| {
-                                if ignore_cache.observe_rule_event(&path) {
-                                    return None;
-                                }
-                                // Checked before the ignore rules, because
-                                // `.git/` is pruned by them and this is the one
-                                // thing inside it the daemon has to see.
-                                if is_git_ref_event(&root, &path) {
-                                    return Some(GIT_HEAD_SENTINEL.to_string());
-                                }
-                                match admitted_watch_path(&root, &path, &mut ignore_cache) {
-                                    Ok(path) => path,
-                                    Err(error) => {
-                                        warn!("failed to evaluate watcher path {path:?}: {error}");
-                                        None
-                                    }
-                                }
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
+                    let admitted = watch_event_paths(&root, event, &mut ignore_cache);
                     buffer.push(admitted, Instant::now());
                 }
-                Ok(Err(e)) => warn!("Watch error: {:?}", e),
+                Ok(Err(error)) => {
+                    let admitted = watch_error_paths(&root, &error);
+                    buffer.push(admitted, Instant::now());
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if let Some(paths) = buffer.take_ready(Instant::now()) {
                         callback(paths);
@@ -346,6 +437,187 @@ pub fn start_file_watcher<P: AsRef<Path>, F: Fn(Vec<String>) + Send + 'static>(
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    fn scratch_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "devmap-watcher-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root.canonicalize().unwrap()
+    }
+
+    /// K-A3: the OS saying "I dropped events, rescan" is the one notice the
+    /// watcher must never filter.
+    ///
+    /// Both backends deliver it as `EventKind::Other` carrying `Flag::Rescan`
+    /// (verified in the vendored crate: `notify-6.1.1/src/fsevent.rs:114-123`
+    /// for FSEvents `MUST_SCAN_SUBDIRS`, `src/inotify.rs:208-209` for
+    /// `Q_OVERFLOW`), and it carries no paths. Dropping it leaves the queue
+    /// empty, so `pending_count` stays 0 and `status` answers `is_fresh: true`
+    /// about a generation missing an arbitrary, unknowable subset of the edits.
+    ///
+    /// The repository root is the store's own spelling for "a whole-tree
+    /// rescan the drain expands" (`classify_pending_entry`), so that is what a
+    /// lost-coverage notice must enqueue.
+    #[test]
+    fn a_dropped_event_notice_requests_a_whole_tree_rescan() {
+        let root = scratch_root("rescan");
+        let mut cache = IgnoreVerdictCache::default();
+
+        let dropped = notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        assert!(
+            dropped.need_rescan(),
+            "the fixture must be the notice the OS actually sends"
+        );
+
+        assert_eq!(
+            watch_event_paths(&root, dropped, &mut cache),
+            vec![root.to_string_lossy().into_owned()],
+            "a dropped-event notice must enqueue the repository root; \
+             discarding it freezes the index while `status` keeps saying fresh"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Positive control for the rescan handling: an ordinary event is still
+    /// classified exactly as before, and an uninteresting one still yields
+    /// nothing. A watcher that answers "rescan the world" to every event is a
+    /// different bug with the same green test.
+    #[test]
+    fn ordinary_events_are_unaffected_by_the_rescan_handling() {
+        let root = scratch_root("rescan-control");
+        std::fs::write(root.join("main.py"), "def main(): pass\n").unwrap();
+        let mut cache = IgnoreVerdictCache::default();
+
+        let modified = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(root.join("main.py"));
+        assert_eq!(
+            watch_event_paths(&root, modified, &mut cache),
+            vec![root.join("main.py").to_string_lossy().into_owned()],
+            "an ordinary edit must still be admitted as itself"
+        );
+
+        // `EventKind::Other` *without* the rescan flag carries no claim about
+        // lost coverage, and `Access` never did.
+        for uninteresting in [
+            notify::Event::new(EventKind::Other).add_path(root.join("main.py")),
+            notify::Event::new(EventKind::Access(notify::event::AccessKind::Read))
+                .add_path(root.join("main.py")),
+        ] {
+            assert!(
+                watch_event_paths(&root, uninteresting, &mut cache).is_empty(),
+                "only a rescan notice may ask for a whole-tree rescan"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// K-A3, second half: a watch *error* is also lost coverage.
+    ///
+    /// `notify::ErrorKind::MaxFilesWatch` ("OS file watch limit reached") means
+    /// whole subtrees are no longer watched. Logging it and continuing leaves
+    /// the daemon reporting fresh about a tree it has stopped seeing.
+    #[test]
+    fn a_watch_error_requests_a_whole_tree_rescan() {
+        let root = scratch_root("watch-error");
+        let error = notify::Error::new(notify::ErrorKind::MaxFilesWatch);
+
+        assert_eq!(
+            watch_error_paths(&root, &error),
+            vec![root.to_string_lossy().into_owned()],
+            "a watcher that lost its watches must ask for a rescan, not just log"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// K-A1 at the watcher: one malformed glob in `.gitignore` must not make
+    /// the watcher drop every path in the tree.
+    ///
+    /// `[z-a]` is a plausible typo that `git` tolerates and `ignore` rejects.
+    /// `GitignoreBuilder::add` reports it as a *partial* error with every other
+    /// line still compiled, but `add_ignore_rules` treated any return as fatal,
+    /// so the verdict for every path became `Err` — which this loop read as
+    /// "not a path to index", the same answer a genuinely ignored path gets.
+    #[test]
+    fn a_malformed_ignore_glob_does_not_make_the_watcher_drop_the_tree() {
+        let root = scratch_root("malformed-glob");
+        std::fs::write(root.join(".gitignore"), "ignored.py\n[z-a]\n").unwrap();
+        std::fs::write(root.join("main.py"), "def main(): pass\n").unwrap();
+        std::fs::write(root.join("ignored.py"), "def ignored(): pass\n").unwrap();
+        let mut cache = IgnoreVerdictCache::default();
+
+        let edited = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(root.join("main.py"));
+        assert_eq!(
+            watch_event_paths(&root, edited, &mut cache),
+            vec![root.join("main.py").to_string_lossy().into_owned()],
+            "one bad glob must not freeze the incremental index"
+        );
+
+        // Positive control: the rules that *are* well formed still apply.
+        let ignored = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(root.join("ignored.py"));
+        assert!(
+            watch_event_paths(&root, ignored, &mut cache).is_empty(),
+            "a genuinely ignored file must still be dropped"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// K-A1(b): an ignore verdict that could not be *computed* must not be
+    /// spelled the same way as a verdict of "ignored".
+    ///
+    /// A `.gitignore` that is a symlink loop is the readable form of the cases
+    /// the store already names as undecidable — "a symlink loop, a parent that
+    /// lost `+x`, a stale handle on a network mount". Stamping it fails, the
+    /// verdict fails, and the path was dropped with a `warn!` nobody reads.
+    /// A redundant re-extract costs time; a dropped one costs correctness.
+    #[cfg(unix)]
+    #[test]
+    fn an_uncomputable_ignore_verdict_admits_the_path_instead_of_dropping_it() {
+        let root = scratch_root("undecidable");
+        std::fs::write(root.join(".gitignore"), "ignored.py\n").unwrap();
+        std::fs::write(root.join("ignored.py"), "def ignored(): pass\n").unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/file.py"), "def f(): pass\n").unwrap();
+        // A self-referential symlink: every `stat` of it returns ELOOP, so the
+        // rule stamp — and with it the verdict — cannot be computed.
+        std::os::unix::fs::symlink(".gitignore", root.join("sub/.gitignore")).unwrap();
+        assert!(
+            std::fs::metadata(root.join("sub/.gitignore")).is_err(),
+            "the fixture must actually be unstattable"
+        );
+        let mut cache = IgnoreVerdictCache::default();
+
+        let edited = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(root.join("sub/file.py"));
+        assert_eq!(
+            watch_event_paths(&root, edited, &mut cache),
+            vec![root.join("sub/file.py").to_string_lossy().into_owned()],
+            "an ignore check that could not run must admit the path, not drop it"
+        );
+
+        // Positive control: failing open must not disable the rules that can be
+        // evaluated.
+        let ignored = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(root.join("ignored.py"));
+        assert!(
+            watch_event_paths(&root, ignored, &mut cache).is_empty(),
+            "a computable verdict of `ignored` must still drop the path"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// A batch whose every path was filtered out must not move the debounce
     /// window.

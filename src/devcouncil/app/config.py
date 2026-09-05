@@ -353,8 +353,8 @@ class IndexingConfig(BaseModel):
 
     ``auto_refresh`` enables best-effort incremental map refresh from the
     post-tool-use hook after agent file edits (never blocks the agent on failure).
-    ``auto_refresh_max_files`` skips refresh when a single hook reports more
-    changed paths than this guard (large refactors should run ``dev map``).
+    It has no companion file-count guard: see ``RETIRED_CONFIG_KEYS`` for why
+    ``auto_refresh_max_files`` is gone.
 
     ``write_graph_html`` writes the interactive graph visualizer alongside the
     code graph during ``dev map`` (off by default — HTML can be large).
@@ -374,7 +374,6 @@ class IndexingConfig(BaseModel):
     primary_languages: list[str] = Field(default_factory=list)
     lsp_refs: bool = False
     auto_refresh: bool = True
-    auto_refresh_max_files: int = 40
     # Serialized liveness debt is bounded independently from the uncapped graph.
     # The defaults support large repositories while the validation ceilings prevent
     # accidental multi-hundred-megabyte repo_map.json artifacts.
@@ -854,6 +853,12 @@ RETIRED_CONFIG_KEYS: Dict[str, str] = {
     ),
     "indexing.repo_map_dependents_cap": (
         "the Rust kernel writes `dependents` and does not read this cap"
+    ),
+    "indexing.auto_refresh_max_files": (
+        "it dropped the refresh entirely above the threshold, so the widest "
+        "changes (branch switch, pull, rebase) were the ones that never "
+        "refreshed the map; the kernel decides what a build revisits, so there "
+        "is no per-build detail left for a cap to bound"
     ),
 }
 

@@ -129,12 +129,7 @@ def test_incremental_map_after_full_map_commits_one_generation(tmp_path: Path) -
     assert gen_after_full == 2  # kernel build + the guides it wrote (see above)
 
     app.write_text("def main():\n    return 2\n", encoding="utf-8")
-    generate_map_artifacts(
-        tmp_path,
-        tmp_path / ".devcouncil" / "repo_map.json",
-        quiet=True,
-        paths=["app.py"],
-    )
+    generate_map_artifacts(tmp_path, tmp_path / ".devcouncil" / "repo_map.json", quiet=True)
     assert DevMapClient(tmp_path).status().generation_id == gen_after_full + 1
 
     # An unchanged tree is a no-op in the kernel: no new generation.

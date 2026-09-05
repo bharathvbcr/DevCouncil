@@ -199,7 +199,7 @@ def run_benchmark(root: Path, *, profile: str = "fast") -> dict[str, Any]:
         encoding="utf-8",
     )
     started = time.perf_counter()
-    refreshed = refresh_map_artifacts(root, map_path, quiet=True, paths=[changed_path])
+    refreshed = refresh_map_artifacts(root, map_path, quiet=True)
     one_file_seconds = time.perf_counter() - started
 
     query = CodeIntelQueryEngine(service)

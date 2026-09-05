@@ -16,6 +16,7 @@ Two kinds of check live here:
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import tomllib
@@ -123,3 +124,45 @@ def test_built_bundle_passes_real_strict_plugin_validation(tmp_path):
         assert report.get("success") is True, (
             f"`claude plugin validate {target.name} --strict` failed:\n{_findings(report)}"
         )
+
+
+_COMMAND_NAMES = (
+    "status", "next", "verify", "repair", "plan", "review", "report", "map", "wiki", "supervise",
+)
+
+
+@pytest.mark.skipif(shutil.which("claude") is None, reason="Claude Code CLI not installed")
+def test_built_bundle_command_inventory_loads(tmp_path):
+    """Claude Code must actually *load* every bundled slash command.
+
+    `claude plugin validate --strict` cannot gate this: the marketplace docs state the
+    validator does not open a plugin's command files, and it passed identically while the
+    bundle emitted `commands/devcouncil/*.md`, which the loader discovers as nothing. So
+    this asserts against the loader's own component inventory (`claude plugin details`,
+    Claude Code 2.1.259) instead of the manifest — the check the previous layout would
+    have failed and `--strict` did not.
+    """
+    for asset in claude_assets.build_plugin_bundle(tmp_path, version="1.2.3", skill_assets=[]):
+        asset.write_if_changed()
+    plugin_root = tmp_path / _PLUGIN_REL / "devcouncil"
+
+    proc = subprocess.run(
+        ["claude", "--plugin-dir", str(plugin_root), "plugin", "details", "devcouncil"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, f"`claude plugin details` failed:\n{proc.stdout}\n{proc.stderr}"
+
+    # Parse the inventory line rather than substring-matching the whole report: "plan" and
+    # "review" both occur elsewhere in it ("planning", "devcouncil-reviewer"), so a naive
+    # `in proc.stdout` would pass for two commands that never loaded.
+    match = re.search(r"^\s*Skills \((\d+)\)\s*(.*)$", proc.stdout, re.MULTILINE)
+    assert match, f"`claude plugin details` reported no component inventory:\n{proc.stdout}"
+    loaded = {name.strip() for name in match.group(2).split(",") if name.strip()}
+
+    missing = sorted(set(_COMMAND_NAMES) - loaded)
+    assert not missing, (
+        f"Claude Code loaded {match.group(1)} command(s) and is missing {missing}. "
+        f"Inventory reported:\n{proc.stdout}"
+    )

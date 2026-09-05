@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import pathlib
 
 import pytest
@@ -86,7 +87,7 @@ def test_plugin_bundle_is_self_contained(tmp_path):
     assert f"{base}/devcouncil/.claude-plugin/plugin.json" in rels
     assert f"{base}/devcouncil/hooks/hooks.json" in rels
     assert f"{base}/devcouncil/.mcp.json" in rels
-    assert any(r.startswith(f"{base}/devcouncil/commands/devcouncil/") for r in rels)
+    assert any(r.startswith(f"{base}/devcouncil/commands/") for r in rels)
     assert any(r.startswith(f"{base}/devcouncil/agents/") for r in rels)
 
     plugin = next(a for a in bundle if a.path.name == "plugin.json")
@@ -107,6 +108,50 @@ def test_plugin_bundle_is_self_contained(tmp_path):
     assert "SessionStart" in hooks["hooks"] and "UserPromptSubmit" in hooks["hooks"]
     assert "PostToolUse" in hooks["hooks"]
     assert "PreToolUse" not in hooks["hooks"]
+
+
+_PLUGIN_COMMAND_NAMES = {
+    "status", "next", "verify", "repair", "plan", "review", "report", "map", "wiki", "supervise",
+}
+
+
+def _plugin_command_paths(bundle, root: pathlib.Path) -> set[str]:
+    prefix = f"{claude_assets.PLUGIN_ROOT_REL.as_posix()}/devcouncil/commands/"
+    return {
+        a.path.relative_to(root).as_posix()[len(prefix):]
+        for a in bundle
+        if a.path.relative_to(root).as_posix().startswith(prefix)
+    }
+
+
+def test_plugin_commands_are_flat_markdown_files(tmp_path):
+    """The plugin's ``commands/`` must be FLAT ``<name>.md``, not ``commands/devcouncil/``.
+
+    This is a *layout* assertion rather than a manifest one on purpose:
+    ``claude plugin validate --strict`` passes identically in both states, because (per the
+    marketplace docs) the validator does not open a plugin's command files at all. The
+    behaviour it cannot see is total — with the nested layout Claude Code 2.1.259's own
+    inventory reports zero commands::
+
+        # commands/devcouncil/*.md               # commands/*.md
+        $ claude --plugin-dir <bundle> plugin details devcouncil
+          Skills (0)                               Skills (10)  map, next, plan, repair,
+          Always-on: ~139 tok                        report, review, status, supervise,
+                                                     verify, wiki
+                                                   Always-on: ~322 tok
+
+    so all ten advertised ``/devcouncil:*`` commands were dead files. The plugin *name*
+    supplies the ``devcouncil:`` prefix; the directory only hides the files.
+    ``test_built_bundle_command_inventory_loads`` in test_plugin_manifest_metadata.py runs
+    the real loader when Claude Code is installed — this one holds the line in bare CI.
+    """
+    bundle = claude_assets.build_plugin_bundle(tmp_path, version="1.2.3", skill_assets=[])
+    commands = _plugin_command_paths(bundle, tmp_path)
+
+    assert commands == {f"{name}.md" for name in _PLUGIN_COMMAND_NAMES}, (
+        "plugin commands/ must hold flat <name>.md files; anything with a path separator "
+        f"is invisible to the plugin loader: {sorted(commands)}"
+    )
 
 
 def test_plugin_session_start_matcher_includes_compact(tmp_path):
@@ -198,10 +243,128 @@ def test_plugin_bundle_and_settings_hooks_cannot_drift(tmp_path, write_gate):
     assert ("PreToolUse" in plugin["hooks"]) is write_gate
 
 
+def _fake_venv(root: pathlib.Path) -> pathlib.Path:
+    """A project venv holding executable `dev` and `devcouncil` binaries."""
+    venv_bin = root / ".venv" / ("Scripts" if os.name == "nt" else "bin")
+    venv_bin.mkdir(parents=True, exist_ok=True)
+    for name in ("dev", "devcouncil"):
+        binary = venv_bin / name
+        binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        binary.chmod(0o755)
+    return venv_bin
+
+
+def test_plugin_mcp_command_is_an_absolute_binary_with_path_injected(tmp_path):
+    """The plugin's MCP server must not be a bare PATH lookup.
+
+    The bundle shipped `"command": "devcouncil"`, but `/plugin install` installs no Python
+    package and the plugin carried no `bin/` and no `PATH` — so on any machine whose Claude
+    Code process lacked the project venv on PATH the MCP server simply never started, and
+    every DevCouncil tool with it. The repo already solved exactly this for Cursor; the
+    plugin now shares that resolver (`common.resolve_devcouncil_executable` /
+    `common.venv_augmented_path`) instead of re-deciding.
+    """
+    venv_bin = _fake_venv(tmp_path)
+
+    bundle = claude_assets.build_plugin_bundle(tmp_path, version="1.0.0", skill_assets=[])
+    server = json.loads(next(a for a in bundle if a.path.name == ".mcp.json").content)["mcpServers"]["devcouncil"]
+
+    command = pathlib.Path(server["command"])
+    assert command.is_absolute(), f"MCP command is a bare PATH lookup: {server['command']!r}"
+    assert command.is_file(), f"MCP command does not exist: {command}"
+    assert command == venv_bin / command.name, "MCP command should resolve to the project venv"
+    assert server["env"]["PATH"].split(os.pathsep)[0] == str(venv_bin), (
+        f"project venv is not first on the MCP server's PATH: {server['env']['PATH']!r}"
+    )
+    assert server["env"]["DEVCOUNCIL_PROJECT_ROOT"] == "${CLAUDE_PROJECT_DIR}"
+
+
+def test_plugin_hook_commands_invoke_an_absolute_binary(tmp_path):
+    """All bundled hooks must invoke a real binary, not a bare `devcouncil`.
+
+    A hook subprocess inherits the host's PATH, which on a clean machine has no DevCouncil
+    on it; every one of the 13 hooks failed there. `.claude/settings.local.json` already
+    got this right via `_hook_command`, so the plugin was the one surface still emitting a
+    bare name.
+    """
+    venv_bin = _fake_venv(tmp_path)
+    devcouncil = venv_bin / "devcouncil"
+
+    bundle = claude_assets.build_plugin_bundle(tmp_path, version="1.0.0", skill_assets=[], write_gate=True)
+    hooks = json.loads(next(a for a in bundle if a.path.name == "hooks.json").content)["hooks"]
+
+    commands = [entry["command"] for groups in hooks.values() for group in groups for entry in group["hooks"]]
+    assert len(commands) == len(hooks_mod.claude_hook_specs(write_gate=True))
+    for command in commands:
+        assert command.startswith(f"{devcouncil} "), (
+            f"hook command does not start with the resolved binary {devcouncil}: {command!r}"
+        )
+        # ${CLAUDE_PROJECT_DIR} still resolves the repo at runtime.
+        assert '--project-root "${CLAUDE_PROJECT_DIR}"' in command
+
+
+def test_plugin_ships_executable_bin_launchers(tmp_path):
+    """`bin/` puts `dev`/`devcouncil` on the Bash tool's PATH while the plugin is enabled.
+
+    The bundled slash commands shell out to bare `dev status` etc.; without this the ten
+    commands restored by the flat-`commands/` fix would load and then fail on a machine
+    with no DevCouncil on PATH. `bin/` is the plugin spec's own slot for this ("Executables
+    added to the Bash tool's PATH and invokable as bare commands while the plugin is
+    enabled"), so the command markdown keeps its portable bare name and its matching
+    `allowed-tools` prefix.
+    """
+    venv_bin = _fake_venv(tmp_path)
+
+    bundle = claude_assets.build_plugin_bundle(tmp_path, version="1.0.0", skill_assets=[])
+    launchers = {
+        a.path.name: a for a in bundle
+        if a.path.parent.name == "bin" and a.path.parent.parent.name == "devcouncil"
+    }
+    assert set(launchers) == {"dev", "devcouncil"}, sorted(launchers)
+
+    for name, asset in launchers.items():
+        assert asset.executable, f"bin/{name} would be written without its +x bit"
+        assert f"exec {venv_bin / name} " in asset.content, asset.content
+        assert asset.write_if_changed() is True
+        assert os.access(asset.path, os.X_OK), f"bin/{name} is not executable on disk"
+        # A stripped +x bit must count as changed, or a re-run would no-op over a dead shim.
+        asset.path.chmod(0o644)
+        assert asset.write_if_changed() is True
+        assert asset.write_if_changed() is False
+
+
 def test_plugin_bundle_write_gate_includes_blocking_hooks():
     bundle = claude_assets.build_plugin_bundle(pathlib.Path("/tmp/x"), version="1.0.0", skill_assets=[], write_gate=True)
     hooks = json.loads(next(a for a in bundle if a.path.name == "hooks.json").content)
     assert "PreToolUse" in hooks["hooks"] and "PostToolUse" in hooks["hooks"]
+
+
+def test_plugin_bundle_includes_the_output_style(tmp_path):
+    """A plugin-only install must not silently lose the DevCouncil output style.
+
+    `dev integrate claude --apply` writes `.claude/output-styles/devcouncil.md`; the bundle
+    shipped nothing, so the two install paths were not equivalent. `output-styles/` is the
+    plugin spec's default directory for this (plugins-reference: Output styles ->
+    `output-styles/`, manifest field `outputStyles`), and Claude Code 2.1.259 lists
+    `output-styles/` among the recognized plugin content directories and documents the
+    manifest field as "When set, the output-styles/ directory is not auto-loaded" — so the
+    default directory is auto-loaded and no manifest entry is invented here.
+    """
+    bundle = claude_assets.build_plugin_bundle(tmp_path, version="1.0.0", skill_assets=[])
+    rel = f"{claude_assets.PLUGIN_ROOT_REL.as_posix()}/devcouncil/output-styles/devcouncil.md"
+    style = next((a for a in bundle if a.path.relative_to(tmp_path).as_posix() == rel), None)
+    assert style is not None, (
+        "the plugin bundle ships no output style; a plugin-only install loses it: "
+        + str(sorted(a.path.relative_to(tmp_path).as_posix() for a in bundle))
+    )
+    # Byte-identical to the .claude/ copy — one body, two destinations.
+    assert style.content == claude_assets.build_output_style(tmp_path)[0].content
+    meta, _ = split_frontmatter(style.content)
+    assert meta["name"] == "DevCouncil"
+
+    # No `outputStyles` override, so Claude Code auto-loads output-styles/.
+    manifest = json.loads(next(a for a in bundle if a.path.name == "plugin.json").content)
+    assert "outputStyles" not in manifest
 
 
 def test_plugin_bundle_includes_lsp_for_detected_languages(tmp_path):
