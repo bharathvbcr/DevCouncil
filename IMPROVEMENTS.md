@@ -1592,10 +1592,16 @@ Three tiers, cheapest decisive signal first: the mtimes of a checkout's git meta
 calls, no subprocess) decide most checkouts; `git status --no-optional-locks` runs only for a
 checkout that has been quiet; the tracked-file walk only after that, and the last two start
 together rather than in sequence. `git` costs ~15 ms per spawn on this machine before it does
-any work, so the three top-level probes are issued at once. Measured on this repository with
-two other checkouts: **p50 45 ms, p95 65 ms** for the whole guard (was 146 ms before the
-tiering and the concurrency; 115 ms in the artificial worst case where every tier runs for
-every sibling).
+any work, so the three top-level probes are issued at once.
+
+Measured on this repository, and the number depends on how many checkouts tier 1 can decide,
+so both ends are here: with two other checkouts, both recently active (tier 1 decides them, no
+subprocess per sibling), **p50 45 ms / p95 65 ms**; with three, two of them quiet and clean so
+they pay `git status` *and* the tracked-file walk, **p50 103 ms / p95 118 ms**. Forcing the
+window to zero so every tier runs for every sibling: p50 137 ms. Computing the same answer
+serially, before the tiering and the concurrency, was 146 ms for the two-sibling case and
+177 ms for the all-tiers case. So the cheap case got 3x cheaper and the expensive case is the
+one to watch: it scales with the number of *quiet* checkouts, not with how many there are.
 
 `--no-optional-locks` is not incidental: a plain `git status` refreshes and rewrites the index
 it reads, and that index belongs to the other session's working tree. A guard must observe the
