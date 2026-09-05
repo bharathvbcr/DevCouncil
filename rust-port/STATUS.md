@@ -2443,3 +2443,46 @@ for this failure: an unread file wrongly reported as read is what deletes
 working code, and the reverse merely caps confidence until the next full pass.
 Making it exact would mean persisting the refused *paths* and maintaining that
 set across batches, which is real state for a bounded and self-clearing gain.
+
+### K-A4 — a search answer stitched from two generations
+
+`StoreQueryEngine::search` resolved "the latest generation" four separate
+times: `latest_generation_id`, `count_search_symbols`, `search_symbols`,
+`latest_repo_root`. Each took and released the connection lock on its own, so a
+writer committing between any two of them split one answer across two
+generations — and the daemon is *designed* to commit while clients query.
+
+`Response` states the contract this breaks: clients enforce
+`shown + hidden == total`. When the newer generation matched more rows than the
+older one counted, `total` came back smaller than `shown`,
+`total.saturating_sub(shown)` clamped `hidden` to zero, and the response
+claimed `truncated: false`. Measured against the pre-fix code:
+
+```
+shown=40 hidden=0 total=1 truncated=false
+```
+
+Forty rows returned under a count of one, with nothing marked withheld, on a
+tool exposed over MCP.
+
+`Store::search_page` now takes the count, the rows and the repo root under one
+lock against one explicitly pinned generation. `neighbors` answers the same
+race by detecting a straddle and disclosing it instead of locking, and its
+comment says why: holding the lock across a whole fan-out blocks the writer too
+long. That reasoning is about fan-outs — `search` is a count, one limited
+select and one row, so it can afford the exact answer, and an exact answer
+beats a disclosed approximation whenever it can be had.
+
+**On the tests, and what they are worth.** The race can only be *exercised*
+probabilistically: against the pre-fix code the concurrency probe caught it in
+2 of 3 runs, at 2 violations per 2,000 queries — and the third run passed with
+the defect fully present. A guard that green-lights a live bug a third of the
+time is the same failure this repository exists to prevent, so it is not the
+guard. It is kept, shortened, and labelled: only its *red* carries information.
+
+The guards are deterministic and test the structure the fix installed —
+`search_page` names the generation it read and its count matches its own row
+list; a store with no generation returns `None` rather than an empty page,
+which is a different answer; and `search` reports the current generation's
+count across a generation change. Those hold the fix in place without depending
+on winning a race.

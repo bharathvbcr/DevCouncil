@@ -449,6 +449,17 @@ pub struct WalCheckpointResult {
     pub checkpointed_frames: i64,
 }
 
+/// One consistent snapshot of a search: the matching rows, the count they were
+/// drawn from, and the repo root they resolve against — all from the same
+/// generation. See [`Store::search_page`] for why they must travel together.
+#[derive(Debug, Clone)]
+pub struct SearchPage {
+    pub generation: u32,
+    pub total: u32,
+    pub rows: Vec<StoredSymbol>,
+    pub repo_root: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredSymbol {
     pub name: String,
@@ -3125,14 +3136,61 @@ impl Store {
     }
 
     pub fn search_symbols(&self, query: &str, limit: usize) -> Result<Vec<StoredSymbol>> {
-        if query.trim().is_empty() || limit == 0 {
-            return Ok(Vec::new());
-        }
         let conn = lock_conn(&self.conn)?;
         let gen = match Self::latest_generation_id_locked(&conn)? {
             Some(generation) => generation,
             None => return Ok(Vec::new()),
         };
+        Self::search_symbols_locked(&conn, gen, query, limit)
+    }
+
+    /// The rows, and the count they were drawn from, against **one** generation.
+    ///
+    /// `count_search_symbols` and `search_symbols` each resolved "the latest
+    /// generation" independently, taking and releasing the connection lock on
+    /// their own. A writer committing between them — which is precisely what
+    /// the daemon does while a client queries — split the answer across two
+    /// generations: the count described the old one and the rows the new one.
+    ///
+    /// `Response` states the contract that breaks: clients enforce
+    /// `shown + hidden == total`. When the newer generation matched more rows
+    /// than the older one counted, `total` came back *smaller* than `shown`,
+    /// `total.saturating_sub(shown)` clamped `hidden` to zero, and the response
+    /// claimed `truncated: false` over a list that was neither complete nor
+    /// consistent. Measured before this existed: `shown=40 hidden=0 total=1`.
+    ///
+    /// One lock and one explicitly pinned generation for every read, so the
+    /// answer describes a single snapshot. Returns `None` when the store holds
+    /// no generation at all, which is a different answer from an empty page.
+    pub fn search_page(&self, query: &str, limit: usize) -> Result<Option<SearchPage>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some(generation) = Self::latest_generation_id_locked(&conn)? else {
+            return Ok(None);
+        };
+        let repo_root: Option<Option<String>> = conn
+            .query_row(
+                "SELECT repo_root FROM generations WHERE id = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(Some(SearchPage {
+            generation,
+            total: Self::count_search_symbols_locked(&conn, generation, query)?,
+            rows: Self::search_symbols_locked(&conn, generation, query, limit)?,
+            repo_root: repo_root.flatten().filter(|root| !root.is_empty()),
+        }))
+    }
+
+    fn search_symbols_locked(
+        conn: &Connection,
+        gen: u32,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredSymbol>> {
+        if query.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
         let match_query = fts_match_query(query)?;
         let mut stmt = conn.prepare(
             "SELECT n.name, n.qualified_name, n.kind, p.path,
@@ -3165,13 +3223,17 @@ impl Store {
     }
 
     pub fn count_search_symbols(&self, query: &str) -> Result<u32> {
-        if query.trim().is_empty() {
-            return Ok(0);
-        }
         let conn = lock_conn(&self.conn)?;
         let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
             return Ok(0);
         };
+        Self::count_search_symbols_locked(&conn, gen, query)
+    }
+
+    fn count_search_symbols_locked(conn: &Connection, gen: u32, query: &str) -> Result<u32> {
+        if query.trim().is_empty() {
+            return Ok(0);
+        }
         let match_query = fts_match_query(query)?;
         // CROSS JOIN pins the FTS table as the outer loop. As a plain JOIN,
         // SQLite 3.45 (the bundled version) leads with `nodes_fts_map` on

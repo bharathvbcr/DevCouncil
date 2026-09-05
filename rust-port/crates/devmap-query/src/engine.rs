@@ -54,19 +54,33 @@ impl<'a> StoreQueryEngine<'a> {
     }
 
     pub fn search(&self, req: Request<String>) -> anyhow::Result<Response<SymbolHit>> {
-        if self.store.latest_generation_id()?.is_none() {
-            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
-                reason: "no persisted generation is available".to_string(),
-            }));
-        }
         if req.query.trim().is_empty() {
             return Ok(budget_take(Vec::new(), req.token_budget, |_| 0));
         }
-        let total = self.store.count_search_symbols(&req.query)?;
         let page = budget_page_size(req.token_budget);
         let pool = search_rank_pool_size(req.token_budget);
-        let rows = self.store.search_symbols(&req.query, pool)?;
-        let repo_root = self.store.latest_repo_root()?;
+        // One snapshot. The count, the rows and the root used to be three
+        // independent reads, each resolving "the latest generation" for itself,
+        // so a daemon commit landing between them produced an answer stitched
+        // from two generations — `shown=40 hidden=0 total=1 truncated=false`
+        // was measured. `shown + hidden == total` is the contract clients
+        // enforce, and it cannot be honoured by numbers describing different
+        // corpora.
+        //
+        // `neighbors` answers the same race by *detecting* a straddle and
+        // disclosing it rather than locking, on the grounds that holding the
+        // store lock across a whole fan-out blocks the writer for too long.
+        // That trade is about fan-outs. This is a count, one limited select and
+        // one row — so the exact answer is affordable here, and an exact answer
+        // beats a disclosed approximation whenever it can be had.
+        let Some(snapshot) = self.store.search_page(&req.query, pool)? else {
+            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+                reason: "no persisted generation is available".to_string(),
+            }));
+        };
+        let total = snapshot.total;
+        let rows = snapshot.rows;
+        let repo_root = snapshot.repo_root;
         let query = req.query.to_lowercase();
         // Rank, then truncate — R7, and the reason the pool above is wider than
         // the page below. The store cuts its page with `ORDER BY bm25(...)` and

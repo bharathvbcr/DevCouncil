@@ -7,7 +7,8 @@ pub mod schema;
 
 pub use db::{
     current_git_head, BuildHistoryRow, GenerationWriteOpts, PendingClaim, PendingEnqueueReport,
-    PendingReconcile, PendingSupersede, Store, StoreStatus, StoredEdge, StoredFile, StoredSymbol,
+    PendingReconcile, PendingSupersede, SearchPage, Store, StoreStatus, StoredEdge, StoredFile,
+    StoredSymbol,
     VacuumAction, VacuumOutcome, WalCheckpointMode, WalCheckpointResult, WriterLock,
     MAX_PENDING_ATTEMPTS,
 };
