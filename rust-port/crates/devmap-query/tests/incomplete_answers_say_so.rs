@@ -293,3 +293,135 @@ fn a_degraded_dead_symbol_list_names_how_much_of_the_corpus_was_read() {
     assert_eq!(dead.shown as usize, dead.items.len());
     assert_eq!(dead.total, dead.shown + dead.hidden);
 }
+
+/// Force a stored parse outcome, as the extractor would have recorded it.
+///
+/// `Fallback` is what the pattern scanner produces for a language with no
+/// linked grammar (`devmap-extract/src/fallback.rs`): named declarations are
+/// matched, and **no calls and no imports are extracted at all**. Reproducing
+/// that here rather than relying on which grammars this build happens to link
+/// keeps the test about the outcome flag, which is the thing every consumer
+/// reads.
+fn degrade(ext: &mut Extraction, outcome: ParseOutcome) {
+    if matches!(outcome, ParseOutcome::Fallback { .. }) {
+        ext.engine = ExtractionEngine::Unavailable {
+            requested_language: ext.language.clone(),
+        };
+        ext.imports.clear();
+        ext.calls.clear();
+    }
+    ext.parse_outcome = outcome;
+}
+
+fn store_of_extractions(extractions: Vec<Extraction>) -> Store {
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions);
+    let analysis = devmap_analyze::analyze(&extractions, &resolution);
+    let store = Store::open_in_memory().unwrap();
+    store
+        .save_generation_with_opts(
+            &extractions,
+            &resolution,
+            &analysis,
+            GenerationWriteOpts::default(),
+        )
+        .unwrap();
+    store
+}
+
+/// `dependencies` called a pattern-recovered file's edge list complete.
+///
+/// Both engines special-cased `ParseOutcome::Failed` — a file that contributed
+/// nothing — and let `Fallback` fall through to `resolution: Available` with no
+/// caveat. But a fallback extraction contains no imports and no calls by
+/// construction, so its dependency set is empty *because nothing looked*, and
+/// that answer was byte-identical to the one given for a fully parsed file that
+/// genuinely imports nothing. `preview` has always reported this file state;
+/// `dependencies` is where a reader goes to ask what a file needs.
+///
+/// `Partial` is the same shape one tier up: tree-sitter parsed the file and
+/// flagged error ranges, and a call inside an error region is invisible to
+/// extraction — so the edge list is a lower bound there too.
+#[test]
+fn dependencies_over_a_degraded_parse_say_the_edge_list_is_a_lower_bound() {
+    for outcome in [
+        ParseOutcome::Fallback {
+            reason: "no linked grammar for vb; declarations recovered by pattern".to_string(),
+        },
+        ParseOutcome::Partial {
+            error_ranges: Vec::new(),
+        },
+    ] {
+        let mut extractions = vec![
+            extract_file("lib.py", "def helper():\n    return 1\n"),
+            extract_file(
+                "app.py",
+                "from lib import helper\n\n\ndef run():\n    return helper()\n",
+            ),
+        ];
+        degrade(&mut extractions[1], outcome.clone());
+        let store = store_of_extractions(extractions.clone());
+
+        let stored = StoreQueryEngine::new(&store)
+            .dependencies(Request {
+                query: "app.py".to_string(),
+                token_budget: 10_000,
+                min_confidence: 0.0,
+                max_depth: 3,
+            })
+            .unwrap();
+        assert!(
+            stored.walk_incomplete.is_some(),
+            "a {outcome:?} file's dependency list is a lower bound and must say so; got {stored:?}"
+        );
+
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&extractions);
+        let resolution = resolver.resolve_all(&extractions);
+        let in_memory = QueryEngine::new(&extractions, &resolution).dependencies(Request {
+            query: "app.py".to_string(),
+            token_budget: 10_000,
+            min_confidence: 0.0,
+            max_depth: 3,
+        });
+        assert!(
+            in_memory.walk_incomplete.is_some(),
+            "the in-memory engine must carry the same caveat as the store-backed one; \
+             got {in_memory:?}"
+        );
+    }
+}
+
+/// The caveat must not appear on a clean parse.
+///
+/// A marker that rides on every answer leaves a reader exactly where they
+/// started, which is the failure mode `dead_symbol_coverage_gap` documents.
+#[test]
+fn dependencies_over_a_clean_parse_carry_no_coverage_caveat() {
+    let extractions = vec![
+        extract_file("lib.py", "def helper():\n    return 1\n"),
+        extract_file(
+            "app.py",
+            "from lib import helper\n\n\ndef run():\n    return helper()\n",
+        ),
+    ];
+    let store = store_of_extractions(extractions.clone());
+
+    let stored = StoreQueryEngine::new(&store)
+        .dependencies(Request {
+            query: "app.py".to_string(),
+            token_budget: 10_000,
+            min_confidence: 0.0,
+            max_depth: 3,
+        })
+        .unwrap();
+    assert_eq!(
+        stored.walk_incomplete, None,
+        "a cleanly parsed file's dependency list is complete: {stored:?}"
+    );
+    assert!(
+        !stored.items.is_empty(),
+        "the fixture must actually produce edges, or the assertion above is vacuous"
+    );
+}
