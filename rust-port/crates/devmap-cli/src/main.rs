@@ -6,6 +6,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
+mod claude;
+
 use devmap_extract::collect_go_modules;
 use devmap_query::{
     generate_code_graph_encodings, generate_manifest_with_edges, resolve_manifest_output,
@@ -680,6 +682,53 @@ enum Commands {
         #[arg(long)]
         print_config: bool,
     },
+
+    /// Emit and check Dev Map's own Claude Code integration.
+    ///
+    /// Hook specs and a plugin manifest, built and validated here rather than
+    /// by a generator living somewhere else: Claude Code drops configuration it
+    /// cannot make sense of *quietly* — an unknown event name is ignored at
+    /// runtime, a matcher on an event without matcher support is ignored, an
+    /// `if` outside a tool event means the handler never runs — so a writer
+    /// that only serializes reports the same success for a dead install as for
+    /// a working one.
+    Claude {
+        #[command(subcommand)]
+        action: ClaudeAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClaudeAction {
+    /// Print the `hooks` block for `.claude/settings.json`.
+    ///
+    /// Printed, not installed: a settings file is the user's, and merging into
+    /// it is their edit to make. Everything needed to make it is here.
+    Hooks,
+
+    /// List every documented hook event beside what Dev Map does about it.
+    ///
+    /// Coverage stated as a decision per event, so "not handled" is on the
+    /// record with its reason rather than being an omission nobody counted.
+    Events,
+
+    /// Write the installable plugin bundle: marketplace, manifest, hooks, MCP.
+    Plugin {
+        /// Directory the bundle is written under.
+        #[arg(long, default_value = ".devcouncil/claude-plugin")]
+        out: PathBuf,
+        /// Render to stdout instead of writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Check an existing hook config, plugin manifest, or marketplace file.
+    Validate {
+        path: PathBuf,
+        /// Treat warnings as errors, as `claude plugin validate --strict` does.
+        #[arg(long)]
+        strict: bool,
+    },
 }
 
 fn open_for_read(db: &std::path::Path) -> anyhow::Result<Store> {
@@ -1335,7 +1384,8 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
         | Commands::Repair { .. }
         | Commands::Workspace { .. }
         | Commands::Serve { .. }
-        | Commands::Mcp { .. } => Ok(()),
+        | Commands::Mcp { .. }
+        | Commands::Claude { .. } => Ok(()),
     }
 }
 
@@ -2639,26 +2689,17 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 // no database, so it can be run against a repository that has
                 // never been indexed — which is when a user configures a host.
                 let executable = std::env::current_exe()?;
-                let db = cli.db.clone();
-                let entry = match http {
-                    Some(address) => serde_json::json!({
-                        "type": "http",
-                        "url": format!(
-                            "http://{}",
-                            if address.contains(':') {
-                                address.clone()
-                            } else {
-                                format!("127.0.0.1:{address}")
-                            }
-                        ),
-                    }),
-                    None => serde_json::json!({
-                        "type": "stdio",
-                        "command": executable.display().to_string(),
-                        "args": ["--db", db.display().to_string(), "mcp"],
-                    }),
-                };
-                emit_json(cli, &serde_json::json!({"mcpServers": {"devmap": entry}}))?;
+                // One owner for "how do I reach this server": the plugin bundle
+                // calls the same builder, so a host configured from one cannot
+                // point at a different server than a host configured from the
+                // other. It also refuses a non-UTF-8 path rather than writing
+                // `display()`'s replacement characters into a `command` that
+                // then names no file on disk.
+                let entry = claude::mcp_entry(&executable, &cli.db, http.as_deref())?;
+                emit_json(
+                    cli,
+                    &serde_json::json!({"mcpServers": {claude::MCP_SERVER_NAME: entry}}),
+                )?;
                 return Ok(());
             }
 
@@ -2668,11 +2709,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     // A bare port means loopback. Spelling the default out here
                     // rather than accepting "8080" as 0.0.0.0 is the difference
                     // between serving one machine and serving a network.
-                    let address = if address.contains(':') {
-                        address.clone()
-                    } else {
-                        format!("127.0.0.1:{address}")
-                    };
+                    let address = claude::normalize_http_address(address);
                     let parsed: std::net::SocketAddr = address.parse().map_err(|err| {
                         anyhow::anyhow!("could not parse --http address '{address}': {err}")
                     })?;
@@ -2720,9 +2757,164 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 .with_ipc_path(ipc_path);
             daemon.run_loop().await?;
         }
+        Commands::Claude { action } => run_claude(&cli, action)?,
     }
 
     Ok(())
+}
+
+/// `devmap claude …` — emission and validation of Dev Map's Claude Code surface.
+///
+/// Nothing here opens the store or starts anything: a user configures a host
+/// before the repository has ever been indexed, so every one of these must work
+/// on a fresh clone. Same contract as `serve --print-socket-path` and
+/// `mcp --print-config`.
+fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
+    let subcommands = claude::known_subcommands::<Cli>();
+    match action {
+        ClaudeAction::Hooks => {
+            let executable = std::env::current_exe()?;
+            let block = claude::hooks_block(&executable, &cli.db, &subcommands)?;
+            emit_json(cli, &block)
+        }
+        ClaudeAction::Events => {
+            let coverage = claude::event_coverage();
+            if cli.json {
+                let rows: Vec<serde_json::Value> = coverage
+                    .iter()
+                    .map(|(event, hook, reason)| {
+                        serde_json::json!({
+                            "event": event,
+                            "handled": hook.is_some(),
+                            // The authorization surface, named in the data so a
+                            // consumer checking it reads the same list the
+                            // writer enforces rather than a copy of it.
+                            "decides_permission":
+                                claude::PERMISSION_DECIDING_EVENTS.contains(event),
+                            "matcher": hook.map(|h| h.matcher),
+                            "subcommand": hook.map(|h| h.subcommand),
+                            "reason": reason,
+                        })
+                    })
+                    .collect();
+                let handled = coverage.iter().filter(|(_, h, _)| h.is_some()).count();
+                // Both numbers, always: "2 handled" beside a list of two reads
+                // as complete coverage of a surface that has 33 events.
+                emit_json(
+                    cli,
+                    &serde_json::json!({
+                        "events_total": coverage.len(),
+                        "events_handled": handled,
+                        "events": rows,
+                    }),
+                )
+            } else {
+                for (event, hook, reason) in &coverage {
+                    match hook {
+                        Some(hook) => println!(
+                            "{event:<20} handled   devmap {} (matcher {:?})\n{:22}{reason}",
+                            hook.subcommand, hook.matcher, ""
+                        ),
+                        None => println!("{event:<20} -\n{:22}{reason}", ""),
+                    }
+                }
+                let handled = coverage.iter().filter(|(_, h, _)| h.is_some()).count();
+                println!("\n{handled} of {} events handled", coverage.len());
+                Ok(())
+            }
+        }
+        ClaudeAction::Plugin { out, dry_run } => {
+            let executable = std::env::current_exe()?;
+            let version = env!("CARGO_PKG_VERSION");
+            if *dry_run {
+                let rendered = claude::render_plugin_bundle(
+                    &executable,
+                    &cli.db,
+                    Some(version),
+                    &subcommands,
+                )?;
+                let files: serde_json::Map<String, serde_json::Value> = rendered
+                    .into_iter()
+                    .map(|(path, json)| {
+                        Ok((
+                            path.to_str()
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("bundle path is not valid UTF-8: {path:?}")
+                                })?
+                                .to_string(),
+                            serde_json::from_str::<serde_json::Value>(&json)?,
+                        ))
+                    })
+                    .collect::<anyhow::Result<_>>()?;
+                return emit_json(cli, &serde_json::Value::Object(files));
+            }
+            let written = claude::write_plugin_bundle(
+                out,
+                &executable,
+                &cli.db,
+                Some(version),
+                &subcommands,
+            )?;
+            let changed = written.iter().filter(|f| f.changed).count();
+            if cli.json {
+                emit_json(
+                    cli,
+                    &serde_json::json!({
+                        "out": out,
+                        "files": written.iter().map(|f| serde_json::json!({
+                            "path": f.path,
+                            "changed": f.changed,
+                        })).collect::<Vec<_>>(),
+                        "changed": changed,
+                    }),
+                )
+            } else {
+                for file in &written {
+                    println!(
+                        "{} {}",
+                        if file.changed { "wrote  " } else { "current" },
+                        file.path.display()
+                    );
+                }
+                println!(
+                    "\n{changed} of {} file(s) changed. Install with:\n  \
+                     claude plugin marketplace add {}\n  claude plugin install {}@{}",
+                    written.len(),
+                    out.display(),
+                    claude::PLUGIN_NAME,
+                    claude::MARKETPLACE_NAME,
+                );
+                Ok(())
+            }
+        }
+        ClaudeAction::Validate { path, strict } => {
+            let report = claude::validate_file(path, *strict)?;
+            if cli.json {
+                emit_json(cli, &report.to_json())?;
+            } else {
+                for diagnostic in &report.diagnostics {
+                    println!("{diagnostic}");
+                }
+                println!(
+                    "{}: {} error(s), {} warning(s){}",
+                    if report.ok() { "ok" } else { "FAILED" },
+                    report.errors().count(),
+                    report.warnings().count(),
+                    if report.strict {
+                        " (strict: warnings block)"
+                    } else {
+                        ""
+                    },
+                );
+            }
+            // A validator that exits 0 on a failed document is worse than none:
+            // a CI step reads the code, not the prose.
+            if !report.ok() {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
