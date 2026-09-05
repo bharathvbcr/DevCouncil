@@ -3408,14 +3408,18 @@ which is why this reached it.
 
 ### Verification on the final tree
 
+Numbers taken at `7cd9813`, which is `main` plus this branch's remaining commits.
+`main` moved five times while this pass ran and was merged in each time; the
+gates below were re-run after every merge, and only the last run is quoted.
+
 | gate | result |
 |---|---|
 | `cargo fmt --all -- --check` | exit 0, no output |
 | `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
-| `cargo test --workspace --no-fail-fast` | **1,345 passed, 0 failed, 2 ignored**; zero `test result: FAILED` lines |
+| `cargo test --workspace --no-fail-fast` | **1,357 passed, 0 failed, 2 ignored**; zero `test result: FAILED` lines |
 | `cargo check -p devmap-{extract,query,store,analyze} --no-default-features --all-targets` | 4/4 exit 0 |
 | `cargo build --release` (worktree's own target) | exit 0; `devmap 0.1.0 (store schema 13, code graph schema 2)` |
-| `pytest tests/unit -q` | **4,162 passed, 0 failed, 9 xfailed** in 450 s |
+| `pytest tests/unit -q` | **4,167 passed, 0 failed, 9 xfailed**; last run 1,463 s, against 450 s earlier, because the machine went to load 150-500 |
 | `ruff check src tests` | `All checks passed!` |
 | `dev map doctor --json` | `ok: true` |
 | `dev hook post-tool-use`, unchanged tree | **0.83 s** (min of 8 at load 5.4; 0.85 s min of 5 at load 7.8), against the 1.5 s pre-seam baseline |
