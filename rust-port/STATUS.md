@@ -2938,3 +2938,88 @@ callers compare whole generations for incremental-vs-cold equivalence, where an
 omitted row is the failure they exist to detect. Conflating the two reads broke
 exactly those seven tests during this work, which is how the distinction got
 documented on the function.
+
+## The MCP / hooks / plugins fan-out
+
+Three lanes, file-disjoint, each with its own `CARGO_TARGET_DIR`, briefed to
+read the live specification rather than recall it and to say plainly when a
+test is a structural guard rather than a watched-red proof. Every claim below
+was re-verified against the code before its commit landed; the reports were not
+taken at face value.
+
+### Q-15 — the MCP server did not conform to the spec it advertised (`49be1c5`)
+
+Twelve defects. The three that matter are honesty failures rather than crashes.
+
+`server/discover` answered on stdio advertising `2026-07-28`, telling dual-era
+clients to probe with it, and the request handler then read no version at all.
+`id: null` was answered with a *successful result* — one the client is obliged
+to reject. And every success emitted `structuredContent` with no `outputSchema`
+declared anywhere, so the fields a client would use to detect an incomplete
+answer — `truncated`, `walk_incomplete`, `shown`/`hidden`/`total`, the whole
+basis of the honesty contract in this file — were undeclared. A client could
+not have validated the very markers that exist to stop it over-trusting us.
+
+`devmap_neighbors` also declared a budget it multiplies by up to 32:
+`neighbors_once` spends the full `token_budget` per target *and* per direction,
+over up to `MAX_NEIGHBOR_TARGETS` (16) targets. The behaviour is right — each
+walk needs its own budget — so the declaration was fixed, and it now derives
+the multiplier from the constant so it cannot drift.
+
+Left as a genuine conflict rather than a guess: error frames emit `"id": null`
+when the id is unrecoverable. JSON-RPC 2.0 §5 says it MUST be Null; the MCP
+schema types `id` as `string | number`, implying omission. The existing test
+encoding the JSON-RPC reading was **not** weakened to suit the change.
+
+### Q-16 — Dev Map could not integrate itself (`4f4ec2f`)
+
+Hook specs and plugin manifests were emitted only by the Python layer. The Rust
+CLI now emits and validates its own: `devmap claude hooks | events | plugin |
+validate`.
+
+33 hook events exist; Dev Map handles 2 and records a machine-readable reason
+for the other 31, and `devmap claude events` reports "2 of 33" rather than just
+the handled count — a table showing only what it covers reads as coverage it
+does not have.
+
+`PreToolUse`, `PermissionRequest` and `PermissionDenied` are the events whose
+output can allow or deny a tool call, rewrite its input, or persist a rule up to
+`bypassPermissions`. Nothing is implemented on them, and that is *enforced*:
+the writer bails on any spec whose event is in `PERMISSION_DECIDING_EVENTS`. A
+code index has nothing to contribute to an authorization decision. The writer
+also refuses a hook naming a `devmap` subcommand the binary does not register —
+such a hook fails on every fire, silently, for ever.
+
+The `claude plugin validate --strict` acceptance test is `#[ignore]`d because CI
+has no `claude` binary, so an ordinary run reports it *ignored* and never as a
+pass.
+
+### Q-17 — the drain read its own mistake back as proof (`0db537e`)
+
+The drain read git HEAD twice: once to decide whether to rebuild, once to stamp
+the generation, seconds apart across a full resolve. A checkout landing between
+them made it decide "unmoved, carry forward" and then stamp the generation with
+the HEAD it *had* moved to — and that stamp makes the error permanent, because
+the next drain compares HEAD against the stamp, finds them equal, and carries
+forward again. One read now, returning `{sha, moved}`, with the stamp being that
+same reading.
+
+Four more of the same family: a file removed mid-read was charged a retry toward
+*permanent quarantine*; `exists()`/`is_file()` collapsed every stat failure
+(symlink loop, lost `+x`, stale NFS handle) into "deleted", which drops the
+file's rows and hands the dead-code pass symbols to call unreferenced; the
+watcher fabricated U+FFFD paths for non-UTF-8 names and recorded deletions of
+files nothing had ever indexed; and `Err(_) => return Ok(())` in the IPC handler
+returned exactly the `Ok(())` a *served* request returns.
+
+The O(batch²) claim lookup is the one performance fix here, measured at the real
+8192 bound: 62.35 ms → 348.6 µs (178.9x), with 16 ms → 62 ms across a 2x batch
+confirming the quadratic. **It ships with no red test, stated rather than
+implied** — identical observable behaviour, so nothing can fail against the
+pre-fix code. The measurement is the evidence.
+
+The watcher event-queue overflow, recorded under K-B2 as argued-from-
+construction because it needed the notify thread to outrun the consumer, is now
+staged deterministically with no OS involvement: the flag stays clear for all
+4,096 events, the 4,097th sets it, and the rescan is delivered *ahead* of the
+itemised paths still queued behind it.
