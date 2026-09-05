@@ -3815,9 +3815,23 @@ impl Store {
         let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
             return Ok(None);
         };
+        // The two big arrays are dropped *inside SQLite*, so they never cross
+        // into this process. `AnalysisDisclosure` already skipped them, but
+        // skipping is per token and there are 10 MB of tokens: measured on the
+        // benchmark corpus this column is 10,122,764 bytes and what survives
+        // the strip is 200. `dead_symbols` is the duplicate being paged;
+        // `communities` is the other unbounded array and no disclosure reads
+        // it.
+        //
+        // Absence and corruption stay distinguishable, which is the whole
+        // reason this is safe: `json_remove(NULL, ...)` is NULL, so a
+        // generation with no analysis still reads as none, while a malformed
+        // blob makes SQLite raise ("malformed JSON") rather than quietly
+        // returning NULL — a corrupt analysis must not read as an absent one.
         let raw: Option<String> = snapshot
             .query_row(
-                "SELECT analysis_json FROM generations WHERE id = ?1",
+                "SELECT json_remove(analysis_json, '$.dead_symbols', '$.communities')
+                 FROM generations WHERE id = ?1",
                 params![generation],
                 |row| row.get(0),
             )

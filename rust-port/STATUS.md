@@ -2925,13 +2925,15 @@ is reported rather than dropped.
 
 **What this did not fix, measured.** Allocations fell 78x (4,065 to 52) but
 wall clock only 2.8x, and the gap is the point: the 10 MB blob is still
-`SELECT`ed whole into a Rust `String` and still lexed end to end. Skipping a
-field is cheap per token but there are 10 MB of tokens. Two further fixes
-remain, in increasing order of value and risk: extract the scalars with
-`json_extract` inside SQLite so the blob never crosses into Rust at all; or,
-at the root, stop storing `dead_symbols` in `analysis_json` when
-`generation_dead_symbols` already holds it — a stored-format change, so a
-migration question rather than a patch.
+`SELECT`ed whole into a Rust `String` and still lexed end to end.
+
+The follow-up is Q-18 below, and it is worth reading for how the prediction
+came out: stripping the arrays inside SQLite cut what crosses the boundary by
+50,613x and moved wall clock by 4.5%. The blob still has to be *parsed* to be
+stripped; the parse moved from serde to SQLite's JSON1 and did not disappear.
+The only fix that removes it is to stop storing `dead_symbols` in
+`analysis_json` when `generation_dead_symbols` already holds it — a
+stored-format change, so a migration question rather than a patch.
 
 `Store::latest_dead_symbols` stays unbounded and unfiltered on purpose. Its
 callers compare whole generations for incremental-vs-cold equivalence, where an
@@ -3023,3 +3025,43 @@ construction because it needed the notify thread to outrun the consumer, is now
 staged deterministically with no OS involvement: the flag stays clear for all
 4,096 events, the 4,097th sets it, and the rescan is delivered *ahead* of the
 itemised paths still queued behind it.
+
+
+### Q-18 — a 10 MB blob crossed the boundary to deliver 200 bytes
+
+Q-14 stopped `dead_page` *materialising* the analysis summary's embedded
+dead-symbol list, but not *transferring* it: the column was still `SELECT`ed
+whole into a Rust `String`. It is now stripped inside SQLite —
+`json_remove(analysis_json, '$.dead_symbols', '$.communities')` — so only the
+disclosure fields cross. Measured on the benchmark corpus: **10,122,764 bytes
+in the column, 200 bytes out**.
+
+**Call this what it is: a memory bound, not a speed-up.** Interleaved, three
+rounds, both binaries warm:
+
+```text
+dead_symbols warm p50   before  13.48  13.62  13.47   median 13.48 ms
+                        after   12.96  12.87  12.67   median 12.87 ms
+                                                      -4.5%
+```
+
+The ranges do not overlap, so the 4.5% is real — and it is far less than the
+byte reduction suggests, which is the useful part of the result. SQLite must
+still parse 10 MB of JSON in order to strip it; the parse moved out of serde
+and into JSON1 rather than going away. What genuinely changed is the transient
+allocation: a 10 MB `String` per call became 200 bytes, and with the MCP server
+now admitting up to 256 in-flight requests that is the difference between a
+bounded read and one whose peak memory is set by the size of the corpus.
+
+The safety of the strip rests on corruption and absence staying
+distinguishable. They do, and by SQLite's own behaviour rather than by a guard
+of ours: a malformed blob **raises**, where `json_extract` on a missing path
+would have returned `NULL` — and `NULL` is exactly what a generation with no
+analysis produces, so that spelling would have turned "could not be read" into
+"is not there" with nothing failing.
+
+`a_corrupt_analysis_is_not_an_absent_one.rs` pins it, and **is a structural
+guard, not a red test — checked, not assumed.** Run against the previous
+`SELECT analysis_json` spelling it still passes, because serde rejected the
+malformed blob just as SQLite now does. There is no pre-fix state in which it
+fails; what it guards is the future change that would reintroduce the hazard.
