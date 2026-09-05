@@ -1332,19 +1332,59 @@ which is both narrower and stricter. Found because a new, correct warning broke 
   observed once during this session and **could not be reproduced**: 25 consecutive
   `devmap build` rounds and 6 `dev map` cycles with real file churn both hold the freelist at
   0. Recorded as observed-once, not as a defect.
-* **`import devcouncil.cli.main` is still 546 ms** (was 582 ms). `cli/commands/artifacts`
-  reaches `storage.db` directly, and `cli/main.py` eagerly registers 33 Typer sub-apps.
-  Making those lazy needs a custom lazy Click group that changes `--help` behaviour across
-  all 33.
+
+### Python: `dev <anything>` paid for all 72 commands
+
+`cli/main.py` eagerly imported ~50 command modules and registered 75 commands at import
+time, so `dev version` loaded the ORM, the MCP handlers and the graph adapters before
+printing a string. Registration is now deferred through a `TyperGroup` subclass that resolves
+a command the first time Click asks for it by name; `list_commands` still enumerates all 72,
+so `--help`, completion and `dev <typo>` suggestions are unchanged. `hook.py` and `map.py`
+additionally moved their `storage.db` / `CodeReviewGraphAdapter` imports to their call sites.
+
+Measured on this machine, same interpreter, minimum of three `-X importtime` runs:
+**392 ms -> 21 ms** for `import devcouncil.cli.main`. That baseline is conservative — it is
+HEAD's eager `main.py` measured against a tree that *already* has the lazy
+`app/__init__.py` facade, so the pre-pass figure was higher.
+
+`tests/unit/test_cli_lazy_commands.py` pins all three properties: the 72-command surface is
+compared name-by-name against a list captured before the change, the group resolves each
+command on demand, and `dev version` completes without `sqlalchemy` or `devcouncil.storage.db`
+entering `sys.modules`. The `dev hook` case is deliberately *not* asserted — `active_task_id`
+opens the database as its first act, so the ORM is genuinely required there.
+
+### `preview` built 1,836 rows to report one integer
+
+`ambiguous_callers` is "and M more the floor excluded". It came from
+`callers_of(&at_risk, path, 0.0)?.len()` — the same query the confident list had just run,
+re-run at floor 0.0, fully materialised into `StoredEdge` (six `String` allocations a row),
+and reduced to a `usize`. On this repository the busiest symbol has 918 callers against an
+average of 9 over 5,673 symbols, so previewing a file that declares a hot symbol built
+~1,836 rows and kept none.
+
+`Store::count_callers_of` issues `SELECT COUNT(*)` over the identical `WHERE` clause, with
+the same `checked_min_confidence` guard, the same `BTreeSet` de-duplication and the same
+`MAX_CALLER_BATCH` chunking. Because a count and a listing that drift are indistinguishable
+from a correct answer, the test pins them *against each other* rather than against a
+hand-computed number, across four floors and a name list larger than one chunk. Removing the
+`sp.path <> ?2` filter from the count alone makes it fail (40 vs 0), which is the drift it
+exists to catch.
+
+### The most frequent build reported no timings
+
+A no-source-change build is what a watcher does on almost every tick, and `--json` answered
+it with a hand-written format string: `{"unchanged":true,"files":…,"generation":…,
+"reclaim":…}`. No `timings` key of any kind — so the one build shape a profiler most wants
+to look at was the one it could not see, and "the warm path is fast" was an assertion nobody
+could check from the tool's own output. The branch is not free: it hashes every file in the
+tree to *prove* nothing changed, and it runs the reclaim decision. Both are already timed
+stages; only the reporting was missing. It now goes through `emit_json` with
+`progress.timings_json()`, like every other build result.
 
 ### Still open
 
-* `preview` materialises every caller edge twice before budgeting — once for the list, once
-  for `.len()` on `ambiguous_callers`. The output is budgeted; the intermediate is not.
 * `traverse_graph` rebuilds its index per query. Inherent to being handed an unindexed slice;
   removing it means caching an index across queries.
-* The no-op build path emits no `timings` at all, so the most frequent build in the system has
-  no phase profile.
 * `devmap --version` reports `schema 13` while the artifact declares `schema_version: 2`. Two
   different numbers called "schema" in one tool.
 * `repomap` and `devmap.Client` have **no production caller** in this repository — no `main`

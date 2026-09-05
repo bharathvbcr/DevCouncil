@@ -862,3 +862,93 @@ fn the_extraction_cache_fallback_uses_an_index_rather_than_scanning() {
 fn params_for_plan() -> [&'static dyn rusqlite::ToSql; 4] {
     [&1i64, &"python", &"g", &"a"]
 }
+
+/// The count and the listing must agree, including across a chunk boundary.
+///
+/// `preview` reports "N confident callers, and M more the floor excluded". The
+/// second number used to come from `callers_of(..., 0.0).len()` — the same
+/// query, fully materialised, thrown away. Counting it instead is only safe if
+/// the two share every filter, so this pins them against each other rather than
+/// against a hand-computed expectation: a `WHERE` clause added to one and not
+/// the other fails here.
+///
+/// The name list deliberately exceeds `MAX_CALLER_BATCH` so the chunked path is
+/// the one under test — per-chunk counts must sum without double-counting, the
+/// same property that makes the chunked listing exact.
+#[test]
+fn count_callers_of_matches_the_listing_it_replaces() {
+    let mut callers_src = String::from("def target():\n    return 1\n\n\n");
+    for index in 0..40 {
+        callers_src.push_str(&format!("def caller_{index}():\n    return target()\n\n\n"));
+    }
+    let store = store_with(&[
+        ("callers.py", callers_src.as_str()),
+        ("target.py", "def target():\n    return 2\n"),
+    ]);
+
+    // More names than one chunk holds, with a duplicate, so both the chunking
+    // and the de-duplication are exercised. `target_symbol` in
+    // `generation_edges` is `path::Name`, never the bare name.
+    let mut names: Vec<String> = (0..700).map(|index| format!("absent_{index}")).collect();
+    names.push("callers.py::target".to_string());
+    names.push("callers.py::target".to_string());
+    assert!(
+        names.len() > Store::MAX_CALLER_BATCH,
+        "the chunked path is the one under test"
+    );
+
+    // Guard the guard: if the fixture stopped producing edges, every assertion
+    // below would compare 0 against 0 and pass while testing nothing.
+    let baseline = store
+        .callers_of(&names, "target.py", 0.0)
+        .expect("list callers");
+    assert!(
+        !baseline.is_empty(),
+        "fixture produced no caller edges, so the comparison below is vacuous"
+    );
+
+    for floor in [0.0f32, 0.5, 0.9, 1.0] {
+        let listed = store
+            .callers_of(&names, "target.py", floor)
+            .expect("list callers");
+        let counted = store
+            .count_callers_of(&names, "target.py", floor)
+            .expect("count callers");
+        assert_eq!(
+            counted,
+            listed.len(),
+            "count and listing disagree at floor {floor}"
+        );
+    }
+
+    // The excluded file is a filter, not a decoration: dropping it from one of
+    // the two queries would go unnoticed by the loop above, where no edge
+    // originates in the excluded file anyway.
+    assert_eq!(
+        store
+            .count_callers_of(&names, "callers.py", 0.0)
+            .expect("count with the declaring file excluded"),
+        store
+            .callers_of(&names, "callers.py", 0.0)
+            .expect("list with the declaring file excluded")
+            .len(),
+        "the two queries disagree about which file is excluded"
+    );
+
+    // Class A: a NaN floor is refused by both, not silently answered as zero —
+    // `preview` reads the count as "and M more the floor excluded", so a zero
+    // from a comparison that never ran is a sentence about the code.
+    assert!(
+        store
+            .count_callers_of(&names, "target.py", f32::NAN)
+            .is_err(),
+        "a NaN floor must be refused, not counted as zero"
+    );
+    // An empty name list is a real zero, not a refusal.
+    assert_eq!(
+        store
+            .count_callers_of(&[], "target.py", 0.0)
+            .expect("empty"),
+        0
+    );
+}

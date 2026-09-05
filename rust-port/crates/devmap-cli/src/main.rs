@@ -1331,12 +1331,27 @@ async fn main() -> anyhow::Result<()> {
                         ));
                     }
                     if cli.json {
-                        println!(
-                            "{{\"unchanged\":true,\"files\":{},\"generation\":{},\"reclaim\":{}}}",
-                            extractions.len(),
-                            generation,
-                            serde_json::to_string(&reclaim_note(&vacuum))?
-                        );
+                        // Built through `serde_json` and carrying `timings`,
+                        // like every other build result.
+                        //
+                        // This was a hand-written format string with no
+                        // timings key at all — so the *most frequent* build in
+                        // the system, the one a watcher runs on almost every
+                        // tick, was the one build shape a profiler could not
+                        // see. It is not an empty truth either: this path
+                        // hashes every file in the tree to prove nothing
+                        // changed, and it runs the reclaim decision, both of
+                        // which are already timed stages.
+                        emit_json(
+                            &cli,
+                            &serde_json::json!({
+                                "unchanged": true,
+                                "files": extractions.len(),
+                                "generation": generation,
+                                "reclaim": reclaim_note(&vacuum),
+                                "timings": progress.timings_json(),
+                            }),
+                        )?;
                     } else {
                         println!(
                             "No source changes; generation #{} still current ({} files).",

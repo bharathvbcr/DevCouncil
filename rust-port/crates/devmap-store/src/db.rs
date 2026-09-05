@@ -3037,6 +3037,71 @@ impl Store {
     /// a symbol nothing depends on. Chunking keeps the answer complete and
     /// bounds only the statement, and the documented total order is restored
     /// across chunks by the sort below.
+    /// How many callers `callers_of` would return, without building them.
+    ///
+    /// `preview` needs two numbers from the same query: the confident callers
+    /// it lists, and how many more the confidence floor excluded. The second
+    /// was obtained by calling `callers_of` again at floor 0.0 and taking
+    /// `.len()` — materialising every matching `StoredEdge`, six `String`
+    /// allocations apiece, to produce one integer. On this repository the
+    /// busiest symbol has 918 callers, so previewing a file that declares one
+    /// built ~1,836 rows and discarded all of them.
+    ///
+    /// Deliberately shares every filter, guard and chunk boundary with
+    /// `callers_of` — including `checked_min_confidence`, so a NaN floor is
+    /// refused here too rather than counting zero. `count_matches_the_listing`
+    /// pins the two against each other; a filter added to one and not the other
+    /// fails that test rather than silently making the "hidden" number wrong.
+    pub fn count_callers_of(
+        &self,
+        names: &[String],
+        exclude_file: &str,
+        min_confidence: f32,
+    ) -> Result<usize> {
+        let min_confidence = checked_min_confidence(min_confidence)?;
+        if names.is_empty() {
+            return Ok(0);
+        }
+        let unique: Vec<&String> = {
+            let mut seen = BTreeSet::new();
+            names.iter().filter(|name| seen.insert(*name)).collect()
+        };
+        let conn = lock_conn(&self.conn)?;
+        let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
+            return Ok(0);
+        };
+        let mut total: usize = 0;
+        for chunk in unique.chunks(Self::MAX_CALLER_BATCH) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT COUNT(*)
+                 FROM generation_edges e
+                 JOIN paths sp ON sp.id = e.source_file_id
+                 WHERE e.generation_id = ?1
+                   AND e.edge_kind = 'Calls'
+                   AND sp.path <> ?2
+                   AND CAST(ROUND(e.confidence * 1000) AS INTEGER) >= CAST(ROUND(?3 * 1000) AS INTEGER)
+                   AND e.target_symbol IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 3);
+            bound.push(&gen);
+            bound.push(&exclude_file);
+            bound.push(&min_confidence);
+            for name in chunk {
+                bound.push(*name);
+            }
+            // Chunks partition the *names*, and each edge names one target, so
+            // the per-chunk counts sum without double-counting — the same
+            // property that makes `callers_of`'s chunked concatenation exact.
+            let count: i64 = stmt.query_row(bound.as_slice(), |row| row.get(0))?;
+            total += usize::try_from(count).unwrap_or(0);
+        }
+        Ok(total)
+    }
+
     pub fn callers_of(
         &self,
         names: &[String],

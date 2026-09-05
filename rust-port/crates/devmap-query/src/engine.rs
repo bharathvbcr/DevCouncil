@@ -1234,10 +1234,13 @@ impl<'a> StoreQueryEngine<'a> {
         // no confident callers and 900 ambiguous ones is not the same situation
         // as one nothing references, and the difference decides whether a
         // reader should go and look.
+        // Counted, not built. This asked for every caller edge at floor 0.0 —
+        // six `String` allocations per row — solely to take `.len()`. On this
+        // repository the busiest symbol has 918 callers, so previewing a file
+        // that declares one materialised ~1,836 rows and kept none of them.
         let ambiguous_callers = self
             .store
-            .callers_of(&at_risk, path, 0.0)?
-            .len()
+            .count_callers_of(&at_risk, path, 0.0)?
             .saturating_sub(callers.len());
 
         let degraded_reason = match &candidate.parse_outcome {

@@ -6,8 +6,6 @@ import os
 import sys
 from pathlib import Path
 from rich.console import Console
-from devcouncil.storage.db import get_db
-from devcouncil.storage.repositories import TaskRepository
 from devcouncil.execution.hook_policy import HookPolicy
 from devcouncil.telemetry.traces import TraceLogger
 from devcouncil.telemetry.stages import log_step
@@ -17,6 +15,27 @@ from devcouncil.live.tasks import active_task_id
 app = typer.Typer()
 console = Console()
 logger = logging.getLogger(__name__)
+
+
+def __getattr__(name: str) -> object:
+    """Resolve `get_db` on first access, not at import.
+
+    This hook runs on every tool call an agent makes, and every path through it
+    returns before opening a database whenever no single task is active — which
+    is every call under `hook_gate.mode=off`. A module-scope import made that
+    common path load SQLAlchemy and SQLModel (~120 ms measured) to reach a
+    database it never opens.
+
+    Deferring it into each function would have saved the same time but removed
+    the name, and `hook.get_db` is the seam five tests substitute to drive
+    `_verify_active_task`. PEP 562 keeps it a real, patchable module attribute
+    that costs nothing until something asks for it.
+    """
+    if name == "get_db":
+        from devcouncil.storage.db import get_db as _get_db
+
+        return _get_db
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _project_root(project_root: Path | None = None) -> Path:
@@ -105,7 +124,12 @@ def _active_task(root: Path):
     active_id = active_task_id(root)
     if not active_id:
         return None
-    db = get_db(root)
+    # Resolved here, not at module scope: see `__getattr__` above. `get_db` is
+    # read through the module object so a substituted attribute is the one used
+    # — a `from … import` would bind the real function regardless.
+    from devcouncil.storage.repositories import TaskRepository
+
+    db = sys.modules[__name__].get_db(root)
     if not db:
         return None
     with db.get_session() as session:
@@ -832,7 +856,7 @@ def _status_line(root: Path) -> str | None:
     context into Claude Code. Best-effort: any failure returns None so a hook never
     breaks the session."""
     try:
-        db = get_db(root)
+        db = sys.modules[__name__].get_db(root)
         if not db:
             return None
         from devcouncil.storage.repositories import ArtifactGraphRepository, StateRepository
@@ -1378,12 +1402,13 @@ def _verify_active_task(root: Path) -> str:
             EvidenceRepository,
             GapRepository,
             RequirementRepository,
+            TaskRepository,
         )
         from devcouncil.verification.next_actions import split_next_actions
         from devcouncil.verification.verifier import Verifier, verification_task_status
 
         active_id = active_task_id(root)
-        db = get_db(root)
+        db = sys.modules[__name__].get_db(root)
         if not active_id or not db:
             return "Run [bold]dev verify[/bold] to finalize implementation evidence."
         with db.get_session() as session:
