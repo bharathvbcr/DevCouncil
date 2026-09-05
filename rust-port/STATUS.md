@@ -2611,3 +2611,43 @@ only the *freshness* claim that an empty store falsifies. Returning
 `is_fresh: false` with `degraded_reason: null` would have moved the same defect
 one step downstream, leaving a caller told the index is stale with no way to
 learn why.
+
+### K-B3 — a torn-read guard that quietly became a length check
+
+`read_stable_source` proves a changed file was not being written while it was
+read: stat, read, stat, and admit only if nothing moved. The comparison was
+
+```rust
+before.modified().ok() == after.modified().ok()
+```
+
+On a filesystem where `modified()` errors, both sides collapse to `None`,
+`None == None` is true, and the guard degrades to comparing lengths — which is
+precisely what a same-size in-place edit survives. The read is then admitted as
+clean and stored as though it were the file on disk, with nothing recording
+that the timestamp half of the check never ran. The timestamps are the only
+signal separating "nothing moved" from "it changed to something the same size",
+so losing them has to make the answer *I cannot tell*, not *yes*.
+
+**No red test was possible through the IO path** — `modified()` does not fail on
+macOS or Linux, and the audit's own reachability label for this was INFERRED,
+not verified. Rather than write a test against the fix and imply it had proved
+something, the decision was **extracted first, unchanged**, and the existing
+stat-read-stat test re-run to show the extraction altered no behaviour. The red
+proof is then against the extracted pre-fix logic:
+
+```
+a_read_with_no_usable_timestamp_is_not_called_stable  FAILED
+  with no modification time on either side there is nothing left but the length,
+  and equal lengths are exactly what a same-size in-place edit produces
+```
+
+The control passed throughout and pins the three genuine rejections — length
+moved, mtime moved, content shorter than the file — so a "fix" that answered
+`false` unconditionally would fail it. One side alone is also rejected: half a
+timestamp comparison is not a comparison.
+
+The failure message was widened too. It said only "did not stabilize", which
+misdirects for this case: a file genuinely churning settles, a filesystem that
+cannot report modification times never will, and an operator reading the old
+message would keep waiting for the second to clear.

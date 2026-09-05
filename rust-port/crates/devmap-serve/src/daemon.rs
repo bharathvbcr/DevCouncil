@@ -88,6 +88,35 @@ impl ShutdownSignals {
     }
 }
 
+/// Whether a stat-read-stat round proves the read was not torn.
+///
+/// K-B3. This was `before.modified().ok() == after.modified().ok()` inline. On
+/// a filesystem where `modified()` errors, both sides collapse to `None`,
+/// `None == None` is true, and the guard silently degrades to a length
+/// comparison — which is exactly what a same-size in-place edit survives. The
+/// read would then be admitted as clean and stored as though it were the file
+/// on disk, with nothing anywhere recording that the timestamp half of the
+/// check never ran.
+///
+/// The timestamps are the only signal separating "nothing moved" from "it
+/// changed to something the same size", so losing them has to make the answer
+/// *I cannot tell*, not *yes*. Both sides are required; one alone is not a
+/// comparison.
+fn read_is_stable(
+    before_len: u64,
+    after_len: u64,
+    before_modified: Option<std::time::SystemTime>,
+    after_modified: Option<std::time::SystemTime>,
+    source_len: usize,
+) -> bool {
+    let (Some(before_modified), Some(after_modified)) = (before_modified, after_modified) else {
+        return false;
+    };
+    before_len == after_len
+        && before_modified == after_modified
+        && u64::try_from(source_len).is_ok_and(|length| length == after_len)
+}
+
 fn read_stable_source(path: &std::path::Path, relative: &str) -> anyhow::Result<String> {
     read_stable_source_with(path, relative, || std::fs::read_to_string(path))
 }
@@ -114,15 +143,25 @@ where
         let source = read()
             .map_err(|error| anyhow::anyhow!("cannot read changed source {relative:?}: {error}"))?;
         let after = std::fs::metadata(path)?;
-        if before.len() == after.len()
-            && before.modified().ok() == after.modified().ok()
-            && u64::try_from(source.len()).is_ok_and(|length| length == after.len())
-        {
+        if read_is_stable(
+            before.len(),
+            after.len(),
+            before.modified().ok(),
+            after.modified().ok(),
+            source.len(),
+        ) {
             return Ok(source);
         }
     }
+    // Names both ways a round can fail, because they call for different
+    // responses: a file genuinely churning will settle, while a filesystem that
+    // cannot report modification times never will, and an operator reading only
+    // "did not stabilize" would keep waiting for the second case to clear.
     anyhow::bail!(
-        "changed source {relative:?} did not stabilize across {STABLE_READ_ATTEMPTS} stat-read-stat attempts"
+        "changed source {relative:?} did not stabilize across {STABLE_READ_ATTEMPTS} \
+         stat-read-stat attempts: it is being written during the read, or its \
+         modification time cannot be read and a same-length edit therefore cannot be \
+         distinguished from a stable one"
     )
 }
 
@@ -2712,4 +2751,58 @@ mod tests {
         }));
         fs::remove_dir_all(root).unwrap();
     }
+
+    /// K-B3: a stability check that could not run must not answer "stable".
+    ///
+    /// The guard read `before.modified().ok() == after.modified().ok()`. On a
+    /// filesystem where `modified()` errors, both sides become `None`, `None ==
+    /// None` is true, and the guard silently degrades to a length comparison —
+    /// so an in-place edit that keeps the file's length is admitted as a clean
+    /// read and stored as though it were the file on disk. The timestamps are
+    /// the only thing that distinguishes those two cases, so losing them must
+    /// make the answer "I cannot tell", not "yes".
+    #[test]
+    fn a_read_with_no_usable_timestamp_is_not_called_stable() {
+        assert!(
+            !read_is_stable(10, 10, None, None, 10),
+            "with no modification time on either side there is nothing left but the \
+             length, and equal lengths are exactly what a same-size in-place edit \
+             produces. Answering `true` here is a check that could not run reporting \
+             what a check that ran and passed reports."
+        );
+        // One side alone is no better: a comparison needs both.
+        let now = std::time::SystemTime::now();
+        assert!(
+            !read_is_stable(10, 10, Some(now), None, 10),
+            "half a timestamp comparison is not a timestamp comparison"
+        );
+        assert!(!read_is_stable(10, 10, None, Some(now), 10));
+    }
+
+    /// The OFF direction: a genuinely stable read must still be admitted, or
+    /// the daemon simply stops indexing.
+    #[test]
+    fn a_read_with_matching_metadata_is_still_stable() {
+        let now = std::time::SystemTime::now();
+        assert!(
+            read_is_stable(10, 10, Some(now), Some(now), 10),
+            "same length, same mtime, and the content length agrees: this is the \
+             case the guard exists to admit"
+        );
+        // And the real signals still reject.
+        assert!(
+            !read_is_stable(10, 11, Some(now), Some(now), 10),
+            "a length that moved under the reader is a torn read"
+        );
+        let later = now + std::time::Duration::from_secs(1);
+        assert!(
+            !read_is_stable(10, 10, Some(now), Some(later), 10),
+            "an mtime that moved under the reader is a torn read"
+        );
+        assert!(
+            !read_is_stable(10, 10, Some(now), Some(now), 9),
+            "content shorter than the file it came from is a torn read"
+        );
+    }
+
 }
