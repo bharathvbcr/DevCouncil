@@ -54,7 +54,11 @@ async fn start() -> String {
 /// Hand-rolled rather than pulling in a client crate for a test: the requests are
 /// one-shot, and building the bytes by hand is also what lets the malformed-input
 /// tests below send things a client library would refuse to construct.
-async fn request(address: &str, raw: &str) -> (u16, Value) {
+///
+/// Returns the status, the header block and the body separately, because the
+/// envelope tests below need each of the three and a helper that parsed the body
+/// as JSON could not see a `202` with no body at all.
+async fn exchange(address: &str, raw: &str) -> (u16, String, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = tokio::net::TcpStream::connect(address)
         .await
@@ -70,20 +74,87 @@ async fn request(address: &str, raw: &str) -> (u16, Value) {
         .nth(1)
         .and_then(|code| code.parse().ok())
         .unwrap_or_else(|| panic!("no status line in response: {text}"));
-    let body = text
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body)
-        .unwrap_or("");
-    let parsed = serde_json::from_str(body)
+    match text.split_once("\r\n\r\n") {
+        Some((head, body)) => (status, head.to_string(), body.to_string()),
+        None => (status, text, String::new()),
+    }
+}
+
+async fn request(address: &str, raw: &str) -> (u16, Value) {
+    let (status, _, body) = exchange(address, raw).await;
+    let parsed = serde_json::from_str(&body)
         .unwrap_or_else(|err| panic!("body was not JSON ({err}): {body}"));
     (status, parsed)
 }
 
-fn post(body: &str) -> String {
+/// The `_meta` fields the 2026-07-28 revision requires on every request.
+///
+/// Injected rather than written into each test body because they are not what
+/// any of these tests is about: the revision replaced the `initialize` handshake
+/// with per-request metadata, so a request without them is malformed for a
+/// reason unrelated to whatever the test is probing. Existing values are kept —
+/// the version-refusal test states its own and must keep stating it.
+fn with_request_meta(body: &str) -> String {
+    let Ok(mut parsed) = serde_json::from_str::<Value>(body) else {
+        return body.to_string();
+    };
+    let Some(object) = parsed.as_object_mut() else {
+        return body.to_string();
+    };
+    if let Some(params) = object
+        .entry("params")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+    {
+        if let Some(meta) = params.entry("_meta").or_insert_with(|| json!({})).as_object_mut() {
+            meta.entry("io.modelcontextprotocol/protocolVersion")
+                .or_insert_with(|| json!("2026-07-28"));
+            meta.entry("io.modelcontextprotocol/clientCapabilities")
+                .or_insert_with(|| json!({}));
+        }
+    }
+    parsed.to_string()
+}
+
+/// The headers a conforming 2026-07-28 client mirrors out of the body.
+///
+/// Derived from the body rather than hardcoded, because the server's job is to
+/// check that the two agree: a helper that stated a fixed `Mcp-Method` would
+/// send a mismatched request on every test that is not `ping`.
+fn mirrored_headers(body: &str) -> Vec<(String, String)> {
+    let parsed: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let version = parsed
+        .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+        .and_then(Value::as_str)
+        .unwrap_or("2026-07-28");
+    let mut headers = vec![("MCP-Protocol-Version".to_string(), version.to_string())];
+    if let Some(method) = parsed.get("method").and_then(Value::as_str) {
+        headers.push(("Mcp-Method".to_string(), method.to_string()));
+    }
+    if let Some(name) = parsed.pointer("/params/name").and_then(Value::as_str) {
+        headers.push(("Mcp-Name".to_string(), name.to_string()));
+    }
+    headers
+}
+
+fn raw_post(body: &str, headers: &[(String, String)]) -> String {
+    let mut head = String::from(
+        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\n",
+    );
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
     format!(
-        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{head}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
+}
+
+fn post(body: &str) -> String {
+    let body = with_request_meta(body);
+    let headers = mirrored_headers(&body);
+    raw_post(&body, &headers)
 }
 
 /// `server/discover` replaces `initialize` in the modern era, and this is the
@@ -293,15 +364,8 @@ async fn http_and_stdio_answer_the_same_question_identically() {
 /// `request` parses the body as JSON and throws the headers away, which is
 /// precisely what the test below has to look at.
 async fn raw_exchange(address: &str, raw: &str) -> String {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut stream = tokio::net::TcpStream::connect(address)
-        .await
-        .expect("connect");
-    stream.write_all(raw.as_bytes()).await.expect("write");
-    stream.flush().await.expect("flush");
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).await.expect("read");
-    String::from_utf8_lossy(&response).to_string()
+    let (_, head, body) = exchange(address, raw).await;
+    format!("{head}\r\n\r\n{body}")
 }
 
 /// The two properties that keep a browser out, pinned together.
@@ -364,4 +428,440 @@ async fn a_browser_cannot_reach_this_endpoint_even_with_a_null_origin() {
              code graph. {label} response carried one:\n{headers}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Envelope conformance: the parts of `2026-07-28` that live in the HTTP layer
+// and therefore cannot be checked anywhere else.
+// ---------------------------------------------------------------------------
+
+/// A notification is `202 Accepted` with no body.
+///
+/// "If the body is a JSON-RPC *notification*: If the server accepts it, the
+/// server **MUST** return HTTP status code `202 Accepted` with no body."
+///
+/// Answering `200` with a JSON-RPC frame instead is not a cosmetic difference.
+/// The frame this server sent carried `"id": null`, and the revision states the
+/// id "**MUST NOT** be `null`" — so a client got a response object it is
+/// required to reject, for a message it was never going to correlate.
+#[tokio::test]
+async fn a_notification_post_is_accepted_with_no_body() {
+    let address = start().await;
+    let (status, _, body) = exchange(
+        &address,
+        &post(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
+    )
+    .await;
+    assert_eq!(status, 202, "a notification is 202, got {status}: {body}");
+    assert!(
+        body.trim().is_empty(),
+        "a 202 carries no body; this one carried: {body}"
+    );
+}
+
+/// The protocol version header is required on every request POST.
+///
+/// "Every POST request to the MCP endpoint **MUST** include an
+/// `MCP-Protocol-Version` header", and a missing required standard header is
+/// listed as a `HeaderMismatch` (`-32020`) validation failure. This server
+/// serves one revision and nothing older, so it has no fallback to read a
+/// header-less request under.
+#[tokio::test]
+async fn a_request_without_the_protocol_version_header_is_refused() {
+    let address = start().await;
+    let body = with_request_meta(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+    // Every mirrored header except the version one.
+    let headers: Vec<(String, String)> = mirrored_headers(&body)
+        .into_iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("MCP-Protocol-Version"))
+        .collect();
+    let (status, response) = request(&address, &raw_post(&body, &headers)).await;
+    assert_eq!(status, 400, "a missing required header is 400: {response}");
+    assert_eq!(
+        response["error"]["code"],
+        json!(-32020),
+        "HeaderMismatch names the missing header: {response}"
+    );
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.to_ascii_lowercase().contains("mcp-protocol-version"),
+        "the refusal must name the header the client has to add, got: {message}"
+    );
+}
+
+/// Headers and body must agree, or an intermediary and this server are acting
+/// on different requests.
+///
+/// "Servers that process the request body **MUST** reject requests where the
+/// values specified in the headers do not match ... This prevents potential
+/// security vulnerabilities when different components in the network rely on
+/// different sources of truth (e.g., a load balancer routing on the header value
+/// while the MCP server executes based on the body value)." A gateway that
+/// allows `Mcp-Name: devmap_status` and forwards a body calling
+/// `devmap_preview` is exactly that failure.
+#[tokio::test]
+async fn headers_that_contradict_the_body_are_refused() {
+    let address = start().await;
+    let body = with_request_meta(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"devmap_status","arguments":{}}}"#,
+    );
+    let cases = [
+        ("MCP-Protocol-Version", "2025-11-25"),
+        ("Mcp-Method", "tools/list"),
+        ("Mcp-Name", "devmap_preview"),
+    ];
+    for (header, wrong) in cases {
+        let headers: Vec<(String, String)> = mirrored_headers(&body)
+            .into_iter()
+            .map(|(name, value)| {
+                if name.eq_ignore_ascii_case(header) {
+                    (name, wrong.to_string())
+                } else {
+                    (name, value)
+                }
+            })
+            .collect();
+        let (status, response) = request(&address, &raw_post(&body, &headers)).await;
+        assert_eq!(status, 400, "{header}: {response}");
+        assert_eq!(
+            response["error"]["code"],
+            json!(-32020),
+            "a header that disagrees with the body is HeaderMismatch, not a generic \
+             invalid-request: {header} -> {response}"
+        );
+    }
+}
+
+/// An unsupported version must say what *is* supported.
+///
+/// `UnsupportedProtocolVersionError` carries a required
+/// `data: { supported: string[], requested: string }`. Without it the client is
+/// told no and given nothing to retry with — the spec's recovery path is
+/// literally "use one of the versions in its advertised `supported` list".
+#[tokio::test]
+async fn an_unsupported_version_names_the_versions_that_would_work() {
+    let address = start().await;
+    let (status, response) = request(
+        &address,
+        &post(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25"}}}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(response["error"]["code"], json!(-32022), "{response}");
+    assert_eq!(
+        response["error"]["data"]["supported"],
+        json!(["2026-07-28"]),
+        "the error must list what the client can retry with: {response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["requested"],
+        json!("2025-11-25"),
+        "and echo what was asked for: {response}"
+    );
+}
+
+/// A body that is not JSON is refused before it is dispatched.
+///
+/// Enforcing the content type is also half of what keeps a browser out. A POST
+/// with `Content-Type: text/plain` is a CORS-*simple* request: no preflight, so
+/// `Origin: null` from a sandboxed iframe or a `file://` page reaches the
+/// handler and runs. The module's own safety argument — "a JSON body makes the
+/// request non-simple, so a browser must preflight" — is only true if a
+/// non-JSON content type is actually refused.
+#[tokio::test]
+async fn a_non_json_content_type_is_refused() {
+    let address = start().await;
+    let body = with_request_meta(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+    for content_type in ["text/plain", "application/x-www-form-urlencoded", "multipart/form-data"] {
+        let raw = raw_post(&body, &mirrored_headers(&body))
+            .replace("Content-Type: application/json", &format!("Content-Type: {content_type}"));
+        let (status, response) = request(&address, &raw).await;
+        assert_eq!(
+            status, 415,
+            "{content_type} must be refused as an unsupported media type: {response}"
+        );
+    }
+}
+
+/// A client that cannot read what this endpoint sends is told so.
+///
+/// This transport answers with `application/json`. A request whose `Accept`
+/// excludes it gets a body it said it could not parse — HTTP's answer to that is
+/// `406`, and a client that asked for SSE needs to learn that this endpoint has
+/// no stream rather than to receive JSON labelled as something it rejected.
+#[tokio::test]
+async fn an_accept_header_that_excludes_json_is_refused() {
+    let address = start().await;
+    let body = with_request_meta(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+    let raw = raw_post(&body, &mirrored_headers(&body)).replace(
+        "Accept: application/json, text/event-stream",
+        "Accept: text/event-stream",
+    );
+    let (status, response) = request(&address, &raw).await;
+    assert_eq!(
+        status, 406,
+        "an Accept that excludes application/json must be refused: {response}"
+    );
+}
+
+/// RFC 9110 §15.5.6: "The origin server MUST generate an Allow header field in a
+/// 405 (Method Not Allowed) response".
+///
+/// Without it a client that got a 405 has to guess which verb to use, and the
+/// spec's own backward-compatibility probe reaches this endpoint with GET.
+#[tokio::test]
+async fn a_405_states_which_method_is_allowed() {
+    let address = start().await;
+    for verb in ["GET", "DELETE", "OPTIONS", "PUT"] {
+        let (status, head, _) = exchange(
+            &address,
+            &format!("{verb} / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(status, 405, "{verb}");
+        let lowered = head.to_ascii_lowercase();
+        assert!(
+            lowered.contains("allow: post"),
+            "a 405 must name the methods it allows; {verb} got:\n{head}"
+        );
+    }
+}
+
+/// DNS rebinding, second line.
+///
+/// The `Origin` check misses the case it was written for: a sandboxed iframe, a
+/// `data:` URL and a `file://` page all send `Origin: null`, which this server
+/// accepts. What is left to catch a rebound request is the `Host` header — a
+/// page that resolved `evil.example` to 127.0.0.1 sends `Host: evil.example`,
+/// and nothing can legitimately reach a loopback listener under a public name.
+/// Checked only when the listener is on loopback, because a deployment that
+/// binds a routable interface has a real hostname and this must not break it.
+#[tokio::test]
+async fn a_host_header_naming_a_public_name_is_refused_on_a_loopback_listener() {
+    let address = start().await;
+    let body = with_request_meta(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+    let raw = raw_post(&body, &mirrored_headers(&body))
+        .replace("Host: localhost", "Host: evil.example");
+    let (status, response) = request(&address, &raw).await;
+    assert_eq!(
+        status, 403,
+        "a Host naming a routable name cannot legitimately reach 127.0.0.1: {response}"
+    );
+
+    // The loopback names a real client uses must keep working, or this check
+    // costs more than it buys.
+    for host in ["localhost", "127.0.0.1", &address, "[::1]:9"] {
+        let raw = raw_post(&body, &mirrored_headers(&body))
+            .replace("Host: localhost", &format!("Host: {host}"));
+        let (status, response) = request(&address, &raw).await;
+        assert_eq!(status, 200, "Host: {host} must be accepted: {response}");
+    }
+}
+
+/// A batch is not a body this transport takes, and must say which fault it is.
+///
+/// "The body of the HTTP POST **MUST** be a single JSON-RPC *request* or
+/// *notification*." Reporting an array as "request has no string 'method'"
+/// sends the client looking for a missing field in a body that has no fields.
+#[tokio::test]
+async fn a_batch_body_is_refused_by_name() {
+    let address = start().await;
+    let batch = r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#;
+    let (status, response) = request(&address, &raw_post(batch, &[
+        ("MCP-Protocol-Version".to_string(), "2026-07-28".to_string()),
+    ])).await;
+    assert_eq!(status, 400, "{response}");
+    let message = response["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        message.contains("batch") || message.contains("single"),
+        "the refusal must say a batch is not a valid body here, got: {message}"
+    );
+}
+
+/// Every result this transport returns carries the revision's `resultType`.
+///
+/// Asserted here as well as on the dispatcher because this is the transport that
+/// actually speaks `2026-07-28`, where the field is a MUST rather than an inert
+/// extra.
+#[tokio::test]
+async fn every_http_result_carries_the_result_type() {
+    let address = start().await;
+    for body in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"server/discover"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"devmap_status","arguments":{}}}"#,
+    ] {
+        let (status, response) = request(&address, &post(body)).await;
+        assert_eq!(status, 200, "{body}: {response}");
+        assert_eq!(
+            response["result"]["resultType"],
+            json!("complete"),
+            "no resultType for {body}: {response}"
+        );
+    }
+}
+
+/// The simple-request path a browser actually has.
+///
+/// `a_browser_cannot_reach_this_endpoint_even_with_a_null_origin` checks that a
+/// preflight is refused. This checks the request that is never preflighted:
+/// `fetch(url, {method:"POST", body:"..."})` sends `Content-Type: text/plain`
+/// and a typeless `Blob` body sends none at all — both CORS-simple, both
+/// delivered without asking. If either reached the handler, a sandboxed page
+/// could run tool calls against the user's private index; the response would be
+/// unreadable, but the calls would have happened.
+#[tokio::test]
+async fn a_cors_simple_post_never_reaches_the_handler() {
+    let address = start().await;
+    let body = with_request_meta(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+    let conformant = raw_post(&body, &mirrored_headers(&body));
+    for simple in [
+        conformant.replace("Content-Type: application/json", "Content-Type: text/plain"),
+        conformant.replace(
+            "Content-Type: application/json",
+            "Content-Type: multipart/form-data; boundary=x",
+        ),
+        conformant.replace("Content-Type: application/json\r\n", ""),
+    ] {
+        let raw = simple.replace("Host: localhost", "Host: localhost\r\nOrigin: null");
+        let (status, response) = request(&address, &raw).await;
+        assert_eq!(
+            status, 415,
+            "a CORS-simple POST must be refused before dispatch: {response}"
+        );
+        assert!(
+            response.get("result").is_none(),
+            "nothing may run for a refused content type: {response}"
+        );
+    }
+}
+
+/// A chunked body that declares nothing and sends everything.
+///
+/// `read_body` checks `Content-Length` *and* the accumulating stream, and the
+/// second check is the only one that fires here — a `Content-Length` check alone
+/// lets this through and buffers the whole thing. The refusal must arrive rather
+/// than the connection dying, or the client cannot tell a limit from a crash.
+#[tokio::test]
+async fn a_chunked_body_over_the_limit_is_refused_mid_stream() {
+    let address = start().await;
+    // 1 MB is the limit; 16 chunks of 128 KB crosses it without ever declaring
+    // a length.
+    let chunk = "x".repeat(128 * 1024);
+    let mut raw = String::from(
+        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         Accept: application/json\r\nMCP-Protocol-Version: 2026-07-28\r\n\
+         Mcp-Method: ping\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+    );
+    for _ in 0..16 {
+        raw.push_str(&format!("{:x}\r\n{chunk}\r\n", chunk.len()));
+    }
+    raw.push_str("0\r\n\r\n");
+
+    // Written from a task while the response is read here, because the server
+    // answers before the body is finished and then closes: a client that
+    // insisted on completing its write would take an EPIPE and never read the
+    // refusal it was sent. That is what a real client does, and it is also the
+    // only way to prove the refusal is *delivered* rather than merely decided.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(&address)
+        .await
+        .expect("connect");
+    let (mut reader, mut writer) = stream.split();
+    let send = async move {
+        // Errors are expected and are the point: the server stops reading.
+        let _ = writer.write_all(raw.as_bytes()).await;
+        let _ = writer.flush().await;
+    };
+    let mut response = Vec::new();
+    let receive = reader.read_to_end(&mut response);
+    let (_, read) = tokio::join!(send, receive);
+    let _ = read;
+
+    let text = String::from_utf8_lossy(&response).to_string();
+    let status: u16 = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| {
+            panic!("the refusal must reach the client, not just be decided: {text:?}")
+        });
+    assert_eq!(
+        status, 413,
+        "an undeclared oversized body must be refused mid-stream: {text}"
+    );
+}
+
+/// Header values that try to break the framing.
+///
+/// A `Mcp-Name` carrying CR/LF would split the response if it were ever echoed,
+/// and a value that decodes to something other than the body's name must be a
+/// mismatch rather than a pass. Neither may take the connection down: a refusal
+/// the client can read is the point.
+#[tokio::test]
+async fn hostile_header_values_are_refused_without_dropping_the_connection() {
+    let address = start().await;
+    let body = with_request_meta(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"devmap_status","arguments":{}}}"#,
+    );
+    for hostile in [
+        // Base64 of "devmap_preview": decodes to a different tool than the body
+        // names, so the decode has to happen before the comparison.
+        "=?base64?ZGV2bWFwX3ByZXZpZXc=?=",
+        // Not base64 at all, inside the sentinel.
+        "=?base64?!!!!?=",
+        // Base64 of bytes that are not UTF-8.
+        "=?base64?/w==?=",
+        "devmap_status\u{200b}",
+        "",
+    ] {
+        let headers: Vec<(String, String)> = mirrored_headers(&body)
+            .into_iter()
+            .map(|(name, value)| {
+                if name.eq_ignore_ascii_case("Mcp-Name") {
+                    (name, hostile.to_string())
+                } else {
+                    (name, value)
+                }
+            })
+            .collect();
+        let (status, response) = request(&address, &raw_post(&body, &headers)).await;
+        assert_eq!(status, 400, "Mcp-Name {hostile:?}: {response}");
+        assert_eq!(
+            response["error"]["code"],
+            json!(-32020),
+            "Mcp-Name {hostile:?} must be a HeaderMismatch, not a silent pass: {response}"
+        );
+    }
+
+    // The encoding is not decoration: a name that legitimately needs it must be
+    // decoded and compared, and here it names a tool that does not exist — so
+    // the answer is "unknown tool", not "header mismatch".
+    let body = with_request_meta(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"devmap_søk","arguments":{}}}"#,
+    );
+    let headers: Vec<(String, String)> = mirrored_headers(&body)
+        .into_iter()
+        .map(|(name, value)| {
+            if name.eq_ignore_ascii_case("Mcp-Name") {
+                // Base64 of the UTF-8 bytes of `devmap_søk`.
+                (name, "=?base64?ZGV2bWFwX3PDuGs=?=".to_string())
+            } else {
+                (name, value)
+            }
+        })
+        .collect();
+    let (status, response) = request(&address, &raw_post(&body, &headers)).await;
+    assert_eq!(
+        response["error"]["code"],
+        json!(-32602),
+        "an encoded name that matches the body must be accepted, leaving only the fact \
+         that the tool does not exist (status {status}): {response}"
+    );
 }

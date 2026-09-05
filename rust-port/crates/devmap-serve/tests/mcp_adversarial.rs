@@ -705,26 +705,66 @@ async fn unbroken_a_store_that_appears_mid_session_is_picked_up() {
 /// A client cannot steer a tool at another command, by any spelling tried:
 /// a smuggled `cmd`, a case-variant tool name, a tool name that differs only by
 /// a zero-width character, or arguments that are not an object.
+///
+/// Each case also states *which* refusal mechanism it must arrive by, because
+/// the two are not interchangeable and the spec draws the line straight through
+/// this table. A bad argument value is a tool error the model can correct; a
+/// name that is not in the tool list, or a `tools/call` that does not satisfy
+/// the `CallToolRequest` schema, is a protocol error — the model cannot fix a
+/// name it was never offered, and a model handed "unknown tool" inside a tool
+/// *result* sees a tool that ran and retries the same non-existent name.
 #[tokio::test]
 async fn unbroken_a_tool_cannot_be_steered_at_another_command() {
-    let store = corpus();
-    for (tool, arguments) in [
-        ("devmap_search", json!({"query": "x", "cmd": "dead"})),
-        ("devmap_search", json!({"query": "x", "Cmd": "dead"})),
+    /// How a refusal must reach the caller.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum By {
+        /// `isError: true` inside the result — the model's to fix.
+        ToolError,
+        /// A JSON-RPC error — the runtime's to fix.
+        ProtocolError,
+    }
+    for (tool, arguments, mechanism) in [
+        (
+            "devmap_search",
+            json!({"query": "x", "cmd": "dead"}),
+            By::ToolError,
+        ),
+        (
+            "devmap_search",
+            json!({"query": "x", "Cmd": "dead"}),
+            By::ToolError,
+        ),
         (
             "devmap_search",
             json!({"query": "x", "__proto__": {"cmd": "dead"}}),
+            By::ToolError,
         ),
-        ("DEVMAP_STATUS", json!({})),
-        ("devmap_status\u{200b}", json!({})),
-        ("devmap_dead_symbols", json!("dead")),
+        ("DEVMAP_STATUS", json!({}), By::ProtocolError),
+        ("devmap_status\u{200b}", json!({}), By::ProtocolError),
+        ("devmap_dead_symbols", json!("dead"), By::ProtocolError),
     ] {
+        let store = corpus();
         let response = call(&store, tool, arguments.clone()).await;
-        assert_eq!(
-            response["result"]["isError"],
-            json!(true),
-            "{tool} accepted {arguments}"
-        );
+        match mechanism {
+            By::ToolError => {
+                assert_eq!(
+                    response["result"]["isError"],
+                    json!(true),
+                    "{tool} accepted {arguments}"
+                );
+            }
+            By::ProtocolError => {
+                assert!(
+                    response.get("result").is_none(),
+                    "{tool} with {arguments} must not be answered with a tool result: {response}"
+                );
+                assert_eq!(
+                    response["error"]["code"],
+                    json!(-32602),
+                    "{tool} with {arguments}: {response}"
+                );
+            }
+        }
     }
 }
 

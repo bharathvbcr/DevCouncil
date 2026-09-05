@@ -29,11 +29,20 @@
 //!
 //! # Honesty
 //!
-//! A tool call that could not run returns `isError: true`. It never returns an
-//! empty success. This is the repository's Class A rule at the protocol edge: a
-//! check that could not run must not report what a check that ran and passed
-//! reports, because an agent reading `[]` deletes the function that list was
-//! supposed to protect.
+//! A tool call that could not run says so. It never returns an empty success.
+//! This is the repository's Class A rule at the protocol edge: a check that
+//! could not run must not report what a check that ran and passed reports,
+//! because an agent reading `[]` deletes the function that list was supposed to
+//! protect.
+//!
+//! *How* it says so is not a free choice. The specification defines two
+//! mechanisms and they reach different readers: `isError: true` inside the
+//! result reaches the model, which is asked to self-correct; a JSON-RPC error
+//! reaches the client runtime, which is not. So a bad argument *value* is a tool
+//! error, and a fault in the request itself — an unknown tool, a `tools/call`
+//! that does not satisfy the `CallToolRequest` schema — is a protocol error. See
+//! [`RpcError::is_tool_input_fault`], which carries that judgement from the
+//! point that makes it to the point that acts on it.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -195,6 +204,20 @@ mod codes {
 pub struct RpcError {
     code: i64,
     message: String,
+    /// Whether the model that chose these arguments could fix this itself.
+    ///
+    /// The specification splits tool failures in two and the split is not
+    /// stylistic. A *protocol* error — unknown tool, a `tools/call` that does not
+    /// satisfy the `CallToolRequest` schema — is returned as a JSON-RPC error and
+    /// reaches the client runtime, which owns the tool list and can re-read it. A
+    /// *tool execution* error is returned inside the result with `isError: true`
+    /// and reaches the model, "to enable self-correction".
+    ///
+    /// Sending one as the other has a direction that matters. A model told
+    /// "unknown tool 'devmap_serch'" inside a tool *result* sees a tool that ran
+    /// and failed, so it retries the same non-existent name; the runtime, which
+    /// is the only layer that could correct the name, never hears about it.
+    tool_input: bool,
 }
 
 impl RpcError {
@@ -208,10 +231,26 @@ impl RpcError {
         &self.message
     }
 
+    /// True when this is a value the model supplied and can supply differently.
+    pub fn is_tool_input_fault(&self) -> bool {
+        self.tool_input
+    }
+
+    /// A fault in the request itself: reported as a JSON-RPC error.
     fn new(code: i64, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
+            tool_input: false,
+        }
+    }
+
+    /// A fault in the argument values: reported as `isError: true`.
+    fn tool_input(code: i64, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            tool_input: true,
         }
     }
 }
@@ -476,7 +515,17 @@ pub fn tool_specs() -> Vec<Value> {
 /// Returns the serde error verbatim on failure. That message names the field and
 /// the expected type, which is what an agent needs to correct its next call; a
 /// generic "invalid arguments" would send it guessing.
+///
+/// Each failure is classified as a request fault or a tool-input fault (see
+/// [`RpcError::is_tool_input_fault`]) at the point that knows which it is. The
+/// two are carried to the client by different mechanisms, and a second switch
+/// over messages further down would be a second place for that judgement to
+/// live, and to drift.
 pub fn to_ipc_command(name: &str, arguments: Option<&Value>) -> Result<IpcCommand, RpcError> {
+    // A request fault, not a tool-input fault: "any errors in *finding* the
+    // tool ... should be reported as an MCP error response". The model cannot
+    // fix a name that is not in the list it was given — the runtime that holds
+    // the list can.
     let cmd = TOOLS
         .iter()
         .find(|(tool, _)| *tool == name)
@@ -488,6 +537,9 @@ pub fn to_ipc_command(name: &str, arguments: Option<&Value>) -> Result<IpcComman
     let mut object = match arguments {
         None | Some(Value::Null) => Map::new(),
         Some(Value::Object(map)) => map.clone(),
+        // Also a request fault. `CallToolRequestParams.arguments` is typed
+        // `{[key: string]: unknown}`, so a string or an array here is a call
+        // the runtime built wrongly, not a value the model chose wrongly.
         Some(other) => {
             return Err(RpcError::new(
                 codes::INVALID_PARAMS,
@@ -521,7 +573,10 @@ pub fn to_ipc_command(name: &str, arguments: Option<&Value>) -> Result<IpcComman
         // Sorted: the message is compared in tests and read by an agent, and
         // `Map`'s iteration order should not decide either.
         unknown.sort_unstable();
-        return Err(RpcError::new(
+        // A tool-input fault from here on: the tool exists and the call is
+        // well-formed, so what is wrong is a value the model chose and can
+        // choose again.
+        return Err(RpcError::tool_input(
             codes::INVALID_PARAMS,
             format!(
                 "unknown argument{} for {name}: {}. Accepted: {}",
@@ -564,7 +619,7 @@ pub fn to_ipc_command(name: &str, arguments: Option<&Value>) -> Result<IpcComman
                 continue;
             };
             if let Err(reason) = check_constraints(key, value, rules) {
-                return Err(RpcError::new(codes::INVALID_PARAMS, reason));
+                return Err(RpcError::tool_input(codes::INVALID_PARAMS, reason));
             }
         }
     }
@@ -572,7 +627,7 @@ pub fn to_ipc_command(name: &str, arguments: Option<&Value>) -> Result<IpcComman
     object.insert("cmd".to_string(), Value::String(cmd.to_string()));
 
     serde_json::from_value(Value::Object(object))
-        .map_err(|err| RpcError::new(codes::INVALID_PARAMS, err.to_string()))
+        .map_err(|err| RpcError::tool_input(codes::INVALID_PARAMS, err.to_string()))
 }
 
 /// The argument names a tool declares, read from the tool's own schema.
@@ -701,21 +756,35 @@ fn initialize_result(params: Option<&Value>) -> Value {
             // true would promise a notification that never comes.
             "tools": {"listChanged": false}
         },
-        "serverInfo": {
-            "name": "devmap",
-            "title": "Dev Map code intelligence",
-            "version": env!("CARGO_PKG_VERSION")
-        },
+        "serverInfo": server_info(),
         "instructions": INSTRUCTIONS
     })
 }
 
-/// Protocol revisions reachable over the modern single-exchange HTTP transport.
+/// Who answered. One copy, reached two ways.
+///
+/// `initialize` publishes it as `serverInfo`, and [`complete`] publishes it in
+/// every result's `_meta`. Both are needed and neither is redundant: the modern
+/// era has no `initialize` at all, and `DiscoverResult` carries no `serverInfo`
+/// field, so `_meta` is the only place a client that never handshook can learn
+/// which build produced its answers.
+fn server_info() -> Value {
+    json!({
+        "name": "devmap",
+        "title": "Dev Map code intelligence",
+        "version": env!("CARGO_PKG_VERSION")
+    })
+}
+
+/// Protocol revisions this server serves under the modern, per-request era.
 ///
 /// Kept separate from [`HANDSHAKE_PROTOCOL_VERSIONS`] because they are different
 /// eras with different framing, not a longer version of the same list: a modern
-/// request is a self-contained POST carrying its protocol version in `_meta`,
-/// with no `initialize` and no session id.
+/// request is self-contained and carries its protocol version in `_meta`, with
+/// no `initialize` and no session id. The split is by era, not by transport —
+/// the era is reached over HTTP here, and announced over stdio through
+/// [`discover_result`], which is the probe the stdio binding tells a modern
+/// client to send first.
 pub const MODERN_PROTOCOL_VERSIONS: &[&str] = &["2026-07-28"];
 
 /// How long a client may cache `tools/list` and `server/discover`.
@@ -732,17 +801,22 @@ pub const CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 ///
 /// The modern era's replacement for `initialize`: a client probes what this
 /// server speaks without opening a session. `supportedVersions` lists only the
-/// modern revisions, because that is what a caller reaching this method over
-/// this transport can actually use — listing the handshake revisions would
-/// advertise versions this endpoint does not serve.
+/// modern revisions, because those are the ones a caller selecting from this
+/// list can then state in `_meta` — listing the handshake revisions would
+/// advertise a negotiation that does not happen through this method.
+///
+/// Answered on stdio as well as over HTTP, and deliberately: the stdio binding
+/// tells a client that supports both eras to probe with `server/discover`
+/// *before any other request*, so refusing it there would make this server look
+/// legacy to every modern client that followed the specification.
 fn discover_result() -> Value {
     json!({
         "supportedVersions": MODERN_PROTOCOL_VERSIONS,
         "capabilities": {"tools": {"listChanged": false}},
         "instructions": INSTRUCTIONS,
-        // Live here, unlike on the handshake transports. The Python server
-        // configures these correctly and they are sieved out on every version
-        // stdio can negotiate; on this transport they reach the client.
+        // Required fields: `DiscoverResult` extends `CacheableResult`. Whether a
+        // given client reads them is a property of that client's revision, not a
+        // reason to omit them.
         "ttlMs": CACHE_TTL_MS,
         "cacheScope": "private"
     })
@@ -771,12 +845,17 @@ async fn call_tool(
         .ok_or_else(|| RpcError::new(codes::INVALID_PARAMS, "tools/call requires a string 'name'"))?
         .to_string();
 
-    // Argument faults are reported as tool errors, not JSON-RPC errors: the
-    // agent that sent them is the one that must correct them, and a tool error
-    // reaches the model while a protocol error reaches only the client runtime.
+    // Argument *value* faults are reported as tool errors, not JSON-RPC errors:
+    // the agent that sent them is the one that must correct them, and a tool
+    // error reaches the model while a protocol error reaches only the client
+    // runtime. Faults in the *request* — an unknown tool, arguments that are not
+    // an object — go the other way, for the same reason read in reverse: the
+    // model cannot fix them and the runtime can. The classification is made
+    // where the fault is raised; this is only the routing.
     let command = match to_ipc_command(&name, params.get("arguments")) {
         Ok(command) => command,
-        Err(err) => return Ok(tool_error(err.message)),
+        Err(err) if err.is_tool_input_fault() => return Ok(tool_error(err.message)),
+        Err(err) => return Err(err),
     };
 
     let request = IpcRequest {
@@ -904,31 +983,114 @@ impl Session {
     }
 }
 
+/// The `tools/list` payload, honouring the pagination contract.
+///
+/// This server returns its whole list in one page and never sets `nextCursor`,
+/// so every cursor it is handed is one it did not issue. Ignoring it and
+/// re-serving page one is the failure the pagination rules exist to prevent: a
+/// client paging forward would receive the same nine tools believing them to be
+/// the next nine, and would stop only because `nextCursor` was absent — having
+/// double-counted the list without ever being told. "Invalid cursors SHOULD
+/// result in an error with code -32602."
+fn list_tools(params: Option<&Value>) -> Result<Value, RpcError> {
+    if let Some(cursor) = params.and_then(|p| p.get("cursor")) {
+        return Err(RpcError::new(
+            codes::INVALID_PARAMS,
+            format!(
+                "cursor {cursor} was not issued by this server: tools/list returns every tool \
+in a single page and never sets nextCursor, so there is no page after the first. Retry \
+without a cursor."
+            ),
+        ));
+    }
+    // `ListToolsResult` extends `CacheableResult`, so the hint is a required
+    // field of this result rather than an HTTP-layer decoration — and it is
+    // written here, once, because `server/discover` already carried it on both
+    // transports while `tools/list` carried it on only one. The same connection
+    // answering one cacheable method with a hint and the other without is a
+    // client-visible inconsistency with no reason behind it.
+    Ok(json!({
+        "tools": tool_specs(),
+        "ttlMs": CACHE_TTL_MS,
+        "cacheScope": "private"
+    }))
+}
+
+/// Stamp the revision's required `resultType` on a result payload.
+///
+/// `Result.resultType`: "Servers implementing this protocol version MUST include
+/// this field." It tells a client whether what it holds is the final answer
+/// (`complete`) or a request for more input (`input_required`); this server
+/// never asks for more input, so every result it produces is complete.
+///
+/// Applied at the one place every result passes through, and to the handshake
+/// eras as well as the modern one. `Result` has always been
+/// `{[key: string]: unknown}`, so an older client ignores the field, and the
+/// specification tells clients to read an *absent* `resultType` as `"complete"` —
+/// so its presence can never mean less than its absence. Stamping per method
+/// instead would be nine chances to forget one, and the one forgotten would be
+/// the one a modern client rejected.
+///
+/// A payload that already states its own type keeps it.
+///
+/// The same place stamps `_meta.io.modelcontextprotocol/serverInfo`, which the
+/// specification asks for on "every result's `_meta`" for the same reason this
+/// function exists at all: the modern era keeps no connection state, so anything
+/// a client can only learn once is something it cannot learn.
+fn complete(mut result: Value) -> Value {
+    let Some(object) = result.as_object_mut() else {
+        return result;
+    };
+    object
+        .entry("resultType")
+        .or_insert_with(|| json!("complete"));
+    // Merged, not overwritten: a result that already carries `_meta` of its own
+    // keeps it, and only the key this server owns is written.
+    if let Some(meta) = object
+        .entry("_meta")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+    {
+        meta.entry("io.modelcontextprotocol/serverInfo")
+            .or_insert_with(server_info);
+    }
+    result
+}
+
 /// Run one JSON-RPC method, with a cancellation flag the caller may trip.
 ///
 /// Split from [`handle_method`] so the stdio session can hand in a flag it holds
 /// a second handle on; every other caller wants the flag nobody will ever set.
+///
+/// A method that produces no payload of its own answers with an empty result
+/// rather than "no result". Whether a frame is written at all is the transport's
+/// decision and is made from the presence of an `id`, not from this — a
+/// `notifications/initialized` that arrives carrying an id is a request, and a
+/// request is owed a response frame whatever its method name suggests.
 pub async fn handle_method_cancellable(
     store: &Arc<StoreSlot>,
     method: &str,
     params: Option<Value>,
     cancel: devmap_query::Cancel,
-) -> Result<Option<Value>, RpcError> {
-    match method {
-        "initialize" => Ok(Some(initialize_result(params.as_ref()))),
-        // Accepted and answered nowhere. `notifications/cancelled` is acted on
-        // by the session before it ever reaches this function; reaching here
-        // means there was no session, so there is nothing in flight to stop.
-        "notifications/initialized" | "notifications/cancelled" => Ok(None),
-        "ping" => Ok(Some(json!({}))),
-        "server/discover" => Ok(Some(discover_result())),
-        "tools/list" => Ok(Some(json!({"tools": tool_specs()}))),
-        "tools/call" => call_tool(store, params, cancel).await.map(Some),
-        other => Err(RpcError::new(
-            codes::METHOD_NOT_FOUND,
-            format!("method '{other}' is not supported by this server"),
-        )),
-    }
+) -> Result<Value, RpcError> {
+    let result = match method {
+        "initialize" => initialize_result(params.as_ref()),
+        // Accepted and acted on nowhere. `notifications/cancelled` is handled by
+        // the session before it ever reaches this function; reaching here means
+        // there was no session, so there is nothing in flight to stop.
+        "notifications/initialized" | "notifications/cancelled" => json!({}),
+        "ping" => json!({}),
+        "server/discover" => discover_result(),
+        "tools/list" => list_tools(params.as_ref())?,
+        "tools/call" => call_tool(store, params, cancel).await?,
+        other => {
+            return Err(RpcError::new(
+                codes::METHOD_NOT_FOUND,
+                format!("method '{other}' is not supported by this server"),
+            ))
+        }
+    };
+    Ok(complete(result))
 }
 
 /// Run one JSON-RPC method against the store.
@@ -936,7 +1098,7 @@ pub async fn handle_method(
     store: &Arc<StoreSlot>,
     method: &str,
     params: Option<Value>,
-) -> Result<Option<Value>, RpcError> {
+) -> Result<Value, RpcError> {
     handle_method_cancellable(store, method, params, devmap_query::Cancel::default()).await
 }
 
@@ -1071,15 +1233,15 @@ async fn dispatch_single(session: &Arc<Session>, value: Value) -> Option<Value> 
         return None;
     }
 
+    // A request whose method legitimately produces no payload still needs a
+    // response frame, or the client waits forever for an id it will never see
+    // again; `handle_method_cancellable` returns an empty result for those, so
+    // there is one shape here rather than two.
     match outcome {
-        Ok(Some(result)) => respond(
+        Ok(result) => respond(
             has_id,
             json!({"jsonrpc": "2.0", "id": id, "result": result}),
         ),
-        // A request whose method legitimately produces no result still needs a
-        // response frame, or the client waits forever for an id it will never
-        // see again.
-        Ok(None) => respond(has_id, json!({"jsonrpc": "2.0", "id": id, "result": {}})),
         Err(err) => respond(has_id, rpc_error_frame(Some(id), err.code, err.message)),
     }
 }

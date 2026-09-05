@@ -374,18 +374,31 @@ async fn argument_faults_are_tool_errors_not_protocol_errors() {
     }
 }
 
+/// A name that is nearly a real tool is refused, never guessed at.
+///
+/// This test asserted `isError: true`, which was wrong: the specification puts
+/// "any errors in *finding* the tool" on the protocol-error side, and
+/// `an_unknown_tool_is_a_protocol_error_not_a_tool_error` below is the case
+/// pinned against the spec text. What is left here is the property that case
+/// does not cover — that a near-miss is refused rather than resolved to the
+/// closest match. `devmap_serch` is one edit from `devmap_search`, and a server
+/// that helpfully ran the neighbour would answer a question nobody asked, under
+/// a name the caller believes it chose.
 #[tokio::test]
 async fn an_unknown_tool_name_is_reported_to_the_agent() {
     let store = corpus();
-    let response = call(&store, "devmap_not_a_tool", json!({})).await;
-    assert_eq!(response["result"]["isError"], json!(true));
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        text.contains("devmap_not_a_tool"),
-        "the error must name the tool that does not exist, got: {text}"
-    );
+    for name in ["devmap_not_a_tool", "devmap_serch", "devmap_search "] {
+        let response = call(&store, name, json!({"query": "helper"})).await;
+        assert!(
+            response.get("result").is_none(),
+            "{name} was answered instead of refused: {response}"
+        );
+        let text = response["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            text.contains(name),
+            "the error must name the tool that does not exist, got: {text}"
+        );
+    }
 }
 
 /// A successful answer must carry both encodings.
@@ -468,5 +481,223 @@ async fn the_transport_loop_answers_a_whole_session() {
         frames[2]["result"]["isError"],
         json!(false),
         "impact on an indexed symbol must succeed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MCP 2026-07-28 conformance.
+//
+// This server answers `server/discover` with `supportedVersions:
+// ["2026-07-28"]` on BOTH transports — the stdio binding's own backward
+// compatibility section tells a modern client to probe with `server/discover`
+// before anything else and to continue on the version it advertises. So the
+// revision's result requirements are this dispatcher's requirements, not just
+// the HTTP module's.
+// ---------------------------------------------------------------------------
+
+/// Every result must carry `resultType`.
+///
+/// Schema `Result.resultType`: "Servers implementing this protocol version MUST
+/// include this field." It is what tells a client whether the result is the
+/// final answer (`complete`) or a request for more input (`input_required`);
+/// absent, a client that supports MRTR has to guess, and the guess it is told to
+/// make is the one that ends the exchange.
+///
+/// Stamped on the handshake-era results too. `Result` has always been
+/// `{[key: string]: unknown}`, so an older client ignores it, and the spec tells
+/// clients to read an absent field as `"complete"` — so the field can never mean
+/// less than its absence. One stamping point, no per-method exceptions to get
+/// wrong.
+#[tokio::test]
+async fn every_result_carries_the_required_result_type() {
+    let store = corpus();
+    let frames = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"server/discover"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"devmap_status","arguments":{}}}"#,
+        // The failure path is a result too, and the one a client is most likely
+        // to mis-parse: `isError: true` is still `resultType: "complete"`.
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"devmap_search","arguments":{"query":"x","nonsuch":1}}}"#,
+        // A notification method reaching this dispatcher with an id still owes
+        // the client a result frame, and that frame is a result like any other.
+        r#"{"jsonrpc":"2.0","id":1,"method":"notifications/initialized"}"#,
+    ];
+    for frame in frames {
+        let response = handle_line(&store, frame)
+            .await
+            .unwrap_or_else(|| panic!("a request must be answered: {frame}"));
+        assert_eq!(
+            response["result"]["resultType"],
+            json!("complete"),
+            "result carries no resultType for: {frame}\n{response}"
+        );
+    }
+}
+
+/// An unknown tool is a protocol error, not a tool error.
+///
+/// The two mechanisms are not interchangeable and the spec draws the line at
+/// exactly this case: "any errors in _finding_ the tool ... should be reported
+/// as an MCP error response", and the tools page lists "Unknown tool" as its
+/// first example of a protocol error, with `-32602`.
+///
+/// The distinction has teeth. A tool error is fed back to the model to
+/// self-correct; a model told "unknown tool 'devmap_serch'" *inside a tool
+/// result* will retry the same non-existent tool, because from its side a tool
+/// result means the tool ran. A protocol error reaches the client runtime, which
+/// is the layer that owns the tool list and can re-read it.
+#[tokio::test]
+async fn an_unknown_tool_is_a_protocol_error_not_a_tool_error() {
+    let store = corpus();
+    let response = call(&store, "devmap_not_a_tool", json!({})).await;
+    assert!(
+        response.get("result").is_none(),
+        "an unknown tool must not be answered with a tool result: {response}"
+    );
+    assert_eq!(
+        response["error"]["code"],
+        json!(-32602),
+        "unknown tool is INVALID_PARAMS per the tools spec: {response}"
+    );
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("devmap_not_a_tool"),
+        "the error must name the tool that does not exist, got: {message}"
+    );
+    assert_eq!(response["id"], json!(1), "the id must survive: {response}");
+}
+
+/// `arguments` that is not an object fails the CallToolRequest schema.
+///
+/// `CallToolRequestParams.arguments` is typed `{ [key: string]: unknown }`, so a
+/// string or an array there is a malformed request — the spec's second listed
+/// protocol-error case — not a value the model chose badly. Reporting it as a
+/// tool error tells the model its *arguments* were rejected when what was
+/// rejected was the shape of the call its runtime built.
+#[tokio::test]
+async fn tool_arguments_that_are_not_an_object_are_a_protocol_error() {
+    let store = corpus();
+    for arguments in [json!("query=helper"), json!(["helper"]), json!(7)] {
+        let response = call(&store, "devmap_search", arguments.clone()).await;
+        assert!(
+            response.get("result").is_none(),
+            "arguments {arguments} is a malformed CallToolRequest, not a bad value: {response}"
+        );
+        assert_eq!(response["error"]["code"], json!(-32602), "{response}");
+    }
+}
+
+/// A cursor this server never issued must be refused, not ignored.
+///
+/// `tools/list` is a paginated operation. This server returns its whole list in
+/// one page and never sets `nextCursor`, so *every* cursor is one it did not
+/// issue. Ignoring it re-serves page one: a client paging through would receive
+/// the same nine tools again under the belief they were the next nine, and
+/// stop only because `nextCursor` was absent — having double-counted the list
+/// and never been told. "Invalid cursors SHOULD result in an error with code
+/// -32602 (Invalid params)."
+#[tokio::test]
+async fn a_tools_list_cursor_this_server_never_issued_is_refused() {
+    let store = corpus();
+    for cursor in [json!("eyJwYWdlIjogMn0="), json!(""), json!(3), json!(null)] {
+        let frame = json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/list",
+            "params": {"cursor": cursor}
+        });
+        let response = handle_line(&store, &frame.to_string())
+            .await
+            .expect("a request must be answered");
+        assert!(
+            response.get("result").is_none(),
+            "cursor {cursor} was silently ignored and page one was re-served: {response}"
+        );
+        assert_eq!(
+            response["error"]["code"],
+            json!(-32602),
+            "an invalid cursor is INVALID_PARAMS: {response}"
+        );
+    }
+}
+
+/// The complete list says it is complete.
+///
+/// Counts never lie: `tools/list` returns every tool this server has, so it must
+/// carry no `nextCursor` — a cursor here would promise a page that does not
+/// exist, and its absence is the only signal a client has that it has seen
+/// everything.
+#[tokio::test]
+async fn an_uncursored_tools_list_is_the_whole_list_and_says_so() {
+    let store = corpus();
+    let response = handle_line(&store, r#"{"jsonrpc":"2.0","id":5,"method":"tools/list"}"#)
+        .await
+        .expect("answered");
+    let result = &response["result"];
+    assert!(
+        result.get("nextCursor").is_none(),
+        "this server pages nothing; a nextCursor would name a page that does not exist: {result}"
+    );
+    assert_eq!(
+        result["tools"].as_array().map(Vec::len),
+        Some(tool_specs().len()),
+        "the listed tools must be all of them, not a capped sample: {result}"
+    );
+}
+
+/// Every result identifies the server that produced it.
+///
+/// "Servers SHOULD include the following `io.modelcontextprotocol/*` field in
+/// every result's `_meta` ... to identify themselves without relying on any
+/// prior connection state." On the modern transport that is not a nicety: there
+/// is no `initialize`, and `DiscoverResult` has no `serverInfo` field of its
+/// own, so `_meta` is the *only* place a client can learn what it is talking to.
+/// Without it, "which devmap version answered this?" is unanswerable for every
+/// caller that did not go through the handshake.
+#[tokio::test]
+async fn every_result_identifies_the_server_that_produced_it() {
+    let store = corpus();
+    for frame in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"server/discover"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"devmap_status","arguments":{}}}"#,
+    ] {
+        let response = handle_line(&store, frame).await.expect("answered");
+        let info = &response["result"]["_meta"]["io.modelcontextprotocol/serverInfo"];
+        assert_eq!(info["name"], json!("devmap"), "for {frame}: {response}");
+        assert!(
+            info["version"].as_str().is_some_and(|v| !v.is_empty()),
+            "Implementation requires a version for {frame}: {response}"
+        );
+    }
+}
+
+/// `tools/list` carries its cache hint on every transport that serves it.
+///
+/// `ListToolsResult` extends `CacheableResult`, so `ttlMs` and `cacheScope` are
+/// required fields of it — and this server advertises `2026-07-28` through
+/// `server/discover` on stdio as well as over HTTP, which is the probe the stdio
+/// binding tells a modern client to send first. `server/discover` already
+/// carried them here; `tools/list` did not, so the same connection answered one
+/// cacheable method with a hint and the other without.
+#[tokio::test]
+async fn tools_list_carries_its_cache_hint_on_the_shared_dispatcher() {
+    let store = corpus();
+    let response = handle_line(&store, r#"{"jsonrpc":"2.0","id":6,"method":"tools/list"}"#)
+        .await
+        .expect("answered");
+    assert_eq!(response["result"]["ttlMs"], json!(300_000), "{response}");
+    assert_eq!(response["result"]["cacheScope"], json!("private"), "{response}");
+
+    // And nothing else claims to be cacheable: an un-annotated result is
+    // uncacheable, and saying otherwise would let a client serve a stale answer
+    // about an index that has since moved.
+    let pinged = handle_line(&store, r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#)
+        .await
+        .expect("answered");
+    assert!(
+        pinged["result"].get("ttlMs").is_none(),
+        "ping is not cacheable and must not be advertised as such: {pinged}"
     );
 }

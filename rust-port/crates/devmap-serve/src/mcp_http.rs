@@ -10,9 +10,12 @@
 //! the same exchange: no session id, no negotiation, nothing retained between
 //! requests.
 //!
-//! That is why `ttlMs` / `cacheScope` are live here and inert on stdio. The
-//! Python server sets them correctly and every version its transport can
-//! negotiate sieves them back out; on this transport they reach the client.
+//! `ttlMs` / `cacheScope` are written by the shared dispatcher, not here: they
+//! are required fields of `ListToolsResult` and `DiscoverResult` in this
+//! revision. What is true of this transport is that they are always *read* —
+//! the Python server sets them correctly and every version its handshake can
+//! negotiate sieves them back out, so a client that reaches them is a client
+//! that got here.
 //!
 //! # Dispatch is shared
 //!
@@ -43,7 +46,7 @@ use hyper::{header, Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{json, Value};
 
-use crate::mcp::{handle_method, StoreSlot, CACHE_TTL_MS, MODERN_PROTOCOL_VERSIONS};
+use crate::mcp::{handle_method, StoreSlot, MODERN_PROTOCOL_VERSIONS};
 
 /// Largest request body accepted, in bytes.
 ///
@@ -63,6 +66,31 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(45);
 /// How long a connection may stay idle before being dropped.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The one media type this endpoint reads and writes.
+const JSON_MEDIA_TYPE: &str = "application/json";
+
+/// Headers the revision requires a client to mirror out of the request body.
+///
+/// Lower-case because `Request::headers` is looked up case-insensitively but
+/// these strings are also what the refusal messages name, and a client reading
+/// "add MCP-Protocol-Version" should be able to search the spec for it.
+const PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
+const METHOD_HEADER: &str = "Mcp-Method";
+const NAME_HEADER: &str = "Mcp-Name";
+
+/// `-32020 HeaderMismatch`: the headers and the body describe different requests,
+/// or a required header is missing or malformed.
+const HEADER_MISMATCH: i64 = -32020;
+
+/// `-32022 UnsupportedProtocolVersion`.
+const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+
+/// `_meta` key carrying the per-request protocol version.
+const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+
+/// `_meta` key carrying the capabilities this request may be answered with.
+const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+
 /// JSON-RPC error code to HTTP status.
 ///
 /// Mirrors the reference SDK's `ERROR_CODE_HTTP_STATUS`. The spec makes the
@@ -80,17 +108,6 @@ fn status_for(code: i64) -> StatusCode {
     }
 }
 
-/// Methods whose answers a client may cache, per the spec's cacheable set.
-///
-/// Only the two this server implements. A method not listed gets no cache
-/// fields, which is the correct default: an un-annotated result is uncacheable.
-fn cache_hint_for(method: &str) -> Option<(u64, &'static str)> {
-    match method {
-        "tools/list" | "server/discover" => Some((CACHE_TTL_MS, "private")),
-        _ => None,
-    }
-}
-
 fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
     let bytes = serde_json::to_vec(body).unwrap_or_else(|_| {
         // Serializing a Value we just built cannot fail in practice; if it
@@ -100,7 +117,7 @@ fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
     });
     Response::builder()
         .status(status)
-        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_TYPE, JSON_MEDIA_TYPE)
         // This endpoint is not for browsers. Saying so explicitly stops a page
         // from reading a response it managed to send.
         .header("X-Content-Type-Options", "nosniff")
@@ -108,11 +125,49 @@ fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::from_static(b"{}"))))
 }
 
+/// `202 Accepted`, empty, which is the whole of a notification's answer.
+///
+/// "If the server accepts it, the server MUST return HTTP status code
+/// `202 Accepted` with no body." A JSON-RPC frame here would carry `id: null`
+/// for a message that has no id, and the revision states the id "MUST NOT be
+/// `null`" — a response the client is required to reject, for a message it was
+/// never going to correlate.
+fn accepted() -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::ACCEPTED)
+        .header("X-Content-Type-Options", "nosniff")
+        .body(Full::new(Bytes::new()))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+}
+
 fn rpc_error_body(id: Value, code: i64, message: impl Into<String>) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": {"code": code, "message": message.into()}
+    })
+}
+
+/// A refusal that also says what would have worked.
+///
+/// `UnsupportedProtocolVersionError` carries a required
+/// `data: { supported, requested }`, and the client's documented recovery is to
+/// "use one of the versions in its advertised `supported` list". Without the
+/// data the refusal is a dead end: the client is told no and handed nothing to
+/// retry with, which is how a version mismatch turns into "the server is down".
+fn unsupported_version_body(id: Value, requested: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": UNSUPPORTED_PROTOCOL_VERSION,
+            "message": format!(
+                "this transport speaks {}; the request stated {requested}. Handshake \
+revisions are served over stdio instead.",
+                MODERN_PROTOCOL_VERSIONS.join(", ")
+            ),
+            "data": {"supported": MODERN_PROTOCOL_VERSIONS, "requested": requested}
+        }
     })
 }
 
@@ -126,24 +181,195 @@ fn rpc_error_body(id: Value, code: i64, message: impl Into<String>) -> Value {
 /// Absent origins pass — that is the non-browser client this exists for.
 /// **`null` also passes, and `null` is not only a non-browser client:** a
 /// sandboxed iframe, a `data:` URL and a `file://` page all send `Origin: null`,
-/// so this check alone does not keep a browser out. Two other properties do, and
-/// because the safety rests on their conjunction rather than on this function,
-/// `a_browser_cannot_reach_this_endpoint_even_with_a_null_origin` pins both:
+/// so this check alone does not keep a browser out. Three other properties do,
+/// and because the safety rests on their conjunction rather than on this
+/// function, `a_browser_cannot_reach_this_endpoint_even_with_a_null_origin`
+/// pins them:
 ///
-/// 1. **POST only.** A JSON body makes the request non-simple, so a browser must
-///    preflight with `OPTIONS`, which is answered `405` — the real request never
-///    leaves the browser.
+/// 1. **POST only, and `application/json` only.** Those two together are what
+///    make the request non-simple, so a browser must preflight with `OPTIONS`,
+///    which is answered `405` — the real request never leaves the browser. The
+///    method alone is not enough: a POST with `Content-Type: text/plain` is a
+///    simple request and is sent without a preflight, which is why
+///    [`content_type_is_json`] is load-bearing rather than tidy.
 /// 2. **No CORS headers, ever.** Without `Access-Control-Allow-Origin` the
 ///    response is unreadable cross-origin even where a request does go out.
+/// 3. **`Host` must not name a routable host on a loopback listener**
+///    ([`host_is_acceptable`]) — the rebinding case that reaches here with
+///    `Origin: null`.
 ///
-/// Adding an `OPTIONS` handler or any `Access-Control-Allow-*` header would
-/// therefore reopen the hole this closes, which is exactly what that test fails
-/// on.
+/// Adding an `OPTIONS` handler, any `Access-Control-Allow-*` header, or a
+/// relaxation of the content type would therefore reopen the hole this closes,
+/// which is exactly what that test fails on.
 fn origin_is_acceptable(request: &Request<Incoming>) -> bool {
     match request.headers().get(header::ORIGIN) {
         None => true,
         Some(origin) => matches!(origin.to_str(), Ok("null")),
     }
+}
+
+/// Refuse a request that reached a loopback listener under a routable name.
+///
+/// The second line against DNS rebinding, and the one that catches what
+/// [`origin_is_acceptable`] cannot: a sandboxed iframe, a `data:` URL and a
+/// `file://` page all send `Origin: null`, which that function accepts by
+/// design. A page that resolved `evil.example` to 127.0.0.1 still has to send
+/// `Host: evil.example`, and nothing can legitimately reach a loopback socket
+/// under a public name — the name does not resolve to 127.0.0.1 for anyone whose
+/// resolver has not been steered.
+///
+/// Scoped to loopback listeners on purpose. The module's contract is that the
+/// bind address is the caller's to choose, and a deployment that binds a
+/// routable interface has a real hostname that must keep working; refusing every
+/// unfamiliar `Host` would break it for a threat it does not have.
+///
+/// IP literals pass. Rebinding needs a *name* for the browser to resolve, and a
+/// caller that already knows the socket address is not being steered to it.
+fn host_is_acceptable(request: &Request<Incoming>, local: Option<SocketAddr>) -> bool {
+    if !local.is_some_and(|addr| addr.ip().is_loopback()) {
+        return true;
+    }
+    let Some(host) = request.headers().get(header::HOST) else {
+        // HTTP/1.1 requires a Host; hyper rejects a request without one before
+        // this point, and HTTP/2 synthesises it from `:authority`. Absent here
+        // means there is nothing to steer, so there is nothing to refuse.
+        return true;
+    };
+    let Ok(host) = host.to_str() else {
+        return false;
+    };
+    let name = strip_port(host);
+    name.parse::<std::net::IpAddr>().is_ok()
+        || name.eq_ignore_ascii_case("localhost")
+        || name.to_ascii_lowercase().ends_with(".localhost")
+}
+
+/// The host portion of an authority, with the port and any IPv6 brackets gone.
+fn strip_port(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        // `[::1]:8080` — the colons inside the brackets are the address.
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match authority.rsplit_once(':') {
+        Some((host, _)) => host,
+        None => authority,
+    }
+}
+
+/// Whether the body's media type is the one this endpoint reads.
+///
+/// Enforcing this is half of what keeps a browser out, and the half the module
+/// header claims without checking. A POST with `Content-Type: text/plain` is a
+/// CORS-*simple* request: no preflight, so it is never stopped by the `OPTIONS`
+/// refusal, and `Origin: null` from a sandboxed page reaches the handler and
+/// runs. Requiring `application/json` is what makes every browser request
+/// non-simple and therefore preflighted — and the preflight is answered `405`.
+///
+/// Absent counts as wrong. A `fetch` with a typeless `Blob` body sends no
+/// `Content-Type` at all, so treating "absent" as "probably JSON" would leave
+/// the same hole open under a different shape.
+fn content_type_is_json(request: &Request<Incoming>) -> bool {
+    request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            let essence = value.split(';').next().unwrap_or("").trim();
+            essence.eq_ignore_ascii_case(JSON_MEDIA_TYPE)
+        })
+}
+
+/// Whether the client said it can read what this endpoint sends.
+///
+/// This transport answers with `application/json` and has no SSE stream, so a
+/// client whose `Accept` excludes JSON would be handed a body it declared it
+/// could not parse. An absent header is `*/*` per RFC 9110 and passes.
+///
+/// The most specific matching range decides, and `q=0` on it is a refusal rather
+/// than a match — a client that writes `application/json;q=0` has said the one
+/// thing this endpoint produces is unacceptable, and answering anyway would be
+/// reading its header as decoration.
+fn accepts_json(request: &Request<Incoming>) -> bool {
+    let Some(accept) = request.headers().get(header::ACCEPT) else {
+        return true;
+    };
+    let Ok(accept) = accept.to_str() else {
+        return false;
+    };
+    if accept.trim().is_empty() {
+        return true;
+    }
+    // (specificity, quality) of the best match so far. Specificity: 2 for
+    // `application/json`, 1 for `application/*`, 0 for `*/*`.
+    let mut best: Option<(u8, f32)> = None;
+    for range in accept.split(',') {
+        let mut parts = range.split(';');
+        let essence = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        let specificity = match essence.as_str() {
+            JSON_MEDIA_TYPE => 2,
+            "application/*" => 1,
+            "*/*" => 0,
+            _ => continue,
+        };
+        let quality = parts
+            .filter_map(|parameter| {
+                let (key, value) = parameter.split_once('=')?;
+                key.trim().eq_ignore_ascii_case("q").then_some(value)
+            })
+            .next()
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .unwrap_or(1.0);
+        if best.is_none_or(|(seen, _)| specificity > seen) {
+            best = Some((specificity, quality));
+        }
+    }
+    match best {
+        Some((_, quality)) => quality > 0.0,
+        None => false,
+    }
+}
+
+/// Decode the `=?base64?…?=` sentinel a client uses for a header value that
+/// cannot be written as plain ASCII.
+///
+/// Needed for correctness, not completeness. `Mcp-Name` mirrors `params.name`,
+/// which is whatever the model asked for: a call to `devmap_søk` forces a
+/// conforming client to encode the header, and a server that compared the
+/// encoded form to the raw body value would answer `HeaderMismatch` for a
+/// request whose only fault is that the tool does not exist. Wrong error, wrong
+/// recovery.
+///
+/// Returns `None` for a malformed encoding rather than falling back to the raw
+/// text: a value we could not decode is a value we did not check, and a check
+/// that could not run must not report what a check that passed reports.
+fn decode_header_value(value: &str) -> Option<String> {
+    let Some(encoded) = value
+        .strip_prefix("=?base64?")
+        .and_then(|rest| rest.strip_suffix("?="))
+    else {
+        return Some(value.to_string());
+    };
+    let mut bytes = Vec::with_capacity(encoded.len() * 3 / 4);
+    let mut accumulator: u32 = 0;
+    let mut bits: u32 = 0;
+    for byte in encoded.bytes() {
+        let sextet = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            _ => return None,
+        };
+        accumulator = (accumulator << 6) | u32::from(sextet);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push((accumulator >> bits) as u8);
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// Read the body, refusing anything over [`MAX_BODY_BYTES`].
@@ -189,8 +415,176 @@ async fn read_body(request: Request<Incoming>) -> Result<Bytes, (StatusCode, Str
     Ok(Bytes::from(collected))
 }
 
+/// One mirrored header, with "present but unreadable" kept distinct from
+/// "absent".
+///
+/// Collapsing the two would let a header carrying bytes we could not decode be
+/// treated as a header the client never sent — a check that could not run
+/// reporting what a check that ran and passed reports.
+enum HeaderRead {
+    Absent,
+    Value(String),
+    Undecodable,
+}
+
+impl HeaderRead {
+    fn from(request: &Request<Incoming>, name: &str) -> Self {
+        match request.headers().get(name) {
+            None => Self::Absent,
+            Some(raw) => match raw.to_str().ok().and_then(decode_header_value) {
+                Some(value) => Self::Value(value),
+                None => Self::Undecodable,
+            },
+        }
+    }
+}
+
+/// The headers this revision requires a client to mirror out of the body.
+///
+/// Read before the body is consumed, because `read_body` takes the request.
+struct MirroredHeaders {
+    protocol_version: HeaderRead,
+    method: HeaderRead,
+    name: HeaderRead,
+}
+
+impl MirroredHeaders {
+    fn read(request: &Request<Incoming>) -> Self {
+        Self {
+            protocol_version: HeaderRead::from(request, PROTOCOL_VERSION_HEADER),
+            method: HeaderRead::from(request, METHOD_HEADER),
+            name: HeaderRead::from(request, NAME_HEADER),
+        }
+    }
+
+    /// Check the headers against the body they claim to describe.
+    ///
+    /// `None` when they agree. Otherwise the status and JSON-RPC error body to
+    /// send, already carrying the request's own id so the client can match the
+    /// failure to the call it made.
+    ///
+    /// The mismatch case is a security requirement, not a tidiness one: "this
+    /// prevents potential security vulnerabilities when different components in
+    /// the network rely on different sources of truth (e.g., a load balancer
+    /// routing on the header value while the MCP server executes based on the
+    /// body value)". A gateway that authorised `Mcp-Name: devmap_status` and
+    /// forwarded a body calling `devmap_preview` is exactly that.
+    fn check(&self, body: &Value, id: &Value, method: &str) -> Option<(StatusCode, Value)> {
+        let mismatch = |message: String| {
+            Some((
+                StatusCode::BAD_REQUEST,
+                rpc_error_body(id.clone(), HEADER_MISMATCH, message),
+            ))
+        };
+
+        // The version header first: it is the header an intermediary reads to
+        // decide whether header/body validation applies at all, so a request
+        // without it cannot be checked by anything downstream either.
+        let version = match &self.protocol_version {
+            HeaderRead::Absent => {
+                return mismatch(format!(
+                    "every request POST must carry {PROTOCOL_VERSION_HEADER}; this transport \
+serves only {} and has no earlier revision to read a header-less request under.",
+                    MODERN_PROTOCOL_VERSIONS.join(", ")
+                ))
+            }
+            HeaderRead::Undecodable => {
+                return mismatch(format!("{PROTOCOL_VERSION_HEADER} is not readable text"))
+            }
+            HeaderRead::Value(value) => value.as_str(),
+        };
+
+        let meta = body.pointer("/params/_meta");
+        match meta
+            .and_then(|meta| meta.get(META_PROTOCOL_VERSION))
+            .and_then(Value::as_str)
+        {
+            None => {
+                return Some((
+                    StatusCode::BAD_REQUEST,
+                    rpc_error_body(
+                        id.clone(),
+                        -32602,
+                        format!(
+                            "params._meta.{META_PROTOCOL_VERSION} is required on every request: \
+this revision replaced the initialize handshake with per-request metadata, so the version \
+cannot be inferred from an earlier exchange."
+                        ),
+                    ),
+                ))
+            }
+            Some(stated) if stated != version => {
+                return mismatch(format!(
+                    "{PROTOCOL_VERSION_HEADER} is {version} but params._meta.\
+{META_PROTOCOL_VERSION} is {stated}; the header and the body must state the same revision."
+                ))
+            }
+            Some(_) => {}
+        }
+
+        if !MODERN_PROTOCOL_VERSIONS.contains(&version) {
+            return Some((
+                StatusCode::BAD_REQUEST,
+                unsupported_version_body(id.clone(), version),
+            ));
+        }
+
+        if meta.and_then(|meta| meta.get(META_CLIENT_CAPABILITIES)).is_none() {
+            return Some((
+                StatusCode::BAD_REQUEST,
+                rpc_error_body(
+                    id.clone(),
+                    -32602,
+                    format!(
+                        "params._meta.{META_CLIENT_CAPABILITIES} is required on every request. \
+An empty object declares no optional capabilities; omitting it is not the same statement, \
+because a server must not infer capabilities from a previous request."
+                    ),
+                ),
+            ));
+        }
+
+        match &self.method {
+            HeaderRead::Absent => {
+                return mismatch(format!(
+                    "{METHOD_HEADER} is required on every request and must carry the body's \
+method, which here is '{method}'"
+                ))
+            }
+            HeaderRead::Undecodable => {
+                return mismatch(format!("{METHOD_HEADER} is not readable text"))
+            }
+            HeaderRead::Value(value) if value != method => {
+                return mismatch(format!(
+                    "{METHOD_HEADER} is '{value}' but the body calls '{method}'"
+                ))
+            }
+            HeaderRead::Value(_) => {}
+        }
+
+        // `Mcp-Name` mirrors `params.name`, and is required exactly where that
+        // field exists. `tools/call` is the only such method this server has.
+        let named = body.pointer("/params/name").and_then(Value::as_str)?;
+        match &self.name {
+            HeaderRead::Absent => mismatch(format!(
+                "{NAME_HEADER} is required on a request carrying params.name, which here is \
+'{named}'"
+            )),
+            HeaderRead::Undecodable => mismatch(format!(
+                "{NAME_HEADER} is not readable text; a value that cannot be written as plain \
+ASCII is carried as =?base64?<utf-8>?="
+            )),
+            HeaderRead::Value(value) if value != named => mismatch(format!(
+                "{NAME_HEADER} is '{value}' but the body names '{named}'"
+            )),
+            HeaderRead::Value(_) => None,
+        }
+    }
+}
+
 async fn handle_request(
     store: Arc<StoreSlot>,
+    local: Option<SocketAddr>,
     request: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     if !origin_is_acceptable(&request) {
@@ -205,20 +599,67 @@ and has no browser client",
         ));
     }
 
+    if !host_is_acceptable(&request, local) {
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            &rpc_error_body(
+                Value::Null,
+                -32600,
+                "this listener is on loopback and the request named a routable host: nothing \
+can legitimately reach 127.0.0.1 under a public name, so this is a rebound request",
+            ),
+        ));
+    }
+
     if request.method() != Method::POST {
         // The modern transport is POST-only. A GET here is usually a client
         // reaching for the legacy SSE stream, so the message says which
         // transport this is rather than only which verb was wrong.
+        //
+        // `Allow` because RFC 9110 §15.5.6 makes it a MUST on a 405, and because
+        // without it a client that got here has to guess.
+        let body = rpc_error_body(
+            Value::Null,
+            -32600,
+            "this endpoint speaks the MCP 2026-07-28 single-exchange transport: one \
+JSON-RPC request per POST. It has no SSE stream and no session.",
+        );
+        let mut response = json_response(StatusCode::METHOD_NOT_ALLOWED, &body);
+        response
+            .headers_mut()
+            .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+        return Ok(response);
+    }
+
+    if !content_type_is_json(&request) {
         return Ok(json_response(
-            StatusCode::METHOD_NOT_ALLOWED,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
             &rpc_error_body(
                 Value::Null,
                 -32600,
-                "this endpoint speaks the MCP 2026-07-28 single-exchange transport: one \
-JSON-RPC request per POST. It has no SSE stream and no session.",
+                format!(
+                    "this endpoint reads only {JSON_MEDIA_TYPE}. Requiring it is also what \
+forces a browser to preflight, and the preflight is refused."
+                ),
             ),
         ));
     }
+
+    if !accepts_json(&request) {
+        return Ok(json_response(
+            StatusCode::NOT_ACCEPTABLE,
+            &rpc_error_body(
+                Value::Null,
+                -32600,
+                format!(
+                    "this endpoint answers with {JSON_MEDIA_TYPE} and has no SSE stream; the \
+request's Accept header excludes it."
+                ),
+            ),
+        ));
+    }
+
+    let headers = MirroredHeaders::read(&request);
 
     let body = match read_body(request).await {
         Ok(body) => body,
@@ -254,11 +695,43 @@ JSON-RPC request per POST. It has no SSE stream and no session.",
         }
     };
 
+    // "The body of the HTTP POST MUST be a single JSON-RPC request or
+    // notification." Named as the fault it is: an array reported as "no string
+    // 'method'" sends a client looking for a missing field in a body that has no
+    // fields, and batching is a thing the client may well believe it can do —
+    // the stdio transport here does accept it.
+    if !parsed.is_object() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &rpc_error_body(
+                Value::Null,
+                -32600,
+                if parsed.is_array() {
+                    "a batch is not a valid body for this transport: the MCP 2026-07-28 \
+Streamable HTTP binding takes a single JSON-RPC request or notification per POST. Send one \
+request per POST."
+                } else {
+                    "the body must be a single JSON-RPC request or notification object"
+                },
+            ),
+        ));
+    }
+
     // The id is recovered before dispatch so that an error can be reported
     // against it. A client matching responses to ids cannot use a frame whose id
     // is null, so losing the id turns a reportable failure into an unmatchable
     // one.
+    //
+    // Presence, not value: a body with no `id` member is a notification, and a
+    // notification is answered `202` with nothing in it.
+    let is_request = parsed.get("id").is_some();
     let id = parsed.get("id").cloned().unwrap_or(Value::Null);
+    if parsed.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &rpc_error_body(id, -32600, "jsonrpc must be \"2.0\""),
+        ));
+    }
     let method = match parsed.get("method").and_then(Value::as_str) {
         Some(method) => method.to_string(),
         None => {
@@ -268,37 +741,14 @@ JSON-RPC request per POST. It has no SSE stream and no session.",
             ))
         }
     };
-    if parsed.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &rpc_error_body(id, -32600, "jsonrpc must be \"2.0\""),
-        ));
-    }
 
-    // A modern request states its protocol version in `_meta`. An absent one is
-    // accepted as the era's only revision; a *stated* one that we do not speak is
-    // refused rather than answered, because answering it would mean guessing
-    // which surface the client expects and being wrong silently.
-    if let Some(stated) = parsed
-        .get("params")
-        .and_then(|p| p.get("_meta"))
-        .and_then(|m| m.get("io.modelcontextprotocol/protocolVersion"))
-        .and_then(Value::as_str)
-    {
-        if !MODERN_PROTOCOL_VERSIONS.contains(&stated) {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &rpc_error_body(
-                    id,
-                    // UNSUPPORTED_PROTOCOL_VERSION
-                    -32022,
-                    format!(
-                        "this transport speaks {}; the request stated {stated}. Handshake \
-revisions are served over stdio instead.",
-                        MODERN_PROTOCOL_VERSIONS.join(", ")
-                    ),
-                ),
-            ));
+    // Only for requests. The revision states outright that "header requirements
+    // for notification POSTs are not defined by this revision", and the `_meta`
+    // protocol fields are specified for *client requests* — a notification that
+    // carried neither would be refused for a rule that was never written.
+    if is_request {
+        if let Some((status, body)) = headers.check(&parsed, &id, &method) {
+            return Ok(json_response(status, &body));
         }
     }
 
@@ -325,24 +775,31 @@ revisions are served over stdio instead.",
         }
     };
 
-    match outcome {
-        Ok(result) => {
-            // A notification over this transport still gets a body: there is no
-            // stream to leave silent, and an empty 200 is what a POST-per-exchange
-            // client is waiting on.
-            let mut result = result.unwrap_or_else(|| json!({}));
-            if let Some((ttl, scope)) = cache_hint_for(&method) {
-                if let Some(object) = result.as_object_mut() {
-                    object.insert("ttlMs".to_string(), json!(ttl));
-                    object.insert("cacheScope".to_string(), json!(scope));
-                }
-            }
-            Ok(json_response(
-                StatusCode::OK,
-                &json!({"jsonrpc": "2.0", "id": id, "result": result}),
-            ))
-        }
-        Err(err) => Ok(json_response(
+    match (outcome, is_request) {
+        // "If the server accepts it, the server MUST return HTTP status code
+        // 202 Accepted with no body."
+        (Ok(_), false) => Ok(accepted()),
+        // No cache hint is written here. `tools/list` and `server/discover`
+        // carry their own `ttlMs`/`cacheScope` out of the shared dispatcher,
+        // where they are required fields of `ListToolsResult` and
+        // `DiscoverResult` rather than an HTTP decoration. This module used to
+        // insert the same two values a second time on top of the ones
+        // `discover_result` had already written — a second owner writing the
+        // same field, which is one edit away from two owners writing different
+        // ones.
+        (Ok(result), true) => Ok(json_response(
+            StatusCode::OK,
+            &json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        )),
+        // "If the server cannot accept it, it MUST return an HTTP error status
+        // code. The HTTP response body MAY comprise a JSON-RPC error response
+        // that has no `id`." An unknown notification method is the case: 202
+        // would claim this server acted on something it discarded.
+        (Err(err), false) => Ok(json_response(
+            status_for(err.code()),
+            &json!({"jsonrpc": "2.0", "error": {"code": err.code(), "message": err.message()}}),
+        )),
+        (Err(err), true) => Ok(json_response(
             status_for(err.code()),
             &rpc_error_body(id, err.code(), err.message()),
         )),
@@ -376,10 +833,16 @@ pub async fn serve_http_on(
                 continue;
             }
         };
+        // The address this connection was accepted *on*, not the peer's. It is
+        // what tells `host_is_acceptable` whether the listener is on loopback,
+        // and therefore whether a `Host` naming a routable name could ever be
+        // legitimate. Read per connection because a caller may bind anywhere.
+        let local = stream.local_addr().ok();
         let store = Arc::clone(&store);
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
-            let service = service_fn(move |request| handle_request(Arc::clone(&store), request));
+            let service =
+                service_fn(move |request| handle_request(Arc::clone(&store), local, request));
             let connection = http1::Builder::new()
                 // hyper panics at connection setup if a timeout is configured
                 // with no timer to drive it — "timeout `header_read_timeout`
