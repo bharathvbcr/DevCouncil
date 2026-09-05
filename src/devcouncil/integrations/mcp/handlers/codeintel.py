@@ -68,7 +68,7 @@ def tools() -> list[Tool]:
         Tool(
             name="devcouncil_code_explore",
             description="Unified code exploration: source, callers/callees, semantic hops, and blast radius.",
-            inputSchema=_schema({
+            input_schema=_schema({
                 "query": {"type": "string", "maxLength": _MAX_STRING_LENGTH},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
             }, ["query"]),
@@ -76,7 +76,7 @@ def tools() -> list[Tool]:
         Tool(
             name="devcouncil_code_search",
             description="FTS5 symbol, qualified-name, and path search over the committed generation.",
-            inputSchema=_schema({
+            input_schema=_schema({
                 "query": {"type": "string", "maxLength": _MAX_STRING_LENGTH},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
             }, ["query"]),
@@ -84,7 +84,7 @@ def tools() -> list[Tool]:
         Tool(
             name="devcouncil_code_path",
             description="Shortest call/import/framework path with confidence and provenance per hop.",
-            inputSchema=_schema({
+            input_schema=_schema({
                 "from": {"type": "string", "maxLength": _MAX_STRING_LENGTH},
                 "to": {"type": "string", "maxLength": _MAX_STRING_LENGTH},
                 "maxDepth": {"type": "integer", "minimum": 1, "maximum": 64, "default": 32},
@@ -93,7 +93,7 @@ def tools() -> list[Tool]:
         Tool(
             name="devcouncil_code_impact",
             description="Inbound symbol blast radius for one or more paths/symbols.",
-            inputSchema=_schema({
+            input_schema=_schema({
                 "targets": {
                     "type": "array",
                     "items": {"type": "string", "maxLength": _MAX_STRING_LENGTH},
@@ -105,7 +105,7 @@ def tools() -> list[Tool]:
         Tool(
             name="devcouncil_code_dead",
             description="Confidence-tiered dead-code candidates; never deletes code.",
-            inputSchema=_schema({
+            input_schema=_schema({
                 "minimumConfidence": {
                     "type": "string",
                     "enum": ["extracted", "inferred", "ambiguous"],
@@ -116,7 +116,7 @@ def tools() -> list[Tool]:
         Tool(
             name="devcouncil_code_affected_tests",
             description="Tests reachable through the inbound blast radius of paths/symbols.",
-            inputSchema=_schema({
+            input_schema=_schema({
                 "targets": {
                     "type": "array",
                     "items": {"type": "string", "maxLength": _MAX_STRING_LENGTH},
@@ -128,7 +128,7 @@ def tools() -> list[Tool]:
         Tool(
             name="devcouncil_code_sync",
             description="Reconcile and commit pending source changes to the canonical index.",
-            inputSchema=_schema({
+            input_schema=_schema({
                 "paths": {
                     "type": "array",
                     "items": {"type": "string", "maxLength": _MAX_STRING_LENGTH},
@@ -139,7 +139,7 @@ def tools() -> list[Tool]:
         Tool(
             name="devcouncil_code_status",
             description="Canonical generation, native watcher backend, pending files, and degraded state.",
-            inputSchema=_schema({}),
+            input_schema=_schema({}),
         ),
     ]
 

@@ -57,7 +57,7 @@ async def list_resources(root: Path) -> list[Resource]:
                     uri=item["uri"],
                     name=item["name"],
                     description=item["description"],
-                    mimeType=item["mimeType"],
+                    mime_type=item["mimeType"],
                 )
                 for item in descriptors
                 if isinstance(item, dict) and item.get("uri")
@@ -70,7 +70,7 @@ async def list_resources(root: Path) -> list[Resource]:
             uri=item["uri"],
             name=item["name"],
             description=item["description"],
-            mimeType=item["mimeType"],
+            mime_type=item["mimeType"],
         )
         for item in list_mcp_resource_uris(root)
     ]

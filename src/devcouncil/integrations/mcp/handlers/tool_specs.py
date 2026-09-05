@@ -160,9 +160,9 @@ def _annotated(tool: Tool) -> Tool:
     read_only, destructive, idempotent, open_world = behaviour
     return tool.model_copy(
         update={
-            # Field names, not the wire aliases the ``Tool`` literals below use:
-            # the two build the same object, and only this form type-checks.
-            # Serialization is ``by_alias``, so the wire still says
+            # Field names, as everywhere this package builds an SDK model:
+            # ``mcp.types`` accepts the wire alias too, but only the field name
+            # type-checks. Serialization is ``by_alias``, so the wire still says
             # ``readOnlyHint``.
             "annotations": ToolAnnotations(
                 read_only_hint=read_only,

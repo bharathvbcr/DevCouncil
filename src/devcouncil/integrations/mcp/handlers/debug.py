@@ -68,7 +68,7 @@ def tools() -> list[Tool]:
                 "Discover installed DAP adapters after explicit one-time consent; "
                 "returns paths, versions, hashes, and launch/attach support."
             ),
-            inputSchema=_schema({"consent": {
+            input_schema=_schema({"consent": {
                 "type": "boolean",
                 "default": False,
                 "description": (
@@ -82,7 +82,7 @@ def tools() -> list[Tool]:
         Tool(
             name="devcouncil_debug_start",
             description="Launch or attach a capability-negotiated DAP session.",
-            inputSchema=_schema({
+            input_schema=_schema({
                 "adapterId": {"type": "string"},
                 "adapterCommand": {"type": "array", "items": {"type": "string"}},
                 "request": {"type": "string", "enum": ["launch", "attach"], "default": "launch"},
@@ -97,7 +97,7 @@ def tools() -> list[Tool]:
         Tool(
             name="devcouncil_debug_breakpoints",
             description="Replace all breakpoints for one source in a DAP session.",
-            inputSchema=_schema({
+            input_schema=_schema({
                 "sessionId": {"type": "string"},
                 "source": {"type": "string", "description": "Source file inside the server root."},
                 "lines": {"type": "array", "items": {"type": "integer"}},
@@ -106,7 +106,7 @@ def tools() -> list[Tool]:
         Tool(
             name="devcouncil_debug_control",
             description="Continue, pause, or step a DAP session.",
-            inputSchema=_schema({
+            input_schema=_schema({
                 "sessionId": {"type": "string"},
                 "action": {"type": "string", "enum": ["continue", "pause", "next", "stepIn", "stepOut"]},
                 "threadId": {"type": "integer"},
@@ -115,7 +115,7 @@ def tools() -> list[Tool]:
         Tool(
             name="devcouncil_debug_inspect",
             description="Inspect threads, stack frames, scopes, variables, source, or disassembly.",
-            inputSchema=_schema({
+            input_schema=_schema({
                 "sessionId": {"type": "string"},
                 "operation": {"type": "string", "enum": ["threads", "stackTrace", "scopes", "variables", "source", "disassemble"]},
                 "arguments": {"type": "object"},
@@ -124,7 +124,7 @@ def tools() -> list[Tool]:
         Tool(
             name="devcouncil_debug_evaluate",
             description="Side-effectful DAP evaluate; allowSideEffects must be explicitly true.",
-            inputSchema=_schema({
+            input_schema=_schema({
                 "sessionId": {"type": "string"},
                 "expression": {"type": "string"},
                 "frameId": {"type": "integer"},
@@ -134,7 +134,7 @@ def tools() -> list[Tool]:
         Tool(
             name="devcouncil_debug_trace",
             description="Capture a DAP stack, run exact Python tracing, or import JSONL/Node CPU profile evidence.",
-            inputSchema=_schema({
+            input_schema=_schema({
                 "provider": {"type": "string", "enum": ["dap-stack", "python", "node", "import"]},
                 "sessionId": {"type": "string"},
                 "threadId": {"type": "integer"},
@@ -146,7 +146,7 @@ def tools() -> list[Tool]:
         Tool(
             name="devcouncil_debug_stop",
             description="Disconnect a DAP session and optionally leave the debuggee running.",
-            inputSchema=_schema({
+            input_schema=_schema({
                 "sessionId": {"type": "string"},
                 "terminateDebuggee": {"type": "boolean", "default": True},
             }, ["sessionId"]),
