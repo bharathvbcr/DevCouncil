@@ -184,3 +184,110 @@ fn writing_only_inside_a_tagged_cache_directory_does_not_move_the_content_finger
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The second shape of the same disagreement, found by attacking the pair
+/// rather than by re-reading the cache rule.
+///
+/// Discovery refuses a symlink whose target resolves outside the repository —
+/// `preview` and `classify_pending_entry` have always refused such a path, and
+/// `collect_sources_with_report` now does too, recording it as
+/// `DiscoverySkipReason::EscapesRoot`. `git ls-files` lists the link (it is a
+/// tracked mode-120000 entry), and `keep_indexable`'s final `is_file()` follows
+/// it, so the inventory counted a file discovery will never index and hashed
+/// bytes the map does not describe.
+///
+/// Measured with the release binary before the fix, on the fixture below:
+///
+/// ```text
+/// devmap build      files_indexed: 1   discovery_refused_files: 1   (paths: a.py)
+/// devmap freshness  files: 2           c2:496ee98036e5aaad…
+/// # edit the file OUTSIDE the repository, through the in-tree symlink
+/// devmap freshness  files: 2           c2:8bcb1a2b56f64d37…
+/// ```
+///
+/// The direction is the same as the cache case and so is the cost: the map
+/// reads stale on a file it deliberately never indexed, so `--if-stale`,
+/// `--watch` and `verify` rebuild on a change they cannot absorb.
+#[test]
+fn a_symlink_out_of_the_repository_is_absent_from_the_inventory_too() {
+    let base = std::env::temp_dir().join(format!(
+        "devmap-escapelink-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let root = base.join("repo");
+    let outside = base.join("elsewhere");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("s.py"), "SECRET_V1 = 1\n").unwrap();
+    std::fs::write(root.join("a.py"), "def a():\n    return 1\n").unwrap();
+    std::os::unix::fs::symlink(outside.join("s.py"), root.join("esc.py")).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "-A"],
+        vec![
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "x",
+        ],
+    ] {
+        let ok = Command::new("git")
+            .args(&args)
+            .current_dir(&root)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("skipped: git is unavailable here");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+    }
+
+    // The premise, checked rather than assumed: git really does list the link,
+    // so the inventory has something to wrongly keep.
+    let listed = Command::new("git")
+        .args(["ls-files"])
+        .current_dir(&root)
+        .output()
+        .expect("git ls-files");
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listed.contains("esc.py"),
+        "the fixture must have a tracked symlink for this to mean anything: {listed}"
+    );
+
+    let indexed = discovered(&root);
+    assert!(
+        !indexed.iter().any(|path| path == "esc.py"),
+        "discovery must refuse the escaping symlink, or this test is about \
+         something else: {indexed:?}"
+    );
+
+    let listing = inventory(&root, InventoryLimits::default());
+    assert!(matches!(listing.source, InventorySource::Git));
+    assert!(
+        !listing.files.iter().any(|path| path == "esc.py"),
+        "the inventory counted a file discovery refuses to index: {:?}",
+        listing.files
+    );
+
+    // And the digest must not move when a file outside the repository does.
+    let before = content_fingerprint(&root, &listing.files, false);
+    std::fs::write(outside.join("s.py"), "SECRET_V2 = 2\n").unwrap();
+    let after = content_fingerprint(&root, &listing.files, false);
+    assert_eq!(
+        before, after,
+        "editing a file outside the repository moved this repository's content \
+         fingerprint, so the map reads stale on a change it can never absorb"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}

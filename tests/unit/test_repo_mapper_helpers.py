@@ -1443,3 +1443,57 @@ def test_subsystem_carries_role_file_counts_field():
 
     sub = RepoSubsystem(area="a", summary="", entry_points=[], critical_files=[])
     assert sub.role_file_counts == {}
+
+
+def test_get_git_files_drops_a_symlink_that_leaves_the_repository(tmp_path) -> None:
+    """The inventory counts what the map covers, and a symlink out is not covered.
+
+    The kernel refuses such a path at discovery
+    (``DiscoverySkipReason::EscapesRoot``), because ``preview`` and the drain's
+    ``classify_pending_entry`` have always refused a path that resolves outside
+    the repository root. ``git ls-files`` lists the link — it is an ordinary
+    mode-120000 entry — and ``_keep``'s ``is_file()`` follows it, so the
+    inventory counted a file that is never indexed and
+    ``_content_fingerprint`` hashed bytes the map does not describe. The map
+    then reads stale on a change it can never absorb, which is the same failure
+    ``_CacheDirectoryCache`` was added for, in a second shape.
+
+    ``freshness_parity`` compares this list against the kernel's file for file,
+    so this rule and ``devmap_extract::escapes_root`` have to agree.
+    """
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "s.py").write_text("SECRET_V1 = 1\n")
+    root = tmp_path / "repo"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "app.py").write_text("def app():\n    return 1\n")
+    (root / "esc.py").symlink_to(outside / "s.py")
+    (root / "inside.py").symlink_to(root / "src" / "app.py")
+
+    for args in (
+        ["init", "-q"],
+        ["add", "-A"],
+        ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"],
+    ):
+        result = subprocess.run(
+            ["git", *args], cwd=root, capture_output=True, text=True, check=False
+        )
+        if result.returncode != 0:
+            pytest.skip(f"git unavailable: {result.stderr.strip()}")
+
+    # The premise, asserted rather than assumed: git really does track the link.
+    listed = subprocess.run(
+        ["git", "ls-files"], cwd=root, capture_output=True, text=True, check=True
+    ).stdout.split()
+    assert "esc.py" in listed, listed
+
+    files = RepoMapper(root).get_git_files()
+    assert "esc.py" not in files, (
+        "the inventory kept a symlink whose target is outside the repository, so "
+        f"the content fingerprint hashes bytes the map never indexes: {files}"
+    )
+    # A symlink whose target is inside the tree is ordinary and stays: the bytes
+    # it names are in the repository under their own path either way, and the
+    # kernel's discovery walk keeps it too.
+    assert "inside.py" in files, files
+    assert "src/app.py" in files, files

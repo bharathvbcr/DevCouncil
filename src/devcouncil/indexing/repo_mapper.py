@@ -2020,6 +2020,42 @@ class RepoMapper:
                 return empty, empty
             return empty
 
+    def _escapes_root(self, path: str) -> bool:
+        """Whether ``path`` is a symlink pointing out of the repository.
+
+        A transcription of ``devmap_extract::escapes_root``, and paired with it
+        by ``freshness_parity``, which compares the two inventories file for
+        file. The kernel refuses such a path at discovery
+        (``DiscoverySkipReason::EscapesRoot``) for the reason ``preview`` and
+        the drain's ``classify_pending_entry`` have always refused it: a file
+        outside the repository is not this repository's file. ``git ls-files``
+        lists the link anyway — it is an ordinary mode-120000 entry — and the
+        ``is_file()`` beside this call follows it, so without this the inventory
+        counted a path the map never indexes and ``_content_fingerprint``
+        hashed bytes it does not describe. The map then read stale on a change
+        it can never absorb, which is exactly what ``_CacheDirectoryCache``
+        was added to stop, in a second shape.
+
+        Not a symlink: ``False`` in one ``lstat``, which is every path in an
+        ordinary repository. Fail-closed when the target will not resolve — a
+        dangling link, a loop, a parent that lost ``+x`` — because containment
+        that could not be established is not containment.
+        """
+        absolute = self.project_root / path
+        try:
+            if not absolute.is_symlink():
+                return False
+        except OSError:
+            return True
+        try:
+            root = self.project_root.resolve()
+        except OSError:
+            root = self.project_root
+        try:
+            return not absolute.resolve().is_relative_to(root)
+        except OSError:
+            return True
+
     def _is_runtime_or_generated_file(self, path: str) -> bool:
         normalized = path.replace("\\", "/")
         parts = set(normalized.split("/"))
@@ -2140,6 +2176,7 @@ class RepoMapper:
                     for path in paths
                     if not self._is_runtime_or_generated_file(path)
                     and not caches.is_inside_tagged_cache(path)
+                    and not self._escapes_root(path)
                     and (self.project_root / path).is_file()
                 ]
 

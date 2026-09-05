@@ -503,6 +503,12 @@ pub(crate) fn walk_error_path(error: &ignore::Error) -> Option<&Path> {
 
 /// Where a symlinked candidate actually points, when that is outside `root`.
 ///
+/// Public because the *freshness inventory* has to ask the same question and
+/// get the same answer. `freshness::keep_indexable` and this walk each decide
+/// what the map covers; two implementations of "does this path leave the
+/// repository" is how they come to disagree, and a disagreement there makes a
+/// map permanently stale on a file it deliberately never indexed.
+///
 /// `None` for anything that is not a symlink — the ordinary case, and one stat
 /// — and for a symlink whose target resolves inside the repository, which is
 /// the monorepo's shared config or vendored header and whose bytes the walk
@@ -517,7 +523,7 @@ pub(crate) fn walk_error_path(error: &ignore::Error) -> Option<&Path> {
 /// parent that lost `+x`. Containment is then *unknown*, and unknown must not
 /// be recorded as proven-inside; the path is refused and the reason travels
 /// with it.
-fn escapes_root(root: &Path, path: &Path) -> Option<String> {
+pub fn escapes_root(root: &Path, path: &Path) -> Option<String> {
     let link = fs::symlink_metadata(path).ok()?;
     if !link.file_type().is_symlink() {
         return None;

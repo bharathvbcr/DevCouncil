@@ -311,6 +311,25 @@ fn keep_indexable(
             ) {
                 return false;
             }
+            // A tracked symlink whose target resolves outside the repository is
+            // the second shape of the disagreement this function exists to
+            // close. `git ls-files` lists it — it is an ordinary mode-120000
+            // entry — and the `is_file()` below follows it, so the inventory
+            // counted a path discovery refuses (`DiscoverySkipReason::
+            // EscapesRoot`) and hashed bytes the map does not describe.
+            // Measured before this line: editing a file *outside* the
+            // repository, through an in-tree symlink, moved the repository's
+            // content fingerprint from `c2:496ee980…` to `c2:8bcb1a2b…` while
+            // `devmap build` reported `files_indexed: 1,
+            // discovery_refused_files: 1`.
+            //
+            // Through `devmap_extract::escapes_root` rather than a second
+            // containment test here, for the reason the cache check above is
+            // shared: two implementations of one rule is how the two walks come
+            // to disagree again.
+            if devmap_extract::escapes_root(root, &root.join(path)).is_some() {
+                return false;
+            }
             // Index entries whose working-tree file was deleted but not staged
             // are skipped, exactly as `_keep` does. Last because it is a `stat`
             // per surviving path, and the filters above have already dropped the
