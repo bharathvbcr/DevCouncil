@@ -20,6 +20,31 @@ use crate::model::*;
 /// reach cost one round trip instead of thirty-two.
 pub const MAX_NEIGHBOR_TARGETS: usize = 16;
 
+/// Largest token budget any request may ask for.
+///
+/// A budget is how much answer the caller is willing to read, and every budget
+/// buys work — rows scored, spans read, edges packed — so an unbounded one is
+/// an unbounded request. 100,000 is far past what any consumer of this kernel
+/// renders and small enough that one request cannot monopolise a daemon.
+///
+/// Owned here because the query layer is what *spends* a budget: the transport
+/// validates against this and the CLI refuses past it, and separate private
+/// copies of the number are separate places for one of them to drift into
+/// permitting work the engine is not sized for.
+pub const MAX_TOKEN_BUDGET: u32 = 100_000;
+
+/// Deepest walk any traversal will perform, whatever `max_depth` asks for.
+///
+/// Depth multiplies with branching factor, so this is the difference between a
+/// bounded question and one that visits the whole graph before `max_nodes`
+/// stops it. Nothing in a real call graph needs 64 hops of transitive impact;
+/// a walk that reaches it says so on `walk_incomplete` rather than presenting
+/// a truncated radius as a complete one.
+///
+/// Owned here for the same reason as [`MAX_TOKEN_BUDGET`]: this is where the
+/// clamp is actually applied, so this is where the number belongs.
+pub const MAX_TRAVERSAL_DEPTH: usize = 64;
+
 pub struct QueryEngine<'a> {
     extractions: &'a [Extraction],
     resolution: &'a ResolutionResult,
@@ -392,7 +417,7 @@ impl<'a> StoreQueryEngine<'a> {
             &edges,
             from,
             to,
-            req.max_depth.min(64),
+            req.max_depth.min(MAX_TRAVERSAL_DEPTH),
             5_000,
             &self.cancel,
         )? {
@@ -495,7 +520,7 @@ impl<'a> StoreQueryEngine<'a> {
         // abandoned request from paying for the sort and the budgeting that
         // follow.
         self.cancel.check()?;
-        let max_depth = req.max_depth.min(64);
+        let max_depth = req.max_depth.min(MAX_TRAVERSAL_DEPTH);
         let max_nodes = TRAVERSAL_MAX_NODES;
         let walk = traverse_graph(
             &start,
@@ -814,7 +839,7 @@ impl<'a> StoreQueryEngine<'a> {
         max_depth: usize,
         min_confidence: f32,
     ) -> anyhow::Result<BlastWalk> {
-        let depth_cap = max_depth.clamp(1, 64);
+        let depth_cap = max_depth.clamp(1, MAX_TRAVERSAL_DEPTH);
         let mut seed_set: BTreeSet<(String, String)> = BTreeSet::new();
         let mut unmatched: Vec<String> = Vec::new();
         for target in targets {
@@ -2545,7 +2570,11 @@ fn node_id_of(file_path: &str, symbol_name: &str) -> String {
 /// Lifted out of `traverse` so the blast radius resolves its seeds through the
 /// same matcher the traversal does. Resolving them two ways is how a radius
 /// ends up seeded from a symbol the trace never visits.
-pub fn traversal_starts(edges: &[ResolvedEdge], target: &str, reverse: bool) -> Vec<(String, String)> {
+pub fn traversal_starts(
+    edges: &[ResolvedEdge],
+    target: &str,
+    reverse: bool,
+) -> Vec<(String, String)> {
     edges
         .iter()
         .filter(|edge| {

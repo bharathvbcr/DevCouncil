@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use devmap_query::{Request, StoreQueryEngine};
+use devmap_query::{Request, StoreQueryEngine, MAX_TOKEN_BUDGET, MAX_TRAVERSAL_DEPTH};
 use devmap_store::{Store, StoreStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -45,8 +45,9 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 /// exit, not a silent spin. Each failure backs off exponentially.
 const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 30;
 const MAX_QUERY_BYTES: usize = 4 * 1024;
-const MAX_TOKEN_BUDGET: u32 = 100_000;
-const MAX_TRAVERSAL_DEPTH: usize = 64;
+// The token-budget and traversal-depth ceilings are `devmap_query`'s: the
+// engine applies them, so the transport that fronts it imports them rather
+// than keeping a second spelling that can drift.
 
 /// Records when the daemon last did anything a consumer asked of it.
 ///
@@ -2052,7 +2053,6 @@ mod tests {
             "a built, drained store is current: {value}"
         );
     }
-
 }
 
 #[cfg(test)]

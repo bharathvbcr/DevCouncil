@@ -28,8 +28,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_QUERY_BYTES: usize = 4 * 1024;
-const MAX_TOKEN_BUDGET: u32 = 100_000;
-const MAX_TRAVERSAL_DEPTH: usize = 64;
+const MAX_TOKEN_BUDGET: u32 = devmap_query::MAX_TOKEN_BUDGET;
+const MAX_TRAVERSAL_DEPTH: usize = devmap_query::MAX_TRAVERSAL_DEPTH;
 const MAX_NEIGHBOR_TARGETS: usize = devmap_query::MAX_NEIGHBOR_TARGETS;
 
 /// Every exchange in this file is bounded by this. A hang is a failure with a
