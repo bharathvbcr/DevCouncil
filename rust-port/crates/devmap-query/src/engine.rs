@@ -179,6 +179,9 @@ impl<'a> StoreQueryEngine<'a> {
                 reason: format!("{} could not be parsed", req.query),
             }));
         }
+        // Computed before the rows are read so the caveat and the edges come
+        // from the same `latest_file` row, not from two looks at the store.
+        let coverage_gap = file_edge_coverage_gap(&file.parse_outcome);
         let rows = self
             .store
             .latest_edges_for_file(&req.query, req.min_confidence)?;
@@ -186,7 +189,13 @@ impl<'a> StoreQueryEngine<'a> {
             .into_iter()
             .map(stored_edge_to_resolved)
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(budget_take(edges, req.token_budget, |_| 25))
+        let mut response = budget_take(edges, req.token_budget, |_| 25);
+        // Composed, not assigned: `budget_take` may already have set a reason
+        // of its own, and a reader deciding whether to act on this list needs
+        // every qualification the answer holds, not the last one written.
+        response.walk_incomplete =
+            devmap_analyze::combine_reasons(response.walk_incomplete.take(), coverage_gap);
+        Ok(response)
     }
 
     pub fn impact(&self, req: Request<String>) -> anyhow::Result<Response<ResolvedEdge>> {
@@ -2474,6 +2483,14 @@ impl<'a> QueryEngine<'a> {
         if !matches!(availability, ResolutionAvailability::Available) {
             return unavailable_response(availability);
         }
+        // The same statement the store-backed engine makes, from the same
+        // owner: a file whose calls and imports were never extracted answers
+        // here in the exact shape of one that genuinely has none.
+        let coverage_gap = self
+            .extractions
+            .iter()
+            .find(|extraction| &extraction.file_path == file_path)
+            .and_then(|extraction| file_edge_coverage_gap(&extraction.parse_outcome));
         let mut deps = Vec::new();
 
         for edge in &self.resolution.edges {
@@ -2493,7 +2510,10 @@ impl<'a> QueryEngine<'a> {
                 .then_with(|| a.target_symbol.cmp(&b.target_symbol))
         });
 
-        budget_take(deps, req.token_budget, |_| 25)
+        let mut response = budget_take(deps, req.token_budget, |_| 25);
+        response.walk_incomplete =
+            devmap_analyze::combine_reasons(response.walk_incomplete.take(), coverage_gap);
+        response
     }
 
     /// Inbound blast radius (impact) with parametric depth (closes G8).
@@ -3178,6 +3198,38 @@ fn search_rank_pool_size(token_budget: u32) -> usize {
     page.saturating_mul(SEARCH_RANK_OVERSAMPLE)
         .min(SEARCH_RANK_POOL_MAX)
         .max(page)
+}
+
+/// Why one file's edge list is a lower bound, or `None` when it is not.
+///
+/// `Failed` is not here: a file that contributed nothing is refused outright
+/// with `resolution: Unavailable`, which is a stronger statement than this one
+/// and is made by the callers. The two states below did contribute — they are
+/// the ones that answer in the shape of a complete extraction while holding
+/// less than one.
+///
+/// `Clean` returns `None`, and that is the load-bearing case: a caveat that
+/// rides on every answer tells a reader nothing, which is the failure mode
+/// [`dead_symbol_coverage_gap`] documents for its own marker.
+///
+/// One owner for both engines. `StoreQueryEngine::dependencies` reads the
+/// outcome off a stored row and `QueryEngine::dependencies` off an in-memory
+/// `Extraction`, and two near-copies of this sentence would let the same file
+/// be described differently depending on which one was asked.
+fn file_edge_coverage_gap(outcome: &ParseOutcome) -> Option<String> {
+    match outcome {
+        ParseOutcome::Clean | ParseOutcome::Failed { .. } => None,
+        ParseOutcome::Fallback { reason } => Some(format!(
+            "this file's declarations were recovered by pattern rather than parsed ({reason}); \
+             the pattern scanner extracts no calls and no imports at all, so an empty or short \
+             list here is not evidence the file has no dependencies"
+        )),
+        ParseOutcome::Partial { error_ranges } => Some(format!(
+            "this file parsed with {} error range(s); a call or import inside an error region \
+             is invisible to extraction, so this list is a lower bound",
+            error_ranges.len()
+        )),
+    }
 }
 
 /// Why a dead-symbol list is a lower bound, or `None` when it is not.
