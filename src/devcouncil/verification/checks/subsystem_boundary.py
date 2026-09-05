@@ -6,6 +6,10 @@ and that the task plan never declared it would span, is a candidate architecture
 crossing: business logic leaking into a UI layer, a storage change reaching into the
 council prompts, etc.
 
+When the map never computed neighbors at all, the gate reports that it could not
+check rather than flagging every pair: "no evidence of adjacency" and "evidence of
+non-adjacency" are different facts, and only the second is a finding about the change.
+
 This gate flags those crossings. It is **advisory (non-blocking) by default** — an
 undeclared crossing is often legitimate, so it should inform review rather than halt the
 loop — but is ``blocking``-configurable for teams that want a hard architectural
@@ -28,6 +32,7 @@ from devcouncil.indexing.subsystem_map import (
     area_for_path,
     areas_touched,
     cross_boundary_pairs,
+    neighbors_established,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,8 +59,49 @@ def detect_subsystem_boundary_gaps(
         return []
 
     changed = [p.replace("\\", "/") for p in changed_files if p and p.strip()]
-    if len(areas_touched(changed, repo_map)) < 2:
+    touched = areas_touched(changed, repo_map)
+    if len(touched) < 2:
         return []
+
+    if not neighbors_established(repo_map):
+        # The change spans areas and the map cannot say whether any two of them
+        # are adjacent, so there is nothing to compare the crossing against.
+        # Returning `[]` here would be this gate's "ran and found nothing",
+        # which is the one thing a check that could not run must never report.
+        #
+        # Never blocking, whatever `blocking` says: that flag is about an
+        # undeclared crossing, and refusing the loop over the map writer's
+        # missing feature would halt every repository the kernel maps rather
+        # than the ones with a boundary problem.
+        logger.info(
+            "subsystem-boundary gate: neighbors not established by the map; "
+            "%d areas touched by task %s could not be checked",
+            len(touched), task.id,
+        )
+        return [Gap(
+            id=next_gap_id(task.id, "BOUNDARY-UNCHECKED"),
+            severity="low",
+            gap_type="architecture_check_unavailable",
+            task_id=task.id,
+            description=(
+                "The subsystem-boundary check could not run: this repository map "
+                "does not establish which subsystems are neighbors, so no pair of "
+                f"the {len(touched)} areas this change touches is known to be "
+                "adjacent or not. No architecture-drift finding is implied either way."
+            ),
+            evidence=[
+                "areas touched: " + ", ".join(touched[:_MAX_CROSSINGS]),
+                "repo_map.json: every subsystem's `neighbors` is empty and no "
+                "producer marker claims they were computed",
+            ],
+            recommended_fix=(
+                "Review this cross-subsystem edit by hand. The map writer does not "
+                "compute neighbors yet, so `dev map` will not populate them; set "
+                "verification.subsystem_boundary.enabled to false if this notice is "
+                "not useful."
+            ),
+            blocking=False,
+        )]
 
     planned_paths = [pf.path.replace("\\", "/") for pf in task.planned_files]
     planned_areas = set(areas_touched(planned_paths, repo_map))

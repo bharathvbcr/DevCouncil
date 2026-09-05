@@ -624,22 +624,38 @@ class TaskPolicyEngine:
                     target=path,
                     task_id=task.id,
                 )
-            if any(
+            adjacency = [
                 are_neighbors(target_area, planned_area, data)
                 for planned_area in planned_areas
-            ):
+            ]
+            if any(answer is True for answer in adjacency):
                 return PolicyDecision(
                     action="allow",
                     reason="File is in a neighboring subsystem of a planned file.",
                     target=path,
                     task_id=task.id,
                 )
+            # Still a deny when adjacency could not be established — an
+            # unmeasured relation is not permission — but the reason must not
+            # claim the map looked and found none. Sending an agent to widen its
+            # scope over a fact nothing established is how it fixes the wrong
+            # thing; the honest version points at the map instead.
+            if any(answer is None for answer in adjacency):
+                why = (
+                    f"subsystem `{target_area}` is outside planned files, and the "
+                    "neighbour relation is not established by this map, so adjacency "
+                    "could not be checked"
+                )
+            else:
+                why = (
+                    f"subsystem `{target_area}` is outside planned files and not a "
+                    "declared neighbor"
+                )
             return PolicyDecision(
                 action="deny",
                 reason=(
                     f"Task {task.id} does not authorize changes to {path} "
-                    f"(subsystem `{target_area}` is outside planned files and not a "
-                    f"declared neighbor). Expand scope with `dev scope update`."
+                    f"({why}). Expand scope with `dev scope update`."
                 ),
                 target=path,
                 rule="scope.unplanned",

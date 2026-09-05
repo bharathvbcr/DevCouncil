@@ -94,3 +94,58 @@ def test_blocking_flag_makes_gap_block():
     )
     assert len(gaps) == 1
     assert gaps[0].blocking is True
+
+
+_NEIGHBORS_NEVER_COMPUTED = {
+    "subsystems": [
+        {"area": "src/ui", "neighbors": []},
+        {"area": "src/api", "neighbors": []},
+        {"area": "src/storage", "neighbors": []},
+    ],
+}
+
+
+def test_a_map_that_never_computed_neighbors_reports_that_it_could_not_check():
+    """Class A: "could not check" must not read as "checked, and here is drift".
+
+    Every subsystem's `neighbors` is the literal `[]` the kernel writes, so no
+    pair in this map is known to be non-adjacent. Flagging `architecture_drift`
+    for such a pair reports a finding about the change when the only fact
+    available is a limitation of the producer.
+    """
+    gaps = detect_subsystem_boundary_gaps(
+        task=_task(["src/ui/a.py"]),
+        changed_files=["src/ui/a.py", "src/storage/b.py"],
+        repo_map=_NEIGHBORS_NEVER_COMPUTED, next_gap_id=_ids(),
+    )
+    assert len(gaps) == 1
+    gap = gaps[0]
+    assert gap.gap_type == "architecture_check_unavailable"
+    assert gap.blocking is False
+    assert "neighbour" in gap.description or "neighbor" in gap.description
+
+
+def test_an_unavailable_check_never_blocks_even_when_configured_to():
+    """`blocking` is about an undeclared crossing, not about a producer gap.
+
+    Blocking on this would halt the loop in every repository whose map writer
+    does not compute the field — a gate failing closed on its own inability to
+    run, which is not the same thing as failing closed on a finding.
+    """
+    gaps = detect_subsystem_boundary_gaps(
+        task=_task(["src/ui/a.py"]),
+        changed_files=["src/ui/a.py", "src/storage/b.py"],
+        repo_map=_NEIGHBORS_NEVER_COMPUTED, next_gap_id=_ids(), blocking=True,
+    )
+    assert [g.gap_type for g in gaps] == ["architecture_check_unavailable"]
+    assert gaps[0].blocking is False
+
+
+def test_a_single_area_change_still_needs_no_check():
+    """Nothing to check is not the same as a check that could not run."""
+    gaps = detect_subsystem_boundary_gaps(
+        task=_task(["src/ui/a.py"]),
+        changed_files=["src/ui/a.py", "src/ui/b.py"],
+        repo_map=_NEIGHBORS_NEVER_COMPUTED, next_gap_id=_ids(),
+    )
+    assert gaps == []

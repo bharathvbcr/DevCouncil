@@ -16,6 +16,11 @@ class Gap(BaseModel):
         "diff_not_exercised",
         "assumption_violated",
         "architecture_drift",
+        # The boundary gate ran but its input could not answer: the repo map
+        # never established which subsystems are neighbors, so no pair in it is
+        # known to be non-adjacent. Distinct from `architecture_drift`, which is
+        # a finding about the change.
+        "architecture_check_unavailable",
         "security_risk",
         "dependency_risk",
         "migration_gap",

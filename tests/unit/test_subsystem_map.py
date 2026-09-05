@@ -8,6 +8,7 @@ from devcouncil.indexing.subsystem_map import (
     dependents_of,
     impact_targets,
     is_entry_root,
+    neighbors_established,
     neighbors_for_area,
 )
 
@@ -130,3 +131,56 @@ def test_is_entry_root_without_metadata_keeps_the_prior_answer():
 def test_is_entry_root_survives_malformed_metadata():
     for meta in ("nonsense", {"entry_roots": "nonsense"}, {"entry_roots": {"total": "x"}}):
         assert is_entry_root("src/other.py", {"entry_roots": ["src/main.py"], "liveness_meta": meta}) is False
+
+
+# --- neighbours: absence of evidence is not evidence of absence -------------------
+
+_NO_NEIGHBORS_COMPUTED = {
+    "subsystems": [
+        {"area": "src/ui", "neighbors": []},
+        {"area": "src/api", "neighbors": []},
+        {"area": "src/storage", "neighbors": []},
+    ],
+}
+
+_NEIGHBORS_COMPUTED_AND_EMPTY = {
+    "meta": {"devmap_rust": {"neighbors_computed": True}},
+    "subsystems": [
+        {"area": "src/ui", "neighbors": []},
+        {"area": "src/api", "neighbors": []},
+        {"area": "src/storage", "neighbors": []},
+    ],
+}
+
+
+def test_adjacency_is_unknown_when_the_map_never_computed_neighbors():
+    """An all-empty ``neighbors`` field is the producer's silence, not an answer.
+
+    The kernel writes ``"neighbors": []`` as a literal for every subsystem
+    (``devmap-query/src/manifest.rs``), so reading that as "not adjacent" makes
+    every repository look like one with no adjacent subsystems at all.
+    """
+    assert neighbors_established(_NO_NEIGHBORS_COMPUTED) is False
+    assert are_neighbors("src/ui", "src/storage", _NO_NEIGHBORS_COMPUTED) is None
+    # A same-area or unknown-side answer needs no evidence and stays definite.
+    assert are_neighbors("src/ui", "src/ui", _NO_NEIGHBORS_COMPUTED) is True
+    assert are_neighbors("src/ui", None, _NO_NEIGHBORS_COMPUTED) is True
+    # And an unknown relation is not a crossing: nothing can be claimed.
+    assert cross_boundary_pairs(
+        ["src/ui/a.py", "src/storage/b.py"], _NO_NEIGHBORS_COMPUTED
+    ) == []
+
+
+def test_the_provenance_marker_turns_an_empty_list_into_a_real_answer():
+    """With the producer saying it computed them, empty means empty."""
+    assert neighbors_established(_NEIGHBORS_COMPUTED_AND_EMPTY) is True
+    assert are_neighbors("src/ui", "src/storage", _NEIGHBORS_COMPUTED_AND_EMPTY) is False
+    assert cross_boundary_pairs(
+        ["src/ui/a.py", "src/storage/b.py"], _NEIGHBORS_COMPUTED_AND_EMPTY
+    ) == [("src/storage", "src/ui")]
+
+
+def test_a_populated_neighbor_list_is_its_own_evidence():
+    """No marker needed: a map that names a neighbour computed neighbours."""
+    assert neighbors_established(_MAP) is True
+    assert are_neighbors("src/ui", "src/storage", _MAP) is False

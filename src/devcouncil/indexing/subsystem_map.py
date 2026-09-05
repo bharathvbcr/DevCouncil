@@ -51,8 +51,50 @@ def neighbors_for_area(area: str | None, data: Mapping | None) -> list[str]:
     return []
 
 
-def are_neighbors(area_a: str | None, area_b: str | None, data: Mapping | None) -> bool:
-    """True when the two areas are the same or declared neighbors (in either direction)."""
+def neighbors_established(data: Mapping | None) -> bool:
+    """Whether this map carries evidence that subsystem neighbors were computed.
+
+    Two independent positive claims, either of which counts: the producer's own
+    provenance marker under ``meta``, and a non-empty ``neighbors`` list
+    anywhere in ``subsystems`` — a map that names one adjacency demonstrably
+    computed them.
+
+    Absence of both is absence of evidence, not evidence of absence. The kernel
+    writes ``"neighbors": []`` as a literal for every subsystem
+    (``rust-port/crates/devmap-query/src/manifest.rs``), and it has been the only
+    map writer since the Python one was retired, so an empty field says "this
+    producer does not compute the field" far more often than it says "this
+    repository has no adjacent subsystems". Reading the first as the second is
+    how :func:`are_neighbors` came to answer *not adjacent* for a relation
+    nothing ever measured.
+    """
+    meta = (data or {}).get("meta")
+    if isinstance(meta, Mapping):
+        marker = meta.get("devmap_rust")
+        if isinstance(marker, Mapping) and marker.get("neighbors_computed") is True:
+            return True
+    for sub in (data or {}).get("subsystems") or []:
+        if isinstance(sub, dict) and sub.get("neighbors"):
+            return True
+    return False
+
+
+def are_neighbors(
+    area_a: str | None,
+    area_b: str | None,
+    data: Mapping | None,
+) -> bool | None:
+    """Whether two areas are adjacent: ``True``/``False``, or ``None`` for unknown.
+
+    ``None`` means the map never established the neighbor relation, so the
+    honest answer is neither yes nor no — the same rule and the same tri-state
+    :func:`is_entry_root` uses for a capped list, for the same reason: a
+    negative is only evidence when the producer was in a position to give one.
+
+    The positive answers need no such evidence and stay definite. Two names for
+    one area are adjacent by identity, an unknown side is not something to flag,
+    and an area listed as a neighbor is listed whatever else the map omits.
+    """
     if not area_a or not area_b:
         return True  # unknown side → don't flag
     if area_a == area_b:
@@ -61,7 +103,7 @@ def are_neighbors(area_a: str | None, area_b: str | None, data: Mapping | None) 
         return True
     if area_a in neighbors_for_area(area_b, data):
         return True
-    return False
+    return False if neighbors_established(data) else None
 
 
 def dependents_of(path: str, data: Mapping | None) -> list[str]:
@@ -201,6 +243,9 @@ def cross_boundary_pairs(
     crossings: set[tuple[str, str]] = set()
     for i, area_a in enumerate(areas):
         for area_b in areas[i + 1:]:
-            if not are_neighbors(area_a, area_b, data):
+            # `is False`, not falsiness: an unknown relation (``None``) is not a
+            # crossing. Callers that need to tell "no crossings" from "could not
+            # look" ask :func:`neighbors_established` — see the boundary gate.
+            if are_neighbors(area_a, area_b, data) is False:
                 crossings.add(tuple(sorted((area_a, area_b))))  # type: ignore[arg-type]
     return sorted(crossings)

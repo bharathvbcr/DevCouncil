@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from devcouncil.domain.task import PlannedFile, Task
@@ -177,3 +178,52 @@ def test_both_engines_agree_on_what_allowed_means():
 
         assert policy.allowed is expected
         assert hook.allowed is expected
+
+
+def _repo_map(root: Path, *, neighbors_computed: bool) -> None:
+    dev = root / ".devcouncil"
+    dev.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "subsystems": [
+            {"area": "src/ui", "neighbors": []},
+            {"area": "src/storage", "neighbors": []},
+        ],
+    }
+    if neighbors_computed:
+        payload["meta"] = {"devmap_rust": {"neighbors_computed": True}}
+    (dev / "repo_map.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _ui_task() -> Task:
+    return Task(
+        id="TASK-042",
+        title="t",
+        description="d",
+        planned_files=[PlannedFile(path="src/ui/view.py", reason="impl", allowed_change="modify")],
+    )
+
+
+def test_deny_says_adjacency_was_never_established_when_the_map_cannot_answer(tmp_path: Path):
+    """The write is still refused; the reason stops claiming a fact.
+
+    "not a declared neighbor" asserts the map looked and found no adjacency.
+    With every `neighbors` list the literal `[]` the kernel writes, the map never
+    established the relation at all, and telling an agent to widen its scope for
+    a reason that is not true sends it to fix the wrong thing.
+    """
+    _repo_map(tmp_path, neighbors_computed=False)
+    decision = TaskPolicyEngine(tmp_path).evaluate_file_change("src/storage/db.py", _ui_task())
+
+    assert decision.action == "deny"
+    assert decision.rule == "scope.unplanned"
+    assert "not established by this map" in decision.reason
+    assert "not a declared neighbor" not in decision.reason
+
+
+def test_deny_still_says_not_a_declared_neighbor_when_the_map_did_answer(tmp_path: Path):
+    _repo_map(tmp_path, neighbors_computed=True)
+    decision = TaskPolicyEngine(tmp_path).evaluate_file_change("src/storage/db.py", _ui_task())
+
+    assert decision.action == "deny"
+    assert decision.rule == "scope.unplanned"
+    assert "not a declared neighbor" in decision.reason
