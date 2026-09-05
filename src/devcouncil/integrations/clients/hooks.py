@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 import typer
@@ -38,6 +39,9 @@ OPENCODE_HOOK_PLUGIN_NAME = _common.OPENCODE_HOOK_PLUGIN_NAME
 SUPPORTED_HOOK_TOOLS = _common.SUPPORTED_HOOK_TOOLS
 
 SESSION_START_MATCHER = "startup|resume|clear|compact"
+# Hook `timeout` is expressed in SECONDS, not milliseconds -- see the command-hook
+# fields table in https://code.claude.com/docs/en/hooks.md.
+DEFAULT_HOOK_TIMEOUT_SECONDS = 10
 GIT_MAP_HOOK_MARKER = "# DevCouncil: refresh repo map"
 # Clients that install PreToolUse / BeforeTool / Cursor pre / OpenCode before containment.
 CONTAINMENT_HOOK_CLIENTS = ("claude", "codex", "cursor", "grok", "opencode", "gemini")
@@ -58,7 +62,62 @@ def _stop_hook_timeout_seconds(project_root: Path) -> int:
             return 150
     except Exception:
         pass
-    return 10
+    return DEFAULT_HOOK_TIMEOUT_SECONDS
+
+
+@dataclass(frozen=True)
+class ClaudeHookSpec:
+    """One DevCouncil-owned Claude Code hook.
+
+    Both writers of Claude hook config walk this table -- ``_install_claude_hooks``
+    (``.claude/settings.local.json``) and the plugin bundle's ``hooks/hooks.json`` in
+    ``integrations.claude_assets`` -- so the two cannot drift in events, matchers, or
+    timeouts again. They differ only in how the command string is built (a resolved
+    absolute ``dev`` path vs. ``${CLAUDE_PROJECT_DIR}``), which stays with each writer.
+    """
+
+    event: str
+    """Claude Code hook event the handler is registered under."""
+    matcher: str
+    """Tool/source matcher; "" means every invocation of this event."""
+    hook_event: str
+    """Slug passed to ``devcouncil hook <slug>``."""
+    name: str
+    """DevCouncil-owned hook name; ``_upsert_hook`` replaces by it."""
+    write_gate: bool = False
+    """Blocking gate -- installed only under ``--write-gate``, removed otherwise."""
+    stop_gate: bool = False
+    """Runs the stop gate, so it needs the longer stop-gate timeout."""
+
+    def timeout(self, project_root: Path) -> int:
+        """Timeout in **seconds** -- Claude Code's ``timeout`` field is seconds, not ms."""
+        if self.stop_gate:
+            return _stop_hook_timeout_seconds(project_root)
+        return DEFAULT_HOOK_TIMEOUT_SECONDS
+
+
+CLAUDE_TOOL_MATCHER = "Bash|Write|Edit|MultiEdit"
+# Refresh-only PostToolUse is always installed so assist mode keeps the map warm; the
+# blocking PreToolUse gate is the one write_gate=True entry. Lifecycle events after Stop
+# cover status-on-start/prompt, teardown, compaction, subagent finish, and notifications,
+# completing DevCouncil's coverage of the documented Claude Code hook surface.
+CLAUDE_HOOK_SPECS: tuple[ClaudeHookSpec, ...] = (
+    ClaudeHookSpec("PostToolUse", CLAUDE_TOOL_MATCHER, "post-tool-use", "devcouncil-post-tool-use"),
+    ClaudeHookSpec("PreToolUse", CLAUDE_TOOL_MATCHER, "pre-tool-use", "devcouncil-pre-tool-use", write_gate=True),
+    ClaudeHookSpec("Stop", "", "agent-response", "devcouncil-agent-response-ready", stop_gate=True),
+    ClaudeHookSpec("SessionStart", SESSION_START_MATCHER, "session-start", "devcouncil-session-start"),
+    ClaudeHookSpec("UserPromptSubmit", "", "user-prompt-submit", "devcouncil-user-prompt-submit"),
+    ClaudeHookSpec("SessionEnd", "", "session-end", "devcouncil-session-end"),
+    ClaudeHookSpec("PreCompact", "", "pre-compact", "devcouncil-pre-compact"),
+    ClaudeHookSpec("PostCompact", "", "post-compact", "devcouncil-post-compact"),
+    ClaudeHookSpec("SubagentStop", "", "subagent-stop", "devcouncil-subagent-stop", stop_gate=True),
+    ClaudeHookSpec("Notification", "", "notification", "devcouncil-notification"),
+)
+
+
+def claude_hook_specs(*, write_gate: bool) -> tuple[ClaudeHookSpec, ...]:
+    """The Claude hooks to emit for this posture; the blocking gate is opt-in."""
+    return tuple(spec for spec in CLAUDE_HOOK_SPECS if write_gate or not spec.write_gate)
 
 
 def _hook_command(project_root: Path, client: str, event: str) -> str:
@@ -75,7 +134,9 @@ def _hook_command(project_root: Path, client: str, event: str) -> str:
         str(project_root),
     ])
 
-def _upsert_hook(settings: dict, event: str, matcher: str, command: str, name: str, *, timeout: int = 10) -> None:
+def _upsert_hook(
+    settings: dict, event: str, matcher: str, command: str, name: str, *, timeout: int = DEFAULT_HOOK_TIMEOUT_SECONDS
+) -> None:
     hooks = settings.setdefault("hooks", {})
     groups = hooks.setdefault(event, [])
     target_group = None
@@ -459,89 +520,21 @@ def _install_claude_hooks(project_root: Path, *, write_gate: bool = False) -> li
     off by default loses no containment.)"""
     path = project_root / ".claude" / "settings.local.json"
     settings = _load_json(path)
-    matcher = "Bash|Write|Edit|MultiEdit"
-    # Refresh-only PostToolUse is always installed so assist mode keeps the map warm.
-    _upsert_hook(
-        settings,
-        "PostToolUse",
-        matcher,
-        _hook_command(project_root, "claude", "post-tool-use"),
-        "devcouncil-post-tool-use",
-    )
-    if write_gate:
+    for spec in CLAUDE_HOOK_SPECS:
+        if spec.write_gate and not write_gate:
+            # Reapplying the default assist integration must actually disable a
+            # previously opted-in blocking gate; otherwise interactive sessions stay
+            # fail-closed forever despite --no-write-gate.
+            _remove_named_hook(settings, spec.event, spec.name)
+            continue
         _upsert_hook(
             settings,
-            "PreToolUse",
-            matcher,
-            _hook_command(project_root, "claude", "pre-tool-use"),
-            "devcouncil-pre-tool-use",
+            spec.event,
+            spec.matcher,
+            _hook_command(project_root, "claude", spec.hook_event),
+            spec.name,
+            timeout=spec.timeout(project_root),
         )
-    else:
-        # Reapplying the default assist integration must actually disable a
-        # previously opted-in blocking gate; otherwise interactive sessions stay
-        # fail-closed forever despite --no-write-gate.
-        _remove_named_hook(settings, "PreToolUse", "devcouncil-pre-tool-use")
-    _upsert_hook(
-        settings,
-        "Stop",
-        "",
-        _hook_command(project_root, "claude", "agent-response"),
-        "devcouncil-agent-response-ready",
-        timeout=_stop_hook_timeout_seconds(project_root),
-    )
-    # Lifecycle events: status-on-start/prompt, teardown, compaction, subagent finish,
-    # and notifications. These complete DevCouncil's coverage of the documented Claude
-    # Code hook surface beyond the pre/post/stop gate.
-    _upsert_hook(
-        settings,
-        "SessionStart",
-        SESSION_START_MATCHER,
-        _hook_command(project_root, "claude", "session-start"),
-        "devcouncil-session-start",
-    )
-    _upsert_hook(
-        settings,
-        "UserPromptSubmit",
-        "",
-        _hook_command(project_root, "claude", "user-prompt-submit"),
-        "devcouncil-user-prompt-submit",
-    )
-    _upsert_hook(
-        settings,
-        "SessionEnd",
-        "",
-        _hook_command(project_root, "claude", "session-end"),
-        "devcouncil-session-end",
-    )
-    _upsert_hook(
-        settings,
-        "PreCompact",
-        "",
-        _hook_command(project_root, "claude", "pre-compact"),
-        "devcouncil-pre-compact",
-    )
-    _upsert_hook(
-        settings,
-        "PostCompact",
-        "",
-        _hook_command(project_root, "claude", "post-compact"),
-        "devcouncil-post-compact",
-    )
-    _upsert_hook(
-        settings,
-        "SubagentStop",
-        "",
-        _hook_command(project_root, "claude", "subagent-stop"),
-        "devcouncil-subagent-stop",
-        timeout=_stop_hook_timeout_seconds(project_root),
-    )
-    _upsert_hook(
-        settings,
-        "Notification",
-        "",
-        _hook_command(project_root, "claude", "notification"),
-        "devcouncil-notification",
-    )
     _save_json(path, settings)
     # Keep runtime gate posture and assist/contain flag in sync with --write-gate.
     def mutate(config: dict) -> None:

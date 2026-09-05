@@ -16,6 +16,7 @@ from typer.testing import CliRunner
 
 from devcouncil.cli.main import app
 from devcouncil.integrations import claude_assets
+from devcouncil.integrations.clients import hooks as hooks_mod
 from devcouncil.knowledge.frontmatter import split_frontmatter
 
 runner = CliRunner()
@@ -108,13 +109,93 @@ def test_plugin_bundle_is_self_contained(tmp_path):
     assert "PreToolUse" not in hooks["hooks"]
 
 
-def test_plugin_session_start_matcher_includes_compact():
-    hooks = json.loads(claude_assets._plugin_hooks_json())
+def test_plugin_session_start_matcher_includes_compact(tmp_path):
+    hooks = json.loads(claude_assets._plugin_hooks_json(tmp_path))
     matcher = hooks["hooks"]["SessionStart"][0]["matcher"]
     assert "compact" in matcher
     assert "clear" in matcher
     events = set(hooks["hooks"])
     assert {"PreCompact", "PostCompact", "SessionEnd"} <= events
+
+
+def _plugin_hook_timeouts(hooks_json: str) -> dict[str, int]:
+    """{event: timeout} for the single DevCouncil handler each plugin event carries."""
+    return {
+        event: group["hooks"][0]["timeout"]
+        for event, groups in json.loads(hooks_json)["hooks"].items()
+        for group in groups
+    }
+
+
+def test_plugin_hook_timeouts_are_seconds_not_milliseconds(tmp_path):
+    """Claude Code's hook `timeout` field is SECONDS (docs: hooks.md, command hook fields).
+
+    The plugin bundle once emitted 10000/150000 here, which Claude Code read as ~2.7h and
+    ~41h -- a hung hook would never have been cancelled. 600s is the documented default
+    for a command hook; DevCouncil's own budgets sit well under it, so a value above 600
+    means the units drifted back to milliseconds.
+    """
+    _init_repo(tmp_path)
+    timeouts = _plugin_hook_timeouts(claude_assets._plugin_hooks_json(tmp_path, write_gate=True))
+
+    assert timeouts, "plugin bundle emitted no hooks"
+    assert all(0 < value <= 600 for value in timeouts.values()), timeouts
+    # Default lifecycle/tool hooks get the shared 10s budget.
+    assert timeouts["PostToolUse"] == hooks_mod.DEFAULT_HOOK_TIMEOUT_SECONDS == 10
+    assert timeouts["PreToolUse"] == 10
+    assert timeouts["Notification"] == 10
+
+
+def test_plugin_stop_hooks_use_stop_gate_timeout_in_seconds(tmp_path):
+    """Stop/SubagentStop run claims + verification, so they get the longer budget -- 150
+    seconds, not the 150000 the bundle used to declare."""
+    _init_repo(tmp_path)
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "project:\n  name: t\nexecution:\n  stop_gate:\n"
+        "    mode: assist\n    check_claims: true\n    verify_active_task: true\n",
+        encoding="utf-8",
+    )
+    timeouts = _plugin_hook_timeouts(claude_assets._plugin_hooks_json(tmp_path))
+
+    assert hooks_mod._stop_hook_timeout_seconds(tmp_path) == 150
+    assert timeouts["Stop"] == 150
+    assert timeouts["SubagentStop"] == 150
+    # A non-stop-gate hook must not inherit the long budget.
+    assert timeouts["PostToolUse"] == 10
+
+
+@pytest.mark.parametrize("write_gate", [False, True])
+def test_plugin_bundle_and_settings_hooks_cannot_drift(tmp_path, write_gate):
+    """The plugin bundle and .claude/settings.local.json describe the same hooks.
+
+    Both generators walk the shared ``CLAUDE_HOOK_SPECS`` table; this pins the two
+    outputs together so a future edit to one has to move the table, not just that file.
+    Commands legitimately differ (absolute `dev` path vs ${CLAUDE_PROJECT_DIR}), so this
+    compares the event/matcher/timeout triples that must agree.
+    """
+    _init_repo(tmp_path)
+    hooks_mod._install_claude_hooks(tmp_path, write_gate=write_gate)
+    settings = json.loads((tmp_path / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
+
+    def triples(config: dict) -> set[tuple[str, str, int]]:
+        return {
+            (event, group.get("matcher", ""), hook["timeout"])
+            for event, groups in config["hooks"].items()
+            for group in groups
+            for hook in group["hooks"]
+            if hook.get("name", "").startswith("devcouncil-") or "devcouncil hook " in hook["command"]
+        }
+
+    def entry_count(config: dict) -> int:
+        return sum(len(group["hooks"]) for groups in config["hooks"].values() for group in groups)
+
+    plugin = json.loads(claude_assets._plugin_hooks_json(tmp_path, write_gate=write_gate))
+    assert triples(plugin) == triples(settings)
+    # Sets alone would tolerate a duplicated event, so pin the handler count too.
+    assert entry_count(plugin) == entry_count(settings) == len(
+        hooks_mod.claude_hook_specs(write_gate=write_gate)
+    )
+    assert ("PreToolUse" in plugin["hooks"]) is write_gate
 
 
 def test_plugin_bundle_write_gate_includes_blocking_hooks():
