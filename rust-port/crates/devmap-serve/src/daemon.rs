@@ -476,6 +476,19 @@ impl Daemon {
         for (path, reason) in discovery.skipped_paths {
             match reason {
                 DiscoverySkipReason::NonSource => {}
+                DiscoverySkipReason::EscapesRoot { .. } => {
+                    // Refused, and deliberately not queued — for the reason the
+                    // arm below gives, plus one of its own: the drain's
+                    // `classify_pending_entry` declines a symlink outright, so
+                    // a row queued here could never be processed and would hold
+                    // `is_fresh` at false forever. The two sides agree that a
+                    // path pointing out of the repository is not this
+                    // repository's file, and the refusal is a coverage fact.
+                    warn!(
+                        "connect-time sweep refused {path:?} ({reason:?}); it resolves outside \
+                         the repository root, so it is absent from the graph and is NOT queued"
+                    );
+                }
                 DiscoverySkipReason::Oversized { .. } | DiscoverySkipReason::Unreadable { .. } => {
                     // K1(c): reported as a refusal, not queued as work.
                     //

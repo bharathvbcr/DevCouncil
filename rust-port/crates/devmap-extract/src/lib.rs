@@ -479,6 +479,36 @@ pub fn collect_sources(root: &Path) -> anyhow::Result<Vec<(String, String)>> {
     Ok(sources)
 }
 
+/// Where a symlinked candidate actually points, when that is outside `root`.
+///
+/// `None` for anything that is not a symlink — the ordinary case, and one stat
+/// — and for a symlink whose target resolves inside the repository, which is
+/// the monorepo's shared config or vendored header and whose bytes the walk
+/// reaches under their real name regardless.
+///
+/// Both roots are canonicalised before the comparison. A lexical prefix test
+/// answers "inside" for `../../elsewhere/secret.py` and for any root reached
+/// through a symlink of its own, which on macOS is every path under
+/// `std::env::temp_dir()`.
+///
+/// Fail-closed when the target will not resolve — a dangling link, a loop, a
+/// parent that lost `+x`. Containment is then *unknown*, and unknown must not
+/// be recorded as proven-inside; the path is refused and the reason travels
+/// with it.
+fn escapes_root(root: &Path, path: &Path) -> Option<String> {
+    let link = fs::symlink_metadata(path).ok()?;
+    if !link.file_type().is_symlink() {
+        return None;
+    }
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    match path.canonicalize() {
+        Ok(target) => {
+            (!target.starts_with(&canonical_root)).then(|| target.to_string_lossy().into_owned())
+        }
+        Err(error) => Some(format!("target could not be resolved: {error}")),
+    }
+}
+
 /// Collect source files and report each admitted or rejected candidate.
 /// Gitignored paths are rejected by the walker before they become candidates.
 pub fn collect_sources_with_report(
@@ -547,6 +577,29 @@ pub fn collect_sources_with_report(
             report
                 .skipped_paths
                 .push((rel_str, DiscoverySkipReason::NonSource));
+            continue;
+        }
+        // Containment, at the third owner of one rule.
+        //
+        // `preview` refuses a `--file` that "resolves outside the indexed
+        // repository root" and `classify_pending_entry` refuses a queued path
+        // that is not a regular file or directory, which is how the drain
+        // declines a symlink. This walk enforced neither. `WalkBuilder` is
+        // configured not to *descend* through symlinks, so a symlinked
+        // directory was never a way out — but `Path::is_file` and
+        // `fs::read_to_string` both follow a link, so a single symlinked file
+        // was read through without anyone asking where it pointed.
+        //
+        // Measured: a repository holding `src/creds.py -> <outside>/credentials.py`
+        // indexed that file's symbols, reported `discovery_refused_files: 0`,
+        // and `preview --file src/creds.py` then refused to show the very
+        // symbols the build had just written — the two halves of one tool
+        // disagreeing about where the repository ends, with the half that reads
+        // the bytes being the permissive one.
+        if let Some(target) = escapes_root(root, p) {
+            report
+                .skipped_paths
+                .push((rel_str, DiscoverySkipReason::EscapesRoot { target }));
             continue;
         }
         let metadata = match entry.metadata() {

@@ -351,9 +351,21 @@ pub struct TextRange {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiscoverySkipReason {
     NonSource,
-    Oversized { bytes: u64, limit: u64 },
+    Oversized {
+        bytes: u64,
+        limit: u64,
+    },
     NonUtf8Path,
-    Unreadable { reason: String },
+    Unreadable {
+        reason: String,
+    },
+    /// A symlink inside the tree whose target is not, or whose target could not
+    /// be resolved to say either way. The bytes belong to somebody else's
+    /// directory, and reading them puts a file the repository does not contain
+    /// into a graph that claims to describe it.
+    EscapesRoot {
+        target: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -387,7 +399,13 @@ impl DiscoverySkipReason {
             DiscoverySkipReason::NonSource => false,
             DiscoverySkipReason::Oversized { .. }
             | DiscoverySkipReason::NonUtf8Path
-            | DiscoverySkipReason::Unreadable { .. } => true,
+            | DiscoverySkipReason::Unreadable { .. }
+            // A refusal, not an ordinary pass-over: unlike a symlink to a file
+            // inside the tree — which the walk reaches under its real name
+            // anyway — nothing else in the graph accounts for these bytes. The
+            // path was a source this indexer was pointed at and declined to
+            // read, which is the definition on this side of the line.
+            | DiscoverySkipReason::EscapesRoot { .. } => true,
         }
     }
 }
