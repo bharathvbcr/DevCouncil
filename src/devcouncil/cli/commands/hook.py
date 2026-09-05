@@ -1365,6 +1365,88 @@ def directory_added(
 
 
 @app.command()
+def stop_failure(
+    event_json: str | None = typer.Argument(None, help="The JSON hook payload from Claude Code."),
+    client: str = typer.Option("claude", "--client", help="Hook client (claude)."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """Claude Code StopFailure hook: record that the stop gate never evaluated the turn.
+
+    StopFailure fires *instead of* ``Stop`` when an API error (rate limit, auth failure,
+    overload) ends the turn, so the stop gate -- claim checks and active-task
+    verification -- does not run at all.  ``_handle_unified_stop`` already refuses to let
+    a gate that *failed* look like one that passed (``UNEVALUATED_STOP_NOTICE``); a turn
+    where the gate was never invoked left no record anywhere, so a trace read back later
+    counted it as a clean stop.
+
+    The event is fire-and-forget by contract -- Claude Code ignores this hook's stdout
+    and exit code -- so recording is all it can do, and blocking or verifying here would
+    burn the stop-gate budget for a result nobody reads.
+    """
+    payload = _read_stdin_payload(event_json)
+    root = _effective_root(project_root, payload)
+    error = str(payload.get("error") or "unknown")
+    try:
+        TraceLogger(root).log_event(
+            "stop_gate_not_evaluated",
+            {
+                "client": client.lower(),
+                "session_id": payload.get("session_id"),
+                "error": error,
+                "error_details": str(payload.get("error_details") or "")[:500],
+            },
+            summary=(
+                f"Turn ended on API error ({error}); the DevCouncil stop gate did not "
+                "evaluate it. This is not a pass."
+            ),
+        )
+    except Exception as e:
+        logger.debug("Failed to record stop_gate_not_evaluated trace event: %s", e)
+
+
+@app.command()
+def subagent_start(
+    event_json: str | None = typer.Argument(None, help="The JSON hook payload from Claude Code."),
+    client: str = typer.Option("claude", "--client", help="Hook client (claude)."),
+    project_root: Path | None = typer.Option(None, "--project-root", help="Repository root containing .devcouncil/."),
+):
+    """Claude Code SubagentStart hook: give a subagent the context it is judged against.
+
+    ``SubagentStop`` runs the same stop gate as ``Stop``, so a subagent's response is
+    held to the active task's claims and verification -- but a subagent starts with a
+    fresh context window and inherits none of the session briefing, so it was being
+    judged by a lease and a task it was never told about.  Exit 0 with
+    ``additionalContext`` is the only channel Claude Code delivers to the *subagent*
+    (a ``systemMessage`` here reaches the user, not the agent that has to act on it).
+    """
+    payload = _read_stdin_payload(event_json)
+    root = _effective_root(project_root, payload)
+    try:
+        TraceLogger(root).log_event(
+            "subagent_start",
+            {
+                "client": client.lower(),
+                "agent_id": payload.get("agent_id"),
+                "agent_type": payload.get("agent_type"),
+            },
+            summary=f"Subagent started: {payload.get('agent_type') or 'unknown'}",
+        )
+    except Exception as e:
+        logger.debug("Failed to record subagent_start trace event: %s", e)
+    # The same briefing SessionStart injects, minus the compaction branch: a subagent
+    # never starts from a compact, so `_session_start_context`'s compact path cannot
+    # apply and `session_briefing` is the whole of it.
+    context = None
+    try:
+        from devcouncil.execution.stop_gate import session_briefing
+
+        context = session_briefing(root, payload)
+    except Exception:
+        context = None
+    _emit_additional_context("SubagentStart", context or _status_line(root))
+
+
+@app.command()
 def subagent_stop(
     event_json: str | None = typer.Argument(None, help="The JSON hook payload from Claude Code."),
     client: str = typer.Option("claude", "--client", help="Hook client (claude)."),

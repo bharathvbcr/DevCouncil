@@ -319,6 +319,11 @@ def test_claude_installed_event_surface_is_exactly_this(tmp_path):
         "FileChanged",
         "CwdChanged",
         "DirectoryAdded",
+        # StopFailure fires *instead of* Stop on an API-error turn end, so without it
+        # the stop gate silently never evaluates that turn; SubagentStart tells a
+        # subagent about the task SubagentStop will hold it to.
+        "StopFailure",
+        "SubagentStart",
     }
 
 
@@ -726,3 +731,217 @@ def test_hook_events_never_exit_nonzero_on_bad_payload(tmp_path):
             hook_app, [command, "not json at all", "--project-root", str(tmp_path)]
         )
         assert result.exit_code == 0, f"{command}: {result.output}"
+
+
+# --------------------------------------------------------------------------
+# The emitted hook table must name events, slugs and timeouts Claude Code
+# actually honors -- a wrong one is *silently ignored* at runtime
+# (reproduced: `claude plugin validate` 2.1.259 reports
+# "hooks.<Event>: unknown hook event; entry ignored at runtime"), so a writer
+# that does not check reports the same success for a dead hook as for a live one.
+# --------------------------------------------------------------------------
+
+
+def _spec_with(**overrides):
+    from devcouncil.integrations.clients.hooks import ClaudeHookSpec
+
+    base = {
+        "event": "PostToolUse",
+        "matcher": "",
+        "hook_event": "post-tool-use",
+        "name": "devcouncil-test",
+    }
+    base.update(overrides)
+    return ClaudeHookSpec(**base)
+
+
+def test_settings_writer_refuses_an_event_claude_code_does_not_know(tmp_path, monkeypatch):
+    """A typo'd event is dropped at runtime; the install must not report success."""
+    from devcouncil.integrations.clients import hooks as hooks_mod
+
+    (tmp_path / ".devcouncil").mkdir(parents=True)
+    monkeypatch.setattr(
+        hooks_mod, "CLAUDE_HOOK_SPECS", (_spec_with(event="PostToolUseX"),), raising=True
+    )
+    try:
+        hooks_mod._install_claude_hooks(tmp_path)
+    except ValueError as exc:
+        assert "PostToolUseX" in str(exc)
+    else:
+        raise AssertionError("writer accepted an unknown Claude Code hook event")
+    assert not (tmp_path / ".claude" / "settings.local.json").exists()
+
+
+def test_settings_writer_refuses_a_slug_with_no_hook_command(tmp_path, monkeypatch):
+    """`devcouncil hook <slug>` must exist, or the hook fails on every fire."""
+    from devcouncil.integrations.clients import hooks as hooks_mod
+
+    (tmp_path / ".devcouncil").mkdir(parents=True)
+    monkeypatch.setattr(
+        hooks_mod, "CLAUDE_HOOK_SPECS", (_spec_with(hook_event="no-such-slug"),), raising=True
+    )
+    try:
+        hooks_mod._install_claude_hooks(tmp_path)
+    except ValueError as exc:
+        assert "no-such-slug" in str(exc)
+    else:
+        raise AssertionError("writer accepted a hook slug with no CLI command")
+
+
+def test_settings_writer_refuses_a_non_positive_timeout(tmp_path, monkeypatch):
+    """Claude Code's schema is `timeout: number().positive()`; 0 drops the entry."""
+    from devcouncil.integrations.clients import hooks as hooks_mod
+
+    (tmp_path / ".devcouncil").mkdir(parents=True)
+    monkeypatch.setattr(hooks_mod, "DEFAULT_HOOK_TIMEOUT_SECONDS", 0, raising=True)
+    monkeypatch.setattr(hooks_mod, "CLAUDE_HOOK_SPECS", (_spec_with(),), raising=True)
+    try:
+        hooks_mod._install_claude_hooks(tmp_path)
+    except ValueError as exc:
+        assert "timeout" in str(exc).lower()
+    else:
+        raise AssertionError("writer accepted a non-positive hook timeout")
+
+
+def test_plugin_hooks_json_refuses_an_event_claude_code_does_not_know(tmp_path, monkeypatch):
+    """The plugin bundle is the artifact other people install; same gate."""
+    from devcouncil.integrations import claude_assets
+    from devcouncil.integrations.clients import hooks as hooks_mod
+
+    monkeypatch.setattr(
+        hooks_mod, "CLAUDE_HOOK_SPECS", (_spec_with(event="BeforeTool"),), raising=True
+    )
+    try:
+        claude_assets._plugin_hooks_json(tmp_path)
+    except ValueError as exc:
+        assert "BeforeTool" in str(exc)
+    else:
+        raise AssertionError("plugin writer accepted an unknown Claude Code hook event")
+
+
+def test_shipped_hook_table_passes_its_own_gate():
+    """The real table must satisfy the check, not just the synthetic ones."""
+    from devcouncil.integrations.clients.hooks import (
+        CLAUDE_HOOK_EVENTS,
+        CLAUDE_HOOK_SPECS,
+    )
+
+    assert {spec.event for spec in CLAUDE_HOOK_SPECS} <= CLAUDE_HOOK_EVENTS
+
+
+# --------------------------------------------------------------------------
+# StopFailure: the turn can end without Stop ever firing
+# --------------------------------------------------------------------------
+
+
+def test_stop_failure_hook_is_registered(tmp_path):
+    """StopFailure fires *instead of* Stop on an API error, so the stop gate
+    never runs -- and nothing recorded that it did not."""
+    from devcouncil.integrations.clients.hooks import _install_claude_hooks
+
+    (tmp_path / ".devcouncil").mkdir(parents=True)
+    _install_claude_hooks(tmp_path)
+    assert "devcouncil-stop-failure" in _hook_names(_claude_settings(tmp_path), "StopFailure")
+
+
+def test_stop_failure_records_that_the_stop_gate_did_not_evaluate(tmp_path):
+    _repo(tmp_path)
+    payload = {
+        "hook_event_name": "StopFailure",
+        "cwd": str(tmp_path),
+        "error": "rate_limit",
+    }
+    result = runner.invoke(
+        hook_app, ["stop-failure", json.dumps(payload), "--project-root", str(tmp_path)]
+    )
+    assert result.exit_code == 0, result.output
+    trace = (tmp_path / ".devcouncil" / "logs" / "traces.jsonl").read_text(encoding="utf-8")
+    assert "stop_gate_not_evaluated" in trace
+    assert "rate_limit" in trace
+
+
+# --------------------------------------------------------------------------
+# SubagentStart: a subagent is gated on stop by rules it was never told
+# --------------------------------------------------------------------------
+
+
+def test_subagent_start_hook_is_registered(tmp_path):
+    from devcouncil.integrations.clients.hooks import _install_claude_hooks
+
+    (tmp_path / ".devcouncil").mkdir(parents=True)
+    _install_claude_hooks(tmp_path)
+    assert "devcouncil-subagent-start" in _hook_names(
+        _claude_settings(tmp_path), "SubagentStart"
+    )
+
+
+def test_subagent_start_names_the_task_the_subagent_will_be_gated_on(tmp_path):
+    """Exit 0 + additionalContext is the only channel a subagent can read.
+
+    SubagentStop holds the subagent to the active task; this asserts the subagent is
+    actually told which task that is, rather than just that *something* was emitted.
+    """
+    from devcouncil.domain.task import PlannedFile, Task
+    from devcouncil.storage.db import get_db
+    from devcouncil.storage.repositories import TaskRepository
+
+    _repo(tmp_path)
+    # `session_briefing` reads the stop-gate config, so a repo without one falls all
+    # the way back to the bare status line and the active task never appears.
+    (tmp_path / ".devcouncil" / "config.yaml").write_text(
+        "project:\n  name: test\n", encoding="utf-8"
+    )
+    db = get_db(tmp_path)
+    with db.get_session() as session:
+        TaskRepository(session).save(
+            Task(
+                id="TASK-042",
+                title="Implement feature",
+                description="Do the thing",
+                status="running",
+                planned_files=[
+                    PlannedFile(path="pkg/a.py", reason="logic", allowed_change="modify")
+                ],
+            )
+        )
+
+    payload = {
+        "hook_event_name": "SubagentStart",
+        "cwd": str(tmp_path),
+        "agent_id": "a1",
+        "agent_type": "general-purpose",
+    }
+    result = runner.invoke(
+        hook_app, ["subagent-start", json.dumps(payload), "--project-root", str(tmp_path)]
+    )
+    assert result.exit_code == 0, result.output
+    emitted = json.loads(result.stdout.strip().splitlines()[-1])
+    assert emitted["hookSpecificOutput"]["hookEventName"] == "SubagentStart"
+    assert "TASK-042" in emitted["hookSpecificOutput"]["additionalContext"]
+
+
+# --------------------------------------------------------------------------
+# statusMessage: the blocking hooks make the user wait with no explanation
+# --------------------------------------------------------------------------
+
+
+def test_blocking_hooks_declare_a_status_message(tmp_path):
+    """`statusMessage` names the spinner; the stop gate can hold a turn 150s."""
+    from devcouncil.integrations.clients.hooks import _install_claude_hooks
+
+    (tmp_path / ".devcouncil").mkdir(parents=True)
+    _install_claude_hooks(tmp_path, write_gate=True)
+    settings = _claude_settings(tmp_path)
+    for event, name in (
+        ("Stop", "devcouncil-agent-response-ready"),
+        ("SubagentStop", "devcouncil-subagent-stop"),
+        ("PreToolUse", "devcouncil-pre-tool-use"),
+    ):
+        handlers = [
+            handler
+            for group in settings["hooks"][event]
+            for handler in group["hooks"]
+            if handler.get("name") == name
+        ]
+        assert handlers, f"{event}/{name} not installed"
+        assert handlers[0].get("statusMessage"), f"{event}/{name} has no statusMessage"

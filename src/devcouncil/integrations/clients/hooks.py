@@ -44,6 +44,37 @@ SUPPORTED_HOOK_TOOLS = _common.SUPPORTED_HOOK_TOOLS
 # compares it as an exact alternation list rather than a regex — a missing
 # entry silently never fires.
 SESSION_START_MATCHER = "startup|resume|clear|compact|fork"
+
+# Every hook event Claude Code recognizes, transcribed from the shipped 2.1.259
+# binary's own event array (the one backing the `/hooks` browser and hook-config
+# validation) and cross-checked against
+# https://code.claude.com/docs/en/hooks#hook-lifecycle.  An event outside this set is
+# not an error Claude Code raises: `claude plugin validate` reports
+# "unknown hook event; entry ignored at runtime" and the entry is dropped, so without
+# this list a typo installs a hook that can never fire while the writer reports
+# success.  Kept whole rather than pruned to the events DevCouncil emits, so adding a
+# handler is a one-line change here instead of a fresh research pass.
+CLAUDE_HOOK_EVENTS: frozenset[str] = frozenset({
+    "PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch",
+    "Notification", "UserPromptSubmit", "UserPromptExpansion",
+    "SessionStart", "SessionEnd", "Stop", "StopFailure",
+    "SubagentStart", "SubagentStop", "PreCompact", "PostCompact",
+    "PreModelSwitch", "PostModelSwitch", "PermissionRequest", "PermissionDenied",
+    "Setup", "TeammateIdle", "TaskCreated", "TaskCompleted",
+    "Elicitation", "ElicitationResult", "ConfigChange",
+    "WorktreeCreate", "WorktreeRemove", "InstructionsLoaded",
+    "CwdChanged", "FileChanged", "DirectoryAdded", "MessageDisplay",
+})
+
+# FileChanged and StopFailure use a *narrower* exact-match character set than every
+# other event (letters, digits, ``_`` and ``|`` only).  Anything else — a hyphen, a
+# space, a dot — keeps the whole matcher on the regular-expression path, where for
+# FileChanged it is additionally registered as a literal filename to watch.  Both
+# failures are silent, so the set is checked rather than trusted.
+# https://code.claude.com/docs/en/hooks#matcher-patterns
+_NARROW_MATCHER_EVENTS = frozenset({"FileChanged", "StopFailure"})
+_NARROW_MATCHER_RE = re.compile(r"^[A-Za-z0-9_|]+$")
+
 GIT_MAP_HOOK_MARKER = "# DevCouncil: refresh repo map"
 # Clients that install PreToolUse / BeforeTool / Cursor pre / OpenCode before containment.
 CONTAINMENT_HOOK_CLIENTS = ("claude", "codex", "cursor", "grok", "opencode", "gemini")
@@ -102,6 +133,13 @@ class ClaudeHookSpec:
     """Runs the stop gate, so it needs the longer stop-gate timeout."""
     extra: tuple[str, ...] = ()
     """Extra argv after the shared hook command (e.g. ``--defer-batch``)."""
+    status_message: str = ""
+    """Spinner label while this hook runs; "" leaves Claude Code's generic one.
+
+    Only the hooks that make a human wait carry one -- the stop gate can hold a turn
+    for ``STOP_GATE_HOOK_TIMEOUT_SECONDS`` and the write gate sits in front of every
+    Bash/Write/Edit, and an unexplained pause reads as the session having hung.
+    """
 
     def timeout(self, project_root: Path) -> int:
         """Timeout in **seconds** -- Claude Code's ``timeout`` field is seconds, not ms."""
@@ -114,9 +152,10 @@ CLAUDE_TOOL_MATCHER = "Bash|Write|Edit|MultiEdit"
 # Refresh-only PostToolUse is always installed so assist mode keeps the map warm;
 # ``--defer-batch`` queues paths so PostToolBatch can drain them once per batch.
 # The blocking PreToolUse gate is the one write_gate=True entry. Lifecycle events
-# after Stop cover status-on-start/prompt, teardown, compaction, subagent finish,
-# and notifications. FileChanged/CwdChanged/DirectoryAdded cover map freshness
-# for changes that never pass through a tool call.
+# after Stop cover status-on-start/prompt, teardown, compaction, subagent start and
+# finish, and notifications. StopFailure covers the turn ends Stop never sees.
+# FileChanged/CwdChanged/DirectoryAdded cover map freshness for changes that never
+# pass through a tool call.
 CLAUDE_HOOK_SPECS: tuple[ClaudeHookSpec, ...] = (
     ClaudeHookSpec(
         "PostToolUse",
@@ -126,14 +165,42 @@ CLAUDE_HOOK_SPECS: tuple[ClaudeHookSpec, ...] = (
         extra=("--defer-batch",),
     ),
     ClaudeHookSpec("PostToolBatch", "", "post-tool-batch", "devcouncil-post-tool-batch"),
-    ClaudeHookSpec("PreToolUse", CLAUDE_TOOL_MATCHER, "pre-tool-use", "devcouncil-pre-tool-use", write_gate=True),
-    ClaudeHookSpec("Stop", "", "agent-response", "devcouncil-agent-response-ready", stop_gate=True),
+    ClaudeHookSpec(
+        "PreToolUse",
+        CLAUDE_TOOL_MATCHER,
+        "pre-tool-use",
+        "devcouncil-pre-tool-use",
+        write_gate=True,
+        status_message="DevCouncil write gate",
+    ),
+    ClaudeHookSpec(
+        "Stop",
+        "",
+        "agent-response",
+        "devcouncil-agent-response-ready",
+        stop_gate=True,
+        status_message="DevCouncil stop gate (claims + verification)",
+    ),
+    # Fires *instead of* Stop when an API error ends the turn, so the stop gate above
+    # never runs.  Fire-and-forget by contract (output and exit code are ignored), so
+    # this can only record that nothing was checked -- which is the whole point.
+    ClaudeHookSpec("StopFailure", "", "stop-failure", "devcouncil-stop-failure"),
     ClaudeHookSpec("SessionStart", SESSION_START_MATCHER, "session-start", "devcouncil-session-start"),
     ClaudeHookSpec("UserPromptSubmit", "", "user-prompt-submit", "devcouncil-user-prompt-submit"),
     ClaudeHookSpec("SessionEnd", "", "session-end", "devcouncil-session-end"),
     ClaudeHookSpec("PreCompact", "", "pre-compact", "devcouncil-pre-compact"),
     ClaudeHookSpec("PostCompact", "", "post-compact", "devcouncil-post-compact"),
-    ClaudeHookSpec("SubagentStop", "", "subagent-stop", "devcouncil-subagent-stop", stop_gate=True),
+    # SubagentStop gates a subagent's stop; without SubagentStart the subagent was
+    # judged by a lease and task it was never told about.
+    ClaudeHookSpec("SubagentStart", "", "subagent-start", "devcouncil-subagent-start"),
+    ClaudeHookSpec(
+        "SubagentStop",
+        "",
+        "subagent-stop",
+        "devcouncil-subagent-stop",
+        stop_gate=True,
+        status_message="DevCouncil subagent stop gate",
+    ),
     ClaudeHookSpec("Notification", "", "notification", "devcouncil-notification"),
     ClaudeHookSpec("FileChanged", "", "file-changed", "devcouncil-file-changed"),
     ClaudeHookSpec("CwdChanged", "", "cwd-changed", "devcouncil-cwd-changed"),
@@ -141,8 +208,90 @@ CLAUDE_HOOK_SPECS: tuple[ClaudeHookSpec, ...] = (
 )
 
 
-def claude_hook_specs(*, write_gate: bool) -> tuple[ClaudeHookSpec, ...]:
-    """The Claude hooks to emit for this posture; the blocking gate is opt-in."""
+def _hook_command_slugs() -> frozenset[str]:
+    """Every ``devcouncil hook <slug>`` the CLI actually registers.
+
+    Fails closed: a slug list we could not read must not read as "every slug is fine",
+    which is how a hook that errors on every single fire gets installed and reported as
+    a success.  If this import cannot resolve, the hooks it would have validated cannot
+    run either, so refusing to write is the honest outcome.
+    """
+    try:
+        import click
+        from typer.main import get_command
+
+        from devcouncil.cli.commands.hook import app as hook_app
+
+        # `get_command` is typed as returning a bare `click.Command`; only a Group
+        # carries subcommands. Narrowed rather than cast so a Typer app that
+        # collapsed to a single command surfaces as the refusal below instead of an
+        # AttributeError from inside the writer.
+        command = get_command(hook_app)
+        if not isinstance(command, click.Group):
+            raise TypeError(f"`devcouncil hook` resolved to {type(command).__name__}, not a group")
+        return frozenset(command.commands)
+    except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+        raise ValueError(
+            f"cannot enumerate `devcouncil hook` subcommands, so the hook config cannot "
+            f"be checked against them; refusing to write it: {exc}"
+        ) from exc
+
+
+def validate_claude_hook_specs(
+    specs: tuple[ClaudeHookSpec, ...], *, project_root: Path
+) -> None:
+    """Raise ``ValueError`` unless every spec is one Claude Code will actually run.
+
+    Claude Code drops a hook it cannot make sense of *quietly* -- an unknown event is
+    reported only by ``claude plugin validate`` ("unknown hook event; entry ignored at
+    runtime"), a ``timeout`` that is not a positive number fails the entry's schema, and
+    a command whose subcommand does not exist simply exits non-zero on every fire into a
+    debug log nobody reads.  In all three cases the writer previously reported the same
+    success it reports for a working install.  Both writers call this before touching a
+    file, so a bad table fails the install rather than shipping dead hooks.
+    """
+    slugs = _hook_command_slugs()
+    for spec in specs:
+        where = f"{spec.name or '<unnamed>'} ({spec.event})"
+        if spec.event not in CLAUDE_HOOK_EVENTS:
+            raise ValueError(
+                f"{where}: {spec.event!r} is not a Claude Code hook event; it would be "
+                f"ignored at runtime. Known events: {', '.join(sorted(CLAUDE_HOOK_EVENTS))}"
+            )
+        if not spec.name.strip():
+            raise ValueError(
+                f"{spec.event}: hook has no DevCouncil name, so re-applying integration "
+                "cannot replace or remove it"
+            )
+        if spec.hook_event not in slugs:
+            raise ValueError(
+                f"{where}: `devcouncil hook {spec.hook_event}` is not a registered "
+                f"subcommand, so the hook would fail on every fire. "
+                f"Known slugs: {', '.join(sorted(slugs))}"
+            )
+        if spec.event in _NARROW_MATCHER_EVENTS and spec.matcher:
+            if not _NARROW_MATCHER_RE.match(spec.matcher):
+                raise ValueError(
+                    f"{where}: {spec.matcher!r} leaves this event's matcher on the "
+                    "regular-expression path (only letters, digits, `_` and `|` are "
+                    "exact-matched for FileChanged/StopFailure)"
+                )
+        timeout = spec.timeout(project_root)
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
+            raise ValueError(
+                f"{where}: timeout must be a positive whole number of seconds, got "
+                f"{timeout!r}; Claude Code rejects the entry otherwise"
+            )
+
+
+def claude_hook_specs(*, write_gate: bool, project_root: Path) -> tuple[ClaudeHookSpec, ...]:
+    """The validated Claude hooks to emit for this posture; the blocking gate is opt-in.
+
+    Validation covers the whole table, not just the returned subset: the write-gate
+    entry is still written to ``.claude/settings.local.json`` under ``--write-gate``,
+    and a broken spec should fail the install that would have shipped it.
+    """
+    validate_claude_hook_specs(CLAUDE_HOOK_SPECS, project_root=project_root)
     return tuple(spec for spec in CLAUDE_HOOK_SPECS if write_gate or not spec.write_gate)
 
 
@@ -169,6 +318,7 @@ def _upsert_hook(
     name: str,
     *,
     timeout: int = DEFAULT_HOOK_TIMEOUT_SECONDS,
+    status_message: str = "",
 ) -> None:
     hooks = settings.setdefault("hooks", {})
     groups = hooks.setdefault(event, [])
@@ -202,12 +352,17 @@ def _upsert_hook(
             target_group = group
             break
 
-    hook_payload = {
+    hook_payload: dict = {
         "type": "command",
         "name": name,
         "command": command,
         "timeout": timeout,
     }
+    if status_message:
+        # Optional spinner label (Claude Code hook-handler field `statusMessage`).
+        # Omitted when empty rather than written as "" so a hook without one keeps
+        # Claude Code's own default instead of a blank status.
+        hook_payload["statusMessage"] = status_message
 
     if target_group is None:
         groups.append({"matcher": matcher, "hooks": [hook_payload]})
@@ -574,7 +729,13 @@ def _install_claude_hooks(project_root: Path, *, write_gate: bool = False) -> li
     human sessions — in an interactive session there is no task lease, so the gate would
     fail-closed and deny every command. (``dev run --executor claude`` does its own
     post-hoc scope enforcement and does not depend on this hook, so leaving PreToolUse
-    off by default loses no containment.)"""
+    off by default loses no containment.)
+
+    Refuses to write a table Claude Code would silently ignore -- see
+    :func:`validate_claude_hook_specs`. The check runs before the file is opened so a
+    bad spec leaves the previous, working settings in place rather than half-replacing
+    them."""
+    validate_claude_hook_specs(CLAUDE_HOOK_SPECS, project_root=project_root)
     path = project_root / ".claude" / "settings.local.json"
     settings = _load_json(path)
     for spec in CLAUDE_HOOK_SPECS:
@@ -591,6 +752,7 @@ def _install_claude_hooks(project_root: Path, *, write_gate: bool = False) -> li
             _hook_command(project_root, "claude", spec.hook_event, *spec.extra),
             spec.name,
             timeout=spec.timeout(project_root),
+            status_message=spec.status_message,
         )
     _save_json(path, settings)
     # Keep runtime gate posture and assist/contain flag in sync with --write-gate.

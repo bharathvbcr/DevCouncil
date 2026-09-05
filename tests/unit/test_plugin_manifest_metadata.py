@@ -166,3 +166,42 @@ def test_built_bundle_command_inventory_loads(tmp_path):
         f"Claude Code loaded {match.group(1)} command(s) and is missing {missing}. "
         f"Inventory reported:\n{proc.stdout}"
     )
+
+
+# --- a version we could not determine must not look like one we did --------------
+
+
+def test_version_lookup_returns_none_when_the_package_is_not_installed(monkeypatch):
+    """`0.0.0` is a fabricated version, not a missing one.
+
+    ``version`` is optional in both plugin.json and a marketplace entry
+    (plugins-reference "Metadata fields": ``name`` is the only required field), so
+    omitting it says "unpinned", which is true. Writing ``0.0.0`` asserts a release
+    that does not exist, and ``claude plugin tag`` would happily cut a
+    ``devcouncil--v0.0.0`` tag from it.
+    """
+    import importlib.metadata
+
+    from devcouncil.integrations.clients import claude as claude_client
+
+    def _missing(_name: str) -> str:
+        raise importlib.metadata.PackageNotFoundError(_name)
+
+    monkeypatch.setattr(importlib.metadata, "version", _missing)
+    assert claude_client._devcouncil_version() is None
+
+
+def test_manifests_omit_an_undeterminable_version():
+    manifest = json.loads(claude_assets._plugin_json(None))
+    assert "version" not in manifest, (
+        f"plugin.json invented a version it could not determine: {manifest!r}"
+    )
+    entry = json.loads(claude_assets._marketplace_json(None))["plugins"][0]
+    assert "version" not in entry, (
+        f"marketplace entry invented a version it could not determine: {entry!r}"
+    )
+
+
+def test_manifests_keep_a_version_that_was_determined():
+    assert json.loads(claude_assets._plugin_json("1.2.3"))["version"] == "1.2.3"
+    assert json.loads(claude_assets._marketplace_json("1.2.3"))["plugins"][0]["version"] == "1.2.3"

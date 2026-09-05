@@ -445,11 +445,14 @@ _PLUGIN_REPOSITORY = "https://github.com/bharathvbcr/DevCouncil.git"
 _PLUGIN_LICENSE = "Apache-2.0"
 
 
-def _plugin_json(version: str) -> str:
+def _plugin_json(version: str | None) -> str:
     manifest = {
         "name": _PLUGIN_NAME,
         "description": "DevCouncil: evidence-gated planning, execution, and verification for coding agents.",
-        "version": version,
+        # Omitted, not faked, when the running install cannot report its own version:
+        # `name` is the only required manifest field, so an absent `version` says
+        # "unpinned" while a placeholder would assert a release that does not exist.
+        **({"version": version} if version else {}),
         "author": {"name": "DevCouncil", "url": _PLUGIN_HOMEPAGE},
         # Optional per the Plugins spec, but this is a *published, installable* artifact:
         # without them an installed plugin cannot tell the user its terms or where it came
@@ -463,7 +466,7 @@ def _plugin_json(version: str) -> str:
     return json.dumps(manifest, indent=2) + "\n"
 
 
-def _marketplace_json(version: str) -> str:
+def _marketplace_json(version: str | None) -> str:
     manifest = {
         "name": _MARKETPLACE_NAME,
         # `claude plugin validate --strict` (Claude Code 2.1.259) treats a
@@ -482,7 +485,9 @@ def _marketplace_json(version: str) -> str:
                 "name": _PLUGIN_NAME,
                 "source": f"./{_PLUGIN_NAME}",
                 "description": "DevCouncil Claude Code integration: commands, subagents, skills, hooks, and MCP.",
-                "version": version,
+                # Same rule as the plugin manifest: an entry with no version is
+                # unpinned; an entry pinned at a made-up version is wrong.
+                **({"version": version} if version else {}),
             }
         ],
     }
@@ -505,7 +510,7 @@ def _plugin_hooks_json(root: Path, *, write_gate: bool = False) -> str:
     # The plugin ships no binary of its own, and a hook subprocess inherits the *host's*
     # PATH -- which on a clean machine has neither `devcouncil` nor `dev` on it. Resolve
     # the same absolute venv binary `_hook_command` bakes into .claude/settings.local.json
-    # (common.resolve_devcouncil_executable) so all 13 hooks can actually start.
+    # (common.resolve_devcouncil_executable) so every bundled hook can actually start.
     executable = resolve_devcouncil_executable(root)
 
     def cmd(spec: ClaudeHookSpec) -> str:
@@ -516,12 +521,15 @@ def _plugin_hooks_json(root: Path, *, write_gate: bool = False) -> str:
         )
 
     hooks: dict[str, list] = {}
-    for spec in claude_hook_specs(write_gate=write_gate):
+    for spec in claude_hook_specs(write_gate=write_gate, project_root=root):
         group: dict = {}
         if spec.matcher:
             group["matcher"] = spec.matcher
         # timeout is in SECONDS -- Claude Code's documented unit for the hook field.
-        group["hooks"] = [{"type": "command", "command": cmd(spec), "timeout": spec.timeout(root)}]
+        handler: dict = {"type": "command", "command": cmd(spec), "timeout": spec.timeout(root)}
+        if spec.status_message:
+            handler["statusMessage"] = spec.status_message
+        group["hooks"] = [handler]
         hooks.setdefault(spec.event, []).append(group)
     return json.dumps({"hooks": hooks}, indent=2) + "\n"
 
@@ -711,7 +719,11 @@ def _plugin_bin_launchers(plugin: Path, root: Path) -> list[GeneratedAsset]:
 
 
 def build_plugin_bundle(
-    root: Path, *, version: str, skill_assets: list[GeneratedAsset] | None = None, write_gate: bool = False
+    root: Path,
+    *,
+    version: str | None,
+    skill_assets: list[GeneratedAsset] | None = None,
+    write_gate: bool = False,
 ) -> list[GeneratedAsset]:
     """Build the plugin tree: manifest, marketplace, bundled commands/agents, hooks, MCP."""
     plugin = _plugin_dir(root)

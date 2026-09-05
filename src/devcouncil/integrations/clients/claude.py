@@ -49,14 +49,21 @@ def _claude_command(project_root: Path, scope: str) -> list[str]:
         *_server_args(project_root),
     ]
 
-def _devcouncil_version() -> str:
-    """Package version for plugin manifests, or a stable placeholder when uninstalled."""
+def _devcouncil_version() -> str | None:
+    """Package version for plugin manifests, or None when it cannot be determined.
+
+    ``version`` is optional in both ``plugin.json`` and a marketplace entry, so leaving
+    it out states "unpinned", which is true. The previous placeholder ``0.0.0`` stated a
+    release that does not exist: it reads to `/plugin` and to `claude plugin tag`
+    exactly like a version we actually looked up, and would cut a `devcouncil--v0.0.0`
+    tag from a manifest whose version was never known.
+    """
     import importlib.metadata
 
     try:
         return importlib.metadata.version("devcouncil")
     except importlib.metadata.PackageNotFoundError:
-        return "0.0.0"
+        return None
 
 _CLAUDE_OUTPUT_STYLE = "DevCouncil"
 

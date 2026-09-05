@@ -238,7 +238,7 @@ def test_plugin_bundle_and_settings_hooks_cannot_drift(tmp_path, write_gate):
     assert triples(plugin) == triples(settings)
     # Sets alone would tolerate a duplicated event, so pin the handler count too.
     assert entry_count(plugin) == entry_count(settings) == len(
-        hooks_mod.claude_hook_specs(write_gate=write_gate)
+        hooks_mod.claude_hook_specs(write_gate=write_gate, project_root=tmp_path)
     )
     assert ("PreToolUse" in plugin["hooks"]) is write_gate
 
@@ -283,7 +283,7 @@ def test_plugin_hook_commands_invoke_an_absolute_binary(tmp_path):
     """All bundled hooks must invoke a real binary, not a bare `devcouncil`.
 
     A hook subprocess inherits the host's PATH, which on a clean machine has no DevCouncil
-    on it; every one of the 13 hooks failed there. `.claude/settings.local.json` already
+    on it; every one of the bundled hooks failed there. `.claude/settings.local.json` already
     got this right via `_hook_command`, so the plugin was the one surface still emitting a
     bare name.
     """
@@ -294,7 +294,7 @@ def test_plugin_hook_commands_invoke_an_absolute_binary(tmp_path):
     hooks = json.loads(next(a for a in bundle if a.path.name == "hooks.json").content)["hooks"]
 
     commands = [entry["command"] for groups in hooks.values() for group in groups for entry in group["hooks"]]
-    assert len(commands) == len(hooks_mod.claude_hook_specs(write_gate=True))
+    assert len(commands) == len(hooks_mod.claude_hook_specs(write_gate=True, project_root=tmp_path))
     for command in commands:
         assert command.startswith(f"{devcouncil} "), (
             f"hook command does not start with the resolved binary {devcouncil}: {command!r}"
