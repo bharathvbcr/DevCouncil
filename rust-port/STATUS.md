@@ -3139,29 +3139,56 @@ below says what was kept from each side.
 
 ### Performance
 
-Release, in-process MCP, p50, `crates/devmap-serve/examples/mcp_bench.rs`. Both
-sides measured **in the same session on the same machine**: `main`'s binaries
-against corpora `main`'s kernel built, this branch's binaries against copies of
-the same trees rebuilt with this kernel. The rebuild is not a confound — the two
-stores agree exactly on size (15,080 nodes / 74,729 edges and 41,276 / 271,508),
-which is also the strongest available equivalence check on the port.
+Release, in-process MCP, `crates/devmap-serve/examples/mcp_bench.rs`. Both sides
+measured **in the same session on the same machine**, runs interleaved:
+`main`'s binaries against corpora `main`'s kernel built, this branch's binaries
+against copies of the same trees rebuilt with this kernel after the merges. The
+rebuild is not a confound — the two stores agree exactly on size (15,080 nodes /
+74,729 edges and 41,276 / 271,508), which is also the strongest available
+equivalence check on the port.
 
-| store | metric | `main` | this branch | vs `main` | `d2fb25e` |
+**The machine was not quiet** (load 3–5 from other sessions), so what is quoted
+is the **minimum p50 across the runs**, the convention this repository's other
+sweeps use. A noisy round is reported here rather than dropped: `impact` on
+scholarlm read 73.06 ms / 2.82 ms in the quiet rounds and 99.56 ms / 10.11 ms in
+the loudest, which is the size of the spread you should expect if you re-run it.
+
+| store | metric | `main` | this branch | ratio | `d2fb25e` |
 |---|---|---|---|---|---|
-| corpus (15,080 / 74,729) | status | 866 µs | **15.2 µs** | 57x | 16 µs |
-| | search | 2.067 ms | 2.217 ms | **+7%** | 2.43 ms |
-| | impact | 18.62 ms | **0.951 ms** | 19.6x | 0.93 ms |
-| | tools/list | 32.6 µs | 33.2 µs | — | — |
-| scholarlm (41,276 / 271,508) | status | 2.771 ms | **12.8 µs** | 217x | 18 µs |
-| | search | 3.415 ms | 3.578 ms | **+5%** | 3.87 ms |
-| | impact | 73.15 ms | **3.039 ms** | 24x | 3.0 ms |
-| | tools/list | 33.7 µs | 33.7 µs | — | — |
+| corpus (15,080 / 74,729) | status | 774 µs | **13.6 µs** | 57x faster | 16 µs |
+| | search | 2.038 ms | 2.129 ms | **+4%** | 2.43 ms |
+| | impact | 18.62 ms | **947 µs** | 19.7x faster | 0.93 ms |
+| | tools/list | 32.3 µs | 73.3 µs | **+127%** — `main`'s, see below | — |
+| scholarlm (41,276 / 271,508) | status | 2.689 ms | **12.8 µs** | 210x faster | 18 µs |
+| | search | 3.396 ms | 3.386 ms | — | 3.87 ms |
+| | impact | 73.06 ms | **2.823 ms** | 25.9x faster | 3.0 ms |
+| | tools/list | 33.3 µs | 70.0 µs | **+110%** — `main`'s, see below | — |
 
-`impact_breakdown`, same stores: the SQL read is unchanged (4.96 ms -> 4.96 ms,
-17.69 ms -> 17.80 ms) — the index is built from the rows that read returns, so it
-adds no I/O — while the whole `impact("helper")` call falls 17.57 ms -> 0.88 ms
-and 45.98 ms -> 2.69 ms. The read is now 563% and 660% of the call it feeds,
-which is the point: what remains is the read, not the walk.
+Every row is within 20% of `d2fb25e`, which was the gate this port had to clear.
+
+`impact_breakdown`, same stores: the SQL read is unchanged (4.98 ms -> 5.06 ms,
+17.69 ms -> 17.64 ms) — the index is built from the rows that read returns, so it
+adds no I/O — while the whole `impact("helper")` call falls 17.57 ms -> 814 µs and
+45.98 ms -> 2.61 ms. The read is now 622% and 675% of the call it feeds, which is
+the point: what remains is the read, not the walk.
+
+**`tools/list` doubled, and it is not this port.** `main`'s `49be1c5` declares an
+`outputSchema` on every one of the 18 tools — the fix for "every success emitted
+`structuredContent` with no `outputSchema` declared", where the undeclared fields
+were exactly the incompleteness markers (`truncated`, `walk_incomplete`,
+`shown`/`hidden`/`total`) a client had no way to validate. The baseline binaries
+predate that commit, so this row is not like-for-like: it is the cost of the tool
+definitions getting bigger, paid once per `tools/list`, and it buys a client the
+ability to check the honesty markers this codebase's contract rests on.
+
+**`search` is flat to +7% against `main`, and where it is slower that is the
+price of K-B1.** Bounding each hit's read to `span_end + 3` bytes replaces one
+`read_to_string` per hit with a bounded read that must also handle the short-read
+and mid-character cases, and the 200-hit page cap does not help a query whose
+page was already smaller. Recorded rather than smoothed over: the unbounded
+version was faster and would open 5,001 files for a generous budget. Interleaved
+medians over three rounds put it at +6.6% on corpus and −8% on scholarlm, which
+is inside this machine's noise either way.
 
 ### The second merge: `main`'s `49be1c5` and `0db537e` (2026-09-05, later)
 

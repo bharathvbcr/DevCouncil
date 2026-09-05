@@ -1425,9 +1425,9 @@ observed once earlier; it stays recorded as observed-once, not as a defect.
   (`devmap-store/src/edge_index.rs`, `Store::edge_index`), not once per question; the
   in-memory and store-backed walks are the one implementation, `traverse_graph_indexed`, and
   `traverse_graph` is the thin single-use wrapper for callers holding a loose edge slice.
-  Measured p50 on two settled corpora: `impact` 18.6 ms -> 0.95 ms (15,080 nodes / 74,729
-  edges) and 73.2 ms -> 3.04 ms (41,276 / 271,508); `status` 866 µs -> 15 µs and 2.77 ms ->
-  13 µs. See STATUS.md → "Port of the 1a2151 round-1 work onto main (2026-09-05)".
+  Measured p50 on two settled corpora: `impact` 18.62 ms -> 947 µs (15,080 nodes / 74,729
+  edges) and 73.06 ms -> 2.82 ms (41,276 / 271,508); `status` 774 µs -> 13.6 µs and
+  2.689 ms -> 12.8 µs. See STATUS.md → "Port of the 1a2151 round-1 work onto main (2026-09-05)".
 * ~~`devmap --version` reports `schema 13` while the artifact declares `schema_version: 2`.~~
   **Closed 2026-09-05** (`d6ac670`) — the line reads `devmap 0.1.0 (store schema 13, code
   graph schema 2)`, naming both numbers instead of one. The store number stays first on
