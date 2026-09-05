@@ -79,6 +79,19 @@ def stub_kernel(monkeypatch, *, record: list | None = None) -> None:  # noqa: AN
         graph.write_text(json.dumps({"meta": {"map_engine": "devmap-rust"}, "nodes": [], "edges": []}), encoding="utf-8")
         return out
 
+    def _fake_build_map_result(root: Path, **kwargs):  # noqa: ANN001
+        written = _fake_build_map(root, **kwargs)
+        return devmap_engine.BuildResult(
+            map_path=written,
+            graph_path=root / ".devcouncil" / "graph" / "code_graph.json",
+        )
+
+    # `build_map_result` is the one function that runs the kernel; `build_map`
+    # is its path-returning adapter and delegates here, so this substitution
+    # covers both. Patching only `build_map` would leave every caller that wants
+    # the build's own report — which is `refresh_map_artifacts` — running the
+    # real kernel.
+    monkeypatch.setattr(devmap_engine, "build_map_result", _fake_build_map_result)
     monkeypatch.setattr(map_cmd, "build_map", _fake_build_map, raising=False)
     monkeypatch.setattr(devmap_engine, "build_map", _fake_build_map)
     monkeypatch.setattr(map_artifacts, "write_agent_guides", lambda *_a, **_k: False)

@@ -333,6 +333,15 @@ def _engine_stub(monkeypatch, tmp_path: Path, *, record: list | None = None):
         graph.write_text('{"nodes": [], "edges": []}', encoding="utf-8")
         return out
 
+    def _fake_build_map_result(root: Path, **kwargs):  # noqa: ANN001
+        return devmap_engine.BuildResult(
+            map_path=_fake_build_map(root, **kwargs),
+            graph_path=root / ".devcouncil" / "graph" / "code_graph.json",
+        )
+
+    # `build_map_result` is the one function that runs the kernel; `build_map`
+    # is its path-returning adapter and delegates here.
+    monkeypatch.setattr(devmap_engine, "build_map_result", _fake_build_map_result)
     monkeypatch.setattr(map_cmd, "build_map", _fake_build_map, raising=False)
     monkeypatch.setattr(devmap_engine, "build_map", _fake_build_map)
     # A repository without guides gets them written after the first build and
@@ -635,7 +644,7 @@ def test_refresh_stale_map_if_needed_never_raises_when_the_kernel_is_unavailable
     def _boom(*_a, **_k):
         raise DevMapEngineError("no kernel")
 
-    monkeypatch.setattr(devmap_engine, "build_map", _boom)
+    monkeypatch.setattr(devmap_engine, "build_map_result", _boom)
     assert map_refresh.refresh_stale_map_if_needed(root) is False
 
 

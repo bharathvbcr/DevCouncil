@@ -2938,3 +2938,164 @@ callers compare whole generations for incremental-vs-cold equivalence, where an
 omitted row is the failure they exist to detect. Conflating the two reads broke
 exactly those seven tests during this work, which is how the distinction got
 documented on the function.
+
+## Seam lane: the per-tool-call refresh moved onto the kernel (2026-09-05)
+
+`dev hook post-tool-use` runs after every tool call an agent makes. On an
+**unchanged** tree it cost **1.41 s**, and essentially none of that was work:
+
+| what | cost | why it was spent |
+|---|---|---|
+| `import devcouncil.cli.commands.hook` | 149 ms | `live.tasks` → `storage.db` loaded SQLAlchemy + SQLModel (90 ms) and `json_persist`/`hook_policy`/`telemetry.traces` loaded pydantic (42 ms), on a path that opens no database and writes no trace |
+| `compute_freshness` in Python | ~150 ms | two `git ls-files` passes and a stat walk over 1,388 files, immediately after the kernel had walked the same tree |
+| `devmap build` | 250 ms | the real incremental check |
+| `devmap manifest` | 430 ms | re-read the whole generation out of SQLite and re-serialized a **22 MB** `code_graph.json` to produce bytes identical to the ones on disk; `write_atomic` then compared them and declined the rename |
+| `devmap status` | 10 ms | a third process, asking the store a question the build already knew |
+| debounce | 300 ms | deliberate burst coalescing; unchanged |
+
+Three process spawns and 22 MB of JSON for a tree that had not moved.
+
+### What changed
+
+**One invocation.** `devmap build --manifest` writes `repo_map.json` and
+`code_graph.json` from the generation the build leaves current, in the same
+process and the same store open, and embeds the store's own status in its
+`--json` result. `devmap manifest` stays a command of its own. `devmap_engine`
+gained `build_map_result`, which is now the one function that runs the kernel;
+`build_map` is its path-returning adapter. The seam's `_kernel_status` spawn is
+gone from the fused path and kept as the fallback for a kernel that cannot
+report it.
+
+**Artifacts are rewritten only when they would change.** A sidecar beside the
+store (`<db>.artifacts.json`) records the writing binary's own `(path, size,
+mtime)`, every input the artifacts derive from — generation id, pending count,
+built head, repo root, the three freshness stamps, the code-graph schema — and
+each output's `(len, mtime, inode)` as written. When all of it still holds the
+generation is never read. Fail-closed in every direction: an unreadable sidecar,
+a missing or edited output, a different binary, one differing input — each is a
+miss, and a miss regenerates. `artifacts.rs`'s existing `should_regenerate`
+could not do this job: it reads the finished file back, which for a 22 MB graph
+means the serialization has already happened.
+
+**The kernel computes its own freshness digests.** `devmap_query::freshness` is
+a deliberate transcription of `RepoMapper.get_git_files` /
+`_files_fingerprint` / `_content_fingerprint`, down to the `\0` separator, the
+`c2:` scheme and the `(size, mtime_ns, ctime_ns)` memo key — it reads and writes
+*the same* `.devcouncil/cache/content_hashes.json` Python does, rather than
+keeping a second memo of the same computation. SHA-1 and BLAKE2b are implemented
+in-tree (no hashing crate is linked and none was added) and pinned to FIPS 180-4,
+RFC 7693 Appendix A and CPython `hashlib` vectors. Only the git path is
+implemented: when git cannot answer, the kernel reports
+`freshness_source: "unavailable"` and the Python `stamp_freshness` fallback runs,
+because a second transcription of a *different* enumeration is where the two
+would silently disagree.
+
+**`devmap freshness`** answers `{stale, reason, checked:{head, inventory,
+content}}` for a working tree, with no store required. It short-circuits exactly
+as `map_is_stale` does — the content fingerprint is computed only once head and
+inventory match — and a skipped field carries `checked: false` and no verdict.
+
+**Python shrank.** `hook.py`'s six heaviest imports are deferred (as thin
+functions, not a PEP 562 module `__getattr__`: `__getattr__` is consulted for
+`module.name` and **not** for a bare global inside a function, which is why the
+existing `get_db` deferral had to spell out `sys.modules[__name__].get_db` — and
+why deferring `dump_json` that way raised `NameError` inside
+`_try_acquire_refresh_lock`, silently disabling the map refresh under the hook's
+`except Exception`).
+
+### Measured
+
+Release kernel pinned via `DEVMAP_BINARY`, on a quiet copy of this repository
+(1,414 tracked files, 22.5 MB `code_graph.json`), min of 8:
+
+| `dev hook post-tool-use` | before | after |
+|---|---|---|
+| unchanged tree | **1.41 s** | **0.77 s** (−45%) |
+| one edited file | 4.12 s | 3.93 s |
+| a new file | 4.18 s | 3.91 s |
+
+A confirmation run of the unchanged row against the *final* kernel binary
+(rebuilt after the port lane's last merge landed under it) gave 0.83 s, min of
+5. Both numbers are reported; the table's 0.77 s is the min of 8.
+
+Kernel only, unchanged tree, same corpus:
+
+| | before | after |
+|---|---|---|
+| `build` | 0.25 s | — |
+| `manifest` | 0.43 s | 0.06 s standalone (skip) |
+| `status` | 0.009 s | — |
+| **the three together** | **0.69 s, three processes** | **0.31 s, one process** |
+
+`import devcouncil.cli.commands.hook`: **149 ms → 31 ms**, and a cold import now
+loads neither SQLAlchemy, SQLModel, pydantic nor rich.
+
+The two changed-tree rows moved less than their own spread (before 4.12–6.06 s,
+after 3.93–5.87 s). They are dominated by the kernel's whole-tree resolve and
+analyze, which this lane does not touch, and are reported as unmoved.
+
+### `map_is_stale` was left on Python, with the measurement that says why
+
+The brief asked for `RepoMapper.map_is_stale` to delegate to the kernel. It was
+built (`devmap freshness`), measured, and **not** switched. On this repository,
+in-process:
+
+```text
+python get_git_files (2 x git ls-files + 1,388 stats)   52 ms
+python _content_fingerprint (warm memo)                  7 ms   (cold: 50 ms)
+python map_is_stale, whole call                         81 ms   (min of 5)
+kernel  devmap freshness, whole call incl. spawn        54 ms   (min of 5)
+```
+
+The check is dominated by `git ls-files` and the stat walk, which both
+implementations pay identically; Rust's advantage on hashing is most of the way
+cancelled by a process spawn. Delegating would trade ~27 ms for a second code
+path in a fail-closed correctness check with twelve call sites, and would make
+the check *unavailable* (hence stale, hence a rebuild loop) wherever the kernel
+binary is missing but Python can answer perfectly well. The command ships
+because the fused build uses the same code in-process, where it replaces
+Python's work rather than duplicating it, and because a non-Python consumer can
+now ask.
+
+### The daemon path: the premise does not hold, so nothing was changed
+
+The brief asked that the hook not spawn a build when a daemon socket is live,
+since "the watcher already indexes changes". Verified, and it is the store the
+watcher indexes, not the artifacts: `rg 'write_manifest_atomically|repo_map.json|
+write_code_graph' rust-port/crates/devmap-serve/src/` matches nothing, so
+`devmap serve` never writes `repo_map.json` or `code_graph.json`. Eleven Python
+modules read the graph and the agent guides tell agents to open the map, so a
+hook that skipped the build behind a live daemon would leave both permanently
+behind the store. (For the record on the other half: the hook does not consult
+`DevMapClient` or a socket at all today — `rg 'DevMapClient|ipc|socket'
+src/devcouncil/cli/commands/hook.py` matches nothing — so there is no existing
+daemon branch to make consistent.)
+
+What the fused command does instead is the right shape for that case: when the
+daemon has kept the store current, `build --manifest` takes the unchanged
+early-return and the artifact stamp declines both writes, so the hook's cost
+behind a live daemon is already the 0.31 s floor. Giving the daemon the
+artifacts is a `devmap-serve` change and is left as a named follow-up.
+
+### Red tests
+
+| what it holds | test |
+|---|---|
+| the fused command writes both artifacts and reports the store | `devmap-cli/tests/manifest_is_written_once.rs::one_invocation_writes_the_artifacts_and_reports_the_store` |
+| a no-op leaves length, mtime and inode untouched | `…::a_second_run_over_an_unchanged_tree_rewrites_nothing` |
+| every input that changes the artifacts defeats the skip | `…::every_input_that_changes_the_artifacts_defeats_the_skip` |
+| what a skip preserves equals what a write produces | `…::the_skipped_artifacts_equal_the_ones_a_forced_write_produces` |
+| `freshness` answers field by field and fails closed | `…::freshness_answers_field_by_field_and_fails_closed` |
+| a skipped content check reports no verdict | `…::a_skipped_content_check_says_it_was_skipped` |
+| the kernel's three digests equal Python's, byte for byte | `devmap-query/tests/freshness_parity.rs::the_kernel_and_python_agree_on_all_three_freshness_digests` |
+| …on an empty repo, quoted and non-ASCII names, an excluded file name, a 1 MiB file, untracked and deleted paths | `…::the_two_agree_on_an_adversarial_tree` |
+| SHA-1 / BLAKE2b against published vectors, and streaming = one-shot | `devmap-query/src/digest.rs::{sha1_matches_the_fips_180_vectors, blake2b_matches_rfc_7693_and_cpython_hashlib, sha1_streaming_equals_one_shot, blake2b_streaming_equals_one_shot}` |
+| the stamp skips only when every question answers the same | `devmap-query/src/artifacts.rs::the_artifact_stamp_skips_only_when_every_question_answers_the_same` |
+| the hook module loads no ORM and no pydantic | `tests/unit/test_hook_import_cost.py::test_importing_the_hook_module_does_not_load_the_orm_or_pydantic` |
+| every deferred name resolves *as a global*, not only as an attribute | `…::test_every_deferred_name_still_resolves_and_is_still_patchable`, `…::test_the_lock_helper_can_serialize_without_a_module_scope_import` |
+
+`sha1_streaming_equals_one_shot` failed on the first run against the
+implementation written for it — `Sha1::update` reset its buffer to empty
+whenever a chunk arrived that did not complete a block, so any input fed in
+pieces smaller than 64 bytes digested wrongly while the one-shot path was
+correct. That is why the streaming tests exist beside the vector tests.

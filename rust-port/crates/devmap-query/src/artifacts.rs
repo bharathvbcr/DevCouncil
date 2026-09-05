@@ -1,5 +1,6 @@
 //! Artifact writers with tmp+rename (V14) and fingerprint skip-on-unchanged.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -63,6 +64,154 @@ pub fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<bool> {
         fs::remove_file(&tmp).ok();
     }
     result
+}
+
+// ---- consumer-artifact stamp -------------------------------------------------
+//
+// `should_regenerate` below answers the same question for the HTML artifacts by
+// reading the file back and looking for a marker in it. That is affordable for a
+// visualizer page and is not for the pair `manifest` writes: `code_graph.json`
+// is 22 MB on this repository, and by the time the marker could be compared the
+// generation has already been read out of SQLite and serialized — 0.43 s of a
+// 1.39 s `dev hook post-tool-use` spent producing bytes identical to the ones
+// already on disk. `write_atomic` then declines the rename, so nothing changed
+// and nothing was saved.
+//
+// The stamp moves the decision in front of all of that. It is a small sidecar
+// naming (a) the binary that wrote the artifacts, (b) every input their content
+// derives from, and (c) what each output looked like when it was written; when
+// all three still hold, the store is never read.
+
+/// What one written artifact looked like immediately after it was written.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactRecord {
+    pub path: String,
+    pub len: u64,
+    pub mtime_ns: i128,
+    /// Inode, 0 where the platform has none. Catches a file swapped for another
+    /// of the same length whose mtime was restored with it.
+    #[serde(default)]
+    pub ino: u64,
+}
+
+impl ArtifactRecord {
+    fn of(path: &Path) -> std::io::Result<Self> {
+        let meta = fs::metadata(path)?;
+        Ok(Self {
+            path: path.to_string_lossy().into_owned(),
+            len: meta.len(),
+            mtime_ns: mtime_ns(&meta),
+            ino: ino_of(&meta),
+        })
+    }
+}
+
+fn mtime_ns(meta: &fs::Metadata) -> i128 {
+    meta.modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_nanos() as i128)
+        .unwrap_or(-1)
+}
+
+#[cfg(unix)]
+fn ino_of(meta: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.ino()
+}
+
+#[cfg(not(unix))]
+fn ino_of(_meta: &fs::Metadata) -> u64 {
+    0
+}
+
+/// The layout of the sidecar. A stamp written under a different layout is not
+/// read as though it were this one; it is a miss, and the artifacts regenerate.
+const ARTIFACT_STAMP_VERSION: u32 = 1;
+
+/// The sidecar: what produced the consumer artifacts, and from what.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactStamp {
+    pub version: u32,
+    /// Identity of the kernel that wrote these artifacts — see
+    /// [`writer_identity`]. A rebuilt kernel regenerates once, on purpose: the
+    /// same generation emitted by a different binary is a different artifact,
+    /// and that is exactly what an extractor or emitter change *is*.
+    pub writer: String,
+    /// Every input the artifacts' bytes derive from, named. A map rather than a
+    /// struct so that adding an input can only ever cause a regeneration:
+    /// an unknown key on either side makes the maps unequal, where a new struct
+    /// field would quietly default and compare equal to a stamp that never
+    /// carried it.
+    pub inputs: BTreeMap<String, String>,
+    pub outputs: Vec<ArtifactRecord>,
+}
+
+/// `path:len:mtime_ns` of the running binary.
+///
+/// Two builds of this workspace both report `devmap 0.1.0`, so the version
+/// string is not an identity. The executable's own stat is: same bytes on disk,
+/// same emitter. Unreadable — a binary deleted or replaced under a running
+/// process — yields a value that matches nothing, so the artifacts regenerate
+/// rather than being trusted to a writer that cannot be identified.
+pub fn writer_identity() -> String {
+    let Ok(exe) = std::env::current_exe() else {
+        return "unidentified-writer".to_string();
+    };
+    match fs::metadata(&exe) {
+        Ok(meta) => format!("{}:{}:{}", exe.display(), meta.len(), mtime_ns(&meta)),
+        Err(_) => "unidentified-writer".to_string(),
+    }
+}
+
+impl ArtifactStamp {
+    /// Stamp `outputs` as they are on disk right now.
+    pub fn of(inputs: BTreeMap<String, String>, outputs: &[&Path]) -> std::io::Result<Self> {
+        Ok(Self {
+            version: ARTIFACT_STAMP_VERSION,
+            writer: writer_identity(),
+            inputs,
+            outputs: outputs
+                .iter()
+                .map(|path| ArtifactRecord::of(path))
+                .collect::<std::io::Result<Vec<_>>>()?,
+        })
+    }
+
+    pub fn read(path: &Path) -> Option<Self> {
+        let text = fs::read_to_string(path).ok()?;
+        let stamp: Self = serde_json::from_str(&text).ok()?;
+        (stamp.version == ARTIFACT_STAMP_VERSION).then_some(stamp)
+    }
+
+    pub fn write(&self, path: &Path) -> std::io::Result<()> {
+        let json = serde_json::to_vec(self)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        write_atomic(path, &json).map(|_| ())
+    }
+
+    /// True when the artifacts this stamp describes are still exactly the ones
+    /// the current inputs would produce.
+    ///
+    /// Fail-closed in every direction: an unreadable sidecar, a missing output,
+    /// a stat that will not answer, a different writer, one differing input —
+    /// each is a miss, and a miss regenerates. The only way to skip is for every
+    /// question to have been asked and answered the same.
+    pub fn still_current(&self, inputs: &BTreeMap<String, String>, outputs: &[&Path]) -> bool {
+        if self.writer != writer_identity() || &self.inputs != inputs {
+            return false;
+        }
+        if self.outputs.len() != outputs.len() {
+            return false;
+        }
+        outputs
+            .iter()
+            .zip(self.outputs.iter())
+            .all(|(path, record)| {
+                record.path == path.to_string_lossy()
+                    && ArtifactRecord::of(path).is_ok_and(|current| &current == record)
+            })
+    }
 }
 
 /// Skip regeneration when fingerprint matches existing artifact header (V14).
@@ -158,6 +307,104 @@ mod tests {
         };
         assert!(should_regenerate(&path, &fp2));
         let _ = fs::remove_file(&path);
+    }
+
+    fn stamp_dir(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "devmap-stamp-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).expect("temp dir");
+        base
+    }
+
+    fn inputs(generation: &str) -> std::collections::BTreeMap<String, String> {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("generation_id".to_string(), generation.to_string());
+        map.insert("content_fingerprint".to_string(), "c2:abc".to_string());
+        map
+    }
+
+    /// The whole point of the sidecar: after a write, the same inputs skip; any
+    /// change to an input, or to an artifact on disk, does not.
+    #[test]
+    fn the_artifact_stamp_skips_only_when_every_question_answers_the_same() {
+        let dir = stamp_dir("current");
+        let map = dir.join("repo_map.json");
+        let graph = dir.join("code_graph.json");
+        let sidecar = dir.join("devmap.sqlite.artifacts.json");
+        fs::write(&map, br#"{"map_engine":"devmap-rust"}"#).unwrap();
+        fs::write(&graph, br#"{"meta":{}}"#).unwrap();
+        let outputs = [map.as_path(), graph.as_path()];
+
+        // Nothing written yet: there is no stamp, so nothing may be skipped.
+        assert!(ArtifactStamp::read(&sidecar).is_none());
+
+        ArtifactStamp::of(inputs("7"), &outputs)
+            .unwrap()
+            .write(&sidecar)
+            .unwrap();
+        let stamp = ArtifactStamp::read(&sidecar).expect("the stamp reads back");
+        assert!(stamp.still_current(&inputs("7"), &outputs));
+
+        // A moved generation is a different artifact.
+        assert!(!stamp.still_current(&inputs("8"), &outputs));
+
+        // An input this run does not know about must not compare equal to a
+        // stamp that never carried it.
+        let mut extra = inputs("7");
+        extra.insert("pending_count".to_string(), "3".to_string());
+        assert!(!stamp.still_current(&extra, &outputs));
+
+        // An artifact edited or replaced under us is not the one we wrote.
+        fs::write(&graph, br#"{"meta":{"tampered":true}}"#).unwrap();
+        assert!(!stamp.still_current(&inputs("7"), &outputs));
+
+        // …and one that is simply gone certainly is not.
+        fs::remove_file(&graph).unwrap();
+        assert!(!stamp.still_current(&inputs("7"), &outputs));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A corrupt, truncated or foreign-layout sidecar must read as "no stamp",
+    /// never as a stamp that happens to match.
+    #[test]
+    fn an_unreadable_stamp_is_a_miss_not_a_match() {
+        let dir = stamp_dir("corrupt");
+        let sidecar = dir.join("stamp.json");
+        for body in [
+            "".as_bytes(),
+            b"not json at all",
+            br#"{"version": 999, "writer": "x", "inputs": {}, "outputs": []}"#,
+            br#"{"version": 1, "writer": "x"}"#,
+        ] {
+            fs::write(&sidecar, body).unwrap();
+            assert!(
+                ArtifactStamp::read(&sidecar).is_none(),
+                "must not parse: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A stamp written by another binary is not this binary's evidence.
+    #[test]
+    fn a_stamp_from_a_different_writer_never_matches() {
+        let dir = stamp_dir("writer");
+        let artifact = dir.join("repo_map.json");
+        fs::write(&artifact, b"{}").unwrap();
+        let outputs = [artifact.as_path()];
+        let mut stamp = ArtifactStamp::of(inputs("1"), &outputs).unwrap();
+        assert!(stamp.still_current(&inputs("1"), &outputs));
+        stamp.writer = "/some/other/devmap:123:456".to_string();
+        assert!(!stamp.still_current(&inputs("1"), &outputs));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
