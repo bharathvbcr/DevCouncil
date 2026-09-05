@@ -189,10 +189,10 @@ def test_a_git_without_ahead_behind_falls_back_to_rev_list(tmp_path: Path, monke
 
     real = git_siblings._git_text
 
-    def old_git(args, cwd, *, timeout=git_siblings.GIT_PROBE_TIMEOUT):
+    def old_git(args, cwd, *, budget):
         if any("ahead-behind" in arg for arg in args):
             return None, "git for-each-ref exited 128: fatal: unknown field name: ahead-behind"
-        return real(args, cwd, timeout=timeout)
+        return real(args, cwd, budget=budget)
 
     monkeypatch.setattr(git_siblings, "_git_text", old_git)
     report = inspect_session_siblings(main)
@@ -342,6 +342,49 @@ def test_hints_are_capped_in_count_and_length() -> None:
     joined = "; ".join(hints)
     assert "+7 more" in joined
     assert "4 behind main" in joined
+
+
+def test_a_spent_budget_refuses_to_spawn_git_and_says_why(tmp_path: Path) -> None:
+    from devcouncil.utils import git_siblings
+
+    spent = git_siblings._Budget(0.0, per_call=5.0)
+
+    text, reason = git_siblings._git_text(["worktree", "list"], tmp_path, budget=spent)
+
+    assert text is None
+    assert "budget" in reason
+
+
+def test_the_guard_stops_at_its_budget_however_many_checkouts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Per-call timeouts alone let eight wedged checkouts stall a session start."""
+    import subprocess as sp
+
+    from devcouncil.utils import git_siblings
+
+    main = _repo(tmp_path / "main")
+    porcelain = "".join(
+        f"worktree {tmp_path / f'wt{i}'}\nHEAD {'0' * 40}\nbranch refs/heads/claude/b{i}\n\n"
+        for i in range(git_siblings.MAX_SIBLINGS)
+    )
+    for i in range(git_siblings.MAX_SIBLINGS):
+        (tmp_path / f"wt{i}").mkdir()
+
+    def wedged_git(args, cwd, *, timeout=60.0, check=False):
+        # A git that hangs until its timeout, exactly as a stuck filesystem does.
+        time.sleep(timeout)
+        out = porcelain if args and args[0] == "worktree" else ""
+        return sp.CompletedProcess(list(args), 0, out, "")
+
+    monkeypatch.setattr(git_siblings, "run_git", wedged_git)
+
+    started = time.monotonic()
+    report = inspect_session_siblings(main, budget_seconds=0.5, timeout=5.0)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3.0, f"the guard ran for {elapsed:.1f}s on a 0.5s budget"
+    assert any("budget" in reason for reason in report.unavailable), report.unavailable
 
 
 def test_oversized_git_output_is_bounded() -> None:

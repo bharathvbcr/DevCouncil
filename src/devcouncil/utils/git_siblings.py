@@ -49,9 +49,14 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from devcouncil.utils.proc import git_repo_state, run_git
 
-#: Every git probe here runs on the session-start path, so the ceiling is short:
-#: a session must not wait on a wedged git to be told who else is around.
+#: Ceiling for a single git probe. Short, because this runs on the session-start
+#: path: a session must not wait on one wedged git to be told who else is around.
 GIT_PROBE_TIMEOUT: float = 5.0
+#: Ceiling for the *whole* guard. Per-call timeouts alone do not bound it — eight
+#: checkouts on a stuck filesystem are eight timeouts, four workers deep — and an
+#: unbounded aggregate on the session-start path is how a warning becomes a stall.
+#: Whatever is answered inside the budget is reported; the rest says it ran out.
+GUARD_BUDGET_SECONDS: float = 8.0
 #: Default activity window. A checkout touched inside it is "live".
 DEFAULT_WINDOW_MINUTES: float = 30.0
 #: Branch namespaces worth warning about by default.
@@ -161,6 +166,30 @@ class _Accumulator:
 # ---------------------------------------------------------------------------
 
 
+class _Budget:
+    """The guard's shared wall clock: how long any one probe may still take.
+
+    Every git call asks for a slice, so a probe that starts late gets a smaller
+    ceiling and a probe that starts after the budget is gone gets none at all —
+    and says so rather than returning an empty answer.
+    """
+
+    __slots__ = ("_deadline", "_per_call", "_total")
+
+    def __init__(self, seconds: float, *, per_call: float = GIT_PROBE_TIMEOUT) -> None:
+        self._total = max(0.0, seconds)
+        self._per_call = max(0.0, per_call)
+        self._deadline = time.monotonic() + self._total
+
+    def slice(self) -> float:
+        """Seconds the next git call may take; ``0.0`` when the budget is spent."""
+        return max(0.0, min(self._per_call, self._deadline - time.monotonic()))
+
+    @property
+    def exhausted_reason(self) -> str:
+        return f"session guard budget exhausted ({self._total:g}s)"
+
+
 def _bound_text(text: str) -> str:
     """Cap a git command's output before anything parses it."""
     if len(text) <= MAX_GIT_OUTPUT_CHARS:
@@ -168,15 +197,17 @@ def _bound_text(text: str) -> str:
     return text[:MAX_GIT_OUTPUT_CHARS]
 
 
-def _git_text(
-    args: Sequence[str], cwd: Path, *, timeout: float = GIT_PROBE_TIMEOUT
-) -> Tuple[Optional[str], str]:
+def _git_text(args: Sequence[str], cwd: Path, *, budget: _Budget) -> Tuple[Optional[str], str]:
     """``(stdout, "")`` when git answered, ``(None, reason)`` when it could not.
 
     ``run_git`` already converts a hang into returncode 124 rather than an
     exception; a missing git raises ``OSError``, which is a failure to run and
-    not an answer, so it is surfaced as a reason too.
+    not an answer, so it is surfaced as a reason too. A spent budget is a third
+    way not to have an answer, and it names itself as one.
     """
+    timeout = budget.slice()
+    if timeout <= 0:
+        return None, budget.exhausted_reason
     try:
         result = run_git(list(args), cwd, timeout=timeout)
     except OSError as exc:
@@ -300,7 +331,7 @@ def _status_paths(text: str) -> List[str]:
 
 
 def _tracked_newest_mtime(
-    worktree: Path, *, cutoff: float, timeout: float
+    worktree: Path, *, cutoff: float, budget: _Budget
 ) -> Tuple[Optional[float], str, bool]:
     """Newest tracked-file mtime; ``(mtime, reason, truncated)``.
 
@@ -309,7 +340,7 @@ def _tracked_newest_mtime(
     finding anything inside the window — a scan that did not finish must not be
     reported as a scan that finished and found nothing.
     """
-    text, error = _git_text(["ls-files", "-z"], worktree, timeout=timeout)
+    text, error = _git_text(["ls-files", "-z"], worktree, budget=budget)
     if text is None:
         return None, error, False
     names = [name for name in text.split("\0") if name]
@@ -396,7 +427,7 @@ def _resolve_probe(
 
 
 def _probe_siblings(
-    entries: Sequence[_Worktree], *, now: float, window: float, timeout: float
+    entries: Sequence[_Worktree], *, now: float, window: float, budget: _Budget
 ) -> List[_Probe]:
     """Probe every other checkout, cheapest signal first and the rest in parallel.
 
@@ -421,9 +452,9 @@ def _probe_siblings(
         jobs = [
             (
                 entry,
-                pool.submit(_sibling_status, Path(entry.path), timeout=timeout),
+                pool.submit(_sibling_status, Path(entry.path), budget=budget),
                 pool.submit(
-                    _tracked_newest_mtime, Path(entry.path), cutoff=cutoff, timeout=timeout
+                    _tracked_newest_mtime, Path(entry.path), cutoff=cutoff, budget=budget
                 ),
             )
             for entry in pending
@@ -437,7 +468,7 @@ def _probe_siblings(
     return probes
 
 
-def _sibling_status(worktree: Path, *, timeout: float) -> Tuple[Optional[str], str]:
+def _sibling_status(worktree: Path, *, budget: _Budget) -> Tuple[Optional[str], str]:
     """``git status`` in *another session's* checkout, observing only.
 
     ``--no-optional-locks`` is the point: a plain ``git status`` refreshes and
@@ -447,7 +478,7 @@ def _sibling_status(worktree: Path, *, timeout: float) -> Tuple[Optional[str], s
     return _git_text(
         ["--no-optional-locks", "status", "--porcelain", "-z", "--untracked-files=no"],
         worktree,
-        timeout=timeout,
+        budget=budget,
     )
 
 
@@ -456,11 +487,11 @@ def _sibling_status(worktree: Path, *, timeout: float) -> Tuple[Optional[str], s
 # ---------------------------------------------------------------------------
 
 
-def _branch_rows(root: Path, *, timeout: float) -> Tuple[Optional[List[Tuple[str, Optional[float]]]], str]:
+def _branch_rows(root: Path, *, budget: _Budget) -> Tuple[Optional[List[Tuple[str, Optional[float]]]], str]:
     text, error = _git_text(
         ["for-each-ref", "--format=%(refname:short)\t%(committerdate:unix)", "refs/heads"],
         root,
-        timeout=timeout,
+        budget=budget,
     )
     if text is None:
         return None, error
@@ -478,7 +509,7 @@ def _branch_rows(root: Path, *, timeout: float) -> Tuple[Optional[List[Tuple[str
 
 
 def _ahead_behind(
-    root: Path, names: Sequence[str], default_branch: str, *, timeout: float
+    root: Path, names: Sequence[str], default_branch: str, *, budget: _Budget
 ) -> Tuple[Dict[str, Tuple[int, int]], str]:
     """``{branch: (ahead, behind)}`` relative to *default_branch*.
 
@@ -498,7 +529,7 @@ def _ahead_behind(
             *patterns,
         ],
         root,
-        timeout=timeout,
+        budget=budget,
     )
     if text is not None:
         pairs: Dict[str, Tuple[int, int]] = {}
@@ -529,7 +560,7 @@ def _ahead_behind(
                     f"refs/heads/{name}...refs/heads/{default_branch}",
                 ],
                 root,
-                timeout=timeout,
+                budget=budget,
             )
             for name in names
         }
@@ -590,10 +621,12 @@ def inspect_session_siblings(
     window_minutes: Optional[float] = None,
     branch_prefixes: Optional[Sequence[str]] = None,
     timeout: float = GIT_PROBE_TIMEOUT,
+    budget_seconds: float = GUARD_BUDGET_SECONDS,
     now: Optional[float] = None,
 ) -> SessionGuardReport:
     """Answer the three session-guard questions for the repository at *root*.
 
+    ``timeout`` bounds one git call, ``budget_seconds`` bounds the whole guard.
     Never raises: every question either answers or records why it could not.
     """
     root = Path(root).expanduser()
@@ -601,17 +634,20 @@ def inspect_session_siblings(
         resolved = root.resolve()
     except OSError:
         resolved = root
+    budget = _Budget(budget_seconds, per_call=timeout)
+    if budget.slice() <= 0:
+        return SessionGuardReport(unavailable=(budget.exhausted_reason,))
 
     # Spawning git costs ~15 ms here before it does any work, and these three
     # questions do not depend on each other, so they are asked at once. The
     # answers are still read in order, and "is this a repository at all?" still
     # decides whether the other two mean anything.
     with ThreadPoolExecutor(max_workers=3) as pool:
-        state = pool.submit(git_repo_state, resolved, timeout=timeout)
+        state = pool.submit(git_repo_state, resolved, timeout=budget.slice())
         worktrees = pool.submit(
-            _git_text, ["worktree", "list", "--porcelain"], resolved, timeout=timeout
+            _git_text, ["worktree", "list", "--porcelain"], resolved, budget=budget
         )
-        refs = pool.submit(_branch_rows, resolved, timeout=timeout)
+        refs = pool.submit(_branch_rows, resolved, budget=budget)
         inside, why = state.result()
         worktree_text, worktree_error = worktrees.result()
         rows, rows_error = refs.result()
@@ -633,7 +669,7 @@ def inspect_session_siblings(
         worktree_error,
         now=moment,
         window=window,
-        timeout=timeout,
+        budget=budget,
     )
     branches, behind, default_branch = _collect_branches(
         resolved,
@@ -643,7 +679,7 @@ def inspect_session_siblings(
         current_branch=current_branch,
         prefixes=prefixes,
         now=moment,
-        timeout=timeout,
+        budget=budget,
     )
     return SessionGuardReport(
         live_siblings=tuple(siblings),
@@ -664,13 +700,13 @@ def _collect_siblings(
     *,
     now: float,
     window: float,
-    timeout: float,
+    budget: _Budget,
 ) -> Tuple[List[SiblingCheckout], Optional[str]]:
     if text is None:
         acc.unavailable.append(f"live sibling checkouts: {error}")
         # The branch questions still need to know which branch this checkout is
         # on, and the worktree listing was where that came from.
-        out, _why = _git_text(["symbolic-ref", "--short", "-q", "HEAD"], root, timeout=timeout)
+        out, _why = _git_text(["symbolic-ref", "--short", "-q", "HEAD"], root, budget=budget)
         return [], (out.strip() or None) if out is not None else None
 
     entries, capped = _parse_worktrees(text)
@@ -683,7 +719,7 @@ def _collect_siblings(
         return [], current_branch
 
     siblings: List[SiblingCheckout] = []
-    for probe in _probe_siblings(others, now=now, window=window, timeout=timeout):
+    for probe in _probe_siblings(others, now=now, window=window, budget=budget):
         if probe.sibling is not None:
             siblings.append(probe.sibling)
         if probe.unavailable:
@@ -703,7 +739,7 @@ def _collect_branches(
     current_branch: Optional[str],
     prefixes: Sequence[str],
     now: float,
-    timeout: float,
+    budget: _Budget,
 ) -> Tuple[List[DivergentBranch], Optional[int], Optional[str]]:
     if rows is None:
         acc.unavailable.append(f"divergent branches: {error}")
@@ -735,7 +771,7 @@ def _collect_branches(
     queried = [name for name, _ in candidates]
     if current_branch and current_branch not in queried:
         queried.append(current_branch)
-    pairs, failures = _ahead_behind(root, queried, default_branch, timeout=timeout)
+    pairs, failures = _ahead_behind(root, queried, default_branch, budget=budget)
     if failures:
         acc.unavailable.append(f"divergent branches: {failures}")
     divergent = [
@@ -753,7 +789,7 @@ def _collect_branches(
     else:
         # Detached HEAD, or the branch probe could not answer for it.
         out, why = _git_text(
-            ["rev-list", "--count", f"HEAD..refs/heads/{default_branch}"], root, timeout=timeout
+            ["rev-list", "--count", f"HEAD..refs/heads/{default_branch}"], root, budget=budget
         )
         if out is None:
             acc.unavailable.append(f"commits this checkout is behind: {why}")
