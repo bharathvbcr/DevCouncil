@@ -3432,3 +3432,167 @@ The hook figure does not reproduce the seam lane's 0.77 s and is not claimed to:
 this machine ran at load 5-10 throughout (several sibling sessions building), and
 0.83 s is what it gives under that. The shape of the improvement holds; the last
 60 ms is not evidence either way.
+
+## Adversarial pass on the reconciled kernel (2026-09-05)
+
+An attack pass over the kernel as reconciled, driven through the release binary
+and the real transports rather than through the library where a fixture can
+flatter it. Six defects, each with a test that was watched failing against the
+tree that carried it; everything else in the table survived, which is a result
+too and is recorded as one.
+
+| surface | attacks run | verdict | closed by |
+|---|---|---|---|
+| **discovery: hostile trees** | symlink loops; symlinks escaping the root, absolute and `../..`; symlinked directories; 13 hostile file names (newline, tab, RTL override, 4-byte emoji, combining marks, ZWJ, `CON`/`PRN`/`NUL`/`COM1`/`LPT1`, trailing space, 250-char name); 30,000 files; a 377-level directory chain; a `.gitignore` of 10,000 patterns with one malformed glob; `CACHEDIR.TAG`; an unreadable file; an unreadable directory; a source exactly at `MAX_SOURCE_BYTES` and at +1; a 5,000-cell notebook; a 50 MB minified JS one-liner; a 400 KB single-line JS expression | **2 defects** | `discovery_stays_inside_the_root.rs`, `an_unreadable_subtree_is_a_hole_not_a_dead_build.rs` |
+| **discovery: torn reads** | a writer thread flipping bytes to `NUL`/`0xFF`/quotes/braces at random offsets throughout 10 consecutive full builds | survived — every mutated file became an `Unreadable` refusal, `degraded_reason` named all 120, `pragma integrity_check` `ok`, status never claimed fresh over nothing | — |
+| **concurrency** | 6 simultaneous `build --full` on one store; 50 `SIGKILL`s at uniformly random points of a build, each followed by a status probe, then a rebuild compared against an uninterrupted build's edge digest | survived — 6/6 exit 0 with 6 distinct generations, 0 of 50 kills left an unreadable or dishonest store, digest **converged** (`0b8ef0e5b555df72`) | — |
+| **query semantics** | `neighbors` cross-checked against the `impact` and `trace` it claims to compose, over a 61-module generated corpus, at floors 0.0/0.4/0.9 and depths 1/2/3; every reported edge checked against the generation's edge table and against the floor it claimed; `dead` checked against every inbound `Calls` edge at any confidence; `shown + hidden == total` and `truncated == (hidden > 0)` over 100+ budgeted answers; `count_callers_of` against `callers_of` at four floors, two exclusions, and a chunk-crossing batch with duplicates | **1 defect** (the depth) | `answers_agree_with_each_other.rs` |
+| **artifacts sidecar** | in-place rewrite of an artifact at equal length with its mtime restored by `utimensat`; corrupt, truncated and foreign-version sidecars; a deleted artifact; a foreign writer | **1 defect** (the restored mtime) | `artifacts_sidecar_adversarial.rs` |
+| **`devmap freshness`** | a repository with no commits; a detached HEAD; a tracked file deleted from disk; in-tree and escaping symlinks; a directory that is not a repository; `git` absent from `PATH`; each with and without `--expect-*` | honesty rule survived — every unanswerable case reported `source: "unavailable"` with a reason, `stale: null` when nothing was asked and `stale: true` when something was, and the skipped content check carried `checked: false` rather than a `match`. Never a false `fresh`. **1 defect** in what the inventory counts | `the_freshness_inventory_counts_only_what_discovery_can_index.rs`, `test_repo_mapper_helpers.py` |
+| **MCP over HTTP** | HTTP/1.0; `Expect: 100-continue` with and without the body; three pipelined keep-alive requests; a `Content-Length` of 100000 with a 60-byte body; 64 MiB declared; chunked encoding; a 70 KB header; `GET`; a garbage request line; no `Content-Type`; a non-JSON body; headers then `FIN`; 64 and 200 concurrent `tools/call` | survived — `100 Continue` then the answer; `408` after `BODY_READ_TIMEOUT` on the lying length; `413` *before* buffering on the 64 MiB declaration; `415`, `405`, `400` each on its own case; three answers to three pipelined requests; 200/200 `200 OK`, no `500`, no hang. The rebinding guard also refused every request whose `Host` was a name (`403`), which is what it is for | — |
+| **MCP over stdio** | 300 pipelined `tools/call` from a client that never reads its socket; 300 with a concurrent reader | survived — RSS grew 34 MB and stopped, the process stayed alive, and on draining, **301 of 301** answers were present; with a reader, 301 distinct ids and 0 errors. Nothing shed, nothing lost | — |
+| **determinism (R4)** | the same 120-file, three-language corpus built 5 times in fresh directories on `RAYON_NUM_THREADS=1` and 5 times on 8 | survived — all 10 `code_graph.json` byte-identical after stripping timestamps (`1a947483159beb72`, 1,654,041 bytes) | — |
+| **digests** | reviewed against the pinned FIPS 180-4 / RFC 7693 / CPython vectors already in `digest.rs`, including 55/56/64/128/129 byte boundaries, 1 MiB + 1, and chunked-by-1 streaming | already closed, pinned by `digest.rs::{sha1_matches_the_fips_180_vectors, sha1_streaming_equals_one_shot, blake2b_matches_rfc_7693_and_cpython_hashlib, blake2b_streaming_equals_one_shot}` and `tests/freshness_parity.rs` | — |
+| **tool surface** | `tools/list` over both transports | survived — 9 tools on each, `outputSchema` on 9 of 9, same names. (The brief's "18 tools" is not this server's count) | — |
+
+### The six defects
+
+**1. An artifact stamp a restored mtime can satisfy.** `ArtifactStamp::still_current`
+recorded `len`, `mtime_ns` and `ino`, all three of which an unprivileged writer
+can restore: rewrite `code_graph.json` in place at the same length and put its
+modification time back — what `cp -p`, `rsync --times`, `tar -x` and
+`File::set_times` all do — and `build --manifest` skipped regeneration and
+reported `artifacts_unchanged: true` over a graph belonging to another
+generation. Permanently: every later run compared against the same doctored
+stat. `ArtifactRecord` now also carries `ctime_ns`, which userspace cannot
+back-date and which `freshness::stat_key` in the same crate already carried for
+exactly this reason; `ARTIFACT_STAMP_VERSION` goes to 2.
+
+**2. A walk over a partly-read corpus.** Found here and, independently, on
+`main`. `impact` answered `shown: 0, total: 0, Available, walk_incomplete: None`
+over a generation whose own analysis summary recorded that the only caller's
+file had failed to parse — while `dead` quoted that summary and `deps` refused
+outright. The answer an agent reads as "nothing calls this, it is safe to
+delete" was the one of the three that gave it unqualified. `main`'s
+implementation is the one kept, because it hangs the disclosure inside
+`GenerationEdges` keyed to the generation the rows came from — no straddle
+window and no per-query cost, against the 2.9 µs separate read this branch
+wrote. What this branch keeps is the second exit: `traverse_over` also returns
+early with "no indexed traversal start", and that sentence is much weaker when
+the file the symbol lives in was never read.
+
+**3. A composition that spent the caller's depth on one direction.** `neighbors`
+walked `max_depth` inbound and a hardcoded single hop outbound, so a composed
+answer at depth 3 reported a three-level caller tree beside one hop of callees
+with nothing saying which half was cut short. Measured at depth 2: 17 edges
+against `trace`'s 35. It is the defect the `min_confidence` note in the same
+function describes and closes, surviving in the parameter beside it — and
+`neighbors_composition.rs` compares every field of both halves against the calls
+they replace at depth 1, the one depth where the pinned value and the requested
+one agree.
+
+**4. The cold walk did not stop at the repository boundary.** `preview` refuses
+a path that "resolves outside the indexed repository root" and
+`classify_pending_entry` refuses a queued path that is not a regular file or
+directory. `collect_sources_with_report` enforced neither: `WalkBuilder` never
+*descends* through a symlink, but `Path::is_file` and `fs::read_to_string` both
+follow one, so `src/creds.py -> <outside>/credentials.py` was read and its
+symbols indexed — and `preview` then declined to show the symbols the build had
+just written. Now refused and recorded as `DiscoverySkipReason::EscapesRoot`,
+which `is_refusal` counts as coverage loss; a symlink whose target is inside the
+repository is still read, because the walk reaches those bytes under their real
+name anyway.
+
+**5. One unreadable directory cost the whole map.** An unreadable *file* is a
+recorded `Unreadable` refusal and the build describes everything else; an
+unreadable *directory* propagated out of the walker and `devmap build` exited 1
+with `node_count: 0`, "nothing has been indexed yet". The same `result?` sat in
+`collect_go_modules`, which `devmap build` calls over the same root immediately
+afterwards, so fixing only the discovery walk left the binary failing exactly as
+before — caught because the fix was checked through the release binary and not
+only through the unit test. An error naming a path below the root is now
+recorded (discovery) or stepped over (go.mod enrichment, whose loss the
+discovery pass over the same tree already records); an error naming the root, or
+naming no path, stays fatal.
+
+**6. The freshness inventory did not stop at the boundary either.** The second
+shape of the disagreement `aecb670` closed for tagged cache directories, found
+by attacking the pair rather than by re-reading the cache rule. `git ls-files`
+lists a tracked symlink — it is an ordinary mode-120000 entry — and
+`keep_indexable`'s closing `is_file()` follows it, so the inventory counted a
+path discovery refuses and hashed bytes the map does not describe. Measured:
+`devmap build` reported `files_indexed: 1, discovery_refused_files: 1` while
+`devmap freshness` reported `files: 2` and its fingerprint moved from
+`c2:496ee980…` to `c2:8bcb1a2b…` on an edit that touched only a file *outside*
+the repository. Same cost as the cache case — the map reads stale on a change it
+can never absorb. `escapes_root` is now public and both walks call it, and
+`RepoMapper._escapes_root` transcribes it into `_keep` because
+`freshness_parity` compares the two inventories file for file.
+
+### A flaky test that was not a kernel defect
+
+`a_fan_out_pays_for_its_index_once_per_direction` was reported failing at load
+average ~350 on "the fixture must produce real callers", and passing in
+isolation — which reads as a load-sensitive defect in `neighbors` or the
+per-generation edge index. It is neither. Its `core.py` is 312 KB of 6,001
+functions and `extract_file` gives a file `DEFAULT_PARSE_BUDGET`, five seconds,
+after which **no symbols are claimed for it at all**. Measured in a debug build
+on an idle machine: 2,882 ms; with a cargo build alongside: 5,018 ms, at which
+point extraction returns `ParseOutcome::Failed { "extraction of 312038 bytes
+exceeded the 5s budget … " }`, the store holds 9 edges instead of 12,018, and
+`neighbors` correctly answers `Unavailable` for all sixteen targets. The fixture
+sat at 58% of its budget with the variance to cross it. Both `chain_store`
+fixtures now extract through `extract_treesitter_with_budget` with a budget no
+machine can exhaust and assert `ParseOutcome::Clean` on their own inputs, so a
+future refusal is reported as a refused fixture rather than as an assertion
+about the query engine two hundred lines away.
+
+### Left open, with the reason
+
+* **Cold and incremental still disagree about an in-repository symlink.**
+  `db.rs::classify_pending_entry` refuses *every* symlink — `symlink_metadata`
+  gives neither `is_dir()` nor `is_file()`, so it lands on
+  `Ok(_) => Err("not a regular file or directory")` — while
+  `collect_sources_with_report` indexes one whose target is inside the tree. A
+  cold build therefore holds `src/util.py -> shared/util.py` and the drain drops
+  the row that would refresh it. Pre-existing, not touched by this pass, and the
+  choice between the two rules is a product decision rather than a bug fix.
+* **Resolver/liveness honesty (brief surface 5) was not attacked.**
+  `Resolution::confidence` is already the single owner of the tier mapping with
+  its own tests, so the marginal value of a second pass was lower than the
+  surfaces above and the budget went there instead. Not "clear" — unexamined.
+* **The 200-cycle `tools/soak.sh` run on a copy of `corpus_scholarlm` (brief
+  surface 6) was not run.** The 50-kill convergence run and the 6-way concurrent
+  build cover the crash and writer-contention halves; the RSS-plateau half is
+  unmeasured.
+* **A clap argument error is not one-line JSON.** `devmap preview src/x.py`
+  (positional instead of `--file`) prints clap's usage block to stderr and exits
+  2, whichever way `--json` is set. Every exit from the program's own code is
+  one line of JSON; this one is before `main` runs. Recorded rather than
+  changed, because exit 2 with usage on stderr is the conventional contract and
+  a caller can already tell it apart.
+
+### Verification
+
+Taken at `94cf7af`, which is `main` plus this pass's commits; `main` moved twice
+while the pass ran and was merged in each time, and only the last run is quoted.
+
+| gate | result |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0, no output |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
+| `cargo test --workspace --no-fail-fast` | **1,384 passed, 0 failed, 2 ignored**; zero `test result: FAILED` lines in the log |
+| `pytest tests/unit -q -p no:cacheprovider` | **4,173 passed, 0 failed, 9 xfailed** in 465 s |
+| `ruff check src tests` | `All checks passed!` |
+| `cargo build --release -p devmap-cli` | exit 0; every attack above re-run against that binary |
+
+The two ignored tests are the pre-existing pair
+(`the_emitted_bundle_passes_claude_plugin_validate_strict`, which needs the
+`claude` CLI on PATH, and `concurrent_prune_writer_child`, a child-process
+helper).
+
+Two of the six fixes were verified through the release binary and not only
+through their unit tests, and one of those checks is why defect 5 is complete:
+`collect_sources_with_report` was fixed, the test went green, and the binary
+still exited 1 — because `collect_go_modules` carried the same `result?` and
+`devmap build` calls it over the same root two lines later.
