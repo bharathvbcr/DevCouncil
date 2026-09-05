@@ -192,13 +192,23 @@ impl<'a> StoreQueryEngine<'a> {
         }
         // A composed answer must come from one generation.
         //
-        // The fan-out is `2 * targets.len()` sub-queries, each taking and
-        // releasing the store lock on its own. A build committing mid-fan-out
-        // left one answer describing two different snapshots of the repository —
-        // measured at 25 of 62 composed answers under contention — and nothing
-        // in the response disclosed it. That is not a regression against the
-        // separate `impact`/`deps` calls this replaced, which straddled the same
-        // way; but those were visibly separate exchanges and this is sold as one.
+        // The fan-out used to be `2 * targets.len()` sub-queries, each taking
+        // and releasing the store lock on its own. A build committing
+        // mid-fan-out left one answer describing two different snapshots of the
+        // repository — measured at 25 of 62 composed answers under contention —
+        // and nothing in the response disclosed it. That is not a regression
+        // against the separate `impact`/`deps` calls this replaced, which
+        // straddled the same way; but those were visibly separate exchanges and
+        // this is sold as one.
+        //
+        // `neighbors_once` now reads the edge table once for the whole
+        // fan-out, so the parts of one answer can no longer disagree with each
+        // other about the graph. The check below stays because that read is
+        // still not atomic with the two generation probes around it: a commit
+        // landing between the first probe and the read produces an answer from
+        // a generation the caller was not told about. One read narrows the
+        // window; it does not close it, and an undisclosed straddle is the
+        // defect either way.
         //
         // Detected rather than locked out: holding the store lock across the
         // whole fan-out would block the writer for the duration of a composed
@@ -239,6 +249,33 @@ impl<'a> StoreQueryEngine<'a> {
         min_confidence: f32,
         max_depth: usize,
     ) -> anyhow::Result<Vec<Neighbors>> {
+        // Nothing asked, nothing read. Without this the hoisted load below
+        // would pull the whole edge table to answer a request with no targets.
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One edge load for the whole fan-out.
+        //
+        // `impact` and `trace` each begin by reading and converting every edge
+        // in the generation, so a composed answer over N targets paid for that
+        // 2N times — 16 full reads for the eight-target fan-out the daemon
+        // sends, of a table that does not change between them. On a
+        // 660,000-edge store the read is 38 ms and the conversion 33 ms, so
+        // fifteen of those sixteen reads were 1.07 s of a 2.56 s answer.
+        //
+        // This is the same hoist `explore` already performs, for the same
+        // reason and through the same seam: `traverse_over` *is* the body of
+        // `impact`/`trace` once the edges are in hand, so every direction below
+        // gets exactly the traversal, budget and `walk_incomplete` reason it
+        // got before — the ownership of the load moved, nothing else. The
+        // filter is `min_confidence`, which is one value for the whole request,
+        // so a single load can serve every target and both directions.
+        //
+        // It also makes the composition *more* coherent than it was: the parts
+        // of one answer now share one edge snapshot instead of racing each
+        // other. The generation straddle check in [`Self::neighbors`] still
+        // wraps this, because the load is not the only store read here.
+        let edges = self.resolved_edges(min_confidence)?;
         let mut answers = Vec::with_capacity(targets.len());
         for target in targets {
             // Plain `check`, not `check_every`: the latter consults the flag
@@ -246,25 +283,30 @@ impl<'a> StoreQueryEngine<'a> {
             // most MAX_NEIGHBOR_TARGETS (16) times, so it would fire on target
             // 0 and never again.
             //
-            // In practice cancellation already lands inside `impact`, whose
-            // traversal checks the flag as it walks, so this is not what
-            // rescues a cancelled request — measurement confirms a composition
-            // stops partway through either way. It closes the gap *between*
-            // sub-queries, and costs one relaxed load per target.
+            // In practice cancellation already lands inside `traverse_over`,
+            // which checks the flag on either side of the walk, so this is not
+            // what rescues a cancelled request — measurement confirms a
+            // composition stops partway through either way. It closes the gap
+            // *between* sub-queries, and costs one relaxed load per target.
             self.cancel.check()?;
             // `min_confidence` applies to *both* directions. It was hardcoded to
             // 0.0 here, which silently discarded the caller's filter on the
             // inbound side: one composed answer would report every caller while
             // reporting only the callees that cleared the threshold, so its two
-            // halves disagreed about what the filter meant. `traverse` honours
-            // the field (`resolved_edges(req.min_confidence)`), so there was
-            // never a reason not to pass it.
-            let callers = self.impact(Request {
-                query: target.clone(),
-                token_budget,
-                min_confidence,
-                max_depth,
-            })?;
+            // halves disagreed about what the filter meant. It is now applied
+            // once, in the shared `resolved_edges(min_confidence)` above, and
+            // again inside `traverse_over` — so the two halves cannot diverge
+            // by construction rather than by both remembering to pass it.
+            let callers = self.traverse_over(
+                &edges,
+                Request {
+                    query: target.clone(),
+                    token_budget,
+                    min_confidence,
+                    max_depth,
+                },
+                true,
+            )?;
             // Outbound edges come from whichever query can actually answer
             // for this target's shape.
             //
@@ -300,12 +342,16 @@ impl<'a> StoreQueryEngine<'a> {
             //
             // `deps` the command is unchanged; only this composition's `callees`
             // tightened to what the field has always claimed to be.
-            let callees = self.trace(Request {
-                query: target.clone(),
-                token_budget,
-                min_confidence,
-                max_depth: 1,
-            })?;
+            let callees = self.traverse_over(
+                &edges,
+                Request {
+                    query: target.clone(),
+                    token_budget,
+                    min_confidence,
+                    max_depth: 1,
+                },
+                false,
+            )?;
             answers.push(Neighbors {
                 target: target.clone(),
                 callers,
@@ -2413,19 +2459,38 @@ impl<'a> QueryEngine<'a> {
     }
 }
 
-fn traversed_resolution_edges(
+/// The traversed identities, mapped back to the full edges they name.
+///
+/// Public so `examples/query_bench.rs` can time this phase of an `impact`
+/// call against the real function rather than against a copy of it that
+/// could drift from it.
+pub fn traversed_resolution_edges(
     traversal: &devmap_analyze::traversal::TraversalResult,
     edges: &[ResolvedEdge],
     min_confidence: f32,
 ) -> Vec<ResolvedEdge> {
-    let traversed: std::collections::BTreeSet<(String, String, String)> = traversal
+    // Borrowed keys. The set is built from the walk, which outlives this call,
+    // and probed with slices of `edges`, which the caller owns — so the scan
+    // allocates nothing. The previous spelling built an owned `(String, String,
+    // String)` key for *every edge in the generation* purely to ask a question
+    // and then dropped it: three allocations per edge, so ~2.0M per `impact`
+    // on a 660,000-edge store, measured at 42.9 ms against 11.2 ms here
+    // (`examples/query_phase_ab.rs`, hypothesis H2).
+    //
+    // `edge_kind_name` has to spell a kind exactly as `traverse_graph` recorded
+    // it — that side uses `format!("{:?}", kind)`. If the two ever diverge this
+    // filter matches nothing and `impact` answers "no callers" from a
+    // comparison that never ran, which is the Class A failure this codebase
+    // treats as worse than a visible gap. Both directions are pinned by
+    // `edge_kind_name_is_the_spelling_traverse_graph_records`.
+    let traversed: std::collections::BTreeSet<(&str, &str, &str)> = traversal
         .traversed_edges
         .iter()
         .map(|edge| {
             (
-                edge.source.clone(),
-                edge.target.clone(),
-                edge.edge_kind.clone(),
+                edge.source.as_str(),
+                edge.target.as_str(),
+                edge.edge_kind.as_str(),
             )
         })
         .collect();
@@ -2434,9 +2499,9 @@ fn traversed_resolution_edges(
         .filter(|edge| {
             edge.confidence.0 >= min_confidence
                 && traversed.contains(&(
-                    edge.source_symbol.clone(),
-                    edge.target_symbol.clone(),
-                    format!("{:?}", edge.edge_kind),
+                    edge.source_symbol.as_str(),
+                    edge.target_symbol.as_str(),
+                    edge_kind_name(edge.edge_kind),
                 ))
         })
         .cloned()
@@ -2480,7 +2545,7 @@ fn node_id_of(file_path: &str, symbol_name: &str) -> String {
 /// Lifted out of `traverse` so the blast radius resolves its seeds through the
 /// same matcher the traversal does. Resolving them two ways is how a radius
 /// ends up seeded from a symbol the trace never visits.
-fn traversal_starts(edges: &[ResolvedEdge], target: &str, reverse: bool) -> Vec<(String, String)> {
+pub fn traversal_starts(edges: &[ResolvedEdge], target: &str, reverse: bool) -> Vec<(String, String)> {
     edges
         .iter()
         .filter(|edge| {
@@ -3064,6 +3129,81 @@ mod tests {
     use super::*;
     use devmap_extract::extract_file;
     use devmap_resolve::Resolver;
+
+    /// Every `EdgeKind`, so a variant added to the enum cannot slip past the
+    /// two spellings below without failing here.
+    ///
+    /// `edge_kind_name`'s own `match` has no wildcard arm, so a new variant is
+    /// a compile error there; this array is what stops a new variant from being
+    /// *added to the enum and to that match* while going untested. The length
+    /// assertion below is what stops the array itself from silently shrinking.
+    const ALL_EDGE_KINDS: [EdgeKind; 14] = [
+        EdgeKind::Imports,
+        EdgeKind::Calls,
+        EdgeKind::Contains,
+        EdgeKind::Defines,
+        EdgeKind::Instantiates,
+        EdgeKind::Extends,
+        EdgeKind::Implements,
+        EdgeKind::SubscribesTo,
+        EdgeKind::HandlesRoute,
+        EdgeKind::WiredTo,
+        EdgeKind::MemberOf,
+        EdgeKind::DependsOn,
+        EdgeKind::TaintFlow,
+        EdgeKind::References,
+    ];
+
+    /// `edge_kind_name` must spell a kind exactly as `traverse_graph` records
+    /// it, and exactly as `stored_edge_to_resolved` parses it back.
+    ///
+    /// This is load-bearing, not cosmetic. `traversed_resolution_edges` selects
+    /// the walk's edges out of the generation by comparing
+    /// `edge_kind_name(kind)` against the `format!("{:?}", kind)` string
+    /// `traverse_graph` put in `EdgeIdentity::edge_kind`. If those two ever
+    /// disagree for one variant, every edge of that kind silently fails the
+    /// membership test and `impact` reports "no callers" — a positive claim
+    /// produced by a comparison that never matched, which is exactly the
+    /// failure mode this codebase treats as worse than an empty answer. There
+    /// is no output to observe it in: the answer is well-formed and wrong.
+    ///
+    /// Three spellings are tied together here — the `Debug` derive, the
+    /// `edge_kind_name` table, and the store's string parser — so no two of
+    /// them can drift apart unnoticed.
+    #[test]
+    fn edge_kind_name_is_the_spelling_traverse_graph_records() {
+        let mut seen = std::collections::BTreeSet::new();
+        for kind in ALL_EDGE_KINDS {
+            let name = edge_kind_name(kind);
+            assert_eq!(
+                name,
+                format!("{kind:?}"),
+                "edge_kind_name disagrees with the Debug spelling traverse_graph \
+                 records in EdgeIdentity::edge_kind; traversed_resolution_edges \
+                 would drop every {kind:?} edge and report an empty blast radius"
+            );
+            let round_tripped = stored_edge_to_resolved(StoredEdge {
+                source_file: "a.py".to_string(),
+                target_file: "b.py".to_string(),
+                source_symbol: "a.py::from".to_string(),
+                target_symbol: "b.py::to".to_string(),
+                edge_kind: name.to_string(),
+                confidence: 1.0,
+            })
+            .expect("the store must parse back the name this table emits");
+            assert_eq!(
+                round_tripped.edge_kind, kind,
+                "the store parses {name:?} as a different kind than it names"
+            );
+            assert!(seen.insert(name), "two kinds share the name {name:?}");
+        }
+        assert_eq!(
+            seen.len(),
+            ALL_EDGE_KINDS.len(),
+            "the kind table must hold one distinct name per variant"
+        );
+        assert_eq!(ALL_EDGE_KINDS.len(), 14, "a variant was added or removed");
+    }
 
     /// A symbol too large for the budget is returned capped, and says so.
     ///

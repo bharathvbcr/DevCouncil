@@ -54,10 +54,55 @@ fn has_source_extension(query: &str) -> bool {
     )
 }
 
+/// `file` names `query`, exactly or as a segment-aligned suffix, with `\\` and
+/// `/` treated as the same separator.
+///
+/// Byte-wise rather than `file.replace('\\', "/") == query.replace(...) ||
+/// file.ends_with(&format!("/{query}"))`. That spelling allocated to answer a
+/// boolean — measured at four heap operations per call — and
+/// `traversal_starts` calls this once per edge in the generation, so one
+/// `impact` on a 660,000-edge store discarded ~2.6M of them. Over that store
+/// the scan cost 37.3 ms and costs 3.4 ms here; see
+/// `examples/query_phase_ab.rs`, hypothesis H1.
+///
+/// Equivalent by construction, not by resemblance: `/` (0x2F) and `\\` (0x5C)
+/// are ASCII, so they never occur inside a multi-byte UTF-8 sequence, and
+/// folding one to the other is a length-preserving byte map. Comparing the
+/// folded bytes is therefore the same predicate as comparing the folded
+/// strings. `path_matching_agrees_with_the_spelling_it_replaced`, below,
+/// differential-tests it against that spelling, and
+/// `tests/query_work_is_bounded_by_the_answer.rs` pins the allocation count.
 fn path_matches(file: &str, query: &str) -> bool {
-    let file = file.replace('\\', "/");
-    let query = query.replace('\\', "/");
-    file == query || file.ends_with(&format!("/{query}"))
+    let file = file.as_bytes();
+    let query = query.as_bytes();
+    if separator_insensitive_eq(file, query) {
+        return true;
+    }
+    // The `ends_with("/{query}")` half: the separator has to be there too, so
+    // `abc.go` does not match a query of `bc.go`.
+    match file.len().checked_sub(query.len() + 1) {
+        Some(boundary) => {
+            as_separator(file[boundary]) == b'/'
+                && separator_insensitive_eq(&file[boundary + 1..], query)
+        }
+        None => false,
+    }
+}
+
+fn as_separator(byte: u8) -> u8 {
+    if byte == b'\\' {
+        b'/'
+    } else {
+        byte
+    }
+}
+
+fn separator_insensitive_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(a, b)| as_separator(*a) == as_separator(*b))
 }
 
 fn symbol_matches(symbol: &str, query: &str) -> bool {
@@ -144,6 +189,70 @@ mod tests {
         assert!(has_source_extension("app.tsx"));
         assert!(!has_source_extension("Type.method"));
         assert!(!has_source_extension("noextension"));
+    }
+
+    /// The allocation-free matcher answers exactly what the `replace`/`format!`
+    /// spelling answered.
+    ///
+    /// The rewrite is justified by an argument — `/` and `\\` are ASCII, so
+    /// folding one to the other is a length-preserving byte map and comparing
+    /// folded bytes is comparing folded strings — and an argument is not
+    /// evidence. This is the evidence: the old spelling, kept here as an
+    /// oracle, run against the new one over the inputs that could separate
+    /// them. Multi-byte text is in the table because a byte-wise comparison is
+    /// where a naive rewrite breaks; the empty query is there because
+    /// `checked_sub(query.len() + 1)` is the guard that keeps it from
+    /// underflowing.
+    #[test]
+    fn path_matching_agrees_with_the_spelling_it_replaced() {
+        fn oracle(file: &str, query: &str) -> bool {
+            let file = file.replace('\\', "/");
+            let query = query.replace('\\', "/");
+            file == query || file.ends_with(&format!("/{query}"))
+        }
+
+        let fragments = [
+            "",
+            "/",
+            "\\",
+            "a",
+            "a.go",
+            "b/c.go",
+            "a/b/c.go",
+            "a\\b\\c.go",
+            "a/b\\c.go",
+            "abc.go",
+            "bc.go",
+            "/b/c.go",
+            "a/b/c.go/",
+            "a//b.go",
+            // Multi-byte: 0xC3 0xA9 and a 4-byte emoji. A byte-wise fold must
+            // not mistake a continuation byte for a separator.
+            "caf\u{e9}/m\u{f3}dulo.go",
+            "caf\u{e9}\\m\u{f3}dulo.go",
+            "m\u{f3}dulo.go",
+            "\u{1F980}/ferris.rs",
+            "ferris.rs",
+            // A name whose bytes end the same way another one does, which is
+            // what the boundary check exists to reject.
+            "xxbc.go",
+        ];
+
+        let mut checked = 0usize;
+        for file in fragments {
+            for query in fragments {
+                assert_eq!(
+                    path_matches(file, query),
+                    oracle(file, query),
+                    "path_matches({file:?}, {query:?}) diverged from the spelling it replaced"
+                );
+                checked += 1;
+            }
+        }
+        // The pair count is asserted so a future edit that empties the table
+        // cannot leave a green test that checked nothing.
+        assert_eq!(checked, fragments.len() * fragments.len());
+        assert_eq!(checked, 400);
     }
 
     #[test]
