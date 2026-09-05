@@ -428,6 +428,10 @@ def _tools() -> list[Tool]:
             description=(
                 "Blast-radius impact for given paths: import dependents, neighbor "
                 "subsystem areas, and cross-boundary area pairs from the repo map. "
+                "`cross_boundary_checked` is false when the map never established "
+                "which subsystems are neighbors, in which case an empty "
+                "`cross_boundary_pairs` means the check could not run, not that "
+                "every touched area is adjacent. "
                 "Set precise=true to resolve dependents via live LSP references when "
                 "a language server is available (falls back to import-level dependents)."
             ),
