@@ -31,6 +31,7 @@ from devcouncil.devmap_engine import (
     DevMapEngineError,
     find_engine_binary,
 )
+from devcouncil.utils.git_siblings import inspect_session_siblings, session_guard_detail
 
 #: Free-page share above which the store is worth reclaiming. The kernel's own
 #: threshold is 5%; doctor warns well above it because steady state after a
@@ -528,6 +529,29 @@ def render_build_lines(result: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def _siblings_verdict(root: Path) -> tuple[Optional[bool], str, str]:
+    """``(ok, detail, code)`` for the ``siblings`` check.
+
+    The map is not what breaks when two sessions share a repository — the work
+    is — so this never fails the doctor. It still refuses to say "none" when it
+    could not look: a probe that raised or that git could not answer reports
+    ``None`` (unknown) with the reason, exactly like the store and freshness
+    checks above.
+    """
+    try:
+        report = inspect_session_siblings(root)
+    except Exception as exc:  # a guard that crashes must not read as a clean repository
+        return None, f"could not check: {exc}", "siblings_unknown"
+    detail = session_guard_detail(report)
+    if report.live_siblings:
+        return False, detail, "live_sibling"
+    if report.divergent_branches:
+        return False, detail, "divergent_branch"
+    if report.unavailable:
+        return None, detail, "siblings_unknown"
+    return True, detail, ""
+
+
 def run_doctor(root: Path) -> Dict[str, Any]:
     """Checks with verdicts. ``ok`` is False when any *critical* check fails.
 
@@ -763,6 +787,22 @@ def run_doctor(root: Path) -> Dict[str, Any]:
     else:
         check("build", True, "none running", critical=False)
 
+    ok_siblings, detail_siblings, code_siblings = _siblings_verdict(root)
+    check(
+        "siblings",
+        ok_siblings,
+        detail_siblings,
+        critical=False,
+        code=code_siblings,
+        fix=""
+        if ok_siblings is True
+        else (
+            "another session may be working in this repository — look before you write "
+            "(git worktree list; git branch --no-merged)"
+        ),
+        fix_command="" if ok_siblings is True else "git worktree list",
+    )
+
     runs = status["last_build"]
     last = runs.get("last") if isinstance(runs, dict) else None
     if last and not last.get("ok", True):
@@ -798,6 +838,12 @@ _BUILD_RESOLVES = {
 }
 #: Codes no command inside the repository can fix.
 _NEEDS_A_PERSON = {"engine_missing", "schema_newer_than_kernel"}
+#: Codes that describe the world *around* this checkout rather than its map.
+#: `--fix` lists them so a failing check cannot vanish from its output, but —
+#: unlike `_NEEDS_A_PERSON` — they must not hold back the build it would run.
+#: (`siblings_unknown` is not here: it rides on `ok: None`, which `--fix` never
+#: treats as failing in the first place.)
+_REPORT_ONLY = {"live_sibling", "divergent_branch"}
 
 
 def _quarantine_store(root: Path) -> Dict[str, Any]:
@@ -844,7 +890,11 @@ def apply_fixes(root: Path) -> Dict[str, Any]:
         }
 
     for item in failing:
-        if item["code"] in _NEEDS_A_PERSON or item["code"].startswith("last_build_failed"):
+        if (
+            item["code"] in _NEEDS_A_PERSON
+            or item["code"] in _REPORT_ONLY
+            or item["code"].startswith("last_build_failed")
+        ):
             not_applied.append({"code": item["code"], "fix": item["fix"], "fix_command": item["fix_command"]})
     if "stale_build_marker" in codes:
         marker = root / LIVE_BUILD_RELPATH

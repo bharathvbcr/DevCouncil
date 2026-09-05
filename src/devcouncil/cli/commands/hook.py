@@ -4,7 +4,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from devcouncil.telemetry.stages import log_step
 
 app = typer.Typer()
@@ -970,6 +970,72 @@ def agent_response(
     """
     _handle_unified_stop(event_json, client=client, project_root=project_root, hook_kind="stop")
 
+
+#: The status line carries at most one "Continuity — …" sentence, and
+#: :func:`_with_continuity` is the only thing that writes it.
+_CONTINUITY_LEAD = " Continuity — "
+
+
+def _with_continuity(base: str, hints: Sequence[str]) -> str:
+    """Fold *hints* into the line's single Continuity sentence."""
+    if not hints:
+        return base
+    joined = "; ".join(hints)
+    if base.endswith(".") and _CONTINUITY_LEAD in base:
+        return f"{base[:-1]}; {joined}."
+    return f"{base}{_CONTINUITY_LEAD}{joined}."
+
+
+def _session_guard_hints(root: Path) -> list[str]:
+    """"Who else is working in this repository?", as Continuity clauses.
+
+    Spawns git, so it is opt-in and SessionStart is the only caller: it is the
+    one moment a session can still pick a different branch or checkout. The
+    per-prompt and per-tool-call hooks must never pay for it.
+    """
+    try:
+        from devcouncil.utils.git_siblings import inspect_session_siblings, session_guard_hints
+
+        return session_guard_hints(inspect_session_siblings(root))
+    except Exception:
+        logger.debug("session guard probe failed", exc_info=True)
+        return []
+
+
+def _continuity_hints(root: Path) -> list[str]:
+    """The clauses that follow "Continuity —" on the status line.
+
+    Each source is guarded on its own: one that cannot answer contributes
+    nothing rather than costing the whole line.
+    """
+    hints: list[str] = []
+    try:
+        from devcouncil.indexing.repo_mapper import RepoMapper
+        from devcouncil.utils.json_persist import read_json
+
+        map_path = root / ".devcouncil" / "repo_map.json"
+        if map_path.is_file():
+            loaded = read_json(map_path)
+            data = loaded if isinstance(loaded, dict) else {}
+            if RepoMapper(root).map_is_stale(data):
+                hints.append("repo map stale — run `dev map` (or MCP graph_ingest)")
+        else:
+            hints.append("no repo map — run `dev map`")
+    except Exception:
+        pass
+    try:
+        from devcouncil.integrations.check import _cursor_config_status
+
+        status, fixable, _ = _cursor_config_status(root)
+        if status != "ok" and fixable:
+            hints.append(
+                f"Cursor MCP {status} — run `dev integrate cursor --apply`"
+            )
+    except Exception:
+        pass
+    return hints
+
+
 def _status_line(root: Path) -> str | None:
     """A one-line DevCouncil status snapshot, or None when uninitialized/unavailable.
 
@@ -993,34 +1059,7 @@ def _status_line(root: Path) -> str | None:
             f"gaps: {summary['total_gaps']} ({summary['blocking_gaps']} blocking). "
             "Use the devcouncil_* MCP tools and `dev` CLI to stay inside the verify loop."
         )
-        hints: list[str] = []
-        try:
-            from devcouncil.indexing.repo_mapper import RepoMapper
-            from devcouncil.utils.json_persist import read_json
-
-            map_path = root / ".devcouncil" / "repo_map.json"
-            if map_path.is_file():
-                loaded = read_json(map_path)
-                data = loaded if isinstance(loaded, dict) else {}
-                if RepoMapper(root).map_is_stale(data):
-                    hints.append("repo map stale — run `dev map` (or MCP graph_ingest)")
-            else:
-                hints.append("no repo map — run `dev map`")
-        except Exception:
-            pass
-        try:
-            from devcouncil.integrations.check import _cursor_config_status
-
-            status, fixable, _ = _cursor_config_status(root)
-            if status != "ok" and fixable:
-                hints.append(
-                    f"Cursor MCP {status} — run `dev integrate cursor --apply`"
-                )
-        except Exception:
-            pass
-        if hints:
-            return f"{base} Continuity — {'; '.join(hints)}."
-        return base
+        return _with_continuity(base, _continuity_hints(root))
     except Exception:
         return None
 
@@ -1164,6 +1203,8 @@ def _session_start_context(root: Path, payload: dict) -> str | None:
         record_compact_brief(root, str(session_id) if session_id else None)
         return compact_briefing(root, payload)
     base = _status_line(root)
+    if base:
+        base = _with_continuity(base, _session_guard_hints(root))
     try:
         from devcouncil.execution.stop_gate import session_briefing
 
