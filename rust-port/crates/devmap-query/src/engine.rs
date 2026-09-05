@@ -4647,8 +4647,9 @@ mod search_bounds_tests {
         // The symbol is in the first 100 bytes; the rest is filler the answer
         // never names.
         const FILLER: usize = 50 * 1024 * 1024;
+        const HEAD: &str = "def findable_symbol():\n    return 1\n";
         let mut source = String::with_capacity(FILLER + 128);
-        source.push_str("def findable_symbol():\n    return 1\n");
+        source.push_str(HEAD);
         let head = source.len();
         source.push_str("# ");
         while source.len() < FILLER {
@@ -4657,10 +4658,27 @@ mod search_bounds_tests {
         source.push('\n');
         std::fs::write(dir.join("huge.py"), &source).expect("write fixture");
 
-        let store = store_of("huge.py", &source);
+        // The *generation* is extracted from the head, not from the 50 MB
+        // buffer, while the file on disk stays 50 MB — which is the only half
+        // this test is about, since `hit_from_stored` reads the file and not
+        // the buffer. Extracting the whole thing made the fixture depend on
+        // wall time: `extract_treesitter` shares one `DEFAULT_PARSE_BUDGET`
+        // (5 s) between the parse and the walk, and a 50 MB source in a debug
+        // build overruns it whenever the machine is busy. The symptom was this
+        // test passing when run alone and failing whenever anything ran beside
+        // it — `shown: 0`, reported as "the fixture must produce exactly one
+        // hit", with nothing pointing at the budget. The head is a prefix of
+        // the file, so the span the store records is the same span either way.
+        let store = store_of("huge.py", HEAD);
         // The engine resolves spans against the generation's recorded root.
         {
-            let ext = extract_file("huge.py", &source);
+            let ext = extract_file("huge.py", HEAD);
+            assert!(
+                ext.symbols.iter().any(|s| s.name == "findable_symbol"),
+                "fixture precondition: the head must extract the symbol, or the \
+                 search below finds nothing for a reason that has nothing to do \
+                 with how many bytes it read"
+            );
             let mut resolver = Resolver::new();
             resolver.index_extractions(std::slice::from_ref(&ext));
             let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
