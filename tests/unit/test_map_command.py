@@ -123,7 +123,7 @@ def test_map_engine_unavailable_exits(tmp_path, monkeypatch):
         raise engine.DevMapEngineError("kernel unavailable")
 
     monkeypatch.setattr(map_cmd, "build_map", _boom, raising=False)
-    monkeypatch.setattr(engine, "build_map", _boom)
+    monkeypatch.setattr(engine, "build_map_result", _boom)
     result = runner.invoke(app, ["map"])
     assert result.exit_code == 1
 

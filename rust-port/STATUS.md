@@ -3065,3 +3065,285 @@ guard, not a red test — checked, not assumed.** Run against the previous
 `SELECT analysis_json` spelling it still passes, because serde rejected the
 malformed blob just as SQLite now does. There is no pre-fix state in which it
 fails; what it guards is the future change that would reintroduce the hazard.
+## Seam lane: the per-tool-call refresh moved onto the kernel (2026-09-05)
+
+`dev hook post-tool-use` runs after every tool call an agent makes. On an
+**unchanged** tree it cost **1.41 s**, and essentially none of that was work:
+
+| what | cost | why it was spent |
+|---|---|---|
+| `import devcouncil.cli.commands.hook` | 149 ms | `live.tasks` → `storage.db` loaded SQLAlchemy + SQLModel (90 ms) and `json_persist`/`hook_policy`/`telemetry.traces` loaded pydantic (42 ms), on a path that opens no database and writes no trace |
+| `compute_freshness` in Python | ~150 ms | two `git ls-files` passes and a stat walk over 1,388 files, immediately after the kernel had walked the same tree |
+| `devmap build` | 250 ms | the real incremental check |
+| `devmap manifest` | 430 ms | re-read the whole generation out of SQLite and re-serialized a **22 MB** `code_graph.json` to produce bytes identical to the ones on disk; `write_atomic` then compared them and declined the rename |
+| `devmap status` | 10 ms | a third process, asking the store a question the build already knew |
+| debounce | 300 ms | deliberate burst coalescing; unchanged |
+
+Three process spawns and 22 MB of JSON for a tree that had not moved.
+
+### What changed
+
+**One invocation.** `devmap build --manifest` writes `repo_map.json` and
+`code_graph.json` from the generation the build leaves current, in the same
+process and the same store open, and embeds the store's own status in its
+`--json` result. `devmap manifest` stays a command of its own. `devmap_engine`
+gained `build_map_result`, which is now the one function that runs the kernel;
+`build_map` is its path-returning adapter. The seam's `_kernel_status` spawn is
+gone from the fused path and kept as the fallback for a kernel that cannot
+report it.
+
+**Artifacts are rewritten only when they would change.** A sidecar beside the
+store (`<db>.artifacts.json`) records the writing binary's own `(path, size,
+mtime)`, every input the artifacts derive from — generation id, pending count,
+built head, repo root, the three freshness stamps, the code-graph schema — and
+each output's `(len, mtime, inode)` as written. When all of it still holds the
+generation is never read. Fail-closed in every direction: an unreadable sidecar,
+a missing or edited output, a different binary, one differing input — each is a
+miss, and a miss regenerates. `artifacts.rs`'s existing `should_regenerate`
+could not do this job: it reads the finished file back, which for a 22 MB graph
+means the serialization has already happened.
+
+**The kernel computes its own freshness digests.** `devmap_query::freshness` is
+a deliberate transcription of `RepoMapper.get_git_files` /
+`_files_fingerprint` / `_content_fingerprint`, down to the `\0` separator, the
+`c2:` scheme and the `(size, mtime_ns, ctime_ns)` memo key — it reads and writes
+*the same* `.devcouncil/cache/content_hashes.json` Python does, rather than
+keeping a second memo of the same computation. SHA-1 and BLAKE2b are implemented
+in-tree (no hashing crate is linked and none was added) and pinned to FIPS 180-4,
+RFC 7693 Appendix A and CPython `hashlib` vectors. Only the git path is
+implemented: when git cannot answer, the kernel reports
+`freshness_source: "unavailable"` and the Python `stamp_freshness` fallback runs,
+because a second transcription of a *different* enumeration is where the two
+would silently disagree.
+
+**`devmap freshness`** answers `{stale, reason, checked:{head, inventory,
+content}}` for a working tree, with no store required. It short-circuits exactly
+as `map_is_stale` does — the content fingerprint is computed only once head and
+inventory match — and a skipped field carries `checked: false` and no verdict.
+
+**Python shrank.** `hook.py`'s six heaviest imports are deferred (as thin
+functions, not a PEP 562 module `__getattr__`: `__getattr__` is consulted for
+`module.name` and **not** for a bare global inside a function, which is why the
+existing `get_db` deferral had to spell out `sys.modules[__name__].get_db` — and
+why deferring `dump_json` that way raised `NameError` inside
+`_try_acquire_refresh_lock`, silently disabling the map refresh under the hook's
+`except Exception`).
+
+### Measured
+
+Release kernel pinned via `DEVMAP_BINARY`, on a quiet copy of this repository
+(1,414 tracked files, 22.5 MB `code_graph.json`), min of 8:
+
+| `dev hook post-tool-use` | before | after |
+|---|---|---|
+| unchanged tree | **1.41 s** | **0.77 s** (−45%) |
+| one edited file | 4.12 s | 3.93 s |
+| a new file | 4.18 s | 3.91 s |
+
+A confirmation run of the unchanged row against the *final* kernel binary
+(rebuilt after the port lane's last merge landed under it) gave 0.83 s, min of
+5. Both numbers are reported; the table's 0.77 s is the min of 8.
+
+Kernel only, unchanged tree, same corpus:
+
+| | before | after |
+|---|---|---|
+| `build` | 0.25 s | — |
+| `manifest` | 0.43 s | 0.06 s standalone (skip) |
+| `status` | 0.009 s | — |
+| **the three together** | **0.69 s, three processes** | **0.31 s, one process** |
+
+`import devcouncil.cli.commands.hook`: **149 ms → 31 ms**, and a cold import now
+loads neither SQLAlchemy, SQLModel, pydantic nor rich.
+
+The two changed-tree rows moved less than their own spread (before 4.12–6.06 s,
+after 3.93–5.87 s). They are dominated by the kernel's whole-tree resolve and
+analyze, which this lane does not touch, and are reported as unmoved.
+
+### `map_is_stale` was left on Python, with the measurement that says why
+
+The brief asked for `RepoMapper.map_is_stale` to delegate to the kernel. It was
+built (`devmap freshness`), measured, and **not** switched. On this repository,
+in-process:
+
+```text
+python get_git_files (2 x git ls-files + 1,388 stats)   52 ms
+python _content_fingerprint (warm memo)                  7 ms   (cold: 50 ms)
+python map_is_stale, whole call                         81 ms   (min of 5)
+kernel  devmap freshness, whole call incl. spawn        54 ms   (min of 5)
+```
+
+The check is dominated by `git ls-files` and the stat walk, which both
+implementations pay identically; Rust's advantage on hashing is most of the way
+cancelled by a process spawn. Delegating would trade ~27 ms for a second code
+path in a fail-closed correctness check with twelve call sites, and would make
+the check *unavailable* (hence stale, hence a rebuild loop) wherever the kernel
+binary is missing but Python can answer perfectly well. The command ships
+because the fused build uses the same code in-process, where it replaces
+Python's work rather than duplicating it, and because a non-Python consumer can
+now ask.
+
+### The daemon path: the premise does not hold, so nothing was changed
+
+The brief asked that the hook not spawn a build when a daemon socket is live,
+since "the watcher already indexes changes". Verified, and it is the store the
+watcher indexes, not the artifacts: `rg 'write_manifest_atomically|repo_map.json|
+write_code_graph' rust-port/crates/devmap-serve/src/` matches nothing, so
+`devmap serve` never writes `repo_map.json` or `code_graph.json`. Eleven Python
+modules read the graph and the agent guides tell agents to open the map, so a
+hook that skipped the build behind a live daemon would leave both permanently
+behind the store. (For the record on the other half: the hook does not consult
+`DevMapClient` or a socket at all today — `rg 'DevMapClient|ipc|socket'
+src/devcouncil/cli/commands/hook.py` matches nothing — so there is no existing
+daemon branch to make consistent.)
+
+What the fused command does instead is the right shape for that case: when the
+daemon has kept the store current, `build --manifest` takes the unchanged
+early-return and the artifact stamp declines both writes, so the hook's cost
+behind a live daemon is already the 0.31 s floor. Giving the daemon the
+artifacts is a `devmap-serve` change and is left as a named follow-up.
+
+### Red tests
+
+| what it holds | test |
+|---|---|
+| the fused command writes both artifacts and reports the store | `devmap-cli/tests/manifest_is_written_once.rs::one_invocation_writes_the_artifacts_and_reports_the_store` |
+| a no-op leaves length, mtime and inode untouched | `…::a_second_run_over_an_unchanged_tree_rewrites_nothing` |
+| every input that changes the artifacts defeats the skip | `…::every_input_that_changes_the_artifacts_defeats_the_skip` |
+| what a skip preserves equals what a write produces | `…::the_skipped_artifacts_equal_the_ones_a_forced_write_produces` |
+| `freshness` answers field by field and fails closed | `…::freshness_answers_field_by_field_and_fails_closed` |
+| a skipped content check reports no verdict | `…::a_skipped_content_check_says_it_was_skipped` |
+| the kernel's three digests equal Python's, byte for byte | `devmap-query/tests/freshness_parity.rs::the_kernel_and_python_agree_on_all_three_freshness_digests` |
+| …on an empty repo, quoted and non-ASCII names, an excluded file name, a 1 MiB file, untracked and deleted paths | `…::the_two_agree_on_an_adversarial_tree` |
+| SHA-1 / BLAKE2b against published vectors, and streaming = one-shot | `devmap-query/src/digest.rs::{sha1_matches_the_fips_180_vectors, blake2b_matches_rfc_7693_and_cpython_hashlib, sha1_streaming_equals_one_shot, blake2b_streaming_equals_one_shot}` |
+| the stamp skips only when every question answers the same | `devmap-query/src/artifacts.rs::the_artifact_stamp_skips_only_when_every_question_answers_the_same` |
+| the hook module loads no ORM and no pydantic | `tests/unit/test_hook_import_cost.py::test_importing_the_hook_module_does_not_load_the_orm_or_pydantic` |
+| every deferred name resolves *as a global*, not only as an attribute | `…::test_every_deferred_name_still_resolves_and_is_still_patchable`, `…::test_the_lock_helper_can_serialize_without_a_module_scope_import` |
+
+`sha1_streaming_equals_one_shot` failed on the first run against the
+implementation written for it — `Sha1::update` reset its buffer to empty
+whenever a chunk arrived that did not complete a block, so any input fed in
+pieces smaller than 64 bytes digested wrongly while the one-shot path was
+correct. That is why the streaming tests exist beside the vector tests.
+
+## Port of the 1a2151 round-1 work onto main (2026-09-05)
+
+Two sessions carried `AUDIT_KERNEL_2026-09-05.md` at the same time. One landed
+its fixes directly on `main`; the other landed an independent set on
+`claude/dev-map-performance-hardening-1a2151`, commit `d2fb25e`. `main` is the
+integration line, so `d2fb25e` was **not merged** — it is kept intact as the
+record of the second set, and the pieces `main` lacked were ported onto
+`claude/devmap-reconcile-1a2151` one at a time, each adapted to `main`'s owners.
+
+The rule the whole pass ran under: **where both lines had an implementation of
+the same behaviour, exactly one survives.** A port that lands beside what it
+duplicates is the failure mode this section exists to rule out, so every row
+below says what was kept from each side.
+
+### Piece by piece
+
+| piece | verdict | what was kept from each side |
+|---|---|---|
+| Discovery refusals as coverage loss (K-A2) | **already on main** (`a3ed650`, `c8ea0a7`) | `main`'s `DiscoverySkipReason::is_refusal` + `DiscoveryCoverage` + `analyze_with_discovery` stay the refusal owner. The port's `refused_by_discovery` fold was dropped as a second owner; its test was rewritten against `main`'s spelling (`devmap-cli/tests/discovery_refusal_is_coverage_loss.rs`) |
+| `is_fresh` requires a generation (K-A6) | **already on main** (`b338c0e`) | `devmap_serve::index_is_fresh` / `freshness_degraded_reason` stay the one owner. The port's `StoreStatus::is_fresh()` is the same fix by another name and was dropped |
+| Watcher queue bounds (K-B2), torn-read mtime guard (K-B3) | **already on main** (`91ecdac`, `80e3fff`) | `main`'s, unchanged |
+| Search counted from one generation (K-A4), store snapshot pin | **already on main** (`14560f7`, `ec1e862`) | `main`'s. `ec1e862` is a correctness fix the port did not have; it stays and the ported index is built from rows read *inside* that snapshot |
+| Feature-off builds, MCP 2026-07-28 conformance | **already on main** (`88d8cf8`, `6ff1a07`, `b458f37`) | `main`'s. The ported stress tests were rewritten to send the conformant headers (`serve_stress.rs::post` derives `_meta` and the mirrored `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` from its own body) |
+| Ambiguous fan-out cap | **already on main** | `AMBIGUOUS_FANOUT_CAP`; see AGENT_PLAN.md's SC4 row |
+| One owner for `MAX_TOKEN_BUDGET` / `MAX_TRAVERSAL_DEPTH` | **ported**, `1a7fd98` | Kept `main`'s `validate_request` wording and its `assert_eq!` pins, which now check the imported constants and so pin the whole chain. Replaced: the `const` pair in `protocol.rs`, the `.min(64)` / `.clamp(1, 64)` literals in `engine.rs`, `ipc_fuzz.rs`'s private copies |
+| CLI boundary validation, one-line `--json`, `--version` naming both schemas, `Store::latest_analysis_status` | **ported**, `d6ac670` | Kept `main`'s freshness and refusal owners (above). `combine_reasons` is `main`'s joiner and does the joining here. Tests `cli_json_contract.rs` (5), `discovery_refusal_is_coverage_loss.rs` (4) |
+| Per-generation edge index | **folded**, `1dcbc69` + merge `c063a89` | Both lines answered "stop rebuilding the adjacency map per question". `main`'s `e8c3521` hoisted it to once per direction per request; this branch caches it on the store per generation. Kept: `main`'s `GraphIndex` API shape and `TraversalLimits` (direction lives in the index, so a mismatch is not expressible), `main`'s allocation work in full, `main`'s `path_matches`, `latest_snapshot`, and `latest_edge_rows` keying the cache by the generation the rows were *read* from. Kept from the port: `GenerationEdges` / `DirectedEdges` as the storage, and `traverse_indexed` as the one walk. `AdjacencyIndex` stays for callers holding a loose edge slice — `main`'s per-direction path is intact, just no longer the only one |
+| K-B1: bounded search page and per-hit read | **ported**, `2f9916a` | The half `14560f7` / `ec1e862` did not cover: those made `{total, shown, hidden, truncated}` come from one generation; this bounds the I/O the page buys (`SEARCH_PAGE_MAX = 200`, `read_source_prefix`). Fixed a feature-off regression `e8c3521` had introduced (`query_bench` / `query_work_is_bounded_by_the_answer` call `extract_file` without `required-features`) |
+| Admission control on three transports, `BODY_READ_TIMEOUT` | **ported**, `177abbd`, then **folded** against `49be1c5` | `devmap-serve/src/admission.rs` is the one implementation; the socket's existing semaphore is *replaced* by it, not joined by it. `main` then added its own stdio ceiling, and the merge is described below. Tests `serve_stress.rs` (9), `daemon_binary_retirement.rs` |
+| K-B4: claim index | **folded**, `3425d76` + merge with `0db537e` | Both lines found it and wrote the same `HashMap`. `main`'s code was kept; the port's comment contributed the equivalence argument `main`'s lacked — `pending_paths.path` is the table's conflict target, so a claim set holds each path once and the map is *exactly* the scan, same claim and same panic. `main`'s measurements stand (batch 1024 898.8 µs -> 45.5 µs; 4096 16.18 ms -> 286.3 µs; 8192 62.35 ms -> 348.6 µs). No red test on either side — a cost, not an answer |
+| E-8 `recover_lock`, the `ignore_rule_tolerance` diagnostic pin, `mutation_fuzz.rs`, the `budget_probe` throughput table | **ported**, `0306e9e` | Not ported: the `test_process_recovery.rs` fixture change, which existed only to work around the round-1 branch's refusal-as-`ParseOutcome::Failed` fold. `main` records refusals through `DiscoveryCoverage` and still leaves an oversized file queued, so that fixture passes unchanged |
+| `extract_tree_with_report` as the one fold owner; `DiscoveryReport::refusals` in the daemon | **ported**, `4795d23` | Adapted to `main`'s refusal owner rather than adding a second. The daemon's two `!matches!(reason, NonSource)` wildcard copies now call `discovery.refusals()`, so a skip reason added later cannot silently default to "not a refusal" on one path only |
+| MCP client entry (`mcp --print-config`) | **main's kept**, merge `d5fbeb0` | `main`'s `claude::mcp_entry`, which the plugin bundle also calls, so a host configured from `--print-config` cannot point at a different server than one configured from the emitted plugin. The port's inline builder is gone |
+| Ruff fixes | **ported**, `cdfbea1` | The six findings the merge carried |
+| Seam: one kernel invocation per refresh, skip-on-unchanged artifacts, kernel-side freshness digests | **ported**, `035fe1e` + `3231018` | The CLI half (`build --manifest`, `freshness`, `StampFlags` / `InventoryFlags` shared by `build` and `manifest`) was staged while `main.rs` was owned by the port lane and applied afterwards by three-way merge against the reconciled file, which had since gained `main`'s `claude` subcommand. Pinned by `devmap-cli/tests/manifest_is_written_once.rs` (6) |
+| Ledger edits (`AGENT_PLAN.md`, `IMPROVEMENTS.md`, `AUDIT_KERNEL_2026-09-05.md`) | **re-derived** | Written against `main`'s state rather than copied from `d2fb25e`, because several rows the round-1 branch closed were closed differently here |
+
+### Performance
+
+Release, in-process MCP, p50, `crates/devmap-serve/examples/mcp_bench.rs`. Both
+sides measured **in the same session on the same machine**: `main`'s binaries
+against corpora `main`'s kernel built, this branch's binaries against copies of
+the same trees rebuilt with this kernel. The rebuild is not a confound — the two
+stores agree exactly on size (15,080 nodes / 74,729 edges and 41,276 / 271,508),
+which is also the strongest available equivalence check on the port.
+
+| store | metric | `main` | this branch | vs `main` | `d2fb25e` |
+|---|---|---|---|---|---|
+| corpus (15,080 / 74,729) | status | 866 µs | **15.2 µs** | 57x | 16 µs |
+| | search | 2.067 ms | 2.217 ms | **+7%** | 2.43 ms |
+| | impact | 18.62 ms | **0.951 ms** | 19.6x | 0.93 ms |
+| | tools/list | 32.6 µs | 33.2 µs | — | — |
+| scholarlm (41,276 / 271,508) | status | 2.771 ms | **12.8 µs** | 217x | 18 µs |
+| | search | 3.415 ms | 3.578 ms | **+5%** | 3.87 ms |
+| | impact | 73.15 ms | **3.039 ms** | 24x | 3.0 ms |
+| | tools/list | 33.7 µs | 33.7 µs | — | — |
+
+`impact_breakdown`, same stores: the SQL read is unchanged (4.96 ms -> 4.96 ms,
+17.69 ms -> 17.80 ms) — the index is built from the rows that read returns, so it
+adds no I/O — while the whole `impact("helper")` call falls 17.57 ms -> 0.88 ms
+and 45.98 ms -> 2.69 ms. The read is now 563% and 660% of the call it feeds,
+which is the point: what remains is the read, not the walk.
+
+### The second merge: `main`'s `49be1c5` and `0db537e` (2026-09-05, later)
+
+`main` moved two more commits after the port had landed, and both touched
+`devmap-serve`. Both are folds, not additions, and both left two implementations
+of one behaviour in the auto-merge:
+
+**The stdio in-flight ceiling.** The port bounded it with `Admission` at 32,
+waiting up to 5 s and then answering a JSON-RPC refusal that named the ceiling.
+`main` bounded it at 256 by waiting on the oldest task, and its commit message
+records that its own first attempt *shed* at 64 and was caught by
+`concurrent_requests_never_interleave_or_lose_an_id`. Git merged the two
+cleanly into a file carrying **both** ceilings — the failure mode this whole
+pass exists to prevent.
+
+`main`'s policy wins, and its reasoning is now the reason in the source: a bound
+that discards a well-formed request from a client doing nothing wrong is data
+loss wearing a good error message, and an agent host draining a plan pipelines
+hundreds of requests as a matter of course. The port's *structure* wins: the
+ceiling is held by `Admission`, the one implementation the socket and HTTP
+transports already use, so the number is visible (`peak()`, `shed()`) instead of
+being a `while tasks.len() >= N` nobody can measure. So: `MAX_IN_FLIGHT_REQUESTS
+= 256` (`main`'s number and doc), enforced by `Admission::admit()` (waiting,
+`main`'s policy — the same call the socket transport makes), and `main`'s
+`while tasks.len() >= …` loop removed as the second ceiling.
+
+`Admission::admit_within` — the wait-then-shed method — had exactly one caller,
+this one, and is **deleted** rather than left as an unused public method that
+re-invites the policy `main` rejected. Verified callerless with
+`rg --no-ignore --hidden` over every `.rs`/`.py`/`.md`/`.toml`/`.go` file and by
+the crate building without it. Its unit test is replaced by one for the policy
+that is actually in force: `a_full_pool_queues_the_waiter_and_a_freed_permit_wakes_it`
+asserts both halves — a full pool queues rather than refusing, and `shed()` stays
+zero while it waits.
+
+`serve_stress.rs::ten_thousand_pipelined_stdio_requests_stay_inside_the_ceiling`
+was strengthened accordingly: it accepted "a result, or a refusal naming the
+ceiling" and now requires a result, with `shed() == 0`. Measured under the new
+policy: in-flight peak **8,333 unbounded against 32 bounded**, 10,000 requests,
+none shed, none lost. `main`'s
+`a_pipeline_deeper_than_the_in_flight_bound_answers_every_id_exactly_once`
+(1,024-deep) passes unchanged.
+
+**The drain's claim index (K-B4).** The port's `3425d76` and `main`'s `0db537e`
+are the same `HashMap`, arrived at independently. `main`'s code was kept; the
+port's comment contributed the equivalence argument `main`'s lacked.
+
+`cargo test -p devmap-serve --no-fail-fast` after the fold: **231 passed, 0
+failed, 0 ignored**, which includes `main`'s new `mcp_spec_conformance.rs` and
+`daemon_drain_races.rs` alongside the ported `serve_stress.rs`.
+
+**`search` is 5-7% slower than `main`, and that is the price of K-B1**, not
+noise. Bounding each hit's read to `span_end + 3` bytes replaces one
+`read_to_string` per hit with a bounded read that must also handle the
+short-read and mid-character cases, and the 200-hit page cap does not help a
+query whose page was already smaller. Recorded rather than smoothed over: the
+unbounded version was faster and would open 5,001 files for a generous budget.
+Both figures are within 20% of `d2fb25e` on every row, which was the gate this
+port had to clear.

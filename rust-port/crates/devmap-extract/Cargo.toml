@@ -120,6 +120,10 @@ name = "adversarial_corpus"
 required-features = ["parse"]
 
 [[test]]
+name = "mutation_fuzz"
+required-features = ["parse"]
+
+[[test]]
 name = "budget_is_a_real_bound"
 required-features = ["parse"]
 

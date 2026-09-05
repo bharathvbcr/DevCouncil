@@ -202,7 +202,13 @@ def generate_map_artifacts(
 
 
 def _kernel_status(root: Path):
-    """The kernel's own view of the store after a build, or ``None`` if unreadable."""
+    """The kernel's own view of the store after a build, or ``None`` if unreadable.
+
+    **The fallback, not the path.** A kernel that fuses the manifest into the
+    build reports its store in the build result, and `_status_from_build` reads
+    it from there; this exists for one that does not, where the only way to ask
+    is another invocation.
+    """
     try:
         from devcouncil.devmap_client import DevMapClient, DevMapClientError
 
@@ -214,6 +220,43 @@ def _kernel_status(root: Path):
             return None
     except Exception:  # noqa: BLE001 - a status probe must never fail a build
         logger.debug("kernel status probe failed", exc_info=True)
+        return None
+
+
+def _status_from_build(payload: Any):
+    """The store status the build already reported, as a ``DevMapStatus``.
+
+    ``None`` when the build did not carry one, or carried one this reader cannot
+    make sense of — never a partially-filled status with zeros standing in for
+    fields that were absent. A status that could not be read is reported as
+    unknown; the caller then asks the kernel directly.
+    """
+    if not isinstance(payload, dict):
+        return None
+    try:
+        from devcouncil.devmap_client import DevMapStatus
+
+        required = ("pending_count", "node_count", "edge_count", "is_fresh")
+        if any(key not in payload for key in required):
+            return None
+        if type(payload["is_fresh"]) is not bool:
+            return None
+        generation = payload.get("generation_id")
+        degraded = payload.get("degraded_reason")
+        if degraded is not None and not isinstance(degraded, str):
+            return None
+        return DevMapStatus(
+            generation_id=int(generation) if isinstance(generation, int) else 0,
+            pending_count=int(payload["pending_count"]),
+            node_count=int(payload["node_count"]),
+            edge_count=int(payload["edge_count"]),
+            is_fresh=payload["is_fresh"],
+            degraded_reason=degraded or None,
+            quarantined_count=int(payload.get("quarantined_count") or 0),
+            raw=payload,
+        )
+    except (TypeError, ValueError):
+        logger.debug("build result carried an unreadable store status", exc_info=True)
         return None
 
 
@@ -260,7 +303,7 @@ def refresh_map_artifacts(
     del liveness, lsp_refs, graph, quiet
     from devcouncil.devmap_engine import (
         DevMapEngineError,
-        build_map,
+        build_map_result,
         write_json_atomically,
     )
     from devcouncil.utils.json_persist import read_json
@@ -269,7 +312,8 @@ def refresh_map_artifacts(
     output = Path(output).expanduser()
     output = output if output.is_absolute() else root / output
 
-    written = build_map(root, output=output, full=full)
+    built = build_map_result(root, output=output, full=full)
+    written = built.map_path
     payload = read_json(written)
     if not isinstance(payload, dict):
         raise DevMapEngineError(f"the kernel wrote an unreadable map at {written}")
@@ -302,7 +346,8 @@ def refresh_map_artifacts(
         # files — and the store, the artifacts and the stamps all describe the
         # same tree. Only when a guide actually changed, which on a repository
         # that already carries them is never.
-        written = build_map(root, output=output)
+        built = build_map_result(root, output=output)
+        written = built.map_path
         payload = read_json(written)
         if not isinstance(payload, dict):
             raise DevMapEngineError(f"the kernel wrote an unreadable map at {written}")
@@ -311,7 +356,13 @@ def refresh_map_artifacts(
             write_json_atomically(written, payload)
         repo_map = RepoMap.model_validate(payload)
 
-    kernel = _kernel_status(root)
+    # The build already asked the store how it is; a kernel that reports it in
+    # the build result has answered, and spawning `devmap status` to ask again
+    # would both cost a process and answer about a *later* moment than the build
+    # it is being attributed to. `_kernel_status` remains for a kernel that
+    # cannot report it — and for that kernel the probe is still the only way to
+    # tell a fresh store from a degraded one, which is why it was not deleted.
+    kernel = _status_from_build(built.status) or _kernel_status(root)
     reason = ""
     if kernel is not None and (kernel.degraded_reason or not kernel.is_fresh):
         reason = kernel.degraded_reason or (
@@ -320,7 +371,9 @@ def refresh_map_artifacts(
     return GraphRefreshResult(
         repo_map=repo_map,
         graph=None,
-        generation=(kernel.generation_id if kernel is not None else None),
+        generation=(
+            kernel.generation_id if kernel is not None else built.generation
+        ),
         mode=MAP_ENGINE,
         degraded=False,
         reason=reason,

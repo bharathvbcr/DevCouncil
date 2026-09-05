@@ -70,9 +70,11 @@ def engine_info(root: Path) -> Dict[str, Any]:
         )
         text = (probe.stdout or probe.stderr or "").strip()
         info["version"] = text or None
-        # `devmap 0.1.0 (schema 12)` — the schema is the number that decides
-        # whether this binary can open the store; the package version does not
-        # move on a schema bump.
+        # `devmap 0.1.0 (store schema 13, code graph schema 2)` — the *first*
+        # number after the word `schema` is the store schema, the one that
+        # decides whether this binary can open the store. The kernel prints it
+        # first for that reason; the package version does not move on a schema
+        # bump, and the code-graph number is a different thing entirely.
         if "schema" in text:
             tail = text.split("schema", 1)[1]
             digits = "".join(ch for ch in tail if ch.isdigit() or ch == " ").split()

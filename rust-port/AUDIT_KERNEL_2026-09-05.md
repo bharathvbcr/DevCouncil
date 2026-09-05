@@ -24,10 +24,59 @@ S-8, S-11. **S-7 was falsified** — rusqlite 0.31 already sets a 5 s busy timeo
 on every connection, so the wait the audit called missing was present; the call
 was made explicit anyway rather than left to a dependency default.
 
-Still open at the time of writing: **K-A2** (discovery refusals — oversized,
-unreadable, non-UTF-8 — never enter `extractions`, so a 1 MiB+ caller still
-yields a `graph_degraded: false` map; the parse-failure half is fixed, the
-discovery half is not), **E-8**, and the R-*, Q-*, K-A* items not listed above.
+**Status as of 2026-09-05, evening** (three fix lanes plus the reconcile pass;
+see STATUS.md's dated 2026-09-05 sections). Closed with red-first tests:
+
+* **K-A2** — a discovery refusal is now coverage loss with one owner:
+  `devmap_extract::DiscoverySkipReason::is_refusal` (`devmap-extract/src/model.rs:385`)
+  decides what counts, `devmap_analyze::liveness::DiscoveryCoverage` charges it,
+  and the count leaves the kernel as `discovery_refused_files`, kept apart from
+  parse failures, on the code graph and both `build --json` shapes. Pinned by
+  `devmap-analyze/tests/discovery_refusals_are_coverage_loss.rs`,
+  `devmap-serve/tests/daemon_discovery_refusals.rs` and
+  `devmap-cli/tests/discovery_refusal_is_coverage_loss.rs`.
+* **K-A4** — `search`'s `total`/`hidden`/`truncated` are counted inside the
+  caller's own transaction (`Store::generation_counts_locked`,
+  `devmap-store/src/db.rs:3072`), so they cannot straddle two generations.
+* **K-A6** — freshness has one owner, `devmap_serve::index_is_fresh` /
+  `freshness_degraded_reason` (`devmap-serve/src/protocol.rs:404,416`), and a
+  store holding zero generations is not fresh on any surface.
+* **K-B1** — `MAX_TOKEN_BUDGET` now bounds the *work*: a search page is
+  `budget_page_size(budget).min(SEARCH_PAGE_MAX)` (200) and each hit reads only
+  the prefix its span needs (`read_source_prefix`), not the whole file.
+* **K-B2** — the notify→thread channel is a bounded `sync_channel`
+  (`WATCH_QUEUE_CAPACITY`) and `DebounceBuffer.pending` is capped at
+  `MAX_DEBOUNCE_PATHS`.
+* **K-B3** — `read_is_stable` takes the two `modified()` options explicitly and
+  a filesystem that cannot report them fails loudly instead of degrading to a
+  length-only check.
+* **K-B4** — `claim_of`'s linear scan is a `HashMap` index built once per drain
+  (`devmap-serve/src/daemon.rs:659`).
+* **E-8** — `recover_lock` (`devmap-extract/src/lib.rs:158`, crate-private —
+  both ends of the prune-ledger mutex go through it) takes the inner guard of a
+  poisoned mutex, so a poisoned prune ledger can no longer silently empty
+  `DiscoveryReport::skipped_paths`. Pinned by
+  `devmap-extract/src/lib.rs::prune_ledger_tests::a_poisoned_prune_ledger_is_recovered_rather_than_silently_dropped`.
+* **Q-12** — the per-edge `format!("{:?}", edge.edge_kind)` is gone; edge kinds
+  are interned once per generation (`devmap_store::edge_kind_from_stored`,
+  `GraphIndex::kind_label`).
+* Every **R-\*** row (`devmap-resolve/tests/audit_regressions.rs`).
+
+Verified already closed by earlier commits and pinned with tests: **K-A1**,
+**K-A3**, **K-A5**, **Q-6**, **Q-8**, **Q-10**. **Q-11** is not a defect and must not
+be re-raised: `pdg.rs` (`devmap-analyze/src/pdg.rs`) is the Phase 7.1 adjunct
+port in progress (AGENT_PLAN.md §7.1, STATUS.md "PDG kernel"), unwired by plan
+rather than dead, and stays.
+
+**Where these fixes live.** Two lines carried the same audit concurrently. The
+implementations above are the ones on the reconcile branch
+`claude/devmap-reconcile-1a2151`, which is `main` plus the round-1 work ported
+onto it; K-A2, K-A4, K-A6, K-B2 and K-B3 are `main`'s own implementations kept
+in the merge, K-B1, E-8 and Q-12 are the ported ones, and K-B4 was written
+independently on both lines (`main`'s implementation kept). Where both lines
+had an implementation, exactly one survives — see STATUS.md, "Port of the 1a2151
+round-1 work onto main (2026-09-05)", for which side each piece came from.
+
 Check `STATUS.md` for anything closed after this header was written; where this
 report and the code disagree, the code wins.
 

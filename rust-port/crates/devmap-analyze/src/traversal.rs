@@ -34,52 +34,7 @@ impl Default for TraversalOptions {
     }
 }
 
-/// Adjacency over a fixed edge slice, in one direction.
-///
-/// Built once and walked many times. `neighbors` fans out over up to 16
-/// targets and asks each for both directions, and `explore` does the same per
-/// definition; every one of those walks used to rebuild this map over the
-/// whole generation first. Two directions over one edge slice is two indexes,
-/// not `2n`.
-///
-/// **The direction lives here and nowhere else.** `traverse_graph_indexed`
-/// takes its caps from [`TraversalLimits`], which deliberately has no
-/// `reverse` field, and reads the direction off the index instead. An index
-/// built for one direction therefore cannot be walked as the other: the
-/// mismatch is not expressible, rather than being an invariant a caller has to
-/// remember. That matters because a reversed walk over a forward index does
-/// not fail — it answers, plausibly and wrongly, which is how "what depends on
-/// this" quietly becomes "what this depends on".
-pub struct AdjacencyIndex<'a> {
-    reverse: bool,
-    adj: BTreeMap<&'a str, Vec<&'a ResolvedEdge>>,
-}
-
-impl<'a> AdjacencyIndex<'a> {
-    /// Index `edges` by the endpoint a walk in this direction starts from.
-    ///
-    /// Borrowed keys and borrowed edges: `edges` outlives the walk, so nothing
-    /// here owns a copy of a name it did not create.
-    pub fn build(edges: &'a [ResolvedEdge], reverse: bool) -> Self {
-        let mut adj: BTreeMap<&'a str, Vec<&'a ResolvedEdge>> = BTreeMap::new();
-        for edge in edges {
-            let key: &'a str = if reverse {
-                &edge.target_symbol
-            } else {
-                &edge.source_symbol
-            };
-            adj.entry(key).or_default().push(edge);
-        }
-        Self { reverse, adj }
-    }
-
-    /// The direction this index was built for.
-    pub fn reverse(&self) -> bool {
-        self.reverse
-    }
-}
-
-/// What bounds one walk. No direction — see [`AdjacencyIndex`].
+/// What bounds one walk. No direction — see [`GraphIndex::reverse`].
 #[derive(Debug, Clone, Copy)]
 pub struct TraversalLimits {
     pub max_depth: usize,
@@ -165,24 +120,173 @@ pub struct TraversalResult {
     pub stop: TraversalStop,
 }
 
-/// Bytes of the input graph this walk is allowed to copy.
+/// One edge, as a bounded walk needs to see it.
 ///
-/// Zero, and that is the point. The adjacency index borrows every edge instead
-/// of cloning it, so the only owned strings a walk allocates are for the nodes
-/// and edges it actually **reports** — a set bounded by `max_nodes`. Before
-/// this, `adj` held `Vec<ResolvedEdge>` and every edge was deep-cloned (four
-/// `String`s each) before `max_nodes` was consulted at all: a 1,000-node
-/// question over DevCouncil's ~944,000-edge graph copied the whole graph first.
+/// Borrowed, never owned: the walk reads these fields to decide priority, to
+/// apply the reverse-direction exclusions and to record an
+/// [`EdgeIdentity`], and everything it keeps is bounded by `max_nodes`.
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeView<'a> {
+    pub source_symbol: &'a str,
+    pub target_symbol: &'a str,
+    pub source_file: &'a str,
+    pub target_file: &'a str,
+    pub kind: devmap_extract::model::EdgeKind,
+}
+
+/// Adjacency in **one** direction, addressed by node id.
+///
+/// **The direction lives here and nowhere else.** [`traverse_graph_indexed`]
+/// takes its caps from [`TraversalLimits`], which deliberately has no `reverse`
+/// field, and reads the direction off the index instead. An index built for one
+/// direction therefore cannot be walked as the other: the mismatch is not
+/// expressible, rather than being an invariant a caller has to remember. That
+/// matters because a reversed walk over a forward index does not fail — it
+/// answers, plausibly and wrongly, which is how "what depends on this" becomes
+/// "what this depends on".
+///
+/// A trait rather than one concrete type because there are two kinds of index
+/// and they are indexed at different lifetimes: [`AdjacencyIndex`] over an edge
+/// slice the caller already holds, built per fan-out, and the store's
+/// per-*generation* index, built once for as long as the generation stands.
+/// Both walk through this, so there is one implementation of the walk.
+///
+/// Ids are opaque handles into the index; the walk only ever passes them back
+/// to [`Self::edge`] and [`Self::admits`]. `neighbors` must return them in the
+/// graph's own stable order, because that order is the final tie-break in
+/// every answer built from the walk (R4).
+pub trait GraphIndex {
+    /// The direction this index was built for.
+    fn reverse(&self) -> bool;
+    /// Edge ids incident to `node` in this index's direction, in graph order.
+    /// Empty for a node the index does not know.
+    fn neighbors(&self, node: &str) -> &[u32];
+    /// The edge behind an id from [`Self::neighbors`].
+    ///
+    /// Called inside the neighbour sort, so it must stay cheap: field borrows,
+    /// no lookups and no allocation.
+    fn edge(&self, id: u32) -> EdgeView<'_>;
+    /// The same text `format!("{kind:?}")` would produce for this edge.
+    ///
+    /// Separate from [`Self::edge`] because it is needed only for the edges the
+    /// walk actually *records* — a set bounded by `max_nodes` — while `edge`
+    /// runs on every comparison of every expansion. An index that persists the
+    /// label hands it back; one that does not interns it once.
+    fn kind_label(&self, id: u32) -> &str;
+    /// Whether the caller's confidence floor admits this edge.
+    ///
+    /// Applied inside the walk rather than by pre-filtering the graph, so a
+    /// shared index serves every threshold. An index whose edges are already
+    /// filtered answers `true`.
+    fn admits(&self, id: u32) -> bool;
+}
+
+/// [`GraphIndex`] over an edge slice the caller holds, built per fan-out.
+///
+/// This is what [`traverse_graph`] uses, and the reason it is still O(edges)
+/// no matter how small the caps: you cannot know what is adjacent to a node
+/// without looking at every edge you were handed. A caller that asks many
+/// questions of one unchanging graph should build a persistent index instead
+/// and call [`traverse_indexed`] — that is exactly what the store-backed query
+/// engine does.
+///
+/// Borrowed keys and borrowed ids. Before this existed the adjacency held
+/// `Vec<ResolvedEdge>` and every edge was deep-cloned (four `String`s each)
+/// before `max_nodes` was consulted at all: a 1,000-node question over
+/// DevCouncil's ~944,000-edge graph copied the whole graph first.
+pub struct AdjacencyIndex<'a> {
+    reverse: bool,
+    edges: &'a [ResolvedEdge],
+    /// A B-tree, not a hash map, and measured: `traversal_allocation` holds
+    /// this index to a *flat* per-input-edge allocation, and a hash map's
+    /// power-of-two bucket growth is not flat — a 500,000-key graph overshoots
+    /// its final table twice as far as a 50,000-key one, and the realloc
+    /// history is charged to a walk that visits 64 nodes.
+    adjacency: BTreeMap<&'a str, Vec<u32>>,
+    /// Kind labels, interned once per call rather than per crossed edge.
+    labels: std::collections::HashMap<devmap_extract::model::EdgeKind, String>,
+    empty: Vec<u32>,
+}
+
+impl<'a> AdjacencyIndex<'a> {
+    /// Index `edges` by the endpoint a walk in this direction starts from.
+    ///
+    /// Built once and walked many times. `neighbors` fans out over up to 16
+    /// targets and asks each for both directions, and `explore` does the same
+    /// per definition; every one of those walks used to rebuild this map over
+    /// the whole slice first. Two directions over one edge slice is two
+    /// indexes, not `2n`.
+    ///
+    /// Ids beyond `u32::MAX` cannot be addressed, so an oversized slice is
+    /// truncated at the index rather than silently mis-addressed; no graph
+    /// this kernel builds comes close, and a wrong answer is worse than a
+    /// bounded one.
+    pub fn build(edges: &'a [ResolvedEdge], reverse: bool) -> Self {
+        let usable = edges.len().min(u32::MAX as usize);
+        let edges = &edges[..usable];
+        let mut adjacency: BTreeMap<&'a str, Vec<u32>> = BTreeMap::new();
+        let mut labels = std::collections::HashMap::new();
+        for (id, edge) in edges.iter().enumerate() {
+            let key: &'a str = if reverse {
+                &edge.target_symbol
+            } else {
+                &edge.source_symbol
+            };
+            adjacency.entry(key).or_default().push(id as u32);
+            labels
+                .entry(edge.edge_kind)
+                .or_insert_with(|| format!("{:?}", edge.edge_kind));
+        }
+        Self {
+            reverse,
+            edges,
+            adjacency,
+            labels,
+            empty: Vec::new(),
+        }
+    }
+}
+
+impl GraphIndex for AdjacencyIndex<'_> {
+    fn reverse(&self) -> bool {
+        self.reverse
+    }
+
+    fn neighbors(&self, node: &str) -> &[u32] {
+        self.adjacency.get(node).unwrap_or(&self.empty)
+    }
+
+    fn edge(&self, id: u32) -> EdgeView<'_> {
+        let edge = &self.edges[id as usize];
+        EdgeView {
+            source_symbol: &edge.source_symbol,
+            target_symbol: &edge.target_symbol,
+            source_file: &edge.source_file,
+            target_file: &edge.target_file,
+            kind: edge.edge_kind,
+        }
+    }
+
+    fn kind_label(&self, id: u32) -> &str {
+        &self.labels[&self.edges[id as usize].edge_kind]
+    }
+
+    fn admits(&self, _id: u32) -> bool {
+        true
+    }
+}
+
+/// Bounded walk over a slice of edges, indexing them first.
 ///
 /// This spelling still builds an index per call, which is inherent to being
 /// handed an unindexed slice — you cannot know what is adjacent to a node
 /// without looking at every edge. What used to be deferred here as "a decision
-/// for the caller that owns the query loop" is now available to that caller:
-/// build an [`AdjacencyIndex`] once and call [`traverse_graph_indexed`], and a
-/// fan-out pays O(edges) once per direction instead of once per walk. Measured
-/// on this repository's store, `neighbors` over eight targets asked for
-/// sixteen walks in two directions, and so paid for fourteen indexes it had
-/// already built.
+/// for the caller that owns the query loop" is available to that caller two
+/// ways: build an [`AdjacencyIndex`] once and call [`traverse_graph_indexed`],
+/// so a fan-out pays O(edges) once per direction instead of once per walk; or,
+/// for the store-backed engine, hand it an index the store keeps for the life
+/// of a generation, so a question pays for the edges it reaches and nothing
+/// else.
 pub fn traverse_graph(
     start_nodes: &[String],
     edges: &[ResolvedEdge],
@@ -201,14 +305,17 @@ pub fn traverse_graph(
 /// index and calls it, so a caller that shares an index across a fan-out gets
 /// exactly the walk, caps and [`TraversalStop`] reasons the one-shot spelling
 /// gives — the ownership of the index moved, nothing else.
-pub fn traverse_graph_indexed(
+///
+/// Everything the walk keeps is bounded by `limits.max_nodes` — the visited
+/// set, the enqueued set and the recorded edges — and every decline it makes is
+/// recorded in [`TraversalStop`] rather than left to look like a graph that
+/// ran out.
+pub fn traverse_graph_indexed<I: GraphIndex + ?Sized>(
     start_nodes: &[String],
-    index: &AdjacencyIndex<'_>,
+    index: &I,
     limits: TraversalLimits,
 ) -> TraversalResult {
-    let adj = &index.adj;
-    let reverse = index.reverse;
-
+    let reverse = index.reverse();
     let mut visited: BTreeSet<&str> = BTreeSet::new();
     let mut enqueued: BTreeSet<&str> = BTreeSet::new(); // G21: Separate enqueued tracking
     let mut queue: VecDeque<(&str, usize)> = VecDeque::new();
@@ -225,16 +332,26 @@ pub fn traverse_graph_indexed(
         }
     }
 
+    // Reused across expansions so a walk allocates one neighbour buffer, not
+    // one per visited node.
+    let mut sorted_neighbors: Vec<u32> = Vec::new();
+
     while let Some((curr, depth)) = queue.pop_front() {
         if !visited.insert(curr) {
             continue;
         }
         max_depth_reached = max_depth_reached.max(depth);
+        let neighbors = index.neighbors(curr);
+        // Only edges the confidence floor admits count as "still expanding".
+        // The pre-filtered slice this replaced held nothing else, so an index
+        // that filters lazily must not report a node as expandable on an edge
+        // the answer would never contain.
+        let has_admitted = neighbors.iter().any(|id| index.admits(*id));
         if depth >= limits.max_depth || visited.len() >= limits.max_nodes {
             // Only a prune that actually cost the walk an expansion is a
             // decline. A node with no outgoing edges is fully explored, and
             // counting it would make every bounded walk call itself partial.
-            if adj.contains_key(curr) {
+            if has_admitted {
                 if depth >= limits.max_depth {
                     stop.depth_capped = true;
                 }
@@ -245,90 +362,96 @@ pub fn traverse_graph_indexed(
             continue;
         }
 
-        if let Some(neighbors) = adj.get(curr) {
-            // Priority ordering: contains -> calls -> rest.
-            //
-            // Cloned because the sort must not disturb the shared index, but
-            // this is now a vector of pointers rather than of edges — a node
-            // with 100,000 inbound edges copies 800 KB of pointers, not 20 MB
-            // of re-allocated strings.
-            let mut sorted_neighbors = neighbors.clone();
-            sorted_neighbors.sort_by(|a, b| {
-                let priority = |edge: &ResolvedEdge| match edge.edge_kind {
+        if !has_admitted {
+            continue;
+        }
+
+        // Priority ordering: contains -> calls -> rest.
+        //
+        // Copied because the sort must not disturb the shared index, but this
+        // is a vector of ids rather than of edges — a node with 100,000
+        // inbound edges copies 400 KB of ids, not 20 MB of re-allocated
+        // strings.
+        sorted_neighbors.clear();
+        sorted_neighbors.extend(neighbors.iter().copied().filter(|id| index.admits(*id)));
+        sorted_neighbors.sort_by(|a, b| {
+            let left = index.edge(*a);
+            let right = index.edge(*b);
+            let priority = |kind: devmap_extract::model::EdgeKind| match kind {
+                devmap_extract::model::EdgeKind::Contains
+                | devmap_extract::model::EdgeKind::Defines => 0,
+                devmap_extract::model::EdgeKind::Calls => 1,
+                _ => 2,
+            };
+            priority(left.kind)
+                .cmp(&priority(right.kind))
+                .then_with(|| left.source_symbol.cmp(right.source_symbol))
+                .then_with(|| left.target_symbol.cmp(right.target_symbol))
+                .then_with(|| left.source_file.cmp(right.source_file))
+                .then_with(|| left.target_file.cmp(right.target_file))
+        });
+
+        for id in &sorted_neighbors {
+            let edge = index.edge(*id);
+            // Impact must not walk *upward* through containment. A symbol is
+            // contained by its file, so following that edge in reverse reaches
+            // the file and from there every sibling symbol in it — turning
+            // "what depends on this" into "everything nearby". Both structural
+            // kinds are excluded: `Contains` is the kind actually emitted
+            // today, `Defines` is kept so a future producer of it cannot
+            // silently reopen this hole.
+            if reverse
+                && matches!(
+                    edge.kind,
                     devmap_extract::model::EdgeKind::Contains
-                    | devmap_extract::model::EdgeKind::Defines => 0,
-                    devmap_extract::model::EdgeKind::Calls => 1,
-                    _ => 2,
-                };
-                priority(a)
-                    .cmp(&priority(b))
-                    .then_with(|| a.source_symbol.cmp(&b.source_symbol))
-                    .then_with(|| a.target_symbol.cmp(&b.target_symbol))
-                    .then_with(|| a.source_file.cmp(&b.source_file))
-                    .then_with(|| a.target_file.cmp(&b.target_file))
-            });
+                        | devmap_extract::model::EdgeKind::Defines
+                )
+            {
+                continue;
+            }
+            // File-level topology (package imports, Go package stars) is
+            // impact for a *file* query. Following it from a symbol node turns
+            // `impact Type.method` into "every importer of this package" — the
+            // ScholarLM `segment` flood.
+            if reverse
+                && is_symbol_node(curr)
+                && matches!(
+                    edge.kind,
+                    devmap_extract::model::EdgeKind::Imports
+                        | devmap_extract::model::EdgeKind::MemberOf
+                )
+            {
+                continue;
+            }
+            let next_node: &str = if reverse {
+                edge.source_symbol
+            } else {
+                edge.target_symbol
+            };
 
-            for edge in sorted_neighbors {
-                // Impact must not walk *upward* through containment. A symbol
-                // is contained by its file, so following that edge in reverse
-                // reaches the file and from there every sibling symbol in it —
-                // turning "what depends on this" into "everything nearby".
-                // Both structural kinds are excluded: `Contains` is the kind
-                // actually emitted today, `Defines` is kept so a future
-                // producer of it cannot silently reopen this hole.
-                if reverse
-                    && matches!(
-                        edge.edge_kind,
-                        devmap_extract::model::EdgeKind::Contains
-                            | devmap_extract::model::EdgeKind::Defines
-                    )
-                {
-                    continue;
-                }
-                // File-level topology (package imports, Go package stars) is
-                // impact for a *file* query. Following it from a symbol node
-                // turns `impact Type.method` into "every importer of this
-                // package" — the ScholarLM `segment` flood.
-                if reverse
-                    && is_symbol_node(curr)
-                    && matches!(
-                        edge.edge_kind,
-                        devmap_extract::model::EdgeKind::Imports
-                            | devmap_extract::model::EdgeKind::MemberOf
-                    )
-                {
-                    continue;
-                }
-                let next_node: &str = if reverse {
-                    &edge.source_symbol
-                } else {
-                    &edge.target_symbol
-                };
+            if !enqueued.contains(next_node) && enqueued.len() >= limits.max_nodes {
+                stop.node_capped = true;
+                continue;
+            }
 
-                if !enqueued.contains(next_node) && enqueued.len() >= limits.max_nodes {
-                    stop.node_capped = true;
-                    continue;
-                }
+            if traversed_edges.len() < limits.max_nodes.saturating_sub(1) {
+                // The only place the walk allocates from edge text, and it is
+                // bounded by `max_nodes` rather than by the graph.
+                traversed_edges.push(EdgeIdentity {
+                    source: edge.source_symbol.to_string(),
+                    target: edge.target_symbol.to_string(),
+                    edge_kind: index.kind_label(*id).to_string(),
+                    line: 0,
+                    col: 0,
+                });
+            } else {
+                // Walked, but never reported: without this counter the edge is
+                // simply absent from `total`.
+                stop.edges_unrecorded += 1;
+            }
 
-                if traversed_edges.len() < limits.max_nodes.saturating_sub(1) {
-                    // The only place the walk allocates from edge text, and it
-                    // is bounded by `max_nodes` rather than by the graph.
-                    traversed_edges.push(EdgeIdentity {
-                        source: edge.source_symbol.clone(),
-                        target: edge.target_symbol.clone(),
-                        edge_kind: format!("{:?}", edge.edge_kind),
-                        line: 0,
-                        col: 0,
-                    });
-                } else {
-                    // Walked, but never reported: without this counter the edge
-                    // is simply absent from `total`.
-                    stop.edges_unrecorded += 1;
-                }
-
-                if enqueued.insert(next_node) {
-                    queue.push_back((next_node, depth + 1));
-                }
+            if enqueued.insert(next_node) {
+                queue.push_back((next_node, depth + 1));
             }
         }
     }

@@ -5,17 +5,49 @@
 //! a path, or a symbol name (including `Type.method`).
 
 pub fn traversal_start_matches(query: &str, symbol: &str, file: &str) -> bool {
+    match classify(query) {
+        StartQuery::Nothing => false,
+        StartQuery::Qualified {
+            file: wanted_file,
+            symbol: wanted_symbol,
+        } => path_matches(file, wanted_file) && symbol_matches(symbol, wanted_symbol),
+        StartQuery::Path(path) => path_matches(file, path),
+        StartQuery::Symbol(name) => symbol_matches(symbol, name),
+    }
+}
+
+/// What a traversal-start query is asking about.
+///
+/// The classification is separated from the per-edge test because an index can
+/// answer the three shapes very differently — a symbol query needs only the
+/// distinct symbols, a path query only the distinct files — and a second
+/// hand-written copy of "is this a path or a name" would be a second thing to
+/// keep in step with [`traversal_start_matches`]. There is one classifier, and
+/// both the scan and the index go through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartQuery<'a> {
+    /// `path::symbol` — both halves must match.
+    Qualified { file: &'a str, symbol: &'a str },
+    /// A file path.
+    Path(&'a str),
+    /// A symbol name, possibly `Type.method`.
+    Symbol(&'a str),
+    /// Empty or blank: matches nothing, rather than everything.
+    Nothing,
+}
+
+pub fn classify(query: &str) -> StartQuery<'_> {
     let query = query.trim();
     if query.is_empty() {
-        return false;
+        return StartQuery::Nothing;
     }
-    if let Some((file_part, symbol_part)) = split_qualified(query) {
-        return path_matches(file, file_part) && symbol_matches(symbol, symbol_part);
+    if let Some((file, symbol)) = split_qualified(query) {
+        return StartQuery::Qualified { file, symbol };
     }
     if looks_like_path(query) {
-        return path_matches(file, query);
+        return StartQuery::Path(query);
     }
-    symbol_matches(symbol, query)
+    StartQuery::Symbol(query)
 }
 
 fn split_qualified(query: &str) -> Option<(&str, &str)> {
@@ -72,7 +104,7 @@ fn has_source_extension(query: &str) -> bool {
 /// strings. `path_matching_agrees_with_the_spelling_it_replaced`, below,
 /// differential-tests it against that spelling, and
 /// `tests/query_work_is_bounded_by_the_answer.rs` pins the allocation count.
-fn path_matches(file: &str, query: &str) -> bool {
+pub fn path_matches(file: &str, query: &str) -> bool {
     let file = file.as_bytes();
     let query = query.as_bytes();
     if separator_insensitive_eq(file, query) {
@@ -105,7 +137,7 @@ fn separator_insensitive_eq(left: &[u8], right: &[u8]) -> bool {
             .all(|(a, b)| as_separator(*a) == as_separator(*b))
 }
 
-fn symbol_matches(symbol: &str, query: &str) -> bool {
+pub fn symbol_matches(symbol: &str, query: &str) -> bool {
     if symbol == query {
         return true;
     }

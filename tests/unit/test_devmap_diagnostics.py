@@ -319,7 +319,7 @@ def test_dev_map_prints_the_code_the_fix_and_the_run_id_on_failure(tmp_path: Pat
             "devmap exited 2: build", code="store_locked", fix="dev map abort", run_id="abc123def456", stage="build"
         )
 
-    monkeypatch.setattr("devcouncil.devmap_engine.build_map", _boom)
+    monkeypatch.setattr("devcouncil.devmap_engine.build_map_result", _boom)
     result = CliRunner().invoke(app, ["map", "--project-root", str(root), "--no-wiki"])
     assert result.exit_code == 1
     assert "[store_locked]" in result.output

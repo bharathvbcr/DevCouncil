@@ -1,11 +1,10 @@
 use devmap_analyze::clones::group_clones;
 use devmap_analyze::traversal::{
-    traverse_graph, traverse_graph_indexed, AdjacencyIndex, TraversalLimits, TraversalOptions,
-    TraversalStop,
+    traverse_graph, traverse_graph_indexed, TraversalLimits, TraversalOptions, TraversalStop,
 };
 use devmap_extract::model::*;
 use devmap_resolve::model::*;
-use devmap_store::{Store, StoredEdge, StoredSymbol};
+use devmap_store::{GenerationEdges, Store, StoredEdge, StoredSymbol};
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -22,6 +21,31 @@ use crate::model::*;
 /// as separate calls. It adds no reach the client did not have — it makes that
 /// reach cost one round trip instead of thirty-two.
 pub const MAX_NEIGHBOR_TARGETS: usize = 16;
+
+/// Largest token budget any request may ask for.
+///
+/// A budget is how much answer the caller is willing to read, and every budget
+/// buys work — rows scored, spans read, edges packed — so an unbounded one is
+/// an unbounded request. 100,000 is far past what any consumer of this kernel
+/// renders and small enough that one request cannot monopolise a daemon.
+///
+/// Owned here because the query layer is what *spends* a budget: the transport
+/// validates against this and the CLI refuses past it, and separate private
+/// copies of the number are separate places for one of them to drift into
+/// permitting work the engine is not sized for.
+pub const MAX_TOKEN_BUDGET: u32 = 100_000;
+
+/// Deepest walk any traversal will perform, whatever `max_depth` asks for.
+///
+/// Depth multiplies with branching factor, so this is the difference between a
+/// bounded question and one that visits the whole graph before `max_nodes`
+/// stops it. Nothing in a real call graph needs 64 hops of transitive impact;
+/// a walk that reaches it says so on `walk_incomplete` rather than presenting
+/// a truncated radius as a complete one.
+///
+/// Owned here for the same reason as [`MAX_TOKEN_BUDGET`]: this is where the
+/// clamp is actually applied, so this is where the number belongs.
+pub const MAX_TRAVERSAL_DEPTH: usize = 64;
 
 pub struct QueryEngine<'a> {
     extractions: &'a [Extraction],
@@ -60,7 +84,7 @@ impl<'a> StoreQueryEngine<'a> {
         if req.query.trim().is_empty() {
             return Ok(budget_take(Vec::new(), req.token_budget, |_| 0));
         }
-        let page = budget_page_size(req.token_budget);
+        let page = search_page_size(req.token_budget);
         let pool = search_rank_pool_size(req.token_budget);
         // One snapshot. The count, the rows and the root used to be three
         // independent reads, each resolving "the latest generation" for itself,
@@ -98,10 +122,11 @@ impl<'a> StoreQueryEngine<'a> {
         // building a hit reads the file off disk. So a ten-times wider pool
         // costs ten times the string comparisons and not one extra file read —
         // `page`, not `pool`, bounds what is materialised.
-        let mut ranked: Vec<(f32, devmap_store::StoredSymbol)> = rows
-            .into_iter()
-            .map(|row| (name_match_score(&row, &query), row))
-            .collect();
+        let mut ranked: Vec<(f32, devmap_store::StoredSymbol)> = Vec::with_capacity(rows.len());
+        for (index, row) in rows.into_iter().enumerate() {
+            self.cancel.check_every(index)?;
+            ranked.push((name_match_score(&row, &query), row));
+        }
         ranked.sort_by(|(left_score, left), (right_score, right)| {
             right_score
                 .total_cmp(left_score)
@@ -112,6 +137,11 @@ impl<'a> StoreQueryEngine<'a> {
         });
         let mut hits = Vec::with_capacity(ranked.len().min(page));
         for (score, row) in ranked.into_iter().take(page) {
+            // Every iteration here opens a file. Checked per row rather than
+            // per `CHECK_INTERVAL` because the unit of work is an I/O, not a
+            // string comparison: a page of 200 abandoned reads is 200 reads
+            // nobody is waiting for.
+            self.cancel.check()?;
             hits.push(hit_from_stored(
                 row,
                 repo_root.as_deref(),
@@ -278,15 +308,34 @@ impl<'a> StoreQueryEngine<'a> {
         // of one answer now share one edge snapshot instead of racing each
         // other. The generation straddle check in [`Self::neighbors`] still
         // wraps this, because the load is not the only store read here.
-        let edges = self.resolved_edges(min_confidence)?;
-        // One index per direction for the whole fan-out, for the same reason
-        // the edge load above is shared. Every walk below used to rebuild this
-        // map over the entire generation first, so N targets x 2 directions
-        // paid O(edges) 2N times over an edge slice that does not change
-        // between them. There are only ever two directions, so there are only
-        // ever two indexes.
-        let inbound = AdjacencyIndex::build(&edges, true);
-        let outbound = AdjacencyIndex::build(&edges, false);
+        //
+        // What is hoisted is the *index*, and it is not built here at all: the
+        // store keeps one per generation, so the fan-out pays a hash lookup per
+        // target rather than a whole-generation scan — and so does a single
+        // `impact`, which is the half a per-request index cannot reach. One
+        // directed view per direction, three words each over the shared index,
+        // because a walk must not be given a direction that disagrees with the
+        // adjacency it reads.
+        devmap_store::checked_min_confidence(min_confidence)?;
+        let Some(index) = self.generation_edges()? else {
+            return Ok(targets
+                .iter()
+                .map(|target| {
+                    let unavailable = || {
+                        unavailable_response(ResolutionAvailability::Unavailable {
+                            reason: "no persisted generation is available".to_string(),
+                        })
+                    };
+                    Neighbors {
+                        target: target.clone(),
+                        callers: unavailable(),
+                        callees: unavailable(),
+                    }
+                })
+                .collect());
+        };
+        let inbound = index.directed(true, min_confidence);
+        let outbound = index.directed(false, min_confidence);
         let mut answers = Vec::with_capacity(targets.len());
         for target in targets {
             // Plain `check`, not `check_every`: the latter consults the flag
@@ -309,7 +358,7 @@ impl<'a> StoreQueryEngine<'a> {
             // again inside `traverse_over` — so the two halves cannot diverge
             // by construction rather than by both remembering to pass it.
             let callers = self.traverse_over(
-                &edges,
+                &index,
                 &inbound,
                 Request {
                     query: target.clone(),
@@ -354,7 +403,7 @@ impl<'a> StoreQueryEngine<'a> {
             // `deps` the command is unchanged; only this composition's `callees`
             // tightened to what the field has always claimed to be.
             let callees = self.traverse_over(
-                &edges,
+                &index,
                 &outbound,
                 Request {
                     query: target.clone(),
@@ -403,7 +452,7 @@ impl<'a> StoreQueryEngine<'a> {
             &edges,
             from,
             to,
-            req.max_depth.min(64),
+            req.max_depth.min(MAX_TRAVERSAL_DEPTH),
             5_000,
             &self.cancel,
         )? {
@@ -451,16 +500,37 @@ impl<'a> StoreQueryEngine<'a> {
     ///
     /// One owner for the conversion, and the one place the whole edge set is
     /// walked before any traversal starts — so it is where an abandoned
-    /// request stops earliest. `latest_edges` takes and releases the store lock
-    /// internally, so nothing here holds it across the walk that follows.
+    /// request stops earliest. It reads the store's shared per-generation rows
+    /// rather than a private copy of them, so the whole-set materialisation is
+    /// one allocation of `ResolvedEdge`s and not a `StoredEdge` clone before
+    /// it. Only `trace_between` still needs the whole set; everything else
+    /// asks [`Self::generation_edges`] for the adjacency and pays for the
+    /// edges it reaches.
     fn resolved_edges(&self, min_confidence: f32) -> anyhow::Result<Vec<ResolvedEdge>> {
-        let rows = self.store.latest_edges(min_confidence)?;
-        let mut edges = Vec::with_capacity(rows.len());
-        for (index, row) in rows.into_iter().enumerate() {
-            self.cancel.check_every(index)?;
-            edges.push(stored_edge_to_resolved(row)?);
+        let min_confidence = devmap_store::checked_min_confidence(min_confidence)?;
+        let Some(index) = self.generation_edges()? else {
+            return Ok(Vec::new());
+        };
+        let mut edges = Vec::new();
+        for (id, row) in index.edges().iter().enumerate() {
+            self.cancel.check_every(id)?;
+            if !index.admits(id as u32, min_confidence) {
+                continue;
+            }
+            edges.push(stored_edge_to_resolved(row.clone())?);
         }
         Ok(edges)
+    }
+
+    /// The latest generation's adjacency, or `None` when nothing is persisted.
+    ///
+    /// Built once per generation and memoised in the store, so a long-lived
+    /// `devmap mcp` pays for it on the first graph question after a build and
+    /// not on every question. The index is a snapshot of one generation: a
+    /// build that lands mid-walk cannot mix two generations into one answer,
+    /// and the next call after it gets the new one.
+    fn generation_edges(&self) -> anyhow::Result<Option<std::sync::Arc<GenerationEdges>>> {
+        Ok(self.store.generation_edges()?)
     }
 
     fn traverse(
@@ -468,61 +538,73 @@ impl<'a> StoreQueryEngine<'a> {
         req: Request<String>,
         reverse: bool,
     ) -> anyhow::Result<Response<ResolvedEdge>> {
-        // The store lock is released by `latest_edges` before it returns — it
+        // Before the generation lookup, not after: an unevaluable threshold is
+        // a refusal whatever the store holds, and answering "no persisted
+        // generation is available" to a caller who asked an unanswerable
+        // question tells them about the store when the fault is in the request.
+        devmap_store::checked_min_confidence(req.min_confidence)?;
+        // The store lock is released before the index is returned — the store
         // locks, reads and drops — so nothing below this line holds it. An
         // abandoned traversal therefore cannot block the drain loop's writes
         // while it unwinds.
-        let edges = self.resolved_edges(req.min_confidence)?;
-        self.traverse_over(&edges, &AdjacencyIndex::build(&edges, reverse), req)
+        let Some(index) = self.generation_edges()? else {
+            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+                reason: "no persisted generation is available".to_string(),
+            }));
+        };
+        let direction = index.directed(reverse, req.min_confidence);
+        self.traverse_over(&index, &direction, req)
     }
 
-    /// The traversal itself, over an edge set the caller already holds.
+    /// The traversal itself, over an index the caller already holds.
     ///
     /// Split out of [`Self::traverse`] because `explore` needs `2 * n + 1`
-    /// walks for one answer and every one of them used to re-read and re-convert
-    /// the whole generation's edge table — 71,195 rows on this repository. The
-    /// walk is unchanged; only the ownership of the edge load moved up, so a
-    /// composed query pays for it once. Every caller still gets exactly the
-    /// traversal `impact`/`trace` performs, including the `walk_incomplete`
-    /// reason, because there is only one implementation of it.
+    /// walks for one answer and every one of them used to re-read and
+    /// re-convert the whole generation's edge table — 271,543 rows on the
+    /// ScholarLM corpus. The walk is unchanged; what moved is where the
+    /// adjacency comes from. Every caller still gets exactly the traversal
+    /// `impact`/`trace` performs, including the `walk_incomplete` reason,
+    /// because there is only one implementation of it.
     fn traverse_over(
         &self,
-        edges: &[ResolvedEdge],
-        index: &AdjacencyIndex<'_>,
+        index: &GenerationEdges,
+        direction: &devmap_store::DirectedEdges<'_>,
         req: Request<String>,
     ) -> anyhow::Result<Response<ResolvedEdge>> {
-        // The direction is the index's, not a second argument that could
+        let min_confidence = devmap_store::checked_min_confidence(req.min_confidence)?;
+        // The direction is the view's, not a second argument that could
         // disagree with it. A reversed walk over a forward index answers
         // plausibly and wrongly rather than failing, so the two are not
         // separable here.
-        let reverse = index.reverse();
+        let reverse = devmap_analyze::traversal::GraphIndex::reverse(direction);
         let target = req.query.trim();
-        let start: Vec<String> = traversal_starts(edges, target, reverse)
-            .into_iter()
-            .map(|(symbol, _)| symbol)
-            .collect();
+        let start: Vec<String> =
+            indexed_traversal_starts(index, target, reverse, min_confidence, &self.cancel)?
+                .into_iter()
+                .map(|(symbol, _)| symbol)
+                .collect();
         if start.is_empty() {
             return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                 reason: format!("{target} has no indexed traversal start"),
             }));
         }
-        // `traverse_graph` is bounded by `max_nodes`/`max_depth` and does not
+        // `traverse_indexed` is bounded by `max_nodes`/`max_depth` and does not
         // itself consult the flag; checking on either side of it keeps an
         // abandoned request from paying for the sort and the budgeting that
         // follow.
         self.cancel.check()?;
-        let max_depth = req.max_depth.min(64);
+        let max_depth = req.max_depth.min(MAX_TRAVERSAL_DEPTH);
         let max_nodes = TRAVERSAL_MAX_NODES;
         let walk = traverse_graph_indexed(
             &start,
-            index,
+            direction,
             TraversalLimits {
                 max_depth,
                 max_nodes,
             },
         );
         self.cancel.check()?;
-        let mut traversed = traversed_resolution_edges(&walk, edges, req.min_confidence);
+        let mut traversed = indexed_traversed_edges(index, &walk, min_confidence, &self.cancel)?;
         traversed.sort_by(|a, b| {
             b.confidence
                 .0
@@ -569,6 +651,10 @@ impl<'a> StoreQueryEngine<'a> {
         min_confidence: f32,
         max_depth: usize,
     ) -> anyhow::Result<ExploreReport> {
+        // Refused here, before the empty-report shapes below can absorb it: a
+        // threshold no comparison can evaluate is a bad request, not a
+        // repository with nothing in it.
+        devmap_store::checked_min_confidence(min_confidence)?;
         let budget = explore_budget(token_budget);
         let empty = |reason: String| ExploreReport {
             query: query.to_string(),
@@ -671,22 +757,21 @@ impl<'a> StoreQueryEngine<'a> {
         }
 
         self.cancel.check()?;
-        let edges = self.resolved_edges(min_confidence)?;
-        // One index per direction for the whole fan-out, for the same reason
-        // the edge load above is shared. Every walk below used to rebuild this
-        // map over the entire generation first, so N targets x 2 directions
-        // paid O(edges) 2N times over an edge slice that does not change
-        // between them. There are only ever two directions, so there are only
-        // ever two indexes.
-        let inbound = AdjacencyIndex::build(&edges, true);
-        let outbound = AdjacencyIndex::build(&edges, false);
+        let Some(index) = self.generation_edges()? else {
+            return Ok(empty("no persisted generation is available".to_string()));
+        };
+        // One directed view per direction for the whole fan-out. There are only
+        // ever two directions, so there are only ever two views, and each is a
+        // borrow of the generation index the store already holds.
+        let inbound = index.directed(true, min_confidence);
+        let outbound = index.directed(false, min_confidence);
         let per_direction = edges_per_direction(&budget, definitions.shown);
         let mut budget = budget;
         budget.edges_per_direction = per_direction;
         for definition in &mut definitions.items {
             self.cancel.check()?;
             definition.callers = self.traverse_over(
-                &edges,
+                &index,
                 &inbound,
                 Request {
                     query: definition.id.clone(),
@@ -696,7 +781,7 @@ impl<'a> StoreQueryEngine<'a> {
                 },
             )?;
             definition.callees = self.traverse_over(
-                &edges,
+                &index,
                 &outbound,
                 Request {
                     query: definition.id.clone(),
@@ -713,7 +798,7 @@ impl<'a> StoreQueryEngine<'a> {
             .map(|definition| definition.id.clone())
             .collect();
         let blast_radius = self
-            .blast_walk(&edges, &seeds, max_depth, min_confidence)?
+            .blast_walk(&index, &seeds, max_depth, min_confidence)?
             .into_radius(budget.blast_radius);
         Ok(ExploreReport {
             query: query.to_string(),
@@ -742,6 +827,7 @@ impl<'a> StoreQueryEngine<'a> {
         min_confidence: f32,
         max_depth: usize,
     ) -> anyhow::Result<AffectedTestsReport> {
+        devmap_store::checked_min_confidence(min_confidence)?;
         let layer_budget = token_budget / 2;
         let list_budget = token_budget.saturating_sub(layer_budget);
         let empty_report = |reason: String| AffectedTestsReport {
@@ -772,8 +858,12 @@ impl<'a> StoreQueryEngine<'a> {
             );
         }
 
-        let edges = self.resolved_edges(min_confidence)?;
-        let walk = self.blast_walk(&edges, targets, max_depth, min_confidence)?;
+        let Some(index) = self.generation_edges()? else {
+            return Ok(empty_report(
+                "no persisted generation is available".to_string(),
+            ));
+        };
+        let walk = self.blast_walk(&index, targets, max_depth, min_confidence)?;
 
         // Derived from the *complete* walk, never from the budgeted layers.
         // Reading the presentation back would drop every test whose band the
@@ -832,16 +922,18 @@ impl<'a> StoreQueryEngine<'a> {
     /// walk reached rather than what a budget left of it.
     fn blast_walk(
         &self,
-        edges: &[ResolvedEdge],
+        index: &GenerationEdges,
         targets: &[String],
         max_depth: usize,
         min_confidence: f32,
     ) -> anyhow::Result<BlastWalk> {
-        let depth_cap = max_depth.clamp(1, 64);
+        let min_confidence = devmap_store::checked_min_confidence(min_confidence)?;
+        let depth_cap = max_depth.clamp(1, MAX_TRAVERSAL_DEPTH);
         let mut seed_set: BTreeSet<(String, String)> = BTreeSet::new();
         let mut unmatched: Vec<String> = Vec::new();
         for target in targets {
-            let matched = traversal_starts(edges, target.trim(), true);
+            let matched =
+                indexed_traversal_starts(index, target.trim(), true, min_confidence, &self.cancel)?;
             if matched.is_empty() {
                 unmatched.push(target.clone());
                 continue;
@@ -863,14 +955,24 @@ impl<'a> StoreQueryEngine<'a> {
             return Ok(walk);
         }
 
-        let mut inbound: BTreeMap<&str, Vec<&ResolvedEdge>> = BTreeMap::new();
-        for (index, edge) in edges.iter().enumerate() {
-            self.cancel.check_every(index)?;
-            if edge.confidence.0 < min_confidence {
-                continue;
-            }
-            inbound.entry(&edge.target_symbol).or_default().push(edge);
-        }
+        // The inbound edges of one node, in the generation's own order, at or
+        // above the floor. Two thresholds for the same reason
+        // `indexed_traversed_edges` applies two: `admits` is the store's
+        // rounded comparison for what exists, the plain compare is the one this
+        // walk applied before an index existed, and an edge can pass one and
+        // fail the other. The whole-generation `BTreeMap` this replaced was
+        // rebuilt per call, which is the cost the index exists to remove.
+        let inbound = |node: &str| {
+            index
+                .into_target_symbol(node)
+                .iter()
+                .copied()
+                .filter(|id| {
+                    index.admits(*id, min_confidence)
+                        && index.edge(*id).confidence >= min_confidence
+                })
+                .map(|id| index.edge(id))
+        };
 
         let mut visited: BTreeSet<String> = walk
             .seeds
@@ -884,7 +986,7 @@ impl<'a> StoreQueryEngine<'a> {
             let mut seen: BTreeSet<String> = BTreeSet::new();
             let mut lowest: Option<f32> = None;
             for node in &frontier {
-                for edge in inbound.get(node.as_str()).into_iter().flatten() {
+                for edge in inbound(node.as_str()) {
                     if visited.contains(edge.source_symbol.as_str())
                         || seen.contains(edge.source_symbol.as_str())
                     {
@@ -905,8 +1007,8 @@ impl<'a> StoreQueryEngine<'a> {
                     // the answer.
                     members.insert((edge.source_symbol.clone(), edge.source_file.clone()));
                     lowest = Some(match lowest {
-                        Some(current) => current.min(edge.confidence.0),
-                        None => edge.confidence.0,
+                        Some(current) => current.min(edge.confidence),
+                        None => edge.confidence,
                     });
                 }
             }
@@ -928,10 +1030,7 @@ impl<'a> StoreQueryEngine<'a> {
                 // Something was still expanding when the depth bound stopped
                 // it. Left unsaid, a capped radius reads as a complete one.
                 walk.stop.depth_capped = frontier.iter().any(|node| {
-                    inbound
-                        .get(node.as_str())
-                        .into_iter()
-                        .flatten()
+                    inbound(node.as_str())
                         .any(|edge| !visited.contains(edge.source_symbol.as_str()))
                 });
             }
@@ -2246,23 +2345,10 @@ pub fn resolved_edge_from_stored(edge: StoredEdge) -> anyhow::Result<ResolvedEdg
 }
 
 fn stored_edge_to_resolved(edge: StoredEdge) -> anyhow::Result<ResolvedEdge> {
-    let edge_kind = match edge.edge_kind.as_str() {
-        "Imports" => EdgeKind::Imports,
-        "Calls" => EdgeKind::Calls,
-        "Contains" => EdgeKind::Contains,
-        "Defines" => EdgeKind::Defines,
-        "Instantiates" => EdgeKind::Instantiates,
-        "Extends" => EdgeKind::Extends,
-        "Implements" => EdgeKind::Implements,
-        "SubscribesTo" => EdgeKind::SubscribesTo,
-        "HandlesRoute" => EdgeKind::HandlesRoute,
-        "WiredTo" => EdgeKind::WiredTo,
-        "MemberOf" => EdgeKind::MemberOf,
-        "DependsOn" => EdgeKind::DependsOn,
-        "TaintFlow" => EdgeKind::TaintFlow,
-        "References" => EdgeKind::References,
-        other => anyhow::bail!("stored generation has unknown edge kind {other:?}"),
-    };
+    // The kind table lives with the rows it decodes, in `devmap-store`: the
+    // stored spelling is that crate's `format!("{kind:?}")` on the way in, and
+    // a second table here could disagree with the one the edge index uses.
+    let edge_kind = devmap_store::edge_kind_from_stored(&edge.edge_kind)?;
     Ok(ResolvedEdge {
         source_file: edge.source_file,
         target_file: edge.target_file,
@@ -2589,11 +2675,140 @@ fn node_id_of(file_path: &str, symbol_name: &str) -> String {
     format!("{file_path}::{symbol_name}")
 }
 
-/// Nodes a walk from `target` would start at, in the given direction.
+/// The edges a walk crossed, read out of the index instead of scanned for.
+///
+/// Same answer as [`traversed_resolution_edges`] over the whole generation,
+/// and the same *set*: every stored edge whose `(source, target, kind)` the
+/// walk crossed, including duplicates in other files, at or above the caller's
+/// floor. What changes is the cost — the out-edges of the symbols the walk
+/// actually reached, rather than every row in the generation.
+///
+/// Two thresholds, deliberately, because the code this replaces applied two:
+/// `admits` is the store's rounded comparison, which decides what the walk was
+/// allowed to cross, and the plain `>= min_confidence` below decides what the
+/// answer may contain. An edge can pass the first and fail the second, and it
+/// did before, so it still must.
+fn indexed_traversed_edges(
+    index: &GenerationEdges,
+    traversal: &devmap_analyze::traversal::TraversalResult,
+    min_confidence: f32,
+    cancel: &Cancel,
+) -> anyhow::Result<Vec<ResolvedEdge>> {
+    let traversed: std::collections::BTreeSet<(&str, &str, &str)> = traversal
+        .traversed_edges
+        .iter()
+        .map(|edge| {
+            (
+                edge.source.as_str(),
+                edge.target.as_str(),
+                edge.edge_kind.as_str(),
+            )
+        })
+        .collect();
+    let sources: std::collections::BTreeSet<&str> =
+        traversed.iter().map(|(source, _, _)| *source).collect();
+    let mut ids: Vec<u32> = Vec::new();
+    for (checked, source) in sources.iter().enumerate() {
+        cancel.check_every(checked)?;
+        for id in index.from_source_symbol(source) {
+            let edge = index.edge(*id);
+            if !index.admits(*id, min_confidence) || edge.confidence < min_confidence {
+                continue;
+            }
+            if traversed.contains(&(
+                edge.source_symbol.as_str(),
+                edge.target_symbol.as_str(),
+                edge.edge_kind.as_str(),
+            )) {
+                ids.push(*id);
+            }
+        }
+    }
+    // Ascending ids are the generation's own edge order, which is the order the
+    // scan this replaces produced and the final tie-break of the sort that
+    // follows (R4).
+    ids.sort_unstable();
+    let mut edges = Vec::with_capacity(ids.len());
+    for (checked, id) in ids.into_iter().enumerate() {
+        cancel.check_every(checked)?;
+        edges.push(stored_edge_to_resolved(index.edge(id).clone())?);
+    }
+    Ok(edges)
+}
+
+/// Traversal starts, found through the index rather than by scanning.
+///
+/// Identical to the [`traversal_starts`] scan it replaced — same pairs, same
+/// order, same duplicates, because `traverse_indexed` counts the raw start
+/// list when it reports `starts_dropped` and a deduplicated one would change
+/// the answer. What changes is the cost: a symbol query tests the distinct
+/// symbols (41,276 on the ScholarLM corpus) and a path query the distinct
+/// files (4,499), instead of testing every one of 271,543 edges.
 ///
 /// Lifted out of `traverse` so the blast radius resolves its seeds through the
 /// same matcher the traversal does. Resolving them two ways is how a radius
 /// ends up seeded from a symbol the trace never visits.
+fn indexed_traversal_starts(
+    index: &GenerationEdges,
+    target: &str,
+    reverse: bool,
+    min_confidence: f32,
+    cancel: &Cancel,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let mut ids: Vec<u32> = Vec::new();
+    match crate::query_match::classify(target) {
+        crate::query_match::StartQuery::Nothing => {}
+        crate::query_match::StartQuery::Qualified { file, symbol } => {
+            for (checked, (candidate, group)) in index.symbols(reverse).enumerate() {
+                cancel.check_every(checked)?;
+                if !crate::query_match::symbol_matches(candidate, symbol) {
+                    continue;
+                }
+                for id in group {
+                    let row = index.edge(*id);
+                    let path = if reverse {
+                        &row.target_file
+                    } else {
+                        &row.source_file
+                    };
+                    if crate::query_match::path_matches(path, file) {
+                        ids.push(*id);
+                    }
+                }
+            }
+        }
+        crate::query_match::StartQuery::Path(path) => {
+            for (checked, (candidate, group)) in index.files(reverse).enumerate() {
+                cancel.check_every(checked)?;
+                if crate::query_match::path_matches(candidate, path) {
+                    ids.extend_from_slice(group);
+                }
+            }
+        }
+        crate::query_match::StartQuery::Symbol(name) => {
+            for (checked, (candidate, group)) in index.symbols(reverse).enumerate() {
+                cancel.check_every(checked)?;
+                if crate::query_match::symbol_matches(candidate, name) {
+                    ids.extend_from_slice(group);
+                }
+            }
+        }
+    }
+    ids.retain(|id| index.admits(*id, min_confidence));
+    ids.sort_unstable();
+    Ok(ids
+        .into_iter()
+        .map(|id| {
+            let row = index.edge(id);
+            if reverse {
+                (row.target_symbol.clone(), row.target_file.clone())
+            } else {
+                (row.source_symbol.clone(), row.source_file.clone())
+            }
+        })
+        .collect())
+}
+
 pub fn traversal_starts(
     edges: &[ResolvedEdge],
     target: &str,
@@ -2909,6 +3124,32 @@ fn budget_page_size(token_budget: u32) -> usize {
         .max(1) as usize
 }
 
+/// Hard ceiling on hits one `search` may materialise, whatever the budget asks.
+///
+/// K-B1: every hit on a search page is a file opened and read, and the page was
+/// `token_budget / 20 + 1` — 5,001 rows at a 100,000-token budget. The token
+/// budget is a *presentation* limit the caller chooses; letting it set the
+/// number of files opened turns "give me a generous budget" into "open five
+/// thousand files". 200 is far past any page a reader consumes and far below
+/// anything that reads a corpus.
+///
+/// It applies to `search` and not to `explore`, and the difference is where the
+/// I/O is: `explore` scores stored rows and opens a file only for the
+/// definitions that survive its own `limit` —
+/// `explore_reads_one_file_per_definition_it_returns_not_per_candidate` pins
+/// that — so capping its candidate page would cost ranking quality on a
+/// high-match query and buy no bounded-ness at all.
+///
+/// The cap trims the page, never the count: `total` is still measured over the
+/// whole index and a trimmed page still reports `truncated` and `hidden`.
+pub const SEARCH_PAGE_MAX: usize = 200;
+
+/// Hits `search` will materialise for this budget: what it can show, capped at
+/// what it is allowed to open. See [`SEARCH_PAGE_MAX`].
+fn search_page_size(token_budget: u32) -> usize {
+    budget_page_size(token_budget).min(SEARCH_PAGE_MAX)
+}
+
 /// How many candidates keyword search pulls from the store before ranking them.
 ///
 /// The store orders its page by bm25 and this crate ranks by exact/prefix/other
@@ -2928,7 +3169,10 @@ const SEARCH_RANK_OVERSAMPLE: usize = 10;
 const SEARCH_RANK_POOL_MAX: usize = 2_000;
 
 fn search_rank_pool_size(token_budget: u32) -> usize {
-    let page = budget_page_size(token_budget);
+    // The *capped* page: the floor below exists so the pool can never be
+    // narrower than what will be shown, and taking it from the uncapped page
+    // would let a large budget reopen the ceiling the cap just closed.
+    let page = search_page_size(token_budget);
     // Never below the page: a pool smaller than what the budget could show
     // would drop results the caller has already paid for.
     page.saturating_mul(SEARCH_RANK_OVERSAMPLE)
@@ -3011,6 +3255,76 @@ thread_local! {
     /// per thread rather than globally so tests running in parallel in one
     /// binary cannot contaminate each other's count.
     pub(crate) static SOURCE_SPAN_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// Bytes those reads pulled off disk on this thread.
+    ///
+    /// The count above says how many files were opened; it says nothing about
+    /// how much of each was read, and `read_to_string` read all of it. A 50 MB
+    /// vendored bundle answered a one-line span with 50 MB of I/O and 50 MB of
+    /// resident string, per hit, and neither the response nor the read counter
+    /// showed it.
+    pub(crate) static SOURCE_SPAN_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Read only as much of a file as a span ending at `span_end` can need.
+///
+/// K-B1: this was `fs::read_to_string`, so one search hit cost the size of the
+/// file it lives in — a 50 MB generated bundle answered a one-line span with
+/// 50 MB of I/O and 50 MB of resident `String`, per hit, per query, bounded by
+/// nothing. A span at byte 40 needs bytes `0..40`: the prefix, because the line
+/// number is the count of newlines before it, and not one byte more.
+///
+/// Up to three bytes past `span_end` are read and then discarded so a prefix
+/// that lands mid-character still decodes. A file that is shorter than
+/// `span_end` — the working tree moved on since the generation was written —
+/// comes back as whatever is there, exactly as reading the whole file did, and
+/// the caller's span lookup fails the same way it failed before.
+///
+/// The error is preserved rather than collapsed: a file that cannot be read
+/// must not look like a file with nothing in it.
+fn read_source_prefix(path: &std::path::Path, span_end: usize) -> std::io::Result<String> {
+    use std::io::Read;
+
+    // One UTF-8 character is at most four bytes, so three extra can complete
+    // whatever character `span_end` lands inside.
+    let wanted = span_end.saturating_add(3);
+    let mut file = std::fs::File::open(path)?;
+    // Sized from the smaller of what is wanted and what is there, so the common
+    // case — a small file, read whole — costs one allocation, as
+    // `read_to_string` did. Growing from empty instead cost 14% of `search`
+    // (2.37 ms -> 2.70 ms p50 on this repository's store, interleaved), because
+    // a search page is a hundred files and almost all of them are small. A file
+    // whose length cannot be read falls back to growth rather than failing:
+    // the read below is the thing that must succeed, not the hint.
+    let hint = file
+        .metadata()
+        .map(|meta| (meta.len() as usize).min(wanted))
+        .unwrap_or(0);
+    let mut buffer = Vec::with_capacity(hint);
+    // `take` bounds the read at the source, so a hostile or generated file
+    // cannot make this allocate more than the span asked for.
+    file.by_ref().take(wanted as u64).read_to_end(&mut buffer)?;
+    #[cfg(test)]
+    SOURCE_SPAN_BYTES.with(|bytes| bytes.set(bytes.get().saturating_add(buffer.len() as u64)));
+    match String::from_utf8(buffer) {
+        Ok(text) => Ok(text),
+        Err(error) => {
+            // Either the file is not UTF-8 — the same failure `read_to_string`
+            // reported — or the cut landed mid-character. Keep the longest
+            // valid prefix when it still covers the span, and report the error
+            // otherwise, so a truncated read is never passed off as the file.
+            let valid = error.utf8_error().valid_up_to();
+            let bytes = error.into_bytes();
+            if valid >= span_end {
+                Ok(String::from_utf8_lossy(&bytes[..valid]).into_owned())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "stream did not contain valid UTF-8",
+                ))
+            }
+        }
+    }
 }
 
 /// Build a hit from a stored symbol row, reading its source span from disk.
@@ -3028,7 +3342,8 @@ fn hit_from_stored(
     let owned_root = repo_root.map(str::to_string);
     #[cfg(test)]
     SOURCE_SPAN_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
-    let source_result = std::fs::read_to_string(resolve_source_path(&owned_root, &row.path));
+    let source_result =
+        read_source_prefix(&resolve_source_path(&owned_root, &row.path), row.span_end);
     let source_unavailable_reason = source_result.as_ref().err().map(|error| {
         format!(
             "source unavailable at query time for {:?}: {error}",
@@ -3822,5 +4137,554 @@ mod tests {
         assert_eq!(response.hidden, 2);
         assert!(response.truncated);
         assert_eq!(response.tokens_used, 0);
+    }
+}
+
+#[cfg(test)]
+mod indexed_start_equivalence_tests {
+    use super::*;
+    use devmap_extract::model::EdgeKind;
+    use devmap_store::{GenerationEdges, StoredEdge};
+
+    fn stored(
+        source_symbol: &str,
+        source_file: &str,
+        target_symbol: &str,
+        target_file: &str,
+        kind: EdgeKind,
+        confidence: f32,
+    ) -> StoredEdge {
+        StoredEdge {
+            source_file: source_file.to_string(),
+            target_file: target_file.to_string(),
+            source_symbol: source_symbol.to_string(),
+            target_symbol: target_symbol.to_string(),
+            edge_kind: edge_kind_name(kind).to_string(),
+            confidence,
+        }
+    }
+
+    /// The generation used by every case below.
+    ///
+    /// Deliberately awkward: duplicate edges, a self-edge, two files that share
+    /// a basename, a symbol whose tail collides with another's method, a
+    /// file-shaped node id, and confidences that straddle the store's rounding
+    /// boundary. Sorted the way the store sorts a generation, because the order
+    /// is part of what the index must reproduce.
+    fn rows() -> Vec<StoredEdge> {
+        let mut rows = vec![
+            stored(
+                "a/b/c.go::Run",
+                "a/b/c.go",
+                "hub",
+                "hub.go",
+                EdgeKind::Calls,
+                1.0,
+            ),
+            stored(
+                "a/b/c.go::Run",
+                "a/b/c.go",
+                "hub",
+                "hub.go",
+                EdgeKind::Calls,
+                1.0,
+            ),
+            stored(
+                "x/c.go::Run",
+                "x/c.go",
+                "hub",
+                "hub.go",
+                EdgeKind::Calls,
+                0.9,
+            ),
+            stored("hub", "hub.go", "hub", "hub.go", EdgeKind::Calls, 0.8),
+            stored(
+                "p.py::T.run",
+                "p.py",
+                "hub",
+                "hub.go",
+                EdgeKind::Calls,
+                0.7495,
+            ),
+            stored("p.py::run", "p.py", "hub", "hub.go", EdgeKind::Calls, 0.75),
+            stored(
+                "a/b/c.go",
+                "a/b/c.go",
+                "a/b/c.go::Run",
+                "a/b/c.go",
+                EdgeKind::Contains,
+                1.0,
+            ),
+            stored(
+                "q.py::only",
+                "q.py",
+                "q.py::only",
+                "q.py",
+                EdgeKind::Calls,
+                0.2,
+            ),
+        ];
+        rows.sort_by(|left, right| {
+            right
+                .confidence
+                .total_cmp(&left.confidence)
+                .then_with(|| left.source_file.cmp(&right.source_file))
+                .then_with(|| left.target_file.cmp(&right.target_file))
+                .then_with(|| left.source_symbol.cmp(&right.source_symbol))
+                .then_with(|| left.target_symbol.cmp(&right.target_symbol))
+                .then_with(|| left.edge_kind.cmp(&right.edge_kind))
+        });
+        rows
+    }
+
+    fn resolved(rows: &[StoredEdge], min_confidence: f32) -> Vec<ResolvedEdge> {
+        rows.iter()
+            .filter(|row| {
+                (row.confidence * 1000.0).round() as i64 >= (min_confidence * 1000.0).round() as i64
+            })
+            .map(|row| stored_edge_to_resolved(row.clone()).expect("kind"))
+            .collect()
+    }
+
+    /// Every query shape, both directions, several floors: the index must
+    /// return exactly what the scan returned, in the same order, duplicates
+    /// included.
+    ///
+    /// Duplicates are the case worth stating: `traverse_indexed` derives
+    /// `starts_dropped` from the *raw* start list, so an index that helpfully
+    /// deduplicated would change `walk_incomplete` on a capped walk without
+    /// changing anything a smaller test would look at.
+    #[test]
+    fn the_indexed_starts_are_the_scan_s_starts() {
+        let rows = rows();
+        let index = GenerationEdges::build(std::sync::Arc::new(rows.clone())).expect("index");
+        let cancel = Cancel::new();
+        let queries = [
+            "hub",
+            "Run",
+            "c.go",
+            "a/b/c.go",
+            "x/c.go",
+            "a/b/c.go::Run",
+            "c.go::Run",
+            "p.py::run",
+            "run",
+            "T.run",
+            "only",
+            "q.py",
+            "",
+            "   ",
+            "::",
+            "nothing_here",
+            "no/such.go",
+        ];
+        for query in queries {
+            for reverse in [false, true] {
+                for floor in [0.0f32, 0.2, 0.75, 0.9, 1.0, -1.0, 2.0] {
+                    let edges = resolved(&rows, floor);
+                    let expected = traversal_starts(&edges, query.trim(), reverse);
+                    let actual =
+                        indexed_traversal_starts(&index, query.trim(), reverse, floor, &cancel)
+                            .expect("indexed starts");
+                    assert_eq!(
+                        actual, expected,
+                        "query {query:?} reverse={reverse} floor={floor}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same for the edges a walk reports: same set, same order.
+    #[test]
+    fn the_indexed_traversed_edges_are_the_scan_s_traversed_edges() {
+        let rows = rows();
+        let index = GenerationEdges::build(std::sync::Arc::new(rows.clone())).expect("index");
+        let cancel = Cancel::new();
+        for query in ["hub", "Run", "a/b/c.go", "only"] {
+            for reverse in [false, true] {
+                for floor in [0.0f32, 0.75, 0.9] {
+                    for max_depth in [1usize, 3, 64] {
+                        let edges = resolved(&rows, floor);
+                        let start: Vec<String> = traversal_starts(&edges, query, reverse)
+                            .into_iter()
+                            .map(|(symbol, _)| symbol)
+                            .collect();
+                        if start.is_empty() {
+                            continue;
+                        }
+                        let opts = TraversalOptions {
+                            max_depth,
+                            max_nodes: TRAVERSAL_MAX_NODES,
+                            reverse,
+                        };
+                        let scanned = traverse_graph(&start, &edges, &opts);
+                        let walked = traverse_graph_indexed(
+                            &start,
+                            &index.directed(reverse, floor),
+                            opts.limits(),
+                        );
+                        assert_eq!(
+                            scanned.visited_nodes, walked.visited_nodes,
+                            "{query:?} reverse={reverse} floor={floor} depth={max_depth}"
+                        );
+                        assert_eq!(scanned.traversed_edges, walked.traversed_edges);
+                        assert_eq!(scanned.stop, walked.stop);
+                        assert_eq!(scanned.max_depth_reached, walked.max_depth_reached);
+
+                        let expected = traversed_resolution_edges(&scanned, &edges, floor);
+                        let actual =
+                            indexed_traversed_edges(&index, &walked, floor, &cancel).expect("ok");
+                        assert_eq!(
+                            actual.len(),
+                            expected.len(),
+                            "{query:?} reverse={reverse} floor={floor} depth={max_depth}"
+                        );
+                        for (left, right) in actual.iter().zip(expected.iter()) {
+                            assert_eq!(left.source_symbol, right.source_symbol);
+                            assert_eq!(left.target_symbol, right.target_symbol);
+                            assert_eq!(left.source_file, right.source_file);
+                            assert_eq!(left.target_file, right.target_file);
+                            assert_eq!(left.edge_kind, right.edge_kind);
+                            assert_eq!(left.confidence.0, right.confidence.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The two confidence tests are not one test.
+    ///
+    /// `admits` rounds and decides what the walk may cross; the plain compare
+    /// decides what the answer may contain. 0.7495 passes the first at a floor
+    /// of 0.75 and fails the second, and that asymmetry was in the code this
+    /// replaced — an index that applied only one of them would answer with an
+    /// edge the scan withheld.
+    #[test]
+    fn an_edge_on_the_rounding_boundary_is_crossed_but_not_reported() {
+        let rows = rows();
+        let index = GenerationEdges::build(std::sync::Arc::new(rows.clone())).expect("index");
+        let boundary = index
+            .edges()
+            .iter()
+            .position(|row| row.confidence == 0.7495)
+            .expect("fixture holds the boundary edge") as u32;
+        assert!(
+            index.admits(boundary, 0.75),
+            "0.7495 rounds to 750 and must be admitted, as the store admits it"
+        );
+        assert!(
+            index.edge(boundary).confidence < 0.75,
+            "and must still fail the plain compare the answer applies"
+        );
+    }
+
+    /// A confidence no comparison can evaluate is refused, not answered.
+    ///
+    /// Over an *empty* store deliberately: the refusal has to come before the
+    /// generation lookup, or a caller who asked an unanswerable question is
+    /// told about the store instead. That ordering was free while every
+    /// traversal went through `latest_edges`, which validated first; the index
+    /// path has to state it.
+    #[test]
+    fn a_nan_floor_is_refused_by_every_indexed_surface() {
+        let store = Store::open_in_memory().expect("store");
+        let engine = StoreQueryEngine::new(&store);
+        for request in [
+            Request {
+                query: "hub".to_string(),
+                token_budget: 2_000,
+                min_confidence: f32::NAN,
+                max_depth: 3,
+            },
+            Request {
+                query: "hub".to_string(),
+                token_budget: 2_000,
+                min_confidence: f32::NAN,
+                max_depth: 1,
+            },
+        ] {
+            assert!(
+                engine.impact(request.clone()).is_err(),
+                "NaN was answered rather than refused"
+            );
+        }
+        assert!(engine
+            .affected_tests(&["hub".to_string()], 2_000, f32::NAN, 3)
+            .is_err());
+        assert!(engine.explore("hub", 5, 2_000, f32::NAN, 3).is_err());
+    }
+
+    /// A self-edge and a duplicate must not turn a bounded walk into a loop.
+    #[test]
+    fn cycles_self_edges_and_duplicates_terminate() {
+        let rows = vec![
+            stored("a", "a.py", "b", "b.py", EdgeKind::Calls, 1.0),
+            stored("b", "b.py", "c", "c.py", EdgeKind::Calls, 1.0),
+            stored("c", "c.py", "a", "a.py", EdgeKind::Calls, 1.0),
+            stored("a", "a.py", "a", "a.py", EdgeKind::Calls, 1.0),
+            stored("a", "a.py", "b", "b.py", EdgeKind::Calls, 1.0),
+        ];
+        let index = GenerationEdges::build(std::sync::Arc::new(rows)).expect("index");
+        for reverse in [false, true] {
+            let walk = traverse_graph_indexed(
+                &["a".to_string()],
+                &index.directed(reverse, 0.0),
+                TraversalLimits {
+                    max_depth: 64,
+                    max_nodes: TRAVERSAL_MAX_NODES,
+                },
+            );
+            assert_eq!(walk.visited_nodes.len(), 3, "reverse={reverse}");
+            assert!(!walk.stop.is_incomplete(), "a cycle is not a cap");
+        }
+    }
+
+    /// A walk that stops exactly at its node cap says so.
+    #[test]
+    fn a_walk_at_the_node_cap_reports_the_cap_rather_than_a_small_graph() {
+        let rows: Vec<StoredEdge> = (0..TRAVERSAL_MAX_NODES + 200)
+            .map(|i| {
+                stored(
+                    &format!("n{i}"),
+                    "chain.py",
+                    &format!("n{}", i + 1),
+                    "chain.py",
+                    EdgeKind::Calls,
+                    1.0,
+                )
+            })
+            .collect();
+        let index = GenerationEdges::build(std::sync::Arc::new(rows)).expect("index");
+        let walk = traverse_graph_indexed(
+            &["n0".to_string()],
+            &index.directed(false, 0.0),
+            TraversalLimits {
+                max_depth: 64,
+                max_nodes: TRAVERSAL_MAX_NODES,
+            },
+        );
+        assert!(
+            walk.stop.is_incomplete(),
+            "a walk stopped by depth 64 over a 5,200-long chain is a lower bound"
+        );
+        let reason = walk
+            .stop
+            .reason(64, TRAVERSAL_MAX_NODES)
+            .expect("an incomplete walk needs a reason");
+        assert!(reason.contains("lower bound"), "{reason}");
+    }
+
+    /// A cancelled walk stops rather than finishing the fan-out.
+    #[test]
+    fn a_cancelled_start_lookup_stops_instead_of_scanning_every_symbol() {
+        let rows: Vec<StoredEdge> = (0..20_000)
+            .map(|i| {
+                stored(
+                    &format!("s{i}"),
+                    "wide.py",
+                    "hub",
+                    "hub.py",
+                    EdgeKind::Calls,
+                    1.0,
+                )
+            })
+            .collect();
+        let index = GenerationEdges::build(std::sync::Arc::new(rows)).expect("index");
+        let cancel = Cancel::new();
+        cancel.cancel();
+        assert!(
+            indexed_traversal_starts(&index, "s1", false, 0.0, &cancel).is_err(),
+            "a cancelled start lookup ran to completion"
+        );
+    }
+}
+
+// Needs the parsing frontend: every case here builds a real generation from
+// source. Without `parse` the crate answers questions about a persisted map and
+// cannot make one, so these are compiled out rather than left to break the
+// `--no-default-features` build.
+#[cfg(all(test, feature = "parse"))]
+mod search_bounds_tests {
+    use super::*;
+    use devmap_analyze::analyze;
+    use devmap_extract::extract_file;
+    use devmap_resolve::Resolver;
+    use devmap_store::Store;
+
+    /// A store whose only file is `path`, holding `source`.
+    fn store_of(path: &str, source: &str) -> Store {
+        let ext = extract_file(path, source);
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(std::slice::from_ref(&ext));
+        let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+        let analysis = analyze(std::slice::from_ref(&ext), &resolution);
+        let store = Store::open_in_memory().expect("store");
+        store
+            .save_generation(std::slice::from_ref(&ext), &resolution, &analysis)
+            .expect("generation");
+        store
+    }
+
+    /// A hit near the top of a huge file must not read the whole file.
+    ///
+    /// K-B1: `hit_from_stored` called `fs::read_to_string`, so the cost of one
+    /// search hit was the size of the file it lives in, however far the span
+    /// was from the end. On a repository carrying a generated or vendored
+    /// bundle that is tens of megabytes of I/O and tens of megabytes resident,
+    /// per hit, per query — bounded by nothing.
+    #[test]
+    fn a_hit_near_the_top_of_a_huge_file_reads_a_bounded_prefix() {
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-hugefile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+
+        // The symbol is in the first 100 bytes; the rest is filler the answer
+        // never names.
+        const FILLER: usize = 50 * 1024 * 1024;
+        let mut source = String::with_capacity(FILLER + 128);
+        source.push_str("def findable_symbol():\n    return 1\n");
+        let head = source.len();
+        source.push_str("# ");
+        while source.len() < FILLER {
+            source.push('x');
+        }
+        source.push('\n');
+        std::fs::write(dir.join("huge.py"), &source).expect("write fixture");
+
+        let store = store_of("huge.py", &source);
+        // The engine resolves spans against the generation's recorded root.
+        {
+            let ext = extract_file("huge.py", &source);
+            let mut resolver = Resolver::new();
+            resolver.index_extractions(std::slice::from_ref(&ext));
+            let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+            let analysis = analyze(std::slice::from_ref(&ext), &resolution);
+            store
+                .save_generation_with_opts(
+                    std::slice::from_ref(&ext),
+                    &resolution,
+                    &analysis,
+                    devmap_store::GenerationWriteOpts {
+                        repo_root: Some(dir.to_string_lossy().to_string()),
+                        ..Default::default()
+                    },
+                )
+                .expect("generation with a root");
+        }
+
+        SOURCE_SPAN_READS.with(|reads| reads.set(0));
+        SOURCE_SPAN_BYTES.with(|bytes| bytes.set(0));
+        let response = StoreQueryEngine::new(&store)
+            .search(Request {
+                query: "findable_symbol".to_string(),
+                token_budget: 2_000,
+                min_confidence: 0.0,
+                max_depth: 1,
+            })
+            .expect("search");
+        let bytes = SOURCE_SPAN_BYTES.with(|bytes| bytes.get());
+
+        assert_eq!(
+            response.shown, 1,
+            "the fixture must produce exactly one hit"
+        );
+        assert!(
+            response.items[0].source_span.contains("findable_symbol"),
+            "the span must still be the symbol's own text: {:?}",
+            response.items[0].source_span
+        );
+        assert!(
+            bytes < (head as u64) * 8 + 4096,
+            "one hit whose span ends at byte {head} read {bytes} bytes of a \
+             {FILLER}-byte file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cancelled search stops instead of opening every file on its page.
+    #[test]
+    fn a_cancelled_search_stops_before_materialising_its_page() {
+        const SYMBOLS: usize = 4_000;
+        let mut source = String::new();
+        for index in 0..SYMBOLS {
+            source.push_str(&format!("def widget_{index:05}():\n    return {index}\n"));
+        }
+        let store = store_of("things.py", &source);
+
+        let cancel = Cancel::new();
+        cancel.cancel();
+        SOURCE_SPAN_READS.with(|reads| reads.set(0));
+        let outcome = StoreQueryEngine::new(&store)
+            .with_cancel(cancel)
+            .search(Request {
+                query: "widget".to_string(),
+                token_budget: 100_000,
+                min_confidence: 0.0,
+                max_depth: 1,
+            });
+        let reads = SOURCE_SPAN_READS.with(|reads| reads.get());
+
+        assert!(
+            outcome.is_err(),
+            "a cancelled search answered instead of stopping"
+        );
+        assert!(
+            reads < 64,
+            "a cancelled search opened {reads} files before noticing"
+        );
+    }
+
+    /// The number of files one search may open is capped by the page ceiling,
+    /// not by whatever token budget the caller asked for.
+    ///
+    /// K-B1: `budget_page_size(100_000)` is 5,001, and every row on the page is
+    /// a file read. The token budget is a *presentation* limit chosen by the
+    /// caller; letting it set the number of files opened makes a large budget a
+    /// request for thousands of file reads.
+    #[test]
+    fn a_huge_token_budget_does_not_buy_thousands_of_file_reads() {
+        const SYMBOLS: usize = 4_000;
+        let mut source = String::new();
+        for index in 0..SYMBOLS {
+            source.push_str(&format!("def widget_{index:05}():\n    return {index}\n"));
+        }
+        let store = store_of("things.py", &source);
+
+        SOURCE_SPAN_READS.with(|reads| reads.set(0));
+        let response = StoreQueryEngine::new(&store)
+            .search(Request {
+                query: "widget".to_string(),
+                token_budget: 100_000,
+                min_confidence: 0.0,
+                max_depth: 1,
+            })
+            .expect("search");
+        let reads = SOURCE_SPAN_READS.with(|reads| reads.get());
+
+        assert_eq!(
+            response.total, SYMBOLS as u32,
+            "the index-wide count must stay honest whatever the page cap"
+        );
+        assert!(
+            reads <= SEARCH_PAGE_MAX,
+            "a 100,000-token budget opened {reads} files; the page ceiling is \
+             {SEARCH_PAGE_MAX}"
+        );
+        assert!(
+            response.truncated && response.hidden > 0,
+            "a capped page must say it was capped: shown={} total={} hidden={}",
+            response.shown,
+            response.total,
+            response.hidden
+        );
     }
 }

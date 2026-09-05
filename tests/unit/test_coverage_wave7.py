@@ -141,7 +141,9 @@ def test_refresh_map_artifacts_fails_closed_without_a_kernel(tmp_path, monkeypat
     out.write_text('{"seed": true}', encoding="utf-8")
 
     monkeypatch.setattr(
-        "devcouncil.devmap_engine.build_map",
+        # `build_map_result` is the one function that runs the kernel;
+        # `build_map` is its path-returning adapter and delegates here.
+        "devcouncil.devmap_engine.build_map_result",
         lambda *a, **k: (_ for _ in ()).throw(DevMapEngineError("no kernel")),
     )
 
@@ -289,7 +291,7 @@ def test_map_if_stale_skips_and_an_unbuildable_map_exits_one(tmp_path, monkeypat
     def _unbuildable(*_args, **_kwargs):
         raise engine.DevMapEngineError("kernel unavailable")
 
-    monkeypatch.setattr(engine, "build_map", _unbuildable)
+    monkeypatch.setattr(engine, "build_map_result", _unbuildable)
     broken = runner.invoke(app, ["map", "--project-root", str(tmp_path), "-o", str(out)])
     assert broken.exit_code == 1
 

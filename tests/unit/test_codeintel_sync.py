@@ -104,7 +104,7 @@ def test_map_artifacts_propagates_a_kernel_failure_without_writing_a_map(
             "devmap build failed (exit 1): the store is locked by devmap pid 4242"
         )
 
-    monkeypatch.setattr("devcouncil.devmap_engine.build_map", boom)
+    monkeypatch.setattr("devcouncil.devmap_engine.build_map_result", boom)
     with pytest.raises(DevMapEngineError, match="locked"):
         map_artifacts.refresh_map_artifacts(
             tmp_path,
@@ -156,7 +156,7 @@ def test_map_artifacts_keeps_the_prior_artifacts_when_the_kernel_times_out(
     def boom(*_a, **_k):
         raise DevMapEngineError("devmap timed out after 900s: build")
 
-    monkeypatch.setattr("devcouncil.devmap_engine.build_map", boom)
+    monkeypatch.setattr("devcouncil.devmap_engine.build_map_result", boom)
     with pytest.raises(DevMapEngineError, match="timed out"):
         map_artifacts.refresh_map_artifacts(tmp_path, map_path, quiet=True, full=True)
 

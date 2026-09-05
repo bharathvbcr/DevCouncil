@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use devmap_query::{Request, StoreQueryEngine};
+use devmap_query::{Request, StoreQueryEngine, MAX_TOKEN_BUDGET, MAX_TRAVERSAL_DEPTH};
 use devmap_store::{Store, StoreStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -45,8 +45,9 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 /// exit, not a silent spin. Each failure backs off exponentially.
 const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 30;
 const MAX_QUERY_BYTES: usize = 4 * 1024;
-const MAX_TOKEN_BUDGET: u32 = 100_000;
-const MAX_TRAVERSAL_DEPTH: usize = 64;
+// The token-budget and traversal-depth ceilings are `devmap_query`'s: the
+// engine applies them, so the transport that fronts it imports them rather
+// than keeping a second spelling that can drift.
 
 /// Records when the daemon last did anything a consumer asked of it.
 ///
@@ -985,7 +986,7 @@ impl UnixIpcServer {
     }
 
     pub async fn run(self, store: Arc<Store>, activity: Arc<Activity>) -> anyhow::Result<()> {
-        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+        let admission = crate::admission::Admission::new(MAX_CONCURRENT_CONNECTIONS);
         let mut consecutive_accept_errors: u32 = 0;
         loop {
             match self.listener.accept().await {
@@ -993,10 +994,14 @@ impl UnixIpcServer {
                     consecutive_accept_errors = 0;
                     // Saturated pool => accept pauses here: backpressure lands
                     // in the kernel backlog rather than unbounded task memory.
-                    let permit = Arc::clone(&permits)
-                        .acquire_owned()
+                    // This is the one transport for which waiting is the right
+                    // answer — the peer is a local client on a Unix socket that
+                    // will simply wait — and `Admission` spells the other two
+                    // choices for the two transports that need them.
+                    let permit = admission
+                        .admit()
                         .await
-                        .map_err(|_| anyhow::anyhow!("connection semaphore closed"))?;
+                        .ok_or_else(|| anyhow::anyhow!("connection semaphore closed"))?;
                     let store = Arc::clone(&store);
                     let activity = Arc::clone(&activity);
                     tokio::spawn(async move {
@@ -1057,7 +1062,7 @@ pub async fn run_named_pipe(
     let mut server = ServerOptions::new()
         .first_pipe_instance(true)
         .create(name)?;
-    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let admission = crate::admission::Admission::new(MAX_CONCURRENT_CONNECTIONS);
     let mut consecutive_connect_errors: u32 = 0;
     loop {
         match server.connect().await {
@@ -1082,10 +1087,10 @@ pub async fn run_named_pipe(
         // Same bound as the Unix transport: saturated pool => stop creating
         // pipe instances until a slot frees, instead of fanning out without
         // limit.
-        let permit = Arc::clone(&permits)
-            .acquire_owned()
+        let permit = admission
+            .admit()
             .await
-            .map_err(|_| anyhow::anyhow!("connection semaphore closed"))?;
+            .ok_or_else(|| anyhow::anyhow!("connection semaphore closed"))?;
         let connected = server;
         server = ServerOptions::new().create(name)?;
         let store = Arc::clone(&store);

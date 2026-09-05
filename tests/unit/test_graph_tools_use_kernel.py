@@ -19,9 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
-
-import pytest
 
 from devcouncil.integrations.mcp.handlers import map as mapmod
 

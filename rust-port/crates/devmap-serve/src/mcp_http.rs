@@ -46,6 +46,7 @@ use hyper::{header, Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{json, Value};
 
+use crate::admission::Admission;
 use crate::mcp::{handle_method, StoreSlot, META_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSIONS};
 // The codes are the shared ones. `-32020` and `-32022` are allocated by the
 // specification out of a range it reserves for itself, so they belong with the
@@ -74,6 +75,37 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// How long a connection may stay idle before being dropped.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long the body of one request may take to arrive.
+///
+/// `header_read_timeout` bounds the *headers*; nothing bounded the body, so
+/// `Content-Length: 4096` followed by four bytes and silence held a connection
+/// — and one of the ceiling's permits — forever. Generous against a real
+/// client on a loopback socket, and a megabyte that has not arrived in ten
+/// seconds is an abandoned connection rather than a slow one.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Ceiling on connections served at once.
+///
+/// The same 64 the socket transport allows, for the same reason it states: an
+/// accepted connection may buffer up to [`MAX_BODY_BYTES`] before any
+/// validation runs, so a flood of them converts directly into task memory
+/// nothing bounds. This transport had no ceiling at all — one `tokio::spawn`
+/// per accept, for as many accepts as the kernel would give it.
+const MAX_CONCURRENT_HTTP_CONNECTIONS: usize = 64;
+
+/// How long the shed response has to reach a peer before it is abandoned.
+///
+/// The shed path exists to keep the accept loop honest, so it must not become
+/// its own way to hold a connection: it writes a fixed answer and closes, reads
+/// no body, touches no store, and gives up if even that cannot be delivered.
+const SHED_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a client is asked to wait before trying again, in seconds.
+///
+/// A number, not a date: a client's clock is not ours to trust, and the value
+/// only has to be long enough that a retrying herd does not arrive together.
+const RETRY_AFTER_SECS: u64 = 1;
 
 /// The one media type this endpoint reads and writes.
 const JSON_MEDIA_TYPE: &str = "application/json";
@@ -116,6 +148,47 @@ fn status_for(code: i64) -> StatusCode {
         // server failed to answer it, which is a 500 and not the client's fault.
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+
+/// The answer to a connection there is no permit for.
+///
+/// Shedding is a *response*, not a dropped accept, and that is the whole
+/// choice here. Pausing the accept loop — which is what the socket transport
+/// does, correctly, for a local peer on a Unix socket — pushes excess
+/// connections into the kernel listen backlog, and an overrun backlog resets
+/// them. To an HTTP client a reset on connect and a reset on read are
+/// indistinguishable from a dead server: there is nothing in either to act on,
+/// so every client retries blind, at whatever interval it happens to use. A
+/// `503` carrying `Retry-After` is a thing an HTTP client already knows how to
+/// obey, and it says which of the two possible facts is true — "busy now" and
+/// not "gone".
+///
+/// Written by hand rather than through hyper because the point is to answer
+/// without building a connection to answer over: no header parsing, no body
+/// read, no service, no store handle.
+fn shed_response() -> Vec<u8> {
+    let body = serde_json::to_vec(&rpc_error_body(
+        Value::Null,
+        -32000,
+        format!(
+            "this server is already serving its ceiling of \
+{MAX_CONCURRENT_HTTP_CONNECTIONS} concurrent connections and shed this one; \
+retry in {RETRY_AFTER_SECS}s"
+        ),
+    ))
+    .unwrap_or_else(|_| b"{}".to_vec());
+    let mut response = format!(
+        "HTTP/1.1 503 Service Unavailable\r\n\
+Content-Type: application/json\r\n\
+Content-Length: {}\r\n\
+Retry-After: {RETRY_AFTER_SECS}\r\n\
+X-Content-Type-Options: nosniff\r\n\
+Connection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(&body);
+    response
 }
 
 fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
@@ -625,12 +698,26 @@ request's Accept header excludes it."
 
     let headers = MirroredHeaders::read(&request);
 
-    let body = match read_body(request).await {
-        Ok(body) => body,
-        Err((status, message)) => {
+    let body = match tokio::time::timeout(BODY_READ_TIMEOUT, read_body(request)).await {
+        Ok(Ok(body)) => body,
+        Ok(Err((status, message))) => {
             return Ok(json_response(
                 status,
                 &rpc_error_body(Value::Null, INVALID_REQUEST, message),
+            ))
+        }
+        Err(_) => {
+            return Ok(json_response(
+                StatusCode::REQUEST_TIMEOUT,
+                &rpc_error_body(
+                    Value::Null,
+                    -32600,
+                    format!(
+                        "the request body was still incomplete after {}s and the exchange \
+was abandoned",
+                        BODY_READ_TIMEOUT.as_secs()
+                    ),
+                ),
             ))
         }
     };
@@ -832,6 +919,25 @@ pub async fn serve_http_on(
     store: Arc<StoreSlot>,
     listener: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
+    serve_http_on_with_admission(
+        store,
+        listener,
+        Admission::new(MAX_CONCURRENT_HTTP_CONNECTIONS),
+    )
+    .await
+}
+
+/// [`serve_http_on`] over a ceiling the caller owns.
+///
+/// The [`Admission`] is passed in rather than built here so a host running
+/// several transports in one process can share one pool between them, and so a
+/// test can observe `peak` and `shed` — a server that quietly refuses one
+/// request in ten looks exactly like one that is merely busy.
+pub async fn serve_http_on_with_admission(
+    store: Arc<StoreSlot>,
+    listener: tokio::net::TcpListener,
+    admission: Admission,
+) -> anyhow::Result<()> {
     loop {
         let (stream, _peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -847,8 +953,29 @@ pub async fn serve_http_on(
         // and therefore whether a `Host` naming a routable name could ever be
         // legitimate. Read per connection because a caller may bind anywhere.
         let local = stream.local_addr().ok();
+        // Shed rather than wait. See `shed_response`: a paused accept loop is
+        // indistinguishable from a dead server to an HTTP client, while a 503
+        // with `Retry-After` is something it already knows how to obey.
+        let Some(admitted) = admission.try_admit() else {
+            tracing::warn!(
+                "MCP HTTP shed a connection at the {}-connection ceiling ({} shed so far)",
+                admission.limit(),
+                admission.shed()
+            );
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let mut stream = stream;
+                let _ = tokio::time::timeout(SHED_WRITE_TIMEOUT, async {
+                    let _ = stream.write_all(&shed_response()).await;
+                    let _ = stream.shutdown().await;
+                })
+                .await;
+            });
+            continue;
+        };
         let store = Arc::clone(&store);
         tokio::spawn(async move {
+            let _admitted = admitted;
             let io = TokioIo::new(stream);
             let service =
                 service_fn(move |request| handle_request(Arc::clone(&store), local, request));

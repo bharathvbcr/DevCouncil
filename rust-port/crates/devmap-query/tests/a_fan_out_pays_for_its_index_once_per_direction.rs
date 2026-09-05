@@ -147,21 +147,53 @@ fn a_fan_out_does_not_pay_for_an_index_per_target() {
     // budgeted answers, sixteen sets of reported edges — and that marginal
     // cost is the answer, not the graph. What must not scale is the index.
     //
-    // Measured on this fixture, with the hoist reverted so the index is
-    // rebuilt per target and then restored, everything else identical:
+    // This began as a *ratio*: many-target against one-target, with a factor of
+    // two between "index per target" (3.4x) and "index per direction" (1.0x).
+    // Measured on this fixture with the index rebuilt per target and then
+    // shared, everything else identical:
     //
     //     index per target     299,720 for 16 targets vs 88,310 for one — 3.4x
     //     index per direction   75,160 for 16 targets vs 74,275 for one — 1.0x
     //
-    // The same answer costs 4x the allocations when the index is not shared,
-    // and the per-target growth is the entire difference. Two sits between
-    // those worlds with room on both sides rather than being tuned to either.
+    // Both of those worlds build an index *per request*, which is what made the
+    // one-target figure large enough for a ratio to mean anything. The store now
+    // keeps one index per *generation*, so the per-request build is gone
+    // entirely and the one-target figure collapses to what the answer costs —
+    // 155 allocations here. What is left in the many-target figure is almost
+    // purely marginal, so the ratio rises (7.7x) precisely *because* the fixed
+    // cost this test was written to find has been removed. A ratio cannot
+    // distinguish "the index is rebuilt per target" from "there is no fixed cost
+    // left to divide by".
+    //
+    // The two absolute statements survive both designs and say the same thing
+    // more directly.
+    let generation_edges = store.latest_edges(0.0).expect("edges").len();
     assert!(
-        many_targets < one_target * 2,
-        "neighbors over {} targets allocated {many_targets} against {one_target} for a \
-         single target — a {:.1}x ratio. The adjacency index is being rebuilt per \
-         target instead of once per direction.",
-        targets.len(),
-        many_targets as f64 / one_target as f64
+        generation_edges > 8_000,
+        "the fixture must hold a generation large enough for a per-index cost to \
+         show, got {generation_edges} edge(s)"
+    );
+
+    // One: adding a target must not cost a pass over the generation. Rebuilding
+    // an index per target means at least one allocation per edge indexed; the
+    // marginal cost here is 69 against 12,018 edges.
+    let marginal = many_targets.saturating_sub(one_target) / (targets.len() - 1);
+    assert!(
+        marginal * 8 < generation_edges,
+        "each of the {} extra targets cost {marginal} allocations against a \
+         {generation_edges}-edge generation — the adjacency is being rebuilt per \
+         target rather than shared",
+        targets.len() - 1
+    );
+
+    // Two: the whole fan-out, both directions, must cost less than one pass over
+    // the generation — the property the shared index exists to buy, stated
+    // without reference to any single-target baseline.
+    assert!(
+        many_targets < generation_edges,
+        "neighbors over {} targets allocated {many_targets} against a \
+         {generation_edges}-edge generation — that is a per-generation cost, not a \
+         per-answer one",
+        targets.len()
     );
 }

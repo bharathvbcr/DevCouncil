@@ -592,17 +592,19 @@ impl Daemon {
             // the file still exists, so its stored row is kept untouched (it
             // stays at the last good extraction until it becomes readable
             // again).
-            for (path, reason) in discovery
-                .skipped_paths
-                .iter()
-                .filter(|(_, reason)| !matches!(reason, DiscoverySkipReason::NonSource))
-            {
+            //
+            // Which skips count is `DiscoverySkipReason::is_refusal`, through
+            // `DiscoveryReport::refusals`, and nowhere else. Spelled here as
+            // `!matches!(reason, NonSource)` it was a second copy of the rule
+            // the CLI's build path reads from the owner — and a wildcard copy
+            // at that, so a skip reason added later would silently default to
+            // "not a refusal" on this path while the CLI stopped compiling
+            // until someone chose a side.
+            for (path, reason) in discovery.refusals() {
                 warn!("refused source {path:?} in changed directory {canonical:?}: {reason:?}");
             }
             let refused: std::collections::BTreeSet<String> = discovery
-                .skipped_paths
-                .iter()
-                .filter(|(_, reason)| !matches!(reason, DiscoverySkipReason::NonSource))
+                .refusals()
                 .map(|(path, _)| {
                     // Discovery reports paths relative to the changed
                     // directory; stored rows are relative to the daemon
@@ -845,6 +847,16 @@ impl Daemon {
         // `batch_limit` (8192) and `claim_of` runs once per path in it, so the
         // linear `find` this replaces made the lookup step itself O(batch) and
         // the drain O(batch²) — a stride is not a bound when one step is not.
+        // The constant was raised from 64 to 8,192 precisely so that large
+        // batches become normal, which is what turned the scan from a cost into
+        // a bound nobody was holding.
+        //
+        // The map is *exactly* equivalent to the scan, not merely faster:
+        // `pending_paths.path` is the table's conflict target, so a claim set
+        // holds each path once — same claim for every path, same panic on a
+        // path that came from no claim. Measured, rustc -O: batch 1024
+        // 898.8 us -> 45.5 us; 4096 16.18 ms -> 286.3 us; 8192 (the real bound)
+        // 62.35 ms -> 348.6 us.
         let claim_of: std::collections::HashMap<&str, &devmap_store::PendingClaim> = claims
             .iter()
             .map(|claim| (claim.path.as_str(), claim))

@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use crate::edge_index::GenerationEdges;
 use devmap_analyze::clones::CloneCandidate;
 use devmap_analyze::model::*;
 use devmap_extract::model::*;
@@ -364,6 +365,36 @@ pub struct Store {
     /// The cached set is unfiltered; `min_confidence` is applied per request
     /// against the same rounding rule the SQL used, so the answer is unchanged.
     edge_cache: Mutex<Option<(u32, std::sync::Arc<Vec<StoredEdge>>)>>,
+    /// Adjacency over the same rows [`Store::edge_cache`] holds, keyed by the
+    /// same generation id.
+    ///
+    /// It shares that `Arc` rather than copying the edge text, so what this
+    /// adds is four maps of `u32` ids — see
+    /// [`GenerationEdges::adjacency_bytes`]. Without it every graph question
+    /// paid for the whole generation before the walk began: the clone out of
+    /// the cache, the conversion of every row, and an adjacency map over every
+    /// row, for a question whose answer touches a few dozen edges.
+    edge_index: Mutex<Option<(u32, std::sync::Arc<GenerationEdges>)>>,
+    /// `(generation, node_count, edge_count)` for the generation last asked
+    /// about.
+    ///
+    /// `status` is the cheapest question the kernel answers and it scaled with
+    /// the corpus — two `COUNT(*)`s over the generation's whole node and edge
+    /// tables, per call, for numbers that cannot change while the generation
+    /// stands. Rows are only inserted under a *new* generation id and only
+    /// deleted a whole generation at a time, so the id is a complete key: a
+    /// memo under it cannot go stale, it can only be replaced by a newer
+    /// generation's. Only the newest asked-about generation is held, so this is
+    /// three words of memory rather than a map that grows with history.
+    generation_counts: Mutex<Option<(u32, usize, usize)>>,
+    /// The analysis status of the generation last asked about.
+    ///
+    /// Immutable for the same reason the counts are — a generation's
+    /// `analysis_json` is written once, under a new id — so the id is a
+    /// complete key. Reading it at all means going to the summary blob, which
+    /// on the ScholarLM corpus is milliseconds; `devmap status` asks for it on
+    /// every call and nothing else about it can change.
+    generation_analysis_status: Mutex<Option<(u32, AnalysisStatus)>>,
 }
 
 /// A held cross-process writer lock on one store (K13).
@@ -775,7 +806,7 @@ fn fts_match_query(query: &str) -> Result<String> {
     Ok(format!("\"{}\"*", query.replace('"', "\"\"")))
 }
 
-fn checked_min_confidence(value: f32) -> Result<f32> {
+pub fn checked_min_confidence(value: f32) -> Result<f32> {
     if value.is_nan() {
         return Err(rusqlite::Error::InvalidParameterName(
             "min_confidence must be a number; got NaN, which no confidence \
@@ -1396,6 +1427,9 @@ impl Store {
         Ok(Self {
             conn: Mutex::new(conn),
             edge_cache: Mutex::new(None),
+            edge_index: Mutex::new(None),
+            generation_counts: Mutex::new(None),
+            generation_analysis_status: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
         })
     }
@@ -1604,6 +1638,9 @@ impl Store {
         Ok(Self {
             conn: Mutex::new(conn),
             edge_cache: Mutex::new(None),
+            edge_index: Mutex::new(None),
+            generation_counts: Mutex::new(None),
+            generation_analysis_status: Mutex::new(None),
             db_path: None,
         })
     }
@@ -3026,6 +3063,103 @@ impl Store {
         .transpose()
     }
 
+    /// Node and edge counts for `generation`, counted at most once.
+    ///
+    /// See [`Store::generation_counts`] for why the generation id is a
+    /// sufficient key. Takes the caller's snapshot rather than the raw
+    /// connection so the first (uncached) count is still read inside the
+    /// transaction that resolved the generation id.
+    fn generation_counts_locked(
+        &self,
+        snapshot: &rusqlite::Transaction<'_>,
+        generation: u32,
+    ) -> Result<(usize, usize)> {
+        if let Ok(cache) = self.generation_counts.lock() {
+            if let Some((cached, nodes, edges)) = *cache {
+                if cached == generation {
+                    return Ok((nodes, edges));
+                }
+            }
+        }
+        let nodes: usize = snapshot.query_row(
+            "SELECT COUNT(*) FROM generation_nodes WHERE generation_id = ?1",
+            params![generation],
+            |row| row.get::<_, i64>(0).map(|n| n as usize),
+        )?;
+        let edges: usize = snapshot.query_row(
+            "SELECT COUNT(*) FROM generation_edges WHERE generation_id = ?1",
+            params![generation],
+            |row| row.get::<_, i64>(0).map(|n| n as usize),
+        )?;
+        if let Ok(mut cache) = self.generation_counts.lock() {
+            *cache = Some((generation, nodes, edges));
+        }
+        Ok((nodes, edges))
+    }
+
+    /// The latest generation's analysis **status**, without its summary.
+    ///
+    /// `devmap status` needs one enum to decide whether the graph is degraded,
+    /// and reading it through [`Store::latest_analysis`] deserialises the whole
+    /// `AnalysisSummary` to get there — every dead symbol, every community,
+    /// every clone-coverage counter. On the ScholarLM corpus that blob is large
+    /// enough to cost milliseconds on a surface whose whole budget is a few.
+    ///
+    /// SQLite's `->` operator returns a *JSON* representation rather than SQL
+    /// text, so a unit variant comes back as `"Ok"` and a struct variant as its
+    /// object, and both feed straight back into serde. That matters: the
+    /// encoding of `AnalysisStatus` stays owned by its derive, and this method
+    /// does not hand-decode variant names that a future variant would silently
+    /// fall out of.
+    ///
+    /// Not the same reader as [`devmap_analyze::model::AnalysisDisclosure`],
+    /// deliberately, but the difference is no longer where the bytes stop.
+    /// When this was written the disclosure still transferred the whole blob
+    /// and stepped serde over its vectors; `dead_page` now strips them in
+    /// SQLite too, with `json_remove`, so neither reader carries the summary
+    /// across. What remains is the shape of the question: the disclosure wants
+    /// five fields inside a snapshot `dead_page` is already holding, and this
+    /// wants one field on a surface a health check polls often enough to cache
+    /// it per generation. Both decode `AnalysisStatus` through its own derive,
+    /// so neither can drift from the writer.
+    pub fn latest_analysis_status(&self) -> Result<Option<AnalysisStatus>> {
+        let conn = lock_conn(&self.conn)?;
+        // One snapshot for the generation id and the row it names, for the same
+        // reason `status` takes one: resolving the newest generation and then
+        // reading its analysis in two separate reads lets a prune between them
+        // answer `None` for a store that holds a generation.
+        let snapshot = conn.unchecked_transaction()?;
+        let Some(generation) = Self::latest_generation_id_locked(&snapshot)? else {
+            return Ok(None);
+        };
+        if let Ok(cache) = self.generation_analysis_status.lock() {
+            if let Some((cached, status)) = cache.as_ref() {
+                if *cached == generation {
+                    return Ok(Some(status.clone()));
+                }
+            }
+        }
+        let raw: Option<Option<String>> = snapshot
+            .query_row(
+                "SELECT analysis_json -> '$.status' FROM generations WHERE id = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(Some(json)) = raw else {
+            return Ok(None);
+        };
+        let status: AnalysisStatus = serde_json::from_str(&json).map_err(|error| {
+            rusqlite::Error::InvalidParameterName(format!(
+                "stored generation analysis status is invalid: {error}"
+            ))
+        })?;
+        if let Ok(mut cache) = self.generation_analysis_status.lock() {
+            *cache = Some((generation, status.clone()));
+        }
+        Ok(Some(status))
+    }
+
     pub fn status(&self, db_path: &str) -> Result<StoreStatus> {
         let conn = lock_conn(&self.conn)?;
         // Every number below describes one instant. `status` resolves the
@@ -3046,18 +3180,15 @@ impl Store {
                 row.get::<_, i64>(0).map(|n| n as usize)
             })?;
         let (node_count, edge_count) = if let Some(g) = latest {
-            let nodes: usize = snapshot.query_row(
-                "SELECT COUNT(*) FROM generation_nodes WHERE generation_id = ?1",
-                params![g],
-                |row| row.get::<_, i64>(0).map(|n| n as usize),
-            )?;
-            let edges: usize = snapshot.query_row(
-                "SELECT COUNT(*) FROM generation_edges WHERE generation_id = ?1",
-                params![g],
-                |row| row.get::<_, i64>(0).map(|n| n as usize),
-            )?;
-            (nodes, edges)
+            // Counted at most once per generation. The two `COUNT(*)`s still
+            // run inside the snapshot the first time, so the pair a caller sees
+            // is still one instant's; what the memo removes is re-counting a
+            // generation whose rows cannot change (measured on a 271k-edge
+            // store: 2.87 ms of a 2.9 ms `status`).
+            self.generation_counts_locked(&snapshot, g)?
         } else {
+            // No generation, nothing to count. Not a cached zero — there are
+            // genuinely no rows to describe.
             (0, 0)
         };
         let quarantined_count: usize = snapshot.query_row(
@@ -3678,52 +3809,96 @@ impl Store {
         // A caller got "this depends on nothing" — a positive claim — from a
         // comparison that never ran. `checked_min_confidence` refuses the input
         // instead, so neither implementation is asked an unanswerable question.
-        fn admits(confidence: f32, min_confidence: f32) -> bool {
-            (confidence * 1000.0).round() as i64 >= (min_confidence * 1000.0).round() as i64
-        }
-
         let min_confidence = checked_min_confidence(min_confidence)?;
+        let Some((_, all)) = self.latest_edge_rows()? else {
+            return Ok(Vec::new());
+        };
+        Ok(all
+            .iter()
+            .filter(|edge| crate::edge_index::admits(edge.confidence, min_confidence))
+            .cloned()
+            .collect())
+    }
 
+    /// The latest generation's unfiltered edge rows, and the generation they
+    /// came from.
+    ///
+    /// The one place [`Store::edge_cache`] is consulted and filled, so
+    /// [`Store::latest_edges`] and [`Store::generation_edges`] read the same
+    /// rows for the same generation and share one allocation of them. `None`
+    /// means no generation has been persisted.
+    ///
+    /// Keyed by the generation the rows were *read from*, not by the one
+    /// sampled before the load. This function asks the question twice — once
+    /// to probe the cache, once inside the load's own snapshot — and a writer
+    /// committing between the two made the entry `(N, edges of N+1)`: a key
+    /// that can never be hit again, so the cache silently stopped being one
+    /// until the next load rewrote it. Labelling the entry with the generation
+    /// its rows came from makes the key mean what it says.
+    fn latest_edge_rows(&self) -> Result<Option<(u32, std::sync::Arc<Vec<StoredEdge>>)>> {
         let current = {
             let conn = lock_conn(&self.conn)?;
             Self::latest_generation_id_locked(&conn)?
         };
         let Some(current) = current else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         if let Ok(cache) = self.edge_cache.lock() {
             if let Some((generation, edges)) = cache.as_ref() {
                 if *generation == current {
-                    return Ok(edges
-                        .iter()
-                        .filter(|edge| admits(edge.confidence, min_confidence))
-                        .cloned()
-                        .collect());
+                    return Ok(Some((current, std::sync::Arc::clone(edges))));
                 }
             }
         }
-        // Keyed by the generation the rows were *read from*, not by `current`.
-        //
-        // `current` was sampled by its own statement, above, and the load below
-        // resolves the latest generation again under its own snapshot — this
-        // function is the one place in the store that asks the question twice.
-        // A writer committing between the two made the entry `(N, edges of
-        // N+1)`: a key that can never be hit again, so the cache the doc calls
-        // a bounded replacement for per-query allocation silently stopped being
-        // one until the next load rewrote it. Labelling the entry with the
-        // generation its rows came from makes the key mean what it says.
         let Some((loaded, all)) = self.latest_edges_uncached(0.0)? else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
-        let filtered: Vec<StoredEdge> = all
-            .iter()
-            .filter(|edge| admits(edge.confidence, min_confidence))
-            .cloned()
-            .collect();
+        let all = std::sync::Arc::new(all);
         if let Ok(mut cache) = self.edge_cache.lock() {
-            *cache = Some((loaded, std::sync::Arc::new(all)));
+            *cache = Some((loaded, std::sync::Arc::clone(&all)));
         }
-        Ok(filtered)
+        Ok(Some((loaded, all)))
+    }
+
+    /// Adjacency over the latest generation's edges, built once per generation.
+    ///
+    /// `None` when no generation has been persisted. The returned index is a
+    /// snapshot: it stays internally consistent — every edge in it comes from
+    /// one generation — even if a build commits a newer one while a walk is
+    /// running, and the next call after that build gets the newer generation
+    /// because the memo is keyed by its id.
+    ///
+    /// Errors on an unknown stored edge kind, which is where the per-request
+    /// conversion used to fail: a store written by a binary that knows an edge
+    /// kind this one does not is refused rather than half-read.
+    pub fn generation_edges(&self) -> Result<Option<std::sync::Arc<GenerationEdges>>> {
+        let Some((current, rows)) = self.latest_edge_rows()? else {
+            return Ok(None);
+        };
+        if let Ok(cache) = self.edge_index.lock() {
+            if let Some((generation, index)) = cache.as_ref() {
+                if *generation == current {
+                    return Ok(Some(std::sync::Arc::clone(index)));
+                }
+            }
+        }
+        if rows.len() > u32::MAX as usize {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "generation {current} holds {} edges, more than the {} an edge \
+                 index can address; answering over a prefix of it would be a \
+                 wrong answer rather than a bounded one",
+                rows.len(),
+                u32::MAX
+            )));
+        }
+        let index = std::sync::Arc::new(
+            GenerationEdges::build(rows)
+                .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?,
+        );
+        if let Ok(mut cache) = self.edge_index.lock() {
+            *cache = Some((current, std::sync::Arc::clone(&index)));
+        }
+        Ok(Some(index))
     }
 
     /// Every edge of the latest generation, and the generation they came from.

@@ -1,35 +1,95 @@
 import typer
 import json
-from devcouncil.utils.json_persist import dump_json
 import logging
 import os
 import sys
 from pathlib import Path
-from rich.console import Console
-from devcouncil.execution.hook_policy import HookPolicy
-from devcouncil.telemetry.traces import TraceLogger
+from typing import Any
 from devcouncil.telemetry.stages import log_step
-from devcouncil.live.signals import write_signal
-from devcouncil.live.tasks import active_task_id
 
 app = typer.Typer()
-console = Console()
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Deferred imports.
+#
+# This module is imported for every hook event a coding CLI fires — one per tool
+# call, and PostToolUse is the one that fires most — so its import time is paid
+# on every agent turn whether or not anything it imports is used. Measured with
+# `python -X importtime`, it cost **149 ms**, of which `live.tasks` alone
+# (SQLAlchemy and SQLModel, through `storage.db`) was **90 ms** and the pydantic
+# behind `json_persist` and `hook_policy` another **42 ms** — none of it reached
+# by `post_tool_use`, which decides from the payload's file extensions whether to
+# build a map and otherwise returns. After deferring them the module imports in
+# **31 ms**, and a cold `import devcouncil.cli.commands.hook` loads neither
+# SQLAlchemy, SQLModel, pydantic nor rich.
+#
+# Each is a *thin function*, not a PEP 562 module `__getattr__` entry. That
+# distinction is load-bearing: `__getattr__` is consulted for `module.name`
+# attribute access and **not** for a bare global reference inside a function, so
+# a name deferred that way NameErrors at every call site that does not spell out
+# `sys.modules[__name__].name` — which is exactly why `_verify_active_task` does
+# spell it out for `get_db`. A function is a real entry in the module dict: it
+# resolves as a global, and `monkeypatch.setattr(hook, "HookPolicy", …)` — which
+# eleven tests do — replaces it as it always could.
+#
+# `log_step` stays at module scope: 0.2 ms, and it runs on the map path itself.
+# ---------------------------------------------------------------------------
+
+
+def dump_json(payload: Any, **kwargs: Any) -> str:
+    """`devcouncil.utils.json_persist.dump_json`, imported on first use."""
+    from devcouncil.utils.json_persist import dump_json as _dump_json
+
+    return _dump_json(payload, **kwargs)
+
+
+def active_task_id(root: Path) -> str | None:
+    """`devcouncil.live.tasks.active_task_id`, imported on first use.
+
+    The heaviest of the four: `live.tasks` reaches `storage.db` and loads the
+    whole ORM, on a hook that opens a database only when a single task is
+    genuinely active — which under `hook_gate.mode=off` is never.
+    """
+    from devcouncil.live.tasks import active_task_id as _active_task_id
+
+    return _active_task_id(root)
+
+
+def HookPolicy(*args: Any, **kwargs: Any) -> Any:  # noqa: N802 - stands in for the class
+    """`devcouncil.execution.hook_policy.HookPolicy`, imported on first use."""
+    from devcouncil.execution.hook_policy import HookPolicy as _HookPolicy
+
+    return _HookPolicy(*args, **kwargs)
+
+
+def TraceLogger(*args: Any, **kwargs: Any) -> Any:  # noqa: N802 - stands in for the class
+    """`devcouncil.telemetry.traces.TraceLogger`, imported on first use.
+
+    Reached by a dozen commands here and by none of them on the map path, and it
+    is what pulls pydantic in: 57 ms of the module's import, for a trace record
+    a `PostToolUse` never writes.
+    """
+    from devcouncil.telemetry.traces import TraceLogger as _TraceLogger
+
+    return _TraceLogger(*args, **kwargs)
+
+
+def write_signal(*args: Any, **kwargs: Any) -> Any:
+    """`devcouncil.live.signals.write_signal`, imported on first use."""
+    from devcouncil.live.signals import write_signal as _write_signal
+
+    return _write_signal(*args, **kwargs)
+
+
 def __getattr__(name: str) -> object:
-    """Resolve `get_db` on first access, not at import.
+    """Resolve `get_db` on first access — see the deferred-imports note above.
 
-    This hook runs on every tool call an agent makes, and every path through it
-    returns before opening a database whenever no single task is active — which
-    is every call under `hook_gate.mode=off`. A module-scope import made that
-    common path load SQLAlchemy and SQLModel (~120 ms measured) to reach a
-    database it never opens.
-
-    Deferring it into each function would have saved the same time but removed
-    the name, and `hook.get_db` is the seam five tests substitute to drive
-    `_verify_active_task`. PEP 562 keeps it a real, patchable module attribute
-    that costs nothing until something asks for it.
+    `get_db` keeps the `__getattr__` form rather than becoming a wrapper because
+    its two call sites already reach it as `sys.modules[__name__].get_db`, which
+    is what makes the form work, and because five tests substitute
+    `hook.get_db` with a value they then expect to be used as-is.
     """
     if name == "get_db":
         from devcouncil.storage.db import get_db as _get_db
@@ -308,7 +368,12 @@ def _emit_decision(client: str, action: str, reason: str) -> None:
                 separators=(",", ":"),
             ))
             return
-        console.print(f"[yellow]DevCouncil Warning:[/yellow] {reason}")
+        # rich is imported here and nowhere else in this module: one branch, of
+        # one action, of one client family reaches it, and a module-scope
+        # `Console()` made every hook event pay for the terminal renderer.
+        from rich.console import Console
+
+        Console().print(f"[yellow]DevCouncil Warning:[/yellow] {reason}")
 
 
 def _emit_unevaluable(client: str, reason: str, strict: bool) -> None:

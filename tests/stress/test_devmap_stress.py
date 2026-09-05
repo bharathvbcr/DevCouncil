@@ -269,6 +269,8 @@ def test_a_two_thousand_file_burst_costs_one_rebuild(tmp_path, monkeypatch):
             stop.set()
 
     monkeypatch.setattr(engine, "build_map", _build)
+    # …and the function it adapts, which is what `refresh_map_artifacts` calls.
+    monkeypatch.setattr(engine, "build_map_result", _build)
     monkeypatch.setattr(map_cmd.RepoMapper, "map_is_stale", lambda self, data: True)
     monkeypatch.setattr(map_cmd, "WATCH_POLL_INTERVAL_SECONDS", 600.0)
 

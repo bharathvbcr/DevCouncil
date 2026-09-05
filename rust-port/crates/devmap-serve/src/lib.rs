@@ -1,9 +1,11 @@
+pub mod admission;
 pub mod daemon;
 pub mod mcp;
 pub mod mcp_http;
 pub mod protocol;
 pub mod watcher;
 
+pub use admission::{Admission, Admitted};
 pub use daemon::{default_ipc_path_for, Daemon, DEFAULT_DRAIN_BATCH_LIMIT};
 pub use mcp::{serve_stdio, tool_specs, StoreSlot};
 pub use mcp_http::serve_http;

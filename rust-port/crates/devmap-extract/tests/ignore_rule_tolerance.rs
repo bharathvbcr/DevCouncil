@@ -192,3 +192,58 @@ fn an_unreadable_ignore_file_leaves_paths_admitted_rather_than_ignored() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// K-A1's other half: the dropped line is *reported*, not silently swallowed.
+///
+/// Tolerating the malformed glob is only half an honest answer. A rule the
+/// developer wrote and the kernel is not applying is invisible from both sides
+/// — the watcher sees a path it admits, the developer sees a `.gitignore` line
+/// that does nothing — so the verdict travels with one diagnostic per line that
+/// could not be compiled. Nothing else in the workspace asserts this, and the
+/// `problems.push` in `add_ignore_rules` can be deleted without a single
+/// existing test failing.
+#[test]
+fn the_unusable_rule_line_is_reported_alongside_the_verdict() {
+    let root = scratch_repo("reporting");
+    write(
+        &root,
+        ".gitignore",
+        &format!("before.py\n{MALFORMED_GLOB}\nafter.py\n"),
+    );
+    write(&root, "before.py", "def before(): pass\n");
+    write(&root, "src.py", "def src(): pass\n");
+
+    let (ignored, problems) =
+        devmap_extract::is_gitignored_reporting(&root, &root.join("src.py"), false)
+            .expect("a partly-unusable rule file must still produce a verdict");
+    assert!(!ignored, "the verdict itself is unchanged");
+    assert_eq!(
+        problems.len(),
+        1,
+        "exactly one rule file was partly unusable: {problems:?}"
+    );
+    assert!(
+        problems[0].contains(".gitignore"),
+        "the diagnostic must name the file whose lines are not being applied: {problems:?}"
+    );
+    assert!(
+        problems[0].contains("not being applied"),
+        "and must say the lines are not in force, not merely that something was odd: \
+         {problems:?}"
+    );
+
+    // Positive control: a well-formed tree pays nothing and reports nothing, so
+    // a caller can treat a non-empty list as real news.
+    let clean = scratch_repo("reporting-clean");
+    write(&clean, ".gitignore", "build/\n");
+    write(&clean, "src.py", "def src(): pass\n");
+    let (_, none) = devmap_extract::is_gitignored_reporting(&clean, &clean.join("src.py"), false)
+        .expect("a well-formed rule file must produce a verdict");
+    assert!(
+        none.is_empty(),
+        "a well-formed tree must report no problems: {none:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&clean);
+}

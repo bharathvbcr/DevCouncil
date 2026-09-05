@@ -52,6 +52,7 @@ use devmap_store::Store;
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
+use crate::admission::Admission;
 use crate::protocol::{dispatch, validate_request, IpcCommand, IpcRequest, PROTOCOL_VERSION};
 
 /// The store, opened on first successful use rather than at startup.
@@ -214,6 +215,15 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// including a cancellation — until one call retires, which is bounded by
 /// [`CALL_TIMEOUT`]; that is the unavoidable cost of any ceiling, and 256 makes
 /// it a case a real client has to work to reach.
+///
+/// The ceiling is *held* by [`crate::admission::Admission`], which is the one
+/// implementation for all three transports and the only thing that can say what
+/// a bound actually did: `peak()` is the high-water mark and `shed()` the count
+/// refused, and a ceiling nobody can measure is indistinguishable from a server
+/// that is merely busy. stdio takes the waiting policy — [`Admission::admit`],
+/// the same one the socket transport uses — for the reason above; only the HTTP
+/// transport sheds, because a 503 with `Retry-After` is something an HTTP client
+/// already knows how to act on and a paused accept loop is not.
 pub const MAX_IN_FLIGHT_REQUESTS: usize = 256;
 
 /// Largest tool result this server will send, in bytes of serialized JSON.
@@ -2148,6 +2158,34 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    serve_streams_with_admission(
+        store,
+        reader,
+        writer,
+        Admission::new(MAX_IN_FLIGHT_REQUESTS),
+    )
+    .await
+}
+
+/// The transport loop under a caller-supplied ceiling on requests in flight.
+///
+/// The [`Admission`] is passed in rather than built here for the reason
+/// `serve_http_on_with_admission` gives: one host process may run several
+/// sessions that should share a budget, and the pool's counters — the
+/// high-water mark, and how many requests were shed — are the only way to see a
+/// ceiling doing its job. On this transport `shed()` must stay zero: the policy
+/// is to wait (see [`MAX_IN_FLIGHT_REQUESTS`]), so a non-zero count here is a
+/// bug rather than a busy server.
+pub async fn serve_streams_with_admission<R, W>(
+    store: Arc<StoreSlot>,
+    reader: BufReader<R>,
+    writer: W,
+    admission: Admission,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let session = Arc::new(Session::new(store));
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
     let mut reader = reader;
@@ -2209,25 +2247,39 @@ continued for {seen} bytes in total before terminating"
             }
         };
 
+        // Backpressure, and nothing else. Reaping is not a bound — it only
+        // removes what has already finished, and a peer writing faster than
+        // tasks retire outgrows it without limit — so the permit is taken
+        // *before* the spawn and held by the task until it retires. While this
+        // await is held the loop is not reading the next frame, so the pressure
+        // reaches the peer through the pipe rather than through this process's
+        // heap.
+        //
+        // It waits rather than refusing on purpose: a bound that discards a
+        // well-formed request from a client doing nothing wrong is data loss
+        // wearing a good error message, and an agent host draining a plan
+        // pipelines hundreds of requests as a matter of course. The wait is
+        // bounded in the only way that matters — every admitted call is bounded
+        // by `CALL_TIMEOUT`, so a permit is never held forever.
+        let Some(admitted) = admission.admit().await else {
+            // The pool is closed, which nothing here does. Ending the session
+            // is the only honest answer: continuing would spawn unadmitted work
+            // and put this loop back where the ceiling was added to fix it.
+            break;
+        };
+
         let session = Arc::clone(&session);
         let writer = Arc::clone(&writer);
         tasks.push(tokio::spawn(async move {
+            let _admitted = admitted;
             if let Some(frame) = handle_line_in(&session, &text).await {
                 let _ = write_frame(&writer, &frame).await;
             }
         }));
-        // Finished tasks are reaped as we go so a long session does not
-        // accumulate a handle per request it ever served.
+        // Finished handles are still reaped as we go, so a long session does not
+        // accumulate a handle per request it ever served. This bounds the vector
+        // and not the fan-out; the fan-out is the admission above.
         tasks.retain(|task| !task.is_finished());
-        // Reaping is not a bound: it only removes what has already finished, and
-        // a peer writing faster than tasks retire outgrew it without limit. Past
-        // the ceiling, wait for the oldest rather than read another frame —
-        // backpressure, so nothing is dropped and the connection simply stops
-        // consuming until there is room.
-        while tasks.len() >= MAX_IN_FLIGHT_REQUESTS {
-            let _ = tasks.remove(0).await;
-            tasks.retain(|task| !task.is_finished());
-        }
     }
 
     for task in tasks {
