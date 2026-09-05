@@ -2230,10 +2230,13 @@ fn go_package_name_of(ext: &Extraction) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "parse")]
     use super::*;
+    #[cfg(feature = "parse")]
     use devmap_extract::extract_file;
 
     #[test]
+    #[cfg(feature = "parse")]
     fn relative_js_import_uses_parent_dir_not_filename() {
         let a = extract_file("pkg/a.js", "import './b'\nexport function fromA() {}\n");
         let b = extract_file("pkg/b.js", "export function fromB() {}\n");
@@ -2405,6 +2408,7 @@ mod import_resolution_tests {
     }
 
     /// Fixture spanning the per-language import-path resolvers.
+    #[cfg(feature = "parse")]
     fn path_fixture() -> Resolver {
         use devmap_extract::extract_file;
         let files = [
@@ -2440,6 +2444,7 @@ mod import_resolution_tests {
     ///
     /// Every expectation was read off the resolver before being pinned.
     #[test]
+    #[cfg(feature = "parse")]
     fn each_language_resolves_import_paths_by_its_own_rules() {
         let resolver = path_fixture();
         let resolve =
@@ -2533,6 +2538,7 @@ mod import_resolution_tests {
     }
 
     /// Fixture spanning every tier of the Go import ladder.    /// Fixture spanning every tier of the Go import ladder.
+    #[cfg(feature = "parse")]
     fn go_fixture() -> Resolver {
         use devmap_extract::extract_file;
         let files = [
@@ -2572,6 +2578,7 @@ mod import_resolution_tests {
     }
 
     #[test]
+    #[cfg(feature = "parse")]
     fn probe_extended() {
         let r = go_fixture();
         for spec in [
@@ -2601,6 +2608,7 @@ mod import_resolution_tests {
     ///
     /// Every expectation was read off the resolver before being pinned.
     #[test]
+    #[cfg(feature = "parse")]
     fn the_go_import_ladder_resolves_each_tier_in_order() {
         let resolver = go_fixture();
 
@@ -2684,6 +2692,7 @@ mod import_resolution_tests {
     /// because a later tier happens to reach the same files: both halves of the
     /// prefix test and the "did it find anything" check are only observable here.
     #[test]
+    #[cfg(feature = "parse")]
     fn the_module_tier_resolves_what_no_weaker_tier_reaches() {
         let resolver = go_fixture();
         assert_eq!(
@@ -2707,6 +2716,7 @@ mod import_resolution_tests {
     /// against the outer module's layout and lands on a directory that does not
     /// exist — the import silently resolves to nothing.
     #[test]
+    #[cfg(feature = "parse")]
     fn the_longest_matching_module_prefix_wins() {
         let resolver = go_fixture();
         assert_eq!(
@@ -2727,6 +2737,7 @@ mod import_resolution_tests {
     /// file at `a/deep/nested/pkg/`, a strictly longer suffix than the Go
     /// package at `deep/nested/pkg/`.
     #[test]
+    #[cfg(feature = "parse")]
     fn only_go_files_contribute_suffix_tier_candidates() {
         let resolver = go_fixture();
         assert_eq!(
@@ -2746,6 +2757,7 @@ mod import_resolution_tests {
     /// the package, and losing it breaks every package-level import edge on
     /// exactly the path a restarted daemon takes.
     #[test]
+    #[cfg(feature = "parse")]
     fn a_go_package_name_survives_source_stripping() {
         use devmap_extract::extract_file;
 
@@ -2789,6 +2801,7 @@ mod import_resolution_tests {
     /// resolve to. Binding every cgo import in a repository to one unrelated
     /// package is a confidently wrong edge, not a missing one.
     #[test]
+    #[cfg(feature = "parse")]
     fn cgos_pseudo_package_never_binds_to_a_real_directory() {
         let resolver = go_fixture();
         assert_eq!(
@@ -2811,6 +2824,7 @@ mod import_resolution_tests {
     /// applies, resolution must not depend on the order `go.mod` files happen
     /// to be walked in. `>` keeps the first declaration, and this pins it.
     #[test]
+    #[cfg(feature = "parse")]
     fn equal_length_module_prefixes_resolve_deterministically() {
         let resolver = go_fixture();
         assert_eq!(
@@ -2822,6 +2836,7 @@ mod import_resolution_tests {
 
     /// A package's file set is exactly its own directory, minus tests.    /// A package's file set is exactly its own directory, minus tests.
     #[test]
+    #[cfg(feature = "parse")]
     fn go_files_in_dir_is_exact_and_excludes_tests() {
         let resolver = go_fixture();
 
@@ -2852,6 +2867,7 @@ mod import_resolution_tests {
     /// multiplies every import edge by the package's file count, which is the
     /// fan-out SC10 removed. `main` is not importable, so it stays a file.
     #[test]
+    #[cfg(feature = "parse")]
     fn go_import_edges_target_the_package_not_its_files() {
         let resolver = go_fixture();
 
@@ -3011,9 +3027,12 @@ mod import_resolution_tests {
 
 #[cfg(test)]
 mod ladder_tests {
+    #[cfg(feature = "parse")]
     use super::*;
+    #[cfg(feature = "parse")]
     use devmap_extract::extract_file;
 
+    #[cfg(feature = "parse")]
     fn indexed(files: &[(&str, &str)]) -> (Resolver, Vec<devmap_extract::model::Extraction>) {
         let extractions: Vec<_> = files
             .iter()
@@ -3032,6 +3051,7 @@ mod ladder_tests {
     /// — a confidently wrong edge, since nothing downstream can tell the
     /// difference.
     #[test]
+    #[cfg(feature = "parse")]
     fn go_package_lookup_is_directory_scoped_and_abstains_when_ambiguous() {
         let (resolver, _) = indexed(&[
             ("pkg/a.go", "package pkg\nfunc Helper() {}\n"),
@@ -3070,6 +3090,7 @@ mod ladder_tests {
     }
 
     #[test]
+    #[cfg(feature = "parse")]
     fn go_package_lookup_abstains_when_two_files_declare_the_name() {
         let (resolver, _) = indexed(&[
             ("pkg/a.go", "package pkg\nfunc Dup() {}\n"),
@@ -3085,6 +3106,7 @@ mod ladder_tests {
 
     /// A symbol declared in the querying file wins outright.
     #[test]
+    #[cfg(feature = "parse")]
     fn go_package_lookup_prefers_the_querying_file() {
         let (resolver, _) = indexed(&[
             ("pkg/a.go", "package pkg\nfunc Same() {}\n"),
@@ -3105,6 +3127,7 @@ mod ladder_tests {
     /// language test applies it to Go and TypeScript too, and dropping the
     /// `target != self` test suppresses a *genuine* same-file definition.
     #[test]
+    #[cfg(feature = "parse")]
     fn python_stdlib_names_do_not_resolve_across_files_but_do_within_one() {
         // Cross-file: `open` defined in another module must NOT be reached.
         let (cross, cross_exts) = indexed(&[
@@ -3179,9 +3202,12 @@ mod ladder_tests {
 
 #[cfg(test)]
 mod reference_resolution_tests {
+    #[cfg(feature = "parse")]
     use super::*;
+    #[cfg(feature = "parse")]
     use devmap_extract::extract_file;
 
+    #[cfg(feature = "parse")]
     fn resolve(files: &[(&str, &str)]) -> ResolutionResult {
         let extractions: Vec<_> = files
             .iter()
@@ -3192,6 +3218,7 @@ mod reference_resolution_tests {
         resolver.resolve_all(&extractions)
     }
 
+    #[cfg(feature = "parse")]
     fn reference_targets(result: &ResolutionResult, name: &str) -> Vec<String> {
         result
             .edges
@@ -3203,6 +3230,7 @@ mod reference_resolution_tests {
             .collect()
     }
 
+    #[cfg(feature = "parse")]
     fn edge_rows(result: &ResolutionResult) -> Vec<String> {
         let mut rows: Vec<String> = result
             .edges
@@ -3216,6 +3244,7 @@ mod reference_resolution_tests {
         rows
     }
 
+    #[cfg(feature = "parse")]
     fn edges_of(result: &ResolutionResult, kinds: &[EdgeKind]) -> Vec<String> {
         let mut rows: Vec<String> = result
             .edges
@@ -3237,6 +3266,7 @@ mod reference_resolution_tests {
     /// `type contains method` edge and duplicates the file edge in its place,
     /// so a method stops being reachable through its type.
     #[test]
+    #[cfg(feature = "parse")]
     fn containment_names_the_file_and_the_declaring_type() {
         let result = resolve(&[(
             "a.py",
@@ -3263,6 +3293,7 @@ mod reference_resolution_tests {
     /// `main` test groups exactly the one package that is not importable while
     /// leaving the importable ones ungrouped.
     #[test]
+    #[cfg(feature = "parse")]
     fn go_package_membership_groups_non_main_packages_only() {
         let package = resolve(&[
             ("pkg/a.go", "package pkg\nfunc A() {}\n"),
@@ -3296,6 +3327,7 @@ mod reference_resolution_tests {
     /// fan-out SC10 removed — the edge count grows with the size of the
     /// imported package rather than with the number of imports.
     #[test]
+    #[cfg(feature = "parse")]
     fn a_go_import_edge_names_the_package_not_each_file() {
         let result = resolve(&[
             (
@@ -3321,6 +3353,7 @@ mod reference_resolution_tests {
     /// HIGH, and a multi-candidate guess must stay SPECULATIVE. G5 exists so a
     /// guess is never presented with the confidence of a fact.
     #[test]
+    #[cfg(feature = "parse")]
     fn call_confidence_reflects_how_the_callee_was_found() {
         let same_file = resolve(&[
             (
@@ -3395,6 +3428,7 @@ mod reference_resolution_tests {
     /// names it in the argument list. An Express handler written as an arrow
     /// function is genuinely anonymous and correctly binds to nothing.
     #[test]
+    #[cfg(feature = "parse")]
     fn a_route_binds_only_to_an_unambiguous_same_family_handler() {
         let route_file = (
             "srv.rs",
@@ -3478,6 +3512,7 @@ mod reference_resolution_tests {
     /// in Python, TypeScript and Go resolves at all — losing it leaves every
     /// `mod.fn()` call unresolved, and the callee with no callers.
     #[test]
+    #[cfg(feature = "parse")]
     fn a_module_qualified_call_resolves_through_its_import_binding() {
         let python = resolve(&[
             (
@@ -3526,6 +3561,7 @@ mod reference_resolution_tests {
     /// wrong sends the import to a directory that does not exist, so it silently
     /// resolves to nothing.
     #[test]
+    #[cfg(feature = "parse")]
     fn rust_self_and_super_paths_resolve_relative_to_their_module() {
         use devmap_extract::extract_file;
         let files = [
@@ -3571,6 +3607,7 @@ mod reference_resolution_tests {
     /// never be reported dead again. The guard is deliberately scoped to other
     /// files: a same-file definition really does shadow the builtin.
     #[test]
+    #[cfg(feature = "parse")]
     fn python_builtins_are_not_captured_by_a_same_named_user_function() {
         let cross_file = resolve(&[
             ("app.py", "def run(p):\n    return open(p)\n"),
@@ -3602,6 +3639,7 @@ mod reference_resolution_tests {
     /// reference means; picking either produces a confidently wrong edge, and
     /// the wrong one also makes a genuinely dead symbol look live.
     #[test]
+    #[cfg(feature = "parse")]
     fn an_ambiguous_same_file_name_resolves_to_nothing() {
         let ambiguous = resolve(&[(
             "a.py",
@@ -3632,6 +3670,7 @@ mod reference_resolution_tests {
     /// same-named *function* is a confidently wrong edge, and it also leaves
     /// the real type looking unreferenced.
     #[test]
+    #[cfg(feature = "parse")]
     fn a_type_position_prefers_a_type_over_a_same_named_value() {
         let result = resolve(&[
             ("t.ts", "export class Shape {}\n"),
@@ -3654,6 +3693,7 @@ mod reference_resolution_tests {
     /// a Python annotation resolve to an identically-named Go type — a
     /// confidently wrong cross-language edge.
     #[test]
+    #[cfg(feature = "parse")]
     fn references_do_not_resolve_across_language_families() {
         let result = resolve(&[
             (
@@ -3676,6 +3716,7 @@ mod reference_resolution_tests {
     /// directions. Dropping it resolves an unexported identifier from another
     /// package, which the Go compiler would reject outright.
     #[test]
+    #[cfg(feature = "parse")]
     fn unexported_go_symbols_are_invisible_from_another_package() {
         let result = resolve(&[
             ("pkg/a.go", "package pkg\ntype hidden struct{}\n"),

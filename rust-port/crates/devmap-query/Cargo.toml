@@ -18,3 +18,67 @@ default = ["parse"]
 # Forwards the parsing frontend. Off, this crate builds without tree-sitter
 # and answers questions about a persisted map rather than building one.
 parse = ["devmap-extract/parse", "devmap-resolve/parse", "devmap-analyze/parse", "devmap-store/parse"]
+
+# Which targets need a grammar.
+#
+# `--no-default-features` is the shape an embedder links, and this crate's test
+# suite did not compile in it: these targets import items that are
+# `#[cfg(feature = "parse")]`, and one unresolved import fails a whole target,
+# so `cargo test -p devmap-query --no-default-features` returned a build
+# error instead of results. A build error reads as "not meant to be tested",
+# which is how it survived — no test had ever run in that configuration.
+#
+# `required-features` skips these when `parse` is off rather than failing the
+# build. Nothing changes with default features on, where `parse` is enabled.
+
+[[test]]
+name = "coverage_loss_artifacts"
+required-features = ["parse"]
+
+[[test]]
+name = "explore_and_affected"
+required-features = ["parse"]
+
+[[test]]
+name = "incomplete_answers_say_so"
+required-features = ["parse"]
+
+[[test]]
+name = "manifest_truncation_counts"
+required-features = ["parse"]
+
+[[test]]
+name = "neighbors_adversarial"
+required-features = ["parse"]
+
+[[test]]
+name = "neighbors_composition"
+required-features = ["parse"]
+
+[[test]]
+name = "preview_containment"
+required-features = ["parse"]
+
+[[test]]
+name = "preview_unreadable_file"
+required-features = ["parse"]
+
+[[test]]
+name = "query_cancellation"
+required-features = ["parse"]
+
+[[test]]
+name = "search_counts_under_concurrent_writes"
+required-features = ["parse"]
+
+[[test]]
+name = "search_ranks_before_paging"
+required-features = ["parse"]
+
+[[test]]
+name = "snapshot_budget"
+required-features = ["parse"]
+
+[[test]]
+name = "workspace_search_totals"
+required-features = ["parse"]

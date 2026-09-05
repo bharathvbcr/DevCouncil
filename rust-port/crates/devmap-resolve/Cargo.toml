@@ -16,3 +16,39 @@ default = ["parse"]
 # Forwards the parsing frontend. Off, this crate builds without tree-sitter
 # and answers questions about a persisted map rather than building one.
 parse = ["devmap-extract/parse"]
+
+# Which targets need a grammar.
+#
+# `--no-default-features` is the shape an embedder links, and this crate's tests
+# did not compile in it: every fixture here is built by `devmap_extract::
+# extract_file`, which is `#[cfg(feature = "parse")]`. One unresolved import
+# fails a whole target, so the command returned a build error rather than
+# results — which reads as "not meant to be tested", and is how it survived.
+#
+# `required-features` skips these when `parse` is off instead of failing the
+# build. The inline tests are gated the same way, per fn rather than per module,
+# so the 20 that need no grammar still run in the feature-off configuration.
+
+[[test]]
+name = "adversarial_resolve"
+required-features = ["parse"]
+
+[[test]]
+name = "audit_regressions"
+required-features = ["parse"]
+
+[[test]]
+name = "embedded_script_families"
+required-features = ["parse"]
+
+[[test]]
+name = "parallel_determinism"
+required-features = ["parse"]
+
+[[test]]
+name = "primary_languages"
+required-features = ["parse"]
+
+[[test]]
+name = "test_phase3_hardening"
+required-features = ["parse"]

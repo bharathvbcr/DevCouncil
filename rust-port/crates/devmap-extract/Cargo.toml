@@ -174,3 +174,35 @@ required-features = ["parse"]
 [[example]]
 name = "budget_probe"
 required-features = ["parse"]
+
+# Which targets need a grammar.
+#
+# `--no-default-features` is the shape an embedder links, and this crate's test
+# suite did not compile in it: these targets import items that are
+# `#[cfg(feature = "parse")]`, and one unresolved import fails a whole target,
+# so `cargo test -p devmap-extract --no-default-features` returned a build
+# error instead of results. A build error reads as "not meant to be tested",
+# which is how it survived — no test had ever run in that configuration.
+#
+# `required-features` skips these when `parse` is off rather than failing the
+# build. Nothing changes with default features on, where `parse` is enabled.
+
+[[test]]
+name = "embedded_scripts"
+required-features = ["parse"]
+
+[[test]]
+name = "langcalls_erlang_pascal"
+required-features = ["parse"]
+
+[[test]]
+name = "langcalls_nix"
+required-features = ["parse"]
+
+[[test]]
+name = "langcalls_shell_sql_solidity"
+required-features = ["parse"]
+
+[[test]]
+name = "ts_import_export_fabrication"
+required-features = ["parse"]

@@ -2520,3 +2520,50 @@ default features        before: 318 passed / 16 targets  after: 318 passed / 16 
 The second line is the one that matters as much as the first: gating tests is
 one careless attribute away from silently deleting them from the build everyone
 actually runs, so the default count and target count are asserted unchanged.
+
+### Q-9 (continued) — the same gap in four more crates
+
+The first pass fixed `devmap-extract` alone. Four other crates carry the same
+`parse` feature — `devmap-resolve`, `devmap-analyze`, `devmap-query`,
+`devmap-store` — and three had the identical defect, including `devmap-query`,
+which is the crate GitPulse actually links. Fixing one and stopping would have
+left the named consumer's configuration exactly as untested as before.
+
+**My own tooling failed the way the bug does.** I wrote a script to derive
+`required-features` from compiler output. For `devmap-resolve` it reported
+
+```
+devmap-resolve: declared 0 target(s)
+```
+
+which reads as "already clean". It was not: the build was still broken. The
+script looked for `could not compile … (test "name")` and broke out of its loop
+whenever that pattern matched nothing — and `devmap-resolve`'s failure was in
+the **lib-test** target, which stopped cargo before it reached any integration
+test. A check that could not run reported what a check that ran and passed
+reports, inside the tooling for the fix. It was caught only by running the tests
+afterwards instead of trusting the script's summary.
+
+`devmap-resolve` also needed more than target declarations. Its inline tests are
+fixture-driven, and gating only the functions that name `extract_file` broke
+every test calling *those* — so the gate has to be a fixpoint over the call
+graph (7 seeds closed to 32 functions), plus three module-level
+`use devmap_extract::extract_file;` statements that live outside any function,
+plus five helpers left dead once their only callers were gated. Gating per
+function rather than per module is what keeps 15 of its tests running with the
+feature off instead of none.
+
+| crate | default (before → after) | feature-off (before → after) |
+|---|---|---|
+| devmap-extract | 380 → 380 | build error → 60 |
+| devmap-resolve | 113 → 113 | build error → 15 |
+| devmap-analyze | 86 → 86 | build error → 25 |
+| devmap-query | 166 → 166 | build error → 38 |
+| devmap-store | 101 → 101 | 101 → 101 (never had the defect) |
+
+The default column is asserted from baselines captured *before* any gating, for
+the reason the whole item exists: gating tests is one careless attribute away
+from deleting them from the build everyone runs, and that deletion would be
+invisible. `cargo clippy --all-targets` is clean in **both** configurations —
+feature-off clippy is what surfaced the five orphaned helpers, which no test run
+would have reported.
