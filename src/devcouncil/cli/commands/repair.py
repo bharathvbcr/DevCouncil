@@ -34,11 +34,9 @@ async def run_repair_flow(project_root: Path = Path(".")):
             task_repo = TaskRepository(session)
 
             all_gaps = gap_repo.get_all()
-            from devcouncil.gating.policy import apply_gate_enforcement
+            from devcouncil.gating.policy import apply_gate_enforcement, gate_mode_of
 
-            cfg = load_config(root)
-            gates = getattr(cfg, "gates", None)
-            gate_mode = gates.mode if gates and hasattr(gates, "mode") else "enforce"
+            gate_mode = gate_mode_of(load_config(root))
             effective_gaps = apply_gate_enforcement(all_gaps, mode=gate_mode)
             blocking_gaps = [g for g in effective_gaps if g.blocking]
 

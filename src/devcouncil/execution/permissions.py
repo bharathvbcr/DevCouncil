@@ -29,12 +29,9 @@ class PermissionManager:
 
     def _load_enforcement_posture(self) -> bool:
         """Task allowlists are mandatory only under strict gate enforcement."""
-        try:
-            from devcouncil.app.config import load_config
+        from devcouncil.gating.policy import gate_mode
 
-            return load_config(self.project_root).gates.mode == "enforce"
-        except Exception:
-            return True
+        return gate_mode(self.project_root) == "enforce"
 
     def _load_devcouncilignore(self) -> List[str]:
         """Load additional restricted paths from .devcouncilignore."""

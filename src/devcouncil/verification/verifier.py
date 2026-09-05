@@ -271,12 +271,11 @@ class Verifier:
 
     async def verify_task(self, task: Task, requirements: List[Requirement]) -> Tuple[List[Gap], List[Any]]:
         logger.info("verify_task: task=%s requirements=%d", task.id, len(requirements))
-        try:
-            gate_mode = load_config(self.project_root).gates.mode
-        except Exception:
-            # Ad-hoc Verifier use predates project initialization. Preserve the
-            # established strict fallback; relaxing gates must be explicit.
-            gate_mode = "enforce"
+        from devcouncil.gating.policy import gate_mode as resolve_gate_mode
+
+        # Ad-hoc Verifier use predates project initialization; `gate_mode`
+        # preserves the strict fallback, because relaxing gates must be explicit.
+        gate_mode = resolve_gate_mode(self.project_root)
         if gate_mode == "off":
             diff_content = self.get_diff()
             if not diff_content.strip():

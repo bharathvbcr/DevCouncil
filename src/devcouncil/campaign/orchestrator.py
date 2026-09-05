@@ -404,16 +404,9 @@ class Campaign:
         assert_allowed(Rank.REVIEWER, Action.QC_REVIEW)
         passed, gaps = self._quality_control(task)
         verified = bool(passed and executed)
-        from devcouncil.app.config import load_config
+        from devcouncil.gating.policy import gate_mode as resolve_gate_mode
 
-        try:
-            cfg = load_config(self.root)
-            gates = getattr(cfg, "gates", None)
-            gate_mode = gates.mode if gates and hasattr(gates, "mode") else "enforce"
-        except Exception:
-            gate_mode = "enforce"
-
-        quality_skipped = gate_mode == "off"
+        quality_skipped = resolve_gate_mode(self.root) == "off"
 
         self.mailbox.send(
             "coordinator",

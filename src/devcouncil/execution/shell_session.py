@@ -109,10 +109,9 @@ class GuardedShellSession:
         self.project_root = project_root.resolve()
         self.task = task
         self.shell = shell
-        try:
-            self.gate_mode = load_config(self.project_root).gates.mode
-        except Exception:
-            self.gate_mode = "enforce"
+        from devcouncil.gating.policy import gate_mode
+
+        self.gate_mode = gate_mode(self.project_root)
         if command_timeout is None:
             try:
                 command_timeout = load_config(self.project_root).execution.command_timeout

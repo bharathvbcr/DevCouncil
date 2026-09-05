@@ -2,7 +2,7 @@ import logging
 from dataclasses import replace
 from collections import deque
 from pydantic import BaseModel
-from typing import Any, List, Literal, Optional
+from typing import Any, List, Literal, Optional, cast, get_args
 from pathlib import Path
 
 from devcouncil.domain.requirement import Requirement
@@ -24,6 +24,44 @@ def is_hard_safety_gap(gap: Gap) -> bool:
 
 
 GateMode = Literal["off", "advisory", "enforce"]
+
+#: The posture used when configuration cannot be read. Relaxing a gate is always
+#: an explicit act; a missing, unreadable or half-written config must never do it.
+GATE_MODE_FALLBACK: GateMode = "enforce"
+
+
+def gate_mode_of(config: object) -> GateMode:
+    """The posture carried by an already-loaded config object.
+
+    Narrows at the boundary instead of trusting the attribute: callers reach
+    this with a real ``Config``, with ``None`` (the config never loaded), and
+    with duck-typed stand-ins from tests, and only a value in the vocabulary is
+    a posture. Anything else -- absent, ``None``, a typo in hand-written YAML
+    that got past validation -- is the fail-closed default, not a fourth mode
+    that silently matches no branch and therefore behaves like ``advisory``.
+    """
+    mode = getattr(getattr(config, "gates", None), "mode", None)
+    if mode in get_args(GateMode):
+        return cast(GateMode, mode)
+    return GATE_MODE_FALLBACK
+
+
+def gate_mode(project_root: Path) -> GateMode:
+    """Resolve the project's gate posture, preserving the fail-closed default.
+
+    The one owner of a shape that had been copied into nine modules: load the
+    config, read ``gates.mode``, and answer ``enforce`` if anything at all goes
+    wrong (no project yet, unreadable YAML, a validation error). Because each
+    copy re-derived the type from ``getattr``, every consumer of
+    :func:`apply_gate_enforcement` and :func:`effective_artifact_graph` received
+    an unchecked ``str``.
+    """
+    try:
+        from devcouncil.app.config import load_config
+
+        return gate_mode_of(load_config(project_root))
+    except Exception:
+        return GATE_MODE_FALLBACK
 
 
 def apply_gate_enforcement(gaps: List[Gap], *, mode: GateMode) -> List[Gap]:
@@ -200,16 +238,9 @@ class GatePolicy:
         self.planned_files = PlannedFilesCheck()
         self.clean_git = CleanGitCheck()
         self.map_policy = FailClosedMapPolicy()
-        self.mode: GateMode = "enforce"
-        if project_root is not None:
-            try:
-                from devcouncil.app.config import load_config
-
-                self.mode = load_config(project_root).gates.mode
-            except Exception:
-                # Missing/invalid configuration keeps the established fail-closed
-                # posture. Disabling enforcement must always be explicit.
-                self.mode = "enforce"
+        # Missing/invalid configuration keeps the established fail-closed
+        # posture: `gate_mode` answers `enforce` for every failure.
+        self.mode: GateMode = gate_mode(project_root) if project_root is not None else GATE_MODE_FALLBACK
 
     def check_plan_approval(
         self,

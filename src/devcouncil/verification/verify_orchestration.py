@@ -583,10 +583,10 @@ async def run_verify_orchestration(
 
     from devcouncil.verification.gap_ids import normalize_verify_gaps
     from devcouncil.verification.verifier import VerificationOutcome
-    from devcouncil.gating.policy import apply_gate_enforcement
+    from devcouncil.gating.policy import apply_gate_enforcement, gate_mode_of
 
     gaps = normalize_verify_gaps(gaps)
-    gate_mode = getattr(getattr(_cfg, "gates", None), "mode", "enforce")
+    gate_mode = gate_mode_of(_cfg)
     gaps = apply_gate_enforcement(gaps, mode=gate_mode)
     blocking_count = len([g for g in gaps if g.blocking])
     log_step(

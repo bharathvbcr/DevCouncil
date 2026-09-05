@@ -30,16 +30,6 @@ RECORD_COMMAND_STATUSES = frozenset({"started", "finished", "failed", "blocked"}
 CLI_TIMEOUT_SECONDS = 120
 
 
-def _gate_mode(project_root: Path) -> str:
-    """Resolve gate posture, preserving the legacy fail-closed default."""
-    try:
-        from devcouncil.app.config import load_config
-
-        return load_config(project_root).gates.mode
-    except Exception:
-        return "enforce"
-
-
 def _db(project_root: Path):
     from devcouncil.cli.commands.init import initialize_project
     from devcouncil.storage.db import get_db
@@ -74,7 +64,9 @@ def verify_task_payload(
     lease_token: str,
     sandbox: str = "local",
 ) -> dict[str, Any]:
-    gate_mode = _gate_mode(project_root)
+    from devcouncil.gating.policy import gate_mode as resolve_gate_mode
+
+    gate_mode = resolve_gate_mode(project_root)
     if sandbox in {"docker", "nix"} and gate_mode != "off":
         return {
             "ok": False,
@@ -449,7 +441,9 @@ def next_task_payload(
     with db.get_session() as session:
         from devcouncil.gating.policy import is_hard_safety_gap
 
-        gate_mode = _gate_mode(project_root)
+        from devcouncil.gating.policy import gate_mode as resolve_gate_mode
+
+        gate_mode = resolve_gate_mode(project_root)
         tasks = TaskRepository(session).get_all()
         leased_task_ids = {
             lease.task_id
@@ -511,7 +505,9 @@ def run_command_payload(
         return {"ok": False, "error": "DevCouncil state is unavailable in this directory.", "code": "not_initialized"}
 
     with db.get_session() as session:
-        enforce = _gate_mode(project_root) == "enforce"
+        from devcouncil.gating.policy import gate_mode as resolve_gate_mode
+
+        enforce = resolve_gate_mode(project_root) == "enforce"
         if enforce:
             if not task_id:
                 return {

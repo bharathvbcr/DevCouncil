@@ -21,6 +21,7 @@ from devcouncil.telemetry.traces import TraceEvent, read_trace_events_since
 
 if TYPE_CHECKING:
     from devcouncil.artifacts.graph import ArtifactGraph
+    from devcouncil.gating.policy import GateMode
 
 LOGO_ASSET = "devcouncil_logo_premium.png"
 LEGACY_LOGO_ASSET = "devcouncil-logo.svg"
@@ -152,7 +153,7 @@ def _recent_trace_events_cached(project_root: Path) -> list[TraceEvent]:
     return buffer
 
 
-def _dashboard_gaps_summary(session, *, gate_mode: str = "enforce") -> dict:
+def _dashboard_gaps_summary(session, *, gate_mode: GateMode = "enforce") -> dict:
     from devcouncil.gating.policy import apply_gate_enforcement
 
     all_gaps = GapRepository(session).get_all()
@@ -236,13 +237,9 @@ def dashboard_payload(project_root: Path) -> dict:
         }
     with db.get_session() as session:
         graph = _artifact_graph_cached(project_root, session)
-        from devcouncil.app.config import load_config
-        from devcouncil.gating.policy import effective_artifact_graph
+        from devcouncil.gating.policy import effective_artifact_graph, gate_mode as resolve_gate_mode
 
-        try:
-            gate_mode = load_config(project_root).gates.mode
-        except Exception:
-            gate_mode = "enforce"
+        gate_mode = resolve_gate_mode(project_root)
         graph = effective_artifact_graph(graph, mode=gate_mode)
         state = StateRepository(session).get_state()
         persisted_phase = state.current_phase if state else None

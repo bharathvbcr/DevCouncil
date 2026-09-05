@@ -76,15 +76,9 @@ def status_snapshot(root: Path) -> str:
         with db.get_session() as session:
             graph = ArtifactGraphRepository(session).load_graph()
             state = StateRepository(session).get_state()
-        try:
-            from devcouncil.app.config import load_config
-            cfg = load_config(root)
-            gates = getattr(cfg, "gates", None)
-            gate_mode = gates.mode if gates and hasattr(gates, "mode") else "enforce"
-        except Exception:
-            gate_mode = "enforce"
+        from devcouncil.gating.policy import effective_artifact_graph, gate_mode as resolve_gate_mode
 
-        from devcouncil.gating.policy import effective_artifact_graph
+        gate_mode = resolve_gate_mode(root)
 
         graph = effective_artifact_graph(graph, mode=gate_mode)
         summary = dict(graph.coverage_summary())
@@ -103,12 +97,9 @@ def status_snapshot(root: Path) -> str:
 
 def render_prompt_text(name: str, arguments: dict, root: Path) -> str:
     snapshot = status_snapshot(root)
-    try:
-        from devcouncil.app.config import load_config
+    from devcouncil.gating.policy import gate_mode as resolve_gate_mode
 
-        gate_mode = load_config(root).gates.mode
-    except Exception:
-        gate_mode = "enforce"
+    gate_mode = resolve_gate_mode(root)
     if name == "devcouncil_implement_next_task":
         client_id = arguments.get("client_id") or "claude-code"
         completion_step = (

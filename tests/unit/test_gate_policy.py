@@ -3,9 +3,15 @@ from pathlib import Path
 
 from devcouncil.domain.assumption import Assumption
 from devcouncil.domain.critique import CritiqueFinding
+from devcouncil.domain.gap import Gap
 from devcouncil.domain.requirement import AcceptanceCriterion, Requirement
 from devcouncil.domain.task import PlannedFile, Task
-from devcouncil.gating.policy import GatePolicy
+from devcouncil.gating.policy import (
+    GatePolicy,
+    apply_gate_enforcement,
+    gate_mode,
+    gate_mode_of,
+)
 from devcouncil.cli.commands.plan import _reconcile_findings
 
 
@@ -158,3 +164,61 @@ def test_task_ready_passes_with_commands_and_expected_evidence(monkeypatch):
 
     assert result.passed
 
+
+
+# --- the one owner of gate posture ----------------------------------------------
+
+
+def _blocking_gap() -> Gap:
+    return Gap(
+        id="GAP-1",
+        severity="high",
+        gap_type="acceptance_criteria_unproven",
+        description="unproven",
+        recommended_fix="prove it",
+        blocking=True,
+    )
+
+
+def test_gate_mode_is_enforce_when_no_project_config_exists(tmp_path):
+    assert gate_mode(tmp_path) == "enforce"
+
+
+def test_gate_mode_reads_the_configured_posture(tmp_path):
+    config_dir = tmp_path / ".devcouncil"
+    config_dir.mkdir()
+    (config_dir / "config.yaml").write_text(
+        "project:\n  name: t\ngates:\n  mode: advisory\n", encoding="utf-8"
+    )
+
+    assert gate_mode(tmp_path) == "advisory"
+
+
+def test_gate_mode_is_enforce_when_the_config_cannot_be_parsed(tmp_path):
+    config_dir = tmp_path / ".devcouncil"
+    config_dir.mkdir()
+    (config_dir / "config.yaml").write_text("gates: [not, a, mapping\n", encoding="utf-8")
+
+    assert gate_mode(tmp_path) == "enforce"
+
+
+def test_a_posture_outside_the_vocabulary_does_not_disable_enforcement():
+    """Fail closed on an unrecognised mode, not open.
+
+    ``apply_gate_enforcement`` branches on ``mode == "enforce"`` and demotes every
+    non-safety blocker otherwise, so any value it does not recognise reads as
+    "relax the gates". The nine hand-rolled ``getattr(..., "mode", "enforce")``
+    reads this replaced passed such a value straight through; the boundary now
+    refuses it.
+    """
+    unknown = SimpleNamespace(gates=SimpleNamespace(mode="Off"))
+
+    assert gate_mode_of(unknown) == "enforce"
+    assert gate_mode_of(None) == "enforce"
+    assert gate_mode_of(SimpleNamespace(gates=None)) == "enforce"
+    assert [gap.blocking for gap in apply_gate_enforcement([_blocking_gap()], mode=gate_mode_of(unknown))] == [True]
+
+
+def test_gate_mode_of_passes_through_every_real_posture():
+    for mode in ("off", "advisory", "enforce"):
+        assert gate_mode_of(SimpleNamespace(gates=SimpleNamespace(mode=mode))) == mode

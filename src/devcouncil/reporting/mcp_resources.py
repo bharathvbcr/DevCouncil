@@ -17,16 +17,13 @@ from devcouncil.utils.json_persist import dump_json
 
 
 def _effective_views(project_root: Path, graph, live_review=None):  # noqa: ANN001
-    from devcouncil.app.config import load_config
     from devcouncil.gating.policy import (
         effective_artifact_graph,
         effective_live_review,
+        gate_mode,
     )
 
-    try:
-        mode = load_config(project_root).gates.mode
-    except Exception:
-        mode = "enforce"
+    mode = gate_mode(project_root)
     return (
         effective_artifact_graph(graph, mode=mode),
         effective_live_review(live_review, mode=mode),
