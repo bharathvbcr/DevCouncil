@@ -157,6 +157,22 @@ pub enum Resolution {
     Unresolved {
         reason: String,
     },
+    /// A relation the graph asserts about its own shape rather than a reference
+    /// one symbol makes to another: the synthetic Go package node that every
+    /// file of a package is a member of.
+    ///
+    /// A separate variant because `SameFile` was doing this job and saying
+    /// something untrue while it did. That rung means "the declaration is in
+    /// this very file", and the package star edge runs from `geo/measure.go` to
+    /// `package:geo/geo` — two different names — so an edge whose evidence
+    /// claimed they were one file was the only shape in the emitted graph where
+    /// `resolution` and the edge disagreed about where the target lives. The
+    /// tier is unchanged and deserved: a Go package clause is written at the top
+    /// of the file, which is as deterministic as evidence gets.
+    Structural {
+        target_symbol: String,
+        target_file: String,
+    },
 }
 
 impl Resolution {
@@ -185,11 +201,15 @@ impl Resolution {
     /// - `Unresolved` — no edge is ever built from this variant. It scores at
     ///   the floor so that an edge built from it by mistake sorts below every
     ///   honest one rather than above them.
+    /// - `Structural` — not a resolved reference at all: a relation the graph
+    ///   asserts about its own shape, whose certainty comes from a declaration
+    ///   the file carries outright (a Go package clause).
     pub fn confidence(&self) -> Confidence {
         match self {
             Resolution::SameFile { .. }
             | Resolution::ImportScoped { .. }
-            | Resolution::ReceiverType { .. } => Confidence::DETERMINISTIC,
+            | Resolution::ReceiverType { .. }
+            | Resolution::Structural { .. } => Confidence::DETERMINISTIC,
             Resolution::UniqueGlobal { .. } => Confidence::HIGH,
             Resolution::AmbiguousGlobal { .. } | Resolution::Unresolved { .. } => {
                 Confidence::SPECULATIVE
@@ -224,6 +244,10 @@ impl Resolution {
                 target_symbol,
                 target_file,
                 ..
+            }
+            | Resolution::Structural {
+                target_symbol,
+                target_file,
             } => Some((target_file.as_str(), target_symbol.as_str())),
             // Several targets, or none: neither can answer "which one".
             Resolution::AmbiguousGlobal { .. } | Resolution::Unresolved { .. } => None,

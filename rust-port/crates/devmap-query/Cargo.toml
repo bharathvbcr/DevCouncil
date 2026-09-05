@@ -129,3 +129,11 @@ required-features = ["parse"]
 [[test]]
 name = "answers_agree_with_each_other"
 required-features = ["parse"]
+
+[[test]]
+name = "subsystem_neighbours_are_computed"
+required-features = ["parse"]
+
+[[test]]
+name = "stored_edges_keep_the_confidence_their_evidence_earned"
+required-features = ["parse"]

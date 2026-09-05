@@ -46,6 +46,10 @@ fn entitled_confidence(resolution: &Resolution) -> Confidence {
         Resolution::SameFile { .. }
         | Resolution::ImportScoped { .. }
         | Resolution::ReceiverType { .. } => Confidence::DETERMINISTIC,
+        // Not a resolved reference: a relation the graph asserts about its own
+        // shape, from a declaration the file carries outright (a Go package
+        // clause). Deterministic for the same reason the three above are.
+        Resolution::Structural { .. } => Confidence::DETERMINISTIC,
         // One match across the whole family, with nothing tying it to this
         // file. Strong, not certain.
         Resolution::UniqueGlobal { .. } => Confidence::HIGH,
@@ -170,6 +174,7 @@ fn every_edge_confidence_matches_the_evidence_it_names() {
             Resolution::UniqueGlobal { .. } => "UniqueGlobal",
             Resolution::AmbiguousGlobal { .. } => "AmbiguousGlobal",
             Resolution::Unresolved { .. } => "Unresolved",
+            Resolution::Structural { .. } => "Structural",
         };
         if !seen_tiers.iter().any(|seen| seen == tier) {
             seen_tiers.push(tier.to_string());

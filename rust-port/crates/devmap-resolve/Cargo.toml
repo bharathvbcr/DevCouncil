@@ -52,3 +52,7 @@ required-features = ["parse"]
 [[test]]
 name = "test_phase3_hardening"
 required-features = ["parse"]
+
+[[test]]
+name = "resolution_honesty"
+required-features = ["parse"]

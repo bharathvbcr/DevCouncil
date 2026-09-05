@@ -1430,7 +1430,7 @@ impl Resolver {
                     file,
                     pkg_node.clone(),
                     EdgeKind::MemberOf,
-                    Arc::new(Resolution::SameFile {
+                    Arc::new(Resolution::Structural {
                         target_symbol: pkg_node.clone(),
                         target_file: pkg_node.clone(),
                     }),
