@@ -1,11 +1,12 @@
 import asyncio
 import json
 import subprocess
+from typing import get_args, get_type_hints
 
 from devcouncil.domain.evidence import CommandResult, TestEvidence
 from devcouncil.domain.requirement import AcceptanceCriterion, Requirement
-from devcouncil.domain.task import PlannedFile, Task
-from devcouncil.verification.verifier import Verifier
+from devcouncil.domain.task import PlannedFile, Task, TaskStatus
+from devcouncil.verification.verifier import Verifier, verification_task_status
 from devcouncil.live.cards import review_turn, save_card
 from devcouncil.live.transcripts import latest_assistant_turn
 
@@ -1015,3 +1016,19 @@ def test_run_command_survives_unparseable_shell_syntax(tmp_path):
     # The malformed-command detector must classify it as unrunnable so the
     # acceptance repair loop can regenerate it.
     assert verifier._command_is_malformed(result)
+
+
+def test_verification_task_status_only_produces_task_statuses():
+    """The producer's declared return type stays inside the persisted vocabulary.
+
+    Seven call sites assign this straight into ``Task.status``. While the return
+    type was a bare ``str`` none of those assignments was checked, so a mapping
+    that grew a status the model does not accept would have been caught only by
+    a pydantic ``ValidationError`` at write time, on whichever surface happened
+    to run first.
+    """
+    produced = set(get_args(get_type_hints(verification_task_status)["return"]))
+
+    assert produced == {"blocked", "done", "verified"}
+    assert produced <= set(get_args(TaskStatus))
+    assert set(get_args(TaskStatus)) == set(get_args(get_type_hints(Task)["status"]))

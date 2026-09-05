@@ -1,6 +1,24 @@
 from pydantic import BaseModel, Field
 from typing import Literal, List, Optional
 
+#: The task lifecycle vocabulary, in one place.
+#:
+#: Every surface that persists a status writes one of these, and
+#: ``verification_task_status`` in devcouncil.verification.verifier is the only
+#: producer of the post-verification three. Naming the set is what lets a
+#: caller's return type be checked against it instead of being a bare ``str``
+#: that mypy waves through.
+TaskStatus = Literal[
+    "planned",
+    "ready",
+    "running",
+    "blocked",
+    "verified",
+    "done",
+    "cancelled",
+]
+
+
 class PlannedFile(BaseModel):
     path: str
     reason: str
@@ -85,12 +103,4 @@ class Task(BaseModel):
             "whose prerequisites are unmet rather than letting it fail spuriously."
         ),
     )
-    status: Literal[
-        "planned",
-        "ready",
-        "running",
-        "blocked",
-        "verified",
-        "done",
-        "cancelled",
-    ] = "planned"
+    status: TaskStatus = "planned"

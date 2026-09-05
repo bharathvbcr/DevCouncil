@@ -25,7 +25,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Protocol, Sequence, Tuple
+from typing import Callable, Dict, List, Literal, Optional, Protocol, Sequence, Tuple
 
 from devcouncil.domain.requirement import Requirement
 from devcouncil.domain.task import Task
@@ -37,6 +37,13 @@ from devcouncil.campaign.roles import Action, Rank, assert_allowed
 
 # (passed, blocking_gap_descriptions)
 VerifyFn = Callable[[Task, List[Requirement]], Tuple[bool, List[str]]]
+
+#: What a campaign reports about one task. Wider than ``Task.status``: a task
+#: never dispatched is ``"skipped"``, and a task whose executor never produced a
+#: change is ``"failed"`` rather than ``"blocked"`` — the persisted task status
+#: for both is ``"blocked"``, and the rollup counts them together, but the
+#: distinction is what tells the operator whether the gate or the agent failed.
+CampaignStatus = Literal["verified", "done", "blocked", "skipped", "failed"]
 
 
 class ExecutorLike(Protocol):
@@ -58,7 +65,7 @@ class TaskOutcome:
     bloom: str
     executed: bool
     verified: bool
-    status: str  # "verified" | "done" | "blocked" | "skipped" | "failed"
+    status: CampaignStatus
     message: str = ""
     blocking_gaps: List[str] = field(default_factory=list)
 
@@ -416,6 +423,7 @@ class Campaign:
         )
         self._set_roster(owner, status="idle", current="-")
 
+        status: CampaignStatus
         if verified:
             task.status = "done" if quality_skipped else "verified"
             with self._state_lock:

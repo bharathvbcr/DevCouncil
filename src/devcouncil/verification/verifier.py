@@ -1,7 +1,7 @@
 import logging
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Literal, Optional, Tuple
 
 from devcouncil.app.config import load_config
 
@@ -75,8 +75,17 @@ class VerificationOutcome:
         return asdict(self)
 
 
-def verification_task_status(gaps: List[Gap], outcome: VerificationOutcome | None) -> str:
-    """Map a verification result to an honest persisted task status."""
+def verification_task_status(
+    gaps: List[Gap],
+    outcome: VerificationOutcome | None,
+) -> Literal["blocked", "done", "verified"]:
+    """Map a verification result to an honest persisted task status.
+
+    The return type is the three statuses this mapping can actually produce, not
+    the whole :data:`~devcouncil.domain.task.TaskStatus` vocabulary: every caller
+    assigns the result straight into ``Task.status``, and a bare ``str`` made
+    that assignment unchecked at seven call sites at once.
+    """
     if any(gap.blocking for gap in gaps):
         return "blocked"
     if outcome is not None and bool(getattr(outcome, "verification_skipped", False)):
