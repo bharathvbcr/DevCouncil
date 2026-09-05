@@ -935,20 +935,20 @@ impl<'a> StoreQueryEngine<'a> {
         &self,
         token_budget: u32,
     ) -> anyhow::Result<Response<devmap_analyze::DeadSymbolReport>> {
-        if self.store.latest_generation_id()?.is_none() {
+        // One snapshot. This resolved the generation three times — an existence
+        // check, the analysis, then the rows — so the coverage disclosure could
+        // describe a different generation than the findings it was attached to.
+        // That combination is what promotes a row from "look at this" to "safe
+        // to delete": a disclosure saying the corpus was fully covered, over
+        // rows from a generation where it was not.
+        let Some(page) = self.store.dead_page()? else {
             return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
-        }
-        let analysis = self.store.latest_analysis()?;
-        let dead = self
-            .store
-            .latest_dead_symbols()?
-            .into_iter()
-            .filter(|row| !row.is_exempt)
-            .collect();
+        };
+        let dead = page.rows.into_iter().filter(|row| !row.is_exempt).collect();
         let mut response = budget_take(dead, token_budget, |_| 30);
-        response.walk_incomplete = dead_symbol_coverage_gap(analysis.as_ref());
+        response.walk_incomplete = dead_symbol_coverage_gap(page.analysis.as_ref());
         Ok(response)
     }
 
@@ -1348,9 +1348,19 @@ impl<'a> StoreQueryEngine<'a> {
             // for this feature to do nothing.
             .map(|s| s.qualified_name.clone())
             .collect();
-        let callers: Vec<PreviewCaller> = self
-            .store
-            .callers_of(&at_risk, path, min_confidence)?
+        // One snapshot for the list and the denominator it is measured
+        // against. Read separately they could describe two generations, and the
+        // `saturating_sub` below turns that into silence: when the newer
+        // generation holds fewer callers the difference clamps to zero and this
+        // reports that the confidence floor hid nothing. Drawn from one
+        // generation the floored set is a subset of the unfiltered one, so the
+        // subtraction cannot underflow at all.
+        let page = self.store.callers_page(&at_risk, path, min_confidence)?;
+        let (caller_edges, total_unfiltered) = match page {
+            Some(page) => (page.callers, page.total_unfiltered),
+            None => (Vec::new(), 0),
+        };
+        let callers: Vec<PreviewCaller> = caller_edges
             .into_iter()
             .map(|edge| PreviewCaller {
                 target_symbol: edge.target_symbol,
@@ -1367,10 +1377,7 @@ impl<'a> StoreQueryEngine<'a> {
         // six `String` allocations per row — solely to take `.len()`. On this
         // repository the busiest symbol has 918 callers, so previewing a file
         // that declares one materialised ~1,836 rows and kept none of them.
-        let ambiguous_callers = self
-            .store
-            .count_callers_of(&at_risk, path, 0.0)?
-            .saturating_sub(callers.len());
+        let ambiguous_callers = total_unfiltered.saturating_sub(callers.len());
 
         let degraded_reason = match &candidate.parse_outcome {
             ParseOutcome::Partial { .. } => Some(
@@ -2545,7 +2552,11 @@ fn node_id_of(file_path: &str, symbol_name: &str) -> String {
 /// Lifted out of `traverse` so the blast radius resolves its seeds through the
 /// same matcher the traversal does. Resolving them two ways is how a radius
 /// ends up seeded from a symbol the trace never visits.
-pub fn traversal_starts(edges: &[ResolvedEdge], target: &str, reverse: bool) -> Vec<(String, String)> {
+pub fn traversal_starts(
+    edges: &[ResolvedEdge],
+    target: &str,
+    reverse: bool,
+) -> Vec<(String, String)> {
     edges
         .iter()
         .filter(|edge| {

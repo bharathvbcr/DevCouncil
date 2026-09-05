@@ -82,3 +82,7 @@ required-features = ["parse"]
 [[test]]
 name = "workspace_search_totals"
 required-features = ["parse"]
+
+[[test]]
+name = "paired_reads_are_one_generation"
+required-features = ["parse"]

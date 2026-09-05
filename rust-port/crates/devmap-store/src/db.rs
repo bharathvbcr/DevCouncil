@@ -449,6 +449,40 @@ pub struct WalCheckpointResult {
     pub checkpointed_frames: i64,
 }
 
+/// A caller listing and the unfiltered total it is measured against, from one
+/// generation.
+///
+/// `preview` reports how many callers the confidence floor excluded, as
+/// `count_callers_of(.., 0.0) - callers.len()`. Taken from two separate reads
+/// those numbers can describe two generations, and the subtraction is
+/// saturating — so when the newer generation has fewer callers the difference
+/// clamps to zero and `preview` reports that the floor hid nothing. "No
+/// ambiguous callers" and "I counted a different corpus" then look identical,
+/// which is the reading that lets an edit through as safe.
+#[derive(Debug, Clone)]
+pub struct CallersPage {
+    pub generation: u32,
+    /// Callers at or above the requested floor.
+    pub callers: Vec<StoredEdge>,
+    /// Callers at floor 0.0 — the denominator the floor is measured against.
+    pub total_unfiltered: usize,
+}
+
+/// The dead-symbol rows and the analysis that qualifies them, from one
+/// generation.
+///
+/// `dead_symbols` attaches a coverage disclosure derived from
+/// `AnalysisSummary` to rows read separately. Two reads, two generations: the
+/// disclosure could say the corpus was fully covered while the rows came from a
+/// generation that was not, which is the exact combination that promotes a
+/// finding from "look at this" to "safe to delete".
+#[derive(Debug, Clone)]
+pub struct DeadPage {
+    pub generation: u32,
+    pub analysis: Option<AnalysisSummary>,
+    pub rows: Vec<DeadSymbolReport>,
+}
+
 /// One consistent snapshot of a search: the matching rows, the count they were
 /// drawn from, and the repo root they resolve against — all from the same
 /// generation. See [`Store::search_page`] for why they must travel together.
@@ -3456,6 +3490,16 @@ impl Store {
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(0);
         };
+        Self::count_callers_in(&snapshot, gen, &unique, exclude_file, min_confidence)
+    }
+
+    fn count_callers_in(
+        snapshot: &Connection,
+        gen: u32,
+        unique: &[&String],
+        exclude_file: &str,
+        min_confidence: f32,
+    ) -> Result<usize> {
         let mut total: usize = 0;
         for chunk in unique.chunks(Self::MAX_CALLER_BATCH) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
@@ -3514,6 +3558,16 @@ impl Store {
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(Vec::new());
         };
+        Self::callers_in(&snapshot, gen, &unique, exclude_file, min_confidence)
+    }
+
+    fn callers_in(
+        snapshot: &Connection,
+        gen: u32,
+        unique: &[&String],
+        exclude_file: &str,
+        min_confidence: f32,
+    ) -> Result<Vec<StoredEdge>> {
         let mut out: Vec<StoredEdge> = Vec::new();
         for chunk in unique.chunks(Self::MAX_CALLER_BATCH) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
@@ -3697,11 +3751,93 @@ impl Store {
         Ok(Some((gen, rows.collect::<Result<Vec<_>>>()?)))
     }
 
+    /// The callers of `names` and the unfiltered total, against one generation.
+    ///
+    /// `callers_of` and `count_callers_of` each open their own snapshot, so a
+    /// caller that needs both numbers to agree cannot get that by calling them
+    /// in sequence — which is what `preview` was doing. See [`CallersPage`].
+    pub fn callers_page(
+        &self,
+        names: &[String],
+        exclude_file: &str,
+        min_confidence: f32,
+    ) -> Result<Option<CallersPage>> {
+        let min_confidence = checked_min_confidence(min_confidence)?;
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        if names.is_empty() {
+            return Ok(Some(CallersPage {
+                generation,
+                callers: Vec::new(),
+                total_unfiltered: 0,
+            }));
+        }
+        let unique: Vec<&String> = {
+            let mut seen = BTreeSet::new();
+            names.iter().filter(|name| seen.insert(*name)).collect()
+        };
+        Ok(Some(CallersPage {
+            generation,
+            callers: Self::callers_in(
+                &snapshot,
+                generation,
+                &unique,
+                exclude_file,
+                min_confidence,
+            )?,
+            // The denominator is deliberately unfiltered: the difference from
+            // `callers` is precisely what the floor excluded.
+            total_unfiltered: Self::count_callers_in(
+                &snapshot,
+                generation,
+                &unique,
+                exclude_file,
+                0.0,
+            )?,
+        }))
+    }
+
+    /// The dead-symbol rows and the analysis that qualifies them, against one
+    /// generation. See [`DeadPage`].
+    pub fn dead_page(&self) -> Result<Option<DeadPage>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        let raw: Option<String> = snapshot
+            .query_row(
+                "SELECT analysis_json FROM generations WHERE id = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let analysis = raw
+            .map(|json| {
+                serde_json::from_str::<AnalysisSummary>(&json).map_err(|error| {
+                    rusqlite::Error::InvalidParameterName(format!(
+                        "stored generation analysis is invalid: {error}"
+                    ))
+                })
+            })
+            .transpose()?;
+        Ok(Some(DeadPage {
+            generation,
+            analysis,
+            rows: Self::dead_symbols_in(&snapshot, generation)?,
+        }))
+    }
+
     pub fn latest_dead_symbols(&self) -> Result<Vec<DeadSymbolReport>> {
         let conn = lock_conn(&self.conn)?;
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(Vec::new());
         };
+        Self::dead_symbols_in(&snapshot, gen)
+    }
+
+    fn dead_symbols_in(snapshot: &Connection, gen: u32) -> Result<Vec<DeadSymbolReport>> {
         let mut stmt = snapshot.prepare(
             "SELECT symbol_name, file_path, confidence, is_exempt, exemption_reason
              FROM generation_dead_symbols

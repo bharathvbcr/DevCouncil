@@ -6,11 +6,10 @@ pub mod extract_cache;
 pub mod schema;
 
 pub use db::{
-    current_git_head, BuildHistoryRow, GenerationWriteOpts, PendingClaim, PendingEnqueueReport,
-    PendingReconcile, PendingSupersede, SearchPage, Store, StoreStatus, StoredEdge, StoredFile,
-    StoredSymbol,
-    VacuumAction, VacuumOutcome, WalCheckpointMode, WalCheckpointResult, WriterLock,
-    MAX_PENDING_ATTEMPTS,
+    current_git_head, BuildHistoryRow, CallersPage, DeadPage, GenerationWriteOpts, PendingClaim,
+    PendingEnqueueReport, PendingReconcile, PendingSupersede, SearchPage, Store, StoreStatus,
+    StoredEdge, StoredFile, StoredSymbol, VacuumAction, VacuumOutcome, WalCheckpointMode,
+    WalCheckpointResult, WriterLock, MAX_PENDING_ATTEMPTS,
 };
 #[cfg(feature = "parse")]
 pub use extract_cache::{extract_tree_cached, extract_tree_cached_with_report};

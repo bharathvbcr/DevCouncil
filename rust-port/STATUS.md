@@ -2696,3 +2696,51 @@ the same reason: lost coverage must not look like a quiet tree.
 outrunning the consumer, which this suite cannot stage deterministically. The
 reachable half — the debounce cap — is covered; the queue bound is argued from
 construction, and is recorded here as such rather than implied to be tested.
+
+### Q-10 — two reads, two generations, one answer (devmap-query)
+
+The K-A4 class that `search_page` closed had two more instances in the query
+engine. Both compose a *pair* of store reads, and `Store`'s reads each open
+their own snapshot, so the pair can straddle a commit.
+
+**`preview`.** It lists callers at or above a confidence floor, counts callers
+at floor 0.0, and subtracts to report how many the floor excluded. The two
+differing floors are deliberate and documented — the difference is precisely
+what the floor hid. The defect is the straddle, and `saturating_sub` is what
+makes it silent: when the newer generation holds fewer callers the difference
+clamps to zero and `preview` reports that the floor excluded nothing. "No
+ambiguous callers" and "I counted a different corpus" become the same answer,
+on the surface whose entire job is to say what an edit would break. Drawn from
+one generation the floored set is a subset of the unfiltered one, so the
+subtraction cannot underflow at all.
+
+**`dead_symbols`.** It resolved the generation three times — an existence
+check, `latest_analysis`, then `latest_dead_symbols` — and attached the
+coverage disclosure from one read to rows from another. A disclosure saying
+the corpus was fully covered, over rows from a generation where it was not, is
+the exact combination that promotes a finding from "look at this" to "safe to
+delete".
+
+Both now go through `Store::callers_page` / `Store::dead_page`, built on the
+`latest_snapshot` mechanism `search_page` already introduced rather than a
+second pattern beside it.
+
+**On the tests, plainly: four of the five are structural guards, not red
+tests.** They pin `callers_page`/`dead_page` to a single generation going
+forward, but they are green against the pre-fix code too, because with nothing
+interleaving both spellings return the latest generation. No test written
+against the new API can be red against the old one: the defect needs a commit
+to land *between* the two reads, and there is no longer a gap between them to
+land in.
+
+So the evidence is the fifth test, which reproduces the straddle itself — two
+handles on one file-backed store, a commit forced between the two unpaired
+reads, showing the analysis describing generation 1 while the rows describe
+generation 2. Not a race; a forced schedule. It passes before and after the
+fix, because it exercises the old composition, which still exists and is still
+unsafe to use as a pair. That is recorded in the test's own doc comment so five
+green checkmarks cannot be read as five proofs.
+
+The third instance the store audit found — `latest_dead_symbols` +
+`count_dead_at_least` — is deliberately left alone: `count_dead_at_least` has
+only a test caller, and pairing it would mean shipping an unwired API.
