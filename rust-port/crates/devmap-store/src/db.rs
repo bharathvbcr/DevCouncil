@@ -231,34 +231,60 @@ fn classify_pending_entry(
         devmap_extract::CacheVerdict::Outside => {}
     }
     let absolute = root.join(canonical);
-    match std::fs::symlink_metadata(&absolute) {
-        Ok(metadata) if metadata.is_dir() => Ok(()),
-        Ok(metadata) if metadata.is_file() => {
-            if metadata.len() > devmap_extract::MAX_SOURCE_BYTES {
-                return Err(format!(
-                    "{} bytes exceeds the {} byte source ceiling, so extraction can never succeed",
-                    metadata.len(),
-                    devmap_extract::MAX_SOURCE_BYTES
-                ));
+    // What this path is, asked at the one owner the *cold walk* asks
+    // (`devmap_extract::candidate_kind`). This used to be a second, stricter
+    // rule spelled out locally: `symlink_metadata` plus "anything that is
+    // neither a plain file nor a plain directory is garbage", which refused
+    // every symlink — including the in-repository ones the cold walk indexes.
+    // A cold build then indexed `src/util.py -> shared/util.py` and the next
+    // drain of that path deleted the queued edit as unprocessable, leaving the
+    // stored extraction stale while `status` reported fresh.
+    match devmap_extract::candidate_kind(root, &absolute) {
+        // The whole-subtree rescan the drain expands.
+        devmap_extract::CandidateKind::Directory => Ok(()),
+        devmap_extract::CandidateKind::File { bytes } => {
+            if bytes > devmap_extract::MAX_SOURCE_BYTES {
+                return Err(devmap_extract::DiscoverySkipReason::Oversized {
+                    bytes,
+                    limit: devmap_extract::MAX_SOURCE_BYTES,
+                }
+                .to_string());
             }
             if !devmap_extract::is_indexable_source(canonical) {
-                return Err("not an indexable source file".to_string());
+                return Err(devmap_extract::DiscoverySkipReason::NonSource.to_string());
             }
             Ok(())
         }
-        // A symlink, socket, fifo or device. Never a source this build reads.
-        Ok(_) => Err("not a regular file or directory".to_string()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        // The walk never descends a link, so the files under the target are
+        // indexed under their real names and only under those. Expanding this
+        // row would put the same bytes in the graph twice, under a second path
+        // no cold build ever produces.
+        devmap_extract::CandidateKind::LinkedDirectory => Err(
+            "a symlink to a directory, which discovery never descends; the files under it \
+             are queued under their own names"
+                .to_string(),
+        ),
+        // A socket, fifo or device. Never a source this build reads.
+        devmap_extract::CandidateKind::Other => Err("not a regular file or directory".to_string()),
+        // Refused by discovery — a link out of the repository, or one whose
+        // target will not resolve to say either way. A `devmap build` writes no
+        // rows for it, so there is work here only while the graph still claims
+        // one: the drain has to remove it, exactly as a full build's output
+        // would. With nothing claimed, the row is garbage and is dropped with
+        // discovery's own wording rather than a file-type complaint that sends
+        // the reader looking for a socket.
+        devmap_extract::CandidateKind::Refused(reason) => {
+            if still_claimed(canonical, indexed) {
+                Ok(())
+            } else {
+                Err(reason.to_string())
+            }
+        }
+        devmap_extract::CandidateKind::Absent => {
             // Absent. This is a deletion the drain must process only if the
             // graph still claims the path — or claims something beneath it,
             // which is how a removed directory reaches its indexed children.
-            let prefix = format!("{canonical}/");
-            let still_indexed = indexed.contains(canonical)
-                || indexed
-                    .range(prefix.clone()..)
-                    .next()
-                    .is_some_and(|entry| entry.starts_with(&prefix));
-            if still_indexed {
+            if still_claimed(canonical, indexed) {
                 Ok(())
             } else {
                 Err("no longer exists under the root and is not in the stored graph".to_string())
@@ -274,8 +300,24 @@ fn classify_pending_entry(
         // Keep it. A transient failure is retried, and a path that keeps
         // failing is quarantined after `MAX_PENDING_ATTEMPTS`, which is a
         // visible state an operator can act on.
-        Err(_transient) => Ok(()),
+        devmap_extract::CandidateKind::Undecidable(_) => Ok(()),
     }
+}
+
+/// Does the stored graph still assert this path, or anything beneath it?
+///
+/// A removed directory reaches its indexed children through the prefix scan;
+/// without it the drain would drop the row and leave the graph describing files
+/// that are gone.
+fn still_claimed(canonical: &str, indexed: &BTreeSet<String>) -> bool {
+    if indexed.contains(canonical) {
+        return true;
+    }
+    let prefix = format!("{canonical}/");
+    indexed
+        .range(prefix.clone()..)
+        .next()
+        .is_some_and(|entry| entry.starts_with(&prefix))
 }
 
 /// What [`Store::enqueue_pending_paths_under_root`] accepted and refused.

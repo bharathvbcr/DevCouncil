@@ -260,6 +260,11 @@ struct PendingDelta {
     affected: std::collections::BTreeSet<String>,
     deleted: std::collections::BTreeSet<String>,
     fresh: Vec<devmap_extract::Extraction>,
+    /// Paths this delta could not read because discovery refuses them. Carried
+    /// so the drain's coverage number cannot report a corpus fully walked when
+    /// this batch just met a file it was turned away from. Paths, not a count,
+    /// because a batch may name one file through several events.
+    refused: std::collections::BTreeSet<String>,
 }
 
 /// Default bounded lifetime for an idle daemon, in seconds.
@@ -477,13 +482,15 @@ impl Daemon {
             match reason {
                 DiscoverySkipReason::NonSource => {}
                 DiscoverySkipReason::EscapesRoot { .. } => {
-                    // Refused, and deliberately not queued — for the reason the
-                    // arm below gives, plus one of its own: the drain's
-                    // `classify_pending_entry` declines a symlink outright, so
-                    // a row queued here could never be processed and would hold
-                    // `is_fresh` at false forever. The two sides agree that a
-                    // path pointing out of the repository is not this
-                    // repository's file, and the refusal is a coverage fact.
+                    // Refused, and deliberately not queued *as new work* — for
+                    // the reason the arm below gives: no retry can bring a path
+                    // that leaves the repository back inside it. A path the
+                    // stored graph still claims is a different matter, and the
+                    // `previous`/`current` difference above has already queued
+                    // that one, so the drain can drop its rows exactly as a full
+                    // build would. The two sides agree that a path pointing out
+                    // of the repository is not this repository's file, and the
+                    // refusal is a coverage fact.
                     warn!(
                         "connect-time sweep refused {path:?} ({reason:?}); it resolves outside \
                          the repository root, so it is absent from the graph and is NOT queued"
@@ -585,6 +592,44 @@ impl Daemon {
         }
 
         let mut delta = PendingDelta::default();
+        // What the cold walk makes of this path, at the one owner
+        // (`devmap_extract::candidate_kind`). Asked before `is_dir()`, which
+        // follows a link and would send a symlinked directory down the
+        // subtree-expansion branch that discovery itself never descends.
+        match devmap_extract::candidate_kind(root, &candidate) {
+            // Refused: a link out of the repository, or one whose target will
+            // not resolve to say either way. `devmap build` writes no rows for
+            // such a path, so the drain has to reach the same state. It used to
+            // `bail!` here instead, which charges the path a retry, quarantines
+            // it after five — and leaves the rows the build path had already
+            // stopped writing in the generation, so the graph went on claiming
+            // symbols for a file outside the repository.
+            devmap_extract::CandidateKind::Refused(reason) => {
+                let relative = stored_path(root, &candidate)?;
+                warn!(
+                    "changed source {relative:?} is {reason}; removing its rows, as a \
+                     full build of this tree would, and charging the refusal to coverage"
+                );
+                delta.affected.insert(relative.clone());
+                delta.deleted.insert(relative.clone());
+                delta.refused.insert(relative);
+                return Ok(delta);
+            }
+            // A link to a directory inside the repository. The walk does not
+            // descend one, and the files under the target are queued under
+            // their own names, so there is nothing to do for this path —
+            // expanding it would put the same bytes in the graph twice.
+            devmap_extract::CandidateKind::LinkedDirectory => {
+                let relative = stored_path(root, &candidate)?;
+                delta.affected.insert(relative);
+                return Ok(delta);
+            }
+            devmap_extract::CandidateKind::File { .. }
+            | devmap_extract::CandidateKind::Directory
+            | devmap_extract::CandidateKind::Other
+            | devmap_extract::CandidateKind::Absent
+            | devmap_extract::CandidateKind::Undecidable(_) => {}
+        }
         if candidate.is_dir() {
             let canonical = candidate.canonicalize()?;
             if !canonical.starts_with(root) {
@@ -616,19 +661,29 @@ impl Daemon {
             for (path, reason) in discovery.refusals() {
                 warn!("refused source {path:?} in changed directory {canonical:?}: {reason:?}");
             }
+            // Discovery reports paths relative to the changed directory;
+            // stored rows are relative to the daemon root. Map through the same
+            // prefix the sources below use, or the deletion guard misses them.
+            let at_root = |path: &String| {
+                if prefix.is_empty() {
+                    path.clone()
+                } else {
+                    format!("{prefix}{path}")
+                }
+            };
+            delta
+                .refused
+                .extend(discovery.refusals().map(|(path, _)| at_root(path)));
+            // Only the refusals that are about *this attempt* keep their rows.
+            // A containment refusal says the path is not the repository's, and
+            // a full build of the same tree writes nothing for it — so keeping
+            // its rows here is the drain disagreeing with the build path about
+            // where the repository ends. `is_containment_refusal` draws that
+            // line once, beside the enum it is about.
             let refused: std::collections::BTreeSet<String> = discovery
                 .refusals()
-                .map(|(path, _)| {
-                    // Discovery reports paths relative to the changed
-                    // directory; stored rows are relative to the daemon
-                    // root. Map through the same prefix the sources below
-                    // use, or the deletion guard misses them.
-                    if prefix.is_empty() {
-                        path.clone()
-                    } else {
-                        format!("{prefix}{path}")
-                    }
-                })
+                .filter(|(_, reason)| !reason.is_containment_refusal())
+                .map(|(path, _)| at_root(path))
                 .collect();
             let mut live_under_directory = std::collections::BTreeSet::new();
             for (relative_to_directory, source) in sources {
@@ -842,6 +897,9 @@ impl Daemon {
         let previous = self.store.latest_extractions()?;
         let mut affected = std::collections::BTreeSet::new();
         let mut deleted = std::collections::BTreeSet::new();
+        // Paths this batch met and discovery refused. A set, so a file named by
+        // several events in one batch is one refusal.
+        let mut refused: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         // Keyed by path, because two queue entries can cover one file: a
         // directory and a file inside it arrive together in a single watcher
         // batch, and a whole-tree rescan sits beside whatever per-path events
@@ -901,6 +959,7 @@ impl Daemon {
                 Ok(delta) => {
                     affected.extend(delta.affected);
                     deleted.extend(delta.deleted);
+                    refused.extend(delta.refused);
                     for extraction in delta.fresh {
                         fresh.insert(extraction.file_path.clone(), extraction);
                     }
@@ -998,17 +1057,27 @@ impl Daemon {
             // coverage rather than over-claiming it, which is the side of the
             // trade the rest of the kernel is built on: an unread file wrongly
             // reported as read is what deletes working code.
-            let discovery = match self
+            let measured = self
                 .store
                 .latest_analysis()?
-                .and_then(|summary| summary.discovery_refused_files)
-            {
-                Some(refused) => DiscoveryCoverage::refused(refused),
+                .and_then(|summary| summary.discovery_refused_files);
+            let discovery = match measured {
+                // A floor, not a sum: the carried number is a whole-tree
+                // measurement and the batch's is a handful of paths that may
+                // already be inside it, so adding them would double-count. What
+                // must not happen is the other direction — a drain that was
+                // turned away from a file *this batch* reporting the corpus
+                // fully walked because the last full walk happened to refuse
+                // nothing. `max` is the honest reading of two lower bounds.
+                Some(previous) => DiscoveryCoverage::refused(previous.max(refused.len())),
                 // Only reachable for a generation written before the count was
                 // recorded at all. `none()` leaves it honestly unmeasured
                 // instead of asserting zero — and the payload check above sends
                 // a store that old down the full-rebuild branch regardless.
-                None => DiscoveryCoverage::none(),
+                None if refused.is_empty() => DiscoveryCoverage::none(),
+                // Except when this batch measured something: one refusal seen
+                // is more than nothing known.
+                None => DiscoveryCoverage::refused(refused.len()),
             };
             (carried, false, discovery)
         } else {

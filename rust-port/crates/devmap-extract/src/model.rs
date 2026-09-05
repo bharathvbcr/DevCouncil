@@ -374,6 +374,33 @@ pub struct DiscoveryReport {
     pub skipped_paths: Vec<(String, DiscoverySkipReason)>,
 }
 
+/// One wording for one refusal.
+///
+/// The drain reports what it refused in prose an operator reads out of
+/// `devmap status`; the cold walk reports the same facts as this enum. Spelling
+/// them separately is how "resolves outside the repository" and "not a regular
+/// file or directory" came to describe the same symlink.
+impl std::fmt::Display for DiscoverySkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiscoverySkipReason::NonSource => write!(f, "not an indexable source path"),
+            DiscoverySkipReason::Oversized { bytes, limit } => write!(
+                f,
+                "{bytes} bytes exceeds the {limit} byte source ceiling, so extraction \
+                 can never succeed"
+            ),
+            DiscoverySkipReason::NonUtf8Path => {
+                write!(f, "a path that is not representable as UTF-8")
+            }
+            DiscoverySkipReason::Unreadable { reason } => write!(f, "unreadable: {reason}"),
+            DiscoverySkipReason::EscapesRoot { target } => write!(
+                f,
+                "a symlink the repository does not contain ({target}), which discovery refuses"
+            ),
+        }
+    }
+}
+
 impl DiscoverySkipReason {
     /// Is this skip a hole in the graph, or the ordinary case?
     ///
@@ -407,6 +434,21 @@ impl DiscoverySkipReason {
             // read, which is the definition on this side of the line.
             | DiscoverySkipReason::EscapesRoot { .. } => true,
         }
+    }
+
+    /// Does this refusal say the path is not the repository's at all?
+    ///
+    /// The distinction decides what happens to rows a previous generation
+    /// wrote for the path. `Oversized` and `Unreadable` are about *this
+    /// attempt*: the file may shrink, or regain `+r`, and until it does its
+    /// last good extraction is the best description of it the graph has, so the
+    /// rows are kept. `EscapesRoot` is about the path itself — the bytes belong
+    /// to somebody else's directory — and a `devmap build` writes no rows for
+    /// it, so a drain that kept them would leave the graph claiming symbols the
+    /// build path had already stopped claiming, which is the disagreement
+    /// between the two walks that this rule exists to end.
+    pub fn is_containment_refusal(&self) -> bool {
+        matches!(self, DiscoverySkipReason::EscapesRoot { .. })
     }
 }
 

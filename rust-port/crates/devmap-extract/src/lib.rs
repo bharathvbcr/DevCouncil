@@ -524,16 +524,128 @@ pub(crate) fn walk_error_path(error: &ignore::Error) -> Option<&Path> {
 /// be recorded as proven-inside; the path is refused and the reason travels
 /// with it.
 pub fn escapes_root(root: &Path, path: &Path) -> Option<String> {
-    let link = fs::symlink_metadata(path).ok()?;
-    if !link.file_type().is_symlink() {
-        return None;
+    match candidate_kind(root, path) {
+        CandidateKind::Refused(DiscoverySkipReason::EscapesRoot { target }) => Some(target),
+        _ => None,
     }
+}
+
+/// What discovery makes of one path, before anything reads its bytes.
+///
+/// The variants a caller must not collapse into each other are the point:
+/// "refused", "absent" and "the stat could not run" have three different
+/// consequences, and every place that answered them with one `bool` got at
+/// least one of them wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CandidateKind {
+    /// A regular file, or a symlink to one that stays inside the repository.
+    /// An ordinary source candidate under its own name.
+    ///
+    /// `bytes` is the size of the bytes that would actually be read — the
+    /// *target's* through a link. `ignore::DirEntry::metadata()` reports the
+    /// link's own size instead (a path length, tens of bytes), which is how a
+    /// 30 MB file reached `read_to_string` under a symlink whose stat said it
+    /// was nowhere near `MAX_SOURCE_BYTES`.
+    File { bytes: u64 },
+    /// A real directory. The walk descends it; the drain expands it.
+    Directory,
+    /// A symlink to a directory inside the repository. Neither path descends a
+    /// link, and the files under the target are reached under their real names,
+    /// so this path is not itself work.
+    LinkedDirectory,
+    /// A socket, fifo or device — or a link to one. Never a source.
+    Other,
+    /// The path leaves the repository, or will not resolve to say either way.
+    /// Carries the reason discovery records, so both callers report one thing.
+    Refused(DiscoverySkipReason),
+    /// Nothing is there. The *only* verdict that may be read as a deletion.
+    Absent,
+    /// The filesystem could not answer. Containment is unknown, and unknown is
+    /// not absence: ELOOP, EACCES on a parent, ESTALE on a mount all land here.
+    Undecidable(String),
+}
+
+/// The one owner of "is this path something this repository contains, and what
+/// is it?" — for the cold walk in [`collect_sources_with_report`] and for the
+/// drain's `classify_pending_entry` alike.
+///
+/// The two used to answer it separately and disagreed about exactly one shape.
+/// The cold walk kept a symlinked file whose target resolves inside the root
+/// (a monorepo's shared config, a vendored header: the bytes are the
+/// repository's either way) and refused only one that escapes it. The drain
+/// refused **every** symlink, as "not a regular file or directory". Measured:
+/// a cold build indexed `src/util.py -> shared/util.py`, and the next drain of
+/// that path deleted the queued row as structurally unprocessable — so the
+/// edit was dropped, the stored extraction went stale, and `status` went on
+/// reporting fresh. The cold walk's rule is the one that survives, and it is
+/// stated here once.
+///
+/// One `symlink_metadata` for the ordinary case, which is what `is_file()`
+/// cost before — and unlike `is_file()` it does not collapse a dangling link,
+/// a link loop and a link to a directory into the same silent `false`.
+pub fn candidate_kind(root: &Path, path: &Path) -> CandidateKind {
+    let link = match fs::symlink_metadata(path) {
+        Ok(link) => link,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return CandidateKind::Absent,
+        Err(error) => return CandidateKind::Undecidable(error.to_string()),
+    };
+    if !link.file_type().is_symlink() {
+        return kind_of(&link);
+    }
+    // Both roots are canonicalised before the comparison. A lexical prefix test
+    // answers "inside" for `../../elsewhere/secret.py` and for any root reached
+    // through a symlink of its own, which on macOS is every path under
+    // `std::env::temp_dir()`.
+    //
+    // Fail-closed when the target will not resolve. Containment is then
+    // *unknown*, and unknown must not be recorded as proven-inside — but which
+    // kind of unknown decides what the drain may do about it, so the two are
+    // kept apart here rather than collapsed into one refusal.
     let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    match path.canonicalize() {
-        Ok(target) => {
-            (!target.starts_with(&canonical_root)).then(|| target.to_string_lossy().into_owned())
+    let target = match path.canonicalize() {
+        Ok(target) => target,
+        // The link dangles. That is a fact about the link, not about this
+        // attempt: the target is not there, a full build writes no rows for the
+        // path, and the drain may remove any it already wrote.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return CandidateKind::Refused(DiscoverySkipReason::EscapesRoot {
+                target: format!("target could not be resolved: {error}"),
+            })
         }
-        Err(error) => Some(format!("target could not be resolved: {error}")),
+        // Every other resolution failure — a loop, a parent that lost `+x`, a
+        // stale handle on a mount — is a question that could not be answered.
+        // The walk records it as a refusal (below) because it read nothing; the
+        // drain retries it, because *its* verdict deletes the file's rows and a
+        // wrongly-dropped row is a symbol the dead-code pass is then free to
+        // call unreferenced.
+        Err(error) => return CandidateKind::Undecidable(error.to_string()),
+    };
+    if !target.starts_with(&canonical_root) {
+        return CandidateKind::Refused(DiscoverySkipReason::EscapesRoot {
+            target: target.to_string_lossy().into_owned(),
+        });
+    }
+    match fs::metadata(&target) {
+        // Inside the repository, so the link is transparent — except for a
+        // directory, which neither path descends through a link.
+        Ok(metadata) if metadata.is_dir() => CandidateKind::LinkedDirectory,
+        Ok(metadata) => kind_of(&metadata),
+        // `canonicalize` resolved it a syscall ago, so this is a race or a mode
+        // change, not proof the target was never there.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => CandidateKind::Absent,
+        Err(error) => CandidateKind::Undecidable(error.to_string()),
+    }
+}
+
+fn kind_of(metadata: &fs::Metadata) -> CandidateKind {
+    if metadata.is_dir() {
+        CandidateKind::Directory
+    } else if metadata.is_file() {
+        CandidateKind::File {
+            bytes: metadata.len(),
+        }
+    } else {
+        CandidateKind::Other
     }
 }
 
@@ -627,9 +739,31 @@ pub fn collect_sources_with_report(
             }
         };
         let p = entry.path();
-        if !p.is_file() {
-            continue;
-        }
+        // What this path is, at the one owner the drain also asks
+        // ([`candidate_kind`]) — and asked *before* anything follows the link.
+        // `is_file()` follows it and answers `false` for a dangling link, a
+        // link loop and a link to a directory alike, so the report said nothing
+        // at all about a `src/x.py -> /nowhere`: not indexed, not refused, not
+        // mentioned.
+        let candidate = match candidate_kind(root, p) {
+            // The candidate, sized by the bytes that would actually be read.
+            CandidateKind::File { bytes } => Ok(bytes),
+            // Recorded under the link's own name, once past the source gate.
+            CandidateKind::Refused(reason) => Err(reason),
+            // A path this walk was pointed at and could not read is the same
+            // hole as one it was refused, whatever the errno: `Unreadable` is
+            // what the walker's own errors are already recorded as.
+            CandidateKind::Undecidable(reason) => Err(DiscoverySkipReason::Unreadable { reason }),
+            // Stepped over without a word, exactly as `!is_file()` did: a real
+            // directory (the walk descends it itself), a link to one (neither
+            // path descends a link, and its files are reached under their real
+            // names), a socket, and a path that vanished between the walker
+            // naming it and this stat.
+            CandidateKind::Directory
+            | CandidateKind::LinkedDirectory
+            | CandidateKind::Other
+            | CandidateKind::Absent => continue,
+        };
         let Ok(rel) = p.strip_prefix(root) else {
             continue;
         };
@@ -647,12 +781,10 @@ pub fn collect_sources_with_report(
                 .push((rel_str, DiscoverySkipReason::NonSource));
             continue;
         }
-        // Containment, at the third owner of one rule.
+        // Containment, from the verdict already taken above.
         //
         // `preview` refuses a `--file` that "resolves outside the indexed
-        // repository root" and `classify_pending_entry` refuses a queued path
-        // that is not a regular file or directory, which is how the drain
-        // declines a symlink. This walk enforced neither. `WalkBuilder` is
+        // repository root". This walk enforced nothing: `WalkBuilder` is
         // configured not to *descend* through symlinks, so a symlinked
         // directory was never a way out — but `Path::is_file` and
         // `fs::read_to_string` both follow a link, so a single symlinked file
@@ -664,29 +796,23 @@ pub fn collect_sources_with_report(
         // symbols the build had just written — the two halves of one tool
         // disagreeing about where the repository ends, with the half that reads
         // the bytes being the permissive one.
-        if let Some(target) = escapes_root(root, p) {
-            report
-                .skipped_paths
-                .push((rel_str, DiscoverySkipReason::EscapesRoot { target }));
-            continue;
-        }
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                report.skipped_paths.push((
-                    rel_str,
-                    DiscoverySkipReason::Unreadable {
-                        reason: error.to_string(),
-                    },
-                ));
+        //
+        // Recorded after the `is_indexable_source` gate above, deliberately: a
+        // `node_modules -> /shared/node_modules` is not a source file, and
+        // charging every repository that has one with permanent coverage loss
+        // would make the marker useless.
+        let bytes = match candidate {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                report.skipped_paths.push((rel_str, reason));
                 continue;
             }
         };
-        if metadata.len() > MAX_SOURCE_BYTES {
+        if bytes > MAX_SOURCE_BYTES {
             report.skipped_paths.push((
                 rel_str,
                 DiscoverySkipReason::Oversized {
-                    bytes: metadata.len(),
+                    bytes,
                     limit: MAX_SOURCE_BYTES,
                 },
             ));

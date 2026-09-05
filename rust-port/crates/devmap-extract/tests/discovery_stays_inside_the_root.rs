@@ -1,13 +1,14 @@
 //! A cold build must not read a file that lives outside the repository.
 //!
-//! The rule has three owners and only two of them enforced it. `preview`
-//! refuses a `--file` that "resolves outside the indexed repository root", and
-//! `classify_pending_entry` refuses a queued path that is not "a regular file
-//! or directory", which is how the drain declines a symlink. The cold walk in
-//! [`devmap_extract::collect_sources_with_report`] did neither: `WalkBuilder`
-//! is configured not to *descend* through symlinks, but `Path::is_file` and
-//! `fs::read_to_string` both follow one, so a single symlinked file was read
-//! through without anyone asking where it pointed.
+//! The rule had three owners and only one of them enforced it. `preview`
+//! refuses a `--file` that "resolves outside the indexed repository root"; the
+//! drain refused *every* symlink, in-repository ones included; and the cold
+//! walk in [`devmap_extract::collect_sources_with_report`] enforced nothing at
+//! all — `WalkBuilder` is configured not to *descend* through symlinks, but
+//! `Path::is_file` and `fs::read_to_string` both follow one, so a single
+//! symlinked file was read through without anyone asking where it pointed.
+//! There is now one owner, [`devmap_extract::candidate_kind`], and the drain
+//! asks it too.
 //!
 //! Measured with the release binary on a two-file repository containing
 //! `src/a.py` and `src/creds.py -> <outside>/credentials.py`:
@@ -151,5 +152,112 @@ fn a_relative_symlink_that_climbs_out_of_the_repository_is_not_read() {
         skip_reason(&report, "src/secret.py").is_some_and(DiscoverySkipReason::is_refusal),
         "the refusal must be recorded as coverage loss: {:?}",
         report.skipped_paths
+    );
+}
+
+/// A link that will not resolve is *unknown*, and unknown must be recorded.
+///
+/// `Path::is_file` follows the link and collapses ENOENT-on-the-target into the
+/// same `false` it returns for a directory, so the walk stepped over a dangling
+/// `src/gone.py` in complete silence: it was not indexed, not refused, and not
+/// mentioned in the report at all. `escapes_root` had the right answer the
+/// whole time ("target could not be resolved") and was asked three lines too
+/// late to be heard.
+#[test]
+fn a_dangling_symlink_is_recorded_as_a_refusal_rather_than_passed_over_in_silence() {
+    let root = scratch("dangling");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.py"), "def a():\n    return 1\n").unwrap();
+    std::os::unix::fs::symlink(root.join("nowhere.py"), root.join("src/gone.py")).unwrap();
+
+    let (sources, report) = collect_sources_with_report(&root).expect("discovery runs");
+    assert!(
+        !sources.iter().any(|(path, _)| path == "src/gone.py"),
+        "a link with no target has no bytes to index"
+    );
+    assert!(
+        skip_reason(&report, "src/gone.py").is_some_and(DiscoverySkipReason::is_refusal),
+        "a link whose target will not resolve is coverage loss, not silence: {:?}",
+        report.skipped_paths
+    );
+}
+
+/// The same rule for a link that resolves to itself: `canonicalize` fails with
+/// ELOOP, which is "could not be established", not "inside".
+#[test]
+fn a_symlink_loop_is_recorded_as_a_refusal() {
+    let root = scratch("loop");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.py"), "def a():\n    return 1\n").unwrap();
+    std::os::unix::fs::symlink("loop.py", root.join("src/loop.py")).unwrap();
+
+    let (sources, report) = collect_sources_with_report(&root).expect("discovery runs");
+    assert!(
+        !sources.iter().any(|(path, _)| path == "src/loop.py"),
+        "a self-referential link names no bytes"
+    );
+    assert!(
+        skip_reason(&report, "src/loop.py").is_some_and(DiscoverySkipReason::is_refusal),
+        "ELOOP is a refusal, not a silent pass-over: {:?}",
+        report.skipped_paths
+    );
+}
+
+/// The size ceiling has to be measured on the bytes that will be *read*.
+///
+/// The walk sized a candidate with `ignore::DirEntry::metadata()`, which does
+/// not follow the link — it reports the size of the link itself, a path length
+/// of a few dozen bytes. `fs::read_to_string` three lines below follows it. So
+/// a file over `MAX_SOURCE_BYTES`, reached through an in-repository symlink,
+/// walked straight through the ceiling that exists to bound this loop's memory.
+#[test]
+fn a_file_over_the_ceiling_reached_through_an_in_root_symlink_is_still_refused_by_size() {
+    let root = scratch("oversize-link");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("vendor")).unwrap();
+    let big = root.join("vendor/big.py");
+    fs::write(&big, "x = 1\n".repeat(400_000)).unwrap();
+    assert!(
+        fs::metadata(&big).unwrap().len() > devmap_extract::MAX_SOURCE_BYTES,
+        "the fixture must be over the ceiling"
+    );
+    std::os::unix::fs::symlink(&big, root.join("src/big.py")).unwrap();
+
+    let (sources, report) = collect_sources_with_report(&root).expect("discovery runs");
+    assert!(
+        !sources.iter().any(|(path, _)| path == "src/big.py"),
+        "the ceiling must bound the bytes actually read, not the link's own size"
+    );
+    assert!(
+        matches!(
+            skip_reason(&report, "src/big.py"),
+            Some(DiscoverySkipReason::Oversized { .. })
+        ),
+        "the refusal must name the size, as it does for the real path: {:?}",
+        report.skipped_paths
+    );
+}
+
+/// A link to a directory inside the repository is not a way in: the walk does
+/// not descend it, and the files under the target are reached under their real
+/// names. Pinned so the drain, which now asks the same owner, can be held to
+/// the same answer.
+#[test]
+fn a_symlink_to_a_directory_inside_the_repository_is_not_descended() {
+    let root = scratch("dirlink");
+    fs::create_dir_all(root.join("shared/pkg")).unwrap();
+    fs::write(root.join("shared/pkg/mod.py"), "def m():\n    return 1\n").unwrap();
+    std::os::unix::fs::symlink(root.join("shared/pkg"), root.join("pkg")).unwrap();
+
+    let (sources, _) = collect_sources_with_report(&root).expect("discovery runs");
+    let paths: Vec<&str> = sources.iter().map(|(path, _)| path.as_str()).collect();
+    assert!(
+        paths.contains(&"shared/pkg/mod.py"),
+        "the real path must be indexed: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|path| path.starts_with("pkg/")),
+        "the walk must not descend a link, or the same bytes are indexed twice \
+         under two names: {paths:?}"
     );
 }
