@@ -457,16 +457,13 @@ fn consumer_manifest_json(
                 "total": subsystems_total,
                 "truncated": subsystems_total > subsystems.len(),
                 "dropped_no_area": subsystems_dropped_no_area,
-                // Provenance for `subsystems[].neighbors`. The field was a
-                // literal `[]` for its whole life here, and an empty list is
-                // exactly what a repository with no coupling would also
-                // produce — so `backend/go_orchestrator/repomap` stopped
-                // reading it and derives adjacency itself, saying in its
-                // package doc that a consumer "cannot tell 'this repository
-                // has no adjacent subsystems' from 'this producer does not
-                // compute the field'". This flag is that distinction, and the
-                // counts are the usual shown/total pair for a capped list.
-                "neighbors_computed": true,
+                // The shown/total pair for the capped neighbour lists. The
+                // *provenance* — whether this producer computes the field at
+                // all — is one key and lives in `meta.devmap_rust` below,
+                // where `code_graph.json` already keeps a producer's account of
+                // its own run and where `subsystem_map.neighbors_established`
+                // reads it. Two copies of one boolean in one artifact is the
+                // shape that drifts.
                 "neighbors_shown": neighbors_shown,
                 "neighbors_total": neighbors_total,
                 "neighbors_truncated": neighbors_total > neighbors_shown,
@@ -502,6 +499,23 @@ fn consumer_manifest_json(
         "processes": [],
         "map_engine": CONSUMER_MAP_ENGINE,
         "freshness": freshness,
+        // This producer's account of its own run, under the key
+        // `code_graph.json` already uses for the same purpose.
+        //
+        // `neighbors_computed` is the distinction `backend/go_orchestrator/repomap`
+        // could not make and gave up on the field over: an empty
+        // `subsystems[].neighbors` is what a repository with no coupling
+        // produces *and* what a producer that stubs the field produces, and its
+        // package doc says a consumer "cannot tell 'this repository has no
+        // adjacent subsystems' from 'this producer does not compute the
+        // field'". `subsystem_map.neighbors_established` reads exactly this
+        // key; the counts that go with it are in
+        // `liveness_meta.subsystems.neighbors_*`.
+        "meta": {
+            "devmap_rust": {
+                "neighbors_computed": true,
+            },
+        },
     });
     // Compact, not pretty. This artifact is not read by a person: it is the
     // file the agent guides instruct an agent to open before searching, and on

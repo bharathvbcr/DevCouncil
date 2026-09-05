@@ -120,12 +120,16 @@ fn an_area_with_no_cross_area_edge_gets_a_computed_empty_list() {
 #[test]
 fn the_manifest_states_that_neighbours_were_computed() {
     let map = manifest();
-    let meta = &map["liveness_meta"]["subsystems"];
+    // The flag lives where `subsystem_map.neighbors_established` reads it and
+    // where `code_graph.json` keeps the same kind of claim; the counts live
+    // beside the artifact's other shown/total pairs. One home each.
     assert_eq!(
-        meta["neighbors_computed"],
+        map["meta"]["devmap_rust"]["neighbors_computed"],
         serde_json::json!(true),
-        "the manifest must say the field was derived, not left at a literal: {meta}"
+        "the manifest must say the field was derived, not left at a literal: {}",
+        map["meta"]
     );
+    let meta = &map["liveness_meta"]["subsystems"];
     assert_eq!(
         meta["neighbors_total"],
         serde_json::json!(2),
