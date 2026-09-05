@@ -1551,3 +1551,99 @@ Five tests, each written against the unmodified code and watched fail:
   `disallow_untyped_defs` nor `check_untyped_defs`, so mypy skipped the bodies of every
   untyped function — it reported that as three `annotation-unchecked` notes. Turning either on
   is a much larger pass and a decision for the maintainer, not a side effect of this one.
+
+## Session guard: live siblings and divergent branches (2026-09-05)
+
+Twice in one day this repository was worked on by two agent sessions at once and neither knew.
+The first time, one session edited the main checkout and committed to `main` while another
+worked in a linked worktree on a branch; both merged the same unmerged branch and both fixed
+the same audit findings with different code, which then had to be reconciled by hand. The
+second time, a previous day's branch simply sat unmerged with nothing at session start to say
+so. In both cases the information was sitting in `git worktree list` and `git branch
+--no-merged` the whole time — nobody was asked.
+
+`devcouncil/utils/git_siblings.py` asks. It answers three questions about the repository root,
+each independently so one failure cannot silence the others:
+
+* **live siblings** — every checkout in `git worktree list --porcelain` other than this one
+  that has uncommitted changes, or that something touched inside the activity window
+  (30 minutes; `DEVCOUNCIL_SIBLING_WINDOW_MINUTES`), reported with path, branch and age;
+* **divergent branches** — local branches under the watched prefixes (`claude/`;
+  `DEVCOUNCIL_SIBLING_BRANCH_PREFIXES`) that are ahead of the default branch, with the count
+  and the age of the tip;
+* **behind** — commits on the default branch (`main`, else `master`;
+  `DEVCOUNCIL_DEFAULT_BRANCH`) that this checkout does not have.
+
+The answer reaches a session in the one place a session already looks first: the
+`Continuity — …` clause of the SessionStart status line. `_with_continuity` in `hook.py` is now
+the only thing that writes that sentence, so the new clauses fold into the existing ones rather
+than starting a second one. `dev map doctor` carries the same finding as a non-critical
+`siblings` check.
+
+**Honesty.** A probe that could not run reports *why* — `could not check: …` in the hint,
+`ok: null` in the doctor — and never the "none" a probe that ran and found nothing reports.
+A directory that is not a repository is an *answer*, not a failure, and `proc.git_repo_state`
+already owned that distinction. Every listing that hits a cap says so (`partial: only the
+first 20 matching branches were counted`).
+
+**Cost.** SessionStart is the only caller: UserPromptSubmit, SubagentStart and the statusline
+keep the cheap `_status_line`, and PostToolUse — the hook that fires most — never sees it.
+Three tiers, cheapest decisive signal first: the mtimes of a checkout's git metadata (stat
+calls, no subprocess) decide most checkouts; `git status --no-optional-locks` runs only for a
+checkout that has been quiet; the tracked-file walk only after that, and the last two start
+together rather than in sequence. `git` costs ~15 ms per spawn on this machine before it does
+any work, so the three top-level probes are issued at once. Measured on this repository with
+two other checkouts: **p50 45 ms, p95 65 ms** for the whole guard (was 146 ms before the
+tiering and the concurrency; 115 ms in the artificial worst case where every tier runs for
+every sibling).
+
+`--no-optional-locks` is not incidental: a plain `git status` refreshes and rewrites the index
+it reads, and that index belongs to the other session's working tree. A guard must observe the
+tree it warns about, never perturb it.
+
+### The neighbour rule was answering from a field the kernel stubs (2026-09-05)
+
+Found by the Go/`repomap` review (`rust-port/STATUS.md`, "Left open, for the Python and Rust
+lanes") and fixed on the Python side here. `devmap-query/src/manifest.rs:302` writes
+`"neighbors": []` as a literal for every subsystem, and the kernel has been the only map
+writer since the Python one was retired on 2026-09-02, so the field is always empty.
+`indexing/subsystem_map.are_neighbors` read it and returned `False` — reporting a measured
+non-adjacency for a relation nothing ever measured. **Measured on this repository's map: 16
+subsystems, 0 with a non-empty `neighbors`, no `meta`; every distinct pair answered `False`.**
+
+Two consumers were acting on that:
+
+* `execution/policy_engine.py` denied every unplanned cross-subsystem write with "not a
+  declared neighbor". The neighbour rung one line above — allow a write into a *neighbouring*
+  subsystem of a planned file — could never fire.
+* `verification/checks/subsystem_boundary.py` raised an `architecture_drift` gap for every
+  cross-area change, because `cross_boundary_pairs` read "no declared neighbours" as "not
+  adjacent".
+
+`are_neighbors` is now a tri-state — `True` / `False` / `None` for unknown — which is the
+shape and the reasoning `is_entry_root` two functions below already used for a capped list: a
+negative is only evidence when the producer was in a position to give one. `neighbors_established`
+decides, from two independent positive claims: a non-empty `neighbors` list anywhere (a map
+that names one adjacency demonstrably computed them), or the producer's own marker. Positive
+answers need no evidence and stay definite, so every existing test kept its exact assertions.
+
+The consumers were changed to match, and neither loosens anything:
+
+* The policy engine **still denies** — an unmeasured relation is not permission, and no write
+  that was refused before is allowed now — but the reason says the relation "is not established
+  by this map" rather than sending an agent to widen its scope over a fact nothing established.
+* The boundary gate reports a new `architecture_check_unavailable` gap (low, never blocking)
+  instead of returning `[]`, which would have been its "ran and found nothing". It stays
+  non-blocking even when the gate is configured `blocking=True`: that flag is about an
+  undeclared crossing, and halting the loop over the map writer's missing feature would stop
+  every repository the kernel maps rather than the ones with a boundary problem.
+
+**Open, and for whoever reconciles the two lanes:** the Rust writer's fix had not landed on
+this branch when this was written (`manifest.rs` still holds the literal, and no marker key
+exists anywhere in `rust-port/`), so the marker read here is
+`meta.devmap_rust.neighbors_computed` — one constant, in `subsystem_map.neighbors_established`,
+to change if the Rust lane names it differently. A third reader is untouched:
+`integrations/mcp/handlers/map.py:157` forwards `sub.get("neighbors")` raw, so an MCP client
+still cannot tell an empty list from an uncomputed one. Its `_subsystem_detail(sub)` takes only
+the subsystem dict, so surfacing this there means passing the whole map in and adding a key to
+an advertised tool's payload — a contract change, deliberately not made as a side effect.
