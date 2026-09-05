@@ -1660,9 +1660,13 @@ shape as `is_entry_root` and `walk_incomplete` already in that handler. Both key
 cross-boundary by removing neighbor links"); its assertion is unchanged and its map now carries
 the producer marker, so the empty lists are an answer rather than a field nobody computed.
 
-**Open, for whoever reconciles the two lanes:** the Rust writer's fix had not landed on this
-branch when this was written (`manifest.rs` still holds the literal, and no marker key exists
-anywhere under `rust-port/`), so the marker read here is `meta.devmap_rust.neighbors_computed`
-— one constant, in `subsystem_map.neighbors_established`, to change if the Rust lane names it
-differently. Once the kernel computes neighbours and sets the marker, every surface above goes
-back to giving definite answers with no further Python change.
+**The two lanes converged on the key.** The Rust writer's fix landed on this branch as
+`696e1b8` while this was being written, and it emits exactly the marker this reader had been
+told to assume: `meta.devmap_rust.neighbors_computed`. Its counts, though, brought a second
+Class A case with them. Each area's `neighbors` list is capped
+(`liveness_meta.subsystems.neighbors_truncated`, with `neighbors_shown`/`neighbors_total`), and
+couplings whose endpoint could not be placed in any area are counted separately
+(`neighbors_endpoints_unresolved`) — so on such a map a *negative* is a capped sample answering
+as a complete one, the same trap `is_entry_root` two functions below already documents.
+`are_neighbors` now degrades the negative to unknown when the map makes either claim. The
+positive is untouched in both cases: a listed neighbour is listed whatever the cap dropped.

@@ -184,3 +184,76 @@ def test_a_populated_neighbor_list_is_its_own_evidence():
     """No marker needed: a map that names a neighbour computed neighbours."""
     assert neighbors_established(_MAP) is True
     assert are_neighbors("src/ui", "src/storage", _MAP) is False
+
+
+_NEIGHBORS_TRUNCATED = {
+    "meta": {"devmap_rust": {"neighbors_computed": True}},
+    "liveness_meta": {
+        "subsystems": {
+            "neighbors_shown": 4,
+            "neighbors_total": 9,
+            "neighbors_truncated": True,
+            "neighbors_endpoints_unresolved": 0,
+        }
+    },
+    "subsystems": [
+        {"area": "src/ui", "neighbors": ["src/api"]},
+        {"area": "src/api", "neighbors": ["src/ui"]},
+        {"area": "src/storage", "neighbors": []},
+    ],
+}
+
+_NEIGHBORS_WITH_UNPLACED_ENDPOINTS = {
+    "meta": {"devmap_rust": {"neighbors_computed": True}},
+    "liveness_meta": {
+        "subsystems": {
+            "neighbors_shown": 2,
+            "neighbors_total": 2,
+            "neighbors_truncated": False,
+            "neighbors_endpoints_unresolved": 3,
+        }
+    },
+    "subsystems": [
+        {"area": "src/ui", "neighbors": ["src/api"]},
+        {"area": "src/api", "neighbors": ["src/ui"]},
+        {"area": "src/storage", "neighbors": []},
+    ],
+}
+
+
+def test_a_capped_neighbor_list_cannot_answer_a_negative():
+    """The writer bounds each area's list; absence from a capped list proves nothing.
+
+    Same rule as ``is_entry_root`` two functions down. A *listed* neighbour is
+    still a neighbour — presence survives any cap — so only the negative
+    degrades.
+    """
+    assert are_neighbors("src/ui", "src/api", _NEIGHBORS_TRUNCATED) is True
+    assert are_neighbors("src/ui", "src/storage", _NEIGHBORS_TRUNCATED) is None
+    assert cross_boundary_pairs(
+        ["src/ui/a.py", "src/storage/b.py"], _NEIGHBORS_TRUNCATED
+    ) == []
+
+
+def test_couplings_the_map_could_not_place_also_withhold_the_negative():
+    """`neighbors_endpoints_unresolved` counts adjacency that was not computed.
+
+    "No neighbours" and "some couplings could not be placed in an area" are
+    different answers, and the second cannot rule anything out.
+    """
+    assert are_neighbors("src/ui", "src/api", _NEIGHBORS_WITH_UNPLACED_ENDPOINTS) is True
+    assert are_neighbors("src/ui", "src/storage", _NEIGHBORS_WITH_UNPLACED_ENDPOINTS) is None
+
+
+def test_a_complete_computed_relation_still_answers_no():
+    """The metadata present and claiming completeness keeps the negative definite."""
+    complete = dict(_NEIGHBORS_TRUNCATED)
+    complete["liveness_meta"] = {
+        "subsystems": {
+            "neighbors_shown": 2,
+            "neighbors_total": 2,
+            "neighbors_truncated": False,
+            "neighbors_endpoints_unresolved": 0,
+        }
+    }
+    assert are_neighbors("src/ui", "src/storage", complete) is False

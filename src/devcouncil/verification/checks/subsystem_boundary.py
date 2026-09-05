@@ -92,11 +92,12 @@ def detect_subsystem_boundary_gaps(
             evidence=[
                 "areas touched: " + ", ".join(touched[:_MAX_CROSSINGS]),
                 "repo_map.json: every subsystem's `neighbors` is empty and no "
-                "producer marker claims they were computed",
+                "`meta.devmap_rust.neighbors_computed` marker claims they were derived",
             ],
             recommended_fix=(
-                "Review this cross-subsystem edit by hand. The map writer does not "
-                "compute neighbors yet, so `dev map` will not populate them; set "
+                "Run `dev map` with a current kernel to derive subsystem neighbors, "
+                "then re-verify. Until the map carries them, review this "
+                "cross-subsystem edit by hand, or set "
                 "verification.subsystem_boundary.enabled to false if this notice is "
                 "not useful."
             ),

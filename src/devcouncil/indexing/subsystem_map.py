@@ -55,18 +55,19 @@ def neighbors_established(data: Mapping | None) -> bool:
     """Whether this map carries evidence that subsystem neighbors were computed.
 
     Two independent positive claims, either of which counts: the producer's own
-    provenance marker under ``meta``, and a non-empty ``neighbors`` list
-    anywhere in ``subsystems`` — a map that names one adjacency demonstrably
-    computed them.
+    provenance marker at ``meta.devmap_rust.neighbors_computed``, and a
+    non-empty ``neighbors`` list anywhere in ``subsystems`` — a map that names
+    one adjacency demonstrably computed them. The second is what answers for a
+    map written before the marker existed.
 
     Absence of both is absence of evidence, not evidence of absence. The kernel
-    writes ``"neighbors": []`` as a literal for every subsystem
-    (``rust-port/crates/devmap-query/src/manifest.rs``), and it has been the only
-    map writer since the Python one was retired, so an empty field says "this
-    producer does not compute the field" far more often than it says "this
-    repository has no adjacent subsystems". Reading the first as the second is
-    how :func:`are_neighbors` came to answer *not adjacent* for a relation
-    nothing ever measured.
+    emitted ``"neighbors": []`` as a literal for every subsystem for the whole
+    life of the field, and it has been the only map writer since the Python one
+    was retired, so on any map built before that was fixed an empty field says
+    "this producer does not compute the field" rather than "this repository has
+    no adjacent subsystems". Reading the first as the second is how
+    :func:`are_neighbors` came to answer *not adjacent* for a relation nothing
+    ever measured.
     """
     meta = (data or {}).get("meta")
     if isinstance(meta, Mapping):
@@ -76,6 +77,37 @@ def neighbors_established(data: Mapping | None) -> bool:
     for sub in (data or {}).get("subsystems") or []:
         if isinstance(sub, dict) and sub.get("neighbors"):
             return True
+    return False
+
+
+def _neighbors_answer_is_partial(data: Mapping | None) -> bool:
+    """Whether the map says its neighbor lists are less than the whole relation.
+
+    Two positive claims, read the same way :func:`_entry_roots_truncated` reads
+    its own: the per-area lists were capped (the writer bounds them because a
+    directory-level area can couple to hundreds), or some coupling edge named an
+    endpoint the generation could not place in any area. Either way a *listed*
+    neighbor is still a neighbor, but an absent one is no longer evidence of
+    absence — so the negative degrades to unknown while the positive stands.
+
+    Only a positive claim counts. A map carrying no such metadata claims no
+    truncation and is answered as complete; the producer is the only thing that
+    can know.
+    """
+    meta = (data or {}).get("liveness_meta")
+    if not isinstance(meta, Mapping):
+        return False
+    subs = meta.get("subsystems")
+    if not isinstance(subs, Mapping):
+        return False
+    if subs.get("neighbors_truncated") is True:
+        return True
+    unresolved = subs.get("neighbors_endpoints_unresolved")
+    if isinstance(unresolved, int) and not isinstance(unresolved, bool) and unresolved > 0:
+        return True
+    shown, total = subs.get("neighbors_shown"), subs.get("neighbors_total")
+    if isinstance(shown, int) and isinstance(total, int) and not isinstance(shown, bool):
+        return total > shown
     return False
 
 
@@ -91,6 +123,10 @@ def are_neighbors(
     :func:`is_entry_root` uses for a capped list, for the same reason: a
     negative is only evidence when the producer was in a position to give one.
 
+    ``None`` also covers a relation the map only partly holds: the writer caps
+    each area's list and reports what it could not place, and a negative read
+    off a capped sample is a capped sample answering as a complete one.
+
     The positive answers need no such evidence and stay definite. Two names for
     one area are adjacent by identity, an unknown side is not something to flag,
     and an area listed as a neighbor is listed whatever else the map omits.
@@ -103,7 +139,9 @@ def are_neighbors(
         return True
     if area_a in neighbors_for_area(area_b, data):
         return True
-    return False if neighbors_established(data) else None
+    if not neighbors_established(data) or _neighbors_answer_is_partial(data):
+        return None
+    return False
 
 
 def dependents_of(path: str, data: Mapping | None) -> list[str]:
