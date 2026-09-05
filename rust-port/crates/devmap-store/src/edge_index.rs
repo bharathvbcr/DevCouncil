@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use devmap_analyze::model::AnalysisDisclosure;
 use devmap_analyze::traversal::{EdgeView, GraphIndex};
 use devmap_extract::model::EdgeKind;
 
@@ -93,6 +94,16 @@ pub(crate) fn admits(confidence: f32, min_confidence: f32) -> bool {
 /// part of the contract and not an accident of the container (R4).
 pub struct GenerationEdges {
     edges: Arc<Vec<StoredEdge>>,
+    /// How much of the corpus the generation that produced these edges
+    /// actually read, travelling with the adjacency rather than beside it.
+    ///
+    /// A walk over this index is only as complete as the graph it walks, and
+    /// the two facts have to come from one generation or the qualification
+    /// describes a different snapshot than the answer. Holding it here is what
+    /// makes that structural: there is no way to obtain the adjacency without
+    /// it. `None` means the disclosure could not be read, which is a distinct
+    /// answer from a disclosure saying coverage was complete.
+    analysis: Option<AnalysisDisclosure>,
     /// Parsed once. The stored `edge_kind` string stays available for the
     /// `EdgeIdentity` label, so nothing formats a kind per crossed edge.
     kinds: Vec<EdgeKind>,
@@ -120,7 +131,15 @@ impl GenerationEdges {
     /// Fails on an unknown edge kind, exactly where the old per-request
     /// conversion failed, so a store from a newer binary is refused rather than
     /// half-read.
-    pub fn build(edges: Arc<Vec<StoredEdge>>) -> Result<Self, UnknownEdgeKind> {
+    ///
+    /// `analysis` must describe the same generation as `edges`. It is a
+    /// parameter rather than something set afterwards so the production caller
+    /// cannot build an index and forget it; a hand-built index in a test passes
+    /// `None`, which is the truth for one.
+    pub fn build(
+        edges: Arc<Vec<StoredEdge>>,
+        analysis: Option<AnalysisDisclosure>,
+    ) -> Result<Self, UnknownEdgeKind> {
         // Ids are `u32`. A generation with more edges than that cannot be
         // addressed, and answering over a silently truncated prefix would be a
         // wrong answer rather than a bounded one, so it is refused by the
@@ -146,6 +165,7 @@ impl GenerationEdges {
         }
         Ok(Self {
             edges,
+            analysis,
             kinds,
             by_source_symbol,
             by_target_symbol,
@@ -158,6 +178,13 @@ impl GenerationEdges {
     /// The generation's edge rows, in their stored order.
     pub fn edges(&self) -> &Arc<Vec<StoredEdge>> {
         &self.edges
+    }
+
+    /// The coverage disclosure of the generation these edges came from.
+    ///
+    /// `None` is "could not be read", not "complete" — see the field.
+    pub fn analysis(&self) -> Option<&AnalysisDisclosure> {
+        self.analysis.as_ref()
     }
 
     pub fn len(&self) -> usize {
@@ -361,7 +388,8 @@ mod tests {
     fn an_unknown_kind_is_refused_rather_than_dropped() {
         let error = edge_kind_from_stored("FromTheFuture").expect_err("must refuse");
         assert!(error.to_string().contains("FromTheFuture"));
-        let refused = GenerationEdges::build(Arc::new(vec![edge("a", "b", "FromTheFuture", 1.0)]));
+        let refused =
+            GenerationEdges::build(Arc::new(vec![edge("a", "b", "FromTheFuture", 1.0)]), None);
         assert!(refused.is_err(), "an index must not half-read a generation");
     }
 
@@ -372,7 +400,7 @@ mod tests {
             edge("c", "b", "Calls", 0.9),
             edge("a", "d", "Calls", 0.8),
         ];
-        let index = GenerationEdges::build(Arc::new(rows)).expect("index");
+        let index = GenerationEdges::build(Arc::new(rows), None).expect("index");
         assert_eq!(index.from_source_symbol("a"), &[0, 2]);
         assert_eq!(index.into_target_symbol("b"), &[0, 1]);
         assert_eq!(index.from_source_symbol("nothing"), &[] as &[u32]);
@@ -385,7 +413,7 @@ mod tests {
             edge("a", "a", "Calls", 1.0),
             edge("a", "a", "Contains", 1.0),
         ];
-        let index = GenerationEdges::build(Arc::new(rows)).expect("index");
+        let index = GenerationEdges::build(Arc::new(rows), None).expect("index");
         assert_eq!(index.from_source_symbol("a"), &[0, 1, 2]);
         assert_eq!(index.into_target_symbol("a"), &[0, 1, 2]);
     }
@@ -393,7 +421,7 @@ mod tests {
     #[test]
     fn the_confidence_floor_is_the_stores_rounding_rule() {
         let rows = vec![edge("a", "b", "Calls", 0.7495)];
-        let index = GenerationEdges::build(Arc::new(rows)).expect("index");
+        let index = GenerationEdges::build(Arc::new(rows), None).expect("index");
         // Rounds to 750 >= 750: admitted, exactly as `latest_edges` admits it.
         assert!(index.admits(0, 0.75));
         assert!(!index.admits(0, 0.76));

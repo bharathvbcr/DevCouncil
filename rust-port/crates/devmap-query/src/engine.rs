@@ -600,11 +600,12 @@ impl<'a> StoreQueryEngine<'a> {
         // separable here.
         let reverse = devmap_analyze::traversal::GraphIndex::reverse(direction);
         let target = req.query.trim();
-        // Read once, before either exit below can return without it. A walk
-        // over a corpus with a hole in it is a lower bound whether it found a
-        // start or not — "no indexed traversal start" is a much weaker
-        // statement when the file the symbol lives in was never read.
-        let coverage_gap = self.traversal_coverage_gap();
+        // Read once, before either exit below can return without it, and from
+        // the index rather than from the store: a walk over a corpus with a
+        // hole in it is a lower bound whether it found a start or not, and
+        // "no indexed traversal start" is a much weaker statement when the file
+        // the symbol lives in was never read.
+        let coverage_gap = analysis_coverage_gap(index.analysis());
         let start: Vec<String> =
             indexed_traversal_starts(index, target, reverse, min_confidence, &self.cancel)?
                 .into_iter()
@@ -643,73 +644,25 @@ impl<'a> StoreQueryEngine<'a> {
                 .then_with(|| a.source_symbol.cmp(&b.source_symbol))
         });
         let mut response = budget_take(traversed, req.token_budget, |_| EDGE_TOKENS);
+        // Two independent qualifications, composed rather than ranked.
+        //
         // The budgeter counts what it received. When the walk itself stopped
         // early, `total` is the size of a partial answer and `truncated: false`
         // is a claim the walk never earned — this is where `impact` said "here
         // is the blast radius" after visiting three levels of a deeper graph.
         //
-        // Composed with the corpus caveat rather than replacing it: a walk can
-        // be both truncated by its own limits and short of edges nobody ever
-        // extracted, and a reader deciding whether to act on the answer needs
-        // both statements, not whichever was written last.
-        response.walk_incomplete =
-            devmap_analyze::combine_reasons(walk.stop.reason(max_depth, max_nodes), coverage_gap);
+        // The second is about the graph rather than the walk: a traversal that
+        // ran to completion over a corpus whose call extraction did not cover
+        // every file has searched everything *it has*, which is not the same as
+        // everything there is. `impact` returning an empty list is the reading
+        // that gets a live symbol deleted, and it read identically in both
+        // cases. The disclosure rides on the index so it describes the same
+        // generation the edges came from.
+        response.walk_incomplete = devmap_analyze::combine_reasons(
+            walk.stop.reason(max_depth, max_nodes),
+            analysis_coverage_gap(index.analysis()),
+        );
         Ok(response)
-    }
-
-    /// Why every walk over this generation is a lower bound, or `None` when it
-    /// is not.
-    ///
-    /// The corpus-level counterpart of [`file_edge_coverage_gap`], which
-    /// qualifies one file's outbound list. A traversal crosses the whole
-    /// generation, so the fact it has to disclose is the analysis summary's
-    /// own: a file that failed to parse, was recovered by pattern, or was
-    /// refused by discovery contributes no call edges at all, and an edge that
-    /// was never extracted is indistinguishable in the store from an edge that
-    /// does not exist.
-    ///
-    /// `dead_symbols` has carried this disclosure since K-A2 and
-    /// `dependencies` refuses outright for a file whose parse failed; the walk
-    /// did neither, so `impact` — the answer an agent reads as "nothing calls
-    /// this, it is safe to change" — was the one place a corpus with a known
-    /// hole in it produced a confident empty list.
-    ///
-    /// Fail-closed on both no-answer paths: a status that is absent or will not
-    /// read back is unknown coverage, not proven coverage. It is deliberately
-    /// not an error — a corrupt analysis blob must not turn every query into a
-    /// failure.
-    ///
-    /// One `latest_analysis_status` per walk, which is memoised per generation
-    /// behind a generation-id probe: measured at **2.9 µs** per call, release
-    /// build, over a 200-file store. A 16-target `neighbors` makes 32 of them —
-    /// 93 µs against the 92 ms that fan-out costs on the ScholarLM corpus — so
-    /// the read is not hoisted out to the composition. Keeping it here keeps
-    /// one owner for the disclosure, and every entry point that walks (
-    /// `impact`, `trace`, `neighbors`, `explore`) inherits it without having to
-    /// remember to.
-    fn traversal_coverage_gap(&self) -> Option<String> {
-        use devmap_analyze::model::AnalysisStatus;
-        let unknown = || {
-            Some(
-                "the analysis summary for this generation could not be read, so how much of \
-                 the corpus this walk crossed is unknown"
-                    .to_string(),
-            )
-        };
-        match self.store.latest_analysis_status() {
-            Ok(Some(AnalysisStatus::Ok)) => None,
-            Ok(Some(AnalysisStatus::Partial { reason })) => Some(format!(
-                "the corpus this walk crossed was not fully read ({reason}); a call edge that \
-                 was never extracted is indistinguishable from one that does not exist, so \
-                 this list is a lower bound"
-            )),
-            Ok(Some(AnalysisStatus::Timeout { reason })) => Some(format!(
-                "the analysis of the corpus this walk crossed timed out ({reason}); a call \
-                 edge that was never attributed is indistinguishable from one that does not \
-                 exist, so this list is a lower bound"
-            )),
-            Ok(None) | Err(_) => unknown(),
-        }
     }
 
     /// Definitions matching `query`, each with its source, both call-graph
@@ -1176,7 +1129,7 @@ impl<'a> StoreQueryEngine<'a> {
             .max(response.shown);
         response.hidden = response.total.saturating_sub(response.shown);
         response.truncated = response.hidden > 0;
-        response.walk_incomplete = dead_symbol_coverage_gap(page.analysis.as_ref());
+        response.walk_incomplete = analysis_coverage_gap(page.analysis.as_ref());
         Ok(response)
     }
 
@@ -3291,7 +3244,7 @@ fn search_rank_pool_size(token_budget: u32) -> usize {
 ///
 /// `Clean` returns `None`, and that is the load-bearing case: a caveat that
 /// rides on every answer tells a reader nothing, which is the failure mode
-/// [`dead_symbol_coverage_gap`] documents for its own marker.
+/// [`analysis_coverage_gap`] documents for its own marker.
 ///
 /// One owner for both engines. `StoreQueryEngine::dependencies` reads the
 /// outcome off a stored row and `QueryEngine::dependencies` off an in-memory
@@ -3313,14 +3266,26 @@ fn file_edge_coverage_gap(outcome: &ParseOutcome) -> Option<String> {
     }
 }
 
-/// Why a dead-symbol list is a lower bound, or `None` when it is not.
+/// Why an answer derived from one generation's graph is a lower bound.
 ///
 /// Two independent reasons, joined rather than ranked — a reader deciding
-/// whether to act on "delete this" needs every qualification the run holds, not
-/// the first one that fired. `None` on a converged analysis with every call
-/// attributed is the load-bearing case: a marker that appears on every answer
-/// leaves a caller exactly where it started.
-fn dead_symbol_coverage_gap(
+/// whether to act on "nothing calls this" needs every qualification the run
+/// holds, not the first one that fired. `None` on a converged analysis with
+/// every call attributed is the load-bearing case: a marker that appears on
+/// every answer leaves a caller exactly where it started.
+///
+/// Shared by `dead_symbols` and by every traversal, because they are the same
+/// claim about the same graph. `dead_symbols` had it and `impact` did not,
+/// which is backwards: the dead list is explicitly a *candidate* list and
+/// already exempts symbols in unread files, while `impact` is what a reader
+/// consults immediately before deleting a symbol, and it answered `items: [],
+/// resolution: Available, walk_incomplete: None` over a corpus whose only
+/// calling file had never been parsed.
+///
+/// The wording is direction-neutral for that reason: it describes the holes in
+/// the graph, and leaves what those holes mean to the surface that names
+/// itself.
+fn analysis_coverage_gap(
     analysis: Option<&devmap_analyze::model::AnalysisDisclosure>,
 ) -> Option<String> {
     use devmap_analyze::model::AnalysisStatus;
@@ -3329,7 +3294,7 @@ fn dead_symbol_coverage_gap(
     let Some(analysis) = analysis else {
         return Some(
             "the analysis summary for this generation could not be read, so the coverage \
-             behind these findings is unknown"
+             behind this answer is unknown"
                 .to_string(),
         );
     };
@@ -3340,8 +3305,8 @@ fn dead_symbol_coverage_gap(
     };
     let unresolved = (analysis.unresolved_calls > 0).then(|| {
         format!(
-            "{} call(s) in this generation are unattributed: any of them could be the \
-             caller of a symbol listed here, so this list is a lower bound",
+            "{} call(s) in this generation are unattributed: the graph behind this answer \
+             is missing that many edges, so it is a lower bound",
             analysis.unresolved_calls
         )
     });
@@ -4390,7 +4355,7 @@ mod indexed_start_equivalence_tests {
     #[test]
     fn the_indexed_starts_are_the_scan_s_starts() {
         let rows = rows();
-        let index = GenerationEdges::build(std::sync::Arc::new(rows.clone())).expect("index");
+        let index = GenerationEdges::build(std::sync::Arc::new(rows.clone()), None).expect("index");
         let cancel = Cancel::new();
         let queries = [
             "hub",
@@ -4432,7 +4397,7 @@ mod indexed_start_equivalence_tests {
     #[test]
     fn the_indexed_traversed_edges_are_the_scan_s_traversed_edges() {
         let rows = rows();
-        let index = GenerationEdges::build(std::sync::Arc::new(rows.clone())).expect("index");
+        let index = GenerationEdges::build(std::sync::Arc::new(rows.clone()), None).expect("index");
         let cancel = Cancel::new();
         for query in ["hub", "Run", "a/b/c.go", "only"] {
             for reverse in [false, true] {
@@ -4497,7 +4462,7 @@ mod indexed_start_equivalence_tests {
     #[test]
     fn an_edge_on_the_rounding_boundary_is_crossed_but_not_reported() {
         let rows = rows();
-        let index = GenerationEdges::build(std::sync::Arc::new(rows.clone())).expect("index");
+        let index = GenerationEdges::build(std::sync::Arc::new(rows.clone()), None).expect("index");
         let boundary = index
             .edges()
             .iter()
@@ -4559,7 +4524,7 @@ mod indexed_start_equivalence_tests {
             stored("a", "a.py", "a", "a.py", EdgeKind::Calls, 1.0),
             stored("a", "a.py", "b", "b.py", EdgeKind::Calls, 1.0),
         ];
-        let index = GenerationEdges::build(std::sync::Arc::new(rows)).expect("index");
+        let index = GenerationEdges::build(std::sync::Arc::new(rows), None).expect("index");
         for reverse in [false, true] {
             let walk = traverse_graph_indexed(
                 &["a".to_string()],
@@ -4589,7 +4554,7 @@ mod indexed_start_equivalence_tests {
                 )
             })
             .collect();
-        let index = GenerationEdges::build(std::sync::Arc::new(rows)).expect("index");
+        let index = GenerationEdges::build(std::sync::Arc::new(rows), None).expect("index");
         let walk = traverse_graph_indexed(
             &["n0".to_string()],
             &index.directed(false, 0.0),
@@ -4624,7 +4589,7 @@ mod indexed_start_equivalence_tests {
                 )
             })
             .collect();
-        let index = GenerationEdges::build(std::sync::Arc::new(rows)).expect("index");
+        let index = GenerationEdges::build(std::sync::Arc::new(rows), None).expect("index");
         let cancel = Cancel::new();
         cancel.cancel();
         assert!(
