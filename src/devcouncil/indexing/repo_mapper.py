@@ -57,6 +57,102 @@ _GENERATED_SUFFIXES = (
     # managers are detected, and they are small.
 )
 
+# Cache Directory Tagging Standard. A directory is a cache directory if and only
+# if it holds a ``CACHEDIR.TAG`` whose content *begins* with this exact 43-byte
+# line. Checked by signature rather than by filename so a source file that
+# happens to be called ``CACHEDIR.TAG`` cannot silently delete a subtree from the
+# inventory. Transcribed from ``devmap_extract::CACHEDIR_TAG_SIGNATURE``.
+_CACHEDIR_TAG_FILE = "CACHEDIR.TAG"
+_CACHEDIR_TAG_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
+
+
+class _CacheDirectoryCache:
+    """Memoised ancestor lookup for the Cache Directory Tagging Standard.
+
+    Transcribed from ``devmap_extract::CacheDirectoryCache``, and it has to stay
+    a transcription: ``tests/freshness_parity.rs`` compares this inventory
+    against the kernel's file for file.
+
+    **Why the inventory consults it at all.** ``dev map``'s discovery walk prunes
+    a tagged directory whole — cargo, pip, uv, ccache, tox, ruff and pytest all
+    write a ``CACHEDIR.TAG``, and a build cache is not source. The freshness
+    inventory did not, so a tagged cache that no ``.gitignore`` happened to cover
+    was skipped by the walk (never indexed) and counted by the fingerprint (moved
+    on every write into it). The map then read stale on files it had deliberately
+    declined to index, and ``--if-stale`` / ``--watch`` / ``verify`` rebuilt
+    forever without converging. A gitignored cache never reaches here at all:
+    ``git ls-files`` does not list it.
+
+    **Cost.** One ``open`` per *distinct directory* rather than per path, and the
+    scan stops at the first tagged prefix — so a cache holding 50,000 files is
+    opened once and its contents are never probed. Measured on this repository it
+    is a net win, because a path ruled out here never pays for its ``is_file()``
+    stat: ``get_git_files()`` went from 2.53s to 0.67s (median of three), and the
+    inventory from 9,654 paths to 1,402 — every one of the 8,252 it dropped lay
+    under a ``target-lane*`` build cache that ``dev map`` had never indexed.
+
+    One instance is scoped to one root, as the kernel's is: the memo is keyed on
+    the repo-relative prefix alone, so sharing an instance across two checkouts
+    would let one checkout's build cache make the other's ordinary directory of
+    the same name read as one.
+    """
+
+    __slots__ = ("_root", "_verdict")
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+        self._verdict: Dict[str, bool] = {}
+
+    def is_inside_tagged_cache(self, relative: str) -> bool:
+        """True when ``relative`` is inside a tagged cache — or is not evaluable.
+
+        ``relative`` itself is checked too, so passing a directory answers for
+        the directory. The repository root is deliberately **not** checked: a
+        user who points ``dev map`` at a tagged directory has asked for it.
+
+        An absolute path or one carrying a ``..`` component is answered True
+        without opening anything, because ``root / part`` is not a containment
+        operation — ``src/..`` *is* the root, which defeats the exemption above,
+        and ``../sibling`` leaves the repository entirely. That is the kernel's
+        ``CacheVerdict::NotRepoRelative``, and the inventory excludes on it for
+        the same reason it excludes a cache: a path no ancestor of which could be
+        opened was *not* evaluated, and must not read as one that was evaluated
+        and cleared. ``git ls-files`` at the top of a work tree cannot produce
+        one, so this is a contract rather than a live branch.
+        """
+        if relative.startswith("/"):
+            return True
+        prefix = ""
+        for part in relative.split("/"):
+            # An empty component (``a//b``) is skipped and ``.`` is ignored,
+            # which leaves ``""`` and ``"."`` meaning the root itself: exempt.
+            if not part or part == ".":
+                continue
+            if part == "..":
+                return True
+            prefix = f"{prefix}/{part}" if prefix else part
+            tagged = self._verdict.get(prefix)
+            if tagged is None:
+                tagged = self._is_cache_directory(self._root / prefix)
+                self._verdict[prefix] = tagged
+            if tagged:
+                return True
+        return False
+
+    @staticmethod
+    def _is_cache_directory(directory: Path) -> bool:
+        try:
+            with open(directory / _CACHEDIR_TAG_FILE, "rb") as handle:
+                head = handle.read(len(_CACHEDIR_TAG_SIGNATURE))
+        except OSError:
+            # Absent, unreadable, or the "directory" is really a file — none of
+            # which is a declaration that this is a cache.
+            return False
+        # A file shorter than the signature cannot carry it; the short read
+        # compares unequal, which is the same "not a cache directory" answer the
+        # kernel's ``read_exact`` error path gives.
+        return head == _CACHEDIR_TAG_SIGNATURE
+
 
 def _is_aux_area_root(name: str) -> bool:
     return name.casefold() in _AUX_AREA_ROOTS
@@ -2008,6 +2104,10 @@ class RepoMapper:
 
     def get_git_files(self) -> List[str]:
         include_untracked, max_files = self._inventory_limits()
+        # One memo for every path this call classifies, on either branch: the
+        # tagged-ancestor lookup is memoised per directory, and both `ls-files`
+        # passes walk the same tree.
+        caches = _CacheDirectoryCache(self.project_root)
         try:
             from devcouncil.utils.proc import git_output
 
@@ -2020,11 +2120,26 @@ class RepoMapper:
                 return [p.replace("\\", "/") for p in output.split("\0") if p]
 
             def _keep(paths: List[str]) -> List[str]:
-                # Skip index entries whose working-tree file was deleted but not staged.
+                # Three filters, cheapest first. The order is only about cost —
+                # each one excludes, so the set they leave is the same either
+                # way round.
+                #
+                # The middle one cannot live in ``_is_runtime_or_generated_file``:
+                # that predicate is a pure function of a path string, and whether
+                # a directory carries a ``CACHEDIR.TAG`` can only be answered by
+                # opening it. See ``_CacheDirectoryCache`` for why the inventory
+                # has to ask — in one sentence, ``dev map`` never indexes a
+                # tagged cache, so counting one here made the map permanently
+                # stale on files it had deliberately declined to index.
+                #
+                # ``is_file()`` last: it is a stat per surviving path, and it is
+                # the filter that skips index entries whose working-tree file was
+                # deleted but not staged.
                 return [
                     path
                     for path in paths
                     if not self._is_runtime_or_generated_file(path)
+                    and not caches.is_inside_tagged_cache(path)
                     and (self.project_root / path).is_file()
                 ]
 
@@ -2069,7 +2184,18 @@ class RepoMapper:
 
             files = []
             for root, dirnames, filenames in os.walk(self.project_root):
-                dirnames[:] = [name for name in dirnames if name not in IGNORED_DIR_NAMES]
+                # Pruned at the directory, as the kernel's discovery walk prunes
+                # it: a tagged cache costs one `open` here instead of a stat and
+                # a name test for each of its tens of thousands of files, and the
+                # walk never descends into it. The root itself is never reached
+                # by this test — `os.walk` only offers its children — which
+                # matches the kernel's exemption for a root the caller named.
+                dirnames[:] = [
+                    name
+                    for name in dirnames
+                    if name not in IGNORED_DIR_NAMES
+                    and not _CacheDirectoryCache._is_cache_directory(Path(root) / name)
+                ]
                 for f in filenames:
                     # Normalize to forward slashes like the git branch above —
                     # backslash paths make every stored (posix) path look
