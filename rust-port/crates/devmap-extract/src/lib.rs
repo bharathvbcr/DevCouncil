@@ -519,10 +519,14 @@ pub(crate) fn walk_error_path(error: &ignore::Error) -> Option<&Path> {
 /// through a symlink of its own, which on macOS is every path under
 /// `std::env::temp_dir()`.
 ///
-/// Fail-closed when the target will not resolve — a dangling link, a loop, a
-/// parent that lost `+x`. Containment is then *unknown*, and unknown must not
-/// be recorded as proven-inside; the path is refused and the reason travels
-/// with it.
+/// A dangling link answers `Some`: its target is definitely not there, which is
+/// a fact about the link. A link that will not resolve for any *other* reason —
+/// a loop, a parent that lost `+x`, a stale mount — answers `None` here,
+/// because containment is then unknown rather than disproven, and [`candidate_kind`]
+/// reports it as `Undecidable` so the caller can decide what unknown costs it.
+/// A caller that needs "not indexable" rather than "proven outside" must still
+/// test the path itself; `freshness::keep_indexable`'s trailing `is_file()`
+/// does exactly that.
 pub fn escapes_root(root: &Path, path: &Path) -> Option<String> {
     match candidate_kind(root, path) {
         CandidateKind::Refused(DiscoverySkipReason::EscapesRoot { target }) => Some(target),
