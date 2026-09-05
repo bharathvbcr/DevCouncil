@@ -282,7 +282,7 @@ fn consumer_manifest_json(
         .map(|ext| ext.file_path.as_str())
         .collect();
     let mut seen_areas: BTreeSet<String> = BTreeSet::new();
-    let subsystems: Vec<Value> = lean
+    let kept: Vec<(&SubsystemEntry, String)> = lean
         .subsystems
         .iter()
         .filter_map(|entry| {
@@ -294,15 +294,46 @@ fn consumer_manifest_json(
             if !file_paths.iter().any(|path| path.starts_with(&prefix)) {
                 return None;
             }
-            Some(json!({
+            Some((entry, area))
+        })
+        .collect();
+    // The areas a consumer can resolve a path to, longest first — the order
+    // `subsystem_map.area_for_path` matches in, so adjacency is computed in the
+    // vocabulary the lookup will use rather than in a second one beside it.
+    let mut lookup_areas: Vec<String> = kept.iter().map(|(_, area)| area.clone()).collect();
+    lookup_areas.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    let adjacency = area_adjacency(&lookup_areas, edges);
+    let mut neighbors_shown = 0usize;
+    let mut neighbors_total = 0usize;
+    let subsystems: Vec<Value> = kept
+        .iter()
+        .map(|(entry, area)| {
+            let coupled = adjacency.get(area);
+            let total = coupled.map_or(0, BTreeMap::len);
+            // Ranked by how many coupling edges run between the two areas, then
+            // by name so a tie is not decided by hash order (R4). Emitted in
+            // rank order rather than alphabetically: membership is what the
+            // policy gate asks, but a reader deciding which coupling matters
+            // needs the strongest first, and the cap has to cut the weakest.
+            let mut ranked: Vec<(&String, &usize)> =
+                coupled.map(|map| map.iter().collect()).unwrap_or_default();
+            ranked.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+            let names: Vec<&str> = ranked
+                .iter()
+                .take(SUBSYSTEM_NEIGHBOR_CAP)
+                .map(|(name, _)| name.as_str())
+                .collect();
+            neighbors_shown += names.len();
+            neighbors_total += total;
+            json!({
                 "area": area,
                 "summary": "",
                 "entry_points": entry.entry_points,
                 "critical_files": [entry.path],
-                "neighbors": [],
+                "neighbors": names,
                 "handoff_paths": [],
                 "role_files": {},
-            }))
+            })
         })
         .collect();
     // Two independent narrowings, reported as two numbers. `SUBSYSTEM_CAP` cuts
@@ -426,6 +457,19 @@ fn consumer_manifest_json(
                 "total": subsystems_total,
                 "truncated": subsystems_total > subsystems.len(),
                 "dropped_no_area": subsystems_dropped_no_area,
+                // Provenance for `subsystems[].neighbors`. The field was a
+                // literal `[]` for its whole life here, and an empty list is
+                // exactly what a repository with no coupling would also
+                // produce — so `backend/go_orchestrator/repomap` stopped
+                // reading it and derives adjacency itself, saying in its
+                // package doc that a consumer "cannot tell 'this repository
+                // has no adjacent subsystems' from 'this producer does not
+                // compute the field'". This flag is that distinction, and the
+                // counts are the usual shown/total pair for a capped list.
+                "neighbors_computed": true,
+                "neighbors_shown": neighbors_shown,
+                "neighbors_total": neighbors_total,
+                "neighbors_truncated": neighbors_total > neighbors_shown,
             },
             "important_files": {
                 "shown": lean.important_files.len(),
@@ -553,6 +597,97 @@ fn file_area(path: &str) -> String {
         .filter(|parent| !parent.is_empty() && *parent != ".")
         .unwrap_or(".")
         .replace('\\', "/")
+}
+
+/// How many neighbours one subsystem may name.
+///
+/// A cap, because `area_for_path` falls back to a file's own parent directory
+/// when no subsystem prefix matches it, so a repository with a wide flat tree
+/// can couple one area to hundreds. What is cut is reported beside it.
+const SUBSYSTEM_NEIGHBOR_CAP: usize = 32;
+
+/// Which areas are coupled, and how strongly, from the generation's own edges.
+///
+/// The same derivation `backend/go_orchestrator/repomap` performs, deliberately:
+/// that package gave up on `subsystems[].neighbors` because this writer emitted
+/// a literal `[]`, and two implementations of one relation are how the map and
+/// its readers come to disagree about repository structure. If the two must
+/// coexist they must at least compute the same thing.
+///
+/// - Only `calls`, `references` and `imports` couple two areas. `contains`,
+///   `defines` and `member_of` are structural relations inside a file and say
+///   nothing about one area depending on another.
+/// - Only edges at `extracted` confidence. An `ambiguous` edge is a resolution
+///   the analyser explicitly declined to make, and this relation is read by the
+///   write gate to *widen* what a task may touch — a scope decision resting on
+///   a guess is the opposite of evidence. Measured on this repository by the Go
+///   side: ambiguous edges account for 288 of 431 linked area pairs, so
+///   admitting them roughly triples the neighbourhood.
+/// - Symmetric: a reference in one direction is a coupling in both.
+///
+/// Areas are resolved the way `subsystem_map.area_for_path` resolves them — the
+/// longest declared subsystem area that prefixes the file, else the file's own
+/// parent directory — because a relation keyed by a vocabulary the lookup does
+/// not use is an empty relation with extra steps. That exact mismatch
+/// (`community-4` against a directory path) is why the field joined nothing
+/// before it was a literal.
+fn area_adjacency(
+    lookup_areas: &[String],
+    edges: &[ResolvedEdge],
+) -> BTreeMap<String, BTreeMap<String, usize>> {
+    // One memo for the sweep. A generation has tens of files and hundreds of
+    // thousands of edges, so resolving the area per edge would repeat the
+    // prefix scan 271,000 times on the benchmark corpus.
+    let mut area_of: BTreeMap<&str, String> = BTreeMap::new();
+    let mut adjacency: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    for edge in edges {
+        if !matches!(
+            edge.edge_kind,
+            EdgeKind::Calls | EdgeKind::References | EdgeKind::Imports
+        ) {
+            continue;
+        }
+        if crate::code_graph::confidence_label(edge.confidence.0) != "extracted" {
+            continue;
+        }
+        if edge.source_file == edge.target_file {
+            continue;
+        }
+        let from = area_of
+            .entry(edge.source_file.as_str())
+            .or_insert_with(|| resolved_area(&edge.source_file, lookup_areas))
+            .clone();
+        let to = area_of
+            .entry(edge.target_file.as_str())
+            .or_insert_with(|| resolved_area(&edge.target_file, lookup_areas))
+            .clone();
+        if from == to {
+            continue;
+        }
+        *adjacency
+            .entry(from.clone())
+            .or_default()
+            .entry(to.clone())
+            .or_default() += 1;
+        *adjacency.entry(to).or_default().entry(from).or_default() += 1;
+    }
+    adjacency
+}
+
+/// `subsystem_map.area_for_path`, in this kernel: the longest declared
+/// subsystem area that prefixes the path, and the file's own parent directory
+/// when none does. `lookup_areas` must already be longest-first.
+fn resolved_area(path: &str, lookup_areas: &[String]) -> String {
+    for area in lookup_areas {
+        if path == area
+            || (path.len() > area.len()
+                && path.as_bytes()[area.len()] == b'/'
+                && path.starts_with(area.as_str()))
+        {
+            return area.clone();
+        }
+    }
+    file_area(path)
 }
 
 fn build_dependents(
