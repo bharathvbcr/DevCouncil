@@ -93,28 +93,9 @@ def test_graph_doctor_cypher_explore_affected_corpus(tmp_path, monkeypatch):
         == 1
     )
 
-    class _Engine:
-        def __init__(self, root):
-            pass
-
-        def explore(self, query, limit=20):
-            return {
-                "definitions": [
-                    {
-                        "id": "a.f",
-                        "path": "a.py",
-                        "line": 1,
-                        "source": "def f():\n  pass",
-                        "callers": [],
-                        "callees": ["a.g"],
-                    }
-                ]
-            }
-
-        def affected_tests(self, targets):
-            return {"tests": ["tests/test_a.py"]}
-
-    monkeypatch.setattr("devcouncil.codeintel.query.CodeIntelQueryEngine", _Engine)
+    monkeypatch.setattr(
+        "devcouncil.devmap_client.try_connect", lambda _root: _KernelStub()
+    )
     ex = runner.invoke(app, ["map", "explore", "f", "--project-root", str(tmp_path)])
     assert ex.exit_code == 0
     aff = runner.invoke(
@@ -122,15 +103,8 @@ def test_graph_doctor_cypher_explore_affected_corpus(tmp_path, monkeypatch):
     )
     assert aff.exit_code == 0
     monkeypatch.setattr(
-        "devcouncil.codeintel.query.CodeIntelQueryEngine.affected_tests",
-        lambda self, targets: {"tests": []},
+        "devcouncil.devmap_client.try_connect", lambda _root: _KernelStub(tests=())
     )
-    # rebind engine for empty tests
-    class _Empty(_Engine):
-        def affected_tests(self, targets):
-            return {"tests": []}
-
-    monkeypatch.setattr("devcouncil.codeintel.query.CodeIntelQueryEngine", _Empty)
     empty = runner.invoke(
         app, ["map", "affected", "a.f", "--project-root", str(tmp_path)]
     )
@@ -299,7 +273,7 @@ def test_graph_pdg_build_survives_oversized_compatibility_export(tmp_path, monke
         app, ["map", "pdg", "build", "--json", "--project-root", str(tmp_path)]
     )
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["ok"] is True
     assert payload["compatibility_export"] == "degraded"
     assert "stub" in payload["compatibility_export_reason"]
@@ -371,3 +345,72 @@ def test_map_liveness_summary_and_if_stale(tmp_path, monkeypatch):
         liveness_unreachable_unreliable=True,
     )
     assert map_cmd._liveness_summary(unreliable) is not None
+
+
+def _kernel_response(items):
+    return {
+        "items": items,
+        "shown": len(items),
+        "hidden": 0,
+        "total": len(items),
+        "truncated": False,
+        "tokens_used": 0,
+        "resolution": "Available",
+    }
+
+
+class _KernelStub:
+    """The kernel seam the CLI query commands now go through.
+
+    `dev map search|explore|affected` used to be stubbed by replacing
+    `CodeIntelQueryEngine`; that class was deleted with the rest of the Python
+    query surface. The payloads here are the kernel's own wire shapes — nested
+    `Response` objects carrying their counters — because that is what the
+    commands read.
+    """
+
+    def __init__(self, tests=("tests/test_a.py",)):
+        self._tests = list(tests)
+
+    def search(self, query, limit=2000, semantic=False):
+        from devcouncil.devmap_client import BudgetedResponse
+
+        items = [{"symbol_name": query, "file_path": "a.py", "kind": "Function",
+                  "span": [1, 1], "score": 0.9}]
+        return BudgetedResponse(
+            shown=1, hidden=0, total=1, truncated=False, tokens_used=0,
+            items=items, resolution="Available",
+        )
+
+    def explore(self, query, limit=20, **_kwargs):
+        return {
+            "query": query,
+            "limit": limit,
+            "definitions": _kernel_response([{
+                "id": "a.py::f",
+                "symbol_name": "f",
+                "qualified_name": "f",
+                "file_path": "a.py",
+                "kind": "Function",
+                "span": [1, 2],
+                "source": "def f():\n  pass",
+                "score": 1.0,
+                "callers": _kernel_response([]),
+                "callees": _kernel_response([{"source_symbol": "a.py::g"}]),
+            }]),
+            "blast_radius": {"seeds": [], "unmatched_targets": [],
+                             "layers": _kernel_response([]), "total_impacted": 0},
+            "budget": {"total": 8000, "definitions": 4000,
+                       "edges_per_direction": 500, "blast_radius": 2000},
+        }
+
+    def affected_tests(self, targets, **_kwargs):
+        rows = [{"path": path, "depth": 1, "symbols": [], "reached_symbols": 0}
+                for path in self._tests]
+        return {
+            "targets": list(targets),
+            "tests": _kernel_response(rows),
+            "blast_radius": {"seeds": [], "unmatched_targets": [],
+                             "layers": _kernel_response([]), "total_impacted": 0},
+        }
+

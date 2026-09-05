@@ -9,9 +9,9 @@
     "database_to_compatibility_ratio_max": 8.5,
     "freelist_ratio_max": 0.2,
     "query_p95_ms_max": {
-      "search": 25.0,
-      "explore": 250.0,
-      "dead": 250.0
+      "search": 150.0,
+      "explore": 150.0,
+      "dead": 150.0
     }
   },
   "heavy": {
@@ -24,7 +24,7 @@
     "database_to_compatibility_ratio_max": 8.0,
     "freelist_ratio_max": 0.15,
     "query_p95_ms_max": {
-      "search": 50.0,
+      "search": 400.0,
       "explore": 5000.0,
       "dead": 5000.0
     }

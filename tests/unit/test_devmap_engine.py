@@ -15,7 +15,10 @@ Two defects found while wiring it, both by measurement rather than review:
 from __future__ import annotations
 
 import json
+import logging
+import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -282,3 +285,135 @@ def test_an_older_kernel_without_the_stamp_flags_still_gets_a_stamped_map(tmp_pa
     payload = json.loads(map_path.read_text())
     for field in ("generated_head", "indexed_hash", "content_fingerprint"):
         assert payload.get(field), f"{field} was not stamped by the fallback"
+
+
+# --- binary selection: schema first, then the optimized build ----------------
+#
+# Measured on this repository while the kernel workspace was being built:
+# `find_engine_binary` returned `rust-port/target/debug/devmap` because a
+# `cargo test` had just written it, and the debug kernel is **5.8x slower** at
+# the same work — `manifest` 6.25 / 6.36 / 6.82 s against 0.54 / 1.10 / 1.79 s
+# for the release build on the same store with the same argv, interleaved. That
+# turned a 0.9 s `dev map` into 8.5 s for anyone who had run the test suite.
+
+
+def _fake_kernel(path: Path, *, schema: int | None) -> Path:
+    """A kernel stand-in that answers both probes `find_engine_binary` makes.
+
+    Real binaries are unusable here: the test needs to control the reported
+    schema and the mtime independently, and a real build reports whatever it
+    was built from.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    schema_line = (
+        f'  printf \'{{"expected_schema_version": {schema}}}\\n\'\n'
+        if schema is not None
+        else "  printf '{}\\n'\n"
+    )
+    path.write_text(
+        "#!/bin/sh\n"
+        "for arg in \"$@\"; do\n"
+        '  [ "$arg" = status ] && is_status=1\n'
+        "done\n"
+        'if [ -n "$is_status" ]; then\n'
+        f"{schema_line}"
+        "  exit 0\n"
+        "fi\n"
+        "echo 'Usage: devmap manifest [OPTIONS] --output <OUTPUT> "
+        "--graph-output <GRAPH_OUTPUT>'\n"
+    )
+    path.chmod(0o755)
+    return path
+
+
+def _only_these_candidates(monkeypatch, tmp_path):
+    """Keep the search to the fixture: no package tree, no PATH."""
+    import shutil as _shutil
+
+    monkeypatch.setattr(devmap_engine, "__file__", str(tmp_path / "elsewhere" / "b" / "c.py"))
+    monkeypatch.setattr(_shutil, "which", lambda _: None)
+    devmap_engine._MANIFEST_HELP_CACHE.clear()
+    # `getattr` so the red demonstration of these tests is the *selection*
+    # failing, not an AttributeError on a cache that did not exist yet.
+    getattr(devmap_engine, "_SCHEMA_PROBE_CACHE", {}).clear()
+    # The debug-kernel warning fires once per selection; without this a test
+    # asserting it would pass or fail on test *order*.
+    getattr(devmap_engine, "_DEBUG_KERNEL_WARNED", set()).clear()
+
+
+def test_an_optimized_build_wins_over_a_newer_debug_build_at_the_same_schema(
+    tmp_path, monkeypatch
+):
+    """Newest-wins picked a 5.8x slower kernel whenever the suite had just run.
+
+    Age was only ever a *proxy* for "was this built after the schema bump".
+    The binary answers that question directly, so the proxy is not needed to
+    settle it — and when the two builds agree on the schema there is nothing
+    left for age to decide except how slow the map is.
+    """
+    root = tmp_path / "repo"
+    release = _fake_kernel(root / "rust-port" / "target" / "release" / "devmap", schema=12)
+    debug = _fake_kernel(root / "rust-port" / "target" / "debug" / "devmap", schema=12)
+    os.utime(release, (1_000_000, 1_000_000))
+    os.utime(debug, (2_000_000, 2_000_000))
+    _only_these_candidates(monkeypatch, tmp_path)
+
+    assert find_engine_binary(root) == str(release)
+
+
+def test_a_newer_schema_still_beats_the_optimized_build(tmp_path, monkeypatch, caplog):
+    """Speed never outranks being able to open the store.
+
+    This is the case the age rule was written for, and it must keep working:
+    a release build made before a schema bump and a debug build made after it
+    both pass the capability probe, because the flags did not change. The
+    difference is now read off the binary instead of inferred from its mtime.
+
+    The warning is part of the contract. Selecting a debug kernel costs ~6x on
+    every `dev map`, and a cost that large must never be paid silently.
+    """
+    root = tmp_path / "repo"
+    release = _fake_kernel(root / "rust-port" / "target" / "release" / "devmap", schema=12)
+    debug = _fake_kernel(root / "rust-port" / "target" / "debug" / "devmap", schema=13)
+    os.utime(release, (2_000_000, 2_000_000))
+    os.utime(debug, (1_000_000, 1_000_000))
+    _only_these_candidates(monkeypatch, tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="devcouncil.devmap_engine"):
+        assert find_engine_binary(root) == str(debug)
+    assert any("debug" in record.message for record in caplog.records), caplog.text
+
+
+def test_with_no_schema_evidence_the_newest_capable_build_still_wins(tmp_path, monkeypatch):
+    """A kernel too old to report its schema degrades to the previous rule.
+
+    Preferring `release` on no evidence would resurrect the exact bug the age
+    rule was added to fix, so the optimized-build preference applies only where
+    the schemas are known *and* equal.
+    """
+    root = tmp_path / "repo"
+    release = _fake_kernel(root / "rust-port" / "target" / "release" / "devmap", schema=None)
+    debug = _fake_kernel(root / "rust-port" / "target" / "debug" / "devmap", schema=None)
+    os.utime(release, (1_000_000, 1_000_000))
+    os.utime(debug, (2_000_000, 2_000_000))
+    _only_these_candidates(monkeypatch, tmp_path)
+
+    assert find_engine_binary(root) == str(debug)
+
+
+def test_the_schema_probe_creates_no_store(tmp_path, monkeypatch):
+    """The probe must be a question, not a side effect.
+
+    `status` against a path with no store reports the schema and exits 0. If it
+    ever started creating one, every candidate probe would leave a stray store
+    behind — and on the real path, would race the build it is selecting for.
+    """
+    root = tmp_path / "repo"
+    _fake_kernel(root / "rust-port" / "target" / "release" / "devmap", schema=12)
+    _only_these_candidates(monkeypatch, tmp_path)
+    before = sorted(p.name for p in Path(tempfile.gettempdir()).glob("devmap-schema-probe-*"))
+
+    find_engine_binary(root)
+
+    after = sorted(p.name for p in Path(tempfile.gettempdir()).glob("devmap-schema-probe-*"))
+    assert after == before

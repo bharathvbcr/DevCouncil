@@ -29,7 +29,7 @@ def test_prompt_json_emits_parseable_envelope(tmp_path):
         ))
     result = runner.invoke(app, ["prompt", "TASK-001", "--json", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["ok"] is True
     assert payload["task_id"] == "TASK-001"
     assert "Build it" in payload["prompt"]
@@ -39,7 +39,7 @@ def test_prompt_json_reports_missing_task(tmp_path):
     _init(tmp_path)
     result = runner.invoke(app, ["prompt", "NOPE", "--json", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["ok"] is False
 
 
@@ -83,5 +83,5 @@ def test_handoff_json_envelope(tmp_path):
         "handoff", "TASK-001", "--from", "codex", "--to", "claude",
         "--json", "--project-root", str(tmp_path),
     ])
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert "ok" in payload and payload["task_id"] == "TASK-001"

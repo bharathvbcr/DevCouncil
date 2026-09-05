@@ -24,7 +24,7 @@ def test_report_json(tmp_path, monkeypatch):
 
     result = runner.invoke(app, ["report", "--json"])
     assert result.exit_code == 0
-    assert json.loads(result.output)["verdict"] == "passed"
+    assert json.loads(result.stdout)["verdict"] == "passed"
 
 
 def test_report_planning_only(tmp_path, monkeypatch):
@@ -124,7 +124,7 @@ def test_report_rigor_json(tmp_path, monkeypatch):
 
     result = runner.invoke(app, ["report", "rigor", "--json"])
     assert result.exit_code == 0
-    json.loads(result.output)
+    json.loads(result.stdout)
 
 
 def test_report_rigor_markdown(tmp_path, monkeypatch):

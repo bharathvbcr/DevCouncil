@@ -256,7 +256,17 @@ pub(crate) fn unwired_candidates(
 struct GraphProvenance {
     duplicate_node_ids_dropped: usize,
     duplicate_edges_dropped: usize,
+    /// Edges with at least one endpoint that names no node.
+    ///
+    /// Counting edges rather than identities is deliberate and is the contract
+    /// the Go consumer decodes (`repomap.go` → `OrphanEndpoints`, "counts edges
+    /// the producer wrote whose endpoints are not nodes"). The key's *name*
+    /// reads as a count of endpoints, and the two differ by more than 2x on
+    /// this repository, so `distinct_edge_endpoints_without_node` carries that
+    /// second number rather than leaving the name to be misread.
     edge_endpoints_without_node: usize,
+    /// Distinct endpoint identities that name no node.
+    distinct_edge_endpoints_without_node: usize,
     files_without_readable_source: usize,
     dead_code_exempt_omitted: usize,
     dead_code_without_node: usize,
@@ -277,13 +287,19 @@ struct GraphProvenance {
 /// generation behind it: a consumer reading `nodes: []` cannot tell an empty
 /// repository from a store that was never built, and every liveness conclusion
 /// drawn from the second is wrong.
-pub fn generate_code_graph_json(
+/// Build the code-graph model once.
+///
+/// Both encodings — the verbose JSON eleven Python consumers read, and the
+/// interned form `encode_compact` produces — are rendered from *this* value.
+/// A second traversal would be a second place for a field to be dropped, and
+/// the two artifacts would then disagree with nothing to notice it.
+fn build_code_graph_value(
     extractions: &[Extraction],
     analysis: &AnalysisSummary,
     edges: &[ResolvedEdge],
     freshness: &FreshnessInfo,
     repo_root: Option<&str>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Value> {
     if freshness.generation_id == 0 {
         anyhow::bail!("code graph unavailable: no committed generation (build a generation first)");
     }
@@ -400,9 +416,20 @@ pub fn generate_code_graph_json(
     provenance.duplicate_edges_dropped = before_dedup - edge_keys.len();
 
     let mut edge_values: Vec<Value> = Vec::with_capacity(edge_keys.len());
+    // Sorted, so the count is a function of the identities and not of edge
+    // order, and so a future emitter can list them without a second pass.
+    let mut missing_endpoints: BTreeSet<&str> = BTreeSet::new();
     for (source, target, kind, confidence) in edge_keys {
-        if !node_index.contains_key(source) || !node_index.contains_key(target) {
+        let source_missing = !node_index.contains_key(source);
+        let target_missing = !node_index.contains_key(target);
+        if source_missing || target_missing {
             provenance.edge_endpoints_without_node += 1;
+        }
+        if source_missing {
+            missing_endpoints.insert(source);
+        }
+        if target_missing {
+            missing_endpoints.insert(target);
         }
         edge_values.push(json!({
             "source": source,
@@ -435,6 +462,8 @@ pub fn generate_code_graph_json(
             .cmp(&right.file_path)
             .then_with(|| left.symbol_name.cmp(&right.symbol_name))
     });
+
+    provenance.distinct_edge_endpoints_without_node = missing_endpoints.len();
 
     let mut dead_code: Vec<Value> = Vec::new();
     let mut dead_seen: BTreeSet<String> = BTreeSet::new();
@@ -572,6 +601,8 @@ pub fn generate_code_graph_json(
                 "duplicate_node_ids_dropped": provenance.duplicate_node_ids_dropped,
                 "duplicate_edges_dropped": provenance.duplicate_edges_dropped,
                 "edge_endpoints_without_node": provenance.edge_endpoints_without_node,
+                "distinct_edge_endpoints_without_node":
+                    provenance.distinct_edge_endpoints_without_node,
                 "files_without_readable_source": provenance.files_without_readable_source,
                 "regex_fallback_files": provenance.regex_fallback_files,
                 "unavailable": unavailable,
@@ -591,7 +622,353 @@ pub fn generate_code_graph_json(
     // Indentation was therefore 23.3% of the file (27.30 MB → 20.94 MB
     // measured) spent on whitespace no reader sees, paid again on every write,
     // every read, and every byte of disk churn the watcher causes.
+    Ok(payload)
+}
+
+/// Verbose encoding: the artifact eleven Python consumers under
+/// `src/devcouncil/` read with `json.load`.
+pub fn generate_code_graph_json(
+    extractions: &[Extraction],
+    analysis: &AnalysisSummary,
+    edges: &[ResolvedEdge],
+    freshness: &FreshnessInfo,
+    repo_root: Option<&str>,
+) -> anyhow::Result<String> {
+    let payload = build_code_graph_value(extractions, analysis, edges, freshness, repo_root)?;
+    // Compact, not pretty — unlike `repo_map.json`, which stays indented.
+    //
+    // The two artifacts have different readers. `repo_map.json` is small
+    // (0.3 MB here) and `CLAUDE.md` tells agents to open it, so its indentation
+    // buys something. This graph is 20.9 MB on DevCouncil and 105 MB on a
+    // 4,300-file repository; nobody reads that by hand, and every one of its
+    // consumers reaches it through `json.load`, which cannot tell the two apart.
     Ok(serde_json::to_string(&payload)?)
+}
+
+/// Both encodings from one traversal.
+///
+/// The verbose form stays canonical for interchange — every existing consumer
+/// reads it, and `DIVERGENCES.md` records which is which. The interned form is
+/// written *beside* it, never instead of it, for readers that pay for the
+/// artifact by the byte.
+///
+/// One entry point rather than two, because two would mean two traversals of
+/// the same model whenever a caller wants both, and the second traversal is
+/// exactly where the two encodings would eventually disagree.
+pub fn generate_code_graph_encodings(
+    extractions: &[Extraction],
+    analysis: &AnalysisSummary,
+    edges: &[ResolvedEdge],
+    freshness: &FreshnessInfo,
+    repo_root: Option<&str>,
+    want_compact: bool,
+) -> anyhow::Result<(String, Option<String>)> {
+    let payload = build_code_graph_value(extractions, analysis, edges, freshness, repo_root)?;
+    let compact = if want_compact {
+        Some(serde_json::to_string(&encode_compact(&payload)?)?)
+    } else {
+        None
+    };
+    Ok((serde_json::to_string(&payload)?, compact))
+}
+
+/// Identity of the interned layout. A decoder written against `v1` must refuse
+/// a later version rather than read it as `v1` and answer from a layout it does
+/// not understand.
+pub const CODE_GRAPH_COMPACT_ENCODING: &str = "devmap-compact-v1";
+
+/// Consumer default path for the interned artifact, beside the verbose one.
+pub const CODE_GRAPH_COMPACT_DEFAULT_OUTPUT: &str = ".devcouncil/graph/code_graph.compact.json";
+
+/// The tables worth interning. Both are arrays of uniformly-shaped objects and
+/// together they are 99.7% of the artifact (measured on DevCouncil: edges
+/// 75.6%, nodes 24.1%); every other key is under 0.25% and is copied verbatim,
+/// because interning it would add decoder surface for no measurable return.
+const COMPACT_TABLES: &[&str] = &["nodes", "edges"];
+
+/// How one column is stored.
+///
+/// `Interned` columns hold an index into the shared string table; `Raw` columns
+/// hold the value itself. The choice is **derived from the data** — a column is
+/// interned only when every row in it is a string — rather than declared from a
+/// field list that could drift out of step with what the emitter produces.
+const COLUMN_INTERNED: &str = "s";
+const COLUMN_RAW: &str = "j";
+
+/// Interned encoding of the same model.
+///
+/// The verbose artifact repeats every symbol identity once per edge endpoint:
+/// on DevCouncil, 14,324 distinct endpoint strings are written 147,726 times,
+/// and `source` + `target` alone are 52.6% of the file. This encoding writes
+/// each distinct string once and refers to it by index.
+///
+/// **What it deliberately does not do is decide anything.** It carries no
+/// field list of its own, drops no key, and applies no filter: a table whose
+/// rows are not uniformly shaped is copied through verbatim and named in
+/// `verbatim_tables`, so a reader is told which tables were interned rather
+/// than having to infer it. `decode_compact` reverses this exactly, and the
+/// round-trip is what the tests assert against a real artifact — a field the
+/// encoder failed to carry cannot pass that check.
+pub fn encode_compact(payload: &Value) -> anyhow::Result<Value> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("code graph payload is not a JSON object"))?;
+
+    // Sorted, not first-seen: the table is then a function of the *set* of
+    // strings and not of the traversal that found them, so two builds of the
+    // same graph are byte-identical even if the emitter's visit order changes
+    // (R4). It is also diffable, which first-seen order is not.
+    let mut pool: BTreeSet<&str> = BTreeSet::new();
+    let mut specs: BTreeMap<&str, Vec<(String, &'static str)>> = BTreeMap::new();
+    let mut verbatim: Vec<&str> = Vec::new();
+
+    for &table in COMPACT_TABLES {
+        let Some(rows) = object.get(table).and_then(Value::as_array) else {
+            // Absent is not malformed: a payload without the key simply has no
+            // such table, and it is neither interned nor listed as skipped.
+            continue;
+        };
+        match column_spec(rows) {
+            Some(spec) => {
+                for row in rows {
+                    let Some(row) = row.as_object() else { continue };
+                    for (name, kind) in &spec {
+                        if *kind == COLUMN_INTERNED {
+                            if let Some(text) = row.get(name).and_then(Value::as_str) {
+                                pool.insert(text);
+                            }
+                        }
+                    }
+                }
+                specs.insert(table, spec);
+            }
+            None => verbatim.push(table),
+        }
+    }
+
+    let strings: Vec<&str> = pool.into_iter().collect();
+    let index: BTreeMap<&str, usize> = strings
+        .iter()
+        .enumerate()
+        .map(|(position, &text)| (text, position))
+        .collect();
+
+    let mut out = Map::new();
+    for (key, value) in object {
+        if let Some(spec) = specs.get(key.as_str()) {
+            let rows = value
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("table {key} stopped being an array"))?;
+            let mut encoded: Vec<Value> = Vec::with_capacity(rows.len());
+            for row in rows {
+                let row = row
+                    .as_object()
+                    .ok_or_else(|| anyhow::anyhow!("row in {key} is not an object"))?;
+                let mut cells: Vec<Value> = Vec::with_capacity(spec.len());
+                for (name, kind) in spec {
+                    let cell = row
+                        .get(name)
+                        .ok_or_else(|| anyhow::anyhow!("row in {key} is missing {name}"))?;
+                    if *kind == COLUMN_INTERNED {
+                        let text = cell.as_str().ok_or_else(|| {
+                            anyhow::anyhow!("{key}.{name} was typed as a string and is not one")
+                        })?;
+                        let position = index.get(text).ok_or_else(|| {
+                            anyhow::anyhow!("{key}.{name} holds a string absent from the pool")
+                        })?;
+                        cells.push(json!(position));
+                    } else {
+                        cells.push(cell.clone());
+                    }
+                }
+                encoded.push(Value::Array(cells));
+            }
+            out.insert(
+                key.clone(),
+                json!({
+                    "fields": spec
+                        .iter()
+                        .map(|(name, kind)| json!([name, kind]))
+                        .collect::<Vec<Value>>(),
+                    "rows": encoded,
+                }),
+            );
+        } else {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+
+    out.insert("encoding".to_string(), json!(CODE_GRAPH_COMPACT_ENCODING));
+    out.insert("strings".to_string(), json!(strings));
+    out.insert(
+        "interned_tables".to_string(),
+        json!(specs.keys().copied().collect::<Vec<&str>>()),
+    );
+    // Named rather than left to inference: a consumer that finds `nodes` shaped
+    // like the verbose artifact needs to know that is the encoder reporting it
+    // could not intern the table, not the encoder having silently changed form.
+    verbatim.sort_unstable();
+    out.insert("verbatim_tables".to_string(), json!(verbatim));
+    Ok(Value::Object(out))
+}
+
+/// Column layout for a table, or `None` when the rows are not uniformly shaped.
+///
+/// Uniformity is required in both directions — same key set, and a column is
+/// interned only when *every* row holds a string there. A single row breaking
+/// either rule sends the whole table through verbatim, which costs bytes and
+/// keeps the artifact readable; guessing per row would make the layout depend
+/// on data the decoder cannot see.
+fn column_spec(rows: &[Value]) -> Option<Vec<(String, &'static str)>> {
+    let first = rows.first()?.as_object()?;
+    let names: Vec<&String> = first.keys().collect();
+    let mut interned = vec![true; names.len()];
+    for row in rows {
+        let row = row.as_object()?;
+        if row.len() != names.len() {
+            return None;
+        }
+        for (position, name) in names.iter().enumerate() {
+            let cell = row.get(name.as_str())?;
+            if !cell.is_string() {
+                interned[position] = false;
+            }
+        }
+    }
+    Some(
+        names
+            .into_iter()
+            .zip(interned)
+            .map(|(name, is_interned)| {
+                (
+                    name.clone(),
+                    if is_interned {
+                        COLUMN_INTERNED
+                    } else {
+                        COLUMN_RAW
+                    },
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Reverse `encode_compact`, or fail saying why.
+///
+/// Every failure here is a refusal rather than a partial answer: a decoder that
+/// returns half a graph when an index is out of range hands its caller a
+/// smaller graph with no signal that it is smaller, and every downstream
+/// "no callers" answer would then be wrong in the confident direction.
+pub fn decode_compact(compact: &Value) -> anyhow::Result<Value> {
+    let object = compact
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("compact code graph is not a JSON object"))?;
+
+    let encoding = object
+        .get("encoding")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("compact code graph carries no `encoding`"))?;
+    if encoding != CODE_GRAPH_COMPACT_ENCODING {
+        anyhow::bail!(
+            "compact code graph is encoded as {encoding}; this decoder reads \
+             {CODE_GRAPH_COMPACT_ENCODING} only"
+        );
+    }
+
+    let strings: Vec<&str> = object
+        .get("strings")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("compact code graph carries no string table"))?
+        .iter()
+        .map(|entry| {
+            entry
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("string table holds a non-string"))
+        })
+        .collect::<anyhow::Result<Vec<&str>>>()?;
+
+    let interned: BTreeSet<&str> = object
+        .get("interned_tables")
+        .and_then(Value::as_array)
+        .map(|names| names.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+
+    let mut out = Map::new();
+    for (key, value) in object {
+        if key == "encoding" || key == "strings" || key == "interned_tables" {
+            continue;
+        }
+        if key == "verbatim_tables" {
+            continue;
+        }
+        if !interned.contains(key.as_str()) {
+            out.insert(key.clone(), value.clone());
+            continue;
+        }
+        let table = value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("interned table {key} is not an object"))?;
+        let fields = table
+            .get("fields")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("interned table {key} carries no field list"))?;
+        let mut spec: Vec<(String, bool)> = Vec::with_capacity(fields.len());
+        for field in fields {
+            let pair = field
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("field spec in {key} is not a pair"))?;
+            let name = pair
+                .first()
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("field spec in {key} has no name"))?;
+            let kind = pair
+                .get(1)
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("field spec in {key} has no storage kind"))?;
+            match kind {
+                COLUMN_INTERNED => spec.push((name.to_string(), true)),
+                COLUMN_RAW => spec.push((name.to_string(), false)),
+                other => anyhow::bail!("field {name} in {key} declares unknown storage {other}"),
+            }
+        }
+        let rows = table
+            .get("rows")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("interned table {key} carries no rows"))?;
+        let mut decoded: Vec<Value> = Vec::with_capacity(rows.len());
+        for (position, row) in rows.iter().enumerate() {
+            let cells = row
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("row {position} of {key} is not an array"))?;
+            if cells.len() != spec.len() {
+                anyhow::bail!(
+                    "row {position} of {key} has {} cells for {} fields",
+                    cells.len(),
+                    spec.len()
+                );
+            }
+            let mut object = Map::new();
+            for ((name, is_interned), cell) in spec.iter().zip(cells) {
+                if *is_interned {
+                    let slot = cell.as_u64().ok_or_else(|| {
+                        anyhow::anyhow!("{key}.{name} in row {position} is not a string index")
+                    })? as usize;
+                    let text = strings.get(slot).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "{key}.{name} in row {position} points at string {slot} of {}",
+                            strings.len()
+                        )
+                    })?;
+                    object.insert(name.clone(), json!(text));
+                } else {
+                    object.insert(name.clone(), cell.clone());
+                }
+            }
+            decoded.push(Value::Object(object));
+        }
+        out.insert(key.clone(), Value::Array(decoded));
+    }
+    Ok(Value::Object(out))
 }
 
 /// Refuse to clobber a Python (or otherwise foreign) `code_graph.json` unless
@@ -1475,5 +1852,351 @@ mod tests {
         for path in [ours, python, no_meta, broken] {
             let _ = std::fs::remove_dir_all(path.parent().unwrap());
         }
+    }
+
+    // ---- G6: interned wire format -------------------------------------------
+    //
+    // Measured on DevCouncil itself before this encoding existed
+    // (1,311 files / 14,488 nodes / 73,863 edges): `code_graph.json` is
+    // 20,899,318 bytes, of which `edges` is 75.6% and `nodes` 24.1%. Inside
+    // `edges`, `source` + `target` alone are 68.3% — 11.0 MB spent writing
+    // 14,324 distinct endpoint strings 147,726 times.
+
+    /// A graph with enough repetition for interning to have something to do.
+    fn compact_fixture() -> (Vec<Extraction>, AnalysisSummary, Vec<ResolvedEdge>) {
+        let extractions = vec![
+            extract_file(
+                "pkg/alpha.py",
+                "def one():\n    two()\n\ndef two():\n    pass\n",
+            ),
+            extract_file(
+                "pkg/beta.py",
+                "def three():\n    one()\n\ndef four():\n    one()\n",
+            ),
+        ];
+        let edges = vec![
+            edge(
+                "pkg/alpha.py::one",
+                "pkg/alpha.py::two",
+                EdgeKind::Calls,
+                Confidence::HIGH,
+            ),
+            edge(
+                "pkg/beta.py::three",
+                "pkg/alpha.py::one",
+                EdgeKind::Calls,
+                Confidence::HIGH,
+            ),
+            edge(
+                "pkg/beta.py::four",
+                "pkg/alpha.py::one",
+                EdgeKind::Calls,
+                Confidence::MEDIUM,
+            ),
+        ];
+        (extractions, empty_analysis(), edges)
+    }
+
+    /// The round trip is the field-completeness proof.
+    ///
+    /// An encoder that drops a key, reorders a row, or loses a type produces a
+    /// decoded value that is no longer equal to the model it came from. Nothing
+    /// weaker would do: asserting on a hand-written list of expected fields
+    /// tests the list, and the list is exactly what would go stale when the
+    /// emitter grows a field.
+    #[test]
+    fn the_interned_encoding_round_trips_to_the_verbose_model_exactly() {
+        let (extractions, analysis, edges) = compact_fixture();
+        let verbose = graph(&extractions, &analysis, &edges);
+        let compact = encode_compact(&verbose).unwrap();
+        let decoded = decode_compact(&compact).unwrap();
+        assert_eq!(
+            decoded, verbose,
+            "the interned encoding must lose nothing; a decoded graph that \
+             differs from its model is a field the encoder failed to carry"
+        );
+    }
+
+    /// Interning must actually pay, and it must pay on the tables that hold the
+    /// bytes. A test that only round-trips would pass on an encoder that
+    /// rewrote the artifact unchanged.
+    #[test]
+    fn the_interned_encoding_is_smaller_and_names_the_tables_it_interned() {
+        let (extractions, analysis, edges) = compact_fixture();
+        let verbose =
+            generate_code_graph_json(&extractions, &analysis, &edges, &freshness(), None).unwrap();
+        let (_, compact) = generate_code_graph_encodings(
+            &extractions,
+            &analysis,
+            &edges,
+            &freshness(),
+            None,
+            true,
+        )
+        .unwrap();
+        let compact = compact.expect("compact was requested");
+        assert!(
+            compact.len() < verbose.len(),
+            "interned {} bytes vs verbose {} bytes",
+            compact.len(),
+            verbose.len()
+        );
+
+        let value: Value = serde_json::from_str(&compact).unwrap();
+        assert_eq!(value["encoding"], json!(CODE_GRAPH_COMPACT_ENCODING));
+        assert_eq!(value["interned_tables"], json!(["edges", "nodes"]));
+        assert_eq!(value["verbatim_tables"], json!([]));
+        // The clobber guard reads `meta.map_engine`; an artifact that lost it
+        // would be indistinguishable from a foreign one.
+        assert_eq!(value["meta"]["map_engine"], json!(CONSUMER_MAP_ENGINE));
+        // Every endpoint string appears once in the pool, not once per edge.
+        let pool = value["strings"].as_array().unwrap();
+        let occurrences = pool
+            .iter()
+            .filter(|entry| entry.as_str() == Some("pkg/alpha.py::one"))
+            .count();
+        assert_eq!(occurrences, 1, "the string table must deduplicate");
+    }
+
+    /// R4: build twice, byte-identical.
+    ///
+    /// The string table is sorted rather than first-seen precisely so this
+    /// holds even if the emitter's visit order changes.
+    #[test]
+    fn the_interned_encoding_is_byte_identical_across_builds() {
+        let (extractions, analysis, edges) = compact_fixture();
+        let first = generate_code_graph_encodings(
+            &extractions,
+            &analysis,
+            &edges,
+            &freshness(),
+            None,
+            true,
+        )
+        .unwrap()
+        .1;
+        let second = generate_code_graph_encodings(
+            &extractions,
+            &analysis,
+            &edges,
+            &freshness(),
+            None,
+            true,
+        )
+        .unwrap()
+        .1;
+        assert_eq!(first, second);
+    }
+
+    /// A table whose rows are not uniformly shaped is copied through rather
+    /// than interned, and the artifact says so.
+    ///
+    /// The alternative — interning per row against a spec taken from the first
+    /// one — writes cells the decoder cannot place, and the failure surfaces as
+    /// a graph with silently missing fields rather than as an error.
+    #[test]
+    fn a_ragged_table_is_carried_verbatim_and_named_rather_than_interned() {
+        let payload = json!({
+            "nodes": [
+                {"id": "a", "kind": "function", "line": 1},
+                {"id": "b", "kind": "function"},
+            ],
+            "edges": [
+                {"source": "a", "target": "b", "kind": "calls"},
+            ],
+            "meta": {"map_engine": CONSUMER_MAP_ENGINE},
+        });
+        let compact = encode_compact(&payload).unwrap();
+        assert_eq!(compact["interned_tables"], json!(["edges"]));
+        assert_eq!(compact["verbatim_tables"], json!(["nodes"]));
+        assert_eq!(compact["nodes"], payload["nodes"]);
+        assert_eq!(decode_compact(&compact).unwrap(), payload);
+    }
+
+    /// Class A at the decoder: a decode that could not run must not look like
+    /// one that ran and found an empty graph.
+    ///
+    /// Each of these was demonstrated red by removing the corresponding guard.
+    #[test]
+    fn the_decoder_refuses_a_damaged_artifact_rather_than_returning_part_of_one() {
+        let (extractions, analysis, edges) = compact_fixture();
+        let verbose = graph(&extractions, &analysis, &edges);
+        let good = encode_compact(&verbose).unwrap();
+
+        let mut wrong_version = good.clone();
+        wrong_version["encoding"] = json!("devmap-compact-v99");
+        let error = decode_compact(&wrong_version).unwrap_err().to_string();
+        assert!(error.contains("devmap-compact-v99"), "{error}");
+
+        let mut no_encoding = good.clone();
+        no_encoding.as_object_mut().unwrap().remove("encoding");
+        assert!(decode_compact(&no_encoding)
+            .unwrap_err()
+            .to_string()
+            .contains("no `encoding`"));
+
+        let mut no_pool = good.clone();
+        no_pool.as_object_mut().unwrap().remove("strings");
+        assert!(decode_compact(&no_pool)
+            .unwrap_err()
+            .to_string()
+            .contains("no string table"));
+
+        // An index one past the end of the pool: the shape a truncated string
+        // table produces, and the one that would otherwise decode to whatever
+        // string happened to sit at a wrapped offset.
+        let mut short_pool = good.clone();
+        let pool_len = short_pool["strings"].as_array().unwrap().len();
+        short_pool["strings"] = json!(Vec::<String>::new());
+        let error = decode_compact(&short_pool).unwrap_err().to_string();
+        assert!(error.contains("points at string"), "{error}");
+        assert!(pool_len > 0);
+
+        // A row with a cell removed: arity is checked against the spec, not
+        // zipped short.
+        let mut ragged = good.clone();
+        ragged["edges"]["rows"][0].as_array_mut().unwrap().pop();
+        let error = decode_compact(&ragged).unwrap_err().to_string();
+        assert!(error.contains("cells for"), "{error}");
+
+        // A storage kind the decoder does not know is a refusal, not a guess.
+        let mut unknown_storage = good;
+        unknown_storage["edges"]["fields"][0] = json!(["source", "z"]);
+        let error = decode_compact(&unknown_storage).unwrap_err().to_string();
+        assert!(error.contains("unknown storage z"), "{error}");
+    }
+
+    /// The ratio is the point, and it has to be measured at a scale where the
+    /// repetition exists.
+    ///
+    /// The small fixture above proves the encoding is *correct*; it proves
+    /// almost nothing about whether it is *worth* anything, because a two-file
+    /// graph has little repetition to collapse. This one builds a graph whose
+    /// edge count dominates its node count — the real shape: DevCouncil is
+    /// 14,488 nodes and 73,863 edges, so every symbol identity is written about
+    /// ten times as an endpoint.
+    ///
+    /// The floor is deliberately well under the measured result. It is a
+    /// regression gate against a column quietly losing its interning, not a
+    /// pinned number that has to be re-tuned whenever the emitter changes.
+    #[test]
+    fn interning_pays_at_the_scale_the_artifact_is_actually_written_at() {
+        const FILES: usize = 60;
+        const FUNCTIONS: usize = 12;
+
+        let mut extractions = Vec::with_capacity(FILES);
+        for file in 0..FILES {
+            let mut source = String::new();
+            for function in 0..FUNCTIONS {
+                source.push_str(&format!(
+                    "def deeply_nested_handler_name_{file}_{function}():\n    pass\n\n"
+                ));
+            }
+            extractions.push(extract_file(
+                &format!("src/subsystem/package/module_with_a_long_path_{file}.py"),
+                &source,
+            ));
+        }
+
+        // Every function calls every function in the next file over: N*M edges
+        // across a fixed identity set, which is what interning collapses.
+        let mut edges = Vec::new();
+        for file in 0..FILES {
+            let next = (file + 1) % FILES;
+            for function in 0..FUNCTIONS {
+                for callee in 0..FUNCTIONS {
+                    edges.push(edge(
+                        &format!(
+                            "src/subsystem/package/module_with_a_long_path_{file}.py::deeply_nested_handler_name_{file}_{function}"
+                        ),
+                        &format!(
+                            "src/subsystem/package/module_with_a_long_path_{next}.py::deeply_nested_handler_name_{next}_{callee}"
+                        ),
+                        EdgeKind::Calls,
+                        Confidence::HIGH,
+                    ));
+                }
+            }
+        }
+
+        let analysis = empty_analysis();
+        let verbose =
+            generate_code_graph_json(&extractions, &analysis, &edges, &freshness(), None).unwrap();
+        let (_, compact) = generate_code_graph_encodings(
+            &extractions,
+            &analysis,
+            &edges,
+            &freshness(),
+            None,
+            true,
+        )
+        .unwrap();
+        let compact = compact.expect("compact was requested");
+
+        let ratio = verbose.len() as f64 / compact.len() as f64;
+        assert!(
+            ratio >= 3.0,
+            "interning recovered only {ratio:.2}x ({} verbose vs {} compact bytes) \
+             over {} nodes and {} edges; a column has probably stopped being interned",
+            verbose.len(),
+            compact.len(),
+            FILES * (FUNCTIONS + 1),
+            edges.len()
+        );
+
+        // Correctness must survive the scale, not just the two-file fixture.
+        let decoded = decode_compact(&serde_json::from_str(&compact).unwrap()).unwrap();
+        let model: Value = serde_json::from_str(&verbose).unwrap();
+        assert_eq!(decoded, model);
+    }
+
+    /// Two counts, because one name cannot honestly carry both.
+    ///
+    /// `edge_endpoints_without_node` counts *edges* with a dangling endpoint —
+    /// the number the Go consumer decodes into `OrphanEndpoints`, documented
+    /// there as "counts edges the producer wrote whose endpoints are not
+    /// nodes". The name reads as a count of *endpoints*, and on this repository
+    /// the two differ by more than 2x: 360 edges reference 167 distinct
+    /// endpoints that have no node. Renaming the key would break the consumer
+    /// that already reads it correctly, so the distinct count travels beside it
+    /// instead and neither number can be mistaken for the other.
+    #[test]
+    fn a_dangling_endpoint_is_counted_once_per_edge_and_once_per_identity() {
+        let extractions = [extract_file("m.py", "def caller(): pass\n")];
+        // Three edges, two distinct absent targets: the arithmetic separates
+        // the two counts, which an equal-count fixture could not.
+        let edges = [
+            edge(
+                "m.py::caller",
+                "m.py::gone",
+                EdgeKind::Calls,
+                Confidence::HIGH,
+            ),
+            edge(
+                "m.py::caller",
+                "m.py::gone",
+                EdgeKind::References,
+                Confidence::HIGH,
+            ),
+            edge(
+                "m.py::caller",
+                "m.py::alsogone",
+                EdgeKind::Calls,
+                Confidence::HIGH,
+            ),
+        ];
+        let value = graph(&extractions, &empty_analysis(), &edges);
+        let provenance = &value["meta"]["devmap_rust"];
+
+        assert_eq!(
+            provenance["edge_endpoints_without_node"],
+            json!(3),
+            "the existing key counts edges, and the Go consumer depends on that"
+        );
+        assert_eq!(
+            provenance["distinct_edge_endpoints_without_node"],
+            json!(2),
+            "the number the key's name reads as must be carried too"
+        );
     }
 }

@@ -8,6 +8,18 @@ impl Budget {
     pub const DEPS: u32 = 2000;
     pub const DEAD: u32 = 2000;
     pub const MANIFEST: u32 = 2000;
+    /// `explore` is four answers in one — ranked definitions with their source,
+    /// both call-graph directions per definition, and a layered blast radius —
+    /// and every one of them is paid for out of this single number (see
+    /// [`ExploreBudget`]). At the 2000 the single-answer surfaces use, the
+    /// definition list alone consumes the whole allowance on a repository with
+    /// ordinary function bodies and the edge lists come back empty-but-counted.
+    /// Four times that keeps a five-definition answer readable while staying
+    /// far under the daemon's 100,000 ceiling.
+    pub const EXPLORE: u32 = 8000;
+    /// `affected` returns one row per test file plus its blast radius; the rows
+    /// are small, so the single-answer default is the right size.
+    pub const AFFECTED: u32 = 2000;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,6 +259,138 @@ pub struct SymbolHit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_span_omitted_bytes: Option<u32>,
     pub score: f32,
+}
+
+/// One distance band of an inbound blast radius.
+///
+/// `nodes` is what the walk reached at exactly this depth; `node_count` is how
+/// many it reached, which stays exact even when the band's list was trimmed to
+/// fit the budget. `lowest_confidence` is the weakest edge that reached
+/// anything in the band — a blast radius held together by name-only
+/// attribution should not read like one built from resolved calls.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlastLayer {
+    pub depth: usize,
+    pub nodes: Vec<String>,
+    /// Nodes first reached at this depth, before any per-layer trimming.
+    pub node_count: u32,
+    /// Nodes omitted from `nodes` by the per-layer cap. Zero means the list is
+    /// the whole band.
+    #[serde(default)]
+    pub nodes_omitted: u32,
+    /// Weakest confidence among the edges that reached this band. `None` when
+    /// the band is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lowest_confidence: Option<f32>,
+}
+
+/// What an inbound walk from a set of seeds reaches, banded by distance.
+///
+/// Distance is the point of the shape: "42 symbols are affected" is far less
+/// useful than "3 call it directly and 39 are reached through those 3". The
+/// kernel's [`crate::StoreQueryEngine::impact`] answers reachability as a flat
+/// edge list; this answers *how far*, which is what a blast radius is for.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlastRadius {
+    /// Node ids the walk started from, after matching the caller's targets
+    /// against the graph.
+    pub seeds: Vec<String>,
+    /// Targets that matched no traversal start. Carried rather than dropped:
+    /// a blast radius computed from two of three targets must never read as
+    /// one computed from all three.
+    #[serde(default)]
+    pub unmatched_targets: Vec<String>,
+    pub layers: Response<BlastLayer>,
+    /// Distinct nodes reached, excluding the seeds themselves.
+    pub total_impacted: u32,
+}
+
+/// One matched definition, with its source and both call-graph directions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExploreDefinition {
+    /// `file::symbol`, the identity every other devmap surface uses.
+    pub id: String,
+    pub symbol_name: String,
+    pub qualified_name: String,
+    pub file_path: String,
+    pub kind: String,
+    /// Language recorded for the file in this generation. `None` means the
+    /// generation holds no row for it — "not recorded", never "no language".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// 1-based inclusive line range, or `(0, 0)` when the source could not be
+    /// read — in which case `source_unavailable_reason` says why.
+    pub span: (u32, u32),
+    pub source: String,
+    /// Set when the file behind this definition could not be read at query
+    /// time. An empty `source` with no reason means the symbol's span is
+    /// genuinely empty; an empty `source` *with* a reason means nothing was
+    /// examined. Those are different answers and must not share a shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_unavailable_reason: Option<String>,
+    /// Bytes of the symbol's source omitted to fit the budget. Absent means
+    /// `source` is the whole span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_omitted_bytes: Option<u32>,
+    pub score: f32,
+    /// Inbound edges. A whole [`Response`], so `total` stays exact even when
+    /// the budget bought no items — "0 shown of 42" is not "no callers".
+    pub callers: Response<ResolvedEdge>,
+    /// Outbound edges, on the same terms.
+    pub callees: Response<ResolvedEdge>,
+}
+
+/// How one caller-supplied token budget was divided across `explore`'s parts.
+///
+/// Published rather than implied. `explore` returns four things and a single
+/// `tokens_used` on the definition list would describe only one of them; a
+/// reader who cannot see the split cannot tell a thin edge list caused by the
+/// graph from one caused by the allowance.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ExploreBudget {
+    /// What the caller asked for.
+    pub total: u32,
+    /// Share spent packing definitions and their source spans.
+    pub definitions: u32,
+    /// Share each caller/callee list of each returned definition may spend.
+    pub edges_per_direction: u32,
+    /// Share spent on the blast radius layers.
+    pub blast_radius: u32,
+}
+
+/// Definitions matching a query, their neighbourhoods, and their blast radius.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExploreReport {
+    pub query: String,
+    /// Ranked before truncation, and `total` is the measured match count for
+    /// the whole index — not the size of the page the budget could show.
+    pub definitions: Response<ExploreDefinition>,
+    /// Cap the caller asked for, echoed so a short list is attributable.
+    pub limit: u32,
+    pub blast_radius: BlastRadius,
+    pub budget: ExploreBudget,
+}
+
+/// A test file the inbound walk reached, and how far away it was.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AffectedTest {
+    pub path: String,
+    /// Shortest distance from any seed to a symbol in this file. `0` means the
+    /// target itself lives in a test file.
+    pub depth: usize,
+    /// Symbols in this file the walk reached. Bounded; `reached_symbols` is the
+    /// exact count.
+    pub symbols: Vec<String>,
+    pub reached_symbols: u32,
+}
+
+/// Test files reachable through the inbound blast radius of some targets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AffectedTestsReport {
+    pub targets: Vec<String>,
+    /// Ranked nearest-first, then by path, before truncation.
+    pub tests: Response<AffectedTest>,
+    pub blast_radius: BlastRadius,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

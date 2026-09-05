@@ -40,7 +40,7 @@ def test_ast_cli_outputs_matches(tmp_path):
     result = runner.invoke(app, ["ast", "match", "target", "--project-root", str(tmp_path)])
 
     assert result.exit_code == 0
-    assert json.loads(result.output)["matches"][0]["name"] == "target_symbol"
+    assert json.loads(result.stdout)["matches"][0]["name"] == "target_symbol"
 
 
 def test_ast_cli_clamps_zero_limit(tmp_path):
@@ -53,7 +53,7 @@ def test_ast_cli_clamps_zero_limit(tmp_path):
     result = runner.invoke(app, ["ast", "match", "target", "--limit", "0", "--project-root", str(tmp_path)])
 
     assert result.exit_code == 0
-    assert json.loads(result.output)["matches"][0]["name"] == "target_symbol"
+    assert json.loads(result.stdout)["matches"][0]["name"] == "target_symbol"
 
 
 def test_lsp_cli_reports_missing_project_root(tmp_path):

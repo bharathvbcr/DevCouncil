@@ -103,24 +103,41 @@ pub struct TraversalResult {
     pub stop: TraversalStop,
 }
 
+/// Bytes of the input graph this walk is allowed to copy.
+///
+/// Zero, and that is the point. The adjacency index borrows every edge instead
+/// of cloning it, so the only owned strings a walk allocates are for the nodes
+/// and edges it actually **reports** — a set bounded by `max_nodes`. Before
+/// this, `adj` held `Vec<ResolvedEdge>` and every edge was deep-cloned (four
+/// `String`s each) before `max_nodes` was consulted at all: a 1,000-node
+/// question over DevCouncil's ~944,000-edge graph copied the whole graph first.
+///
+/// One thing this does **not** fix: the index is still built once per call, so
+/// a single walk is still O(edges) in time no matter how small its caps. That
+/// is inherent to being handed an unindexed slice — you cannot know what is
+/// adjacent to a node without looking at every edge — and removing it means
+/// keeping an index across queries, which is a decision for the caller that
+/// owns the query loop, not for this function.
 pub fn traverse_graph(
     start_nodes: &[String],
     edges: &[ResolvedEdge],
     opts: &TraversalOptions,
 ) -> TraversalResult {
-    let mut adj: BTreeMap<String, Vec<ResolvedEdge>> = BTreeMap::new();
+    // Borrowed keys and borrowed edges. `edges` and `start_nodes` outlive the
+    // walk, so nothing here needs to own a copy of a name it did not create.
+    let mut adj: BTreeMap<&str, Vec<&ResolvedEdge>> = BTreeMap::new();
     for edge in edges {
-        let key = if opts.reverse {
-            edge.target_symbol.clone()
+        let key: &str = if opts.reverse {
+            &edge.target_symbol
         } else {
-            edge.source_symbol.clone()
+            &edge.source_symbol
         };
-        adj.entry(key).or_default().push(edge.clone());
+        adj.entry(key).or_default().push(edge);
     }
 
-    let mut visited: BTreeSet<String> = BTreeSet::new();
-    let mut enqueued: BTreeSet<String> = BTreeSet::new(); // G21: Separate enqueued tracking
-    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+    let mut visited: BTreeSet<&str> = BTreeSet::new();
+    let mut enqueued: BTreeSet<&str> = BTreeSet::new(); // G21: Separate enqueued tracking
+    let mut queue: VecDeque<(&str, usize)> = VecDeque::new();
     let mut traversed_edges = Vec::new();
     let mut max_depth_reached = 0;
     let mut stop = TraversalStop {
@@ -129,13 +146,13 @@ pub fn traverse_graph(
     };
 
     for start in start_nodes.iter().take(opts.max_nodes) {
-        if enqueued.insert(start.clone()) {
-            queue.push_back((start.clone(), 0));
+        if enqueued.insert(start.as_str()) {
+            queue.push_back((start.as_str(), 0));
         }
     }
 
     while let Some((curr, depth)) = queue.pop_front() {
-        if !visited.insert(curr.clone()) {
+        if !visited.insert(curr) {
             continue;
         }
         max_depth_reached = max_depth_reached.max(depth);
@@ -143,7 +160,7 @@ pub fn traverse_graph(
             // Only a prune that actually cost the walk an expansion is a
             // decline. A node with no outgoing edges is fully explored, and
             // counting it would make every bounded walk call itself partial.
-            if adj.contains_key(&curr) {
+            if adj.contains_key(curr) {
                 if depth >= opts.max_depth {
                     stop.depth_capped = true;
                 }
@@ -154,8 +171,13 @@ pub fn traverse_graph(
             continue;
         }
 
-        if let Some(neighbors) = adj.get(&curr) {
-            // Priority ordering: contains -> calls -> rest
+        if let Some(neighbors) = adj.get(curr) {
+            // Priority ordering: contains -> calls -> rest.
+            //
+            // Cloned because the sort must not disturb the shared index, but
+            // this is now a vector of pointers rather than of edges — a node
+            // with 100,000 inbound edges copies 800 KB of pointers, not 20 MB
+            // of re-allocated strings.
             let mut sorted_neighbors = neighbors.clone();
             sorted_neighbors.sort_by(|a, b| {
                 let priority = |edge: &ResolvedEdge| match edge.edge_kind {
@@ -194,7 +216,7 @@ pub fn traverse_graph(
                 // turns `impact Type.method` into "every importer of this
                 // package" — the ScholarLM `segment` flood.
                 if opts.reverse
-                    && is_symbol_node(&curr)
+                    && is_symbol_node(curr)
                     && matches!(
                         edge.edge_kind,
                         devmap_extract::model::EdgeKind::Imports
@@ -203,34 +225,34 @@ pub fn traverse_graph(
                 {
                     continue;
                 }
-                let next_node = if opts.reverse {
-                    edge.source_symbol.clone()
+                let next_node: &str = if opts.reverse {
+                    &edge.source_symbol
                 } else {
-                    edge.target_symbol.clone()
+                    &edge.target_symbol
                 };
 
-                if !enqueued.contains(&next_node) && enqueued.len() >= opts.max_nodes {
+                if !enqueued.contains(next_node) && enqueued.len() >= opts.max_nodes {
                     stop.node_capped = true;
                     continue;
                 }
 
-                let edge_id = EdgeIdentity {
-                    source: edge.source_symbol.clone(),
-                    target: edge.target_symbol.clone(),
-                    edge_kind: format!("{:?}", edge.edge_kind),
-                    line: 0,
-                    col: 0,
-                };
                 if traversed_edges.len() < opts.max_nodes.saturating_sub(1) {
-                    traversed_edges.push(edge_id);
+                    // The only place the walk allocates from edge text, and it
+                    // is bounded by `max_nodes` rather than by the graph.
+                    traversed_edges.push(EdgeIdentity {
+                        source: edge.source_symbol.clone(),
+                        target: edge.target_symbol.clone(),
+                        edge_kind: format!("{:?}", edge.edge_kind),
+                        line: 0,
+                        col: 0,
+                    });
                 } else {
                     // Walked, but never reported: without this counter the edge
                     // is simply absent from `total`.
                     stop.edges_unrecorded += 1;
                 }
 
-                if !enqueued.contains(&next_node) {
-                    enqueued.insert(next_node.clone());
+                if enqueued.insert(next_node) {
                     queue.push_back((next_node, depth + 1));
                 }
             }
@@ -239,7 +261,7 @@ pub fn traverse_graph(
 
     TraversalResult {
         stop,
-        visited_nodes: visited,
+        visited_nodes: visited.into_iter().map(str::to_string).collect(),
         traversed_edges,
         max_depth_reached,
     }

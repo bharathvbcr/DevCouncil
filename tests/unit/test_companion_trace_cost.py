@@ -81,7 +81,7 @@ def test_trace_tail_json_emits_events_and_next_cursor(tmp_path, monkeypatch):
 
     result = runner.invoke(app, ["trace", "tail", "--json"])
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert "events" in payload and "next_cursor" in payload
     assert payload["events"][0]["type"] == "e1"
     assert payload["events"][0]["task_id"] == "T1"
@@ -90,14 +90,14 @@ def test_trace_tail_json_emits_events_and_next_cursor(tmp_path, monkeypatch):
     # Re-poll with --since <cursor>: only-new (none yet).
     result = runner.invoke(app, ["trace", "tail", "--json", "--since", str(cursor)])
     assert result.exit_code == 0
-    payload2 = json.loads(result.output)
+    payload2 = json.loads(result.stdout)
     assert payload2["events"] == []
     assert payload2["next_cursor"] == cursor
 
     # Append and poll again — only the new event.
     TraceLogger(tmp_path).log_event("e2", {}, task_id="T2")
     result = runner.invoke(app, ["trace", "tail", "--json", "--since", str(cursor)])
-    payload3 = json.loads(result.output)
+    payload3 = json.loads(result.stdout)
     assert [e["type"] for e in payload3["events"]] == ["e2"]
 
 

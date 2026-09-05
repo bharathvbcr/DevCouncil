@@ -107,7 +107,18 @@ func TestAHungBinaryFailsFastWithinTheCooldown(t *testing.T) {
 		"#!/bin/sh\nprintf '%s\\n' \"$@\" >> "+argvLog+"\nprintf '\\036\\n' >> "+argvLog+"\n"+
 			"case \" $* \" in *\" --help \"*) sleep 60;; esac\necho '{}'\n")
 	c := New(bin, dir)
-	c.probeTimeout = 150 * time.Millisecond
+	// Two seconds, not 150ms. The assertion below counts lines the *child*
+	// writes before it hangs, and at 150ms the probe's own kill raced the
+	// operating system's ability to fork /bin/sh and reach the first printf:
+	// under `go test ./... -race`, where all seven packages spawn processes at
+	// once, the child was killed before it recorded anything and the count came
+	// back 0. Isolated, it passed 10 times out of 10 — which is exactly the
+	// shape of a test that is green until CI is busy.
+	//
+	// Nothing this test asserts is weakened by the larger bound: "the probe was
+	// bounded at all" is checked against 5s below, and the fail-fast assertion
+	// (50ms) never execs, because the cooldown short-circuits before it.
+	c.probeTimeout = 2 * time.Second
 
 	start := time.Now()
 	err := c.Probe(context.Background())

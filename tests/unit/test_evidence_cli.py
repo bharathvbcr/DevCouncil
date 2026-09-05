@@ -57,7 +57,7 @@ def test_evidence_suggest_reports_matching_test_with_high_confidence(tmp_path):
     result = runner.invoke(app, ["evidence", "suggest", "TASK-001", "--project-root", str(tmp_path)])
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["task_id"] == "TASK-001"
     commands = {item["command"]: item for item in payload["suggestions"]}
     assert "pytest tests/test_app.py" in commands
@@ -75,7 +75,7 @@ def test_evidence_suggest_apply_appends_high_confidence_tests(tmp_path):
     )
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert "pytest tests/test_app.py" in payload["expected_tests"]
     with db.get_session() as session:
         task = TaskRepository(session).get_by_id("TASK-001")

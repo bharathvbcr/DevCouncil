@@ -465,6 +465,31 @@ fn merge_definitions(
     }
 }
 
+/// Deepest statement nesting this builder will walk.
+///
+/// `validate_statements` and `PdgBuilder::build_sequence` each recurse once per
+/// nesting level, and `FunctionPdgInput` derives `Deserialize` — so the tree is
+/// caller-supplied data with nothing between it and the recursion. Measured
+/// before this bound existed: a 200,000-deep `Loop` chain produced
+/// `thread has overflowed its stack / fatal runtime error: stack overflow,
+/// aborting` and a `SIGABRT`. That is not an error a `Result`-returning
+/// function may produce: it takes down every other request in the process.
+///
+/// 256 is far above anything a grammar produces from real source — human and
+/// generated code alike nest in the low tens — and far below the thousands of
+/// frames the stack can hold, so it separates hostile input from deep code
+/// rather than sitting between them. It is also twice `serde_json`'s own
+/// default recursion limit of 128, so no tree this crate can be handed as JSON
+/// is refused by it.
+///
+/// **Enforced before the crate recurses, not during.** `validate_statements`
+/// runs to completion before `PdgBuilder` is constructed, so one check covers
+/// both recursive walks. Note that a caller which has *already built* a tree
+/// far deeper than this still owns a value whose derived `Drop` is recursive;
+/// that hazard belongs to the caller's own structure and is not something this
+/// entry point can take back.
+pub const MAX_PDG_NESTING_DEPTH: usize = 256;
+
 pub fn build_function_pdg(input: &FunctionPdgInput) -> anyhow::Result<FunctionPdg> {
     if input.function_name.trim().is_empty() {
         anyhow::bail!("PDG function name must not be empty");
@@ -478,7 +503,7 @@ pub fn build_function_pdg(input: &FunctionPdgInput) -> anyhow::Result<FunctionPd
             anyhow::bail!("PDG parameter names must be unique and non-empty");
         }
     }
-    validate_statements(&input.body, input.start_line, input.end_line)?;
+    validate_statements(&input.body, input.start_line, input.end_line, 0)?;
     Ok(PdgBuilder::new(input).finish())
 }
 
@@ -486,7 +511,15 @@ fn validate_statements(
     statements: &[PdgStatement],
     start_line: u32,
     end_line: u32,
+    depth: usize,
 ) -> anyhow::Result<()> {
+    // Checked on entry rather than before each recursive call, so every arm
+    // below is covered by one statement instead of five that can drift apart.
+    if depth > MAX_PDG_NESTING_DEPTH {
+        anyhow::bail!(
+            "PDG statement nesting exceeds {MAX_PDG_NESTING_DEPTH} levels; the              control-flow walk recurses once per level and would overflow the              stack"
+        );
+    }
     for statement in statements {
         if !(start_line..=end_line).contains(&statement.line) {
             anyhow::bail!(
@@ -516,22 +549,22 @@ fn validate_statements(
                 then_body,
                 else_body,
             } => {
-                validate_statements(then_body, start_line, end_line)?;
-                validate_statements(else_body, start_line, end_line)?;
+                validate_statements(then_body, start_line, end_line, depth + 1)?;
+                validate_statements(else_body, start_line, end_line, depth + 1)?;
             }
             PdgStatementKind::Loop { body } => {
-                validate_statements(body, start_line, end_line)?;
+                validate_statements(body, start_line, end_line, depth + 1)?;
             }
             PdgStatementKind::Try {
                 body,
                 handlers,
                 finally_body,
             } => {
-                validate_statements(body, start_line, end_line)?;
+                validate_statements(body, start_line, end_line, depth + 1)?;
                 for handler in handlers {
-                    validate_statements(handler, start_line, end_line)?;
+                    validate_statements(handler, start_line, end_line, depth + 1)?;
                 }
-                validate_statements(finally_body, start_line, end_line)?;
+                validate_statements(finally_body, start_line, end_line, depth + 1)?;
             }
             PdgStatementKind::Basic | PdgStatementKind::Return | PdgStatementKind::Raise => {}
         }

@@ -9,7 +9,7 @@ use tracing_subscriber::FmtSubscriber;
 use devmap_analyze::analyze;
 use devmap_extract::collect_go_modules;
 use devmap_query::{
-    generate_code_graph_json, generate_manifest_with_edges, resolve_manifest_output,
+    generate_code_graph_encodings, generate_manifest_with_edges, resolve_manifest_output,
     resolved_edge_from_stored, semantic_snapshots, write_code_graph_atomically,
     write_manifest_atomically, FreshnessInfo, Request, ResolutionAvailability, StampedFreshness,
     StoreQueryEngine, CODE_GRAPH_DEFAULT_OUTPUT,
@@ -65,7 +65,7 @@ fn non_empty(value: &Option<String>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// `devmap 0.1.0 (schema 12)` — package identity plus store compatibility.
+/// `devmap 0.1.0 (schema 13)` — package identity plus store compatibility.
 ///
 /// K3: every build of this workspace reports `devmap 0.1.0`, so the package
 /// version alone cannot tell a caller whether the binary in hand can open the
@@ -413,6 +413,41 @@ enum Commands {
         #[arg(short, long, default_value_t = 2000)]
         budget: u32,
     },
+    /// Definitions matching a query, with source, callers, callees and a
+    /// layered blast radius — the whole neighbourhood in one invocation.
+    ///
+    /// Replaces the Python `CodeIntelQueryEngine.explore`, which loaded the
+    /// entire graph into process memory to answer. The budget is divided across
+    /// the four parts and the division is reported in `budget`, so a thin edge
+    /// list is attributable to the allowance rather than mistaken for a symbol
+    /// nothing calls.
+    Explore {
+        query: String,
+        /// Definitions to consider. The budget decides how many are packed;
+        /// both numbers are reported.
+        #[arg(short, long, default_value_t = 20)]
+        limit: usize,
+        #[arg(short, long, default_value_t = devmap_query::Budget::EXPLORE)]
+        budget: u32,
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
+        #[arg(long, default_value_t = 0.0)]
+        min_confidence: f32,
+    },
+    /// Test files reachable through the inbound blast radius of some targets.
+    ///
+    /// Ranked nearest-first: a budget-trimmed list keeps the tests closest to
+    /// the change. Targets that match nothing are named rather than dropped.
+    Affected {
+        #[arg(required = true, num_args = 1..)]
+        targets: Vec<String>,
+        #[arg(short, long, default_value_t = devmap_query::Budget::AFFECTED)]
+        budget: u32,
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
+        #[arg(long, default_value_t = 0.0)]
+        min_confidence: f32,
+    },
     /// Ask what an unsaved edit would do to the graph, without writing it.
     ///
     /// Reads the candidate content from `--content` (a file, or `-` for stdin)
@@ -488,6 +523,23 @@ enum Commands {
         /// Symbol-level graph companion artifact.
         #[arg(long, default_value = CODE_GRAPH_DEFAULT_OUTPUT)]
         graph_output: PathBuf,
+        /// Also write the interned encoding of the same graph here.
+        ///
+        /// Opt-in and additive: the verbose artifact above stays canonical and
+        /// is written either way, because every existing consumer reads it.
+        /// This form carries the identical model with each distinct string
+        /// written once and referred to by index — on this repository
+        /// 20,899,318 B becomes 4,951,872 B (-76.3%), `json.loads` 103.2 ms
+        /// becomes 49.5 ms, write+fsync 10.7 ms becomes 4.2 ms. `source` and
+        /// `target` alone were 52.6% of the verbose file: 14,324 distinct
+        /// endpoint strings written 147,726 times.
+        ///
+        /// It does **not** make the graph readable by an agent — 5.2M tokens
+        /// becomes 1.2M, which is still unopenable. It buys bytes, parse time
+        /// and disk churn. Use `devmap search` / `impact` / `trace` to read the
+        /// graph.
+        #[arg(long)]
+        compact_graph_output: Option<PathBuf>,
         /// Replace a Python-schema or otherwise foreign repo map / code graph.
         #[arg(long, default_value_t = false)]
         force: bool,
@@ -659,6 +711,132 @@ fn emit_edges(resp: &devmap_query::Response<devmap_resolve::ResolvedEdge>) {
     if let Some(reason) = &resp.walk_incomplete {
         println!("warning: {reason}");
     }
+}
+
+fn emit_blast_radius(radius: &devmap_query::BlastRadius) {
+    if !radius.unmatched_targets.is_empty() {
+        println!(
+            "warning: no indexed traversal start for: {}",
+            radius.unmatched_targets.join(", ")
+        );
+    }
+    if let ResolutionAvailability::Unavailable { reason } = &radius.layers.resolution {
+        emit_unavailable(reason);
+        return;
+    }
+    println!("blast radius: {} impacted", radius.total_impacted);
+    for layer in &radius.layers.items {
+        let confidence = layer
+            .lowest_confidence
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "  depth {}: {} nodes (lowest confidence {confidence}){}",
+            layer.depth,
+            layer.node_count,
+            if layer.nodes_omitted > 0 {
+                format!(", {} not listed", layer.nodes_omitted)
+            } else {
+                String::new()
+            }
+        );
+        for node in &layer.nodes {
+            println!("    {node}");
+        }
+    }
+    emit_truncation(
+        radius.layers.shown,
+        radius.layers.hidden,
+        radius.layers.total,
+        radius.layers.truncated,
+    );
+    if let Some(reason) = &radius.layers.walk_incomplete {
+        println!("warning: {reason}");
+    }
+}
+
+fn emit_explore(report: &devmap_query::ExploreReport) {
+    if let ResolutionAvailability::Unavailable { reason } = &report.definitions.resolution {
+        emit_unavailable(reason);
+        return;
+    }
+    for definition in &report.definitions.items {
+        println!(
+            "{}:{}-{}  {}  {}",
+            definition.file_path,
+            definition.span.0,
+            definition.span.1,
+            definition.kind,
+            definition.id
+        );
+        // Class A: an unreadable file is reported as unread, never as a symbol
+        // whose body happens to be empty.
+        match &definition.source_unavailable_reason {
+            Some(reason) => println!("  source unavailable: {reason}"),
+            None => {
+                for line in definition.source.lines() {
+                    println!("  {line}");
+                }
+                if let Some(omitted) = definition.source_omitted_bytes {
+                    println!("  ... {omitted} bytes omitted to fit the budget");
+                }
+            }
+        }
+        println!(
+            "  callers: {} of {}{}   callees: {} of {}{}",
+            definition.callers.shown,
+            definition.callers.total,
+            if definition.callers.truncated {
+                " (truncated)"
+            } else {
+                ""
+            },
+            definition.callees.shown,
+            definition.callees.total,
+            if definition.callees.truncated {
+                " (truncated)"
+            } else {
+                ""
+            },
+        );
+    }
+    emit_truncation(
+        report.definitions.shown,
+        report.definitions.hidden,
+        report.definitions.total,
+        report.definitions.truncated,
+    );
+    println!(
+        "budget: {} total = {} definitions + {} per edge direction + {} blast radius",
+        report.budget.total,
+        report.budget.definitions,
+        report.budget.edges_per_direction,
+        report.budget.blast_radius
+    );
+    emit_blast_radius(&report.blast_radius);
+}
+
+fn emit_affected(report: &devmap_query::AffectedTestsReport) {
+    if let ResolutionAvailability::Unavailable { reason } = &report.tests.resolution {
+        emit_unavailable(reason);
+        return;
+    }
+    for test in &report.tests.items {
+        println!(
+            "{}  depth {}  {} reached symbol(s)",
+            test.path, test.depth, test.reached_symbols
+        );
+    }
+    emit_truncation(
+        report.tests.shown,
+        report.tests.hidden,
+        report.tests.total,
+        report.tests.truncated,
+    );
+    if let Some(reason) = &report.tests.walk_incomplete {
+        println!("warning: {reason}");
+    }
+    emit_blast_radius(&report.blast_radius);
 }
 
 fn emit_dead(resp: &devmap_query::Response<devmap_analyze::DeadSymbolReport>) {
@@ -1507,6 +1685,46 @@ async fn main() -> anyhow::Result<()> {
                 emit_dead(&payload);
             }
         }
+        Commands::Explore {
+            query,
+            limit,
+            budget,
+            depth,
+            min_confidence,
+        } => {
+            let store = open_for_read(&cli.db)?;
+            let report = StoreQueryEngine::new(&store).explore(
+                query,
+                *limit,
+                *budget,
+                *min_confidence,
+                *depth,
+            )?;
+            if cli.json {
+                emit_json(&cli, &serde_json::to_value(&report)?)?;
+            } else {
+                emit_explore(&report);
+            }
+        }
+        Commands::Affected {
+            targets,
+            budget,
+            depth,
+            min_confidence,
+        } => {
+            let store = open_for_read(&cli.db)?;
+            let report = StoreQueryEngine::new(&store).affected_tests(
+                targets,
+                *budget,
+                *min_confidence,
+                *depth,
+            )?;
+            if cli.json {
+                emit_json(&cli, &serde_json::to_value(&report)?)?;
+            } else {
+                emit_affected(&report);
+            }
+        }
         Commands::Workspace { action } => {
             // Rooted at the store's repository, so `devmap --db X workspace` and
             // `dev map workspace` agree on where the registry lives.
@@ -1751,6 +1969,7 @@ async fn main() -> anyhow::Result<()> {
             path,
             output,
             graph_output,
+            compact_graph_output,
             force,
             generated_head,
             indexed_hash,
@@ -1797,12 +2016,13 @@ async fn main() -> anyhow::Result<()> {
                     .ok()
                     .map(|root| root.to_string_lossy().into_owned())
             });
-            let graph_json = generate_code_graph_json(
+            let (graph_json, compact_graph_json) = generate_code_graph_encodings(
                 &extractions,
                 &analysis,
                 &edges,
                 &freshness,
                 repo_root.as_deref(),
+                compact_graph_output.is_some(),
             )?;
 
             let dest = resolve_manifest_output(repo_root.as_deref(), output);
@@ -1813,15 +2033,35 @@ async fn main() -> anyhow::Result<()> {
             ensure_parent(&graph_dest)?;
             write_code_graph_atomically(&graph_dest, &graph_json, *force)?;
 
+            // Written through the same clobber guard as the verbose artifact.
+            // A foreign file at this path is refused for the same reason: the
+            // guard's question is "did this kernel write what is already here",
+            // and the answer does not depend on the encoding.
+            let compact_dest = match (compact_graph_output, &compact_graph_json) {
+                (Some(destination), Some(json)) => {
+                    let destination = resolve_manifest_output(repo_root.as_deref(), destination);
+                    ensure_parent(&destination)?;
+                    write_code_graph_atomically(&destination, json, *force)?;
+                    Some(destination)
+                }
+                _ => None,
+            };
+
             if !cli.json {
                 println!("Manifest written to {:?}", dest);
                 println!("Code graph written to {:?}", graph_dest);
+                if let Some(destination) = &compact_dest {
+                    println!("Interned code graph written to {:?}", destination);
+                }
             } else {
                 emit_json(
                     &cli,
                     &serde_json::json!({
                         "output": dest,
                         "graph_output": graph_dest,
+                        // Absent, not empty, when no interned artifact was
+                        // asked for: `""` would read as a path that failed.
+                        "compact_graph_output": compact_dest,
                         "generation_id": gen_id,
                     }),
                 )?;

@@ -638,7 +638,17 @@ var errCapped = errors.New("output exceeded its bound")
 
 func (c *capped) Write(p []byte) (int, error) {
 	room := c.limit - c.buf.Len()
-	if room > len(p) {
+	// `>=`, and the equality is the whole of it. A write that exactly fills the
+	// remaining room loses nothing, and the test was `>`: a stream of precisely
+	// limit bytes was marked truncated, which on stdout discarded a complete
+	// answer as "produced more than <limit> bytes" and on stderr told the
+	// operator that notices — including refusals — were never read when every
+	// one of them had been. A bound is a maximum, and the stream that meets it
+	// exactly is the one place where reporting "at" as "past" is the whole
+	// verdict rather than a rounding. Truncation is now recorded when a byte is
+	// actually dropped, which is on the next write, and the flood is stopped in
+	// the same place it always was.
+	if room >= len(p) {
 		return c.buf.Write(p)
 	}
 	if room > 0 {
@@ -837,17 +847,30 @@ func (c *Client) Manifest(ctx context.Context, mapPath, graphPath string) (*Mani
 	if err != nil {
 		return nil, abandon(adopted, err)
 	}
-	for _, artifact := range []string{mapPath, graphPath} {
-		info, statErr := os.Stat(artifact)
+	for _, artifact := range manifestDestinations(mapPath, graphPath) {
+		info, statErr := os.Stat(artifact.path)
 		switch {
 		case statErr != nil:
 			return nil, abandon(adopted, fmt.Errorf(
 				"devmap manifest exited without error but %s is not on disk, so the "+
-					"artifact the scope rung reads is whatever was there before: %w", artifact, statErr))
+					"artifact the scope rung reads is whatever was there before: %w", artifact.path, statErr))
 		case info.Size() == 0:
 			return nil, abandon(adopted, fmt.Errorf(
 				"devmap manifest wrote %s as an empty file, which holds no nodes and would "+
-					"load as an index that has not been built", artifact))
+					"load as an index that has not been built", artifact.path))
+		}
+		// Present and non-empty were two thirds of one class, and the third is
+		// the one a producer can actually reach: a run that exits zero having
+		// written a truncated document. Size cannot catch it — half a code
+		// graph has a perfectly good size — so the file was reported as written
+		// and the failure surfaced later, in another process, as a parse error
+		// about a file nothing had said anything about. See destination.readable
+		// for why this asks only whether the document parses.
+		if err := artifact.readable(); err != nil {
+			return nil, abandon(adopted, fmt.Errorf(
+				"devmap manifest exited without error but the artifact it wrote could not be "+
+					"read back, so what the scope rung would load is neither the previous graph "+
+					"nor a complete one: %w", err))
 		}
 	}
 	report := &ManifestReport{

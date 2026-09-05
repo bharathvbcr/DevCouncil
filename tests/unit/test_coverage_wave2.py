@@ -713,18 +713,13 @@ def test_graph_cmd_corpus_and_pdg_text_paths(tmp_path, monkeypatch):
     )
     assert bad_mode.exit_code == 2
 
-    class Engine:
-        def search(self, q, limit=50):
-            return {
-                "matches": [
-                    {"path": "a.py", "id": "n1", "kind": "function", "label": "run", "score": 0.9}
-                ]
-            }
+    monkeypatch.setattr(
+        "devcouncil.devmap_client.try_connect", lambda _root: _KernelStub()
+    )
 
-    monkeypatch.setattr("devcouncil.codeintel.query.CodeIntelQueryEngine", lambda root: Engine())
-
-    # Plain search still falls back to the Python engine when no devmap index
-    # exists: prefix matching is prefix matching wherever it runs.
+    # Plain search is the kernel's, like every other query surface. It no longer
+    # falls back to a Python engine when no devmap index exists — there is no
+    # Python engine, and an unbuilt index is reported rather than answered.
     plain = runner.invoke(gc.app, ["search", "run", "--project-root", str(mapped)])
     assert plain.exit_code == 0, plain.output
 
@@ -733,10 +728,81 @@ def test_graph_cmd_corpus_and_pdg_text_paths(tmp_path, monkeypatch):
     # default — and return prefix matches under a flag that promised ranking by
     # similarity. Ranking is now the kernel's, and with no index there is no
     # semantic answer to give, so it says so instead of substituting a
-    # different one.
+    # different one. The stub is withdrawn first because "no index" is the
+    # condition under test.
+    monkeypatch.setattr("devcouncil.devmap_client.try_connect", lambda _root: None)
     sem = runner.invoke(
         gc.app,
         ["search", "run", "--semantic", "--project-root", str(mapped)],
     )
     assert sem.exit_code == 3, sem.output
     assert "semantic search is unavailable" in sem.output
+
+
+def _kernel_response(items):
+    return {
+        "items": items,
+        "shown": len(items),
+        "hidden": 0,
+        "total": len(items),
+        "truncated": False,
+        "tokens_used": 0,
+        "resolution": "Available",
+    }
+
+
+class _KernelStub:
+    """The kernel seam the CLI query commands now go through.
+
+    `dev map search|explore|affected` used to be stubbed by replacing
+    `CodeIntelQueryEngine`; that class was deleted with the rest of the Python
+    query surface. The payloads here are the kernel's own wire shapes — nested
+    `Response` objects carrying their counters — because that is what the
+    commands read.
+    """
+
+    def __init__(self, tests=("tests/test_a.py",)):
+        self._tests = list(tests)
+
+    def search(self, query, limit=2000, semantic=False):
+        from devcouncil.devmap_client import BudgetedResponse
+
+        items = [{"symbol_name": query, "file_path": "a.py", "kind": "Function",
+                  "span": [1, 1], "score": 0.9}]
+        return BudgetedResponse(
+            shown=1, hidden=0, total=1, truncated=False, tokens_used=0,
+            items=items, resolution="Available",
+        )
+
+    def explore(self, query, limit=20, **_kwargs):
+        return {
+            "query": query,
+            "limit": limit,
+            "definitions": _kernel_response([{
+                "id": "a.py::f",
+                "symbol_name": "f",
+                "qualified_name": "f",
+                "file_path": "a.py",
+                "kind": "Function",
+                "span": [1, 2],
+                "source": "def f():\n  pass",
+                "score": 1.0,
+                "callers": _kernel_response([]),
+                "callees": _kernel_response([{"source_symbol": "a.py::g"}]),
+            }]),
+            "blast_radius": {"seeds": [], "unmatched_targets": [],
+                             "layers": _kernel_response([]), "total_impacted": 0},
+            "budget": {"total": 8000, "definitions": 4000,
+                       "edges_per_direction": 500, "blast_radius": 2000},
+        }
+
+    def affected_tests(self, targets, **_kwargs):
+        rows = [{"path": path, "depth": 1, "symbols": [], "reached_symbols": 0}
+                for path in self._tests]
+        return {
+            "targets": list(targets),
+            "tests": _kernel_response(rows),
+            "blast_radius": {"seeds": [], "unmatched_targets": [],
+                             "layers": _kernel_response([]), "total_impacted": 0},
+        }
+

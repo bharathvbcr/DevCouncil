@@ -27,6 +27,22 @@ struct FrozenLanguageSpec {
     fixture: String,
 }
 
+/// Deliberate divergences from the frozen registry's `embedded` lists (R3).
+///
+/// Recorded here rather than by regenerating the snapshot. The snapshot is
+/// what *Python* declared; rewriting it would erase the evidence that the two
+/// ever differed, and the next divergence would then land silently. Every row
+/// must also appear in `rust-port/DIVERGENCES.md`.
+const EMBEDDED_DIVERGENCES: &[(&str, &[&str], &str)] = &[(
+    "Vue",
+    &["typescript", "tsx", "javascript", "css", "html"],
+    "X38: Vue single-file components are routinely written with JSX render \
+     functions and Vue's own compiler accepts `<script lang=\"tsx\">`. Python \
+     never read `embedded` at all, so its list records no decision about TSX. \
+     Svelte and Astro deliberately do NOT get it: Svelte's template is not JSX \
+     and an Astro `<script>` is plain JS/TS.",
+)];
+
 #[test]
 fn test_x8_language_authority_matches_frozen_python_registry() {
     let frozen: Vec<FrozenLanguageSpec> =
@@ -38,7 +54,15 @@ fn test_x8_language_authority_matches_frozen_python_registry() {
         assert_eq!(rust.name, python.name);
         assert_eq!(rust.grammar, python.grammar);
         assert_eq!(rust.extensions, python.extensions);
-        assert_eq!(rust.embedded, python.embedded);
+        // Strict everywhere except where a divergence is declared by name, so
+        // an *undeclared* change to any `embedded` list still fails loudly.
+        match EMBEDDED_DIVERGENCES
+            .iter()
+            .find(|(name, _, _)| *name == python.name)
+        {
+            Some((_, expected, reason)) => assert_eq!(rust.embedded, *expected, "{reason}"),
+            None => assert_eq!(rust.embedded, python.embedded, "{}", python.name),
+        }
         assert!(!python.fixture.is_empty());
     }
 }

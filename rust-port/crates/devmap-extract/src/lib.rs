@@ -5,6 +5,8 @@
 #[cfg(feature = "parse")]
 pub mod cache;
 pub mod clonesig;
+#[cfg(feature = "parse")]
+pub mod embedded;
 pub mod fallback;
 pub mod frameworks;
 pub mod gomod;

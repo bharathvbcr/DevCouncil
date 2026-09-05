@@ -432,7 +432,7 @@ pub fn extract_treesitter_with_budget(
                 crate::clonesig::stamp_signatures(&mut symbols, root, source);
                 crate::clonesig::stamp_declaration_hashes(&mut symbols, root, source);
 
-                return Extraction {
+                let mut extraction = Extraction {
                     file_path: path.to_string(),
                     language: lang.to_string(),
                     content_hash,
@@ -461,6 +461,23 @@ pub fn extract_treesitter_with_budget(
                     scope_locals: collect_scope_locals(root, source, &file_symbol_name),
                     source_code: Some(source.to_string()),
                 };
+
+                // The code inside a template language's `<script>` blocks, in
+                // the outer file's own coordinates. Last, and after
+                // `collect_scope_locals`, for two reasons: each inner parse
+                // clears the per-scope local cache that call reuses, and the
+                // merge restores the orderings established just above. For
+                // every language whose registry entry declares no embedded
+                // languages — all but Svelte, Vue, Astro and Liquid — this
+                // returns after one registry lookup.
+                crate::embedded::merge_embedded_scripts(
+                    &mut extraction,
+                    root,
+                    source,
+                    lang,
+                    walk_deadline,
+                );
+                return extraction;
             }
         }
     }
@@ -1206,6 +1223,77 @@ fn walk_tree(
 
 /// Nodes walked between deadline checks. See `walk_tree`.
 const DEADLINE_CHECK_STRIDE: u32 = 256;
+
+/// The `{ a, b as c }` binding clause of a JS/TS import or export, read off
+/// the tree rather than found by scanning the statement's text.
+///
+/// The traversal is bounded to the statement's own clause on purpose:
+/// `export_clause` is a direct child of an `export_statement`, and
+/// `named_imports` sits under the `import_clause`. Neither is reachable from a
+/// function body, which is exactly what the previous `text.find('{')` scan
+/// could not say — for `export function helper(n) { if (n > 0) { … } }` it took
+/// the *body*'s brace and the `if` block's close, and read `if` out of the
+/// slice as an imported name.
+fn js_binding_clause(node: Node) -> Option<Node> {
+    for index in 0..node.child_count() {
+        let Some(child) = node.child(index) else {
+            continue;
+        };
+        match child.kind() {
+            "export_clause" | "named_imports" => return Some(child),
+            "import_clause" => {
+                for inner in 0..child.child_count() {
+                    if let Some(grandchild) = child.child(inner) {
+                        if grandchild.kind() == "named_imports" {
+                            return Some(grandchild);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `(names, locals)` for one binding clause: the name as the module spells it,
+/// and the name this file binds it to.
+///
+/// Quotes are trimmed because ES2022 allows a string module-export-name
+/// (`export { "a-b" as c }`), where the grammar's `name` node is a `string`.
+fn js_specifier_bindings(clause: Node, source: &str) -> (Vec<String>, Vec<String>) {
+    let mut names = Vec::new();
+    let mut locals = Vec::new();
+    for index in 0..clause.named_child_count() {
+        let Some(specifier) = clause.named_child(index) else {
+            continue;
+        };
+        if !matches!(specifier.kind(), "import_specifier" | "export_specifier") {
+            continue;
+        }
+        let Some(name_node) = specifier.child_by_field_name("name") else {
+            continue;
+        };
+        let name = get_node_text(name_node, source)
+            .trim_matches(['"', '\''])
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let local = specifier
+            .child_by_field_name("alias")
+            .map(|alias| {
+                get_node_text(alias, source)
+                    .trim_matches(['"', '\''])
+                    .to_string()
+            })
+            .filter(|alias| !alias.is_empty())
+            .unwrap_or_else(|| name.clone());
+        names.push(name);
+        locals.push(local);
+    }
+    (names, locals)
+}
 
 fn find_string_child(node: Node, source: &str) -> Option<String> {
     if let Some(s) = node.child_by_field_name("source") {
@@ -2365,22 +2453,20 @@ fn extract_node(
                         module_specifier: (!mod_spec.is_empty()).then(|| mod_spec.clone()),
                         span: span.clone(),
                     });
-                } else if let Some(idx1) = text.find('{') {
-                    if let Some(idx2) = text.find('}') {
-                        let inner = &text[idx1 + 1..idx2];
-                        let (names, locals) = crate::model::parse_import_bindings(inner);
-                        imported_names = names;
-                        local_names = locals;
-                        if text.trim_start().starts_with("export") {
-                            for (local, exported) in imported_names.iter().zip(local_names.iter()) {
-                                exports.push(ExtractedExport {
-                                    exported_name: exported.clone(),
-                                    local_name: Some(local.clone()),
-                                    module_specifier: (!mod_spec.is_empty())
-                                        .then(|| mod_spec.clone()),
-                                    span: span.clone(),
-                                });
-                            }
+                } else if let Some(clause) = js_binding_clause(node) {
+                    let (names, locals) = js_specifier_bindings(clause, source);
+                    imported_names = names;
+                    local_names = locals;
+                    // The node's kind, not the text's prefix: a statement is an
+                    // export because the grammar says so.
+                    if node.kind() == "export_statement" {
+                        for (local, exported) in imported_names.iter().zip(local_names.iter()) {
+                            exports.push(ExtractedExport {
+                                exported_name: exported.clone(),
+                                local_name: Some(local.clone()),
+                                module_specifier: (!mod_spec.is_empty()).then(|| mod_spec.clone()),
+                                span: span.clone(),
+                            });
                         }
                     }
                 } else if text.trim_start().starts_with("import ") {
@@ -2397,7 +2483,12 @@ fn extract_node(
                     }
                 }
 
-                if !mod_spec.is_empty() || !imported_names.is_empty() {
+                // A module edge needs a module. Gating on `imported_names`
+                // instead let `export { a as b };` — a purely local re-export
+                // with no `from` — push an import whose `module_specifier` was
+                // `""`, an endpoint no resolver can ever bind, and it did the
+                // same for every function body the old text scan mis-sliced.
+                if !mod_spec.is_empty() {
                     imports.push(ExtractedImport {
                         raw_import: text,
                         module_specifier: mod_spec,
@@ -6309,7 +6400,13 @@ mod tests {
                     // A namespace import records the `*` sentinel, which is how
                     // `ns.anything` stays resolvable without enumerating names.
                     ("pkg", vec!["*"], vec!["ns"], Some("ns")),
-                    ("", vec!["x"], vec!["x"], None),
+                    // `export { x };` is deliberately absent. It used to appear
+                    // here as `("", ["x"], ["x"], None)` — an import with an
+                    // empty module specifier — and this expectation pinned the
+                    // defect rather than the intent: a local re-export with no
+                    // `from` is an export and nothing else, and `""` is an
+                    // endpoint no resolver can ever bind. It still appears in
+                    // the export set below, which is where it belongs.
                 ],
                 vec!["d", "f.ts", "val", "x"],
             ),
@@ -6370,6 +6467,20 @@ mod tests {
                 .collect();
             exports.sort_unstable();
             assert_eq!(exports, expected_exports, "{grammar}: export set drifted");
+
+            // No import names an empty module.
+            //
+            // The loop below already refused an empty binding *name*, and this
+            // test still passed while every `export { x };` in the corpus
+            // pushed an import whose module was `""` — the check was one field
+            // short of the class it was written for.
+            for import in &extraction.imports {
+                assert!(
+                    !import.module_specifier.is_empty(),
+                    "{grammar}: an import must name a module, got {:?}",
+                    import.raw_import
+                );
+            }
 
             // Every import's binding pairs are well formed, so the resolver
             // cannot be handed a binding keyed on an empty name.

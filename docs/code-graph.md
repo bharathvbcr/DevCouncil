@@ -154,9 +154,24 @@ dev map export -o out.graphml      # GraphML (or --format okf)
 dev map search request_handler     # FTS5 symbol/path search (kernel)
 dev map search "auth flow" --semantic  # Name-similarity ranking in the kernel; no embedding index
 dev map cypher 'MATCH (a)-[r:CALLS]->(b) RETURN a.id, b.id LIMIT 20'
-dev map explore request_handler    # source + semantic paths + blast radius
-dev map affected src/foo.py        # tests in the inbound impact closure
+dev map explore request_handler    # source + callers/callees + blast radius (kernel)
+dev map affected request_handler   # tests in the inbound impact closure (kernel)
 ```
+
+`explore` and `affected` moved into the kernel on 2026-09-05, replacing a Python
+engine that loaded the whole graph into process memory. Both take a symbol or a
+`path::symbol` — `affected` resolves its targets through the same traversal
+matcher `impact` uses, so a bare file path works only when the graph has an edge
+touching that file. Three contract changes came with the move, recorded in
+`rust-port/DIVERGENCES.md` (`Q1`–`Q6`):
+
+- `explore` ranks its matches before the cut and reports the index-wide match
+  count, not the size of the page it returned; each caller/callee list keeps its
+  own exact total, so `0 shown of 42` never reads as "no callers".
+- A source snippet that could not be read carries `source_unavailable_reason`
+  instead of coming back as an empty body.
+- `affected` ranks nearest-first, carries each test's distance, and names targets
+  that matched nothing rather than folding them into "no affected tests".
 
 ## How a build works
 
@@ -198,8 +213,12 @@ with a CLI fallback for every request. The kernel binary is located by one rule 
 advertises, because every build reports the same version string.
 
 Query surfaces that still run on the Python side (`check`, `process`, `routes`, `shape-check`,
-`api-impact`, `cypher`, `explore`, `affected`, `pdg`, the HTML visualizers) read the Python
-query cache, which `load_code_graph` fills from the kernel's `code_graph.json` after each build.
+`api-impact`, `cypher`, `pdg`, the HTML visualizers, and the MCP tools `devcouncil_graph_impact`,
+`devcouncil_route_map`, `devcouncil_shape_check`, `devcouncil_api_impact`, `devcouncil_pdg_query`,
+`devcouncil_explain`) read the Python query cache, which `load_code_graph` fills from the kernel's
+`code_graph.json` after each build. `explore` and `affected` left that list on 2026-09-05; every
+`devcouncil_code_*` MCP tool is now kernel-only and reports `Unavailable` rather than substituting
+a second engine's answer.
 
 ```bash
 cd rust-port && ./verify.sh

@@ -322,3 +322,99 @@ fn an_unbuilt_store_publishes_no_graph_at_all() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+/// The interned encoding is opt-in, additive, and says the same thing (G6).
+///
+/// The assertion that carries the weight is the last one: the interned file,
+/// decoded, must equal the verbose file the *same* invocation wrote. Anything
+/// weaker — that it exists, that it is smaller, that it parses — would pass on
+/// an encoder that silently dropped a field, which is the failure this whole
+/// design is arranged against.
+#[test]
+fn the_interned_graph_is_opt_in_and_decodes_to_the_verbose_one() {
+    let root = temp_root("compact");
+    let db = root.join("index.sqlite");
+    write_fixture(&root);
+    build(&root, &db);
+
+    let compact_path = root.join(".devcouncil/graph/code_graph.compact.json");
+    let graph_path = root.join(".devcouncil/graph/code_graph.json");
+
+    // Off by default: the flag is the only thing that writes it, and the
+    // absence must be reported as absent rather than as an empty path.
+    let plain = run_manifest(&root, &db, &[]);
+    assert!(plain.status.success());
+    assert!(
+        !compact_path.exists(),
+        "the interned artifact must not appear without being asked for"
+    );
+    let plain_json: Value =
+        serde_json::from_slice(&plain.stdout).expect("manifest --json must emit JSON");
+    assert_eq!(
+        plain_json.get("compact_graph_output"),
+        Some(&Value::Null),
+        "no interned artifact must read as null, never as an empty path"
+    );
+
+    let asked = run_manifest(
+        &root,
+        &db,
+        &[
+            "--compact-graph-output",
+            ".devcouncil/graph/code_graph.compact.json",
+            "--force",
+        ],
+    );
+    assert!(
+        asked.status.success(),
+        "manifest failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&asked.stdout),
+        String::from_utf8_lossy(&asked.stderr)
+    );
+    assert!(
+        graph_path.is_file(),
+        "the verbose artifact stays canonical and is written either way"
+    );
+    assert!(
+        compact_path.is_file(),
+        "the interned artifact must be written"
+    );
+
+    let verbose: Value =
+        serde_json::from_str(&fs::read_to_string(&graph_path).expect("read verbose"))
+            .expect("verbose must be JSON");
+    let compact: Value =
+        serde_json::from_str(&fs::read_to_string(&compact_path).expect("read interned"))
+            .expect("interned must be JSON");
+
+    assert_eq!(
+        compact["encoding"],
+        Value::String("devmap-compact-v1".to_string())
+    );
+    assert_eq!(
+        devmap_query::decode_compact(&compact).expect("decode"),
+        verbose,
+        "the two files this invocation wrote must be the same model"
+    );
+
+    // The clobber guard covers both paths: identity is `meta.map_engine`, and
+    // the question it asks does not depend on the encoding.
+    fs::write(&compact_path, r#"{"nodes": [], "edges": []}"#).expect("plant a foreign file");
+    let refused = run_manifest(
+        &root,
+        &db,
+        &[
+            "--compact-graph-output",
+            ".devcouncil/graph/code_graph.compact.json",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "a foreign file at the interned path must be refused without --force"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("refuse to overwrite"),
+        "the refusal must say why: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}

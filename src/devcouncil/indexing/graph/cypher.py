@@ -63,10 +63,14 @@ def run_cypher(project_root: Path, query: str, *, default_limit: int = 50) -> Di
     limit = max(1, min(_MAX_ROW_LIMIT, requested_limit))
     name_filter, path_prefix = _parse_where(m.group("where") or "")
 
-    from devcouncil.codeintel.query.engine import CodeIntelQueryEngine
+    from devcouncil.codeintel.service import get_codeintel_service
 
     try:
-        graph = CodeIntelQueryEngine(project_root)._graph()
+        # The service owns the store, the root and the runtime-observation
+        # table; this used to reach through a query engine's private `_graph`
+        # for all three. Same graph, same runtime merge, same failure mode —
+        # asked of the owner instead.
+        graph = get_codeintel_service(project_root).load_with_runtime_observations()
     except FileNotFoundError:
         return {"ok": False, "error": "No committed graph generation."}
 

@@ -147,5 +147,10 @@ def test_cli_report_rigor_json(tmp_path, monkeypatch):
     result = runner.invoke(app, ["report", "rigor", "--json"])
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    # `result.output` is stdout+stderr combined, so a single log line at
+    # WARNING or above turned this into a JSON parse error. The contract the
+    # `--json` surface actually offers is JSON *on stdout*; asserting that is
+    # both narrower and stricter — a warning wrongly written to stdout still
+    # fails, where merging the streams could not tell the two apart.
+    payload = json.loads(result.stdout)
     assert payload["by_gap_type"]["stub_detected"] == 1

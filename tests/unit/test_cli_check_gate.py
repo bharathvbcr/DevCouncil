@@ -28,7 +28,7 @@ def test_check_verify_clean_tree_passes(tmp_path, monkeypatch):
     result = runner.invoke(app, ["check", "--verify", "--json"])
 
     assert result.exit_code == 0
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     assert data["verified"] is True
     assert data["reason"] == "no_changes"
 
@@ -45,6 +45,6 @@ def test_check_verify_emits_next_actions_contract(tmp_path, monkeypatch):
     # Wiring contract: the command runs and emits the typed structure regardless of
     # the host test environment.
     assert result.exit_code in (0, 1)
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     assert {"verified", "changed_files", "gaps", "next_actions", "diff_coverage"} <= set(data)
     assert "app.py" in data["changed_files"]

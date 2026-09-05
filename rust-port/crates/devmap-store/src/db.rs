@@ -11,9 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::schema::{
     BUILD_HISTORY_RETENTION, BUILD_HISTORY_TABLE, CREATE_SCHEMA_V3, CURRENT_SCHEMA_VERSION,
-    MIGRATION_V10_TO_V11, MIGRATION_V11_TO_V12, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5,
-    MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9,
-    MIGRATION_V9_TO_V10, UNRESOLVED_TABLE,
+    MIGRATION_V10_TO_V11, MIGRATION_V11_TO_V12, MIGRATION_V12_TO_V13, MIGRATION_V3_TO_V4,
+    MIGRATION_V4_TO_V5, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8,
+    MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, UNRESOLVED_TABLE,
 };
 
 /// Failed drain attempts after which a pending path stops being retried.
@@ -562,6 +562,37 @@ impl std::fmt::Display for VacuumAction {
 /// degenerate but both implementations agree on them, and so is any finite
 /// value outside 0.0..=1.0 — an empty answer there is a filter that ran and
 /// matched nothing, which is a real result.
+/// The FTS5 `MATCH` expression for a user's search string, or an error naming
+/// why the store cannot express it.
+///
+/// The rule is that the *whole* input is one quoted prefix phrase, so FTS5
+/// operators, column filters, parentheses, wildcards and hyphens stay data
+/// rather than becoming syntax. Doubling interior quotes is the FTS5 escape.
+///
+/// **An interior NUL breaks that rule, and the escape cannot fix it.** SQLite
+/// hands the MATCH argument to FTS5's parser as a C string, so `"alpha\0beta"*`
+/// is parsed as `"alpha` — the closing quote is beyond the terminator. The
+/// observable result was `unterminated string` raised from inside SQLite: a
+/// query surface leaking a parser error for an input the caller was entitled to
+/// pass. Silently truncating at the NUL is worse — the search would then run on
+/// a prefix of what was asked and report the answer as if it had run on all of
+/// it. So the store refuses and says so.
+///
+/// One function rather than three copies: `search_fts`, `search_symbols` and
+/// `count_search_symbols` each carried their own `replace('"', "\"\"")` and
+/// their own `format!`, which is why the NUL hole existed in all three and
+/// would have been closed in one.
+fn fts_match_query(query: &str) -> Result<String> {
+    if let Some(offset) = query.find('\0') {
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "search query contains a NUL byte at offset {offset}; SQLite's \
+             full-text parser reads the query as a C string, so no escaping \
+             can carry one through"
+        )));
+    }
+    Ok(format!("\"{}\"*", query.replace('"', "\"\"")))
+}
+
 fn checked_min_confidence(value: f32) -> Result<f32> {
     if value.is_nan() {
         return Err(rusqlite::Error::InvalidParameterName(
@@ -586,6 +617,21 @@ impl Store {
     /// reason. Bounded because the reason is a one-line diagnostic, not a
     /// dump — the honest total stays in `quarantined_count`.
     pub const DEGRADED_SAMPLE: usize = 5;
+
+    /// Names bound into one [`Store::callers_of`] statement.
+    ///
+    /// Each name is a bind parameter, and SQLite's `SQLITE_MAX_VARIABLE_NUMBER`
+    /// is 32,766 in the bundled build — so a single generated file with more
+    /// changed symbols than that made the statement unpreparable. 512 is far
+    /// below that ceiling rather than adjacent to it, because the ceiling is a
+    /// compile-time option of whatever SQLite the binary links, and a bound
+    /// derived from it would be a bound this crate does not control.
+    ///
+    /// This bounds the *statement*, not the answer: `callers_of` walks every
+    /// chunk and returns the union. A cap on the result would manufacture false
+    /// "nothing depends on this" verdicts, which is the one thing this query
+    /// must never do.
+    pub const MAX_CALLER_BATCH: usize = 512;
 
     fn configure_connection(conn: &Connection) -> Result<()> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -867,9 +913,25 @@ impl Store {
         Ok(Some(version))
     }
 
+    /// Whether the migration chain has a path from `version` to
+    /// [`CURRENT_SCHEMA_VERSION`].
+    ///
+    /// The single owner of that question. It was previously implicit in the
+    /// shape of [`Self::migrate`] — a version with no `if` arm fell through to
+    /// the final equality check — which meant the only way to *ask* was to run
+    /// the migration, and running the migration meant having already written to
+    /// the file. `Store::open` needs the answer before it writes anything, so
+    /// the predicate is stated once and consulted from both places.
+    ///
+    /// 0 is a store with no schema yet; 1 and 2 are the Python engine's
+    /// databases, which this kernel never wrote and cannot read.
+    pub fn schema_is_migratable(version: i32) -> bool {
+        version == 0 || (3..=CURRENT_SCHEMA_VERSION).contains(&version)
+    }
+
     fn migrate(conn: &mut Connection, store: &str) -> Result<()> {
         let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > CURRENT_SCHEMA_VERSION {
+        if !Self::schema_is_migratable(version) {
             return Err(Self::unsupported_schema(store, version));
         }
         let mut version = version;
@@ -1035,9 +1097,20 @@ impl Store {
                 tx.execute_batch(MIGRATION_V11_TO_V12)?;
             }
             tx.execute("PRAGMA user_version = 12", [])?;
-            Self::validate_schema(&tx)?;
+            // No mid-chain validation: v13 adds the extraction-cache index
+            // below, and the end-of-chain check is the authoritative one.
             tx.commit()?;
             version = 12;
+        }
+        if version == 12 {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // `CREATE INDEX IF NOT EXISTS` is idempotent, so this needs no
+            // probe — unlike the ADD COLUMN migrations above.
+            tx.execute_batch(MIGRATION_V12_TO_V13)?;
+            tx.execute("PRAGMA user_version = 13", [])?;
+            Self::validate_schema(&tx)?;
+            tx.commit()?;
+            version = 13;
         }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(Self::unsupported_schema(store, version));
@@ -1049,9 +1122,28 @@ impl Store {
     pub fn open<P: AsRef<Path>>(db_path: P) -> Result<Self> {
         let path = db_path.as_ref();
         let mut conn = Connection::open(path)?;
+        let store = path.display().to_string();
+
+        // Decide whether this binary may touch the file *before* touching it.
+        //
+        // `enable_wal` used to run first, so pointing any devmap command at a
+        // store this kernel cannot read — the Python engine's `index.sqlite` at
+        // `user_version = 2` is the live instance PLAN.md §3.1 Class D names —
+        // rewrote its header into WAL mode and left `-wal`/`-shm` beside it,
+        // and only then printed the refusal. "Refuses rather than degrades on
+        // mismatch" is not satisfied by a refusal that has already written.
+        //
+        // This can only refuse, never admit: `migrate` re-reads the version
+        // itself, under the write lock, so a store migrated by another process
+        // between these two reads is still handled there.
+        let stamped: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if !Self::schema_is_migratable(stamped) {
+            return Err(Self::unsupported_schema(&store, stamped));
+        }
+
         Self::configure_connection(&conn)?;
         Self::enable_wal(&conn)?;
-        Self::migrate(&mut conn, &path.display().to_string())?;
+        Self::migrate(&mut conn, &store)?;
         Ok(Self {
             conn: Mutex::new(conn),
             edge_cache: Mutex::new(None),
@@ -2668,11 +2760,7 @@ impl Store {
              ORDER BY rowid
              LIMIT ?3",
         )?;
-        // Treat the complete user input as a quoted prefix phrase. Doubling
-        // internal quotes is the FTS5 escape, so operators, column filters,
-        // parentheses, wildcards, and hyphens remain data rather than syntax.
-        let escaped_query = query.replace('"', "\"\"");
-        let match_q = format!("\"{}\"*", escaped_query);
+        let match_q = fts_match_query(query)?;
         let sqlite_limit = limit.min(i64::MAX as usize) as i64;
         let rows = stmt.query_map(params![gen, match_q, sqlite_limit], |row| {
             Ok((
@@ -2735,8 +2823,7 @@ impl Store {
             Some(generation) => generation,
             None => return Ok(Vec::new()),
         };
-        let escaped_query = query.replace('"', "\"\"");
-        let match_query = format!("\"{}\"*", escaped_query);
+        let match_query = fts_match_query(query)?;
         let sqlite_limit = limit.min(i64::MAX as usize) as i64;
         let mut stmt = conn.prepare(
             "SELECT n.name, n.qualified_name, n.kind, p.path,
@@ -2778,8 +2865,7 @@ impl Store {
         let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
             return Ok(0);
         };
-        let escaped_query = query.replace('"', "\"\"");
-        let match_query = format!("\"{}\"*", escaped_query);
+        let match_query = fts_match_query(query)?;
         // CROSS JOIN pins the FTS table as the outer loop. As a plain JOIN,
         // SQLite 3.45 (the bundled version) leads with `nodes_fts_map` on
         // `generation_id` and re-scans full-text storage once per mapped row:
@@ -2941,54 +3027,92 @@ impl Store {
     ///
     /// An empty `names` returns no rows without touching the database, rather
     /// than building `IN ()`, which SQLite rejects.
+    ///
+    /// A large `names` is **chunked**, never refused and never truncated. Each
+    /// name becomes one bind parameter, so an unchunked query with more than
+    /// `SQLITE_MAX_VARIABLE_NUMBER` names failed to even prepare — surfacing
+    /// `too many SQL variables` from the middle of a `preview`, naming neither
+    /// the caller nor the limit. Truncating the list instead would have been
+    /// worse: a dropped name contributes zero callers, which reads exactly like
+    /// a symbol nothing depends on. Chunking keeps the answer complete and
+    /// bounds only the statement, and the documented total order is restored
+    /// across chunks by the sort below.
     pub fn callers_of(
         &self,
         names: &[String],
         exclude_file: &str,
         min_confidence: f32,
     ) -> Result<Vec<StoredEdge>> {
+        // Same guard as `latest_edges` and `latest_edges_for_file`: NaN cannot
+        // be compared, and binding it makes SQLite evaluate `>= NULL` as NULL
+        // so every row is rejected. The empty result that comes back is the
+        // sentence "nothing calls this", produced by a filter that never ran —
+        // and `dead_symbols.py` reads exactly that emptiness as proof a symbol
+        // is unused. See `checked_min_confidence`.
+        let min_confidence = checked_min_confidence(min_confidence)?;
         if names.is_empty() {
             return Ok(Vec::new());
         }
+        // `IN` already ignores duplicates, so deduplicating preserves the
+        // result exactly while making each edge belong to a single chunk.
+        let unique: Vec<&String> = {
+            let mut seen = BTreeSet::new();
+            names.iter().filter(|name| seen.insert(*name)).collect()
+        };
         let conn = lock_conn(&self.conn)?;
         let Some(gen) = Self::latest_generation_id_locked(&conn)? else {
             return Ok(Vec::new());
         };
-        let placeholders = std::iter::repeat_n("?", names.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT sp.path, tp.path, e.source_symbol, e.target_symbol,
-                    e.edge_kind, e.confidence
-             FROM generation_edges e
-             JOIN paths sp ON sp.id = e.source_file_id
-             JOIN paths tp ON tp.id = e.target_file_id
-             WHERE e.generation_id = ?1
-               AND e.edge_kind = 'Calls'
-               AND sp.path <> ?2
-               AND CAST(ROUND(e.confidence * 1000) AS INTEGER) >= CAST(ROUND(?3 * 1000) AS INTEGER)
-               AND e.target_symbol IN ({placeholders})
-             ORDER BY e.confidence DESC, e.target_symbol, sp.path, e.source_symbol"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(names.len() + 3);
-        bound.push(&gen);
-        bound.push(&exclude_file);
-        bound.push(&min_confidence);
-        for name in names {
-            bound.push(name);
+        let mut out: Vec<StoredEdge> = Vec::new();
+        for chunk in unique.chunks(Self::MAX_CALLER_BATCH) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT sp.path, tp.path, e.source_symbol, e.target_symbol,
+                        e.edge_kind, e.confidence
+                 FROM generation_edges e
+                 JOIN paths sp ON sp.id = e.source_file_id
+                 JOIN paths tp ON tp.id = e.target_file_id
+                 WHERE e.generation_id = ?1
+                   AND e.edge_kind = 'Calls'
+                   AND sp.path <> ?2
+                   AND CAST(ROUND(e.confidence * 1000) AS INTEGER) >= CAST(ROUND(?3 * 1000) AS INTEGER)
+                   AND e.target_symbol IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 3);
+            bound.push(&gen);
+            bound.push(&exclude_file);
+            bound.push(&min_confidence);
+            for name in chunk {
+                bound.push(*name);
+            }
+            let rows = stmt.query_map(bound.as_slice(), |row| {
+                Ok(StoredEdge {
+                    source_file: row.get(0)?,
+                    target_file: row.get(1)?,
+                    source_symbol: row.get(2)?,
+                    target_symbol: row.get(3)?,
+                    edge_kind: row.get(4)?,
+                    confidence: row.get(5)?,
+                })
+            })?;
+            for row in rows {
+                out.push(row?);
+            }
         }
-        let rows = stmt.query_map(bound.as_slice(), |row| {
-            Ok(StoredEdge {
-                source_file: row.get(0)?,
-                target_file: row.get(1)?,
-                source_symbol: row.get(2)?,
-                target_symbol: row.get(3)?,
-                edge_kind: row.get(4)?,
-                confidence: row.get(5)?,
-            })
-        })?;
-        rows.collect()
+        // The order the single-statement form got from SQL, restored in Rust so
+        // a chunked answer and an unchunked one are byte-identical.
+        out.sort_by(|left, right| {
+            right
+                .confidence
+                .total_cmp(&left.confidence)
+                .then_with(|| left.target_symbol.cmp(&right.target_symbol))
+                .then_with(|| left.source_file.cmp(&right.source_file))
+                .then_with(|| left.source_symbol.cmp(&right.source_symbol))
+        });
+        Ok(out)
     }
 
     pub fn latest_edges_for_file(

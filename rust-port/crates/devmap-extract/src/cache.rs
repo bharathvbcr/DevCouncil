@@ -154,7 +154,14 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// so a v28 row for a 2,500-declaration file says "2000 declaration(s)
 /// recovered by pattern" with no trace of the 500 that were dropped. Reusing
 /// those rows would keep serving a prefix under a reason that reads as a set.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "29";
+/// v30 reads the `<script>` blocks of Svelte, Vue, Astro and Liquid files
+/// (`crate::embedded`). A v29 payload for any of those four is the outer
+/// grammar's answer alone: one `File` node, no imports, no calls, no exports,
+/// under `ParseOutcome::Clean` — a complete-looking result over a file whose
+/// entire code half was never read. Reusing those rows would leave every
+/// component in the tree permanently symbol-less while looking freshly indexed,
+/// and would keep reporting `Clean` for a block that fails to parse.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "30";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
@@ -205,7 +212,37 @@ pub fn current_payload_identity(language: &str) -> (String, String) {
 }
 
 /// Real compiled grammar semver — never a constant placeholder (closes S14).
+///
+/// For a template language this also names the grammars that parse its embedded
+/// `<script>` blocks, because the payload depends on them: a `.svelte` file's
+/// symbols, calls and imports now come out of `tree-sitter-typescript`, and
+/// keying only on `tree-sitter-svelte-ng` would serve a cached extraction back
+/// unchanged across a TypeScript grammar bump that changes every one of them.
+/// The embedded list is read from [`crate::languages::LanguageSpec::embedded`]
+/// through [`crate::embedded::permitted_embedded_languages`] rather than
+/// restated here, so the identity can never name a different set from the one
+/// extraction routes to.
 pub fn grammar_version_for(language: &str) -> String {
+    let base = base_grammar_identity(language);
+    let embedded = crate::embedded::permitted_embedded_languages(language);
+    if embedded.is_empty() {
+        return base;
+    }
+    let embedded: Vec<String> = embedded
+        .into_iter()
+        .map(base_grammar_identity)
+        .collect::<Vec<_>>();
+    format!("{base}+embedded[{}]", embedded.join(","))
+}
+
+/// The identity of `language`'s own compiled grammar, with no embedded
+/// component.
+///
+/// Split out from [`grammar_version_for`] so the embedded suffix is built from
+/// a function that cannot itself consult the embedded list: one level, and a
+/// registry entry that named its own language could not send this into
+/// unbounded recursion.
+pub(crate) fn base_grammar_identity(language: &str) -> String {
     let (package, package_version, variant, grammar): (&str, &str, &str, tree_sitter::Language) =
         match language {
             "python" => (

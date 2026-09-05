@@ -15,7 +15,6 @@ from devcouncil.codeintel.debug.protocol import DAPClient, DAPError, encode_mess
 from devcouncil.codeintel.debug.session import DebugSessionManager, redact_value
 from devcouncil.codeintel.debug.tracing import PythonTraceProvider, load_node_cpu_profile
 from devcouncil.codeintel.service import get_codeintel_service
-from devcouncil.codeintel.query import CodeIntelQueryEngine
 from devcouncil.indexing.graph.schema import CodeGraph, Confidence, DeadCodeEntry
 
 
@@ -219,7 +218,25 @@ def test_debug_session_presents_adapter_version_requests_and_capabilities(
     assert payload["capabilities"]["supportsConfigurationDoneRequest"] is True
 
 
-def test_matching_runtime_observation_removes_dead_candidate(tmp_path: Path) -> None:
+def test_matching_runtime_observation_becomes_a_graph_edge(tmp_path: Path) -> None:
+    """A fingerprint-matched observation reaches the graph as a runtime edge.
+
+    This used to assert the same observation through
+    ``CodeIntelQueryEngine.dead``, which suppressed a dead candidate it proved
+    live. That engine is gone: every dead-code surface — MCP
+    ``devcouncil_code_dead`` and ``dev graph dead`` — answers from the Rust
+    kernel, so ``dead()`` had no production caller and the suppression it
+    performed was never reachable outside this test.
+
+    What *is* still reachable is the merge itself: ``run_cypher`` reads the
+    graph through ``load_with_runtime_observations``, so an observation still
+    changes an answer an agent can ask for. That is what this now pins, at the
+    owner the loader moved to.
+
+    Retired with the engine, and not replaced in the kernel: the kernel's dead
+    list does not consult runtime observations, so a symbol proven live by a
+    debug session is still reported as a dead candidate there.
+    """
     service = get_codeintel_service(tmp_path)
     fingerprint = source_fingerprint(tmp_path)
     service.persist(CodeGraph(dead_code=[
@@ -241,6 +258,11 @@ def test_matching_runtime_observation_removes_dead_candidate(tmp_path: Path) -> 
         "kind": "observed_calls",
     }])
 
-    result = CodeIntelQueryEngine(service).dead(minimum_confidence="ambiguous")
-    assert result["dead_code"] == []
-    assert result["runtime_proven_live"] == ["app.py::live_at_runtime"]
+    graph = service.load_with_runtime_observations()
+    runtime = [edge for edge in graph.edges if edge.extras.get("provenance") == "runtime"]
+    assert [(edge.source, edge.target, edge.kind) for edge in runtime] == [
+        ("app.py::entry", "app.py::live_at_runtime", "observed_calls")
+    ]
+    assert runtime[0].extras["source_fingerprint"] == fingerprint
+    # An observed call is direct evidence, not a sampled guess.
+    assert runtime[0].confidence is Confidence.EXTRACTED

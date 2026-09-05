@@ -44,7 +44,7 @@ def test_runs_list_parses_manifests_newest_first(tmp_path):
 
     result = runner.invoke(runs_app, ["list", "--json", "--project-root", str(tmp_path)])
     assert result.exit_code == 0, result.output
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     ids = [run["run_id"] for run in data["runs"]]
     assert ids == ["run-new", "run-old"]
     assert data["count"] == 2
@@ -58,7 +58,7 @@ def test_runs_list_status_filter(tmp_path):
     result = runner.invoke(
         runs_app, ["list", "--json", "--status", "failed", "--project-root", str(tmp_path)]
     )
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     assert [r["run_id"] for r in data["runs"]] == ["run-bad"]
 
 
@@ -69,7 +69,7 @@ def test_runs_list_flags_orphaned_running(tmp_path):
     os.utime(path, (old, old))
 
     result = runner.invoke(runs_app, ["list", "--json", "--project-root", str(tmp_path)])
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     run = data["runs"][0]
     assert run["status"] == "running"
     assert run["orphaned"] is True
@@ -78,7 +78,7 @@ def test_runs_list_flags_orphaned_running(tmp_path):
 def test_runs_list_fresh_running_not_orphaned(tmp_path):
     _write_manifest(tmp_path, "run-live", status="running")
     result = runner.invoke(runs_app, ["list", "--json", "--project-root", str(tmp_path)])
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     assert data["runs"][0]["orphaned"] is False
 
 
@@ -93,7 +93,7 @@ def test_runs_show_includes_redacted_transcript_tail(tmp_path):
         runs_app, ["show", "run-1", "--json", "--project-root", str(tmp_path)]
     )
     assert result.exit_code == 0, result.output
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     assert data["ok"] is True
     assert data["manifest"]["run_id"] == "run-1"
     assert "REDACTED" in data["transcript_tail"]
@@ -105,7 +105,7 @@ def test_runs_show_missing_run_errors(tmp_path):
         runs_app, ["show", "nope", "--json", "--project-root", str(tmp_path)]
     )
     assert result.exit_code == 1
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     assert data["ok"] is False
 
 

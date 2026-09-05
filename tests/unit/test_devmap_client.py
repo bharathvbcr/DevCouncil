@@ -811,3 +811,261 @@ def test_default_socket_path_matches_what_the_kernel_binds(tmp_path) -> None:
     # Printing must create nothing: no endpoint directory, no store.
     assert not Path(printed).parent.exists()
     assert not (repo / ".devcouncil").exists()
+
+
+# ---- explore / affected: the two surfaces that moved out of Python ------------
+
+
+def _budgeted(items: list[dict] | None = None) -> dict:
+    items = items or []
+    return {
+        "items": items,
+        "shown": len(items),
+        "hidden": 0,
+        "total": len(items),
+        "truncated": False,
+        "tokens_used": 0,
+        "resolution": "Available",
+    }
+
+
+def _explore_payload() -> dict:
+    return {
+        "query": "widget",
+        "limit": 5,
+        "definitions": _budgeted([
+            {
+                "id": "a.py::widget",
+                "callers": _budgeted(),
+                "callees": _budgeted(),
+            }
+        ]),
+        "blast_radius": {
+            "seeds": [],
+            "unmatched_targets": [],
+            "layers": _budgeted(),
+            "total_impacted": 0,
+        },
+        "budget": {"total": 8000, "definitions": 4000, "edges_per_direction": 500,
+                   "blast_radius": 2000},
+    }
+
+
+def test_explore_forwards_the_same_request_to_ipc_and_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One request, two transports, and they must ask the same question.
+
+    A drift between the IPC payload and the argv means the answer depends on
+    whether a daemon happened to be live, which is exactly the kind of
+    difference nothing downstream can see.
+    """
+    client = DevMapClient(tmp_path)
+    captured: dict[str, object] = {}
+
+    def request(payload: dict[str, object], cli_args: list[str], **_kwargs: object):
+        captured["payload"] = payload
+        captured["cli_args"] = cli_args
+        return _explore_payload()
+
+    monkeypatch.setattr(client, "_request", request)
+    client.explore("widget", limit=5, budget=8000, depth=2)
+
+    assert captured["payload"] == {
+        "cmd": "explore",
+        "query": "widget",
+        "limit": 5,
+        "budget": 8000,
+        "depth": 2,
+        "min_confidence": 0.0,
+    }
+    assert captured["cli_args"] == [
+        "explore", "--limit", "5", "--budget", "8000", "--depth", "2",
+        "--min-confidence", "0.0", "--", "widget",
+    ]
+
+
+def test_affected_tests_forwards_the_same_request_to_ipc_and_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = DevMapClient(tmp_path)
+    captured: dict[str, object] = {}
+
+    def request(payload: dict[str, object], cli_args: list[str], **_kwargs: object):
+        captured["payload"] = payload
+        captured["cli_args"] = cli_args
+        return {
+            "targets": ["a", "b"],
+            "tests": _budgeted(),
+            "blast_radius": {
+                "seeds": [], "unmatched_targets": [], "layers": _budgeted(),
+                "total_impacted": 0,
+            },
+        }
+
+    monkeypatch.setattr(client, "_request", request)
+    client.affected_tests(["a", "b"], budget=2000, depth=3)
+
+    assert captured["payload"] == {
+        "cmd": "affected",
+        "targets": ["a", "b"],
+        "budget": 2000,
+        "depth": 3,
+        "min_confidence": 0.0,
+    }
+    assert captured["cli_args"] == [
+        "affected", "--budget", "2000", "--depth", "3",
+        "--min-confidence", "0.0", "--", "a", "b",
+    ]
+
+
+def test_explore_validates_every_budgeted_section_not_just_the_outer_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A composed answer is several responses, and each carries its own counters.
+
+    Checking only `definitions` would let an edge list arrive with
+    `shown + hidden != total` — the invariant the separate `impact`/`trace`
+    calls have always been held to — and the caller would read a broken count
+    as a measured one.
+    """
+    client = DevMapClient(tmp_path)
+    payload = _explore_payload()
+    payload["definitions"]["items"][0]["callers"] = {
+        "items": [],
+        "shown": 0,
+        "hidden": 0,
+        # A caller list claiming 7 callers while reporting none hidden.
+        "total": 7,
+        "truncated": False,
+        "tokens_used": 0,
+        "resolution": "Available",
+    }
+    monkeypatch.setattr(client, "_request", lambda *_a, **_k: payload)
+
+    with pytest.raises(DevMapClientError, match="count invariant"):
+        client.explore("widget")
+
+
+def test_affected_blast_radius_layers_are_validated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = DevMapClient(tmp_path)
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda *_a, **_k: {
+            "targets": ["a"],
+            "tests": _budgeted(),
+            "blast_radius": {"seeds": [], "unmatched_targets": [], "total_impacted": 0},
+        },
+    )
+    with pytest.raises(DevMapClientError, match="blast radius is missing layers"):
+        client.affected_tests(["a"])
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"limit": 0}, "limit must be an integer"),
+        ({"limit": 101}, "limit must be an integer"),
+        ({"min_confidence": 1.5}, "min_confidence must be within"),
+        ({"budget": -1}, "budget must be an integer"),
+    ],
+)
+def test_explore_refuses_out_of_range_arguments_before_any_transport(
+    tmp_path: Path, kwargs: dict, match: str
+) -> None:
+    """Refused locally, with the local message, rather than after a round trip.
+
+    The kernel refuses these too — it does not clamp them, because a caller who
+    asked for 500 definitions and silently got 100 cannot tell a capped list
+    from a complete one. Validating here only makes the refusal cheaper.
+    """
+    client = DevMapClient(tmp_path)
+    with pytest.raises(DevMapClientError, match=match):
+        client.explore("widget", **kwargs)
+
+
+def test_affected_tests_refuses_an_empty_target_list(tmp_path: Path) -> None:
+    """No targets is not a question with an empty answer."""
+    client = DevMapClient(tmp_path)
+    with pytest.raises(DevMapClientError, match="at least one target"):
+        client.affected_tests([])
+
+
+def test_a_daemon_that_does_not_know_the_command_falls_through_to_the_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A daemon outlives the binary that started it, so it can predate a command.
+
+    ``serde`` rejects an unrecognised ``cmd`` tag outright, which reaches the
+    client as the daemon's ``invalid_request`` code. That is a fact about the
+    *server*, not about the answer, and the CLI is the same kernel over another
+    transport — so the request is retried there rather than reported as a
+    failed query. Every other daemon error still surfaces, because a query that
+    genuinely failed must not be silently re-run somewhere else.
+    """
+    from devcouncil.devmap_client import DevMapUnsupportedCommand
+
+    client = DevMapClient(tmp_path, autospawn=False)
+    calls: list[str] = []
+
+    def socket_request(_payload):
+        calls.append("socket")
+        raise DevMapUnsupportedCommand("unknown variant `explore`")
+
+    def cli_command(cli_args, **_kwargs):
+        calls.append("cli")
+        return _explore_payload()
+
+    monkeypatch.setattr(client, "_send_socket_request", socket_request)
+    monkeypatch.setattr(client, "_run_cli_command", cli_command)
+
+    report = client.explore("widget")
+
+    assert calls == ["socket", "cli"]
+    assert report["definitions"]["shown"] == 1
+
+
+def test_a_real_daemon_error_is_not_retried_on_the_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The narrow escape hatch must stay narrow."""
+    client = DevMapClient(tmp_path, autospawn=False)
+    calls: list[str] = []
+
+    def socket_request(_payload):
+        calls.append("socket")
+        raise DevMapClientError("devmap daemon error [request_failed]: boom")
+
+    monkeypatch.setattr(client, "_send_socket_request", socket_request)
+    monkeypatch.setattr(
+        client, "_run_cli_command", lambda *_a, **_k: calls.append("cli") or {}
+    )
+
+    with pytest.raises(DevMapClientError, match="request_failed"):
+        client.explore("widget")
+    assert calls == ["socket"]
+
+
+def test_explore_default_budget_matches_the_kernel() -> None:
+    """Two constants, one number. Drift makes the same call cost differently."""
+    import re
+
+    from devcouncil.devmap_client import AFFECTED_BUDGET, EXPLORE_BUDGET, MAX_EXPLORE_LIMIT
+
+    model = Path(__file__).resolve().parents[2] / "rust-port/crates/devmap-query/src/model.rs"
+    source = model.read_text(encoding="utf-8")
+    explore = re.search(r"pub const EXPLORE: u32 = (\d+);", source)
+    affected = re.search(r"pub const AFFECTED: u32 = (\d+);", source)
+    assert explore and affected, "the kernel's Budget constants moved"
+    assert int(explore.group(1)) == EXPLORE_BUDGET
+    assert int(affected.group(1)) == AFFECTED_BUDGET
+
+    protocol = (
+        Path(__file__).resolve().parents[2] / "rust-port/crates/devmap-serve/src/protocol.rs"
+    ).read_text(encoding="utf-8")
+    limit = re.search(r"const MAX_EXPLORE_LIMIT: usize = (\d+);", protocol)
+    assert limit, "the kernel's explore limit moved"
+    assert int(limit.group(1)) == MAX_EXPLORE_LIMIT

@@ -40,6 +40,18 @@ MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_QUERY_BYTES = 4 * 1024
 MAX_TOKEN_BUDGET = 100_000
 MAX_TRAVERSAL_DEPTH = 64
+#: Mirrors ``devmap_query::Budget::EXPLORE``. ``explore`` funds four sections
+#: from one number — definitions with source, both edge directions per
+#: definition, and a blast radius — so it is deliberately larger than the 2000
+#: every single-answer surface uses. Kept in sync by
+#: ``test_explore_default_budget_matches_the_kernel``.
+EXPLORE_BUDGET = 8_000
+#: Mirrors ``devmap_query::Budget::AFFECTED``.
+AFFECTED_BUDGET = 2_000
+#: Mirrors ``devmap_serve::protocol::MAX_EXPLORE_LIMIT``. The kernel refuses a
+#: larger limit rather than trimming it, so this is validated here to fail with
+#: the local message instead of a round trip.
+MAX_EXPLORE_LIMIT = 100
 # Per-read socket timeout. Bounds one recv(2) call; the response deadline below
 # bounds the exchange as a whole. Without the deadline, a server that dribbles
 # one byte per timeout-1 forever keeps this loop alive for weeks — measured in
@@ -184,6 +196,23 @@ def try_connect(
     if not status.generation_id or status.node_count <= 0:
         return None
     return client
+
+
+class DevMapUnsupportedCommand(Exception):
+    """The daemon serving this repository does not implement the command.
+
+    A daemon outlives the binary that started it — it retires after 30 idle
+    minutes — so a client from a newer kernel routinely meets an older server.
+    ``serde`` rejects an unrecognised ``cmd`` tag outright, and that arrives
+    here as the daemon's ``invalid_request`` code: a fact about the *server*,
+    not about the answer.
+
+    It is raised rather than swallowed so :meth:`DevMapClient._request` can
+    retry over the CLI, which is the **same kernel over a different
+    transport** — not a second engine. Every other daemon error still surfaces
+    as :class:`DevMapClientError`, because a query that genuinely failed must
+    not be re-run somewhere else and reported as a success.
+    """
 
 
 class DevMapClientError(Exception):
@@ -518,6 +547,14 @@ class DevMapClient:
             if isinstance(error, dict):
                 code = error.get("code", "unknown")
                 message = error.get("message", "unspecified daemon error")
+                if code == "invalid_request":
+                    # The frame did not deserialize into this daemon's request
+                    # type. The client only ever sends well-formed requests for
+                    # the protocol it was built against, so this means the two
+                    # kernels differ — an older daemon that predates a command.
+                    raise DevMapUnsupportedCommand(
+                        f"devmap daemon rejected the request as unrecognised: {message}"
+                    )
                 raise DevMapClientError(f"devmap daemon error [{code}]: {message}")
             raise DevMapClientError("devmap daemon returned an invalid error envelope")
         result = envelope.get("result")
@@ -638,13 +675,20 @@ class DevMapClient:
 
     def _request(self, payload: Dict[str, Any], cli_args: List[str], timeout: float = 120.0) -> Dict[str, Any]:
         if time.monotonic() >= self._transport_unhealthy_until:
-            response = self._send_socket_request(payload)
-            if response is not None:
-                return response
-            if self._start_daemon():
+            try:
                 response = self._send_socket_request(payload)
                 if response is not None:
                     return response
+                if self._start_daemon():
+                    response = self._send_socket_request(payload)
+                    if response is not None:
+                        return response
+            except DevMapUnsupportedCommand:
+                # A daemon older than this client. The CLI below is the same
+                # kernel reached another way, so the retry answers the question
+                # that was asked rather than substituting a different engine's
+                # answer for it.
+                pass
         return self._run_cli_command(cli_args, timeout=timeout)
 
     def _budgeted(self, resp: Dict[str, Any], budget: int) -> BudgetedResponse:
@@ -883,6 +927,144 @@ class DevMapClient:
             ["dead", "--budget", str(budget)],
         )
         return self._budgeted(resp, budget)
+
+    def _validate_budgeted_sections(self, payload: Dict[str, Any], budget: int) -> None:
+        """Run every budgeted section of a composed answer past :meth:`_budgeted`.
+
+        A composed response is several responses in a trench coat, and each of
+        them carries its own counters. Checking only the outer list would let an
+        edge list arrive with ``shown + hidden != total`` — the exact invariant
+        the separate ``impact``/``trace`` calls have always been held to — and a
+        caller would read a broken count as a measured one.
+        """
+        definitions = payload.get("definitions")
+        if isinstance(definitions, dict):
+            checked = self._budgeted(definitions, budget)
+            for item in checked.items:
+                for side in ("callers", "callees"):
+                    section = item.get(side)
+                    if not isinstance(section, dict):
+                        raise DevMapClientError(
+                            f"devmap explore definition is missing {side}"
+                        )
+                    self._budgeted(section, budget)
+        tests = payload.get("tests")
+        if isinstance(tests, dict):
+            self._budgeted(tests, budget)
+        radius = payload.get("blast_radius")
+        if isinstance(radius, dict):
+            layers = radius.get("layers")
+            if not isinstance(layers, dict):
+                raise DevMapClientError("devmap blast radius is missing layers")
+            self._budgeted(layers, budget)
+
+    def explore(
+        self,
+        query: str,
+        limit: int = 20,
+        budget: int = EXPLORE_BUDGET,
+        depth: int = 3,
+        min_confidence: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Definitions matching ``query``, with source, edges and blast radius.
+
+        The composition happens in the kernel. It used to happen in a second
+        Python engine that loaded the whole graph into process memory — and
+        which, since the Python writer was retired, had no store to load and
+        raised ``FileNotFoundError`` on every call.
+
+        Returned as the kernel's own payload rather than a reshaped one: this
+        client owns transport and invariant checking, not presentation. Every
+        budgeted section is validated, so a caller can trust the counters
+        without re-deriving them.
+        """
+        self._validate_query(query)
+        self._validate_budget(budget)
+        self._validate_depth(depth)
+        if type(limit) is not int or not 1 <= limit <= MAX_EXPLORE_LIMIT:
+            raise DevMapClientError(
+                f"devmap explore limit must be an integer within [1, {MAX_EXPLORE_LIMIT}]"
+            )
+        if (
+            not isinstance(min_confidence, (int, float))
+            or isinstance(min_confidence, bool)
+            or not 0.0 <= float(min_confidence) <= 1.0
+        ):
+            raise DevMapClientError("devmap explore min_confidence must be within [0, 1]")
+        resp = self._request(
+            {
+                "cmd": "explore",
+                "query": query,
+                "limit": limit,
+                "budget": budget,
+                "depth": depth,
+                "min_confidence": float(min_confidence),
+            },
+            [
+                "explore",
+                "--limit",
+                str(limit),
+                "--budget",
+                str(budget),
+                "--depth",
+                str(depth),
+                "--min-confidence",
+                str(float(min_confidence)),
+                *_positional(query),
+            ],
+        )
+        self._validate_budgeted_sections(resp, budget)
+        return resp
+
+    def affected_tests(
+        self,
+        targets: List[str],
+        budget: int = AFFECTED_BUDGET,
+        depth: int = 3,
+        min_confidence: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Test files reachable through the inbound blast radius of ``targets``.
+
+        No target-count limit is duplicated here on purpose: the kernel owns the
+        bound and *refuses* an over-long list rather than trimming it, so drift
+        between the two surfaces shows up as a loud error instead of a short
+        answer that reads as a complete one.
+        """
+        if not isinstance(targets, list):
+            raise DevMapClientError("devmap affected targets must be a list")
+        if not targets:
+            raise DevMapClientError("devmap affected requires at least one target")
+        for target in targets:
+            self._validate_query(target, "target")
+        self._validate_budget(budget)
+        self._validate_depth(depth)
+        if (
+            not isinstance(min_confidence, (int, float))
+            or isinstance(min_confidence, bool)
+            or not 0.0 <= float(min_confidence) <= 1.0
+        ):
+            raise DevMapClientError("devmap affected min_confidence must be within [0, 1]")
+        resp = self._request(
+            {
+                "cmd": "affected",
+                "targets": list(targets),
+                "budget": budget,
+                "depth": depth,
+                "min_confidence": float(min_confidence),
+            },
+            [
+                "affected",
+                "--budget",
+                str(budget),
+                "--depth",
+                str(depth),
+                "--min-confidence",
+                str(float(min_confidence)),
+                *_positional(*targets),
+            ],
+        )
+        self._validate_budgeted_sections(resp, budget)
+        return resp
 
     def preview(
         self,

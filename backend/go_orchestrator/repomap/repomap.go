@@ -48,6 +48,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"sort"
@@ -90,9 +91,13 @@ var couplingKinds = map[string]bool{"calls": true, "references": true, "imports"
 const ConfidenceExtracted = "extracted"
 
 type graph struct {
-	Nodes         []node `json:"nodes"`
-	Edges         []edge `json:"edges"`
-	SchemaVersion int    `json:"schema_version"`
+	Nodes []node `json:"nodes"`
+	Edges []edge `json:"edges"`
+	// SchemaVersion is a pointer so an absent key stays absent. Go's decoder
+	// leaves a missing int at zero and reports no error, which made a document
+	// declaring nothing about its schema indistinguishable from one declaring
+	// the supported version — see Degraded, where that silence was the verdict.
+	SchemaVersion *int `json:"schema_version"`
 	Meta          struct {
 		// DevmapRust is the producer's own account of the run that wrote this
 		// file. Every field here was being decoded and discarded, including
@@ -102,8 +107,14 @@ type graph struct {
 			GenerationID             int    `json:"generation_id"`
 			AnalysisStatus           string `json:"analysis_status"`
 			EdgeEndpointsWithoutNode int    `json:"edge_endpoints_without_node"`
-			DuplicateEdgesDropped    int    `json:"duplicate_edges_dropped"`
-			DuplicateNodeIDsDropped  int    `json:"duplicate_node_ids_dropped"`
+			// DistinctEdgeEndpointsWithoutNode is the same loss counted by
+			// identity rather than by edge, and it is a pointer for the same
+			// reason SchemaVersion is: the producers that predate the key emit
+			// nothing, and "360 edges naming 0 distinct endpoints" is not a
+			// smaller report but an impossible one.
+			DistinctEdgeEndpointsWithoutNode *int `json:"distinct_edge_endpoints_without_node"`
+			DuplicateEdgesDropped            int  `json:"duplicate_edges_dropped"`
+			DuplicateNodeIDsDropped          int  `json:"duplicate_node_ids_dropped"`
 		} `json:"devmap_rust"`
 	} `json:"meta"`
 }
@@ -120,7 +131,13 @@ const SupportedSchema = 2
 type Provenance struct {
 	// Stamped reports whether the producer wrote a provenance block at all.
 	// Its absence is why GenerationID zero cannot be read as "generation zero".
-	Stamped        bool   `json:"stamped"`
+	Stamped bool `json:"stamped"`
+	// SchemaDeclared reports whether the artifact named a schema version, and
+	// is why SchemaVersion zero cannot be read as "the version this build
+	// happens to be fine with". It is the same distinction Stamped draws, at
+	// the field that decides whether every other one means what this build
+	// thinks it means.
+	SchemaDeclared bool   `json:"schema_declared"`
 	SchemaVersion  int    `json:"schema_version"`
 	GenerationID   int    `json:"generation_id"`
 	Nodes          int    `json:"nodes"`
@@ -128,15 +145,34 @@ type Provenance struct {
 	// OrphanEndpoints counts edges the producer wrote whose endpoints are not
 	// nodes in the same file. build skips exactly these, so each is a coupling
 	// this map cannot see.
-	OrphanEndpoints         int `json:"orphan_endpoints"`
-	DuplicateEdgesDropped   int `json:"duplicate_edges_dropped"`
-	DuplicateNodeIDsDropped int `json:"duplicate_node_ids_dropped"`
+	OrphanEndpoints int `json:"orphan_endpoints"`
+	// DistinctOrphanEndpoints counts the identities those edges point at, and
+	// is nil when the producer does not emit it.
+	//
+	// It is carried alongside the edge count rather than instead of it because
+	// the two answer different questions and the ratio is the diagnostic. On
+	// this repository they are 360 and 167: edges lost to many different
+	// missing symbols is a wide, shallow gap in the index — files that were
+	// never read — while the same edges lost to a handful of identities is one
+	// symbol the extractor failed on. The remedies are not the same, and the
+	// edge count alone cannot tell an operator which they are looking at.
+	DistinctOrphanEndpoints *int `json:"distinct_orphan_endpoints,omitempty"`
+	DuplicateEdgesDropped   int  `json:"duplicate_edges_dropped"`
+	DuplicateNodeIDsDropped int  `json:"duplicate_node_ids_dropped"`
 }
 
 // Map answers the two questions the neighbour rung asks.
 type Map struct {
 	// areaOf maps a repo-relative file path to its area.
 	areaOf map[string]string
+	// areas is the set of the values in areaOf, kept rather than counted and
+	// discarded. AreaForPath answered "is this directory an area" by scanning
+	// every entry of areaOf, once per ancestor level of the path — so judging
+	// one write cost the size of the repository times the depth of the path,
+	// on precisely the paths the scope rung exists to judge: the files created
+	// during a turn, which are by definition not in the index. build already
+	// computed this set to count areas; it now keeps it.
+	areas map[string]bool
 	// adjacent maps an area to the areas it references or is referenced by.
 	adjacent map[string]map[string]bool
 	// stats describe what was loaded, for the run report.
@@ -224,6 +260,30 @@ func (s Stats) Permissive() bool {
 // Stats returns what was loaded.
 func (m *Map) Stats() Stats { return m.stats }
 
+// MaxGraphBytes bounds the artifact this build will read.
+//
+// Every other payload the harness takes from another process is bounded — the
+// reply on devmap's stdout at 64 MiB, its stderr at 4 MiB, the adoption check's
+// marker scan to a 64 KiB window, the retained notices, the preserved copies —
+// and this read, the largest of all of them, was not. The code graph for this
+// repository is 20 MiB and grows with the tree, it is written by a binary from
+// another repository, and it is read at session start, which is the one moment
+// there is nothing to fall back on.
+//
+// The cost is not the file. Loading it holds the bytes and the decoded tree at
+// once: 68 MiB of allocation for a 20 MiB artifact, measured by
+// BenchmarkLoadRealisticGraph, so the bound has to be set against roughly three
+// and a half times itself in transient memory. At 1.5 KiB per node this admits
+// a graph of some 170,000 symbols, which is a very large monorepo, and refuses
+// the runaway or corrupt file that would otherwise be read in full before
+// anything noticed its size.
+//
+// Refusing is the right failure. A caller that cannot load the map records the
+// scope rung as unavailable, which is the same honest answer it gives for a
+// repository that has never been indexed — where reading the file would instead
+// take the memory of the process that was about to report it.
+const MaxGraphBytes int64 = 256 << 20
+
 // Load reads a code graph artifact.
 //
 // An empty graph is an error rather than an empty map. A Map with no files
@@ -231,8 +291,18 @@ func (m *Map) Stats() Stats { return m.stats }
 // degradation — correct but useless — whereas an error at load time tells the
 // caller to build the index. The distinction is the difference between a gate
 // that knows it is blind and one that reports blindness on every decision.
-func Load(graphPath string) (*Map, error) {
-	raw, err := os.ReadFile(graphPath)
+func Load(graphPath string) (*Map, error) { return loadBounded(graphPath, MaxGraphBytes) }
+
+// loadBounded is Load with the bound as an argument, so a test can drive the
+// refusal without producing a quarter of a gigabyte to reach it.
+func loadBounded(graphPath string, max int64) (*Map, error) {
+	file, err := os.Open(graphPath)
+	if err != nil {
+		return nil, fmt.Errorf("repomap: reading %s: %w", graphPath, err)
+	}
+	defer file.Close()
+
+	raw, err := readBounded(file, max)
 	if err != nil {
 		return nil, fmt.Errorf("repomap: reading %s: %w", graphPath, err)
 	}
@@ -244,6 +314,66 @@ func Load(graphPath string) (*Map, error) {
 		return nil, fmt.Errorf("repomap: %s holds no nodes; the index has not been built", graphPath)
 	}
 	return build(g), nil
+}
+
+// readBounded reads a source whole, or refuses it for being larger than max.
+//
+// The size is checked twice and the second check is the one that matters. A
+// stat is a claim about the file as it was a moment ago, and the case this
+// bound exists for — a producer rewriting the artifact while a session starts —
+// is exactly the case where the file is longer than the stat that preceded the
+// read. So the stat gives the cheap refusal before any bytes move, and the read
+// itself is limited to one byte past the bound, which holds whatever stat said
+// and whatever the source turns out to be.
+func readBounded(source *os.File, max int64) ([]byte, error) {
+	tooLarge := func(size int64, known bool) error {
+		if known {
+			return fmt.Errorf("the artifact is %d bytes, larger than the %d byte bound this build "+
+				"reads; it was refused rather than loaded, because reading it costs several times "+
+				"its own size in memory and a file this large is a producer that has gone wrong",
+				size, max)
+		}
+		return fmt.Errorf("the artifact is larger than the %d byte bound this build reads and was "+
+			"refused rather than loaded; its size was not knowable in advance, so the read itself "+
+			"was stopped at the bound", max)
+	}
+
+	// A regular file answers for its own length; a pipe, device or stream does
+	// not, and reports zero. Only the first can be refused before it is read.
+	var size int64
+	if info, err := source.Stat(); err == nil && info.Mode().IsRegular() {
+		size = info.Size()
+		if size > max {
+			return nil, tooLarge(size, true)
+		}
+	}
+
+	// Sized from the stat so the ordinary case is one allocation rather than
+	// the doubling io.ReadAll would do; the spare byte is what a source that
+	// grew past its own stat lands in.
+	capacity := size + 1
+	if capacity < 4<<10 {
+		capacity = 4 << 10
+	}
+	raw := make([]byte, 0, capacity)
+	limited := io.LimitReader(source, max+1)
+	for {
+		if len(raw) == cap(raw) {
+			raw = append(raw, 0)[:len(raw)]
+		}
+		n, err := limited.Read(raw[len(raw):cap(raw)])
+		raw = raw[:len(raw)+n]
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
+		}
+	}
+	if int64(len(raw)) > max {
+		return nil, tooLarge(int64(len(raw)), false)
+	}
+	return raw, nil
 }
 
 func build(g graph) *Map {
@@ -258,13 +388,23 @@ func build(g graph) *Map {
 		// the stamp usable is that it names a generation, not that the key
 		// existed.
 		Stamped:                 rust.GenerationID > 0,
-		SchemaVersion:           g.SchemaVersion,
+		SchemaDeclared:          g.SchemaVersion != nil,
 		GenerationID:            rust.GenerationID,
 		Nodes:                   len(g.Nodes),
 		AnalysisStatus:          rust.AnalysisStatus,
 		OrphanEndpoints:         rust.EdgeEndpointsWithoutNode,
 		DuplicateEdgesDropped:   rust.DuplicateEdgesDropped,
 		DuplicateNodeIDsDropped: rust.DuplicateNodeIDsDropped,
+	}
+	if g.SchemaVersion != nil {
+		m.prov.SchemaVersion = *g.SchemaVersion
+	}
+	if n := rust.DistinctEdgeEndpointsWithoutNode; n != nil {
+		// Copied rather than aliased: the pointer travels out of this package
+		// on every Provenance, and one that still pointed into the decoded
+		// document would let a caller alter what the next one reads.
+		distinct := *n
+		m.prov.DistinctOrphanEndpoints = &distinct
 	}
 
 	// nodeArea covers every node, not only files, because edges join symbols.
@@ -291,9 +431,9 @@ func build(g graph) *Map {
 		}
 	}
 
-	areas := map[string]bool{}
+	m.areas = make(map[string]bool, len(m.areaOf))
 	for _, area := range m.areaOf {
-		areas[area] = true
+		m.areas[area] = true
 	}
 
 	for _, e := range g.Edges {
@@ -322,7 +462,7 @@ func build(g graph) *Map {
 	}
 
 	m.stats.Files = len(m.areaOf)
-	m.stats.Areas = len(areas)
+	m.stats.Areas = len(m.areas)
 	m.stats.Edges = len(g.Edges)
 	for area, neighbours := range m.adjacent {
 		m.stats.Adjacencies += len(neighbours)
@@ -361,11 +501,11 @@ func (m *Map) AreaForPath(p string) (string, bool) {
 			return dir, true
 		}
 		// A directory that is some indexed file's area is a real area even if
-		// nothing references it.
-		for _, area := range m.areaOf {
-			if area == dir {
-				return dir, true
-			}
+		// nothing references it. This was a scan of every entry in areaOf, run
+		// again at each level of the path; it is the same question asked of the
+		// set build already had.
+		if m.areas[dir] {
+			return dir, true
 		}
 	}
 	return "", false
@@ -452,7 +592,18 @@ func (m *Map) Neighbours(area string) []string {
 const rejectedValueLimit = 8
 
 // Provenance returns what the artifact said about the run that produced it.
-func (m *Map) Provenance() Provenance { return m.prov }
+//
+// The one pointer in it is copied out rather than shared. A caller holding a
+// value type does not expect writing through it to change what the next caller
+// reads, and a count that could be edited after the fact is not provenance.
+func (m *Map) Provenance() Provenance {
+	out := m.prov
+	if m.prov.DistinctOrphanEndpoints != nil {
+		distinct := *m.prov.DistinctOrphanEndpoints
+		out.DistinctOrphanEndpoints = &distinct
+	}
+	return out
+}
 
 // Degraded names, one line each, the ways this map is less than it appears.
 //
@@ -462,11 +613,40 @@ func (m *Map) Provenance() Provenance { return m.prov }
 func (m *Map) Degraded() []string {
 	var out []string
 
-	if m.prov.SchemaVersion != 0 && m.prov.SchemaVersion != SupportedSchema {
+	// The schema check, in the three answers it has to keep apart.
+	//
+	// The guard here used to be `!= 0 && != SupportedSchema`, which meant a
+	// document that declared nothing produced the same verdict as one declaring
+	// the supported version: silence. Absent is neither. It is the field that
+	// fixes what every other field in the file means, and a build that cannot
+	// establish it is reading areas, kinds and confidences on an assumption.
+	//
+	// The two mismatches are also not one failure, and the direction is the
+	// operator's remedy. Reading an older graph, this build looks for fields
+	// that had not been written yet and finds them absent — the map is short.
+	// Reading a newer one, the fields are there and this build's understanding
+	// of them is the stale half: a value it matches on by name may have been
+	// split or given a meaning it no longer has, and the map is then
+	// confidently wrong rather than visibly incomplete.
+	switch {
+	case !m.prov.SchemaDeclared:
 		out = append(out, fmt.Sprintf(
-			"the code graph declares schema version %d and this build reads %d; fields it "+
-				"renamed or moved are read as absent, and an area or coupling this build "+
-				"cannot see is indistinguishable from one that does not exist",
+			"the code graph declares no schema version and this build reads %d, so nothing "+
+				"establishes that its areas, kinds and confidences mean what this build takes "+
+				"them to mean; every answer below rests on that assumption", SupportedSchema))
+	case m.prov.SchemaVersion < SupportedSchema:
+		out = append(out, fmt.Sprintf(
+			"the code graph declares schema version %d, older than the %d this build reads; "+
+				"fields added since are absent from it, and an area or coupling this build "+
+				"cannot see is indistinguishable from one that does not exist — rewrite the "+
+				"artifact with `manvi map build`",
+			m.prov.SchemaVersion, SupportedSchema))
+	case m.prov.SchemaVersion > SupportedSchema:
+		out = append(out, fmt.Sprintf(
+			"the code graph declares schema version %d, newer than the %d this build reads; "+
+				"this build is behind its producer, so a field it still matches by name may "+
+				"have been renamed, split or given another meaning, and the map would be "+
+				"wrong rather than short — rebuild the harness against the current producer",
 			m.prov.SchemaVersion, SupportedSchema))
 	}
 	if status := m.prov.AnalysisStatus; status != "" && status != "ok" {
@@ -491,10 +671,37 @@ func (m *Map) Degraded() []string {
 			m.vocab.couplingRejected, ConfidenceExtracted, m.rejected()))
 	}
 	if m.prov.OrphanEndpoints > 0 {
-		out = append(out, fmt.Sprintf(
+		line := fmt.Sprintf(
 			"%d edge(s) in the graph name an endpoint that is not a node in it; each is a "+
 				"coupling this map cannot place, so two areas it joins are not neighbours here",
-			m.prov.OrphanEndpoints))
+			m.prov.OrphanEndpoints)
+		// The distinct count sharpens that into a diagnosis, and is appended
+		// only when the producer gave it: a build reading an artifact from
+		// before the key existed decodes nothing, and reporting that as zero
+		// would state something impossible about the edges just counted.
+		if n := m.prov.DistinctOrphanEndpoints; n != nil {
+			line += fmt.Sprintf(", between them naming %d distinct missing identit(y/ies) — "+
+				"many means files the index never read, few means a symbol the extractor "+
+				"failed on", *n)
+		}
+		out = append(out, line)
+	}
+	// What the producer discarded before it wrote. These were decoded and one
+	// of them was never read at all, which made them provenance nobody could
+	// act on. A duplicate node id is two nodes claiming one identity, resolved
+	// by keeping one of them — and whichever it was, its area is the area this
+	// map now answers with for that symbol. That is the same class of fact as
+	// an orphan endpoint: something the map cannot see, reported so its absence
+	// is not read as evidence.
+	if dropped := m.prov.DuplicateNodeIDsDropped; dropped > 0 {
+		out = append(out, fmt.Sprintf(
+			"the producer dropped %d node(s) whose ids duplicated another's, so for each of "+
+				"them this map answers with the area of whichever one it kept", dropped))
+	}
+	if dropped := m.prov.DuplicateEdgesDropped; dropped > 0 {
+		out = append(out, fmt.Sprintf(
+			"the producer dropped %d duplicate edge(s) before writing, so the edge count here "+
+				"is of distinct relations rather than of everything the analysis found", dropped))
 	}
 	return out
 }
@@ -522,8 +729,13 @@ func (m *Map) rejected() string {
 // complaint. On this repository the index stood at generation 4 while the
 // artifact carried generation 2, and both were reported as one healthy map.
 //
-// indexNodes may be zero when the caller could not read the index, in which
-// case the node comparison is skipped rather than assumed to hold.
+// Either argument may be zero when the caller could not read that half of the
+// index. A comparison that cannot run is reported as one that did not run, not
+// omitted: this function's whole purpose is to be the second opinion on an
+// artifact that looks healthy, and an empty answer is what every caller reads
+// as "checked, and they agree". That is the same failure the unstamped branch
+// below already refuses to make, at the other end of the same comparison — the
+// artifact could not account for itself there, and here the index could not.
 func (m *Map) DisagreementsWith(indexGeneration, indexNodes int) []string {
 	var out []string
 	if !m.prov.Stamped {
@@ -532,7 +744,14 @@ func (m *Map) DisagreementsWith(indexGeneration, indexNodes int) []string {
 				"index now at generation %d is unverified; the scope rung is deciding from a "+
 				"file of unknown age", indexGeneration)}
 	}
-	if indexGeneration > 0 && m.prov.GenerationID != indexGeneration {
+	switch {
+	case indexGeneration <= 0:
+		out = append(out, fmt.Sprintf(
+			"the index reported no generation, so whether the code graph written from "+
+				"generation %d is the current one is unverified; the scope rung is deciding "+
+				"from a file that could not be compared with anything",
+			m.prov.GenerationID))
+	case m.prov.GenerationID != indexGeneration:
 		out = append(out, fmt.Sprintf(
 			"the code graph was written from generation %d and the index now stands at %d, so "+
 				"the scope rung is deciding from a snapshot the navigation tools have already "+
@@ -544,14 +763,20 @@ func (m *Map) DisagreementsWith(indexGeneration, indexNodes int) []string {
 	// different number of nodes was not written from it whatever it claims.
 	// The producer's own dropped-duplicate count is subtracted rather than
 	// tolerated, so the comparison stays exact.
-	if indexNodes > 0 {
-		expected := indexNodes - m.prov.DuplicateNodeIDsDropped
-		if m.prov.Nodes != expected {
-			out = append(out, fmt.Sprintf(
-				"the code graph holds %d node(s) and the index reports %d (less %d dropped as "+
-					"duplicates), so the two do not describe the same tree",
-				m.prov.Nodes, indexNodes, m.prov.DuplicateNodeIDsDropped))
-		}
+	if indexNodes <= 0 {
+		out = append(out, fmt.Sprintf(
+			"the index reported no node count, so whether the %d node(s) in the code graph "+
+				"are the ones it holds is unverified; the generation stamp alone cannot "+
+				"establish it, which is why there are two checks here",
+			m.prov.Nodes))
+		return out
+	}
+	expected := indexNodes - m.prov.DuplicateNodeIDsDropped
+	if m.prov.Nodes != expected {
+		out = append(out, fmt.Sprintf(
+			"the code graph holds %d node(s) and the index reports %d (less %d dropped as "+
+				"duplicates), so the two do not describe the same tree",
+			m.prov.Nodes, indexNodes, m.prov.DuplicateNodeIDsDropped))
 	}
 	return out
 }
