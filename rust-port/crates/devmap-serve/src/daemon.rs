@@ -15,6 +15,16 @@ use crate::watcher::start_file_watcher;
 
 const STABLE_READ_ATTEMPTS: usize = 3;
 
+/// How many per-path failures one drain's error message itemises.
+///
+/// The count of failures is bounded by `batch_limit` (8192) and each rendered
+/// entry carries a path plus a whole error, so an itemised list of all of them
+/// is an error message megabytes long — logged in full by `run_loop`, and again
+/// on every backoff retry. Five is a sample; `failed.len()` beside it is the
+/// truth, and both are reported. Same shape, and the same reason, as
+/// `Store::DEGRADED_SAMPLE`.
+const DRAIN_FAILURE_SAMPLE: usize = 5;
+
 struct AbortTaskOnDrop<T>(tokio::task::JoinHandle<T>);
 
 impl<T> Drop for AbortTaskOnDrop<T> {
@@ -121,6 +131,43 @@ fn read_stable_source(path: &std::path::Path, relative: &str) -> anyhow::Result<
     read_stable_source_with(path, relative, || std::fs::read_to_string(path))
 }
 
+/// Whether a filesystem error means the path is **not there**, as opposed to
+/// the syscall not having been possible.
+///
+/// The distinction is the whole point. "Not there" is a fact the queue can act
+/// on — it reconciles as a deletion. "I could not look" — a symlink loop
+/// (`ELOOP`), a parent that lost `+x` (`EACCES`), a stale handle on a network
+/// mount, an I/O error on the device — is not, and answering it with a deletion
+/// drops the file's rows out of the generation on the strength of a check that
+/// never ran.
+///
+/// `NotADirectory` is absence too: a parent component became a file, so nothing
+/// can live at this path and no retry will change that.
+fn path_is_absent(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// Whether a failure means the path stopped existing while it was being read.
+///
+/// Searched down the whole cause chain because the read is wrapped in context
+/// before it reaches the caller, and a `NotFound` that only survives as text in
+/// a message is not a fact anything can branch on.
+///
+/// This is the one read failure that is not a failure at all: the file is gone,
+/// which is a state the queue already knows how to express. Every other kind —
+/// `PermissionDenied`, `IsADirectory`, an I/O error on the device — stays a
+/// failure, because retrying those can succeed and pretending the file was
+/// deleted would drop its rows out of the graph.
+fn vanished_under_the_reader(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(path_is_absent)
+}
+
 fn read_stable_source_with<F>(
     path: &std::path::Path,
     relative: &str,
@@ -140,8 +187,15 @@ where
                 before.len()
             );
         }
-        let source = read()
-            .map_err(|error| anyhow::anyhow!("cannot read changed source {relative:?}: {error}"))?;
+        // `context`, not `anyhow!("{error}")`: formatting the cause into a
+        // string throws the `io::ErrorKind` away, and the caller has to be able
+        // to tell "this file was removed under me" from every other read
+        // failure — one is a deletion to reconcile, the others are retries to
+        // charge. See `vanished_under_the_reader`. The rendered message is the
+        // same either way.
+        let source = read().map_err(|error| {
+            anyhow::Error::new(error).context(format!("cannot read changed source {relative:?}"))
+        })?;
         let after = std::fs::metadata(path)?;
         if read_is_stable(
             before.len(),
@@ -188,8 +242,20 @@ pub struct Daemon {
     store_path: Option<std::path::PathBuf>,
 }
 
+/// What one drain established about git HEAD, from one reading of it.
+///
+/// Two fields rather than two calls: see [`Daemon::head_for_drain`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DrainHead {
+    /// The identity to stamp the generation with.
+    sha: String,
+    /// Whether it differs from the stored generation's, and the rows in that
+    /// generation therefore describe a checkout that is no longer current.
+    moved: bool,
+}
+
 /// One batch of watcher/discovery work, before it is persisted.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct PendingDelta {
     affected: std::collections::BTreeSet<String>,
     deleted: std::collections::BTreeSet<String>,
@@ -465,6 +531,22 @@ impl Daemon {
         previous: &[devmap_extract::Extraction],
         pending: &str,
     ) -> anyhow::Result<PendingDelta> {
+        self.collect_pending_path_with(root, previous, pending, &read_stable_source)
+    }
+
+    /// [`Self::collect_pending_path`] with the source read injected.
+    ///
+    /// The seam exists so a test can make the file vanish *between* the
+    /// existence check and the read — the window this function has to survive
+    /// and the one no test can schedule from the outside. Same reason
+    /// [`read_stable_source_with`] has one.
+    fn collect_pending_path_with(
+        &self,
+        root: &std::path::Path,
+        previous: &[devmap_extract::Extraction],
+        pending: &str,
+        read_source: &dyn Fn(&std::path::Path, &str) -> anyhow::Result<String>,
+    ) -> anyhow::Result<PendingDelta> {
         let raw = std::path::Path::new(pending);
         if raw
             .components()
@@ -558,55 +640,171 @@ impl Daemon {
 
         let relative = stored_path(root, &candidate)?;
         delta.affected.insert(relative.clone());
-        if candidate.exists() {
-            let canonical = candidate.canonicalize()?;
-            if !canonical.starts_with(root) {
-                anyhow::bail!("watched file resolves outside daemon root: {canonical:?}");
-            }
-            if !canonical.is_file() || !is_indexable_source(&relative) {
+        // `Path::exists()` collapses *every* stat failure into `false`, not
+        // just "no such file": a symlink loop (`ELOOP`), a parent that lost
+        // `+x` (`EACCES`), a stale handle on a network mount. Each of those is
+        // a question that could not be answered, and this branch answers with a
+        // **deletion** — which drops the file's rows out of the generation. A
+        // wrongly-kept row is merely stale; a wrongly-dropped one is a symbol
+        // the dead-code pass is then free to call unreferenced. So only the
+        // errors that actually mean "not there" may reconcile as a deletion,
+        // and the rest are failures the queue retries and then quarantines,
+        // which is where an unresolvable path is supposed to become visible.
+        match std::fs::metadata(&candidate) {
+            Ok(_) => {}
+            Err(error) if path_is_absent(&error) => {
                 delta.deleted.insert(relative);
                 return Ok(delta);
             }
-            let source = read_stable_source(&canonical, &relative)?;
-            delta.fresh.push(extract_file(&relative, &source));
-        } else {
-            delta.deleted.insert(relative);
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "cannot determine whether changed source {relative:?} still exists"
+                )));
+            }
         }
+        // Everything from here down races an ordinary create-then-delete: the
+        // existence check above is a stat, and the canonicalize, the stat inside
+        // the stable read and the read itself are three more syscalls after it.
+        // A file that goes away in any of those windows used to come back as a
+        // *failure*, which charges the path a retry attempt — five of them and
+        // the store quarantines it permanently. Editors writing scratch files,
+        // a build emitting and removing intermediates, `git checkout` churn:
+        // all of them are this, and none of them is an error. A path that is
+        // gone is a deletion, which is the answer the absence branch above
+        // already gives; losing a race to reach it must not change the answer.
+        let vanished = |error: anyhow::Error| -> anyhow::Result<PendingDelta> {
+            if !vanished_under_the_reader(&error) {
+                return Err(error);
+            }
+            let mut delta = PendingDelta::default();
+            delta.affected.insert(relative.clone());
+            delta.deleted.insert(relative.clone());
+            info!(
+                "changed source {relative:?} was removed while it was being read; \
+                 reconciling it as a deletion rather than charging a retry: {error}"
+            );
+            Ok(delta)
+        };
+        let canonical = match candidate.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(error) => return vanished(error.into()),
+        };
+        if !canonical.starts_with(root) {
+            anyhow::bail!("watched file resolves outside daemon root: {canonical:?}");
+        }
+        // Same rule as the existence check above: `is_file()` is another stat,
+        // and swallowing its failure into `false` turns "I could not look" into
+        // "not a regular file, drop its rows".
+        let metadata = match std::fs::metadata(&canonical) {
+            Ok(metadata) => metadata,
+            Err(error) => return vanished(anyhow::Error::new(error)),
+        };
+        if !metadata.is_file() || !is_indexable_source(&relative) {
+            delta.deleted.insert(relative);
+            return Ok(delta);
+        }
+        let source = match read_source(&canonical, &relative) {
+            Ok(source) => source,
+            Err(error) => return vanished(error),
+        };
+        delta.fresh.push(extract_file(&relative, &source));
         Ok(delta)
+    }
+
+    /// The git HEAD one drain builds against, read exactly once. (B5)
+    ///
+    /// Both facts the drain needs about HEAD come out of a *single* reading,
+    /// because they are two uses of one observation and the old code took two:
+    ///
+    /// - `moved` decided whether the rows in the last generation may be carried
+    ///   forward, from `current_git_head` called near the top of the drain;
+    /// - `sha` stamped the generation about to be written, from a *second*
+    ///   `current_git_head` called after extraction, resolution and analysis —
+    ///   seconds later on any real repository.
+    ///
+    /// A checkout landing between the two made the drain decide "HEAD has not
+    /// moved, carry the rows forward" and then stamp the result with the HEAD
+    /// it had moved to. That stamp is what made the damage permanent rather
+    /// than transient: the very next drain compares the current HEAD against
+    /// the one just stored, finds them equal, and carries forward again. The
+    /// rebuild the checkout called for is never run, by a check reading its own
+    /// mistake back as proof that nothing happened.
+    ///
+    /// `moved` is also no longer gated on a git-HEAD sentinel being in the same
+    /// claimed batch. The sentinel is what *wakes* the daemon when only `.git`
+    /// changed; it is not evidence, and requiring it meant an ordinary file
+    /// event drained at a moved HEAD took the carry-forward path — then stamped
+    /// the new HEAD and suppressed the sentinel's own rebuild one batch later.
+    /// Comparing unconditionally costs nothing: the drain has to read HEAD for
+    /// the stamp regardless, and this is that same read.
+    ///
+    /// Fails *safe*, not quiet. A stored `head_sha` that cannot be read answers
+    /// `moved`, forcing a full rebuild: a redundant one costs time while a
+    /// skipped one costs correctness. An unreadable *current* HEAD is folded
+    /// into the stamp instead, for the reason stated at the comparison below.
+    fn head_for_drain(
+        &self,
+        root: &std::path::Path,
+        read_head: &dyn Fn(&std::path::Path) -> anyhow::Result<String>,
+    ) -> DrainHead {
+        // `"unavailable"` is what this kernel stamps when HEAD cannot be read —
+        // `devmap build` uses the same spelling, and
+        // `latest_generation_head_sha` documents that it comes back verbatim
+        // rather than as "never built".
+        let sha = match read_head(root) {
+            Ok(sha) => sha,
+            Err(error) => {
+                warn!("cannot read git HEAD for {root:?}: {error}");
+                "unavailable".to_string()
+            }
+        };
+        // Compared against the *stamp*, not against the raw reading. The two
+        // differ in exactly one case and it matters: outside a git repository
+        // every reading fails, so treating an unreadable HEAD as "moved" made
+        // every drain in such a tree a full re-extraction, for ever. Comparing
+        // stamps makes the rule self-consistent — this drain stores `sha`, so
+        // the next one finds them equal and stops — while keeping every real
+        // move loud: a stored `abc123` against an unreadable HEAD still differs
+        // from `"unavailable"` and still rebuilds.
+        //
+        // The residual: a checkout that moves while HEAD stays unreadable is
+        // not noticed *by this check*. It is not lost — the connect-time sweep
+        // content-hashes the whole tree and the watcher sees the files a
+        // checkout rewrites — only the shortcut is. Weighed against a daemon
+        // that re-extracts the entire repository on every batch, which is what
+        // the alternative actually did.
+        let moved = match self.store.latest_generation_head_sha() {
+            // No generation yet: nothing to invalidate.
+            Ok(None) => false,
+            Ok(Some(stored)) => sha != stored,
+            Err(error) => {
+                warn!("cannot read the stored head_sha, assuming HEAD moved: {error}");
+                true
+            }
+        };
+        DrainHead { sha, moved }
     }
 
     /// Process up to `batch_limit` claimed paths. Only claimed files are read
     /// from disk; unchanged extraction payloads come from the durable generation.
     /// Attempts are recorded before work starts, and paths are acknowledged only
-    /// Whether the working tree's HEAD differs from the one the latest
-    /// generation was built at. (B5)
-    ///
-    /// Fails *safe*, not quiet: if either side cannot be read the answer is
-    /// `true`, forcing a full rebuild. An unreadable HEAD is precisely the
-    /// state in which "nothing changed" is the claim least worth trusting, and
-    /// a redundant full rebuild costs time while a skipped one costs
-    /// correctness.
-    fn head_differs_from_last_generation(&self, root: &std::path::Path) -> bool {
-        let stored = match self.store.latest_generation_head_sha() {
-            Ok(Some(stored)) => stored,
-            // No generation yet: nothing to invalidate.
-            Ok(None) => return false,
-            Err(error) => {
-                warn!("cannot read the stored head_sha, assuming HEAD moved: {error}");
-                return true;
-            }
-        };
-        match devmap_store::current_git_head(root) {
-            Ok(current) => current != stored,
-            Err(error) => {
-                warn!("cannot read git HEAD, assuming it moved: {error}");
-                true
-            }
-        }
-    }
-
     /// after extraction, resolution, analysis, and persistence all succeed.
     pub fn drain_pending_batch(&self) -> anyhow::Result<usize> {
+        self.drain_pending_batch_with_head(&current_git_head)
+    }
+
+    /// [`Self::drain_pending_batch`] with the HEAD reading injected.
+    ///
+    /// The seam exists for the same reason [`read_stable_source_with`]'s does:
+    /// the property under test is *when* the kernel looks at something that
+    /// another process is free to change, and a test cannot schedule a `git
+    /// checkout` into the middle of a resolve. With the reading injected it can
+    /// hand back a different answer on a second call and assert there is no
+    /// second call.
+    fn drain_pending_batch_with_head(
+        &self,
+        read_head: &dyn Fn(&std::path::Path) -> anyhow::Result<String>,
+    ) -> anyhow::Result<usize> {
         let claims = self.store.claim_pending_batch(self.batch_limit)?;
         if claims.is_empty() {
             return Ok(0);
@@ -643,11 +841,18 @@ impl Daemon {
         let mut succeeded: Vec<devmap_store::PendingClaim> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
         let mut failures = Vec::new();
+        // Indexed once rather than scanned per path. `claims` is bounded by
+        // `batch_limit` (8192) and `claim_of` runs once per path in it, so the
+        // linear `find` this replaces made the lookup step itself O(batch) and
+        // the drain O(batch²) — a stride is not a bound when one step is not.
+        let claim_of: std::collections::HashMap<&str, &devmap_store::PendingClaim> = claims
+            .iter()
+            .map(|claim| (claim.path.as_str(), claim))
+            .collect();
         let claim_of = |path: &str| {
-            claims
-                .iter()
-                .find(|claim| claim.path == path)
-                .cloned()
+            claim_of
+                .get(path)
+                .map(|claim| (*claim).clone())
                 .expect("every batch path came from a claim")
         };
         // B5: git moved HEAD or a ref. Not a file to extract — a statement that
@@ -657,7 +862,9 @@ impl Daemon {
         let head_event = batch
             .iter()
             .any(|pending| pending == crate::watcher::GIT_HEAD_SENTINEL);
-        let head_moved = head_event && self.head_differs_from_last_generation(&root);
+        // One reading, used both to decide and to stamp. See `head_for_drain`.
+        let head = self.head_for_drain(&root, read_head);
+        let head_moved = head.moved;
         if head_event {
             succeeded.push(claim_of(crate::watcher::GIT_HEAD_SENTINEL));
         }
@@ -677,7 +884,16 @@ impl Daemon {
                 Err(error) => {
                     warn!("pending path {pending:?} failed in isolation: {error}");
                     failed.push(pending.clone());
-                    failures.push(format!("{pending}: {error}"));
+                    // A sample, kept at a fixed size. The batch is bounded at
+                    // `batch_limit` (8192) and every entry here carries a whole
+                    // rendered error, so accumulating one per path built an
+                    // error message whose length was a function of how badly
+                    // the batch went — megabytes into a single `warn!` line,
+                    // re-emitted on every retry. `failed.len()` is the honest
+                    // total and is reported beside the sample.
+                    if failures.len() < DRAIN_FAILURE_SAMPLE {
+                        failures.push(format!("{pending}: {error}"));
+                    }
                 }
             }
         }
@@ -689,7 +905,21 @@ impl Daemon {
         }
 
         if succeeded.is_empty() {
-            anyhow::bail!("every pending path failed: {}", failures.join("; "));
+            // Both numbers, never just the sample. `StoreStatus::degraded_reason`
+            // reports quarantined paths the same way and for the same reason: a
+            // list that stops at five without saying so reads exactly like a
+            // batch in which only five things went wrong.
+            let elided = failed.len().saturating_sub(failures.len());
+            let shown = failures.join("; ");
+            if elided > 0 {
+                anyhow::bail!(
+                    "all {} claimed path(s) failed; first {} of them: {shown}, \
+                     and {elided} more not shown",
+                    failed.len(),
+                    failures.len()
+                );
+            }
+            anyhow::bail!("all {} claimed path(s) failed: {shown}", failed.len());
         }
         // One entry per file from here down, whatever the queue asked for.
         let fresh: Vec<devmap_extract::Extraction> = fresh.into_values().collect();
@@ -778,7 +1008,12 @@ impl Daemon {
         resolver.index_extractions(&extractions);
         let resolution = resolver.resolve_all(&extractions);
         let analysis = analyze_with_discovery(&extractions, &resolution, discovery);
-        let head_sha = current_git_head(&self.root).unwrap_or_else(|_| "unavailable".to_string());
+        // The reading the carry-forward decision was made against, not a fresh
+        // one: a checkout that landed while the resolve above was running must
+        // leave the generation stamped at the HEAD it actually describes, so
+        // the next drain still sees a difference and rebuilds. See
+        // `head_for_drain`.
+        let head_sha = head.sha;
         // K13: hold the cross-process writer lock across persist + prune. A
         // `devmap build` running beside the daemon otherwise races it on
         // SQLite's busy timeout alone, and the loser surfaces `database is
@@ -1233,11 +1468,35 @@ pub fn default_ipc_path_for(root: &std::path::Path) -> std::path::PathBuf {
     format!(r"\\.\pipe\devmap-{:016x}", ipc_identity_for(root)).into()
 }
 
+/// The repo-relative key `candidate` is stored under.
+///
+/// Refuses a name whose bytes are not UTF-8 rather than converting lossily.
+/// The lossy spelling is not this file — it is a *different* path, with
+/// `U+FFFD` where the bytes were, naming something that does not exist. Stored,
+/// it becomes a row no lookup can ever match and no deletion pass can ever
+/// clear; used as an extraction key, it claims the daemon indexed a file it
+/// did not. Both are the same defect: a conversion that could not be performed
+/// answering exactly like one that was.
+///
+/// The watcher refuses these before they reach the queue, so the reachable
+/// route here is a symlinked component resolving through an unrepresentable
+/// name during `canonicalize`. A refusal costs the path a retry attempt and,
+/// after `MAX_PENDING_ATTEMPTS`, a place in `degraded_reason` — which is the
+/// honest end state for a path this kernel cannot index, and the one
+/// `collect_sources_with_report` already gives it on the build path.
 fn stored_path(root: &std::path::Path, candidate: &std::path::Path) -> anyhow::Result<String> {
     let relative = candidate
         .strip_prefix(root)
         .map_err(|_| anyhow::anyhow!("path {:?} is outside daemon root {:?}", candidate, root))?;
-    Ok(relative.to_string_lossy().replace('\\', "/"))
+    let relative = relative.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "path {:?} is not UTF-8 relative to daemon root {:?}; it cannot be stored \
+             and is absent from the graph",
+            candidate,
+            root
+        )
+    })?;
+    Ok(relative.replace('\\', "/"))
 }
 
 #[cfg(test)]
@@ -1247,6 +1506,40 @@ mod tests {
     // form is the correct one for them: no discovery step ran over what they
     // assembled. The drain itself must never use it.
     use devmap_analyze::analyze;
+
+    /// The HEAD identity a drain reads in a scratch tree that is not a git
+    /// repository: `current_git_head` fails there, and the drain stamps
+    /// `"unavailable"` — the same spelling `devmap build` uses outside git.
+    ///
+    /// Fixtures below record it explicitly rather than using `save_generation`,
+    /// whose convenience default is `"unknown"`. `"unknown"` is not a claim
+    /// that HEAD is unchanged, it is the absence of a claim, and the drain
+    /// answers an absent claim by rebuilding rather than carrying rows forward
+    /// from a checkout it cannot vouch for. Every real writer — `devmap build`,
+    /// the extraction cache, this drain — records a real identity, so
+    /// `"unknown"` reaches no production store; a fixture that leaves it there
+    /// silently moves the test onto the full-rebuild branch and stops
+    /// exercising the differential one it was written for.
+    const SCRATCH_HEAD: &str = "unavailable";
+
+    /// `Store::save_generation` with the scratch tree's HEAD recorded. See
+    /// [`SCRATCH_HEAD`].
+    fn save_scratch_generation(
+        store: &Store,
+        extractions: &[devmap_extract::Extraction],
+        resolution: &devmap_resolve::ResolutionResult,
+        analysis: &devmap_analyze::model::AnalysisSummary,
+    ) {
+        store
+            .save_generation_with_metadata(
+                extractions,
+                resolution,
+                analysis,
+                GenerationWriteOpts::default(),
+                SCRATCH_HEAD,
+            )
+            .unwrap();
+    }
 
     /// The stat-read-stat loop refuses a file that changed under it, and the
     /// size limit is exclusive.
@@ -1584,9 +1877,7 @@ mod tests {
         let resolution = resolver.resolve_all(&initial);
         let analysis = analyze(&initial, &resolution);
         let store = Store::open_in_memory().unwrap();
-        store
-            .save_generation(&initial, &resolution, &analysis)
-            .unwrap();
+        save_scratch_generation(&store, &initial, &resolution, &analysis);
 
         // The edit: one legitimate change, and the sibling grows past the
         // source-size limit so discovery refuses it.
@@ -1656,9 +1947,7 @@ mod tests {
         let resolution = resolver.resolve_all(&initial);
         let analysis = analyze(&initial, &resolution);
         let store = Store::open_in_memory().unwrap();
-        store
-            .save_generation(&initial, &resolution, &analysis)
-            .unwrap();
+        save_scratch_generation(&store, &initial, &resolution, &analysis);
 
         // A source whose name is not valid UTF-8 appears after the last build.
         // Some volume configurations (APFS with name normalization among them)
@@ -1782,9 +2071,7 @@ mod tests {
         let resolution = resolver.resolve_all(&initial);
         let analysis = analyze(&initial, &resolution);
         let store = Store::open_in_memory().unwrap();
-        store
-            .save_generation(&initial, &resolution, &analysis)
-            .unwrap();
+        save_scratch_generation(&store, &initial, &resolution, &analysis);
 
         fs::write(root.join("changed.py"), "def changed():\n    return 2\n").unwrap();
         fs::remove_file(root.join("deleted.py")).unwrap();
@@ -1845,9 +2132,7 @@ mod tests {
         let resolution = resolver.resolve_all(&initial);
         let analysis = analyze(&initial, &resolution);
         let store = Store::open_in_memory().unwrap();
-        store
-            .save_generation(&initial, &resolution, &analysis)
-            .unwrap();
+        save_scratch_generation(&store, &initial, &resolution, &analysis);
 
         fs::write(&a_path, "def new_a():\n    return 3\n").unwrap();
         fs::remove_file(&b_path).unwrap();
@@ -1864,6 +2149,394 @@ mod tests {
         assert!(persisted.iter().any(|ext| {
             ext.file_path == "b.py" && ext.symbols.iter().any(|symbol| symbol.name == "stable_b")
         }));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A checkout that lands *during* a drain must not be able to stamp itself
+    /// onto a generation built from the previous one.
+    ///
+    /// The drain used to read git HEAD twice: once to decide whether the stored
+    /// rows may be carried forward, and again — after extraction, resolution
+    /// and analysis, seconds later on any real repository — to stamp the
+    /// generation. A `git checkout` in between made it decide "unmoved, carry
+    /// forward" and then record the HEAD it had moved to. The next drain then
+    /// compared the current HEAD against that stamp, found them equal, and
+    /// carried forward again: the rebuild the checkout called for is never run,
+    /// because the check reads its own mistake back as proof nothing happened.
+    ///
+    /// The reading is injected because a test cannot schedule a checkout into
+    /// the middle of a resolve. A reader that answers differently the second
+    /// time makes the two-read shape visible directly: there must be no second
+    /// call, and the stamp must be the answer the decision was made on.
+    #[test]
+    fn one_drain_reads_git_head_exactly_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let root = std::env::temp_dir().join(format!(
+            "devmap-head-once-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        let root = root.canonicalize().unwrap();
+        fs::write(root.join("src/a.py"), "def a():\n    return 1\n").unwrap();
+
+        let decided_at = "a".repeat(40);
+        let moved_to = "b".repeat(40);
+
+        let daemon = Daemon::new(Store::open_in_memory().unwrap(), root.clone());
+        daemon
+            .store
+            .enqueue_pending_paths_under_root(&root, &["src/a.py".to_string()])
+            .unwrap();
+        let first = decided_at.clone();
+        assert_eq!(
+            daemon
+                .drain_pending_batch_with_head(&move |_: &std::path::Path| Ok(first.clone()))
+                .unwrap(),
+            1
+        );
+
+        // A file the drain is never told about, so a carry-forward and a full
+        // re-extraction are distinguishable from the stored generation alone.
+        fs::write(root.join("src/b.py"), "def b():\n    return 2\n").unwrap();
+        fs::write(root.join("src/a.py"), "def a():\n    return 99\n").unwrap();
+        daemon
+            .store
+            .enqueue_pending_paths_under_root(&root, &["src/a.py".to_string()])
+            .unwrap();
+
+        let reads = AtomicUsize::new(0);
+        let decided = decided_at.clone();
+        let moved = moved_to.clone();
+        let drained = daemon
+            .drain_pending_batch_with_head(&move |_: &std::path::Path| {
+                // First answer matches the stored generation, so the drain
+                // decides "carry forward". Every later answer is the checkout
+                // that landed while it was working.
+                if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(decided.clone())
+                } else {
+                    Ok(moved.clone())
+                }
+            })
+            .unwrap();
+        assert_eq!(drained, 1);
+
+        assert_eq!(
+            daemon
+                .store
+                .latest_generation_head_sha()
+                .unwrap()
+                .as_deref(),
+            Some(decided_at.as_str()),
+            "the generation must be stamped at the HEAD its carry-forward decision \
+             was made against; stamping a later reading is what makes the next \
+             drain believe the checkout never happened"
+        );
+        let mut persisted: Vec<String> = daemon
+            .store
+            .latest_extractions()
+            .unwrap()
+            .into_iter()
+            .map(|extraction| extraction.file_path)
+            .collect();
+        persisted.sort();
+        assert_eq!(
+            persisted,
+            vec!["src/a.py".to_string()],
+            "and it must be the generation that decision produced"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A stored key that cannot be spelled is a refusal, not a renamed file.
+    ///
+    /// `to_string_lossy` on a name whose bytes are not UTF-8 does not produce
+    /// the path; it produces a different one, with `U+FFFD` where the bytes
+    /// were. Stored as an extraction key that is a row nothing can ever match;
+    /// used as a queue entry it names a file that does not exist, which the
+    /// drain reconciles as a *deletion*. Either way a conversion that could not
+    /// be performed answered exactly like one that was.
+    #[cfg(unix)]
+    #[test]
+    fn a_stored_path_that_is_not_utf8_is_refused_not_lossily_renamed() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = std::path::Path::new("/repo");
+        let unrepresentable = root.join(std::ffi::OsStr::from_bytes(b"src/caf\xe9.py"));
+        assert!(
+            unrepresentable.to_str().is_none(),
+            "the fixture must actually be unrepresentable"
+        );
+        let error = stored_path(root, &unrepresentable)
+            .expect_err("an unspellable key must be refused, not invented");
+        assert!(
+            error.to_string().contains("not UTF-8"),
+            "and the refusal must say why: {error}"
+        );
+
+        // Positive control: ordinary names still resolve, and still resolve to
+        // forward slashes.
+        assert_eq!(
+            stored_path(root, &root.join("src/cafe.py")).unwrap(),
+            "src/cafe.py"
+        );
+    }
+
+    /// A wholly-failed batch reports a bounded sample and the honest total.
+    ///
+    /// The message itemised every failure. `batch_limit` is 8192 and each entry
+    /// is a path plus a rendered error, so a batch that went entirely wrong —
+    /// a vendored tree that lost its read bit, a mount that went away — built a
+    /// megabyte-scale string, handed it to `run_loop`, and had it logged whole
+    /// on every backoff retry for as long as the condition lasted. Bounding it
+    /// without carrying the total would be the other failure: five named paths
+    /// and nothing saying there were more reads exactly like a batch in which
+    /// only five things went wrong.
+    #[cfg(unix)]
+    #[test]
+    fn a_wholly_failed_batch_reports_a_bounded_sample_and_the_real_total() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, daemon) = daemon_with_one_indexed_source("failure-sample");
+        let daemon = daemon.with_batch_limit(64);
+        let poisoned = DRAIN_FAILURE_SAMPLE * 3;
+        let mut paths = Vec::new();
+        for index in 0..poisoned {
+            let relative = format!("src/poison_{index}.py");
+            let path = root.join(&relative);
+            fs::write(&path, "def poisoned():\n    return 1\n").unwrap();
+            // Readable-by-nobody, so the read inside the drain fails while the
+            // file plainly still exists — a failure, not a deletion.
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+            paths.push(relative);
+        }
+        // The one indexed source is not enqueued, so every claimed path fails.
+        daemon
+            .store
+            .enqueue_pending_paths_under_root(&root, &paths)
+            .unwrap();
+
+        let error = daemon
+            .drain_pending_batch()
+            .expect_err("every claimed path failed, so the batch must fail");
+        let rendered = error.to_string();
+
+        assert!(
+            rendered.contains(&format!("all {poisoned} claimed path(s) failed")),
+            "the honest total must be reported, got: {rendered}"
+        );
+        let named = paths
+            .iter()
+            .filter(|relative| rendered.contains(relative.as_str()))
+            .count();
+        assert_eq!(
+            named, DRAIN_FAILURE_SAMPLE,
+            "exactly the sample may be itemised; {named} of {poisoned} were named in: \
+             {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "{} more not shown",
+                poisoned - DRAIN_FAILURE_SAMPLE
+            )),
+            "and the elided count must be stated, or the sample reads as the whole \
+             set: {rendered}"
+        );
+
+        for relative in &paths {
+            let _ = fs::set_permissions(root.join(relative), fs::Permissions::from_mode(0o600));
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A scratch tree holding one previously-indexed source, and a daemon
+    /// rooted at it. Returns the canonical root and the daemon.
+    fn daemon_with_one_indexed_source(tag: &str) -> (std::path::PathBuf, Daemon) {
+        let root = std::env::temp_dir().join(format!(
+            "devmap-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        let root = root.canonicalize().unwrap();
+        fs::write(root.join("src/a.py"), "def a():\n    return 1\n").unwrap();
+        let daemon = Daemon::new(Store::open_in_memory().unwrap(), root.clone());
+        (root, daemon)
+    }
+
+    /// A file removed between the existence check and the read is a deletion,
+    /// not a failed attempt.
+    ///
+    /// `collect_pending_path` stats the path, canonicalizes it, stats it again
+    /// inside the stable read, and only then reads it. A create-then-delete —
+    /// an editor's scratch file, a build's intermediate, `git checkout` churn —
+    /// routinely lands in one of those windows. Every one of them used to
+    /// propagate as an error, and an error charges the path a retry attempt:
+    /// five of those and the store quarantines it *permanently*, so a file that
+    /// was only ever deleted stops being indexed for the life of the store and
+    /// shows up in `degraded_reason` as though something were wrong with it.
+    ///
+    /// The `!exists()` branch already answers "deleted" for exactly this file.
+    /// Losing a race to reach that branch must not change the answer.
+    #[test]
+    fn a_source_removed_while_it_is_read_is_reconciled_as_a_deletion() {
+        let (root, daemon) = daemon_with_one_indexed_source("vanish-read");
+        let previous = vec![extract_file("src/a.py", "def a():\n    return 1\n")];
+
+        let delta = daemon
+            .collect_pending_path_with(&root, &previous, "src/a.py", &|_, _| {
+                Err(anyhow::Error::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "No such file or directory (os error 2)",
+                ))
+                .context("cannot read changed source \"src/a.py\""))
+            })
+            .expect(
+                "a file that stopped existing under the reader is a deletion the queue \
+                 already knows how to express, not an attempt to charge toward quarantine",
+            );
+
+        assert!(
+            delta.deleted.contains("src/a.py"),
+            "the vanished path must be reconciled as deleted, got {:?}",
+            delta.deleted
+        );
+        assert!(
+            delta.fresh.is_empty(),
+            "and nothing may be extracted from a file that is not there"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A path whose existence cannot be determined must not be reported gone.
+    ///
+    /// `Path::exists()` and `Path::is_dir()` answer `false` for *every* stat
+    /// failure, not only "no such file": a symlink loop (`ELOOP`), a parent
+    /// that lost `+x` (`EACCES`), a stale handle on a network mount. Each is a
+    /// question that could not be answered, and the drain answered all of them
+    /// with a **deletion** — which removes the file's rows from the graph. That
+    /// is the one direction that destroys information: a wrongly-kept row is
+    /// stale, a wrongly-dropped one is a symbol the dead-code pass is now free
+    /// to call unreferenced.
+    ///
+    /// The undecidable answer is a failure, which the queue already knows what
+    /// to do with: retry, then quarantine and name the path in
+    /// `degraded_reason`. `admitted_watch_path` states the same rule for the
+    /// same cases on the way in.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_whose_existence_is_undecidable_is_not_reported_deleted() {
+        let (root, daemon) = daemon_with_one_indexed_source("eloop");
+        // Self-referential: every stat of it returns ELOOP.
+        std::os::unix::fs::symlink("looped.py", root.join("src/looped.py")).unwrap();
+        assert!(
+            fs::metadata(root.join("src/looped.py")).is_err(),
+            "the fixture must actually be unstattable"
+        );
+        let previous = vec![extract_file(
+            "src/looped.py",
+            "def looped():\n    return 1\n",
+        )];
+
+        let error = daemon
+            .collect_pending_path(&root, &previous, "src/looped.py")
+            .expect_err(
+                "a stat that could not run must not answer the same as one that ran and \
+                 found the file gone — that answer deletes the file's rows",
+            );
+        assert!(
+            error.to_string().contains("still exists"),
+            "and the refusal must say the question is the one that failed: {error}"
+        );
+
+        // Positive control: a path that is genuinely absent is still a deletion.
+        let previous = vec![extract_file("src/gone.py", "def gone():\n    return 1\n")];
+        let delta = daemon
+            .collect_pending_path(&root, &previous, "src/gone.py")
+            .expect("an absent path is an answerable question");
+        assert!(
+            delta.deleted.contains("src/gone.py"),
+            "a file that is not there is deleted, got {:?}",
+            delta.deleted
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The OFF direction, and the reason this is a `NotFound` check and not a
+    /// blanket `Ok`: a file that exists but cannot be read is a *failure*.
+    /// Retrying it can succeed once the permission is fixed, and answering
+    /// "deleted" would drop its rows out of the graph on the strength of a
+    /// check that never ran.
+    #[test]
+    fn an_unreadable_source_is_still_a_failure_not_a_deletion() {
+        let (root, daemon) = daemon_with_one_indexed_source("vanish-denied");
+        let previous = vec![extract_file("src/a.py", "def a():\n    return 1\n")];
+
+        let error = daemon
+            .collect_pending_path_with(&root, &previous, "src/a.py", &|_, _| {
+                Err(anyhow::Error::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Permission denied (os error 13)",
+                ))
+                .context("cannot read changed source \"src/a.py\""))
+            })
+            .expect_err("an unreadable file that still exists must not read as deleted");
+        assert!(
+            error.to_string().contains("cannot read changed source"),
+            "and the refusal must still name the read, got: {error}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The wrapper must keep the `io::ErrorKind` reachable.
+    ///
+    /// `read_stable_source_with` formatted its cause into a message, which left
+    /// "the file was removed" indistinguishable from every other read failure
+    /// once it reached the caller — a fact that only survives as text is not
+    /// one anything can branch on, and the branch above is what keeps an
+    /// ordinary deletion out of quarantine.
+    #[test]
+    fn a_vanished_read_stays_recognisable_as_vanished() {
+        let (root, daemon) = daemon_with_one_indexed_source("vanish-chain");
+        drop(daemon);
+        let path = root.join("src/a.py");
+
+        let error = read_stable_source_with(&path, "src/a.py", || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No such file or directory (os error 2)",
+            ))
+        })
+        .expect_err("the injected read fails");
+        assert!(
+            error.to_string().contains("cannot read changed source"),
+            "the message must not change: {error}"
+        );
+        assert!(
+            vanished_under_the_reader(&error),
+            "and the kind must survive the wrapping, or the caller cannot tell a \
+             deletion from a device error: {error:?}"
+        );
+
+        let denied = read_stable_source_with(&path, "src/a.py", || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Permission denied (os error 13)",
+            ))
+        })
+        .expect_err("the injected read fails");
+        assert!(
+            !vanished_under_the_reader(&denied),
+            "and a predicate that answered yes to everything would be worth nothing"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2133,9 +2806,7 @@ mod tests {
         let resolution = resolver.resolve_all(&initial);
         let analysis = analyze(&initial, &resolution);
         let store = Store::open_in_memory().unwrap();
-        store
-            .save_generation(&initial, &resolution, &analysis)
-            .unwrap();
+        save_scratch_generation(&store, &initial, &resolution, &analysis);
 
         // The window in which the OS dropped events: this file appears, and no
         // per-path event for it is ever delivered.
@@ -2234,9 +2905,7 @@ mod tests {
         let resolution = resolver.resolve_all(&initial);
         let analysis = analyze(&initial, &resolution);
         let store = Store::open_in_memory().unwrap();
-        store
-            .save_generation(&initial, &resolution, &analysis)
-            .unwrap();
+        save_scratch_generation(&store, &initial, &resolution, &analysis);
 
         fs::write(root.join("pkg/mod.py"), "def helper():\n    return 2\n").unwrap();
 
@@ -2669,9 +3338,7 @@ mod tests {
         let analysis = analyze(&initial, &resolution);
         let database = root.join(".devcouncil/codeintel/index.sqlite");
         let store = Store::open(&database).unwrap();
-        store
-            .save_generation(&initial, &resolution, &analysis)
-            .unwrap();
+        save_scratch_generation(&store, &initial, &resolution, &analysis);
         let socket = root.join("devmap.sock");
         let daemon = Daemon::new(store, root.clone())
             .with_idle_poll(Duration::from_millis(50))
