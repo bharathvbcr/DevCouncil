@@ -479,6 +479,28 @@ pub fn collect_sources(root: &Path) -> anyhow::Result<Vec<(String, String)>> {
     Ok(sources)
 }
 
+/// The path a walker error is *about*, when it is about one.
+///
+/// `ignore::Error` wraps the underlying failure in `WithPath`/`WithDepth`/
+/// `WithLineNumber` layers and exposes no accessor for the path, so this
+/// unwraps them. `Loop` names two paths — the ancestor and the child that
+/// points back at it — and the child is the entry the walk actually stopped
+/// on, which is the one to record.
+///
+/// `None` means the failure names no path at all, and the caller must not
+/// treat it as an entry it can step over.
+pub(crate) fn walk_error_path(error: &ignore::Error) -> Option<&Path> {
+    match error {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            walk_error_path(err)
+        }
+        ignore::Error::Loop { child, .. } => Some(child),
+        ignore::Error::Partial(errors) => errors.iter().find_map(walk_error_path),
+        _ => None,
+    }
+}
+
 /// Where a symlinked candidate actually points, when that is outside `root`.
 ///
 /// `None` for anything that is not a symlink — the ordinary case, and one stat
@@ -557,7 +579,47 @@ pub fn collect_sources_with_report(
         .build();
 
     for result in walker {
-        let entry = result?;
+        let entry = match result {
+            Ok(entry) => entry,
+            // A path below the root that the walker could not descend into or
+            // stat. Recorded and stepped over, not fatal.
+            //
+            // The `?` that used to be here made one `chmod 000` directory cost
+            // the entire map: measured on a tree of eight ordinary sources plus
+            // one unreadable directory, `devmap build` exited 1 with a single
+            // JSON error and `status` then reported `node_count: 0`, "nothing
+            // has been indexed yet". An unreadable *file* three lines below is
+            // recorded as `Unreadable` and skipped, and the build describes the
+            // rest of the repository — two spellings of "this indexer could not
+            // read that path", one a hole and one a dead build. A root-owned
+            // build directory, an object pack with odd modes or a mount that
+            // lost `+x` are ordinary; none of them is a reason to refuse to
+            // describe everything else.
+            //
+            // The root itself stays fatal, below: a root that could not be
+            // opened was never examined, and answering "no sources here" for
+            // one is a check that could not run reporting as a check that ran.
+            Err(error) => {
+                let named = walk_error_path(&error)
+                    .and_then(|path| path.strip_prefix(root).ok().map(Path::to_path_buf))
+                    .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+                    .filter(|relative| !relative.is_empty());
+                match named {
+                    Some(relative) => report.skipped_paths.push((
+                        relative,
+                        DiscoverySkipReason::Unreadable {
+                            reason: error.to_string(),
+                        },
+                    )),
+                    // Either the error names the root, or it names nothing at
+                    // all — a `.gitignore` this walk could not read, say. Both
+                    // are about the pass as a whole rather than about one entry
+                    // under it, and neither can be stepped over.
+                    None => return Err(error.into()),
+                }
+                continue;
+            }
+        };
         let p = entry.path();
         if !p.is_file() {
             continue;
