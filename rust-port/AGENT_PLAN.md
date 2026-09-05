@@ -431,11 +431,45 @@ never run `devmap build` against the repository root's store from a test.
    retry. **Check `git status` and file mtimes before assuming a failure is yours**, and
    re-run a suite before treating it as a gate (W6 in PLAN.md §10).
 
-4. **The working store is nine schema versions stale.** `.devcouncil/codeintel/index.sqlite`
-   is at `user_version=2`; the binary writes `12`. It is refused at open, not misread, but no
-   gate notices the drift. Do not draw measurements from it.
+4. ~~The working store is nine schema versions stale.~~ **Stale as of 2026-09-05:** the store
+   the seam opens is `.devcouncil/codeintel/devmap.sqlite` (`devmap_client.DEFAULT_DB_PATH`), and
+   `find_engine_binary` no longer ranks candidate kernels by mtime — it probes each one's
+   `devmap status` `n` (the schema it writes), keeps only the capable, and prefers a release
+   build among equals, because mtime was wrong in both directions (a newer release build can
+   carry an older schema, and two builds at the same schema differ in mtime for no reason that
+   should decide anything). The measurement rule stands for a different reason: **never
+   benchmark against this repository's own live store** — build and settle a copy, and see
+   STATUS.md's dated 2026-09-05 sections for the corpus procedure.
+
+5. **Two sessions carried the same audit on 2026-09-05, and `main` is the integration
+   line.** A second session implemented many of the same findings directly on `main` while
+   branch `claude/dev-map-performance-hardening-1a2151` (commit `d2fb25e`) implemented them
+   independently. `d2fb25e` is kept intact as the *record* of the second set and is not
+   merged; branch `claude/devmap-reconcile-1a2151` is `main` plus the pieces of it `main`
+   lacked, ported one at a time. **Before re-implementing anything from
+   `AUDIT_KERNEL_2026-09-05.md`, read that file's "Where these fixes live" paragraph and
+   STATUS.md's "Port of the 1a2151 round-1 work onto main" section**: several findings look
+   open on one line and closed on the other, and the fix for each already exists somewhere.
+   Where both lines had an implementation, exactly one was kept — never leave two.
 
 ### Open work
+
+**What closed on the reconcile line (2026-09-05).** Detail, tests and numbers in STATUS.md's
+"Port of the 1a2151 round-1 work onto main (2026-09-05)" section; the commits are on
+`claude/devmap-reconcile-1a2151`.
+
+| Item | Commit |
+|---|---|
+| One owner for `MAX_TOKEN_BUDGET` / `MAX_TRAVERSAL_DEPTH` in `devmap-query` | `1a7fd98` |
+| CLI argv bounds (`validate_limits`) and one-line `--json` on every exit | `d6ac670` |
+| Per-generation edge index (`devmap-store/src/edge_index.rs`), replacing the per-question read; `impact` 18.6 ms -> 0.95 ms and 73.2 ms -> 3.04 ms p50, `status` 866 µs -> 15 µs and 2.77 ms -> 13 µs | `1dcbc69` |
+| K-B1: a search page is bounded in files and in bytes | `2f9916a` |
+| Admission control across the three transports, plus an HTTP body deadline | `177abbd` |
+| K-B4: the drain batch's claims are indexed once instead of scanned per path | `3425d76` |
+| E-8: `recover_lock`, and grammar mutation fuzzing | `0306e9e` |
+| One owner for uncached tree extraction and for the refusal rule | `4795d23` |
+| Seam: one kernel invocation per map refresh, skip-on-unchanged artifacts, kernel-side freshness digests (`hook.py` import cost 149 ms -> 31 ms) | `035fe1e` |
+| `devmap build --manifest` and `devmap freshness` | `3231018` |
 
 Status is one of: **open** (not started), **partial** (started, gated), **decision** (blocked
 on a human). Nothing here is "done" — closed items live in STATUS.md's dated sections.
@@ -448,7 +482,7 @@ on a human). Nothing here is "done" — closed items live in STATUS.md's dated s
 | SC14 | Nested-symbol identity collisions inside anonymous callbacks and nested types | STATUS.md | partial |
 | SC29 | Unexplained SC26 per-file memory increase | STATUS.md | open |
 | SC2/B3 | Write amplification + genuinely incremental resolve | PLAN.md §7.5 | **decision** (#2) |
-| SC4 | Collapse speculative ambiguous calls into one edge with a candidate set | STATUS.md | **decision** (#7) |
+| SC4 | Collapse speculative ambiguous calls into one edge with a candidate set | STATUS.md | **superseded 2026-09-05** — the fan-out is not collapsed (no winner is picked) but its *emission* is bounded: audit R-7 capped one call site at `AMBIGUOUS_FANOUT_CAP` (16, `devmap-resolve/src/model.rs:244`) edges, each carrying candidate total and cap in `details`, with the full candidate list kept on the `Resolution`; pinned by `audit_regressions.rs::an_ambiguous_fanout_is_capped_and_says_so` and `adversarial_resolve.rs::every_ambiguous_candidate_names_an_indexed_file`. Decision #7 is answered by that bound |
 | — | VB.NET: the one frozen `LANGUAGE_SPECS` entry with no linked grammar | STATUS.md | **decision** (#1) |
 | G4 | Speculative edit preview — "what breaks if I change this" without writing | PLAN.md §3 | **closed** — `devmap preview` ships with `crates/devmap-cli/tests/test_preview.rs`, so the R2 objection below is answered. The paragraph that follows is retained only as the record of why it was once fenced off |
 | G6 | Compact wire format — `code_graph.json` is 84 MB / ~21M tokens on a 3,674-file corpus | PLAN.md §3 · `DIVERGENCES.md` X39 | **closed 2026-09-05** — `devmap manifest --compact-graph-output`; interned encoding of the same model from the same traversal, 21,186,034 B -> 5,001,998 B (-76.4%) on this repository, round-trip asserted. Note it does **not** make the graph agent-readable (5.3M tokens -> 1.25M), and **nothing reads it yet** — the intended first consumer is `backend/go_orchestrator/repomap` |

@@ -3099,3 +3099,75 @@ implementation written for it — `Sha1::update` reset its buffer to empty
 whenever a chunk arrived that did not complete a block, so any input fed in
 pieces smaller than 64 bytes digested wrongly while the one-shot path was
 correct. That is why the streaming tests exist beside the vector tests.
+
+## Port of the 1a2151 round-1 work onto main (2026-09-05)
+
+Two sessions carried `AUDIT_KERNEL_2026-09-05.md` at the same time. One landed
+its fixes directly on `main`; the other landed an independent set on
+`claude/dev-map-performance-hardening-1a2151`, commit `d2fb25e`. `main` is the
+integration line, so `d2fb25e` was **not merged** — it is kept intact as the
+record of the second set, and the pieces `main` lacked were ported onto
+`claude/devmap-reconcile-1a2151` one at a time, each adapted to `main`'s owners.
+
+The rule the whole pass ran under: **where both lines had an implementation of
+the same behaviour, exactly one survives.** A port that lands beside what it
+duplicates is the failure mode this section exists to rule out, so every row
+below says what was kept from each side.
+
+### Piece by piece
+
+| piece | verdict | what was kept from each side |
+|---|---|---|
+| Discovery refusals as coverage loss (K-A2) | **already on main** (`a3ed650`, `c8ea0a7`) | `main`'s `DiscoverySkipReason::is_refusal` + `DiscoveryCoverage` + `analyze_with_discovery` stay the refusal owner. The port's `refused_by_discovery` fold was dropped as a second owner; its test was rewritten against `main`'s spelling (`devmap-cli/tests/discovery_refusal_is_coverage_loss.rs`) |
+| `is_fresh` requires a generation (K-A6) | **already on main** (`b338c0e`) | `devmap_serve::index_is_fresh` / `freshness_degraded_reason` stay the one owner. The port's `StoreStatus::is_fresh()` is the same fix by another name and was dropped |
+| Watcher queue bounds (K-B2), torn-read mtime guard (K-B3) | **already on main** (`91ecdac`, `80e3fff`) | `main`'s, unchanged |
+| Search counted from one generation (K-A4), store snapshot pin | **already on main** (`14560f7`, `ec1e862`) | `main`'s. `ec1e862` is a correctness fix the port did not have; it stays and the ported index is built from rows read *inside* that snapshot |
+| Feature-off builds, MCP 2026-07-28 conformance | **already on main** (`88d8cf8`, `6ff1a07`, `b458f37`) | `main`'s. The ported stress tests were rewritten to send the conformant headers (`serve_stress.rs::post` derives `_meta` and the mirrored `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` from its own body) |
+| Ambiguous fan-out cap | **already on main** | `AMBIGUOUS_FANOUT_CAP`; see AGENT_PLAN.md's SC4 row |
+| One owner for `MAX_TOKEN_BUDGET` / `MAX_TRAVERSAL_DEPTH` | **ported**, `1a7fd98` | Kept `main`'s `validate_request` wording and its `assert_eq!` pins, which now check the imported constants and so pin the whole chain. Replaced: the `const` pair in `protocol.rs`, the `.min(64)` / `.clamp(1, 64)` literals in `engine.rs`, `ipc_fuzz.rs`'s private copies |
+| CLI boundary validation, one-line `--json`, `--version` naming both schemas, `Store::latest_analysis_status` | **ported**, `d6ac670` | Kept `main`'s freshness and refusal owners (above). `combine_reasons` is `main`'s joiner and does the joining here. Tests `cli_json_contract.rs` (5), `discovery_refusal_is_coverage_loss.rs` (4) |
+| Per-generation edge index | **folded**, `1dcbc69` + merge `c063a89` | Both lines answered "stop rebuilding the adjacency map per question". `main`'s `e8c3521` hoisted it to once per direction per request; this branch caches it on the store per generation. Kept: `main`'s `GraphIndex` API shape and `TraversalLimits` (direction lives in the index, so a mismatch is not expressible), `main`'s allocation work in full, `main`'s `path_matches`, `latest_snapshot`, and `latest_edge_rows` keying the cache by the generation the rows were *read* from. Kept from the port: `GenerationEdges` / `DirectedEdges` as the storage, and `traverse_indexed` as the one walk. `AdjacencyIndex` stays for callers holding a loose edge slice — `main`'s per-direction path is intact, just no longer the only one |
+| K-B1: bounded search page and per-hit read | **ported**, `2f9916a` | The half `14560f7` / `ec1e862` did not cover: those made `{total, shown, hidden, truncated}` come from one generation; this bounds the I/O the page buys (`SEARCH_PAGE_MAX = 200`, `read_source_prefix`). Fixed a feature-off regression `e8c3521` had introduced (`query_bench` / `query_work_is_bounded_by_the_answer` call `extract_file` without `required-features`) |
+| Admission control on three transports, `BODY_READ_TIMEOUT` | **ported**, `177abbd` | `devmap-serve/src/admission.rs` is the one implementation; the socket's existing semaphore is *replaced* by it, not joined by it. Tests `serve_stress.rs` (9), `daemon_binary_retirement.rs` |
+| K-B4: claim index | **ported**, `3425d76` | Straight port; re-measured here rather than carried over (8,192 claims 48.2 ms -> 414 µs; 50,000 claims 1.83 s -> 2.2 ms). No red test — a cost, not an answer |
+| E-8 `recover_lock`, the `ignore_rule_tolerance` diagnostic pin, `mutation_fuzz.rs`, the `budget_probe` throughput table | **ported**, `0306e9e` | Not ported: the `test_process_recovery.rs` fixture change, which existed only to work around the round-1 branch's refusal-as-`ParseOutcome::Failed` fold. `main` records refusals through `DiscoveryCoverage` and still leaves an oversized file queued, so that fixture passes unchanged |
+| `extract_tree_with_report` as the one fold owner; `DiscoveryReport::refusals` in the daemon | **ported**, `4795d23` | Adapted to `main`'s refusal owner rather than adding a second. The daemon's two `!matches!(reason, NonSource)` wildcard copies now call `discovery.refusals()`, so a skip reason added later cannot silently default to "not a refusal" on one path only |
+| MCP client entry (`mcp --print-config`) | **main's kept**, merge `d5fbeb0` | `main`'s `claude::mcp_entry`, which the plugin bundle also calls, so a host configured from `--print-config` cannot point at a different server than one configured from the emitted plugin. The port's inline builder is gone |
+| Ruff fixes | **ported**, `cdfbea1` | The six findings the merge carried |
+| Seam: one kernel invocation per refresh, skip-on-unchanged artifacts, kernel-side freshness digests | **ported**, `035fe1e` + `3231018` | The CLI half (`build --manifest`, `freshness`, `StampFlags` / `InventoryFlags` shared by `build` and `manifest`) was staged while `main.rs` was owned by the port lane and applied afterwards by three-way merge against the reconciled file, which had since gained `main`'s `claude` subcommand. Pinned by `devmap-cli/tests/manifest_is_written_once.rs` (6) |
+| Ledger edits (`AGENT_PLAN.md`, `IMPROVEMENTS.md`, `AUDIT_KERNEL_2026-09-05.md`) | **re-derived** | Written against `main`'s state rather than copied from `d2fb25e`, because several rows the round-1 branch closed were closed differently here |
+
+### Performance
+
+Release, in-process MCP, p50, `crates/devmap-serve/examples/mcp_bench.rs`. Both
+sides measured **in the same session on the same machine**: `main`'s binaries
+against corpora `main`'s kernel built, this branch's binaries against copies of
+the same trees rebuilt with this kernel. The rebuild is not a confound — the two
+stores agree exactly on size (15,080 nodes / 74,729 edges and 41,276 / 271,508),
+which is also the strongest available equivalence check on the port.
+
+| store | metric | `main` | this branch | vs `main` | `d2fb25e` |
+|---|---|---|---|---|---|
+| corpus (15,080 / 74,729) | status | 866 µs | **15.2 µs** | 57x | 16 µs |
+| | search | 2.067 ms | 2.217 ms | **+7%** | 2.43 ms |
+| | impact | 18.62 ms | **0.951 ms** | 19.6x | 0.93 ms |
+| | tools/list | 32.6 µs | 33.2 µs | — | — |
+| scholarlm (41,276 / 271,508) | status | 2.771 ms | **12.8 µs** | 217x | 18 µs |
+| | search | 3.415 ms | 3.578 ms | **+5%** | 3.87 ms |
+| | impact | 73.15 ms | **3.039 ms** | 24x | 3.0 ms |
+| | tools/list | 33.7 µs | 33.7 µs | — | — |
+
+`impact_breakdown`, same stores: the SQL read is unchanged (4.96 ms -> 4.96 ms,
+17.69 ms -> 17.80 ms) — the index is built from the rows that read returns, so it
+adds no I/O — while the whole `impact("helper")` call falls 17.57 ms -> 0.88 ms
+and 45.98 ms -> 2.69 ms. The read is now 563% and 660% of the call it feeds,
+which is the point: what remains is the read, not the walk.
+
+**`search` is 5-7% slower than `main`, and that is the price of K-B1**, not
+noise. Bounding each hit's read to `span_end + 3` bytes replaces one
+`read_to_string` per hit with a bounded read that must also handle the
+short-read and mid-character cases, and the 200-hit page cap does not help a
+query whose page was already smaller. Recorded rather than smoothed over: the
+unbounded version was faster and would open 5,001 files for a generous budget.
+Both figures are within 20% of `d2fb25e` on every row, which was the gate this
+port had to clear.
