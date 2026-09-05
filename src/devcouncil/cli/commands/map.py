@@ -18,7 +18,11 @@ from devcouncil.indexing.repo_mapper import RepoMap, RepoMapper
 from devcouncil.utils.json_persist import dump_json
 
 if TYPE_CHECKING:  # pragma: no cover - resolved by `__getattr__` at runtime.
-    from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
+    # Type checkers see the attribute the PEP 562 hook below provides; ruff
+    # cannot, so this import is "unused" to it and load-bearing to mypy.
+    from devcouncil.integrations.code_review_graph import (  # noqa: F401
+        CodeReviewGraphAdapter,
+    )
 
 # Back-compat aliases for tests / external importers.
 _write_agent_guides = write_agent_guides

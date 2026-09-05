@@ -30,8 +30,7 @@ _configure_stdio()
 
 import importlib  # noqa: E402 - imports follow stdio reconfiguration
 
-import typer
-from typer.core import TyperGroup
+from typer.core import TyperGroup  # noqa: E402 - same reason
 
 #: `dev <name>` -> (module under `devcouncil.cli.commands`, attribute, kind).
 #:
