@@ -262,16 +262,72 @@ fn ls_files(root: &Path, flags: &[&str]) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// `RepoMapper._keep`: the paths git listed that the map can actually cover.
+///
+/// Three filters, cheapest first, and the order is only about cost — each one
+/// excludes, so the set they leave is the same whichever way round they run.
+///
+/// The middle one is the one that has to be here rather than in
+/// `is_runtime_or_generated_file`: that predicate is a pure function of a path
+/// string, and whether a directory carries a `CACHEDIR.TAG` can only be answered
+/// by opening it. Discovery already prunes tagged directories whole
+/// (`devmap_extract::collect_sources_with_report`), so a file inside one is
+/// never indexed, never queued, and can never affect an answer the map gives —
+/// while counting it here moved `content_fingerprint` on every write a build
+/// made into its own cache, and the map then read stale on files it had
+/// deliberately declined to index. `--if-stale`, `--watch` and `verify` rebuilt
+/// forever without converging.
+///
+/// A cache that *is* gitignored never reaches this: `git ls-files` does not list
+/// it. The gap is a tagged cache no ignore rule happens to cover — measured on
+/// this workspace, `rust-port/.gitignore` carries `/target/`, which does not
+/// match the `target-lane*` directories beside it, and 8,252 of the 9,654 paths
+/// the old rule kept came from them. Dropping them took `inventory()` on this
+/// repository from 2.33s to 0.75s, because a path ruled out here never pays for
+/// its `stat`.
+///
+/// [`NotRepoRelative`] excludes too. `git ls-files` run at the root of a work
+/// tree cannot emit an absolute path or one carrying `..`, so this is a
+/// contract, not a live branch — but a path no ancestor of which could be
+/// opened is a path that was *not* evaluated, and letting it through would make
+/// it indistinguishable from one that was evaluated and cleared. Discovery
+/// cannot index a path outside the root either way.
+///
+/// [`NotRepoRelative`]: devmap_extract::CacheVerdict::NotRepoRelative
+fn keep_indexable(
+    root: &Path,
+    caches: &mut devmap_extract::CacheDirectoryCache,
+    paths: Vec<String>,
+) -> Vec<String> {
+    paths
+        .into_iter()
+        .filter(|path| {
+            if is_runtime_or_generated_file(path) {
+                return false;
+            }
+            if !matches!(
+                caches.tagged_ancestor(root, path),
+                devmap_extract::CacheVerdict::Outside
+            ) {
+                return false;
+            }
+            // Index entries whose working-tree file was deleted but not staged
+            // are skipped, exactly as `_keep` does. Last because it is a `stat`
+            // per surviving path, and the filters above have already dropped the
+            // bulk of a tree whose build output is not ignored.
+            root.join(path).is_file()
+        })
+        .collect()
+}
+
 /// `RepoMapper.get_git_files`, git path only.
 pub fn inventory(root: &Path, limits: InventoryLimits) -> Inventory {
-    let keep = |paths: Vec<String>| -> Vec<String> {
-        paths
-            .into_iter()
-            // Index entries whose working-tree file was deleted but not staged
-            // are skipped, exactly as `_keep` does.
-            .filter(|path| !is_runtime_or_generated_file(path) && root.join(path).is_file())
-            .collect()
-    };
+    // One memo for both `ls-files` passes: the tagged-ancestor lookup costs one
+    // `open` per *distinct directory* rather than one per path, and it stops at
+    // the first tagged prefix — so a cache directory holding 50,000 files is
+    // opened once and its contents are never probed at all.
+    let mut caches = devmap_extract::CacheDirectoryCache::default();
+    let mut keep = |paths: Vec<String>| keep_indexable(root, &mut caches, paths);
 
     let tracked = match ls_files(root, &["--cached"]) {
         Ok(paths) => keep(paths),

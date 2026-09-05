@@ -1132,6 +1132,172 @@ def test_get_git_files_can_exclude_untracked(tmp_path, monkeypatch) -> None:
     assert mapper.get_git_files() == ["tracked.py"]
 
 
+# ----------------------------------------------------------------------
+# the inventory covers exactly what `dev map` can index
+#
+# `dev map`'s discovery walk honours the Cache Directory Tagging Standard: a
+# directory holding a `CACHEDIR.TAG` with the standard's signature is pruned
+# whole, never walked, never indexed. cargo, pip, uv, ccache, tox, ruff and
+# pytest all write one, and a build cache is not source.
+#
+# `get_git_files` did not, so a tagged cache that no `.gitignore` happened to
+# cover was skipped by the walk and counted by `_content_fingerprint`, which then
+# moved on every write a build made into its own cache. `map_is_stale` answered
+# True on files the map had deliberately declined to index, so `--if-stale`,
+# `--watch` and `verify` rebuilt forever without converging — each rebuild
+# re-stamping a fingerprint the next build would disagree with again.
+#
+# Measured on this workspace: `rust-port/.gitignore` carries `/target/`, which
+# does not match the `target-lane*` directories beside it, and 7,465 of the 8,867
+# paths `get_git_files()` returned came from them.
+# ----------------------------------------------------------------------
+
+_CACHEDIR_TAG_BODY = (
+    "Signature: 8a477f597d28d172789f06886806bc55\n"
+    "# This file is a cache directory tag created by a build tool.\n"
+)
+
+
+def _repo_with_a_tagged_cache(tmp_path, *, signature: str = _CACHEDIR_TAG_BODY):
+    """One real source file plus a tagged cache directory, and **no** `.gitignore`.
+
+    An ignored cache is invisible to `git ls-files` already and proves nothing.
+    The defect lives in the gap between "the build tool declared this a cache"
+    and "git was never told".
+    """
+    root = tmp_path / "repo"
+    (root / "src").mkdir(parents=True)
+    (root / "target-lane9" / "debug").mkdir(parents=True)
+    (root / "src" / "app.py").write_text("def app():\n    return 1\n", encoding="utf-8")
+    (root / "target-lane9" / "CACHEDIR.TAG").write_text(signature, encoding="utf-8")
+    (root / "target-lane9" / "debug" / "artifact.py").write_text(
+        "def artifact():\n    return 2\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=root, check=True)
+    subprocess.run(["git", "add", "src/app.py"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "one real source file"], cwd=root, check=True)
+    return root
+
+
+def test_a_tagged_cache_directory_is_absent_from_the_inventory(tmp_path) -> None:
+    root = _repo_with_a_tagged_cache(tmp_path)
+
+    # The premise, stated rather than assumed: git lists the cache, because
+    # nothing ignores it.
+    listed = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "target-lane9/debug/artifact.py" in listed, listed
+
+    files = RepoMapper(root).get_git_files()
+
+    assert "src/app.py" in files, files
+    counted = [path for path in files if path.startswith("target-lane9/")]
+    assert not counted, (
+        f"freshness counted {len(counted)} path(s) inside a tagged cache directory that "
+        f"`dev map` will never index, so the map can never stop being stale: {counted}"
+    )
+
+
+def test_a_cache_only_write_does_not_make_the_map_stale(tmp_path) -> None:
+    root = _repo_with_a_tagged_cache(tmp_path)
+    mapper = RepoMapper(root, persist_content_cache=False)
+
+    files = mapper.get_git_files()
+    stamped = {
+        "generated_head": mapper._git_head(),
+        "indexed_hash": mapper._files_fingerprint(files),
+        "content_fingerprint": mapper._content_fingerprint(files),
+    }
+    assert mapper.map_is_stale(stamped) is False, "precondition: a just-stamped map is fresh"
+
+    # A build writes into its own cache. Nothing `dev map` would index changed,
+    # so nothing the map answers can have changed either.
+    (root / "target-lane9" / "debug" / "artifact.py").write_text(
+        "def artifact():\n    return 3\n", encoding="utf-8"
+    )
+    (root / "target-lane9" / "debug" / "fresh.json").write_text("{}\n", encoding="utf-8")
+
+    assert mapper.map_is_stale(stamped) is False, (
+        "a write no walk will ever read marked the map stale; every rebuild re-stamps a "
+        "fingerprint the next build will disagree with again"
+    )
+
+    # …and the check still has teeth: an edit to indexed source is still stale.
+    (root / "src" / "app.py").write_text("def app():\n    return 99\n", encoding="utf-8")
+    assert mapper.map_is_stale(stamped) is True
+
+
+def test_only_the_standards_signature_hides_a_subtree(tmp_path) -> None:
+    """A file merely *named* `CACHEDIR.TAG` must not delete a subtree.
+
+    The tag is checked by its 43-byte signature, not by its name, precisely so
+    that a source file with that name cannot silently shrink the inventory —
+    which would make the map read fresh while missing real code.
+    """
+    root = _repo_with_a_tagged_cache(tmp_path, signature="not the standard's signature\n")
+
+    files = RepoMapper(root).get_git_files()
+
+    assert "target-lane9/debug/artifact.py" in files, files
+
+
+def test_the_cache_lookup_matches_the_kernels_verdicts(tmp_path) -> None:
+    """The transcription `freshness_parity.rs` depends on, checked directly.
+
+    Mirrors `devmap-extract/tests/a_cache_verdict_answers_for_the_root_it_was_asked.rs`:
+    the root is exempt, and a path that is not repo-relative is answered without
+    opening anything — `root / ".."` is not a containment operation, so `src/..`
+    *is* the root (which would defeat the exemption) and `../sibling` leaves the
+    repository entirely.
+    """
+    from devcouncil.indexing.repo_mapper import _CacheDirectoryCache
+
+    root = tmp_path / "root"
+    (root / "pkg" / "deep").mkdir(parents=True)
+    (root / "src").mkdir()
+    (root / "pkg" / "CACHEDIR.TAG").write_text(_CACHEDIR_TAG_BODY, encoding="utf-8")
+    (root / "src" / "main.py").write_text("x = 1\n", encoding="utf-8")
+    # The root itself is tagged and still exempt: pointing `dev map` at a tagged
+    # directory is a request, not an accident.
+    (root / "CACHEDIR.TAG").write_text(_CACHEDIR_TAG_BODY, encoding="utf-8")
+
+    caches = _CacheDirectoryCache(root)
+
+    assert caches.is_inside_tagged_cache("pkg/mod.py") is True
+    assert caches.is_inside_tagged_cache("pkg/deep/mod.py") is True
+    assert caches.is_inside_tagged_cache("src/main.py") is False
+    # `""` and `"."` mean the root, which is exempt.
+    assert caches.is_inside_tagged_cache("") is False
+    assert caches.is_inside_tagged_cache(".") is False
+    # Not repo-relative: excluded rather than cleared, so a path that was never
+    # evaluated can never read as one that was evaluated and passed.
+    assert caches.is_inside_tagged_cache("src/../src/main.py") is True
+    assert caches.is_inside_tagged_cache("../sibling/artifact.py") is True
+    assert caches.is_inside_tagged_cache("/etc/passwd") is True
+    # A repeated question is answered from the memo, not from a second `open`.
+    assert caches.is_inside_tagged_cache("pkg/mod.py") is True
+
+
+def test_the_walk_fallback_also_skips_tagged_cache_directories(tmp_path) -> None:
+    """The no-git fallback feeds the same consumers, so it obeys the same rule."""
+    plain = tmp_path / "plain"
+    (plain / "pkg").mkdir(parents=True)
+    (plain / "pkg" / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (plain / "build-cache" / "inner").mkdir(parents=True)
+    (plain / "build-cache" / "CACHEDIR.TAG").write_text(_CACHEDIR_TAG_BODY, encoding="utf-8")
+    (plain / "build-cache" / "inner" / "gen.py").write_text("y = 2\n", encoding="utf-8")
+
+    # No `git init`: this is the `os.walk` branch.
+    assert RepoMapper(plain).get_git_files() == ["pkg/a.py"]
+
+
 def _tiny_git_repo(tmp_path):
     """A repo whose gitignored file exists on disk — the walk fallback lists it,
     `git ls-files` does not, so the two inventories are distinguishable."""
