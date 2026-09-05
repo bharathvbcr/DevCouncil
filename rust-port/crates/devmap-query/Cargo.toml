@@ -121,3 +121,11 @@ required-features = ["parse"]
 [[test]]
 name = "a_delete_this_list_reads_for_its_answer"
 required-features = ["parse"]
+
+[[test]]
+name = "a_traversal_over_a_hole_says_so"
+required-features = ["parse"]
+
+[[test]]
+name = "answers_agree_with_each_other"
+required-features = ["parse"]
