@@ -9,11 +9,12 @@ use tracing_subscriber::FmtSubscriber;
 mod claude;
 
 use devmap_extract::collect_go_modules;
+use devmap_query::freshness::{self, FreshnessDigests, InventoryLimits, InventorySource};
 use devmap_query::{
     generate_code_graph_encodings, generate_manifest_with_edges, resolve_manifest_output,
     resolved_edge_from_stored, semantic_snapshots, write_code_graph_atomically,
-    write_manifest_atomically, FreshnessInfo, Request, ResolutionAvailability, StampedFreshness,
-    StoreQueryEngine, CODE_GRAPH_DEFAULT_OUTPUT,
+    write_manifest_atomically, ArtifactStamp, FreshnessInfo, Request, ResolutionAvailability,
+    StampedFreshness, StoreQueryEngine, CODE_GRAPH_DEFAULT_OUTPUT, CODE_GRAPH_SCHEMA_VERSION,
 };
 use devmap_resolve::{Resolver, UnresolvedClass};
 use devmap_serve::{default_ipc_path_for, Daemon};
@@ -365,6 +366,71 @@ enum WorkspaceAction {
     Links,
 }
 
+/// Caller-computed freshness digests to stamp into both artifacts.
+///
+/// The kernel computes these itself now (see `devmap_query::freshness`), so
+/// these flags are no longer how the values normally arrive. They stay because a
+/// caller with its own inventory rules — a monorepo tool that indexes a subtree,
+/// a test that wants a fixed stamp — is entitled to say what the digests are,
+/// and because a value supplied here is used verbatim rather than recomputed.
+///
+/// Supplying *any* of the three switches the whole set to caller-supplied: a run
+/// that mixed one caller digest with two of its own would stamp an identity no
+/// single snapshot of the tree ever had.
+#[derive(Debug, Clone, clap::Args)]
+struct StampFlags {
+    /// Caller-computed `generated_head` (`git rev-parse HEAD`).
+    #[arg(long)]
+    generated_head: Option<String>,
+    /// Caller-computed `indexed_hash` (SHA-1 over the git file list).
+    #[arg(long)]
+    indexed_hash: Option<String>,
+    /// Caller-computed `content_fingerprint` (scheme-prefixed SHA-1 over file bytes).
+    #[arg(long)]
+    content_fingerprint: Option<String>,
+}
+
+impl StampFlags {
+    fn supplied(&self) -> Option<StampedFreshness> {
+        let stamped = StampedFreshness {
+            generated_head: non_empty(&self.generated_head),
+            indexed_hash: non_empty(&self.indexed_hash),
+            content_fingerprint: non_empty(&self.content_fingerprint),
+        };
+        let any = stamped.generated_head.is_some()
+            || stamped.indexed_hash.is_some()
+            || stamped.content_fingerprint.is_some();
+        any.then_some(stamped)
+    }
+}
+
+/// The two inventory rules `RepoMapper._inventory_limits` reads out of
+/// `.devcouncil/config.yaml`.
+///
+/// Passed in rather than parsed here: they live in a YAML document holding the
+/// whole project configuration, and a second reader for two scalars would
+/// disagree with the real one in ways that surface as a silently different file
+/// set — which is a *wrong digest*, not a missing one. The defaults match the
+/// defaults `_inventory_limits` falls back to.
+#[derive(Debug, Clone, Copy, clap::Args)]
+struct InventoryFlags {
+    /// Fingerprint tracked files only (`indexing.include_untracked: false`).
+    #[arg(long)]
+    no_untracked: bool,
+    /// Inventory ceiling (`indexing.max_indexed_files`).
+    #[arg(long, default_value_t = 50_000)]
+    max_indexed_files: usize,
+}
+
+impl From<InventoryFlags> for InventoryLimits {
+    fn from(flags: InventoryFlags) -> Self {
+        Self {
+            include_untracked: !flags.no_untracked,
+            max_indexed_files: flags.max_indexed_files,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Cold or incremental build of the code-intelligence graph
@@ -386,6 +452,36 @@ enum Commands {
         /// stand in: it narrows the write, it does not widen the read.
         #[arg(long)]
         full: bool,
+        /// Also write `repo_map.json` and `code_graph.json` from the generation
+        /// this build leaves current, in this same process.
+        ///
+        /// The seam ran `build` and then `manifest` as two invocations, which
+        /// meant two process launches, two store opens, and — because the
+        /// second process cannot see what the first decided — a full
+        /// re-serialization of a 22 MB code graph on every tick where nothing
+        /// had changed. Fused, the unchanged case is one open and one stat of
+        /// each artifact.
+        ///
+        /// `devmap manifest` stays a command of its own: writing the artifacts
+        /// from a store somebody else built is a real request, and a caller
+        /// that wants it should not have to run a build to get it.
+        #[arg(long)]
+        manifest: bool,
+        #[arg(
+            long,
+            requires = "manifest",
+            default_value = ".devcouncil/repo_map.json"
+        )]
+        output: PathBuf,
+        #[arg(long, requires = "manifest", default_value = CODE_GRAPH_DEFAULT_OUTPUT)]
+        graph_output: PathBuf,
+        /// Replace a Python-schema or otherwise foreign repo map / code graph.
+        #[arg(long, requires = "manifest", default_value_t = false)]
+        force: bool,
+        #[command(flatten)]
+        stamps: StampFlags,
+        #[command(flatten)]
+        inventory: InventoryFlags,
     },
     Search {
         query: String,
@@ -570,28 +666,41 @@ enum Commands {
         /// Replace a Python-schema or otherwise foreign repo map / code graph.
         #[arg(long, default_value_t = false)]
         force: bool,
-        /// Caller-computed `generated_head` to stamp into both artifacts.
-        ///
-        /// The three stamp flags exist because the kernel cannot compute these
-        /// values and the caller can. `devcouncil.devmap_engine.stamp_freshness`
-        /// used to add them by reading each finished artifact back, parsing it,
-        /// setting three scalars and re-serializing the whole thing — 1.68 s of
-        /// a 2.72 s `dev map` on this repository, almost all of it Python
-        /// re-encoding a 26 MB graph the kernel had just encoded.
-        ///
-        /// Passing them in means they are written once, by the writer, at
-        /// generation time. Omitted, the artifacts carry the empty values and
-        /// their `meta.devmap_rust.unavailable` markers exactly as before: a
-        /// value is stamped only when a caller supplies a real one, and never
-        /// invented here.
+        #[command(flatten)]
+        stamps: StampFlags,
+        #[command(flatten)]
+        inventory: InventoryFlags,
+    },
+    /// The three freshness digests for a working tree, and — with the
+    /// `--expect-*` flags — whether a map stamped with given values is stale.
+    ///
+    /// This is `RepoMapper.map_is_stale`'s expensive half moved off Python: two
+    /// `git ls-files` passes and a stat walk over the whole inventory, which
+    /// cost ~150 ms per call in the interpreter and are asked on every
+    /// `--if-stale`, every watch tick and every verify. It needs no store, so it
+    /// answers for a repository that has never been indexed.
+    ///
+    /// The comparison is reported field by field: a caller is told *which* of
+    /// head, inventory and content moved, not merely that something did.
+    Freshness {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// The `generated_head` a map carries. Compared, never written.
         #[arg(long)]
-        generated_head: Option<String>,
-        /// Caller-computed `indexed_hash` (SHA-1 over the git file list).
+        expect_head: Option<String>,
+        /// The `indexed_hash` a map carries.
         #[arg(long)]
-        indexed_hash: Option<String>,
-        /// Caller-computed `content_fingerprint` (scheme-prefixed SHA-1 over file bytes).
+        expect_indexed_hash: Option<String>,
+        /// The `content_fingerprint` a map carries.
         #[arg(long)]
-        content_fingerprint: Option<String>,
+        expect_content_fingerprint: Option<String>,
+        /// Read the digest memo but never write it, for callers that must not
+        /// modify the project — the MCP freshness probe runs on tools annotated
+        /// `readOnlyHint: true`, and that annotation is a promise.
+        #[arg(long)]
+        no_cache_write: bool,
+        #[command(flatten)]
+        inventory: InventoryFlags,
     },
     Status,
     /// Longitudinal view: how the map has moved across recent builds.
@@ -729,6 +838,369 @@ enum ClaudeAction {
         #[arg(long)]
         strict: bool,
     },
+}
+
+/// Everything one `manifest` write needs, whether it was asked for on its own
+/// or fused onto the end of a build.
+struct ManifestRequest<'a> {
+    /// The tree the caller named. Used only when the store cannot say where its
+    /// repository root is.
+    path: &'a std::path::Path,
+    db: &'a std::path::Path,
+    output: &'a std::path::Path,
+    graph_output: &'a std::path::Path,
+    compact_graph_output: Option<&'a std::path::Path>,
+    force: bool,
+    stamps: &'a StampFlags,
+    inventory: InventoryLimits,
+}
+
+/// What a `manifest` write did, for the caller's `--json` payload.
+struct ManifestOutcome {
+    output: std::path::PathBuf,
+    graph_output: std::path::PathBuf,
+    compact_graph_output: Option<std::path::PathBuf>,
+    generation_id: u32,
+    /// True when the artifacts on disk were already exactly the ones this run
+    /// would have written, and the store was therefore never read.
+    artifacts_unchanged: bool,
+    /// `caller` / `kernel` / `unavailable` — where the three stamps came from.
+    freshness_source: &'static str,
+    freshness_unavailable_reason: String,
+}
+
+/// `<db>.artifacts.json` — the stamp beside the store the artifacts came from.
+///
+/// Beside the store rather than beside the artifacts: it describes what *this*
+/// store's current generation produced, and two stores pointed at one output
+/// path must not share one stamp. It also keeps it out of the git inventory,
+/// so it can never change the fingerprint it helps compute.
+fn artifact_stamp_path(db: &std::path::Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}.artifacts.json", db.display()))
+}
+
+/// Write `repo_map.json` and `code_graph.json` from the store's current
+/// generation — or prove they are already written and touch nothing.
+///
+/// The proof is a sidecar naming the binary, every input the artifacts derive
+/// from, and each output's `(len, mtime, inode)` as written. When it holds, the
+/// generation is never read out of SQLite and nothing is serialized: the case a
+/// watcher and the PostToolUse hook hit on almost every tick.
+fn write_consumer_artifacts(
+    store: &Store,
+    request: ManifestRequest<'_>,
+) -> anyhow::Result<ManifestOutcome> {
+    let gen_id = store.latest_generation_id()?.ok_or_else(|| {
+        anyhow::anyhow!("manifest unavailable: build a persisted generation first")
+    })?;
+    let status = store.status(&request.db.display().to_string())?;
+    let built_head = store
+        .latest_generation_head()?
+        .unwrap_or_else(|| "unavailable".to_string());
+    let repo_root = store.latest_repo_root()?.or_else(|| {
+        request
+            .path
+            .canonicalize()
+            .ok()
+            .map(|root| root.to_string_lossy().into_owned())
+    });
+
+    // The tree the digests describe is the one the store indexed. Falling back
+    // to the caller's path only when the store cannot say keeps the stamps and
+    // the generation talking about the same directory.
+    let tree = repo_root
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| request.path.to_path_buf());
+
+    let (stamped, freshness_source, freshness_unavailable_reason) = match request.stamps.supplied()
+    {
+        Some(supplied) => (supplied, "caller", String::new()),
+        None => {
+            let digests = freshness::compute(&tree, request.inventory, true);
+            let source = if digests.unavailable_reason.is_empty() {
+                "kernel"
+            } else {
+                "unavailable"
+            };
+            (
+                StampedFreshness {
+                    generated_head: digests.generated_head,
+                    indexed_hash: digests.indexed_hash,
+                    content_fingerprint: digests.content_fingerprint,
+                },
+                source,
+                digests.unavailable_reason,
+            )
+        }
+    };
+
+    let dest = resolve_manifest_output(repo_root.as_deref(), request.output);
+    let graph_dest = resolve_manifest_output(repo_root.as_deref(), request.graph_output);
+    let compact_dest = request
+        .compact_graph_output
+        .map(|destination| resolve_manifest_output(repo_root.as_deref(), destination));
+
+    // Every input the artifacts' bytes derive from. `{:?}` on the options so a
+    // digest that could not be computed (`None`) can never compare equal to one
+    // that came out empty (`Some("")`).
+    let mut inputs: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    inputs.insert("generation_id".into(), gen_id.to_string());
+    inputs.insert("pending_count".into(), status.pending_count.to_string());
+    inputs.insert("built_head".into(), built_head.clone());
+    inputs.insert("repo_root".into(), format!("{repo_root:?}"));
+    inputs.insert(
+        "generated_head".into(),
+        format!("{:?}", stamped.generated_head),
+    );
+    inputs.insert("indexed_hash".into(), format!("{:?}", stamped.indexed_hash));
+    inputs.insert(
+        "content_fingerprint".into(),
+        format!("{:?}", stamped.content_fingerprint),
+    );
+    inputs.insert(
+        "code_graph_schema".into(),
+        CODE_GRAPH_SCHEMA_VERSION.to_string(),
+    );
+    inputs.insert("compact".into(), format!("{compact_dest:?}"));
+
+    let stamp_path = artifact_stamp_path(request.db);
+    let mut outputs: Vec<&std::path::Path> = vec![dest.as_path(), graph_dest.as_path()];
+    if let Some(compact) = &compact_dest {
+        outputs.push(compact.as_path());
+    }
+    if ArtifactStamp::read(&stamp_path).is_some_and(|stamp| stamp.still_current(&inputs, &outputs))
+    {
+        return Ok(ManifestOutcome {
+            output: dest,
+            graph_output: graph_dest,
+            compact_graph_output: compact_dest,
+            generation_id: gen_id,
+            artifacts_unchanged: true,
+            freshness_source,
+            freshness_unavailable_reason,
+        });
+    }
+
+    let extractions = store.latest_extractions()?;
+    let analysis = store.latest_analysis()?.ok_or_else(|| {
+        anyhow::anyhow!("manifest unavailable: build a persisted generation first")
+    })?;
+    let edges = store
+        .latest_edges(0.0)?
+        .into_iter()
+        .map(resolved_edge_from_stored)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    // One freshness identity for both artifacts: a map and a graph stamped from
+    // different generations is the drift the single command exists to prevent.
+    let freshness = FreshnessInfo {
+        head_sha: built_head,
+        generation_id: gen_id,
+        pending_count: status.pending_count,
+        stamped,
+    };
+    let (_manifest, json_str) =
+        generate_manifest_with_edges(&extractions, &analysis, freshness.clone(), &edges);
+    let (graph_json, compact_graph_json) = generate_code_graph_encodings(
+        &extractions,
+        &analysis,
+        &edges,
+        &freshness,
+        repo_root.as_deref(),
+        compact_dest.is_some(),
+    )?;
+
+    ensure_parent(&dest)?;
+    write_manifest_atomically(&dest, &json_str, request.force)?;
+    ensure_parent(&graph_dest)?;
+    write_code_graph_atomically(&graph_dest, &graph_json, request.force)?;
+    // Written through the same clobber guard as the verbose artifact. A foreign
+    // file at this path is refused for the same reason: the guard's question is
+    // "did this kernel write what is already here", and the answer does not
+    // depend on the encoding.
+    if let (Some(destination), Some(json)) = (&compact_dest, &compact_graph_json) {
+        ensure_parent(destination)?;
+        write_code_graph_atomically(destination, json, request.force)?;
+    }
+
+    // The stamp last, and only after every write succeeded: a stamp claiming
+    // artifacts that were never written is a skip that skips nothing real.
+    // A stamp that cannot be written is not fatal — it costs the next run a
+    // regeneration, which is the behaviour that existed before the stamp.
+    match ArtifactStamp::of(inputs, &outputs) {
+        Ok(stamp) => {
+            if let Err(error) = stamp.write(&stamp_path) {
+                eprintln!(
+                    "  note: could not record the artifact stamp at {} ({error}); \
+                     the next manifest will regenerate rather than skip",
+                    stamp_path.display()
+                );
+            }
+        }
+        Err(error) => eprintln!(
+            "  note: could not stat the artifacts just written ({error}); \
+             the next manifest will regenerate rather than skip"
+        ),
+    }
+
+    Ok(ManifestOutcome {
+        output: dest,
+        graph_output: graph_dest,
+        compact_graph_output: compact_dest,
+        generation_id: gen_id,
+        artifacts_unchanged: false,
+        freshness_source,
+        freshness_unavailable_reason,
+    })
+}
+
+/// The store fields `devmap status` reports, as one object.
+///
+/// One owner, because two callers ask for them now: `status` itself, and the
+/// build that writes the artifacts, which embeds them so the seam does not have
+/// to spawn a third process to learn what the store it just wrote looks like.
+/// The schema keys are *not* here — they come from a probe `status` runs before
+/// it opens the store at all, and a build has already opened it.
+fn store_status_fields(
+    store: &Store,
+    db: &std::path::Path,
+) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
+    let status = store.status(&db.display().to_string())?;
+    // K-A2: the graph's own degradation belongs in the answer a health check
+    // reads.
+    //
+    // `freshness_degraded_reason` describes the *index* — no generation
+    // persisted, paths stuck in the retry queue — and said nothing about a
+    // generation built from a corpus the extractor could not read in full. That
+    // is how a repository whose only caller of a symbol was refused for being
+    // oversized reported `degraded_reason: null` while both artifacts of the
+    // same build carried `graph_degraded: true`. Both degradations can hold at
+    // once and neither may shadow the other, so they are joined with
+    // `devmap_analyze::combine_reasons`, the same joiner the analysis uses for
+    // its own pair.
+    let analysis_degraded = match store.latest_analysis_status()? {
+        Some(devmap_analyze::model::AnalysisStatus::Ok) | None => None,
+        Some(devmap_analyze::model::AnalysisStatus::Partial { reason }) => {
+            Some(format!("partial: {reason}"))
+        }
+        Some(devmap_analyze::model::AnalysisStatus::Timeout { reason }) => {
+            Some(format!("timeout: {reason}"))
+        }
+    };
+    let degraded_reason = devmap_analyze::combine_reasons(
+        devmap_serve::freshness_degraded_reason(&status),
+        analysis_degraded,
+    );
+    let serde_json::Value::Object(fields) = serde_json::json!({
+        "generation_id": status.latest_generation,
+        "pending_count": status.pending_count,
+        "node_count": status.node_count,
+        "edge_count": status.edge_count,
+        // K-A6: one owner for this rule, shared with the daemon's `status`.
+        // Computing it here as `pending_count == 0` is what let a store with no
+        // generation at all report as current.
+        "is_fresh": devmap_serve::index_is_fresh(&status),
+        "db_path": status.db_path,
+        "degraded_reason": degraded_reason,
+        "quarantined_count": status.quarantined_count,
+        // K1(g): naming the stuck paths is what makes a degraded status
+        // actionable — "64 path(s) exceeded the retry threshold" told an
+        // operator nothing about which 64.
+        "quarantined_paths": status.quarantined_paths,
+    }) else {
+        unreachable!("json! of an object literal is an object")
+    };
+    Ok(fields)
+}
+
+/// The `manifest` result, as JSON or as the two human lines it always printed.
+fn report_manifest(cli: &Cli, outcome: &ManifestOutcome) -> anyhow::Result<()> {
+    if cli.json {
+        return emit_json(cli, &manifest_json(outcome));
+    }
+    if outcome.artifacts_unchanged {
+        println!(
+            "Artifacts already current for generation #{} ({:?}, {:?}).",
+            outcome.generation_id, outcome.output, outcome.graph_output
+        );
+    } else {
+        println!("Manifest written to {:?}", outcome.output);
+        println!("Code graph written to {:?}", outcome.graph_output);
+        if let Some(destination) = &outcome.compact_graph_output {
+            println!("Interned code graph written to {:?}", destination);
+        }
+    }
+    if !outcome.freshness_unavailable_reason.is_empty() {
+        println!(
+            "  freshness stamps unavailable: {}",
+            outcome.freshness_unavailable_reason
+        );
+    }
+    Ok(())
+}
+
+fn manifest_json(outcome: &ManifestOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "output": outcome.output,
+        "graph_output": outcome.graph_output,
+        // Absent, not empty, when no interned artifact was asked for: `""`
+        // would read as a path that failed.
+        "compact_graph_output": outcome.compact_graph_output,
+        "generation_id": outcome.generation_id,
+        // The artifacts on disk were already the ones this run would write, so
+        // the generation was never read and nothing was serialized. Reported
+        // rather than left silent: a caller timing this command needs to know
+        // which of the two paths it measured.
+        "artifacts_unchanged": outcome.artifacts_unchanged,
+        "freshness_source": outcome.freshness_source,
+        "freshness_unavailable_reason": outcome.freshness_unavailable_reason,
+    })
+}
+
+/// The `--manifest` half of a build: the artifacts and the store's own status,
+/// as one JSON object, or `None` when the build was not asked to write them.
+///
+/// Both are computed from the store this build already has open. That is the
+/// whole point of the flag: the seam used to run `build`, then `manifest`, then
+/// `status` — three processes, three store opens — to answer one question about
+/// one generation.
+#[allow(clippy::too_many_arguments)]
+fn build_manifest_payload(
+    cli: &Cli,
+    store: &Store,
+    enabled: bool,
+    path: &std::path::Path,
+    output: &std::path::Path,
+    graph_output: &std::path::Path,
+    force: bool,
+    stamps: &StampFlags,
+    inventory: InventoryFlags,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    if !enabled {
+        return Ok(None);
+    }
+    let outcome = write_consumer_artifacts(
+        store,
+        ManifestRequest {
+            path,
+            db: &cli.db,
+            output,
+            graph_output,
+            compact_graph_output: None,
+            force,
+            stamps,
+            inventory: inventory.into(),
+        },
+    )?;
+    let mut payload = manifest_json(&outcome);
+    // The store's own view, so a caller does not need a third process to learn
+    // whether the generation it just built is fresh, degraded or backed up
+    // behind a pending queue.
+    payload["status"] = serde_json::Value::Object(store_status_fields(store, &cli.db)?);
+    if !cli.json {
+        report_manifest(cli, &outcome)?;
+    }
+    Ok(Some(payload))
 }
 
 fn open_for_read(db: &std::path::Path) -> anyhow::Result<Store> {
@@ -1381,6 +1853,7 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
         Commands::Build { .. }
         | Commands::Status
         | Commands::Manifest { .. }
+        | Commands::Freshness { .. }
         | Commands::Repair { .. }
         | Commands::Workspace { .. }
         | Commands::Serve { .. }
@@ -1435,6 +1908,12 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             affected: affected_flag,
             deleted,
             full,
+            manifest: write_manifest,
+            output,
+            graph_output,
+            force,
+            stamps,
+            inventory,
         } => {
             let progress = ProgressReporter::new(cli.progress, cli.json);
             let build_started = std::time::Instant::now();
@@ -1613,6 +2092,23 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                             retired.len()
                         ));
                     }
+                    // The artifacts, from the generation this build just
+                    // proved current. On this path the stamp almost always
+                    // holds, so nothing is read out of the store and nothing is
+                    // written — which is the entire saving: `manifest` used to
+                    // re-serialize a 22 MB code graph here to produce bytes
+                    // identical to the ones already on disk.
+                    let manifest = build_manifest_payload(
+                        cli,
+                        &store,
+                        *write_manifest,
+                        path,
+                        output,
+                        graph_output,
+                        *force,
+                        stamps,
+                        *inventory,
+                    )?;
                     if cli.json {
                         // Built through `serde_json` and carrying `timings`,
                         // like every other build result.
@@ -1638,6 +2134,10 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                                 "generation": generation,
                                 "reclaim": reclaim_note(&vacuum),
                                 "timings": progress.timings_json(),
+                                // `null` when `--manifest` was not asked for,
+                                // never an empty object: a caller must be able
+                                // to tell "not requested" from "wrote nothing".
+                                "manifest": manifest,
                             }),
                         )?;
                     } else {
@@ -1842,6 +2342,17 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 }
             }
 
+            let manifest = build_manifest_payload(
+                cli,
+                &store,
+                *write_manifest,
+                path,
+                output,
+                graph_output,
+                *force,
+                stamps,
+                *inventory,
+            )?;
             if cli.json {
                 emit_json(
                     cli,
@@ -1868,6 +2379,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                         // build reads it from the result rather than scraping
                         // the human progress lines off stderr.
                         "timings": progress.timings_json(),
+                        "manifest": manifest,
                     }),
                 )?;
             } else {
@@ -2300,101 +2812,157 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             graph_output,
             compact_graph_output,
             force,
-            generated_head,
-            indexed_hash,
-            content_fingerprint,
+            stamps,
+            inventory,
         } => {
             let store = open_for_read(&cli.db)?;
-            let extractions = store.latest_extractions()?;
-            let analysis = store.latest_analysis()?.ok_or_else(|| {
-                anyhow::anyhow!("manifest unavailable: build a persisted generation first")
-            })?;
-            let gen_id = store.latest_generation_id()?.ok_or_else(|| {
-                anyhow::anyhow!("manifest unavailable: build a persisted generation first")
-            })?;
-            let status = store.status(&cli.db.display().to_string())?;
-            let built_head = store
-                .latest_generation_head()?
-                .unwrap_or_else(|| "unavailable".to_string());
-            let edges = store
-                .latest_edges(0.0)?
-                .into_iter()
-                .map(resolved_edge_from_stored)
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            // One freshness identity for both artifacts: a map and a graph
-            // stamped from different generations is the drift the single
-            // command exists to prevent.
-            let freshness = FreshnessInfo {
-                head_sha: built_head,
-                generation_id: gen_id,
-                pending_count: status.pending_count,
-                // Blank flags are treated as absent. An empty `--indexed-hash`
-                // is a caller whose digest computation failed, and stamping ""
-                // as though it were a result is the exact confusion the
-                // "unavailable" markers exist to prevent.
-                stamped: StampedFreshness {
-                    generated_head: non_empty(generated_head),
-                    indexed_hash: non_empty(indexed_hash),
-                    content_fingerprint: non_empty(content_fingerprint),
+            let outcome = write_consumer_artifacts(
+                &store,
+                ManifestRequest {
+                    path,
+                    db: &cli.db,
+                    output,
+                    graph_output,
+                    compact_graph_output: compact_graph_output.as_deref(),
+                    force: *force,
+                    stamps,
+                    inventory: (*inventory).into(),
+                },
+            )?;
+            report_manifest(cli, &outcome)?;
+        }
+        Commands::Freshness {
+            path,
+            expect_head,
+            expect_indexed_hash,
+            expect_content_fingerprint,
+            no_cache_write,
+            inventory,
+        } => {
+            let limits: InventoryLimits = (*inventory).into();
+            let listing = freshness::inventory(path, limits);
+            let mut digests = match &listing.source {
+                InventorySource::Unavailable(reason) => FreshnessDigests {
+                    unavailable_reason: format!("git file inventory unavailable: {reason}"),
+                    ..Default::default()
+                },
+                InventorySource::Git => FreshnessDigests {
+                    generated_head: Some(freshness::git_head(path)).filter(|head| !head.is_empty()),
+                    indexed_hash: Some(freshness::files_fingerprint(&listing.files)),
+                    // Left for the short-circuit below to decide: hashing the
+                    // whole inventory is the expensive part, and a caller whose
+                    // head or file set has already moved has its answer.
+                    content_fingerprint: None,
+                    unavailable_reason: String::new(),
                 },
             };
-            let (_manifest, json_str) =
-                generate_manifest_with_edges(&extractions, &analysis, freshness.clone(), &edges);
-            let repo_root = store.latest_repo_root()?.or_else(|| {
-                path.canonicalize()
-                    .ok()
-                    .map(|root| root.to_string_lossy().into_owned())
-            });
-            let (graph_json, compact_graph_json) = generate_code_graph_encodings(
-                &extractions,
-                &analysis,
-                &edges,
-                &freshness,
-                repo_root.as_deref(),
-                compact_graph_output.is_some(),
-            )?;
 
-            let dest = resolve_manifest_output(repo_root.as_deref(), output);
-            ensure_parent(&dest)?;
-            write_manifest_atomically(&dest, &json_str, *force)?;
+            // One field at a time, and only the fields the caller asked about.
+            let compare = |expected: &Option<String>, actual: &Option<String>| {
+                expected.as_deref().map(|expected| {
+                    let actual = actual.clone().unwrap_or_default();
+                    serde_json::json!({
+                        "stored": expected,
+                        "actual": actual,
+                        "match": expected == actual,
+                    })
+                })
+            };
+            let head = compare(expect_head, &digests.generated_head);
+            let files = compare(expect_indexed_hash, &digests.indexed_hash);
+            let cheap_mismatch = [&head, &files]
+                .into_iter()
+                .flatten()
+                .any(|checked| checked["match"] != serde_json::Value::Bool(true));
+            // `RepoMapper.map_is_stale` computes the content fingerprint only
+            // after head and inventory both match, and this has to cost what
+            // that costs or delegating to it is a regression: hashing 1,385
+            // files is ~110 ms against ~25 ms for the two `git ls-files` passes
+            // that already answered. Computed anyway when nobody asked a
+            // question, because then the digests *are* the answer.
+            let content_wanted = !cheap_mismatch
+                && (expect_content_fingerprint.is_some()
+                    || (expect_head.is_none() && expect_indexed_hash.is_none()));
+            if content_wanted && listing.is_available() {
+                digests.content_fingerprint = Some(freshness::content_fingerprint(
+                    path,
+                    &listing.files,
+                    !*no_cache_write,
+                ));
+            }
+            let content = if content_wanted {
+                compare(expect_content_fingerprint, &digests.content_fingerprint)
+            } else {
+                // Not "matched": *not checked*. A field whose check was skipped
+                // must never report what a field that was checked and passed
+                // reports, so it carries no `match` at all.
+                expect_content_fingerprint.as_deref().map(|expected| {
+                    serde_json::json!({
+                        "stored": expected,
+                        "checked": false,
+                        "reason": "head or inventory already differ",
+                    })
+                })
+            };
+            let asked = head.is_some() || files.is_some() || content.is_some();
+            let mismatched: Vec<&str> = [
+                ("head", &head),
+                ("inventory", &files),
+                ("content", &content),
+            ]
+            .into_iter()
+            .filter_map(|(name, checked)| {
+                checked
+                    .as_ref()
+                    .filter(|value| value.get("match") == Some(&serde_json::Value::Bool(false)))
+                    .map(|_| name)
+            })
+            .collect();
 
-            let graph_dest = resolve_manifest_output(repo_root.as_deref(), graph_output);
-            ensure_parent(&graph_dest)?;
-            write_code_graph_atomically(&graph_dest, &graph_json, *force)?;
-
-            // Written through the same clobber guard as the verbose artifact.
-            // A foreign file at this path is refused for the same reason: the
-            // guard's question is "did this kernel write what is already here",
-            // and the answer does not depend on the encoding.
-            let compact_dest = match (compact_graph_output, &compact_graph_json) {
-                (Some(destination), Some(json)) => {
-                    let destination = resolve_manifest_output(repo_root.as_deref(), destination);
-                    ensure_parent(&destination)?;
-                    write_code_graph_atomically(&destination, json, *force)?;
-                    Some(destination)
-                }
-                _ => None,
+            // Fail closed. An inventory that could not be enumerated cannot
+            // prove a map fresh, so the answer is "stale, and here is why it
+            // could not be checked" — never "fresh" by absence of evidence.
+            let (stale, reason) = if !digests.unavailable_reason.is_empty() {
+                (asked.then_some(true), digests.unavailable_reason.clone())
+            } else if !asked {
+                (None, String::new())
+            } else if mismatched.is_empty() {
+                (Some(false), String::new())
+            } else {
+                (
+                    Some(true),
+                    format!(
+                        "{} changed since the map was written",
+                        mismatched.join(", ")
+                    ),
+                )
             };
 
-            if !cli.json {
-                println!("Manifest written to {:?}", dest);
-                println!("Code graph written to {:?}", graph_dest);
-                if let Some(destination) = &compact_dest {
-                    println!("Interned code graph written to {:?}", destination);
-                }
-            } else {
-                emit_json(
-                    cli,
-                    &serde_json::json!({
-                        "output": dest,
-                        "graph_output": graph_dest,
-                        // Absent, not empty, when no interned artifact was
-                        // asked for: `""` would read as a path that failed.
-                        "compact_graph_output": compact_dest,
-                        "generation_id": gen_id,
-                    }),
-                )?;
-            }
+            emit_json(
+                cli,
+                &serde_json::json!({
+                    "path": path,
+                    "source": match listing.source {
+                        InventorySource::Git => "git",
+                        InventorySource::Unavailable(_) => "unavailable",
+                    },
+                    "unavailable_reason": digests.unavailable_reason,
+                    "generated_head": digests.generated_head,
+                    "indexed_hash": digests.indexed_hash,
+                    "content_fingerprint": digests.content_fingerprint,
+                    "files": listing.files.len(),
+                    // Class A: a capped inventory fingerprints a subset of the
+                    // tree, and the number it was cut from travels with it.
+                    "inventory_capped_from": listing.capped_from,
+                    "stale": stale,
+                    "reason": reason,
+                    "checked": {
+                        "head": head,
+                        "inventory": files,
+                        "content": content,
+                    },
+                }),
+            )?;
         }
         Commands::Status => {
             // Answers even with no store, but never creates one. The client
@@ -2461,54 +3029,14 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     cli.db.display()
                 );
             };
-            let status = store.status(&cli.db.display().to_string())?;
-            // K-A2: the graph's own degradation belongs in the answer a health
-            // check reads.
-            //
-            // `freshness_degraded_reason` describes the *index* — no generation
-            // persisted, paths stuck in the retry queue — and said nothing
-            // about a generation built from a corpus the extractor could not
-            // read in full. That is how a repository whose only caller of a
-            // symbol was refused for being oversized reported
-            // `degraded_reason: null` while both artifacts of the same build
-            // carried `graph_degraded: true`. Both degradations can hold at
-            // once and neither may shadow the other, so they are joined with
-            // `devmap_analyze::combine_reasons`, the same joiner the analysis
-            // uses for its own pair.
-            let analysis_degraded = match store.latest_analysis_status()? {
-                Some(devmap_analyze::model::AnalysisStatus::Ok) | None => None,
-                Some(devmap_analyze::model::AnalysisStatus::Partial { reason }) => {
-                    Some(format!("partial: {reason}"))
-                }
-                Some(devmap_analyze::model::AnalysisStatus::Timeout { reason }) => {
-                    Some(format!("timeout: {reason}"))
-                }
-            };
-            let degraded_reason = devmap_analyze::combine_reasons(
-                devmap_serve::freshness_degraded_reason(&status),
-                analysis_degraded,
+            let mut payload = store_status_fields(&store, &cli.db)?;
+            payload.insert("schema_outdated".into(), serde_json::json!(false));
+            payload.insert("schema_version".into(), serde_json::json!(stored_schema));
+            payload.insert(
+                "expected_schema_version".into(),
+                serde_json::json!(devmap_store::CURRENT_SCHEMA_VERSION),
             );
-            let payload = serde_json::json!({
-                "generation_id": status.latest_generation,
-                "pending_count": status.pending_count,
-                "node_count": status.node_count,
-                "edge_count": status.edge_count,
-                // K-A6: one owner for this rule, shared with the daemon's
-                // `status`. Computing it here as `pending_count == 0` is what
-                // let a store with no generation at all report as current.
-                "is_fresh": devmap_serve::index_is_fresh(&status),
-                "db_path": status.db_path,
-                "degraded_reason": degraded_reason,
-                "quarantined_count": status.quarantined_count,
-                // K1(g): naming the stuck paths is what makes a degraded
-                // status actionable — "64 path(s) exceeded the retry
-                // threshold" told an operator nothing about which 64.
-                "quarantined_paths": status.quarantined_paths,
-                "schema_outdated": false,
-                "schema_version": stored_schema,
-                "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
-            });
-            emit_json(cli, &payload)?;
+            emit_json(cli, &serde_json::Value::Object(payload))?;
         }
         Commands::History { last } => {
             let store = open_for_read(&cli.db)?;
