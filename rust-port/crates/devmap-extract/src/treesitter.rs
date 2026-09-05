@@ -491,7 +491,9 @@ pub fn extract_treesitter_with_budget(
                     );
                 }
 
-                return Extraction {
+                // Bound rather than returned: the embedded-script merge below
+                // still has to run, and it mutates this value in place.
+                let mut extraction = Extraction {
                     file_path: path.to_string(),
                     language: lang.to_string(),
                     content_hash,
@@ -520,6 +522,29 @@ pub fn extract_treesitter_with_budget(
                     scope_locals: collect_scope_locals(root, source, &file_symbol_name),
                     source_code: Some(source.to_string()),
                 };
+
+                // The code inside a template language's `<script>` blocks, in
+                // the outer file's own coordinates. Last, and after
+                // `collect_scope_locals`, for two reasons: each inner parse
+                // clears the per-scope local cache that call reuses, and the
+                // merge restores the orderings established just above. For
+                // every language whose registry entry declares no embedded
+                // languages — all but Svelte, Vue, Astro and Liquid — this
+                // returns after one registry lookup.
+                // The one clock, not a second one started here. This used to
+                // pass a deadline computed inside the arm as
+                // `Instant::now() + budget`, which restarted the budget after
+                // the parse had already spent part of it. `deadline` is the
+                // clock `BudgetGuard` is armed with and the one every other
+                // stage checks.
+                crate::embedded::merge_embedded_scripts(
+                    &mut extraction,
+                    root,
+                    source,
+                    lang,
+                    deadline,
+                );
+                return extraction;
             }
         }
     }
@@ -2046,8 +2071,7 @@ pub(crate) fn generic_declaration(node: Node, source: &str) -> Option<(SymbolKin
     // `function_definition` carries no name field; taking both would emit the
     // same function twice.
     if node.kind() == "function_declarator"
-        && bounded_parent(node)
-            .is_some_and(|parent| parent.kind() == "function_definition")
+        && bounded_parent(node).is_some_and(|parent| parent.kind() == "function_definition")
     {
         return None;
     }
@@ -2574,7 +2598,12 @@ fn extract_node(
                     }
                 }
 
-                if !mod_spec.is_empty() || !imported_names.is_empty() {
+                // A module edge needs a module. Gating on `imported_names`
+                // instead let `export { a as b };` — a purely local re-export
+                // with no `from` — push an import whose `module_specifier` was
+                // `""`, an endpoint no resolver can ever bind, and it did the
+                // same for every function body the old text scan mis-sliced.
+                if !mod_spec.is_empty() {
                     imports.push(ExtractedImport {
                         raw_import: text,
                         module_specifier: mod_spec,
@@ -4004,9 +4033,7 @@ fn extract_c_header_export(
         "function_declarator" => {
             // A definition's own declarator is not a declaration of an
             // interface; the definition is already the symbol.
-            if bounded_parent(node)
-                .is_some_and(|parent| parent.kind() == "function_definition")
-            {
+            if bounded_parent(node).is_some_and(|parent| parent.kind() == "function_definition") {
                 return;
             }
             let Some(name_node) = c_declarator_name_node(node) else {
@@ -5016,9 +5043,7 @@ fn is_defining_name(node: Node) -> bool {
     // symbol it declares — `Main.kt::Mode.FAST` referencing `Main.kt::Mode.FAST`
     // — which is the self-reference shape
     // `c_family_declarations_do_not_reference_themselves` already pins for C.
-    if bounded_parent(node)
-        .is_some_and(|parent| parent.kind() == "enum_entry")
-    {
+    if bounded_parent(node).is_some_and(|parent| parent.kind() == "enum_entry") {
         return true;
     }
     // R spells every function declaration as an assignment — `helper <-
@@ -5038,9 +5063,7 @@ fn is_defining_name(node: Node) -> bool {
     // self-reference shape `c_family_declarations_do_not_reference_themselves`
     // pins for C. A parameter's identifiers hang off `formal_parameter_list`
     // rather than off the signature, so this reaches only the name.
-    if bounded_parent(node)
-        .is_some_and(|parent| parent.kind() == "constructor_signature")
-    {
+    if bounded_parent(node).is_some_and(|parent| parent.kind() == "constructor_signature") {
         return true;
     }
     let mut current = node;
@@ -6659,7 +6682,13 @@ mod tests {
                     // A namespace import records the `*` sentinel, which is how
                     // `ns.anything` stays resolvable without enumerating names.
                     ("pkg", vec!["*"], vec!["ns"], Some("ns")),
-                    ("", vec!["x"], vec!["x"], None),
+                    // `export { x };` is deliberately absent. It used to appear
+                    // here as `("", ["x"], ["x"], None)` — an import with an
+                    // empty module specifier — and this expectation pinned the
+                    // defect rather than the intent: a local re-export with no
+                    // `from` is an export and nothing else, and `""` is an
+                    // endpoint no resolver can ever bind. It still appears in
+                    // the export set below, which is where it belongs.
                 ],
                 vec!["d", "f.ts", "val", "x"],
             ),
@@ -6720,6 +6749,20 @@ mod tests {
                 .collect();
             exports.sort_unstable();
             assert_eq!(exports, expected_exports, "{grammar}: export set drifted");
+
+            // No import names an empty module.
+            //
+            // The loop below already refused an empty binding *name*, and this
+            // test still passed while every `export { x };` in the corpus
+            // pushed an import whose module was `""` — the check was one field
+            // short of the class it was written for.
+            for import in &extraction.imports {
+                assert!(
+                    !import.module_specifier.is_empty(),
+                    "{grammar}: an import must name a module, got {:?}",
+                    import.raw_import
+                );
+            }
 
             // Every import's binding pairs are well formed, so the resolver
             // cannot be handed a binding keyed on an empty name.

@@ -444,17 +444,19 @@ on a human). Nothing here is "done" — closed items live in STATUS.md's dated s
 
 | ID | Item | Owner doc | Status |
 |---|---|---|---|
-| SC34 | Call-graph blackout across ~26 non-C languages | STATUS.md | open |
+| SC34 | Call-graph blackout across ~26 non-C languages | STATUS.md | **closed 2026-09-05** — 11 languages closed earlier; `erlang`, `pascal`, `solidity`, `shell`, `sql`, `nix` closed in this pass; `svelte`/`vue`/`astro`/`liquid` closed by embedded `<script>` extraction. `hcl` and `cfml` **declined with reasons and pinned by tests**; `cobol` stays unlinked (`UNSAFE_GRAMMARS`) and `vb.net` still has no grammar (decision #1). Orphaned call edges 0 for every language added |
 | SC14 | Nested-symbol identity collisions inside anonymous callbacks and nested types | STATUS.md | partial |
 | SC29 | Unexplained SC26 per-file memory increase | STATUS.md | open |
 | SC2/B3 | Write amplification + genuinely incremental resolve | PLAN.md §7.5 | **decision** (#2) |
 | SC4 | Collapse speculative ambiguous calls into one edge with a candidate set | STATUS.md | **decision** (#7) |
 | — | VB.NET: the one frozen `LANGUAGE_SPECS` entry with no linked grammar | STATUS.md | **decision** (#1) |
-| G4 | Speculative edit preview — "what breaks if I change this" without writing | PLAN.md §3 | **in progress — do not start** |
-| G6 | Compact wire format — `code_graph.json` is 84 MB / ~21M tokens on a 3,674-file corpus | PLAN.md §3 · spec below | open |
-| G7 | Savings accounting — tokens saved versus reading the files | PLAN.md §3 · spec below | open |
+| G4 | Speculative edit preview — "what breaks if I change this" without writing | PLAN.md §3 | **closed** — `devmap preview` ships with `crates/devmap-cli/tests/test_preview.rs`, so the R2 objection below is answered. The paragraph that follows is retained only as the record of why it was once fenced off |
+| G6 | Compact wire format — `code_graph.json` is 84 MB / ~21M tokens on a 3,674-file corpus | PLAN.md §3 · `DIVERGENCES.md` X39 | **closed 2026-09-05** — `devmap manifest --compact-graph-output`; interned encoding of the same model from the same traversal, 21,186,034 B -> 5,001,998 B (-76.4%) on this repository, round-trip asserted. Note it does **not** make the graph agent-readable (5.3M tokens -> 1.25M), and **nothing reads it yet** — the intended first consumer is `backend/go_orchestrator/repomap` |
+| G7 | Savings accounting — tokens saved versus reading the files | PLAN.md §3 | **already closed** — `devmap savings` exists and PLAN.md §3 records it closed; this row was stale |
 
-**G4 is being built by another session as of 2026-09-02 15:23.** `devmap-query/src/engine.rs`
+**Superseded 2026-09-05 — G4 is closed and this paragraph is history, not instruction.** `crates/devmap-cli/tests/test_preview.rs` exists and passes, so the "ships no tests yet" objection no longer holds; do not read the "do not start" below as current. The original note follows.
+
+> **G4 was being built by another session as of 2026-09-02 15:23.** `devmap-query/src/engine.rs`
 carries a `preview()` entry point and a `PreviewChange` enum; `devmap-cli/src/main.rs` carries
 a `Preview` subcommand and `emit_preview`. It compiles and the suite is green, but it ships no
 tests yet, so it does not meet R2. **Do not start G4.** Either take it over from that session

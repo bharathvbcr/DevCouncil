@@ -17,13 +17,14 @@ pub use artifacts::{
 };
 pub use cancel::{cancelled_queries, Cancel, QueryCancelled};
 pub use code_graph::{
-    generate_code_graph_json, write_code_graph_atomically, CODE_GRAPH_DEFAULT_OUTPUT,
-    CODE_GRAPH_SCHEMA_VERSION,
+    decode_compact, encode_compact, generate_code_graph_encodings, generate_code_graph_json,
+    write_code_graph_atomically, CODE_GRAPH_COMPACT_DEFAULT_OUTPUT, CODE_GRAPH_COMPACT_ENCODING,
+    CODE_GRAPH_DEFAULT_OUTPUT, CODE_GRAPH_SCHEMA_VERSION,
 };
 pub use engine::{
-    budget_take, clone_group_tokens, link_candidates, parse_clone_kind, resolved_edge_from_stored,
-    workspace_search, PathOutsideRepoRoot, QueryEngine, StoreQueryEngine, BYTES_PER_TOKEN,
-    MAX_NEIGHBOR_TARGETS, PREVIEW_CALLER_MIN_CONFIDENCE,
+    budget_take, clone_group_tokens, is_test_path, link_candidates, parse_clone_kind,
+    resolved_edge_from_stored, workspace_search, PathOutsideRepoRoot, QueryEngine,
+    StoreQueryEngine, BYTES_PER_TOKEN, MAX_NEIGHBOR_TARGETS, PREVIEW_CALLER_MIN_CONFIDENCE,
 };
 pub use escape::{html_escape, render_symbol_label};
 pub use manifest::{

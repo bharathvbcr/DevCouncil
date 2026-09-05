@@ -28,149 +28,186 @@ def _configure_stdio() -> None:
 
 _configure_stdio()
 
-from devcouncil.cli.commands import (  # noqa: E402 - imports follow stdio reconfiguration
-    artifacts,
-    agents,
-    baseline,
-    boot,
-    check,
-    config,
-    cost,
-    ast,
-    dashboard,
-    debug_cmd,
-    design,
-    doctor,
-    go,
-    hook,
-    init,
-    integrate,
-    logs,
-    lsp,
-    map,
-    graph_cmd,
-    mcp_server,
-    okf,
-    plan,
-    prompt,
-    repair,
-    report,
-    reset_demo_state,
-    rollback,
-    run,
-    runs,
-    setup,
-    campaign,
-    show,
-    status,
-    gaps,
-    requirements,
-    export,
-    tasks,
-    trace,
-    verify,
-    version,
-    watch,
-    wiki,
-    shell,
-    semantic,
-    evidence,
-    handoff,
-    skills,
-    scaffold,
-    provenance,
-    lease,
-    gated_write,
-    task_gate,
-)
-from devcouncil.cli.commands.watch_fs import watch_fs  # noqa: E402 - imports follow stdio reconfiguration
+import importlib  # noqa: E402 - imports follow stdio reconfiguration
+
+import typer
+from typer.core import TyperGroup
+
+#: `dev <name>` -> (module under `devcouncil.cli.commands`, attribute, kind).
+#:
+#: `kind` is `"typer"` for an attribute that is a `typer.Typer` (registered as a
+#: sub-command group) and `"command"` for a plain function (registered as one
+#: command).
+#:
+#: **Why a table instead of ~75 import-and-register statements.** `dev hook
+#: post-tool-use` runs on every tool call an agent makes and measured 408-493 ms,
+#: nearly all of it importing the other 49 command modules. 23 of them pull
+#: `devcouncil.storage.db`, so every hook loaded SQLAlchemy and SQLModel — about
+#: 120 ms — to answer a question that, with no single task running, never reaches
+#: the database at all.
+#:
+#: The names here are the CLI's public surface and
+#: `tests/unit/test_cli_lazy_commands.py` pins the full list against what it was
+#: before this table existed, so a typo removes a command loudly rather than
+#: silently.
+_LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
+    # Sub-command groups.
+    "init": ("init", "app", "typer"),
+    "doctor": ("doctor", "app", "typer"),
+    "tasks": ("tasks", "app", "typer"),
+    "report": ("report", "app", "typer"),
+    "rollback": ("rollback", "app", "typer"),
+    "config": ("config", "app", "typer"),
+    "artifacts": ("artifacts", "app", "typer"),
+    "agents": ("agents", "app", "typer"),
+    "hook": ("hook", "app", "typer"),
+    "version": ("version", "app", "typer"),
+    "mcp-server": ("mcp_server", "app", "typer"),
+    # `integrate` and `integrations` are the same sub-app under two names.
+    "integrate": ("integrate", "app", "typer"),
+    "integrations": ("integrate", "app", "typer"),
+    "trace": ("trace", "app", "typer"),
+    "logs": ("logs", "app", "typer"),
+    "cost": ("cost", "app", "typer"),
+    "runs": ("runs", "app", "typer"),
+    "setup": ("setup", "app", "typer"),
+    "lsp": ("lsp", "app", "typer"),
+    "ast": ("ast", "app", "typer"),
+    "dashboard": ("dashboard", "app", "typer"),
+    "debug": ("debug_cmd", "app", "typer"),
+    "watch": ("watch", "app", "typer"),
+    "semantic": ("semantic", "app", "typer"),
+    "evidence": ("evidence", "app", "typer"),
+    "skills": ("skills", "app", "typer"),
+    "okf": ("okf", "app", "typer"),
+    "design": ("design", "app", "typer"),
+    "wiki": ("wiki", "app", "typer"),
+    "campaign": ("campaign", "app", "typer"),
+    "resource": ("provenance", "resource_app", "typer"),
+    "lease": ("lease", "lease_app", "typer"),
+    "scope": ("task_gate", "scope_app", "typer"),
+    # `map` and `graph` are the same sub-app under two names.
+    "map": ("map", "app", "typer"),
+    "graph": ("map", "app", "typer"),
+    "corpus": ("graph_cmd", "corpus_app", "typer"),
+    # Plain commands.
+    "baseline": ("baseline", "baseline", "command"),
+    "boot": ("boot", "boot", "command"),
+    "e2e": ("go", "go", "command"),
+    "go": ("go", "go", "command"),
+    "graph-context": ("map", "graph_context_cmd", "command"),
+    "scaffold-ci": ("scaffold", "scaffold_ci_command", "command"),
+    "plan": ("plan", "plan", "command"),
+    "approve": ("plan", "approve", "command"),
+    "prompt": ("prompt", "prompt", "command"),
+    "reset-demo-state": ("reset_demo_state", "reset_demo_state", "command"),
+    "run": ("run", "run", "command"),
+    # shell/handoff take a positional TASK_ID followed by options, so they must
+    # be plain commands — as typer sub-apps (click groups) the documented
+    # `dev shell TASK-001 --command ...` form fails to parse.
+    "shell": ("shell", "shell", "command"),
+    "handoff": ("handoff", "handoff", "command"),
+    "show": ("show", "show", "command"),
+    "verify": ("verify", "verify", "command"),
+    "check": ("check", "check", "command"),
+    "repair": ("repair", "repair", "command"),
+    "status": ("status", "status", "command"),
+    "gaps": ("gaps", "gaps", "command"),
+    "provenance": ("provenance", "provenance", "command"),
+    "checkout": ("lease", "checkout", "command"),
+    "release": ("lease", "release", "command"),
+    "write": ("gated_write", "write", "command"),
+    "apply-patch": ("gated_write", "apply_patch", "command"),
+    "next-task": ("task_gate", "next_task", "command"),
+    "policy-check": ("task_gate", "policy_check", "command"),
+    "record-command": ("task_gate", "record_command", "command"),
+    "run-cmd": ("task_gate", "run_cmd", "command"),
+    "attach-committed-range": ("task_gate", "attach_committed_range", "command"),
+    "verify-leased": ("task_gate", "verify_leased", "command"),
+    "evidence-append": ("task_gate", "evidence_append", "command"),
+    "evidence-list": ("task_gate", "evidence_list", "command"),
+    "handoff-leased": ("task_gate", "handoff_leased", "command"),
+    "requirements": ("requirements", "requirements", "command"),
+    "export": ("export", "export_state", "command"),
+    "optimize": ("agents", "optimize_agent", "command"),
+}
+
+
+def _prepare_watch(sub_app: "typer.Typer") -> None:
+    """`dev watch fs` lives in its own module and is attached to `watch`.
+
+    Done here rather than at import time because there is no import time any
+    more: the attachment has to happen when `watch` is built, and exactly once,
+    which is what the built-command cache below guarantees.
+    """
+    from devcouncil.cli.commands.watch_fs import watch_fs
+
+    sub_app.command("fs")(watch_fs)
+
+
+#: Sub-apps needing a mutation before they are converted to a Click command.
+_BEFORE_BUILD = {"watch": _prepare_watch}
+
+
+class LazyCommandGroup(TyperGroup):
+    """Import a command's module the first time that command is asked for.
+
+    `list_commands` advertises every name without importing anything, so
+    completion and the command list stay cheap. `get_command` is the only place
+    that imports, and it caches the built command on the group, so a command is
+    never built twice in one process.
+
+    `dev --help` still renders every command's help, which means it still
+    imports every module — correct, and rare. The hot path is
+    `dev <one command>`, which now imports one.
+    """
+
+    def list_commands(self, ctx: "typer.Context") -> list[str]:
+        return sorted({*super().list_commands(ctx), *_LAZY_COMMANDS})
+
+    def get_command(self, ctx: "typer.Context", name: str):
+        found = super().get_command(ctx, name)
+        if found is not None:
+            return found
+        spec = _LAZY_COMMANDS.get(name)
+        if spec is None:
+            # Unknown name: Click's own "no such command" path, not a crash.
+            return None
+        module_name, attribute, kind = spec
+        module = importlib.import_module(f"devcouncil.cli.commands.{module_name}")
+        target = getattr(module, attribute)
+        if kind == "typer":
+            prepare = _BEFORE_BUILD.get(name)
+            if prepare is not None:
+                prepare(target)
+            # `get_group`, never `get_command`. Typer collapses a sub-app that
+            # holds exactly one command and no callback into a bare
+            # `click.Command`, so `dev lsp inspect` parsed `inspect` as a
+            # positional argument to `dev lsp` and failed. `add_typer` — what
+            # the eager registration used — always builds a group, and this is
+            # the call that reproduces it.
+            command = typer.main.get_group(target)
+        else:
+            holder = typer.Typer()
+            holder.command(name=name)(target)
+            # The collapse is correct here and only here: a holder with one
+            # command is exactly `app.command(...)`, a leaf that takes its own
+            # arguments.
+            command = typer.main.get_command(holder)
+        command.name = name
+        # Cache on the group so a second lookup in the same process — Click does
+        # several while parsing — neither re-imports nor rebuilds.
+        self.add_command(command, name)
+        return command
+
 
 app = typer.Typer(
     name="dev",
     help="DevCouncil: Gated orchestrator for AI-assisted software development.",
     add_completion=False,
+    cls=LazyCommandGroup,
 )
 
-# Typer subcommands (those using app = Typer())
-app.add_typer(init.app, name="init")
-app.add_typer(doctor.app, name="doctor")
-app.add_typer(tasks.app, name="tasks")
-app.add_typer(report.app, name="report")
-app.add_typer(rollback.app, name="rollback")
-app.add_typer(config.app, name="config")
-app.add_typer(artifacts.app, name="artifacts")
-app.add_typer(agents.app, name="agents")
-app.add_typer(hook.app, name="hook")
-app.add_typer(version.app, name="version")
-app.add_typer(mcp_server.app, name="mcp-server")
-app.add_typer(integrate.app, name="integrate")
-app.add_typer(integrate.app, name="integrations")
-app.add_typer(trace.app, name="trace")
-app.add_typer(logs.app, name="logs")
-app.add_typer(cost.app, name="cost")
-app.add_typer(runs.app, name="runs")
-app.add_typer(setup.app, name="setup")
-app.add_typer(lsp.app, name="lsp")
-app.add_typer(ast.app, name="ast")
-app.add_typer(dashboard.app, name="dashboard")
-app.add_typer(debug_cmd.app, name="debug")
-app.add_typer(watch.app, name="watch")
-app.add_typer(semantic.app, name="semantic")
-app.add_typer(evidence.app, name="evidence")
-app.add_typer(skills.app, name="skills")
-app.add_typer(okf.app, name="okf")
-app.add_typer(design.app, name="design")
-app.add_typer(wiki.app, name="wiki")
-app.add_typer(campaign.app, name="campaign")
-app.add_typer(provenance.resource_app, name="resource")
-app.add_typer(lease.lease_app, name="lease")
-app.add_typer(task_gate.scope_app, name="scope")
-watch.app.command("fs")(watch_fs)
-
-# Direct command registrations (those defined as def cmd())
-app.command(name="baseline")(baseline.baseline)
-app.command(name="boot")(boot.boot)
-app.command(name="e2e")(go.go)
-app.command(name="go")(go.go)
-# Shared map/graph Typer (integrate/integrations dual-register pattern).
-app.add_typer(map.app, name="map")
-app.add_typer(map.app, name="graph")
-app.add_typer(graph_cmd.corpus_app, name="corpus")
-app.command(name="graph-context")(map.graph_context_cmd)
-app.command(name="scaffold-ci")(scaffold.scaffold_ci_command)
-app.command(name="plan")(plan.plan)
-app.command(name="approve")(plan.approve)
-app.command(name="prompt")(prompt.prompt)
-app.command(name="reset-demo-state")(reset_demo_state.reset_demo_state)
-app.command(name="run")(run.run)
-# shell/handoff take a positional TASK_ID followed by options, so they must be
-# plain commands — as typer sub-apps (click groups) the documented
-# `dev shell TASK-001 --command ...` form fails to parse.
-app.command(name="shell")(shell.shell)
-app.command(name="handoff")(handoff.handoff)
-app.command(name="show")(show.show)
-app.command(name="verify")(verify.verify)
-app.command(name="check")(check.check)
-app.command(name="repair")(repair.repair)
-app.command(name="status")(status.status)
-app.command(name="gaps")(gaps.gaps)
-app.command(name="provenance")(provenance.provenance)
-app.command(name="checkout")(lease.checkout)
-app.command(name="release")(lease.release)
-app.command(name="write")(gated_write.write)
-app.command(name="apply-patch")(gated_write.apply_patch)
-app.command(name="next-task")(task_gate.next_task)
-app.command(name="policy-check")(task_gate.policy_check)
-app.command(name="record-command")(task_gate.record_command)
-app.command(name="run-cmd")(task_gate.run_cmd)
-app.command(name="attach-committed-range")(task_gate.attach_committed_range)
-app.command(name="verify-leased")(task_gate.verify_leased)
-app.command(name="evidence-append")(task_gate.evidence_append)
-app.command(name="evidence-list")(task_gate.evidence_list)
-app.command(name="handoff-leased")(task_gate.handoff_leased)
-app.command(name="requirements")(requirements.requirements)
-app.command(name="export")(export.export_state)
-app.command(name="optimize")(agents.optimize_agent)
 
 @app.callback()
 def main(

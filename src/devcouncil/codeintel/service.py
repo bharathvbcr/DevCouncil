@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from devcouncil.codeintel.store import CodeIntelStore
-from devcouncil.indexing.graph.schema import CodeGraph
+from devcouncil.indexing.graph.schema import CodeGraph, Confidence, GraphEdge
 
 
 def canonical_project_root(root: Path) -> Path:
@@ -73,6 +73,60 @@ class CodeIntelService:
 
     def load(self) -> CodeGraph | None:
         return self.store.load_graph()
+
+    def load_with_runtime_observations(self) -> CodeGraph:
+        """The committed graph, plus fingerprint-matched runtime edges.
+
+        Moved here from ``CodeIntelQueryEngine._graph`` when that module was
+        retired. It was never a query concern: the store, the root and the
+        runtime-observation table are all owned by this service, and the engine
+        was reaching through it for all three. ``run_cypher`` — the one
+        production caller left — now asks the owner directly.
+
+        Runtime edges are additive and never overwrite an extracted edge: an
+        observation that duplicates a static edge is dropped, so provenance on
+        an existing edge cannot be rewritten by a later session. Sampled kinds
+        are `INFERRED`, because a stack sample witnesses that a call happened,
+        not that the edge is the only one it could have been.
+
+        Raises:
+            FileNotFoundError: when no generation has been committed.
+        """
+        graph = self.load()
+        if graph is None:
+            raise FileNotFoundError("no code-intelligence index; run `dev map init`")
+        # Fingerprinting shells out to git (diff + untracked hashing) — only pay
+        # that per-query cost when runtime evidence actually exists to match.
+        if not self.store.has_runtime_observations():
+            return graph
+        from devcouncil.codeintel.debug.fingerprint import source_fingerprint
+
+        fingerprint = source_fingerprint(self.project_root)
+        runtime = self.store.runtime_observations(source_fingerprint=fingerprint)
+        existing = {(edge.source, edge.target, edge.kind) for edge in graph.edges}
+        for observation in runtime:
+            kind = str(observation["kind"])
+            key = (str(observation["source"]), str(observation["target"]), kind)
+            if key in existing:
+                continue
+            sampled = kind in {"sampled_calls", "sampled_stack"}
+            graph.edges.append(GraphEdge(
+                source=key[0],
+                target=key[1],
+                kind=kind,
+                confidence=Confidence.INFERRED if sampled else Confidence.EXTRACTED,
+                reason="fingerprint-matched runtime observation",
+                extras={
+                    "provenance": "runtime",
+                    "confidence_score": 0.75 if sampled else 1.0,
+                    "source_fingerprint": fingerprint,
+                    "runtime_session": observation["session_id"],
+                    "count": observation["count"],
+                    "evidence": observation["evidence"],
+                },
+            ))
+            existing.add(key)
+        return graph
 
     def cached_query(self, namespace: str, key: str, loader: Callable[[], Any]) -> Any:
         generation = self.store.current_generation()

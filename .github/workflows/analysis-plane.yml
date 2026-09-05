@@ -169,6 +169,18 @@ jobs:
         working-directory: backend/go_orchestrator
         run: go test ./... -count=1
 
+      # A separate step, not a flag on the one above, so the fast signal still
+      # arrives first and a race is attributed to the race detector rather than
+      # read as a flaky test.
+      #
+      # This gate is not speculative. The concurrency work on 2026-09-05 landed
+      # a data race in `Provenance()` — one reader's caller could rewrite the
+      # next reader's provenance through an aliased pointer — and `go test`
+      # was green on it. `-race` was the only thing that saw it.
+      - name: Race detector
+        working-directory: backend/go_orchestrator
+        run: go test ./... -count=1 -race
+
       # The live-contract tests are the only check that the field names this
       # module decodes are the ones devmap emits. If they skipped, the step
       # above was green without ever having spoken to the producer, so the skip

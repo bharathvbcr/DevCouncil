@@ -126,6 +126,99 @@ def _binary_candidates(root: Optional[Path]) -> List[Path]:
     return unique
 
 
+def _expected_schema_version(binary: str) -> Optional[int]:
+    """The store schema this kernel writes, asked of the binary itself.
+
+    `find_engine_binary` used to rank candidates by mtime, on the reasoning
+    that "a schema bump is exactly the kind of change that moves the build time
+    and not the help text". That is true, and it is still the wrong evidence:
+    build time is a *proxy* for the schema, and the proxy is wrong in both
+    directions. A release build made after a debug build has a newer mtime and
+    may carry an older schema; and two builds at the *same* schema differ in
+    mtime for no reason that should decide anything — at which point the rule
+    silently prefers the unoptimized one, which is 5.8x slower at the same work
+    (measured: `manifest` 6.25/6.36/6.82 s debug against 0.54/1.10/1.79 s
+    release, interleaved, same store, same argv).
+
+    `devmap --db <path with no store> status` reports `expected_schema_version`
+    and exits 0 without creating anything, so the question can be asked
+    directly. Memoised by path, mtime and size exactly as `_manifest_help` is:
+    every build of this workspace reports the same `devmap 0.1.0`, so the path
+    alone is not an identity.
+
+    Returns `None` when the binary cannot answer — a kernel too old to have the
+    field, a probe that fails, unparseable output. `None` is not 0: it means
+    "no evidence", and the caller must not treat it as a low version.
+    """
+    try:
+        stat = Path(binary).stat()
+        key = (binary, stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        key = (binary, 0, 0)
+    if key in _SCHEMA_PROBE_CACHE:
+        return _SCHEMA_PROBE_CACHE[key]
+
+    version: Optional[int] = None
+    # A path under the temp directory that this process never creates. The
+    # probe is a question about the *binary*, so it must not touch the store it
+    # is being selected for — running `status` against the real store would
+    # race the build this selection is for.
+    probe_db = Path(tempfile.gettempdir()) / f"devmap-schema-probe-{uuid.uuid4().hex}.sqlite"
+    try:
+        probe = subprocess.run(
+            [binary, "--db", str(probe_db), "status"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        payload = json.loads(probe.stdout or "{}")
+        candidate = payload.get("expected_schema_version")
+        if isinstance(candidate, int):
+            version = candidate
+    except (OSError, subprocess.SubprocessError, ValueError):
+        version = None
+    finally:
+        # Belt and braces: `status` is verified not to create a store, and if
+        # that ever changes the probe must not leave one behind.
+        try:
+            probe_db.unlink()
+        except OSError:
+            pass
+    _SCHEMA_PROBE_CACHE[key] = version
+    return version
+
+
+_SCHEMA_PROBE_CACHE: dict[tuple[str, int, int], Optional[int]] = {}
+
+#: Debug-kernel selections already warned about, as `(path, schema)`.
+#:
+#: Keyed on the schema too, so a rebuilt debug kernel at a new schema warns
+#: again — that is a different decision, not a repeat of the same one.
+_DEBUG_KERNEL_WARNED: set[tuple[str, Optional[int]]] = set()
+
+
+def _is_debug_build(binary: str) -> bool:
+    """Whether this path is a cargo `debug` profile build.
+
+    Read off the path because there is nothing else to read: a Rust binary does
+    not report its own optimization level, and `--version` is identical across
+    profiles. The convention is cargo's own and the candidate list is built
+    from `target/release` and `target/debug` directly, so the inference is
+    exact for every candidate this module constructs.
+
+    The failure mode is bounded on purpose: a release binary copied into a
+    directory called `target/debug` would be ranked below an equally-capable
+    sibling. That costs a tie-break, never correctness — schema always outranks
+    this, so a mislabelled binary can never be preferred over one that can
+    actually open the store.
+    """
+    parts = Path(binary).parts
+    return any(
+        parts[index] == "target" and parts[index + 1] == "debug"
+        for index in range(len(parts) - 1)
+    )
+
+
 def find_engine_binary(root: Optional[Path] = None) -> str:
     """Locate a devmap binary that can actually do what this module asks of it.
 
@@ -154,15 +247,26 @@ def find_engine_binary(root: Optional[Path] = None) -> str:
     refuses anything that cannot write the graph companion — rather than
     discovering it mid-build and leaving a map with no `code_graph.json`.
 
-    **Age, among the capable.** A release build made before a schema bump and a
-    debug build made after it both pass the capability probe — the flags did
-    not change, the schema did. Preferring `release` by position picked the one
-    that refuses the store. Among candidates that pass the probe the newest
-    build wins, because a schema bump is exactly the kind of change that moves
-    the build time and not the help text.
+    **Schema, among the capable — and speed among equals.** A release build made
+    before a schema bump and a debug build made after it both pass the
+    capability probe: the flags did not change, the schema did. That was first
+    fixed by preferring the newest build, which is a *proxy* for the schema and
+    is wrong in both directions — a newer release build can carry an older
+    schema, and two builds at the same schema differ in mtime for no reason
+    that should decide anything. The binary is now asked
+    (`_expected_schema_version`), so candidates rank by the schema they
+    actually write; among equal, known schemas the optimized build wins,
+    because the unoptimized one is **5.8x slower** at the same work (measured:
+    `manifest` 6.25 / 6.36 / 6.82 s debug against 0.54 / 1.10 / 1.79 s release,
+    interleaved, same store, same argv — an 8.5 s `dev map` where the release
+    kernel makes it 0.9 s). With no schema evidence from either candidate the
+    rule degrades to newest-wins, so a kernel too old to answer is judged
+    exactly as before rather than by a preference it has no evidence for.
     """
     override = os.environ.get(BINARY_ENV_VAR, "").strip()
-    capable: List[tuple[int, str]] = []
+    #: `(path, mtime_ns)` — path first, because the schema probe is keyed on it
+    #: and the ranking below reads all three of schema, profile and age.
+    capable: List[tuple[str, int]] = []
     rejected: List[str] = []
     for candidate in _binary_candidates(root):
         if not (candidate.is_file() and os.access(candidate, os.X_OK)):
@@ -184,7 +288,7 @@ def find_engine_binary(root: Optional[Path] = None) -> str:
                 mtime = candidate.stat().st_mtime_ns
             except OSError:
                 mtime = 0
-            capable.append((mtime, str(candidate)))
+            capable.append((str(candidate), mtime))
             continue
         if is_override:
             raise DevMapEngineError(
@@ -194,8 +298,47 @@ def find_engine_binary(root: Optional[Path] = None) -> str:
             )
 
     if capable:
-        capable.sort(key=lambda item: item[0], reverse=True)
-        return capable[0][1]
+        # Schema first, then the optimized build, then age. The middle term is
+        # neutralised whenever any candidate cannot report its schema: without
+        # that evidence, preferring `release` would resurrect the very bug the
+        # age rule was added to fix.
+        schemas = {path: _expected_schema_version(path) for path, _ in capable}
+        schema_known = all(version is not None for version in schemas.values())
+
+        def rank(item: tuple[str, int]) -> tuple[int, int, int]:
+            path, mtime = item
+            version = schemas[path]
+            return (
+                version if version is not None else -1,
+                0 if not schema_known else int(not _is_debug_build(path)),
+                mtime,
+            )
+
+        capable.sort(key=rank, reverse=True)
+        chosen, _ = capable[0]
+        chosen_identity = (chosen, schemas[chosen])
+        if _is_debug_build(chosen) and chosen_identity not in _DEBUG_KERNEL_WARNED:
+            # Never silent: an unoptimized kernel costs ~6x on every `dev map`,
+            # and the caller cannot see which binary answered.
+            #
+            # Once per selection, not once per call. `find_engine_binary` runs
+            # several times in a single command, and three identical warnings
+            # for one decision is noise that trains a reader to skip it.
+            _DEBUG_KERNEL_WARNED.add(chosen_identity)
+            alternatives = ", ".join(
+                f"{path} (schema {schemas[path]})"
+                for path, _ in capable[1:]
+                if not _is_debug_build(path)
+            )
+            logger.warning(
+                "using the debug devmap kernel at %s (schema %s) — it is roughly "
+                "6x slower than a release build at the same work%s. Rebuild with "
+                "`cargo build --release -p devmap-cli` in rust-port/.",
+                chosen,
+                schemas[chosen],
+                f"; passed over: {alternatives}" if alternatives else "",
+            )
+        return chosen
 
     detail = "; ".join(rejected) if rejected else "none found"
     raise DevMapEngineError(

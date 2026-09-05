@@ -6,6 +6,22 @@ from devcouncil.indexing.graph.cypher import _parse_where, run_cypher
 from devcouncil.indexing.graph.schema import CodeGraph, Confidence, GraphEdge, GraphNode, NodeKind
 
 
+class _FakeService:
+    """Stands in for ``CodeIntelService``, which owns the graph load.
+
+    ``run_cypher`` used to reach through ``CodeIntelQueryEngine._graph`` — a
+    private method on a query engine — for a graph the service owns. The engine
+    was retired with the rest of the Python query surface; the stub follows the
+    caller to its new owner rather than the deleted one.
+    """
+
+    def __init__(self, graph: CodeGraph) -> None:
+        self._graph = graph
+
+    def load_with_runtime_observations(self) -> CodeGraph:
+        return self._graph
+
+
 def _graph() -> CodeGraph:
     return CodeGraph(
         nodes=[
@@ -56,16 +72,16 @@ def test_run_cypher_rejects_unknown_rel(tmp_path):
 
 
 def test_run_cypher_no_graph(tmp_path, monkeypatch):
-    class Missing:
-        def __init__(self, root):
-            pass
+    def missing(root):
+        class Service:
+            def load_with_runtime_observations(self):
+                raise FileNotFoundError("missing")
 
-        def _graph(self):
-            raise FileNotFoundError("missing")
+        return Service()
 
     monkeypatch.setattr(
-        "devcouncil.codeintel.query.engine.CodeIntelQueryEngine",
-        Missing,
+        "devcouncil.codeintel.service.get_codeintel_service",
+        missing,
     )
     result = run_cypher(tmp_path, "MATCH (a)-[r:CALLS]->(b) RETURN a,b")
     assert result["ok"] is False
@@ -75,16 +91,9 @@ def test_run_cypher_no_graph(tmp_path, monkeypatch):
 def test_run_cypher_calls_with_filters(tmp_path, monkeypatch):
     graph = _graph()
 
-    class FakeEngine:
-        def __init__(self, root):
-            pass
-
-        def _graph(self):
-            return graph
-
     monkeypatch.setattr(
-        "devcouncil.codeintel.query.engine.CodeIntelQueryEngine",
-        FakeEngine,
+        "devcouncil.codeintel.service.get_codeintel_service",
+        lambda root: _FakeService(graph),
     )
     result = run_cypher(
         tmp_path,
@@ -99,16 +108,9 @@ def test_run_cypher_calls_with_filters(tmp_path, monkeypatch):
 def test_run_cypher_nodes_only(tmp_path, monkeypatch):
     graph = _graph()
 
-    class FakeEngine:
-        def __init__(self, root):
-            pass
-
-        def _graph(self):
-            return graph
-
     monkeypatch.setattr(
-        "devcouncil.codeintel.query.engine.CodeIntelQueryEngine",
-        FakeEngine,
+        "devcouncil.codeintel.service.get_codeintel_service",
+        lambda root: _FakeService(graph),
     )
     result = run_cypher(
         tmp_path,
@@ -123,16 +125,9 @@ def test_run_cypher_nodes_only(tmp_path, monkeypatch):
 def test_run_cypher_imports_relationship(tmp_path, monkeypatch):
     graph = _graph()
 
-    class FakeEngine:
-        def __init__(self, root):
-            pass
-
-        def _graph(self):
-            return graph
-
     monkeypatch.setattr(
-        "devcouncil.codeintel.query.engine.CodeIntelQueryEngine",
-        FakeEngine,
+        "devcouncil.codeintel.service.get_codeintel_service",
+        lambda root: _FakeService(graph),
     )
     result = run_cypher(tmp_path, "MATCH (a)-[r:IMPORTS]->(b) RETURN a,b")
     assert result["ok"] is True
@@ -148,15 +143,9 @@ def test_run_cypher_rejects_delete(tmp_path):
 
 
 def _stub_engine(monkeypatch, graph):
-    class FakeEngine:
-        def __init__(self, root):
-            pass
-
-        def _graph(self):
-            return graph
-
     monkeypatch.setattr(
-        "devcouncil.codeintel.query.engine.CodeIntelQueryEngine", FakeEngine
+        "devcouncil.codeintel.service.get_codeintel_service",
+        lambda root: _FakeService(graph),
     )
 
 

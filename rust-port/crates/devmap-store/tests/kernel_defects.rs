@@ -669,11 +669,20 @@ fn k1_claim_acknowledgement_survives_a_concurrent_requeue() {
 /// batch, which is exactly the state this repository's store was found in: 64
 /// rows at `attempts = 5`, the daemon's batch limit exactly.
 ///
-/// The batch-wide failure here is real, not injected: two pending rows spelling
-/// one file (the absolute path the watcher used to enqueue, and the relative
-/// one the reconcile sweep used) resolve to a single repo-relative path, and
-/// the generation write refuses duplicate extraction paths. That collision is
-/// the same producer disagreement K1(a) fixes at the other end.
+/// The batch-wide failure here is a real store-level fault, not an injected
+/// one: the cross-process writer lock (K13) cannot be opened for writing, which
+/// is what a permissions or filesystem fault looks like from inside the drain.
+/// It is taken *after* the per-path loop and *before* the acknowledgement,
+/// which is precisely the window this test exists to cover.
+///
+/// It used to be produced by enqueuing two spellings of one file — the absolute
+/// path the watcher used and the relative one the reconcile sweep used — and
+/// relying on the generation write to refuse the duplicate. That route is gone:
+/// `drain_pending_batch` now keys its fresh extractions by path in a
+/// `BTreeMap`, deliberately, so an overlapping batch resolves to one entry per
+/// file instead of failing on every retry. The de-duplication is the newer,
+/// better behaviour; only this fixture's way of provoking a failure was
+/// retired by it, so the fixture moved rather than the property.
 #[test]
 fn k1_a_failing_path_does_not_charge_an_attempt_to_its_batch_mates() {
     use devmap_serve::Daemon;
@@ -690,21 +699,44 @@ fn k1_a_failing_path_does_not_charge_an_attempt_to_its_batch_mates() {
     // precisely because the canonicalising producer refuses it up front — this
     // is a row of the kind already sitting in stores today.
     let poison = "../escapes.py".to_string();
-    let duplicate = canonical_root.join("good.py").display().to_string();
+    let sibling = canonical_root.join("good.py").display().to_string();
 
     {
         let store = Store::open(&db).unwrap();
         store
-            .enqueue_pending_paths(&[poison.clone(), "good.py".to_string(), duplicate.clone()])
+            .enqueue_pending_paths(&[poison.clone(), "good.py".to_string(), sibling.clone()])
             .unwrap();
+        drop(store);
+
+        // Make the writer lock unopenable for writing. Created and chmodded
+        // here rather than mid-drain because the drain offers no seam: the
+        // fault has to already exist when `lock_writer` reaches it. The claim
+        // and every read above it still work — this touches one lock file, not
+        // the database.
+        let lock_path = Store::writer_lock_path(&db);
+        fs::write(&lock_path, b"").unwrap();
+        let mut permissions = fs::metadata(&lock_path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&lock_path, permissions).unwrap();
+
+        let store = Store::open(&db).unwrap();
         let daemon = Daemon::new(store, root.clone());
         let error = daemon
             .drain_pending_batch()
-            .expect_err("two spellings of one file must fail the generation write");
+            .expect_err("an unwritable writer lock must fail the batch-wide step");
+        // Fails closed rather than quietly: running as a user that can write
+        // through a read-only mode would make the fixture inert, and this
+        // assertion is what says so instead of the test passing vacuously.
         assert!(
-            error.to_string().contains("duplicate extraction path"),
-            "fixture precondition — the batch-wide step must be what failed: {error}"
+            error.to_string().to_lowercase().contains("permission")
+                || error.to_string().contains("denied"),
+            "fixture precondition — the writer lock must be what failed: {error}"
         );
+
+        let mut permissions = fs::metadata(&lock_path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&lock_path, permissions).unwrap();
     }
 
     let store = Store::open(&db).unwrap();
@@ -719,10 +751,10 @@ fn k1_a_failing_path_does_not_charge_an_attempt_to_its_batch_mates() {
         "a path that resolved cleanly must not be charged for a batch-wide \
          failure it did not cause"
     );
-    assert_eq!(store.pending_attempts(&duplicate).unwrap(), Some(0));
+    assert_eq!(store.pending_attempts(&sibling).unwrap(), Some(0));
 
     // And with no batch-wide failure, a clean path is acknowledged outright.
-    store.clear_pending_paths(&[duplicate]).unwrap();
+    store.clear_pending_paths(&[sibling]).unwrap();
     {
         let store = Store::open(&db).unwrap();
         let daemon = Daemon::new(store, root.clone());

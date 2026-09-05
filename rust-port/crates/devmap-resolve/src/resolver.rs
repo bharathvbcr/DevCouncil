@@ -106,6 +106,23 @@ pub struct Resolver {
     /// binds this name. Nothing here claims to know the value's *type*, so it
     /// can never feed dispatch, and no confidently-wrong edge can come out of it.
     scope_locals: BTreeSet<(String, String, String)>,
+    /// Slash-separated components in the deepest path this resolver indexed.
+    ///
+    /// The module ladders in [`Self::resolve_import_path`] walk a specifier
+    /// from its full length down to one segment, probing a candidate file path
+    /// at every rung. Nothing bounded how many rungs there were: a specifier is
+    /// limited only by the extractor's `MAX_SOURCE_BYTES`, and each rung
+    /// allocates a fresh path, so one `use crate::a::a::…;` line cost time
+    /// quadratic in its own length. Measured before the bound: a 40,000-segment
+    /// specifier took **124 s** in one file, and the source-size limit permits
+    /// roughly eight times that.
+    ///
+    /// This is the honest ceiling. A rung can only match a file that was
+    /// indexed, so a rung with more components than the deepest indexed path
+    /// cannot match anything — skipping it removes no answer. Derived from the
+    /// corpus rather than picked, so it cannot become a cap on what a real
+    /// repository is allowed to contain.
+    max_indexed_path_depth: usize,
 }
 
 impl Default for Resolver {
@@ -133,6 +150,7 @@ impl Resolver {
             go_modules_fresh: false,
             go_package_by_file: BTreeMap::new(),
             scope_locals: BTreeSet::new(),
+            max_indexed_path_depth: 0,
         }
     }
 
@@ -423,6 +441,11 @@ impl Resolver {
         self.symbol_parents.clear();
         self.go_package_by_file.clear();
         self.scope_locals.clear();
+        self.max_indexed_path_depth = extractions
+            .iter()
+            .map(|ext| ext.file_path.split('/').count())
+            .max()
+            .unwrap_or(0);
         // `go_modules` is the one input this method does not own: it arrives
         // through `index_go_modules`, which callers may run before *or* after
         // this. Discard it unless it was supplied for this snapshot, so a
@@ -661,7 +684,7 @@ impl Resolver {
                 let types: Vec<_> = candidates
                     .iter()
                     .filter(|(_, kind, candidate_family)| {
-                        *candidate_family == family
+                        family.admits(*candidate_family)
                             && matches!(kind, SymbolKind::Class | SymbolKind::Struct)
                     })
                     .map(|(path, kind, _)| (path, kind))
@@ -869,8 +892,15 @@ impl Resolver {
                             self.scoped_receiver_types
                                 .get(&format!("{}:{}:{}", ext.file_path, caller, recv))
                         });
-                        if let Some(class_type) =
-                            scoped.or_else(|| self.receiver_types.get(&recv_key))
+                        // `admits` gates this rung as well as the global one.
+                        // `type_methods` is keyed by `(family, type, method)`,
+                        // so two languages sharing `Generic` could dispatch a
+                        // method onto each other's type at DETERMINISTIC
+                        // confidence — a worse version of the same defect the
+                        // global rung had.
+                        if let Some(class_type) = scoped
+                            .or_else(|| self.receiver_types.get(&recv_key))
+                            .filter(|_| family.admits(family))
                         {
                             let key = (family, class_type.clone(), call.callee_name.clone());
                             if let Some(hits) = self.type_methods.get(&key) {
@@ -1054,7 +1084,7 @@ impl Resolver {
                             let family_hits: Vec<_> = hits
                                 .iter()
                                 .filter(|(path, _, candidate_family)| {
-                                    *candidate_family == family
+                                    family.admits(*candidate_family)
                                         && (*candidate_family != LangFamily::Go
                                             || Self::go_symbol_visible_from(
                                                 &ext.file_path,
@@ -1315,7 +1345,7 @@ impl Resolver {
                         let family_hits: Vec<_> = hits
                             .iter()
                             .filter(|(path, _, candidate_family)| {
-                                *candidate_family == family
+                                family.admits(*candidate_family)
                                     && (*candidate_family != LangFamily::Go
                                         || Self::go_symbol_visible_from(
                                             &ext.file_path,
@@ -1956,7 +1986,7 @@ impl Resolver {
             let family_hits: Vec<_> = hits
                 .iter()
                 .filter(|(path, kind, candidate_family)| {
-                    *candidate_family == family
+                    family.admits(*candidate_family)
                         && (!prefer_types || is_type(*kind))
                         && (*candidate_family != LangFamily::Go
                             || Self::go_symbol_visible_from(&ext.file_path, path, name))
@@ -2028,6 +2058,33 @@ impl Resolver {
         )
     }
 
+    /// Start the module ladder at the deepest rung that could match an indexed
+    /// file, instead of at the specifier's full length.
+    ///
+    /// The ladder builds a candidate path from `parts`, probes it, pops one
+    /// segment and repeats — so it visits every prefix of `parts` from longest
+    /// to shortest, and its cost is quadratic in `parts.len()`. That length is
+    /// bounded only by the extractor's source-size limit, which makes a single
+    /// `use crate::a::a::…;` line a build-length stall.
+    ///
+    /// Lossless, because the rungs it skips are exactly the ones that could not
+    /// have matched: a candidate path with more `/`-separated components than
+    /// the deepest path this resolver indexed is absent from `file_symbols` by
+    /// construction, so `contains_key` on it is `false` without being asked.
+    /// Every shorter prefix is still visited, in the same order, because the
+    /// ladder continues to pop from the truncated vector.
+    ///
+    /// See [`Self::max_indexed_path_depth`] for the measurement.
+    fn trim_to_indexed_depth(&self, parts: &mut Vec<&str>) {
+        // `+ 1` because `crate::a::b` probes `src/a/b.rs`, which has one more
+        // path component than the specifier has segments. Deliberately
+        // generous: this must never cut a rung that could have matched.
+        let ceiling = self.max_indexed_path_depth.saturating_add(1);
+        if parts.len() > ceiling {
+            parts.truncate(ceiling);
+        }
+    }
+
     fn resolve_import_path(
         &self,
         current_file: &str,
@@ -2037,7 +2094,12 @@ impl Resolver {
         let clean_spec = specifier.trim_matches(|c| c == '\'' || c == '"');
         let dir = Self::parent_dir(current_file);
 
-        if matches!(lang, "javascript" | "typescript" | "tsx") && clean_spec.starts_with('.') {
+        // The family, not a hand-listed set of grammar keys. The list this
+        // replaces omitted `jsx` (which `from_lang` has always treated as
+        // JS/TS) and every embedded-script host, so a `.svelte` file's
+        // `import { helper } from "./helpers"` was classified as an *external*
+        // import — the corpus was told a local file came from outside it.
+        if LangFamily::from_lang(lang) == LangFamily::JsTs && clean_spec.starts_with('.') {
             let base = Self::normalize_rel(&dir, clean_spec);
             let candidates = [
                 base.clone(),
@@ -2106,6 +2168,7 @@ impl Resolver {
         if lang == "rust" && clean_spec.starts_with("crate::") {
             let crate_tail = clean_spec.strip_prefix("crate::")?;
             let mut parts: Vec<&str> = crate_tail.split("::").collect();
+            self.trim_to_indexed_depth(&mut parts);
             while !parts.is_empty() {
                 let rust_path = parts.join("/");
                 let candidates = [
@@ -2134,6 +2197,7 @@ impl Resolver {
                 }
             }
             let mut parts: Vec<&str> = tail.split("::").collect();
+            self.trim_to_indexed_depth(&mut parts);
             while !parts.is_empty() {
                 let module_path = parts.join("/");
                 let base = Self::normalize_rel(&module_dir, &module_path);

@@ -143,6 +143,33 @@ pub enum IpcCommand {
         #[serde(default = "default_budget")]
         budget: u32,
     },
+    /// Definitions matching a query, with source, both call-graph directions
+    /// and a layered blast radius, in one exchange.
+    ///
+    /// The MCP `devcouncil_code_explore` tool answered this from a second
+    /// engine in Python that loaded the whole graph into process memory; the
+    /// composition is the cost, so the composition moved into the kernel.
+    Explore {
+        query: String,
+        #[serde(default = "default_explore_limit")]
+        limit: usize,
+        #[serde(default = "default_explore_budget")]
+        budget: u32,
+        #[serde(default = "default_depth")]
+        depth: usize,
+        #[serde(default)]
+        min_confidence: f32,
+    },
+    /// Test files reachable through the inbound blast radius of some targets.
+    Affected {
+        targets: Vec<String>,
+        #[serde(default = "default_budget")]
+        budget: u32,
+        #[serde(default = "default_depth")]
+        depth: usize,
+        #[serde(default)]
+        min_confidence: f32,
+    },
     Preview {
         /// Repository-relative path the buffer would be written to.
         file: String,
@@ -172,6 +199,21 @@ pub enum IpcCommand {
 fn default_preview_confidence() -> f32 {
     devmap_query::PREVIEW_CALLER_MIN_CONFIDENCE
 }
+
+fn default_explore_limit() -> usize {
+    20
+}
+
+/// `explore` pays for four sections out of one number, so its default is the
+/// engine's own, not the single-answer 2000 every other surface uses.
+fn default_explore_budget() -> u32 {
+    devmap_query::Budget::EXPLORE
+}
+
+/// Ceiling on `explore`'s definition list. The budget usually bites first; this
+/// bounds the work a caller can ask for before the budget is even consulted —
+/// each definition costs two traversals.
+const MAX_EXPLORE_LIMIT: usize = 100;
 
 #[derive(Debug, Serialize)]
 struct ErrorBody {
@@ -266,6 +308,48 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
             ("", *budget, *depth, Some(*min_confidence))
         }
         IpcCommand::Dead { budget } => ("", *budget, 1, None),
+        IpcCommand::Explore {
+            query,
+            limit,
+            budget,
+            depth,
+            min_confidence,
+        } => {
+            // Refused, not clamped: a caller that asked for 500 definitions and
+            // silently received 100 cannot tell a capped list from the whole
+            // match set, which is the one thing every count here exists to
+            // prevent.
+            if *limit > MAX_EXPLORE_LIMIT {
+                return Err(format!(
+                    "explore accepts at most {MAX_EXPLORE_LIMIT} definitions, got {limit}"
+                ));
+            }
+            (query.as_str(), *budget, *depth, Some(*min_confidence))
+        }
+        IpcCommand::Affected {
+            targets,
+            budget,
+            depth,
+            min_confidence,
+        } => {
+            if targets.len() > devmap_query::MAX_NEIGHBOR_TARGETS {
+                return Err(format!(
+                    "affected accepts at most {} targets, got {}",
+                    devmap_query::MAX_NEIGHBOR_TARGETS,
+                    targets.len()
+                ));
+            }
+            // The scalar check below sees one string; this request carries a
+            // list, so an over-long entry at index 9 must not ride in because
+            // index 0 was short.
+            if let Some(oversized) = targets.iter().find(|t| t.len() > MAX_QUERY_BYTES) {
+                return Err(format!(
+                    "affected target exceeds {MAX_QUERY_BYTES} bytes: {} bytes",
+                    oversized.len()
+                ));
+            }
+            ("", *budget, *depth, Some(*min_confidence))
+        }
         IpcCommand::Preview {
             file,
             budget,
@@ -397,6 +481,30 @@ pub(crate) fn dispatch(
             "neighbors": engine.neighbors(&targets, budget, min_confidence, depth)?,
         })),
         IpcCommand::Dead { budget } => Ok(serde_json::to_value(engine.dead_symbols(budget)?)?),
+        IpcCommand::Explore {
+            query,
+            limit,
+            budget,
+            depth,
+            min_confidence,
+        } => Ok(serde_json::to_value(engine.explore(
+            &query,
+            limit,
+            budget,
+            min_confidence,
+            depth,
+        )?)?),
+        IpcCommand::Affected {
+            targets,
+            budget,
+            depth,
+            min_confidence,
+        } => Ok(serde_json::to_value(engine.affected_tests(
+            &targets,
+            budget,
+            min_confidence,
+            depth,
+        )?)?),
         IpcCommand::Preview {
             file,
             content,
@@ -1094,6 +1202,141 @@ mod tests {
             }
             other => panic!("expected an impact command, got {other:?}"),
         }
+    }
+
+    /// The `explore` dispatch arm returns the wire shape its client reads.
+    ///
+    /// `DevMapClient.explore` hands `definitions` and both edge lists of every
+    /// definition to `_budgeted`, which enforces `shown + hidden == total`,
+    /// `truncated == (hidden > 0)` and `tokens_used <= budget`. A dispatch that
+    /// nested the sections differently, or emitted bare arrays instead of whole
+    /// responses, type-checks here and fails at the seam.
+    #[test]
+    fn the_explore_dispatch_returns_budgeted_responses_for_every_section() {
+        let store = corpus_store(8);
+        let request = IpcRequest {
+            version: 1,
+            command: IpcCommand::Explore {
+                query: "widget".to_string(),
+                limit: 3,
+                budget: 8_000,
+                depth: 2,
+                min_confidence: 0.0,
+            },
+        };
+        let value = dispatch(&store, request, &devmap_query::Cancel::new())
+            .expect("a well-formed explore request must dispatch");
+
+        for field in ["query", "definitions", "limit", "blast_radius", "budget"] {
+            assert!(
+                !value[field].is_null(),
+                "the explore result is missing `{field}`"
+            );
+        }
+        let definitions = &value["definitions"];
+        assert_eq!(
+            definitions["shown"].as_u64().unwrap() + definitions["hidden"].as_u64().unwrap(),
+            definitions["total"].as_u64().unwrap(),
+            "definitions break shown + hidden == total, which the client rejects"
+        );
+        assert_eq!(
+            definitions["truncated"].as_bool().unwrap(),
+            definitions["hidden"].as_u64().unwrap() > 0,
+            "truncated must agree with hidden, which the client rejects"
+        );
+        for definition in definitions["items"].as_array().expect("items array") {
+            for side in ["callers", "callees"] {
+                let response = &definition[side];
+                assert_eq!(
+                    response["shown"].as_u64().unwrap() + response["hidden"].as_u64().unwrap(),
+                    response["total"].as_u64().unwrap(),
+                    "{side} breaks shown + hidden == total, which the client rejects"
+                );
+            }
+        }
+        let layers = &value["blast_radius"]["layers"];
+        assert_eq!(
+            layers["shown"].as_u64().unwrap() + layers["hidden"].as_u64().unwrap(),
+            layers["total"].as_u64().unwrap(),
+            "the blast radius breaks shown + hidden == total"
+        );
+    }
+
+    /// The `affected` dispatch arm carries its list and its radius separately.
+    #[test]
+    fn the_affected_dispatch_returns_a_budgeted_test_list_and_its_radius() {
+        let store = corpus_store(8);
+        let request = IpcRequest {
+            version: 1,
+            command: IpcCommand::Affected {
+                targets: vec!["things.py::widget_00001".to_string()],
+                budget: 2_000,
+                depth: 2,
+                min_confidence: 0.0,
+            },
+        };
+        let value = dispatch(&store, request, &devmap_query::Cancel::new())
+            .expect("a well-formed affected request must dispatch");
+
+        for field in ["targets", "tests", "blast_radius"] {
+            assert!(
+                !value[field].is_null(),
+                "the affected result is missing `{field}`"
+            );
+        }
+        let tests = &value["tests"];
+        assert_eq!(
+            tests["shown"].as_u64().unwrap() + tests["hidden"].as_u64().unwrap(),
+            tests["total"].as_u64().unwrap(),
+            "the test list breaks shown + hidden == total, which the client rejects"
+        );
+    }
+
+    /// The two new surfaces are bounded exactly like the ones they join.
+    ///
+    /// Refused rather than clamped, in both cases: a caller that asked for 500
+    /// definitions and silently got 100 cannot tell a capped list from a
+    /// complete one, which is the failure every count in this protocol exists
+    /// to prevent.
+    #[test]
+    fn explore_and_affected_refuse_rather_than_trim_their_fan_out() {
+        let explore = |limit: usize| IpcRequest {
+            version: 1,
+            command: IpcCommand::Explore {
+                query: "widget".to_string(),
+                limit,
+                budget: 2_000,
+                depth: 1,
+                min_confidence: 0.0,
+            },
+        };
+        assert!(validate_request(&explore(MAX_EXPLORE_LIMIT)).is_ok());
+        assert!(validate_request(&explore(MAX_EXPLORE_LIMIT + 1)).is_err());
+
+        let affected = |count: usize| IpcRequest {
+            version: 1,
+            command: IpcCommand::Affected {
+                targets: (0..count).map(|index| format!("t{index}")).collect(),
+                budget: 2_000,
+                depth: 1,
+                min_confidence: 0.0,
+            },
+        };
+        assert!(validate_request(&affected(devmap_query::MAX_NEIGHBOR_TARGETS)).is_ok());
+        assert!(validate_request(&affected(devmap_query::MAX_NEIGHBOR_TARGETS + 1)).is_err());
+
+        // An over-long entry buried in the list must not ride in because the
+        // first entry was short.
+        let oversized = IpcRequest {
+            version: 1,
+            command: IpcCommand::Affected {
+                targets: vec!["ok".to_string(), "t".repeat(MAX_QUERY_BYTES + 1)],
+                budget: 2_000,
+                depth: 1,
+                min_confidence: 0.0,
+            },
+        };
+        assert!(validate_request(&oversized).is_err());
     }
 
     /// The `neighbors` dispatch arm returns the wire shape its client reads.

@@ -52,8 +52,12 @@ use tree_sitter::Node;
 use crate::model::{SymbolKind, WiringKind};
 
 pub(crate) mod dart;
+pub(crate) mod erlang;
 pub(crate) mod kotlin;
+pub(crate) mod nix;
+pub(crate) mod pascal;
 pub(crate) mod r;
+pub(crate) mod solidity;
 pub(crate) mod swift;
 
 /// What the declaration arm emits for one node.
@@ -124,6 +128,10 @@ pub(crate) fn declaration_of(lang: &str, node: Node, source: &str) -> Option<Dec
         "kotlin" => kotlin::declaration(node, source),
         "dart" => dart::declaration(node, source),
         "r" => r::declaration(node, source),
+        "erlang" => erlang::declaration(node, source),
+        "nix" => nix::declaration(node, source),
+        "pascal" => pascal::declaration(node, source),
+        "solidity" => solidity::declaration(node, source),
         _ if crate::treesitter::is_c_family_grammar(lang) => {
             crate::treesitter::c_family_declaration(node, source)
         }
@@ -155,6 +163,7 @@ pub(crate) fn is_exported_of(lang: &str, node: Node, source: &str, name: &str, p
     match lang {
         "swift" => swift::is_exported(node, source),
         "kotlin" => kotlin::is_exported(node, source),
+        "pascal" => pascal::is_exported(node, source),
         // Dart's privacy *is* the leading underscore — `_helper` is
         // library-private and nothing else is — so the generic fallback is the
         // language rule here, not an approximation of it.

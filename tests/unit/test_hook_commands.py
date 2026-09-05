@@ -225,7 +225,7 @@ def test_agent_response_codex_block_uses_native_stop_schema(tmp_path, monkeypatc
         hook_app, ["agent-response", "{}", "--client", "codex", "--project-root", str(tmp_path)]
     )
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload == {"continue": False, "stopReason": "verification failed"}
 
 
@@ -254,7 +254,7 @@ def test_session_start_injects_status_context(tmp_path, monkeypatch):
         hook_app, ["session-start", json.dumps({"session_id": "abc"}), "--project-root", str(tmp_path)]
     )
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["hookSpecificOutput"]["hookEventName"] == "SessionStart"
     assert "snapshot" in payload["hookSpecificOutput"]["additionalContext"]
 
@@ -361,7 +361,7 @@ def test_post_task_verify_enabled_runs_verification(tmp_path, monkeypatch):
     result = runner.invoke(hook_app, ["post-task", "--client", "codex", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert "verified summary" in result.output
-    assert json.loads(result.output) == {"systemMessage": "verified summary"}
+    assert json.loads(result.stdout) == {"systemMessage": "verified summary"}
 
 
 # ---- metadata helpers ---------------------------------------------------------
@@ -448,7 +448,7 @@ def test_session_start_compact_uses_slim_briefing(tmp_path, monkeypatch):
         ["session-start", json.dumps({"source": "compact"}), "--project-root", str(tmp_path)],
     )
     assert result.exit_code == 0
-    ctx = json.loads(result.output)["hookSpecificOutput"]["additionalContext"]
+    ctx = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
     assert ctx == slim
     assert "FULL STATUS" not in ctx
 
@@ -467,7 +467,7 @@ def test_session_start_non_compact_keeps_status_and_briefing(tmp_path, monkeypat
         ["session-start", json.dumps({"source": "startup"}), "--project-root", str(tmp_path)],
     )
     assert result.exit_code == 0
-    ctx = json.loads(result.output)["hookSpecificOutput"]["additionalContext"]
+    ctx = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
     assert "snapshot" in ctx
     assert "continuity" in ctx
 

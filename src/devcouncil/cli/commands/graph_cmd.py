@@ -914,21 +914,23 @@ def graph_search(
     root = _root(project_root)
     result = _devmap_query_payload(root, "search", query=query, limit=limit, semantic=semantic)
     if result is None:
-        if semantic:
-            # No silent downgrade. Prefix matching is a different answer, and
-            # returning it under a `--semantic` flag is the failure this used
-            # to have: the old path fell through to keyword search whenever the
-            # embedding index was missing, which it was by default.
-            typer.secho(
-                "semantic search is unavailable: it needs the devmap index "
-                "(run `dev map` to build one)",
-                fg=typer.colors.YELLOW,
-                err=True,
-            )
-            raise typer.Exit(3)
-        from devcouncil.codeintel.query import CodeIntelQueryEngine
-
-        result = CodeIntelQueryEngine(root).search(query, limit=limit)
+        # No second engine, and no silent downgrade. The Python
+        # `CodeIntelQueryEngine` that answered plain search here read
+        # `.devcouncil/codeintel/index.sqlite`, which nothing has written since
+        # the Python writer was retired — so it did not answer, it raised. An
+        # unbuilt map is reported as one.
+        #
+        # The two messages stay distinct: `--semantic` and plain search fail for
+        # the same reason but a user who asked for one must not read a refusal
+        # of the other as evidence that the flag is what broke.
+        label = "semantic search" if semantic else "search"
+        typer.secho(
+            f"{label} is unavailable: it needs the devmap index "
+            "(run `dev map` to build one)",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        raise typer.Exit(3)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -991,20 +993,53 @@ def graph_explore(
     limit: int = typer.Option(20, "--limit"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Return source, related symbols, paths, and blast radius in one query."""
-    from devcouncil.codeintel.query import CodeIntelQueryEngine
+    """Return source, related symbols, paths, and blast radius in one query.
 
-    result = CodeIntelQueryEngine(_root(project_root)).explore(query, limit=limit)
+    Answered by the kernel. The Python engine this used to call loaded the whole
+    graph into process memory to walk it, and since the Python writer was
+    retired it had no store to load at all.
+    """
+    from devcouncil.devmap_client import DevMapClientError, try_connect
+
+    client = try_connect(_root(project_root))
+    if client is None:
+        typer.secho(
+            "explore is unavailable: it needs the devmap index "
+            "(run `dev map` to build one)",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        raise typer.Exit(3)
+    try:
+        result = client.explore(query, limit=limit)
+    except DevMapClientError as exc:
+        typer.secho(f"explore is unavailable: {exc}", fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(3) from exc
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
-    for definition in result["definitions"]:
-        console.print(f"[bold]{definition['id']}[/bold] {definition['path']}:{definition['line']}")
-        if definition["source"]:
-            console.print(definition["source"])
+    definitions = result.get("definitions") or {}
+    for definition in definitions.get("items") or []:
+        span = definition.get("span") or (0, 0)
         console.print(
-            f"  callers={len(definition['callers'])} callees={len(definition['callees'])}"
+            f"[bold]{definition['id']}[/bold] {definition['file_path']}:{span[0]}"
         )
+        # Class A: a file that could not be read is reported as unread, never
+        # rendered as a symbol whose body happens to be empty.
+        reason = definition.get("source_unavailable_reason")
+        if reason:
+            console.print(f"  [yellow]source unavailable:[/yellow] {reason}")
+        elif definition.get("source"):
+            console.print(definition["source"])
+        callers = definition.get("callers") or {}
+        callees = definition.get("callees") or {}
+        console.print(
+            f"  callers={callers.get('shown', 0)}/{callers.get('total', 0)}"
+            f" callees={callees.get('shown', 0)}/{callees.get('total', 0)}"
+        )
+    console.print(
+        f"shown {definitions.get('shown', 0)} of {definitions.get('total', 0)}"
+    )
 
 
 @app.command("affected")
@@ -1013,18 +1048,43 @@ def graph_affected(
     project_root: Path = typer.Option(Path("."), "--project-root"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Find tests reachable through the inbound blast radius."""
-    from devcouncil.codeintel.query import CodeIntelQueryEngine
+    """Find tests reachable through the inbound blast radius.
 
-    result = CodeIntelQueryEngine(_root(project_root)).affected_tests(targets)
+    Kernel-answered, ranked nearest-first. A target that matched nothing is
+    named rather than folded into "no affected tests" — which is what the
+    Python engine's empty seed set used to produce for a typo.
+    """
+    from devcouncil.devmap_client import DevMapClientError, try_connect
+
+    client = try_connect(_root(project_root))
+    if client is None:
+        typer.secho(
+            "affected is unavailable: it needs the devmap index "
+            "(run `dev map` to build one)",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        raise typer.Exit(3)
+    try:
+        result = client.affected_tests(list(targets))
+    except DevMapClientError as exc:
+        typer.secho(f"affected is unavailable: {exc}", fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(3) from exc
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
-    if not result["tests"]:
+    unmatched = (result.get("blast_radius") or {}).get("unmatched_targets") or []
+    if unmatched:
+        console.print(
+            f"[yellow]no indexed traversal start for:[/yellow] {', '.join(unmatched)}"
+        )
+    tests = result.get("tests") or {}
+    rows = tests.get("items") or []
+    if not rows:
         console.print("No affected tests found.")
-        return
-    for test in result["tests"]:
-        console.print(test)
+    for row in rows:
+        console.print(f"{row['path']}  depth {row['depth']}")
+    console.print(f"shown {tests.get('shown', 0)} of {tests.get('total', 0)}")
 
 
 @hooks_app.command("install")

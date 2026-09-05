@@ -1,8 +1,15 @@
 """Registry-backed MCP tools for transactional code intelligence.
 
-Phase 6 hybrid: prefer ``DevMapClient`` (Rust) for search/path/impact/dead/status
-when the daemon/CLI is available against a compatible index; otherwise fall back
-to the frozen Python ``CodeIntelQueryEngine``.
+Every tool here answers from the Rust ``devmap`` kernel through
+``DevMapClient``, or reports that it could not. There is no second engine: a
+Python fallback answering from a store the kernel does not write is the SC23
+shape — two answers, no signal which one replied — and the last two holdouts,
+``explore`` and ``affected_tests``, were migrated with it.
+
+Those two were not merely slower. Since the Python writer was retired nothing
+creates ``.devcouncil/codeintel/index.sqlite``, so ``CodeIntelQueryEngine``
+raised ``FileNotFoundError`` on every call and both tools answered
+``codeintel_not_initialized`` on a repository with a freshly built map.
 """
 
 from __future__ import annotations
@@ -14,7 +21,6 @@ from typing import Any, Awaitable, Callable
 
 from mcp.types import TextContent, Tool
 
-from devcouncil.codeintel.query import CodeIntelQueryEngine
 from devcouncil.codeintel.service import canonical_project_root
 from devcouncil.devmap_client import (
     BudgetedResponse,
@@ -288,6 +294,210 @@ def _incomplete_walk_envelope(
     return _unavailable(
         root, label, f"walk incomplete: {note}", {**empty, "walk_incomplete": note}
     )
+#: Coarse confidence names the Python engine published, and the score bands the
+#: kernel's floats fall into. One owner: `dead` derived these inline and
+#: `explore`'s blast radius needs the same vocabulary, and two copies would let
+#: the same edge be `inferred` in one tool and `extracted` in another.
+_CONFIDENCE_BANDS = ((0.9, "extracted"), (0.5, "inferred"))
+
+
+def _confidence_tier(score: float) -> str:
+    for floor, name in _CONFIDENCE_BANDS:
+        if score >= floor:
+            return name
+    return "ambiguous"
+
+
+#: Payload keys `explore` always carries, empty, so an unavailable answer is
+#: readable by the same code that reads a successful one. `ok: False` and
+#: `resolution` are what say it is not a measured zero.
+_EXPLORE_EMPTY: dict[str, Any] = {
+    "definitions": [],
+    "match_count": 0,
+    "match_total": 0,
+    "matches_truncated": False,
+    "blast_radius": {"seeds": [], "layers": [], "total_impacted": 0},
+}
+
+_AFFECTED_EMPTY: dict[str, Any] = {
+    "tests": [],
+    "test_details": [],
+    "tests_total": 0,
+    "tests_truncated": False,
+    "blast_radius": {"seeds": [], "layers": [], "total_impacted": 0},
+}
+
+
+def _section_unavailable(section: dict[str, Any], label: str) -> str | None:
+    """Why a budgeted section of a composed answer could not be produced.
+
+    A section is unavailable when the kernel said so, and also when the walk
+    behind it stopped early — those are different facts and both are carried,
+    but only the first makes the section's zero meaningless.
+    """
+    reason = resolution_unavailable_reason(section.get("resolution"))
+    return f"{label}: {reason}" if reason else None
+
+
+def _blast_radius_payload(radius: dict[str, Any]) -> dict[str, Any]:
+    """The kernel's banded radius in the shape consumers already read.
+
+    Python published `{seeds, layers:[{depth, nodes, confidence, count}],
+    total_impacted}` and every key survives. What is added is what Python could
+    not say: which targets matched nothing, how many nodes a band held beyond
+    the ones listed, and whether the walk itself was cut short.
+    """
+    layers_section = radius.get("layers") or {}
+    layers = []
+    for layer in layers_section.get("items") or []:
+        score = layer.get("lowest_confidence")
+        layers.append({
+            "depth": layer.get("depth"),
+            "nodes": layer.get("nodes") or [],
+            "count": layer.get("node_count", 0),
+            # A band with no edges has no confidence to report; naming one
+            # would invent evidence. Python defaulted to "extracted" here,
+            # which reads as measured.
+            "confidence": _confidence_tier(float(score)) if isinstance(score, (int, float)) else None,
+            "confidence_score": score,
+            "nodes_omitted": layer.get("nodes_omitted", 0),
+        })
+    return {
+        "seeds": radius.get("seeds") or [],
+        "unmatched_targets": radius.get("unmatched_targets") or [],
+        "layers": layers,
+        "total_impacted": radius.get("total_impacted", 0),
+        "layers_shown": layers_section.get("shown", 0),
+        "layers_total": layers_section.get("total", 0),
+        "layers_truncated": bool(layers_section.get("truncated")),
+        "walk_incomplete": layers_section.get("walk_incomplete"),
+        "unavailable": _section_unavailable(layers_section, "blast_radius"),
+    }
+
+
+def _edge_direction(section: dict[str, Any], label: str) -> dict[str, Any]:
+    """One call-graph direction: its edges, its exact count, and why not more.
+
+    `<side>_total` is the measured number of edges regardless of how many the
+    budget bought, so "0 shown of 42" can never be read as "no callers".
+    `<side>_unavailable` separates that again from a direction whose walk could
+    not run at all.
+    """
+    return {
+        label: section.get("items") or [],
+        f"{label}_total": section.get("total", 0),
+        f"{label}_truncated": bool(section.get("truncated")),
+        f"{label}_shown": section.get("shown", 0),
+        f"{label}_unavailable": _section_unavailable(section, label),
+        f"{label}_walk_incomplete": section.get("walk_incomplete"),
+    }
+
+
+def _explore_via_client(root: Path, query: str, limit: int) -> dict[str, Any]:
+    client = try_connect(root)
+    if client is None:
+        return _unavailable(
+            root, "explore", "no built devmap store (run `dev map`)", _EXPLORE_EMPTY
+        )
+    try:
+        report = client.explore(query, limit=limit)
+        definitions_section = report.get("definitions") or {}
+        reason = _section_unavailable(definitions_section, "definitions")
+        if reason:
+            return _unavailable(root, "explore", reason, _EXPLORE_EMPTY)
+        definitions = []
+        for item in definitions_section.get("items") or []:
+            span = item.get("span") or (0, 0)
+            line = int(span[0]) if isinstance(span, (list, tuple)) and span else 0
+            end_line = int(span[1]) if isinstance(span, (list, tuple)) and len(span) > 1 else line
+            definitions.append({
+                "id": item.get("id", ""),
+                "kind": item.get("kind", "symbol"),
+                "path": item.get("file_path", ""),
+                "name": item.get("symbol_name", ""),
+                "qualified_name": item.get("qualified_name", ""),
+                "line": line,
+                "end_line": end_line,
+                # `None` means the generation recorded no language for the
+                # file, which is not the same as a file with no language.
+                "language": item.get("language"),
+                "source": item.get("source", ""),
+                # Class A: an unreadable file is not a symbol with an empty
+                # body, and a capped span is not the verbatim source.
+                "source_unavailable_reason": item.get("source_unavailable_reason"),
+                "source_omitted_bytes": item.get("source_omitted_bytes"),
+                "score": item.get("score"),
+                **_edge_direction(item.get("callers") or {}, "callers"),
+                **_edge_direction(item.get("callees") or {}, "callees"),
+            })
+        return _client_envelope(
+            root,
+            client,
+            {
+                "query": query,
+                "definitions": definitions,
+                # The legacy names keep their legacy meanings: `match_count` is
+                # what came back, `match_total` what the index holds.
+                "match_count": definitions_section.get("shown", len(definitions)),
+                "match_total": definitions_section.get("total", 0),
+                "matches_truncated": bool(definitions_section.get("truncated")),
+                "limit_applied": limit,
+                "blast_radius": _blast_radius_payload(report.get("blast_radius") or {}),
+                "budget": report.get("budget") or {},
+            },
+            operation="explore",
+        )
+    except DevMapClientError as exc:
+        logger.warning(
+            "devmap (Rust) explore failed: %s. The kernel is the only engine; "
+            "this answers unavailable rather than substituting another.",
+            exc,
+        )
+        return _unavailable(root, "explore", str(exc), _EXPLORE_EMPTY)
+
+
+def _affected_via_client(root: Path, targets: list[str], max_depth: int) -> dict[str, Any]:
+    client = try_connect(root)
+    if client is None:
+        return _unavailable(
+            root, "affected_tests", "no built devmap store (run `dev map`)", _AFFECTED_EMPTY
+        )
+    if not targets:
+        # Not an empty answer: nothing was asked, so nothing was measured.
+        return _unavailable(
+            root, "affected_tests", "no targets were supplied", _AFFECTED_EMPTY
+        )
+    try:
+        report = client.affected_tests(targets, depth=max(1, min(64, max_depth)))
+        tests_section = report.get("tests") or {}
+        reason = _section_unavailable(tests_section, "tests")
+        if reason:
+            return _unavailable(root, "affected_tests", reason, _AFFECTED_EMPTY)
+        rows = tests_section.get("items") or []
+        return _client_envelope(
+            root,
+            client,
+            {
+                "targets": targets,
+                # The contract shape: a list of paths. `test_details` carries
+                # the distance and the symbols the walk actually reached, which
+                # is what makes a trimmed list orderable rather than arbitrary.
+                "tests": [str(row.get("path", "")) for row in rows],
+                "test_details": rows,
+                "tests_total": tests_section.get("total", 0),
+                "tests_truncated": bool(tests_section.get("truncated")),
+                "tests_walk_incomplete": tests_section.get("walk_incomplete"),
+                "blast_radius": _blast_radius_payload(report.get("blast_radius") or {}),
+            },
+            operation="affected_tests",
+        )
+    except DevMapClientError as exc:
+        logger.warning(
+            "devmap (Rust) affected_tests failed: %s. The kernel is the only "
+            "engine; this answers unavailable rather than substituting another.",
+            exc,
+        )
+        return _unavailable(root, "affected_tests", str(exc), _AFFECTED_EMPTY)
 
 
 def _hit_to_match(item: dict[str, Any]) -> dict[str, Any]:
@@ -533,10 +743,7 @@ def _dead_via_client(root: Path, minimum_confidence: str) -> dict[str, Any]:
             confidence = str(item.get("confidence") or item.get("tier") or "inferred")
             # Rust may emit numeric confidence; map coarsely for filtering.
             if isinstance(item.get("confidence"), (int, float)):
-                score = float(item["confidence"])
-                confidence = (
-                    "extracted" if score >= 0.9 else "inferred" if score >= 0.5 else "ambiguous"
-                )
+                confidence = _confidence_tier(float(item["confidence"]))
             if ranks.get(confidence, 0) < floor:
                 continue
             path = str(item.get("file_path") or item.get("path") or "")
@@ -684,13 +891,16 @@ def _status_via_client(root: Path) -> dict[str, Any]:
 
 
 async def _explore(root: Path, arguments: dict) -> list[TextContent]:
-    # Explore needs source snippets + caller/callee relations; keep Python primary
-    # until Rust exposes an equivalent compose API. Prefer search via client only
-    # as a soft enrichment is intentionally not done here (contract mismatch).
-    query = str(arguments["query"])
-    limit = int(arguments.get("limit", 20))
+    # The Rust kernel answers, or says it cannot. The Python
+    # `CodeIntelQueryEngine` that used to answer here loaded a whole `CodeGraph`
+    # into process memory and walked it — and since the Python writer was
+    # retired there is no store for it to load, so it raised
+    # `FileNotFoundError` on every call and this tool reported
+    # `codeintel_not_initialized` against a freshly built map.
     return json_text(
-        await asyncio.to_thread(lambda: CodeIntelQueryEngine(root).explore(query, limit=limit))
+        await asyncio.to_thread(
+            _explore_via_client, root, str(arguments["query"]), int(arguments.get("limit", 20))
+        )
     )
 
 
@@ -739,11 +949,13 @@ async def _dead(root: Path, arguments: dict) -> list[TextContent]:
 
 
 async def _affected(root: Path, arguments: dict) -> list[TextContent]:
-    targets = [str(value) for value in arguments.get("targets") or []]
-    max_depth = int(arguments.get("maxDepth", 3))
+    # Kernel-only, on the same terms as its six siblings above.
     return json_text(
         await asyncio.to_thread(
-            lambda: CodeIntelQueryEngine(root).affected_tests(targets, max_depth=max_depth)
+            _affected_via_client,
+            root,
+            [str(value) for value in arguments.get("targets") or []],
+            int(arguments.get("maxDepth", 3)),
         )
     )
 

@@ -284,44 +284,53 @@ def test_query_envelope_reports_kernel_freshness_not_a_python_watcher(
     It used to report the Python ``SyncCoordinator``'s state — a watcher over a
     store the kernel does not write. An unreachable kernel is now reported as
     ``unavailable`` with the reason, never as a second store's healthy verdict.
+
+    Retargeted from ``CodeIntelQueryEngine._envelope`` to
+    ``handlers.codeintel._client_envelope``: the Python engine was deleted with
+    the rest of the query surface, and the MCP envelope is the only remaining
+    place this block is built.
     """
     from types import SimpleNamespace
 
-    from devcouncil.codeintel.query import CodeIntelQueryEngine
     from devcouncil.devmap_client import DevMapClientError
-
-    engine = CodeIntelQueryEngine(tmp_path)
-    monkeypatch.setattr(
-        engine.service, "status", lambda: {"generation": 4, "schema_version": 2}
-    )
+    from devcouncil.integrations.mcp.handlers import codeintel as handlers
 
     class _Fresh:
         def status(self):
             return SimpleNamespace(
                 generation_id=9,
                 pending_count=0,
+                node_count=2,
+                edge_count=1,
                 is_fresh=True,
                 degraded_reason=None,
+                quarantined_count=0,
+                raw={"schema_version": 12, "analyzer_version": "devmap"},
             )
 
-    engine._devmap_client = _Fresh()
-    envelope = engine._envelope({})
+    envelope = handlers._client_envelope(tmp_path, _Fresh(), {}, operation="search")
     assert envelope["sync"] == {
         "state": "fresh",
-        "generation": 9,
         "pending": 0,
-        "degraded_reason": "",
+        "fresh": True,
+        "degraded_reason": None,
     }
+    assert envelope["generation"] == 9
 
     class _Broken:
+        def search(self, query, limit=2000, semantic=False):
+            raise DevMapClientError("devmap store is missing; run `dev map`")
+
         def status(self):
             raise DevMapClientError("devmap store is missing; run `dev map`")
 
-    engine._devmap_client = _Broken()
-    degraded = engine._envelope({})["sync"]
-    assert degraded["state"] == "unavailable"
-    assert degraded["generation"] is None
-    assert "devmap store is missing" in degraded["degraded_reason"]
+    monkeypatch.setattr(handlers, "try_connect", lambda _root: _Broken())
+    degraded = handlers._search_via_client(tmp_path, "anything", 10)
+    # Not a zero-match answer: a kernel that could not be asked must not read
+    # like one that was asked and found nothing.
+    assert degraded["ok"] is False
+    assert degraded["matches"] == []
+    assert "devmap store is missing" in degraded["resolution"]["Unavailable"]["reason"]
 
 
 def test_hook_map_refresh_defers_loudly_when_the_kernel_cannot_build(

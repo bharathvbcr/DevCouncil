@@ -33,7 +33,7 @@ def test_semantic_snapshot_writes_payload(tmp_path):
     )
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["task_id"] == "TASK-9"
     assert payload["stage"] == "before"
     snapshot_path = tmp_path / ".devcouncil" / "semantic" / "TASK-9" / "before.json"
@@ -74,7 +74,7 @@ def test_semantic_diff_detects_import_change(tmp_path):
     )
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     types = {item["type"] for item in payload["classifications"]}
     assert "import_dependency_change" in types
     assert payload["summary"]

@@ -28,11 +28,29 @@ pub enum LangFamily {
     Lua,
     R,
     Dart,
-    /// Languages that extract **no calls**. Sharing one bucket is harmless here
-    /// only because a language with no call sites contributes no edges to
-    /// mis-resolve — the moment one gains call extraction it must get its own
-    /// variant above, which `every_call_extracting_language_owns_its_bucket`
-    /// enforces rather than leaving to memory.
+    Erlang,
+    Nix,
+    Pascal,
+    /// `sh`, `bash` and `zsh` all answer `detect_language` with `"shell"`, so
+    /// one variant covers the family the grammar already merges.
+    Shell,
+    Solidity,
+    Sql,
+    /// Languages that extract **no calls**.
+    ///
+    /// Sharing one bucket was justified on the grounds that a language with no
+    /// call sites contributes no edges to mis-resolve. That reasoning is sound
+    /// and the premise kept going stale: embedded `<script>` extraction gave
+    /// `.svelte`, `.vue`, `.astro` and `.liquid` files real calls while they
+    /// still sat here, and a Svelte function bound to a Solidity contract
+    /// method at 0.9 confidence — measured, not hypothesised.
+    ///
+    /// So `Generic` is now **inert** rather than merely unpopulated:
+    /// [`LangFamily::admits`] refuses every cross-file resolution into or out of
+    /// it. A language that lands here by mistake now produces a *missing* edge
+    /// and an honest `generation_unresolved` row instead of a confident wrong
+    /// one, which is the direction SC9 settled on — abstaining is correct,
+    /// answering with the winner of a race is not.
     Generic,
 }
 
@@ -50,6 +68,29 @@ impl LangFamily {
             // otherwise identical C->C cross-file call resolved. Metal needs no
             // entry here — it rides the `cpp` grammar key.
             "c" | "cpp" | "csharp" | "java" | "objc" | "cuda" => LangFamily::CStyle,
+            // Template languages whose code lives in an embedded `<script>`.
+            //
+            // `crates/devmap-extract/src/embedded.rs` routes those regions back
+            // through the TypeScript or JavaScript grammar under the outer
+            // file's own path, so the symbols and calls recorded against a
+            // `.svelte` file *are* JS/TS ones and legitimately resolve against
+            // `.ts` and `.js` siblings. `LanguageSpec::embedded` names exactly
+            // `typescript`/`tsx`/`javascript` (plus `css`/`html`, which no
+            // linked grammar reads) for all four, and
+            // `an_embedded_script_host_shares_its_script_family` asserts that
+            // rather than trusting this comment.
+            //
+            // Before this arm they were `Generic`, which cost both directions:
+            // `Widget.svelte::renderWidget` resolved to
+            // `Vault.sol::Vault.helperOnlyInSolidity` at 0.9, and the same
+            // file's call to a real `helpers.ts` export produced no edge at all.
+            "svelte" | "vue" | "astro" | "liquid" => LangFamily::JsTs,
+            "erlang" => LangFamily::Erlang,
+            "nix" => LangFamily::Nix,
+            "pascal" => LangFamily::Pascal,
+            "shell" => LangFamily::Shell,
+            "solidity" => LangFamily::Solidity,
+            "sql" => LangFamily::Sql,
             "swift" => LangFamily::Swift,
             "kotlin" => LangFamily::Kotlin,
             "ruby" => LangFamily::Ruby,
@@ -62,6 +103,29 @@ impl LangFamily {
             "dart" => LangFamily::Dart,
             _ => LangFamily::Generic,
         }
+    }
+
+    /// Whether a call in `self` may resolve to a declaration in `other`.
+    ///
+    /// The single owner of the cross-family rule, because it was previously
+    /// spelled `*candidate_family == family` in four places and each one had to
+    /// be correct independently.
+    ///
+    /// Two clauses, and the second is the one that is new. Equality keeps a
+    /// Python call from binding a Go function. `self != Generic` keeps a
+    /// language that was *misfiled* into the catch-all from binding another
+    /// language that was misfiled into the same catch-all — which is not a
+    /// hypothetical: `svelte` and `solidity` shared `Generic` and produced
+    /// `Widget.svelte::renderWidget -> Vault.sol::Vault.helperOnlyInSolidity`
+    /// at 0.9.
+    ///
+    /// Stated over the *bucket* rather than over the languages in it, because
+    /// the list of languages in it is exactly the thing that keeps going stale.
+    /// `Generic` means "no evidence that a call here can resolve anywhere", and
+    /// the honest response to no evidence is to abstain: the call is still
+    /// recorded in `generation_unresolved`, so nothing goes missing silently.
+    pub fn admits(self, other: Self) -> bool {
+        self == other && self != LangFamily::Generic
     }
 }
 

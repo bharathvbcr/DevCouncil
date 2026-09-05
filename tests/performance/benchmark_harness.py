@@ -21,8 +21,8 @@ try:
 except ImportError:  # Windows has no resource module
     resource = None  # type: ignore[assignment]
 
-from devcouncil.codeintel.query import CodeIntelQueryEngine
 from devcouncil.codeintel.service import get_codeintel_service
+from devcouncil.devmap_client import DevMapClient
 from devcouncil.indexing.graph.build import graph_path, load_code_graph
 from devcouncil.indexing.map_artifacts import refresh_map_artifacts
 
@@ -202,20 +202,41 @@ def run_benchmark(root: Path, *, profile: str = "fast") -> dict[str, Any]:
     refreshed = refresh_map_artifacts(root, map_path, quiet=True)
     one_file_seconds = time.perf_counter() - started
 
-    query = CodeIntelQueryEngine(service)
+    # Measured against the engine that actually answers. These three used to
+    # time `CodeIntelStore.search` and `CodeIntelQueryEngine.explore`/`dead` —
+    # a Python store and a Python engine, neither of which is on any query path
+    # since the kernel cutover. A ratchet on code nothing calls guards nothing.
+    #
+    # `autospawn=False` keeps the harness from leaving a daemon behind per
+    # fixture, so every measurement below pays a process spawn per call. That is
+    # the *worst* transport the live surfaces use, not the typical one — an MCP
+    # server holds a warm daemon — so these numbers are an upper bound and the
+    # thresholds are set against that.
+    #
+    # The spawn dominates. Measured on this host, 15 samples of a bare
+    # `devmap --json --db <store> status` — the cheapest possible invocation,
+    # which does no query work at all: min 15.21 ms, median 20.97 ms,
+    # p95 33.78 ms, max 64.14 ms. Against that floor the three query p50s on
+    # the 256-file fixture were 18-23 ms (search), 22-27 ms (explore) and
+    # 16-25 ms (dead): all transport, no measurable query. `query_p95_ms_max`
+    # is therefore 150 ms for the fast profile — roughly 4x the measured spawn
+    # p95, enough to absorb host noise across seven iterations, and two orders
+    # of magnitude below the Python engine it replaced (1.16-2.05 s per
+    # `explore` on this repository, measured before the cutover).
+    client = DevMapClient(root, autospawn=False)
     iterations = int(thresholds["query_iterations"])
     target = f"benchmark_symbol_{changed_index}"
     query_metrics = {
         "search": _latencies_ms(
-            lambda: service.store.search(target, limit=20),
+            lambda: client.search(target, limit=2000),
             iterations,
         ),
         "explore": _latencies_ms(
-            lambda: query.explore(target, limit=20),
+            lambda: client.explore(target, limit=20),
             iterations,
         ),
         "dead": _latencies_ms(
-            lambda: query.dead(minimum_confidence="inferred"),
+            lambda: client.dead_symbols(),
             iterations,
         ),
     }

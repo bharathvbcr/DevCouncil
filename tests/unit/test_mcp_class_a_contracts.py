@@ -16,14 +16,7 @@ import json
 
 import pytest
 
-from devcouncil.codeintel.query.engine import CodeIntelQueryEngine
-from devcouncil.indexing.graph.schema import (
-    CodeGraph,
-    Confidence,
-    GraphEdge,
-    GraphNode,
-    NodeKind,
-)
+from devcouncil.integrations.mcp.handlers import codeintel as codeintel_handlers
 from devcouncil.integrations.mcp import util as mcp_util
 from devcouncil.integrations.mcp.handlers import ast_lsp as ast_handlers
 from devcouncil.integrations.mcp.handlers import trace as trace_handlers
@@ -102,56 +95,97 @@ async def test_ast_match_under_the_cap_reports_a_real_total(tmp_path):
     assert out["truncated"] is False
 
 
-# ---- CodeIntelQueryEngine.explore ---------------------------------------------
+# ---- devcouncil_code_explore: counts survive the engine change ----------------
+#
+# These asserted the same two properties against `CodeIntelQueryEngine.explore`,
+# which loaded a whole `CodeGraph` into process memory. That engine is deleted;
+# the tool answers from the Rust kernel. The properties are the tool's, not the
+# engine's, so they move to the seam that is left — the handler that turns a
+# kernel report into the tool's payload. The kernel side is covered by
+# `rust-port/crates/devmap-query/tests/explore_and_affected.rs`.
 
 
-class _Store:
-    def content_for_path(self, path):  # noqa: ARG002 - stub
-        return None
+def _kernel_response(items, *, total=None, truncated=None):
+    """A kernel `Response` with honest counters."""
+    shown = len(items)
+    total = shown if total is None else total
+    hidden = total - shown
+    return {
+        "items": items,
+        "shown": shown,
+        "hidden": hidden,
+        "total": total,
+        "truncated": hidden > 0 if truncated is None else truncated,
+        "tokens_used": 0,
+        "resolution": "Available",
+    }
 
 
-class _Service:
-    store = _Store()
+class _KernelStub:
+    def __init__(self, report):
+        self._report = report
+
+    def explore(self, query, limit=20, **_kwargs):
+        return self._report
+
+    def status(self):
+        import types
+
+        return types.SimpleNamespace(
+            generation_id=1,
+            pending_count=0,
+            node_count=1,
+            edge_count=0,
+            is_fresh=True,
+            degraded_reason=None,
+            quarantined_count=0,
+            raw={"schema_version": 12, "analyzer_version": "devmap"},
+        )
 
 
-class _StubEngine(CodeIntelQueryEngine):
-    """Engine over a hand-built graph; the store and envelope are stubbed out."""
-
-    def __init__(self, graph: CodeGraph) -> None:  # noqa: D107
-        self._stub_graph = graph
-        self.service = _Service()
-        self._devmap_client = None
-
-    def _graph(self) -> CodeGraph:
-        return self._stub_graph
-
-    def _envelope(self, payload):
-        return {"ok": True, **payload}
-
-
-def _explore_graph(match_count: int = 5, caller_count: int = 0) -> CodeGraph:
-    nodes = [
-        GraphNode(id=f"m{i}.py::widget_{i}", kind=NodeKind.FUNCTION, path=f"m{i}.py", name=f"widget_{i}")
-        for i in range(match_count)
+def _explore_report(*, shown_definitions, total_definitions, callers, callers_total,
+                    source="def widget(): ...", source_unavailable_reason=None):
+    definitions = [
+        {
+            "id": f"m{index}.py::widget_{index}",
+            "symbol_name": f"widget_{index}",
+            "qualified_name": f"widget_{index}",
+            "file_path": f"m{index}.py",
+            "kind": "Function",
+            "language": "python",
+            "span": [1, 2],
+            "source": source,
+            "source_unavailable_reason": source_unavailable_reason,
+            "score": 1.0,
+            "callers": _kernel_response(callers, total=callers_total),
+            "callees": _kernel_response([]),
+        }
+        for index in range(shown_definitions)
     ]
-    edges: list[GraphEdge] = []
-    if match_count:
-        target = nodes[0].id
-        for i in range(caller_count):
-            caller = GraphNode(
-                id=f"c{i}.py::caller_{i}", kind=NodeKind.FUNCTION, path=f"c{i}.py", name=f"caller_{i}"
-            )
-            nodes.append(caller)
-            edges.append(
-                GraphEdge(
-                    source=caller.id, target=target, kind="calls", confidence=Confidence.EXTRACTED
-                )
-            )
-    return CodeGraph(nodes=nodes, edges=edges)
+    return {
+        "query": "widget_",
+        "limit": shown_definitions,
+        "definitions": _kernel_response(definitions, total=total_definitions),
+        "blast_radius": {
+            "seeds": [],
+            "unmatched_targets": [],
+            "layers": _kernel_response([]),
+            "total_impacted": 0,
+        },
+        "budget": {"total": 8000, "definitions": 4000, "edges_per_direction": 500,
+                   "blast_radius": 2000},
+    }
 
 
-def test_explore_reports_match_total_beside_the_cap():
-    out = _StubEngine(_explore_graph(match_count=5)).explore("widget_", limit=2)
+def test_explore_reports_match_total_beside_the_cap(tmp_path, monkeypatch):
+    report = _explore_report(
+        shown_definitions=2, total_definitions=5, callers=[], callers_total=0
+    )
+    monkeypatch.setattr(
+        "devcouncil.integrations.mcp.handlers.codeintel.try_connect", lambda _root: _KernelStub(report)
+    )
+
+    out = codeintel_handlers._explore_via_client(tmp_path, "widget_", 2)
 
     assert len(out["definitions"]) == 2
     assert out["match_count"] == 2
@@ -160,8 +194,18 @@ def test_explore_reports_match_total_beside_the_cap():
     assert out["limit_applied"] == 2
 
 
-def test_explore_reports_caller_and_callee_totals():
-    out = _StubEngine(_explore_graph(match_count=1, caller_count=60)).explore("widget_0", limit=5)
+def test_explore_reports_caller_and_callee_totals(tmp_path, monkeypatch):
+    report = _explore_report(
+        shown_definitions=1,
+        total_definitions=1,
+        callers=[{"source_symbol": f"c{index}.py::caller_{index}"} for index in range(50)],
+        callers_total=60,
+    )
+    monkeypatch.setattr(
+        "devcouncil.integrations.mcp.handlers.codeintel.try_connect", lambda _root: _KernelStub(report)
+    )
+
+    out = codeintel_handlers._explore_via_client(tmp_path, "widget_0", 5)
 
     definition = out["definitions"][0]
     assert len(definition["callers"]) == 50
@@ -169,6 +213,52 @@ def test_explore_reports_caller_and_callee_totals():
     assert definition["callers_truncated"] is True
     assert definition["callees_total"] == 0
     assert definition["callees_truncated"] is False
+
+
+def test_explore_source_that_could_not_be_read_is_not_an_empty_body(tmp_path, monkeypatch):
+    """Class A, on the snippet: unread and empty must not share a shape."""
+    report = _explore_report(
+        shown_definitions=1,
+        total_definitions=1,
+        callers=[],
+        callers_total=0,
+        source="",
+        source_unavailable_reason="source unavailable at query time for \"m0.py\"",
+    )
+    monkeypatch.setattr(
+        "devcouncil.integrations.mcp.handlers.codeintel.try_connect", lambda _root: _KernelStub(report)
+    )
+
+    out = codeintel_handlers._explore_via_client(tmp_path, "widget_0", 5)
+
+    definition = out["definitions"][0]
+    assert definition["source"] == ""
+    assert "m0.py" in definition["source_unavailable_reason"]
+
+
+def test_explore_without_a_kernel_is_unavailable_not_an_empty_match_set(tmp_path, monkeypatch):
+    """An engine that could not run must not answer like one that found nothing."""
+    monkeypatch.setattr("devcouncil.integrations.mcp.handlers.codeintel.try_connect", lambda _root: None)
+
+    out = codeintel_handlers._explore_via_client(tmp_path, "widget_", 20)
+
+    assert out["ok"] is False
+    assert out["definitions"] == []
+    assert out["match_total"] == 0
+    assert "Unavailable" in out["resolution"]
+    assert out["operation"] == "explore"
+
+
+def test_affected_tests_without_a_kernel_is_unavailable_not_no_tests(tmp_path, monkeypatch):
+    """The costliest possible false negative: "no tests are affected"."""
+    monkeypatch.setattr("devcouncil.integrations.mcp.handlers.codeintel.try_connect", lambda _root: None)
+
+    out = codeintel_handlers._affected_via_client(tmp_path, ["widget"], 3)
+
+    assert out["ok"] is False
+    assert out["tests"] == []
+    assert "Unavailable" in out["resolution"]
+    assert out["operation"] == "affected_tests"
 
 
 # ---- freshness: unknown is never rendered as verified-fresh --------------------
@@ -179,7 +269,7 @@ async def test_freshness_unknown_when_the_fingerprint_check_cannot_run(tmp_path,
     dev = tmp_path / ".devcouncil"
     dev.mkdir()
     (dev / "repo_map.json").write_text(json.dumps({"languages": ["python"]}), encoding="utf-8")
-    monkeypatch.setattr("devcouncil.devmap_client.try_connect", lambda root: None)
+    monkeypatch.setattr("devcouncil.integrations.mcp.handlers.codeintel.try_connect", lambda root: None)
 
     def boom(self, data):
         raise RuntimeError("git unavailable")
@@ -203,7 +293,7 @@ async def test_freshness_from_artifact_names_the_unreachable_kernel(tmp_path, mo
     dev = tmp_path / ".devcouncil"
     dev.mkdir()
     (dev / "repo_map.json").write_text(json.dumps({"languages": ["python"]}), encoding="utf-8")
-    monkeypatch.setattr("devcouncil.devmap_client.try_connect", lambda root: None)
+    monkeypatch.setattr("devcouncil.integrations.mcp.handlers.codeintel.try_connect", lambda root: None)
     monkeypatch.setattr(
         "devcouncil.indexing.repo_mapper.RepoMapper.map_is_stale", lambda self, data: False
     )
@@ -221,36 +311,62 @@ async def test_freshness_from_artifact_names_the_unreachable_kernel(tmp_path, mo
     assert "devmap store" in out["sync"]["kernel_unavailable"]
 
 
-class _SearchStore(_Store):
-    def __init__(self, rows):
+class _SearchKernelStub(_KernelStub):
+    """A kernel whose search measures the corpus, not just the page it returned."""
+
+    def __init__(self, rows, total):
+        super().__init__({})
         self._rows = rows
+        self._total = total
 
-    def search(self, query, *, limit=50):  # noqa: ARG002 - stub
-        return self._rows[:limit]
+    def search(self, query, limit=2000, semantic=False):  # noqa: ARG002 - stub
+        from devcouncil.devmap_client import BudgetedResponse
+
+        return BudgetedResponse(
+            shown=len(self._rows),
+            hidden=self._total - len(self._rows),
+            total=self._total,
+            truncated=self._total > len(self._rows),
+            tokens_used=0,
+            items=self._rows,
+            resolution="Available",
+        )
 
 
-class _SearchEngine(_StubEngine):
-    def __init__(self, rows):
-        super().__init__(CodeGraph(nodes=[], edges=[]))
-        store = _SearchStore(rows)
-        self.service = type("S", (), {"store": store, "cached_query": staticmethod(
-            lambda kind, key, produce: produce()
-        )})()
+def test_search_capped_rows_are_not_reported_as_complete(tmp_path, monkeypatch):
+    """A capped page carries the corpus-wide total, not the page's length.
 
+    The Python engine could not do this: its store applied the limit inside SQL,
+    so it reported ``total: None`` with a ``total_reason`` explaining that the
+    number had never been measured. That was the honest answer available to it.
+    The kernel counts the match set with ``count_search_symbols`` before
+    paging, so the same surface now reports a measured total — an upgrade from
+    "not counted" to a count, with the capping still declared.
+    """
+    rows = [{"symbol_name": f"n{index}", "file_path": "a.py", "span": [1, 1]}
+            for index in range(10)]
+    monkeypatch.setattr(
+        "devcouncil.integrations.mcp.handlers.codeintel.try_connect",
+        lambda _root: _SearchKernelStub(rows, total=42),
+    )
 
-def test_search_capped_rows_are_not_reported_as_complete():
-    out = _SearchEngine([{"id": f"n{i}"} for i in range(10)]).search("n", limit=3)
+    out = codeintel_handlers._search_via_client(tmp_path, "n", 3)
 
     assert len(out["matches"]) == 3
     assert out["shown"] == 3
     assert out["truncated"] is True
-    # The store applies the limit in SQL, so the unfiltered count is unmeasured.
-    assert out["total"] is None
-    assert out["total_reason"]
+    assert out["total"] == 42
 
 
-def test_search_under_the_cap_reports_a_real_total():
-    out = _SearchEngine([{"id": "n0"}]).search("n", limit=50)
+def test_search_under_the_cap_reports_a_real_total(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "devcouncil.integrations.mcp.handlers.codeintel.try_connect",
+        lambda _root: _SearchKernelStub(
+            [{"symbol_name": "n0", "file_path": "a.py", "span": [1, 1]}], total=1
+        ),
+    )
+
+    out = codeintel_handlers._search_via_client(tmp_path, "n", 50)
 
     assert out["shown"] == 1
     assert out["total"] == 1

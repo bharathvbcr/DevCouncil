@@ -435,7 +435,9 @@ fn a_deeply_nested_source_is_refused_within_its_budget() {
         ok.parse_outcome
     );
     assert!(
-        ok.symbols.iter().any(|s| s.qualified_name == "svc/fine.go::T.M"),
+        ok.symbols
+            .iter()
+            .any(|s| s.qualified_name == "svc/fine.go::T.M"),
         "and still qualifies its methods: {:?}",
         ok.symbols
             .iter()

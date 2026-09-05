@@ -276,3 +276,210 @@ func TestAManifestDisagreeingWithItsIndexIsReported(t *testing.T) {
 		t.Fatalf("both generations must be named: %q", joined)
 	}
 }
+
+// TestAnAnswerThatExactlyFillsTheBoundIsNotAFlood.
+//
+// capped marked a stream truncated whenever a write reached the limit, rather
+// than when one was dropped, so the two ends of the same bound gave the same
+// verdict: an answer of exactly maxOutput bytes was refused as having "produced
+// more than" that many, and stderr of exactly maxStderr was reported as a
+// stream cut off at the bound with "an unknown number of notices — including
+// refusals — never read".
+//
+// Both are false claims about a complete stream, and the first also throws away
+// an answer that arrived whole. The bound is a maximum, and the case that meets
+// it exactly is the one case where the difference between "at" and "past" is
+// the whole verdict — which is exactly where an off-by-one lands.
+//
+// The count is asserted through the real command path rather than against the
+// writer, because what is under test is the verdict decode reaches from it. The
+// producer emits a payload padded to precisely the limit, which the shell can
+// do exactly and which no amount of buffering can round.
+func TestAnAnswerThatExactlyFillsTheBoundIsNotAFlood(t *testing.T) {
+	const limit = 4 << 10
+
+	// A status document padded with spaces to exactly `limit` bytes. JSON
+	// ignores the padding; capped does not.
+	const envelope = `{"generation_id":4,"node_count":9,"edge_count":9,"is_fresh":true}`
+	padded := envelope + strings.Repeat(" ", limit-len(envelope))
+	if len(padded) != limit {
+		t.Fatalf("the fixture is %d bytes, not the %d under test", len(padded), limit)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "devmap")
+	// printf rather than echo: echo appends a newline, which would put the
+	// stream one byte past the bound and test the other case.
+	script := clapHelp("#!/bin/sh\nprintf '%s' '" + padded + "'\n")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := New(path, dir)
+	c.maxOutput = limit
+
+	status, err := c.Status(context.Background())
+	if err != nil {
+		t.Fatalf("an answer of exactly the %d byte bound is within it, not past it: %v", limit, err)
+	}
+	if status.GenerationID != 4 || status.NodeCount != 9 {
+		t.Fatalf("the answer was decoded wrong: %+v", status)
+	}
+
+	// The other end of the same writer. One byte past the bound must still be
+	// refused, or the fix above would have removed the guard rather than
+	// corrected it.
+	over := filepath.Join(dir, "devmap-over")
+	script = clapHelp("#!/bin/sh\nprintf '%s ' '" + padded + "'\n")
+	if err := os.WriteFile(over, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c = New(over, dir)
+	c.maxOutput = limit
+	if _, err := c.Status(context.Background()); err == nil {
+		t.Fatal("one byte past the bound must still be refused")
+	} else if !strings.Contains(err.Error(), "more than") {
+		t.Fatalf("the refusal must name the bound, got %v", err)
+	}
+}
+
+// TestNoticesThatExactlyFillTheirBoundAreNotReportedAsCutOff. The soft half of
+// the same off-by-one: stderr truncation is advisory rather than fatal, so it
+// does not lose the answer — it states, in the run report an operator reads,
+// that notices were dropped when every one of them was read.
+func TestNoticesThatExactlyFillTheirBoundAreNotReportedAsCutOff(t *testing.T) {
+	const limit = 1 << 10
+	noise := strings.Repeat("n", limit-1) + "\n" // exactly limit bytes on stderr
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "devmap")
+	script := clapHelp("#!/bin/sh\nprintf '%s' '" + noise + "' >&2\n" +
+		"echo '{\"files_indexed\":1,\"symbols\":1,\"edges\":1}'\n")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := New(path, dir)
+	c.maxStderr = limit
+	// The build's own index check is not what this is about; a status the fake
+	// does not answer would add a disagreement and confuse the verdict.
+	c.Timeout = 5 * time.Second
+
+	report, err := c.Build(context.Background(), 30*time.Second)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if report.StreamTruncated {
+		t.Fatalf("stderr of exactly the %d byte bound was reported as cut off at it: %v",
+			limit, report.Degraded())
+	}
+	for _, line := range report.Degraded() {
+		if strings.Contains(line, "truncated") {
+			t.Fatalf("a complete notices stream was reported as truncated: %q", line)
+		}
+	}
+}
+
+// TestAManifestThatWroteSomethingUnreadableIsNotReportedAsWritten.
+//
+// Manifest already refuses two members of one class: the artifact that is not
+// on disk, and the one that is there but empty. The argument for both is in its
+// doc comment — an artifact that is not what the command exists to write is a
+// failure of that command, not a degradation of it, because the caller's next
+// line is "wrote <path>" and the gate goes on deciding from whatever is there.
+//
+// The third member was missing, and it is the one the producer can actually
+// reach: a run that exits zero having written a truncated document. Size is not
+// the test — half a code graph has a perfectly good size — so a manifest that
+// wrote `{"nodes":[{"id":"a"` was reported as a clean run, and the failure
+// surfaced later, in another package, at session start, as a parse error about
+// a file nothing had said anything about.
+//
+// The check is on well-formedness alone and deliberately not on the engine
+// marker. A producer that renames itself must stay recoverable: artifact.go
+// preserves a file it reads as foreign, which is noisy and lossless, and
+// failing the manifest on the marker would turn that into the permanent wedge
+// that file exists to have removed.
+func TestAManifestThatWroteSomethingUnreadableIsNotReportedAsWritten(t *testing.T) {
+	// Each case writes the two artifacts with the shell fragment given, so what
+	// lands on disk is exactly the byte sequence named.
+	for _, tc := range []struct {
+		name             string
+		mapDoc, graphDoc string
+	}{
+		{"a code graph cut off mid-document", `{"map_engine":"devmap-rust"}`, `{"nodes":[{"id":"a"`},
+		{"a repo map that is not JSON at all", `<html>500 Internal Error</html>`, `{"meta":{"map_engine":"devmap-rust"}}`},
+		{"a code graph with a second document after it",
+			`{"map_engine":"devmap-rust"}`, `{"meta":{"map_engine":"devmap-rust"}} {"nodes":[]}`},
+		{"a code graph of only whitespace", `{"map_engine":"devmap-rust"}`, "   \n\t  "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			mapPath := filepath.Join(dir, "repo_map.json")
+			graphPath := filepath.Join(dir, "code_graph.json")
+
+			script := clapHelp("#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in\n" +
+				"  status) echo '" + healthyStatus + "'; exit 0;;\n" +
+				"  manifest)\n" +
+				"    printf '%s' '" + tc.mapDoc + "' > " + mapPath + "\n" +
+				"    printf '%s' '" + tc.graphDoc + "' > " + graphPath + "\n" +
+				"    echo '{\"generation_id\":3}'; exit 0;;\n" +
+				"esac; done\necho '{}'\n")
+			bin := filepath.Join(dir, "devmap")
+			if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			c := New(bin, dir)
+			report, err := c.Manifest(context.Background(), mapPath, graphPath)
+			if err == nil {
+				t.Fatalf("a manifest that wrote an unreadable artifact reported success "+
+					"(clean=%v, degraded=%v); the gate would keep deciding from it",
+					report.Clean(), report.Degraded())
+			}
+			for _, want := range []string{"could not be read back", "manifest"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the failure must say what went wrong (%q), got: %v", want, err)
+				}
+			}
+		})
+	}
+}
+
+// TestAManifestThatWroteReadableArtifactsStillSucceeds. The guard above must
+// not be one that fails the ordinary run, and in particular must not fail an
+// artifact written by a producer that has renamed its engine — artifact.go
+// preserves those rather than refusing them, and a manifest that refused one
+// would restore the wedge that file was written to remove.
+func TestAManifestThatWroteReadableArtifactsStillSucceeds(t *testing.T) {
+	for _, tc := range []struct{ name, graphDoc string }{
+		{"the producer's own artifact", `{"nodes":[],"meta":{"map_engine":"devmap-rust"}}`},
+		{"an artifact from a producer that renamed itself", `{"nodes":[],"meta":{"map_engine":"devmap-rust-2"}}`},
+		{"an artifact carrying no engine marker at all", `{"nodes":[]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			mapPath := filepath.Join(dir, "repo_map.json")
+			graphPath := filepath.Join(dir, "code_graph.json")
+
+			script := clapHelp("#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in\n" +
+				"  status) echo '" + healthyStatus + "'; exit 0;;\n" +
+				"  manifest)\n" +
+				"    printf '%s' '{\"map_engine\":\"devmap-rust\"}' > " + mapPath + "\n" +
+				"    printf '%s' '" + tc.graphDoc + "' > " + graphPath + "\n" +
+				"    echo '{\"generation_id\":3}'; exit 0;;\n" +
+				"esac; done\necho '{}'\n")
+			bin := filepath.Join(dir, "devmap")
+			if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			c := New(bin, dir)
+			report, err := c.Manifest(context.Background(), mapPath, graphPath)
+			if err != nil {
+				t.Fatalf("a manifest whose artifacts parse must succeed: %v", err)
+			}
+			if report.GenerationID != 3 {
+				t.Errorf("generation %d, want 3", report.GenerationID)
+			}
+		})
+	}
+}

@@ -180,6 +180,16 @@ func TestTheLiveContractHolds(t *testing.T) {
 	if notes := m.DisagreementsWith(status.GenerationID, status.NodeCount); len(notes) != 0 {
 		t.Fatalf("a freshly written artifact must not read as diverged from the index it came from: %v", notes)
 	}
+	// Declared before compared. An artifact that names no schema decodes as
+	// version zero, and this build reports that as unknown rather than as a
+	// mismatch — so a producer that renamed or moved the key would otherwise be
+	// caught only by the value check below, which cannot say which of the two
+	// happened. The live binary is the only thing that can settle that the key
+	// is still spelled the way this build reads it.
+	if !p.SchemaDeclared {
+		t.Error("the artifact declares no schema version under the key this build reads; " +
+			"every field in it is now being interpreted on an assumption")
+	}
 	if p.SchemaVersion != repomap.SupportedSchema {
 		t.Errorf("the producer now writes schema %d and this build reads %d; "+
 			"check what moved before raising SupportedSchema", p.SchemaVersion, repomap.SupportedSchema)

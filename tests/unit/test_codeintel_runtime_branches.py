@@ -26,7 +26,6 @@ from devcouncil.codeintel.debug.protocol import (
 from devcouncil.codeintel.debug.python_trace_runner import run_trace
 from devcouncil.codeintel.debug.session import DebugSession, DebugSessionManager
 from devcouncil.codeintel.languages import workers
-from devcouncil.codeintel.query import CodeIntelQueryEngine
 from devcouncil.codeintel.service import CodeIntelService
 from devcouncil.codeintel.store.sqlite import CodeIntelStore
 from devcouncil.indexing.graph.schema import (
@@ -42,6 +41,105 @@ from devcouncil.integrations.mcp.handlers import codeintel as mcp_codeintel
 
 
 runner = CliRunner()
+
+
+class _FakeKernelClient:
+    """Stands in for ``DevMapClient`` on the CLI's query commands.
+
+    ``dev map explore`` / ``affected`` / ``search`` used to be stubbed by
+    replacing ``CodeIntelQueryEngine``. That class is gone: all three now ask
+    the Rust kernel through ``try_connect``, so the stub follows the seam. The
+    payloads below are the kernel's own wire shapes — nested ``Response``
+    objects with their counters — because that is what the commands read, and a
+    stub that returned the old flat lists would pass while the real thing
+    failed.
+    """
+
+    def __init__(self, *, tests: list[str] | None = None) -> None:
+        self._tests = ["tests/test_app.py"] if tests is None else tests
+
+    @staticmethod
+    def _response(items: list[dict]) -> dict:
+        return {
+            "items": items,
+            "shown": len(items),
+            "hidden": 0,
+            "total": len(items),
+            "truncated": False,
+            "tokens_used": 0,
+            "resolution": "Available",
+        }
+
+    def explore(self, query, limit=20, **_kwargs):
+        return {
+            "query": query,
+            "limit": limit,
+            "definitions": self._response([
+                {
+                    "id": f"app.py::{query}",
+                    "symbol_name": query,
+                    "file_path": "app.py",
+                    "kind": "Function",
+                    "span": [2, 3],
+                    "source": "def target():",
+                    "score": 1.0,
+                    "callers": self._response([{"source_symbol": "app.py::caller"}]),
+                    "callees": self._response([]),
+                }
+            ]),
+            "blast_radius": {
+                "seeds": [f"app.py::{query}"],
+                "unmatched_targets": [],
+                "layers": self._response([]),
+                "total_impacted": 0,
+            },
+            "budget": {"total": 8000, "definitions": 4000, "edges_per_direction": 500,
+                       "blast_radius": 2000},
+        }
+
+    def affected_tests(self, targets, **_kwargs):
+        rows = [] if list(targets) == ["none"] else [
+            {"path": path, "depth": 1, "symbols": [], "reached_symbols": 0}
+            for path in self._tests
+        ]
+        return {
+            "targets": list(targets),
+            "tests": self._response(rows),
+            "blast_radius": {
+                "seeds": list(targets),
+                "unmatched_targets": [],
+                "layers": self._response([]),
+                "total_impacted": 0,
+            },
+        }
+
+    def impact(self, target, depth=3):
+        """Unavailable, so ``_devmap_query_payload`` degrades as it always did.
+
+        ``dev map impact`` is not part of this migration and still falls back to
+        the Python ``diff_impact``. Before ``try_connect`` was stubbed here, no
+        store existed and the fallback was reached by returning ``None``; the
+        stub has to reproduce that rather than accidentally answer.
+        """
+        from devcouncil.devmap_client import DevMapClientError
+
+        raise DevMapClientError(f"no kernel impact in this fixture: {target}")
+
+    def search(self, query, limit=2000, semantic=False):
+        from devcouncil.devmap_client import BudgetedResponse
+
+        items = [{
+            "symbol_name": query,
+            "file_path": "app.py",
+            "kind": "Function",
+            "span": [2, 3],
+            "score": 1.0,
+        }]
+        return BudgetedResponse(
+            shown=1, hidden=0, total=1, truncated=False, tokens_used=0,
+            items=items, resolution="Available",
+        )
+
 
 
 class _FakeManager:
@@ -460,30 +558,19 @@ def _query_graph() -> CodeGraph:
     )
 
 
-def test_query_engine_explore_paths_impact_tests_dead_and_cache(tmp_path: Path) -> None:
-    (tmp_path / "app.py").write_text(
-        "def target():\n    return 1\n\ndef caller():\n    return target()\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "test_app.py").write_text(
-        "def test_target(): pass\n", encoding="utf-8"
-    )
+def test_generation_keyed_query_cache_memoises_within_a_generation(tmp_path: Path) -> None:
+    """The service's per-generation cache answers a repeated key once.
+
+    What is left of a set of assertions that also exercised
+    ``CodeIntelQueryEngine``'s ``explore``/``path``/``impact``/
+    ``affected_tests``/``dead``. That engine was deleted: every one of those
+    surfaces is answered by the Rust kernel now, and the kernel's own tests
+    (``rust-port/crates/devmap-query/tests/explore_and_affected.rs``) cover the
+    behaviour with fixtures that do not need a Python graph. The cache is not
+    part of that migration — it belongs to the service — so it keeps its test.
+    """
     service = CodeIntelService(tmp_path)
     service.persist(_query_graph())
-    engine = CodeIntelQueryEngine(service)
-
-    explored = engine.explore("target")
-    assert explored["definitions"][0]["source"].startswith("1: def target")
-    assert explored["definitions"][0]["callers"][0]["source"] == "app.py::caller"
-    assert engine.path("target", "caller")["found"] is True
-    assert engine.path("missing", "caller")["reason"] == "endpoint not found"
-    assert engine.path("app.py::target", "test_target", max_depth=1)["found"] is False
-    assert engine.impact(["target"], max_depth=4)["blast_radius"]["total_impacted"] == 2
-    assert engine.affected_tests(["target"])["tests"] == ["tests/test_app.py"]
-    assert engine.dead(minimum_confidence="extracted")["dead_code"][0]["tier"].startswith(
-        "high-confidence"
-    )
 
     calls = 0
 
@@ -494,19 +581,25 @@ def test_query_engine_explore_paths_impact_tests_dead_and_cache(tmp_path: Path) 
 
     assert service.cached_query("fixture", "key", load) == {"calls": 1}
     assert service.cached_query("fixture", "key", load) == {"calls": 1}
-    assert CodeIntelQueryEngine._snippet(None, 1, 1) == ""
-    assert CodeIntelQueryEngine._snippet(b"x\n", 0, 0) == ""
-    assert CodeIntelQueryEngine._lowest_confidence([]) == "extracted"
-    assert CodeIntelQueryEngine._is_test_path("pkg/widget.spec.ts")
+    assert calls == 1
 
 
-def test_query_engine_skips_fingerprint_without_runtime_observations(
+def test_runtime_merge_skips_fingerprinting_without_runtime_observations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Fingerprinting shells out to git, so it runs only when it can match.
+
+    Retargeted from ``CodeIntelQueryEngine._graph`` to
+    ``CodeIntelService.load_with_runtime_observations``, which is where that
+    loader now lives — ``run_cypher`` is its one production caller. The
+    dead-candidate suppression the second half of this test used to assert went
+    with the engine; see
+    ``test_codeintel_debug.test_matching_runtime_observation_becomes_a_graph_edge``
+    for what survives and what does not.
+    """
     (tmp_path / "app.py").write_text("def target():\n    return 1\n", encoding="utf-8")
     service = CodeIntelService(tmp_path)
     service.persist(_query_graph())
-    engine = CodeIntelQueryEngine(service)
 
     def _boom(root: Path) -> str:
         raise AssertionError("source_fingerprint must not run without runtime evidence")
@@ -514,7 +607,8 @@ def test_query_engine_skips_fingerprint_without_runtime_observations(
     monkeypatch.setattr(
         "devcouncil.codeintel.debug.fingerprint.source_fingerprint", _boom
     )
-    assert engine.impact(["target"])["blast_radius"]["total_impacted"] >= 1
+    graph = service.load_with_runtime_observations()
+    assert not [edge for edge in graph.edges if edge.extras.get("provenance") == "runtime"]
 
     session = service.store.start_runtime_session(
         provider="pytest", source_fingerprint="fp", build_fingerprint="bp"
@@ -532,9 +626,11 @@ def test_query_engine_skips_fingerprint_without_runtime_observations(
         "devcouncil.codeintel.debug.fingerprint.source_fingerprint",
         lambda root: "fp",
     )
-    dead = engine.dead(minimum_confidence="extracted")
-    assert dead["runtime_proven_live"] == ["app.py::target"]
-    assert dead["dead_code"] == []
+    merged = service.load_with_runtime_observations()
+    runtime = [edge for edge in merged.edges if edge.extras.get("provenance") == "runtime"]
+    assert [(edge.source, edge.target) for edge in runtime] == [
+        ("app.py::caller", "app.py::target")
+    ]
 
 
 def test_mcp_debug_dispatches_every_provider_and_manager_action(
@@ -773,40 +869,6 @@ def test_graph_cli_status_sync_search_explore_and_affected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import devcouncil.codeintel as codeintel
-    import devcouncil.codeintel.query as query_module
-
-    class Engine:
-        def __init__(self, root):
-            assert root == tmp_path
-
-        def search(self, query, limit):
-            return {
-                "matches": [
-                    {
-                        "path": "app.py",
-                        "line": 2,
-                        "id": f"app.py::{query}",
-                        "kind": "function",
-                    }
-                ]
-            }
-
-        def explore(self, query, limit):
-            return {
-                "definitions": [
-                    {
-                        "id": f"app.py::{query}",
-                        "path": "app.py",
-                        "line": 2,
-                        "source": "2: def target():",
-                        "callers": ["caller"],
-                        "callees": [],
-                    }
-                ]
-            }
-
-        def affected_tests(self, targets):
-            return {"tests": ["tests/test_app.py"] if targets != ["none"] else []}
 
     monkeypatch.setattr(
         codeintel,
@@ -820,7 +882,9 @@ def test_graph_cli_status_sync_search_explore_and_affected(
             }
         ),
     )
-    monkeypatch.setattr(query_module, "CodeIntelQueryEngine", Engine)
+    monkeypatch.setattr(
+        "devcouncil.devmap_client.try_connect", lambda _root: _FakeKernelClient()
+    )
     # `status` and `sync` read and drive the kernel now, not the coordinator.
     monkeypatch.setattr(
         "devcouncil.devmap_health.kernel_status",
@@ -1384,28 +1448,6 @@ def test_trace_loaders_runtime_version_and_import(
 def test_mcp_codeintel_dispatch_all_handlers_and_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class Engine:
-        def __init__(self, _root):
-            return None
-
-        def explore(self, query, limit):
-            return {"operation": "explore", "query": query, "limit": limit}
-
-        def search(self, query, limit):
-            return {"operation": "search", "query": query, "limit": limit}
-
-        def path(self, start, end, max_depth):
-            return {"operation": "path", "from": start, "to": end, "depth": max_depth}
-
-        def impact(self, targets, max_depth):
-            return {"operation": "impact", "targets": targets, "depth": max_depth}
-
-        def dead(self, minimum_confidence):
-            return {"operation": "dead", "confidence": minimum_confidence}
-
-        def affected_tests(self, targets, max_depth):
-            return {"operation": "affected", "targets": targets, "depth": max_depth}
-
     def _kernel_cli_refresh(_root, _output, *_a, **_k):
         return types.SimpleNamespace(
             generation=11,
@@ -1420,7 +1462,6 @@ def test_mcp_codeintel_dispatch_all_handlers_and_errors(
             ),
         )
 
-    monkeypatch.setattr(mcp_codeintel, "CodeIntelQueryEngine", Engine)
     monkeypatch.setattr(
         "devcouncil.indexing.map_artifacts.refresh_map_artifacts", _kernel_cli_refresh
     )
@@ -1430,16 +1471,26 @@ def test_mcp_codeintel_dispatch_all_handlers_and_errors(
         assert result is not None
         return json.loads(result[0].text)
 
+    # Every query tool is kernel-only now, and this fixture has no devmap
+    # store — so every one of them must answer with the same tri-state refusal,
+    # naming its own operation and carrying the reason. There is no stubbed
+    # Python engine here any more because there is no Python engine: `explore`
+    # and `affected_tests` were the last two, and a substituted answer with no
+    # signal which engine produced it is the shape this whole migration removed.
     calls = [
         ("devcouncil_code_explore", {"query": "x"}, "explore"),
         ("devcouncil_code_search", {"query": "x"}, "search"),
         ("devcouncil_code_path", {"from": "a", "to": "b"}, "path"),
         ("devcouncil_code_impact", {"targets": ["a"]}, "impact"),
         ("devcouncil_code_dead", {}, "dead"),
-        ("devcouncil_code_affected_tests", {"targets": ["a"]}, "affected"),
+        ("devcouncil_code_affected_tests", {"targets": ["a"]}, "affected_tests"),
     ]
     for name, arguments, operation in calls:
-        assert asyncio.run(invoke(name, arguments))["operation"] == operation
+        payload = asyncio.run(invoke(name, arguments))
+        assert payload["operation"] == operation
+        assert payload["ok"] is False, f"{name} must not report an unbuilt store as a zero"
+        assert "Unavailable" in payload["resolution"], f"{name} must carry the reason"
+        assert payload["engine"] == "devmap-rust"
     # No daemon in this fixture, so `_sync` falls through to the kernel CLI —
     # never to a Python coordinator, which no longer exists.
     synced = asyncio.run(invoke("devcouncil_code_sync", {"paths": ["app.py"]}))
@@ -1477,7 +1528,6 @@ def test_graph_cli_remaining_output_branches(
 ) -> None:
     import devcouncil.cli.commands.map as map_command
     import devcouncil.codeintel as codeintel
-    import devcouncil.codeintel.query as query_module
     import devcouncil.indexing.graph.build as graph_build
     import devcouncil.indexing.graph.intel as intel
     import devcouncil.indexing.map_artifacts as map_artifacts
@@ -1535,28 +1585,9 @@ def test_graph_cli_remaining_output_branches(
     )
     assert failed_doctor.exit_code == 1
 
-    class Engine:
-        def __init__(self, _root):
-            return None
-
-        def explore(self, _query, limit):
-            return {
-                "definitions": [
-                    {
-                        "id": "app.py::target",
-                        "path": "app.py",
-                        "line": 1,
-                        "source": "",
-                        "callers": [],
-                        "callees": ["callee"],
-                    }
-                ]
-            }
-
-        def affected_tests(self, _targets):
-            return {"tests": ["tests/test_app.py"]}
-
-    monkeypatch.setattr(query_module, "CodeIntelQueryEngine", Engine)
+    monkeypatch.setattr(
+        "devcouncil.devmap_client.try_connect", lambda _root: _FakeKernelClient()
+    )
     assert '"definitions"' in runner.invoke(
         app,
         [

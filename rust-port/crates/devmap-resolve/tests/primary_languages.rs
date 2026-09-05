@@ -41,15 +41,39 @@ fn swift_and_kotlin_do_not_share_a_resolution_bucket() {
         assert_ne!(kotlin, family, "Kotlin must not match a {owned} candidate");
     }
 
-    // `Generic` still exists, and is still correct, for languages that
-    // contribute no call sites — they cannot mis-resolve what they never emit.
-    for quiet in ["cobol", "solidity"] {
+    // `Generic` still exists for languages that contribute no call sites.
+    //
+    // This list was `["cobol", "solidity"]` and the Solidity half went stale the
+    // day Solidity gained call extraction — which is the whole failure mode this
+    // file exists to catch, reproduced in the test that guards against it. So
+    // membership is now *derived* rather than asserted: a language may sit in
+    // the shared bucket only if nothing claims it emits calls.
+    for quiet in ["cobol", "html", "css", "json", "yaml", "toml", "markdown"] {
+        assert!(
+            !devmap_extract::langcalls::CALL_EXTRACTION_LANGUAGES.contains(&quiet),
+            "{quiet} is listed as a call-extracting language, so it can no longer \
+             be used here as an example of one that is not"
+        );
         assert_eq!(
             LangFamily::from_lang(quiet),
             LangFamily::Generic,
-            "{quiet} extracts no calls, so the shared bucket is harmless for it"
+            "{quiet} extracts no calls, so the shared bucket is where it belongs"
         );
     }
+
+    // And the bucket is inert regardless, which is what makes the staleness
+    // above survivable: two languages that share `Generic` cannot resolve into
+    // each other even while someone is still noticing that one of them moved.
+    assert!(
+        !LangFamily::Generic.admits(LangFamily::Generic),
+        "the shared bucket must never admit a resolution; that is how a Svelte \
+         call reached a Solidity contract method at 0.9"
+    );
+    assert_eq!(
+        LangFamily::from_lang("solidity"),
+        LangFamily::Solidity,
+        "Solidity extracts calls now and must own a bucket"
+    );
 }
 
 /// Each primary language answers from its own standard library, and only for

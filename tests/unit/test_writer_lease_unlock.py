@@ -300,7 +300,7 @@ def test_map_unlock_cli_dead_pid(tmp_path: Path, monkeypatch) -> None:
         ["map", "unlock", "--project-root", str(tmp_path), "--json"],
     )
     assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["ok"] is True
     assert payload["action"] == "freed"
 

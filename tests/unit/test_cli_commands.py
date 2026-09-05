@@ -45,7 +45,7 @@ def test_cli_check_clean_tree_reports_nothing(tmp_path, monkeypatch):
     result = runner.invoke(app, ["check", "--json"])
 
     assert result.exit_code == 0
-    assert json.loads(result.output)["ok"] is True
+    assert json.loads(result.stdout)["ok"] is True
 
 
 def test_cli_check_expands_github_reference_goal(tmp_path, monkeypatch):
@@ -1711,7 +1711,7 @@ def test_cli_watch_review_can_scope_card_to_task(tmp_path, monkeypatch):
     ])
 
     assert result.exit_code == 0
-    assert json.loads(result.output)["task_id"] == "TASK-001"
+    assert json.loads(result.stdout)["task_id"] == "TASK-001"
 
 
 def test_cli_watch_review_defaults_to_single_running_task(tmp_path, monkeypatch):
@@ -1739,7 +1739,7 @@ def test_cli_watch_review_defaults_to_single_running_task(tmp_path, monkeypatch)
     result = runner.invoke(app, ["watch", "review", "--transcript", str(transcript), "--json"])
 
     assert result.exit_code == 0
-    assert json.loads(result.output)["task_id"] == "TASK-001"
+    assert json.loads(result.stdout)["task_id"] == "TASK-001"
 
 
 def test_cli_watch_review_is_idempotent_for_same_turn(tmp_path, monkeypatch):
@@ -3298,7 +3298,7 @@ def test_cli_report_json_is_machine_readable(tmp_path, monkeypatch):
     result = runner.invoke(app, ["report", "--json"])
 
     assert result.exit_code == 0
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     assert data["verdict"] == "passed"
 
 
@@ -3315,7 +3315,7 @@ def test_cli_report_json_includes_live_review_blockers(tmp_path, monkeypatch):
     result = runner.invoke(app, ["report", "--json"])
 
     assert result.exit_code == 0
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     assert data["verdict"] == "blocked"
     assert data["live_review"]["cards"]["critical_open"] == 1
     assert data["live_review"]["blocking_cards"][0]["verdict"] == "Critical Issues"
@@ -3462,8 +3462,8 @@ def test_cli_status_auto_initializes_when_missing(tmp_path, monkeypatch):
 
     result = runner.invoke(app, ["status", "--json"])
     assert result.exit_code == 0
-    assert json.loads(result.output)["initialized"] is True
-    assert json.loads(result.output)["phase"] == "NEW"
+    assert json.loads(result.stdout)["initialized"] is True
+    assert json.loads(result.stdout)["phase"] == "NEW"
 
 
 def test_cli_status_auto_initializes_with_project_root(tmp_path, monkeypatch):
@@ -3474,7 +3474,7 @@ def test_cli_status_auto_initializes_with_project_root(tmp_path, monkeypatch):
 
     result = runner.invoke(app, ["status", "--json", "--project-root", str(project)])
     assert result.exit_code == 0
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     assert data["initialized"] is True
     assert data["phase"] == "NEW"
     assert (project / ".devcouncil" / "state.sqlite").exists()

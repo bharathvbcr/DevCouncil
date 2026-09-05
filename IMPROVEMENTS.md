@@ -1053,3 +1053,340 @@ the kernel correctly reported none. Second, the first version of this wiring pas
 the callee reads `kwargs["name_or_path"]`, which would have raised on every call while every
 mocked test stayed green; `test_handlers_call_the_kernel_with_the_kwargs_it_actually_declares`
 drives the real function to pin the keyword contract, and is red against that bug.
+
+## `explore` and `affected_tests` move into the kernel; `codeintel/query/` deleted (2026-09-05)
+
+Closes next step 4 of the 2026-09-02 handoff for the two MCP surfaces agents actually
+call. `src/devcouncil/codeintel/query/` is gone (−364 lines); the kernel gained
+`StoreQueryEngine::explore` and `::affected_tests`, a `devmap explore` / `devmap affected`
+CLI pair, and the `explore` / `affected` IPC commands.
+
+**The Python path was not merely slower — it could not answer.** `CodeIntelQueryEngine`
+reads `.devcouncil/codeintel/index.sqlite`, and nothing has written that store since the
+Python writer was retired on 2026-09-02. Measured on a worktree with a freshly built map:
+
+```
+$ python -c "CodeIntelQueryEngine(Path('.')).explore('budget_take', limit=3)"
+FileNotFoundError no code-intelligence index; run `dev map init`
+```
+
+`devcouncil_code_explore` and `devcouncil_code_affected_tests` therefore answered
+`codeintel_not_initialized` against a repository whose map was current. The store only
+reappears as a *side effect* of `load_code_graph`, which imports `code_graph.json` under a
+writer lease from tools an agent reads as read-only — so whether these tools worked
+depended on whether some unrelated Python graph surface had run first.
+
+**Measured, this repository (14,330 nodes / 74,061 edges), same query, CLI transport
+with no daemon** — the worst transport the kernel uses, since each call pays a process
+spawn:
+
+| Surface | Python cold | Python warm | Rust cold | Rust warm | Speedup (warm) |
+|---|---:|---:|---:|---:|---:|
+| `explore budget_take` | 2.054 s | 1.163–1.470 s | 0.437 s | 0.274–0.279 s | **4.4×** |
+| `affected budget_take` | 0.914 s | 0.902–0.918 s | 0.184 s | 0.124–0.129 s | **7.2×** |
+
+Peak RSS: Python 185.7 MB in-process; Rust 22.9 MB in-process plus a 151 MB subprocess.
+The wall-clock win is real; the memory win is not, on the subprocess transport.
+
+**Equivalence, not just speed.** `affected_tests('budget_take')` returns the *identical*
+11 test files from both engines — despite the stricter test-path predicate (Q5) — so the
+paths the new rule drops were genuinely not tests on this corpus.
+
+**Contract repairs shipped with the move** (`rust-port/DIVERGENCES.md` Q1–Q8): ranking
+before truncation with an index-wide total; a snippet that could not be read reported as
+unread rather than empty; per-direction edge counts that stay exact whatever the budget
+buys; a blast radius banded by distance with measured confidence and an explicit
+`walk_incomplete`; nearest-first affected tests with named unmatched targets.
+
+**Retired, and not replaced:** `CodeIntelQueryEngine.dead`'s `runtime_proven_live`
+suppression. Both dead-code surfaces (MCP `devcouncil_code_dead`, `dev graph dead`) had
+already moved to the kernel, so it had no production caller — but the kernel does not
+consult runtime observations, so a symbol a debug session proved live is still listed as a
+dead candidate. The observation *merge* survives: it moved to
+`CodeIntelService.load_with_runtime_observations`, which `run_cypher` reads.
+
+**Still Python, and out of scope here** — surveyed with `file:line` evidence and left
+alone because none has a kernel equivalent: MCP `devcouncil_graph_impact`, `route_map`,
+`shape_check`, `api_impact`, `pdg_query`, `explain`, `graph_cypher`; CLI `check`,
+`process`, `export`, `routes`, `shape-check`, `api-impact`, `explain`, `pdg`, `html`,
+`view`; and the two surfaces that load the graph without any graph command being typed —
+`execution/prompt_builder.py:573` (every task prompt build) and `knowledge/wiki.py:179`.
+`indexing/graph/build.py`'s `load_code_graph` and the Python cache therefore stay.
+
+## Dev Map hardening and performance pass (2026-09-05)
+
+Six workstreams on disjoint file partitions. Every fix below ships with a test that was run
+against the unmodified code and observed to fail; where a test already existed and encoded
+the defect, its expectation was corrected with the reason recorded at the assertion site
+rather than the test weakened.
+
+**Gates at the end of the pass:** `cargo test --workspace` **1,003 passed / 0 failed**
+(835 at the start); `cargo fmt --check` and `cargo clippy --workspace --all-targets -D warnings`
+clean; `go build`, `go vet`, `go test ./...` and `go test ./... -race` green across all
+7 packages; Python unit suite green.
+
+### Seam: `dev map` was running a 5.8x slower kernel, silently
+
+`find_engine_binary` ranked capable candidates by mtime. Any `cargo test` writes
+`rust-port/target/debug/devmap`, so every subsequent `dev map` selected the **unoptimized**
+build. Measured, interleaved, same store and same argv:
+
+| kernel `manifest` | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| `target/debug` | 6.25 s | 6.36 s | 6.82 s |
+| `target/release` | 0.54 s | 1.10 s | 1.79 s |
+
+A ~0.9 s `dev map` became 8.5 s for anyone who had run the suite.
+
+The docstring said age was a proxy for "built after the schema bump". The binary can be
+*asked* instead: `devmap --db <path with no store> status` reports
+`expected_schema_version`, exits 0, and creates nothing (verified). Selection is now
+**schema, then the optimized build, then age**, degrading to the previous newest-wins rule
+when no candidate can report a schema — preferring `release` on no evidence would resurrect
+the bug the age rule was added to fix. Selecting a debug kernel logs a warning naming the
+cost, once per selection.
+
+Two of the four new tests fail behaviourally against the pre-fix code, and the second red is
+its own finding: with the release build *newer*, the old rule chose it over a debug build
+carrying a **higher** schema. The proxy was wrong in both directions. Probe cost: 51.4 ms
+cold for 3 candidates, 0.4-0.6 ms memoised, against ~5.7 s saved. `dev map` end to end:
+8.48-19.24 s before, **2.28-2.85 s** after, at comparable machine load.
+
+### Extraction: embedded `<script>` blocks were a total blackout
+
+`LanguageSpec.embedded` was declared and read by nothing. A `.svelte` / `.vue` / `.astro` /
+`.liquid` file was parsed by its outer grammar only, and every one of those grammars hands
+the script body back as a single opaque leaf. Measured before, on all four: **1 symbol** (the
+`File` node), **0 imports**, **0 calls**, reported as `ParseOutcome::Clean` —
+indistinguishable from a file that genuinely declares nothing.
+
+`devmap-extract/src/embedded.rs` locates the regions, routes each to the language the
+registry permits, and shifts every span into the outer file's byte coordinates — verified by
+slicing the outer file with every emitted span, including after multi-byte text. 11 of 14 new
+tests fail against the pre-fix code.
+
+Measured on a real external Svelte project (GitPulse, 826 files): svelte **86 symbols -> 650**,
+**0 calls -> 1,611**, with correct qualified names (`src/App.svelte::loadCoverageViewer`).
+
+Vue additionally permits `tsx` (X38) because Vue's own compiler accepts
+`<script lang="tsx">`. Svelte and Astro deliberately do not get it: Svelte's template is not
+JSX and an Astro `<script>` is plain JS/TS.
+
+### Extraction: the TS/JS import arm read function bodies as binding lists
+
+The `"import_statement" | "export_statement"` arm found its bindings with `text.find('{')`
+over the *whole statement text*. For `export function helper(n) { if (n > 0) { return n; }
+return 0; }` that takes the function body's brace and the `if` block's close:
+
+    IMPORT module="" names=["if"]
+    IMPORT module="" names=["return", "n", "0);"]
+    IMPORT module="" names=["NAME"]        <- from a correct `export { NAME as ALIAS };`
+
+Neither `""` as a module nor `if` as an imported name is a value a valid program can produce,
+so every consumer joining on them gets an endpoint no resolver can bind — the SC26/SC32
+whole-expression shape, in the import emitter instead of the call emitter.
+
+Now read off the parse tree (`export_clause` / `named_imports` specifiers), with the import
+push gated on the statement actually naming a module. Six tests, four red against the pre-fix
+code. `each_grammar_extracts_its_exact_imports_and_exports` had **pinned the defect** — it
+expected `("", ["x"], ["x"], None)`. Expectation corrected with the reason at the assertion
+site, and its own guard strengthened: the loop already refused an empty binding *name* and
+was one field short of the class it was written for.
+
+### Extraction: six languages gained a call graph, two were declined
+
+`erlang`, `pascal`, `solidity`, `shell`, `sql` and `nix` had a linked grammar and no
+`calls.push` site, so `impact`, `trace`, dead-code and the PDG answered from an empty call
+graph with nothing separating "no callers" from "callers were never extracted" (SC34). Each
+now has a module under `langcalls/`, callers attributed through
+`langcalls::scope::enclosing_emitted_symbol`, and **orphaned call edges = 0**.
+
+Two were **declined, and pinned by tests that fail if someone adds them**:
+
+* `hcl` — Terraform/OpenTofu has no user-defined function syntax. All five `function_call`
+  nodes in a realistic `.tf` name built-ins, so no edge could ever resolve. The real graph
+  there is `local.x` / `var.y` / `module.m.out`, already emitted as references.
+* `cfml` — script-syntax `.cfc` parses to `(program (component_file (cf_component_content)))`
+  and `<cfscript>` to one opaque node. Script syntax is the dominant modern dialect, so
+  shipping this would claim coverage while seeing nothing in most real files.
+
+A stated "this language has no call graph, and here is why" is worth more than a fabricated
+one. Found in passing and fixed: `generic_symbol_kind` mapped tree-sitter-erlang's `module`
+node to `SymbolKind::Module`, but that node is the module *half* of `fun other:f/2`, so
+`t.erl` emitted a phantom `t.erl::other` declaration.
+
+### Resolution: four languages fell to `Generic` and produced a confident wrong edge
+
+`LangFamily::from_lang` had no arm for `svelte`/`vue`/`astro`/`liquid`. Harmless while they
+contributed zero calls; not harmless once embedded extraction landed. Measured against the
+real binary:
+`Widget.svelte::renderWidget --Calls 0.9--> Vault.sol::Vault.helperOnlyInSolidity` — a Svelte
+function bound to a Solidity contract method — while the same file's call to a real
+`helpers.ts` export produced **no edge at all**. Isolated A/B on this repository: **-9
+fabricated cross-family edges, +0 lost**. `LangFamily::admits` now makes `Generic` inert, so
+the class is closed structurally rather than by four string additions.
+
+### Storage, resolution and analysis: ten defects under adversarial load
+
+| attack | what broke | after |
+|---|---|---|
+| NaN confidence threshold | `callers_of` answered `Ok(Some(0))` — "nothing calls this", from a filter that never ran | all three siblings refuse |
+| 40k-name caller batch | `too many SQL variables`, naming neither caller nor limit | chunked at 512, **not capped** — a dropped name reads as "nothing depends on this" |
+| NUL byte in a search query | `unterminated string`: SQLite hands MATCH to FTS5 as a C string. The escape existed in **three drifted copies** | one `fts_match_query`, refuses NUL by name |
+| open a `user_version=2` store | the file was **mutated before being refused** — `enable_wal` ran ahead of `migrate` | `schema_is_migratable()` consulted before any write; file byte-identical after refusal |
+| 40k-segment `use crate::a::a::…` | **124.468 s** for one import in one file | 5.7 s for three prefixes |
+| 200k-deep PDG statement tree | **stack overflow, SIGABRT** — not an error a `Result` function may produce | refused by name at depth 256 |
+| 64-node walk over a 500k-edge graph | `adj` deep-cloned every edge *before* `max_nodes` was consulted | 661.7 -> 104.8 B/edge |
+| query plan of the SC8 cache fallback | `SCAN generation_files` — no index on the cache identity, and the cache is drained to 0 rows every build, so **every** file fell through the scan on **every** build | schema v12->v13; real binary, 8,001 files, no-op build **2.619 s -> 0.724 s** |
+
+Attacks that found nothing, with the tests kept: racing openers, a store replaced under an
+open handle, a writer `SIGKILL`ed mid-transaction, hostile identifiers round-tripping, a
+20k-deep `super::` chain, path traversal as a JS import, determinism across runs.
+
+Three places were fixed as a *shape* rather than an instance: `fts_match_query` replaced
+three drifted copies of the escape; `LangFamily::admits` replaced `*candidate_family ==
+family` in four places; `schema_is_migratable` became the single owner of "can this binary
+touch this store", consulted by both `open` and `migrate`.
+
+### Artifact: an interned encoding for `code_graph.json` (X39 / PLAN.md §3 `G6`)
+
+Measured by the Rust encoder on this repository (1,331 files):
+
+| | verbose | interned | |
+|---|---|---|---|
+| size | 21,186,034 B | 5,001,998 B | **-76.4%** |
+| `json.loads`, median of 5 | 85.2 ms | 46.2 ms | -46% |
+
+`source` + `target` alone were 52.6% of the verbose file: 14,324 distinct endpoint strings
+written 147,726 times. Opt-in via `devmap manifest --compact-graph-output`; the verbose
+artifact stays canonical and is written either way.
+
+Both encodings render from one `build_code_graph_value` traversal, so a dropped field is
+impossible by construction, and `decode_compact(encode_compact(v)) == v` is the test —
+red-demonstrated by making the encoder skip one column. A table whose rows are not uniformly
+shaped is carried through verbatim and named in `verbatim_tables` rather than interned
+against a spec taken from the first row.
+
+**It does not make the graph agent-readable.** 5.3M tokens to 1.25M is still unopenable. It
+buys bytes, parse time and disk churn; `devmap search` / `impact` / `trace` remain the way to
+read the graph. **No consumer reads it yet** — the intended first one is
+`backend/go_orchestrator/repomap`, whose benchmark shows `Load` is 88% JSON decode.
+
+### Provenance: one name, two counts
+
+`edge_endpoints_without_node` counts **edges** with a dangling endpoint — the contract
+`repomap.go` decodes into `OrphanEndpoints`, documented there correctly. The key's *name*
+reads as a count of endpoints, and on this repository the two differ by more than 2x: 360
+edges naming 167 distinct absent identities. Renaming would break the consumer that already
+reads it right, so `distinct_edge_endpoints_without_node` travels beside it. The ratio is the
+diagnostic: many distinct means files the index never read, few means one symbol the
+extractor failed on.
+
+### Go: ten defects at the artifact boundary
+
+`repomap.Load` did `os.ReadFile` with **no bound** — the only unbounded payload in a package
+that bounds all six others (67 MB transient for 0.6 MB retained on the real artifact).
+`DisagreementsWith(0, 0)` returned `nil`, "checked and agree", when **neither comparison
+ran**. Two bounds were off by one and discarded a *complete* answer (`room > len(p)` for a
+stream that exactly filled the cap). `Manifest` reported success when the producer exited 0
+having written an unparseable artifact. `AreaForPath` on an unindexed path rescanned every
+file per ancestor level: **29,968 -> 190 ns/op**.
+
+`go test ./... -race` now runs in CI. It is not a speculative gate: the concurrency work in
+this pass landed a data race in `Provenance()` that plain `go test` was green on, and the
+detector was the only thing that saw it. One test had to be desensitised first — a 150 ms
+probe timeout raced the OS's ability to fork `/bin/sh` under whole-module load, passing 10 of
+10 in isolation and failing when all seven packages ran at once.
+
+### Python: importing six exception classes loaded SQLAlchemy
+
+`devcouncil/app/errors.py` is six `class X(Exception): pass` and imports nothing — 163 us to
+execute. Importing it cost **304 ms** over a bare interpreter, because
+`devcouncil/app/__init__.py` eagerly reached `Orchestrator` -> `storage.db` -> SQLAlchemy and
+SQLModel: 284.8 ms of ORM an exception class has no use for. Now PEP 562 lazy: **304 ms ->
+4.5 ms**. The facade is kept rather than deleted — one static caller is weak evidence for
+deletion and none at all for reflective paths. `TYPE_CHECKING` preserves the names for mypy,
+which does not run `__getattr__`.
+
+### Tests: 39 assertions conflated stdout with stderr
+
+`json.loads(result.output)` appeared at 39 call sites across 14 files. Click's `result.output`
+is stdout **and** stderr combined, so each of those asserted "the `--json` surface emits JSON
+*and nothing logs a warning*" — and a warning wrongly written to **stdout** would have been
+indistinguishable from one correctly written to stderr. All 39 now read `result.stdout`,
+which is both narrower and stricter. Found because a new, correct warning broke two of them.
+
+### What was measured and deliberately not changed
+
+* **Ambiguous-edge sort** carries an O(candidates) tie-break (`format!("{:?}", …)` over the
+  whole candidate list): 4-5x for 2x candidates, 5.4% of a cold build. That comparator defines
+  the total order edge ordinals come from, and the last change to it was validated with an
+  edge-ordinal digest over 4,742 files. Bounded by a regression test instead.
+* **`extraction_json` is 60% of the store** (64.2 MB of 106 MB at one generation) and it is
+  **the only copy** — `extraction_cache` holds 0 rows after every build, so deleting it makes
+  every incremental build a full re-parse. Not redundancy; it *is* the cache.
+* **Store growth is bounded and flat**: 110.6 MB at one generation -> 222.0 MB, then dead flat
+  over 25 rounds (plateau spread 0.1%), ratio 2.01x = `GENERATION_RETENTION`. Freelist 0.0%
+  after every one of 25 builds.
+* **`dev map` and `devmap build` do not leak free pages.** A 306 MB / 33%-free store was
+  observed once during this session and **could not be reproduced**: 25 consecutive
+  `devmap build` rounds and 6 `dev map` cycles with real file churn both hold the freelist at
+  0. Recorded as observed-once, not as a defect.
+
+### Python: `dev <anything>` paid for all 72 commands
+
+`cli/main.py` eagerly imported ~50 command modules and registered 75 commands at import
+time, so `dev version` loaded the ORM, the MCP handlers and the graph adapters before
+printing a string. Registration is now deferred through a `TyperGroup` subclass that resolves
+a command the first time Click asks for it by name; `list_commands` still enumerates all 72,
+so `--help`, completion and `dev <typo>` suggestions are unchanged. `hook.py` and `map.py`
+additionally moved their `storage.db` / `CodeReviewGraphAdapter` imports to their call sites.
+
+Measured on this machine, same interpreter, minimum of three `-X importtime` runs:
+**392 ms -> 21 ms** for `import devcouncil.cli.main`. That baseline is conservative — it is
+HEAD's eager `main.py` measured against a tree that *already* has the lazy
+`app/__init__.py` facade, so the pre-pass figure was higher.
+
+`tests/unit/test_cli_lazy_commands.py` pins all three properties: the 72-command surface is
+compared name-by-name against a list captured before the change, the group resolves each
+command on demand, and `dev version` completes without `sqlalchemy` or `devcouncil.storage.db`
+entering `sys.modules`. The `dev hook` case is deliberately *not* asserted — `active_task_id`
+opens the database as its first act, so the ORM is genuinely required there.
+
+### `preview` built 1,836 rows to report one integer
+
+`ambiguous_callers` is "and M more the floor excluded". It came from
+`callers_of(&at_risk, path, 0.0)?.len()` — the same query the confident list had just run,
+re-run at floor 0.0, fully materialised into `StoredEdge` (six `String` allocations a row),
+and reduced to a `usize`. On this repository the busiest symbol has 918 callers against an
+average of 9 over 5,673 symbols, so previewing a file that declares a hot symbol built
+~1,836 rows and kept none.
+
+`Store::count_callers_of` issues `SELECT COUNT(*)` over the identical `WHERE` clause, with
+the same `checked_min_confidence` guard, the same `BTreeSet` de-duplication and the same
+`MAX_CALLER_BATCH` chunking. Because a count and a listing that drift are indistinguishable
+from a correct answer, the test pins them *against each other* rather than against a
+hand-computed number, across four floors and a name list larger than one chunk. Removing the
+`sp.path <> ?2` filter from the count alone makes it fail (40 vs 0), which is the drift it
+exists to catch.
+
+### The most frequent build reported no timings
+
+A no-source-change build is what a watcher does on almost every tick, and `--json` answered
+it with a hand-written format string: `{"unchanged":true,"files":…,"generation":…,
+"reclaim":…}`. No `timings` key of any kind — so the one build shape a profiler most wants
+to look at was the one it could not see, and "the warm path is fast" was an assertion nobody
+could check from the tool's own output. The branch is not free: it hashes every file in the
+tree to *prove* nothing changed, and it runs the reclaim decision. Both are already timed
+stages; only the reporting was missing. It now goes through `emit_json` with
+`progress.timings_json()`, like every other build result.
+
+### Still open
+
+* `traverse_graph` rebuilds its index per query. Inherent to being handed an unindexed slice;
+  removing it means caching an index across queries.
+* `devmap --version` reports `schema 13` while the artifact declares `schema_version: 2`. Two
+  different numbers called "schema" in one tool.
+* `repomap` and `devmap.Client` have **no production caller** in this repository — no `main`
+  package, and the only importer is a test.
+* Nothing reads the interned `code_graph` encoding yet.

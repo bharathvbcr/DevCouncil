@@ -131,24 +131,65 @@ func manifestDestinations(mapPath, graphPath string) []destination {
 // overwrite. Both are decisions made without evidence, and the difference
 // between them is which one destroys something.
 func (d destination) foreign() (bool, error) {
-	file, err := os.Open(d.path)
+	engine, wellFormed, present, err := d.scan()
 	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		return false, nil
 	case err != nil:
-		return false, d.unreadable(err)
+		return false, err
+	case !present:
+		return false, nil
+	case !wellFormed:
+		return true, nil
+	}
+	return engine != consumerMapEngine, nil
+}
+
+// scan opens the destination once and reads what this boundary needs to know
+// about it: which producer stamped it, whether the document parses to its end,
+// and whether there is a file there at all.
+//
+// It is one function rather than two because there are two questions asked of
+// these files — is this someone else's, and is this readable — and answering
+// them from separate reads would be two implementations of "what devmap-rust
+// considers a valid artifact" free to disagree about a file that changed
+// between them.
+func (d destination) scan() (engine string, wellFormed, present bool, err error) {
+	file, openErr := os.Open(d.path)
+	switch {
+	case errors.Is(openErr, fs.ErrNotExist):
+		return "", false, false, nil
+	case openErr != nil:
+		return "", false, false, d.unreadable(openErr)
 	}
 	defer file.Close()
 
 	source := &trackingReader{r: bufio.NewReaderSize(file, markerBuffer)}
-	engine, wellFormed := scanMarker(source, d.marker)
+	engine, wellFormed = scanMarker(source, d.marker)
 	if source.err != nil {
-		return false, d.unreadable(source.err)
+		return "", false, true, d.unreadable(source.err)
 	}
-	if !wellFormed {
-		return true, nil
+	return engine, wellFormed, true, nil
+}
+
+// readable reports that the file at this destination parses whole, for a
+// manifest checking what it just wrote.
+//
+// It asks nothing about the engine marker, and that omission is the design.
+// artifact.go's answer to a producer that renames itself is to preserve the
+// file and carry on — noisy and lossless — and a manifest that instead failed
+// on the marker would put back the permanent wedge this file exists to have
+// removed. What a run has to guarantee about its own output is that the output
+// is a document, not that it recognises the name inside it.
+func (d destination) readable() error {
+	_, wellFormed, present, err := d.scan()
+	switch {
+	case err != nil:
+		return err
+	case !present:
+		return fmt.Errorf("%s is not on disk", d.path)
+	case !wellFormed:
+		return fmt.Errorf("%s does not parse as a whole JSON document", d.path)
 	}
-	return engine != consumerMapEngine, nil
+	return nil
 }
 
 // unreadable is the one sentence for a check that could not run.

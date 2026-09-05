@@ -66,7 +66,7 @@ def test_cli_tasks_off_mode_shows_quality_blocked_task_as_effectively_done(
     result = runner.invoke(app, ["tasks", "--json"])
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["gates_mode"] == "off"
     assert payload["tasks"][0]["status"] == "done"
     assert payload["tasks"][0]["persisted_status"] == "blocked"

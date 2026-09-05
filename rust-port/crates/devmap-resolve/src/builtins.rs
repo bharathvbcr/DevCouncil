@@ -472,15 +472,30 @@ pub fn is_builtin(family: LangFamily, name: &str) -> bool {
         LangFamily::JsTs => JS_BUILTINS,
         LangFamily::Swift => SWIFT_BUILTINS,
         LangFamily::Kotlin => KOTLIN_BUILTINS,
-        // C/C++/C#/Java have no free-function builtins that reach the resolver
-        // this way, and `Generic` spans languages with no curated set at all.
         LangFamily::Ruby => RUBY_BUILTINS,
         LangFamily::Php => PHP_BUILTINS,
+        // C/C++/C#/Java have no free-function builtins that reach the resolver
+        // this way, and `Generic` spans languages with no curated set at all.
+        //
+        // The six added when embedded-script extraction landed
+        // (`Erlang`..`Sql`) are here for the honest reason rather than the
+        // convenient one: no curated builtin table has been written for them.
+        // Listing them explicitly rather than adding a `_` arm keeps this match
+        // exhaustive, so the next language forces the same decision instead of
+        // silently inheriting "no builtins" — which would classify every
+        // `length/1` or `echo` as a possible defect and bury the real ones,
+        // the exact signal loss SC18 closed.
         LangFamily::CStyle
         | LangFamily::Scala
         | LangFamily::Lua
         | LangFamily::R
         | LangFamily::Dart
+        | LangFamily::Erlang
+        | LangFamily::Nix
+        | LangFamily::Pascal
+        | LangFamily::Shell
+        | LangFamily::Solidity
+        | LangFamily::Sql
         | LangFamily::Generic => return false,
     };
     table.binary_search(&name).is_ok()

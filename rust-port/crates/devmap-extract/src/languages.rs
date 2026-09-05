@@ -298,7 +298,15 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         name: "Vue",
         grammar: "vue",
         extensions: &[".vue"],
-        embedded: &["typescript", "javascript", "css", "html"],
+        // `tsx` is Vue's alone among the four template languages here. Vue
+        // single-file components are routinely written with JSX render
+        // functions and its own compiler accepts `<script lang="tsx">`.
+        // Svelte's template is not JSX, and an Astro `<script>` is plain
+        // JS/TS — Astro components that use JSX are `.jsx`/`.tsx` files the
+        // registry already claims by extension. Permitting `tsx` there would
+        // parse a region under a grammar its framework never compiles it with.
+        // `jsx` needs no entry: tree-sitter-javascript parses JSX already.
+        embedded: &["typescript", "tsx", "javascript", "css", "html"],
         extractor_id: ExtractorId::Vue,
         lsp_id: "volar",
         viz_color: "#41b883",

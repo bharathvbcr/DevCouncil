@@ -155,3 +155,80 @@ fn history_reports_measured_builds_and_deltas_as_json() {
 
     fs::remove_dir_all(root).expect("remove fixture tree");
 }
+
+/// The most frequent build in the system had no phase profile at all.
+///
+/// A no-source-change build is what a watcher-driven repository does on almost
+/// every tick, and `--json` answered it with
+/// `{"unchanged":true,"files":…,"generation":…,"reclaim":…}` — no `timings` key
+/// of any kind. So the one build shape a profiler most wants to look at was the
+/// one it could not see, and "the warm path is fast" was an assertion nobody
+/// could check from the tool's own output.
+///
+/// It is not a free-standing key either: the branch already spends measurable
+/// time — it hashes every file in the tree to *prove* nothing changed, and it
+/// runs `persist:vacuum` — so the absence was a reporting gap, not an empty
+/// truth.
+#[test]
+fn an_unchanged_build_reports_its_own_timings() {
+    let root = temp_root();
+    let db = root.join("index.sqlite");
+    let build = || {
+        Command::new(env!("CARGO_BIN_EXE_devmap"))
+            .args(["--json", "--db"])
+            .arg(&db)
+            .arg("build")
+            .arg(&root)
+            .output()
+            .expect("run build")
+    };
+
+    let first = build();
+    assert!(first.status.success(), "first build must succeed");
+
+    let second = build();
+    assert!(second.status.success(), "second build must succeed");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&second.stdout).expect("--json must emit JSON");
+    assert_eq!(
+        payload["unchanged"],
+        serde_json::Value::Bool(true),
+        "the second build must take the unchanged path: {payload}"
+    );
+
+    let timings = payload
+        .get("timings")
+        .unwrap_or_else(|| panic!("an unchanged build must report timings: {payload}"));
+    let total = timings["total_seconds"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("total_seconds must be a number: {timings}"));
+    assert!(
+        total > 0.0,
+        "a build that hashed every file cannot have taken zero time: {timings}"
+    );
+    let stages = timings["stages"]
+        .as_array()
+        .unwrap_or_else(|| panic!("stages must be an array: {timings}"));
+    assert!(
+        !stages.is_empty(),
+        "the unchanged path runs discovery and a vacuum decision; both are stages: {timings}"
+    );
+    // The reclaim decision is the one stage a warm-path profiler is looking
+    // for — K5 was a reclaim that reported success without doing anything.
+    //
+    // Searched through `sub` as well as the top level, because that is where it
+    // legitimately lands: `persist:vacuum` is nested under the stage that ran
+    // it, exactly as the full build nests its own `persist:*` entries.
+    let names_vacuum = |stage: &serde_json::Value| {
+        stage["stage"].as_str() == Some("persist:vacuum")
+            || stage["sub"].as_array().is_some_and(|subs| {
+                subs.iter()
+                    .any(|entry| entry["stage"].as_str() == Some("persist:vacuum"))
+            })
+    };
+    assert!(
+        stages.iter().any(names_vacuum),
+        "the vacuum decision must be a timed stage: {timings}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

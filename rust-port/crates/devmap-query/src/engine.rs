@@ -1,8 +1,8 @@
 use devmap_analyze::clones::group_clones;
-use devmap_analyze::traversal::{traverse_graph, TraversalOptions};
+use devmap_analyze::traversal::{traverse_graph, TraversalOptions, TraversalStop};
 use devmap_extract::model::*;
 use devmap_resolve::model::*;
-use devmap_store::{Store, StoredEdge};
+use devmap_store::{Store, StoredEdge, StoredSymbol};
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -402,31 +402,28 @@ impl<'a> StoreQueryEngine<'a> {
         // abandoned traversal therefore cannot block the drain loop's writes
         // while it unwinds.
         let edges = self.resolved_edges(req.min_confidence)?;
+        self.traverse_over(&edges, req, reverse)
+    }
+
+    /// The traversal itself, over an edge set the caller already holds.
+    ///
+    /// Split out of [`Self::traverse`] because `explore` needs `2 * n + 1`
+    /// walks for one answer and every one of them used to re-read and re-convert
+    /// the whole generation's edge table — 71,195 rows on this repository. The
+    /// walk is unchanged; only the ownership of the edge load moved up, so a
+    /// composed query pays for it once. Every caller still gets exactly the
+    /// traversal `impact`/`trace` performs, including the `walk_incomplete`
+    /// reason, because there is only one implementation of it.
+    fn traverse_over(
+        &self,
+        edges: &[ResolvedEdge],
+        req: Request<String>,
+        reverse: bool,
+    ) -> anyhow::Result<Response<ResolvedEdge>> {
         let target = req.query.trim();
-        let start: Vec<String> = edges
-            .iter()
-            .filter(|edge| {
-                if reverse {
-                    crate::query_match::traversal_start_matches(
-                        target,
-                        &edge.target_symbol,
-                        &edge.target_file,
-                    )
-                } else {
-                    crate::query_match::traversal_start_matches(
-                        target,
-                        &edge.source_symbol,
-                        &edge.source_file,
-                    )
-                }
-            })
-            .map(|edge| {
-                if reverse {
-                    edge.target_symbol.clone()
-                } else {
-                    edge.source_symbol.clone()
-                }
-            })
+        let start: Vec<String> = traversal_starts(edges, target, reverse)
+            .into_iter()
+            .map(|(symbol, _)| symbol)
             .collect();
         if start.is_empty() {
             return Ok(unavailable_response(ResolutionAvailability::Unavailable {
@@ -439,10 +436,10 @@ impl<'a> StoreQueryEngine<'a> {
         // follow.
         self.cancel.check()?;
         let max_depth = req.max_depth.min(64);
-        let max_nodes = 5_000;
+        let max_nodes = TRAVERSAL_MAX_NODES;
         let walk = traverse_graph(
             &start,
-            &edges,
+            edges,
             &TraversalOptions {
                 max_depth,
                 max_nodes,
@@ -450,7 +447,7 @@ impl<'a> StoreQueryEngine<'a> {
             },
         );
         self.cancel.check()?;
-        let mut traversed = traversed_resolution_edges(&walk, &edges, req.min_confidence);
+        let mut traversed = traversed_resolution_edges(&walk, edges, req.min_confidence);
         traversed.sort_by(|a, b| {
             b.confidence
                 .0
@@ -459,13 +456,404 @@ impl<'a> StoreQueryEngine<'a> {
                 .then_with(|| a.target_file.cmp(&b.target_file))
                 .then_with(|| a.source_symbol.cmp(&b.source_symbol))
         });
-        let mut response = budget_take(traversed, req.token_budget, |_| 25);
+        let mut response = budget_take(traversed, req.token_budget, |_| EDGE_TOKENS);
         // The budgeter counts what it received. When the walk itself stopped
         // early, `total` is the size of a partial answer and `truncated: false`
         // is a claim the walk never earned — this is where `impact` said "here
         // is the blast radius" after visiting three levels of a deeper graph.
         response.walk_incomplete = walk.stop.reason(max_depth, max_nodes);
         Ok(response)
+    }
+
+    /// Definitions matching `query`, each with its source, both call-graph
+    /// directions, and one layered blast radius over all of them.
+    ///
+    /// Replaces the Python `CodeIntelQueryEngine.explore`, which loaded the
+    /// whole graph into process memory and walked it there. Three contract
+    /// repairs came with the move, all of them in the direction of not
+    /// overclaiming:
+    ///
+    /// * **Ranked before truncated (R7).** Python concatenated exact and
+    ///   partial name matches and sliced `[:limit]`, so which definitions
+    ///   survived depended on node order in the store rather than on relevance.
+    ///   Here the FTS hits are scored and sorted first, and the cut is the
+    ///   budgeter's.
+    /// * **A snippet that could not be read is not an empty snippet (Class A).**
+    ///   Python returned `""` for a file it could not open and `""` for a
+    ///   zero-length span. `source_unavailable_reason` separates them.
+    /// * **One edge load, not `2n + 1`.** See [`Self::traverse_over`].
+    ///
+    /// `limit` caps the definitions considered; the budget decides how many of
+    /// those are actually packed. Both are reported, and `definitions.total` is
+    /// the measured index-wide match count either way.
+    pub fn explore(
+        &self,
+        query: &str,
+        limit: usize,
+        token_budget: u32,
+        min_confidence: f32,
+        max_depth: usize,
+    ) -> anyhow::Result<ExploreReport> {
+        let budget = explore_budget(token_budget);
+        let empty = |reason: String| ExploreReport {
+            query: query.to_string(),
+            definitions: unavailable_response(ResolutionAvailability::Unavailable { reason }),
+            limit: u32::try_from(limit).unwrap_or(u32::MAX),
+            blast_radius: BlastRadius {
+                seeds: Vec::new(),
+                unmatched_targets: Vec::new(),
+                layers: budget_take(Vec::new(), budget.blast_radius, blast_layer_tokens),
+                total_impacted: 0,
+            },
+            budget,
+        };
+        if self.store.latest_generation_id()?.is_none() {
+            return Ok(empty("no persisted generation is available".to_string()));
+        }
+        if query.trim().is_empty() {
+            return Ok(empty("explore requires a non-empty query".to_string()));
+        }
+
+        // Rank first. `count_search_symbols` measures the whole index, so
+        // `total` below describes what matched rather than what fit.
+        let total = self.store.count_search_symbols(query)?;
+        let page = budget_page_size(budget.definitions).max(limit);
+        let rows = self.store.search_symbols(query, page)?;
+        let repo_root = self.store.latest_repo_root()?;
+        let lowered = query.to_lowercase();
+        // Rank the *rows*, then read files for the survivors only.
+        //
+        // Scoring needs `name` and `qualified_name`, both already in the row;
+        // `hit_from_stored` is what opens a file. Materialising first and
+        // cutting afterwards would open one file per candidate — 401 of them at
+        // the default budget — in order to keep `limit` of them, which is the
+        // amplification `search_semantic` was repaired for.
+        let mut scored: Vec<(f32, StoredSymbol)> = rows
+            .into_iter()
+            .map(|row| (name_match_score(&row, &lowered), row))
+            .collect();
+        scored.sort_by(|(left_score, left), (right_score, right)| {
+            right_score
+                .total_cmp(left_score)
+                .then_with(|| left.path.cmp(&right.path))
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| {
+                    (left.span_start, left.span_end).cmp(&(right.span_start, right.span_end))
+                })
+        });
+        scored.truncate(limit);
+        // `qualified_name` is carried out of the row before `hit_from_stored`
+        // consumes it: the hit keeps only the bare name, and a definition that
+        // reported no qualified name would be indistinguishable from one whose
+        // language has none.
+        let ranked: Vec<(String, SymbolHit)> = scored
+            .into_iter()
+            .map(|(score, row)| {
+                let qualified = row.qualified_name.clone();
+                (
+                    qualified,
+                    hit_from_stored(row, repo_root.as_deref(), budget.definitions, score),
+                )
+            })
+            .collect();
+
+        // Pack the definitions before any edge work: a definition the budget
+        // cannot admit must not cost two traversals.
+        let shells: Vec<ExploreDefinition> = ranked
+            .into_iter()
+            .map(|(qualified_name, hit)| ExploreDefinition {
+                // `file::name` — the identity every devmap traversal surface
+                // already resolves, and the one `graph_query` sends today.
+                id: node_id_of(&hit.file_path, &hit.symbol_name),
+                qualified_name,
+                symbol_name: hit.symbol_name,
+                file_path: hit.file_path,
+                kind: hit.kind,
+                language: None,
+                span: hit.span,
+                source: hit.source_span,
+                source_unavailable_reason: hit.source_unavailable_reason,
+                source_omitted_bytes: hit.source_span_omitted_bytes,
+                score: hit.score,
+                callers: budget_take(Vec::new(), 0, |_| EDGE_TOKENS),
+                callees: budget_take(Vec::new(), 0, |_| EDGE_TOKENS),
+            })
+            .collect();
+        let mut definitions = budget_take(shells, budget.definitions, explore_definition_tokens);
+        // `budget_take` counts the page it was handed; the index-wide count is
+        // the honest denominator, exactly as `search` reports it.
+        definitions.total = total.max(definitions.shown);
+        definitions.hidden = definitions.total.saturating_sub(definitions.shown);
+        definitions.truncated = definitions.hidden > 0;
+        // Looked up only for the definitions that survived the budget, and left
+        // `None` when the generation holds no row for the file — a definition
+        // whose language was never recorded must not be labelled with a guess.
+        for definition in &mut definitions.items {
+            definition.language = self
+                .store
+                .latest_file(&definition.file_path)?
+                .map(|file| file.language);
+        }
+
+        self.cancel.check()?;
+        let edges = self.resolved_edges(min_confidence)?;
+        let per_direction = edges_per_direction(&budget, definitions.shown);
+        let mut budget = budget;
+        budget.edges_per_direction = per_direction;
+        for definition in &mut definitions.items {
+            self.cancel.check()?;
+            definition.callers = self.traverse_over(
+                &edges,
+                Request {
+                    query: definition.id.clone(),
+                    token_budget: per_direction,
+                    min_confidence,
+                    max_depth: 1,
+                },
+                true,
+            )?;
+            definition.callees = self.traverse_over(
+                &edges,
+                Request {
+                    query: definition.id.clone(),
+                    token_budget: per_direction,
+                    min_confidence,
+                    max_depth: 1,
+                },
+                false,
+            )?;
+        }
+
+        let seeds: Vec<String> = definitions
+            .items
+            .iter()
+            .map(|definition| definition.id.clone())
+            .collect();
+        let blast_radius = self
+            .blast_walk(&edges, &seeds, max_depth, min_confidence)?
+            .into_radius(budget.blast_radius);
+        Ok(ExploreReport {
+            query: query.to_string(),
+            definitions,
+            limit: u32::try_from(limit).unwrap_or(u32::MAX),
+            blast_radius,
+            budget,
+        })
+    }
+
+    /// Test files reachable through the inbound blast radius of `targets`.
+    ///
+    /// Replaces the Python `CodeIntelQueryEngine.affected_tests`. Two things
+    /// changed with the move. Each test file carries the **distance** at which
+    /// the walk first reached it, and the list is ranked nearest-first before
+    /// truncation, so a budget-trimmed answer keeps the tests most likely to
+    /// break; Python sorted alphabetically and had no cap at all. And a target
+    /// that matched nothing is named in `blast_radius.unmatched_targets`
+    /// instead of silently contributing no seeds — a typo used to come back as
+    /// "no affected tests", which is the flattering reading of "we did not
+    /// look".
+    pub fn affected_tests(
+        &self,
+        targets: &[String],
+        token_budget: u32,
+        min_confidence: f32,
+        max_depth: usize,
+    ) -> anyhow::Result<AffectedTestsReport> {
+        let layer_budget = token_budget / 2;
+        let list_budget = token_budget.saturating_sub(layer_budget);
+        let empty_report = |reason: String| AffectedTestsReport {
+            targets: targets.to_vec(),
+            tests: unavailable_response(ResolutionAvailability::Unavailable { reason }),
+            blast_radius: BlastRadius {
+                seeds: Vec::new(),
+                unmatched_targets: targets.to_vec(),
+                layers: budget_take(Vec::new(), layer_budget, blast_layer_tokens),
+                total_impacted: 0,
+            },
+        };
+        if self.store.latest_generation_id()?.is_none() {
+            return Ok(empty_report(
+                "no persisted generation is available".to_string(),
+            ));
+        }
+        if targets.is_empty() {
+            return Ok(empty_report(
+                "affected_tests requires at least one target".to_string(),
+            ));
+        }
+        if targets.len() > MAX_NEIGHBOR_TARGETS {
+            anyhow::bail!(
+                "affected accepts at most {} targets, got {}",
+                MAX_NEIGHBOR_TARGETS,
+                targets.len()
+            );
+        }
+
+        let edges = self.resolved_edges(min_confidence)?;
+        let walk = self.blast_walk(&edges, targets, max_depth, min_confidence)?;
+
+        // Derived from the *complete* walk, never from the budgeted layers.
+        // Reading the presentation back would drop every test whose band the
+        // token budget trimmed, and the shortfall would be invisible: the test
+        // list's own counters would report a complete answer over a set that
+        // had already been cut. The bands are also sampled for display at
+        // `BLAST_LAYER_NODE_SAMPLE`, which would hide the 51st caller in a band
+        // for the same reason.
+        //
+        // Depth 0 is the seed band: a target that is itself in a test file
+        // counts as an affected test.
+        let mut nearest: BTreeMap<String, (usize, BTreeSet<String>)> = BTreeMap::new();
+        for (symbol, file) in &walk.seeds {
+            record_test_hit(&mut nearest, symbol, file, 0);
+        }
+        for band in &walk.bands {
+            for (symbol, file) in &band.members {
+                record_test_hit(&mut nearest, symbol, file, band.depth);
+            }
+        }
+
+        let mut tests: Vec<AffectedTest> = nearest
+            .into_iter()
+            .map(|(path, (depth, symbols))| AffectedTest {
+                path,
+                depth,
+                reached_symbols: u32::try_from(symbols.len()).unwrap_or(u32::MAX),
+                symbols: symbols.into_iter().take(AFFECTED_SYMBOL_SAMPLE).collect(),
+            })
+            .collect();
+        // Nearest first, then alphabetically — ranked before the budgeter cuts.
+        tests.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.path.cmp(&b.path)));
+        let mut response = budget_take(tests, list_budget, affected_test_tokens);
+        // A test list derived from a walk that stopped early is a lower bound,
+        // and the counters above cannot say so — they describe the budget.
+        response.walk_incomplete = walk.incomplete_reason();
+        Ok(AffectedTestsReport {
+            targets: targets.to_vec(),
+            tests: response,
+            blast_radius: walk.into_radius(layer_budget),
+        })
+    }
+
+    /// Inbound reachability from `targets`, banded by distance.
+    ///
+    /// [`traverse_graph`] answers *what* is reachable and [`Response`] carries
+    /// how much of that fit; neither carries *how far*, and `TraversalResult`
+    /// does not expose per-node depth. So the banding is done here, over the
+    /// same edge set, under the same `max_nodes` bound, and it reports the same
+    /// kind of incompleteness reason — a blast radius that stopped at the cap
+    /// must not read like one that ran out of graph.
+    ///
+    /// Returns the **complete** walk. Sampling and token budgeting happen in
+    /// [`BlastWalk::into_radius`], at the presentation boundary, so anything
+    /// derived from the walk — the affected-test list — sees everything the
+    /// walk reached rather than what a budget left of it.
+    fn blast_walk(
+        &self,
+        edges: &[ResolvedEdge],
+        targets: &[String],
+        max_depth: usize,
+        min_confidence: f32,
+    ) -> anyhow::Result<BlastWalk> {
+        let depth_cap = max_depth.clamp(1, 64);
+        let mut seed_set: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut unmatched: Vec<String> = Vec::new();
+        for target in targets {
+            let matched = traversal_starts(edges, target.trim(), true);
+            if matched.is_empty() {
+                unmatched.push(target.clone());
+                continue;
+            }
+            seed_set.extend(matched);
+        }
+        let seeds: Vec<(String, String)> = seed_set.into_iter().collect();
+        let mut walk = BlastWalk {
+            seeds,
+            unmatched,
+            bands: Vec::new(),
+            total_impacted: 0,
+            stop: TraversalStop::default(),
+            depth_cap,
+            unresolved_seeds: false,
+        };
+        if walk.seeds.is_empty() {
+            walk.unresolved_seeds = true;
+            return Ok(walk);
+        }
+
+        let mut inbound: BTreeMap<&str, Vec<&ResolvedEdge>> = BTreeMap::new();
+        for (index, edge) in edges.iter().enumerate() {
+            self.cancel.check_every(index)?;
+            if edge.confidence.0 < min_confidence {
+                continue;
+            }
+            inbound.entry(&edge.target_symbol).or_default().push(edge);
+        }
+
+        let mut visited: BTreeSet<String> = walk
+            .seeds
+            .iter()
+            .map(|(symbol, _)| symbol.clone())
+            .collect();
+        let mut frontier: Vec<String> = visited.iter().cloned().collect();
+        for depth in 1..=depth_cap {
+            self.cancel.check()?;
+            let mut members: BTreeSet<(String, String)> = BTreeSet::new();
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            let mut lowest: Option<f32> = None;
+            for node in &frontier {
+                for edge in inbound.get(node.as_str()).into_iter().flatten() {
+                    if visited.contains(edge.source_symbol.as_str())
+                        || seen.contains(edge.source_symbol.as_str())
+                    {
+                        continue;
+                    }
+                    // The cap is a *withholding*, recorded as one. A radius
+                    // that stopped at 5,000 nodes must not be readable as one
+                    // that ran out of graph.
+                    if visited.len() + seen.len() >= TRAVERSAL_MAX_NODES {
+                        walk.stop.node_capped = true;
+                        continue;
+                    }
+                    seen.insert(edge.source_symbol.clone());
+                    // The file comes from the edge that actually reached this
+                    // node, not from a global symbol-to-file guess: the same
+                    // qualified name can appear in two files, and attributing a
+                    // reached symbol to the wrong one puts the wrong test in
+                    // the answer.
+                    members.insert((edge.source_symbol.clone(), edge.source_file.clone()));
+                    lowest = Some(match lowest {
+                        Some(current) => current.min(edge.confidence.0),
+                        None => edge.confidence.0,
+                    });
+                }
+            }
+            if seen.is_empty() {
+                break;
+            }
+            walk.total_impacted = walk
+                .total_impacted
+                .saturating_add(u32::try_from(seen.len()).unwrap_or(u32::MAX));
+            walk.bands.push(BlastBand {
+                depth,
+                members,
+                lowest_confidence: lowest,
+                node_count: u32::try_from(seen.len()).unwrap_or(u32::MAX),
+            });
+            visited.extend(seen.iter().cloned());
+            frontier = seen.into_iter().collect();
+            if depth == depth_cap {
+                // Something was still expanding when the depth bound stopped
+                // it. Left unsaid, a capped radius reads as a complete one.
+                walk.stop.depth_capped = frontier.iter().any(|node| {
+                    inbound
+                        .get(node.as_str())
+                        .into_iter()
+                        .flatten()
+                        .any(|edge| !visited.contains(edge.source_symbol.as_str()))
+                });
+            }
+        }
+        Ok(walk)
     }
 
     /// Symbols the latest generation found nothing calling.
@@ -915,10 +1303,13 @@ impl<'a> StoreQueryEngine<'a> {
         // no confident callers and 900 ambiguous ones is not the same situation
         // as one nothing references, and the difference decides whether a
         // reader should go and look.
+        // Counted, not built. This asked for every caller edge at floor 0.0 —
+        // six `String` allocations per row — solely to take `.len()`. On this
+        // repository the busiest symbol has 918 callers, so previewing a file
+        // that declares one materialised ~1,836 rows and kept none of them.
         let ambiguous_callers = self
             .store
-            .callers_of(&at_risk, path, 0.0)?
-            .len()
+            .count_callers_of(&at_risk, path, 0.0)?
             .saturating_sub(callers.len());
 
         let degraded_reason = match &candidate.parse_outcome {
@@ -2038,6 +2429,283 @@ fn traversed_resolution_edges(
         .collect()
 }
 
+/// Ceiling on nodes any one walk in this engine may visit.
+///
+/// Named because three surfaces now share it — `impact`, `trace` and the blast
+/// radius — and a second literal would let one of them cap somewhere else while
+/// reporting the first number in its `walk_incomplete` sentence.
+const TRAVERSAL_MAX_NODES: usize = 5_000;
+
+/// Token cost the budgeter charges for one graph edge, everywhere.
+const EDGE_TOKENS: u32 = 25;
+
+/// Node ids listed per blast-radius band. The band's exact size travels in
+/// `node_count` regardless, so this trims the listing, never the count.
+const BLAST_LAYER_NODE_SAMPLE: usize = 50;
+
+/// Reached symbols listed per affected test file; `reached_symbols` stays exact.
+const AFFECTED_SYMBOL_SAMPLE: usize = 8;
+
+/// Fixed per-definition cost in `explore`'s packer: identity, kind, span, score
+/// and the two edge-response envelopes, before any source text.
+const EXPLORE_DEFINITION_OVERHEAD_TOKENS: u32 = 40;
+
+/// The `file::symbol` identity every traversal surface resolves.
+fn node_id_of(file_path: &str, symbol_name: &str) -> String {
+    if file_path.is_empty() {
+        return symbol_name.to_string();
+    }
+    if symbol_name.is_empty() {
+        return file_path.to_string();
+    }
+    format!("{file_path}::{symbol_name}")
+}
+
+/// Nodes a walk from `target` would start at, in the given direction.
+///
+/// Lifted out of `traverse` so the blast radius resolves its seeds through the
+/// same matcher the traversal does. Resolving them two ways is how a radius
+/// ends up seeded from a symbol the trace never visits.
+fn traversal_starts(edges: &[ResolvedEdge], target: &str, reverse: bool) -> Vec<(String, String)> {
+    edges
+        .iter()
+        .filter(|edge| {
+            if reverse {
+                crate::query_match::traversal_start_matches(
+                    target,
+                    &edge.target_symbol,
+                    &edge.target_file,
+                )
+            } else {
+                crate::query_match::traversal_start_matches(
+                    target,
+                    &edge.source_symbol,
+                    &edge.source_file,
+                )
+            }
+        })
+        .map(|edge| {
+            if reverse {
+                (edge.target_symbol.clone(), edge.target_file.clone())
+            } else {
+                (edge.source_symbol.clone(), edge.source_file.clone())
+            }
+        })
+        .collect()
+}
+
+/// One distance band of a [`BlastWalk`], before sampling or budgeting.
+///
+/// `members` pairs each reached symbol with the file the reaching edge named,
+/// so a derived answer never has to guess which file a qualified name lives in.
+struct BlastBand {
+    depth: usize,
+    members: BTreeSet<(String, String)>,
+    lowest_confidence: Option<f32>,
+    node_count: u32,
+}
+
+/// The complete result of an inbound walk: every band, unsampled, unbudgeted.
+///
+/// Separated from [`BlastRadius`] because two consumers want different things
+/// from it. `affected_tests` needs everything the walk reached — deriving its
+/// answer from a trimmed list would drop tests without any counter saying so.
+/// `explore` needs something that fits a token budget. Presentation is
+/// [`Self::into_radius`]; derivation reads the bands directly.
+struct BlastWalk {
+    seeds: Vec<(String, String)>,
+    unmatched: Vec<String>,
+    bands: Vec<BlastBand>,
+    total_impacted: u32,
+    stop: TraversalStop,
+    depth_cap: usize,
+    /// True when no target resolved to a traversal start at all — an answer of
+    /// "nothing is impacted" that nothing actually looked for.
+    unresolved_seeds: bool,
+}
+
+impl BlastWalk {
+    /// Why the walk is a lower bound, or `None` when it ran to completion.
+    fn incomplete_reason(&self) -> Option<String> {
+        self.stop.reason(self.depth_cap, TRAVERSAL_MAX_NODES)
+    }
+
+    /// Sample each band and pack the bands into `token_budget`.
+    ///
+    /// The two trims are reported separately and neither touches a count:
+    /// `nodes_omitted` per band, `hidden`/`truncated` for the band list.
+    fn into_radius(self, token_budget: u32) -> BlastRadius {
+        let incomplete = self.incomplete_reason();
+        let layers: Vec<BlastLayer> = self
+            .bands
+            .into_iter()
+            .map(|band| {
+                let nodes: Vec<String> = band
+                    .members
+                    .iter()
+                    .take(BLAST_LAYER_NODE_SAMPLE)
+                    .map(|(symbol, _)| symbol.clone())
+                    .collect();
+                BlastLayer {
+                    depth: band.depth,
+                    nodes_omitted: band
+                        .node_count
+                        .saturating_sub(u32::try_from(nodes.len()).unwrap_or(u32::MAX)),
+                    nodes,
+                    node_count: band.node_count,
+                    lowest_confidence: band.lowest_confidence,
+                }
+            })
+            .collect();
+        let mut response = budget_take(layers, token_budget, blast_layer_tokens);
+        if self.unresolved_seeds {
+            response.resolution = ResolutionAvailability::Unavailable {
+                reason: "no target matched an indexed traversal start".to_string(),
+            };
+        }
+        response.walk_incomplete = incomplete;
+        BlastRadius {
+            seeds: self.seeds.into_iter().map(|(symbol, _)| symbol).collect(),
+            unmatched_targets: self.unmatched,
+            layers: response,
+            total_impacted: self.total_impacted,
+        }
+    }
+}
+
+/// Divide one caller-supplied budget across `explore`'s four parts.
+///
+/// Halves and quarters, computed before any work, so the split is deterministic
+/// and reportable. `edges_per_direction` is filled in later — it cannot be
+/// known until the packer has decided how many definitions there are to divide
+/// the edge pool between.
+fn explore_budget(total: u32) -> ExploreBudget {
+    let definitions = total / 2;
+    let blast_radius = total / 4;
+    ExploreBudget {
+        total,
+        definitions,
+        edges_per_direction: 0,
+        blast_radius,
+    }
+}
+
+/// Split the edge pool evenly across every direction of every definition shown.
+///
+/// Deliberately not floored at one edge's worth: a floor would let a large
+/// answer exceed the budget the caller set, and `DevMapClient._budgeted` treats
+/// the budget as a hard contract. A direction that gets nothing still reports
+/// `total` — "0 shown of 42 callers" is a complete answer to "how many", which
+/// is the question the count exists for.
+fn edges_per_direction(budget: &ExploreBudget, shown: u32) -> u32 {
+    let pool = budget
+        .total
+        .saturating_sub(budget.definitions)
+        .saturating_sub(budget.blast_radius);
+    let directions = shown.saturating_mul(2);
+    if directions == 0 {
+        return 0;
+    }
+    pool / directions
+}
+
+/// Token cost of one packed definition: its source span plus a fixed overhead,
+/// charged at the same [`BYTES_PER_TOKEN`] every other surface uses.
+fn explore_definition_tokens(definition: &ExploreDefinition) -> u32 {
+    u32::try_from(definition.source.len() / BYTES_PER_TOKEN as usize)
+        .unwrap_or(u32::MAX)
+        .saturating_add(EXPLORE_DEFINITION_OVERHEAD_TOKENS)
+}
+
+/// Token cost of one blast-radius band: its listed node ids plus a small header.
+fn blast_layer_tokens(layer: &BlastLayer) -> u32 {
+    let bytes: usize = layer.nodes.iter().map(|node| node.len() + 1).sum();
+    u32::try_from(bytes / BYTES_PER_TOKEN as usize)
+        .unwrap_or(u32::MAX)
+        .saturating_add(10)
+}
+
+/// Token cost of one affected-test row: path, listed symbols, and a header.
+fn affected_test_tokens(test: &AffectedTest) -> u32 {
+    let bytes: usize = test.path.len()
+        + test
+            .symbols
+            .iter()
+            .map(|symbol| symbol.len() + 1)
+            .sum::<usize>();
+    u32::try_from(bytes / BYTES_PER_TOKEN as usize)
+        .unwrap_or(u32::MAX)
+        .saturating_add(10)
+}
+
+/// Whether `path` names a test file.
+///
+/// Deliberately stricter than the Python predicate it replaces, which asked
+/// `"/test" in "/" + path` and so counted `src/testing_utils.py`,
+/// `lib/latest/mod.rs` and any path containing the substring anywhere as tests.
+/// Here a directory must be *exactly* a test directory, and a file must carry a
+/// recognised test affix. Recorded in `DIVERGENCES.md`: the affected-test list
+/// gets shorter and the entries that leave were never tests.
+pub fn is_test_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let Some((directories, file_name)) = normalized.rsplit_once('/') else {
+        return is_test_file_name(&normalized);
+    };
+    let in_test_directory = directories.split('/').any(|segment| {
+        matches!(
+            segment.to_lowercase().as_str(),
+            "test" | "tests" | "spec" | "specs" | "__tests__" | "testing" | "e2e"
+        )
+    });
+    in_test_directory || is_test_file_name(file_name)
+}
+
+/// Whether a bare file name carries a test affix.
+///
+/// Affixes only, never bare substrings, and the boundary is the point: `test`
+/// as a suffix of a *word* (`contest`, `attestation`, `latest`) is not a test
+/// affix, and `testing_utils.py` is not `test_utils.py`. The camel-case arm
+/// reads the original casing, so `FooTest.java` is recognised while `contest`
+/// is not — which is why the name is not lower-cased wholesale first.
+fn is_test_file_name(file_name: &str) -> bool {
+    let lowered = file_name.to_lowercase();
+    let stem = file_name.split('.').next().unwrap_or(file_name);
+    let lowered_stem = lowered.split('.').next().unwrap_or(&lowered);
+    lowered.starts_with("test_")
+        || lowered.starts_with("spec_")
+        || lowered.contains(".test.")
+        || lowered.contains(".spec.")
+        || lowered.contains("_test.")
+        || lowered.contains("_spec.")
+        || lowered.contains("-test.")
+        || lowered.contains("-spec.")
+        || matches!(lowered_stem, "test" | "tests" | "spec" | "specs")
+        || stem.ends_with("Test")
+        || stem.ends_with("Tests")
+        || stem.ends_with("Spec")
+        || stem.ends_with("Specs")
+}
+
+/// Fold one reached symbol into the nearest-test table.
+///
+/// A free function rather than a closure so the table can be read back in the
+/// same scope it is built in.
+fn record_test_hit(
+    nearest: &mut BTreeMap<String, (usize, BTreeSet<String>)>,
+    symbol: &str,
+    file: &str,
+    depth: usize,
+) {
+    if !is_test_path(file) {
+        return;
+    }
+    let entry = nearest
+        .entry(file.to_string())
+        .or_insert((depth, BTreeSet::new()));
+    entry.0 = entry.0.min(depth);
+    entry.1.insert(symbol.to_string());
+}
+
 fn unavailable_response<T>(resolution: ResolutionAvailability) -> Response<T> {
     Response {
         items: Vec::new(),
@@ -2173,10 +2841,12 @@ fn dead_symbol_coverage_gap(
 
 /// Rank of one stored symbol against an already-lowercased query.
 ///
-/// The single owner of keyword search's ordering. It runs on the stored row
-/// rather than on a built [`SymbolHit`] precisely so that ranking can happen
-/// before the file reads do — which is what lets the candidate pool be wider
-/// than the answer without costing the caller anything.
+/// The single owner of the ordering, for `search` and for `explore` alike: two
+/// copies would let the same query return a different "best match" depending on
+/// which command asked. It runs on the stored row rather than on a built
+/// [`SymbolHit`] precisely so that ranking can happen before the file reads do
+/// — which is what lets the candidate pool be wider than the answer without
+/// costing the caller anything.
 fn name_match_score(row: &devmap_store::StoredSymbol, query_lower: &str) -> f32 {
     let name = row.name.to_lowercase();
     if name == query_lower || row.qualified_name.to_lowercase() == query_lower {
@@ -2756,6 +3426,58 @@ mod tests {
     /// Semantic search must not read the whole corpus to answer with a page of
     /// it.
     ///
+    /// `explore` opens one file per definition it returns, not per candidate.
+    ///
+    /// The candidate pool is `budget_page_size(definition_budget)` rows — 100
+    /// at the default 8,000-token budget — and a `SymbolHit` is what reads a
+    /// file. Materialising the pool and cutting it to `limit` afterwards would
+    /// open a hundred files to keep three, which is the amplification
+    /// `search_semantic` was repaired for. The ranking runs on the stored rows,
+    /// which already carry both names it scores.
+    #[test]
+    fn explore_reads_one_file_per_definition_it_returns_not_per_candidate() {
+        use devmap_analyze::analyze;
+        use devmap_store::Store;
+
+        const SYMBOLS: usize = 200;
+        const LIMIT: usize = 3;
+
+        let mut source = String::new();
+        for index in 0..SYMBOLS {
+            source.push_str(&format!("def widget_{index:04}():\n    return {index}\n"));
+        }
+        let ext = extract_file("things.py", &source);
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(std::slice::from_ref(&ext));
+        let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+        let analysis = analyze(std::slice::from_ref(&ext), &resolution);
+        let store = Store::open_in_memory().unwrap();
+        store
+            .save_generation(std::slice::from_ref(&ext), &resolution, &analysis)
+            .unwrap();
+
+        SOURCE_SPAN_READS.with(|reads| reads.set(0));
+        let report = StoreQueryEngine::new(&store)
+            .explore("widget", LIMIT, 8_000, 0.0, 1)
+            .expect("explore");
+        let reads = SOURCE_SPAN_READS.with(|reads| reads.get());
+
+        assert_eq!(
+            report.definitions.total, SYMBOLS as u32,
+            "every match must still be counted in `total`"
+        );
+        assert!(
+            report.definitions.shown <= LIMIT as u32,
+            "the limit must bound what is returned, got {}",
+            report.definitions.shown
+        );
+        assert!(
+            reads <= LIMIT,
+            "explore opened {reads} files to return {} definitions",
+            report.definitions.shown
+        );
+    }
+
     /// Every scored symbol was materialised into a `SymbolHit` — one
     /// `read_to_string` each — and only then handed to the budget, so a query
     /// matching a common term opened every file it matched in order to throw

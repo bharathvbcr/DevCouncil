@@ -1,7 +1,9 @@
 import json
 import logging
+import sys
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
@@ -13,12 +15,34 @@ from devcouncil.indexing.map_artifacts import (
     write_agent_guides,
 )
 from devcouncil.indexing.repo_mapper import RepoMap, RepoMapper
-from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
-from devcouncil.storage.db import get_db
 from devcouncil.utils.json_persist import dump_json
+
+if TYPE_CHECKING:  # pragma: no cover - resolved by `__getattr__` at runtime.
+    from devcouncil.integrations.code_review_graph import CodeReviewGraphAdapter
 
 # Back-compat aliases for tests / external importers.
 _write_agent_guides = write_agent_guides
+
+
+def __getattr__(name: str) -> object:
+    """Resolve `CodeReviewGraphAdapter` on first access, not at import.
+
+    `devcouncil.integrations.code_review_graph` costs 62 ms to import and is
+    reached by exactly one subcommand out of this module's many, so paying for
+    it on every `dev map` is waste. A function-local import would also have
+    avoided that, but it would have *removed* the attribute: this name is the
+    seam four tests substitute to drive `dev graph-context`'s output branches,
+    and a seam that silently stops being one is worse than the import cost.
+    PEP 562 keeps it a real, patchable module attribute that costs nothing
+    until something asks for it.
+    """
+    if name == "CodeReviewGraphAdapter":
+        from devcouncil.integrations.code_review_graph import (
+            CodeReviewGraphAdapter as adapter,
+        )
+
+        return adapter
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 app = typer.Typer(
     help=(
@@ -193,6 +217,12 @@ def map_repo(
     from devcouncil.cli.commands.init import initialize_project
 
     initialize_project(root, quiet=True, with_map=False)
+    # Imported at the point of use. Commands are built lazily
+    # (`cli/main.py`), so a module-scope import here is paid by every
+    # `dev map` — and `storage.db` pulls SQLAlchemy and SQLModel, ~85 ms
+    # measured, for one existence check.
+    from devcouncil.storage.db import get_db
+
     if not get_db(root):
         raise typer.Exit(code=1)
 
@@ -442,7 +472,11 @@ def graph_context_cmd(
 ) -> None:
     """Return code-review-graph context for the given files."""
     root = project_root.expanduser().resolve()
-    context = CodeReviewGraphAdapter(root).get_context(files)
+    # Read through the module object so `__getattr__` above runs and so a
+    # substituted attribute is the one used. A `from … import` here would bind
+    # the real class regardless of what a caller patched.
+    adapter = sys.modules[__name__].CodeReviewGraphAdapter
+    context = adapter(root).get_context(files)
     if json_output:
         typer.echo(context.model_dump_json(indent=2))
         return

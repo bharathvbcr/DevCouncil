@@ -1,0 +1,115 @@
+{
+  "binary": {
+    "mtime": "2026-09-05T11:24:53.475001+00:00",
+    "path": "/Users/bharath/Code/devtools/DevCouncil/.claude/worktrees/dev-map-hardening-4a1062/rust-port/target/release/devmap",
+    "size_bytes": 71216480,
+    "version": "devmap 0.1.0 (schema 13)"
+  },
+  "corpus": {
+    "code_bytes": 42900228,
+    "code_files": 1030,
+    "tracked_files": 1366
+  },
+  "corpus_kind": "repository",
+  "generated_at": "2026-09-05T13:26:17+00:00",
+  "label": "post-hardening-2026-09-05",
+  "python": "3.12.13",
+  "repeat": 5,
+  "repo": "/Users/bharath/Code/devtools/DevCouncil/.claude/worktrees/dev-map-hardening-4a1062",
+  "stages": {
+    "cold": {
+      "max_s": 5.525291416000073,
+      "mean_s": 3.4645681416001026,
+      "median_s": 3.3193380000002435,
+      "min_s": 2.5201863339998454,
+      "rel_spread": 1.192413847126437,
+      "rss_bytes": 581959680.0,
+      "samples": 5,
+      "stdev_s": 1.2196920454790863
+    },
+    "dead": {
+      "max_s": 0.011031959000320057,
+      "mean_s": 0.010502166800142732,
+      "median_s": 0.010410249999949883,
+      "min_s": 0.010206084000856208,
+      "rel_spread": 0.0809198708725663,
+      "rss_bytes": 14385152.0,
+      "samples": 5,
+      "stdev_s": 0.0003450188450643738
+    },
+    "e2e": {
+      "max_s": 1.3787685830002374,
+      "mean_s": 1.2749495332000151,
+      "median_s": 1.246872749999966,
+      "min_s": 1.2194149580000158,
+      "rel_spread": 0.13068039222807334,
+      "samples": 5,
+      "stdev_s": 0.0651240463759022
+    },
+    "impact": {
+      "argument": "rust-port/crates/devmap-analyze/src/pdg.rs::PdgBuilder.new",
+      "max_s": 0.13021037499947852,
+      "mean_s": 0.12222764159996587,
+      "median_s": 0.11952679200021521,
+      "min_s": 0.11776525000004767,
+      "rel_spread": 0.10567739634082046,
+      "rss_bytes": 124583936.0,
+      "samples": 5,
+      "stdev_s": 0.005065550800320814
+    },
+    "manifest": {
+      "graph_bytes": 21614004.0,
+      "map_bytes": 319798.0,
+      "max_s": 0.7965941669999665,
+      "mean_s": 0.5392950665998797,
+      "median_s": 0.4742774999995163,
+      "min_s": 0.43468729100004566,
+      "rel_spread": 0.8325683393395619,
+      "samples": 5,
+      "stdev_s": 0.14742171063107024
+    },
+    "path": {
+      "argument": "rust-port/crates/devmap-analyze/src/pdg.rs::build_function_pdg rust-port/crates/devmap-analyze/src/pdg.rs::PdgBuilder.new",
+      "max_s": 0.1092747499997131,
+      "mean_s": 0.10462193319981453,
+      "median_s": 0.1039295000000493,
+      "min_s": 0.10194837499966525,
+      "rel_spread": 0.07186357801261573,
+      "rss_bytes": 122273792.0,
+      "samples": 5,
+      "stdev_s": 0.002763423494816924
+    },
+    "search": {
+      "argument": "__init__",
+      "max_s": 0.010988666999764973,
+      "mean_s": 0.010539383399918733,
+      "median_s": 0.010393000000476604,
+      "min_s": 0.010210749999714608,
+      "rel_spread": 0.07618607840482906,
+      "rss_bytes": 13205504.0,
+      "samples": 5,
+      "stdev_s": 0.000366584367847053
+    },
+    "touch": {
+      "max_s": 2.06817695799964,
+      "mean_s": 1.829105408200121,
+      "median_s": 1.8493547910002235,
+      "min_s": 1.395773041999746,
+      "rel_spread": 0.4817430167848278,
+      "rss_bytes": 456949760.0,
+      "samples": 5,
+      "stdev_s": 0.26311297682647605
+    },
+    "warm": {
+      "max_s": 0.25056962500002555,
+      "mean_s": 0.24135590019996017,
+      "median_s": 0.2397469170000477,
+      "min_s": 0.23607691699999123,
+      "rel_spread": 0.06138977153804014,
+      "rss_bytes": 152993792.0,
+      "samples": 5,
+      "stdev_s": 0.005475488290960886
+    }
+  },
+  "synthetic_files": 0
+}

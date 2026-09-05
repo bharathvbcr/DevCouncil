@@ -2231,8 +2231,44 @@ fn s8_the_schema_gate_refuses_a_store_missing_a_column_its_writers_require() {
 
         {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch("DROP INDEX IF EXISTS idx_generation_unresolved_class")
-                .unwrap();
+            // SQLite refuses `DROP COLUMN` while any index references the
+            // column, so the fixture has to clear them first. Derived from
+            // `sqlite_master` rather than named: this used to drop one index by
+            // name, and the next migration to add an index over one of these
+            // four columns broke the fixture with
+            // `error in index … after drop column`, which reads like a store
+            // fault rather than a test that went stale.
+            let indexes: Vec<String> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT name FROM sqlite_master
+                         WHERE type = 'index' AND tbl_name = ?1 AND sql IS NOT NULL",
+                    )
+                    .unwrap();
+                let names = stmt
+                    .query_map([table], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                names
+                    .into_iter()
+                    .filter(|index| {
+                        let mut info = conn
+                            .prepare(&format!("PRAGMA index_info({index})"))
+                            .unwrap();
+                        let columns: Vec<String> = info
+                            .query_map([], |row| row.get::<_, Option<String>>(2))
+                            .unwrap()
+                            .filter_map(|entry| entry.ok().flatten())
+                            .collect();
+                        columns.iter().any(|name| name == column)
+                    })
+                    .collect()
+            };
+            for index in indexes {
+                conn.execute_batch(&format!("DROP INDEX IF EXISTS {index}"))
+                    .unwrap();
+            }
             conn.execute(&format!("ALTER TABLE {table} DROP COLUMN {column}"), [])
                 .unwrap();
         }

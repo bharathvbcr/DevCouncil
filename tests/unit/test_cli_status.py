@@ -105,7 +105,7 @@ def test_cli_status_treats_stored_blockers_as_advisory_when_gates_disabled(
     result = runner.invoke(app, ["status", "--json", "--fail-on-blocking"])
 
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["gates_enabled"] is False
     assert payload["gates_mode"] == "off"
     assert payload["stored_blocking_gaps"] == 1
