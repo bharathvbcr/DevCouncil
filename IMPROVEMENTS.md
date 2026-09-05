@@ -1645,12 +1645,18 @@ The consumers were changed to match, and neither loosens anything:
   undeclared crossing, and halting the loop over the map writer's missing feature would stop
   every repository the kernel maps rather than the ones with a boundary problem.
 
-**Open, and for whoever reconciles the two lanes:** the Rust writer's fix had not landed on
-this branch when this was written (`manifest.rs` still holds the literal, and no marker key
-exists anywhere in `rust-port/`), so the marker read here is
-`meta.devmap_rust.neighbors_computed` — one constant, in `subsystem_map.neighbors_established`,
-to change if the Rust lane names it differently. A third reader is untouched:
-`integrations/mcp/handlers/map.py:157` forwards `sub.get("neighbors")` raw, so an MCP client
-still cannot tell an empty list from an uncomputed one. Its `_subsystem_detail(sub)` takes only
-the subsystem dict, so surfacing this there means passing the whole map in and adding a key to
-an advertised tool's payload — a contract change, deliberately not made as a side effect.
+The two MCP surfaces that forward the field were the third and fourth readers, and the full
+suite found them: `devcouncil_impact` emitted `cross_boundary_pairs: []` whether the pairs were
+checked or not, and `devcouncil_map`'s subsystem detail forwarded a raw `neighbors: []`. Both
+now carry the companion fact — `cross_boundary_checked` and `neighbors_computed` — the same
+shape as `is_entry_root` and `walk_incomplete` already in that handler. Both keys are additive.
+`test_impact_cross_boundary_force` had encoded the old semantics in its fixture ("force a
+cross-boundary by removing neighbor links"); its assertion is unchanged and its map now carries
+the producer marker, so the empty lists are an answer rather than a field nobody computed.
+
+**Open, for whoever reconciles the two lanes:** the Rust writer's fix had not landed on this
+branch when this was written (`manifest.rs` still holds the literal, and no marker key exists
+anywhere under `rust-port/`), so the marker read here is `meta.devmap_rust.neighbors_computed`
+— one constant, in `subsystem_map.neighbors_established`, to change if the Rust lane names it
+differently. Once the kernel computes neighbours and sets the marker, every surface above goes
+back to giving definite answers with no further Python change.

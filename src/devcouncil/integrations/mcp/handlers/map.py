@@ -31,6 +31,7 @@ from devcouncil.indexing.repo_mapper import RepoMapper
 from devcouncil.indexing.subsystem_map import (
     area_for_path,
     cross_boundary_pairs,
+    neighbors_established,
     dead_symbol_candidates_of,
     dependents_total_of,
     impact_targets,
@@ -145,7 +146,18 @@ def _subsystem_summary(sub: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _subsystem_detail(sub: dict[str, Any]) -> dict[str, Any]:
+def _subsystem_detail(
+    sub: dict[str, Any],
+    *,
+    neighbors_computed: bool = False,
+) -> dict[str, Any]:
+    """One subsystem's detail rows, with `neighbors` carrying whether it is an answer.
+
+    ``neighbors_computed`` defaults to False because that is the fail-closed
+    reading: a caller that did not pass the map cannot vouch for the field, and
+    an empty ``neighbors`` from the kernel means "not computed" far more often
+    than "none".
+    """
     role_files = sub.get("role_files") or {}
     if not isinstance(role_files, dict):
         role_files = {}
@@ -155,6 +167,7 @@ def _subsystem_detail(sub: dict[str, Any]) -> dict[str, Any]:
         "entry_points": list(sub.get("entry_points") or []),
         "critical_files": list(sub.get("critical_files") or []),
         "neighbors": list(sub.get("neighbors") or []),
+        "neighbors_computed": neighbors_computed,
         "handoff_paths": list(sub.get("handoff_paths") or []),
         "role_files": {str(k): list(v or []) for k, v in role_files.items()},
     }
@@ -275,7 +288,9 @@ async def handle_repo_map(root: Path, arguments: dict) -> list[TextContent]:
                 "stale": stale,
                 "path": path,
                 "area": resolved_area or subsystem,
-                "subsystem": _subsystem_detail(sub),
+                "subsystem": _subsystem_detail(
+                    sub, neighbors_computed=neighbors_established(data)
+                ),
                 **symbol_fields,
             })
 
@@ -639,6 +654,13 @@ async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
                 {"areas": [a, b]}
                 for a, b in cross_boundary_pairs(analyzed_paths, data)
             ]
+            # An empty `cross_boundary_pairs` means one of two different things,
+            # and a client cannot tell them apart from the list alone: every
+            # touched pair is adjacent, or this map never established adjacency
+            # at all (the kernel writes `"neighbors": []` for every subsystem).
+            # Same rule as `is_entry_root` and `walk_incomplete` above — the
+            # answer carries whether it could be given.
+            crossings_checked = neighbors_established(data)
             payload: dict[str, Any] = {
                 "ok": True,
                 "stale": stale,
@@ -648,6 +670,7 @@ async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
                 "paths_truncated": len(analyzed_paths) < requested,
                 "neighbor_areas": sorted(all_neighbor_areas),
                 "cross_boundary_pairs": crossings,
+                "cross_boundary_checked": crossings_checked,
             }
             if precise:
                 payload["precise"] = True

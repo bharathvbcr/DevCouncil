@@ -193,9 +193,12 @@ async def test_impact_cross_boundary_force(tmp_path, monkeypatch):
         "devcouncil.integrations.mcp.handlers.map.RepoMapper.map_is_stale",
         lambda self, data: False,
     )
-    # Force a cross-boundary by removing neighbor links in a custom map.
+    # Force a cross-boundary by removing neighbor links in a custom map. The
+    # producer marker stays, so the empty lists are this map's *answer* rather
+    # than a field it never computed — which is what makes the pair a crossing.
     _write_repo_map(
         tmp_path,
+        meta={"devmap_rust": {"neighbors_computed": True}},
         subsystems=[
             {
                 "area": "src/payments",
@@ -222,7 +225,54 @@ async def test_impact_cross_boundary_force(tmp_path, monkeypatch):
             "paths": ["src/payments/gateway.py", "src/billing/invoice.py"],
         }))[0].text
     )
+    assert cross["cross_boundary_checked"] is True
     assert cross["cross_boundary_pairs"] == [{"areas": ["src/billing", "src/payments"]}]
+
+
+@pytest.mark.anyio
+async def test_impact_says_when_the_map_never_established_neighbors(tmp_path, monkeypatch):
+    """An empty `cross_boundary_pairs` is two different answers; say which.
+
+    Same map as above with the marker removed — which is what the kernel
+    actually writes today. No pair can be called a crossing, and the response
+    has to say that rather than look like a clean check.
+    """
+    monkeypatch.setenv("DEVCOUNCIL_PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        "devcouncil.integrations.mcp.handlers.map.RepoMapper.map_is_stale",
+        lambda self, data: False,
+    )
+    _write_repo_map(
+        tmp_path,
+        subsystems=[
+            {
+                "area": "src/payments",
+                "summary": "Payment processing",
+                "entry_points": ["src/payments/gateway.py"],
+                "critical_files": ["src/payments/gateway.py"],
+                "neighbors": [],
+                "handoff_paths": [],
+                "role_files": {},
+            },
+            {
+                "area": "src/billing",
+                "summary": "Billing",
+                "entry_points": ["src/billing/invoice.py"],
+                "critical_files": ["src/billing/invoice.py"],
+                "neighbors": [],
+                "handoff_paths": [],
+                "role_files": {},
+            },
+        ],
+    )
+    payload = json.loads(
+        (await call_tool("devcouncil_impact", {
+            "paths": ["src/payments/gateway.py", "src/billing/invoice.py"],
+        }))[0].text
+    )
+    assert payload["ok"] is True
+    assert payload["cross_boundary_checked"] is False
+    assert payload["cross_boundary_pairs"] == []
 
 
 @pytest.mark.anyio
@@ -988,3 +1038,14 @@ async def test_impact_reports_why_the_lsp_pool_could_not_be_built(tmp_path, monk
     item = out["paths"][0]
     assert item["resolution"] == "import"
     assert "pyright missing" in item["resolution_reason"]
+
+
+def test_subsystem_detail_says_whether_neighbors_were_computed():
+    """An empty `neighbors` row must not read as "this area borders nothing"."""
+    uncomputed = mapmod._subsystem_detail({"area": "a", "neighbors": []})
+    assert uncomputed["neighbors"] == []
+    assert uncomputed["neighbors_computed"] is False
+
+    computed = mapmod._subsystem_detail({"area": "a", "neighbors": []}, neighbors_computed=True)
+    assert computed["neighbors"] == []
+    assert computed["neighbors_computed"] is True
