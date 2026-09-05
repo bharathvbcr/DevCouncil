@@ -1,5 +1,8 @@
 use devmap_analyze::clones::group_clones;
-use devmap_analyze::traversal::{traverse_graph, TraversalOptions, TraversalStop};
+use devmap_analyze::traversal::{
+    traverse_graph, traverse_graph_indexed, AdjacencyIndex, TraversalLimits, TraversalOptions,
+    TraversalStop,
+};
 use devmap_extract::model::*;
 use devmap_resolve::model::*;
 use devmap_store::{Store, StoredEdge, StoredSymbol};
@@ -276,6 +279,14 @@ impl<'a> StoreQueryEngine<'a> {
         // other. The generation straddle check in [`Self::neighbors`] still
         // wraps this, because the load is not the only store read here.
         let edges = self.resolved_edges(min_confidence)?;
+        // One index per direction for the whole fan-out, for the same reason
+        // the edge load above is shared. Every walk below used to rebuild this
+        // map over the entire generation first, so N targets x 2 directions
+        // paid O(edges) 2N times over an edge slice that does not change
+        // between them. There are only ever two directions, so there are only
+        // ever two indexes.
+        let inbound = AdjacencyIndex::build(&edges, true);
+        let outbound = AdjacencyIndex::build(&edges, false);
         let mut answers = Vec::with_capacity(targets.len());
         for target in targets {
             // Plain `check`, not `check_every`: the latter consults the flag
@@ -299,13 +310,13 @@ impl<'a> StoreQueryEngine<'a> {
             // by construction rather than by both remembering to pass it.
             let callers = self.traverse_over(
                 &edges,
+                &inbound,
                 Request {
                     query: target.clone(),
                     token_budget,
                     min_confidence,
                     max_depth,
                 },
-                true,
             )?;
             // Outbound edges come from whichever query can actually answer
             // for this target's shape.
@@ -344,13 +355,13 @@ impl<'a> StoreQueryEngine<'a> {
             // tightened to what the field has always claimed to be.
             let callees = self.traverse_over(
                 &edges,
+                &outbound,
                 Request {
                     query: target.clone(),
                     token_budget,
                     min_confidence,
                     max_depth: 1,
                 },
-                false,
             )?;
             answers.push(Neighbors {
                 target: target.clone(),
@@ -462,7 +473,7 @@ impl<'a> StoreQueryEngine<'a> {
         // abandoned traversal therefore cannot block the drain loop's writes
         // while it unwinds.
         let edges = self.resolved_edges(req.min_confidence)?;
-        self.traverse_over(&edges, req, reverse)
+        self.traverse_over(&edges, &AdjacencyIndex::build(&edges, reverse), req)
     }
 
     /// The traversal itself, over an edge set the caller already holds.
@@ -477,9 +488,14 @@ impl<'a> StoreQueryEngine<'a> {
     fn traverse_over(
         &self,
         edges: &[ResolvedEdge],
+        index: &AdjacencyIndex<'_>,
         req: Request<String>,
-        reverse: bool,
     ) -> anyhow::Result<Response<ResolvedEdge>> {
+        // The direction is the index's, not a second argument that could
+        // disagree with it. A reversed walk over a forward index answers
+        // plausibly and wrongly rather than failing, so the two are not
+        // separable here.
+        let reverse = index.reverse();
         let target = req.query.trim();
         let start: Vec<String> = traversal_starts(edges, target, reverse)
             .into_iter()
@@ -497,13 +513,12 @@ impl<'a> StoreQueryEngine<'a> {
         self.cancel.check()?;
         let max_depth = req.max_depth.min(64);
         let max_nodes = TRAVERSAL_MAX_NODES;
-        let walk = traverse_graph(
+        let walk = traverse_graph_indexed(
             &start,
-            edges,
-            &TraversalOptions {
+            index,
+            TraversalLimits {
                 max_depth,
                 max_nodes,
-                reverse,
             },
         );
         self.cancel.check()?;
@@ -657,6 +672,14 @@ impl<'a> StoreQueryEngine<'a> {
 
         self.cancel.check()?;
         let edges = self.resolved_edges(min_confidence)?;
+        // One index per direction for the whole fan-out, for the same reason
+        // the edge load above is shared. Every walk below used to rebuild this
+        // map over the entire generation first, so N targets x 2 directions
+        // paid O(edges) 2N times over an edge slice that does not change
+        // between them. There are only ever two directions, so there are only
+        // ever two indexes.
+        let inbound = AdjacencyIndex::build(&edges, true);
+        let outbound = AdjacencyIndex::build(&edges, false);
         let per_direction = edges_per_direction(&budget, definitions.shown);
         let mut budget = budget;
         budget.edges_per_direction = per_direction;
@@ -664,23 +687,23 @@ impl<'a> StoreQueryEngine<'a> {
             self.cancel.check()?;
             definition.callers = self.traverse_over(
                 &edges,
+                &inbound,
                 Request {
                     query: definition.id.clone(),
                     token_budget: per_direction,
                     min_confidence,
                     max_depth: 1,
                 },
-                true,
             )?;
             definition.callees = self.traverse_over(
                 &edges,
+                &outbound,
                 Request {
                     query: definition.id.clone(),
                     token_budget: per_direction,
                     min_confidence,
                     max_depth: 1,
                 },
-                false,
             )?;
         }
 

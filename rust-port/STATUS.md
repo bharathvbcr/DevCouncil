@@ -2794,3 +2794,72 @@ pushed, so that step has never executed, and 17 files were unformatted —
 committed ones included. Every commit in this pass would have failed CI before
 reaching a single test. Formatting is now clean workspace-wide; no logic
 changed.
+
+### Q-13 — a fan-out paid for one index per walk, not one per direction
+
+`traverse_graph` builds an adjacency map over the whole edge slice before it
+walks. `neighbors` asks for both directions of up to 16 targets and `explore`
+does the same per definition, so N targets rebuilt the same two maps 2N times
+over an edge slice that does not change between them. The lane that found this
+measured it and left it, correctly, as out of its scope: `traversal.rs` said in
+so many words that sharing an index "is a decision for the caller that owns the
+query loop". This closes it from the caller's side.
+
+`AdjacencyIndex::build(edges, reverse)` is now the index, and
+`traverse_graph_indexed` the walk; `traverse_graph` is a thin wrapper that
+builds a single-use index and calls it, so there is still exactly one
+implementation of the walk and every existing caller is untouched.
+
+**The direction lives in the index and nowhere else.** `traverse_graph_indexed`
+takes [`TraversalLimits`], which deliberately has no `reverse` field, and reads
+the direction off the index. An index built one way cannot be walked the other,
+because the mismatch is not expressible — not because an assertion catches it.
+That distinction matters here more than usual: a reversed walk over a forward
+index does not fail, it answers plausibly and wrongly, which is how "what
+depends on this" silently becomes "what this depends on".
+
+**Measured, interleaved before/after** on a generated corpus of 2,000 files /
+126,000 symbols / 330,000 edges, three rounds alternating the two binaries
+built from the same tree with only the hoist reverted:
+
+```text
+neighbors (8 targets)      cold                warm p50
+  before                   787.83 ms           620.50 ms
+  after                    351.26 ms           180.10 ms
+                           -55% (2.2x)         -71% (3.4x)
+```
+
+Round-to-round spread was under 1% on both sides, and every run returned the
+same answer — "8 answers, 96 edges shown" — so this is the same work done
+fewer times, not less work done.
+
+**Red proof.** `a_fan_out_pays_for_its_index_once_per_direction.rs` counts
+allocations rather than time, for the reason its sibling gives: counts are
+deterministic and a timing assertion turns a loaded machine into a red build.
+It compares `neighbors` against *itself* at one target and at sixteen, which is
+the only shape that isolates a per-target cost — the existing comparison
+against separately-issued queries stays green either way, because the
+composition is still cheaper by the whole edge read.
+
+```text
+index per target     299,720 allocations for 16 targets vs 88,310 for one  3.4x
+index per direction   75,160 allocations for 16 targets vs 74,275 for one  1.0x
+```
+
+With the hoist reverted the test fails at 3.4x; restored, it passes at 1.0x,
+and `engine.rs` was restored byte-for-byte afterwards (shasum matched). The
+bound is 2, which sits between the two worlds rather than being tuned to
+either.
+
+`blast_walk` builds its own inbound index and is deliberately left alone: it
+builds once per call rather than once per target, and it filters on
+`min_confidence`, so it is a different index answering a different question.
+Folding it in would be the kind of unification that produces a helper with a
+boolean meaning "actually do the other thing".
+
+**Still open, measured on the same corpus:** `dead_symbols` reads all 80,000
+non-exempt dead rows to show 66 (39.6 ms warm). The read is genuinely
+unbounded, but `total: 80000` is the honest denominator that makes "66 shown of
+80,000" true, and clients enforce `shown + hidden == total` — so a `LIMIT` has
+to come with a `COUNT`, the way `explore` already pairs them. That is the next
+one, not this one.

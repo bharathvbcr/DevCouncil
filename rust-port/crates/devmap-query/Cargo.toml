@@ -100,3 +100,7 @@ required-features = ["parse"]
 [[example]]
 name = "query_bench"
 required-features = ["parse"]
+
+[[test]]
+name = "a_fan_out_pays_for_its_index_once_per_direction"
+required-features = ["parse"]
