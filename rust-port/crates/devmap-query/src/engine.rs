@@ -411,6 +411,19 @@ impl<'a> StoreQueryEngine<'a> {
             //
             // `deps` the command is unchanged; only this composition's `callees`
             // tightened to what the field has always claimed to be.
+            //
+            // `max_depth` is the caller's, on this side too. It was pinned at
+            // 1 here — a leftover from when this field was answered by
+            // `dependencies`, which is a one-hop query by construction — while
+            // the inbound half above walked the depth the caller asked for. A
+            // composed answer at depth 3 therefore reported a three-level
+            // caller tree beside a single hop of callees, with nothing in it
+            // saying which half had been cut short: exactly the defect the
+            // `min_confidence` note above describes and closes, surviving in
+            // the parameter beside it. `neighbors_composition.rs` compares
+            // every field of both halves against the calls they replace and
+            // could not see it, because it makes every comparison at depth 1 —
+            // the one depth where the pinned value and the requested one agree.
             let callees = self.traverse_over(
                 &index,
                 &outbound,
@@ -418,7 +431,7 @@ impl<'a> StoreQueryEngine<'a> {
                     query: target.clone(),
                     token_budget,
                     min_confidence,
-                    max_depth: 1,
+                    max_depth,
                 },
             )?;
             answers.push(Neighbors {
