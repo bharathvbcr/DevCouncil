@@ -2651,3 +2651,48 @@ The failure message was widened too. It said only "did not stabilize", which
 misdirects for this case: a file genuinely churning settles, a filesystem that
 cannot report modification times never will, and an operator reading the old
 message would keep waiting for the second to clear.
+
+### K-B2 — two unbounded queues in the watcher
+
+Both were bounded only by how fast the user's tree changes, which is not a
+bound. A `git checkout` across a large repository is the ordinary way to reach
+either.
+
+**The debounce set.** `pending` was an uncapped `BTreeSet<String>` held for up
+to `MAX_DEBOUNCE_HOLD` (10 s), growing with every changed path for the whole
+window. It now collapses at `MAX_DEBOUNCE_PATHS` (4,096) — *collapses*, not
+drops. Past that many paths the itemised list has stopped being cheaper than
+re-walking the tree, and the root entry the drain already expands covers every
+path the buffer was holding plus anything it had not yet been told about. The
+only thing lost is the itemisation. Discarding paths would lose real edits with
+nothing recording the loss, which is the failure the cap exists to prevent.
+
+Red proof, with the cap reverted:
+
+```
+a_flood_of_paths_collapses_to_a_rescan_instead_of_growing  FAILED
+  the buffer held 4596 paths; the cap is 4096
+```
+
+The control — two edits still flush as two paths — stayed green throughout, so
+a buffer that answered "rescan everything" to every batch would fail it.
+`watcher.rs` was restored byte-for-byte after the revert (shasum matched).
+
+Writing that test corrected the fix. The first version asserted the flush equals
+the rescan sentinel and **failed with the cap already in place**: the buffer
+collapsed correctly and then re-accumulated the next 500 paths on top. The bound
+still held, but itemising after a collapse is pure cost paid during exactly the
+churn that caused it, so the collapse is now sticky until the batch flushes.
+
+**The event queue.** notify delivered into `std::sync::mpsc::channel()` —
+unbounded. Bounding it alone would have been the wrong fix: `SyncSender::send`
+blocks when full, and the thread it would block is the one the OS delivers to,
+so stalling it is precisely how events get dropped. The send is a `try_send`,
+and a refusal sets a flag the loop answers with a whole-tree rescan — the same
+answer K-A3 already gives the kernel's own "I dropped events" notice, and for
+the same reason: lost coverage must not look like a quiet tree.
+
+**No direct test for the overflow path.** It needs the real notify thread
+outrunning the consumer, which this suite cannot stage deterministically. The
+reachable half — the debounce cap — is covered; the queue bound is argued from
+construction, and is recorded here as such rather than implied to be tested.

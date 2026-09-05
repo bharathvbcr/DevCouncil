@@ -1,7 +1,9 @@
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, sync_channel, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tracing::warn;
 
@@ -120,20 +122,62 @@ impl IgnoreVerdictCache {
 /// waited this long, even mid-storm.
 const MAX_DEBOUNCE_HOLD: Duration = Duration::from_secs(10);
 
+/// The most paths the debounce buffer will itemise before collapsing to a
+/// whole-tree rescan.
+///
+/// K-B2. `pending` was an uncapped `BTreeSet<String>` held for up to
+/// `MAX_DEBOUNCE_HOLD`, so a `git checkout` across a large tree grew it without
+/// limit for ten seconds of churn — bounded only by how fast the tree changed.
+///
+/// The cap collapses rather than drops. Past this many paths the itemised list
+/// has stopped being cheaper than re-walking the tree, and the root entry the
+/// drain already expands covers every one of them plus anything the buffer had
+/// not yet been told about. Dropping entries here would lose edits with nothing
+/// recording the loss; collapsing loses only the itemisation.
+const MAX_DEBOUNCE_PATHS: usize = 4_096;
+
+/// How many watcher events may sit unread before the queue is treated as
+/// overflowed.
+///
+/// K-B2. The notify-to-thread channel was `std::sync::mpsc::channel()` —
+/// unbounded — so during a large `git checkout` it grew for as long as the
+/// producer outran the consumer, with no ceiling and nothing recording that it
+/// had. Bounding it is only half the fix: the send must also never *block*,
+/// because the notify thread is the one the OS delivers to, and stalling it is
+/// how events get dropped in the first place. So the send is a `try_send`, and
+/// a refusal is recorded and answered with a whole-tree rescan — the same
+/// answer the kernel's own "I dropped events" notice already gets (K-A3).
+const WATCH_QUEUE_CAPACITY: usize = 4_096;
+
 struct DebounceBuffer {
     debounce: Duration,
     pending: BTreeSet<String>,
     last_event: Option<Instant>,
     oldest_pending: Option<Instant>,
+    /// What `pending` collapses to once it passes [`MAX_DEBOUNCE_PATHS`].
+    ///
+    /// Required rather than optional: a buffer with nowhere to collapse to
+    /// could only enforce the cap by discarding paths, and a silently discarded
+    /// edit is the failure this cap exists to prevent.
+    collapse_to: Vec<String>,
+    /// Set once `pending` has collapsed, cleared when the batch flushes.
+    ///
+    /// Sticky on purpose: a whole-tree rescan already covers anything that
+    /// arrives before the flush, so continuing to itemise paths after the
+    /// collapse is pure cost — and it is exactly the churn that caused the
+    /// collapse, so it is cost paid at the worst moment.
+    collapsed: bool,
 }
 
 impl DebounceBuffer {
-    fn new(debounce: Duration) -> Self {
+    fn new(debounce: Duration, collapse_to: Vec<String>) -> Self {
         Self {
             debounce,
             pending: BTreeSet::new(),
             last_event: None,
             oldest_pending: None,
+            collapse_to,
+            collapsed: false,
         }
     }
 
@@ -152,7 +196,17 @@ impl DebounceBuffer {
         if self.oldest_pending.is_none() {
             self.oldest_pending = Some(now);
         }
+        if self.collapsed {
+            // The rescan already covers whatever this batch names. Record that
+            // the tree is still moving, and nothing else.
+            self.last_event = Some(now);
+            return;
+        }
         self.pending.extend(admitted);
+        if self.pending.len() > MAX_DEBOUNCE_PATHS {
+            self.pending = self.collapse_to.iter().cloned().collect();
+            self.collapsed = true;
+        }
         self.last_event = Some(now);
     }
 
@@ -170,6 +224,7 @@ impl DebounceBuffer {
         }
         self.last_event = None;
         self.oldest_pending = None;
+        self.collapsed = false;
         Some(std::mem::take(&mut self.pending).into_iter().collect())
     }
 }
@@ -387,14 +442,29 @@ pub fn start_file_watcher<P: AsRef<Path>, F: Fn(Vec<String>) + Send + 'static>(
     callback: F,
 ) -> anyhow::Result<WatcherHandle> {
     let root = root_path.as_ref().canonicalize()?;
-    let (tx, rx) = channel();
+    let (tx, rx) = sync_channel(WATCH_QUEUE_CAPACITY);
     let (stop_tx, stop_rx) = channel();
-    let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
+    // Set when the queue refuses an event. Read and cleared by the loop below,
+    // which answers it with a rescan. An event that cannot be queued is lost
+    // coverage, and lost coverage must not be indistinguishable from a quiet
+    // tree — the same rule K-A3 applies to the kernel's own drop notice.
+    let overflowed = Arc::new(AtomicBool::new(false));
+    let overflow_writer = Arc::clone(&overflowed);
+    let mut watcher = RecommendedWatcher::new(
+        move |event| {
+            // Never block here. This runs on the thread notify delivers to, and
+            // blocking it is precisely what makes the OS drop events.
+            if tx.try_send(event).is_err() {
+                overflow_writer.store(true, Ordering::Relaxed);
+            }
+        },
+        Config::default(),
+    )?;
     watcher.watch(&root, RecursiveMode::Recursive)?;
 
     let thread = std::thread::spawn(move || {
         let _watcher = watcher; // keep alive for the thread lifetime
-        let mut buffer = DebounceBuffer::new(Duration::from_secs(2));
+        let mut buffer = DebounceBuffer::new(Duration::from_secs(2), whole_tree_rescan(&root));
         let mut ignore_cache = IgnoreVerdictCache::default();
 
         loop {
@@ -404,6 +474,18 @@ pub fn start_file_watcher<P: AsRef<Path>, F: Fn(Vec<String>) + Send + 'static>(
             // Deliver matured batches on the event path too: a tree under
             // continuous churn never lets `recv_timeout` expire, so a flush
             // evaluated only on silence would never run again.
+            // A refused event is answered before anything else: the rescan it
+            // asks for supersedes whatever individual paths are queued behind
+            // it, and delaying it would let the batch flush as though the queue
+            // had never overflowed.
+            if overflowed.swap(false, Ordering::Relaxed) {
+                warn!(
+                    "watcher event queue overflowed ({WATCH_QUEUE_CAPACITY} events); \
+                     requesting a whole-tree rescan of {root:?} rather than reporting \
+                     the tree quiet"
+                );
+                buffer.push(whole_tree_rescan(&root), Instant::now());
+            }
             let now = Instant::now();
             if let Some(paths) = buffer.take_ready(now) {
                 callback(paths);
@@ -632,7 +714,7 @@ mod tests {
     #[test]
     fn empty_batches_must_not_extend_the_debounce_window() {
         let start = Instant::now();
-        let mut buffer = DebounceBuffer::new(Duration::from_secs(2));
+        let mut buffer = DebounceBuffer::new(Duration::from_secs(2), whole_tree_rescan(std::path::Path::new("/tmp/devmap-debounce-fixture")));
         buffer.push(["real.py"], start);
 
         // Ten seconds of fully-filtered event batches, 200 ms apart. Each one
@@ -723,7 +805,7 @@ mod tests {
     #[test]
     fn debounce_buffer_waits_deduplicates_and_sorts() {
         let start = Instant::now();
-        let mut buffer = DebounceBuffer::new(Duration::from_secs(2));
+        let mut buffer = DebounceBuffer::new(Duration::from_secs(2), whole_tree_rescan(std::path::Path::new("/tmp/devmap-debounce-fixture")));
         buffer.push(["z.py", "a.py", "z.py"], start);
 
         assert!(buffer
@@ -744,7 +826,7 @@ mod tests {
     #[test]
     fn a_batch_held_past_the_cap_flushes_even_without_quiet() {
         let start = Instant::now();
-        let mut buffer = DebounceBuffer::new(Duration::from_secs(2));
+        let mut buffer = DebounceBuffer::new(Duration::from_secs(2), whole_tree_rescan(std::path::Path::new("/tmp/devmap-debounce-fixture")));
 
         // Events arriving continuously: every one inside the quiet window.
         buffer.push(["a.py"], start);
@@ -961,6 +1043,70 @@ mod tests {
         );
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    /// K-B2: the debounce buffer must be bounded, and bounded by collapsing
+    /// rather than dropping.
+    ///
+    /// `pending` was an uncapped `BTreeSet<String>` held for up to
+    /// `MAX_DEBOUNCE_HOLD` (10 s). A `git checkout` across a large tree grows it
+    /// with every changed path for that whole window, bounded only by how fast
+    /// the tree changes — the watcher's memory is then a function of the user's
+    /// git history, which is not a bound at all.
+    ///
+    /// What makes the cap safe is that it collapses to the root entry the drain
+    /// already expands into a whole-tree rescan. That covers every path the
+    /// buffer was holding *and* anything it had not been told about yet, so the
+    /// only thing lost is the itemisation. Discarding paths instead would drop
+    /// real edits with nothing recording the loss.
+    #[test]
+    fn a_flood_of_paths_collapses_to_a_rescan_instead_of_growing() {
+        let root = std::path::Path::new("/tmp/devmap-debounce-flood");
+        let sentinel = whole_tree_rescan(root);
+        let start = Instant::now();
+        let mut buffer = DebounceBuffer::new(Duration::from_secs(2), sentinel.clone());
+
+        for index in 0..(MAX_DEBOUNCE_PATHS + 500) {
+            buffer.push([format!("src/file_{index}.py")], start);
+        }
+
+        let ready = buffer
+            .take_ready(start + Duration::from_secs(3))
+            .expect("a matured batch must flush");
+        assert!(
+            ready.len() <= MAX_DEBOUNCE_PATHS,
+            "the buffer held {} paths; the cap is {MAX_DEBOUNCE_PATHS}, and an \
+             unbounded set here is bounded only by how fast the tree changes",
+            ready.len()
+        );
+        assert_eq!(
+            ready, sentinel,
+            "past the cap the buffer must carry the whole-tree rescan entry, which \
+             covers every path it was holding plus whatever it had not yet seen. \
+             Anything else here is a dropped edit."
+        );
+    }
+
+    /// The OFF direction: an ordinary batch is still itemised.
+    ///
+    /// A buffer that answered "rescan the world" to every batch would satisfy
+    /// the test above while making every single-file edit re-walk the tree.
+    #[test]
+    fn an_ordinary_batch_is_not_collapsed() {
+        let root = std::path::Path::new("/tmp/devmap-debounce-ordinary");
+        let start = Instant::now();
+        let mut buffer = DebounceBuffer::new(Duration::from_secs(2), whole_tree_rescan(root));
+        buffer.push(["src/a.py", "src/b.py"], start);
+
+        let ready = buffer
+            .take_ready(start + Duration::from_secs(3))
+            .expect("a matured batch must flush");
+        assert_eq!(
+            ready,
+            vec!["src/a.py".to_string(), "src/b.py".to_string()],
+            "two edits are two edits, not a reason to re-index everything"
+        );
+    }
+
 }
 
 #[cfg(test)]
