@@ -557,7 +557,27 @@ pub fn collect_sources_with_report(
 /// Extract every indexable file under `root` (owned paths — no leaks).
 #[cfg(feature = "parse")]
 pub fn extract_tree(root: &Path) -> anyhow::Result<Vec<Extraction>> {
-    let sources = collect_sources(root)?;
+    Ok(extract_tree_with_report(root)?.0)
+}
+
+/// [`extract_tree`], keeping the discovery report it walked.
+///
+/// The one owner of the uncached whole-tree extraction. `devmap build --full`
+/// wrote the walk, the `FileRef` mapping and the `extract_all` call out for
+/// itself only because `extract_tree` dropped the report and the build needs it
+/// to say what discovery refused — so the same three steps existed twice, and
+/// the copy that was not this one was the one running in production. There is
+/// now one, and the CLI calls it.
+///
+/// The report is returned rather than folded in: which skips are coverage loss
+/// is [`crate::model::DiscoverySkipReason::is_refusal`]'s decision and the
+/// caller's to act on, and this function has no business deciding what a
+/// refusal costs a particular build.
+#[cfg(feature = "parse")]
+pub fn extract_tree_with_report(
+    root: &Path,
+) -> anyhow::Result<(Vec<Extraction>, crate::model::DiscoveryReport)> {
+    let (sources, report) = collect_sources_with_report(root)?;
     let refs: Vec<FileRef> = sources
         .iter()
         .map(|(path, src)| FileRef {
@@ -565,7 +585,7 @@ pub fn extract_tree(root: &Path) -> anyhow::Result<Vec<Extraction>> {
             source: src.as_str(),
         })
         .collect();
-    Ok(extract_all(&refs))
+    Ok((extract_all(&refs), report))
 }
 
 #[cfg(all(test, feature = "parse"))]

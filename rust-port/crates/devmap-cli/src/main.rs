@@ -1467,15 +1467,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // source, so a "full" rebuild that used it would recommit exactly
             // the rows the operator is asking to replace.
             let (extractions, discovery) = if *full {
-                let (sources, report) = devmap_extract::collect_sources_with_report(path)?;
-                let refs: Vec<devmap_extract::FileRef<'_>> = sources
-                    .iter()
-                    .map(|(file, source)| devmap_extract::FileRef {
-                        path: file.as_str(),
-                        source: source.as_str(),
-                    })
-                    .collect();
-                (devmap_extract::extract_all(&refs), report)
+                devmap_extract::extract_tree_with_report(path)?
             } else {
                 extract_tree_cached_with_report(&store, path)?
             };

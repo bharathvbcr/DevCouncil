@@ -510,17 +510,19 @@ impl Daemon {
             // the file still exists, so its stored row is kept untouched (it
             // stays at the last good extraction until it becomes readable
             // again).
-            for (path, reason) in discovery
-                .skipped_paths
-                .iter()
-                .filter(|(_, reason)| !matches!(reason, DiscoverySkipReason::NonSource))
-            {
+            //
+            // Which skips count is `DiscoverySkipReason::is_refusal`, through
+            // `DiscoveryReport::refusals`, and nowhere else. Spelled here as
+            // `!matches!(reason, NonSource)` it was a second copy of the rule
+            // the CLI's build path reads from the owner — and a wildcard copy
+            // at that, so a skip reason added later would silently default to
+            // "not a refusal" on this path while the CLI stopped compiling
+            // until someone chose a side.
+            for (path, reason) in discovery.refusals() {
                 warn!("refused source {path:?} in changed directory {canonical:?}: {reason:?}");
             }
             let refused: std::collections::BTreeSet<String> = discovery
-                .skipped_paths
-                .iter()
-                .filter(|(_, reason)| !matches!(reason, DiscoverySkipReason::NonSource))
+                .refusals()
                 .map(|(path, _)| {
                     // Discovery reports paths relative to the changed
                     // directory; stored rows are relative to the daemon
