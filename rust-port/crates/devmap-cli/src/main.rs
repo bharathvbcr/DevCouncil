@@ -2198,9 +2198,12 @@ async fn main() -> anyhow::Result<()> {
                 "pending_count": status.pending_count,
                 "node_count": status.node_count,
                 "edge_count": status.edge_count,
-                "is_fresh": status.pending_count == 0,
+                // K-A6: one owner for this rule, shared with the daemon's
+                // `status`. Computing it here as `pending_count == 0` is what
+                // let a store with no generation at all report as current.
+                "is_fresh": devmap_serve::index_is_fresh(&status),
                 "db_path": status.db_path,
-                "degraded_reason": status.degraded_reason,
+                "degraded_reason": devmap_serve::freshness_degraded_reason(&status),
                 "quarantined_count": status.quarantined_count,
                 // K1(g): naming the stuck paths is what makes a degraded
                 // status actionable — "64 path(s) exceeded the retry

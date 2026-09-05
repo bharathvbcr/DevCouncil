@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use devmap_query::{Request, StoreQueryEngine};
-use devmap_store::Store;
+use devmap_store::{Store, StoreStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -386,6 +386,45 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether the persisted index is actually current.
+///
+/// K-A6. Two different claims that an empty store pulls apart: *nothing is
+/// queued* and *the index is up to date*. `is_fresh` was `pending_count == 0`
+/// at both call sites — this dispatcher and `devmap status` — and neither
+/// consulted `latest_generation`. A store whose schema exists but which holds
+/// no generation, the state a `devmap build` that aborted partway leaves
+/// behind, has nothing queued, so both answered `is_fresh: true` about an index
+/// that does not exist. `devmap_client.is_map_stale()` reads
+/// `not is_fresh or pending_count > 0`, so the whole stack reported the map as
+/// current while nothing at all had been indexed.
+///
+/// One owner because the rule was duplicated verbatim across two crates, and a
+/// copy that drifts puts the defect back in whichever one is not updated.
+pub fn index_is_fresh(status: &StoreStatus) -> bool {
+    status.latest_generation.is_some() && status.pending_count == 0
+}
+
+/// Why the index is not current, when it is not.
+///
+/// The store's own `degraded_reason` first — it knows about quarantined paths
+/// and schema trouble. The empty case is added here rather than there because
+/// from the store's side a generation-less store is not damaged, merely empty;
+/// it is only the *freshness* claim that an empty store falsifies. Returning
+/// `None` while `index_is_fresh` is false would leave a caller told the index
+/// is stale with no way to find out why, which is the same defect one step on.
+pub fn freshness_degraded_reason(status: &StoreStatus) -> Option<String> {
+    if let Some(reason) = status.degraded_reason.clone() {
+        return Some(reason);
+    }
+    if status.latest_generation.is_none() {
+        return Some(
+            "this store holds no generation: nothing has been indexed yet — run `devmap build`"
+                .to_string(),
+        );
+    }
+    None
+}
+
 pub(crate) fn dispatch(
     store: &Store,
     request: IpcRequest,
@@ -407,8 +446,8 @@ pub(crate) fn dispatch(
                 "pending_count": status.pending_count,
                 "node_count": status.node_count,
                 "edge_count": status.edge_count,
-                "is_fresh": status.pending_count == 0,
-                "degraded_reason": status.degraded_reason,
+                "is_fresh": index_is_fresh(&status),
+                "degraded_reason": freshness_degraded_reason(&status),
                 "quarantined_count": status.quarantined_count,
             }))
         }
@@ -1940,6 +1979,80 @@ mod tests {
             "socket path must be cleaned when server stops"
         );
     }
+
+    /// K-A6: a store that holds no generation at all must not report fresh.
+    ///
+    /// `is_fresh` was `pending_count == 0` and consulted nothing else. A store
+    /// whose schema exists but which holds zero generations — the state a
+    /// `devmap build` that aborted partway leaves behind — has nothing queued,
+    /// so it satisfied that test and answered `is_fresh: true` about an index
+    /// that does not exist. Downstream, `devmap_client.is_map_stale()` is
+    /// `not is_fresh or pending_count > 0`, so the whole stack reported the map
+    /// as current while nothing had been indexed.
+    ///
+    /// "Nothing is queued" and "the index is current" are different claims, and
+    /// an empty store is exactly where they come apart.
+    #[test]
+    fn a_store_with_no_generation_is_not_reported_fresh() {
+        let store = Store::open_in_memory().expect("schema, but no generation");
+        let value = dispatch(
+            &store,
+            IpcRequest {
+                version: PROTOCOL_VERSION,
+                command: IpcCommand::Status,
+            },
+            &devmap_query::Cancel::new(),
+        )
+        .expect("status must answer");
+
+        assert!(
+            value["generation_id"].is_null(),
+            "fixture precondition: this store must hold no generation, got {}",
+            value["generation_id"]
+        );
+        assert_eq!(
+            value["pending_count"], 0,
+            "fixture precondition: nothing is queued either — that is the whole trap"
+        );
+        assert_eq!(
+            value["is_fresh"], false,
+            "an index that does not exist cannot be current; reporting `true` here \
+             is a check that could not run answering like one that ran and passed"
+        );
+        assert!(
+            !value["degraded_reason"].is_null(),
+            "a caller that sees `is_fresh: false` must be told why, or it cannot \
+             tell an empty store from a busy one"
+        );
+    }
+
+    /// The OFF direction. A store with a generation and an empty queue is
+    /// genuinely fresh, and must still say so — otherwise the fix has simply
+    /// moved the lie to the other side.
+    #[test]
+    fn a_store_with_a_generation_and_no_backlog_is_still_fresh() {
+        let store = corpus_store(4);
+        let value = dispatch(
+            &store,
+            IpcRequest {
+                version: PROTOCOL_VERSION,
+                command: IpcCommand::Status,
+            },
+            &devmap_query::Cancel::new(),
+        )
+        .expect("status must answer");
+
+        assert!(
+            !value["generation_id"].is_null(),
+            "fixture precondition: this store holds a generation"
+        );
+        assert_eq!(value["pending_count"], 0);
+        assert_eq!(
+            value["is_fresh"], true,
+            "a built, drained store is current: {value}"
+        );
+    }
+
 }
 
 #[cfg(test)]

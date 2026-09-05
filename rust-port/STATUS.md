@@ -2567,3 +2567,47 @@ from deleting them from the build everyone runs, and that deletion would be
 invisible. `cargo clippy --all-targets` is clean in **both** configurations —
 feature-off clippy is what surfaced the five orphaned helpers, which no test run
 would have reported.
+
+### K-A6 — an index that does not exist, reported as current
+
+`is_fresh` was `pending_count == 0`, computed independently at two call sites —
+the daemon's `status` dispatcher and `devmap status` — and neither consulted
+`latest_generation`. A store whose schema exists but which holds **zero
+generations**, the state a `devmap build` that aborts partway leaves behind, has
+nothing queued. So both answered `is_fresh: true` about an index that does not
+exist, with `degraded_reason: null`. Downstream, `devmap_client.is_map_stale()`
+is `not is_fresh or pending_count > 0`, so the entire stack reported the map as
+current while nothing at all had been indexed.
+
+"Nothing is queued" and "the index is up to date" are different claims. An empty
+store is exactly where they come apart, and only one of them was being checked.
+
+Red proof, against the unmodified dispatcher:
+
+```
+a_store_with_no_generation_is_not_reported_fresh
+  left: Bool(true)   right: false
+```
+
+The control — a store with a generation and an empty queue *is* fresh — passed
+while the defect was live, so it constrains the fix rather than following it. A
+change that reported everything stale would satisfy the first test and fail this
+one.
+
+End to end, through the release CLI against a current-schema store with its
+generations removed:
+
+```
+schema_version: 13   generation_id: null   is_fresh: false
+degraded_reason: "this store holds no generation: nothing has been indexed yet — run `devmap build`"
+```
+
+**One owner.** The rule was duplicated verbatim across two crates, which is how
+it survived: fixing one copy leaves the other lying. `index_is_fresh` and
+`freshness_degraded_reason` now live once, in `devmap-serve::protocol`, and
+`devmap-cli` calls them. They were deliberately *not* put on `StoreStatus`: from
+the store's side a generation-less store is not damaged, merely empty — it is
+only the *freshness* claim that an empty store falsifies. Returning
+`is_fresh: false` with `degraded_reason: null` would have moved the same defect
+one step downstream, leaving a caller told the index is stale with no way to
+learn why.
