@@ -258,6 +258,32 @@ def test_the_kernel_stamps_freshness_so_python_never_rewrites_the_graph(tmp_path
 
 
 @requires_engine
+def test_the_two_kernel_capabilities_the_seam_probes_ship_together(tmp_path):
+    """`build --manifest` and `manifest`'s stamp flags are one capability.
+
+    The CLI declares both from one `StampFlags` group flattened into both
+    subcommands, so a binary offering the fused build always accepts the
+    digests. The seam probes them separately — two `--help` reads, two answers —
+    and nothing in Python enforces that they agree.
+
+    It matters because the fallback below simulates an old kernel by turning
+    probes off, and turning off only one describes a binary that has never
+    shipped: the engine takes the fused path and ignores the probe the fixture
+    thought it was controlling. Pinned against the real binary rather than
+    described in a comment, so the day the two are split the fixture is told.
+    """
+    binary = find_engine_binary()
+    fused = devmap_engine._build_accepts_manifest(binary)
+    stamped = devmap_engine._manifest_accepts_stamp_flags(binary)
+    assert fused == stamped, (
+        "`build --manifest` and `manifest --generated-head/--indexed-hash/"
+        f"--content-fingerprint` must ship together: fused={fused} stamped={stamped}. "
+        "If they are genuinely being split, the old-kernel fixture below has to "
+        "be split with them."
+    )
+
+
+@requires_engine
 def test_an_older_kernel_without_the_stamp_flags_still_gets_a_stamped_map(tmp_path, monkeypatch):
     """The fallback survives, because an unstamped map reads permanently stale.
 
@@ -267,8 +293,17 @@ def test_an_older_kernel_without_the_stamp_flags_still_gets_a_stamped_map(tmp_pa
     short-circuits and the watcher rebuilds forever. A kernel too old for the
     flags must therefore still get the values patched in, slowly, rather than
     going without.
+
+    **Both probes are turned off, because they are one capability** (pinned by
+    the test above). An old kernel has neither the fused build nor the stamp
+    flags; patching only `_manifest_accepts_stamp_flags` leaves
+    `_build_accepts_manifest` answering for the *real* binary, the engine takes
+    the fused path, and the fallback under test is never reached — which is how
+    this test read green while the CLI half of the fused build was still held
+    back, and red the moment it landed.
     """
     root = _git_repo(tmp_path)
+    monkeypatch.setattr(devmap_engine, "_build_accepts_manifest", lambda _binary: False)
     monkeypatch.setattr(devmap_engine, "_manifest_accepts_stamp_flags", lambda _binary: False)
 
     called: list[tuple] = []
