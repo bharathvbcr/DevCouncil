@@ -1093,6 +1093,25 @@ impl Daemon {
     /// gave up and killed the daemon it had just spawned after three seconds,
     /// then fell back to re-doing the work through the CLI, on every call.
     pub async fn run_loop(&self) -> anyhow::Result<()> {
+        // Captured *first*, before the IPC endpoint binds, because the window
+        // between binding and here is not empty: `reconcile_connect_time`
+        // sweeps the tree in it, which on a large repository is seconds during
+        // which the socket is already visible to clients.
+        //
+        // Captured after that bind, a binary replaced during startup is read
+        // back as the baseline — `started_as == current` from then on — and the
+        // daemon serves the old kernel for the rest of its life believing it is
+        // current. That is the exact failure the retirement check exists to
+        // prevent, reachable through the check itself. And a rebuild lands in
+        // that window precisely when it is most likely: rebuilding is what
+        // restarts the tooling that spawns this daemon.
+        //
+        // It also makes the check testable. A test can synchronise on the
+        // socket appearing; it has no way to observe a capture that happens
+        // afterwards, so `daemon_binary_retirement.rs` was failing whenever a
+        // cold binary made startup slow enough for its `advance_modification_time`
+        // to land inside the window.
+        let started_as = executable_identity();
         info!(
             "DevMap daemon started for {:?} (batch_limit={})",
             self.root, self.batch_limit
@@ -1219,9 +1238,6 @@ impl Daemon {
         // daemon — idle time runs from loop start, not from zero. That is the
         // orphan case: spawned, used once, client died, nothing left to ask.
         let started_at = std::time::Instant::now();
-        // Captured once, at startup, so the tick below compares against what
-        // this process was actually launched from. See the retirement check.
-        let started_as = executable_identity();
         // Every way out of this loop is a `break` carrying a [`LoopExit`], and
         // the single release below is the only caller of
         // `release_ipc_endpoint`. Two of the six exits — the binary-replacement
