@@ -91,14 +91,43 @@ pub fn is_cache_directory(dir: &Path) -> bool {
     head == CACHEDIR_TAG_SIGNATURE
 }
 
+/// What [`CacheDirectoryCache::tagged_ancestor`] was able to determine.
+///
+/// Three states, not two, because "I opened every ancestor and none carried a
+/// tag" and "I was handed something that is not a repo-relative path, so I
+/// never opened anything" are different answers. Collapsing them into `None`
+/// let a path the walk could not evaluate read as one it evaluated and
+/// cleared — and the caller acts on that by indexing the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheVerdict {
+    /// The path lies inside this repo-relative tagged cache directory.
+    Inside(String),
+    /// Every ancestor was opened; none carried a `CACHEDIR.TAG`.
+    Outside,
+    /// The path is not repo-relative, so no ancestor was opened. The payload
+    /// says which rule it broke, for the caller's refusal message.
+    NotRepoRelative(&'static str),
+}
+
 /// Memoised ancestor lookup for [`is_cache_directory`].
 ///
 /// One `open` per directory rather than per path. Reconciling the pending queue
 /// asks this of every row — 51,136 of them on the live store — and a repository
 /// is a few thousand directories deep in total, so the memo turns
 /// O(rows x depth) syscalls into O(distinct directories).
+///
+/// The memo is scoped to one root at a time. It was keyed on the repo-relative
+/// prefix alone while the root arrived as a per-call parameter, so a single
+/// instance asked about two roots answered the second from the first's cache:
+/// a `pkg/` that is a cargo output tree in one checkout made an ordinary
+/// `pkg/` in another checkout read as a build cache, and a directory this
+/// answers `Inside` for is skipped whole — not walked, not indexed. Every
+/// construction site today pairs one instance with one root, so this was
+/// latent rather than live; it is a property of the type now instead of an
+/// unwritten rule its callers happened to keep.
 #[derive(Debug, Default)]
 pub struct CacheDirectoryCache {
+    root: Option<std::path::PathBuf>,
     verdict: std::collections::HashMap<String, bool>,
 }
 
@@ -109,11 +138,35 @@ impl CacheDirectoryCache {
     /// directory. The repository root is deliberately **not** checked: a user
     /// who points `devmap build` at a tagged directory has asked for it, and
     /// refusing the whole tree would be a worse answer than indexing it.
-    pub fn tagged_ancestor(&mut self, root: &Path, relative: &str) -> Option<String> {
+    ///
+    /// `relative` must be repo-relative and canonical. An absolute path or one
+    /// carrying a `..` component is refused rather than walked, because
+    /// `root.join(part)` is not a containment operation: `src/..` *is* the
+    /// root, which defeats the exemption above, and `../sibling` leaves the
+    /// repository entirely — both were reachable, and both returned the
+    /// escaping string to the caller labelled as a repo-relative cache
+    /// directory. `--affected` hands this raw command-line input, so the
+    /// refusal is load-bearing rather than defensive.
+    ///
+    /// An empty component (`a//b`) is skipped and `.` is ignored, which leaves
+    /// `""` and `"."` meaning the root itself: exempt, hence [`Outside`].
+    ///
+    /// [`Outside`]: CacheVerdict::Outside
+    pub fn tagged_ancestor(&mut self, root: &Path, relative: &str) -> CacheVerdict {
+        if relative.starts_with('/') {
+            return CacheVerdict::NotRepoRelative("is an absolute path");
+        }
+        if self.root.as_deref() != Some(root) {
+            self.verdict.clear();
+            self.root = Some(root.to_path_buf());
+        }
         let mut prefix = String::new();
         for part in relative.split('/') {
             if part.is_empty() || part == "." {
                 continue;
+            }
+            if part == ".." {
+                return CacheVerdict::NotRepoRelative("contains a `..` component");
             }
             if !prefix.is_empty() {
                 prefix.push('/');
@@ -128,16 +181,11 @@ impl CacheDirectoryCache {
                 }
             };
             if tagged {
-                return Some(prefix);
+                return CacheVerdict::Inside(prefix);
             }
         }
-        None
+        CacheVerdict::Outside
     }
-}
-
-/// One-shot [`CacheDirectoryCache::tagged_ancestor`] for a single question.
-pub fn cache_directory_for(root: &Path, relative: &str) -> Option<String> {
-    CacheDirectoryCache::default().tagged_ancestor(root, relative)
 }
 
 /// The contents of a lock, whatever a panic elsewhere did to it.

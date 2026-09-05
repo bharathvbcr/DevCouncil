@@ -215,10 +215,20 @@ fn classify_pending_entry(
     // Discovery no longer walks these directories, so a queued row naming one
     // can only ever fail — and 47,000 of them were queued from two cargo output
     // trees on this repository before discovery learned to skip them.
-    if let Some(cache) = caches.tagged_ancestor(root, canonical) {
-        return Err(format!(
-            "inside {cache}, a build cache marked with CACHEDIR.TAG"
-        ));
+    match caches.tagged_ancestor(root, canonical) {
+        devmap_extract::CacheVerdict::Inside(cache) => {
+            return Err(format!(
+                "inside {cache}, a build cache marked with CACHEDIR.TAG"
+            ));
+        }
+        // `canonical_pending_entry` is supposed to have made this repo-relative
+        // already, so reaching here means the row was written by something that
+        // bypassed it. Unprocessable either way — and now it says which rule the
+        // path broke instead of being waved through as "not a build cache".
+        devmap_extract::CacheVerdict::NotRepoRelative(why) => {
+            return Err(format!("{why}, so it names nothing inside the repository"));
+        }
+        devmap_extract::CacheVerdict::Outside => {}
     }
     let absolute = root.join(canonical);
     match std::fs::symlink_metadata(&absolute) {
@@ -1783,12 +1793,22 @@ impl Store {
                     // repository. Discovery skips the directory, so every one
                     // of those rows was guaranteed to be dropped later or to
                     // index something that is not source.
-                    if let Some(cache) = caches.tagged_ancestor(root, &entry) {
-                        report.refused.push((
-                            raw.clone(),
-                            format!("inside {cache}, a build cache marked with CACHEDIR.TAG"),
-                        ));
-                        continue;
+                    match caches.tagged_ancestor(root, &entry) {
+                        devmap_extract::CacheVerdict::Inside(cache) => {
+                            report.refused.push((
+                                raw.clone(),
+                                format!("inside {cache}, a build cache marked with CACHEDIR.TAG"),
+                            ));
+                            continue;
+                        }
+                        devmap_extract::CacheVerdict::NotRepoRelative(why) => {
+                            report.refused.push((
+                                raw.clone(),
+                                format!("{why}, so it names nothing inside the repository"),
+                            ));
+                            continue;
+                        }
+                        devmap_extract::CacheVerdict::Outside => {}
                     }
                     canonical.insert(entry);
                 }
