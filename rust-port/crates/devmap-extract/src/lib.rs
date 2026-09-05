@@ -140,6 +140,77 @@ pub fn cache_directory_for(root: &Path, relative: &str) -> Option<String> {
     CacheDirectoryCache::default().tagged_ancestor(root, relative)
 }
 
+/// The contents of a lock, whatever a panic elsewhere did to it.
+///
+/// E-8: the prune ledger below was read and written through
+/// `if let Ok(guard) = lock.lock()`, which silently does *nothing* once the
+/// mutex is poisoned — so a panic anywhere under the walk would erase every
+/// pruned `CACHEDIR.TAG` subtree from `skipped_paths` and the report would then
+/// describe a tree it had not walked, with nothing saying so. A ledger that
+/// could not be read must not read as an empty ledger.
+///
+/// Recovering is right here rather than propagating: poisoning says a *writer*
+/// panicked, not that the data is torn. `BTreeSet::insert` has no intermediate
+/// state a panic can leave behind, so the set holds every directory recorded
+/// before the panic, and reporting those is strictly better than reporting
+/// none. The panic itself is not swallowed — it unwinds its own thread as
+/// usual.
+fn recover_lock<T>(lock: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod prune_ledger_tests {
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex};
+
+    /// E-8: a poisoned ledger must not read as an empty one.
+    ///
+    /// The pruned-directory set is shared with `filter_entry`, which the
+    /// `ignore` crate requires to be `Fn + Send + Sync`, so a mutex is the
+    /// honest way to get an answer back out of it. Both ends of that mutex were
+    /// spelled `if let Ok(guard) = lock.lock()`, which does *nothing at all*
+    /// once a panic has poisoned it: every pruned `CACHEDIR.TAG` subtree would
+    /// vanish from `skipped_paths`, and the report would describe a tree it had
+    /// not walked with nothing saying so. On this repository that is 1,041 of
+    /// 2,363 candidate paths.
+    ///
+    /// No end-to-end reproduction is possible today and that is deliberate
+    /// rather than an omission: `collect_sources_with_report` builds the serial
+    /// `Walk`, so a panic inside the closure unwinds out of the function that
+    /// owns the mutex and the report is never read. The trap is one edit away —
+    /// `build_parallel` is the obvious next move for discovery, and it runs the
+    /// same closure on worker threads where one panic poisons the ledger the
+    /// survivors keep writing to. This pins the policy at the only level where
+    /// it is observable: the guard, and both branches of it.
+    #[test]
+    fn a_poisoned_prune_ledger_is_recovered_rather_than_silently_dropped() {
+        let ledger: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
+        super::recover_lock(&ledger).insert("rust-port/target-serve".to_string());
+
+        let writer = Arc::clone(&ledger);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = writer.lock().unwrap();
+            panic!("a walk callback panicked while holding the ledger");
+        }));
+        assert!(panicked.is_err(), "the fixture must actually panic");
+        assert!(
+            ledger.lock().is_err(),
+            "precondition: the ledger is poisoned, which is the case the old \
+             `if let Ok(..)` silently skipped"
+        );
+
+        let recovered = super::recover_lock(&ledger);
+        assert_eq!(
+            recovered.len(),
+            1,
+            "a directory recorded before the panic is still a directory that was \
+             pruned, and the report has to say so"
+        );
+        assert!(recovered.contains("rust-port/target-serve"));
+    }
+}
+
 /// Canonical source-content identity shared by extraction, cache, and
 /// connect-time freshness checks.
 pub fn content_hash(source: &str) -> u64 {
@@ -401,9 +472,7 @@ pub fn collect_sources_with_report(
                 return true;
             }
             if let Ok(relative) = entry.path().strip_prefix(&walk_root) {
-                if let Ok(mut pruned) = pruned_writer.lock() {
-                    pruned.insert(relative.to_string_lossy().replace('\\', "/"));
-                }
+                recover_lock(&pruned_writer).insert(relative.to_string_lossy().replace('\\', "/"));
             }
             false
         })
@@ -471,12 +540,10 @@ pub fn collect_sources_with_report(
     // the ordinary case, like a README beside the code, not a gap in coverage.
     // Recording it at all is what keeps the report honest about the subtree it
     // did not walk.
-    if let Ok(pruned) = pruned.lock() {
-        for directory in pruned.iter() {
-            report
-                .skipped_paths
-                .push((directory.clone(), DiscoverySkipReason::NonSource));
-        }
+    for directory in recover_lock(&pruned).iter() {
+        report
+            .skipped_paths
+            .push((directory.clone(), DiscoverySkipReason::NonSource));
     }
 
     out.sort_by(|a, b| a.0.cmp(&b.0));
