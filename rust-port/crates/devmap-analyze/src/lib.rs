@@ -11,8 +11,9 @@ pub use clones::{
 };
 pub use clustering::{detect_communities, CommunityDetection};
 pub use liveness::{
-    analyze_liveness, analyze_liveness_with_coverage, extraction_coverage, ExtractionCoverage,
-    LivenessOutcome, COVERAGE_LOSS_CONFIDENCE_CAP, COVERAGE_LOSS_REASON, GO_BUILD_VARIANT_REASON,
+    analyze_liveness, analyze_liveness_with_coverage, extraction_coverage, DiscoveryCoverage,
+    ExtractionCoverage, LivenessOutcome, COVERAGE_LOSS_CONFIDENCE_CAP, COVERAGE_LOSS_REASON,
+    GO_BUILD_VARIANT_REASON,
 };
 pub use model::*;
 pub use pdg::*;
@@ -21,8 +22,29 @@ pub use traversal::*;
 use devmap_extract::model::*;
 use devmap_resolve::model::*;
 
+/// Analyse a corpus that was handed to us directly, with no discovery step.
+///
+/// Correct for callers that build their own `extractions` — the single-file
+/// preview path, and tests. A caller that walked a tree must use
+/// [`analyze_with_discovery`] instead and pass what discovery refused, or the
+/// summary will report full coverage of a corpus it never fully saw.
 pub fn analyze(extractions: &[Extraction], resolution: &ResolutionResult) -> AnalysisSummary {
-    let liveness = analyze_liveness_with_coverage(extractions, resolution);
+    analyze_with_discovery(extractions, resolution, DiscoveryCoverage::none())
+}
+
+/// Analyse a corpus, told what discovery refused before extraction saw it.
+///
+/// The refusal count cannot be recovered from `extractions`: a file discovery
+/// turned away has no `Extraction` at all. That is why the gap survived the fix
+/// which closed the parse-failure half of the same rule — every check was
+/// computed from the slice, and the slice is exactly what the missing files are
+/// missing from.
+pub fn analyze_with_discovery(
+    extractions: &[Extraction],
+    resolution: &ResolutionResult,
+    discovery: DiscoveryCoverage,
+) -> AnalysisSummary {
+    let liveness = analyze_liveness_with_coverage(extractions, resolution, discovery);
     let dead_symbols = liveness.reports;
     let detection = detect_communities(extractions, resolution);
     let clone_coverage = clone_coverage(extractions);
