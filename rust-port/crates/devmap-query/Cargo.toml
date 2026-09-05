@@ -86,3 +86,17 @@ required-features = ["parse"]
 [[test]]
 name = "paired_reads_are_one_generation"
 required-features = ["parse"]
+
+[[test]]
+name = "query_work_is_bounded_by_the_answer"
+required-features = ["parse"]
+
+# Examples are targets too, and `--all-targets` builds them. `query_bench`
+# builds a store to measure against, so it needs the frontend for the same
+# reason the tests above do. The other three examples compile without `parse`
+# and are deliberately left ungated: `required-features` means "skip", and
+# skipping a target that would have built is coverage quietly deleted.
+
+[[example]]
+name = "query_bench"
+required-features = ["parse"]

@@ -167,11 +167,7 @@ fn path_matches_candidate(file: &str, query: &str) -> bool {
         }
     }
     fn eq(left: &[u8], right: &[u8]) -> bool {
-        left.len() == right.len()
-            && left
-                .iter()
-                .zip(right)
-                .all(|(a, b)| slash(*a) == slash(*b))
+        left.len() == right.len() && left.iter().zip(right).all(|(a, b)| slash(*a) == slash(*b))
     }
     let file = file.as_bytes();
     let query = query.as_bytes();
@@ -396,11 +392,16 @@ fn h3_traversal_index(edges: &[ResolvedEdge], symbol_target: &str) {
     let (index_only, index_len) = time(|| {
         let mut adj: std::collections::BTreeMap<&str, Vec<&ResolvedEdge>> = Default::default();
         for edge in edges {
-            adj.entry(edge.target_symbol.as_str()).or_default().push(edge);
+            adj.entry(edge.target_symbol.as_str())
+                .or_default()
+                .push(edge);
         }
         adj.len()
     });
-    println!("  whole traverse_graph {whole:>10.2?}  ({} edges recorded)", walk.traversed_edges.len());
+    println!(
+        "  whole traverse_graph {whole:>10.2?}  ({} edges recorded)",
+        walk.traversed_edges.len()
+    );
     println!("  index build only     {index_only:>10.2?}  ({index_len} keys)");
     println!(
         "  => the index is {:.0}% of the call; it is rebuilt on every query, and\n     \

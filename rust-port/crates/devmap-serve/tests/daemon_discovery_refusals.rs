@@ -236,7 +236,9 @@ fn an_incremental_resync_does_not_erase_a_recorded_refusal() {
         "fixture precondition: the payload must be current, or the drain takes \
          the full-rebuild branch and this tests the other path"
     );
-    daemon.drain_pending_batch().expect("the resync must succeed");
+    daemon
+        .drain_pending_batch()
+        .expect("the resync must succeed");
 
     let after = reader.latest_analysis().unwrap().unwrap().status;
     assert!(
@@ -278,7 +280,9 @@ fn an_incremental_resync_of_a_clean_corpus_stays_clean() {
     reader
         .enqueue_pending_paths(&[root.join("lib.py").to_string_lossy().into_owned()])
         .unwrap();
-    daemon.drain_pending_batch().expect("the resync must succeed");
+    daemon
+        .drain_pending_batch()
+        .expect("the resync must succeed");
 
     let after = reader.latest_analysis().unwrap().unwrap().status;
     assert!(

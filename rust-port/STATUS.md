@@ -2744,3 +2744,53 @@ green checkmarks cannot be read as five proofs.
 The third instance the store audit found — `latest_dead_symbols` +
 `count_dead_at_least` — is deliberately left alone: `count_dead_at_least` has
 only a test caller, and pairing it would mean shipping an unwired API.
+
+### Q-11 — the feature-off gate regressed, because nothing ever ran it
+
+`required-features` gating was added to `devmap-query` so the crate's tests
+compile with `--no-default-features` — the shape an embedder links. Two targets
+added after that pass, `query_work_is_bounded_by_the_answer` and the
+`query_bench` example, were never gated, and
+
+```
+cargo check -p devmap-query --no-default-features --all-targets   → exit 101
+```
+
+The gap survived for the same reason it did the first time: a build error reads
+as "this target was not meant to be built here" rather than as a failure, and
+no gate anywhere ran that configuration. `--no-default-features` appeared in no
+CI workflow at all.
+
+Only those two targets were gated. The other four ungated targets
+(`workspace_registry_concurrency`, `impact_breakdown`, `query_phase_ab`,
+`query_snapshot`) compile feature-off and are deliberately left ungated:
+`required-features` means *skip*, so gating a target that would have built is
+coverage quietly deleted. Gating is a cost, not a cleanup — `devmap-query` runs
+39 tests feature-off against 169 with `parse` on, and that gap is the price.
+
+**The new CI job must stay per-crate, and this is the part worth not
+"simplifying".**
+
+```
+cargo check --workspace  --no-default-features --all-targets   → exit 0
+cargo check -p devmap-query --no-default-features --all-targets → exit 101
+```
+
+`--no-default-features` turns off the *workspace members'* own defaults, but
+`devmap-cli` and `devmap-serve` depend on `devmap-query` without
+`default-features = false`, so unification switches `parse` back on for the
+shared graph. The workspace-wide spelling is a check that cannot fail for this
+class — it reports the same green as a check that actually examined something.
+It is the tidier-looking command and the useless one.
+
+Post-fix the per-crate matrix is green across all five `parse` crates, with 245
+tests actually running feature-off: extract 60, resolve 15, analyze 25, store
+106, query 39.
+
+### Q-12 — `cargo fmt --check` had never run on the port
+
+CI's first step is `cargo fmt --all -- --check`. The workflow has never been
+pushed, so that step has never executed, and 17 files were unformatted —
+committed ones included. Every commit in this pass would have failed CI before
+reaching a single test. Formatting is now clean workspace-wide; no logic
+changed.

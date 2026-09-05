@@ -42,7 +42,10 @@ fn generation_of(store: &Store, count: usize) {
         .unwrap();
 }
 
-fn search(engine: &StoreQueryEngine, query: &str) -> devmap_query::Response<devmap_query::SymbolHit> {
+fn search(
+    engine: &StoreQueryEngine,
+    query: &str,
+) -> devmap_query::Response<devmap_query::SymbolHit> {
     engine
         .search(Request {
             query: query.to_string(),

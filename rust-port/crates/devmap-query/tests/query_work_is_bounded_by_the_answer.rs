@@ -120,9 +120,7 @@ fn chain_store(links: usize) -> (Store, Vec<String>) {
             index + 1
         ));
     }
-    core.push_str(&format!(
-        "def link_{links:05}(rows):\n    return rows\n"
-    ));
+    core.push_str(&format!("def link_{links:05}(rows):\n    return rows\n"));
 
     let mut callers = String::from("from core import link_00000\n\n\n");
     for index in 0..8 {
@@ -234,8 +232,11 @@ fn a_query_allocates_for_its_answer_not_for_the_whole_generation() {
         .neighbors(&targets, 2_000, 0.0, 1)
         .expect("neighbors answers");
 
-    let (composed_allocations, composed) =
-        allocations_during(|| engine.neighbors(&targets, 2_000, 0.0, 1).expect("neighbors"));
+    let (composed_allocations, composed) = allocations_during(|| {
+        engine
+            .neighbors(&targets, 2_000, 0.0, 1)
+            .expect("neighbors")
+    });
     let (separate_allocations, _) = allocations_during(|| {
         for target in &targets {
             std::hint::black_box(engine.impact(request(target, 1)).expect("impact"));

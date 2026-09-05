@@ -149,7 +149,10 @@ fn report(label: &str, cold: Duration, warm: &[Duration], answer: String) {
 }
 
 fn skipped(label: &str, why: &str) {
-    println!("{label:<34} {:>11} {:>11} {:>11}  SKIPPED: {why}", "-", "-", "-");
+    println!(
+        "{label:<34} {:>11} {:>11} {:>11}  SKIPPED: {why}",
+        "-", "-", "-"
+    );
 }
 
 fn percentiles(samples: &[Duration]) -> (Duration, Duration) {
@@ -276,7 +279,10 @@ fn trace(corpus: &Corpus, targets: &Targets) -> anyhow::Result<()> {
 
 fn trace_between(corpus: &Corpus, targets: &Targets) -> anyhow::Result<()> {
     let Some((from, to)) = targets.path_endpoints.clone() else {
-        skipped("trace_between (a -> b)", "no connected pair found in this store");
+        skipped(
+            "trace_between (a -> b)",
+            "no connected pair found in this store",
+        );
         return Ok(());
     };
     let (cold, warm, answer) = measure(corpus, WARM_SLOW, |engine| {
@@ -396,7 +402,11 @@ fn artifacts(corpus: &Corpus) -> anyhow::Result<()> {
 
     println!(
         "{:<34} {:>11.2?} {:>11} {:>11}  {} extractions",
-        "  read latest_extractions", read_extractions, "-", "-", extractions.len()
+        "  read latest_extractions",
+        read_extractions,
+        "-",
+        "-",
+        extractions.len()
     );
     println!(
         "{:<34} {:>11.2?} {:>11} {:>11}  {} edges",
@@ -738,9 +748,7 @@ fn write_sources(root: &Path, files: usize, syms: usize) -> anyhow::Result<Vec<(
             let other = (index + 1013) % files;
             (other / per_package, other % per_package)
         };
-        let source = module_source(
-            package, module, syms, up_pkg, up_mod, far_pkg, far_mod,
-        );
+        let source = module_source(package, module, syms, up_pkg, up_mod, far_pkg, far_mod);
         std::fs::write(root.join(&rel), &source)?;
         out.push((rel, source));
     }

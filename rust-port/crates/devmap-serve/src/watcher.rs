@@ -714,7 +714,10 @@ mod tests {
     #[test]
     fn empty_batches_must_not_extend_the_debounce_window() {
         let start = Instant::now();
-        let mut buffer = DebounceBuffer::new(Duration::from_secs(2), whole_tree_rescan(std::path::Path::new("/tmp/devmap-debounce-fixture")));
+        let mut buffer = DebounceBuffer::new(
+            Duration::from_secs(2),
+            whole_tree_rescan(std::path::Path::new("/tmp/devmap-debounce-fixture")),
+        );
         buffer.push(["real.py"], start);
 
         // Ten seconds of fully-filtered event batches, 200 ms apart. Each one
@@ -805,7 +808,10 @@ mod tests {
     #[test]
     fn debounce_buffer_waits_deduplicates_and_sorts() {
         let start = Instant::now();
-        let mut buffer = DebounceBuffer::new(Duration::from_secs(2), whole_tree_rescan(std::path::Path::new("/tmp/devmap-debounce-fixture")));
+        let mut buffer = DebounceBuffer::new(
+            Duration::from_secs(2),
+            whole_tree_rescan(std::path::Path::new("/tmp/devmap-debounce-fixture")),
+        );
         buffer.push(["z.py", "a.py", "z.py"], start);
 
         assert!(buffer
@@ -826,7 +832,10 @@ mod tests {
     #[test]
     fn a_batch_held_past_the_cap_flushes_even_without_quiet() {
         let start = Instant::now();
-        let mut buffer = DebounceBuffer::new(Duration::from_secs(2), whole_tree_rescan(std::path::Path::new("/tmp/devmap-debounce-fixture")));
+        let mut buffer = DebounceBuffer::new(
+            Duration::from_secs(2),
+            whole_tree_rescan(std::path::Path::new("/tmp/devmap-debounce-fixture")),
+        );
 
         // Events arriving continuously: every one inside the quiet window.
         buffer.push(["a.py"], start);
@@ -1106,7 +1115,6 @@ mod tests {
             "two edits are two edits, not a reason to re-index everything"
         );
     }
-
 }
 
 #[cfg(test)]

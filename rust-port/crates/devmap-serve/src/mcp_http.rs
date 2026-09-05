@@ -163,7 +163,7 @@ fn unsupported_version_body(id: Value, requested: &str) -> Value {
             "code": UNSUPPORTED_PROTOCOL_VERSION,
             "message": format!(
                 "this transport speaks {}; the request stated {requested}. Handshake \
-revisions are served over stdio instead.",
+    revisions are served over stdio instead.",
                 MODERN_PROTOCOL_VERSIONS.join(", ")
             ),
             "data": {"supported": MODERN_PROTOCOL_VERSIONS, "requested": requested}
@@ -529,7 +529,10 @@ cannot be inferred from an earlier exchange."
             ));
         }
 
-        if meta.and_then(|meta| meta.get(META_CLIENT_CAPABILITIES)).is_none() {
+        if meta
+            .and_then(|meta| meta.get(META_CLIENT_CAPABILITIES))
+            .is_none()
+        {
             return Some((
                 StatusCode::BAD_REQUEST,
                 rpc_error_body(

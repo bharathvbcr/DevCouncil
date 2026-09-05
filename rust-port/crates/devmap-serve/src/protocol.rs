@@ -2052,7 +2052,6 @@ mod tests {
             "a built, drained store is current: {value}"
         );
     }
-
 }
 
 #[cfg(test)]

@@ -106,7 +106,11 @@ fn with_request_meta(body: &str) -> String {
         .or_insert_with(|| json!({}))
         .as_object_mut()
     {
-        if let Some(meta) = params.entry("_meta").or_insert_with(|| json!({})).as_object_mut() {
+        if let Some(meta) = params
+            .entry("_meta")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+        {
             meta.entry("io.modelcontextprotocol/protocolVersion")
                 .or_insert_with(|| json!("2026-07-28"));
             meta.entry("io.modelcontextprotocol/clientCapabilities")
@@ -484,7 +488,9 @@ async fn a_request_without_the_protocol_version_header_is_refused() {
     );
     let message = response["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        message.to_ascii_lowercase().contains("mcp-protocol-version"),
+        message
+            .to_ascii_lowercase()
+            .contains("mcp-protocol-version"),
         "the refusal must name the header the client has to add, got: {message}"
     );
 }
@@ -574,9 +580,15 @@ async fn an_unsupported_version_names_the_versions_that_would_work() {
 async fn a_non_json_content_type_is_refused() {
     let address = start().await;
     let body = with_request_meta(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
-    for content_type in ["text/plain", "application/x-www-form-urlencoded", "multipart/form-data"] {
-        let raw = raw_post(&body, &mirrored_headers(&body))
-            .replace("Content-Type: application/json", &format!("Content-Type: {content_type}"));
+    for content_type in [
+        "text/plain",
+        "application/x-www-form-urlencoded",
+        "multipart/form-data",
+    ] {
+        let raw = raw_post(&body, &mirrored_headers(&body)).replace(
+            "Content-Type: application/json",
+            &format!("Content-Type: {content_type}"),
+        );
         let (status, response) = request(&address, &raw).await;
         assert_eq!(
             status, 415,
@@ -642,8 +654,8 @@ async fn a_405_states_which_method_is_allowed() {
 async fn a_host_header_naming_a_public_name_is_refused_on_a_loopback_listener() {
     let address = start().await;
     let body = with_request_meta(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
-    let raw = raw_post(&body, &mirrored_headers(&body))
-        .replace("Host: localhost", "Host: evil.example");
+    let raw =
+        raw_post(&body, &mirrored_headers(&body)).replace("Host: localhost", "Host: evil.example");
     let (status, response) = request(&address, &raw).await;
     assert_eq!(
         status, 403,
@@ -669,9 +681,14 @@ async fn a_host_header_naming_a_public_name_is_refused_on_a_loopback_listener() 
 async fn a_batch_body_is_refused_by_name() {
     let address = start().await;
     let batch = r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#;
-    let (status, response) = request(&address, &raw_post(batch, &[
-        ("MCP-Protocol-Version".to_string(), "2026-07-28".to_string()),
-    ])).await;
+    let (status, response) = request(
+        &address,
+        &raw_post(
+            batch,
+            &[("MCP-Protocol-Version".to_string(), "2026-07-28".to_string())],
+        ),
+    )
+    .await;
     assert_eq!(status, 400, "{response}");
     let message = response["error"]["message"]
         .as_str()
