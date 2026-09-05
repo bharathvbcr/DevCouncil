@@ -13,7 +13,11 @@
 //!   lookup key for every edge in the generation and dropped it immediately:
 //!   150,010 allocations to select one edge out of 50,000.
 //! * `neighbors` re-read and re-converted the whole edge table `2 * targets`
-//!   times, once inside each `impact` and each `trace` it composed.
+//!   times, once inside each `impact` and each `trace` it composed. Hoisting
+//!   the load fixed the composition; the per-generation edge index in
+//!   `devmap-store` fixed the sub-queries too, so the bound asserted below is
+//!   now absolute (allocations against the generation's edge count) rather
+//!   than a ratio between the two spellings.
 //!
 //! Timing would catch these, and timing is exactly what should not be asserted
 //! in a test suite: it turns a shared machine under load into a red build.
@@ -120,9 +124,7 @@ fn chain_store(links: usize) -> (Store, Vec<String>) {
             index + 1
         ));
     }
-    core.push_str(&format!(
-        "def link_{links:05}(rows):\n    return rows\n"
-    ));
+    core.push_str(&format!("def link_{links:05}(rows):\n    return rows\n"));
 
     let mut callers = String::from("from core import link_00000\n\n\n");
     for index in 0..8 {
@@ -214,12 +216,24 @@ fn a_query_allocates_for_its_answer_not_for_the_whole_generation() {
         kept.len()
     );
 
-    // 3. The composed fan-out reads the edge table once, not twice per target.
+    // 3. Neither the composed fan-out nor the calls it composes read the edge
+    //    table at all.
     //
-    // Measured against the calls `neighbors` composes, in the same process on
-    // the same store, so the comparison needs no absolute constant: before the
-    // fix the composition performed exactly the same 2N reads as the separate
-    // calls and the two counts were within a few percent of each other.
+    // This began as a *relative* assertion — composed against separate — because
+    // the composition was the only side that had been taught to hoist the edge
+    // load, and `impact`/`trace` still paid for the whole generation each. The
+    // store now holds one adjacency index per generation, so both sides are
+    // bounded by their answers and the ratio between them no longer measures
+    // anything: measured here at 638 composed against 629 separate over a
+    // 4,018-edge generation, where the relative form needed separate to be more
+    // than twice composed.
+    //
+    // The absolute bound is what survives, and it is the stronger claim: eight
+    // targets, two directions each, must allocate an order of magnitude below
+    // the generation's edge count — a per-answer cost, not a per-generation
+    // one. The relative half is kept as a no-regression floor: composing may
+    // not cost *more* than issuing the same queries separately, which is what
+    // a composition that re-read per sub-query would do.
     let (store, targets) = chain_store(2_000);
     let engine = StoreQueryEngine::new(&store);
     let request = |target: &String, depth: usize| Request {
@@ -234,8 +248,11 @@ fn a_query_allocates_for_its_answer_not_for_the_whole_generation() {
         .neighbors(&targets, 2_000, 0.0, 1)
         .expect("neighbors answers");
 
-    let (composed_allocations, composed) =
-        allocations_during(|| engine.neighbors(&targets, 2_000, 0.0, 1).expect("neighbors"));
+    let (composed_allocations, composed) = allocations_during(|| {
+        engine
+            .neighbors(&targets, 2_000, 0.0, 1)
+            .expect("neighbors")
+    });
     let (separate_allocations, _) = allocations_during(|| {
         for target in &targets {
             std::hint::black_box(engine.impact(request(target, 1)).expect("impact"));
@@ -251,11 +268,34 @@ fn a_query_allocates_for_its_answer_not_for_the_whole_generation() {
         composed.iter().any(|entry| entry.callers.shown > 0),
         "the fixture must produce real callers, or both sides measure empty answers"
     );
+    let generation_edges = store.latest_edges(0.0).expect("edges").len();
     assert!(
-        composed_allocations * 2 < separate_allocations,
+        generation_edges > 2_000,
+        "the fixture must hold a generation large enough for a per-edge cost to \
+         show, got {generation_edges} edge(s)"
+    );
+    let fan_out_budget = generation_edges / 2;
+    assert!(
+        composed_allocations < fan_out_budget,
+        "neighbors over {} targets allocated {composed_allocations} times against a \
+         {generation_edges}-edge generation — a per-generation cost, not a \
+         per-answer one (budget {fan_out_budget})",
+        targets.len()
+    );
+    assert!(
+        separate_allocations < fan_out_budget,
+        "the same queries issued one at a time allocated {separate_allocations} \
+         times against a {generation_edges}-edge generation — `impact` and `trace` \
+         are back to materialising the generation per call (budget {fan_out_budget})"
+    );
+    // No-regression floor, with the slack an allocator's bucket growth needs.
+    // Composing must not cost more than the calls it replaces; it is allowed to
+    // cost the same, which is what it now does.
+    assert!(
+        composed_allocations <= separate_allocations + separate_allocations / 4,
         "neighbors over {} targets allocated {composed_allocations} against \
          {separate_allocations} for the same queries issued one at a time — the \
-         composition is still re-reading the edge table per sub-query",
+         composition costs more than what it composes",
         targets.len()
     );
 }

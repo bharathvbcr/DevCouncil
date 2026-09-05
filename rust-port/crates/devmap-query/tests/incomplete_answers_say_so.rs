@@ -247,3 +247,49 @@ fn dead_symbols_over_a_complete_analysis_do_not_claim_to_be_incomplete() {
         dead.walk_incomplete
     );
 }
+
+/// Q-8: the qualification has to carry a *denominator*, not just an adjective.
+///
+/// "The analysis is partial" tells a reader to be careful and nothing about how
+/// careful. The audit's complaint was the missing number: a list read as
+/// "delete these" needs to say how much of the corpus was actually searched for
+/// callers, because one unread file is a different risk from two hundred.
+///
+/// The numbers reach here through `ExtractionCoverage::degraded_reason`, which
+/// `analyze()` folds into `AnalysisStatus::Partial` and `dead_symbols` surfaces
+/// on `walk_incomplete`. This pins the whole chain: a change anywhere along it
+/// that drops the counts leaves the adjective behind and fails here.
+#[test]
+fn a_degraded_dead_symbol_list_names_how_much_of_the_corpus_was_read() {
+    let store = store_of(
+        &[
+            ("lib.py", "def helper():\n    return 1\n"),
+            (
+                "app.py",
+                "from lib import helper\n\n\ndef main():\n    return helper()\n",
+            ),
+        ],
+        &["app.py"],
+    );
+    let dead = StoreQueryEngine::new(&store).dead_symbols(10_000).unwrap();
+    let reason = dead
+        .walk_incomplete
+        .as_deref()
+        .expect("a partial analysis must qualify its dead list");
+
+    assert!(
+        reason.contains("did not cover the whole corpus"),
+        "the reason must name the coverage gap, got {reason:?}"
+    );
+    assert!(
+        reason.contains("1 file(s) failed to parse"),
+        "the reason must carry the count of unread files, got {reason:?}"
+    );
+    assert!(
+        reason.contains("lower bound"),
+        "the reason must say the list is a lower bound, got {reason:?}"
+    );
+    // And the counters still describe the page honestly alongside it.
+    assert_eq!(dead.shown as usize, dead.items.len());
+    assert_eq!(dead.total, dead.shown + dead.hidden);
+}

@@ -14,9 +14,8 @@ pub mod semantic;
 pub mod workspace;
 
 pub use artifacts::{
-    writer_identity, ArtifactRecord, ArtifactStamp,
     render_subsystem_map_html, render_symbol_explorer_html, should_regenerate, write_atomic,
-    ArtifactFingerprint,
+    writer_identity, ArtifactFingerprint, ArtifactRecord, ArtifactStamp,
 };
 pub use cancel::{cancelled_queries, Cancel, QueryCancelled};
 pub use code_graph::{

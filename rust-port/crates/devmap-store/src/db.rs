@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use crate::edge_index::GenerationEdges;
 use devmap_analyze::clones::CloneCandidate;
 use devmap_analyze::model::*;
 use devmap_extract::model::*;
@@ -364,6 +365,16 @@ pub struct Store {
     /// The cached set is unfiltered; `min_confidence` is applied per request
     /// against the same rounding rule the SQL used, so the answer is unchanged.
     edge_cache: Mutex<Option<(u32, std::sync::Arc<Vec<StoredEdge>>)>>,
+    /// Adjacency over the same rows [`Store::edge_cache`] holds, keyed by the
+    /// same generation id.
+    ///
+    /// It shares that `Arc` rather than copying the edge text, so what this
+    /// adds is four maps of `u32` ids — see
+    /// [`GenerationEdges::adjacency_bytes`]. Without it every graph question
+    /// paid for the whole generation before the walk began: the clone out of
+    /// the cache, the conversion of every row, and an adjacency map over every
+    /// row, for a question whose answer touches a few dozen edges.
+    edge_index: Mutex<Option<(u32, std::sync::Arc<GenerationEdges>)>>,
     /// `(generation, node_count, edge_count)` for the generation last asked
     /// about.
     ///
@@ -752,7 +763,7 @@ fn fts_match_query(query: &str) -> Result<String> {
     Ok(format!("\"{}\"*", query.replace('"', "\"\"")))
 }
 
-fn checked_min_confidence(value: f32) -> Result<f32> {
+pub fn checked_min_confidence(value: f32) -> Result<f32> {
     if value.is_nan() {
         return Err(rusqlite::Error::InvalidParameterName(
             "min_confidence must be a number; got NaN, which no confidence \
@@ -1373,6 +1384,7 @@ impl Store {
         Ok(Self {
             conn: Mutex::new(conn),
             edge_cache: Mutex::new(None),
+            edge_index: Mutex::new(None),
             generation_counts: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
@@ -1583,6 +1595,7 @@ impl Store {
         Ok(Self {
             conn: Mutex::new(conn),
             edge_cache: Mutex::new(None),
+            edge_index: Mutex::new(None),
             generation_counts: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
             db_path: None,
@@ -3722,52 +3735,96 @@ impl Store {
         // A caller got "this depends on nothing" — a positive claim — from a
         // comparison that never ran. `checked_min_confidence` refuses the input
         // instead, so neither implementation is asked an unanswerable question.
-        fn admits(confidence: f32, min_confidence: f32) -> bool {
-            (confidence * 1000.0).round() as i64 >= (min_confidence * 1000.0).round() as i64
-        }
-
         let min_confidence = checked_min_confidence(min_confidence)?;
+        let Some((_, all)) = self.latest_edge_rows()? else {
+            return Ok(Vec::new());
+        };
+        Ok(all
+            .iter()
+            .filter(|edge| crate::edge_index::admits(edge.confidence, min_confidence))
+            .cloned()
+            .collect())
+    }
 
+    /// The latest generation's unfiltered edge rows, and the generation they
+    /// came from.
+    ///
+    /// The one place [`Store::edge_cache`] is consulted and filled, so
+    /// [`Store::latest_edges`] and [`Store::generation_edges`] read the same
+    /// rows for the same generation and share one allocation of them. `None`
+    /// means no generation has been persisted.
+    ///
+    /// Keyed by the generation the rows were *read from*, not by the one
+    /// sampled before the load. This function asks the question twice — once
+    /// to probe the cache, once inside the load's own snapshot — and a writer
+    /// committing between the two made the entry `(N, edges of N+1)`: a key
+    /// that can never be hit again, so the cache silently stopped being one
+    /// until the next load rewrote it. Labelling the entry with the generation
+    /// its rows came from makes the key mean what it says.
+    fn latest_edge_rows(&self) -> Result<Option<(u32, std::sync::Arc<Vec<StoredEdge>>)>> {
         let current = {
             let conn = lock_conn(&self.conn)?;
             Self::latest_generation_id_locked(&conn)?
         };
         let Some(current) = current else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         if let Ok(cache) = self.edge_cache.lock() {
             if let Some((generation, edges)) = cache.as_ref() {
                 if *generation == current {
-                    return Ok(edges
-                        .iter()
-                        .filter(|edge| admits(edge.confidence, min_confidence))
-                        .cloned()
-                        .collect());
+                    return Ok(Some((current, std::sync::Arc::clone(edges))));
                 }
             }
         }
-        // Keyed by the generation the rows were *read from*, not by `current`.
-        //
-        // `current` was sampled by its own statement, above, and the load below
-        // resolves the latest generation again under its own snapshot — this
-        // function is the one place in the store that asks the question twice.
-        // A writer committing between the two made the entry `(N, edges of
-        // N+1)`: a key that can never be hit again, so the cache the doc calls
-        // a bounded replacement for per-query allocation silently stopped being
-        // one until the next load rewrote it. Labelling the entry with the
-        // generation its rows came from makes the key mean what it says.
         let Some((loaded, all)) = self.latest_edges_uncached(0.0)? else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
-        let filtered: Vec<StoredEdge> = all
-            .iter()
-            .filter(|edge| admits(edge.confidence, min_confidence))
-            .cloned()
-            .collect();
+        let all = std::sync::Arc::new(all);
         if let Ok(mut cache) = self.edge_cache.lock() {
-            *cache = Some((loaded, std::sync::Arc::new(all)));
+            *cache = Some((loaded, std::sync::Arc::clone(&all)));
         }
-        Ok(filtered)
+        Ok(Some((loaded, all)))
+    }
+
+    /// Adjacency over the latest generation's edges, built once per generation.
+    ///
+    /// `None` when no generation has been persisted. The returned index is a
+    /// snapshot: it stays internally consistent — every edge in it comes from
+    /// one generation — even if a build commits a newer one while a walk is
+    /// running, and the next call after that build gets the newer generation
+    /// because the memo is keyed by its id.
+    ///
+    /// Errors on an unknown stored edge kind, which is where the per-request
+    /// conversion used to fail: a store written by a binary that knows an edge
+    /// kind this one does not is refused rather than half-read.
+    pub fn generation_edges(&self) -> Result<Option<std::sync::Arc<GenerationEdges>>> {
+        let Some((current, rows)) = self.latest_edge_rows()? else {
+            return Ok(None);
+        };
+        if let Ok(cache) = self.edge_index.lock() {
+            if let Some((generation, index)) = cache.as_ref() {
+                if *generation == current {
+                    return Ok(Some(std::sync::Arc::clone(index)));
+                }
+            }
+        }
+        if rows.len() > u32::MAX as usize {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "generation {current} holds {} edges, more than the {} an edge \
+                 index can address; answering over a prefix of it would be a \
+                 wrong answer rather than a bounded one",
+                rows.len(),
+                u32::MAX
+            )));
+        }
+        let index = std::sync::Arc::new(
+            GenerationEdges::build(rows)
+                .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?,
+        );
+        if let Ok(mut cache) = self.edge_index.lock() {
+            *cache = Some((current, std::sync::Arc::clone(&index)));
+        }
+        Ok(Some(index))
     }
 
     /// Every edge of the latest generation, and the generation they came from.

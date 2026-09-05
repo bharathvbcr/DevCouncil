@@ -14,6 +14,14 @@
 //! * **subprocess** — spawning the `devmap` binary per question. This is what the
 //!   Python seam does whenever no daemon socket is live
 //!   (`DevMapClient._request`), and it is the path most sessions are actually on.
+//! * **ipc socket** — one connect / write / read against a live
+//!   `UnixIpcServer` over its Unix socket, serving the same open store. This is
+//!   the path `DevMapClient` takes whenever a daemon *is* live, and it is the
+//!   one the other two were being compared without: the in-process number
+//!   flatters the seam (no client pays it) and the subprocess number damns it
+//!   (nobody with a daemon pays that either). All three are printed together so
+//!   the socket's own overhead — a connect, a frame each way — is attributable
+//!   rather than folded into either neighbour.
 //! * **cold-open** — opening the store, asking once, dropping it. Isolates how
 //!   much of the subprocess number is process startup versus store open, so the
 //!   difference is attributed rather than guessed at.
@@ -90,6 +98,27 @@ fn time_it(label: &str, iterations: usize, mut body: impl FnMut()) -> Stats {
     }
 }
 
+/// One framed request over the daemon's Unix socket, answered on one line.
+///
+/// The connect is inside the measurement on purpose: the Python client opens a
+/// fresh connection per request, so a number that reused one would describe a
+/// client that does not exist.
+#[cfg(unix)]
+async fn ipc_round_trip(
+    socket: &std::path::Path,
+    frame: &str,
+) -> anyhow::Result<serde_json::Value> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::UnixStream::connect(socket).await?;
+    stream.write_all(frame.as_bytes()).await?;
+    stream.write_all(b"\n").await?;
+    stream.flush().await?;
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply).await?;
+    Ok(serde_json::from_slice(reply.trim_ascii())?)
+}
+
 fn main() -> anyhow::Result<()> {
     let db = std::env::args().nth(1).ok_or_else(|| {
         anyhow::anyhow!(
@@ -125,7 +154,8 @@ fn main() -> anyhow::Result<()> {
     );
 
     let runtime = tokio::runtime::Runtime::new()?;
-    let slot = Arc::new(StoreSlot::ready(&db, Arc::new(store)));
+    let store = Arc::new(store);
+    let slot = Arc::new(StoreSlot::ready(&db, Arc::clone(&store)));
 
     // One representative call per shape: a text search, a reverse walk, and the
     // composed multi-target question the seam was built to collapse.
@@ -206,6 +236,49 @@ fn main() -> anyhow::Result<()> {
                  comparison was NOT measured and no spawn number is reported below.\n"
             );
         }
+    }
+
+    // The socket seam. Bound here rather than by spawning `devmap serve`, so the
+    // number is this build's dispatch over this build's transport and carries no
+    // daemon startup, no connect-time sweep and no watcher in it — the steady
+    // state a client actually meets.
+    #[cfg(unix)]
+    {
+        let directory =
+            std::path::PathBuf::from("/tmp").join(format!("devmap-bench-{}", std::process::id()));
+        std::fs::create_dir_all(&directory)?;
+        let socket = directory.join("ipc.sock");
+        let _ = std::fs::remove_file(&socket);
+        // `bind` constructs a `tokio::net::UnixListener`, which registers with
+        // the reactor and panics outside a runtime context.
+        let server = {
+            let _guard = runtime.enter();
+            devmap_serve::protocol::UnixIpcServer::bind(&socket)?
+        };
+        let activity = Arc::new(devmap_serve::protocol::Activity::default());
+        let served = runtime.spawn(server.run(Arc::clone(&store), activity));
+
+        for (name, frame) in [
+            ("status", r#"{"version":1,"cmd":"status"}"#),
+            ("search", r#"{"version":1,"cmd":"search","query":"build"}"#),
+            ("impact", r#"{"version":1,"cmd":"impact","target":"main"}"#),
+        ] {
+            // Same assertion the in-process rows carry: a benchmark of a refused
+            // frame measures the refusal.
+            let probe = runtime.block_on(ipc_round_trip(&socket, frame))?;
+            anyhow::ensure!(
+                probe["ok"] == serde_json::Value::Bool(true),
+                "ipc {name} was refused, so this would benchmark the refusal path: {probe}"
+            );
+            results.push(time_it(&format!("ipc socket {name}"), SAMPLES, || {
+                runtime
+                    .block_on(ipc_round_trip(&socket, frame))
+                    .expect("ipc round trip");
+            }));
+        }
+
+        served.abort();
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     results.push(time_it("cold-open + status", SPAWN_SAMPLES, || {
