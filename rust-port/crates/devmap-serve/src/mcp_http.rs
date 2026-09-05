@@ -46,7 +46,16 @@ use hyper::{header, Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{json, Value};
 
-use crate::mcp::{handle_method, StoreSlot, MODERN_PROTOCOL_VERSIONS};
+use crate::mcp::{handle_method, StoreSlot, META_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSIONS};
+// The codes are the shared ones. `-32020` and `-32022` are allocated by the
+// specification out of a range it reserves for itself, so they belong with the
+// rest of the taxonomy rather than in whichever module happened to need them
+// first; a private copy here would be a second declaration of a number that only
+// works if there is exactly one of it.
+use crate::mcp::codes::{
+    HEADER_MISMATCH, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND,
+    PARSE_ERROR, UNSUPPORTED_PROTOCOL_VERSION,
+};
 
 /// Largest request body accepted, in bytes.
 ///
@@ -78,18 +87,14 @@ const PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 const METHOD_HEADER: &str = "Mcp-Method";
 const NAME_HEADER: &str = "Mcp-Name";
 
-/// `-32020 HeaderMismatch`: the headers and the body describe different requests,
-/// or a required header is missing or malformed.
-const HEADER_MISMATCH: i64 = -32020;
-
-/// `-32022 UnsupportedProtocolVersion`.
-const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
-
-/// `_meta` key carrying the per-request protocol version.
-const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
-
-/// `_meta` key carrying the capabilities this request may be answered with.
-const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+/// `-32021 MissingRequiredClientCapability`, named so [`status_for`] can map it.
+///
+/// This server never emits it — it needs no client capability to answer any of
+/// its tools, and emitting it would name a requirement that does not exist. It
+/// is in the table because the table is a mapping from *the specification's*
+/// codes to statuses, and a code missing from it would fall through to `500`,
+/// which is the wrong answer to give about a request the client could fix.
+const MISSING_REQUIRED_CLIENT_CAPABILITY: i64 = -32021;
 
 /// JSON-RPC error code to HTTP status.
 ///
@@ -100,8 +105,13 @@ const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabiliti
 /// makes an unimplemented method look like a broken one.
 fn status_for(code: i64) -> StatusCode {
     match code {
-        -32700 | -32600 | -32602 | -32020 | -32021 | -32022 => StatusCode::BAD_REQUEST,
-        -32601 => StatusCode::NOT_FOUND,
+        PARSE_ERROR
+        | INVALID_REQUEST
+        | INVALID_PARAMS
+        | HEADER_MISMATCH
+        | MISSING_REQUIRED_CLIENT_CAPABILITY
+        | UNSUPPORTED_PROTOCOL_VERSION => StatusCode::BAD_REQUEST,
+        METHOD_NOT_FOUND => StatusCode::NOT_FOUND,
         // -32603 and anything unrecognised: the request was well-formed and the
         // server failed to answer it, which is a 500 and not the client's fault.
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -145,29 +155,6 @@ fn rpc_error_body(id: Value, code: i64, message: impl Into<String>) -> Value {
         "jsonrpc": "2.0",
         "id": id,
         "error": {"code": code, "message": message.into()}
-    })
-}
-
-/// A refusal that also says what would have worked.
-///
-/// `UnsupportedProtocolVersionError` carries a required
-/// `data: { supported, requested }`, and the client's documented recovery is to
-/// "use one of the versions in its advertised `supported` list". Without the
-/// data the refusal is a dead end: the client is told no and handed nothing to
-/// retry with, which is how a version mismatch turns into "the server is down".
-fn unsupported_version_body(id: Value, requested: &str) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {
-            "code": UNSUPPORTED_PROTOCOL_VERSION,
-            "message": format!(
-                "this transport speaks {}; the request stated {requested}. Handshake \
-    revisions are served over stdio instead.",
-                MODERN_PROTOCOL_VERSIONS.join(", ")
-            ),
-            "data": {"supported": MODERN_PROTOCOL_VERSIONS, "requested": requested}
-        }
     })
 }
 
@@ -469,6 +456,15 @@ impl MirroredHeaders {
     /// routing on the header value while the MCP server executes based on the
     /// body value)". A gateway that authorised `Mcp-Name: devmap_status` and
     /// forwarded a body calling `devmap_preview` is exactly that.
+    ///
+    /// Header/body *agreement* only. Whether the version they agree on is one
+    /// this server serves, and whether the body's `_meta` carries the other
+    /// fields the revision requires, is decided by `classify_era` in the shared
+    /// dispatcher — because those are properties of the request, not of HTTP,
+    /// and while they lived here the stdio transport performed neither. The
+    /// order still holds: a header that contradicts the body is answered before
+    /// the version is judged, so a client is told its request is inconsistent
+    /// before it is told to retry with a different version.
     fn check(&self, body: &Value, id: &Value, method: &str) -> Option<(StatusCode, Value)> {
         let mismatch = |message: String| {
             Some((
@@ -494,57 +490,22 @@ serves only {} and has no earlier revision to read a header-less request under."
             HeaderRead::Value(value) => value.as_str(),
         };
 
-        let meta = body.pointer("/params/_meta");
-        match meta
+        // Compared only when the body states a version at all. A body that
+        // states none is not a *mismatch* — there is nothing to mismatch — it is
+        // a request missing a required field, which the dispatcher answers with
+        // `-32602` as the revision requires. Reporting it here as a header fault
+        // would send the client to look at its headers, which are fine.
+        if let Some(stated) = body
+            .pointer("/params/_meta")
             .and_then(|meta| meta.get(META_PROTOCOL_VERSION))
             .and_then(Value::as_str)
         {
-            None => {
-                return Some((
-                    StatusCode::BAD_REQUEST,
-                    rpc_error_body(
-                        id.clone(),
-                        -32602,
-                        format!(
-                            "params._meta.{META_PROTOCOL_VERSION} is required on every request: \
-this revision replaced the initialize handshake with per-request metadata, so the version \
-cannot be inferred from an earlier exchange."
-                        ),
-                    ),
-                ))
-            }
-            Some(stated) if stated != version => {
+            if stated != version {
                 return mismatch(format!(
                     "{PROTOCOL_VERSION_HEADER} is {version} but params._meta.\
 {META_PROTOCOL_VERSION} is {stated}; the header and the body must state the same revision."
-                ))
+                ));
             }
-            Some(_) => {}
-        }
-
-        if !MODERN_PROTOCOL_VERSIONS.contains(&version) {
-            return Some((
-                StatusCode::BAD_REQUEST,
-                unsupported_version_body(id.clone(), version),
-            ));
-        }
-
-        if meta
-            .and_then(|meta| meta.get(META_CLIENT_CAPABILITIES))
-            .is_none()
-        {
-            return Some((
-                StatusCode::BAD_REQUEST,
-                rpc_error_body(
-                    id.clone(),
-                    -32602,
-                    format!(
-                        "params._meta.{META_CLIENT_CAPABILITIES} is required on every request. \
-An empty object declares no optional capabilities; omitting it is not the same statement, \
-because a server must not infer capabilities from a previous request."
-                    ),
-                ),
-            ));
         }
 
         match &self.method {
@@ -595,7 +556,7 @@ async fn handle_request(
             StatusCode::FORBIDDEN,
             &rpc_error_body(
                 Value::Null,
-                -32600,
+                INVALID_REQUEST,
                 "cross-origin requests are refused: this endpoint serves a private code index \
 and has no browser client",
             ),
@@ -607,7 +568,7 @@ and has no browser client",
             StatusCode::FORBIDDEN,
             &rpc_error_body(
                 Value::Null,
-                -32600,
+                INVALID_REQUEST,
                 "this listener is on loopback and the request named a routable host: nothing \
 can legitimately reach 127.0.0.1 under a public name, so this is a rebound request",
             ),
@@ -623,7 +584,7 @@ can legitimately reach 127.0.0.1 under a public name, so this is a rebound reque
         // without it a client that got here has to guess.
         let body = rpc_error_body(
             Value::Null,
-            -32600,
+            INVALID_REQUEST,
             "this endpoint speaks the MCP 2026-07-28 single-exchange transport: one \
 JSON-RPC request per POST. It has no SSE stream and no session.",
         );
@@ -639,7 +600,7 @@ JSON-RPC request per POST. It has no SSE stream and no session.",
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             &rpc_error_body(
                 Value::Null,
-                -32600,
+                INVALID_REQUEST,
                 format!(
                     "this endpoint reads only {JSON_MEDIA_TYPE}. Requiring it is also what \
 forces a browser to preflight, and the preflight is refused."
@@ -653,7 +614,7 @@ forces a browser to preflight, and the preflight is refused."
             StatusCode::NOT_ACCEPTABLE,
             &rpc_error_body(
                 Value::Null,
-                -32600,
+                INVALID_REQUEST,
                 format!(
                     "this endpoint answers with {JSON_MEDIA_TYPE} and has no SSE stream; the \
 request's Accept header excludes it."
@@ -669,7 +630,7 @@ request's Accept header excludes it."
         Err((status, message)) => {
             return Ok(json_response(
                 status,
-                &rpc_error_body(Value::Null, -32600, message),
+                &rpc_error_body(Value::Null, INVALID_REQUEST, message),
             ))
         }
     };
@@ -681,7 +642,7 @@ request's Accept header excludes it."
                 StatusCode::BAD_REQUEST,
                 &rpc_error_body(
                     Value::Null,
-                    -32700,
+                    PARSE_ERROR,
                     format!("body is not valid UTF-8: {err}"),
                 ),
             ))
@@ -693,7 +654,7 @@ request's Accept header excludes it."
         Err(err) => {
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,
-                &rpc_error_body(Value::Null, -32700, err.to_string()),
+                &rpc_error_body(Value::Null, PARSE_ERROR, err.to_string()),
             ))
         }
     };
@@ -708,7 +669,7 @@ request's Accept header excludes it."
             StatusCode::BAD_REQUEST,
             &rpc_error_body(
                 Value::Null,
-                -32600,
+                INVALID_REQUEST,
                 if parsed.is_array() {
                     "a batch is not a valid body for this transport: the MCP 2026-07-28 \
 Streamable HTTP binding takes a single JSON-RPC request or notification per POST. Send one \
@@ -729,10 +690,34 @@ request per POST."
     // notification is answered `202` with nothing in it.
     let is_request = parsed.get("id").is_some();
     let id = parsed.get("id").cloned().unwrap_or(Value::Null);
+
+    // The same narrowing stdio applies, for the same reason and in the same
+    // words: "Requests MUST include a string or integer ID. Unlike base
+    // JSON-RPC, the ID MUST NOT be `null`." Checked here too rather than only in
+    // the dispatcher because the id is read by this layer — it is what the error
+    // body is addressed to — so this layer is where an unusable one has to be
+    // caught. The offending value is echoed so the client can still resolve the
+    // call, exactly as on stdio.
+    if is_request {
+        if let Some(fault) = crate::mcp::id_fault(&id) {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &rpc_error_body(
+                    id,
+                    INVALID_REQUEST,
+                    format!(
+                        "a request id must be a string or an integer and must not be null; this \
+one is {fault}. The request was not run."
+                    ),
+                ),
+            ));
+        }
+    }
+
     if parsed.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return Ok(json_response(
             StatusCode::BAD_REQUEST,
-            &rpc_error_body(id, -32600, "jsonrpc must be \"2.0\""),
+            &rpc_error_body(id, INVALID_REQUEST, "jsonrpc must be \"2.0\""),
         ));
     }
     let method = match parsed.get("method").and_then(Value::as_str) {
@@ -740,7 +725,7 @@ request per POST."
         None => {
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,
-                &rpc_error_body(id, -32600, "request has no string 'method'"),
+                &rpc_error_body(id, INVALID_REQUEST, "request has no string 'method'"),
             ))
         }
     };
@@ -768,7 +753,7 @@ request per POST."
                 StatusCode::GATEWAY_TIMEOUT,
                 &rpc_error_body(
                     id,
-                    -32603,
+                    INTERNAL_ERROR,
                     format!(
                         "exchange exceeded {}s and was abandoned",
                         EXCHANGE_TIMEOUT.as_secs()
@@ -800,13 +785,34 @@ request per POST."
         // would claim this server acted on something it discarded.
         (Err(err), false) => Ok(json_response(
             status_for(err.code()),
-            &json!({"jsonrpc": "2.0", "error": {"code": err.code(), "message": err.message()}}),
+            &with_error_data(
+                json!({"jsonrpc": "2.0", "error": {"code": err.code(), "message": err.message()}}),
+                &err,
+            ),
         )),
         (Err(err), true) => Ok(json_response(
             status_for(err.code()),
-            &rpc_error_body(id, err.code(), err.message()),
+            &with_error_data(rpc_error_body(id, err.code(), err.message()), &err),
         )),
     }
+}
+
+/// Attach the error's recovery data to the frame, when it has any.
+///
+/// `UnsupportedProtocolVersionError` is why this exists: `data.supported` is the
+/// client's entire documented recovery path, and dropping it on the way out of
+/// the dispatcher would turn a refusal the client can act on into one it can
+/// only report. Omitted rather than written as `null` when there is none, so
+/// "no recovery information" and "recovery information that is null" stay
+/// distinguishable.
+fn with_error_data(mut frame: Value, error: &crate::mcp::RpcError) -> Value {
+    if let (Some(data), Some(object)) = (
+        error.data(),
+        frame.get_mut("error").and_then(Value::as_object_mut),
+    ) {
+        object.insert("data".to_string(), data.clone());
+    }
+    frame
 }
 
 /// Serve the modern transport on `addr` until the process ends.

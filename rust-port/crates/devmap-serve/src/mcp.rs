@@ -190,13 +190,100 @@ const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// only kill.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// JSON-RPC 2.0 reserved error codes, plus the one MCP adds.
-mod codes {
+/// Requests one connection may have outstanding at once.
+///
+/// Requests are served concurrently — they have to be, or a cancellation cannot
+/// be read while the call it cancels is still running — and concurrency without
+/// a ceiling is a peer choosing this process's memory and thread-pool
+/// occupancy. A pipelining client that never waits for an answer got one spawned
+/// task, one in-flight map entry and (for `tools/call`) one queued blocking
+/// closure holding an `Arc<Store>` per frame, for as many frames as it cared to
+/// write, with nothing reaping them until they finished on their own.
+///
+/// **Backpressure, not shedding.** At the ceiling the read loop waits for the
+/// oldest task instead of refusing the new frame. Refusing was the first
+/// attempt and it was wrong: `concurrent_requests_never_interleave_or_lose_an_id`
+/// pipelines 200 requests and requires 200 results, which is a realistic depth
+/// for an agent host draining a plan — so a shed at 64 turned a bound into
+/// visible data loss for a client doing nothing wrong. Waiting costs latency and
+/// loses nothing, which is the correct trade for a bound whose whole purpose is
+/// to stop memory growth.
+///
+/// 256 sits above that 200-deep pipeline, so the ordinary case never waits, and
+/// far below "unbounded". A connection parked at the ceiling delays reading —
+/// including a cancellation — until one call retires, which is bounded by
+/// [`CALL_TIMEOUT`]; that is the unavoidable cost of any ceiling, and 256 makes
+/// it a case a real client has to work to reach.
+pub const MAX_IN_FLIGHT_REQUESTS: usize = 256;
+
+/// Largest tool result this server will send, in bytes of serialized JSON.
+///
+/// The read side has always been bounded — [`MAX_FRAME_BYTES`] on stdio,
+/// `MAX_BODY_BYTES` over HTTP, both 1 MB — and the write side was not. That
+/// asymmetry is not academic: a client built the way this server is built
+/// refuses to read a frame this server was willing to write, and the agent sees
+/// a transport failure rather than "your budget was too large".
+///
+/// The number is derived, not chosen. The declared maximum token budget is
+/// 100,000 and the engine charges 4 bytes per token, so the largest answer any
+/// single-target tool can produce is about 400 KB; the specification asks for
+/// the payload to ride twice (once as `structuredContent`, once serialized into
+/// a text block for clients that read only `content`), and JSON escaping can
+/// grow the text copy again, so the largest *result* those tools can produce is
+/// comfortably under 2 MB. Eight leaves room for that to be wrong.
+///
+/// What it does not leave room for is `devmap_neighbors` at a high budget:
+/// 16 targets x 2 directions x 100,000 tokens is 12.8 MB of payload and roughly
+/// 26 MB of result. That call is exactly the one a caller must be *told* about
+/// rather than handed, which is why the refusal below names the multiplication
+/// and the parameter instead of truncating. Truncating is the one thing this
+/// must not do: a cut answer is indistinguishable from a complete one.
+const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
+
+/// JSON-RPC 2.0's reserved codes, and the ones MCP defines on top of them.
+///
+/// One module rather than a constant per transport, because the specification
+/// partitions the implementation-defined range and the partition is a rule about
+/// the *server*, not about a transport: "`-32020` to `-32099` — reserved for the
+/// MCP specification. Implementations **MUST NOT** emit any code from this
+/// sub-range that is not defined by this specification and **MUST** use defined
+/// codes only with their specified meanings." A second copy of `-32022` living
+/// in the HTTP module is one edit away from being a second copy with a different
+/// number, and the number is the entire interface.
+pub mod codes {
     pub const PARSE_ERROR: i64 = -32700;
     pub const INVALID_REQUEST: i64 = -32600;
     pub const METHOD_NOT_FOUND: i64 = -32601;
     pub const INVALID_PARAMS: i64 = -32602;
     pub const INTERNAL_ERROR: i64 = -32603;
+
+    /// `HeaderMismatch`: the HTTP headers and the body describe different
+    /// requests, or a required mirrored header is missing or malformed.
+    pub const HEADER_MISMATCH: i64 = -32020;
+
+    /// `UnsupportedProtocolVersion`: the revision the request declared is not
+    /// one this server serves through the mechanism the request used.
+    ///
+    /// Carries `data: {supported, requested}` — required, not decorative. The
+    /// client's documented recovery is to "select a mutually supported version
+    /// from the `supported` list and retry", so a refusal without it is a dead
+    /// end that reads to the client as "the server is down".
+    pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+
+    /// Codes this server must never emit, with the reason.
+    ///
+    /// `-32000`..=`-32019` is the sub-range the specification retired: "New
+    /// codes **MUST NOT** be allocated in this sub-range, and new
+    /// implementations **SHOULD NOT** use codes from this sub-range at all."
+    /// `-32020`..=`-32099` is reserved for codes the specification defines, and
+    /// the three it has defined are the two above plus `-32021`
+    /// (`MissingRequiredClientCapability`), which this server has no use for: it
+    /// requires no client capability, so emitting it would name a requirement
+    /// that does not exist.
+    pub fn is_reserved_and_undefined(code: i64) -> bool {
+        (-32099..=-32000).contains(&code)
+            && !matches!(code, HEADER_MISMATCH | UNSUPPORTED_PROTOCOL_VERSION)
+    }
 }
 
 /// A failure with the JSON-RPC code it should be reported under.
@@ -204,6 +291,17 @@ mod codes {
 pub struct RpcError {
     code: i64,
     message: String,
+    /// The machine-readable half of the refusal, when the specification defines
+    /// one for this code.
+    ///
+    /// Separate from `message` because they reach different readers and only one
+    /// of them is actionable: a human reads the message, and the client runtime
+    /// reads `data` to decide what to retry with. `UnsupportedProtocolVersionError`
+    /// is the case that forced this field to exist — its `data.supported` *is*
+    /// the recovery path, and before this the stdio transport had no way to
+    /// carry it at all, so the same refusal was actionable over HTTP and a dead
+    /// end over stdio.
+    data: Option<Value>,
     /// Whether the model that chose these arguments could fix this itself.
     ///
     /// The specification splits tool failures in two and the split is not
@@ -236,21 +334,39 @@ impl RpcError {
         self.tool_input
     }
 
+    /// The structured recovery information, for the codes that define one.
+    pub fn data(&self) -> Option<&Value> {
+        self.data.as_ref()
+    }
+
     /// A fault in the request itself: reported as a JSON-RPC error.
     fn new(code: i64, message: impl Into<String>) -> Self {
+        debug_assert!(
+            !codes::is_reserved_and_undefined(code),
+            "code {code} is in the range the MCP specification reserves for itself and is not \
+one of the codes it defines"
+        );
         Self {
             code,
             message: message.into(),
+            data: None,
             tool_input: false,
+        }
+    }
+
+    /// A refusal that also carries what the client should do about it.
+    fn with_data(code: i64, message: impl Into<String>, data: Value) -> Self {
+        Self {
+            data: Some(data),
+            ..Self::new(code, message)
         }
     }
 
     /// A fault in the argument values: reported as `isError: true`.
     fn tool_input(code: i64, message: impl Into<String>) -> Self {
         Self {
-            code,
-            message: message.into(),
             tool_input: true,
+            ..Self::new(code, message)
         }
     }
 }
@@ -274,6 +390,22 @@ const TOOLS: &[(&str, &str)] = &[
     ("devmap_preview", "preview"),
 ];
 
+/// The declared tool names, in published order.
+///
+/// Exposed so a caller — a test, or anything else counting coverage — measures
+/// against the list this server actually publishes rather than against a number
+/// someone typed. "Nine tools were checked" is only a coverage claim if nine is
+/// read from the same array `tools/list` is built from.
+pub const TOOL_NAMES: &[&str] = &{
+    let mut names = [""; TOOLS.len()];
+    let mut index = 0;
+    while index < TOOLS.len() {
+        names[index] = TOOLS[index].0;
+        index += 1;
+    }
+    names
+};
+
 fn budget_prop(default: u32) -> Value {
     json!({
         "type": "integer",
@@ -283,6 +415,39 @@ fn budget_prop(default: u32) -> Value {
         "description": "Token budget for the answer. The response reports shown/hidden/total \
     and whether it was truncated, so a small budget yields a short answer that still says how much \
     it withheld."
+    })
+}
+
+/// The budget property for the one tool that spends it more than once.
+///
+/// `neighbors` hands the number it is given to the traversal once per target and
+/// once per direction, so with the declared maximum of
+/// [`devmap_query::MAX_NEIGHBOR_TARGETS`] targets a caller receives up to 32
+/// times what it asked for. That is the right *engine* behaviour — a per-target
+/// budget is what makes each entry in a fan-out individually useful, and
+/// trimming a shared budget across targets would silently starve the last ones —
+/// but it made the shared description false for this tool alone.
+///
+/// A budget is the only control an agent has over how much of its context a call
+/// will consume, so being wrong about it by 32x in the overrunning direction is
+/// not a documentation nicety. This is the same defect the `depth` default on
+/// this same tool already had: a published number that the code does not use.
+fn fan_out_budget_prop(default: u32) -> Value {
+    let fan_out = devmap_query::MAX_NEIGHBOR_TARGETS * 2;
+    json!({
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100_000,
+        "default": default,
+        "description": format!(
+            "Token budget **per target, per direction** — not for the answer as a whole. This \
+    tool walks callers and callees separately for each target, and spends this budget on each walk, \
+    so a call over the maximum {} targets can return up to {fan_out}x the number given ({fan_out} x \
+    {default} tokens at the default). Size it by what one target's callers are worth to you, then \
+    multiply by 2x the number of targets to predict the total. Every other tool here spends its \
+    budget once.",
+            devmap_query::MAX_NEIGHBOR_TARGETS
+        )
     })
 }
 
@@ -412,7 +577,10 @@ underneath the answer.",
                         "maxItems": devmap_query::MAX_NEIGHBOR_TARGETS,
                         "description": "Symbols or file paths. More than the maximum is refused, never silently trimmed."
                     },
-                    "budget": budget_prop(2000),
+                    // Not `budget_prop`: this is the one tool that spends the
+                    // budget more than once, and the shared description says it
+                    // is spent once.
+                    "budget": fan_out_budget_prop(2000),
                     // 3, not 1. `IpcCommand::Neighbors::depth` carries
                     // `#[serde(default = "default_depth")]`, and that function
                     // returns 3. Declaring 1 told an agent it had asked for
@@ -481,6 +649,273 @@ writes nothing.",
     }
 }
 
+/// The budget envelope every ranked answer is wrapped in.
+///
+/// `devmap_query::Response<T>` in schema form. The fields listed as required are
+/// exactly the ones that struct declares without `Option` and without
+/// `skip_serializing_if`, so they are present by construction rather than by
+/// habit; `walk_incomplete` is the one field that carries both, and it is
+/// therefore the one field that is optional here.
+///
+/// `items` is left as a bare array on purpose. What varies between these tools
+/// is the element type, and restating each element's fields here would be a
+/// second copy of a Rust struct that nothing keeps in step — the exact drift
+/// [`describe`] exists to prevent on the input side. What this schema is for is
+/// the envelope: `truncated`, `walk_incomplete` and the `shown`/`hidden`/`total`
+/// triple are the fields a reader has to consult before concluding that an empty
+/// `items` means "nothing is there", and they are the fields a client could not
+/// see declared anywhere before.
+fn budgeted_envelope(items: &str) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "items": {"type": "array", "description": items},
+            "shown": {"type": "integer", "description": "Entries present in `items`."},
+            "hidden": {"type": "integer",
+                "description": "Entries the token budget withheld. Non-zero means this answer is \
+    a prefix, not a set."},
+            "total": {"type": "integer",
+                "description": "What a complete answer would have held: shown + hidden."},
+            "truncated": {"type": "boolean",
+                "description": "True when the budget cut the answer. An empty `items` with \
+    `truncated` false is 'nothing matched'; with it true it is 'nothing fitted'."},
+            "tokens_used": {"type": "integer"},
+            "resolution": {"type": ["string", "object"],
+                "description": "\"Available\", or {\"Unavailable\": {\"reason\": …}} when symbol \
+    resolution could not run for this generation — in which case an empty answer says nothing about \
+    the code."},
+            "walk_incomplete": {"type": ["string", "null"],
+                "description": "Present only when the *producer* stopped early — a depth cap, a \
+    cancellation — as distinct from the budgeter trimming a complete set. Its presence means the \
+    answer is partial by an unknown amount, which `hidden` cannot express."}
+        },
+        "required": ["items", "shown", "hidden", "total", "truncated", "tokens_used", "resolution"],
+        "additionalProperties": true
+    })
+}
+
+/// The shape a tool's `structuredContent` is promised to have.
+///
+/// The single owner of that promise: [`tool_specs`] publishes what this returns
+/// and [`structured_content_violation`] checks against what this returns, so the
+/// declaration and the enforcement are one object. Declaring an `outputSchema`
+/// is not free — "Servers **MUST** provide structured results that conform to
+/// this schema" — and a promise nothing checks is the failure mode this module
+/// already refuses on the input side.
+///
+/// Every schema here sets `additionalProperties: true` and requires only fields
+/// the Rust type emits unconditionally. That is deliberate: an over-tight schema
+/// would make a client reject an answer that is correct, and the point of
+/// declaring one is to make the incompleteness markers visible, not to freeze
+/// the payload.
+fn describe_output(cmd: &str) -> Value {
+    match cmd {
+        "status" => json!({
+            "type": "object",
+            "properties": {
+                "generation_id": {"type": ["integer", "null"],
+                    "description": "Null when no generation has ever been built."},
+                "pending_count": {"type": "integer"},
+                "node_count": {"type": "integer",
+                    "description": "Zero means the index is not built. That is a different fact \
+        from 'the symbol does not exist', and every other tool's empty answer should be read through it."},
+                "edge_count": {"type": "integer"},
+                "is_fresh": {"type": "boolean"},
+                "degraded_reason": {"type": ["string", "null"],
+                    "description": "Why the index is not trustworthy, or null when it is."},
+                "quarantined_count": {"type": "integer",
+                    "description": "Files the indexer could not take. Their symbols are absent \
+        from every answer without being reported as missing."}
+            },
+            "required": ["generation_id", "pending_count", "node_count", "edge_count",
+                "is_fresh", "degraded_reason", "quarantined_count"],
+            "additionalProperties": true
+        }),
+        "search" => budgeted_envelope("Ranked symbol hits: name, file, kind, span and source."),
+        "deps" => budgeted_envelope("Outbound edges from the target."),
+        "impact" => budgeted_envelope("Symbols that reach the target, walked in reverse."),
+        "trace" => budgeted_envelope("Call paths from the origin, or between the two endpoints."),
+        "dead" => budgeted_envelope(
+            "Dead-symbol reports, each carrying its own confidence and reason. A candidate list \
+to verify, not a delete list.",
+        ),
+        "neighbors" => json!({
+            "type": "object",
+            "properties": {
+                "neighbors": {"type": "array",
+                    "description": "One entry per requested target, in the order asked."}
+            },
+            "required": ["neighbors"],
+            "additionalProperties": true
+        }),
+        "clones" => json!({
+            "type": "object",
+            "properties": {
+                "groups": {"type": "object",
+                    "description": "A budgeted envelope of clone groups; read its `truncated` \
+        before concluding the list is complete."},
+                "signed_symbols": {"type": "integer",
+                    "description": "Symbols that carried a body signature and could therefore be \
+        compared."},
+                "unsigned_symbols": {"type": "integer",
+                    "description": "Symbols that could not be compared at all. `groups` empty \
+        with this large means 'we could not look', not 'there is no duplication'."}
+            },
+            "required": ["groups", "signed_symbols", "unsigned_symbols"],
+            "additionalProperties": true
+        }),
+        "preview" => json!({
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "parse_status": {"type": "string",
+                    "description": "Clean, Partial, Fallback or Failed, from the proposed \
+        buffer's parse."},
+                "delta_available": {"type": "boolean",
+                    "description": "False when the buffer did not parse well enough to diff. The \
+        symbol list below is then not a delta."},
+                "file_is_indexed": {"type": "boolean",
+                    "description": "False means the caller graph has nothing to say about this \
+        file, so an empty `broken_callers` is uninformative."},
+                "compared_against": {"type": "string",
+                    "description": "`disk`, `nothing` (no such file, so every symbol is an \
+        addition) or `unreadable` (the comparison did not happen). The last two license opposite \
+        conclusions and are kept distinct for that reason."},
+                "degraded_reason": {"type": ["string", "null"]},
+                "symbols": {"type": "array"},
+                "bodies_not_compared": {"type": "integer",
+                    "description": "Symbols whose bodies nothing compared. Not found unchanged — \
+        not examined."},
+                "ambiguous_callers": {"type": "integer",
+                    "description": "Call edges below the confidence floor, and so absent from \
+        `broken_callers`. Counted so 'no callers affected' cannot quietly mean 'none we would vouch for'."},
+                "broken_callers": {"type": "object",
+                    "description": "A budgeted envelope of calls this edit would break."}
+            },
+            "required": ["file_path", "parse_status", "delta_available", "file_is_indexed",
+                "compared_against", "symbols", "broken_callers"],
+            "additionalProperties": true
+        }),
+        other => unreachable!("command tag {other} has no output schema"),
+    }
+}
+
+/// Why `value` does not satisfy the `outputSchema` `tool` published, if it does
+/// not.
+///
+/// Deliberately narrow: it implements `type`, `required` and per-property
+/// `type`, which is the entire vocabulary [`describe_output`] uses — and it
+/// **refuses a schema that uses anything else** rather than passing it. A
+/// validator that silently skips the keyword it does not know reports a
+/// check that never ran as a check that passed, which is the one failure this
+/// repository will not accept from a checker.
+pub fn structured_content_violation(tool: &str, value: &Value) -> Option<String> {
+    let Some((_, cmd)) = TOOLS.iter().find(|(name, _)| *name == tool) else {
+        return Some(format!(
+            "'{tool}' is not a tool this server declares, so there is no outputSchema to check \
+this against; a result cannot be reported as conforming to a schema that does not exist"
+        ));
+    };
+    let schema = describe_output(cmd);
+    let object = schema.as_object()?;
+
+    const UNDERSTOOD: &[&str] = &[
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+        "description",
+    ];
+    if let Some(unknown) = object
+        .keys()
+        .find(|key| !UNDERSTOOD.contains(&key.as_str()))
+    {
+        return Some(format!(
+            "{tool}'s outputSchema uses '{unknown}', which this checker does not implement — so \
+the result was not checked, and an unchecked result must not be reported as a conforming one"
+        ));
+    }
+
+    if let Some(fault) = type_violation("the result", object.get("type"), value) {
+        return Some(format!("{tool}: {fault}"));
+    }
+    let Some(members) = value.as_object() else {
+        return Some(format!(
+            "{tool}: the schema declares an object and the result is {}",
+            kind_of(value)
+        ));
+    };
+    for required in object
+        .get("required")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        let Some(required) = required.as_str() else {
+            return Some(format!("{tool}: a non-string entry in `required`"));
+        };
+        if !members.contains_key(required) {
+            return Some(format!("{tool}: required field '{required}' is absent"));
+        }
+    }
+    for (property, rules) in object
+        .get("properties")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+    {
+        let Some(present) = members.get(property) else {
+            continue;
+        };
+        if let Some(fault) = type_violation(property, rules.get("type"), present) {
+            return Some(format!("{tool}: {fault}"));
+        }
+    }
+    None
+}
+
+/// Whether `value` matches a `type` keyword that is a name or a list of names.
+///
+/// A `type` this function does not recognise is a violation, not a pass, for the
+/// same reason the keyword check above is: an unrecognised constraint is an
+/// unchecked one.
+fn type_violation(what: &str, declared: Option<&Value>, value: &Value) -> Option<String> {
+    let declared = declared?;
+    let names: Vec<&str> = match declared {
+        Value::String(name) => vec![name.as_str()],
+        Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+        other => return Some(format!("{what}: `type` is {}, not a name", kind_of(other))),
+    };
+    if names.is_empty() {
+        return Some(format!("{what}: `type` names nothing"));
+    }
+    for name in &names {
+        let matched = match *name {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "boolean" => value.is_boolean(),
+            "null" => value.is_null(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "number" => value.is_number(),
+            unknown => {
+                return Some(format!(
+                    "{what}: `type: {unknown}` is not a type this checker implements, so nothing \
+was checked"
+                ))
+            }
+        };
+        if matched {
+            return None;
+        }
+    }
+    Some(format!(
+        "{what} is {}, and the schema allows only {}",
+        kind_of(value),
+        names.join(" or ")
+    ))
+}
+
 pub fn tool_specs() -> Vec<Value> {
     TOOLS
         .iter()
@@ -490,6 +925,13 @@ pub fn tool_specs() -> Vec<Value> {
                 "name": name,
                 "description": description,
                 "inputSchema": schema,
+                // Declared because this server emits `structuredContent` on
+                // every successful call, and structured content a client cannot
+                // validate is structured content it has to guess at. The
+                // obligation this creates — "Servers MUST provide structured
+                // results that conform to this schema" — is enforced in
+                // `tool_success` rather than trusted.
+                "outputSchema": describe_output(cmd),
                 "annotations": {
                     // Every tool here reads the index and returns an answer.
                     // `preview` takes file content as an argument but writes
@@ -787,6 +1229,108 @@ fn server_info() -> Value {
 /// client to send first.
 pub const MODERN_PROTOCOL_VERSIONS: &[&str] = &["2026-07-28"];
 
+/// `_meta` key carrying a modern request's protocol version.
+///
+/// Its *presence* is what selects the era, which is the rule the specification
+/// gives a dual-era server: "A request carrying modern per-request `_meta` is
+/// served statelessly according to this revision. An `initialize` request
+/// selects legacy semantics."
+pub const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+
+/// `_meta` key carrying the capabilities a modern request may be answered with.
+pub const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+
+/// Which of the two eras a request asked to be served under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Era {
+    /// No version declared per-request. `initialize` negotiates one for the
+    /// connection, and everything after it is served under that negotiation.
+    Handshake,
+    /// The request carried its own version, identity and capabilities. Nothing
+    /// is remembered between requests, so nothing may be assumed from an
+    /// earlier one.
+    Modern,
+}
+
+/// Read the era off a request, refusing a modern envelope this server cannot honour.
+///
+/// This is the whole of the version negotiation for the modern era, and it lives
+/// here — above the transports — because it is a property of the *request*, not
+/// of the pipe it arrived on. Putting it in the HTTP module (where it was) meant
+/// stdio never performed it: this server answers `server/discover` on stdio
+/// precisely because the stdio binding tells a dual-era client to probe with it
+/// first, so a modern client would be told "yes, modern", declare a version, and
+/// have it ignored on every request after.
+///
+/// Three refusals, and they are distinct on purpose, because each sends the
+/// client somewhere different:
+///
+/// * a version field of the wrong *shape* is `-32602` — fix the request;
+/// * a version we do not serve is `-32022` with `data.supported` — retry with
+///   one of these;
+/// * a missing `clientCapabilities` is `-32602` — "A request missing any
+///   required field is malformed; the server **MUST** reject it with JSON-RPC
+///   error code `-32602`".
+///
+/// `supported` lists only the modern revisions, and that is not an omission.
+/// It is the set of versions a client may legally *state in this field*; the
+/// handshake revisions are reached by handshaking, which is a different
+/// mechanism, and offering them here would invite a retry that cannot work.
+/// The message says where they live instead.
+fn classify_era(params: Option<&Value>) -> Result<Era, RpcError> {
+    let meta = match params.and_then(|params| params.get("_meta")) {
+        Some(meta) => meta,
+        None => return Ok(Era::Handshake),
+    };
+    let stated = match meta.get(META_PROTOCOL_VERSION) {
+        None => return Ok(Era::Handshake),
+        Some(Value::String(stated)) => stated.as_str(),
+        Some(other) => {
+            return Err(RpcError::new(
+                codes::INVALID_PARAMS,
+                format!(
+                    "_meta.{META_PROTOCOL_VERSION} must be a version string such as \"{}\", got {}",
+                    MODERN_PROTOCOL_VERSIONS[0],
+                    kind_of(other)
+                ),
+            ))
+        }
+    };
+
+    if !MODERN_PROTOCOL_VERSIONS.contains(&stated) {
+        let reachable = if HANDSHAKE_PROTOCOL_VERSIONS.contains(&stated) {
+            format!(
+                " {stated} is a handshake revision: it is reached by sending `initialize` with \
+no per-request protocol version, not by declaring it in _meta."
+            )
+        } else {
+            String::new()
+        };
+        return Err(RpcError::with_data(
+            codes::UNSUPPORTED_PROTOCOL_VERSION,
+            format!(
+                "this server serves {} through per-request _meta; the request declared {stated}.\
+{reachable}",
+                MODERN_PROTOCOL_VERSIONS.join(", ")
+            ),
+            json!({"supported": MODERN_PROTOCOL_VERSIONS, "requested": stated}),
+        ));
+    }
+
+    if meta.get(META_CLIENT_CAPABILITIES).is_none() {
+        return Err(RpcError::new(
+            codes::INVALID_PARAMS,
+            format!(
+                "_meta.{META_CLIENT_CAPABILITIES} is required on every request of this revision. \
+An empty object declares no optional capabilities; omitting it is a different statement, because \
+a stateless server has no earlier request to infer them from."
+            ),
+        ));
+    }
+
+    Ok(Era::Modern)
+}
+
 /// How long a client may cache `tools/list` and `server/discover`.
 ///
 /// Five minutes, and the reasoning is the bound rather than the number: this
@@ -911,14 +1455,74 @@ being reported because a partial traversal cannot be distinguished from a comple
 /// forwards `content` to the model — actually shows. Sending only one of them
 /// makes the answer invisible to half the clients in the field.
 fn tool_success(name: &str, value: Value) -> Value {
+    // Checked here, against the tool's own published `outputSchema`, because
+    // declaring one makes conformance a MUST and a client is entitled to
+    // validate. If this ever fails, the honest answer is the failure: a
+    // validating client would reject the result anyway and the agent would be
+    // left with a rejection and no reason, whereas this names the field.
+    if let Some(violation) = structured_content_violation(name, &value) {
+        return tool_error(format!(
+            "{name} produced a result that does not satisfy the outputSchema it publishes: \
+{violation}. The answer is withheld rather than sent, because a client validating against the \
+declared schema would reject it and could not say why. This is a server defect, not a bad \
+argument — the call itself was well-formed."
+        ));
+    }
     let text = serde_json::to_string(&value).unwrap_or_else(|err| {
         format!("{{\"error\":\"{name} result was not serializable: {err}\"}}")
     });
-    json!({
+    let result = json!({
         "content": [{"type": "text", "text": text}],
         "structuredContent": value,
         "isError": false
-    })
+    });
+    if let Some(refusal) = oversized_result_refusal(name, &result) {
+        return tool_error(refusal);
+    }
+    result
+}
+
+/// Why this result is too large to send, if it is.
+///
+/// Measured, not estimated: the frame is already built, so the number in the
+/// refusal is the size of the thing that would have gone out rather than a
+/// prediction. That matters because the message asks the caller to pick a
+/// smaller budget, and a caller cannot scale down from a figure that was guessed.
+///
+/// Public for the same reason [`structured_content_violation`] is: the check the
+/// server performs before emitting and the check a test asserts have to be one
+/// function, or the guard and the behaviour drift.
+pub fn oversized_result_refusal(tool: &str, result: &Value) -> Option<String> {
+    let measured = match serde_json::to_vec(result) {
+        Ok(bytes) => bytes.len(),
+        // Unserializable is not "small enough". The result cannot be sent
+        // either way, and reporting nothing here would let it reach the
+        // transport to fail there with no attribution.
+        Err(err) => {
+            return Some(format!(
+                "{tool} produced a result that could not be serialized at all ({err}), so its \
+size could not be checked and it cannot be sent"
+            ))
+        }
+    };
+    if measured <= MAX_RESULT_BYTES {
+        return None;
+    }
+    let fan_out = if tool == "devmap_neighbors" {
+        format!(
+            " devmap_neighbors spends its budget once per target and once per direction, so the \
+number you passed was multiplied by up to {}; lower `budget`, or ask about fewer targets.",
+            devmap_query::MAX_NEIGHBOR_TARGETS * 2
+        )
+    } else {
+        " Lower `budget` and ask again.".to_string()
+    };
+    Some(format!(
+        "{tool} produced {measured} bytes, over the {MAX_RESULT_BYTES}-byte limit on a single \
+result. Nothing is being sent: this server refuses to write a frame larger than it would agree \
+to read, and a truncated answer is worse than none because a cut list reads exactly like a \
+complete one.{fan_out}"
+    ))
 }
 
 /// A failed tool call.
@@ -940,6 +1544,25 @@ fn rpc_error_frame(id: Option<Value>, code: i64, message: impl Into<String>) -> 
         "id": id.unwrap_or(Value::Null),
         "error": {"code": code, "message": message.into()}
     })
+}
+
+/// The same frame, carrying whatever recovery data the error was raised with.
+///
+/// Separate from [`rpc_error_frame`] only because most refusals have no `data`
+/// to carry and an `Option` at every call site would obscure the ones that do.
+/// The `data` member is omitted rather than written as `null` when there is
+/// none: `null` is a value, and a client reading `error.data` would have to
+/// distinguish "no recovery information" from "recovery information that is
+/// literally null".
+fn rpc_error_frame_from(id: Option<Value>, error: &RpcError) -> Value {
+    let mut frame = rpc_error_frame(id, error.code(), error.message());
+    if let (Some(data), Some(object)) = (
+        error.data(),
+        frame.get_mut("error").and_then(Value::as_object_mut),
+    ) {
+        object.insert("data".to_string(), data.clone());
+    }
+    frame
 }
 /// In-flight requests, so a cancellation notification can reach one.
 ///
@@ -979,6 +1602,46 @@ impl Session {
             if let Some(cancel) = map.get(&id.to_string()) {
                 cancel.cancel();
             }
+        }
+    }
+
+    /// Take a slot for `id`, or say why there is none.
+    ///
+    /// The bound is on concurrency, not on rate: a slot is held only while the
+    /// request is actually running, so a client that waits for its answers never
+    /// meets it however many questions it asks.
+    fn register(&self, id: &Value, cancel: devmap_query::Cancel) -> Result<(), String> {
+        let Ok(mut map) = self.in_flight.lock() else {
+            return Err(
+                "the in-flight table was poisoned by an earlier panic, so this session can no \
+longer account for what it is running and cannot promise this request would be cancellable"
+                    .to_string(),
+            );
+        };
+        // Occupied means the client reused an id that has not been answered:
+        // "The request ID **MUST NOT** match the ID of any other request the
+        // sender has issued and not yet received a response for." Overwriting
+        // was the previous behaviour and it broke cancellation silently — the
+        // first request's flag was dropped from the table, so the cancellation
+        // the client later sent for that id reached the wrong call, and the
+        // first request became unstoppable with nothing saying so.
+        if let Some(existing) = map.insert(id.to_string(), cancel) {
+            // Put the original back: the *earlier* request is the one that owns
+            // this id, and it is still running.
+            map.insert(id.to_string(), existing);
+            return Err(format!(
+                "id {id} already names a request on this connection that has not been answered. \
+Ids must be unique among a sender's outstanding requests; reusing one would make the two \
+answers indistinguishable and would leave the first call uncancellable."
+            ));
+        }
+        Ok(())
+    }
+
+    /// Give back the slot `id` held.
+    fn release(&self, id: &Value) {
+        if let Ok(mut map) = self.in_flight.lock() {
+            map.remove(&id.to_string());
         }
     }
 }
@@ -1073,7 +1736,33 @@ pub async fn handle_method_cancellable(
     params: Option<Value>,
     cancel: devmap_query::Cancel,
 ) -> Result<Value, RpcError> {
+    // Before the method, because the answer to "is this a method I have" depends
+    // on which era is asking, and because a request declaring a revision this
+    // server does not serve must be refused whatever it went on to ask for.
+    let era = classify_era(params.as_ref())?;
+
     let result = match method {
+        // `initialize` under a modern envelope is not a method this server has.
+        // The handshake was removed in the modern revision and `server/discover`
+        // replaces it, so answering would hand a client that had just declared
+        // `2026-07-28` a `protocolVersion` of `2025-11-25` — this server
+        // reporting a negotiation that did not happen, over a mechanism with no
+        // connection to negotiate over. `-32601` is what the HTTP binding maps
+        // to `404`, which is exactly the "I do not have that method" the client
+        // needs to see.
+        "initialize" if era == Era::Modern => {
+            return Err(RpcError::new(
+                codes::METHOD_NOT_FOUND,
+                format!(
+                    "'initialize' is not a method of {}: that revision replaced the handshake \
+with per-request metadata. Use 'server/discover' to learn what this server supports. To \
+handshake instead, send 'initialize' without a per-request _meta.{META_PROTOCOL_VERSION}; this \
+server also serves {}.",
+                    MODERN_PROTOCOL_VERSIONS.join(", "),
+                    HANDSHAKE_PROTOCOL_VERSIONS.join(", ")
+                ),
+            ))
+        }
         "initialize" => initialize_result(params.as_ref()),
         // Accepted and acted on nowhere. `notifications/cancelled` is handled by
         // the session before it ever reaches this function; reaching here means
@@ -1175,12 +1864,39 @@ async fn dispatch_single(session: &Arc<Session>, value: Value) -> Option<Value> 
     };
 
     // Presence, not value. JSON-RPC 2.0 §4: "A Notification is a Request object
-    // without an 'id' member." `id: null` is a request with a null id — legal,
-    // and the specification's own error examples use it. Decoding into
-    // `Option<Value>` folded the two together, so a legal request got no
-    // response at all and its client hung.
+    // without an 'id' member." A frame that carries an `id` member is a request
+    // and is owed a response, whatever that member turned out to contain —
+    // decoding into `Option<Value>` folded "absent" and "null" together, so a
+    // frame that was owed an answer got none and its client hung.
+    //
+    // *Whether the value is a legal id* is a separate question, answered below.
     let has_id = object.contains_key("id");
     let id = object.get("id").cloned().unwrap_or(Value::Null);
+
+    // MCP narrows JSON-RPC's id, in identical words in every revision this
+    // server speaks: "Requests MUST include a string or integer ID. Unlike base
+    // JSON-RPC, the ID MUST NOT be `null`."
+    //
+    // The offending value is echoed rather than replaced with null. JSON-RPC's
+    // own rule — "It MUST be the same as the value of the id member in the
+    // Request Object" — is what lets the client resolve the call it made, and
+    // the id here was read successfully; it is simply not one this protocol
+    // permits. Answering `null` instead would refuse the request *and* hide
+    // which request was refused, so a client with several in flight would learn
+    // only that one of them had failed.
+    if has_id {
+        if let Some(fault) = id_fault(&id) {
+            return Some(rpc_error_frame(
+                Some(id),
+                codes::INVALID_REQUEST,
+                format!(
+                    "a request id must be a string or an integer and must not be null; this one \
+is {fault}. Sending it back so the call can be resolved, but it is not a legal MCP id and the \
+request was not run."
+                ),
+            ));
+        }
+    }
 
     if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return respond(
@@ -1204,26 +1920,71 @@ async fn dispatch_single(session: &Arc<Session>, value: Value) -> Option<Value> 
 
     // Acted on here rather than in `handle_method`, because only the session
     // knows what is running.
-    if method == "notifications/cancelled" {
+    //
+    // `!has_id` is part of the condition, not a detail of it. "Notifications
+    // **MUST NOT** include an ID", so a frame that has one is not a
+    // notification however its method is spelled — and this function already
+    // applies that rule to every other method. `notifications/cancelled` was the
+    // one exception, intercepted before the id was ever consulted, so a frame
+    // carrying both an id and this method cancelled what it named *and* returned
+    // nothing: the client kept an id it would never see resolved, on a
+    // connection that was otherwise healthy. Carrying an id, it falls through
+    // and is answered like any other request whose method produces no payload.
+    if method == "notifications/cancelled" && !has_id {
         if let Some(target) = params.as_ref().and_then(|p| p.get("requestId")) {
             session.cancel(target);
         }
         return None;
     }
 
+    // A frame with no id is a notification, and the only notifications this
+    // protocol has are `notifications/*`. `notifications/cancelled` was handled
+    // above; anything else that arrives without an id is not a notification this
+    // server can act on, and dispatching it anyway was doing real work nobody
+    // could ever see: a `tools/call` sent without an id ran the full query,
+    // held the store lock for up to the call timeout, and threw the answer away,
+    // because a notification must not be answered. The refusal is loud on
+    // stderr — the one channel stdio leaves open for it — and silent on the
+    // wire, which is where the specification requires silence.
+    if !has_id && method != "notifications/initialized" {
+        tracing::warn!(
+            "discarded a frame with no id calling '{method}': the only notifications this \
+server accepts are notifications/initialized and notifications/cancelled, and a request \
+method sent as a notification would run work whose result cannot be returned"
+        );
+        return None;
+    }
+
     let cancel = devmap_query::Cancel::default();
     if has_id {
-        if let Ok(mut map) = session.in_flight.lock() {
-            map.insert(id.to_string(), cancel.clone());
+        // Registering is also where the concurrency bound is applied, because
+        // this is the point at which a request starts costing something: past
+        // here it holds a map entry, a task, and — for `tools/call` — a slot in
+        // the blocking pool for up to the call timeout. Unbounded, a peer that
+        // pipelines without waiting chooses how much of this process it owns.
+        //
+        // Refused rather than queued, and refused *by name*. A client that is
+        // shedding load can back off; a client whose requests were silently
+        // queued behind a thousand others cannot tell overload from a hang.
+        match session.register(&id, cancel.clone()) {
+            Ok(()) => {}
+            // The only way this fails is a reused id, which is the client's own
+            // violation and something it must fix by renumbering. Capacity is
+            // not refused here: the read loop applies backpressure instead, so
+            // there is no "busy" for this to report.
+            Err(refusal) => {
+                return respond(
+                    has_id,
+                    rpc_error_frame(Some(id), codes::INVALID_REQUEST, refusal),
+                );
+            }
         }
     }
 
     let outcome = handle_method_cancellable(&session.store, &method, params, cancel.clone()).await;
 
     if has_id {
-        if let Ok(mut map) = session.in_flight.lock() {
-            map.remove(&id.to_string());
-        }
+        session.release(&id);
     }
 
     // A cancelled request gets no response. The specification is explicit that
@@ -1242,7 +2003,23 @@ async fn dispatch_single(session: &Arc<Session>, value: Value) -> Option<Value> 
             has_id,
             json!({"jsonrpc": "2.0", "id": id, "result": result}),
         ),
-        Err(err) => respond(has_id, rpc_error_frame(Some(id), err.code, err.message)),
+        Err(err) => respond(has_id, rpc_error_frame_from(Some(id), &err)),
+    }
+}
+
+/// Why `id` is not a legal MCP request id, if it is not.
+///
+/// "Integer" is meant literally: `1.5` is a JSON number and not an integer, and
+/// a client that sent it would be matching responses against a value its own
+/// JSON layer may well have rounded. An empty string is legal — the constraint
+/// is on the type, not on the content.
+pub(crate) fn id_fault(id: &Value) -> Option<&'static str> {
+    match id {
+        Value::String(_) => None,
+        Value::Number(number) if number.is_i64() || number.is_u64() => None,
+        Value::Number(_) => Some("a fractional number"),
+        Value::Null => Some("null"),
+        other => Some(kind_of(other)),
     }
 }
 
@@ -1442,6 +2219,15 @@ continued for {seen} bytes in total before terminating"
         // Finished tasks are reaped as we go so a long session does not
         // accumulate a handle per request it ever served.
         tasks.retain(|task| !task.is_finished());
+        // Reaping is not a bound: it only removes what has already finished, and
+        // a peer writing faster than tasks retire outgrew it without limit. Past
+        // the ceiling, wait for the oldest rather than read another frame —
+        // backpressure, so nothing is dropped and the connection simply stops
+        // consuming until there is room.
+        while tasks.len() >= MAX_IN_FLIGHT_REQUESTS {
+            let _ = tasks.remove(0).await;
+            tasks.retain(|task| !task.is_finished());
+        }
     }
 
     for task in tasks {
