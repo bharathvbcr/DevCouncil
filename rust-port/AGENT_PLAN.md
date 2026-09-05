@@ -462,7 +462,7 @@ never run `devmap build` against the repository root's store from a test.
 |---|---|
 | One owner for `MAX_TOKEN_BUDGET` / `MAX_TRAVERSAL_DEPTH` in `devmap-query` | `1a7fd98` |
 | CLI argv bounds (`validate_limits`) and one-line `--json` on every exit | `d6ac670` |
-| Per-generation edge index (`devmap-store/src/edge_index.rs`), replacing the per-question read; `impact` 18.6 ms -> 0.95 ms and 73.2 ms -> 3.04 ms p50, `status` 866 µs -> 15 µs and 2.77 ms -> 13 µs | `1dcbc69` |
+| Per-generation edge index (`devmap-store/src/edge_index.rs`), replacing the per-question read; `impact` 18.62 ms -> 947 µs and 73.06 ms -> 2.82 ms p50, `status` 774 µs -> 13.6 µs and 2.689 ms -> 12.8 µs | `1dcbc69` |
 | K-B1: a search page is bounded in files and in bytes | `2f9916a` |
 | Admission control across the three transports, plus an HTTP body deadline | `177abbd` |
 | K-B4: the drain batch's claims are indexed once instead of scanned per path (`main` found the same defect independently in `0db537e`; its implementation is the one that survived the merge) | `3425d76` |
