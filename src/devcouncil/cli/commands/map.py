@@ -2,6 +2,7 @@ import json
 import logging
 import sys
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -59,6 +60,36 @@ status_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
 
 
+def _disclosed_count(meta: object, key: str, shown: int) -> tuple[str, bool]:
+    """Render ``shown`` against the total the map disclosed for ``key``.
+
+    Every liveness list is capped by the kernel before it reaches the artifact,
+    and the cap leaves no trace in the list itself: this repository's own map
+    carries 200 unwired candidates out of 540 and 200 dead symbols out of 208.
+    ``liveness_meta`` has always recorded ``{shown, total, truncated}`` per
+    bucket (`devmap-query/src/manifest.rs`); it was this line — the one an agent
+    reads before concluding "that is all of them" — that dropped the
+    denominator and showed a capped sample as complete coverage.
+
+    Returns the rendered count and whether it is a *floor* rather than a total.
+    A disclosure that its own list disproves (``total`` below the number of
+    entries actually present, or not an integer) is treated as no disclosure:
+    printing an authoritative-looking total that the artifact contradicts is
+    the failure this function exists to prevent, so the incoherent case falls
+    back to the floor form instead of trusting either number.
+    """
+    total: object = None
+    if isinstance(meta, Mapping):
+        bucket = meta.get(key)
+        if isinstance(bucket, Mapping):
+            total = bucket.get("total")
+    if isinstance(total, int) and not isinstance(total, bool) and total >= shown:
+        return (f"{shown} of {total}" if total > shown else str(shown)), False
+    # An empty list is not a truncated sample of anything, so it needs no floor
+    # marker; a non-empty one with no total behind it is a lower bound only.
+    return (f"{shown}+" if shown else "0"), bool(shown)
+
+
 def _liveness_summary(repo_map: RepoMap) -> str | None:
     unreliable = bool(getattr(repo_map, "liveness_unreachable_unreliable", False))
     if not (
@@ -85,14 +116,47 @@ def _liveness_summary(repo_map: RepoMap) -> str | None:
         if unreliable
         else str(len(repo_map.unreachable_files))
     )
-    return (
-        f"liveness: {len(repo_map.entry_roots)} entry roots, "
-        f"{len(repo_map.unwired_candidates)} unwired, "
-        f"{unreachable_txt} unreachable, "
-        f"{len(repo_map.dead_symbol_candidates)} dead symbols"
-        f"{sample_txt}"
-        " (prefer unwired + extracted dead; map clears on any non-test importer)"
+    meta = getattr(repo_map, "liveness_meta", None)
+    roots_txt, roots_floor = _disclosed_count(meta, "entry_roots", len(repo_map.entry_roots))
+    unwired_txt, unwired_floor = _disclosed_count(
+        meta, "unwired", len(repo_map.unwired_candidates)
     )
+    dead_txt, dead_floor = _disclosed_count(
+        meta, "dead_symbol", len(repo_map.dead_symbol_candidates)
+    )
+    notes = ["prefer unwired + extracted dead"]
+    # `unwired.total` counts only the files the question could be asked of: a
+    # file whose imports never extracted cannot answer "is anything importing
+    # me", so the kernel drops it from the population rather than calling it
+    # unwired. Excluding it is right; not saying so would make an unexamined
+    # file indistinguishable from an examined one that came back clean.
+    excluded = _excluded_coverage_loss(meta)
+    if excluded:
+        notes.append(f"{excluded} files excluded from unwired: extraction coverage loss")
+    if roots_floor or unwired_floor or dead_floor:
+        notes.append("N+ means this map disclosed no total")
+    notes.append("map clears on any non-test importer")
+    return (
+        f"liveness: {roots_txt} entry roots, "
+        f"{unwired_txt} unwired, "
+        f"{unreachable_txt} unreachable, "
+        f"{dead_txt} dead symbols"
+        f"{sample_txt}"
+        f" ({'; '.join(notes)})"
+    )
+
+
+def _excluded_coverage_loss(meta: object) -> int:
+    """Files the unwired question could not be asked of, per the map's own count."""
+    if not isinstance(meta, Mapping):
+        return 0
+    bucket = meta.get("unwired")
+    if not isinstance(bucket, Mapping):
+        return 0
+    excluded = bucket.get("excluded_coverage_loss")
+    if isinstance(excluded, int) and not isinstance(excluded, bool) and excluded > 0:
+        return excluded
+    return 0
 
 
 @app.callback(invoke_without_command=True)
