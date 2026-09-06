@@ -23,7 +23,11 @@ from devcouncil.telemetry.stages import log_stage, log_step
 
 app = typer.Typer()
 
-console = Console()
+# `dev doctor` renders diagnostic tables — that is the whole command, and none of it is
+# a machine-readable document. It also runs inside `dev boot --json` via
+# `render_doctor_check`, where the tables were being drawn onto the payload stream.
+# Binding the only Console here to stderr fixes that at the source.
+status_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
 
 
@@ -997,7 +1001,7 @@ def _print_maturity_table() -> None:
     maturity.add_column("Tier", style="magenta")
     maturity.add_column("Notes", style="green")
     _render_maturity_section(maturity)
-    console.print(maturity)
+    status_console.print(maturity)
 
 
 def render_doctor_check(project_root: Path = Path(".")):
@@ -1155,7 +1159,7 @@ def render_doctor_check(project_root: Path = Path(".")):
             f"{provider} is configured, but this runtime supports: {supported}.",
         )
         _add_logging_row(table, project_root)
-        console.print(table)
+        status_console.print(table)
         _print_maturity_table()
         return
     if provider == "ollama":
@@ -1280,7 +1284,7 @@ def render_doctor_check(project_root: Path = Path(".")):
         )
 
         _add_logging_row(table, project_root)
-        console.print(table)
+        status_console.print(table)
         _print_maturity_table()
         return
     env_var = provider_api_key_env_var(provider)
@@ -1316,7 +1320,7 @@ def render_doctor_check(project_root: Path = Path(".")):
         table.add_row("VERTEXAI_LOCATION", "[green]OK[/green]", location)
 
     _add_logging_row(table, project_root)
-    console.print(table)
+    status_console.print(table)
     _print_maturity_table()
 
 

@@ -114,4 +114,6 @@ def test_render_doctor_check_includes_knowledge_rows(tmp_path: Path) -> None:
     runner = CliRunner()
     result = runner.invoke(app, ["--project-root", str(tmp_path)])
     assert result.exit_code == 0
-    assert "Ingested OKF" in result.stdout
+    # `dev doctor` renders diagnostics, so its tables go to stderr — which is also
+    # what keeps them off the payload stream inside `dev boot --json`.
+    assert "Ingested OKF" in result.stderr

@@ -37,6 +37,13 @@ mode=json	{PY}	-m	devcouncil.cli.main	report	release-health	--json	--output	{ROO
 mode=json	{PY}	-m	devcouncil.cli.main	go	a goal	--json	--executor	nosuchagent	--project-root	{ROOT}
 mode=json	{PY}	-m	devcouncil.cli.main	go	a goal	--json	--project-root	{ROOT}
 
+# --- dev boot: the whole setup phase used to run onto the payload stream --------
+# `{ROOT}` is already initialised by the harness, so this exercises boot's
+# re-init path plus the doctor table, both of which were writing to stdout.
+# --skip-api-key keeps it non-interactive; boot would force that anyway off a TTY.
+mode=json	{PY}	-m	devcouncil.cli.main	boot	a goal	--json	--skip-map	--skip-skills	--skip-integrations	--skip-api-key	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	boot	a goal	--json	--gemini-scope	nonsense	--project-root	{ROOT}
+
 # --- the small commands' pre-flight guards -------------------------------------
 mode=json	{PY}	-m	devcouncil.cli.main	tasks	--json	--project-root	{ROOT}
 mode=json	{PY}	-m	devcouncil.cli.main	semantic	snapshot	TASK-001	--json	--stage	sideways	--project-root	{ROOT}

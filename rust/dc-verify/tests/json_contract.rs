@@ -150,7 +150,7 @@ fn every_json_invocation_puts_exactly_one_object_on_stdout() {
 
     let entries = read_manifest(&python, &project);
     assert!(
-        entries.len() >= 25,
+        entries.len() >= 30,
         "the manifest shrank to {} entries; coverage was removed rather than the CLI fixed",
         entries.len()
     );

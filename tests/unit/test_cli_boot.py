@@ -106,3 +106,57 @@ def test_boot_json_bad_provider_emits_one_object(tmp_path, monkeypatch):
     assert data["ok"] is False
     assert data["error"]
     assert result.stderr
+
+
+def test_boot_json_setup_phase_keeps_stdout_empty(tmp_path, monkeypatch):
+    """The whole setup phase ran onto the payload stream before this.
+
+    `_run_setup_path` is the real one here, not a fake: the leak was never in boot.py
+    itself but in what it calls — the `dev init` banner, `dev setup`'s API-key note, and
+    the `dev doctor` table. The go phase is stubbed because it is covered separately and
+    would otherwise try to reach a model provider.
+    """
+    import devcouncil.cli.commands.boot as boot_cmd
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(boot_cmd, "go_command", lambda *a, **k: None)
+
+    class _NonTTYStdin:
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr(boot_cmd.sys, "stdin", _NonTTYStdin())
+
+    result = runner.invoke(
+        app,
+        ["boot", "Goal", "--json", "--skip-map", "--skip-skills", "--skip-integrations"],
+    )
+
+    assert result.exit_code == 0
+    # The go phase is stubbed, so it emits no payload — the point is that nothing
+    # *else* did either. Every banner the setup phase produced is on stderr.
+    assert result.stdout == ""
+    assert "Initializing DevCouncil" in result.stderr
+    assert "DevCouncil Doctor Check" in result.stderr
+
+
+def test_boot_human_setup_phase_still_reports(tmp_path, monkeypatch):
+    """Characterization: human mode still tells the user what happened."""
+    import devcouncil.cli.commands.boot as boot_cmd
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(boot_cmd, "go_command", lambda *a, **k: None)
+
+    class _NonTTYStdin:
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr(boot_cmd.sys, "stdin", _NonTTYStdin())
+
+    result = runner.invoke(
+        app, ["boot", "Goal", "--skip-map", "--skip-skills", "--skip-integrations"]
+    )
+
+    assert result.exit_code == 0
+    assert "Initializing DevCouncil" in result.output
+    assert "DevCouncil Doctor Check" in result.output

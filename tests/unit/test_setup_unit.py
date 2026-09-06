@@ -43,7 +43,10 @@ def test_set_model_provider_same_provider_no_change_message(tmp_path, capsys):
     _init_config(tmp_path)
     setup_cmd._set_model_provider(tmp_path, "openrouter")
     captured = capsys.readouterr()
+    # Checked on both streams: `dev setup`'s narration now goes to stderr, so
+    # asserting only on stdout would pass even if the message were printed.
     assert "Updated model provider" not in captured.out
+    assert "Updated model provider" not in captured.err
 
 
 def test_set_model_roles_noop_when_empty(tmp_path):
@@ -61,41 +64,41 @@ def test_configure_api_key_ollama_skips(tmp_path, capsys):
         encoding="utf-8",
     )
     setup_cmd._configure_api_key(tmp_path, api_key=None, skip_api_key=False)
-    assert "required" in capsys.readouterr().out
+    assert "required" in capsys.readouterr().err
 
 
 def test_configure_api_key_env_already_set(tmp_path, monkeypatch, capsys):
     _init_config(tmp_path)
     monkeypatch.setenv("OPENROUTER_API_KEY", "from-env")
     setup_cmd._configure_api_key(tmp_path, api_key=None, skip_api_key=False)
-    assert "already set in the environment" in capsys.readouterr().out
+    assert "already set in the environment" in capsys.readouterr().err
 
 
 def test_configure_api_key_local_secret_already_set(tmp_path, capsys):
     _init_config(tmp_path)
     setup_cmd._write_local_secret(tmp_path, "OPENROUTER_API_KEY", "local")
     setup_cmd._configure_api_key(tmp_path, api_key=None, skip_api_key=False)
-    assert "already set in .devcouncil/secrets.env" in capsys.readouterr().out
+    assert "already set in .devcouncil/secrets.env" in capsys.readouterr().err
 
 
 def test_configure_api_key_writes_provided_key(tmp_path, capsys):
     _init_config(tmp_path)
     setup_cmd._configure_api_key(tmp_path, api_key="secret-key", skip_api_key=False)
-    assert "Saved OPENROUTER_API_KEY" in capsys.readouterr().out
+    assert "Saved OPENROUTER_API_KEY" in capsys.readouterr().err
     assert "secret-key" in (tmp_path / ".devcouncil" / "secrets.env").read_text(encoding="utf-8")
 
 
 def test_configure_api_key_skip_flag(tmp_path, capsys):
     _init_config(tmp_path)
     setup_cmd._configure_api_key(tmp_path, api_key=None, skip_api_key=True)
-    assert "Skipped OPENROUTER_API_KEY setup" in capsys.readouterr().out
+    assert "Skipped OPENROUTER_API_KEY setup" in capsys.readouterr().err
 
 
 def test_configure_api_key_non_tty_warns(tmp_path, monkeypatch, capsys):
     _init_config(tmp_path)
     monkeypatch.setattr(setup_cmd.sys.stdin, "isatty", lambda: False)
     setup_cmd._configure_api_key(tmp_path, api_key=None, skip_api_key=False)
-    assert "is not set" in capsys.readouterr().out
+    assert "is not set" in capsys.readouterr().err
 
 
 def test_configure_api_key_interactive_prompt(tmp_path, monkeypatch, capsys):
@@ -103,7 +106,7 @@ def test_configure_api_key_interactive_prompt(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(setup_cmd.sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(setup_cmd.typer, "prompt", lambda *a, **k: "typed-key")
     setup_cmd._configure_api_key(tmp_path, api_key=None, skip_api_key=False)
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert "Saved OPENROUTER_API_KEY" in out
 
 
@@ -112,13 +115,15 @@ def test_configure_api_key_interactive_skip_empty(tmp_path, monkeypatch, capsys)
     monkeypatch.setattr(setup_cmd.sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(setup_cmd.typer, "prompt", lambda *a, **k: "")
     setup_cmd._configure_api_key(tmp_path, api_key=None, skip_api_key=False)
-    assert "Skipped OPENROUTER_API_KEY setup" in capsys.readouterr().out
+    assert "Skipped OPENROUTER_API_KEY setup" in capsys.readouterr().err
 
 
 def test_configure_vertexai_settings_non_vertex_provider(tmp_path, capsys):
     _init_config(tmp_path)
     setup_cmd._configure_vertexai_settings(tmp_path, "openrouter", "proj", "us-central1")
-    assert capsys.readouterr().out == ""
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 def test_configure_vertexai_settings_warns_missing_project(tmp_path, capsys):
@@ -128,13 +133,13 @@ def test_configure_vertexai_settings_warns_missing_project(tmp_path, capsys):
         encoding="utf-8",
     )
     setup_cmd._configure_vertexai_settings(tmp_path, "vertexai", None, None)
-    assert "VERTEXAI_PROJECT is not set" in capsys.readouterr().out
+    assert "VERTEXAI_PROJECT is not set" in capsys.readouterr().err
 
 
 def test_configure_vertexai_settings_writes_project_and_location(tmp_path, capsys):
     _init_config(tmp_path)
     setup_cmd._configure_vertexai_settings(tmp_path, "vertexai", "my-proj", "global")
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert "VERTEXAI_PROJECT" in out
     assert "VERTEXAI_LOCATION" in out
 
@@ -163,4 +168,4 @@ def test_prompt_for_first_run_integrations_user_declines(tmp_path, monkeypatch, 
     monkeypatch.setattr(setup_cmd, "_is_interactive_terminal", lambda: True)
     monkeypatch.setattr(setup_cmd.typer, "confirm", lambda *a, **k: False)
     assert setup_cmd._prompt_for_first_run_integrations(tmp_path, apply=True, gemini_scope="project") is False
-    assert "Skipped coding CLI integration setup" in capsys.readouterr().out
+    assert "Skipped coding CLI integration setup" in capsys.readouterr().err
