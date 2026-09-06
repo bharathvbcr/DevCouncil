@@ -3220,11 +3220,21 @@ def test_cli_setup_apply_skips_missing_optional_integrations(tmp_path, monkeypat
     assert (tmp_path / ".codex" / "hooks.json").exists()
 
 
-def test_prompt_builder_wraps_paths_and_commands_as_markdown_code():
+def test_prompt_builder_wraps_paths_and_commands_as_markdown_code(tmp_path, monkeypatch):
     from devcouncil.domain.task import PlannedFile, Task
     from devcouncil.execution.prompt_builder import PromptBuilder
 
-    prompt = PromptBuilder().build_task_prompt(
+    # `PromptBuilder`'s default root is `Path(".")`. Without these two lines the
+    # builder pointed at the repository the suite is running in, and
+    # `_graph_impact_lines` called `load_code_graph(<repo root>)` — importing
+    # this repo's 34 MB `code_graph.json` into a 94 MB
+    # `.devcouncil/codeintel/index.sqlite`, 66 s of this file's runtime, silent
+    # because that helper catches every exception. The root is passed
+    # explicitly *and* the cwd moved: the explicit root fixes the graph read,
+    # the chdir fixes everything else in `build_task_prompt` that resolves a
+    # relative path.
+    monkeypatch.chdir(tmp_path)
+    prompt = PromptBuilder(tmp_path).build_task_prompt(
         Task(
             id="TASK-001",
             title="Prompt render",
