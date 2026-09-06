@@ -1,0 +1,22 @@
+{
+  "_comment": "Hand-labelled ground truth. `live` is the answer a careful reviewer gives with the whole corpus in front of them, and `why` is the evidence \u2014 a label without one is an opinion. Edit only with a reason recorded here.",
+  "source": "testdata/fixtures/tier_c/solidity_app",
+  "notes": "Every caller is outside the corpus by construction: a contract's public functions are its on-chain ABI, invoked by transactions. A tool that calls them dead is telling a user to delete the contract's interface. Precision only.",
+  "symbols": [
+    {
+      "symbol_id": "Contract.sol::SimpleStorage",
+      "live": true,
+      "why": "The deployable contract: the compilation unit's entire product."
+    },
+    {
+      "symbol_id": "Contract.sol::SimpleStorage.get",
+      "live": true,
+      "why": "A `public view` function \u2014 part of the contract's external ABI."
+    },
+    {
+      "symbol_id": "Contract.sol::SimpleStorage.set",
+      "live": true,
+      "why": "A `public` function \u2014 part of the contract's external ABI."
+    }
+  ]
+}

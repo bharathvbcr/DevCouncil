@@ -1,0 +1,32 @@
+{
+  "_comment": "Hand-labelled ground truth. `live` is the answer a careful reviewer gives with the whole corpus in front of them, and `why` is the evidence \u2014 a label without one is an opinion. Edit only with a reason recorded here.",
+  "source": "testdata/fixtures/tier_b/rust_app",
+  "notes": "Generic trait impl (G19) and grouped `use` (X9). Every symbol is live; precision only.",
+  "symbols": [
+    {
+      "symbol_id": "main.rs::GenericContainer",
+      "live": true,
+      "why": "Instantiated at main.rs:20."
+    },
+    {
+      "symbol_id": "main.rs::GenericContainer.process",
+      "live": true,
+      "why": "The impl reached by `container.process(100)` (main.rs:24)."
+    },
+    {
+      "symbol_id": "main.rs::Processor",
+      "live": true,
+      "why": "Implemented for GenericContainer (main.rs:13)."
+    },
+    {
+      "symbol_id": "main.rs::Processor.process",
+      "live": true,
+      "why": "The trait method the call at main.rs:24 dispatches through."
+    },
+    {
+      "symbol_id": "main.rs::main",
+      "live": true,
+      "why": "The binary entry point: invoked by the runtime, never by corpus code."
+    }
+  ]
+}

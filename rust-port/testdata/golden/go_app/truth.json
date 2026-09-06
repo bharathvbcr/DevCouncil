@@ -1,0 +1,22 @@
+{
+  "_comment": "Hand-labelled ground truth. `live` is the answer a careful reviewer gives with the whole corpus in front of them, and `why` is the evidence \u2014 a label without one is an opinion. Edit only with a reason recorded here.",
+  "source": "testdata/fixtures/tier_b/go_app",
+  "notes": "Composite literal as a type reference (X2) and block imports (X17). Every symbol is live; precision only.",
+  "symbols": [
+    {
+      "symbol_id": "main.go::Config",
+      "live": true,
+      "why": "Referenced by the composite literal `Config{...}` (main.go:19)."
+    },
+    {
+      "symbol_id": "main.go::ProcessConfig",
+      "live": true,
+      "why": "Called by main (main.go:20)."
+    },
+    {
+      "symbol_id": "main.go::main",
+      "live": true,
+      "why": "The program entry point: invoked by the Go runtime, never by corpus code."
+    }
+  ]
+}

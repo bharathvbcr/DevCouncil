@@ -1,0 +1,47 @@
+{
+  "_comment": "Hand-labelled ground truth. `live` is the answer a careful reviewer gives with the whole corpus in front of them, and `why` is the evidence \u2014 a label without one is an opinion. Edit only with a reason recorded here.",
+  "source": "testdata/fixtures/tier_a/liveness_truth",
+  "notes": "The only fixture with genuinely dead symbols, so the only one that can measure recall. `cycle_a`/`cycle_b` are the abandoned-cycle shape: each has an inbound edge from the other, so the one-hop liveness join cannot see them and they are reported by the dead-cluster pass instead, at the `inferred` tier. Scoring the two lists together is what makes recall meaningful here.",
+  "symbols": [
+    {
+      "symbol_id": "api.py::Api",
+      "live": true,
+      "why": "Declared public by `__all__ = [\"Api\"]`."
+    },
+    {
+      "symbol_id": "api.py::Api.public_op",
+      "live": true,
+      "why": "Public member of an `__all__`-exported class: deleting it breaks the declared API even though nothing in the corpus calls it."
+    },
+    {
+      "symbol_id": "api.py::_hidden",
+      "live": true,
+      "why": "Underscore-private by convention and exempt before the verdict runs; labelled live so a regression that started reporting it shows up as a false positive."
+    },
+    {
+      "symbol_id": "api.py::orphan_function",
+      "live": false,
+      "why": "Module-level, absent from `__all__`, and called by nothing."
+    },
+    {
+      "symbol_id": "api.py::cycle_a",
+      "live": false,
+      "why": "Reachable only from cycle_b, which is itself unreachable."
+    },
+    {
+      "symbol_id": "api.py::cycle_b",
+      "live": false,
+      "why": "The other half of the abandoned cycle."
+    },
+    {
+      "symbol_id": "helpers.py::used_helper",
+      "live": true,
+      "why": "Imported and called by api.py."
+    },
+    {
+      "symbol_id": "helpers.py::unused_helper",
+      "live": false,
+      "why": "Nothing imports or calls it."
+    }
+  ]
+}

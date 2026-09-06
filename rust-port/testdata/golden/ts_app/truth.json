@@ -1,0 +1,62 @@
+{
+  "_comment": "Hand-labelled ground truth. `live` is the answer a careful reviewer gives with the whole corpus in front of them, and `why` is the evidence \u2014 a label without one is an opinion. Edit only with a reason recorded here.",
+  "source": "testdata/fixtures/tier_a/ts_app",
+  "notes": "Polymorphic override, barrel re-export, decorator-as-reference and `new`-expression-as-call, all in one corpus. Every symbol is live; this fixture measures precision only.",
+  "symbols": [
+    {
+      "symbol_id": "index.ts::BaseService",
+      "live": true,
+      "why": "Exported, and extended by ServiceConsumer (index.ts:33)."
+    },
+    {
+      "symbol_id": "index.ts::Color",
+      "live": true,
+      "why": "Exported enum: public API."
+    },
+    {
+      "symbol_id": "index.ts::Geometry",
+      "live": true,
+      "why": "Exported namespace: public API."
+    },
+    {
+      "symbol_id": "index.ts::Point",
+      "live": true,
+      "why": "Exported interface inside an exported namespace: public API."
+    },
+    {
+      "symbol_id": "index.ts::ServiceConsumer",
+      "live": true,
+      "why": "Exported class: public API."
+    },
+    {
+      "symbol_id": "index.ts::ServiceConsumer.execute",
+      "live": true,
+      "why": "Concrete implementation of the abstract BaseService.execute; reached through the base type, not by a direct call."
+    },
+    {
+      "symbol_id": "index.ts::logDecorator",
+      "live": true,
+      "why": "Not exported, but applied as `@logDecorator` (index.ts:34) \u2014 a decorator is a reference."
+    },
+    {
+      "symbol_id": "index.ts::overloadFn",
+      "live": true,
+      "why": "Exported function with overload signatures: public API."
+    },
+    {
+      "symbol_id": "reexport.ts::REEXPORTED_VALUE",
+      "live": true,
+      "why": "Exported, and re-exported through `export * from \"./reexport\"` (index.ts:41)."
+    },
+    {
+      "symbol_id": "utils.ts::Helper",
+      "live": true,
+      "why": "Exported, and instantiated via `new utils.Helper()` (index.ts:36)."
+    },
+    {
+      "symbol_id": "utils.ts::Helper.run",
+      "live": true,
+      "why": "Called at index.ts:37 through a namespace import."
+    }
+  ]
+}

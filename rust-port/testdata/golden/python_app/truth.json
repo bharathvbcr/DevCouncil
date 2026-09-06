@@ -1,0 +1,32 @@
+{
+  "_comment": "Hand-labelled ground truth. `live` is the answer a careful reviewer gives with the whole corpus in front of them, and `why` is the evidence \u2014 a label without one is an opinion. Edit only with a reason recorded here.",
+  "source": "testdata/fixtures/tier_a/python_app",
+  "notes": "The `__all__ +=` blind spot (G3). `MyClass` is exported by the accumulation form and `MyClass.execute` is a public member of it; the kernel exempted the class and not the member, and reported the member dead at `extracted` \u2014 the tier whose contract is `safe to act on`. Acting on it deletes public API. Fixed by the `Member of an exported type` exemption in devmap-analyze/liveness.rs.",
+  "symbols": [
+    {
+      "symbol_id": "app.py::MyClass",
+      "live": true,
+      "why": "Declared public by `__all__ += [\"MyClass\"]` (app.py:5)."
+    },
+    {
+      "symbol_id": "app.py::MyClass.execute",
+      "live": true,
+      "why": "Public method of an `__all__`-exported class: consumers outside the corpus can call it, so deleting it breaks the declared API."
+    },
+    {
+      "symbol_id": "app.py::dir",
+      "live": true,
+      "why": "Called by MyClass.execute (app.py:21). A stdlib-shadowing name, which is the blind spot the fixture probes."
+    },
+    {
+      "symbol_id": "app.py::my_func",
+      "live": true,
+      "why": "Declared public by `__all__ = [\"my_func\"]` (app.py:4)."
+    },
+    {
+      "symbol_id": "app.py::open",
+      "live": true,
+      "why": "Called by my_func (app.py:16). Also a stdlib-shadowing name."
+    }
+  ]
+}
