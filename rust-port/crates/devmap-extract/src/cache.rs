@@ -173,7 +173,29 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// behaviours, so it is v31. A single bump covering two changes is
 /// correct — the version answers "may a stored row be reused?", and
 /// either change on its own already answers no.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "31";
+/// v32 adds two things to the payload that a v31 row cannot contain, and by
+/// the same rule either one on its own already answers no:
+///
+/// * **Heritage references (W1.2).** `heritage.rs` pushes
+///   `ReferenceKind::Heritage` and `HeritageInterface` for `extends` /
+///   `implements` / `impl … for` across fifteen languages, which the resolver
+///   turns into `Extends` and `Implements` edges. A v31 row has none of them,
+///   so every subtype relation in a cached file is simply absent — and a
+///   polymorphic override reached only through its base type then reads as
+///   uncalled, which is a delete-this verdict built on an edge that was never
+///   extracted.
+/// * **Wiring annotations (W3.3).** `WiringKind::AllowUnwired` records the
+///   author's explicit `devcouncil: allow-unwired` declaration and
+///   `WiringKind::DynamicImport` records the file forms an `importlib`,
+///   `import('./x')` or worker-URL reference names. A v31 row carries neither,
+///   so a cached file that declares itself intentionally unwired is reported
+///   unwired anyway, and a lazily imported module stays invisible to the
+///   liveness join.
+///
+/// Both are additive to the payload, which is exactly why the bump is
+/// necessary: nothing about a v31 row *looks* stale, so without it a warm cache
+/// serves a complete-looking extraction with the new evidence silently missing.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "32";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

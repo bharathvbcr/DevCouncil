@@ -622,12 +622,16 @@ fn embedded_extraction_is_deterministic() {
 fn the_cache_identity_covers_the_embedded_grammars() {
     use devmap_extract::cache::{grammar_version_for, EXTRACTION_SCHEMA_VERSION};
 
-    // 31, not 30: this change and the notebook/pattern-scanner outcome change
-    // both landed as "v30" on separate branches. The merged tree carries both,
-    // so it is one version past either.
+    // An exact pin, deliberately: it is the tripwire that makes somebody read
+    // `EXTRACTION_SCHEMA_VERSION`'s doc comment and write a rationale paragraph
+    // before changing what a cached payload contains. It has fired twice —
+    // 30 -> 31 for reading `<script>` blocks, and 31 -> 32 for W1.2's heritage
+    // references and W3.3's wiring annotations, both of which are additive and
+    // so leave a stale row looking perfectly complete.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "31",
-        "reading <script> blocks changes what a cached payload means"
+        EXTRACTION_SCHEMA_VERSION, "32",
+        "reading <script> blocks changes what a cached payload means, and so does \
+         every later addition to it"
     );
 
     for language in ["svelte", "vue", "astro"] {

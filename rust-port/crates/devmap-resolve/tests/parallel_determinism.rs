@@ -54,6 +54,33 @@ fn corpus() -> Vec<Extraction> {
             ),
         ));
     }
+    // A TypeScript barrel chain, so `reexport_chains` is a non-empty map to
+    // compare rather than two empty ones. Without it the determinism assertion
+    // on that field passes over a corpus that produces none, which is a check
+    // that cannot fail.
+    files.push(extract_file(
+        "ts/leaf.ts",
+        "export function leafThing() {
+  return 1;
+}
+
+export const LEAF = 2;
+",
+    ));
+    for i in 0..8 {
+        files.push(extract_file(
+            &format!("ts/mid{i}.ts"),
+            "export * from \"./leaf\";
+export { leafThing as aliased } from \"./leaf\";
+",
+        ));
+    }
+    files.push(extract_file(
+        "ts/barrel.ts",
+        &(0..8)
+            .map(|i| format!("export * from \"./mid{i}\";\n"))
+            .collect::<String>(),
+    ));
     files
 }
 
@@ -144,16 +171,23 @@ fn resolution_is_identical_on_one_thread_and_on_eight() {
     );
 
     assert_eq!(serial.receiver_types, parallel.receiver_types);
-    // `reexport_chains` is deliberately *not* compared for equality here.
-    // Nothing in the crate ever writes it, so comparing two always-empty maps
-    // asserted nothing while reading like a determinism check — a check that
-    // could not fail reporting what a check that ran and passed reports. What
-    // is true is that it is empty, and that is what is asserted, in
-    // `reexport_chains_are_never_computed`.
+    // Compared for equality again, and this time it means something.
+    //
+    // It used to assert only that both maps were *empty*, because nothing wrote
+    // the field — a check that could not fail, reporting what a check that ran
+    // and passed reports. W1.3 computes them, so the emptiness assertion became
+    // a claim that was true only because this fixture happens to contain no
+    // re-export: it would have failed the moment the fixture grew one, and the
+    // comment above it would have been read as evidence the *computation* was
+    // wrong.
     assert!(
-        serial.reexport_chains.is_empty() && parallel.reexport_chains.is_empty(),
-        "no code path computes re-export chains; a non-empty map here means \
-         this test and the field's documentation are both stale"
+        !serial.reexport_chains.is_empty(),
+        "the corpus must produce re-export chains, or the comparison below is \
+         two empty maps and cannot fail"
+    );
+    assert_eq!(
+        serial.reexport_chains, parallel.reexport_chains,
+        "thread count changed which re-export chains were computed"
     );
 }
 
