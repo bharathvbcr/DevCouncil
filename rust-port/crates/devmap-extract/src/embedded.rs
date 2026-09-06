@@ -745,6 +745,23 @@ pub(crate) fn merge_embedded_scripts(
                     region.content.start_byte, region.content.end_byte
                 ));
             }
+            ParseOutcome::Skipped { reason } => {
+                // Unreachable: the inner call is handed the *outer* file's
+                // path, and a path the skip rule matches returns before any
+                // embedded region is looked for. Handled as a real case anyway
+                // — the region's bytes went unread either way, and the one
+                // thing that must not happen is a skipped region leaving the
+                // outer file reporting `Clean` over it.
+                diagnostics.push(format!(
+                    "embedded {language} at bytes {}..{} was not parsed: {reason}",
+                    region.content.start_byte, region.content.end_byte
+                ));
+                unparsed.push(TextRange {
+                    start_byte: region.element.start_byte,
+                    end_byte: region.element.end_byte,
+                });
+                continue;
+            }
         }
 
         absorb(extraction, inner, region.content.start_byte);
@@ -841,8 +858,12 @@ fn fold_unparsed_ranges(outcome: &mut ParseOutcome, mut unparsed: Vec<TextRange>
         }
         // A file the outer grammar could not read at all never reaches here —
         // the extractor returns before the merge — and if it ever did, an
-        // unread region inside already-refused bytes says nothing new.
-        ParseOutcome::Failed { .. } | ParseOutcome::Fallback { .. } => {}
+        // unread region inside already-refused bytes says nothing new. A
+        // skipped file is the same shape for the same reason: it claims no
+        // coverage to qualify.
+        ParseOutcome::Failed { .. }
+        | ParseOutcome::Fallback { .. }
+        | ParseOutcome::Skipped { .. } => {}
     }
 }
 

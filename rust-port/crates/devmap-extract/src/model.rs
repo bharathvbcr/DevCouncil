@@ -495,6 +495,37 @@ pub enum ParseOutcome {
     Fallback {
         reason: String,
     },
+    /// No parse was attempted, by decision rather than by failure. `reason`
+    /// names the decision.
+    ///
+    /// Distinct from `Failed`, which this used to be reported as, and the two
+    /// differ in every way a consumer acts on:
+    ///
+    /// * **`Failed` is a symptom.** It says the extractor tried and could not,
+    ///   so a `Failed` count is a number a maintainer is meant to investigate.
+    ///   A vendored minified bundle inflating that count permanently is the
+    ///   same defect [`ExtractionEngine::NotApplicable`] was added to fix —
+    ///   294 of 1,310 files reported as parse failures, hiding the 16 real
+    ///   ones — arriving by a different route.
+    /// * **`Failed` is not cache-admitted** (`cache::cache_admits`), because a
+    ///   failure may not recur and is worth retrying. A skip is a stable
+    ///   verdict about the file's *name and shape*: retrying it every build
+    ///   re-decides an unchanged fact and logs a retry for something that will
+    ///   never succeed.
+    /// * **`Failed`'s reason is written at the moment of failure**, so for a
+    ///   budget overrun it records which phase the deadline landed in — a
+    ///   detail that varies with machine load, which is how two extractions of
+    ///   identical bytes came to disagree. A skip's reason is a function of the
+    ///   path alone.
+    ///
+    /// Like `Failed`, no declarations are recovered and the `File` node is
+    /// still emitted: the file is not parsed, which is not the same as the file
+    /// not existing. Unlike `Fallback`, nothing here was matched by pattern
+    /// either — the symbol list is empty rather than approximate, so a consumer
+    /// must not read this file's silence as evidence about what it declares.
+    Skipped {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -23,6 +23,9 @@ fn outcome(extraction: &Extraction) -> String {
         // should never reach this arm; naming it here rather than matching `_`
         // keeps that a checked expectation instead of an assumption.
         ParseOutcome::Fallback { .. } => "Fallback".to_string(),
+        // Nor this one: the skip rule matches minified bundles by name and a
+        // `.metal` file is not one. Named for the same reason as `Fallback`.
+        ParseOutcome::Skipped { .. } => "Skipped".to_string(),
     }
 }
 

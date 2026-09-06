@@ -36,6 +36,9 @@ fn probe(label: &str, path: &str, lang: &str, source: &str, budget: Duration) {
         }
         devmap_extract::model::ParseOutcome::Failed { .. } => "Failed".to_string(),
         devmap_extract::model::ParseOutcome::Fallback { .. } => "Fallback".to_string(),
+        // A row that reports this spent no time in a grammar at all, so its
+        // ratio measures the skip, not the parse.
+        devmap_extract::model::ParseOutcome::Skipped { .. } => "Skipped".to_string(),
     };
     println!(
         "{label:<28} budget={budget:>8.2?} elapsed={elapsed:>9.2?} ratio={ratio:>6.1}x \

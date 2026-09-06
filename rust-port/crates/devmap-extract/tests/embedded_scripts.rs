@@ -624,12 +624,16 @@ fn the_cache_identity_covers_the_embedded_grammars() {
 
     // An exact pin, deliberately: it is the tripwire that makes somebody read
     // `EXTRACTION_SCHEMA_VERSION`'s doc comment and write a rationale paragraph
-    // before changing what a cached payload contains. It has fired twice —
-    // 30 -> 31 for reading `<script>` blocks, and 31 -> 32 for W1.2's heritage
+    // before changing what a cached payload contains. It has fired three times
+    // — 30 -> 31 for reading `<script>` blocks, 31 -> 32 for W1.2's heritage
     // references and W3.3's wiring annotations, both of which are additive and
-    // so leave a stale row looking perfectly complete.
+    // so leave a stale row looking perfectly complete, and 32 -> 33 for
+    // declining to parse minified bundles. The third is the one case where the
+    // stale rows are *subtractive*: a v32 row for a bundle can hold several
+    // hundred `Clean` symbols this build no longer claims, and `Clean` is
+    // cache-admitted, so without the bump they would be served indefinitely.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "32",
+        EXTRACTION_SCHEMA_VERSION, "33",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

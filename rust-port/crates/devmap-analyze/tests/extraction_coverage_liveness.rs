@@ -521,3 +521,119 @@ fn import_blindness_is_charged_without_capping_the_call_verdict() {
         outcome.reports
     );
 }
+
+/// A skipped file is charged to its own counter, named in the inventory, and
+/// does not degrade the corpus.
+///
+/// Three separate claims, and each one is a way the fix could have gone wrong:
+///
+/// * Charged to `parse_failed_files` would have re-told the lie the `Skipped`
+///   outcome exists to stop — a vendored bundle reported, permanently, as a
+///   file the extractor tried and failed to read.
+/// * Charged nowhere would have been worse and quieter. Before
+///   `ExtractionGap::NotParsed` existed the file matched no arm of
+///   `extraction_gaps` and fell out of the inventory entirely, so a file
+///   nothing read counted as a file whose calls were looked for. That is the
+///   silence `discovery_refused_files` was added to break.
+/// * Folded into `is_complete()` it would cap every dead-code finding in every
+///   repository that vendors one minified bundle — for a file already exempt
+///   from liveness through `WiringKind::Vendored`. `import_blind_files` is kept
+///   out of `is_complete()` for exactly this trade.
+#[test]
+fn a_skipped_file_is_counted_apart_and_does_not_degrade_the_corpus() {
+    let mut extractions = fixture();
+    skip(&mut extractions[1]);
+
+    let coverage = extraction_coverage(&extractions);
+    assert_eq!(
+        coverage.not_parsed_files, 1,
+        "the decision must be visible somewhere"
+    );
+    assert_eq!(
+        coverage.parse_failed_files, 0,
+        "nothing failed; reporting a skip as a parse failure is the defect"
+    );
+    assert_eq!(coverage.pattern_recovered_files, 0);
+    assert_eq!(
+        coverage.files_without_call_extraction(),
+        1,
+        "it really did contribute no call edges — that part is a fact"
+    );
+    assert!(
+        coverage.is_complete(),
+        "a vendored bundle nobody wanted parsed is not a reason to distrust \
+         every finding in the repository"
+    );
+    assert!(coverage.degraded_reason().is_none());
+
+    let gaps = extraction_gaps(&extractions);
+    let named: Vec<&str> = gaps
+        .iter()
+        .filter(|entry| entry.gap == ExtractionGap::NotParsed)
+        .map(|entry| entry.path.as_str())
+        .collect();
+    assert_eq!(
+        named,
+        vec!["app.py"],
+        "the inventory must name the file, not just count it"
+    );
+}
+
+/// The reason a reader sees never says "Parse failed" about a file nobody
+/// parsed.
+///
+/// `is_parse_failed` covers `Skipped` — deliberately, because "nothing calls
+/// it" is only evidence when calls were looked for — and that guard also feeds
+/// the exemption string printed beside the file. Sharing the guard without
+/// splitting the sentence would have put the word "failed" back on exactly the
+/// file this outcome was introduced to stop calling a failure.
+#[test]
+fn a_skipped_file_is_never_described_as_a_parse_failure() {
+    let mut extractions = fixture();
+    skip(&mut extractions[0]);
+
+    let summary = summarize(&extractions);
+    let reasons: Vec<&str> = summary
+        .dead_symbols
+        .iter()
+        .filter(|report| report.file_path == "lib.py")
+        .filter_map(|report| report.exemption_reason.as_deref())
+        .collect();
+    for reason in &reasons {
+        assert!(
+            !reason.contains("Parse failed"),
+            "a file nobody handed to a grammar must not be reported as a parse \
+             failure, got {reason:?}"
+        );
+    }
+
+    for entry in extraction_gaps(&extractions) {
+        if entry.gap == ExtractionGap::NotParsed {
+            assert!(
+                entry.reason.contains("minified"),
+                "the inventory entry must carry the extractor's own reason, got {:?}",
+                entry.reason
+            );
+        }
+    }
+}
+
+/// Shape a file the way `skipped_extraction` does: engine `NotApplicable`, the
+/// `File` node only, nothing claimed.
+///
+/// Mirrors `refuse` above, and for the same reason — leaving the extracted
+/// calls in place would give the resolver its edge back and make the fixture
+/// unable to reproduce anything.
+fn skip(ext: &mut Extraction) {
+    ext.parse_outcome = ParseOutcome::Skipped {
+        reason: "not parsed: minified bundle, whose only declarations are a \
+                 minifier's mangled names"
+            .to_string(),
+    };
+    ext.engine = ExtractionEngine::NotApplicable {
+        language: ext.language.clone(),
+    };
+    ext.symbols.retain(|sym| sym.kind == SymbolKind::File);
+    ext.imports.clear();
+    ext.calls.clear();
+}

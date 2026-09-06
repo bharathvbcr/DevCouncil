@@ -200,6 +200,36 @@ pub fn extract_treesitter_with_budget(
         return refused_extraction(path, lang, source, why.to_string());
     }
 
+    // And a *file* whose shape makes the budget the thing that decides the
+    // answer. `UNSAFE_GRAMMARS` above refuses by language; this refuses by
+    // path, and for the same underlying reason — a parse whose cost is not
+    // bounded by anything the extractor controls.
+    //
+    // A minified bundle is the one shape that reliably reaches the boundary: it
+    // is dense syntax with no line structure, it is large, and it is committed
+    // outside the `node_modules/` and `dist/` directories discovery already
+    // refuses. The real one in this project's tree — 177,599 bytes over five
+    // lines — cost 4.7–5.0 s against a 5 s budget, so which of `Clean`,
+    // `Partial` and `Failed` it published depended on the load average. That is
+    // 449 symbols appearing and disappearing between builds, and a dead-code
+    // verdict changing with them.
+    //
+    // Declining costs nothing, because there was nothing to lose. Every
+    // identifier in the file is a minifier's single letter: `t`, `e`, `n`. As
+    // search results they are noise, as call edges they resolve to nothing, and
+    // as dead-code candidates they are already exempt — `is_vendored_path`
+    // matches the same file and hangs the annotation that exempts it.
+    if crate::wiring::is_minified_bundle(path) {
+        return skipped_extraction(
+            path,
+            lang,
+            source,
+            "not parsed: minified bundle, whose only declarations are a \
+             minifier's mangled names"
+                .to_string(),
+        );
+    }
+
     let mut parser = Parser::new();
 
     let ts_lang: Option<(&str, Language)> = match lang {
@@ -1123,14 +1153,56 @@ fn python_module_aliases(root: Node, source: &str) -> std::collections::BTreeSet
 /// abandoned has an unknown structure, and a pattern scan over it would produce
 /// a plausible-looking symbol set that nothing verified.
 fn refused_extraction(path: &str, lang: &str, source: &str, reason: String) -> Extraction {
+    unparsed_extraction(
+        path,
+        lang,
+        source,
+        ExtractionEngine::Unavailable {
+            requested_language: lang.to_string(),
+        },
+        ParseOutcome::Failed { reason },
+    )
+}
+
+/// A parse this build **chose not to attempt**, reported as such.
+///
+/// Distinct from `refused_extraction` in both fields, and both differences are
+/// the same claim: nothing went wrong here. The engine is `NotApplicable`
+/// rather than `Unavailable` because no grammar was wanted — one exists and is
+/// linked, and asking it was simply not worth the clock — and the outcome is
+/// `Skipped` rather than `Failed` because "we did not try" is not a symptom a
+/// maintainer should be sent to investigate, and because a decision about a
+/// file's name is a stable verdict that may be cached.
+///
+/// Shares its body with the refusal path deliberately. Both emit the `File`
+/// node and the wiring annotations and claim nothing else; when that shape was
+/// two copies, one of them was fixed and the other was not.
+fn skipped_extraction(path: &str, lang: &str, source: &str, reason: String) -> Extraction {
+    unparsed_extraction(
+        path,
+        lang,
+        source,
+        ExtractionEngine::NotApplicable {
+            language: lang.to_string(),
+        },
+        ParseOutcome::Skipped { reason },
+    )
+}
+
+/// The `File`-node-only extraction both no-parse paths publish.
+fn unparsed_extraction(
+    path: &str,
+    lang: &str,
+    source: &str,
+    engine: ExtractionEngine,
+    parse_outcome: ParseOutcome,
+) -> Extraction {
     Extraction {
         file_path: path.to_string(),
         language: lang.to_string(),
         content_hash: content_hash(source),
-        engine: ExtractionEngine::Unavailable {
-            requested_language: lang.to_string(),
-        },
-        parse_outcome: ParseOutcome::Failed { reason },
+        engine,
+        parse_outcome,
         // The File node is still emitted: being unable to parse a file is not a
         // reason to deny it exists, and every edge that targets it needs a node.
         symbols: vec![ExtractedSymbol {

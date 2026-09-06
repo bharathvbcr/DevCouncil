@@ -35,6 +35,37 @@ pub fn is_test_path(path: &str) -> bool {
     looks_like_test || (in_test_dir && !name.starts_with('.'))
 }
 
+/// Suffixes a minifier writes, and a human does not.
+///
+/// `.mjs` and `.cjs` are here because the same bundlers emit them and the same
+/// grammar parses them; `src/mining.js` and `src/minify.js` are not, which is
+/// why the match is on the compound suffix rather than on the substring
+/// `min`.
+const MINIFIED_SUFFIXES: &[&str] = &[".min.js", ".min.mjs", ".min.cjs", ".min.css"];
+
+/// Whether `path` is minifier output — a bundle, not source someone reads.
+///
+/// Split out of [`is_vendored_path`] because two different decisions ask it and
+/// only one of them is about vendoring. `is_vendored_path` asks it to hang a
+/// [`WiringKind::Vendored`] annotation, which exempts a file from *liveness*;
+/// [`crate::treesitter::extract_treesitter_with_budget`] asks it to decline the
+/// parse outright. Keeping one owner is the point: while the shape lived only
+/// inside `is_vendored_path`, the extractor had no way to consult it, and a
+/// 177 KB bundle was handed to tree-sitter on every build — see
+/// `tests/a_minified_bundle_is_not_parsed.rs` for what that cost.
+///
+/// Deliberately narrower than `is_vendored_path`. That predicate's directory
+/// arms — `vendor/`, `vendored/`, `third_party/` — hold ordinary readable
+/// source that parses fine and yields real symbols, and refusing to parse all
+/// of it would be a far larger change than the defect calls for. Only the
+/// name-declared minified forms are declined.
+pub fn is_minified_bundle(path: &str) -> bool {
+    let norm = path.replace('\\', "/").to_lowercase();
+    MINIFIED_SUFFIXES
+        .iter()
+        .any(|suffix| norm.ends_with(suffix))
+}
+
 pub fn is_vendored_path(path: &str) -> bool {
     let norm = path.replace('\\', "/").to_lowercase();
     let parts: Vec<&str> = norm.split('/').collect();
@@ -44,10 +75,7 @@ pub fn is_vendored_path(path: &str) -> bool {
     {
         return true;
     }
-    if norm.ends_with(".min.js") || norm.ends_with(".min.css") {
-        return true;
-    }
-    false
+    is_minified_bundle(&norm)
 }
 
 pub fn is_generated_path(path: &str) -> bool {

@@ -195,7 +195,16 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Both are additive to the payload, which is exactly why the bump is
 /// necessary: nothing about a v31 row *looks* stale, so without it a warm cache
 /// serves a complete-looking extraction with the new evidence silently missing.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "32";
+///
+/// v33 stops parsing minified bundles (`wiring::is_minified_bundle`) and
+/// reports them `ParseOutcome::Skipped`. Every v32 row for such a file is one
+/// of the three answers the coin flip produced — `Clean` with several hundred
+/// mangled symbols, `Partial`, or `Failed` with a budget reason — and each is a
+/// claim this build no longer makes. The `Clean` rows are the reason the bump
+/// is not optional: they are cache-admitted, they look freshly indexed, and
+/// they would keep publishing a minifier's `t`, `e` and `n` as declarations of
+/// the repository long after the extractor stopped producing them.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "33";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
