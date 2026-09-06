@@ -25,8 +25,8 @@ pub mod viz;
 pub mod workspace;
 
 pub use artifacts::{
-    render_subsystem_map_html, render_symbol_explorer_html, should_regenerate, write_atomic,
-    writer_identity, ArtifactFingerprint, ArtifactRecord, ArtifactStamp,
+    should_regenerate, write_atomic, writer_identity, ArtifactFingerprint, ArtifactRecord,
+    ArtifactStamp,
 };
 pub use cancel::{cancelled_queries, Cancel, QueryCancelled};
 pub use code_graph::{

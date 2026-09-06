@@ -260,9 +260,9 @@ fn embed_json(value: &Value) -> String {
         .replace('&', "\\u0026")
 }
 
-/// Render the whole page: one HTML file, no network.
+/// Render the code graph: one HTML file, no network.
 pub fn render_html(graph: &Value, options: &VizOptions) -> String {
-    let payload = build_payload(graph, options);
+    let mut payload = build_payload(graph, options);
     let counts = payload.get("counts").cloned().unwrap_or(json!({}));
     let shown = counts["nodes_shown"].as_u64().unwrap_or(0);
     let total = counts["nodes_total"].as_u64().unwrap_or(0);
@@ -276,14 +276,40 @@ pub fn render_html(graph: &Value, options: &VizOptions) -> String {
     } else {
         format!("{total} nodes")
     };
-    let level = if options.symbols { "symbols" } else { "files" };
-    let title = html_escape(&options.title);
-    let data = embed_json(&payload);
+    payload["view"] = json!({
+        "title": options.title,
+        "subtitle": subtitle,
+        "level": if options.symbols { "symbols" } else { "files" },
+        "suffix": "code graph",
+        "detail_fields": [
+            ["Path", "path"], ["Kind", "kind"], ["Area", "area"],
+            ["Community", "community"], ["Language", "language"],
+        ],
+        "flag_filters": [["dead", "Dead candidates only"]],
+        "legend": [
+            ["#3d8bfd", "reached"], ["#e35d6a", "dead candidate"],
+            ["#34d399", "entry point"], ["#f0ad4e", "unwired"],
+        ],
+    });
+    render_page(&payload)
+}
+
+/// The page both views share.
+///
+/// One shell, driven by `payload.view`: the two graphs differ in what a node
+/// *is*, not in how the page works, and a second copy of this would be the
+/// thing that drifts.
+fn render_page(payload: &Value) -> String {
+    let view = payload.get("view").cloned().unwrap_or(json!({}));
+    let level = view["level"].as_str().unwrap_or("");
+    let title = html_escape(view["title"].as_str().unwrap_or("devmap"));
+    let subtitle = view["subtitle"].as_str().unwrap_or("").to_string();
+    let data = embed_json(payload);
 
     format!(
         r#"<meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>{title} — code graph</title>
+<title>{title} — {suffix}</title>
 <style>
 :root {{
   --bg:#0f1419; --panel:#161d27; --fg:#e7ecf3; --muted:#8b9bb4; --line:#243044;
@@ -317,9 +343,18 @@ label.row {{ display:flex; align-items:center; gap:7px; margin:9px 0 0; color:va
 .tag.dead {{ background:rgba(227,93,106,.18); color:var(--dead); }}
 .tag.entry {{ background:rgba(52,211,153,.18); color:var(--entry); }}
 .tag.unwired {{ background:rgba(240,173,78,.18); color:var(--unwired); }}
+#notes {{ padding:0 16px; font-size:12px; color:var(--muted); }}
+#notes:not(:empty) {{ padding:12px 16px; border-bottom:1px solid var(--line); }}
+#notes details {{ margin-top:6px; }}
+#notes summary {{ cursor:pointer; color:var(--unwired); }}
+#notes ul {{ margin:6px 0 0; padding-left:16px; max-height:180px; overflow:auto; }}
+#notes li {{ word-break:break-all; margin-bottom:3px; }}
 #graph {{ flex:1; position:relative; min-width:0; }}
 #empty {{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
-  color:var(--muted); text-align:center; padding:32px; }}
+  color:var(--muted); text-align:center; padding:32px; pointer-events:none; }}
+/* An author `display` beats the UA sheet's `[hidden] {{ display:none }}`, so the
+   overlay has to opt out explicitly or it never hides. */
+#empty[hidden] {{ display:none; }}
 </style>
 
 <div id="side">
@@ -329,15 +364,11 @@ label.row {{ display:flex; align-items:center; gap:7px; margin:9px 0 0; color:va
   </div>
   <div id="controls">
     <input id="q" type="search" placeholder="Filter by name or path…" autocomplete="off"/>
-    <label class="row"><input type="checkbox" id="deadOnly"/> Dead candidates only</label>
+    <div id="flagFilters"></div>
     <label class="row"><input type="checkbox" id="labels" checked/> Show labels</label>
   </div>
-  <div id="legend">
-    <div><span class="key" style="background:var(--accent)"></span>reached</div>
-    <div><span class="key" style="background:var(--dead)"></span>dead candidate</div>
-    <div><span class="key" style="background:var(--entry)"></span>entry point</div>
-    <div><span class="key" style="background:var(--unwired)"></span>unwired</div>
-  </div>
+  <div id="legend"></div>
+  <div id="notes"></div>
   <div id="detail"><span class="sub">Click a node for detail.</span></div>
 </div>
 <div id="graph"></div>
@@ -358,6 +389,32 @@ const colorFor = n => {{
   return '#3d8bfd';
 }};
 
+const VIEW = DATA.view || {{}};
+function esc(s) {{
+  return String(s).replace(/[&<>"']/g, c =>
+    ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[c]);
+}}
+
+document.getElementById('legend').innerHTML = (VIEW.legend || [])
+  .map(([color, label]) =>
+    '<div><span class="key" style="background:' + esc(color) + '"></span>' + esc(label) + '</div>')
+  .join('');
+
+// Crossings the view could not place onto a subsystem. Dropping them silently
+// would make "nothing crosses here" and "we could not tell" look identical,
+// which is the one thing this page must never do.
+(function notes() {{
+  const total = DATA.unresolved_handoffs_total || 0;
+  if (!total) return;
+  const listed = DATA.unresolved_handoffs || [];
+  const more = total > listed.length ? ' (' + listed.length + ' of ' + total + ' listed)' : '';
+  document.getElementById('notes').innerHTML =
+    '<details><summary>' + total + ' handoff' + (total === 1 ? '' : 's') +
+    ' not drawn' + more + '</summary><ul>' +
+    listed.map(u => '<li>' + esc(u.from) + ': ' + esc(u.text) + '</li>').join('') +
+    '</ul></details>';
+}})();
+
 const el = document.getElementById('graph');
 if (!DATA.nodes.length) {{
   el.innerHTML = '<div id="empty">This generation has no ' + DATA.level +
@@ -374,8 +431,9 @@ if (!DATA.nodes.length) {{
     .nodeLabel(n => n.name + '  ·  ' + n.path)
     .nodeColor(colorFor)
     .nodeRelSize(3)
-    .nodeVal(n => 1 + Math.min(n.degree || 0, 40))
-    .linkColor(() => 'rgba(139,155,180,0.22)')
+    .nodeVal(n => 1 + Math.min(n.degree || 0, VIEW.degree_cap || 40))
+    .linkColor(l => (VIEW.link_colors || {{}})[l.kind] || 'rgba(139,155,180,0.22)')
+    .linkLabel(l => l.label ? esc(l.label) : '')
     .linkDirectionalArrowLength(2.5)
     .linkDirectionalArrowRelPos(1)
     .onNodeClick(showDetail)
@@ -390,44 +448,87 @@ if (!DATA.nodes.length) {{
       ctx.fillText(n.name, n.x, n.y - 7 / scale);
     }});
 
+  // A filter that matches nothing must say so. An empty canvas is also what a
+  // camera pointed at the wrong place looks like, and the two need different
+  // reactions from the reader.
+  const noMatch = document.createElement('div');
+  noMatch.id = 'empty';
+  noMatch.hidden = true;
+  noMatch.textContent = 'Nothing matches this filter.';
+  el.appendChild(noMatch);
+
   const detail = document.getElementById('detail');
+  const byId = new Map((DATA.subsystems || []).map(s => [s.id, s]));
   function showDetail(n) {{
     const tags = flagsOf(n).map(f => '<span class="tag ' + f + '">' + f + '</span>').join('');
-    detail.innerHTML =
-      '<h2>' + esc(n.name) + '</h2>' + tags +
-      '<dl>' +
-      row('Path', n.path + (n.line ? ':' + n.line : '')) +
-      row('Kind', n.kind) +
-      row('Area', n.area) +
-      row('Community', n.community) +
-      row('Language', n.language) +
-      row('Degree', String(n.degree)) +
-      '</dl>';
+    let html = '<h2>' + esc(n.name) + '</h2>' + tags + '<dl>';
+    for (const [label, key] of (VIEW.detail_fields || [])) {{
+      let v = n[key];
+      if (key === 'path' && n.line) v = v + ':' + n.line;
+      html += row(label, v);
+    }}
+    html += row('Degree', String(n.degree)) + '</dl>';
+    const sub = byId.get(n.id);
+    if (sub) {{
+      html += section('Summary', sub.summary ? [sub.summary] : [], 'no summary recorded');
+      html += section('Entry points', sub.entry_points, 'none');
+      html += section('Critical files', sub.critical_files, 'none');
+      html += section('Neighbours', sub.neighbors, 'none');
+      // "computed" vs "empty" is the distinction the whole tool exists to keep.
+      // An un-derived field printed as "none" is a claim the producer never made.
+      html += section('Handoff paths', sub.handoff_paths,
+        DATA.meta && DATA.meta.handoff_paths_computed ? 'none' : 'not computed for this map');
+      for (const [role, files] of Object.entries(sub.role_files || {{}})) {{
+        html += section('Role · ' + role, files, 'none');
+      }}
+      if (!DATA.meta || !DATA.meta.role_files_computed) {{
+        html += '<dt>Role files</dt><dd class="sub">not computed for this map</dd>';
+      }}
+    }}
+    detail.innerHTML = html;
   }}
   const row = (k, v) => v ? '<dt>' + k + '</dt><dd>' + esc(String(v)) + '</dd>' : '';
-  function esc(s) {{
-    return s.replace(/[&<>"']/g, c =>
-      ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[c]);
+  function section(label, items, empty) {{
+    if (!items || !items.length) return '<dt>' + label + '</dt><dd class="sub">' + empty + '</dd>';
+    return '<dt>' + label + '</dt><dd><ul>' +
+      items.map(i => '<li>' + esc(String(i)) + '</li>').join('') + '</ul></dd>';
   }}
-
   function apply() {{
     const term = document.getElementById('q').value.trim().toLowerCase();
-    const deadOnly = document.getElementById('deadOnly').checked;
+    const required = (VIEW.flag_filters || [])
+      .filter(([flag]) => {{
+        const box = document.getElementById('flag-' + flag);
+        return box && box.checked;
+      }})
+      .map(([flag]) => flag);
     const keep = source.nodes.filter(n => {{
-      if (deadOnly && !flagsOf(n).includes('dead')) return false;
+      const f = flagsOf(n);
+      if (required.some(r => !f.includes(r))) return false;
       if (!term) return true;
       return n.name.toLowerCase().includes(term) || (n.path || '').toLowerCase().includes(term);
     }});
     const ids = new Set(keep.map(n => n.id));
+    noMatch.hidden = keep.length > 0;
     graph.graphData({{
       nodes: JSON.parse(JSON.stringify(keep)),
       links: source.links
         .filter(l => ids.has(l.source) && ids.has(l.target))
         .map(l => Object.assign({{}}, l)),
     }});
+    // The survivors are fresh copies with no coordinates, so the simulation
+    // seeds them wherever it likes while the camera stays where it was. Without
+    // this the pane goes blank on a filter that matched — which reads as "no
+    // results" and is the same failure as a silent cap.
+    if (keep.length) setTimeout(() => graph.zoomToFit(400, 40), 60);
   }}
   document.getElementById('q').addEventListener('input', apply);
-  document.getElementById('deadOnly').addEventListener('change', apply);
+  for (const [flag, label] of (VIEW.flag_filters || [])) {{
+    const wrap = document.createElement('label');
+    wrap.className = 'row';
+    wrap.innerHTML = '<input type="checkbox" id="flag-' + flag + '"/> ' + esc(label);
+    document.getElementById('flagFilters').appendChild(wrap);
+    wrap.querySelector('input').addEventListener('change', apply);
+  }}
   document.getElementById('labels').addEventListener('change', e => {{
     showLabels = e.target.checked;
     graph.nodeCanvasObjectMode(() => showLabels ? 'after' : undefined);
@@ -440,6 +541,7 @@ if (!DATA.nodes.length) {{
 </script>
 "#,
         title = title,
+        suffix = html_escape(view["suffix"].as_str().unwrap_or("code graph")),
         subtitle = html_escape(&subtitle),
         level = level,
         force_graph = FORCE_GRAPH_JS,
@@ -637,5 +739,564 @@ mod tests {
         let first = build_payload(&graph(), &VizOptions::default());
         let second = build_payload(&graph(), &VizOptions::default());
         assert_eq!(first, second);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The subsystem map
+// ---------------------------------------------------------------------------
+//
+// A second view over a different artifact: `repo_map.json`'s `subsystems`,
+// rather than the symbol graph. Ported from `indexing/map_viz.py`.
+//
+// It exists because the two answer different questions. The code graph shows
+// which symbols reach which; this shows which *areas* hand work to which, which
+// is the level a reader orients at before they know a symbol's name.
+
+/// Role-bucket entries kept per subsystem. The buckets are already a capped
+/// sample in the artifact; this caps the *display*, and says so.
+const ROLE_FILES_CAP: usize = 24;
+/// Entry points and critical files kept per subsystem.
+const ENTRY_CRITICAL_CAP: usize = 40;
+/// Liveness lists kept in the payload.
+const LIVENESS_CAP: usize = 200;
+
+fn strip_glob(hint: &str) -> String {
+    let text = hint.trim().replace('\\', "/");
+    let text = text.strip_suffix("/*").unwrap_or(&text);
+    text.trim().trim_matches('/').to_string()
+}
+
+/// Longest-match of a path fragment onto a subsystem area.
+///
+/// `handoff_paths` names *files*, and the view draws *areas*, so every crossing
+/// has to be attributed to the subsystem that owns its endpoint. An unattributed
+/// crossing is reported as unresolved rather than dropped: a handoff the view
+/// could not place and a subsystem with no crossings look identical once the
+/// line is missing, and only one of them means "nothing crosses here".
+pub fn match_area(hint: &str, areas: &[String]) -> Option<String> {
+    let cleaned = strip_glob(hint);
+    if cleaned.is_empty() {
+        return None;
+    }
+    let areas: Vec<String> = areas
+        .iter()
+        .filter(|area| !area.is_empty())
+        .map(|area| area.replace('\\', "/"))
+        .collect();
+    if areas.contains(&cleaned) {
+        return Some(cleaned);
+    }
+    let mut best: Option<String> = None;
+    let mut best_score: Option<usize> = None;
+    for area in &areas {
+        let mut candidate: Option<usize> = None;
+        if *area == cleaned
+            || area.ends_with(&format!("/{cleaned}"))
+            || cleaned.starts_with(&format!("{area}/"))
+        {
+            // `cleaned` inside `area`, not the other way round: an area that is
+            // merely a prefix of the hint must score by its own length, or every
+            // ancestor ties with the specific owner and the first one wins.
+            candidate = Some(
+                if area.contains(cleaned.as_str()) || area.ends_with(&cleaned) {
+                    cleaned.len()
+                } else {
+                    area.len()
+                },
+            );
+        } else {
+            let parts: Vec<&str> = area.split('/').collect();
+            for index in 0..parts.len() {
+                let suffix = parts[index..].join("/");
+                if cleaned == suffix
+                    || cleaned.starts_with(&format!("{suffix}/"))
+                    || suffix.starts_with(&format!("{cleaned}/"))
+                {
+                    candidate = Some(candidate.unwrap_or(0).max(suffix.len()));
+                }
+            }
+        }
+        if let Some(score) = candidate {
+            if best_score.is_none_or(|best| score > best) {
+                best_score = Some(score);
+                best = Some(area.clone());
+            }
+        }
+    }
+    best
+}
+
+/// Parse `"a/file.py -> b/file.py"` into the areas each endpoint belongs to.
+///
+/// Returns the display text either way, so an unresolved crossing can still be
+/// named to the reader.
+pub fn resolve_handoff(
+    handoff: &str,
+    areas: &[String],
+) -> (Option<String>, Option<String>, String) {
+    let raw = handoff.trim().to_string();
+    let Some((left, right)) = raw.split_once(" -> ") else {
+        return (None, None, raw);
+    };
+    let source = match_area(left, areas);
+    let target = match_area(right, areas);
+    (source, target, raw)
+}
+
+fn capped_strings(value: Option<&Value>, limit: usize) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .take(limit)
+                .map(|text| text.replace('\\', "/"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Build the subsystem-map payload from `repo_map.json`.
+pub fn build_map_payload(repo_map: &Value) -> Value {
+    let empty = Vec::new();
+    let raw = repo_map
+        .get("subsystems")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+
+    let mut subsystems = Vec::new();
+    let mut areas: Vec<String> = Vec::new();
+    for sub in raw {
+        let area = sub
+            .get("area")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .replace('\\', "/");
+        if area.is_empty() {
+            continue;
+        }
+        areas.push(area.clone());
+        let mut roles = Map::new();
+        if let Some(bucket) = sub.get("role_files").and_then(Value::as_object) {
+            for (role, paths) in bucket {
+                roles.insert(
+                    role.clone(),
+                    json!(capped_strings(Some(paths), ROLE_FILES_CAP)),
+                );
+            }
+        }
+        subsystems.push(json!({
+            "id": area,
+            "area": area,
+            "name": area.rsplit('/').next().unwrap_or(&area),
+            "summary": sub.get("summary").and_then(Value::as_str).unwrap_or(""),
+            "entry_points": capped_strings(sub.get("entry_points"), ENTRY_CRITICAL_CAP),
+            "critical_files": capped_strings(sub.get("critical_files"), ENTRY_CRITICAL_CAP),
+            "neighbors": capped_strings(sub.get("neighbors"), usize::MAX),
+            "handoff_paths": capped_strings(sub.get("handoff_paths"), usize::MAX),
+            "role_files": Value::Object(roles),
+        }));
+    }
+
+    // The shortest path suffix that names exactly one area. Four subsystems
+    // ending in `/src` all labelled "src" is a legend, not an identification,
+    // and the reader cannot tell which node they are looking at.
+    let labels: Vec<String> = areas
+        .iter()
+        .map(|area| {
+            let parts: Vec<&str> = area.split('/').collect();
+            (1..=parts.len())
+                .map(|take| parts[parts.len() - take..].join("/"))
+                .find(|candidate| {
+                    areas
+                        .iter()
+                        .filter(|other| {
+                            *other == area
+                                || other.ends_with(&format!("/{candidate}"))
+                                || *other == candidate
+                        })
+                        .count()
+                        == 1
+                })
+                .unwrap_or_else(|| area.clone())
+        })
+        .collect();
+
+    let nodes: Vec<Value> = subsystems
+        .iter()
+        .zip(&labels)
+        .map(|(sub, label)| {
+            let count = |key: &str| {
+                sub.get(key)
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0)
+            };
+            let entries = count("entry_points");
+            json!({
+                "id": sub["id"],
+                "name": label,
+                "area": sub["area"],
+                "summary": sub["summary"],
+                "degree": (count("neighbors") + count("handoff_paths") + entries).max(1),
+                "flags": if entries > 0 { vec![json!({"flag": "entry"})] } else { Vec::new() },
+                "kind": "subsystem",
+                "path": sub["area"],
+                "community": "",
+                "language": "",
+                "line": 0,
+            })
+        })
+        .collect();
+
+    let mut links = Vec::new();
+    let mut seen: std::collections::BTreeSet<(String, String, &str)> =
+        std::collections::BTreeSet::new();
+    let mut unresolved = Vec::new();
+
+    for sub in &subsystems {
+        let source = sub["id"].as_str().unwrap_or("").to_string();
+        for neighbor in sub["neighbors"].as_array().into_iter().flatten() {
+            let Some(hint) = neighbor.as_str() else {
+                continue;
+            };
+            let target = if areas.iter().any(|area| area == hint) {
+                Some(hint.to_string())
+            } else {
+                match_area(hint, &areas)
+            };
+            let Some(target) = target else { continue };
+            if target == source {
+                continue;
+            }
+            // Neighbourship is symmetric; drawing both directions would double
+            // every line and inflate every degree.
+            if seen.contains(&(source.clone(), target.clone(), "neighbor"))
+                || seen.contains(&(target.clone(), source.clone(), "neighbor"))
+            {
+                continue;
+            }
+            seen.insert((source.clone(), target.clone(), "neighbor"));
+            links.push(json!({"source": source, "target": target, "kind": "neighbor"}));
+        }
+        for handoff in sub["handoff_paths"].as_array().into_iter().flatten() {
+            let Some(text) = handoff.as_str() else {
+                continue;
+            };
+            let (from, to, display) = resolve_handoff(text, &areas);
+            let mut from = from.unwrap_or_else(|| source.clone());
+            let Some(to) = to else {
+                unresolved.push(json!({"from": source, "text": display}));
+                continue;
+            };
+            if !areas.contains(&from) {
+                from = source.clone();
+            }
+            if to == from {
+                continue;
+            }
+            if seen.contains(&(from.clone(), to.clone(), "handoff")) {
+                continue;
+            }
+            seen.insert((from.clone(), to.clone(), "handoff"));
+            links.push(json!({
+                "source": from, "target": to, "kind": "handoff", "label": display
+            }));
+        }
+    }
+
+    let unresolved_total = unresolved.len();
+    unresolved.truncate(100);
+
+    json!({
+        "level": "subsystem",
+        "nodes": nodes,
+        "links": links,
+        "subsystems": subsystems,
+        // Both numbers, as everywhere: a truncated list of crossings the view
+        // could not place must not read as the complete set of them.
+        "unresolved_handoffs": unresolved,
+        "unresolved_handoffs_total": unresolved_total,
+        "counts": {
+            "nodes_shown": nodes.len(),
+            "nodes_total": nodes.len(),
+            "nodes_truncated": false,
+            "links_shown": links.len(),
+            "links_total": links.len(),
+            "max_nodes": nodes.len(),
+        },
+        "liveness": {
+            "entry_roots": capped_strings(repo_map.get("entry_roots"), LIVENESS_CAP),
+            "unwired_candidates": capped_strings(repo_map.get("unwired_candidates"), LIVENESS_CAP),
+            "unreachable_files": capped_strings(repo_map.get("unreachable_files"), LIVENESS_CAP),
+            "liveness_unreachable_unreliable":
+                repo_map.get("liveness_unreachable_unreliable").and_then(Value::as_bool)
+                    .unwrap_or(false),
+        },
+        "meta": {
+            "languages": capped_strings(repo_map.get("languages"), 32),
+            "generated_head": repo_map.get("generated_head").and_then(Value::as_str).unwrap_or(""),
+            // Whether the producer derived these at all. The detail pane printed
+            // "(none)" for an empty list, which is the one reading an un-derived
+            // field cannot support.
+            "handoff_paths_computed": crate::guides::handoff_paths_established(repo_map),
+            "role_files_computed": crate::guides::role_files_established(repo_map),
+        },
+    })
+}
+
+/// Render the subsystem map: the same page, over areas instead of symbols.
+pub fn render_map_html(repo_map: &Value, title: &str) -> String {
+    let mut payload = build_map_payload(repo_map);
+    let subsystems = payload["nodes"].as_array().map(Vec::len).unwrap_or(0);
+    let crossings = payload["links"].as_array().map(Vec::len).unwrap_or(0);
+    let unresolved = payload["unresolved_handoffs_total"].as_u64().unwrap_or(0);
+    let mut subtitle = format!(
+        "{subsystems} subsystem{} · {crossings} crossing{}",
+        if subsystems == 1 { "" } else { "s" },
+        if crossings == 1 { "" } else { "s" },
+    );
+    // Stated in the header, not only in the payload: a map drawn from a partial
+    // attribution must not look like a complete one to a reader who never opens
+    // the panel.
+    if unresolved > 0 {
+        subtitle.push_str(&format!(" · {unresolved} unplaced"));
+    }
+    payload["view"] = json!({
+        "title": title,
+        "subtitle": subtitle,
+        "level": "subsystems",
+        "suffix": "subsystem map",
+        // Fewer subsystems than symbols, and a subsystem's degree counts every
+        // handoff, so the file view's scale draws discs that cover their own
+        // labels and each other.
+        "degree_cap": 12,
+        "detail_fields": [["Area", "area"]],
+        "flag_filters": [["entry", "Has entry points only"]],
+        "legend": [
+            ["#3d8bfd", "subsystem"],
+            ["#34d399", "has entry points"],
+            ["rgba(61,139,253,.55)", "handoff (file-level crossing)"],
+            ["rgba(139,155,180,.22)", "neighbour"],
+        ],
+        "link_colors": { "handoff": "rgba(61,139,253,0.55)" },
+    });
+    render_page(&payload)
+}
+
+#[cfg(test)]
+mod map_tests {
+    use super::*;
+
+    fn repo_map() -> Value {
+        json!({
+            "subsystems": [
+                {
+                    "area": "src/api",
+                    "summary": "http surface",
+                    "entry_points": ["src/api/main.py"],
+                    "critical_files": ["src/api/routes.py"],
+                    "neighbors": ["src/core"],
+                    "handoff_paths": ["src/api/routes.py -> src/core/engine.py"],
+                    "role_files": {"api": ["src/api/routes.py"]},
+                },
+                {
+                    "area": "src/core",
+                    "summary": "engine",
+                    "entry_points": [],
+                    "critical_files": [],
+                    "neighbors": ["src/api"],
+                    "handoff_paths": [],
+                    "role_files": {},
+                },
+            ],
+            "meta": {"devmap_rust": {"role_files_computed": true, "handoff_paths_computed": true}},
+        })
+    }
+
+    #[test]
+    fn areas_resolve_by_longest_match_not_first_hit() {
+        let areas = vec!["src".to_string(), "src/api/v2".to_string()];
+        // "src" also matches; the more specific area is the right owner.
+        assert_eq!(
+            match_area("src/api/v2/routes.py", &areas).as_deref(),
+            Some("src/api/v2")
+        );
+        assert_eq!(match_area("src/other.py", &areas).as_deref(), Some("src"));
+        assert_eq!(match_area("vendor/x.py", &areas), None);
+    }
+
+    #[test]
+    fn trailing_globs_and_separators_are_stripped() {
+        let areas = vec!["src/api".to_string()];
+        for hint in ["src/api/*", "src/api/", "  src/api  ", "src\\api"] {
+            assert_eq!(
+                match_area(hint, &areas).as_deref(),
+                Some("src/api"),
+                "hint {hint:?}"
+            );
+        }
+        assert_eq!(match_area("", &areas), None);
+    }
+
+    #[test]
+    fn a_handoff_splits_into_the_areas_its_endpoints_belong_to() {
+        let areas = vec!["src/api".to_string(), "src/core".to_string()];
+        let (from, to, text) = resolve_handoff("src/api/a.py -> src/core/b.py", &areas);
+        assert_eq!(from.as_deref(), Some("src/api"));
+        assert_eq!(to.as_deref(), Some("src/core"));
+        assert_eq!(text, "src/api/a.py -> src/core/b.py");
+
+        // No separator: still named, never silently dropped.
+        let (from, to, text) = resolve_handoff("src/api/a.py", &areas);
+        assert!(from.is_none() && to.is_none());
+        assert_eq!(text, "src/api/a.py");
+    }
+
+    #[test]
+    fn neighbour_edges_are_drawn_once_not_once_per_direction() {
+        let payload = build_map_payload(&repo_map());
+        let neighbours: Vec<&Value> = payload["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|l| l["kind"] == "neighbor")
+            .collect();
+        // Both subsystems name each other; the pair is one line, not two.
+        assert_eq!(neighbours.len(), 1, "{neighbours:?}");
+    }
+
+    #[test]
+    fn a_handoff_the_view_cannot_place_is_reported_not_dropped() {
+        let mut map = repo_map();
+        map["subsystems"][0]["handoff_paths"] =
+            json!(["src/api/routes.py -> vendor/unknown/lib.py"]);
+        let payload = build_map_payload(&map);
+
+        assert!(
+            payload["links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|l| l["kind"] != "handoff"),
+            "an unplaceable endpoint must not invent an edge"
+        );
+        assert_eq!(payload["unresolved_handoffs_total"], 1);
+        assert_eq!(
+            payload["unresolved_handoffs"][0]["text"],
+            "src/api/routes.py -> vendor/unknown/lib.py"
+        );
+
+        // And the reader sees it without opening the payload.
+        let html = render_map_html(&map, "demo");
+        assert!(html.contains("1 unplaced"), "header must carry the count");
+    }
+
+    #[test]
+    fn the_unresolved_list_is_capped_but_its_true_total_is_not() {
+        let mut map = repo_map();
+        let many: Vec<String> = (0..150)
+            .map(|i| format!("src/api/a.py -> vendor/pkg{i}/b.py"))
+            .collect();
+        map["subsystems"][0]["handoff_paths"] = json!(many);
+        let payload = build_map_payload(&map);
+
+        assert_eq!(
+            payload["unresolved_handoffs"].as_array().unwrap().len(),
+            100
+        );
+        assert_eq!(payload["unresolved_handoffs_total"], 150);
+        assert!(render_map_html(&map, "demo").contains("150 unplaced"));
+    }
+
+    #[test]
+    fn an_uncomputed_field_reads_differently_from_an_empty_one() {
+        let mut map = repo_map();
+        map["meta"]["devmap_rust"]["handoff_paths_computed"] = json!(false);
+        for sub in map["subsystems"].as_array_mut().unwrap() {
+            sub["handoff_paths"] = json!([]);
+        }
+        let payload = build_map_payload(&map);
+        assert_eq!(payload["meta"]["handoff_paths_computed"], json!(false));
+
+        let computed = build_map_payload(&repo_map());
+        assert_eq!(computed["meta"]["handoff_paths_computed"], json!(true));
+    }
+
+    #[test]
+    fn a_subsystem_never_hands_off_to_itself() {
+        let mut map = repo_map();
+        map["subsystems"][0]["handoff_paths"] = json!(["src/api/a.py -> src/api/b.py"]);
+        map["subsystems"][0]["neighbors"] = json!(["src/api"]);
+        let payload = build_map_payload(&map);
+        for link in payload["links"].as_array().unwrap() {
+            assert_ne!(link["source"], link["target"], "self-loop: {link:?}");
+        }
+    }
+
+    #[test]
+    fn a_label_is_the_shortest_suffix_that_names_one_area() {
+        let map = json!({"subsystems": [
+            {"area": "a/x/src"}, {"area": "b/y/src"}, {"area": "c/lib"},
+        ]});
+        let payload = build_map_payload(&map);
+        let names: Vec<&str> = payload["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["name"].as_str().unwrap())
+            .collect();
+        // Bare "src" would name two of the three, so both grow until they do not.
+        assert_eq!(names, vec!["x/src", "y/src", "lib"]);
+    }
+
+    #[test]
+    fn an_empty_map_renders_a_page_that_says_so() {
+        let payload = build_map_payload(&json!({"subsystems": []}));
+        assert_eq!(payload["nodes"].as_array().unwrap().len(), 0);
+        let html = render_map_html(&json!({"subsystems": []}), "demo");
+        assert!(html.contains("has no "), "{html:.400}");
+        assert!(html.contains("0 subsystems"));
+    }
+
+    // Was `artifacts::test_v1_hostile_name_in_subsystem_html`, which pinned this
+    // on a renderer nothing called. The property belongs on the one that ships.
+    #[test]
+    fn v1_a_hostile_subsystem_name_cannot_open_a_tag() {
+        let hostile = "x<img src=x onerror=alert(1)>.ts";
+        let map = json!({"subsystems": [{"area": hostile, "entry_points": [hostile]}]});
+        for html in [
+            render_map_html(&map, hostile),
+            render_map_html(&map, "safe"),
+        ] {
+            assert!(!html.contains("<img"), "raw tag survived into the document");
+        }
+        assert!(render_map_html(&map, hostile).contains("x&lt;img"));
+    }
+
+    // Was `artifacts::test_v1_v2_symbol_payload_is_inert_and_remains_valid_json`.
+    #[test]
+    fn v2_a_hostile_payload_stays_inert_and_still_parses() {
+        let hostile = "</script><img src=x onerror=alert(1)>";
+        let map = json!({"subsystems": [{"area": "src", "summary": hostile,
+            "entry_points": [hostile], "neighbors": ["a&b"]}]});
+        let html = render_map_html(&map, "demo");
+
+        assert!(!html.contains("<img"));
+        // The payload is embedded as a JS string literal, so a closing tag inside
+        // it must not be able to end the script element that carries it.
+        assert!(!html.contains("</script><img"));
+
+        // Inert, and still the same data: escaping that corrupted the payload
+        // would trade one defect for a quieter one.
+        let marker = "const DATA = JSON.parse(";
+        let start = html.find(marker).unwrap() + marker.len();
+        let end = html[start..].find(");\n").unwrap() + start;
+        let literal: String = serde_json::from_str(&html[start..end]).unwrap();
+        let parsed: Value = serde_json::from_str(&literal).unwrap();
+        assert_eq!(parsed["subsystems"][0]["summary"], json!(hostile));
+        assert_eq!(parsed["subsystems"][0]["neighbors"][0], json!("a&b"));
     }
 }

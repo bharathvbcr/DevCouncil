@@ -114,13 +114,25 @@ resolution, no alias tracking and no cross-function reasoning.
 ### See
 
 ```bash
-devmap html .                      # file-level graph → .devmap/graph.html
-devmap html . --symbols            # symbol-level
-devmap html . --max-nodes 4000     # widen the cap
+devmap html .                          # files and their imports → .devmap/graph.html
+devmap html . --level symbols          # symbols and their calls
+devmap html . --level subsystems       # subsystems and the handoffs between them
+devmap html . --max-nodes 4000         # widen the cap
 ```
+
+One flag with three values rather than two booleans, because two booleans for
+three views leave a fourth combination that has to mean something and does not.
 
 One self-contained HTML file. It opens from a `file://` URL on a machine with no
 network and no package manager, because the renderer is embedded.
+
+`--level subsystems` reads `repo_map.json` rather than the store, because that
+is where subsystems are derived; without one it names the command that writes
+it instead of drawing a second, in-memory grouping that could disagree with the
+file every other consumer reads. A crossing whose endpoint it cannot attribute
+to any subsystem is listed as unplaced in the sidebar and counted in the header
+— never dropped, since a missing line and "nothing crosses here" look identical
+once it is gone.
 
 The view is capped — a force layout over 12,000 nodes is a hairball that pins a
 CPU — so nodes are ranked by degree and the most connected survive. The cap is
