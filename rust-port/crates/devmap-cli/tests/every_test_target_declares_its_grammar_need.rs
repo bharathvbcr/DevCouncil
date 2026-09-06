@@ -52,7 +52,10 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
         "devmap-query",
         &[
             "artifacts_sidecar_adversarial",
+            "coupling_spans_inheritance",
+            "every_emitted_field_says_whether_it_ran",
             "freshness_parity",
+            "graph_intel_is_emitted",
             "subsystem_handoff_paths_are_computed",
             "subsystem_roles_and_file_kinds_are_computed",
             "the_freshness_inventory_counts_only_what_discovery_can_index",
