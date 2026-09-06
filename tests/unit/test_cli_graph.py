@@ -59,7 +59,7 @@ def test_cli_graph_query(tmp_path, monkeypatch):
     
     res_json = runner.invoke(app, ["map", "query", "src/a.py::func_a", "--json"])
     assert res_json.exit_code == 0
-    data = json.loads(res_json.output)
+    data = json.loads(res_json.stdout)
     assert len(data["definitions"]) > 0
 
 
@@ -72,7 +72,7 @@ def test_cli_graph_trace(tmp_path, monkeypatch):
     
     res_json = runner.invoke(app, ["map", "trace", "src/a.py::func_a", "src/b.py::func_b", "--json"])
     assert res_json.exit_code == 0
-    data = json.loads(res_json.output)
+    data = json.loads(res_json.stdout)
     assert data["found"] is True
 
 
@@ -86,7 +86,7 @@ def test_cli_graph_dead(tmp_path, monkeypatch):
     
     res_json = runner.invoke(app, ["map", "dead", "--json"])
     assert res_json.exit_code == 0
-    data = json.loads(res_json.output)
+    data = json.loads(res_json.stdout)
     assert len(data["dead_code"]) == 1
     assert data["dead_code"][0]["id"] == "src/a.py::func_a"
 
@@ -101,7 +101,7 @@ def test_cli_graph_check(tmp_path, monkeypatch):
     
     res_json = runner.invoke(app, ["map", "check", "--json"])
     assert res_json.exit_code == 0
-    data = json.loads(res_json.output)
+    data = json.loads(res_json.stdout)
     assert "god_nodes" in data
     assert "circular_imports" in data
 

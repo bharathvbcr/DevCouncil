@@ -49,14 +49,14 @@ def test_cli_lease_checkout_and_release(tmp_path, monkeypatch):
     # 2. Try checkout again (should fail/already leased)
     res2 = runner.invoke(app, ["checkout", task_id, "--client-id", "test-agent", "--agent", "test-runner", "--json"])
     assert res2.exit_code != 0
-    data2 = json.loads(res2.output)
+    data2 = json.loads(res2.stdout)
     assert data2["ok"] is False
     assert "active lease already exists" in data2["error"].lower()
     
     # 3. Release lease
     res3 = runner.invoke(app, ["release", task_id, "--lease-token", lease_tok, "--json"])
     assert res3.exit_code == 0
-    data3 = json.loads(res3.output)
+    data3 = json.loads(res3.stdout)
     assert data3["ok"] is True
     
     # 4. Checkout again (should succeed since released)

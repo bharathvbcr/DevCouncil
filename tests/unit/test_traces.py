@@ -52,7 +52,7 @@ def test_trace_tail_jsonl_remains_one_json_object_per_line(tmp_path, monkeypatch
     result = runner.invoke(app, ["trace", "tail", "--limit", "1"])
 
     assert result.exit_code == 0
-    lines = [line for line in result.output.splitlines() if line.strip()]
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
     assert len(lines) == 1
     assert json.loads(lines[0])["task_id"] == "TASK-001"
 

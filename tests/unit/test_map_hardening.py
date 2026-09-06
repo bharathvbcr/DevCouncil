@@ -267,9 +267,7 @@ def test_graph_dead_fails_loud_on_stale_index(tmp_path: Path) -> None:
     assert as_json.exit_code == 0, as_json.output
     import json as json_module
 
-    # CliRunner merges the stderr staleness banner with stdout; parse the body.
-    body = as_json.output[as_json.output.index("{") : as_json.output.rindex("}") + 1]
-    payload = json_module.loads(body)
+    payload = json_module.loads(as_json.stdout)
     assert payload["index_freshness"]["fresh"] is False
 
 

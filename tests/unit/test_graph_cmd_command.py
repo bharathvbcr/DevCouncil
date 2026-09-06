@@ -55,7 +55,7 @@ def test_graph_doctor_reports_a_kernel_older_than_the_store(tmp_path, monkeypatc
 
     as_json = runner.invoke(app, ["map", "doctor", "--json", "--project-root", str(tmp_path)])
     assert as_json.exit_code == 1
-    payload = json.loads(as_json.output)
+    payload = json.loads(as_json.stdout)
     assert payload["ok"] is False
     schema = next(check for check in payload["checks"] if check["name"] == "schema")
     assert schema["ok"] is False and schema["critical"] is True

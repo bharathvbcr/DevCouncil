@@ -44,7 +44,7 @@ def test_cli_wiki_status_json_missing(tmp_path, monkeypatch):
     
     res = runner.invoke(app, ["wiki", "status", "--json"])
     assert res.exit_code != 0
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["exists"] is False
 
 
@@ -67,7 +67,7 @@ def test_cli_wiki_update_and_read(tmp_path, monkeypatch):
     # Check wiki status
     res_status = runner.invoke(app, ["wiki", "status", "--json"])
     assert res_status.exit_code == 0
-    data_status = json.loads(res_status.output)
+    data_status = json.loads(res_status.stdout)
     assert data_status["exists"] is True
     assert data_status["pages"] > 0
     

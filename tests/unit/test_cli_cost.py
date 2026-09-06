@@ -48,7 +48,7 @@ def test_cli_cost_show_with_data(tmp_path, monkeypatch):
     # JSON output
     res_json = runner.invoke(app, ["cost", "show", "--json"])
     assert res_json.exit_code == 0
-    data = json.loads(res_json.output)
+    data = json.loads(res_json.stdout)
     assert data["total_calls"] == 3
     assert data["by_task"]["TASK-1"]["calls"] == 2
     assert data["by_task"]["(unattributed)"]["calls"] == 1
@@ -70,7 +70,7 @@ def test_cli_cost_budget(tmp_path, monkeypatch):
     # Budget JSON
     res_json = runner.invoke(app, ["cost", "budget", "--json"])
     assert res_json.exit_code == 0
-    data = json.loads(res_json.output)
+    data = json.loads(res_json.stdout)
     assert data["budget_usd"] == 10.0
     
     # Clear budget

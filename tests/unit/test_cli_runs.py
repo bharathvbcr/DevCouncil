@@ -68,7 +68,7 @@ def test_cli_runs_list(tmp_path, monkeypatch):
     # JSON output
     res_json = runner.invoke(app, ["runs", "list", "--json"])
     assert res_json.exit_code == 0
-    data = json.loads(res_json.output)
+    data = json.loads(res_json.stdout)
     assert data["count"] == 1
     assert data["runs"][0]["run_id"] == "run-123"
 
@@ -84,7 +84,7 @@ def test_cli_runs_show(tmp_path, monkeypatch):
     # JSON output
     res_json = runner.invoke(app, ["runs", "show", run_id, "--json"])
     assert res_json.exit_code == 0
-    data = json.loads(res_json.output)
+    data = json.loads(res_json.stdout)
     assert data["ok"] is True
     assert data["run_id"] == run_id
 
@@ -100,7 +100,7 @@ def test_cli_runs_timeline(tmp_path, monkeypatch):
     # JSON output
     res_json = runner.invoke(app, ["runs", "timeline", run_id, "--json"])
     assert res_json.exit_code == 0
-    data = json.loads(res_json.output)
+    data = json.loads(res_json.stdout)
     assert data["run_id"] == run_id
 
 
@@ -137,7 +137,7 @@ def test_cli_runs_supervise(tmp_path, monkeypatch):
     
     res_json = runner.invoke(app, ["runs", "supervise", run_id, "--no-llm", "--json"])
     assert res_json.exit_code == 0
-    data = json.loads(res_json.output)
+    data = json.loads(res_json.stdout)
     assert "verdict" in data
 
 

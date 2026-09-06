@@ -1755,8 +1755,8 @@ def test_cli_watch_review_is_idempotent_for_same_turn(tmp_path, monkeypatch):
 
     assert first.exit_code == 0
     assert second.exit_code == 0
-    first_payload = json.loads(first.output)
-    second_payload = json.loads(second.output)
+    first_payload = json.loads(first.stdout)
+    second_payload = json.loads(second.stdout)
     assert first_payload["id"] == second_payload["id"]
     assert second_payload["duplicate"] is True
     assert len(list((tmp_path / ".devcouncil" / "live" / "cards").glob("*.json"))) == 1
@@ -1770,13 +1770,13 @@ def test_cli_watch_review_force_preserves_resolved_status(tmp_path, monkeypatch)
         encoding="utf-8",
     )
     review_result = runner.invoke(app, ["watch", "review", "--transcript", str(transcript), "--json"])
-    card_id = json.loads(review_result.output)["id"]
+    card_id = json.loads(review_result.stdout)["id"]
     assert runner.invoke(app, ["watch", "resolve", card_id, "--status", "resolved"]).exit_code == 0
 
     force_result = runner.invoke(app, ["watch", "review", "--transcript", str(transcript), "--force", "--json"])
 
     assert force_result.exit_code == 0
-    payload = json.loads(force_result.output)
+    payload = json.loads(force_result.stdout)
     assert payload["duplicate"] is False
     saved = json.loads((tmp_path / ".devcouncil" / "live" / "cards" / f"{card_id}.json").read_text(encoding="utf-8"))
     assert saved["status"] == "resolved"
@@ -1927,7 +1927,7 @@ def test_cli_watch_pending_reviews_signal_and_moves_it(tmp_path, monkeypatch):
     pending_result = runner.invoke(app, ["watch", "pending", "--json"])
 
     assert pending_result.exit_code == 0
-    payload = json.loads(pending_result.output)
+    payload = json.loads(pending_result.stdout)
     assert payload["reviewed"][0]["card"]["verdict"] == "Concerns"
     assert list((tmp_path / ".devcouncil" / "live" / "signals" / "processed").glob("claude-*.json"))
     assert not list((tmp_path / ".devcouncil" / "live" / "signals").glob("claude-*.json"))
@@ -1966,7 +1966,7 @@ def test_cli_watch_pending_defaults_to_single_running_task(tmp_path, monkeypatch
     pending_result = runner.invoke(app, ["watch", "pending", "--json"])
 
     assert pending_result.exit_code == 0
-    payload = json.loads(pending_result.output)
+    payload = json.loads(pending_result.stdout)
     assert payload["reviewed"][0]["card"]["task_id"] == "TASK-001"
 
 
@@ -1986,7 +1986,7 @@ def test_cli_watch_pending_task_id_overrides_signal_scope(tmp_path, monkeypatch)
     pending_result = runner.invoke(app, ["watch", "pending", "--task-id", "TASK-NEW", "--json"])
 
     assert pending_result.exit_code == 0
-    payload = json.loads(pending_result.output)
+    payload = json.loads(pending_result.stdout)
     assert payload["reviewed"][0]["card"]["task_id"] == "TASK-NEW"
 
 
@@ -2001,12 +2001,12 @@ def test_cli_watch_resolve_updates_card_status(tmp_path, monkeypatch):
     )
     review_result = runner.invoke(app, ["watch", "review", "--transcript", str(transcript), "--json"])
     assert review_result.exit_code == 0
-    card_id = json.loads(review_result.output)["id"]
+    card_id = json.loads(review_result.stdout)["id"]
 
     resolve_result = runner.invoke(app, ["watch", "resolve", card_id, "--status", "ignored", "--json"])
 
     assert resolve_result.exit_code == 0
-    payload = json.loads(resolve_result.output)
+    payload = json.loads(resolve_result.stdout)
     assert payload["card"]["status"] == "ignored"
     events = list(read_trace_events(tmp_path))
     assert events[-1].type == "live_review_card_status_updated"
@@ -2065,7 +2065,7 @@ def test_cli_watch_cards_filters_by_task_status_verdict_and_client(tmp_path, mon
     assert other_result.exit_code == 0
     assert runner.invoke(
         app,
-        ["watch", "resolve", json.loads(other_result.output)["id"], "--status", "ignored"],
+        ["watch", "resolve", json.loads(other_result.stdout)["id"], "--status", "ignored"],
     ).exit_code == 0
 
     result = runner.invoke(app, [
@@ -2107,11 +2107,11 @@ def test_cli_watch_cards_rejects_invalid_filters(tmp_path, monkeypatch):
     bad_limit = runner.invoke(app, ["watch", "cards", "--limit", "0", "--json"])
 
     assert bad_status.exit_code == 2
-    assert json.loads(bad_status.output)["error"] == "--status must be open, resolved, or ignored."
+    assert json.loads(bad_status.stdout)["error"] == "--status must be open, resolved, or ignored."
     assert bad_verdict.exit_code == 2
-    assert json.loads(bad_verdict.output)["error"] == "--verdict must be approved, concerns, or critical."
+    assert json.loads(bad_verdict.stdout)["error"] == "--verdict must be approved, concerns, or critical."
     assert bad_limit.exit_code == 2
-    assert json.loads(bad_limit.output)["error"] == "--limit must be greater than 0."
+    assert json.loads(bad_limit.stdout)["error"] == "--limit must be greater than 0."
 
 
 def test_cli_watch_repair_outputs_prompt_for_card(tmp_path, monkeypatch):
@@ -2123,12 +2123,12 @@ def test_cli_watch_repair_outputs_prompt_for_card(tmp_path, monkeypatch):
     )
     review_result = runner.invoke(app, ["watch", "review", "--transcript", str(transcript), "--json"])
     assert review_result.exit_code == 0
-    card_id = json.loads(review_result.output)["id"]
+    card_id = json.loads(review_result.stdout)["id"]
 
     repair_result = runner.invoke(app, ["watch", "repair", card_id, "--json"])
 
     assert repair_result.exit_code == 0
-    payload = json.loads(repair_result.output)
+    payload = json.loads(repair_result.stdout)
     assert payload["card"]["id"] == card_id
     assert "Repair Live Review Card" in payload["prompt"]
     assert f"dev watch resolve {card_id} --status resolved" in payload["prompt"]
@@ -2195,7 +2195,7 @@ def test_cli_watch_status_summarizes_cards_signals_and_scope(tmp_path, monkeypat
     status_result = runner.invoke(app, ["watch", "status", "--task-id", "TASK-001", "--json"])
 
     assert status_result.exit_code == 0
-    payload = json.loads(status_result.output)
+    payload = json.loads(status_result.stdout)
     assert payload["pending_signals"] == 1
     item = payload["pending_signal_items"][0]
     assert item["client"] == "claude"
@@ -2245,7 +2245,7 @@ def test_cli_watch_status_excludes_other_task_blockers(tmp_path, monkeypatch):
     status_result = runner.invoke(app, ["watch", "status", "--task-id", "TASK-001", "--json"])
 
     assert status_result.exit_code == 0
-    payload = json.loads(status_result.output)
+    payload = json.loads(status_result.stdout)
     assert payload["cards"]["critical_open"] == 1
     assert payload["blocking_cards"] == []
 
@@ -2262,7 +2262,7 @@ def test_cli_watch_signals_lists_pending_signal(tmp_path, monkeypatch):
     signals_result = runner.invoke(app, ["watch", "signals", "--json"])
 
     assert signals_result.exit_code == 0
-    payload = json.loads(signals_result.output)
+    payload = json.loads(signals_result.stdout)
     assert payload["signals"][0]["transcript_path"] == "session.jsonl"
 
 
@@ -3287,7 +3287,7 @@ def test_cli_prompt_outputs_raw_markdown(tmp_path, monkeypatch):
     result = runner.invoke(app, ["prompt", "TASK-001"])
 
     assert result.exit_code == 0
-    assert result.output.startswith("# Implement TASK-001")
+    assert result.stdout.startswith("# Implement TASK-001")
     assert "`src/app.py`" in result.output
 
 
@@ -3379,11 +3379,11 @@ def test_cli_status_tasks_show_json_outputs(tmp_path, monkeypatch):
     show = runner.invoke(app, ["show", "TASK-001", "--json"])
 
     assert status.exit_code == 0
-    assert json.loads(status.output)["initialized"] is True
+    assert json.loads(status.stdout)["initialized"] is True
     assert tasks.exit_code == 0
-    assert json.loads(tasks.output)["tasks"][0]["id"] == "TASK-001"
+    assert json.loads(tasks.stdout)["tasks"][0]["id"] == "TASK-001"
     assert show.exit_code == 0
-    assert json.loads(show.output)["task"]["id"] == "TASK-001"
+    assert json.loads(show.stdout)["task"]["id"] == "TASK-001"
 
 
 def test_cli_tasks_cancel_sets_status_and_refuses_done(tmp_path, monkeypatch):
@@ -3595,7 +3595,7 @@ def test_cli_prompt_project_root_option(tmp_path, monkeypatch):
     result = runner.invoke(app, ["prompt", "TASK-001", "--project-root", str(project)])
 
     assert result.exit_code == 0
-    assert result.output.startswith("# Implement TASK-001")
+    assert result.stdout.startswith("# Implement TASK-001")
 
 
 def test_cli_rollback_accepts_after_patch_without_before_patch(tmp_path, monkeypatch):

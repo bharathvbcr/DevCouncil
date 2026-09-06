@@ -279,7 +279,7 @@ def test_cli_runs_and_abort_answer_without_a_store(tmp_path: Path) -> None:
     runner = CliRunner()
     runs = runner.invoke(app, ["map", "runs", "--project-root", str(root), "--json"])
     assert runs.exit_code == 0, runs.output
-    assert json.loads(runs.output.strip().splitlines()[-1] if runs.output.strip().startswith("{") is False else runs.output)["runs"] == [] or "runs" in runs.output
+    assert json.loads(runs.stdout)["runs"] == []
     abort = runner.invoke(app, ["map", "abort", "--project-root", str(root), "--json"])
     assert abort.exit_code == 0, abort.output
     assert '"no_build_in_progress"' in abort.output
