@@ -45,7 +45,7 @@ class DevMapEngineError(RuntimeError):
     - ``fix`` — the exact command or step that resolves it;
     - ``run_id`` — the trace record of the kernel run that failed
       (``dev map runs --last 1 --json``);
-    - ``stage`` — ``build`` / ``manifest`` / ``repair``;
+    - ``stage`` — ``build`` / ``manifest`` / ``repair`` / ``map-html``;
     - ``evidence`` — the kernel's last lines.
 
     The message alone used to be the whole contract, and a message is what an
@@ -765,6 +765,63 @@ def repair_pending(root: Path, *, timeout: float = 300.0) -> str:
         stage="repair",
     )
     return (completed.stdout or "").strip()
+
+
+#: Clap's wording when a subcommand predates the binary in use.
+_UNKNOWN_SUBCOMMAND_MARKERS = ("unrecognized subcommand", "unrecognised subcommand")
+
+MAP_HTML_RELPATH = Path(".devcouncil") / "map.html"
+
+
+def render_map_html(
+    root: Path,
+    *,
+    output: Optional[Path] = None,
+    force: bool = False,
+    timeout: float = 120.0,
+) -> Path:
+    """``devmap map-html``: render the repo map preview to a standalone page.
+
+    The kernel is the only renderer. Python held a second one at
+    `indexing/map_viz.py` until the preview was reworked; two renderers of one
+    artifact is one that silently falls behind, and the Python one had — it
+    coloured nodes by hashing the area name and dropped `files[]` before it
+    could say anything about language or coverage.
+
+    No store is touched: the command reads `repo_map.json`, so it answers for
+    any checkout that has a map even while a build is running.
+    """
+    root = Path(root).expanduser().resolve()
+    out = Path(output) if output is not None else root / MAP_HTML_RELPATH
+    binary = find_engine_binary(root)
+    argv = [binary, "--progress", "never", "map-html", str(root), "--output", str(out)]
+    if force:
+        argv.append("--force")
+    try:
+        _run(argv, cwd=root, timeout=timeout, stage="map-html")
+    except DevMapEngineError as exc:
+        # A kernel too old to have the subcommand fails with clap's message,
+        # which names the flag but not the remedy. Say which binary is short
+        # and what to run, the way `_explain_kernel_failure` does for schemas.
+        if any(marker in str(exc).lower() for marker in _UNKNOWN_SUBCOMMAND_MARKERS):
+            raise DevMapEngineError(
+                f"the devmap binary {binary} has no `map-html` subcommand — it predates "
+                "the Rust map preview.",
+                code="binary_too_old",
+                fix=(
+                    "Rebuild the kernel with `cargo build --release -p devmap-cli` in "
+                    f"rust-port/, or set {BINARY_ENV_VAR} to a newer build."
+                ),
+                stage="map-html",
+            ) from exc
+        raise
+    if not out.is_file():
+        raise DevMapEngineError(
+            f"devmap reported success but did not write {out}",
+            code="artifact_missing",
+            stage="map-html",
+        )
+    return out
 
 
 def _explain_kernel_failure(argv: List[str], output: str) -> Optional[str]:

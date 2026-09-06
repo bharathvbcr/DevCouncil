@@ -54,7 +54,12 @@ def _vendor_js() -> str:
 
 
 def _canvas_controls_css() -> str:
-    """CSS for the shared zoom/pan/layout overlay (graph + map HTML)."""
+    """CSS for the code-graph canvas zoom/pan/layout overlay.
+
+    Was shared with the subsystem map page until that moved to the Rust
+    kernel (`devmap map-html`), which carries its own chrome. One caller
+    now: `render_graph_html` below.
+    """
     return """
 #canvasControls{position:absolute;top:12px;right:12px;z-index:5;display:flex;flex-direction:column;gap:8px;align-items:flex-end;pointer-events:none;font:12px/1.35 ui-sans-serif,system-ui,sans-serif}
 #canvasControls>*{pointer-events:auto}
@@ -80,7 +85,7 @@ def _canvas_controls_css() -> str:
 
 
 def _canvas_controls_js() -> str:
-    """Shared ForceGraph 1.51.4 zoom/pan/layout chrome.
+    """ForceGraph 1.51.4 zoom/pan/layout chrome for the code-graph page.
 
     Expects ``g`` (graph instance) and ``elem`` (container) in scope.
     Optional ``window.__dcCanvasOpts``: ``{getSelectedIds, applyNodeStyle, legendHtml}``.

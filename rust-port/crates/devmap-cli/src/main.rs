@@ -701,6 +701,30 @@ enum Commands {
         #[command(flatten)]
         inventory: InventoryFlags,
     },
+    /// Render the repo map as one self-contained, offline HTML page.
+    ///
+    /// Reads the `repo_map.json` `manifest` writes — no store, so it answers
+    /// for any checkout that has a map, and never blocks on an indexing run.
+    ///
+    /// Supersedes the Python renderer at `src/devcouncil/indexing/map_viz.py`,
+    /// which coloured nodes by hashing the area name and dropped the file
+    /// inventory before it could say anything about language or coverage.
+    MapHtml {
+        /// Repository root; `--input` and `--output` resolve against it.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// The repo map to render.
+        #[arg(long, default_value = ".devcouncil/repo_map.json")]
+        input: PathBuf,
+        /// Where to write the page.
+        #[arg(short, long, default_value = ".devcouncil/map.html")]
+        output: PathBuf,
+        /// Rewrite even when the existing page already carries this map's
+        /// fingerprint.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+
     /// The three freshness digests for a working tree, and — with the
     /// `--expect-*` flags — whether a map stamped with given values is stale.
     ///
@@ -1950,6 +1974,7 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
         Commands::Build { .. }
         | Commands::Status
         | Commands::Manifest { .. }
+        | Commands::MapHtml { .. }
         | Commands::Freshness { .. }
         | Commands::Repair { .. }
         | Commands::Workspace { .. }
@@ -2976,6 +3001,73 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 },
             )?;
             report_manifest(cli, &outcome)?;
+        }
+        Commands::MapHtml {
+            path,
+            input,
+            output,
+            force,
+        } => {
+            let resolve = |p: &PathBuf| -> PathBuf {
+                if p.is_absolute() {
+                    p.clone()
+                } else {
+                    path.join(p)
+                }
+            };
+            let map_path = resolve(input);
+            let out_path = resolve(output);
+
+            let text = std::fs::read_to_string(&map_path).map_err(|err| {
+                anyhow::anyhow!(
+                    "cannot read repo map at {}: {err} (run `devmap manifest` first)",
+                    map_path.display()
+                )
+            })?;
+            let repo_map: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
+                anyhow::anyhow!("{} is not valid JSON: {err}", map_path.display())
+            })?;
+            let fingerprint = devmap_query::fingerprint_for(&repo_map);
+
+            // Skip an unchanged rewrite so a watch tick does not churn the file
+            // — but only when the map carries stamps to fingerprint. An unstamped
+            // map fingerprints to a constant, and skipping on that would pin the
+            // page to whatever was rendered first.
+            let stamped = !fingerprint.generated_head.is_empty();
+            let regenerate =
+                *force || !stamped || devmap_query::should_regenerate(&out_path, &fingerprint);
+            if !regenerate {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "output": out_path.display().to_string(),
+                            "written": false,
+                            "reason": "unchanged",
+                            "fingerprint": fingerprint.fingerprint,
+                        })
+                    );
+                } else {
+                    println!("{} is current", out_path.display());
+                }
+                return Ok(());
+            }
+
+            let html = devmap_query::render_map_preview_html(&repo_map, &fingerprint);
+            devmap_query::write_atomic(&out_path, html.as_bytes())?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "output": out_path.display().to_string(),
+                        "written": true,
+                        "bytes": html.len(),
+                        "fingerprint": fingerprint.fingerprint,
+                    })
+                );
+            } else {
+                println!("Wrote {} ({} bytes)", out_path.display(), html.len());
+            }
         }
         Commands::Freshness {
             path,

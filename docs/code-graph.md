@@ -32,7 +32,7 @@ All map and graph operations live under **`dev map`**. `dev graph …` is a comp
 | `.devcouncil/codeintel/devmap.sqlite` | **Canonical.** The Rust kernel's WAL-mode store: generations, nodes, edges, unresolved references, FTS5, the pending-path queue, build history. Written only by `devmap build` (every `dev map`, `init`, `ingest`, `sync`, verify/checkout refresh and MCP `devcouncil_graph_ingest` go through it). |
 | `.devcouncil/codeintel/index.sqlite` | The Python query cache. Not an engine: `load_code_graph` imports the kernel's `code_graph.json` into it on first read after a build, and the Python-only commands (`check`, `process`, `routes`, `cypher`, `pdg`, …) answer from that cache. Safe to delete; it is rebuilt from the JSON. |
 | `.devcouncil/graph/graph.html` | Self-contained interactive visualizer (`dev map graph-html` / `dev map html --symbols` / alias `dev graph html`; **not** written by default on bare `dev map`) |
-| `.devcouncil/map.html` | Self-contained subsystem map visualizer (`dev map html`; slim payload — no `files[]` / `dependents{}`) |
+| `.devcouncil/map.html` | Self-contained subsystem map visualizer (`dev map html`, rendered by the kernel's `devmap map-html`). Nodes are coloured by dominant language in GitHub Linguist's own palette; the header carries a repo-wide language bar and states how many indexed files the subsystems actually cover. Slim payload — the `files[]` inventory is aggregated into per-subsystem language histograms and not embedded, and `dependents{}` is dropped. |
 | `.devcouncil/graph/demo.html` | Sample self-contained interactive UI from `dev map demo` (no map required; primary demo artifact) |
 | `.devcouncil/graph/demo.svg` | Optional static companion written by `dev map demo` (not the interactive UI) |
 | `AGENTS.md` / `CLAUDE.md` | Marker-guarded workspace guides kept in sync with the map |
@@ -84,7 +84,7 @@ Failure codes a build can raise: `binary_missing`, `schema_newer_than_kernel`, `
 
 Freshness uses git HEAD, a tracked-file hash, and a content fingerprint so plain edits mark the map stale. Fingerprint / git errors fail closed (treat as stale). A **missing** `.devcouncil/repo_map.json` is also stale — hard rigor blocks checkout/verify until `dev map` runs. The guides a build writes are restamped into the fingerprint, so a build never makes its own map read stale. Post-tool-use hooks run `dev map --if-stale --no-wiki`; `dev map --watch` wakes on filesystem events (debounced, with a slow poll as the safety net) and checks exactly the fingerprint `--if-stale` reads.
 
-HTML visualizers: set `indexing.write_graph_html: true` in config if you want bare `dev map` to also write `graph.html`. Otherwise use `dev map graph-html` / `dev map view` (or alias `dev graph html`) for the file/symbol graph, and `dev map html` for the subsystem map.
+HTML visualizers: `dev map html` shells out to the devmap kernel, so it needs a build new enough to have `map-html` (rebuild with `cargo build --release -p devmap-cli` in `rust-port/` if it refuses). Set `indexing.write_graph_html: true` in config if you want bare `dev map` to also write `graph.html`. Otherwise use `dev map graph-html` / `dev map view` (or alias `dev graph html`) for the file/symbol graph, and `dev map html` for the subsystem map.
 
 ## Sample graph demo (no map)
 

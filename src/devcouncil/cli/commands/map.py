@@ -522,15 +522,24 @@ def map_html(
             symbols=symbols,
         )
         return
-    from devcouncil.indexing.map_viz import write_map_html
+    # The kernel renders it. See `devmap_engine.render_map_html` for why there
+    # is no Python fallback: a second renderer of one artifact is one that
+    # falls behind without saying so.
+    from devcouncil.devmap_engine import DevMapEngineError, render_map_html
 
     root = project_root.expanduser().resolve()
     try:
-        out = write_map_html(root, open_browser=open_browser)
-    except FileNotFoundError as exc:
+        out = render_map_html(root)
+    except DevMapEngineError as exc:
         status_console.print(f"[red]{exc}[/red]")
+        if exc.fix:
+            status_console.print(f"[yellow]{exc.fix}[/yellow]")
         raise typer.Exit(code=1) from exc
     status_console.print(f"[green]Wrote {out}[/green]")
+    if open_browser:
+        import webbrowser
+
+        webbrowser.open(out.resolve().as_uri())
 
 
 def graph_context_cmd(

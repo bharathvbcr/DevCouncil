@@ -192,7 +192,6 @@ pub struct LanguageSpec {
     pub embedded: &'static [&'static str],
     pub extractor_id: ExtractorId,
     pub lsp_id: &'static str,
-    pub viz_color: &'static str,
     /// What this language's extractor produces. See [`Capabilities`].
     ///
     /// Not compared against `testdata/golden/language_specs.json`: that frozen
@@ -211,7 +210,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::TypeScript,
         lsp_id: "typescript",
-        viz_color: "#3178c6",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -221,7 +219,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Tsx,
         lsp_id: "typescript",
-        viz_color: "#3178c6",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -231,7 +228,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::JavaScript,
         lsp_id: "javascript",
-        viz_color: "#f7df1e",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -241,7 +237,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::ArkTs,
         lsp_id: "typescript",
-        viz_color: "#002b36",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -251,7 +246,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Python,
         lsp_id: "python",
-        viz_color: "#3572A5",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -261,7 +255,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Go,
         lsp_id: "gopls",
-        viz_color: "#00ADD8",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
     },
     LanguageSpec {
@@ -271,7 +264,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Rust,
         lsp_id: "rust-analyzer",
-        viz_color: "#dea584",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -281,7 +273,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Java,
         lsp_id: "jdtls",
-        viz_color: "#b07219",
         capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -291,7 +282,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::CSharp,
         lsp_id: "omnisharp",
-        viz_color: "#178600",
         capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -301,7 +291,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::VbNet,
         lsp_id: "vbnet",
-        viz_color: "#945db7",
         capabilities: Capabilities::NONE,
     },
     LanguageSpec {
@@ -311,7 +300,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Php,
         lsp_id: "intelephense",
-        viz_color: "#4F5D95",
         capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -321,7 +309,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Ruby,
         lsp_id: "solargraph",
-        viz_color: "#701516",
         capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -331,7 +318,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::C,
         lsp_id: "clangd",
-        viz_color: "#555555",
         capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
@@ -341,7 +327,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Cpp,
         lsp_id: "clangd",
-        viz_color: "#f34b7d",
         capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -351,7 +336,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::ObjC,
         lsp_id: "clangd",
-        viz_color: "#438eff",
         capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -361,7 +345,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Metal,
         lsp_id: "clangd",
-        viz_color: "#8f14e9",
         capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -371,7 +354,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Cuda,
         lsp_id: "clangd",
-        viz_color: "#3A4E3A",
         capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -381,7 +363,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Swift,
         lsp_id: "sourcekit-lsp",
-        viz_color: "#F05138",
         capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -391,7 +372,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Kotlin,
         lsp_id: "kotlin-language-server",
-        viz_color: "#A97BFF",
         capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -401,7 +381,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Scala,
         lsp_id: "metals",
-        viz_color: "#c22d40",
         capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -411,7 +390,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Dart,
         lsp_id: "dart-analysis-server",
-        viz_color: "#00B4AB",
         capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -421,7 +399,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &["typescript", "javascript", "css", "html"],
         extractor_id: ExtractorId::Svelte,
         lsp_id: "svelte-language-server",
-        viz_color: "#ff3e00",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -439,7 +416,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &["typescript", "tsx", "javascript", "css", "html"],
         extractor_id: ExtractorId::Vue,
         lsp_id: "volar",
-        viz_color: "#41b883",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -449,7 +425,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &["typescript", "javascript", "css", "html"],
         extractor_id: ExtractorId::Astro,
         lsp_id: "astro-ls",
-        viz_color: "#ff5a03",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -459,7 +434,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &["html", "javascript", "css"],
         extractor_id: ExtractorId::Liquid,
         lsp_id: "theme-check",
-        viz_color: "#67b8de",
         capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
     },
     LanguageSpec {
@@ -469,7 +443,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Pascal,
         lsp_id: "pascal-lsp",
-        viz_color: "#E3F171",
         capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
@@ -479,7 +452,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Lua,
         lsp_id: "lua-language-server",
-        viz_color: "#000080",
         capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
@@ -489,7 +461,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Luau,
         lsp_id: "luau-lsp",
-        viz_color: "#00A2FF",
         capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
@@ -499,7 +470,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::R,
         lsp_id: "r-languageserver",
-        viz_color: "#198CE7",
         capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
@@ -509,7 +479,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Cfml,
         lsp_id: "cfls",
-        viz_color: "#224f80",
         capabilities: Capabilities::NONE,
     },
     LanguageSpec {
@@ -519,7 +488,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Cobol,
         lsp_id: "cobol-ls",
-        viz_color: "#005ca5",
         capabilities: Capabilities::NONE,
     },
     LanguageSpec {
@@ -529,7 +497,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Erlang,
         lsp_id: "erlang-ls",
-        viz_color: "#B83998",
         capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
@@ -539,7 +506,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Solidity,
         lsp_id: "solc",
-        viz_color: "#AA6746",
         capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
@@ -549,7 +515,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Terraform,
         lsp_id: "terraform-ls",
-        viz_color: "#5C4EE5",
         capabilities: Capabilities::new(REFERENCES),
     },
     LanguageSpec {
@@ -559,7 +524,6 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         embedded: &[],
         extractor_id: ExtractorId::Nix,
         lsp_id: "nil",
-        viz_color: "#7e71de",
         capabilities: Capabilities::new(CALLS | REFERENCES),
     },
 ];
@@ -707,6 +671,25 @@ pub fn language_capability_is_declared(language: &str) -> bool {
         || NON_REGISTRY_CAPABILITIES
             .iter()
             .any(|(name, _)| *name == language)
+}
+
+/// Every language id this build declares, deduplicated and sorted.
+///
+/// The enumerable form of [`language_capability_is_declared`], and the exact
+/// set `detect_language` can return: the registry's grammars plus the fallback
+/// table's rows. A consumer that has to hold a row *per language* — the map
+/// visualizer's colour table is the first — needs the list itself, not a
+/// membership test, or its own coverage check degrades into "the ids I
+/// remembered to think of".
+pub fn declared_language_ids() -> Vec<&'static str> {
+    let mut ids: Vec<&'static str> = LANGUAGE_SPECS
+        .iter()
+        .map(|spec| spec.grammar)
+        .chain(NON_REGISTRY_CAPABILITIES.iter().map(|(name, _)| *name))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 /// Whether a relative path is inside a VCS, build, environment, or devmap-owned
