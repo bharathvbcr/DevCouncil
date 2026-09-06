@@ -1336,12 +1336,29 @@ async function load() {
             json!([{"kind": "routes_to", "source": "GET /x", "target": "h"}]),
         );
         let mapped = route_map(&root, &g, &ScanBudget::default());
-        // Null, not "" and []: this kernel drops the framework at the store
-        // boundary and has no `registers` edge kind.
+        // Null, not "" and []. Two different reasons, and the payload keeps
+        // them apart: this graph carries no route node, so the framework has no
+        // source here — `unavailable`, never "declared by none" — while
+        // middleware has no source *anywhere*, because there is no `registers`
+        // edge kind for any graph to carry.
         assert!(mapped["routes"][0]["framework"].is_null());
+        assert_eq!(mapped["routes"][0]["framework_resolution"], "unavailable");
+        assert_eq!(
+            mapped["routes"][0]["frameworks"],
+            json!([]),
+            "an empty list of known frameworks, not a guess"
+        );
         assert!(mapped["routes"][0]["middleware"].is_null());
         assert_eq!(mapped["capabilities"]["framework_available"], json!(false));
         assert_eq!(mapped["capabilities"]["middleware_available"], json!(false));
+        assert!(
+            mapped["capabilities"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("no route nodes"),
+            "the reason names which of the two cases this is: {:?}",
+            mapped["capabilities"]["reason"]
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

@@ -41,7 +41,23 @@ command -v sqlite3 >/dev/null 2>&1 || { echo "SOAK FAIL: sqlite3 is required to 
 # comparison then held trivially and the growth limit compared 0 against 0 — a
 # check that could not run reporting exactly what a check that ran and passed
 # reports, in the one script whose entire job is to notice drift.
-STORE=".devcouncil/codeintel/devmap.sqlite"
+# Resolved from the kernel after the first build, never hard-coded — see
+# `resolve_store` below. `.devcouncil/codeintel/index.sqlite` is the *Python*
+# engine's file: this script read that one for its whole life, so `digest`
+# returned the empty string and `db_bytes` returned 0 on every cycle. The digest
+# comparison then held trivially and the growth limit compared 0 against 0 — a
+# check that could not run reporting exactly what a check that ran and passed
+# reports, in the one script whose entire job is to notice drift.
+#
+# Hard-coding the *kernel's* path instead was the same mistake once removed. The
+# standalone split made the state directory a property of the repository —
+# `$DEVMAP_HOME`, else `.devmap/` if present, else `.devcouncil/` if present,
+# else `.devmap/` — so a fresh corpus, which has neither, now gets `.devmap/`.
+# `.devcouncil/codeintel/devmap.sqlite` stopped existing and gate 8 of
+# `verify.sh` has been failing ever since. The owner of that resolution is
+# `devmap_extract::paths`; `devmap status --json` reports what it decided, so
+# this asks rather than guesses.
+STORE=""
 CSV="${SOAK_CSV:-$ROOT/soak_samples.csv}"
 # What counts as a plateau: how far the second half's mean may sit above the
 # first half's, in percent. Chosen from measured data, not assumed — see the
@@ -66,15 +82,35 @@ db_bytes() {
   echo $(( main + wal ))
 }
 
-TARGET=$(find . -name '*.py' -not -path './.devcouncil/*' | head -1)
+# Any dotted top-level directory, not `.devcouncil` by name: the state
+# directory is whichever one the kernel picks, and a churn target inside it
+# would be rewritten by the build it is supposed to perturb.
+TARGET=$(find . -name '*.py' -not -path './.*' | head -1)
 [ -n "$TARGET" ] || { echo "SOAK FAIL: no target file"; exit 1; }
 ORIG="$ROOT/.soak_orig.$$"
 cp "$TARGET" "$ORIG"
 restore() { cp "$ORIG" "$TARGET"; }
 trap 'restore; rm -f "$ORIG"' EXIT
 
+# Ask the kernel where it put its store. Fails closed: a path this cannot read,
+# or reads and does not find, stops the run rather than letting `digest` return
+# the empty string on every cycle and the comparison hold trivially.
+resolve_store() {
+  local json path
+  json=$("$DEVMAP" --json status 2>/dev/null) || return 1
+  path=$(printf '%s' "$json" \
+    | sed -n 's/.*"db_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -1)
+  [ -n "$path" ] || return 1
+  printf '%s\n' "$path"
+}
+
 "$DEVMAP" build . >/dev/null 2>&1 || { echo "SOAK FAIL: initial build"; exit 1; }
-[ -f "$STORE" ] || { echo "SOAK FAIL: no store at $ROOT/$STORE after the initial build"; exit 1; }
+STORE=$(resolve_store) || {
+  echo "SOAK FAIL: the kernel did not report a db_path in \`devmap --json status\`"; exit 1; }
+[ -f "$STORE" ] || {
+  echo "SOAK FAIL: the kernel reports its store at $STORE, which does not exist after the initial build"
+  exit 1; }
 BASE_DIGEST=$(digest)
 [ -n "$BASE_DIGEST" ] || { echo "SOAK FAIL: the baseline digest is empty — the store has no edges to compare"; exit 1; }
 BASE_DB=$(db_bytes)
