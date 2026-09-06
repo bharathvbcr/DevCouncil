@@ -96,6 +96,23 @@ pub struct Resolver {
     /// Kept as its own map rather than dropped, so the specifier survives as
     /// evidence in the ledger's reason string.
     unindexed_local_imports: BTreeMap<String, BTreeMap<String, String>>,
+    /// Per-file set of **module-path roots** this file's imports name, split
+    /// into the two halves `external_imports` and `unindexed_local_imports`
+    /// already draw: outside the corpus, and repo-relative-but-unindexed.
+    ///
+    /// X43. A Rust path is addressable without a `use` of its root —
+    /// `use serde_json::Value;` makes `Value` a binding but leaves
+    /// `serde_json::from_str(...)` written as a path, whose *root* is a key
+    /// neither existing map has. These are those roots, derived from the same
+    /// walk so the three maps cannot disagree about what a specifier meant.
+    ///
+    /// Consulted only for a receiver that is syntactically a path (it contains
+    /// `::`), which is what keeps a local variable sharing a crate's name out
+    /// of reach — a binding cannot contain `::`.
+    external_module_roots: BTreeMap<String, BTreeSet<String>>,
+    /// The repo-relative half of the above. A path rooted here is an index gap,
+    /// never `External`.
+    local_module_roots: BTreeMap<String, BTreeSet<String>>,
     /// (file, bare symbol name) → qualified name. Edge endpoints are graph
     /// identities, not bare words: emitting `open` instead of `app.py::open`
     /// makes an edge unjoinable to the node it names.
@@ -195,6 +212,8 @@ impl Resolver {
             declared_types: BTreeMap::new(),
             external_imports: BTreeMap::new(),
             unindexed_local_imports: BTreeMap::new(),
+            external_module_roots: BTreeMap::new(),
+            local_module_roots: BTreeMap::new(),
             qualified_names: BTreeMap::new(),
             symbol_parents: BTreeMap::new(),
             go_modules: Vec::new(),
@@ -294,6 +313,25 @@ impl Resolver {
             ))
     }
 
+    /// The leftmost segment of a dotted, scoped or slashed path.
+    ///
+    /// One owner for a split that `classify_unresolved` was doing inline and
+    /// `index_extractions` now needs too — `metrics.counters.Inc()` is evidence
+    /// about `metrics`, `std::fs::write()` about `std`, and a Go specifier
+    /// `example.com/pkg/sub` about `example.com`. All three separators, because
+    /// the caller does not know which language wrote the string.
+    fn path_root(path: &str) -> &str {
+        path.split("::")
+            .next()
+            .unwrap_or(path)
+            .split('.')
+            .next()
+            .unwrap_or(path)
+            .split('/')
+            .next()
+            .unwrap_or(path)
+    }
+
     /// Whether any indexed file this family may resolve into declares `name`.
     ///
     /// The corpus's veto over a name table. A rung that says "the language
@@ -363,6 +401,14 @@ impl Resolver {
                         return UnresolvedClass::Unresolved;
                     }
                 }
+            }
+            // X43. The qualifier itself, when it *is* a reserved standard-library
+            // root: `p: std::path::PathBuf` emits a `TypeQualifier` reference
+            // named `std`, which is a module and not a type anything declares.
+            if crate::builtins::is_reserved_module_root(family, callee_name) {
+                return UnresolvedClass::External {
+                    module: callee_name.to_string(),
+                };
             }
             // A prelude type, and **nothing in this corpus declares the name**.
             // The second half is the whole guard: where a file does declare it,
@@ -434,13 +480,7 @@ impl Resolver {
         // `metrics.counters.Inc()` is evidence about `metrics` and
         // `std::fs::write()` is evidence about `std`. Both separators are
         // handled because Rust's `scoped_identifier` receivers use `::`.
-        let root = receiver
-            .split("::")
-            .next()
-            .unwrap_or(receiver)
-            .split('.')
-            .next()
-            .unwrap_or(receiver);
+        let root = Self::path_root(receiver);
 
         if let Some(imports) = external {
             // `strings.TrimSpace()` / `assert.Equal()`: the receiver is the
@@ -505,10 +545,90 @@ impl Resolver {
             return UnresolvedClass::Unresolved;
         }
 
+        // X43. The receiver is a **module path** rather than a value.
+        //
+        // `std::fs::write(...)` reached `UninferredReceiver`, the tier that
+        // means "the receiver is a value whose type we could not infer", and
+        // `std::fs` is not a value at all. 2,128 rows on this repository, plus
+        // 373 rooted at `serde_json` — a crate the file's own `use` lines name,
+        // whose *root* is a key no handle-keyed map above holds, because Rust
+        // makes a crate addressable by path without a `use` of the root.
+        //
+        // Two shapes, and the test differs because the evidence does:
+        //
+        // * a receiver containing `::` whose every segment is a plain
+        //   identifier is a path *syntactically* — no binding in these
+        //   languages can contain `::`, so this cannot mistake a local for a
+        //   module. It is also what keeps a chained-call receiver out: the text
+        //   `std::fs::write("out.txt", body)` has a segment with parentheses,
+        //   so `unwrap()` on its result stays an uninferred receiver, which is
+        //   what it is.
+        // * a bare root is only a module if the enclosing scope does **not**
+        //   bind that name. `serde_json::from_str(x)` reduces to the receiver
+        //   `serde_json`, and `let serde_json = build(); serde_json.take()`
+        //   reduces to the same string — the scope's own binding tables are the
+        //   only thing that separates them, and they are asked in the same
+        //   direction the `LocalBinding` rung asks them.
+        let root_is_a_value_here = self.scope_declares_local(file_path, enclosing_symbol, root)
+            || self
+                .declared_types
+                .contains_key(&format!("{file_path}:{root}@type"))
+            || self
+                .receiver_types
+                .contains_key(&format!("{file_path}:{root}"));
+        // The bare shape requires the receiver to *be* the root and nothing
+        // else. `std::fs::write("out.txt", body)` as the receiver of `unwrap()`
+        // is also rooted at `std`, and it is an expression, not a module — the
+        // whole point of the tier it belongs in.
+        let bare_module_handle =
+            receiver == root && Self::receiver_is_module_path(&format!("{root}::x"));
+        if Self::receiver_is_module_path(receiver) || (bare_module_handle && !root_is_a_value_here)
+        {
+            // Repo-relative by construction: `crate::missing::helper()` cannot
+            // name anything outside this tree, so a miss is an index gap and
+            // keeps the tier that says a human should look.
+            if matches!(root, "crate" | "self" | "super")
+                || self
+                    .local_module_roots
+                    .get(file_path)
+                    .is_some_and(|roots| roots.contains(root))
+            {
+                return UnresolvedClass::Unresolved;
+            }
+            if crate::builtins::is_reserved_module_root(family, root)
+                || self
+                    .external_module_roots
+                    .get(file_path)
+                    .is_some_and(|roots| roots.contains(root))
+            {
+                return UnresolvedClass::External {
+                    module: root.to_string(),
+                };
+            }
+        }
+
         // A receiver we could not type. Not a defect — naming its owner needs
         // real type inference — but distinct from a bare-name failure, and by
         // far the larger group.
         UnresolvedClass::UninferredReceiver
+    }
+
+    /// Whether a receiver expression is a module **path** rather than a value.
+    ///
+    /// Syntactic on purpose. A binding cannot contain `::` in any language this
+    /// resolver types receivers for, so a `::`-joined run of plain identifiers
+    /// is a path and nothing else. Requiring *every* segment to be an
+    /// identifier is what excludes a chained call whose text happens to contain
+    /// a path — `std::fs::write("out.txt", body)` as the receiver of `unwrap()`
+    /// — from being read as one.
+    fn receiver_is_module_path(receiver: &str) -> bool {
+        receiver.contains("::")
+            && receiver.split("::").all(|segment| {
+                !segment.is_empty()
+                    && segment
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            })
     }
 
     /// Whether an import specifier names something inside this repository *by
@@ -559,6 +679,8 @@ impl Resolver {
         self.declared_types.clear();
         self.external_imports.clear();
         self.unindexed_local_imports.clear();
+        self.external_module_roots.clear();
+        self.local_module_roots.clear();
         self.qualified_names.clear();
         self.symbol_parents.clear();
         self.go_package_by_file.clear();
@@ -670,10 +792,23 @@ impl Resolver {
             // The half of that mirror whose specifier is repo-relative, and so
             // proves an index gap rather than an outside origin.
             let mut file_local_gap: BTreeMap<String, String> = BTreeMap::new();
+            // X43. The specifier's own leading segment, recorded beside the
+            // local handle. A path is written from its root — `serde_json::
+            // from_str(...)` — and the root of a specifier is a key no
+            // handle-keyed map holds.
+            let mut file_external_roots: BTreeSet<String> = BTreeSet::new();
+            let mut file_local_roots: BTreeSet<String> = BTreeSet::new();
             let mut unresolved_import = |local: String, specifier: &str| {
+                let root = Self::path_root(specifier);
                 if Self::specifier_is_repo_relative(specifier) {
+                    if !root.is_empty() {
+                        file_local_roots.insert(root.to_string());
+                    }
                     file_local_gap.insert(local, specifier.to_string());
                 } else {
+                    if !root.is_empty() {
+                        file_external_roots.insert(root.to_string());
+                    }
                     file_external.insert(local, specifier.to_string());
                 }
             };
@@ -824,6 +959,14 @@ impl Resolver {
             if !file_external.is_empty() {
                 self.external_imports
                     .insert(ext.file_path.clone(), file_external);
+            }
+            if !file_external_roots.is_empty() {
+                self.external_module_roots
+                    .insert(ext.file_path.clone(), file_external_roots);
+            }
+            if !file_local_roots.is_empty() {
+                self.local_module_roots
+                    .insert(ext.file_path.clone(), file_local_roots);
             }
             if !file_local_gap.is_empty() {
                 self.unindexed_local_imports

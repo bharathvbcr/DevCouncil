@@ -76,3 +76,7 @@ required-features = ["parse"]
 [[test]]
 name = "implicit_receiver_dispatch"
 required-features = ["parse"]
+
+[[test]]
+name = "qualified_module_paths"
+required-features = ["parse"]
