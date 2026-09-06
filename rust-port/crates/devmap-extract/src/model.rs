@@ -731,7 +731,19 @@ pub enum ReferenceKind {
     /// dispatch needs the bare type name and provenance needs the qualifier
     /// (SC25).
     TypeQualifier,
+    /// A supertype named in a declaration: a base class, or any supertype in a
+    /// language whose syntax does not separate the two. `enclosing_symbol`
+    /// carries the *declaring* type, so the edge has both endpoints.
     Heritage,
+    /// A supertype the declaration explicitly states it implements.
+    ///
+    /// Emitted only where the grammar says so — Java's `super_interfaces`,
+    /// TypeScript's `implements_clause`, PHP's `class_interface_clause`,
+    /// Dart's `interfaces`, Objective-C's protocol list, Rust's
+    /// `impl Trait for Type`. C#, Swift, Kotlin, Python and Solidity use one
+    /// syntax for both and yield [`Self::Heritage`], because inferring the
+    /// distinction would mean guessing from a naming convention.
+    HeritageInterface,
     Decorator,
     JsxTag,
     /// Identifier in expression/value position (JSX prop, object shorthand, …).

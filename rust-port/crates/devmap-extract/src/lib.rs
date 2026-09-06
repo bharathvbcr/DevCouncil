@@ -2,7 +2,6 @@
 // and its grammars; everything above it — the model types, language detection,
 // go.mod parsing, the ignore rules — does not, and is what a *query* consumer
 // actually uses.
-#[cfg(feature = "parse")]
 pub mod cache;
 pub mod clonesig;
 #[cfg(feature = "parse")]
@@ -10,6 +9,8 @@ pub mod embedded;
 pub mod fallback;
 pub mod frameworks;
 pub mod gomod;
+#[cfg(feature = "parse")]
+pub mod heritage;
 #[cfg(feature = "parse")]
 pub mod langcalls;
 #[cfg(feature = "parse")]

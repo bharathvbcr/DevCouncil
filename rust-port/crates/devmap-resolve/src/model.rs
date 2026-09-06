@@ -630,19 +630,22 @@ pub struct UnresolvedReference {
 pub struct ResolutionResult {
     pub edges: Vec<ResolvedEdge>,
     pub receiver_types: BTreeMap<String, String>, // var_name -> type_name (deterministic R4)
-    /// **Always empty. Nothing computes this.**
+    /// `<file>::<exported name>` -> the file that declares it, for every
+    /// `export { x } from './m'`, followed through nested barrels to the
+    /// terminal declaration.
     ///
-    /// There is no re-export/alias-chain following in this crate — no code path
-    /// writes a single entry, on any input. Reading it as "this repository has
-    /// no re-export chains" is therefore wrong: the honest reading is "never
-    /// computed", and the two must not look alike.
+    /// **Empty is a real answer here, and a narrow one.** A chain is recorded
+    /// only where an export names its own source module — which is JS/TS
+    /// syntax. Python's `from .impl import thing` inside an `__init__.py` is a
+    /// re-export to any reader, and the extractor records it as an *import*
+    /// with no export-side specifier, so no chain exists for it and none is
+    /// inferred. `reexport_chains_are_only_claimed_where_an_export_names_its_
+    /// source` pins that scope.
     ///
-    /// It survives only because `ResolutionResult` is constructed by struct
-    /// literal in four other crates, so removing the field is a cross-crate
-    /// change. `reexport_chains_are_never_computed` pins the emptiness as a
-    /// stated fact rather than leaving a determinism test comparing two empty
-    /// maps and calling that a check.
-    pub reexport_chains: BTreeMap<String, String>, // symbol -> resolved_target
+    /// A cycle yields no entry at all: there is no terminal file, and naming
+    /// either endpoint would invent one. Depth is bounded by
+    /// `REEXPORT_CHAIN_MAX_DEPTH`.
+    pub reexport_chains: BTreeMap<String, String>, // "<file>::<name>" -> "<file>::<name>"
     /// Calls, references and route handlers seen but not attributed.
     /// Deterministically ordered (R4).
     pub unresolved: Vec<UnresolvedReference>,

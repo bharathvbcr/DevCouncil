@@ -760,18 +760,33 @@ fn a_second_snapshot_does_not_reuse_the_first_snapshots_go_modules() {
     );
 }
 
-/// R-9: `reexport_chains` is never computed, and the crate must not present it
-/// as though it were.
+/// R-9, retired into a scope assertion (W1.3).
+///
+/// The original pinned `reexport_chains` as permanently empty. That was true of
+/// a field nothing computed, and it is no longer: `compute_reexport_chains`
+/// follows `export { x } from './m'` to the file that declares `x`.
+///
+/// The pin is kept rather than deleted, on the axis it actually protected — the
+/// map makes a claim only where the kernel has evidence. Python is the case
+/// that tests it: `from .impl import thing` in an `__init__.py` is a re-export
+/// in every sense a reader cares about, and the extractor records it as an
+/// *import*, carrying no source module on any export. So there is no evidence
+/// of the kind this map is built from, and it must stay empty here rather than
+/// be filled by inference.
+///
+/// The ON direction lives in `reexport_chains.rs`, which measures what the
+/// chains buy: an `AmbiguousGlobal` fan-out to two files at confidence 0.2
+/// collapsing to one `ImportScoped` edge at 1.0.
 #[test]
-fn reexport_chains_are_never_computed() {
-    // A Python package that genuinely re-exports through `__init__.py`.
+fn reexport_chains_are_only_claimed_where_an_export_names_its_source() {
     let result = resolve(&[
         ("pkg/__init__.py", "from .impl import thing\n"),
         ("pkg/impl.py", "def thing():\n    return 1\n"),
     ]);
     assert!(
         result.reexport_chains.is_empty(),
-        "no code path writes this map; a non-empty value would mean the \
-         documentation below it is stale"
+        "Python export syntax names no source module, so inferring a chain \
+         here would be a claim without evidence: {:?}",
+        result.reexport_chains
     );
 }

@@ -70,11 +70,12 @@ fn observed(extraction: &Extraction) -> BTreeSet<Capability> {
     if !extraction.references.is_empty() {
         seen.insert(Capability::References);
     }
-    if extraction
-        .references
-        .iter()
-        .any(|r| r.kind == ReferenceKind::Heritage)
-    {
+    if extraction.references.iter().any(|r| {
+        matches!(
+            r.kind,
+            ReferenceKind::Heritage | ReferenceKind::HeritageInterface
+        )
+    }) {
         seen.insert(Capability::Heritage);
     }
     seen

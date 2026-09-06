@@ -1380,6 +1380,10 @@ fn walk_tree(
             references,
             wiring,
         );
+        // Beside `extract_node` rather than inside it: heritage is one decision
+        // that fifteen languages spell differently, and putting it in the
+        // per-language match would scatter it across every arm.
+        crate::heritage::push_heritage_references(node, source, lang, file_symbol_name, references);
         push_children_reversed(node, &mut worklist);
     }
     true

@@ -12,7 +12,10 @@ use devmap_extract::GoModule;
 pub struct Resolver {
     symbol_index: BTreeMap<String, Vec<(String, SymbolKind, LangFamily)>>,
     file_symbols: BTreeMap<String, Vec<String>>, // file_path -> symbol_names
-    receiver_types: BTreeMap<String, String>,    // (file_path:var_name) -> ClassType
+    /// `<file>::<exported name>` -> the file that declares it, for
+    /// `export { x } from './m'`. See `compute_reexport_chains`.
+    reexport_chains: BTreeMap<String, String>,
+    receiver_types: BTreeMap<String, String>, // (file_path:var_name) -> ClassType
     /// (file_path:enclosing_symbol:var_name) -> ClassType.
     ///
     /// A receiver variable belongs to one method, not to a whole file. Keying
@@ -136,6 +139,7 @@ impl Resolver {
         Self {
             symbol_index: BTreeMap::new(),
             file_symbols: BTreeMap::new(),
+            reexport_chains: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
             scoped_receiver_types: BTreeMap::new(),
             poisoned_receiver_keys: BTreeSet::new(),
@@ -429,6 +433,7 @@ impl Resolver {
         // for a rebuild.
         self.symbol_index.clear();
         self.file_symbols.clear();
+        self.reexport_chains.clear();
         self.receiver_types.clear();
         self.scoped_receiver_types.clear();
         self.poisoned_receiver_keys.clear();
@@ -509,6 +514,11 @@ impl Resolver {
             }
         }
 
+        // Between the passes, and necessarily so: following a barrel needs the
+        // complete symbol universe pass one builds, and pass two's import
+        // bindings need the chains.
+        self.reexport_chains = self.compute_reexport_chains(extractions);
+
         // Pass two resolves aliases and receiver hints against the complete
         // universe built above.
         for ext in extractions {
@@ -570,8 +580,28 @@ impl Resolver {
                             .as_deref()
                             .and_then(|file| self.file_symbols.get(file))
                             .is_some_and(|symbols| symbols.iter().any(|symbol| symbol == name));
+                        // The barrel's own statement, used before the
+                        // fallbacks. `export { thing } from './impl'` says
+                        // where `thing` comes from; without consulting it the
+                        // binding points at a file that declares no such
+                        // symbol, the ladder falls through to the bare-name
+                        // global lookup, and a name two files declare fans out
+                        // ambiguously to both — including one the caller
+                        // demonstrably does not call.
+                        let via_reexport = (!declares_name)
+                            .then(|| {
+                                direct.as_deref().and_then(|file| {
+                                    self.reexport_chains.get(&format!("{file}::{name}"))
+                                })
+                            })
+                            .flatten()
+                            .and_then(|terminal| {
+                                terminal.rsplit_once("::").map(|(file, _)| file.to_string())
+                            });
                         let resolved = if declares_name {
                             direct
+                        } else if let Some(file) = via_reexport {
+                            Some(file)
                         } else {
                             let submodule = (ext.language == "python").then(|| {
                                 self.resolve_import_path(
@@ -726,6 +756,111 @@ impl Resolver {
     /// parameter has had no caller since. It is gone rather than left
     /// unreachable, because an unused narrowing hook reads as a supported
     /// option and the next caller would reintroduce the same bug.
+    /// How deep a barrel may nest before this stops following it.
+    ///
+    /// A `packages/*/index.ts` re-exporting a `src/index.ts` re-exporting a
+    /// feature barrel is three; anything past this is either generated or a
+    /// mistake, and following it without a bound turns a malformed tree into a
+    /// hang. Refusing is the honest outcome — the chain is recorded only when
+    /// it terminates.
+    const REEXPORT_CHAIN_MAX_DEPTH: usize = 8;
+
+    /// `<file>::<exported name>` for every `export { x } from './m'`, followed
+    /// to the file that actually declares the name.
+    ///
+    /// **What this is evidence of.** A barrel does not merely suggest where a
+    /// name comes from; it states it. `export { thing } from './impl'` is a
+    /// fact about `thing` that the resolver had in hand and threw away: the
+    /// import binding pointed at `index.ts`, `index.ts` declares no `thing`, so
+    /// the ladder fell through to the bare-name global lookup — and in a
+    /// repository where two files declare `thing`, that produced an
+    /// `AmbiguousGlobal` fan-out to both at confidence 0.2, one of which is an
+    /// edge to a function the caller demonstrably does not call.
+    ///
+    /// Measured on the three-file fixture in `reexport_chains.rs`: two `Calls`
+    /// edges where one is correct, and the barrel names which.
+    ///
+    /// **Terminal, not one hop.** The value is the file that declares the name,
+    /// after following nested barrels, so a consumer reads one entry rather
+    /// than walking the map itself and re-deriving the depth cap.
+    ///
+    /// A cycle — `a.ts` re-exporting from `b.ts` re-exporting from `a.ts` —
+    /// yields no entry at all. There is no terminal file, so there is nothing
+    /// true to record, and recording either endpoint would invent one.
+    fn compute_reexport_chains(&self, extractions: &[Extraction]) -> BTreeMap<String, String> {
+        // One hop per re-export, keyed by the re-exporting file's own name for
+        // the symbol.
+        let mut hops: BTreeMap<String, (String, String)> = BTreeMap::new();
+        for ext in extractions {
+            for export in &ext.exports {
+                let Some(specifier) = export.module_specifier.as_deref() else {
+                    continue;
+                };
+                if export.exported_name.is_empty() {
+                    continue;
+                }
+                let Some(target) =
+                    self.resolve_import_path(&ext.file_path, &ext.language, specifier)
+                else {
+                    // The specifier named no indexed file. Recorded nowhere:
+                    // this is the same index gap `UnresolvedKind::Import`
+                    // already reports, and inventing a chain endpoint for it
+                    // would manufacture graph structure.
+                    continue;
+                };
+                // `export { a as b } from './m'` publishes `b` and asks `./m`
+                // for `a`. Defaulting to the exported name covers the common
+                // `export { a } from './m'`, where the two are equal.
+                let source_name = export
+                    .local_name
+                    .clone()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| export.exported_name.clone());
+                hops.insert(
+                    format!("{}::{}", ext.file_path, export.exported_name),
+                    (target, source_name),
+                );
+            }
+        }
+
+        let mut chains = BTreeMap::new();
+        for (key, _) in hops.iter() {
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            let mut cursor = key.clone();
+            let mut terminal = None;
+            for _ in 0..Self::REEXPORT_CHAIN_MAX_DEPTH {
+                if !seen.insert(cursor.clone()) {
+                    // A cycle. Abandon the whole chain rather than recording
+                    // the last node visited, which would be an answer the tree
+                    // does not support.
+                    terminal = None;
+                    break;
+                }
+                let Some((file, name)) = hops.get(&cursor) else {
+                    break;
+                };
+                let next = format!("{file}::{name}");
+                // The file this hop names declares the symbol itself, so the
+                // walk is over and this is the answer.
+                if self
+                    .file_symbols
+                    .get(file)
+                    .is_some_and(|symbols| symbols.iter().any(|symbol| symbol == name))
+                {
+                    terminal = Some(next);
+                    break;
+                }
+                cursor = next;
+            }
+            if let Some(terminal) = terminal {
+                if terminal != *key {
+                    chains.insert(key.clone(), terminal);
+                }
+            }
+        }
+        chains
+    }
+
     pub fn resolve_all(&self, extractions: &[Extraction]) -> ResolutionResult {
         // Per-file resolution runs in parallel.
         //
@@ -1496,7 +1631,7 @@ impl Resolver {
         ResolutionResult {
             edges,
             receiver_types: self.receiver_types.clone(),
-            reexport_chains: BTreeMap::new(),
+            reexport_chains: self.reexport_chains.clone(),
             unresolved,
         }
     }
@@ -1905,7 +2040,7 @@ impl Resolver {
         }
         let prefer_types = matches!(
             reference.kind,
-            ReferenceKind::Type | ReferenceKind::Heritage
+            ReferenceKind::Type | ReferenceKind::Heritage | ReferenceKind::HeritageInterface
         );
         let is_type = |kind: SymbolKind| {
             matches!(
@@ -2052,7 +2187,16 @@ impl Resolver {
             target_file.to_string(),
             source_symbol,
             target_symbol,
-            EdgeKind::References,
+            // The edge kind follows the reference kind, so `Extends` and
+            // `Implements` come out of the ladder that already exists — same
+            // rungs, same confidences, an ambiguous supertype resolving to
+            // nothing as usual. Both variants were declared with no producer;
+            // every reference to them was a label map or a string parser.
+            match reference.kind {
+                ReferenceKind::Heritage => EdgeKind::Extends,
+                ReferenceKind::HeritageInterface => EdgeKind::Implements,
+                _ => EdgeKind::References,
+            },
             Arc::new(resolution),
             Some(format!("{:?}", reference.kind)),
         )

@@ -182,10 +182,6 @@ impl Capabilities {
 pub const CALLS: u8 = Capability::Calls as u8;
 pub const IMPORTS: u8 = Capability::Imports as u8;
 pub const REFERENCES: u8 = Capability::References as u8;
-/// Declared by no language yet: no extractor emits `ReferenceKind::Heritage`.
-/// Present so the bit exists for the producer work to turn on, and so the
-/// derivation test already fails if one starts emitting it silently.
-#[allow(dead_code)]
 pub const HERITAGE: u8 = Capability::Heritage as u8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -216,7 +212,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::TypeScript,
         lsp_id: "typescript",
         viz_color: "#3178c6",
-        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "TSX",
@@ -226,7 +222,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Tsx,
         lsp_id: "typescript",
         viz_color: "#3178c6",
-        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "JavaScript",
@@ -236,7 +232,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::JavaScript,
         lsp_id: "javascript",
         viz_color: "#f7df1e",
-        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "ArkTS",
@@ -246,7 +242,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::ArkTs,
         lsp_id: "typescript",
         viz_color: "#002b36",
-        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "Python",
@@ -256,7 +252,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Python,
         lsp_id: "python",
         viz_color: "#3572A5",
-        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "Go",
@@ -276,7 +272,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Rust,
         lsp_id: "rust-analyzer",
         viz_color: "#dea584",
-        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "Java",
@@ -286,7 +282,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Java,
         lsp_id: "jdtls",
         viz_color: "#b07219",
-        capabilities: Capabilities::new(CALLS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "C#",
@@ -296,7 +292,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::CSharp,
         lsp_id: "omnisharp",
         viz_color: "#178600",
-        capabilities: Capabilities::new(CALLS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "VB.NET",
@@ -316,7 +312,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Php,
         lsp_id: "intelephense",
         viz_color: "#4F5D95",
-        capabilities: Capabilities::new(CALLS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "Ruby",
@@ -326,7 +322,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Ruby,
         lsp_id: "solargraph",
         viz_color: "#701516",
-        capabilities: Capabilities::new(CALLS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "C",
@@ -346,7 +342,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Cpp,
         lsp_id: "clangd",
         viz_color: "#f34b7d",
-        capabilities: Capabilities::new(CALLS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "Objective-C",
@@ -356,7 +352,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::ObjC,
         lsp_id: "clangd",
         viz_color: "#438eff",
-        capabilities: Capabilities::new(CALLS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "Metal",
@@ -366,7 +362,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Metal,
         lsp_id: "clangd",
         viz_color: "#8f14e9",
-        capabilities: Capabilities::new(CALLS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "CUDA",
@@ -376,7 +372,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Cuda,
         lsp_id: "clangd",
         viz_color: "#3A4E3A",
-        capabilities: Capabilities::new(CALLS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "Swift",
@@ -386,7 +382,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Swift,
         lsp_id: "sourcekit-lsp",
         viz_color: "#F05138",
-        capabilities: Capabilities::new(CALLS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "Kotlin",
@@ -396,7 +392,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Kotlin,
         lsp_id: "kotlin-language-server",
         viz_color: "#A97BFF",
-        capabilities: Capabilities::new(CALLS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "Scala",
@@ -406,7 +402,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Scala,
         lsp_id: "metals",
         viz_color: "#c22d40",
-        capabilities: Capabilities::new(CALLS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "Dart",
@@ -416,7 +412,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Dart,
         lsp_id: "dart-analysis-server",
         viz_color: "#00B4AB",
-        capabilities: Capabilities::new(CALLS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "Svelte",
@@ -426,7 +422,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Svelte,
         lsp_id: "svelte-language-server",
         viz_color: "#ff3e00",
-        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "Vue",
@@ -444,7 +440,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Vue,
         lsp_id: "volar",
         viz_color: "#41b883",
-        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "Astro",
@@ -454,7 +450,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Astro,
         lsp_id: "astro-ls",
         viz_color: "#ff5a03",
-        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "Liquid",
@@ -544,7 +540,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Solidity,
         lsp_id: "solc",
         viz_color: "#AA6746",
-        capabilities: Capabilities::new(CALLS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "Terraform/OpenTofu",

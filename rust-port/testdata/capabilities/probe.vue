@@ -5,6 +5,12 @@
 <script lang="ts">
 import { helper } from "./helper";
 
+export class Widget extends BaseWidget {
+  draw(name: string): string {
+    return helper(name);
+  }
+}
+
 export function render(name: string): string {
   return helper(name);
 }

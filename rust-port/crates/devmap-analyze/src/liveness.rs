@@ -434,6 +434,109 @@ impl ExtractionGap {
     }
 }
 
+/// How far the override join walks a heritage chain.
+///
+/// `Derived -> Middle -> Base` is two hops and ordinary; a bound past this is
+/// either generated code or a cycle, and a cycle in a heritage graph is not
+/// expressible in any language here but is expressible in a *graph*, which is
+/// what this walks. Bounded rather than trusted.
+const HERITAGE_WALK_MAX_DEPTH: usize = 8;
+
+/// Reason carried by an override the base type's call reaches.
+///
+/// Names the supertype, because the exemption is only as good as the edge
+/// behind it and a reader deciding whether to trust it needs to see which
+/// relation fired.
+fn heritage_override_reason(supertype: &str) -> String {
+    format!(
+        "Overrides a method reached through `{supertype}` — polymorphic dispatch, \
+         matched by name on a resolved heritage edge"
+    )
+}
+
+/// `(file, TypeName)` -> the supertypes it declares, from `Extends`/`Implements`.
+///
+/// These edges exist at all only since W1.2: `ReferenceKind::Heritage` and both
+/// edge kinds were declared with no producer, so a method reached only through
+/// its base type had no inbound edge and every override was a candidate
+/// `extracted` false positive.
+///
+/// Ambiguous edges are excluded for the same reason the call join excludes
+/// them: an unresolved supertype is evidence that a base *might* exist, not
+/// proof of which one, and a speculative edge must not exempt a symbol.
+fn supertypes_by_type(resolution: &ResolutionResult) -> HashMap<(&str, &str), Vec<(&str, &str)>> {
+    let mut by_type: HashMap<(&str, &str), Vec<(&str, &str)>> = HashMap::new();
+    for edge in &resolution.edges {
+        if !matches!(edge.edge_kind, EdgeKind::Extends | EdgeKind::Implements) {
+            continue;
+        }
+        if matches!(
+            edge.resolution.as_deref(),
+            Some(Resolution::AmbiguousGlobal { .. }) | Some(Resolution::Unresolved { .. })
+        ) {
+            continue;
+        }
+        let Some(declarer) = edge.source_symbol.rsplit("::").next() else {
+            continue;
+        };
+        let Some(supertype) = edge.target_symbol.rsplit("::").next() else {
+            continue;
+        };
+        by_type
+            .entry((edge.source_file.as_str(), declarer))
+            .or_default()
+            .push((edge.target_file.as_str(), supertype));
+    }
+    by_type
+}
+
+/// Whether a call to a supertype's same-named method reaches this override.
+///
+/// The generalisation of the Go interface pre-pass, which matches on name plus
+/// arity within one package and produces a wiring exemption. This one runs on a
+/// real resolved edge, so it works across files and across languages, and it
+/// still matches the *method* by name only — a supertype's `render` and an
+/// override's `render` are joined because they are spelled the same, which is
+/// what an override is.
+fn reached_through_a_supertype(
+    file: &str,
+    identity: &str,
+    supertypes: &HashMap<(&str, &str), Vec<(&str, &str)>>,
+    called: &HashSet<(String, String)>,
+) -> Option<String> {
+    // Only a method can be an override: `Type.method` is the identity shape
+    // `dead_symbol_identity` produces, and a bare name is a free function.
+    let (declaring_type, method) = identity.rsplit_once('.')?;
+
+    let mut frontier = vec![(file, declaring_type)];
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    for _ in 0..HERITAGE_WALK_MAX_DEPTH {
+        let mut next = Vec::new();
+        for key in frontier {
+            if !seen.insert(key) {
+                continue;
+            }
+            for (super_file, super_name) in supertypes.get(&key).into_iter().flatten() {
+                // Either spelling of the call target: the qualified
+                // `Base.render` an edge names, or the bare `render` the short
+                // name is also recorded under.
+                let qualified = format!("{super_name}.{method}");
+                if called.contains(&(super_file.to_string(), qualified))
+                    || called.contains(&(super_file.to_string(), method.to_string()))
+                {
+                    return Some(heritage_override_reason(super_name));
+                }
+                next.push((*super_file, *super_name));
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    None
+}
+
 /// Reason carried by a finding an unresolved call site vetoed.
 ///
 /// States the imprecision in the reason itself rather than in a code comment,
@@ -658,6 +761,7 @@ pub fn analyze_liveness_with_coverage(
     // Computed once for the whole corpus: the join is name-only, so it has no
     // per-file component to recompute.
     let unresolved_names = unresolved_namesakes(resolution);
+    let supertypes = supertypes_by_type(resolution);
     let go_interface_specs = go_interface_specs_by_package(extractions);
     let c_header_exports = c_header_exported_names(extractions);
     let go_build_variants = go_build_variant_identities(extractions);
@@ -848,9 +952,18 @@ pub fn analyze_liveness_with_coverage(
             };
 
             let is_exported = sym.is_exported;
+            // Computed before the borrowed chain below so the owned string
+            // outlives it.
+            let heritage_exemption = reached_through_a_supertype(
+                &ext.file_path,
+                &dead_symbol_identity(sym, &ext.file_path),
+                &supertypes,
+                &called_symbols,
+            );
             let symbol_exemption: Option<&str> = symbol_exemptions
                 .get(sym.qualified_name.as_str())
                 .copied()
+                .or(heritage_exemption.as_deref())
                 .or_else(|| {
                     go_interface_exemptions
                         .get(sym.qualified_name.as_str())
