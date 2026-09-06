@@ -444,3 +444,53 @@ def test_a_failing_edges_check_is_one_a_build_resolves(
 
     code = _check(result, "edges")["code"]
     assert code in health._BUILD_RESOLVES
+
+
+# --- a corpus the kernel cannot read is not pending work ---------------------
+
+
+def test_a_fully_walked_corpus_with_unreadable_files_is_partial_not_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`pending_count == 0`, nothing quarantined, and yet degraded: the gaps are
+    files the kernel walked and could not read. A rebuild re-measures exactly
+    the same gaps, so the remedy must not be `repair --pending` and `--fix`
+    must not pretend to act on it."""
+    gaps = _empty_gaps()
+    gaps["discovery_refused"] = _gap(
+        ("rust-port/vendor/grammars/cobol/parser.c", "30660349 bytes exceeds the 1048576 byte source ceiling")
+    )
+    result = _doctor(
+        tmp_path,
+        monkeypatch,
+        is_fresh=True,
+        degraded_reason="partial: 1 refused by discovery and never read at all",
+        coverage_gaps=gaps,
+    )
+    kernel = _check(result, "kernel")
+    assert kernel["ok"] is False
+    assert kernel["code"] == "coverage_partial", kernel
+    assert kernel["fix_command"] == "", "there is no command that reads an unreadable file"
+    assert "repair --pending" not in kernel["fix"]
+    assert "no rebuild changes this" in kernel["fix"]
+    assert kernel["coverage_gaps"] == gaps
+    block = _rendered(result, "kernel")
+    assert any("parser.c" in line for line in block), block
+
+
+@pytest.mark.parametrize("kernel_row", [{"pending_count": 3, "is_fresh": False}, {"quarantined_count": 2}])
+def test_queued_or_quarantined_paths_are_still_pending_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kernel_row: Dict[str, Any]
+) -> None:
+    result = _doctor(
+        tmp_path,
+        monkeypatch,
+        degraded_reason="3 path(s) queued",
+        coverage_gaps=_empty_gaps(),
+        **kernel_row,
+    )
+    kernel = _check(result, "kernel")
+    assert kernel["ok"] is False
+    assert kernel["code"] == "pending_paths", kernel
+    assert kernel["fix_command"] == "dev map doctor --fix"
+    assert "repair --pending" in kernel["fix"]

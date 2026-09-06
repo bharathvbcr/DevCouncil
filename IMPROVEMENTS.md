@@ -1759,3 +1759,17 @@ Red first: `tests/unit/test_map_staleness_is_not_degradation.py` — the degrade
 case is the live reproduction above (`map_is_stale` True with every fingerprint equal); the
 reason vocabulary and the fail-closed "could not be verified" path are pinned. 552 related
 unit tests pass; ruff and mypy clean.
+
+
+### The doctor's `kernel` check separates work from limits (2026-09-06)
+
+`pending_count == 0`, nothing quarantined, and still degraded means the kernel walked the
+whole corpus and could not read some of it — here a 30.6 MB vendored `parser.c` over the source
+ceiling and two files with no linked grammar. That was reported under the same code and remedy
+as queued paths (`pending_paths`, `dev map repair --pending, then dev map`), so `--fix` ran a
+repair against nothing pending and a rebuild that re-measures the same gaps: a fix that could
+not work, presented as one that had run. Such a corpus now reports `coverage_partial` with a
+sentence saying what would change it (raise the ceiling, link a grammar) and no `fix_command`
+— `check()` accepts `fix_command=None` to mean "there is no command", where before an empty
+value was replaced by the first clause of the prose. Pinned in
+`tests/unit/test_devmap_coverage_gaps.py`.

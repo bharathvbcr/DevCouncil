@@ -708,15 +708,25 @@ def run_doctor(root: Path) -> Dict[str, Any]:
         critical: bool = True,
         fix: str = "",
         code: str = "",
-        fix_command: str = "",
+        fix_command: Optional[str] = "",
         extra: Optional[Dict[str, Any]] = None,
     ) -> None:
         # `code` is what an agent branches on; `fix_command` is what it runs.
         # `fix` stays the sentence a person reads. A failing check without a
         # code would be a check nobody can act on programmatically, so it is
         # derived from the name when the caller gave none.
+        #
+        # `fix_command=None` says there is *no* command: the fallback below
+        # turns the first clause of `fix` into one, which is right for
+        # "dev map (the kernel overwrites foreign artifacts)" and wrong for a
+        # sentence explaining that nothing can be run — an agent would then be
+        # handed prose to execute.
         if ok is False and not code:
             code = name
+        if fix_command is None:
+            command = ""
+        else:
+            command = fix_command or (fix.split(" (")[0].split(";")[0].strip() if fix else "")
         item: Dict[str, Any] = {
             "name": name,
             "ok": ok,
@@ -724,7 +734,7 @@ def run_doctor(root: Path) -> Dict[str, Any]:
             "critical": critical,
             "fix": fix,
             "code": code,
-            "fix_command": fix_command or (fix.split(" (")[0].split(";")[0].strip() if fix else ""),
+            "fix_command": command,
         }
         # Evidence that does not fit one line of prose. `detail_lines` renders
         # indented under the check; the rest is there for `--json` so a caller
@@ -834,27 +844,57 @@ def run_doctor(root: Path) -> Dict[str, Any]:
                 # inventory only answers a question the failing sentence raised.
                 check("kernel", True, f"generation {kernel.get('generation_id')}, no pending paths")
             else:
-                check(
-                    "kernel",
-                    False,
-                    kernel.get("degraded_reason")
-                    or f"{kernel.get('pending_count')} pending path(s)",
-                    critical=False,
-                    fix="dev map repair --pending, then dev map",
-                    code="pending_paths",
-                    fix_command="dev map doctor --fix",
-                    # The paths behind the counts in `degraded_reason`:
-                    # structured under `coverage_gaps` for `--json`, rendered
-                    # indented under the line for a person.
-                    # `coverage_gaps_reported` is what keeps the JSON honest —
-                    # a kernel that never sent the field and one that sent
-                    # `null` both leave `coverage_gaps` null here.
-                    extra={
-                        "coverage_gaps": kernel.get("coverage_gaps"),
-                        "coverage_gaps_reported": "coverage_gaps" in kernel,
-                        "detail_lines": coverage_gap_lines(kernel),
-                    },
+                # Two different situations used to share one code and one
+                # remedy. Paths still queued or quarantined are work a repair
+                # and a rebuild can finish. A corpus the kernel has fully
+                # walked and *could not read* — an oversized vendored file, a
+                # language with no linked grammar — is not: `dev map` will
+                # re-measure it and report the same gaps, and `--fix` running
+                # `repair --pending` against nothing pending was a fix that
+                # could not work presented as one that had run.
+                permanent = (
+                    not kernel.get("pending_count")
+                    and not kernel.get("quarantined_count")
+                    and bool(kernel.get("degraded_reason"))
                 )
+                gaps = {
+                    "coverage_gaps": kernel.get("coverage_gaps"),
+                    "coverage_gaps_reported": "coverage_gaps" in kernel,
+                    "detail_lines": coverage_gap_lines(kernel),
+                }
+                if permanent:
+                    check(
+                        "kernel",
+                        False,
+                        kernel.get("degraded_reason"),
+                        critical=False,
+                        fix=(
+                            "no rebuild changes this: the files listed are outside what the "
+                            "kernel can read (raise the source ceiling for an oversized file, "
+                            "or link a grammar for its language); findings stay a lower bound"
+                        ),
+                        code="coverage_partial",
+                        fix_command=None,
+                        extra=gaps,
+                    )
+                else:
+                    check(
+                        "kernel",
+                        False,
+                        kernel.get("degraded_reason")
+                        or f"{kernel.get('pending_count')} pending path(s)",
+                        critical=False,
+                        fix="dev map repair --pending, then dev map",
+                        code="pending_paths",
+                        fix_command="dev map doctor --fix",
+                        # The paths behind the counts in `degraded_reason`:
+                        # structured under `coverage_gaps` for `--json`, rendered
+                        # indented under the line for a person.
+                        # `coverage_gaps_reported` is what keeps the JSON honest —
+                        # a kernel that never sent the field and one that sent
+                        # `null` both leave `coverage_gaps` null here.
+                        extra=gaps,
+                    )
         if "error" in kernel:
             check("edges", None, "the kernel status could not be read", critical=False)
         else:
