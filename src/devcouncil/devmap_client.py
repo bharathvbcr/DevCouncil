@@ -352,6 +352,21 @@ class DevMapClientError(Exception):
     """Raised when devmap server/CLI fails or returns an error."""
 
 
+class DevMapRequestRefused(DevMapClientError):
+    """The *request* was refused before any transport was tried.
+
+    A query over :data:`MAX_QUERY_BYTES`, an argument that is not valid UTF-8,
+    a depth or budget outside its range: no engine can serve these, so the
+    caller must not treat the refusal as "the kernel is unavailable" and
+    re-run the request on the Python graph engine. Measured on this
+    repository, a 200 KB ``dev map query`` was refused here in microseconds
+    and then answered by that fallback in 3.9 s — a whole-graph load of 117k
+    payloads scanned for a string no symbol can contain. A subclass of
+    :class:`DevMapClientError` so every existing ``except`` keeps catching
+    it; callers that fall back on the parent must catch this first.
+    """
+
+
 # The kernel's IPC identity, spelled once here and once in
 # `devmap-serve/src/daemon.rs::ipc_identity_for`. `devmap serve
 # --print-socket-path <root>` prints the kernel's answer and creates nothing, and
@@ -567,23 +582,32 @@ class DevMapClient:
     @staticmethod
     def _validate_query(value: str, field_name: str = "query") -> None:
         if not isinstance(value, str):
-            raise DevMapClientError(f"devmap {field_name} must be a string")
-        if len(value.encode("utf-8")) > MAX_QUERY_BYTES:
-            raise DevMapClientError(
+            raise DevMapRequestRefused(f"devmap {field_name} must be a string")
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError as err:
+            # `sys.argv` hands a CLI undecodable bytes as surrogate escapes;
+            # they cannot be sent to the kernel as UTF-8, and before this the
+            # `UnicodeEncodeError` itself was the answer — a traceback.
+            raise DevMapRequestRefused(
+                f"devmap {field_name} is not valid UTF-8 (byte {err.start})"
+            ) from err
+        if len(encoded) > MAX_QUERY_BYTES:
+            raise DevMapRequestRefused(
                 f"devmap {field_name} exceeds {MAX_QUERY_BYTES} UTF-8 bytes"
             )
 
     @staticmethod
     def _validate_budget(value: int) -> None:
         if type(value) is not int or not 0 <= value <= MAX_TOKEN_BUDGET:
-            raise DevMapClientError(
+            raise DevMapRequestRefused(
                 f"devmap budget must be an integer within [0, {MAX_TOKEN_BUDGET}]"
             )
 
     @staticmethod
     def _validate_depth(value: int) -> None:
         if type(value) is not int or not 0 <= value <= MAX_TRAVERSAL_DEPTH:
-            raise DevMapClientError(
+            raise DevMapRequestRefused(
                 f"devmap depth must be an integer within [0, {MAX_TRAVERSAL_DEPTH}]"
             )
 
