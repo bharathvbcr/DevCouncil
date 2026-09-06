@@ -2494,3 +2494,107 @@ fn relation_is_view(conn: &rusqlite::Connection, name: &str) -> bool {
     .map(|kind| kind == "view")
     .unwrap_or(false)
 }
+
+/// A store written before the payload split migrates, and keeps its rows.
+///
+/// This step had no coverage. Every other test creates a store fresh, and a
+/// fresh store is built from the current schema and never walks the chain — so
+/// the migration's `file_payloads` could omit the `file_id` that the fresh
+/// shape declares, that its own `INSERT` names, and that every runtime probe
+/// keys on, and 1,842 tests still passed. What failed was the first real v16
+/// store the binary was pointed at, which is every existing installation.
+#[test]
+fn a_v16_store_migrates_to_the_payload_split_and_keeps_its_rows() {
+    let dir = tmp_dir("migration-v17");
+    let db_path = dir.join("legacy-v16.sqlite");
+
+    // A real v16 store: build one at the current schema, then reverse the v17
+    // split — materialise the view back into a table and drop the split ones.
+    // Synthesising the old DDL by hand would only test a schema this project
+    // never wrote.
+    {
+        let store = Store::open(&db_path).unwrap();
+        drop(store);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO paths (id, path) VALUES (1, 'a.py'), (2, 'twin.py')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO generations (id, created_at, head_sha, repo_root, analysis_json)
+             VALUES (1, 0, 'deadbeef', '/tmp/probe', '{}')",
+            [],
+        )
+        .unwrap();
+        // Two files with byte-identical content. Keyed on content alone they
+        // would collapse into one payload and both report the same path.
+        for (file_id, path) in [(1, "a.py"), (2, "twin.py")] {
+            conn.execute(
+                "INSERT INTO file_payloads
+                   (file_id, content_hash, language, grammar_version, analyzer_version,
+                    parse_outcome_json, engine_json, extraction_json)
+                 VALUES (?1, 99, 'python', 'g1', 'a1', '\"Clean\"', '\"TreeSitter\"', ?2)",
+                rusqlite::params![file_id, format!("{{\"file_path\":\"{path}\"}}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO generation_file_rows (generation_id, file_id, payload_id)
+                 VALUES (1, ?1, ?1)",
+                rusqlite::params![file_id],
+            )
+            .unwrap();
+        }
+        // Now collapse it back to the pre-split shape.
+        conn.execute_batch(
+            "CREATE TABLE gf_flat AS SELECT * FROM generation_files;
+             DROP VIEW generation_files;
+             DROP TABLE generation_file_rows;
+             DROP TABLE file_payloads;
+             ALTER TABLE gf_flat RENAME TO generation_files;
+             PRAGMA user_version = 16;",
+        )
+        .unwrap();
+    }
+
+    let store = Store::open(&db_path).expect("a v16 store must migrate, not fail to open");
+    drop(store);
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let version: i32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 17, "the chain must reach the current schema");
+
+    // The identity carries the file, so byte-identical twins stay two payloads.
+    let payloads: i64 = conn
+        .query_row("SELECT COUNT(*) FROM file_payloads", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        payloads, 2,
+        "content-addressing alone would collapse these to 1"
+    );
+
+    // And both rows still name their own file through the view.
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.path, f.extraction_json
+               FROM generation_files f JOIN paths p ON p.id = f.file_id
+              WHERE f.generation_id = 1 ORDER BY p.path",
+        )
+        .unwrap();
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows.len(), 2, "both membership rows must survive");
+    for (path, payload) in &rows {
+        assert!(
+            payload.contains(path.as_str()),
+            "{path} reports a payload belonging to another file: {payload}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}

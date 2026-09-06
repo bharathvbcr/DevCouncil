@@ -77,7 +77,7 @@ struct Stored {
 }
 
 fn stored(root: &Path) -> Stored {
-    let conn = rusqlite::Connection::open(devmap_extract::paths::store_path(&root)).unwrap();
+    let conn = rusqlite::Connection::open(devmap_extract::paths::store_path(root)).unwrap();
     let one = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
     Stored {
         generations: one("SELECT COUNT(*) FROM generations"),

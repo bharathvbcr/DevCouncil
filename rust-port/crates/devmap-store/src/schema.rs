@@ -629,8 +629,18 @@ ALTER TABLE generation_edges ADD COLUMN candidate_total INTEGER;
 /// membership rows then join back to it, so a store with N generations of an
 /// unchanged file collapses to one payload and N 16-byte rows.
 pub const MIGRATION_V16_TO_V17: &str = r#"
+-- Identical to the fresh-create shape above, `file_id` included. It was omitted
+-- here and present there, so a store created by this build worked and a store
+-- *migrated* by it could not: the INSERT below names `file_id`, and every
+-- runtime probe keys on it. No test migrated a real v16 store, so 1,842 of them
+-- passed over it — a fresh store never walks this step.
+--
+-- The column is not cosmetic. Without it the identity is content-addressed
+-- alone, which collapses two byte-identical files into one payload and makes
+-- both membership rows report the same path.
 CREATE TABLE IF NOT EXISTS file_payloads (
     payload_id         INTEGER PRIMARY KEY,
+    file_id            INTEGER NOT NULL REFERENCES paths(id),
     content_hash       INTEGER NOT NULL,
     language           TEXT NOT NULL,
     grammar_version    TEXT,
@@ -641,7 +651,7 @@ CREATE TABLE IF NOT EXISTS file_payloads (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_file_payloads_identity
-    ON file_payloads(content_hash, language,
+    ON file_payloads(file_id, content_hash, language,
                      COALESCE(grammar_version, ''), COALESCE(analyzer_version, ''));
 
 CREATE TABLE IF NOT EXISTS generation_file_rows (

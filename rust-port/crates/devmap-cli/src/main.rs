@@ -391,13 +391,6 @@ pub enum HtmlLevel {
     Files,
     /// Symbols and their calls, inheritance and named imports.
     Symbols,
-    /// Subsystems, their neighbours and the file-level handoffs between them.
-    ///
-    /// Read from `repo_map.json` rather than the store: subsystems are derived
-    /// when the manifest is written, and drawing a second, in-memory grouping
-    /// here would let the picture disagree with the file every other consumer
-    /// reads.
-    Subsystems,
 }
 
 #[derive(Subcommand)]
@@ -1064,16 +1057,12 @@ enum Commands {
         /// Where to write. Defaults to `<state dir>/graph.html`.
         #[arg(short, long)]
         out: Option<PathBuf>,
-        /// What a node is: files and their imports, symbols and their calls,
-        /// or subsystems and the crossings between them.
+        /// What a node is: files and their imports, or symbols and their calls.
         ///
-        /// One choice rather than stacked booleans, because two flags for three
-        /// views leaves a combination that has to mean something and does not.
+        /// The subsystem view is `devmap map-html`, which reads `repo_map.json`
+        /// and colours by language.
         #[arg(long, value_enum, default_value_t = HtmlLevel::Files)]
         level: HtmlLevel,
-        /// Read subsystems from this `repo_map.json` instead of the state dir.
-        #[arg(long)]
-        map: Option<PathBuf>,
         /// Most nodes to draw, ranked by degree so the hubs survive.
         ///
         /// A force layout stops converging in a browser tab well before a real
@@ -4514,7 +4503,6 @@ represent them",
             path,
             out,
             level,
-            map,
             max_nodes,
         } => {
             let store = open_for_read(&cli.db())?;
@@ -4527,40 +4515,14 @@ represent them",
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "Dev Map".to_string());
 
-            let (payload, html) = if *level == HtmlLevel::Subsystems {
-                let map_path = map
-                    .clone()
-                    .unwrap_or_else(|| devmap_extract::paths::repo_map_path(path));
-                let text = std::fs::read_to_string(&map_path).map_err(|err| {
-                    // Naming the remedy, because "No such file" here is not a
-                    // missing index — the store may be perfectly current and
-                    // this one derived artifact simply never written.
-                    anyhow::anyhow!(
-                        "cannot read {} ({err}). Subsystems come from the manifest: \
-run `devmap manifest {}` first, or pass --map <path>.",
-                        map_path.display(),
-                        path.display(),
-                    )
-                })?;
-                let repo_map: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
-                    anyhow::anyhow!("{} is not valid JSON: {err}", map_path.display())
-                })?;
-                (
-                    devmap_query::viz::build_map_payload(&repo_map),
-                    devmap_query::viz::render_map_html(&repo_map, &title),
-                )
-            } else {
-                let graph = graph_value_for_read(&store, &cli.db())?;
-                let options = devmap_query::viz::VizOptions {
-                    symbols: *level == HtmlLevel::Symbols,
-                    max_nodes: *max_nodes,
-                    title,
-                };
-                (
-                    devmap_query::viz::build_payload(&graph, &options),
-                    devmap_query::viz::render_html(&graph, &options),
-                )
+            let graph = graph_value_for_read(&store, &cli.db())?;
+            let options = devmap_query::viz::VizOptions {
+                symbols: *level == HtmlLevel::Symbols,
+                max_nodes: *max_nodes,
+                title,
             };
+            let payload = devmap_query::viz::build_payload(&graph, &options);
+            let html = devmap_query::viz::render_html(&graph, &options);
 
             let destination = out
                 .clone()
@@ -4580,11 +4542,6 @@ run `devmap manifest {}` first, or pass --map <path>.",
                         // page: a capped view reported as a node count is a
                         // capped view nobody knows is capped.
                         "counts": counts,
-                        // Same rule for crossings the view could not attribute to
-                        // a subsystem. Reporting only the edges that were drawn
-                        // would let a partial attribution read as a complete map.
-                        "unresolved_handoffs": payload["unresolved_handoffs"],
-                        "unresolved_handoffs_total": payload["unresolved_handoffs_total"],
                         "bytes": html.len(),
                     }),
                 )?;
@@ -4599,15 +4556,6 @@ raise --max-nodes to widen"
                     );
                 } else {
                     println!("  {total} nodes drawn");
-                }
-                if let Some(unplaced) = payload["unresolved_handoffs_total"].as_u64() {
-                    if unplaced > 0 {
-                        let drawn = counts["links_total"].as_u64().unwrap_or(0);
-                        println!(
-                            "  {unplaced} handoff(s) not drawn: an endpoint fell outside \
-every subsystem in this map ({drawn} drawn); the page lists them"
-                        );
-                    }
                 }
             }
         }
