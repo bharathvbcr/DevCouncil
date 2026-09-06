@@ -327,6 +327,15 @@ pub const DEFAULT_MAX_IDLE_SECS: u64 = 1800;
 /// before — just 128 times fewer of them.
 pub const DEFAULT_DRAIN_BATCH_LIMIT: usize = 8192;
 
+/// How often a daemon that dropped edits retries the sweep that repairs it.
+///
+/// The repair walks the whole tree, and the condition it is waiting out — a
+/// full volume, a read-only mount — clears on human timescales, not on
+/// `idle_poll`'s. Thirty seconds is short enough that a cleared condition is
+/// noticed within one, and long enough that a store still refusing writes costs
+/// one tree walk a minute rather than one per tick.
+const RESWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
 impl Daemon {
     pub fn new(store: Store, root: std::path::PathBuf) -> Self {
         let ipc_path = default_ipc_path_for(&root);
@@ -1339,6 +1348,12 @@ impl Daemon {
         }));
 
         let mut ticker = tokio::time::interval(self.idle_poll);
+        // Far enough in the past that the first tick after a dropped batch
+        // repairs immediately rather than waiting out a full interval the
+        // failure had nothing to do with.
+        let mut last_resweep = std::time::Instant::now()
+            .checked_sub(RESWEEP_INTERVAL)
+            .unwrap_or_else(std::time::Instant::now);
         let mut consecutive_failures = 0u32;
         let mut next_attempt = tokio::time::Instant::now();
         // An untouched activity record means no consumer ever spoke to this
@@ -1432,6 +1447,49 @@ impl Daemon {
                     // where it matters most: on a repository busy enough that
                     // the queue never empties, a stale daemon would serve old
                     // answers indefinitely.
+                    // A daemon that knows it dropped edits can repair itself,
+                    // and until it does it is stuck: `UnappliedEdits` is
+                    // retired only by a completed sweep, so without this the
+                    // honest `is_fresh: false` persists until an operator
+                    // restarts the process — correct, and permanently degraded
+                    // over a condition that has usually already cleared. The
+                    // full volume that dropped the batch is emptied, the
+                    // read-only mount is remounted, and nothing notices.
+                    //
+                    // The sweep is the right repair and not merely a retry: it
+                    // is the only pass that compares every source's content
+                    // hash against the stored generation, so it re-finds
+                    // whatever the dropped batches named without needing to
+                    // know what that was — which is exactly the thing that was
+                    // lost. It is also already idempotent, because it is what
+                    // startup runs.
+                    //
+                    // Bounded by `RESWEEP_INTERVAL` rather than run every tick:
+                    // `idle_poll` is sub-second, the sweep walks the whole tree,
+                    // and a store still refusing writes would turn a repair
+                    // into a hot loop. Attempted only while degraded, so a
+                    // healthy daemon pays nothing.
+                    if should_resweep(&state.unapplied, last_resweep, std::time::Instant::now())
+                    {
+                        last_resweep = std::time::Instant::now();
+                        match self.reconcile_connect_time() {
+                            Ok(reconciled) => {
+                                info!(
+                                    "re-swept the tree after edits this daemon could not \
+                                     record; {reconciled} changed path(s) queued and the \
+                                     staleness is retired"
+                                );
+                                state.unapplied.cleared_by_sweep();
+                            }
+                            // Still refused. The record stands, which is the
+                            // point: a repair that could not run must not
+                            // report what one that ran and succeeded reports.
+                            Err(err) => warn!(
+                                "re-sweep after unrecorded edits failed; this daemon stays \
+                                 stale and will try again in {RESWEEP_INTERVAL:?}: {err}"
+                            ),
+                        }
+                    }
                     if should_retire_for_new_binary(started_as, executable_identity()) {
                         info!(
                             "devmap binary changed on disk since this daemon started; \
@@ -1643,6 +1701,25 @@ pub(crate) fn note_watch_batch<F>(
             unapplied.record(paths.len(), &err);
         }
     }
+}
+
+/// Whether a daemon that dropped edits should try the sweep that repairs it.
+///
+/// Two conditions, and both matter. A healthy daemon must never pay for a tree
+/// walk it has no reason to make; a degraded one must not turn the repair into a
+/// hot loop against a store that is still refusing writes, which is what an
+/// unbounded retry on a sub-second `idle_poll` would be.
+///
+/// A function rather than an inline `&&` so both halves can be asserted
+/// directly: the composition around it — run the sweep, clear the record —
+/// lives inside `run_loop` and is exercised end to end, but *when* it fires is
+/// the part with two ways to be wrong.
+fn should_resweep(
+    unapplied: &crate::protocol::UnappliedEdits,
+    last: std::time::Instant,
+    now: std::time::Instant,
+) -> bool {
+    !unapplied.is_empty() && now.saturating_duration_since(last) >= RESWEEP_INTERVAL
 }
 
 /// The repo-relative key `candidate` is stored under.
@@ -3598,6 +3675,48 @@ mod tests {
                     .any(|symbol| symbol.name == "new_symbol")
         }));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The repair fires only when there is something to repair, and not oftener.
+    ///
+    /// Both halves have a way to be wrong that the other hides. Without the
+    /// first, every healthy daemon walks its whole tree every 30 seconds
+    /// forever; without the second, a daemon whose store is still refusing
+    /// writes walks it every `idle_poll` — sub-second — which turns a repair
+    /// into the hot loop the drain's own backoff exists to avoid.
+    #[test]
+    fn the_repair_sweep_fires_only_while_degraded_and_not_oftener_than_its_interval() {
+        let now = std::time::Instant::now();
+        let long_ago = now.checked_sub(RESWEEP_INTERVAL).unwrap();
+        let healthy = crate::protocol::UnappliedEdits::default();
+        assert!(
+            !should_resweep(&healthy, long_ago, now),
+            "a daemon with nothing dropped has nothing to repair, however long it \
+             has been since the last attempt"
+        );
+
+        let degraded = crate::protocol::UnappliedEdits::default();
+        degraded.record(3, "database or disk is full");
+        assert!(
+            should_resweep(&degraded, long_ago, now),
+            "a daemon that dropped edits must try to repair itself rather than \
+             stay stale until an operator restarts it"
+        );
+        assert!(
+            !should_resweep(&degraded, now, now),
+            "and must not try again immediately: a store still refusing writes \
+             would make this a tree walk per tick"
+        );
+        let nearly =
+            now.checked_sub(RESWEEP_INTERVAL).unwrap() + std::time::Duration::from_millis(1);
+        assert!(
+            !should_resweep(&degraded, nearly, now),
+            "the interval is a floor, and one millisecond short of it is short of it"
+        );
+
+        // And once a sweep has succeeded there is nothing left to fire for.
+        degraded.cleared_by_sweep();
+        assert!(!should_resweep(&degraded, long_ago, now));
     }
 
     /// A store with one indexed file and one real generation.
