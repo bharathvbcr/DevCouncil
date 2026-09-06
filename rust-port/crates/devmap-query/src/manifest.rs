@@ -1039,6 +1039,54 @@ struct AreaCoupling<'edges> {
     unresolved_endpoints: usize,
 }
 
+/// Whether an edge kind means one area actually depends on another.
+///
+/// Named rather than inlined because the same set has to hold in
+/// `backend/go_orchestrator/repomap`'s `couplingKinds`, and a bare `matches!`
+/// in the middle of a loop is not a thing the other implementation can be
+/// pointed at. The two are one relation computed twice; the list has to be
+/// somewhere a reader of either can find.
+///
+/// The dependency half:
+///
+/// - `Calls` and `References` — one area's code reaches the other's.
+/// - `Imports` — the file-granular form of the same.
+/// - `Extends` and `Implements` (`inherits`/`implements` in the graph) — the
+///   *strongest* coupling there is. A subclass cannot be understood, changed,
+///   or compiled without its base, which is more binding than any call. These
+///   were omitted while the weaker relations were admitted, and the omission
+///   is not evenly distributed: imports are absent entirely in 24 of the 35
+///   languages the extractor handles, among them Java, C#, Swift, Kotlin and
+///   Scala, where inheritance is the primary way one area binds to another.
+///   Measured on a two-file Ruby corpus with no `require_relative`, the
+///   inheritance edge is the *only* edge between the two areas.
+/// - `HandlesRoute` (`routes_to`) — a route node and the handler it dispatches
+///   to. When the handler lives outside the file that declares the route, this
+///   is the only edge that says the two are bound.
+///
+/// The structural half stays out. `Contains`, `Defines` and `MemberOf` are
+/// relations inside one file and say nothing about one area depending on
+/// another; admitting them would make the neighbour rule vacuous rather than
+/// more honest.
+///
+/// The remaining kinds are deliberately not listed. `Instantiates`,
+/// `SubscribesTo`, `WiredTo`, `DependsOn` and `TaintFlow` are each arguably a
+/// coupling, but this relation is read by a write gate to *widen* what a task
+/// may touch, and each one needs its own evidence that it is a dependency and
+/// not a coincidence before it earns that. They are a separate question, not
+/// an oversight.
+pub(crate) fn is_area_coupling(kind: EdgeKind) -> bool {
+    matches!(
+        kind,
+        EdgeKind::Calls
+            | EdgeKind::References
+            | EdgeKind::Imports
+            | EdgeKind::Extends
+            | EdgeKind::Implements
+            | EdgeKind::HandlesRoute
+    )
+}
+
 /// Which areas are coupled, and how strongly, from the generation's own edges.
 ///
 /// The same derivation `backend/go_orchestrator/repomap` performs, deliberately:
@@ -1047,9 +1095,11 @@ struct AreaCoupling<'edges> {
 /// its readers come to disagree about repository structure. If the two must
 /// coexist they must at least compute the same thing.
 ///
-/// - Only `calls`, `references` and `imports` couple two areas. `contains`,
-///   `defines` and `member_of` are structural relations inside a file and say
-///   nothing about one area depending on another.
+/// - Only the kinds [`is_area_coupling`] admits couple two areas — the call,
+///   reference and import relations, plus inheritance, interface
+///   implementation and route dispatch. `contains`, `defines` and `member_of`
+///   are structural relations inside a file and say nothing about one area
+///   depending on another.
 /// - Only edges at `extracted` confidence. An `ambiguous` edge is a resolution
 ///   the analyser explicitly declined to make, and this relation is read by the
 ///   write gate to *widen* what a task may touch — a scope decision resting on
@@ -1104,10 +1154,7 @@ fn area_adjacency<'edges>(
     let mut handoffs: BTreeMap<String, BTreeMap<(&str, &str), usize>> = BTreeMap::new();
     let mut unresolved = 0usize;
     for edge in edges {
-        if !matches!(
-            edge.edge_kind,
-            EdgeKind::Calls | EdgeKind::References | EdgeKind::Imports
-        ) {
+        if !is_area_coupling(edge.edge_kind) {
             continue;
         }
         if crate::code_graph::confidence_label(edge.confidence.0) != "extracted" {
