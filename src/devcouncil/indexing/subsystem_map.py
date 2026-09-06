@@ -155,6 +155,202 @@ def are_neighbors(
     return False if can_rule_out_adjacency(data) else None
 
 
+def handoff_paths_established(data: Mapping | None) -> bool:
+    """Whether this map carries evidence that subsystem handoff paths were computed.
+
+    The same two independent positive claims :func:`neighbors_established`
+    accepts, for the same field-shaped defect: the producer's own provenance
+    marker at ``meta.devmap_rust.handoff_paths_computed``, and a non-empty
+    ``handoff_paths`` list anywhere in ``subsystems`` — a map that names one
+    crossing demonstrably computed them. The second is what answers for a map
+    written before the marker existed.
+
+    The kernel emitted ``"handoff_paths": []`` as a literal for every subsystem
+    for the whole life of the field, and it has been the only map writer since
+    the Python one was retired, so on any map built before that was fixed an
+    empty field says "this producer does not compute the field" rather than
+    "nothing here reaches another subsystem". That distinction matters more for
+    this field than for most: ``indexing/map_artifacts.py`` writes step 6 of the
+    generated agent guide as "Use ``neighbors`` and ``handoff_paths`` in
+    ``subsystems`` to follow cross-subsystem flow", so the guide sent agents to
+    a stub and the stub answered "no flow".
+    """
+    meta = (data or {}).get("meta")
+    if isinstance(meta, Mapping):
+        marker = meta.get("devmap_rust")
+        if isinstance(marker, Mapping) and marker.get("handoff_paths_computed") is True:
+            return True
+    for sub in (data or {}).get("subsystems") or []:
+        if isinstance(sub, dict) and sub.get("handoff_paths"):
+            return True
+    return False
+
+
+def _handoff_paths_answer_is_partial(data: Mapping | None) -> bool:
+    """Whether the map says its handoff lists are less than the whole relation.
+
+    Read exactly as :func:`_neighbors_answer_is_partial` reads its own, off the
+    field's own counters — and it must be its own question rather than a reuse
+    of the neighbour one, because the two cap different populations: an area
+    with two neighbors can reach them through fifty file pairs, so
+    ``neighbors_truncated: false`` says nothing about whether the handoff lists
+    are whole. The unplaceable-endpoint count is shared, because one sweep
+    produces both relations and rejects the same edges from each.
+
+    Only a positive claim counts. A map carrying no such metadata claims no
+    truncation and is answered as complete; the producer is the only thing that
+    can know.
+    """
+    meta = (data or {}).get("liveness_meta")
+    if not isinstance(meta, Mapping):
+        return False
+    subs = meta.get("subsystems")
+    if not isinstance(subs, Mapping):
+        return False
+    if subs.get("handoff_paths_truncated") is True:
+        return True
+    unresolved = subs.get("neighbors_endpoints_unresolved")
+    if isinstance(unresolved, int) and not isinstance(unresolved, bool) and unresolved > 0:
+        return True
+    shown, total = subs.get("handoff_paths_shown"), subs.get("handoff_paths_total")
+    if isinstance(shown, int) and isinstance(total, int) and not isinstance(shown, bool):
+        return total > shown
+    return False
+
+
+def can_rule_out_handoffs(data: Mapping | None) -> bool:
+    """Whether an empty ``handoff_paths`` is evidence that nothing crosses.
+
+    Both halves, the way :func:`can_rule_out_adjacency` takes both:
+    :func:`handoff_paths_established` says the producer computed the relation,
+    and it must also claim to hold all of it. A map that computed handoffs but
+    capped the lists cannot support "this subsystem reaches nothing else".
+    """
+    return handoff_paths_established(data) and not _handoff_paths_answer_is_partial(data)
+
+
+def handoff_paths_for_area(area: str | None, data: Mapping | None) -> list[str] | None:
+    """Declared handoff paths for ``area``: a list, or ``None`` for unknown.
+
+    ``None`` is the honest answer when the map never established the relation,
+    or holds only part of it — the same tri-state, and the same reason, as
+    :func:`are_neighbors` and :func:`is_entry_root`. A *non-empty* list is
+    definite whatever else the map omits; it is only the empty one that has to
+    prove the producer was in a position to give it.
+    """
+    if not area:
+        return None
+    for sub in (data or {}).get("subsystems") or []:
+        if isinstance(sub, dict) and str(sub.get("area")) == area:
+            listed = [str(h) for h in (sub.get("handoff_paths") or [])]
+            if listed:
+                return listed
+            return [] if can_rule_out_handoffs(data) else None
+    return None
+
+
+def role_files_established(data: Mapping | None) -> bool:
+    """Whether this map carries evidence that subsystem role buckets were computed.
+
+    The same two positive claims :func:`neighbors_established` and
+    :func:`handoff_paths_established` accept, for the third field that carried
+    the identical defect: the producer's marker at
+    ``meta.devmap_rust.role_files_computed``, and a non-empty ``role_files``
+    anywhere in ``subsystems``.
+
+    The kernel emitted ``"role_files": {}`` for every subsystem for the field's
+    whole life, so on any map built before that was fixed an empty mapping says
+    "this producer does not compute the field" rather than "this subsystem has
+    no recognisable roles". Four readers took the generated agent guide's step 5
+    at its word and got nothing back, one of them functionally:
+    :mod:`devcouncil.verification.test_resolver` resolves a subsystem's tests
+    through ``role_files["tests"]``, so a change with no direct test importer
+    had no fallback at all.
+    """
+    meta = (data or {}).get("meta")
+    if isinstance(meta, Mapping):
+        marker = meta.get("devmap_rust")
+        if isinstance(marker, Mapping) and marker.get("role_files_computed") is True:
+            return True
+    for sub in (data or {}).get("subsystems") or []:
+        if isinstance(sub, dict) and sub.get("role_files"):
+            return True
+    return False
+
+
+def _role_files_answer_is_partial(data: Mapping | None) -> bool:
+    """Whether the map says its role buckets are less than the whole inventory.
+
+    Almost always ``True`` where the field is computed at all, and that is the
+    point: the buckets are capped per role, so they are a sample for
+    orientation. Read off the field's own counters, never the neighbour or
+    handoff ones — the three cap different populations.
+    """
+    meta = (data or {}).get("liveness_meta")
+    if not isinstance(meta, Mapping):
+        return False
+    subs = meta.get("subsystems")
+    if not isinstance(subs, Mapping):
+        return False
+    if subs.get("role_files_truncated") is True:
+        return True
+    shown, total = subs.get("role_files_shown"), subs.get("role_files_total")
+    if isinstance(shown, int) and isinstance(total, int) and not isinstance(shown, bool):
+        return total > shown
+    return False
+
+
+def role_files_are_complete(data: Mapping | None) -> bool:
+    """Whether a role bucket may be read as the subsystem's whole inventory.
+
+    Both halves, as :func:`can_rule_out_adjacency` takes both. In practice this
+    is ``False`` on any real map, which is the honest answer: ``role_files``
+    is documented as a capped sample, and a consumer that needs completeness
+    goes to ``files`` or reads ``role_file_counts`` for the real total.
+    """
+    return role_files_established(data) and not _role_files_answer_is_partial(data)
+
+
+def role_files_for_area(area: str | None, data: Mapping | None) -> dict[str, list[str]] | None:
+    """Declared role buckets for ``area``: a mapping, or ``None`` for unknown.
+
+    ``None`` means the map never established the relation, so neither "these are
+    the roles" nor "there are none" is supportable. A *populated* mapping is
+    returned as-is and is definite — it is only the empty one that has to prove
+    the producer was in a position to give it.
+    """
+    if not area:
+        return None
+    for sub in (data or {}).get("subsystems") or []:
+        if isinstance(sub, dict) and str(sub.get("area")) == area:
+            listed = sub.get("role_files")
+            if isinstance(listed, Mapping) and listed:
+                return {str(k): [str(p) for p in (v or [])] for k, v in listed.items()}
+            return {} if role_files_established(data) else None
+    return None
+
+
+def role_file_total(area: str | None, role: str, data: Mapping | None) -> int | None:
+    """The real number of files in ``area``'s ``role`` bucket, or ``None``.
+
+    ``role_files[role]`` is capped at a handful of examples, so its length is
+    the size of a sample and never an inventory. This reads the companion
+    ``role_file_counts`` the producer writes beside it; ``None`` means the map
+    does not carry the total, and the sample must not be reported as one.
+    """
+    if not area:
+        return None
+    for sub in (data or {}).get("subsystems") or []:
+        if isinstance(sub, dict) and str(sub.get("area")) == area:
+            counts = sub.get("role_file_counts")
+            if isinstance(counts, Mapping):
+                value = counts.get(role)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    return value
+            return None
+    return None
+
+
 def dependents_of(path: str, data: Mapping | None) -> list[str]:
     """Files that import ``path`` (reverse-import blast radius), from the map.
 
