@@ -843,9 +843,20 @@ fn k2_incremental_vacuum_frees_every_page_it_was_asked_for() {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         conn.execute_batch("CREATE TABLE ballast (id INTEGER PRIMARY KEY, blob BLOB)")
             .unwrap();
+        // Ballast scaled to the page size, so the fixture means the same thing
+        // whatever it is. The assertions below are in *pages*, and a fixed byte
+        // volume is a different number of pages on a different page size: 8 MB
+        // is ~2,000 pages at 4 KiB and ~500 at 16 KiB, which silently turned
+        // this precondition into a failure when the store's page size was
+        // raised. Scaling the rows keeps the page count — and therefore every
+        // threshold below — comparable.
+        let page_size: i64 = conn
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .unwrap();
+        let rows = 2000 * page_size / 4096;
         let payload = vec![b'x'; 4000];
         let tx = conn.unchecked_transaction().unwrap();
-        for id in 0..2000 {
+        for id in 0..rows {
             tx.execute(
                 "INSERT INTO ballast (id, blob) VALUES (?1, ?2)",
                 rusqlite::params![id, payload],

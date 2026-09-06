@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # Sustained-load soak: repeated edit -> rebuild -> query cycles against one
 # store, asserting that nothing drifts over time. The gates prove a *single*
 # build is correct; this proves the hundredth is too.

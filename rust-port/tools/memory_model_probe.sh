@@ -75,6 +75,44 @@ MIN_DEFS=16
 EDGE_CAP_MILLI=800000
 #
 # The model coefficient used for the prediction check, set to the measured mean.
+#
+# STALE, and knowingly so — bisected 2026-09-06, not re-derived here.
+#
+# 410 was measured on 2026-08-17 (0809dec), and that commit still reproduces it
+# exactly: 415,334 milli-bytes/edge, 100% of prediction. Current HEAD measures
+# 718,000-752,000 at this corpus size. `git bisect` over the 182 commits between
+# them lands on 079bc505 (2026-09-02, "close the eight gortex capability gaps"),
+# which rewrote 767 lines of the resolver and added `ResolvedEdge::evidence`.
+# The measurements were bimodal across every bisect step (~404k good vs ~718k
+# bad), so the landing is not a noise artefact.
+#
+# Three mechanisms were proposed and each ruled out by measurement, which is
+# why the number is left alone rather than adjusted to fit:
+#
+#   parallel resolution   RAYON_NUM_THREADS=1/2/4/18 gives 718k/738k/736k/749k.
+#                         Flat. Not concurrent per-thread buffers.
+#   2x parallel collect   the merge already consumes `per_file` by value.
+#   growth reallocation   reserving the exact total before the merge changed
+#                         nothing (716k vs 719k baseline); reverted unshipped.
+#
+# What it *is*: sampling RSS against the phase boundaries on a 810,080-edge
+# corpus puts 459 MiB of a 594 MiB peak inside resolution — 67 MiB at the end of
+# extraction, 526 MiB at the end of resolve — and it stays resident through
+# analyze and persist. That is the `Vec<ResolvedEdge>` itself, held by design,
+# not a leak. The edge grew; the coefficient did not.
+#
+# The coefficient is also scale-dependent, which this linear model does not
+# express: 745,267 milli-bytes/edge at the default 5,000 ambiguous sites against
+# 550,092 at 50,000 (DEVMAP_PROBE_CALLERS=1000), where the per-pair bound passes
+# at 34,380 against its 40,000 cap. The default corpus sits in a small-scale
+# regime where fixed cost is a large share of the delta, so it reports the
+# harshest number of any size this probe can be run at.
+#
+# Re-deriving it means choosing a new safety bound, which is a decision about
+# how much memory this phase is allowed to cost — not a side effect of finding
+# out why it moved. Left red on purpose: a gate reporting a real change is doing
+# its job, and quietly widening it to green is the one response the SC27 note
+# below rules out.
 MODEL_EDGE_BYTES=410
 # The model held to within 0.5% at this shape and 3.4% across an 8x scale sweep.
 # +25% is far outside that, so a trip is a real change in cost per edge. The
@@ -150,12 +188,38 @@ field() { # <metrics line> <key>
   printf '%s\n' "$1" | tr ' ' '\n' | awk -F= -v k="$2" '$1==k {print $2; exit}'
 }
 
+# The resolver emits at most `AMBIGUOUS_FANOUT_CAP` edges per ambiguous site,
+# so the corpus's declaration count is not the fan-out the store ends up with.
+# The probe used to compute its expectations from DEFS alone and assert the
+# derived width equalled it. That assertion was written before the cap existed;
+# once the cap landed the probe could not pass at any DEFS above it, and it
+# failed with "derived widest fan-out 16, corpus has 100" — the probe was wrong,
+# not the kernel.
+#
+# Read from the Rust constant rather than repeated here, the same way verify.sh
+# reads DB_SIZE_GATE_PER_FILE: two copies of a policy is how the last one
+# drifted.
+FANOUT_CAP=$(grep -oE 'AMBIGUOUS_FANOUT_CAP: usize = [0-9]+' \
+  crates/devmap-resolve/src/model.rs | grep -oE '[0-9]+$')
+[ -n "$FANOUT_CAP" ] || { echo "PROBE FAIL: cannot read AMBIGUOUS_FANOUT_CAP"; exit 1; }
+EFFECTIVE_DEFS=$DEFS
+[ "$EFFECTIVE_DEFS" -le "$FANOUT_CAP" ] || EFFECTIVE_DEFS=$FANOUT_CAP
+
 FILES=$((DEFS + CALLERS))
 SITES=$((CALLERS * FNS * CALLEES))
-EXPECT_EDGES=$((SITES * DEFS))
-EXPECT_SUM_N2=$((SITES * DEFS * DEFS))
+EXPECT_EDGES=$((SITES * EFFECTIVE_DEFS))
+EXPECT_SUM_N2=$((SITES * EFFECTIVE_DEFS * EFFECTIVE_DEFS))
 
-echo "CAPPED: this probe builds a synthetic ${FILES}-file corpus (Sum(N^2) = ${EXPECT_SUM_N2}, widest fan-out ${DEFS})."
+# The bytes-per-pair bound is valid above a minimum *emitted* width, which is
+# this one and not DEFS: lowering the cap below MIN_DEFS would silently move the
+# probe into the regime where a corpus can exceed PAIR_CAP_MILLI while using no
+# more memory per edge. Fail rather than report a bound that no longer holds.
+[ "$EFFECTIVE_DEFS" -ge "$MIN_DEFS" ] || {
+  echo "PROBE FAIL: emitted fan-out $EFFECTIVE_DEFS (DEFS=$DEFS capped at $FANOUT_CAP) is below the \
+minimum width $MIN_DEFS the bytes-per-pair bound is valid for"
+  exit 1; }
+
+echo "CAPPED: this probe builds a synthetic ${FILES}-file corpus (Sum(N^2) = ${EXPECT_SUM_N2}, widest emitted fan-out ${EFFECTIVE_DEFS} = min(DEFS ${DEFS}, cap ${FANOUT_CAP}))."
 echo "CAPPED: the production corpus is 12,831 files and is NOT built here. This bounds the per-pair and"
 echo "CAPPED: per-edge memory coefficients, which are corpus-size invariant; it does not bound any real"
 echo "CAPPED: repository's absolute peak. Raise DEVMAP_PROBE_CALLERS to scale the probe up locally."
@@ -188,7 +252,7 @@ echo "probe: peak RSS ambiguous $((RSS_AMB / 1024 / 1024)) MiB, control $((RSS_C
 # here at 10^7 scale: a grouping key that were merely plausible would still have
 # to reproduce SITES x DEFS^2 exactly.
 [ "$GOT_SITES" -eq "$SITES" ] || { echo "PROBE FAIL: derived $GOT_SITES ambiguous sites, corpus has $SITES"; exit 1; }
-[ "$GOT_MAX" -eq "$DEFS" ] || { echo "PROBE FAIL: derived widest fan-out $GOT_MAX, corpus has $DEFS"; exit 1; }
+[ "$GOT_MAX" -eq "$EFFECTIVE_DEFS" ] || { echo "PROBE FAIL: derived widest fan-out $GOT_MAX, corpus emits $EFFECTIVE_DEFS (DEFS=$DEFS, cap=$FANOUT_CAP)"; exit 1; }
 [ "$EDGES" -eq "$EXPECT_EDGES" ] || { echo "PROBE FAIL: derived Sum(N)=$EDGES, corpus has $EXPECT_EDGES"; exit 1; }
 [ "$SUM_N2" -eq "$EXPECT_SUM_N2" ] || { echo "PROBE FAIL: derived Sum(N^2)=$SUM_N2, corpus has $EXPECT_SUM_N2"; exit 1; }
 # The control must contain no ambiguity at all, or it is not a base measurement
