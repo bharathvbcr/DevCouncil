@@ -4509,7 +4509,9 @@ touched here.
 ## Refusal inventory and edge resolution (2026-09-06)
 
 Two open items from the previous pass, on branch `claude/devmap-open-items`
-(forked from `main` at `385baa0`, merged forward to `e1ff55f` before the gate).
+(forked from `main` at `385baa0`; merged forward to `e1ff55f` before the work
+and to `4994695` after it, the second merge conflicting only in this file —
+both sections kept, newest last).
 
 ### 1. `discovery_refused_files` became an inventory — **closed**, `5fd2a8c`
 
