@@ -542,6 +542,25 @@ class MapBench:
                 result[f"{key}_bytes"] = float(artifact.stat().st_size)
             except OSError:
                 result[f"{key}_bytes"] = -1.0
+        # W4.3: how much of what was extracted the resolver could attribute,
+        # beside how long extracting it took. Read from the manifest this stage
+        # just wrote, so it describes the same generation the byte counts do
+        # rather than a second build's.
+        #
+        # A rate the kernel did not report is simply absent — a build with no
+        # call site anywhere has no rate, and rendering that as 0.0 would make a
+        # corpus the resolver handled perfectly look like a total failure.
+        try:
+            manifest = json.loads(self.map_out.read_text(encoding="utf-8"))
+            rate = manifest.get("resolution_rate")
+            if isinstance(rate, dict):
+                for key in ("resolved_sites", "unresolved_sites", "explained_sites"):
+                    if isinstance(rate.get(key), int):
+                        result[key] = float(rate[key])
+                if isinstance(rate.get("net_permille"), int):
+                    result["net_resolution_permille"] = float(rate["net_permille"])
+        except (OSError, ValueError):
+            pass
         return result
 
     # -- query stages ------------------------------------------------------
@@ -582,7 +601,122 @@ class MapBench:
         result["rss_bytes"] = float(
             peak_rss_bytes([*self._base_argv(), "dead"], cwd=self.repo)
         )
+        # W4.3: how fast the answer arrives, beside whether it is right.
+        #
+        # The latency above is measured on this benchmark's corpus, which has no
+        # ground truth. The accuracy below is measured on the labelled corpus,
+        # with *this* binary — the one being benchmarked, not whatever
+        # `cargo test` happens to have built. That is the whole point: a change
+        # that buys speed by dropping edges should be visible in the same table
+        # as the speed it bought.
+        result.update(self._score_labelled_corpus())
         return result
+
+    def _score_labelled_corpus(self) -> Dict[str, float]:
+        """Precision and recall of `dead`, against W4.1's hand-labelled truth.
+
+        Returns an empty dict when the corpus is not present — this benchmark
+        runs against arbitrary checkouts, and a missing fixture set is a reason
+        to report nothing rather than to report zero. A precision of 0.0 and
+        "no corpus to score" must never render the same.
+        """
+        golden = REPO_ROOT / "rust-port" / "testdata" / "golden"
+        if not golden.is_dir():
+            return {}
+
+        claims = 0
+        correct = 0
+        labelled_dead = 0
+        found = 0
+        scored_fixtures = 0
+
+        with tempfile.TemporaryDirectory(prefix="devmap-precision-") as scratch:
+            for truth_path in sorted(golden.glob("*/truth.json")):
+                try:
+                    truth = json.loads(truth_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                source = REPO_ROOT / "rust-port" / str(truth.get("source") or "")
+                if not source.is_dir():
+                    continue
+                labels = {
+                    str(entry["symbol_id"]): bool(entry["live"])
+                    for entry in truth.get("symbols", [])
+                    if isinstance(entry, dict) and "symbol_id" in entry
+                }
+                if not labels:
+                    continue
+
+                work = Path(scratch) / truth_path.parent.name
+                shutil.copytree(source, work)
+                manifest_out = work / "repo_map.json"
+                try:
+                    run([self.binary, "build", "."], cwd=work, timeout=300.0)
+                    raw = run(
+                        [self.binary, "--json", "dead", "--budget", "100000"],
+                        cwd=work,
+                        timeout=300.0,
+                    ).stdout
+                    verdict = json.loads(raw.splitlines()[0])
+                    # Both lists, or the number disagrees with the one
+                    # `labelled_corpus_precision.rs` reports for the same binary
+                    # on the same corpus. `dead` answers with single symbols;
+                    # the abandoned-cycle shape lands in `dead_clusters`,
+                    # because every member has an inbound edge from another
+                    # member and the one-hop join cannot see it. Scoring only
+                    # the first credits the kernel with a recall it does not
+                    # have and charges it for a miss it already reports.
+                    run(
+                        [
+                            self.binary,
+                            "manifest",
+                            ".",
+                            "--output",
+                            str(manifest_out),
+                            "--force",
+                        ],
+                        cwd=work,
+                        timeout=300.0,
+                    )
+                    manifest = json.loads(manifest_out.read_text(encoding="utf-8"))
+                except (BenchError, OSError, ValueError, IndexError):
+                    # A fixture this binary cannot index is not a scoring input.
+                    # Counting it as a perfect score would be the same lie as
+                    # counting a check that could not run as one that passed.
+                    continue
+
+                scored_fixtures += 1
+                claimed = {
+                    f"{item.get('file_path')}::{item.get('symbol_name')}"
+                    for item in (verdict.get("items") or [])
+                }
+                for cluster in manifest.get("dead_clusters") or []:
+                    if isinstance(cluster, dict):
+                        claimed.update(
+                            str(member) for member in (cluster.get("members") or [])
+                        )
+                claims += len(claimed)
+                correct += sum(1 for symbol in claimed if labels.get(symbol) is False)
+                fixture_dead = {s for s, live in labels.items() if not live}
+                labelled_dead += len(fixture_dead)
+                found += len(fixture_dead & claimed)
+
+        if not scored_fixtures:
+            return {}
+        scores: Dict[str, float] = {
+            "accuracy_fixtures": float(scored_fixtures),
+            "accuracy_claims": float(claims),
+            "accuracy_labelled_dead": float(labelled_dead),
+        }
+        # Reported only when there is something to divide by. A tool that
+        # claimed nothing has not been shown to be precise, and rendering that
+        # as 1.0 is exactly the "absence read as evidence" this kernel spends
+        # its effort avoiding.
+        if claims:
+            scores["precision"] = correct / claims
+        if labelled_dead:
+            scores["recall"] = found / labelled_dead
+        return scores
 
     # -- growth ------------------------------------------------------------
 
@@ -810,6 +944,47 @@ def render_markdown(payload: Dict[str, object]) -> str:
             f"Artifacts: `repo_map.json` {int(manifest['map_bytes']) / 1e6:.2f} MB, "
             f"`code_graph.json` {int(manifest['graph_bytes']) / 1e6:.2f} MB",
         ]
+
+    # W4.3: cost and correctness in one report, so a change that buys speed by
+    # dropping edges is visible beside the speed it bought.
+    dead = stages.get("dead") or {}
+    manifest_stage = stages.get("manifest") or {}
+    accuracy: List[str] = []
+    if dead.get("accuracy_fixtures"):
+        claims = int(dead.get("accuracy_claims", 0))
+        labelled = int(dead.get("accuracy_labelled_dead", 0))
+        precision = (
+            f"{dead['precision']:.3f}"
+            if "precision" in dead
+            # Not 1.0. A tool that claimed nothing has not been shown to be
+            # precise, only silent, and the two must not print the same.
+            else "n/a (claimed nothing)"
+        )
+        recall = f"{dead['recall']:.3f}" if "recall" in dead else "n/a (nothing labelled dead)"
+        accuracy += [
+            "",
+            "## `dead` accuracy",
+            "",
+            f"Scored with **this binary** against the hand-labelled corpus "
+            f"(`rust-port/testdata/golden/*/truth.json`), "
+            f"{int(dead['accuracy_fixtures'])} fixture(s).",
+            "",
+            f"- precision: {precision} ({claims} claim(s))",
+            f"- recall: {recall} ({labelled} labelled dead)",
+        ]
+    if "net_resolution_permille" in manifest_stage:
+        resolved = int(manifest_stage.get("resolved_sites", 0))
+        unresolved = int(manifest_stage.get("unresolved_sites", 0))
+        explained = int(manifest_stage.get("explained_sites", 0))
+        accuracy += [
+            "",
+            "## Call resolution",
+            "",
+            f"- net rate: {manifest_stage['net_resolution_permille'] / 10:.1f}% "
+            f"({resolved} resolved, {unresolved} unresolved, {explained} of those "
+            "explained by a builtin, a host global or an import)",
+        ]
+    lines += accuracy
 
     comparison = payload.get("comparison")
     if comparison:
