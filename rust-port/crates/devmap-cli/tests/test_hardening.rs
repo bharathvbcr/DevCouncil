@@ -744,13 +744,21 @@ fn test_dead_code_detection() {
     assert!(test_sym.is_exempt);
     assert!(test_sym.confidence < 0.5); // Should be 0.3 based on specs
 
-    // Function in file with @app.route -> exempt
+    // Function behind `@app.route` -> reached, not merely exempt.
+    //
+    // This asserted "dead but exempt" for as long as `@app.route` produced no
+    // route: the exemption was a heuristic standing in for an edge that did not
+    // exist. It exists now, so `handle` is reached from outside the call graph
+    // and is not a dead candidate at all — a stronger claim, and the one the
+    // `HandlesRoute` edge actually supports.
     let route_sym = analysis
         .dead_symbols
         .iter()
-        .find(|l| l.symbol_name == "handle" && l.file_path == "src/route.py")
-        .unwrap();
-    assert!(route_sym.is_exempt);
+        .find(|l| l.symbol_name == "handle" && l.file_path == "src/route.py");
+    assert!(
+        route_sym.is_none(),
+        "a routed handler is reached, not a dead candidate carrying an exemption: {route_sym:?}"
+    );
 
     // Function in generated _pb2.py -> exempt
     let pb2_sym = analysis
