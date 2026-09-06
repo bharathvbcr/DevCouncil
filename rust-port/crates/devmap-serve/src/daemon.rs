@@ -1931,9 +1931,13 @@ mod tests {
         // produce, exactly as two schema bumps left DevCouncil's own store.
         {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
+            // `generation_files` is a view since schema v17; the identity now
+            // lives on the payload the current generation's rows point at.
             conn.execute(
-                "UPDATE generation_files SET analyzer_version = '0.0.9:extract-v1'
-                 WHERE generation_id = (SELECT max(id) FROM generations)",
+                "UPDATE file_payloads SET analyzer_version = '0.0.9:extract-v1'
+                  WHERE payload_id IN (
+                        SELECT payload_id FROM generation_file_rows
+                         WHERE generation_id = (SELECT max(id) FROM generations))",
                 [],
             )
             .unwrap();

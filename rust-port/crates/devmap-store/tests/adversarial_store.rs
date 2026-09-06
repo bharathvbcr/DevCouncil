@@ -842,10 +842,17 @@ fn the_extraction_cache_fallback_uses_an_index_rather_than_scanning() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    // The index this migration created has a successor. v17 split the payload
+    // out of `generation_files` into a content-addressed `file_payloads`, so
+    // the same four identity columns are now indexed over **one row per
+    // distinct payload** rather than one per generation and file — which is
+    // strictly what v13's own rationale asked for, since it described the old
+    // shape as a scan "whose rows each carry a ~47 KB `extraction_json` the
+    // scan must skip past to reach the identity columns".
     let has_index: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master
-              WHERE type = 'index' AND name = 'idx_generation_files_cache_identity'",
+              WHERE type = 'index' AND name = 'idx_file_payloads_identity'",
             [],
             |row| row.get(0),
         )
@@ -853,6 +860,28 @@ fn the_extraction_cache_fallback_uses_an_index_rather_than_scanning() {
     assert_eq!(
         has_index, 1,
         "migrating a v12 store did not create the extraction-cache index"
+    );
+    // And the plan, which is what the index is *for* — asserted on the migrated
+    // store as well as the fresh one, because an index that exists and is not
+    // used costs write time and buys nothing.
+    let migrated_plan: Vec<String> = conn
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT extraction_json FROM generation_files
+              WHERE content_hash = ?1 AND language = ?2
+                AND grammar_version = ?3 AND analyzer_version = ?4
+              LIMIT 1",
+        )
+        .unwrap()
+        .query_map(params_for_plan(), |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let migrated_rendered = migrated_plan.join(" | ");
+    assert!(
+        migrated_rendered.contains("SEARCH") && migrated_rendered.contains("USING INDEX"),
+        "after migrating, the extraction-cache fallback plans as \
+         {migrated_rendered:?}"
     );
     let _ = fs::remove_dir_all(&dir);
 }

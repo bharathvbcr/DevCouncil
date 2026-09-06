@@ -5274,3 +5274,110 @@ cap-*active* fixture — 40 declarations of one name, 16 edges emitted, 40
 candidates weighed. That second fixture is the one the old one could not be: on
 a 3-candidate corpus candidates and edges coincide, so a column that merely
 echoed the group size would pass there and fail here.
+
+## One payload per file, not per generation (B3, 2026-09-06)
+
+`AGENT_PLAN.md` carried B3 as "write amplification — decision (#2), unstarted".
+The premise was right and the cost was in a different place than the plan said.
+
+### Where it actually was
+
+`PLAN.md` §7.5 frames B3 as row count: "each generation re-materialises all
+59,880 membership rows". Measured on this repository, two generations apart by
+one appended line in one file:
+
+| | rows | bytes |
+|---|---|---|
+| `generation_files` | 3,062 | **169 MB** |
+| `generation_unresolved` | 89,537 | 59 MB |
+| `generation_edges` | 96,525 | 38 MB |
+| `generation_nodes` | 17,475 | 5.5 MB |
+
+**`generation_files` is 54% of a 302.8 MB store on 1,531 rows per generation**,
+because each row carries a serialized `Extraction` averaging 53.7 KB. And
+**1,530 of the 3,062 rows were byte-identical duplicates**: one file changed,
+and the other 1,530 payloads were read out of SQLite, moved through Rust one row
+at a time, and written back. The carry-forward B3's first half added avoids
+re-*deriving* an unchanged payload; it still re-*materialises* it.
+
+So the row count was the visible symptom and the bytes were the cost. A
+membership row is 16 bytes; 1,531 of them is 24 KB.
+
+### Schema v17
+
+One payload per **(file, content, language, grammar, analyzer)** in
+`file_payloads`, one 16-byte row per generation in `generation_file_rows`, and
+`generation_files` kept as a **view** over the join with its exact column set —
+so all twenty-five read sites across five crates, `tools/fanout.sql` and a dozen
+tests are unchanged. What a generation holds for a file has not changed, only
+where the bytes live.
+
+The key is the one v13 already indexed `generation_files` on for the
+extraction-cache fallback, describing it then as a scan "whose rows each carry a
+~47 KB `extraction_json` the scan must skip past to reach the identity columns".
+It no longer skips past anything.
+
+Measured A/B on one fixture, same command, pre-change binary built from
+`7dfa20f`:
+
+| payload bytes added by a one-file edit | before | after |
+|---|---|---|
+| against 100,165 already stored | **100,432 (100%)** | **1,908 (1%)** |
+
+And on this repository: store after the same edit **302.8 MB → 217.6 MB**
+(−28%), `extraction_json` **164.5 MB → 82.4 MB** (−50%, the duplicate half
+exactly), payload rows **3,062 → 1,533** — one per file, shared by both
+generations.
+
+### The bug the symlink test caught
+
+`file_id` is in the payload identity, and the first version of this did not have
+it. A payload is a serialized `Extraction` and an `Extraction` **carries its own
+`file_path`**, so content-addressing alone collapses two byte-identical files
+into one payload and makes both membership rows report the same path. A symlink
+and its target are byte-identical by construction:
+`a_cold_build_indexes_an_in_root_symlink_and_a_drain_of_it_keeps_the_symbol`
+failed on the first run with "the cold walk indexes the link, got []", and it
+passes at `7dfa20f`, so it was a real regression and not a stale fixture.
+
+Nothing is lost by narrowing the key: what B3 deduplicates is the same file,
+unchanged, across generations — 1,530 of the 1,530 duplicates measured.
+
+### What is left, with its measured size
+
+`generation_edges` (96,525 rows) and `generation_unresolved` (89,537) are still
+re-materialised per generation, about **67 MB** of the remaining growth. They are
+not content-addressable per file the way a payload is: an edge's target depends
+on the whole corpus, so carrying one forward because its *source* file did not
+change would be wrong when a rename elsewhere moved the target. That needs the
+validity-range treatment — one row with `[valid_from, valid_to)` rather than one
+row per generation — and it is B3's second half.
+
+It is recorded here with its number rather than asserted by a red test, because
+a failing test standing in for unfinished work reports the same thing as a
+broken one. `a_one_file_edit_writes_one_file_of_rows.rs` says the same in its
+header, beside the invariant that now holds.
+
+### Blast radius, and what it cost
+
+Six test fixtures wrote `generation_files` directly to age or corrupt a stored
+payload; a view is not updatable, so each was repointed at `file_payloads`. One
+of them — `age_stored_payloads` — became three statements rather than one,
+because aging a payload *changes its identity* and a store aged twice can
+already hold the aged twin: age what can be aged, repoint anything whose twin
+exists, drop what nothing points at. The unique constraint found that, which is
+what a unique constraint is for.
+
+Two migration steps needed guards they did not need before: v13's
+`CREATE INDEX ON generation_files` is not legal against a view, and v17's own
+step probes for the view rather than for a column.
+
+### Gate ledger
+
+| check | result |
+|---|---|
+| `cargo test --workspace` | **1,699 passed / 0 failed** |
+| `bash ./verify.sh` | **ALL GATES GREEN** (9/9) |
+| `cargo fmt --all --check` | clean |
+| `cargo clippy --workspace --all-targets -D warnings` | clean |
+| cold-build store, this repository | 143 MiB |

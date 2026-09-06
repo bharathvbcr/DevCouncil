@@ -15,9 +15,9 @@ use crate::edge_index::ResolutionSource;
 use crate::schema::{
     BUILD_HISTORY_RETENTION, BUILD_HISTORY_TABLE, COVERAGE_GAPS_TABLE, CREATE_SCHEMA_V3,
     CURRENT_SCHEMA_VERSION, MIGRATION_V10_TO_V11, MIGRATION_V11_TO_V12, MIGRATION_V12_TO_V13,
-    MIGRATION_V14_TO_V15, MIGRATION_V15_TO_V16, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5,
-    MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9,
-    MIGRATION_V9_TO_V10, UNRESOLVED_TABLE,
+    MIGRATION_V14_TO_V15, MIGRATION_V15_TO_V16, MIGRATION_V16_TO_V17, MIGRATION_V3_TO_V4,
+    MIGRATION_V4_TO_V5, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8,
+    MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, UNRESOLVED_TABLE,
 };
 
 /// Failed drain attempts after which a pending path stops being retried.
@@ -941,6 +941,22 @@ pub fn checked_min_confidence(value: f32) -> Result<f32> {
 /// `_config`) are deliberately absent — SQLite owns their layout and it is not
 /// this crate's to assert. `nodes_fts` itself is this crate's DDL and is
 /// searched by column name, so it is asserted.
+/// One stored extraction payload, as `file_payloads` holds it.
+///
+/// A struct rather than eight positional parameters: five of the eight are
+/// `&str`, so a transposed pair would compile and store an engine description
+/// in the parse-outcome column. Named fields make that a compile error.
+struct StoredPayload<'a> {
+    file_id: u32,
+    content_hash: i64,
+    language: &'a str,
+    grammar_version: &'a str,
+    analyzer_version: &'a str,
+    parse_outcome_json: &'a str,
+    engine_json: &'a str,
+    extraction_json: &'a str,
+}
+
 const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
     ("paths", &["id", "path"]),
     (
@@ -1222,6 +1238,96 @@ impl Store {
         names.try_fold(false, |found, name| Ok(found || name? == column))
     }
 
+    /// The id of the stored payload with this identity, inserting it if new.
+    ///
+    /// Keyed by the **file** plus the four fields the extraction cache keys on.
+    ///
+    /// `file_id` is in the key and must be: a payload is a serialized
+    /// `Extraction`, which carries its own `file_path`, so content-addressing
+    /// alone collapses two byte-identical files into one payload and makes both
+    /// report the same path. A symlink and its target are byte-identical by
+    /// construction, and the end-to-end symlink test caught exactly that on the
+    /// first run.
+    ///
+    /// What B3 deduplicates is the same file, unchanged, across generations —
+    /// 1,530 of the 1,530 duplicate rows measured on this repository — so
+    /// nothing real is lost by narrowing the key.
+    ///
+    /// SELECT-then-INSERT rather than an upsert because the unique index is on
+    /// COALESCE expressions — `grammar_version` and `analyzer_version` are
+    /// nullable and SQLite treats NULLs as distinct inside a UNIQUE index, so a
+    /// plain constraint would let identical NULL-version payloads both insert.
+    /// The probe uses the same expressions the index does. Safe without a
+    /// retry loop: every caller holds the generation write transaction, and the
+    /// store has one writer.
+    fn ensure_payload_id(tx: &Connection, payload: StoredPayload<'_>) -> Result<i64> {
+        let StoredPayload {
+            file_id,
+            content_hash,
+            language,
+            grammar_version,
+            analyzer_version,
+            parse_outcome_json,
+            engine_json,
+            extraction_json,
+        } = payload;
+        if let Some(id) = tx
+            .prepare_cached(
+                "SELECT payload_id FROM file_payloads
+                  WHERE file_id = ?1 AND content_hash = ?2 AND language = ?3
+                    AND COALESCE(grammar_version, '') = ?4
+                    AND COALESCE(analyzer_version, '') = ?5",
+            )?
+            .query_row(
+                params![
+                    file_id,
+                    content_hash,
+                    language,
+                    grammar_version,
+                    analyzer_version
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            return Ok(id);
+        }
+        tx.prepare_cached(
+            "INSERT INTO file_payloads
+             (file_id, content_hash, language, grammar_version, analyzer_version,
+              parse_outcome_json, engine_json, extraction_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?
+        .execute(params![
+            file_id,
+            content_hash,
+            language,
+            grammar_version,
+            analyzer_version,
+            parse_outcome_json,
+            engine_json,
+            extraction_json
+        ])?;
+        Ok(tx.last_insert_rowid())
+    }
+
+    /// Whether `name` exists and is a base table rather than a view.
+    ///
+    /// The migration chain runs over both a genuine old store and a
+    /// freshly-created one carrying the current shape, so a step that is legal
+    /// only against a table has to ask. Absent counts as "not a table": a step
+    /// guarded by this must be skipped when its target does not exist either.
+    fn relation_is_table(conn: &Connection, name: &str) -> Result<bool> {
+        let kind: Option<String> = conn
+            .query_row(
+                "SELECT type FROM sqlite_master WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(kind.as_deref() == Some("table"))
+    }
+
     fn validate_schema(conn: &Connection) -> Result<()> {
         for (table, required_columns) in REQUIRED_SCHEMA {
             let object_type: Option<String> = conn
@@ -1231,9 +1337,15 @@ impl Store {
                     |row| row.get(0),
                 )
                 .optional()?;
-            if object_type.as_deref() != Some("table") {
+            // A view satisfies this contract as fully as a table does, and
+            // `generation_files` became one in v17 so that twenty-five read
+            // sites could keep asking the same question after its payload moved
+            // to a content-addressed table. What this validates is that the
+            // *relation* exists and carries the columns readers name — which
+            // `PRAGMA table_info` answers for a view exactly as for a table.
+            if !matches!(object_type.as_deref(), Some("table") | Some("view")) {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
-                    "required schema object {table:?} is not a table"
+                    "required schema object {table:?} is neither a table nor a view"
                 )));
             }
 
@@ -1496,9 +1608,17 @@ impl Store {
         }
         if version == 12 {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            // `CREATE INDEX IF NOT EXISTS` is idempotent, so this needs no
-            // probe — unlike the ADD COLUMN migrations above.
-            tx.execute_batch(MIGRATION_V12_TO_V13)?;
+            // `CREATE INDEX IF NOT EXISTS` is idempotent, but it is not legal
+            // on a view, and `generation_files` became one in v17. A fresh
+            // store applies `CREATE_SCHEMA_V3` — which carries the current
+            // shape, as every later migration's probe assumes — and then walks
+            // this chain, so this step *does* meet a view and must ask first.
+            // The index it creates has a successor there:
+            // `idx_file_payloads_identity`, on the same four columns, over one
+            // row per distinct payload instead of one per generation and file.
+            if Self::relation_is_table(&tx, "generation_files")? {
+                tx.execute_batch(MIGRATION_V12_TO_V13)?;
+            }
             tx.execute("PRAGMA user_version = 13", [])?;
             // No mid-chain validation: v14 adds the coverage-gap inventory and
             // the edge resolution column below, and the end-of-chain check is
@@ -1540,6 +1660,28 @@ impl Store {
             Self::validate_schema(&tx)?;
             tx.commit()?;
             version = 16;
+        }
+        if version == 16 {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Not an `ADD COLUMN`, so the idempotency probe is different: the
+            // step is complete exactly when `generation_files` has become a
+            // view. A fresh create applies `CREATE_SCHEMA_V3`, which already
+            // carries the split, before this chain runs.
+            let already_split: bool = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                      WHERE name = 'generation_files' AND type = 'view'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|count| count > 0)?;
+            if !already_split {
+                tx.execute_batch(MIGRATION_V16_TO_V17)?;
+            }
+            tx.execute("PRAGMA user_version = 17", [])?;
+            Self::validate_schema(&tx)?;
+            tx.commit()?;
+            version = 17;
         }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(Self::unsupported_schema(store, version));
@@ -2468,59 +2610,31 @@ impl Store {
             )));
         }
 
+        // Carrying a payload forward is now a `payload_id`, not a payload.
+        //
+        // This block used to SELECT each unaffected file's row — language,
+        // hashes, and a `parse_outcome_json`, `engine_json` and
+        // `extraction_json` averaging 53.7 KB together — into Rust and INSERT
+        // it back under the new generation id. Measured on this repository, a
+        // one-line edit to one file moved **~82 MB of JSON** that way, and left
+        // 1,530 byte-identical duplicate rows behind. Since v17 the bytes live
+        // once in `file_payloads` keyed by the identity the extraction cache
+        // already uses, and a carried file is a 16-byte membership row.
+        //
+        // One statement, executed inside SQLite, rather than a loop: there is
+        // nothing for Rust to decide here — `carry` has already decided it —
+        // and a round trip per file was the whole cost.
         if let Some(prev) = prev_gen {
-            if !full_rewrite {
+            if !full_rewrite && !carry.is_empty() {
                 let mut stmt = tx.prepare(
-                    "SELECT p.path, f.language, f.content_hash,
-                            f.parse_outcome_json, f.engine_json, f.extraction_json,
-                            f.grammar_version, f.analyzer_version
-                     FROM generation_files f
-                     JOIN paths p ON p.id = f.file_id
-                     WHERE f.generation_id = ?1",
+                    "INSERT INTO generation_file_rows (generation_id, file_id, payload_id)
+                     SELECT ?1, m.file_id, m.payload_id
+                       FROM generation_file_rows m
+                       JOIN paths p ON p.id = m.file_id
+                      WHERE m.generation_id = ?2 AND p.path = ?3",
                 )?;
-                let rows = stmt.query_map(params![prev], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                    ))
-                })?;
-                for row in rows {
-                    let (
-                        path,
-                        language,
-                        content_hash,
-                        parse_json,
-                        engine_json,
-                        extraction_json,
-                        grammar_version,
-                        analyzer_version,
-                    ) = row?;
-                    if !carry.contains(&path) {
-                        continue;
-                    }
-                    let file_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &path)?;
-                    tx.execute(
-                        "INSERT INTO generation_files
-                         (generation_id, file_id, language, content_hash, parse_outcome_json, engine_json, extraction_json, grammar_version, analyzer_version)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                        params![
-                            gen_id,
-                            file_id,
-                            language,
-                            content_hash,
-                            parse_json,
-                            engine_json,
-                            extraction_json,
-                            grammar_version,
-                            analyzer_version
-                        ],
-                    )?;
+                for path in &carry {
+                    stmt.execute(params![gen_id, prev, path])?;
                 }
             }
         }
@@ -2560,24 +2674,28 @@ impl Store {
                 ))
             })?;
             let file_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &extraction.file_path)?;
-            tx.execute(
-                "INSERT INTO generation_files
-                 (generation_id, file_id, language, content_hash, parse_outcome_json, engine_json, extraction_json, grammar_version, analyzer_version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    gen_id,
+            // The identity this payload was produced with, so a stored row is
+            // usable as a cache fallback without discarding the staleness
+            // guarantee the cache key exists to enforce (SC8). Since v17 it is
+            // also the payload's own key.
+            let identity = devmap_extract::cache::CacheKey::for_extraction(extraction);
+            let payload_id = Self::ensure_payload_id(
+                &tx,
+                StoredPayload {
                     file_id,
-                    extraction.language,
                     content_hash,
-                    parse_json,
-                    engine_json,
-                    extraction_json,
-                    // Stamp the identity this payload was produced with, so the
-                    // row is usable as a cache fallback without discarding the
-                    // staleness guarantee the cache key exists to enforce (SC8).
-                    devmap_extract::cache::CacheKey::for_extraction(extraction).grammar_version,
-                    devmap_extract::cache::CacheKey::for_extraction(extraction).analyzer_version
-                ],
+                    language: &extraction.language,
+                    grammar_version: &identity.grammar_version,
+                    analyzer_version: &identity.analyzer_version,
+                    parse_outcome_json: &parse_json,
+                    engine_json: &engine_json,
+                    extraction_json: &extraction_json,
+                },
+            )?;
+            tx.execute(
+                "INSERT INTO generation_file_rows (generation_id, file_id, payload_id)
+                 VALUES (?1, ?2, ?3)",
+                params![gen_id, file_id, payload_id],
             )?;
         }
 
@@ -5217,7 +5335,7 @@ impl Store {
                 params![old_gen],
             )?;
             tx.execute(
-                "DELETE FROM generation_files WHERE generation_id = ?1",
+                "DELETE FROM generation_file_rows WHERE generation_id = ?1",
                 params![old_gen],
             )?;
             tx.execute(
@@ -5239,6 +5357,20 @@ impl Store {
             tx.execute("DELETE FROM generations WHERE id = ?1", params![old_gen])?;
             pruned_count += 1;
         }
+
+        // A payload outlives its generation only for as long as some *other*
+        // generation still names it. Deleting the membership rows above frees
+        // nothing on its own — the bytes are in `file_payloads`, and since v17
+        // that is where 54% of this store lives — so the orphans go too.
+        //
+        // Deferred to after the loop rather than run per generation: a payload
+        // shared by two pruned generations would otherwise be probed twice, and
+        // the anti-join is one index scan either way.
+        tx.execute(
+            "DELETE FROM file_payloads
+              WHERE payload_id NOT IN (SELECT payload_id FROM generation_file_rows)",
+            [],
+        )?;
 
         // FTS5 deletes only tombstone their postings; without a merge the freed
         // space stays inside the index and the prune reclaims nothing there.
