@@ -326,9 +326,5 @@ every deliberate divergence from the Python implementation this replaced.
 
 ## License
 
-Apache-2.0, per the `LICENSE` at the repository root.
-
-> Note: `Cargo.toml` currently declares `license = "MIT"`, which contradicts that
-> file and the `Apache-2.0` the plugin manifest emits. The declaration is what
-> needs correcting, not the LICENSE — but that is a call for the owner to make,
-> so it is recorded here rather than changed.
+Apache-2.0, per the `LICENSE` at the repository root. `Cargo.toml`, the plugin
+manifest and that file all say so, and a test fails if they stop agreeing.

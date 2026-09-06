@@ -33,7 +33,7 @@ panic = "abort"
 version = "0.1.0"
 edition = "2021"
 authors = ["DevCouncil Team"]
-license = "MIT"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 # "rc" lets Arc<T> derive Serialize/Deserialize. ResolvedEdge shares one
