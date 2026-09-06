@@ -18,7 +18,23 @@ from devcouncil.domain.task import Task
 
 logger = logging.getLogger(__name__)
 
-LIVENESS_SCHEMA_VERSION = 1
+#: Bumped 1 → 2 when the snapshot moved off the retired Python scanner onto the
+#: kernel (:func:`kernel_liveness_snapshot`). Bump this together with
+#: ``wiring.LIVENESS_SCAN_VERSION``: the symbol half already refuses a mismatched
+#: ``scan_version``, and the diff below refuses a mismatched ``schema_version``,
+#: so an old baseline invalidates cleanly instead of being compared across two
+#: engines that disagree about what "unwired" means.
+LIVENESS_SCHEMA_VERSION = 2
+
+#: A list the kernel truncated cannot support a set difference.
+#:
+#: ``unwired_candidates`` and ``dead_symbol_candidates`` are capped samples in
+#: the manifest, published beside their real totals. Diffing two samples
+#: manufactures regressions from wherever the two cuts fell — a file present in
+#: the baseline's 200 and absent from the current 200 reads as "newly stranded"
+#: when nothing about it changed. So a truncated side makes the snapshot
+#: incomplete, and an incomplete baseline makes the ratchet skip.
+TRUNCATED_LIST_IS_INCOMPLETE = True
 
 
 def _norm(path: str) -> str:
@@ -78,6 +94,154 @@ def _symbol_display(entry: str) -> tuple[str, Optional[int], str]:
     return _norm(text), None, ""
 
 
+def _shown_total(meta: Any, key: str) -> tuple[int, int, bool]:
+    """``(shown, total, truncated)`` for one ``liveness_meta`` section.
+
+    A section the kernel did not send reports ``truncated=True``: not knowing
+    whether a list was cut is not the same as knowing it was not, and only one
+    of those two can safely feed a set difference.
+    """
+    section = meta.get(key) if isinstance(meta, Mapping) else None
+    if not isinstance(section, Mapping):
+        return (0, 0, True)
+    try:
+        shown = int(section.get("shown") or 0)
+        total = int(section.get("total") or 0)
+    except (TypeError, ValueError):
+        return (0, 0, True)
+    return (shown, total, bool(section.get("truncated")) or total > shown)
+
+
+def _symbol_index_from_graph(project_root: Path, head: str) -> tuple[list[str], bool]:
+    """``path::name`` for every symbol the kernel's graph knows.
+
+    Returns ``(index, usable)``. The ratchet needs this to tell a symbol that
+    went dead from one this task just wrote — without it the symbol half of the
+    diff refuses to flag anything, which is the "branch that cannot execute"
+    shape this work order removes.
+
+    ``usable`` is False whenever the index cannot be trusted as a complete
+    inventory:
+
+    * the graph is a size-capped export (``compatibility_export_tier``
+      ``compact`` drops node extras, ``stub`` drops nodes entirely), or
+    * it was generated from a different commit than the manifest beside it —
+      pairing a symbol index from one generation with candidate lists from
+      another turns the difference between two generations into a "regression".
+    """
+    try:
+        from devcouncil.indexing.graph.build import load_code_graph
+    except ImportError:
+        return ([], False)
+    try:
+        graph = load_code_graph(project_root)
+    except Exception:
+        logger.warning("code graph unreadable for the symbol index", exc_info=True)
+        return ([], False)
+    if graph is None:
+        return ([], False)
+
+    meta = getattr(graph, "meta", None) or {}
+    tier = meta.get("compatibility_export_tier")
+    if tier is not None and tier != "slim":
+        return ([], False)
+    graph_head = str(getattr(graph, "generated_head", "") or "")
+    if head and graph_head and graph_head != head:
+        return ([], False)
+
+    index = sorted(
+        {
+            f"{_norm(str(node.path))}::{node.name}"
+            for node in (getattr(graph, "nodes", None) or [])
+            if getattr(node, "path", "") and getattr(node, "name", "")
+        }
+    )
+    return (index, bool(index))
+
+
+def kernel_liveness_snapshot(project_root: Path) -> Optional[dict]:
+    """Liveness lists from the kernel — the engine that actually ships.
+
+    Replaces ``RepoMapper.liveness_snapshot``, which ran the Python
+    ``_compute_liveness`` and its regex token scanner. Everything else in the
+    system reads the Rust kernel, so the ratchet compared a Python baseline
+    against a Python current on a code path nothing else used, and both differed
+    from what ``dev map dead`` reports. A regression in it did not mean what a
+    user would see.
+
+    Both sides of the diff come through this one function, so they cannot drift
+    onto different engines. Returns ``None`` when the kernel cannot answer: the
+    caller then declines to write a baseline rather than writing an empty one,
+    because an empty baseline reads as "nothing was stranded" and would clear
+    every future diff.
+    """
+    try:
+        from devcouncil.devmap_client import DevMapClient, DevMapClientError
+
+        client = DevMapClient(project_root)
+        try:
+            # Regenerates the map and the graph together, so the lists below and
+            # the symbol index come from one generation. `read_repo_map` would
+            # be cheaper and wrong: the ratchet's current side has to reflect
+            # the tree *after* this task's edits.
+            manifest = client.manifest()
+        except DevMapClientError as exc:
+            logger.warning("kernel liveness snapshot unavailable: %s", exc)
+            return None
+        if not isinstance(manifest, Mapping):
+            return None
+
+        meta = manifest.get("liveness_meta")
+        _, _, dead_truncated = _shown_total(meta, "dead_symbol")
+        _, _, unwired_truncated = _shown_total(meta, "unwired")
+        # `unreachable_files` is bounded by the dead-cluster caps rather than by
+        # a `liveness_meta` section; the manifest reports that cut separately.
+        unreachable_truncated = bool(manifest.get("dead_clusters_truncated"))
+
+        head = str(manifest.get("generated_head") or "")
+        symbol_index, index_usable = _symbol_index_from_graph(project_root, head)
+
+        rate = manifest.get("resolution_rate")
+        net_permille = None
+        if isinstance(rate, Mapping) and isinstance(rate.get("net_permille"), int):
+            net_permille = rate["net_permille"]
+
+        truncated = sorted(
+            name
+            for name, cut in (
+                ("dead_symbol_candidates", dead_truncated),
+                ("unwired_candidates", unwired_truncated),
+                ("unreachable_files", unreachable_truncated),
+                ("symbol_index", not index_usable),
+            )
+            if cut
+        )
+        return {
+            "entry_roots": _as_list(manifest.get("entry_roots")),
+            "unwired_candidates": _as_list(manifest.get("unwired_candidates")),
+            "unreachable_files": _as_list(manifest.get("unreachable_files")),
+            "dead_symbol_candidates": _as_list(manifest.get("dead_symbol_candidates")),
+            "symbol_index": symbol_index,
+            # The kernel's own reachability verdict, computed since W1.1 from the
+            # component pass rather than hardcoded `true`. That is what makes the
+            # unreachable half of the diff a live branch again instead of one
+            # that could never fire.
+            "liveness_unreachable_unreliable": bool(
+                manifest.get("liveness_unreachable_unreliable")
+            ),
+            # Named, not counted: a reader is told *which* list was cut, and the
+            # baseline writer refuses to record a snapshot built from any of
+            # them. See :data:`TRUNCATED_LIST_IS_INCOMPLETE`.
+            "truncated_lists": truncated,
+            "net_resolution_permille": net_permille,
+            "generated_head": head,
+            "engine": "devmap_rust",
+        }
+    except Exception:
+        logger.warning("kernel liveness snapshot failed", exc_info=True)
+        return None
+
+
 def baseline_is_complete(baseline: Mapping[str, Any] | None) -> bool:
     """True when baseline exists and carries the write-completed marker."""
     return bool(baseline and isinstance(baseline, Mapping) and baseline.get("complete") is True)
@@ -135,6 +299,42 @@ def detect_liveness_regressions(
         added = {_norm(p) for p in (task_added_files or set())}
         task_id = task.id if task is not None else "TASK"
         gap_id = next_gap_id or (lambda tid, kind: f"{tid}-{kind}-1")
+
+        # The W2.1 net resolution rate, ratcheted before the candidate lists.
+        #
+        # A call the resolver stopped being able to attribute does not appear in
+        # any list here — the edge simply is not there, and a symbol whose only
+        # caller became unresolvable reads as "nothing calls it". So the rate
+        # moves first, and a drop in it explains stranding the other checks
+        # would otherwise report as the task's fault.
+        #
+        # Both sides must have measured it. A missing figure on either side is
+        # not a drop to zero.
+        base_rate = baseline.get("net_resolution_permille")
+        cur_rate = current.get("net_resolution_permille")
+        if isinstance(base_rate, int) and isinstance(cur_rate, int) and cur_rate < base_rate:
+            gaps.append(Gap(
+                id=gap_id(task_id, "RESRATE"),
+                severity="high" if blocking else "medium",
+                gap_type="resolution_regression",
+                task_id=task_id,
+                description=(
+                    f"Call resolution fell from {base_rate / 10:.1f}% to "
+                    f"{cur_rate / 10:.1f}% during this task: the resolver can attribute "
+                    "a smaller share of calls than it could at checkout, so every "
+                    "liveness finding below is a weaker claim than it was."
+                ),
+                evidence=[
+                    f"net_resolution_permille:{base_rate}->{cur_rate}",
+                    "regression:resolution_rate",
+                ],
+                recommended_fix=(
+                    "Find what stopped resolving — a changed import, a moved "
+                    "definition, a new dynamic dispatch — and restore the binding, "
+                    "or record why the calls are now legitimately unattributable."
+                ),
+                blocking=blocking,
+            ))
         added_lines = {
             _norm(p): set(lines)
             for p, lines in (diff_added_lines or {}).items()
@@ -308,7 +508,6 @@ def snapshot_liveness_baseline(
     Never raises.
     """
     try:
-        from devcouncil.indexing.repo_mapper import RepoMapper
         from devcouncil.utils.json_persist import write_json
 
         out_dir = project_root / ".devcouncil" / "liveness_baseline"
@@ -326,15 +525,28 @@ def snapshot_liveness_baseline(
                 pass
             # Incomplete/corrupt on disk — fall through and rewrite.
 
-        mapper = RepoMapper(project_root)
-        snap = mapper.liveness_snapshot()
+        snap = kernel_liveness_snapshot(project_root)
+        if snap is None:
+            logger.warning(
+                "no liveness baseline written for %s: the kernel could not be read. "
+                "An empty baseline would read as `nothing was stranded` and clear "
+                "every later diff.",
+                task_id,
+            )
+            return None
         from devcouncil.indexing.wiring import LIVENESS_SCAN_VERSION
 
-        unreliable = bool(snap.get("liveness_unreachable_unreliable")) or not _as_list(
-            snap.get("entry_roots")
-        )
-        # Empty-root scans must not become ratchet baselines (would flood or
-        # falsely look "clean" after fail-soft unreachable=[]).
+        truncated = list(snap.get("truncated_lists") or [])
+        # Three independent reasons a snapshot cannot be a ratchet input, kept
+        # apart so the log says which one fired:
+        #
+        # * empty entry roots — every file looks unreachable, so the diff would
+        #   flood or, after a fail-soft `unreachable=[]`, falsely look clean;
+        # * the kernel's own `unreachable_unreliable` verdict;
+        # * any capped list — see `TRUNCATED_LIST_IS_INCOMPLETE`.
+        no_roots = not _as_list(snap.get("entry_roots"))
+        unreliable = bool(snap.get("liveness_unreachable_unreliable")) or no_roots
+        complete = not unreliable and not (truncated and TRUNCATED_LIST_IS_INCOMPLETE)
         payload: dict[str, Any] = {
             "unwired_candidates": _as_list(snap.get("unwired_candidates")),
             "unreachable_files": _as_list(snap.get("unreachable_files")),
@@ -342,14 +554,29 @@ def snapshot_liveness_baseline(
             "entry_roots": _as_list(snap.get("entry_roots")),
             "symbol_index": _as_list(snap.get("symbol_index")),
             "liveness_unreachable_unreliable": unreliable,
-            "generated_head": mapper._git_head(),
-            "source": "fresh_scan",
+            "truncated_lists": truncated,
+            # The W2.1 net resolution rate, carried so the diff can ratchet it.
+            # A drop here is the earliest signal that extraction regressed, and
+            # it moves before any candidate list does.
+            "net_resolution_permille": snap.get("net_resolution_permille"),
+            "generated_head": snap.get("generated_head") or "",
+            "source": "kernel_manifest",
+            "engine": snap.get("engine") or "devmap_rust",
             "scan_version": LIVENESS_SCAN_VERSION,
             "schema_version": LIVENESS_SCHEMA_VERSION,
-            "complete": not unreliable,
+            "complete": complete,
         }
         write_json(out_path, payload)
-        return out_path if not unreliable else None
+        if not complete:
+            logger.warning(
+                "liveness baseline for %s is not a ratchet input (roots_empty=%s, "
+                "unreliable=%s, truncated=%s)",
+                task_id,
+                no_roots,
+                snap.get("liveness_unreachable_unreliable"),
+                truncated or "none",
+            )
+        return out_path if complete else None
     except Exception:
         logger.debug("snapshot_liveness_baseline failed for %s", task_id, exc_info=True)
         return None

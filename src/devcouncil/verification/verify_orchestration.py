@@ -302,9 +302,9 @@ async def run_verify_orchestration(
     # Liveness ratchet: existing code newly stranded vs checkout baseline.
     if rigor.liveness_ratchet_enabled:
         try:
-            from devcouncil.indexing.repo_mapper import RepoMapper
             from devcouncil.verification.checks.liveness_ratchet import (
                 detect_liveness_regressions,
+                kernel_liveness_snapshot,
                 load_liveness_baseline,
             )
             from devcouncil.verification.checks.wiring import collect_added_files
@@ -315,8 +315,12 @@ async def run_verify_orchestration(
                 liveness_baseline_status = "missing"
             else:
                 liveness_baseline_status = "ok"
-                mapper = RepoMapper(verifier.project_root)
-                current = mapper.liveness_snapshot()
+                # The same function the baseline was written from, so the two
+                # sides of the diff cannot land on different engines. `None`
+                # means the kernel could not answer; `detect_liveness_regressions`
+                # returns no gaps for a missing current side rather than reading
+                # it as "everything became stranded".
+                current = kernel_liveness_snapshot(verifier.project_root)
                 added = collect_added_files(
                     project_root=verifier.project_root,
                     changed_files=changed_files,

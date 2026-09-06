@@ -97,7 +97,13 @@ _WIRING_DECORATOR_HINTS = (
 # v4 = confidence hardening: generated-file / side-effect-carrier / entry-script
 # / barrel-init exemptions, launcher-file references, globals()/hasattr dynamic
 # evidence, and Go/Rust liveness gated on tree-sitter availability.
-LIVENESS_SCAN_VERSION = 4
+# v5 = the scan moved off this module's Python token scanner onto the Rust
+# kernel (`liveness_ratchet.kernel_liveness_snapshot`). Bumped together with
+# `LIVENESS_SCHEMA_VERSION` 1 -> 2: the symbol half of the diff refuses a
+# mismatched `scan_version` and the file half refuses a mismatched
+# `schema_version`, so a baseline written by the old engine invalidates cleanly
+# instead of being compared against a current side that measured something else.
+LIVENESS_SCAN_VERSION = 5
 
 _VENDOR_DIR_NAMES = frozenset({"vendor", "vendored", "node_modules"})
 

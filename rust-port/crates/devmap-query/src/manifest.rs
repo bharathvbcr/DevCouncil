@@ -483,6 +483,18 @@ fn consumer_manifest_json(
         // with everything exported or wired already exempt.
         "unreachable_files": analysis.dead_clusters.unreachable_files,
         "dead_symbol_candidates": dead_symbol_candidates,
+        // The W2.1 figure, published where a consumer that already reads this
+        // artifact can fence it. It was emitted only by `build --json`, which
+        // the liveness ratchet does not run — so the metric built to be the
+        // earliest signal that extraction regressed was unreachable from the
+        // only check that would have ratcheted it.
+        //
+        // Here rather than on `status` because this payload and the lists above
+        // are written from one `analysis`, in one generation. A consumer that
+        // read the rate from a second command could pair a rate from one
+        // generation with candidate lists from another and call the difference
+        // a regression.
+        "resolution_rate": analysis.resolution_rate,
         // No longer unconditional. It now means what its name says: the
         // reachability answer cannot be trusted, because the component pass
         // refused an oversized graph or because call coverage had a hole in it

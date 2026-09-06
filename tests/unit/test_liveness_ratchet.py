@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from pathlib import Path
 
 from devcouncil.domain.task import Task
@@ -12,6 +14,38 @@ from devcouncil.verification.checks.liveness_ratchet import (
 )
 from devcouncil.verification.difficulty import resolve_rigor_policy
 
+
+
+@pytest.fixture
+def kernel_snapshot(monkeypatch):
+    """Stand in for the kernel read, so lifecycle tests test the lifecycle.
+
+    Since W3.1 the baseline is measured by the Rust kernel rather than the
+    retired Python scanner, so `snapshot_liveness_baseline` needs an indexed
+    store. The tests below are about write-once, load and delete — not about
+    what the kernel measures — and building a store in each would make them
+    report the binary on PATH. `test_liveness_kernel_source.py` covers the real
+    kernel path end to end.
+
+    Returns the dict the patched function yields, so a test can mutate it.
+    """
+    snapshot = {
+        "entry_roots": ["pyproject.toml"],
+        "unwired_candidates": ["pkg/orphan.py"],
+        "unreachable_files": [],
+        "dead_symbol_candidates": [],
+        "symbol_index": ["pkg/cli.py::main"],
+        "liveness_unreachable_unreliable": False,
+        "truncated_lists": [],
+        "net_resolution_permille": 500,
+        "generated_head": "deadbeef",
+        "engine": "devmap_rust",
+    }
+    monkeypatch.setattr(
+        "devcouncil.verification.checks.liveness_ratchet.kernel_liveness_snapshot",
+        lambda _root: dict(snapshot),
+    )
+    return snapshot
 
 def _task(*, difficulty: str = "hard") -> Task:
     return Task(
@@ -237,7 +271,7 @@ def test_rigor_easy_advisory_ratchet():
     assert policy.liveness_ratchet_blocking is False
 
 
-def test_snapshot_and_load_baseline(tmp_path):
+def test_snapshot_and_load_baseline(tmp_path, kernel_snapshot):
     import subprocess
 
     (tmp_path / "pkg").mkdir()

@@ -107,6 +107,7 @@ _GAP_TYPE_PRIORITY = {
     "unwired_file": 1,
     "dead_symbol": 1,
     "stranded_code": 1,
+    "resolution_regression": 1,
     "stub_declared": 4,
     "task_not_implemented": 2,
     "migration_gap": 2,

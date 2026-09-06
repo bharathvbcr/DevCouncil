@@ -252,9 +252,23 @@ def test_the_kernel_stamps_freshness_so_python_never_rewrites_the_graph(tmp_path
     unavailable = payloads["graph"]["meta"]["devmap_rust"]["unavailable"]
     assert "indexed_hash" not in unavailable
     assert "content_fingerprint" not in unavailable
-    # Reachability is still genuinely not computed; stamping must not imply it.
-    assert "unreachable_files" in unavailable
-    assert payloads["graph"]["meta"]["liveness_unreachable_unreliable"] is True
+    # Reachability *is* computed since W1.1 — from the strongly-connected
+    # component pass, not a BFS out of the entry roots — so the same rule now
+    # cuts the other way: a computed answer must stop being advertised as
+    # uncomputable, or a consumer skips the check the value could have
+    # satisfied. This assertion used to pin the opposite and was correct when it
+    # was written.
+    assert "unreachable_files" not in unavailable, (
+        "the kernel computes reachability now; advertising it as unavailable "
+        "tells every Python consumer to ignore a real result"
+    )
+    # And the flag is a verdict rather than a constant. It was hardcoded `true`,
+    # which made the liveness ratchet's unreachable half unable to fire at all.
+    # Both of its values are pinned in `devmap-query/src/code_graph.rs`; here it
+    # only has to be a real boolean the artifact carries.
+    assert isinstance(
+        payloads["graph"]["meta"]["liveness_unreachable_unreliable"], bool
+    )
 
 
 @requires_engine

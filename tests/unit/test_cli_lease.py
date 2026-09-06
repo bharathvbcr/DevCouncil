@@ -9,6 +9,13 @@ from devcouncil.storage.repositories import TaskRepository
 
 runner = CliRunner()
 
+# `--json` promises one JSON object on **stdout**; diagnostics go to stderr via
+# `telemetry.logging_setup`'s stderr handler. `res.output` merges both streams,
+# so parsing it made these tests pass only while nothing happened to log —
+# a single `logger.warning` anywhere in the checkout path broke them, and looked
+# like a defect in the lease code. `res.stdout` asserts the contract instead of
+# depending on silence.
+
 
 def _setup_lease_env(tmp_path: Path, monkeypatch) -> tuple[Path, str]:
     reset_db_cache()
@@ -34,7 +41,7 @@ def test_cli_lease_checkout_and_release(tmp_path, monkeypatch):
     # 1. Checkout lease
     res = runner.invoke(app, ["checkout", task_id, "--client-id", "test-agent", "--agent", "test-runner", "--json"])
     assert res.exit_code == 0, f"checkout failed: {res.output}\nexception: {res.exception}"
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["ok"] is True
     lease_tok = data["lease_token"]
     assert lease_tok is not None

@@ -33,6 +33,9 @@ class Gap(BaseModel):
         "unwired_file",
         "dead_symbol",
         "stranded_code",
+        # W3.1: the resolver attributes a smaller share of calls than it could
+        # at checkout. Not a stranding — the cause of one.
+        "resolution_regression",
         "stale_map",
         "corpus_stale",
         "doc_code_ref",

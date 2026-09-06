@@ -47,6 +47,7 @@ _CATEGORY_BY_GAP_TYPE = {
     "unwired_file": "fix_code",
     "dead_symbol": "fix_code",
     "stranded_code": "fix_code",
+    "resolution_regression": "fix_code",
     "stale_map": "refresh_map",
 }
 

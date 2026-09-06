@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import subprocess
 
 from devcouncil.indexing.repo_mapper import RepoMapper
@@ -20,6 +22,38 @@ from devcouncil.verification.checks.liveness_ratchet import (
     snapshot_liveness_baseline,
 )
 
+
+
+@pytest.fixture
+def kernel_snapshot(monkeypatch):
+    """Stand in for the kernel read, so lifecycle tests test the lifecycle.
+
+    Since W3.1 the baseline is measured by the Rust kernel rather than the
+    retired Python scanner, so `snapshot_liveness_baseline` needs an indexed
+    store. The tests below are about write-once, load and delete — not about
+    what the kernel measures — and building a store in each would make them
+    report the binary on PATH. `test_liveness_kernel_source.py` covers the real
+    kernel path end to end.
+
+    Returns the dict the patched function yields, so a test can mutate it.
+    """
+    snapshot = {
+        "entry_roots": ["pyproject.toml"],
+        "unwired_candidates": ["pkg/orphan.py"],
+        "unreachable_files": [],
+        "dead_symbol_candidates": [],
+        "symbol_index": ["pkg/cli.py::main"],
+        "liveness_unreachable_unreliable": False,
+        "truncated_lists": [],
+        "net_resolution_permille": 500,
+        "generated_head": "deadbeef",
+        "engine": "devmap_rust",
+    }
+    monkeypatch.setattr(
+        "devcouncil.verification.checks.liveness_ratchet.kernel_liveness_snapshot",
+        lambda _root: dict(snapshot),
+    )
+    return snapshot
 
 def _git(root, *args):
     subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True)
@@ -206,7 +240,7 @@ def test_ratchet_skips_symbol_whose_def_line_in_diff():
     assert gaps == []
 
 
-def test_baseline_write_once(tmp_path):
+def test_baseline_write_once(tmp_path, kernel_snapshot):
     # Declared entry root required: empty-root scans are incomplete by design.
     _write(tmp_path, {
         "pyproject.toml": (
@@ -247,7 +281,7 @@ def test_baseline_incomplete_treated_as_missing(tmp_path):
     assert load_liveness_baseline(tmp_path, "TASK-1") is None
 
 
-def test_delete_baseline_on_demand(tmp_path):
+def test_delete_baseline_on_demand(tmp_path, kernel_snapshot):
     _write(tmp_path, {
         "pyproject.toml": (
             '[project]\nname = "x"\nversion = "0"\n'
