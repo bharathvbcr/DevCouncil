@@ -75,6 +75,44 @@ MIN_DEFS=16
 EDGE_CAP_MILLI=800000
 #
 # The model coefficient used for the prediction check, set to the measured mean.
+#
+# STALE, and knowingly so — bisected 2026-09-06, not re-derived here.
+#
+# 410 was measured on 2026-08-17 (0809dec), and that commit still reproduces it
+# exactly: 415,334 milli-bytes/edge, 100% of prediction. Current HEAD measures
+# 718,000-752,000 at this corpus size. `git bisect` over the 182 commits between
+# them lands on 079bc505 (2026-09-02, "close the eight gortex capability gaps"),
+# which rewrote 767 lines of the resolver and added `ResolvedEdge::evidence`.
+# The measurements were bimodal across every bisect step (~404k good vs ~718k
+# bad), so the landing is not a noise artefact.
+#
+# Three mechanisms were proposed and each ruled out by measurement, which is
+# why the number is left alone rather than adjusted to fit:
+#
+#   parallel resolution   RAYON_NUM_THREADS=1/2/4/18 gives 718k/738k/736k/749k.
+#                         Flat. Not concurrent per-thread buffers.
+#   2x parallel collect   the merge already consumes `per_file` by value.
+#   growth reallocation   reserving the exact total before the merge changed
+#                         nothing (716k vs 719k baseline); reverted unshipped.
+#
+# What it *is*: sampling RSS against the phase boundaries on a 810,080-edge
+# corpus puts 459 MiB of a 594 MiB peak inside resolution — 67 MiB at the end of
+# extraction, 526 MiB at the end of resolve — and it stays resident through
+# analyze and persist. That is the `Vec<ResolvedEdge>` itself, held by design,
+# not a leak. The edge grew; the coefficient did not.
+#
+# The coefficient is also scale-dependent, which this linear model does not
+# express: 745,267 milli-bytes/edge at the default 5,000 ambiguous sites against
+# 550,092 at 50,000 (DEVMAP_PROBE_CALLERS=1000), where the per-pair bound passes
+# at 34,380 against its 40,000 cap. The default corpus sits in a small-scale
+# regime where fixed cost is a large share of the delta, so it reports the
+# harshest number of any size this probe can be run at.
+#
+# Re-deriving it means choosing a new safety bound, which is a decision about
+# how much memory this phase is allowed to cost — not a side effect of finding
+# out why it moved. Left red on purpose: a gate reporting a real change is doing
+# its job, and quietly widening it to green is the one response the SC27 note
+# below rules out.
 MODEL_EDGE_BYTES=410
 # The model held to within 0.5% at this shape and 3.4% across an 8x scale sweep.
 # +25% is far outside that, so a trip is a real change in cost per edge. The

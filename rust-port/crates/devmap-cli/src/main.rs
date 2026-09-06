@@ -751,6 +751,16 @@ enum Commands {
         /// database by hand or delete it.
         #[arg(long)]
         pending: bool,
+        /// Rewrite the store at the current default page size.
+        ///
+        /// Page size is fixed when a database first gets content, so a store
+        /// built before the default changed keeps its old one for life: the
+        /// pragma is accepted and ignored on an existing database, and the
+        /// daemon reopens whatever it finds. Nothing in the normal course of
+        /// running converts one, which is why this is an explicit action —
+        /// the rewrite takes an exclusive lock and leaves WAL for its duration.
+        #[arg(long = "page-size")]
+        page_size: bool,
     },
     Snapshots {
         #[arg(default_value = "")]
@@ -3272,10 +3282,34 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Repair { fts, pending } => {
+        Commands::Repair {
+            fts,
+            pending,
+            page_size,
+        } => {
             let store = open_for_read(&cli.db)?;
-            if !*fts && !*pending {
-                anyhow::bail!("specify a repair target, e.g. --fts or --pending");
+            if !*fts && !*pending && !*page_size {
+                anyhow::bail!("specify a repair target, e.g. --fts, --pending or --page-size");
+            }
+            if *page_size {
+                let outcome = store.convert_page_size()?;
+                if cli.json {
+                    emit_json(
+                        cli,
+                        &serde_json::json!({
+                            "page_size_before": outcome.before,
+                            "page_size_after": outcome.after,
+                            "converted": outcome.converted,
+                        }),
+                    )?;
+                } else if outcome.converted {
+                    println!(
+                        "Store rewritten at {} byte pages (was {}).",
+                        outcome.after, outcome.before
+                    );
+                } else {
+                    println!("Store already uses {} byte pages.", outcome.after);
+                }
             }
             if *fts {
                 store.repair_fts()?;
