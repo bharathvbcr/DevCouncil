@@ -401,11 +401,28 @@ pub fn extract_treesitter_with_budget(
                     (Vec::new(), Vec::new())
                 };
                 if extraction_overran(deadline) {
+                    // Labelled by what actually ran for *this* language. The
+                    // block above is gated on `lang == "go"`, so naming it
+                    // unconditionally reported a Python file as having spent
+                    // its budget "deriving Go method sets" — a stage that did
+                    // not execute, for a language that has no method sets. The
+                    // refusal was right and the accounting was not, which sends
+                    // a maintainer after a pass that never ran.
+                    //
+                    // For every other language the only work between
+                    // `walk_tree`'s last deadline check and here is the walk's
+                    // own tail: the clock is read every `DEADLINE_CHECK_STRIDE`
+                    // nodes, so a walk can return `true` having crossed the
+                    // deadline within the following stride.
                     return refused_extraction(
                         path,
                         lang,
                         source,
-                        over_budget("deriving Go method sets"),
+                        over_budget(if lang == "go" {
+                            "deriving Go method sets"
+                        } else {
+                            "finishing the syntax-tree walk"
+                        }),
                     );
                 }
 

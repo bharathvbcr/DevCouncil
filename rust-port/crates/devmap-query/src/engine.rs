@@ -108,6 +108,11 @@ impl<'a> StoreQueryEngine<'a> {
         let total = snapshot.total;
         let rows = snapshot.rows;
         let repo_root = snapshot.repo_root;
+        // Taken off the same snapshot as the count and the rows, before either
+        // is consumed, for the reason the comment above gives: a caveat
+        // resolved separately could describe a different corpus from the one
+        // that was searched.
+        let coverage_gap = search_coverage_gap(analysis_status_gap(snapshot.analysis.as_ref()));
         let query = req.query.to_lowercase();
         // Rank, then truncate — R7, and the reason the pool above is wider than
         // the page below. The store cuts its page with `ORDER BY bm25(...)` and
@@ -159,12 +164,19 @@ impl<'a> StoreQueryEngine<'a> {
         // was computed over a sample, which it cannot otherwise know. It is
         // `None` whenever every match was ranked, which on any ordinary query
         // is every time.
-        response.walk_incomplete = (total as usize > pool).then(|| {
+        let ranked_over_a_sample = (total as usize > pool).then(|| {
             format!(
                 "ranked the first {pool} of {total} matches, in the store's \
                  relevance order; a closer match may sit outside that page"
             )
         });
+        // Two independent qualifications, composed rather than ranked — the
+        // same shape `dependencies` and the traversals use. One is about the
+        // *ordering* of what was found; the other is about whether the corpus
+        // searched was the whole repository, and it is the one that decides
+        // whether `total: 0` may be read as "no such symbol".
+        response.walk_incomplete =
+            devmap_analyze::combine_reasons(ranked_over_a_sample, coverage_gap);
         Ok(response)
     }
 
@@ -2490,11 +2502,26 @@ impl<'a> QueryEngine<'a> {
                 .then_with(|| a.span.cmp(&b.span))
         });
 
-        budget_take(hits, req.token_budget, |hit| {
+        let mut response = budget_take(hits, req.token_budget, |hit| {
             u32::try_from(hit.source_span.len() / 4)
                 .unwrap_or(u32::MAX)
                 .saturating_add(20)
-        })
+        });
+        // The same caveat the store-backed search carries, from the same owner
+        // asked of what this engine actually has. A refused extraction in the
+        // slice hides its symbols from this loop exactly as a refused row hides
+        // them from the index, so one engine disclosing and the other not would
+        // let the same corpus answer differently depending on which was asked.
+        //
+        // Composed, not assigned: `budget_take` sets its own reason when the
+        // page was cut.
+        response.walk_incomplete = devmap_analyze::combine_reasons(
+            response.walk_incomplete.take(),
+            search_coverage_gap(
+                devmap_analyze::extraction_coverage(self.extractions).degraded_reason(),
+            ),
+        );
+        response
     }
 
     pub fn dependencies(&self, req: Request<String>) -> Response<ResolvedEdge> {
@@ -3288,6 +3315,35 @@ fn file_edge_coverage_gap(outcome: &ParseOutcome) -> Option<String> {
 fn analysis_coverage_gap(
     analysis: Option<&devmap_analyze::model::AnalysisDisclosure>,
 ) -> Option<String> {
+    let unresolved = analysis
+        .filter(|analysis| analysis.unresolved_calls > 0)
+        .map(|analysis| {
+            format!(
+                "{} call(s) in this generation are unattributed: the graph behind this answer \
+                 is missing that many edges, so it is a lower bound",
+                analysis.unresolved_calls
+            )
+        });
+    devmap_analyze::combine_reasons(analysis_status_gap(analysis), unresolved)
+}
+
+/// The corpus half of [`analysis_coverage_gap`], on its own.
+///
+/// Split out because the two halves answer different questions and not every
+/// surface is entitled to both. `unresolved_calls` is about *edges* — how much
+/// of the call graph was attributed — and it is non-zero on essentially every
+/// real repository. A surface that does not answer from the call graph must not
+/// carry it, or the marker rides on every answer and tells a reader nothing,
+/// which is the failure mode [`analysis_coverage_gap`] documents.
+///
+/// What this half says is about the *corpus*: whether the generation is a
+/// complete read of the repository at all. `AnalysisStatus::Partial` is where
+/// `ExtractionCoverage::degraded_reason` lands, so the counts it carries —
+/// files that failed to parse, were recovered by pattern, or were refused by
+/// discovery — come through verbatim from their one owner.
+fn analysis_status_gap(
+    analysis: Option<&devmap_analyze::model::AnalysisDisclosure>,
+) -> Option<String> {
     use devmap_analyze::model::AnalysisStatus;
     // A generation exists but its analysis blob does not read back. That is a
     // check that could not run, and it must not answer like one that ran.
@@ -3298,19 +3354,38 @@ fn analysis_coverage_gap(
                 .to_string(),
         );
     };
-    let status = match &analysis.status {
+    match &analysis.status {
         AnalysisStatus::Ok => None,
         AnalysisStatus::Partial { reason } => Some(format!("the analysis is partial: {reason}")),
         AnalysisStatus::Timeout { reason } => Some(format!("the analysis timed out: {reason}")),
-    };
-    let unresolved = (analysis.unresolved_calls > 0).then(|| {
+    }
+}
+
+/// What a corpus-level gap means for a *search*, or `None` when there is none.
+///
+/// `search` answers "does a symbol by this name exist here", and a miss is the
+/// answer callers act on hardest: `total: 0, truncated: false, resolution:
+/// Available, walk_incomplete: None` reads as *"there are zero matches in this
+/// corpus"* stated as a completed check. Every symbol of a file that was
+/// refused — a parse over its budget, a grammar that would not load, a NUL byte
+/// caught at the boundary — is absent from the index, so a name that lives only
+/// there answered identically to a name that exists nowhere. A reader deciding
+/// "this symbol does not exist, so I may take the name" and one deciding "this
+/// symbol may exist in a file nothing read" were given the same sentence.
+///
+/// One owner for both engines and one wording, fed from the two places the same
+/// fact lives: the persisted disclosure for [`StoreQueryEngine`], and
+/// [`devmap_analyze::extraction_coverage`] over the slice for [`QueryEngine`].
+/// `None` in, `None` out is the load-bearing case — a fully read corpus must
+/// keep answering without a caveat.
+fn search_coverage_gap(corpus_gap: Option<String>) -> Option<String> {
+    corpus_gap.map(|gap| {
         format!(
-            "{} call(s) in this generation are unattributed: the graph behind this answer \
-             is missing that many edges, so it is a lower bound",
-            analysis.unresolved_calls
+            "the corpus behind this answer is not a complete read of the repository, so a \
+             name that matches nothing here may still be declared in a file that was never \
+             indexed: {gap}"
         )
-    });
-    devmap_analyze::combine_reasons(status, unresolved)
+    })
 }
 
 /// Rank of one stored symbol against an already-lowercased query.
