@@ -1181,10 +1181,32 @@ impl Store {
         // Like `auto_vacuum` below, this only takes on a database with no
         // tables yet — which is why it sits here, before `enable_wal` and
         // `migrate`. An existing 4 KiB store accepts the statement, ignores it,
-        // and keeps its page size until a full vacuum rewrites it; that is the
-        // same conversion path auto_vacuum already relies on, and
-        // `an_existing_small_page_store_opens_and_reads` pins that it is not an
-        // error.
+        // and keeps 4 KiB;
+        // `an_existing_small_page_store_opens_and_reads` pins that this is not
+        // an error.
+        //
+        // It does **not** share auto_vacuum's conversion path, and an earlier
+        // version of this comment claimed it did. `VACUUM` adopts a pending
+        // `auto_vacuum`, but it cannot change `page_size` on a WAL database —
+        // SQLite silently leaves the page size alone, which is exactly what
+        // makes the wrong claim survive a test that only checks the store still
+        // works. Measured: `PRAGMA page_size=16384; VACUUM;` on a 299 MB WAL
+        // store returned page_size 4096.
+        //
+        // Converting an existing store means leaving WAL for the rewrite:
+        //
+        //     PRAGMA journal_mode=DELETE;
+        //     PRAGMA page_size=16384;
+        //     VACUUM;
+        //     PRAGMA journal_mode=WAL;
+        //
+        // (2 s on that same store, 299 MB -> 296 MB.) That is deliberately not
+        // done automatically: it takes an exclusive lock and drops the database
+        // out of WAL for the duration, which is not something to do to somebody
+        // else's store as a side effect of opening it. Existing stores keep
+        // 4 KiB and keep working; new ones get 16 KiB.
+        // `a_plain_vacuum_does_not_convert_an_existing_page_size` pins the
+        // half that is easy to get wrong.
         conn.pragma_update(None, "page_size", 16384)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "cache_size", Self::CACHE_SIZE_KIB)?;
@@ -5773,6 +5795,66 @@ mod connection_tests {
             size, 16384,
             "a store created by this code should use the configured page size"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A plain `VACUUM` does not convert an existing store's page size.
+    ///
+    /// This pins the assumption the comment on the `page_size` pragma makes,
+    /// because getting it wrong is silent: `VACUUM` adopts a pending
+    /// `auto_vacuum`, so "a full vacuum converts it" reads as true for both
+    /// settings and is only true for one. SQLite will not change `page_size` on
+    /// a WAL database, and reports no error when it declines.
+    ///
+    /// Both halves are asserted — that the plain vacuum leaves 4 KiB, and that
+    /// leaving WAL for the rewrite is what actually converts — so the remedy in
+    /// that comment is executable rather than remembered.
+    #[test]
+    fn a_plain_vacuum_does_not_convert_an_existing_page_size() {
+        let dir = scratch("pagesize-vacuum");
+        let path = dir.join("devmap.sqlite");
+        {
+            let conn = Connection::open(&path).expect("seed connection");
+            conn.pragma_update(None, "page_size", 4096).expect("4 KiB");
+            conn.execute_batch("CREATE TABLE seed (x INTEGER); DROP TABLE seed;")
+                .expect("fix the page size into the file header");
+        }
+        // Opening puts it in WAL, which is the state a real store is in.
+        drop(Store::open(&path).expect("store"));
+
+        let conn = Connection::open(&path).expect("connection");
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal_mode");
+        assert_eq!(
+            mode.to_lowercase(),
+            "wal",
+            "the store under test must be WAL"
+        );
+
+        conn.execute_batch("PRAGMA page_size=16384; VACUUM;")
+            .expect("a plain vacuum must succeed, not error");
+        let after_plain: i64 = conn
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .expect("page_size");
+        assert_eq!(
+            after_plain, 4096,
+            "a plain VACUUM on a WAL database leaves the page size alone — it does \
+             not report failure, which is why the claim that it converts survives"
+        );
+
+        conn.execute_batch(
+            "PRAGMA journal_mode=DELETE; PRAGMA page_size=16384; VACUUM; PRAGMA journal_mode=WAL;",
+        )
+        .expect("the documented conversion must succeed");
+        let after_documented: i64 = conn
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .expect("page_size");
+        assert_eq!(
+            after_documented, 16384,
+            "leaving WAL for the rewrite is what actually converts the page size"
+        );
+        drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
