@@ -80,3 +80,7 @@ required-features = ["parse"]
 [[test]]
 name = "qualified_module_paths"
 required-features = ["parse"]
+
+[[test]]
+name = "every_site_is_counted_once"
+required-features = ["parse"]
