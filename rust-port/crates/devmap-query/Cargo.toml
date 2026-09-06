@@ -166,3 +166,15 @@ required-features = ["parse"]
 [[test]]
 name = "routes_under_hostile_input"
 required-features = ["parse"]
+
+[[test]]
+name = "coupling_spans_inheritance"
+required-features = ["parse"]
+
+[[test]]
+name = "every_emitted_field_says_whether_it_ran"
+required-features = ["parse"]
+
+[[test]]
+name = "graph_intel_is_emitted"
+required-features = ["parse"]
