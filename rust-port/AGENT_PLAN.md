@@ -483,6 +483,14 @@ commits are on `claude/devmap-open-items`.
 | `tools/soak.sh` read the *Python* engine's store, so its digest and growth checks had been vacuous for their whole life; now reads `devmap.sqlite`, samples RSS and store bytes per cycle, gained a `--daemon` mode, and asserts a plateau by comparing half-means after a warm-up quarter | `51b7c93` |
 | `devmap-query`'s huge-file read-bound test made independent of wall time — it was failing at HEAD `385baa0` because a 50 MB fixture overran `DEFAULT_PARSE_BUDGET` whenever the machine was busy | `ec31350` |
 
+**What closed on the open-items line (2026-09-06).** Detail, tests and numbers in STATUS.md's
+"Refusal inventory and edge resolution (2026-09-06)" section.
+
+| Item | Commit |
+|---|---|
+| `discovery_refused_files` is an inventory of paths (schema 14, `generation_coverage_gaps`) rather than a count the drain carried forward as `max(previous, this_batch)`. That floor left a repaired file counted until a full re-extraction and, worse, hid a refusal *this batch* met inside a larger carried number. The drain now carries the previous inventory minus its affected set; the count is `COUNT(*)`, derived and never carried, and `save_generation` refuses a summary the inventory cannot account for. The same table names the paths behind all three of `degraded_reason`'s numbers in `devmap status --json` and the daemon's IPC status (`coverage_gaps`, capped at 50 with `{shown, total, truncated}`) — on this repository the refusal is `rust-port/vendor/grammars/cobol/parser.c` at 30.6 MB against the 1 MiB ceiling, which nothing said until now. Also fixed: `daemon_discovery_refusals.rs` never reached the incremental branch it documents, because `save_generation` stamps `head_sha` "unknown" while the daemon reads "unavailable" | `5fd2a8c` |
+| Each edge's `Resolution` kind persisted (schema 15, `generation_edges.resolution`), with `ResolutionSource::{Stored, Reconstructed}` so a variant guessed from a pre-column row can never read as one the resolver recorded. +0.85% store bytes on this repository (14 B/edge). `devmap-query`'s `stored_edge_to_resolved` still sets `resolution: None` — the remaining half needs an edit in a crate that lane did not own; the red test for it is unstaged at `devmap-query/tests/stored_edge_resolution_is_read_not_guessed.rs` | `9fa873e` |
+
 Status is one of: **open** (not started), **partial** (started, gated), **decision** (blocked
 on a human). Nothing here is "done" — closed items live in STATUS.md's dated sections.
 
